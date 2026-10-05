@@ -2859,8 +2859,9 @@ impl Session {
         // no per-port removal — a record already pushed is a port that stays
         // listed until the spawn ends — and the report is answered before
         // the caller hears anything, so the caller never names a port the
-        // host refused. The one window the fail-closed answer cannot close:
-        // a reply lost after the host recorded the port leaves a row entry
+        // host refused. A reply lost after the host recorded the port is
+        // withdrawn again by the report itself before it answers, best-effort:
+        // only a withdrawal the door also never answers leaves a row entry
         // no forward answers, gone with the row at the box's own destroy —
         // the same stale-entry posture a failed withdrawal already accepts.
         if let Err(report) =
@@ -2990,24 +2991,31 @@ impl Session {
                     .box_addresses
                     .map(|addresses| addresses.switch_address)
             });
+            // The withdrawals run side by side, so the sweep is bounded by
+            // one withdrawal's deadline however many ports it takes down.
             if let Some(switch_address) = switch_address {
-                for forwarder in &forwarders {
-                    if let Err(error) = crate::net::listeners::report_withdrawn_port(
-                        &control,
-                        switch_address,
-                        forwarder.internal_port(),
-                        minimald_rpc::PortReportSource::Expose,
-                    )
-                    .await
-                    {
-                        tracing::warn!(
-                            port = forwarder.internal_port(),
-                            reason = %error,
-                            "reporting a stopped box's port withdrawal to the \
-                             VM host daemon failed; the host's row still names it"
-                        );
+                let withdrawals = forwarders.iter().map(|forwarder| {
+                    let control = &control;
+                    async move {
+                        let port = forwarder.internal_port();
+                        if let Err(error) = crate::net::listeners::report_withdrawn_port(
+                            control,
+                            switch_address,
+                            port,
+                            minimald_rpc::PortReportSource::Expose,
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                port,
+                                reason = %error,
+                                "reporting a stopped box's port withdrawal to the \
+                                 VM host daemon failed; the host's row still names it"
+                            );
+                        }
                     }
-                }
+                });
+                futures::future::join_all(withdrawals).await;
             }
         }
 

@@ -147,11 +147,19 @@ const WITHDRAW_PASSES: usize = 3;
 /// never one per poll — while never being given up on.
 const PUBLISH_RETRY_CAP: Duration = Duration::from_secs(30);
 
-/// How long one port report waits for its reply line: the VM host daemon
-/// answers a report from memory, so a report that outlives this is a host
-/// that is not answering, and the bound ends the publish waiting on it
-/// rather than parking it behind a door that may never answer.
-const REPORT_REPLY_TIMEOUT: Duration = Duration::from_secs(10);
+/// The one deadline every attempt of an *admitted*-port report shares: the
+/// VM host daemon answers a report from memory, so a report that outlives
+/// this is a host that is not answering. The publish waiting on it holds
+/// the session's actor, so the bound covers the attempts as a whole — the
+/// dials, the reply waits and the backoffs between them — never each
+/// attempt on its own.
+const REPORT_DEADLINE: Duration = Duration::from_secs(10);
+
+/// The one deadline every attempt of a *withdrawn*-port report shares: the
+/// withdrawal is teardown, so it is given up on sooner than a publish. A
+/// sweep that withdraws several ports runs them side by side, so the sweep
+/// as a whole is bounded by this too.
+const WITHDRAW_REPORT_DEADLINE: Duration = Duration::from_secs(5);
 
 /// How many attempts one *admitted*-port report makes when its reply does
 /// not arrive (T94): the host's admit is idempotent per port and protocol —
@@ -295,15 +303,16 @@ where
     })
 }
 
-/// One report's dial and exchange, timed out as a whole: a door that
-/// accepts and then stalls must not hang the publish or the teardown
-/// waiting on it. The connection closes from this side when the round
-/// returns — the client-side close G-N8's workaround owns.
+/// One report's dial and exchange, timed out as a whole at `deadline`: a
+/// door that accepts and then stalls must not hang the publish or the
+/// teardown waiting on it. The connection closes from this side when the
+/// round returns — the client-side close G-N8's workaround owns.
 async fn report_exchange(
     channel: &BoxReportChannel,
     request: &minimald_rpc::BoxControlRequest,
+    deadline: tokio::time::Instant,
 ) -> io::Result<minimald_rpc::BoxControlReply> {
-    tokio::time::timeout(REPORT_REPLY_TIMEOUT, async {
+    tokio::time::timeout_at(deadline, async {
         match channel {
             BoxReportChannel::Vsock { cid } => {
                 let stream = tokio_vsock::VsockStream::connect(tokio_vsock::VsockAddr::new(
@@ -326,7 +335,7 @@ async fn report_exchange(
         // itself is the failure, and the reason names it.
         io::Error::new(
             io::ErrorKind::TimedOut,
-            format!("the port report's reply did not arrive in {REPORT_REPLY_TIMEOUT:?}"),
+            "the port report's reply did not arrive before its deadline",
         )
     })?
 }
@@ -338,13 +347,19 @@ async fn report_exchange(
 /// that asked it unwinds on the refusal that refused it, with nothing left
 /// standing at either end.
 ///
-/// A reply that never arrives is retried within [`REPORT_ATTEMPTS`]: the
-/// host's admit is idempotent, so a lost reply costs a rate-window entry
-/// and nothing else. A transport failure that outlives the attempts is the
-/// report's own refusal shape — the publish unwinds on it the same way,
-/// fail-closed, because a publish the host never vouched for is not one to
-/// leave standing against the host's grant either. A native host reports
-/// nowhere and publishes as it always did: [`Ok`] without a round trip.
+/// A reply that never arrives is retried within [`REPORT_ATTEMPTS`], all of
+/// them under the one [`REPORT_DEADLINE`]: the host's admit is idempotent,
+/// so a lost reply costs a rate-window entry and nothing else. A transport
+/// failure that outlives the attempts is the report's own refusal shape —
+/// the publish unwinds on it the same way, fail-closed, because a publish
+/// the host never vouched for is not one to leave standing against the
+/// host's grant either. Such a failure is not proof the host never recorded
+/// the port, though — the reply may be the only thing that was lost — so
+/// before it is answered a best-effort withdrawal is reported for the same
+/// port, and a lost reply does not leave a host row naming a port the
+/// unwound publish no longer holds. A refusal needs no withdrawal: the host
+/// answered that it recorded nothing. A native host reports nowhere and
+/// publishes as it always did: [`Ok`] without a round trip.
 pub(crate) async fn report_admitted_port(
     control: &ControlChannel,
     switch_address: Ipv4Addr,
@@ -362,9 +377,10 @@ pub(crate) async fn report_admitted_port(
         proto: IpProto::Tcp,
         source,
     });
+    let deadline = tokio::time::Instant::now() + REPORT_DEADLINE;
     let mut unanswered = None;
     for attempt in 1..=REPORT_ATTEMPTS {
-        match report_exchange(&channel, &request).await {
+        match report_exchange(&channel, &request, deadline).await {
             // Answered, so decided: the recorded port is the grant's own
             // word that the publish may stand.
             Ok(minimald_rpc::BoxControlReply::PortRecorded { .. }) => return Ok(()),
@@ -377,20 +393,40 @@ pub(crate) async fn report_admitted_port(
                 )));
             }
             Ok(other) => {
-                return Err(io::Error::other(format!(
+                // Not the admit's own answer, so not a decision either: the
+                // host's row may or may not name the port, and the unwind
+                // below withdraws it the way a lost reply's does.
+                unanswered = Some(io::Error::other(format!(
                     "the VM host daemon answered the port report with another verb's \
                      reply: {other:?}"
                 )));
+                break;
             }
             // No reply: a lost answer, retried — the host's admit is
             // idempotent, so this attempt cost nothing the next cannot pay.
             Err(error) => unanswered = Some(error),
         }
         if attempt < REPORT_ATTEMPTS {
+            if tokio::time::Instant::now() + REPORT_BACKOFF >= deadline {
+                break;
+            }
             tokio::time::sleep(REPORT_BACKOFF).await;
         }
     }
-    Err(unanswered.expect("the loop ran at least once without deciding"))
+    let unanswered = unanswered.expect("the loop ran at least once without deciding");
+    // Fail-closed, and clean on the host's side too: the host may have
+    // recorded the port before its reply was lost, so the unwind withdraws
+    // it there — best-effort, because the publish is failing either way and
+    // a withdrawal the door never answers leaves only a stale row entry.
+    if let Err(error) = withdraw_report(&channel, switch_address, port, source).await {
+        tracing::warn!(
+            port,
+            reason = %error,
+            "withdrawing an unconfirmed port report from the VM host daemon \
+             failed; the host's row may still name it"
+        );
+    }
+    Err(unanswered)
 }
 
 /// Report one runtime-published port as withdrawn to the VM host daemon
@@ -401,8 +437,9 @@ pub(crate) async fn report_admitted_port(
 /// whose runtime set must stop naming a port nothing publishes any more.
 /// Never refused by the host, so a reply that arrives ends the report
 /// whichever way it is shaped; a reply that never arrives is retried fewer
-/// times than a publish's, and the [`Err`] a test or a caller reads names
-/// what the host's row still holds.
+/// times than a publish's, all under the one [`WITHDRAW_REPORT_DEADLINE`],
+/// and the [`Err`] a test or a caller reads names what the host's row still
+/// holds.
 pub(crate) async fn report_withdrawn_port(
     control: &ControlChannel,
     switch_address: Ipv4Addr,
@@ -412,6 +449,18 @@ pub(crate) async fn report_withdrawn_port(
     let Some(channel) = box_report_channel(control) else {
         return Ok(());
     };
+    withdraw_report(&channel, switch_address, port, source).await
+}
+
+/// The withdrawal's attempts over a resolved report channel, shared by
+/// [`report_withdrawn_port`] and the unwind of an admit whose reply never
+/// arrived.
+async fn withdraw_report(
+    channel: &BoxReportChannel,
+    switch_address: Ipv4Addr,
+    port: u16,
+    source: minimald_rpc::PortReportSource,
+) -> io::Result<()> {
     let request =
         minimald_rpc::BoxControlRequest::WithdrawPort(minimald_rpc::WithdrawPortRequest {
             switch_address,
@@ -419,9 +468,10 @@ pub(crate) async fn report_withdrawn_port(
             proto: IpProto::Tcp,
             source,
         });
+    let deadline = tokio::time::Instant::now() + WITHDRAW_REPORT_DEADLINE;
     let mut unanswered = None;
     for attempt in 1..=WITHDRAW_REPORT_ATTEMPTS {
-        match report_exchange(&channel, &request).await {
+        match report_exchange(channel, &request, deadline).await {
             // Answered: the host's withdrawal is never refused, and a row
             // that held nothing the report named is the report's goal
             // state — both replies end it.
@@ -429,6 +479,9 @@ pub(crate) async fn report_withdrawn_port(
             Err(error) => unanswered = Some(error),
         }
         if attempt < WITHDRAW_REPORT_ATTEMPTS {
+            if tokio::time::Instant::now() + REPORT_BACKOFF >= deadline {
+                break;
+            }
             tokio::time::sleep(REPORT_BACKOFF).await;
         }
     }
@@ -3486,5 +3539,163 @@ mod tests {
 
         watcher.stop().await;
         drop(gvproxy);
+    }
+
+    /// A report door stand-in that answers every withdrawal and either
+    /// refuses each admit (`refuse_admits`) or reads it and hangs up without
+    /// a reply — the lost reply a transport failure is. Every request it
+    /// reads is handed to the test over the returned receiver.
+    async fn admit_failing_door(
+        door: PathBuf,
+        refuse_admits: bool,
+    ) -> (
+        tokio::task::JoinHandle<()>,
+        mpsc::UnboundedReceiver<minimald_rpc::BoxControlRequest>,
+    ) {
+        use tokio::io::AsyncBufReadExt as _;
+        let listener = UnixListener::bind(&door).expect("bind the report door stand-in");
+        let (seen_tx, seen) = mpsc::unbounded_channel();
+        let task = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let (read, mut write) = stream.into_split();
+                let mut line = String::new();
+                if tokio::io::BufReader::new(read)
+                    .read_line(&mut line)
+                    .await
+                    .is_err()
+                {
+                    continue;
+                }
+                let request =
+                    serde_json_lenient::from_str::<minimald_rpc::BoxControlRequest>(line.trim())
+                        .expect("the report door's request line parses");
+                let reply = match &request {
+                    minimald_rpc::BoxControlRequest::AdmitPort(_) if refuse_admits => {
+                        Some(minimald_rpc::BoxControlReply::Error {
+                            error: "the grant does not admit this port".to_string(),
+                        })
+                    }
+                    minimald_rpc::BoxControlRequest::AdmitPort(_) => None,
+                    _ => Some(minimald_rpc::BoxControlReply::PortRecorded {
+                        port: 3000,
+                        proto: IpProto::Tcp,
+                    }),
+                };
+                #[expect(
+                    clippy::let_underscore_must_use,
+                    reason = "the test may drop its receiver once it has its answer"
+                )]
+                let _ = seen_tx.send(request);
+                if let Some(reply) = reply {
+                    let mut reply_line =
+                        serde_json_lenient::to_string(&reply).expect("the reply serialises");
+                    reply_line.push('\n');
+                    #[expect(
+                        clippy::let_underscore_must_use,
+                        reason = "a reporter that already hung up needs no reply"
+                    )]
+                    let _ = write.write_all(reply_line.as_bytes()).await;
+                }
+            }
+        });
+        (task, seen)
+    }
+
+    /// T94: an admit whose reply never arrives fails the publish closed, and
+    /// before it answers it withdraws the same port at the host — the lost
+    /// reply may have followed a recorded port, and the unwound publish must
+    /// not leave the host's row naming it.
+    #[tokio::test]
+    async fn unanswered_admit_report_withdraws_before_failing() {
+        let dir = tempfile::tempdir().unwrap();
+        let control_sock = dir.path().join("control.sock");
+        let door = dir.path().join("report-door.sock");
+        let (task, mut seen) = admit_failing_door(door.clone(), false).await;
+        seed_vm_report_door_for_tests(&control_sock, &door);
+        let lease = Ipv4Addr::new(100, 64, 128, 21);
+
+        let reported = report_admitted_port(
+            &ControlChannel::Unix(control_sock.clone()),
+            lease,
+            3000,
+            minimald_rpc::PortReportSource::Listen,
+        )
+        .await;
+        clear_vm_report_door_for_tests(&control_sock);
+        task.abort();
+
+        assert!(
+            reported.is_err(),
+            "an admit the host never answered is not a publish that stands"
+        );
+        let mut requests = Vec::new();
+        while let Ok(request) = seen.try_recv() {
+            requests.push(request);
+        }
+        let (admits, rest): (Vec<_>, Vec<_>) = requests
+            .iter()
+            .partition(|request| matches!(request, minimald_rpc::BoxControlRequest::AdmitPort(_)));
+        assert_eq!(
+            admits.len(),
+            REPORT_ATTEMPTS,
+            "a lost reply is retried within the attempts: {requests:?}"
+        );
+        assert_eq!(
+            rest,
+            vec![&minimald_rpc::BoxControlRequest::WithdrawPort(
+                minimald_rpc::WithdrawPortRequest {
+                    switch_address: lease,
+                    port: 3000,
+                    proto: IpProto::Tcp,
+                    source: minimald_rpc::PortReportSource::Listen,
+                }
+            )],
+            "the unanswered admit withdraws its port once, after the admits: {requests:?}"
+        );
+        assert!(
+            matches!(
+                requests.last(),
+                Some(minimald_rpc::BoxControlRequest::WithdrawPort(_))
+            ),
+            "the withdrawal follows every admit attempt: {requests:?}"
+        );
+    }
+
+    /// T94: an admit the grant refused is the host's answer that it
+    /// recorded nothing, so the failed publish withdraws nothing.
+    #[tokio::test]
+    async fn refused_admit_report_withdraws_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let control_sock = dir.path().join("control.sock");
+        let door = dir.path().join("report-door.sock");
+        let (task, mut seen) = admit_failing_door(door.clone(), true).await;
+        seed_vm_report_door_for_tests(&control_sock, &door);
+
+        let reported = report_admitted_port(
+            &ControlChannel::Unix(control_sock.clone()),
+            Ipv4Addr::new(100, 64, 128, 22),
+            3000,
+            minimald_rpc::PortReportSource::Listen,
+        )
+        .await;
+        clear_vm_report_door_for_tests(&control_sock);
+        task.abort();
+
+        let error = reported.expect_err("a refused admit fails the publish");
+        assert!(
+            error
+                .to_string()
+                .contains("the grant does not admit this port"),
+            "the refusal carries the grant's reason: {error}"
+        );
+        let mut requests = Vec::new();
+        while let Ok(request) = seen.try_recv() {
+            requests.push(request);
+        }
+        assert_eq!(
+            requests.len(),
+            1,
+            "a refusal is answered once and withdraws nothing: {requests:?}"
+        );
     }
 }
