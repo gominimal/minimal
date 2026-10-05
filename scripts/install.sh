@@ -35,6 +35,18 @@
 # of it (the generated files are ordinary install-record rows; the rc block is
 # stripped by its markers).
 #
+# Every component the manifest carries installs by the same generic loop, and
+# one of them carries a contract worth naming: `min-answerer` (NET-122's
+# box-zone answerer) installs as `bin/min-answerer` beside `min` on every
+# platform the manifest ships `min` for, and an upgrade replaces it like every
+# other `bin` row — same SHA-256 compare, same swap. The installed copy is
+# ONLY the copy source: the session-start advisory finds it beside `min` and
+# its one privileged command copies it to a root-owned path before the service
+# manager ever runs it. The installer itself writes no answerer service — no
+# systemd unit, no launchd plist, nothing at the root-owned paths — and no
+# unit or plist it does write names the user-prefix path, because a unit that
+# ran the user-writable copy would run whatever its owner last put there.
+#
 # The script targets strict POSIX `sh` (not bash): it runs identically under
 # dash, macOS's frozen bash 3.2, busybox, and zsh-invoked-sh. It depends only on
 # tooling present by default on every target: a downloader (curl or wget), a

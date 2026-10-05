@@ -5554,3 +5554,31 @@ async fn ask_expose_without_a_binding_answers_no_one() {
     )]
     let _ = tokio::time::timeout(Duration::from_secs(10), task).await;
 }
+
+/// A guest's per-launch reading probes over the listener its boot holds,
+/// never one bound for the reading (NET-079, design §7.4): with no held
+/// listener the guest's reading is unknown, naming the missing listener,
+/// while a native host binds its own per reading.
+#[test]
+#[serial_test::serial]
+fn per_launch_guest_reading_uses_the_held_listener() {
+    crate::net::classifier::clear_probe_listeners();
+    super::clear_classifier_reading_standin();
+    let root = tempfile::tempdir().expect("a temp tree");
+
+    match super::classifier_reading(root.path(), true) {
+        crate::net::classifier::Reading::Inconclusive { because } => assert!(
+            because.contains("holds no loopback listener"),
+            "the guest's launch reads over its boot's held listener: {because}"
+        ),
+        other => panic!("a guest with no held listener reads as unknown, not {other:?}"),
+    }
+    if let crate::net::classifier::Reading::Inconclusive { because } =
+        super::classifier_reading(root.path(), false)
+    {
+        assert!(
+            !because.contains("holds no loopback listener"),
+            "a native host binds its own listener per reading: {because}"
+        );
+    }
+}
