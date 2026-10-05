@@ -1,10 +1,11 @@
 ---
 id: EPOCH
 title: spec-hash epoch 1 — injective, formally verified BuildSpec encoding
+status: draft
 owner: bryan-minimal
 epic: gominimal/inbox#583
 arch: https://github.com/gominimal/arch/blob/d77725b6dcca73918efb66f0e15e97120db62a0e/architecture.md#d31--the-build-spec-hash-keyspace-contract-and-epochs
-updated: 2026-09-17
+updated: 2026-10-05
 ---
 
 # EPOCH — spec-hash epoch 1: injective, formally verified BuildSpec encoding
@@ -29,12 +30,27 @@ declares, never a global "current" epoch; keyspace rotation is a migration
 class; and evolution after epoch 1 is additive. This spec is epoch 1's
 delivery of that contract; it cites D3.1 by its stable identifier.
 
-**Success:** no two distinct canonical specs can share a cache key, the
-property is machine-checked, and dependency reorder no longer rotates keys.
+This document uses these terms. A spec's **canonical form** is the set of
+fields the epoch-0 encoder covers (`spec_hasher.rs`). In that form the
+dependency edges form a set and every number takes its normal form
+(EPOCH-002, EPOCH-006). A spec's `tests` are outside its canonical form
+(EPOCH-010). Specs with different canonical forms are **canonically
+distinct**. Every **bounded spec** has at most 3 elements in any list and
+at most 8 bytes in any string. Its dependency depth is at most 2. Harnesses
+that are exhaustive over bounded specs state nothing beyond that domain. The **epoch-1 context** is
+the Blake3 `derive_key` context string `minimal.dev spec-hash epoch 1`. The
+**epoch-0 defect catalog** is the list of nine collision-witness classes in
+minimal#1246.
 
-**First slice:** the pure encode/decode codec with machine-checked
-round-trip and all nine witness refutations, plus pinned epoch-1 digests —
-no call-site flip yet.
+**Success:** two distinct canonical specs share a cache key only through a
+Blake3 collision, and a machine checks that property. A dependency reorder
+no longer rotates keys.
+
+**First slice:** the pure encode/decode codec with its machine-checked
+round-trip and the nine witness refutations, plus the pinned epoch-1
+digests. No call site flips yet. A person runs `epoch1_golden_pins` and sees the
+digests reproduce, and runs the Kani lane and sees the round-trip and the
+nine refutations pass.
 
 ## Users and stories
 
@@ -42,17 +58,20 @@ no call-site flip yet.
 build-infra operator; release manager.
 
 - AS A security engineer I WANT the cache key to be an injective function
-  of the spec's meaning SO THAT collision-based cache poisoning is
-  impossible by construction
-- AS A package author I WANT dependency identity to be order-independent SO
-  THAT reordering imports never forces a spurious rebuild
-- AS A verification engineer I WANT a pure bounded codec with a decoder and
-  machine-checked properties SO THAT injectivity is proved rather than
-  asserted
-- AS A build-infra operator I WANT the flip to change only which keys exist
-  SO THAT migration is one cold rebuild, not a format migration
-- AS A release manager I WANT additive evolution after this change SO THAT
-  this is the last breaking keyspace change I schedule
+  of the spec's meaning SO THAT no two distinct specs can share a key and
+  cache poisoning by collision is impossible by construction
+- AS A package author I WANT dependency identity to be order-independent
+  (deps as sets) SO THAT reordering imports in a recipe never forces a
+  spurious catalog rebuild
+- AS A verification engineer I WANT the encoder to be a pure bounded codec
+  with a decoder and machine-checked properties SO THAT the injectivity
+  theorem is proved (Kani now, Lean later) rather than asserted
+- AS A build-infra operator I WANT the epoch flip to change only which keys
+  exist — same 32-byte hashes, same index/snapshot/provenance formats — SO
+  THAT migration is one cold catalog rebuild, not a format migration
+- AS A release manager I WANT additive evolution (reserved tags,
+  absent-means-epoch-1) after this change SO THAT this is the last breaking
+  keyspace change I ever schedule
 
 ## Requirements
 
@@ -62,8 +81,9 @@ build-infra operator; release manager.
   tier:     T3
   verify:   cargo nextest run -p graph epoch1_injectivity_bounded
   property: for all canonical a, b: a != b implies encode(a) != encode(b)
-  harness:  kani_epoch1_injectivity_bounded, exhaustive over the bounded
-    length domains of minimal#1246's verification plan
+  harness:  kani_epoch1_injectivity_bounded, exhaustive over bounded specs
+    (3 elements per list, 8 bytes per string, depth 2). The codec PR can
+    raise the bound after measuring, and must not lower it
   proof:    proofs/SpecHash/Epoch1.lean#encode_injective
 
 - **EPOCH-002** WHEN a spec's dependency edges are permuted THE SYSTEM
@@ -77,22 +97,24 @@ build-infra operator; release manager.
   tier:     T2
   verify:   cargo nextest run -p graph epoch1_roundtrip_bounded
   property: for all bounded specs x: decode(encode(x)) == x
-  harness:  kani_epoch1_roundtrip_bounded, exhaustive over the bounded
-    length domains
+  harness:  kani_epoch1_roundtrip_bounded, exhaustive over bounded specs
+    (3 elements per list, 8 bytes per string, depth 2)
 
 - **EPOCH-004** THE SYSTEM SHALL encode every epoch-0 collision-witness
-  pair from the defect catalog to distinct outputs.
+  pair from the epoch-0 defect catalog to distinct outputs.
   tier:     T2
   verify:   cargo nextest run -p graph epoch1_witness_refutations
   property: for all catalog pairs (a, b): encode(a) != encode(b)
   harness:  kani_epoch1_witness_refutations, one harness per witness class
     in the epoch-0 defect catalog (nine)
 
-- **EPOCH-005** THE SYSTEM SHALL derive epoch-1 hashes under the
-  domain-separated context and keep the hash at 32 bytes, leaving every
-  downstream record format byte-unchanged.
-  tier:     T0
+- **EPOCH-005** THE SYSTEM SHALL derive epoch-1 hashes under the epoch-1
+  context, at 32 bytes, with every downstream record format byte-unchanged.
+  tier:     T1
   verify:   cargo nextest run -p graph epoch1_domain_separation_and_width
+  property: for all specs s: hash_1(s) == blake3_derive_key(epoch-1 context,
+    encode(s)), is 32 bytes, and every record format that embeds a SpecHash
+    serializes it as it serializes an epoch-0 key
 
 - **EPOCH-009** WHEN a Registry Cache Index is sealed THE SYSTEM SHALL
   record in it the epoch its keys were computed under, covered by the
@@ -113,16 +135,38 @@ build-infra operator; release manager.
     representative per equality class
 
 - **EPOCH-007** IF the decoder meets an unknown tag byte THEN THE SYSTEM
-  SHALL hard-error; tags 0xF0–0xFF are reserved, and a new optional field
-  SHALL reuse epoch 1 only when its absence means epoch-1 semantics.
-  tier:     T1
+  SHALL hard-error.
+  tier:     T2
   verify:   cargo nextest run -p graph epoch1_unknown_tag_rejects
-  property: for all byte strings s with an unassigned tag: decode(s) errors
+  property: no two structural tags share a byte, and for all byte strings s
+    with an unassigned tag: decode(s) errors
+  harness:  kani_epoch1_tags_unique_and_unknown_rejected, exhaustive over
+    all 256 tag bytes with a bounded 8-byte payload
+  - THE SYSTEM SHALL keep tags 0xF0 to 0xFF unassigned in epoch 1.
+    tier:   T0
+    verify: cargo nextest run -p graph epoch1_reserved_tags_unassigned
 
 - **EPOCH-008** THE SYSTEM SHALL reproduce the pinned epoch-1 golden
   digests and leave the epoch-0 pin byte-identical.
   tier:     T0
   verify:   cargo nextest run -p graph epoch1_golden_pins
+
+- **EPOCH-010** THE SYSTEM SHALL exclude a spec's `tests` from its canonical
+  form.
+  tier:     T0
+  verify:   cargo nextest run -p graph epoch1_tests_outside_the_hash
+  - IF a test writes into the output tree THEN THE SYSTEM SHALL fail the
+    test.
+    tier:   T0
+    verify: cargo nextest run -p orchestrator a_test_that_writes_the_output_tree_fails
+
+- **EPOCH-011** WHEN the system computes a subset key THE SYSTEM SHALL use
+  the epoch of the spec key it subsets, and SHALL length-frame every output
+  name.
+  tier:     T1
+  verify:   cargo nextest run -p graph epoch1_subset_key_follows_its_spec
+  property: for all subsets u of spec s: epoch(key(u)) == epoch(key(s)), and
+    for all distinct output sets a, b of s: key(u_a) != key(u_b)
 
 ## Non-goals
 
@@ -130,10 +174,11 @@ build-infra operator; release manager.
 - Migrating historical epoch-0 artifacts: immutable history stays valid for
   old pins (minimal#1246 decision 4)
 - Wire varint work: minimal#1109 set 2
-- The slots feature: its own design (this spec only guarantees the name
-  axis is sound)
-- Landing the Lean proof: the formal-verification roadmap (EPOCH-001's
-  proof line is the stated target; Kani holds the property until it lands)
+- The slots feature: gominimal/inbox#350 (this spec only guarantees the
+  name axis is sound)
+- Merging the Lean proof: minimal#1109, harness set 6. EPOCH-001's proof
+  line is the stated target, and Kani holds the property until the proof
+  merges.
 
 ## Design reasoning
 
@@ -155,12 +200,23 @@ over the closure's meaning — EPOCH-001, EPOCH-002 and EPOCH-004; epochs by
 domain-separated context at a fixed 32 bytes, with the epoch declared by
 the index and followed by consumers — EPOCH-005 and EPOCH-009; keyspace
 rotation as a migration class — Rollout and the migration non-goal;
-additive evolution with unknown tags a hard error — EPOCH-007. Selection by
-the pinned index (EPOCH-009) rather than by a global setting is what lets
-historical pins stay valid through the flip without dual-publishing: the
-producing side moves together at one config-plumbed site, consumers follow
-their indices. The Kani harnesses hold EPOCH-001's property until the Lean
-theorem lands (T3 is the target; the harness is the evidence today).
+additive evolution with unknown tags a hard error (EPOCH-007). Under
+EPOCH-007 a new optional field reuses epoch 1 only when its absence means
+epoch-1 semantics. Any other change is a new epoch. EPOCH-009 selects the
+epoch by the pinned index, not by a global setting. That keeps historical
+pins valid through the flip without dual-publishing. The producing side
+moves together at one config-plumbed site. Consumers follow their indices. Kani holds EPOCH-001's property until the Lean theorem
+merges. T3 is the target, and the harness is the evidence today.
+T3 is also a proposal to add a Lean project and a proof lane to this
+repository, which has neither. That cost belongs to minimal#1109, not to
+the codec PR.
+
+Well-definedness beyond dependency order is the canonical form itself.
+Numbers normalize (EPOCH-006) and `tests` stay out (EPOCH-010). Editing a
+test never rotates a key, and a person can re-run tests without a rebuild. The write-guard makes that assumption real instead of hashing
+around it. The subset key (EPOCH-011) follows the spec key's epoch because
+witness class 9 is its collision family. A subset computed under another
+epoch cannot find the index its spec is in.
 
 **Generality:** a second epoch is additive by construction (reserved tags,
 new derive-key context); a second hash algorithm is out of scope by
@@ -170,10 +226,10 @@ encoding, not to the traversal — a second traversal source reuses them.
 ## Security considerations
 
 - **Invariant:** THE SYSTEM SHALL never assign two distinct canonical
-  specs the same cache key.
+  specs the same cache key except through a Blake3 collision.
   enforced by: prefix-free TLV encoding; machine-checked bounded
   injectivity and witness refutations
-  covered by: EPOCH-001, EPOCH-004
+  covered by: EPOCH-001, EPOCH-004, EPOCH-011
 - **Invariant:** THE SYSTEM SHALL never silently absorb unknown structure
   into a hash preimage.
   enforced by: strict decoding, unknown tag = hard error
@@ -202,10 +258,8 @@ encoding, not to the traversal — a second traversal source reuses them.
 
 ## Open questions
 
-- [NEEDS CLARIFICATION (CRITICAL): decision 1 — are `tests` hashed?
-  Changes which spec edits rotate keys. Recommendation on record (out of
-  the hash, plus a write-guard assertion that test execution cannot touch
-  the output tree); decider: maintainers, minimal#1246.]
+- Decision 1 (are `tests` hashed?), decided 2026-10-05: `tests` are outside
+  the canonical form, with a write-guard. EPOCH-010 binds it.
 - Resolved by the architecture: decision 5 (reserved-tag additive
   evolution, unknown tag a hard error, no further breaking change planned)
   is fixed by D3.1; EPOCH-007 binds it.
