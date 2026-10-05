@@ -1400,6 +1400,33 @@ mod tests {
         );
     }
 
+    /// A repo-wide `[params]` entry resolves in a task command: its default
+    /// applies when the task is invoked without arguments, and `--<name>`
+    /// overrides it.
+    #[test]
+    fn interpolate_resolves_hydrated_repo_param() {
+        let mf: mfile::File = toml::from_str(indoc::indoc! {
+            r#"
+            [params]
+            greeting = { type = "string", default = "hi" }
+
+            [tasks.useparam]
+            exec = "echo %{greeting}"
+            "#
+        })
+        .unwrap();
+        let task = mf.task("useparam").unwrap();
+
+        for (argv, want) in [("", "echo hi"), ("--greeting bye", "echo bye")] {
+            let parsed = task.args.parse(argv).unwrap();
+            let resolved = interpolate_task_strings(&task, Some(&parsed)).unwrap();
+            let mfile::TaskAction::Exec(mfile::StrOrList::Single(cmd)) = resolved.action else {
+                panic!("expected a single exec string");
+            };
+            assert_eq!(cmd, want, "argv `{argv}`");
+        }
+    }
+
     /// Helper: build a Context and Graph from the fakerepo test data,
     /// matching the pattern used in lib.rs tests.
     fn setup_ctx_and_graph() -> (TempDir, Context, Graph) {
