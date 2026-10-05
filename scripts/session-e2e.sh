@@ -1388,7 +1388,7 @@ if [ -n "${MINVMD_GVPROXY_BIN:-}" ] || [ -n "$E2E_NATIVE_SWITCH_DIR" ]; then
   echo "own-IP session proof OK (tap up, default route, switch resolver)"
   echo "::endgroup::"
 else
-  echo "own-IP session proof SKIPPED (no MINVMD_GVPROXY_BIN: this target has no switch)"
+  echo "own-IP session proof SKIPPED (no switch: neither MINVMD_GVPROXY_BIN (VM) nor E2E_NATIVE_SWITCH_DIR (native) is set)"
 fi
 }
 
@@ -1426,7 +1426,7 @@ proof_own_ip_egress_declared_and_enforced() {
   echo "::group::own-IP egress: declared and enforced (NET T20)"
 
   if [ -z "${MINVMD_GVPROXY_BIN:-}" ] && [ -z "$E2E_NATIVE_SWITCH_DIR" ]; then
-    echo "own-IP egress proof SKIPPED (no MINVMD_GVPROXY_BIN: this target has no switch)"
+    echo "own-IP egress proof SKIPPED (no switch: neither MINVMD_GVPROXY_BIN (VM) nor E2E_NATIVE_SWITCH_DIR (native) is set)"
     echo "::endgroup::"
     return 0
   fi
