@@ -595,6 +595,13 @@ export XDG_CONFIG_HOME="$WORK/config"
 # above is untouched. The daemon inherits this RUST_LOG at autospawn, so a
 # whole-lane run and a standalone case both get it.
 export RUST_LOG="${RUST_LOG:-warn,minimald::exec=info}"
+# A VM lane's guest daemon takes its filter from the boot line, which carries
+# the RUST_LOG minvmd was started with — so the listen path's debug records
+# (plan, watcher start, sockets seen, verdicts, admissions) must ride this
+# default to reach the guest at all. Widened only when nothing was set by hand.
+if [ -n "${E2E_VM:-}" ] && [ "$RUST_LOG" = "warn,minimald::exec=info" ]; then
+  export RUST_LOG="$RUST_LOG,minimald::net::listeners=debug,minimald::net::provider=debug,minimald::session_host=debug"
+fi
 
 # Millisecond clock: GNU date on Linux; macOS `date` has no %N, use perl.
 if [ -z "$(date +%s%3N | tr -d '0-9')" ]; then
