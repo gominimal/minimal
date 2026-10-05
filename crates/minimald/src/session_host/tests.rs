@@ -4950,17 +4950,15 @@ async fn expose_ask_after_detaching_is_refused_by_the_live_host() {
     // And the refusal came from the live host's own nobody-attached branch —
     // the plan's one info line per refusal for want of a client, naming the
     // box and the port — which the session's no-host shortcut never says,
-    // so this line is what tells the two apart.
-    let refusing = log
-        .lines()
+    // so this line is what tells the two apart. The captured log is shared
+    // by every test in the process, so pick this box's line, not the first.
+    log.lines()
         .find(|line| {
             line.contains("refusing the runtime port publish ask for want of a client to answer it")
+                && line.contains("session=web")
+                && line.contains("port=3000")
         })
-        .unwrap_or_else(|| panic!("the live host that refused the ask should say its line: {log}"));
-    assert!(
-        refusing.contains("session=web") && refusing.contains("port=3000"),
-        "the refusal names the box and the port it was about: {refusing}"
-    );
+        .unwrap_or_else(|| panic!("the live host should name the box and port it refused: {log}"));
 
     // And the decision is audited (NET-046): the daemon decided it, because
     // no human was there to.
