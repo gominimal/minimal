@@ -5644,10 +5644,9 @@ async fn fake_report_door(
                 // the connection, so the door takes the next one.
                 continue;
             }
-            let request = serde_json_lenient::from_str::<minimald_rpc::BoxControlRequest>(
-                line.trim(),
-            )
-            .expect("the report door's request line parses");
+            let request =
+                serde_json_lenient::from_str::<minimald_rpc::BoxControlRequest>(line.trim())
+                    .expect("the report door's request line parses");
             #[expect(
                 clippy::let_underscore_must_use,
                 reason = "the test may drop its receiver once it has its answer"
@@ -5862,9 +5861,7 @@ async fn refused_admission_report_leaves_no_partial_mapping() {
             error: refusal.to_string(),
         })
         .expect("the report door stand-in lives");
-    match expose
-        .await
-        .expect("the expose task should not panic") {
+    match expose.await.expect("the expose task should not panic") {
         Err(crate::net::policy::ExposeFailure::Publish { port, source }) => {
             assert_eq!(port, 3000, "the failed publish names its port");
             assert!(

@@ -3680,9 +3680,10 @@ mod tests {
         // publish it makes is reported to the VM host daemon over the
         // bridged guest report door and admitted against the host-held
         // grant, so the create hands the box the stance.
-        refuse_dynamic_ingress_on_vm(Minvmd, Some(DynamicIngress::Allow))
-            .expect("a VM-backed host keeps an allow stance now that the \
-                     host admits runtime publishes");
+        refuse_dynamic_ingress_on_vm(Minvmd, Some(DynamicIngress::Allow)).expect(
+            "a VM-backed host keeps an allow stance now that the \
+                     host admits runtime publishes",
+        );
         for kind in [Minvmd, Minimald] {
             refuse_dynamic_ingress_on_vm(kind, Some(DynamicIngress::Deny))
                 .expect("deny is never refused");
