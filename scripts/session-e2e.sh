@@ -16783,7 +16783,8 @@ proof_listen_published_port_reaches_peer_and_host() {
     return 0
   fi
   if [ ! -c /dev/net/tun ]; then
-    echo "listen-published port SKIPPED (no /dev/net/tun on this host: an own-IP box cannot open its in-namespace tap; runs for real on a host that has the device)"
+    not_run listen_published_port_reaches_peer_and_host \
+      "no /dev/net/tun on this host: an own-IP box cannot open its in-namespace tap, so the listen through the VM bridge is proven on the KVM lane only — https://github.com/gominimal/inbox/issues/925"
     echo "::endgroup::"
     return 0
   fi
