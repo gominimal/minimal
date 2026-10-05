@@ -804,22 +804,55 @@ async fn serve_answerer_control(
 ) {
     use tokio::io::AsyncWriteExt as _;
 
-    let reply = match (read_control_request(&mut stream).await, stream.peer_cred()) {
-        (Ok(Some(line)), Ok(cred)) => {
-            let request: BoxControlRequest =
-                serde_json_lenient::from_str(&line).unwrap_or(BoxControlRequest::AnswererStatus);
+    // The peer check comes at accept, before a byte is read, as on the VM
+    // host daemon's door: this daemon's own uid may ask every verb, root
+    // only the handover's two, and any other uid is closed on with a
+    // debug line. The 0600 socket mode is the primary gate; this is
+    // defence in depth against a mis-moded file or dir.
+    let own_uid = current_uid();
+    let peer_uid = match stream.peer_cred() {
+        Ok(cred) => cred.uid(),
+        Err(error) => {
+            tracing::debug!(
+                component = "zone-answerer",
+                %error,
+                "answerer control-socket peer check failed"
+            );
+            return;
+        }
+    };
+    let root_peer = peer_uid == 0 && own_uid != 0;
+    if peer_uid != own_uid && !root_peer {
+        tracing::debug!(
+            component = "zone-answerer",
+            peer_uid,
+            "refused an answerer control-socket connection from a uid that is neither this \
+             daemon's nor root"
+        );
+        return;
+    }
+    let reply = match read_control_request(&mut stream).await {
+        // A connect-and-close probe sent no line: nothing to answer.
+        Ok(None) => return,
+        Ok(Some(line)) => {
             // An unparseable line is a status ask, not an error reply: the
             // status ask is the read this door always answers, so a
             // probe's garbage gets the status and closes, rather than a
             // parse-failure no client of this door ever sends.
-            let peer_uid = cred.uid();
-            let own_uid = current_uid();
-            let root_may_ask = peer_uid == 0 && own_uid != 0;
+            let request: BoxControlRequest =
+                serde_json_lenient::from_str(&line).unwrap_or(BoxControlRequest::AnswererStatus);
+            if !answerer_control_admits(peer_uid, own_uid, &request) {
+                tracing::warn!(
+                    component = "zone-answerer",
+                    peer_uid,
+                    "refused an answerer control-socket request from root: root may only \
+                     release the answerer or cancel a release"
+                );
+                return;
+            }
             match request {
-                BoxControlRequest::AnswererStatus if peer_uid == own_uid || peer_uid == 0 => {
-                    BoxControlReply::Status(status.get())
-                }
-                BoxControlRequest::ReleaseAnswerer if peer_uid == own_uid || root_may_ask => {
+                BoxControlRequest::AnswererStatus => BoxControlReply::Status(status.get()),
+                BoxControlRequest::ReleaseAnswerer => {
                     let reply = status.release().await;
                     tracing::info!(
                         acted = reply.acted,
@@ -832,7 +865,7 @@ async fn serve_answerer_control(
                         detail: reply.detail,
                     }
                 }
-                BoxControlRequest::ReleaseAnswererCancel if peer_uid == own_uid || root_may_ask => {
+                BoxControlRequest::ReleaseAnswererCancel => {
                     let reply = status.release_cancel().await;
                     tracing::info!(
                         acted = reply.acted,
@@ -854,21 +887,9 @@ async fn serve_answerer_control(
                             verbs; boxes register over the daemon's RPC channels"
                         .to_string(),
                 },
-                // The gate left no verb behind: a status ask from a peer
-                // that is neither this daemon's uid nor root.
-                _ => BoxControlReply::Error {
-                    error: "the answerer control socket answers its own operator and root \
-                            (root for the handover verbs) only"
-                        .to_string(),
-                },
             }
         }
-        // A connect-and-close probe sent no line: nothing to answer.
-        (Ok(None), _) => return,
-        (Ok(Some(_)), Err(_)) => BoxControlReply::Error {
-            error: "could not read the request's credentials".to_string(),
-        },
-        (Err(error), _) => BoxControlReply::Error {
+        Err(error) => BoxControlReply::Error {
             error: format!("could not read the request line: {error}"),
         },
     };
@@ -930,6 +951,22 @@ async fn read_control_request(
 }
 
 /// This daemon's own uid — the peer check's own half.
+/// Whether the answerer control socket serves `request` from `peer_uid`,
+/// the gate the VM host daemon's door applies: this daemon's own uid asks
+/// every verb, and root — the answerer service's install step, connecting
+/// to a daemon that is not root's — only the handover's release and its
+/// cancel. Any other uid was closed on at accept.
+fn answerer_control_admits(peer_uid: u32, own_uid: u32, request: &BoxControlRequest) -> bool {
+    if peer_uid == own_uid {
+        return true;
+    }
+    peer_uid == 0
+        && matches!(
+            request,
+            BoxControlRequest::ReleaseAnswerer | BoxControlRequest::ReleaseAnswererCancel
+        )
+}
+
 fn current_uid() -> u32 {
     // SAFETY: getuid takes no arguments and cannot fault.
     unsafe { libc::getuid() }
@@ -6320,5 +6357,99 @@ mod tests {
         assert_eq!(resp.peers[0].public_key, remote.public().to_base64());
         // Keep the sink alive until the assertions complete.
         drop(_sink_rx);
+    }
+
+    /// The answerer control socket's gate mirrors the VM host daemon's
+    /// door: the daemon's own uid asks every verb, root only the handover's
+    /// release and its cancel — a status ask or a box verb from root is
+    /// refused — and any other uid nothing.
+    #[test]
+    fn answerer_control_admits_root_only_the_handover_verbs() {
+        let own = 1000;
+        for request in [
+            BoxControlRequest::AnswererStatus,
+            BoxControlRequest::ReleaseAnswerer,
+            BoxControlRequest::ReleaseAnswererCancel,
+        ] {
+            assert!(answerer_control_admits(own, own, &request), "{request:?}");
+        }
+        assert!(answerer_control_admits(
+            0,
+            own,
+            &BoxControlRequest::ReleaseAnswerer
+        ));
+        assert!(answerer_control_admits(
+            0,
+            own,
+            &BoxControlRequest::ReleaseAnswererCancel
+        ));
+        assert!(
+            !answerer_control_admits(0, own, &BoxControlRequest::AnswererStatus),
+            "root asking the status is refused"
+        );
+        assert!(
+            !answerer_control_admits(
+                0,
+                own,
+                &BoxControlRequest::ReadRow(minimald_rpc::ReadRowRequest {
+                    name: "web".to_string(),
+                })
+            ),
+            "root asking a row read is refused"
+        );
+        assert!(!answerer_control_admits(
+            4242,
+            own,
+            &BoxControlRequest::ReleaseAnswerer
+        ));
+    }
+
+    /// A stale control socket — a file at the daemon's own path that no
+    /// listener answers — is unlinked and re-bound; a live one is refused
+    /// and left in place, never taken out from under the daemon serving it.
+    #[tokio::test]
+    async fn answerer_control_rebinds_a_stale_socket_and_refuses_a_live_one() {
+        let server = TestServer::new().await;
+        let dir = std::path::PathBuf::from(server.state.minimal_state_dir().await.as_str());
+        let sock = dir.join(ANSWERER_CONTROL_SOCK_FILE);
+
+        // A corpse: bound, then its listener dropped, so the file stays.
+        drop(std::os::unix::net::UnixListener::bind(&sock).expect("a stale socket binds"));
+        assert!(sock.exists(), "the stale socket file is left behind");
+        spawn_answerer_control(
+            &server.state,
+            crate::net::answerer::AnswererStatus::starting(),
+        )
+        .await
+        .expect("a stale socket is unlinked and re-bound");
+        let mut stream = tokio::net::UnixStream::connect(&sock)
+            .await
+            .expect("the re-bound socket answers");
+        stream
+            .write_all(b"{\"verb\":\"answerer_status\"}\n")
+            .await
+            .expect("the ask is written");
+        let mut reply = String::new();
+        stream
+            .read_to_string(&mut reply)
+            .await
+            .expect("the reply is read");
+        assert!(
+            reply.contains("state"),
+            "the re-bound door answers its own uid a status: {reply}"
+        );
+
+        // Live: a second bind at the same path is refused, the file kept.
+        let refused = spawn_answerer_control(
+            &server.state,
+            crate::net::answerer::AnswererStatus::starting(),
+        )
+        .await
+        .expect_err("a live door is not taken");
+        assert_eq!(refused.kind(), std::io::ErrorKind::AddrInUse);
+        assert!(
+            tokio::net::UnixStream::connect(&sock).await.is_ok(),
+            "the live door still answers"
+        );
     }
 }
