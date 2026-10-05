@@ -1298,7 +1298,6 @@ pub async fn run_timekeep_listener(port: u32) -> std::io::Result<std::convert::I
 /// the caller continues without egress.
 pub async fn bring_up_root_egress() -> std::io::Result<crate::net::switch::SwitchRelay> {
     use crate::net::{DEFAULT_SUBNET, VSOCK_GVPROXY_SHUTTLE_PORT, VSOCK_HOST_CID, switch};
-    use std::net::Ipv4Addr;
 
     const TAP: &str = "eth0";
     let ip = DEFAULT_SUBNET.daemon_ip();
@@ -1314,7 +1313,7 @@ pub async fn bring_up_root_egress() -> std::io::Result<crate::net::switch::Switc
     // ships no `ip`/iproute2 binary, so shelling out is not an option.
     configure_interface_v4(TAP, ip, DEFAULT_SUBNET.prefix(), Some(gateway))?;
     // Bring loopback up too (no address/route needed).
-    configure_interface_v4("lo", Ipv4Addr::LOCALHOST, 8, None)?;
+    bring_up_loopback()?;
 
     // Point the resolver at the switch's DNS server (gvproxy, at the gateway).
     // The rootfs is mounted read-only, so write to the writable /run tmpfs and
@@ -1362,6 +1361,19 @@ fn install_resolv_conf(nameserver: std::net::Ipv4Addr) -> std::io::Result<()> {
         return Err(std::io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// Brings the guest's `lo` up: the interface every loopback address the guest
+/// serves on lives on, and the one its kernel leaves down until something
+/// does this — the microVM's pid-1 has no service manager to bring it up for
+/// it, so until this runs a bind on `127.0.0.1` fails with `EADDRNOTAVAIL` on
+/// a guest whose local table does not carry the address while `lo` is down,
+/// and no connect to it has a route. No address and no route of its own: `lo`
+/// carries `127.0.0.1` the moment it comes up, and the flags ioctl this is
+/// made of is idempotent, so the egress step's own `lo` half and this one
+/// agree however often the boot runs them.
+pub fn bring_up_loopback() -> std::io::Result<()> {
+    configure_interface_v4("lo", std::net::Ipv4Addr::LOCALHOST, 8, None)
 }
 
 /// Assigns `ip`/`prefix` to `ifname`, brings it up, and (when `gateway` is set)
