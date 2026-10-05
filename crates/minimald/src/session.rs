@@ -629,6 +629,13 @@ pub struct Session {
     /// none — and one that is not running — holds an empty list.
     live_ingress: crate::net::provider::RuntimeIngress,
 
+    /// The switch address the VM host daemon admitted this box's runtime
+    /// publishes under (T94), kept from the publish so the stop's withdrawal
+    /// sweep reports against the row it admitted them in without re-reading
+    /// the record — a read that fails there would skip the sweep and leave
+    /// the host's row naming ports nothing publishes.
+    reported_switch_address: Option<std::net::Ipv4Addr>,
+
     /// This box's runtime publications, whichever of the two runtime surfaces
     /// made them — the `min net expose` path or the listen watcher the
     /// launch's plan starts — each port with its owner. Built fresh by the
@@ -774,6 +781,8 @@ impl Session {
             // The same for the ports the box publishes at runtime: nothing is
             // live until a `min net expose` inside it lands (NET-044).
             live_ingress: Default::default(),
+            // No runtime publish has been admitted at a VM host yet.
+            reported_switch_address: None,
             // And for the publications every runtime surface reads: empty
             // until a launch hands its box one, and then whatever the spawn
             // it launched publishes.
@@ -2821,6 +2830,7 @@ impl Session {
                 source: report,
             });
         }
+        self.reported_switch_address = Some(switch_address);
         let forwarder = match expose_dynamic(
             &control,
             loopback_address,
@@ -2987,11 +2997,29 @@ impl Session {
             // rides the expose label: a withdrawal is never refused, and the
             // host removes the port whatever the label says — it is the
             // log's word, not the row's key.
-            let switch_address = self.record.record().await.ok().and_then(|record| {
-                record
-                    .box_addresses
-                    .map(|addresses| addresses.switch_address)
-            });
+            // The address the publishes were admitted under, kept from the
+            // publish; the record's handed address only when no publish of
+            // this surface was admitted (a listen-published port's watcher
+            // withdraws its own).
+            let switch_address = match self.reported_switch_address {
+                Some(address) => Some(address),
+                None => self.record.record().await.ok().and_then(|record| {
+                    record
+                        .box_addresses
+                        .map(|addresses| addresses.switch_address)
+                }),
+            };
+            if switch_address.is_none()
+                && matches!(control, crate::net::policy::ControlChannel::Vsock { .. })
+            {
+                tracing::warn!(
+                    session_id = %self.record.id(),
+                    ports = forwarders.len(),
+                    "no switch address to withdraw a stopped box's runtime ports from the \
+                     VM host daemon; the host's row keeps them until the box is destroyed \
+                     (see gominimal/inbox#914)"
+                );
+            }
             // The withdrawals run side by side under one shared bound: the
             // guest report door serves one connection at a time, so a door
             // that accepts and never answers would otherwise hold each
