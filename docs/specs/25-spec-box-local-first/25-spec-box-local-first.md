@@ -83,7 +83,7 @@ After this ships, a developer on a stock install with no identity plane runs ses
     tier:   T0
     verify: cargo nextest run -p sessions rename_to_running_held_name_or_self_refused_exit2_names_holder
 
-- **BOX-011** THE SYSTEM SHALL hold every box record in exactly one of the states `pending`, `materializing`, `running`, `stopped`, or `exited`, with `stopped` and `exited` records carrying a `reason` (`stopped` for a `stopped` record; `exit`, `timeout` or `oom` for an `exited` one) and an `exit_code` that is the entrypoint's own exit status for reason `exit`, or for reason `stopped` when the entrypoint exited before a signal ended it; 137 for reason `oom`, the kernel's kill; and absent for reason `timeout`, and for reason `stopped` when a signal ended the entrypoint, in which case the record stores that signal's number as `signal` instead (none when BOX-154 set the record).
+- **BOX-011** THE SYSTEM SHALL hold every box record in exactly one of the states `pending`, `materializing`, `running`, `stopped`, or `exited`, with `stopped` and `exited` records carrying a `reason` (`stopped` for a `stopped` record; `exit`, `timeout` or `oom` for an `exited` one) and an `exit_code` that is the entrypoint's own exit status for reason `exit`, or for reason `stopped` when the entrypoint exited before a signal ended it and BOX-154 did not set the record; 137 for reason `oom`, the kernel's kill; and absent for reason `timeout`, for a record BOX-154 set, and for reason `stopped` when a signal ended the entrypoint, in which case the record stores that signal's number as `signal` instead (none when BOX-154 set the record).
   tier:     T2
   verify:   cargo nextest run -p sessions record_state_is_one_of_five_with_exit_reason
   property: For every reachable store state, each record is in exactly one state, `stopped` records carry reason `stopped` and either an exit code when the entrypoint exited on its own, or no exit code and at most one ending signal, never both, and `exited` records carry one of `exit` (with the entrypoint's exit code), `timeout` (with no exit code) or `oom` (with exit code 137).
@@ -357,7 +357,7 @@ After this ships, a developer on a stock install with no identity plane runs ses
   tier:     T0
   verify:   cargo nextest run -p minimald stop_exec_ends_process_group
 
-- **BOX-152** WHEN an exec starts or exits THE SYSTEM SHALL record `exec_started` and `exec_exited` events carrying principal, argv, PTY flag and exit code.
+- **BOX-152** WHEN an exec starts or exits THE SYSTEM SHALL record an `exec_started` event carrying principal, argv and PTY flag, and an `exec_exited` event carrying the same fields and the exit code.
   <!-- was BOX-104 -->
   tier:     T0
   verify:   cargo nextest run -p minimald exec_events_carry_principal_argv_pty_code
