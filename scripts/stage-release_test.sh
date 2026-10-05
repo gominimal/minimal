@@ -49,6 +49,7 @@ unset GCLOUD_STUB_EXISTS GCLOUD_STUB_SMOKED GCLOUD_STUB_RM_ERROR RESTAGE VERSION
 mkdir -p "$root/artifacts" "$root/pkg"
 printf 'fake min\n' >"$root/artifacts/minimal-linux-amd64"
 printf 'fake mip\n' >"$root/artifacts/mip-linux-amd64"
+printf 'fake answerer\n' >"$root/artifacts/min-answerer-linux-amd64"
 printf 'fake deb\n' >"$root/pkg/minimal_0.6.0_amd64.deb"
 
 pass=0 fail=0
@@ -240,6 +241,48 @@ else
 fi
 expect 1 "--extra needs an existing file" "--extra with a missing file fails before anything runs" -- \
     with GCLOUD_STUB_EXISTS=0 -- stage --version 0.6.0 --extra "$root/absent"
+
+# --- min-answerer stages beside min, required like the other binaries -------
+
+# The answerer row: bin/min-answerer beside bin/min on every platform the
+# manifest ships min for, hashed and uploaded with the rest — it is the copy
+# source NET-122's session advisory finds, so a release without it is a
+# release whose advisory cannot offer the host service.
+answerer_out="$(with GCLOUD_STUB_EXISTS=0 -- stage --version 0.6.0 2>&1)"
+answerer_rows="$(printf '%s\n' "$answerer_out" | awk '
+    $1 == "min-answerer" && $2 == "linux" && $3 == "amd64" && $6 == "file" \
+    && $7 == "bin/min-answerer" && $8 == "versions/0.6.0/min-answerer-linux-amd64"')"
+if [ -n "$answerer_rows" ]; then
+    ok "the manifest carries min-answerer as bin/min-answerer beside min, hashed from the artifact"
+else
+    bad "no min-answerer row in the manifest (out: $answerer_out)"
+fi
+expect_calls 1 "min-answerer-linux-amd64 .*gs://test-bucket/versions/0.6.0/$" \
+    "the answerer artifact uploads with the others in the one artifact cp"
+if [ -n "$(printf '%s\n' "$answerer_out" | awk '$1 == "min-answerer" && $7 ~ /^lib\//')" ]; then
+    bad "min-answerer must carry no lib/ component on any platform"
+else
+    ok "the answerer row stages no lib/ component"
+fi
+if [ -n "$(printf '%s\n' "$answerer_out" | awk '$6 == "file" && $7 !~ /^(bin|lib|data)\//')" ]; then
+    bad "the manifest carries a dest outside the bin/lib/data prefixes — no unit or plist path may appear"
+else
+    ok "no row stages a unit or plist: only bin/lib/data paths"
+fi
+
+# Required: a build that produced no answerer fails the stage rather than
+# shipping a table with a hole — the same rule every other binary carries.
+# Every artifact whose row precedes min-answerer's is present, so the first
+# missing one the loop names is the answerer.
+mkdir -p "$root/artifacts-no-answerer"
+printf 'fake daemon\n' >"$root/artifacts-no-answerer/minimald-linux-amd64"
+printf 'fake min\n' >"$root/artifacts-no-answerer/minimal-linux-amd64"
+printf 'fake mip\n' >"$root/artifacts-no-answerer/mip-linux-amd64"
+: >"$GCLOUD_STUB_ARGS"
+expect 1 "missing artifact for min-answerer/linux/amd64" \
+    "a missing answerer artifact fails the stage naming it" -- \
+    "$script" --artifacts-dir "$root/artifacts-no-answerer" --bucket gs://test-bucket --version 0.6.0
+expect_calls 0 "^storage " "nothing is uploaded when the answerer is missing"
 
 # --- --dry-run never talks to gcloud ------------------------------------------
 

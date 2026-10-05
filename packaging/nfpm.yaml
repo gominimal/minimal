@@ -9,7 +9,7 @@
 #   NFPM_ARCH        amd64 or arm64 (one nfpm run per arch)
 #   ARTIFACT_DIR     per-arch dir of the staged static binaries, already
 #                    renamed to their installed names (min, minimald, mip,
-#                    minvmd, gvproxy-min)
+#                    minvmd, gvproxy-min, min-answerer)
 #   COMPLETIONS_DIR  completions generated from the built `min` (the
 #                    scripts/dist-build.sh technique)
 #   APPARMOR_DIR     the repo's packaging/apparmor tree
@@ -72,6 +72,17 @@ contents:
           mode: 0755
     - src: ${ARTIFACT_DIR}/gvproxy-min
       dst: /usr/bin/gvproxy-min
+      expand: true
+      file_info:
+          mode: 0755
+    # min-answerer, the box-zone answerer binary NET-122's session advisory
+    # finds beside `min` and copies into its root-owned service path. The
+    # package ships the binary and nothing else: it installs and enables no
+    # answerer service — no systemd unit file, no postinstall step — so the
+    # advisory's one privileged command stays the one privileged step, run
+    # deliberately by the operator, never as a package's side effect.
+    - src: ${ARTIFACT_DIR}/min-answerer
+      dst: /usr/bin/min-answerer
       expand: true
       file_info:
           mode: 0755

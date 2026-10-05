@@ -229,11 +229,26 @@ fi
 # there. The bytes are stock gvproxy (pinned and SHA-256-verified by
 # scripts/fetch-gvproxy.sh); only the installed name is ours, and
 # `switch::GVPROXY_FILE` is the resolver's matching definition.
+#
+# min-answerer stages as `bin/min-answerer` beside `min` on every platform
+# that stages `min` — exactly where the session advisory's `answerer_source`
+# looks for it (beside the running `min` first, then PATH). The staged copy is
+# only the COPY SOURCE for NET-122's one privileged step: the advisory's
+# command copies it to a root-owned path (`answerer` in the minimal crate's
+# resolver) and installs the service from that; no service unit or launchd
+# plist references the user-prefix path, and neither does this table. It is
+# required like the other binaries — a release without it is a release whose
+# advisory cannot offer the host service, so a missing artifact fails the
+# stage rather than shipping a table with a hole. It carries no lib/ component
+# on any platform: the Linux builds are static musl and the macOS build links
+# only system libraries (the rule scripts/check-answerer-links.sh gates
+# before the binary can leave the build).
 COMPONENTS=(
     # Linux amd64
     "minimald|linux|amd64|file|bin/minimald|minimald-linux-amd64"
     "mip|linux|amd64|file|bin/mip|mip-linux-amd64"
     "minimal|linux|amd64|file|bin/min|minimal-linux-amd64"
+    "min-answerer|linux|amd64|file|bin/min-answerer|min-answerer-linux-amd64"
     "git-remote-min|linux|amd64|symlink|bin/git-remote-min|min"
     "gvproxy-min|linux|amd64|file|bin/gvproxy-min|gvproxy-linux-amd64"
     "minvmd|linux|amd64|file|bin/minvmd|minvmd-linux-amd64"
@@ -244,6 +259,7 @@ COMPONENTS=(
     "minimald|linux|arm64|file|bin/minimald|minimald-linux-arm64"
     "mip|linux|arm64|file|bin/mip|mip-linux-arm64"
     "minimal|linux|arm64|file|bin/min|minimal-linux-arm64"
+    "min-answerer|linux|arm64|file|bin/min-answerer|min-answerer-linux-arm64"
     "git-remote-min|linux|arm64|symlink|bin/git-remote-min|min"
     "gvproxy-min|linux|arm64|file|bin/gvproxy-min|gvproxy-linux-arm64"
     "minvmd|linux|arm64|file|bin/minvmd|minvmd-linux-arm64"
@@ -252,6 +268,7 @@ COMPONENTS=(
     "vmlinuz|linux|arm64|file|data/vmlinuz|vmlinuz-arm64"
     # macOS arm64 (darwin)
     "minimal|darwin|arm64|file|bin/min|minimal-macos-arm64"
+    "min-answerer|darwin|arm64|file|bin/min-answerer|min-answerer-macos-arm64"
     "git-remote-min|darwin|arm64|symlink|bin/git-remote-min|min"
     "minvmd|darwin|arm64|file|bin/minvmd|minvmd-macos-arm64"
     # The trimmed libkrun minvmd links against (built by the release workflow's

@@ -188,12 +188,18 @@ trap 'rm -rf "$workdir"' EXIT
 # name. Same mapping as the PKGBUILD's source arrays
 # (min::minimal-linux-amd64, ...), plus minvmd, which every staged row
 # carries — see the file-list decision in packaging/nfpm.yaml's header.
+# min-answerer carries the same rule: it packages beside `min` as
+# /usr/bin/min-answerer (the copy source NET-122's session advisory finds),
+# root-owned like the other packaged binaries, and nothing here installs or
+# enables the answerer service — the advisory's privileged step stays the
+# one privileged step, so a package never writes the unit files or plist.
 ARTIFACTS=(
     "minimal|min"
     "minimald|minimald"
     "mip|mip"
     "minvmd|minvmd"
     "gvproxy|gvproxy-min"
+    "min-answerer|min-answerer"
 )
 artifacts_root="$workdir/artifacts"
 
