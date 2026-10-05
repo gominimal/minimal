@@ -1239,9 +1239,18 @@ impl File {
     ///  - default profile if set (and not set on the task)
     ///  - default state_key if set (and not set on the task)
     ///  - additional build_packages & runtime_packages set on the stack
+    ///  - repo-wide `[params]` as args, unless the task declares an arg of the same name
     ///
     /// The returned task will not have had any string interpolations applied.
     pub fn hydrate_task_defaults(&self, task: &mut Task) {
+        if let Some(params) = &self.params {
+            for (name, spec) in &params.0 {
+                task.args
+                    .0
+                    .entry(name.clone())
+                    .or_insert_with(|| spec.clone());
+            }
+        }
         if let Some(default_profile) = &self.defaults.profile
             && task.profile.is_none()
         {
@@ -1888,6 +1897,39 @@ mod tests {
                 ("/ro-file", false),
                 ("/rw-file", true),
             ]
+        );
+    }
+
+    /// Repo-wide `[params]` reach every task as defaulted args, and a task
+    /// arg of the same name shadows the repo param.
+    #[test]
+    fn task_inherits_repo_params_as_args() {
+        let mf: File = toml::from_str(indoc! {
+            r#"
+            [params]
+            greeting = { type = "string", default = "hi" }
+            name = { type = "string", default = "repo" }
+
+            [tasks.useparam]
+            bash = "echo %{greeting} %{name}"
+            args.name = { type = "string", default = "task" }
+            "#
+        })
+        .unwrap();
+
+        let task = mf.task("useparam").unwrap();
+        assert_eq!(
+            task.args.0.get("greeting"),
+            Some(&args::ArgSpec {
+                spec: args::ArgSchema::Scalar(args::PrimitiveSpec::String),
+                help: None,
+                default: Some("hi".to_string()),
+            })
+        );
+        assert_eq!(
+            task.args.0.get("name").and_then(|a| a.default.as_deref()),
+            Some("task"),
+            "a task arg must not be replaced by a repo param of the same name"
         );
     }
 

@@ -5501,8 +5501,15 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
     printf '\n[tasks.e2e-echo]\necho = "TASK_RUN_E2E_OK"\n'
     printf '\n[tasks.e2e-fail]\nbash = "exit 7"\n'
     printf '\n[tasks.e2e-envprint]\nexec = "printenv E2E_INHERIT_MARKER"\nenv_vars.E2E_INHERIT_MARKER = { inherit = true }\n'
+    # shellcheck disable=SC2016 # $PWD is the task's, expanded in the box
+    printf '\n[tasks.e2e-ic]\ninherit_cwd = true\nbash = "echo PWD=$PWD"\n'
+    # shellcheck disable=SC2016 # as above
+    printf '\n[tasks.e2e-noic]\nbash = "echo PWD=$PWD"\n'
   } > "$TASK_SEED_DIR/minimal.toml"
   mkdir "$TASK_SEED_DIR/.git"
+  # A file, not just the directory: the upload ships files.
+  mkdir -p "$TASK_SEED_DIR/sub/inner"
+  : > "$TASK_SEED_DIR/sub/inner/marker"
 
   # The loop: run → the task's output on stdout → exit 0 → session gone.
   t0=$(now_ms)
@@ -5667,6 +5674,23 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
     || { echo "::error::ungranted var error does not name the var"; cat "$WORK/env-ungranted.err" 2>/dev/null || true; fail; }
   unset E2E_INHERIT_MARKER # leave the invoking shell as this proof found it
   echo "env_vars inherit: ungranted var refused at the policy gate OK"
+
+  # inherit_cwd: run from a subdirectory, a task that declares it starts at
+  # the same place inside the uploaded tree; one that does not starts at
+  # the root.
+  ic_out="$(cd "$TASK_SEED_DIR/sub/inner" && mnl task run e2e-ic 2>"$WORK/task-ic.err")" \
+    || { echo "::error::'min task run e2e-ic' failed"; cat "$WORK/task-ic.err" 2>/dev/null || true; fail; }
+  if [[ "$ic_out" != *PWD=/workbench/sub/inner* ]]; then
+    echo "::error::inherit_cwd task did not start in sub/inner, got '$ic_out'"
+    fail
+  fi
+  noic_out="$(cd "$TASK_SEED_DIR/sub/inner" && mnl task run e2e-noic 2>"$WORK/task-noic.err")" \
+    || { echo "::error::'min task run e2e-noic' failed"; cat "$WORK/task-noic.err" 2>/dev/null || true; fail; }
+  if [[ "$noic_out" != *PWD=/workbench ]]; then
+    echo "::error::task without inherit_cwd did not start at /workbench, got '$noic_out'"
+    fail
+  fi
+  echo "task run inherit_cwd: sub/inner vs root OK"
 
   echo "task run proof OK"
   echo "::endgroup::"

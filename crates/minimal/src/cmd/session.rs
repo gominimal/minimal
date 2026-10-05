@@ -1850,6 +1850,7 @@ pub async fn cmd_session_run(
                 task: args.task,
                 owns_box: false,
                 args: vec![],
+                cwd: String::new(),
             }
             .encode(),
         ),
@@ -3544,8 +3545,17 @@ pub(crate) async fn destroy_session(
         .await
         .context("DestroySession RPC failed")?;
 
-    if resp.ok().is_some() {
+    if let Some(resp) = resp.ok() {
         println!("Destroyed session {} ({})", id, name.unwrap_or("-"));
+        // A failed `on_destroy` hook does not stop the destroy, so it is a
+        // warning rather than an error: the session is gone either way.
+        for failure in &resp.hook_failures {
+            let (head, output) = failure.split_once('\n').unwrap_or((failure, ""));
+            eprintln!("warning: on_destroy hook {head}; the session was destroyed anyway");
+            if !output.is_empty() {
+                eprintln!("{output}");
+            }
+        }
         // The session is gone; the row its activation bought outlives it on
         // the VM host daemon, and its creator withdraws it here (T66) —
         // presenting the pair the registration handed back. Best-effort: a

@@ -286,6 +286,10 @@ of the repository root.
 inherit_cwd = true
 ```
 
+Under `min task run`, the task starts at the matching path under `/workbench`: run from
+`sub/inner`, it starts at `/workbench/sub/inner`. If that directory is not in the uploaded tree, the
+task starts at `/workbench` and prints a one-line notice on stderr.
+
 ### `args` - Pass arguments to tasks {#args}
 
 _Optional_
