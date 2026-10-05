@@ -295,7 +295,9 @@ whose `package.version` is stale or not above the newest `v*` tag.
   the libkrun link path in `minvmd` to `@rpath`
   ([`scripts/rewrite-macos-linkage.sh`](../../scripts/rewrite-macos-linkage.sh)),
   and checks that `min` links only system libraries. It signs both binaries
-  with the Developer ID, the hardened runtime, and a timestamp.
+  with the Developer ID, the hardened runtime, and a timestamp. Then it
+  notarizes `min`, `minvmd`, and `min-answerer`. See
+  the **Notarization** paragraph below.
 - `build-libkrun-macos-arm64` builds the `libkrun.1.dylib` for macOS users on
   a hosted runner. `sign-macos-artifacts` signs it and the macOS `gvproxy`
   with the Developer ID on the self-hosted runner.
@@ -401,10 +403,8 @@ the steps that the other binaries have:
   signature with the designated requirement that `min` uses.
 - After the signature check, the link gate runs again on the signed
   artifact, and the job uploads it.
-- The patch does not notarize `min-answerer`. The pipeline notarizes no
-  macOS binary today, and
-  [gominimal/inbox#900](https://github.com/gominimal/inbox/issues/900)
-  tracks notarization for all of them.
+- The job notarizes `min-answerer` with the other macOS binaries. See
+  the **Notarization** paragraph below.
 - The release job and the stage-installer job stay the same. They collect
   artifacts by the platform-suffixed names, so the new names go into the
   GitHub Release, the `components` manifest, and the packages. The SHA-256
@@ -422,6 +422,36 @@ This section does not close these residuals:
   unit, and no macOS lane can run `sudo` without a password.
   [`scripts/session-e2e.sh`](../../scripts/session-e2e.sh) skips it there. A
   privileged macOS e2e runner is still necessary for that proof.
+
+**Notarization.** After the signature checks and the last link gate,
+`build-release-macos-arm64` sends `min`, `minvmd`, and `min-answerer` to
+the Apple notary service before it uploads them. The step puts each binary
+in a zip made with `ditto`, because `notarytool` does not take a bare
+Mach-O file. It runs `xcrun notarytool submit --wait` on each zip. The
+release fails unless each result is `Accepted`. On any other result, the
+step prints the notary log for that submission. Notarization does not
+change the file, so the job uploads the same signed bytes.
+
+The job does not staple. The release publishes each binary as a bare Mach-O
+file, and `stapler` can attach a ticket only to an app bundle, a `.pkg`, or
+a `.dmg`. Gatekeeper gets the ticket from Apple online when it checks a
+binary.
+
+The step needs two things that the workflow cannot set up:
+
+- A `notarytool` keychain profile in the signing keychain
+  (`minimal-signing.keychain-db`) on the self-hosted macOS runner. Create it
+  as the runner user with
+  `xcrun notarytool store-credentials <profile> --keychain
+  ~/Library/Keychains/minimal-signing.keychain-db`. Give it an App Store
+  Connect API key (`--key`, `--key-id`, `--issuer`), or an Apple ID with an
+  app-specific password and team `3G47C5HY64`. The step unlocks the keychain
+  with the `KC_PW` secret, as the signing steps do.
+- The repository variable `MACOS_NOTARY_PROFILE`, set to the profile name.
+  If the variable is empty, the step fails before it submits anything.
+
+`libkrun.1.dylib` and the macOS `gvproxy`, which `sign-macos-artifacts`
+signs, are not notarized.
 
 **release job.** This job downloads all build outputs. It writes the release
 notes with `scripts/next-version.sh --notes` and generates shell completions

@@ -450,7 +450,9 @@ jobs:
         # self-hosted runner is offline — a skip here also skips `release`, which
         # needs it.
         runs-on: [self-hosted, macOS, ARM64]
-        timeout-minutes: 45
+        # 60, not 45: the build takes about 15 minutes, and the notarization
+        # step below waits on Apple's notary service for three submissions.
+        timeout-minutes: 60
         needs: [assert-version]
         if: vars.RUN_MACOS_CI != 'false'
         env:
@@ -561,6 +563,64 @@ jobs:
             - name: Re-check min-answerer links on the signed artifact
               # The last check before upload, on the signed and renamed bytes.
               run: scripts/check-answerer-links.sh target/release/min-answerer-macos-arm64
+            - name: Notarize binaries
+              # Submit each signed binary to Apple's notary service and fail the
+              # release unless every result is Accepted. Notarization does not
+              # modify the file, so the uploaded bytes stay the signed, link-gated
+              # bytes above. notarytool takes a zip, a .pkg or a .dmg, never a
+              # bare Mach-O, so each binary goes up in a ditto zip that is used
+              # only for the submission.
+              #
+              # No staple: the release ships each binary as a bare Mach-O file,
+              # and stapler cannot attach a ticket to one (only to an .app, a .pkg
+              # or a .dmg). Gatekeeper looks the ticket up online instead.
+              #
+              # The credentials are a notarytool keychain profile stored in the
+              # signing keychain; the repository variable MACOS_NOTARY_PROFILE
+              # names it.
+              env:
+                  KC_PW: ${{ secrets.KC_PW }}
+                  NOTARY_PROFILE: ${{ vars.MACOS_NOTARY_PROFILE }}
+              run: |
+                  if [ -z "$NOTARY_PROFILE" ]; then
+                    echo "::error::repository variable MACOS_NOTARY_PROFILE is not set" >&2
+                    exit 1
+                  fi
+                  KC=minimal-signing.keychain-db
+                  security unlock-keychain -p "$KC_PW" "$KC"
+
+                  work="$RUNNER_TEMP/notarize"
+                  rm -rf "$work"
+                  mkdir -p "$work"
+                  for f in target/release/minvmd-macos-arm64 \
+                           target/release/minimal-macos-arm64 \
+                           target/release/min-answerer-macos-arm64; do
+                    name=$(basename "$f")
+                    zip="$work/$name.zip"
+                    result="$work/$name.json"
+                    ditto -c -k --keepParent "$f" "$zip"
+
+                    echo "Submitting $name for notarization"
+                    xcrun notarytool submit "$zip" \
+                      --keychain-profile "$NOTARY_PROFILE" \
+                      --keychain "$HOME/Library/Keychains/$KC" \
+                      --wait --timeout 15m \
+                      --output-format json >"$result" || true
+                    cat "$result"
+
+                    status=$(plutil -extract status raw -o - "$result" 2>/dev/null || true)
+                    if [ "$status" != "Accepted" ]; then
+                      echo "::error::notarization of $name ended with status '${status:-none}'" >&2
+                      id=$(plutil -extract id raw -o - "$result" 2>/dev/null || true)
+                      if [ -n "$id" ]; then
+                        xcrun notarytool log "$id" \
+                          --keychain-profile "$NOTARY_PROFILE" \
+                          --keychain "$HOME/Library/Keychains/$KC" || true
+                      fi
+                      exit 1
+                    fi
+                    echo "$name: Accepted"
+                  done
             - name: Upload binary (minvmd)
               uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
               with:
