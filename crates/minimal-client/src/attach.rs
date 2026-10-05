@@ -502,20 +502,29 @@ impl HostAsks {
     }
 }
 
-/// The dialog's question, built from the offer's host-row fields alone: the
-/// box's name as the host row holds it, the protocol and the port. Control
+/// The ask dialog's question: the native dialog's own frame
+/// (`minimald::session_host::ASK_PROMPT`), so a human, and the e2e's pty
+/// driver, meet one dialog wherever the box runs.
+pub const ASK_DIALOG_PROMPT: &str = "Allow the publish to the host?";
+
+/// The ask dialog's choices, the highlighted refusal first, as the native
+/// dialog orders them.
+const ASK_DIALOG_CHOICES: [&str; 2] = ["Deny", "Allow"];
+
+/// The dialog's lead-in, built from the offer's host-row fields alone: the
+/// box's name as the host row holds it, the port and the protocol. Control
 /// characters are dropped so nothing in a name can drive the terminal.
 #[must_use]
-pub fn ask_dialog_text(offer: &minimald_rpc::PendingAskOffer) -> String {
+pub fn ask_dialog_lead_in(offer: &minimald_rpc::PendingAskOffer) -> String {
     let name: String = offer.name.chars().filter(|c| !c.is_control()).collect();
     format!(
-        "Box '{name}' asks to publish {} port {} to the host. Allow?",
-        offer.proto, offer.port
+        "{name} asks to publish port {}/{}.",
+        offer.port, offer.proto
     )
 }
 
 /// The dialog's end as the answer recorded for it: a yes only for an
-/// explicit yes; a no for a no, Ctrl-C, Escape and a closed or failed
+/// explicit Allow; a no for Deny, Ctrl-C, Escape and a closed or failed
 /// input; and no-tty when there was no terminal to render on.
 #[must_use]
 pub fn ask_answer_from(result: Result<bool, inquire::InquireError>) -> minimald_rpc::AskAnswer {
@@ -527,14 +536,16 @@ pub fn ask_answer_from(result: Result<bool, inquire::InquireError>) -> minimald_
 }
 
 /// Render the ask dialog with `inquire` on the real terminal, in the
-/// attach-start termios the suspended relay put back, defaulting to no.
+/// attach-start termios the suspended relay put back: the lead-in, then a
+/// Deny/Allow choice with Deny highlighted.
 #[must_use]
 pub fn render_ask_dialog(offer: &minimald_rpc::PendingAskOffer) -> minimald_rpc::AskAnswer {
+    eprintln!("\r\n{}", ask_dialog_lead_in(offer));
     ask_answer_from(
-        inquire::Confirm::new(&ask_dialog_text(offer))
-            .with_default(false)
-            .with_help_message("y allows the publish; n, Esc or Ctrl-C refuses it")
-            .prompt(),
+        inquire::Select::new(ASK_DIALOG_PROMPT, ASK_DIALOG_CHOICES.to_vec())
+            .with_help_message("Enter picks; Esc or Ctrl-C denies")
+            .prompt()
+            .map(|choice| choice == "Allow"),
     )
 }
 

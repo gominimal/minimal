@@ -4025,10 +4025,12 @@ mod tests {
         assert_eq!(offer.name, "web");
         assert_eq!(Some(offer.box_id), web.box_id);
         assert_eq!(
-            minimal_client::attach::ask_dialog_text(&offer),
-            "Box 'web' asks to publish tcp port 3000 to the host. Allow?"
+            minimal_client::attach::ask_dialog_lead_in(&offer),
+            "web asks to publish port 3000/tcp."
         );
-        let minimald_rpc::BoxControlReply::AskAdmit(outcome) = reply.recv_timeout(ASK_WAIT).unwrap() else {
+        let minimald_rpc::BoxControlReply::AskAdmit(outcome) =
+            reply.recv_timeout(ASK_WAIT).unwrap()
+        else {
             panic!("the guest's ask is answered with its end");
         };
         assert!(
@@ -4085,7 +4087,9 @@ mod tests {
         });
         let reply = stand.guest_ask(&web, 3000);
         offers.recv_timeout(ASK_WAIT).expect("the dialog is shown");
-        let minimald_rpc::BoxControlReply::AskAdmit(outcome) = reply.recv_timeout(ASK_WAIT).unwrap() else {
+        let minimald_rpc::BoxControlReply::AskAdmit(outcome) =
+            reply.recv_timeout(ASK_WAIT).unwrap()
+        else {
             panic!("the guest's ask is answered with its end");
         };
         assert_eq!(
