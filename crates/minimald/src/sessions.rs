@@ -19,6 +19,7 @@ use std::sync::Arc;
 #[cfg(target_os = "linux")]
 use std::sync::RwLock;
 use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
 
 pub(crate) mod composables;
 #[cfg(test)]
@@ -178,7 +179,7 @@ enum ManagerMessage {
     #[cfg(test)]
     RunningCount(Responder<usize>),
     CreateSession(Box<CreateSessionMsg>),
-    DeleteSession(SessionId, Responder<()>),
+    DeleteSession(SessionId, Responder<Vec<String>>),
     Shutdown(bool, Responder<Result<(), ()>>),
     /// Fire-and-forget: drop the `running` entry for a session whose actor
     /// terminated on its own (abort, failed verdict resume, create failure).
@@ -197,7 +198,10 @@ enum ManagerMessage {
 /// Follows the actor pattern.
 #[derive(Debug)]
 pub struct Manager {
-    in_shutdown: bool,
+    /// Cancelled once a shutdown proceeds, before any session is stopped.
+    /// Shared with every [`ManagerHandle`], so a command the shutdown ends
+    /// can tell (see [`ManagerHandle::is_shutting_down`]).
+    in_shutdown: CancellationToken,
     receiver: mpsc::Receiver<ManagerMessage>,
     running: BTreeMap<SessionId, SessionHandle>,
     store: StoreHandle,
@@ -538,8 +542,10 @@ impl Manager {
             }
             (hostnames, loopback)
         };
+        let in_shutdown = CancellationToken::new();
         let handle = ManagerHandle {
             sender,
+            in_shutdown: in_shutdown.clone(),
             #[cfg(target_os = "linux")]
             hostnames: Arc::clone(&hostnames),
             #[cfg(all(test, target_os = "linux"))]
@@ -549,7 +555,7 @@ impl Manager {
         // so its binding can request destruction (see `weak_self`).
         let weak_self = handle.downgrade();
         let mngr = Self {
-            in_shutdown: false,
+            in_shutdown,
             receiver,
             running,
             store,
@@ -950,7 +956,7 @@ impl Manager {
         &mut self,
         pred: SessionKeyPredicate,
     ) -> Result<Option<SessionHandle>, SessionsError> {
-        if self.in_shutdown {
+        if self.in_shutdown.is_cancelled() {
             return Err(SessionsError::new(
                 std::io::ErrorKind::ConnectionRefused,
                 "in shutdown",
@@ -1006,7 +1012,7 @@ impl Manager {
         config: minimald_rpc::SessionConfig,
         username: Option<String>,
     ) -> Result<SessionId, SessionsError> {
-        if self.in_shutdown {
+        if self.in_shutdown.is_cancelled() {
             return Err(SessionsError::new(
                 std::io::ErrorKind::ConnectionRefused,
                 "in shutdown",
@@ -1210,7 +1216,7 @@ impl Manager {
             // any), then removes its on-disk record.
             ManagerMessage::DeleteSession(id, r) => {
                 r.handle(async {
-                    if self.in_shutdown {
+                    if self.in_shutdown.is_cancelled() {
                         return Err(SessionsError::new(
                             std::io::ErrorKind::ConnectionRefused,
                             "in shutdown",
@@ -1260,7 +1266,7 @@ impl Manager {
                     };
                     match actor {
                         Some(hnd) => {
-                            hnd.destroy().await?;
+                            let hook_failures = hnd.destroy().await?;
                             // Belt-and-braces: a dead actor (self-terminated
                             // but not yet evicted) reads as `Ok` above, and
                             // may have died *without* deleting its record
@@ -1271,10 +1277,13 @@ impl Manager {
                             {
                                 return Err(e);
                             }
+                            Ok(hook_failures)
                         }
-                        None => handle.delete().await?,
+                        None => {
+                            handle.delete().await?;
+                            Ok(Vec::new())
+                        }
                     }
-                    Ok(())
                 })
                 .await
             }
@@ -1294,7 +1303,7 @@ impl Manager {
                         }
                     }
 
-                    self.in_shutdown = true;
+                    self.in_shutdown.cancel();
                     // Stop live sessions. Each actor kills its host and
                     // withdraws its own PTask hostname (R3.5) on the way
                     // down; records — and, with them, the loopback grants
@@ -1335,6 +1344,8 @@ impl Manager {
 #[derive(Debug, Clone)]
 pub struct ManagerHandle {
     sender: mpsc::Sender<ManagerMessage>,
+    /// The actor's [`Manager::in_shutdown`].
+    in_shutdown: CancellationToken,
     /// A clone of the actor's shared PTask hostname registry, handed to the
     /// host-side proxies so they resolve `Host:` headers without a round-trip
     /// through the actor mainloop.
@@ -1357,6 +1368,8 @@ pub struct ManagerHandle {
 #[derive(Debug, Clone)]
 pub struct WeakManagerHandle {
     sender: mpsc::WeakSender<ManagerMessage>,
+    /// Mirrors [`ManagerHandle::in_shutdown`].
+    in_shutdown: CancellationToken,
     /// Mirrors [`ManagerHandle::hostnames`]; the registry `Arc` is held so an
     /// [`upgrade`](Self::upgrade) can reconstruct a full handle. This does not
     /// keep the actor alive (only live senders do).
@@ -1375,6 +1388,7 @@ impl WeakManagerHandle {
     pub fn upgrade(&self) -> Option<ManagerHandle> {
         Some(ManagerHandle {
             sender: self.sender.upgrade()?,
+            in_shutdown: self.in_shutdown.clone(),
             #[cfg(target_os = "linux")]
             hostnames: Arc::clone(&self.hostnames),
             #[cfg(all(test, target_os = "linux"))]
@@ -1405,7 +1419,7 @@ impl SessionControl {
     /// delete itself fails (e.g. the manager is mid-shutdown).
     pub async fn destroy(&self) -> Result<(), SessionsError> {
         match self.manager.upgrade() {
-            Some(mngr) => mngr.delete_session(self.id).await,
+            Some(mngr) => mngr.delete_session(self.id).await.map(drop),
             None => Err(SessionsError::new(
                 std::io::ErrorKind::NotConnected,
                 "sessions manager is gone",
@@ -1438,11 +1452,19 @@ impl SessionControl {
 }
 
 impl ManagerHandle {
+    /// Whether a shutdown is under way: set before the shutdown stops any
+    /// session, so a command it ends can still see why when it returns.
+    #[must_use]
+    pub fn is_shutting_down(&self) -> bool {
+        self.in_shutdown.is_cancelled()
+    }
+
     /// Returns a non-owning handle to this manager.
     #[must_use]
     pub fn downgrade(&self) -> WeakManagerHandle {
         WeakManagerHandle {
             sender: self.sender.downgrade(),
+            in_shutdown: self.in_shutdown.clone(),
             #[cfg(target_os = "linux")]
             hostnames: Arc::clone(&self.hostnames),
             #[cfg(all(test, target_os = "linux"))]
@@ -1662,8 +1684,9 @@ impl ManagerHandle {
     /// Deletes the session with the given ID, cascadingly tearing down its
     /// running host and actor (if any) before removing its on-disk record.
     ///
+    /// On success, returns one line per `on_destroy` hook that failed.
     /// Returns a `NotFound` error if no session with that ID is known.
-    pub async fn delete_session(&self, id: SessionId) -> Result<(), SessionsError> {
+    pub async fn delete_session(&self, id: SessionId) -> Result<Vec<String>, SessionsError> {
         let (send, recv) = Responder::channel();
         // Ignore send errors - the recv will also fail.
         let _ = self

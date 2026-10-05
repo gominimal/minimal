@@ -551,6 +551,32 @@ async fn shedding_a_stalled_binding_closes_the_client_channel() {
     attach.stop().await;
 }
 
+/// An attach the daemon ended exits non-zero, so a script can tell it from
+/// one the user ended. A detach and a session process that exited are the
+/// user's own ends and stay 0; a shed keeps ssh's 255.
+#[test]
+fn daemon_ended_attaches_report_a_non_zero_exit_status() {
+    for reason in [
+        MainloopExitReason::Shutdown,
+        MainloopExitReason::HostGone,
+        MainloopExitReason::Superceded,
+    ] {
+        assert_eq!(
+            reason.exit_status(),
+            DAEMON_ENDED_EXIT_STATUS,
+            "{reason:?} must report the daemon-ended status",
+        );
+    }
+    assert_ne!(DAEMON_ENDED_EXIT_STATUS, 0);
+    assert_ne!(
+        DAEMON_ENDED_EXIT_STATUS, SHED_EXIT_STATUS,
+        "the daemon-ended status must not arm the client's blind unwind",
+    );
+    assert_eq!(MainloopExitReason::Detach.exit_status(), 0);
+    assert_eq!(MainloopExitReason::ProcessExited.exit_status(), 0);
+    assert_eq!(MainloopExitReason::Shed.exit_status(), SHED_EXIT_STATUS);
+}
+
 /// A terminal that falls behind is slowed down, not dropped. The shed used
 /// to fire whenever one forward waited longer than the 2 s probe deadline,
 /// which any terminal draining under about 800 KB/s hit while a session

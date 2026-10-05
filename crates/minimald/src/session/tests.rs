@@ -1592,13 +1592,16 @@ async fn session_with_hook(
 }
 
 /// Destroys `id` through the RPC surface a client uses.
-async fn destroy_session(client: &mut TestClient, id: SessionId) {
+async fn destroy_session(
+    client: &mut TestClient,
+    id: SessionId,
+) -> minimald_rpc::DestroySessionResponse {
     use minimald_rpc::{DestroySession, DestroySessionRequest, Errorable};
     match client
         .call::<DestroySession>(&DestroySessionRequest { id })
         .await
     {
-        Errorable::Ok(_) => {}
+        Errorable::Ok(resp) => resp,
         Errorable::Err { error } => panic!("DestroySession failed: {error}"),
     }
 }
@@ -2177,8 +2180,9 @@ async fn destroy_runs_its_hooks_for_a_session_that_was_never_attached() {
 }
 
 /// A destroy hook that fails is reported, not obeyed: the session is
-/// still torn down and its record still deleted. A session that a bad
-/// hook could pin would be unremovable.
+/// still torn down and its record still deleted, and the destroying
+/// client is told which hook failed and how. A session that a bad hook
+/// could pin would be unremovable.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failing_destroy_hook_still_destroys_the_session() {
     let dir = tempfile::tempdir().unwrap();
@@ -2196,7 +2200,22 @@ async fn a_failing_destroy_hook_still_destroys_the_session() {
     )
     .await;
 
-    destroy_session(&mut client, session_id).await;
+    let resp = destroy_session(&mut client, session_id).await;
+    assert_eq!(
+        resp.hook_failures.len(),
+        1,
+        "the failed hook should be reported: {:?}",
+        resp.hook_failures,
+    );
+    let failure = &resp.hook_failures[0];
+    assert!(
+        failure.contains("test"),
+        "the report should name where the hook was declared: {failure}",
+    );
+    assert!(
+        failure.contains("exited with status 3"),
+        "the report should describe the failure in words: {failure}",
+    );
 
     assert!(marker.exists(), "the hook should still have run");
     assert!(
