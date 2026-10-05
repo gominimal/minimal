@@ -242,7 +242,7 @@ fi
 expect 1 "--extra needs an existing file" "--extra with a missing file fails before anything runs" -- \
     with GCLOUD_STUB_EXISTS=0 -- stage --version 0.6.0 --extra "$root/absent"
 
-# --- min-answerer stages beside min, required like the other binaries -------
+# --- min-answerer stages beside min; optional until release.yml ships it -----
 
 # The answerer row: bin/min-answerer beside bin/min on every platform the
 # manifest ships min for, hashed and uploaded with the rest — it is the copy
@@ -270,19 +270,62 @@ else
     ok "no row stages a unit or plist: only bin/lib/data paths"
 fi
 
-# Required: a build that produced no answerer fails the stage rather than
-# shipping a table with a hole — the same rule every other binary carries.
-# Every artifact whose row precedes min-answerer's is present, so the first
-# missing one the loop names is the answerer.
+# Optional until release.yml ships it (temporary, gominimal/inbox#899): a
+# build that produced no answerer warns, names the omitted row, and stages
+# every other artifact. The fixture dir carries an artifact for every other
+# `file` row of the component table, read from the script itself, so the
+# answerer is the only thing missing and the run uses no --allow-missing.
 mkdir -p "$root/artifacts-no-answerer"
-printf 'fake daemon\n' >"$root/artifacts-no-answerer/minimald-linux-amd64"
-printf 'fake min\n' >"$root/artifacts-no-answerer/minimal-linux-amd64"
-printf 'fake mip\n' >"$root/artifacts-no-answerer/mip-linux-amd64"
+awk -F'|' '/^    "[a-z-]+\|(linux|darwin)\|/ && $4 == "file" {
+        sub(/".*$/, "", $6); print $6
+    }' "$script" | sort -u | while read -r base; do
+    case "$base" in min-answerer-*) continue ;; esac
+    printf 'fake %s\n' "$base" >"$root/artifacts-no-answerer/$base"
+done
 : >"$GCLOUD_STUB_ARGS"
-expect 1 "missing artifact for min-answerer/linux/amd64" \
-    "a missing answerer artifact fails the stage naming it" -- \
+no_answerer_rc=0
+no_answerer_out="$("$script" --artifacts-dir "$root/artifacts-no-answerer" \
+    --bucket gs://test-bucket --version 0.6.0 2>&1)" || no_answerer_rc=$?
+if [ "$no_answerer_rc" -eq 0 ]; then
+    ok "a missing answerer artifact does not fail the stage"
+else
+    bad "a missing answerer artifact failed the stage (rc=$no_answerer_rc, out: $no_answerer_out)"
+fi
+for plat in linux/amd64 linux/arm64 darwin/arm64; do
+    if [[ "$no_answerer_out" == *"warning: optional artifact missing, omitting min-answerer/$plat:"* ]]; then
+        ok "the stage warns that min-answerer/$plat is omitted"
+    else
+        bad "no omission warning for min-answerer/$plat (out: $no_answerer_out)"
+    fi
+done
+if [[ "$no_answerer_out" == *"gominimal/inbox#899"* ]]; then
+    ok "the warning names the issue that retires the optional state"
+else
+    bad "the warning does not name gominimal/inbox#899 (out: $no_answerer_out)"
+fi
+if [ -z "$(printf '%s\n' "$no_answerer_out" | awk '$1 == "min-answerer" && $6 == "file"')" ]; then
+    ok "the manifest carries no min-answerer row when the artifact is missing"
+else
+    bad "the manifest carries a min-answerer row with no artifact behind it (out: $no_answerer_out)"
+fi
+if [ -n "$(printf '%s\n' "$no_answerer_out" | awk '$1 == "minimal" && $2 == "darwin" && $7 == "bin/min"')" ] \
+    && [ -n "$(printf '%s\n' "$no_answerer_out" | awk '$1 == "minvmd" && $2 == "linux" && $3 == "arm64"')" ]; then
+    ok "every other artifact still stages"
+else
+    bad "the rest of the table did not stage (out: $no_answerer_out)"
+fi
+expect_calls 1 "/components gs://test-bucket/versions/0.6.0/components$" \
+    "the manifest still uploads when only the answerer is missing"
+expect_calls 0 "min-answerer" "no answerer artifact is uploaded when it is missing"
+
+# Every other binary stays required: the same fixture without minvmd's arm64
+# artifact fails the stage naming it.
+rm "$root/artifacts-no-answerer/minvmd-linux-arm64"
+: >"$GCLOUD_STUB_ARGS"
+expect 1 "missing artifact for minvmd/linux/arm64" \
+    "a missing required artifact still fails the stage naming it" -- \
     "$script" --artifacts-dir "$root/artifacts-no-answerer" --bucket gs://test-bucket --version 0.6.0
-expect_calls 0 "^storage " "nothing is uploaded when the answerer is missing"
+expect_calls 0 "^storage cp " "nothing is uploaded when a required artifact is missing"
 
 # --- --dry-run never talks to gcloud ------------------------------------------
 
