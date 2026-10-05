@@ -7218,10 +7218,9 @@ proof_native_resolution_without_proxy_env() {
         echo "--- activate stderr ---"; cat "$native_err" 2>/dev/null || true
         fail
       fi
-      # A native daemon's advisory carries no answerer step (NET-122: the
-      # host service is a VM-backed host's); should one appear, record the
-      # channel it binds BEFORE running it, so a half-failed run still
-      # leaves the teardown a service to remove.
+      # A native daemon's advisory carries the manager-held answerer step
+      # (T90); record the channel it binds BEFORE running it, so a
+      # half-failed run still leaves the teardown a service to remove.
       case "$native_cmd" in
         *zone-answerer*)
           ANSWERER_SERVICE_CHANNEL="$(answerer_channel_of "$native_cmd")"
@@ -8126,8 +8125,8 @@ proof_box_name_resolves_natively_without_proxy() {
       echo "--- activate stderr ---"; cat "$bn_err" 2>/dev/null || true
       fail
     fi
-    # A native daemon's advisory carries no answerer step; should one
-    # appear, record its channel first so the teardown can remove it.
+    # A native daemon's advisory carries the manager-held answerer step
+    # (T90); record its channel first so the teardown can remove it.
     case "$bn_cmd" in
       *zone-answerer*)
         ANSWERER_SERVICE_CHANNEL="$(answerer_channel_of "$bn_cmd")"
@@ -8460,9 +8459,9 @@ proof_box_name_resolves_natively_without_proxy() {
 
 # ---------------------------------------------------------------------------
 # The box-zone answerer as a host service, end to end (NET-122's host
-# service, NET-138's interim and its handover). VM-backed lanes only: a
-# native daemon's advisory omits the step, and the two resolution cases
-# above keep that lane's story. The case runs where a lane can install the
+# service, NET-138's interim and its handover). VM-backed lanes only: the
+# native lane's handover is proven by native_answerer_survives_session_stop
+# below. The case runs where a lane can install the
 # unit — the KVM lane through passwordless sudo with the systemd variant,
 # a macOS host only if it can install a LaunchDaemon — and a VM lane that
 # cannot FAILS rather than self-skips, so the pin is never silent:
@@ -8531,7 +8530,7 @@ asr_answerer_ready() {
 
 proof_answerer_survives_session_stop() {
   if [ -z "$E2E_VM" ]; then
-    echo "answerer survives session stop SKIPPED (native lane: the answerer host service is a VM-backed host's, and a native daemon's advisory omits the step)"
+    echo "answerer survives session stop SKIPPED (native lane: this is the VM-backed host's handover; native_answerer_survives_session_stop proves the native one)"
     return 0
   fi
   echo "::group::the box-zone answerer host service survives a session stop (NET-122, NET-138)"
