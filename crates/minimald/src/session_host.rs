@@ -5391,6 +5391,10 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
                 // `Err` from `step`, but a destroy or a daemon shutdown either
                 // wants no prompt at all or has already sent its own teardown.
                 let mut pending = self.pending_pty_err.take();
+                // Read before `take_if` below can empty `pending`: with no
+                // stashed pty error, the only way `step` errs is
+                // `Message::Kill`, so the end was asked for.
+                let requested = pending.is_none();
 
                 // Notify *before* the reap when the process may still be
                 // running, because `wait` below is unbounded — see
@@ -5413,14 +5417,29 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
                 // hakoniwa's own account is logged from the process handle,
                 // which has no span and so names no session, and the binding's
                 // prompt line never happens with nothing attached.
-                tracing::warn!(
-                    session_id = %self.session_id,
-                    session = %self.session_name,
-                    ?code,
-                    abnormal = exit.as_ref().is_some_and(ExitReason::is_abnormal),
-                    exit_reason = exit.as_ref().map_or("", |r| r.reason.as_str()),
-                    "session process reaped after pty/step error",
-                );
+                //
+                // A requested teardown is logged at info: its SIGKILL reaps
+                // with the same abnormal reason an OOM kill does, and a warn
+                // for every destroy would bury the deaths nobody asked for.
+                if requested {
+                    tracing::info!(
+                        session_id = %self.session_id,
+                        session = %self.session_name,
+                        ?code,
+                        abnormal = exit.as_ref().is_some_and(ExitReason::is_abnormal),
+                        exit_reason = exit.as_ref().map_or("", |r| r.reason.as_str()),
+                        "session process reaped after requested teardown",
+                    );
+                } else {
+                    tracing::warn!(
+                        session_id = %self.session_id,
+                        session = %self.session_name,
+                        ?code,
+                        abnormal = exit.as_ref().is_some_and(ExitReason::is_abnormal),
+                        exit_reason = exit.as_ref().map_or("", |r| r.reason.as_str()),
+                        "session process reaped after pty/step error",
+                    );
+                }
 
                 // Otherwise notify *after* it, which is the whole point: only
                 // the reap can say whether that shell exited or was killed, and
