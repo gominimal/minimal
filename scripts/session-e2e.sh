@@ -15763,7 +15763,8 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
     # forward by design (sessions::core::switch_request, Refusal::Unheld), and
     # nothing on the host unbinds it at box end, so on main this leg is
     # expected to find the bind still standing. Reported as a known gap with
-    # a ::warning:: until the host-side unbind lands; flip it to `fail` then.
+    # a ::warning:: until the host-side unbind lands (gominimal/inbox#915);
+    # flip it to `fail` then.
     if [ -n "$po_addr" ]; then
       po_t0=$(now_ms)
       curl -sS --max-time 8 -o /dev/null "http://$po_addr:$PO_EXT/" \
@@ -15774,7 +15775,7 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
       if [ "$po_gone_rc" -eq 7 ] && [ $((po_t1 - po_t0)) -lt 4000 ]; then
         echo "declared port refused fast after its box ended: no bind outlived the box"
       else
-        echo "::warning::KNOWN GAP (not asserted): the declared port $po_addr:$PO_EXT was not refused fast after its box was destroyed (curl exit $po_gone_rc in $((po_t1 - po_t0))ms) — the declared forward's bind outlived the box"
+        echo "::warning::KNOWN GAP (not asserted): the declared port $po_addr:$PO_EXT was not refused fast after its box was destroyed (curl exit $po_gone_rc in $((po_t1 - po_t0))ms) — the declared forward's bind outlived the box (https://github.com/gominimal/inbox/issues/915)"
       fi
     fi
 
