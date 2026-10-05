@@ -321,7 +321,9 @@ async fn report_exchange(
         }
     })
     .await
-    .map_err(|_| {
+    .map_err(|_elapsed| {
+        // The elapsed carries no cause of its own to report back: the bound
+        // itself is the failure, and the reason names it.
         io::Error::new(
             io::ErrorKind::TimedOut,
             format!("the port report's reply did not arrive in {REPORT_REPLY_TIMEOUT:?}"),

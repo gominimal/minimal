@@ -663,7 +663,14 @@ fn serve_connection(
 /// accept loop. Bytes past the request line, if any, are discarded: the
 /// door's protocol is one line each way.
 fn drain_until_peer_closes(stream: &mut UnixStream) {
-    let _ = stream.set_read_timeout(Some(GUEST_REPORT_DRAIN_TIMEOUT));
+    if let Err(error) = stream.set_read_timeout(Some(GUEST_REPORT_DRAIN_TIMEOUT)) {
+        // Without the bound a reporter that never closes would pin the
+        // door's serial accept loop, so a timeout that cannot be set ends
+        // the drain here: the reply is already written, and the peer's
+        // close ends the connection all the same.
+        tracing::debug!(error = %error, "the guest report drain could not arm its bound");
+        return;
+    }
     let mut sink = [0u8; 1024];
     loop {
         match std::io::Read::read(stream, &mut sink) {

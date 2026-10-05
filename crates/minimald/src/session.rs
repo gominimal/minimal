@@ -2902,6 +2902,11 @@ impl Session {
             // names a forward that is gone, and the withdrawal report clears
             // it — best-effort, like the unexpose beside it, because there
             // is no caller left to propagate a failure to.
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "the spawn that would carry this withdrawal's failure has \
+                          already ended, so no caller is left to propagate it to"
+            )]
             let _ = crate::net::listeners::report_withdrawn_port(
                 &control,
                 switch_address,
