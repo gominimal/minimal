@@ -1233,6 +1233,32 @@ fn ingress_spec_rejects_malformed_and_bad_proto() {
 }
 
 #[test]
+fn forward_spec_accepts_ephemeral_local_port() {
+    let (local, box_port) = parse_forward_spec("0:80").unwrap();
+    assert_eq!(local, 0);
+    assert_eq!(box_port, 80);
+}
+
+#[test]
+fn forward_spec_rejects_zero_box_port() {
+    let err = parse_forward_spec("8080:0").unwrap_err().to_string();
+    assert!(
+        err.contains("box port must be 1-65535"),
+        "expected the box-port message, got: {err}"
+    );
+}
+
+#[test]
+fn forward_spec_rejects_out_of_range_and_malformed() {
+    assert!(parse_forward_spec("8080:99999").is_err());
+    let err = parse_forward_spec("x:80").unwrap_err().to_string();
+    assert!(
+        err.contains("invalid local port"),
+        "expected the local-port message, got: {err}"
+    );
+}
+
+#[test]
 fn ingress_spec_rejects_box_port_zero() {
     let err = parse_ingress_mapping("8080:0").unwrap_err();
     let msg = err.to_string();
