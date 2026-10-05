@@ -14,7 +14,7 @@ updated: 2026-10-05
 
 Today's CLI has no `box` noun. A session is driven by `min session activate`, `destroy`, `exec`, `rename`, `policy`, `hooks` and `run`, a task by `min task run --keep`, and the daemon by a bare `min stop`; today's listing prints none of type, state, provider or host. The architecture's command tree names one grammar instead: `min box` verbs for any box, the type nouns `session` and `task` as filtered forms of them, `min type`, `min host` and `min provider`, versioned `-o json` schemas, and one exit-code table. This spec specifies those long forms; the daily shortcuts layered on them are left to design work (Non-goals).
 
-The box model, the record, the spec and the operations on them, is `docs/specs/25-spec-box-local-first` (BOX). This spec is the grammar that drives those operations from `min`. It is separate so the model can land first and unblock the networking and egress-proxy specs, and so the grammar is scheduled and reviewed on its own; it lands after BOX. Surfaces: the `min` CLI, its help, completions and synced reference docs.
+The box model, the record, the spec and the operations on them, is `docs/specs/29-spec-box-local-first` (BOX). This spec is the grammar that drives those operations from `min`. It is separate so the model can land first and unblock the networking and egress-proxy specs, and so the grammar is scheduled and reviewed on its own; it lands after BOX. Surfaces: the `min` CLI, its help, completions and synced reference docs.
 
 **Success:** every verb BCLI-026 and BCLI-030 name exists with its flags, `-o json` output carries the versioned schemas, exit codes follow the architecture's table, and each old spelling works for one release with a hint naming its replacement.
 
@@ -117,11 +117,11 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
   tier:     T0
   verify:   cargo nextest run -p minimal task_list_shows_exited_until_pruned
 
-- **BCLI-016** WHEN `min box events <box> -o jsonl` runs THE SYSTEM SHALL replay the full stream BOX-040 writes and BOX-018 and BOX-045 retain, with each line carrying `"schema": "min/v1/event"`, `ts`, `box`, `parent`, `type` and `data`.
+- **BCLI-016** WHEN `min box events <box> -o jsonl` runs THE SYSTEM SHALL replay the full stream as BOX-162 reads it, the events BOX-040 writes and BOX-018 and BOX-045 retain, with each line carrying `"schema": "min/v1/event"`, `ts`, `box`, `parent`, `type` and `data`.
   <!-- was BOX-042 -->
   tier:     T0
   verify:   cargo nextest run -p minimal events_jsonl_replay_schema_fields
-  - WHERE `--follow` is given to `min box events` THE SYSTEM SHALL replay the stream then tail it.
+  - WHERE `--follow` is given to `min box events` THE SYSTEM SHALL replay the stream then tail it, as BOX-162's follow does.
     tier:   T0
     verify: cargo nextest run -p minimal events_follow_replays_then_tails
   - WHERE `--parent <box>` is given to `min box events` THE SYSTEM SHALL merge the children's streams.
@@ -137,6 +137,9 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
   <!-- was BOX-056 -->
   tier:     T0
   verify:   cargo nextest run -p minimal init_entry_type_appends_one
+  - IF `<type>` is one BOX-063 refuses THEN THE SYSTEM SHALL fail with exit 3 as BOX-063 states and append nothing.
+    tier:   T0
+    verify: cargo nextest run -p minimal init_refused_type_exit3_appends_nothing
 
 - **BCLI-019** WHEN `min type list` runs THE SYSTEM SHALL show every resolved type, the six built-in types and each type the project defines, with its source, `builtin` or `project`, naming each type as BOX-161 names the type that supplies a value.
   <!-- was BOX-057 -->
@@ -367,7 +370,7 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
 
 ## Non-goals
 
-- The box model: the record, its states and retention, the expanded spec, the projection, stop, reap, resume, rename, events and the un-enrolled path: `docs/specs/25-spec-box-local-first` (BOX). This spec renders and drives them and adds no behaviour to them.
+- The box model: the record, its states and retention, the expanded spec, the projection, stop, reap, resume, rename, events and the un-enrolled path: `docs/specs/29-spec-box-local-first` (BOX). This spec renders and drives them and adds no behaviour to them.
 - Resource verbs and figures (`min host list|show` capacity, allocatable, allocated, default box size and enforcement; the 137 return on an OOM end): the resources spec (gominimal/inbox#698; BRES), written from that epic.
 - Volume verbs (`min volume list|show|rm|prune`): `docs/specs/27-spec-box-volumes` (BVOL), which carries them as BVOL-006, BVOL-007 and BVOL-012. BRES and BVOL keep their own verbs because they are small and move with the behaviour they render.
 - The dash (epic story S14): an amendment to `docs/specs/07-spec-min-dash-tui`.
