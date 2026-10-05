@@ -1234,7 +1234,7 @@ fn read_row_and_reply(
     let reply = match boxes.row_by_name(&request.name) {
         Some(record) => BoxControlReply::Row(BoxRow {
             name: record.name().to_string(),
-            box_id: record.box_id(),
+            box_id: minimald_rpc::BoxId::from_bytes(record.box_id()),
             switch_address: record.switch_addr(),
             egress_allow_list: record.egress_allow_list().to_vec(),
             declared_ports: record.admitted_ports().to_vec(),

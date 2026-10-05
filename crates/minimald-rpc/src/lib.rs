@@ -962,6 +962,11 @@ pub enum AskRefused {
     QueueFull,
     /// The row's stance is not `ask`.
     StanceNotAsk,
+    /// The row's grant admits no such port: no range is declared, or the
+    /// port is outside the one that is. Refused at the host before any
+    /// dialog is offered, so a client is never asked to answer for a
+    /// publish the grant would refuse anyway.
+    OutsideGrant,
     /// The attached human answered no.
     Denied,
     /// The dialog could not be rendered: no terminal was there.
@@ -3475,6 +3480,7 @@ mod tests {
             (AskRefused::Denied, r#""reason":"denied""#),
             (AskRefused::NoClient, r#""reason":"no_client""#),
             (AskRefused::QueueFull, r#""reason":"queue_full""#),
+            (AskRefused::OutsideGrant, r#""reason":"outside_grant""#),
             (AskRefused::NoTty, r#""reason":"no_tty""#),
             (AskRefused::Cancelled, r#""reason":"cancelled""#),
             (AskRefused::NoRow, r#""reason":"no_row""#),
