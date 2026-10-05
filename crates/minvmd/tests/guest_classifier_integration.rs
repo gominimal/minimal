@@ -1211,7 +1211,7 @@ async fn guest_deny_all_box_answers_inbound_through_the_proxy() {
          s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n\
          s.bind((\"127.0.0.1\", {SERVE_PORT}))\n\
          s.listen(1)\n\
-         s.settimeout(60)\n\
+         s.settimeout(20)\n\
          c, _ = s.accept()\n\
          c.recv(4096)\n\
          c.sendall(b\"HTTP/1.1 200 OK\\r\\nContent-Length: 2\\r\\nConnection: close\\r\\n\\r\\nok\")\n\
@@ -1223,47 +1223,47 @@ async fn guest_deny_all_box_answers_inbound_through_the_proxy() {
     // and a connect that beat the server's bind reads as a gateway error
     // the client simply tries again.
     let fqdn = format!("{}.min.internal", serving.name);
-    let client_cmd = format!(
-        "python3 -c 'import socket, time\n\
-         deadline = time.time() + 60\n\
-         while True:\n\
-             try:\n\
-                 s = socket.create_connection((\"127.0.0.1\", {NODE_PROXY_PORT}), timeout=30)\n\
-                 s.sendall(\"GET http://{fqdn}:{SERVE_PORT}/ HTTP/1.1\\r\\nHost: {fqdn}:{SERVE_PORT}\\r\\nConnection: close\\r\\n\\r\\n\".encode())\n\
-                 buf = b\"\"\n\
-                 while True:\n\
-                     chunk = s.recv(4096)\n\
-                     if not chunk:\n\
-                         break\n\
-                     buf += chunk\n\
-                 s.close()\n\
-                 if b\"200 OK\" in buf:\n\
-                     print(buf.decode(errors=\"replace\"))\n\
-                     break\n\
-             except OSError:\n\
-                 pass\n\
-             if time.time() > deadline:\n\
-                 print(\"no-answer\")\n\
-                 break\n\
-             time.sleep(1)'"
-    );
+    // Python's blocks need their indentation, which a `\`-continued Rust
+    // literal strips from every continued line, so the script is joined
+    // from lines that keep it.
+    let client_script = [
+        "import socket, time".to_string(),
+        "deadline = time.time() + 20".to_string(),
+        "last = \"none\"".to_string(),
+        "while True:".to_string(),
+        "    try:".to_string(),
+        format!(
+            "        s = socket.create_connection((\"127.0.0.1\", {NODE_PROXY_PORT}), timeout=10)"
+        ),
+        format!(
+            "        s.sendall(\"GET http://{fqdn}:{SERVE_PORT}/ HTTP/1.1\\r\\nHost: {fqdn}:{SERVE_PORT}\\r\\nConnection: close\\r\\n\\r\\n\".encode())"
+        ),
+        "        buf = b\"\"".to_string(),
+        "        while True:".to_string(),
+        "            chunk = s.recv(4096)".to_string(),
+        "            if not chunk:".to_string(),
+        "                break".to_string(),
+        "            buf += chunk".to_string(),
+        "        s.close()".to_string(),
+        "        if b\"200 OK\" in buf:".to_string(),
+        "            print(buf.decode(errors=\"replace\"))".to_string(),
+        "            break".to_string(),
+        "        last = buf.decode(errors=\"replace\").splitlines()[:1]".to_string(),
+        "    except OSError as e:".to_string(),
+        "        last = repr(e)".to_string(),
+        "    if time.time() > deadline:".to_string(),
+        "        print(\"no-answer\", last)".to_string(),
+        "        break".to_string(),
+        "    time.sleep(1)".to_string(),
+    ]
+    .join("\n");
+    let client_cmd = format!("python3 -c '{client_script}'");
     let (served, asked) = tokio::join!(
         tokio::time::timeout(EXEC_TIMEOUT * 2, serving.exec(&server_cmd)),
         tokio::time::timeout(EXEC_TIMEOUT * 2, client.exec(&client_cmd)),
     );
-    let (served_out, served_err, served_exit) = served
-        .expect("the server exec did not time out")
-        .expect("the server exec ran");
-    assert_eq!(
-        served_exit,
-        Some(0),
-        "the deny-all box's server did not run; stderr: {served_err}"
-    );
-    assert!(
-        served_out.contains("served"),
-        "the deny-all box never served the connection that reached it\n\
-         --- stdout ---\n{served_out}\n--- stderr ---\n{served_err}"
-    );
+    // The client's result first: a request the proxy never delivered is
+    // named by what the client met, not by the server's idle accept.
     let (asked_out, asked_err, asked_exit) = asked
         .expect("the client exec did not time out")
         .expect("the client exec ran");
@@ -1278,6 +1278,19 @@ async fn guest_deny_all_box_answers_inbound_through_the_proxy() {
          was not answered; the deny-all box must serve what reaches it\n\
          --- stdout ---\n{asked_out}\n--- stderr ---\n{asked_err}\n--- guest boot log ---\n{}",
         guest.boot_log(),
+    );
+    let (served_out, served_err, served_exit) = served
+        .expect("the server exec did not time out")
+        .expect("the server exec ran");
+    assert_eq!(
+        served_exit,
+        Some(0),
+        "the deny-all box's server did not run; stderr: {served_err}"
+    );
+    assert!(
+        served_out.contains("served"),
+        "the deny-all box never served the connection that reached it\n\
+         --- stdout ---\n{served_out}\n--- stderr ---\n{served_err}"
     );
 }
 
