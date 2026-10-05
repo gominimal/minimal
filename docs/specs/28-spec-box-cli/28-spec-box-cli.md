@@ -18,7 +18,7 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
 
 **Success:** every verb BCLI-026 and BCLI-030 name exists with its flags, `-o json` output carries the versioned schemas, exit codes follow the architecture's table, and each old spelling works for one release with a hint naming its replacement.
 
-**First slice:** `min box list|show|stop|rm` and `min ls` over the existing daemon, rendering id, type, state, provider and host (BCLI-001, BCLI-003, BCLI-004, BCLI-045, BCLI-051, BCLI-059, BCLI-060), before any alias work.
+**First slice:** `min box list|show|stop|rm` and `min ls` over the existing daemon, rendering id, name, type, state, provider and host (BCLI-001, BCLI-003, BCLI-004, BCLI-045, BCLI-051, BCLI-059, BCLI-060), before any alias work.
 
 ## Users and stories
 
