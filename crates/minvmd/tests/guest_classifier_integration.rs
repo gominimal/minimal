@@ -1329,7 +1329,7 @@ async fn guest_host_ip_enforcement_per_box_after_load() {
         return;
     };
     let guest = Guest::boot(&gvproxy);
-    let box_session = open_box(
+    let mut box_session = open_box(
         &guest,
         sessions::NetworkMode::HostNet,
         Some(sessions::EgressPolicy::deny_all()),
@@ -1339,11 +1339,27 @@ async fn guest_host_ip_enforcement_per_box_after_load() {
     .await
     .expect("a deny-all box launches on a guest whose table is loaded");
 
-    let recorded = guest
-        .boot_log_lines(&["host_ip_enforcement="])
-        .into_iter()
-        .filter(|line| line.contains(&box_session.name))
-        .collect::<Vec<_>>();
+    // The per-launch classifier line is written when the box's leaf is
+    // placed, which is at its first launch, not at create: run one command
+    // so the launch happens, then read its line within the log deadline.
+    let (_, stderr, exit) = box_session
+        .exec("true")
+        .await
+        .expect("the box runs a command");
+    assert_eq!(exit, Some(0), "the box's launch failed; stderr: {stderr}");
+    let launch_lines = |guest: &Guest| {
+        guest
+            .boot_log_lines(&["host_ip_enforcement="])
+            .into_iter()
+            .filter(|line| line.contains(&box_session.name))
+            .collect::<Vec<_>>()
+    };
+    let end = Instant::now() + LOG_DEADLINE;
+    let mut recorded = launch_lines(&guest);
+    while recorded.is_empty() && Instant::now() < end {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        recorded = launch_lines(&guest);
+    }
     assert!(
         !recorded.is_empty(),
         "the launch of {} recorded no per-launch classifier line; on a guest whose \
