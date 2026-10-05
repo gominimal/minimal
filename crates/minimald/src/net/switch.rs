@@ -601,13 +601,13 @@ async fn write_box_resets(
 
 /// tap → switch: read a raw Ethernet frame, reject it if its source is not the
 /// lease the relay was attached with (NET-084 — the daemon's own relay
-/// included), apply the session's egress verdict to what remains (NET-062 —
+/// included), notice frames to the deprecated literal host address (NET-004),
+/// apply the session's egress verdict to what remains (NET-062 —
 /// dropped frames never reach the switch and are not answered, save the one
 /// drop a DNS pin lifts, NET-066), answer the box's own AAAA/HTTPS/SVCB
 /// lookups (NET-136), record the outbound UDP flow of every datagram this leg
 /// actually forwards (so its reply is allowed back in — finding #2, UDP; only
-/// a declared, forwarded datagram opens a window), notice frames to the
-/// deprecated literal host address (NET-004), prepend its 2-byte LE length,
+/// a declared, forwarded datagram opens a window), prepend its 2-byte LE length,
 /// and write the framed packet to the control socket. `gate` is `None` for the
 /// daemon relay, which is not a box and forwards its own frames unchecked.
 #[expect(
@@ -664,6 +664,20 @@ where
         if let Some(reason) = egress::foreign_source(&summary, reject.lease.octets()) {
             reject.emit(&reason);
             continue;
+        }
+        // NET-004: on a box relay the literal host address is default-deny —
+        // the shared verdict below drops every frame to it — but the relay
+        // still says, once per interval, that a frame went to it. The notice
+        // reports the address only: a frame does not carry the name it was
+        // resolved from, so a frame sent via `host.min.internal` that resolved
+        // to the same address notices too. This sits ahead of the egress
+        // verdict so a frame the verdict drops still produces the notice: the
+        // deprecation is about the destination, not about whether the box's
+        // policy admits it.
+        if let Some(notice) = &notice
+            && is_legacy_host_literal(&buf[..n], notice.alias)
+        {
+            notice.emit();
         }
         // Egress enforcement (NET-062, NET-063, NET-064): every frame is
         // decided against the box's declared policy before it reaches the
@@ -748,14 +762,6 @@ where
                 gate.conntrack.record_egress(pkt);
             }
         }
-        // NET-004: the literal host address still routes — the switch's `nat`
-        // table maps it to the host's loopback — but the relay says, once per
-        // interval, that `host.min.internal` is the name to use instead.
-        if let Some(notice) = &notice
-            && is_legacy_host_literal(&buf[..n], notice.alias)
-        {
-            notice.emit();
-        }
         // One combined write keeps the length prefix and frame atomic even if
         // the socket closes between writes.
         let mut framed = Vec::with_capacity(2 + n);
@@ -824,9 +830,10 @@ pub(crate) const HOST_MIN_INTERNAL: &str = "host.min.internal";
 const LEGACY_HOST_RULE: &str = "legacy-host-literal";
 
 /// True when an Ethernet II frame is an IPv4 packet addressed to `alias` —
-/// NET-004's deprecated literal host address, the address the switch's `nat`
-/// table maps to the host's loopback. Any protocol counts: the notice is about
-/// the destination address, not the transport.
+/// NET-004's deprecated literal host address, default-deny on a box relay.
+/// Any protocol counts: the notice is about the destination address, not the
+/// transport, and not the name the address was resolved from, which a frame
+/// does not carry.
 fn is_legacy_host_literal(frame: &[u8], alias: Ipv4Addr) -> bool {
     // EtherType at 12..14; the IPv4 destination address at 14+16..14+20.
     frame.len() >= ETH_HDR + 20
@@ -837,7 +844,7 @@ fn is_legacy_host_literal(frame: &[u8], alias: Ipv4Addr) -> bool {
 /// Emits NET-004's deprecation notice on the egress relay leg: when a session
 /// box sends frames to the literal host-alias address, the relay says so —
 /// rate-limited, naming the box and [`HOST_MIN_INTERNAL`] — instead of letting
-/// the connection pass silently on an address the code should not keep using.
+/// the verdict drop them silently.
 struct LegacyHostNotice {
     /// The box's switch IP — the relay gate's `session_id` label, the same
     /// identity the policy warnings name.
@@ -5594,6 +5601,65 @@ pub(crate) mod tests {
             notice.emit(),
             "a policy warning must not suppress the deprecation notice"
         );
+    }
+
+    /// NET-004's notice fires ahead of the egress verdict: a frame to the
+    /// literal host address that the box's own policy drops still produces
+    /// the deprecation line — the deprecation is about the destination, not
+    /// about whether the policy admits it — while the frame itself never
+    /// reaches the switch.
+    #[tokio::test]
+    async fn dropped_frame_to_the_literal_still_notices() {
+        let capture = crate::test_harness::captured_log();
+        let alias = SwitchSubnet::default().host_alias();
+        // A lease no other test uses: under libtest every test shares the
+        // captured log, and other relays at [`LEASE`] reach for the literal
+        // too, so only a lease of this test's own ties the line to its frame.
+        let lease = Ipv4Addr::new(100, 64, 0, 77);
+        // Deny-all: the frame to the literal is dropped by the verdict, so
+        // only the notice (and the ARP sentinel behind it) is observable.
+        let deny_all = sessions::SessionPolicy {
+            egress: Some(sessions::EgressPolicy {
+                allow_protocols: None,
+                allow_subnets: None,
+                allow_dns_hosts: None,
+                deny_subnets: Some(vec!["0.0.0.0/0".to_string()]),
+            }),
+            ingress: None,
+            credentialed_upstream: None,
+        };
+        let mut harness = spawn_relay_for(lease, Some(&deny_all), |_| {});
+
+        let to_literal = egress_tcp_frame(lease, alias, 80);
+        let sentinel = arp_frame(lease);
+        harness.box_end.write_all(&to_literal).unwrap();
+        harness.box_end.write_all(&sentinel).unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+            .await
+            .expect("the relay forwards the sentinel")
+            .expect("the switch side stays open");
+        assert_eq!(
+            first, sentinel,
+            "a deny-all box's frame to the literal never reaches the switch"
+        );
+
+        // The drop still notices: the deprecation line names the box and the
+        // replacement, once per interval.
+        let logged = capture.contents();
+        assert!(
+            logged.contains("connection to the deprecated literal host address"),
+            "a dropped frame to the literal still notices: {logged}"
+        );
+        for expected in [
+            "session=100.64.0.77",
+            "deprecated=100.64.255.254",
+            "replacement=\"host.min.internal\"",
+        ] {
+            assert!(
+                logged.contains(expected),
+                "missing {expected:?} in: {logged}"
+            );
+        }
     }
 
     /// NET-084: a frame whose source is not the relay's lease never reaches

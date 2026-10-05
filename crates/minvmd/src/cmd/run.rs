@@ -576,15 +576,20 @@ fn run_foreground() -> Result<()> {
     // loopback, answering from this host-authored table — the same
     // semantics the native daemon's answerer gives, over the same shared
     // decision — so the in-VM daemon starts no answerer of its own and the
-    // host's resolver has one answerer to be pointed at. The port is the
-    // machine's, not this VM's: when another VM host daemon on this host
-    // already holds it, this daemon registers its rows with that holder over
-    // the answerer channel and answers nothing itself, so a second VM's
-    // boxes answer too. Started beside the switch, before the guest boots,
-    // so the node row the registration above published answers from the
-    // moment the VM does — best-effort at startup, like the control socket:
-    // a thread that could not spawn is warned and the VM still boots, its
-    // names then answering from whatever daemon holds the port.
+    // host's resolver has one answerer to be pointed at. The answerer is the
+    // machine's, not this VM's, and the channel decides who holds it: this
+    // daemon connects to the answerer channel first and publishes its rows
+    // there — to the installed host service when the privileged step put one
+    // in, or to another VM host daemon holding the port as the recorded
+    // single-operator interim — and hosts the answerer itself only when no
+    // channel socket exists and the hook port is free, never both, so a
+    // second VM's boxes answer too and the installed service, when there is
+    // one, is the one answerer the machine runs. Started beside the switch,
+    // before the guest boots, so the node row the registration above
+    // published answers from the moment the VM does — best-effort at
+    // startup, like the control socket: a thread that could not spawn is
+    // warned and the VM still boots, its names then answering from whatever
+    // answerer holds the port.
     if let Err(error) =
         crate::net::answerer::spawn(boxes.clone(), DEFAULT_ANSWERER_PORT, answerer_status)
     {
@@ -1262,7 +1267,6 @@ const PORTS_DIR_MODE: u32 = 0o700;
 /// reservation, not a released one.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 fn node_ports_dir() -> Result<std::path::PathBuf> {
-    use anyhow::Context as _;
     #[cfg(target_os = "macos")]
     let base = std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
@@ -1287,17 +1291,40 @@ fn node_ports_dir() -> Result<std::path::PathBuf> {
     let base_is_shared_tmp = std::env::var_os("XDG_RUNTIME_DIR").is_none_or(|v| v.is_empty());
     #[cfg(target_os = "macos")]
     let base_is_shared_tmp = false;
+    node_ports_dir_in(&base, base_is_shared_tmp)
+}
 
+/// The pure half of [`node_ports_dir`]: makes `base` and its `ports` dir
+/// ready and returns the ports dir.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn node_ports_dir_in(
+    base: &std::path::Path,
+    base_is_shared_tmp: bool,
+) -> Result<std::path::PathBuf> {
+    use anyhow::Context as _;
+    use std::os::unix::fs::DirBuilderExt as _;
     // The base is this user's own runtime dir (the XDG_RUNTIME_DIR contract,
-    // or macOS's Application Support): create it when absent, the default
-    // mode — the ports dir itself is the one that carries the claim, so it
-    // is the one created 0700 and the one the owner/mode check refuses. The
-    // `/tmp` fallback's base is the exception, created and checked like the
-    // ports dir.
+    // or macOS's Application Support): created 0700 when absent and
+    // tightened to 0700 when this user owns it, never refused — the ports dir itself is the one that carries the claim, so
+    // it is the one the owner/mode check refuses. The base is also the dir
+    // the zone answerer's interim channel binds in, which refuses a dir open
+    // to group or other, so a base created here under the umask's mode would
+    // leave the interim with no channel. The `/tmp` fallback's base is the
+    // exception, created and checked like the ports dir.
     if base_is_shared_tmp {
-        create_private_dir(&base)?;
+        create_private_dir(base)?;
     } else if !base.exists() {
-        std::fs::create_dir_all(&base).context("creating the node-port reservation base")?;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(PORTS_DIR_MODE)
+            .create(base)
+            .context("creating the node-port reservation base")?;
+    } else {
+        // A base an earlier build created under the umask's mode: tightened
+        // to 0700 when this user owns it, so the interim channel binds there
+        // again; one another user owns is left for the answerer to refuse.
+        crate::sock::restrict_owned_dir(base)
+            .context("tightening the node-port reservation base")?;
     }
     let ports = base.join("ports");
     create_private_dir(&ports)?;
@@ -3208,6 +3235,50 @@ mod tests {
             Some((4242, "pid 4242 (python3)".to_string()))
         );
         assert_eq!(super::lsof_holder(""), None);
+    }
+
+    #[test]
+    fn an_absent_ports_base_is_created_private() {
+        use std::os::unix::fs::PermissionsExt as _;
+        // The base is the per-user run dir the zone answerer's interim
+        // channel binds in, and that bind refuses a dir open to group or
+        // other: a base created under the umask's mode (0755) would leave
+        // the interim with no channel for another state dir's node.
+        let root = tempfile::tempdir().expect("a test runtime dir");
+        let base = root.path().join("minimal");
+        let ports = super::node_ports_dir_in(&base, false).expect("the ports dir is made");
+        assert_eq!(ports, base.join("ports"));
+        for dir in [&base, &ports] {
+            let mode = std::fs::metadata(dir)
+                .expect("the dir exists")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o700, "{} is created 0700", dir.display());
+        }
+    }
+
+    #[test]
+    fn an_owned_wide_ports_base_is_tightened() {
+        use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+        // A base an earlier build left at the umask's mode keeps the
+        // interim channel from binding; the next boot tightens it.
+        let root = tempfile::tempdir().expect("a test runtime dir");
+        let base = root.path().join("minimal");
+        std::fs::DirBuilder::new()
+            .mode(0o755)
+            .create(&base)
+            .expect("a wide base");
+        super::node_ports_dir_in(&base, false).expect("the ports dir is made");
+        let mode = std::fs::metadata(&base)
+            .expect("the base exists")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o700,
+            "{} is tightened to 0700",
+            base.display()
+        );
     }
 
     #[test]

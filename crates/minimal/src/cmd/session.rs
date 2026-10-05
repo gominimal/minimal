@@ -161,6 +161,12 @@ async fn register_box_with_vm_host(
                  report {port}; the registration did not happen"
             )
         }
+        minimald_rpc::BoxControlReply::AnswererRelease { .. } => {
+            anyhow::bail!(
+                "the VM host daemon answered the box registration with an \
+                 answerer release reply; the registration did not happen"
+            )
+        }
     }
 }
 
@@ -367,6 +373,13 @@ pub(crate) async fn withdraw_box_row(
                     status = ?status,
                     "the VM host daemon answered the box row withdrawal with its \
                      answerer status; the row stays published"
+                );
+            }
+            minimald_rpc::BoxControlReply::AnswererRelease { .. } => {
+                tracing::warn!(
+                    box = %name,
+                    "the VM host daemon answered the box row withdrawal with an \
+                     answerer release reply; the row stays published"
                 );
             }
             // A withdrawal is never answered with a registered box — but a
@@ -578,12 +591,62 @@ pub fn box_registered_start_line(
 /// suppresses it — that path must land in a session, never in a config
 /// prompt. Everything else, including the session id on stdout, is
 /// identical for both callers.
+/// The refusal a VM-backed host gives a box created with a dynamic-ingress
+/// stance that could publish (`allow` or `ask`). The VM host's egress gate
+/// admits a runtime publish only at a port the box's host-side registration
+/// already carries, and that registration carries the create's static
+/// `--ingress` mappings alone, so an in-range publish would be decided allow
+/// and then refused at the host. Until the dynamic range reaches the host
+/// registration (gominimal/minimal#1897) the create says so up front instead
+/// of handing the box a stance it cannot keep. `deny`, an absent stance, and
+/// every native host are unchanged.
+fn refuse_dynamic_ingress_on_vm(
+    kind: paths::ProviderKind,
+    mode: Option<sessions::DynamicIngress>,
+) -> Result<(), anyhow::Error> {
+    if kind == paths::ProviderKind::Minvmd
+        && matches!(
+            mode,
+            Some(sessions::DynamicIngress::Allow | sessions::DynamicIngress::Ask)
+        )
+    {
+        anyhow::bail!(
+            "dynamic ingress allow/ask is not yet supported on VM-backed hosts \
+             (gominimal/minimal#1897)"
+        );
+    }
+    Ok(())
+}
+
+/// Refuses a dynamic ingress declaration on a box that is not `own_ip`:
+/// only an own-IP box has a published address a runtime publish could
+/// apply to, so a stance or range on a `host_ip` or `none` box would be a
+/// declaration `min session policy` shows and nothing ever honours. The
+/// CLI reference documents the flags as requiring `--network own_ip`.
+fn refuse_dynamic_ingress_off_own_ip(
+    network: crate::cli::CliNetworkMode,
+    mode: Option<sessions::DynamicIngress>,
+    range: Option<(u16, u16)>,
+) -> Result<(), anyhow::Error> {
+    if network != crate::cli::CliNetworkMode::OwnIp && (mode.is_some() || range.is_some()) {
+        anyhow::bail!(
+            "--dynamic-ingress and --dynamic-range need --network own_ip: only an own-IP box \
+             has a published address to apply them to"
+        );
+    }
+    Ok(())
+}
+
 pub(crate) async fn activate_session(
     global: &GlobalArgs,
     args: ActivateArgs,
     offer_scaffold: bool,
 ) -> Result<(), anyhow::Error> {
     ensure_daemon(global)?;
+    // Before anything is created: a VM-backed host cannot keep an allow/ask
+    // stance yet, so the activation ends here with the reason.
+    refuse_dynamic_ingress_off_own_ip(args.network, args.dynamic_ingress, args.dynamic_range)?;
+    refuse_dynamic_ingress_on_vm(daemon_provider_kind(global), args.dynamic_ingress)?;
 
     let effective_path = match (&args.path, &global.repo_dir) {
         (Some(p), _) => std::path::PathBuf::from(p),
@@ -634,12 +697,20 @@ pub(crate) async fn activate_session(
             deny_subnets: (!args.deny_subnets.is_empty()).then(|| args.deny_subnets.clone()),
         })
     };
+    // NET-043: any dynamic declaration makes the ingress policy too — a
+    // stance alone (with no range, no static mapping) still names how
+    // dynamic requests are decided, and a range without a stance cannot
+    // reach the create (the flag requires its mode). Nothing set keeps
+    // `None`: the deny-all default, which the policy module evaluates the
+    // same as an explicit deny.
+    let has_ingress =
+        !port_mappings.is_empty() || args.dynamic_ingress.is_some() || args.dynamic_range.is_some();
     let policy = sessions::SessionPolicy {
         egress,
-        ingress: (!port_mappings.is_empty()).then_some(sessions::IngressPolicy {
+        ingress: has_ingress.then_some(sessions::IngressPolicy {
             port_mappings,
-            dynamic_allowed_range: None,
-            dynamic_ingress: None,
+            dynamic_allowed_range: args.dynamic_range,
+            dynamic_ingress: args.dynamic_ingress,
         }),
         // NET-134: the lane is the box's own declaration, never a default —
         // a box that did not ask for a credentialed upstream keeps every
@@ -1091,7 +1162,34 @@ pub(crate) async fn activate_session(
             crate::resolver::name_surface_line(surface, created.hostname_proxy_port)
         );
     } else if let Some(answerer_port) = answerer_port {
-        let detection = crate::resolver::session_detection().await;
+        // The answerer service's step (NET-122's host service) is read
+        // beside the detection on a VM-backed host: whether the zone is
+        // manager-held or held only while a session holds it, and whether
+        // the installed copy speaks this daemon's channel protocol. A
+        // native host is not offered the step — its in-daemon answerer
+        // stays the interim — so its advisory falls quiet once the
+        // resolver step is done.
+        let vm_backed = daemon_provider_kind(global) == paths::ProviderKind::Minvmd;
+        let (detection, answerer_step) =
+            tokio::join!(crate::resolver::session_detection(), async {
+                if vm_backed {
+                    crate::resolver::read_answerer_step().await
+                } else {
+                    crate::resolver::AnswererStep::NotOffered
+                }
+            });
+        if vm_backed {
+            // The daemons the step asks to release the hook port: this
+            // CLI's own state dir's VM host daemons, default VM and named
+            // VMs alike — never another state dir's.
+            let controls = client::enumerate_vm_sockets(global.minimal_dir.as_deref(), true)
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|vm| control_sock_beside(&vm.sock))
+                .map(|sock| sock.display().to_string())
+                .collect();
+            crate::resolver::set_handover_controls(controls);
+        }
         // NET-018: name the live surface at the moment the user is about to
         // rely on the names — decided in the one function both verbs share
         // (`resolver`), from the same detection the advisory reads: this
@@ -1127,6 +1225,7 @@ pub(crate) async fn activate_session(
             surface_verdict
                 .as_ref()
                 .and_then(|verdict| verdict.range_present),
+            &answerer_step,
         );
         if let Some(advisory) = &name_advisory {
             eprintln!("{advisory}");
@@ -1151,6 +1250,8 @@ pub(crate) async fn activate_session(
                 range_present = ?verdict.range_present,
                 range_unit_state = ?detection.2.state,
                 range_unit_check = ?detection.2.failed_check,
+                answerer_manager_held = answerer_step.holds(),
+                answerer_step = ?answerer_step,
                 "session start decided the live name surface for this host, \
                  with the range unit's state beside it"
             );
@@ -1191,6 +1292,27 @@ pub(crate) async fn activate_session(
         && let Some(notice) = deny_all_default_notice(sessions::EGRESS_DEFAULT_PHASE)
     {
         eprintln!("{notice}");
+    }
+
+    // When a subnet flag carries host bits (e.g. `--deny-subnets 10.0.0.1/8`),
+    // the enforcement layer reads it as the masked network (`10.0.0.0/8`).
+    // Print a one-line notice naming the normalized form so the user knows
+    // how their entry is read, rather than discovering it through a mismatch.
+    if let Some(egress) = &config.policy.egress {
+        if let Some(entries) = &egress.allow_subnets {
+            for entry in entries {
+                if let Some(normalized) = sessions::normalized_cidr(entry) {
+                    eprintln!("--allow-subnets {entry} is read as {normalized}");
+                }
+            }
+        }
+        if let Some(entries) = &egress.deny_subnets {
+            for entry in entries {
+                if let Some(normalized) = sessions::normalized_cidr(entry) {
+                    eprintln!("--deny-subnets {entry} is read as {normalized}");
+                }
+            }
+        }
     }
 
     // From here the session exists on the daemon in an unfinalized state.
@@ -1809,6 +1931,8 @@ pub(crate) async fn activate_new_for_attach(global: &GlobalArgs) -> Result<(), a
             sync: None,
             network: CliNetworkMode::HostNet,
             ingress: Vec::new(),
+            dynamic_ingress: None,
+            dynamic_range: None,
             allow_subnets: Vec::new(),
             allow_dns_hosts: Vec::new(),
             allow_protocols: Vec::new(),
@@ -2258,6 +2382,26 @@ pub fn format_policy(
     // to show for it — "deny-all" there would claim a deny-rule exists.
     if network != sessions::NetworkMode::HostNet {
         writeln!(out, "ingress")?;
+        // The dynamic row is the resolved stance, printed whether or not
+        // anything was declared (NET-043): an absent setting is the deny the
+        // policy module evaluates it as, and this render is where a person
+        // reads which stance a box runs under — silence would read as
+        // "unset" where there is no unset, only deny. The static half
+        // keeps its own deny-all line: it describes the declared mappings,
+        // not the dynamic stance. An absent setting carries the `(default)`
+        // mark the egress row uses, so it never reads as an explicit deny.
+        let dynamic_ingress = match effective
+            .ingress
+            .as_ref()
+            .and_then(|ingress| ingress.dynamic_ingress)
+        {
+            Some(mode) => mode.to_string(),
+            None => format!("{} (default)", sessions::DynamicIngress::Deny),
+        };
+        let dynamic_range = effective
+            .ingress
+            .as_ref()
+            .and_then(|ingress| ingress.dynamic_allowed_range);
         match &effective.ingress {
             None => writeln!(out, "  deny-all")?,
             Some(ingress) => {
@@ -2274,14 +2418,12 @@ pub fn format_policy(
                         mapping.proto, mapping.external_port, mapping.internal_port
                     )?;
                 }
-                if let Some((lo, hi)) = ingress.dynamic_allowed_range {
-                    writeln!(out, "  dynamic ports  {lo}–{hi}")?;
-                }
-                if let Some(mode) = ingress.dynamic_ingress {
-                    writeln!(out, "  dynamic ingress  {mode}")?;
-                }
             }
         }
+        if let Some((lo, hi)) = dynamic_range {
+            writeln!(out, "  dynamic ports  {lo}–{hi}")?;
+        }
+        writeln!(out, "  dynamic ingress  {dynamic_ingress}")?;
     }
     Ok(())
 }
@@ -2340,15 +2482,26 @@ pub const POLICY_JSON_SCHEMA: &str = "min/v1/session-policy";
 /// `deny_all` where the text rendering writes that reading — the same
 /// decision its "deny-all" line makes, so the document never claims rules
 /// the box never declared. Tagged by `kind` so a client branches on one
-/// field, with the declared policy's own keys flattened beside it.
+/// field, with the declared policy's own keys flattened beside it. The
+/// `dynamic_ingress` key is the resolved stance in both variants (NET-043):
+/// the deny an absent setting evaluates as, never a null a parser would
+/// have to default itself — the document and the text rendering answer
+/// "which stance does this box run under" identically.
 #[derive(serde::Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum PolicyIngressJson<'a> {
     /// Nothing is set, and the switch's default state is the deny: a claim
     /// about the switch, not about declared rules.
-    DenyAll,
+    DenyAll {
+        /// The dynamic stance the box runs under, resolved — deny, the
+        /// evaluation an absent setting takes (NET-043).
+        dynamic_ingress: sessions::DynamicIngress,
+        /// Always `default` here: a box that declared a stance is
+        /// `declared`, whatever the stance.
+        dynamic_ingress_source: &'static str,
+    },
     /// The declared policy, carried as the wire's own shape.
-    Declared(&'a sessions::IngressPolicy),
+    Declared(PolicyDeclaredIngressJson<'a>),
 }
 
 impl<'a> PolicyIngressJson<'a> {
@@ -2358,17 +2511,48 @@ impl<'a> PolicyIngressJson<'a> {
     /// on purpose.
     fn from_effective(policy: Option<&'a sessions::IngressPolicy>) -> Self {
         match policy {
-            None => Self::DenyAll,
+            None => Self::DenyAll {
+                dynamic_ingress: sessions::DynamicIngress::Deny,
+                dynamic_ingress_source: "default",
+            },
             Some(ingress)
                 if ingress.port_mappings.is_empty()
                     && ingress.dynamic_allowed_range.is_none()
                     && ingress.dynamic_ingress.is_none() =>
             {
-                Self::DenyAll
+                Self::DenyAll {
+                    dynamic_ingress: sessions::DynamicIngress::Deny,
+                    dynamic_ingress_source: "default",
+                }
             }
-            Some(ingress) => Self::Declared(ingress),
+            Some(ingress) => Self::Declared(PolicyDeclaredIngressJson {
+                port_mappings: &ingress.port_mappings,
+                dynamic_allowed_range: ingress.dynamic_allowed_range,
+                dynamic_ingress: ingress
+                    .dynamic_ingress
+                    .unwrap_or(sessions::DynamicIngress::Deny),
+                dynamic_ingress_source: if ingress.dynamic_ingress.is_some() {
+                    "declared"
+                } else {
+                    "default"
+                },
+            }),
         }
     }
+}
+
+/// The declared policy as the document carries it: the wire's own keys,
+/// with `dynamic_ingress` resolved to the stance the box runs under rather
+/// than the raw `None` the record stores.
+#[derive(serde::Serialize)]
+struct PolicyDeclaredIngressJson<'a> {
+    port_mappings: &'a [sessions::PortMapping],
+    dynamic_allowed_range: Option<(u16, u16)>,
+    dynamic_ingress: sessions::DynamicIngress,
+    /// `declared` when the box set a stance, `default` when the resolved
+    /// deny is the absent setting's — the text rendering's `(default)` mark,
+    /// as a field, the way the egress block's `source` carries it.
+    dynamic_ingress_source: &'static str,
 }
 
 /// The egress block as the document carries it: the posture the gate
@@ -3474,6 +3658,50 @@ mod tests {
     };
 
     #[test]
+    fn dynamic_ingress_needs_own_ip() {
+        use crate::cli::CliNetworkMode::{HostNet, NoNet, OwnIp};
+        for network in [HostNet, NoNet] {
+            for (mode, range) in [
+                (Some(DynamicIngress::Allow), Some((8000, 8443))),
+                (Some(DynamicIngress::Deny), None),
+                (None, Some((8000, 8443))),
+            ] {
+                let error = refuse_dynamic_ingress_off_own_ip(network, mode, range)
+                    .expect_err("a dynamic declaration off own_ip is refused");
+                assert!(
+                    error.to_string().contains("need --network own_ip"),
+                    "{error}"
+                );
+            }
+            refuse_dynamic_ingress_off_own_ip(network, None, None)
+                .expect("no dynamic declaration is never refused");
+        }
+        refuse_dynamic_ingress_off_own_ip(OwnIp, Some(DynamicIngress::Allow), Some((8000, 8443)))
+            .expect("an own-IP box keeps its dynamic declaration");
+    }
+
+    #[test]
+    fn vm_backed_activate_refuses_dynamic_allow_until_host_admission() {
+        use paths::ProviderKind::{Minimald, Minvmd};
+        for mode in [DynamicIngress::Allow, DynamicIngress::Ask] {
+            let error = refuse_dynamic_ingress_on_vm(Minvmd, Some(mode))
+                .expect_err("a VM-backed host must refuse an allow/ask stance");
+            assert_eq!(
+                error.to_string(),
+                "dynamic ingress allow/ask is not yet supported on VM-backed hosts \
+                 (gominimal/minimal#1897)"
+            );
+            refuse_dynamic_ingress_on_vm(Minimald, Some(mode))
+                .expect("a native host keeps every stance");
+        }
+        for kind in [Minvmd, Minimald] {
+            refuse_dynamic_ingress_on_vm(kind, Some(DynamicIngress::Deny))
+                .expect("deny is never refused");
+            refuse_dynamic_ingress_on_vm(kind, None).expect("an absent stance is never refused");
+        }
+    }
+
+    #[test]
     fn format_policy_dynamic_ingress_allow_prints_row_not_deny_all() {
         let policy = EffectiveSessionPolicy {
             egress: EffectiveEgress::AllowAll,
@@ -3578,7 +3806,7 @@ mod tests {
             );
         }
         assert!(
-            !rendered.contains("(default)"),
+            !rendered.contains("deny-all (default)"),
             "a declared deny-all is a declaration, never a default, so its \
              row carries no mark: {rendered}"
         );
@@ -4520,7 +4748,7 @@ mod tests {
         let _server = minvmd::control::spawn(
             sock_path.clone(),
             registry.clone(),
-            minvmd::net::answerer::AnswererStatus::starting(),
+            minvmd::net::answerer::AnswererStatus::allocating_for_tests("session-test-node"),
             minvmd::control::ProxyPublishStatus::default(),
         )
         .expect("the control server binds its socket");

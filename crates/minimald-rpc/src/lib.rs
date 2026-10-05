@@ -834,6 +834,17 @@ pub enum BoxControlRequest {
     /// box holds the name. Served on the host's control socket only, whose
     /// owner-only file mode is its access control.
     ReadRow(ReadRowRequest),
+    /// Release the interim answerer (NET-122's handover to the host
+    /// service): the daemon stops the answerer it hosts and frees the hook
+    /// port, then waits a bounded window for the service's channel and
+    /// publishes its rows there, re-binding the interim if the channel
+    /// never comes. Answered with [`BoxControlReply::AnswererRelease`] once
+    /// the port is free; a daemon that hosts no interim answers a no-op.
+    /// Accepted from the operator's uid and from root only.
+    ReleaseAnswerer,
+    /// Cancel a release: the daemon re-binds its interim answerer at once.
+    /// A daemon with no release pending answers a no-op.
+    ReleaseAnswererCancel,
 }
 
 /// The VM host daemon's answerer status: the state of the machine's
@@ -871,6 +882,15 @@ pub enum ZoneAnswererStatus {
     /// daemon's table rows answer through it over the answerer channel.
     Registered {
         /// The machine's answerer port the holder serves.
+        port: u16,
+    },
+    /// The installed answerer host service holds the answerer port (NET-122's
+    /// host service): the service manager holds its sockets and this
+    /// daemon's table rows answer through it over the machine-global answerer
+    /// channel. The zone is manager-held, so it answers whether or not any
+    /// session holds it.
+    ManagerHeld {
+        /// The machine's answerer port the service serves.
         port: u16,
     },
     /// The answerer port is held by a process with no channel — a native
@@ -1006,6 +1026,15 @@ pub enum BoxControlReply {
         port: u16,
         /// The protocol the report named.
         proto: IpProto,
+    },
+    /// A release or release-cancel was answered: `acted` says whether the
+    /// daemon did anything (false: it hosted no interim, or had no release
+    /// pending), and `detail` is the sentence it logged.
+    AnswererRelease {
+        /// Whether the request changed anything.
+        acted: bool,
+        /// What the daemon did, as its log line said it.
+        detail: String,
     },
 }
 

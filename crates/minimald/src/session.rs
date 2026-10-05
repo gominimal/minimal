@@ -862,7 +862,12 @@ impl Session {
         // travels on the record; these three are the facts a reader of a
         // diagnostics bundle's daemon-log tail needs to explain why a box
         // can — or cannot — reach anything, without the daemon's flags or
-        // its source at hand.
+        // its source at hand. The ingress half of the same diagnosis
+        // (NET-043): the dynamic stance and the range the record holds,
+        // named as the box runs them — an absent stance is the deny the
+        // policy module evaluates it as, the same reading `min session
+        // policy` prints — so a bundle explains both why a box can reach
+        // out and why the outside can reach in.
         {
             let record = obj.record();
             tracing::info!(
@@ -877,6 +882,17 @@ impl Session {
                     sessions::EGRESS_DEFAULT_PHASE,
                     conf.deny_all_opt_out,
                 ),
+                dynamic_ingress = %record
+                    .policy
+                    .ingress
+                    .as_ref()
+                    .and_then(|ingress| ingress.dynamic_ingress)
+                    .unwrap_or(sessions::DynamicIngress::Deny),
+                dynamic_allowed_range = ?record
+                    .policy
+                    .ingress
+                    .as_ref()
+                    .and_then(|ingress| ingress.dynamic_allowed_range),
                 "session starts"
             );
         }

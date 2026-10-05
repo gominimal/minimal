@@ -836,12 +836,14 @@ pub struct BoxRegistry {
     /// — the plan run's upper half, above the daemon's self-allocation
     /// reserve (`hand_out_run`) — never from the reserve itself.
     next_switch_addr: Arc<AtomicU32>,
-    /// The next published loopback address the client-driven allocation
-    /// hands out, shared the same way.
+    /// The next published loopback address the tests' single-node
+    /// allocation hands out, shared the same way. The daemon's addresses
+    /// are the answerer's ([`Self::register_client_box_at`]).
+    #[cfg(test)]
     next_loopback_addr: Arc<AtomicU32>,
     /// The loopback slice this subnet's switch publishes at, when the
-    /// address plan serves it: the run [`Self::register_client_box`]
-    /// allocates published addresses from. `None` for a subnet the plan
+    /// address plan serves it. A registry the plan does not serve cannot
+    /// register a client box. `None` for a subnet the plan
     /// does not serve — such a registry still holds explicit registrations
     /// (the node's own row among them), it just cannot allocate for a
     /// client box.
@@ -869,6 +871,7 @@ impl Clone for BoxRegistry {
             withdrawal_reports: self.withdrawal_reports.clone(),
             withdrawal_reports_rx: Mutex::new(None),
             next_switch_addr: Arc::clone(&self.next_switch_addr),
+            #[cfg(test)]
             next_loopback_addr: Arc::clone(&self.next_loopback_addr),
             loopback_slice: self.loopback_slice,
             attachments: self.attachments.clone(),
@@ -893,6 +896,7 @@ impl BoxRegistry {
             withdrawal_reports: reports,
             withdrawal_reports_rx: Mutex::new(Some(reports_rx)),
             next_switch_addr: Arc::new(AtomicU32::new(hand_out_run(subnet).0)),
+            #[cfg(test)]
             next_loopback_addr: Arc::new(AtomicU32::new(
                 loopback_slice.map_or(0, |slice| u32::from(slice.first())),
             )),
@@ -964,7 +968,7 @@ impl BoxRegistry {
             .unwrap_or_default();
         let resolves_names = !dns_hosts.is_empty();
         // The box's own id (BEP-070): the one a client-driven registration
-        // minted and checked ([`Self::register_client_box`]), or a fresh
+        // minted and checked ([`Self::register_client_box_at`]), or a fresh
         // UUIDv7 minted here for this creation — never a counter, never a
         // digest of the declaration below, never one a client presented.
         // Minted once, before anything else, so the row and the attachment
@@ -1134,6 +1138,13 @@ impl BoxRegistry {
     /// flip that lands with the last row source (T66's follow-up) changes
     /// it, and this registration makes none.
     ///
+    /// The published loopback address is not this registry's to pick:
+    /// allocation is host-global (design §7.1), so `loopback_addr` comes from
+    /// the machine's answerer — the installed service, or the interim when
+    /// this daemon hosts it — which hands each node's boxes distinct
+    /// addresses from the reserved range. Co-resident nodes never
+    /// self-assign.
+    ///
     /// The box's id is always minted here, for this creation
     /// ([`crate::bep_attach::mint_box_id`]): a spec carries none, so no
     /// client can present an id, and a re-registration under the same
@@ -1142,19 +1153,21 @@ impl BoxRegistry {
     /// holds is refused ([`AllocationError::CollidingBoxId`], BEP-070) —
     /// never re-minted — before any address is spent, and said as one warn
     /// line naming the id.
-    pub fn register_client_box(
+    pub fn register_client_box_at(
         &self,
         spec: ClientBoxSpec,
+        loopback_addr: Ipv4Addr,
     ) -> Result<Arc<BoxRecord>, AllocationError> {
-        self.register_client_box_as(spec, crate::bep_attach::mint_box_id())
+        self.register_client_box_as(spec, loopback_addr, crate::bep_attach::mint_box_id())
     }
 
-    /// [`Self::register_client_box`] with the freshly minted `id` it
+    /// [`Self::register_client_box_at`] with the freshly minted `id` it
     /// creates the box as: the one door the collision check guards, split
     /// out so a test can drive a colliding mint.
     fn register_client_box_as(
         &self,
         spec: ClientBoxSpec,
+        loopback_addr: Ipv4Addr,
         id: BoxId,
     ) -> Result<Arc<BoxRecord>, AllocationError> {
         // One id names one box (BEP-070): the check runs before any
@@ -1169,18 +1182,12 @@ impl BoxRegistry {
             );
             return Err(AllocationError::CollidingBoxId { id });
         }
-        let slice = self
-            .loopback_slice
-            .ok_or(AllocationError::UnplannedSubnet(self.subnet))?;
+        if self.loopback_slice.is_none() {
+            return Err(AllocationError::UnplannedSubnet(self.subnet));
+        }
         let (hand_out_first, hand_out_last) = hand_out_run(self.subnet);
         let switch_addr = take_next(&self.next_switch_addr, hand_out_first, hand_out_last)
             .ok_or(AllocationError::SwitchExhausted)?;
-        let loopback_addr = take_next(
-            &self.next_loopback_addr,
-            u32::from(slice.first()),
-            u32::from(slice.last()),
-        )
-        .ok_or(AllocationError::LoopbackExhausted)?;
         let mut registration = BoxRegistration::new(spec.name, switch_addr, loopback_addr)
             .with_admitted_ports(spec.ingress_ports);
         if let Some(policy) = spec.egress {
@@ -1198,6 +1205,27 @@ impl BoxRegistry {
         }
         registration.box_id = Some(id);
         Ok(self.register(registration))
+    }
+
+    /// [`Self::register_client_box_at`] with the published loopback address
+    /// drawn from this registry's own slice cursor — the single-node shape
+    /// the registry's own tests drive, where no answerer arbitrates. The
+    /// daemon never registers this way: its addresses are the answerer's.
+    #[cfg(test)]
+    pub fn register_client_box(
+        &self,
+        spec: ClientBoxSpec,
+    ) -> Result<Arc<BoxRecord>, AllocationError> {
+        let slice = self
+            .loopback_slice
+            .ok_or(AllocationError::UnplannedSubnet(self.subnet))?;
+        let loopback_addr = take_next(
+            &self.next_loopback_addr,
+            u32::from(slice.first()),
+            u32::from(slice.last()),
+        )
+        .ok_or(AllocationError::LoopbackExhausted)?;
+        self.register_client_box_at(spec, loopback_addr)
     }
 
     /// Whether some live row or attachment already holds `id` (BEP-070):
@@ -2316,6 +2344,7 @@ mod tests {
                     dynamic_ingress: None,
                     dynamic_allowed_range: None,
                 },
+                Ipv4Addr::from(u32::from(web.loopback_addr()) + 1),
                 web.box_id(),
             )
             .expect_err("an id a live box holds is not a second box's");
