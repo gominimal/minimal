@@ -17205,6 +17205,9 @@ PY
     eib_restore_log
     fail
   fi
+  # The record's `local` is the whole address the forward bound — host and
+  # port, the same string the reply printed — so the host probe below reads
+  # it as the URL it is.
   eib_rec_addr="$(printf '%s\n' "$eib_rec" | sed -n 's/.*"local":"\([0-9][0-9.]*:[0-9]*\)".*/\1/p')"
   echo "daemon log: $eib_rec"
   if [ -n "$eib_addr" ] && [ "$eib_addr:$eib_port" != "$eib_rec_addr" ]; then
@@ -17259,13 +17262,13 @@ PY
   env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy \
     -u ALL_PROXY -u all_proxy -u NO_PROXY -u no_proxy \
     curl -sS --max-time 8 -o "$WORK/eib-host.body" -w '%{http_code}' \
-    "http://$eib_rec_addr:$eib_port/" >"$WORK/eib-host.out" 2>"$WORK/eib-host.err"
+    "http://$eib_rec_addr/" >"$WORK/eib-host.out" 2>"$WORK/eib-host.err"
   eib_hrc=$?
   eib_t1=$(now_ms)
   eib_hms=$((eib_t1 - eib_t0))
   eib_hstatus="$(tail -n1 "$WORK/eib-host.out" 2>/dev/null | tr -d '\r\n')"
   eib_body="$(cat "$WORK/eib-host.body" 2>/dev/null || true)"
-  echo "host probe: GET http://$eib_rec_addr:$eib_port/ -> curl exit $eib_hrc in ${eib_hms}ms (status ${eib_hstatus:-none}) — bound at the recorded address, and the relay gate has not admitted it (NET-047's pending contract)"
+  echo "host probe: GET http://$eib_rec_addr/ -> curl exit $eib_hrc in ${eib_hms}ms (status ${eib_hstatus:-none}) — bound at the recorded address, and the relay gate has not admitted it (NET-047's pending contract)"
   if [ "$eib_hrc" -eq 0 ] || [ "$eib_hstatus" = "200" ]; then
     echo "::error::the host probe reached the allow box's runtime publish — the gate admitted a port no declaration names and no watcher published (NET-047)"
     eib_restore_log
