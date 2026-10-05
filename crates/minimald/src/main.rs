@@ -244,11 +244,16 @@ pub struct ListenArgs {
     #[arg(long)]
     hostname_proxy_port: Option<u16>,
 
-    /// Port the box-zone answerer must listen on (UDP), when this deployment
-    /// pins one — the port the host's resolver is pointed at to answer
-    /// `*.min.internal`, whose documented default is 7656. Unset (the
-    /// default) gives it the same try-the-default-then-select treatment the
-    /// hostname proxy's flag documents.
+    /// Port the machine's box-zone answerer serves on (UDP), when this
+    /// deployment pins one — the port the host's resolver is pointed at to
+    /// answer `*.min.internal`, whose documented default is 7656. On a
+    /// native host the daemon is first a client of the installed
+    /// `min-answerer` service (its rows publish over the machine-global
+    /// channel and it hosts nothing); the port is the hook port it hosts
+    /// the single-operator interim on while no service serves, and
+    /// unlike the hostname proxy there is no select-when-busy for it: the
+    /// address is the one the host's resolver is routed to, so a held
+    /// hook port is a surfaced error, never a move.
     #[arg(long)]
     zone_answerer_port: Option<u16>,
 
@@ -480,13 +485,17 @@ async fn async_main() -> Result<(), MainError> {
                 // In-VM (DM1/3/4) the PTask attaches to the host gvproxy over the
                 // vsock shuttle, so no in-guest gvproxy binary path is needed.
                 gvproxy_bin: None,
-                // Auto-select the hostname proxy's port: a VM daemon shares its
-                // host with whatever native daemon runs there, and the host
-                // gvproxy publishes whichever port this guest ends up on, so
-                // the two route both sets of names at the same time (NET-027)
-                // rather than fighting over one pinned port. `None` still
-                // tries the documented default first — it only relocates when
-                // something else on the machine holds it.
+                // The node ports are the host's, not the daemon's: minvmd
+                // assigns them before the VM boots (NET-025) and hands them
+                // on the kernel command line, so the guest binds exactly
+                // what the host's box table already admits (NET-138) and the
+                // host gvproxy publishes it at the same number. Binds as
+                // handed and selects none; a boot that carries no tokens — an
+                // older minvmd, a native run — falls back to default-then-
+                // select, the pre-handoff behaviour. The tokens are read
+                // once the log sink is live, below, because a token present
+                // but unusable is a surfaced boot error, which `Cli`
+                // construction has nowhere to raise.
                 hostname_proxy_port: None,
                 zone_answerer_port: None,
                 // The microVM's pid-1 has no flags to read: the guest runs
@@ -534,6 +543,34 @@ async fn async_main() -> Result<(), MainError> {
     let logger = DaemonLogger::install(log_mode)?;
 
     let listen_args = cli.listen_args().unwrap();
+
+    // The node ports this daemon listens on, resolved once: the hostname
+    // proxy's port from the token the VM host handed on the boot line in a
+    // microVM, the CLI's otherwise. The read lives here, once the log sink
+    // is live, because a token present but unusable is a surfaced boot
+    // failure, not a fallback: the daemon would otherwise publish a
+    // listener the host's box table does not name (NET-025, NET-138) and
+    // strand every client pointed at the handed one. A handed port that
+    // cannot bind — something in the guest already holds it — fails the
+    // boot here too, probed in the bind base the daemon's own listeners
+    // use, rather than surfacing after READY, when the host already
+    // believes the VM healthy.
+    //
+    // The answerer's half is `None` on a VM boot by construction, not by
+    // read: a VM-hosted daemon starts no zone answerer — the VM host
+    // daemon's host answerer owns the zone (NET-138) — so the boot line
+    // carries no answerer token and no port exists to report.
+    let (hostname_proxy_port, zone_answerer_port) = if is_minimal_microvm() {
+        let proxy = guest::handed_proxy_port().map_err(|e| MainError::Other(e.to_string()))?;
+        guest::probe_handed_node_port(proxy)
+            .map_err(|e| MainError::IO(e, "binding the handed node port"))?;
+        (proxy, None)
+    } else {
+        (
+            listen_args.hostname_proxy_port,
+            listen_args.zone_answerer_port,
+        )
+    };
 
     // Daemonize before doing any work: re-exec ourselves in a new session and
     // wait until the SSH socket is accepting connections, then return so the
@@ -611,6 +648,158 @@ async fn async_main() -> Result<(), MainError> {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
         }
+    }
+
+    // NET-079: the daemon's own classifier leaf, entered at start so its own
+    // traffic is decided as the daemon's (NET-080), never classed with a
+    // box's, and so the daemon sits in a *sibling* of every box leaf — never
+    // above them, where a controller it enabled could make the box leaves
+    // domain invalid (spike finding F). Each box then joins its own leaf in
+    // the sandbox's pre-exec closure and unshares its cgroup namespace onto
+    // it, which is what keeps a box out of every other leaf on the tree (see
+    // `sandbox2::classifier`).
+    //
+    // In the guest this is pid 1, which mounts cgroup2 itself
+    // (`guest::enter_rootfs`) and so builds the tree here; a tree it could
+    // not build is a broken image, not a deployment state, and
+    // `session_host` refuses a host-address box on it (design §7.1).
+    // Natively the installer installs the tree and delegates it to this
+    // account, and entering it is a migration whose common ancestor this
+    // daemon can write only from *inside* the tree: the installer's `--pid`
+    // step or a `Delegate=yes` unit places it. A daemon left outside keeps
+    // running and places no box — `create_session_leaf` decides that per
+    // launch, by migrating a throwaway child, so no box is ever spawned into
+    // a join it dies making.
+    let tree_root = std::path::Path::new(sandbox2::classifier::TREE_ROOT);
+    if let Err(e) = sandbox2::classifier::enter_daemon_leaf(tree_root) {
+        if guest::is_microvm_daemon() {
+            tracing::error!(
+                error = %e,
+                tree = sandbox2::classifier::TREE_ROOT,
+                "entering the daemon's own classifier leaf: this guest image \
+                 cannot decide per box, and host-address boxes will be refused"
+            );
+        } else {
+            tracing::warn!(
+                error = %e,
+                tree = sandbox2::classifier::TREE_ROOT,
+                daemon_cgroup = ?sandbox2::classifier::own_cgroup_path(),
+                install = %sandbox2::classifier::install_hint(),
+                "entering the daemon's own classifier leaf failed, so every \
+                 box launch now decides its placement by whether it can \
+                 migrate into the tree: enter it with the installer's --pid \
+                 step, or start the daemon from a Delegate=yes unit"
+            );
+        }
+    }
+
+    // NET-079: the empty leaves a daemon death left behind are swept here, at
+    // the next start, so a leaf named by a session's id is never mistaken for
+    // a leftover its next launch could take: a fresh launch finding one
+    // reports the collision. A leaf that still holds a session refuses its
+    // own removal and stays, which is the emptiness the sweep tests by.
+    match sandbox2::classifier::sweep_box_leaves(tree_root) {
+        Ok(swept) if swept.is_empty() => {}
+        Ok(swept) => tracing::info!(
+            count = swept.len(),
+            leaves = ?swept
+                .iter()
+                .map(|leaf| leaf.display().to_string())
+                .collect::<Vec<_>>(),
+            "swept the empty classifier leaves a previous daemon left behind"
+        ),
+        Err(e) => tracing::debug!(
+            error = %e,
+            "sweeping the box cohort at start"
+        ),
+    }
+
+    // NET-079: the guest's own classifier boot, after the tree above exists
+    // and before the decision below reads it — the one host whose table this
+    // daemon loads itself, because its kernel is its image's alone and no
+    // person can run an installer inside a microVM. [`boot_guest_classifier`]
+    // runs it in the one order its halves can keep: loopback up first —
+    // nothing else in the boot has brought `lo` up by this point, and the
+    // probe's listener on 127.0.0.1 is a bind on an address a guest without
+    // its loopback up does not carry — then the listeners the effect probe
+    // connects to, held for the daemon's life because the probe's evidence
+    // is a port that is refused whenever a launch looks, not one the probe
+    // brings with it, then the load itself: the installer's table rendered
+    // for the tree this daemon just entered its own leaf of, checked with
+    // `nft -c`, loaded in one transaction, the presence marker written only
+    // once it loaded. The load logs its own outcome — check line and load
+    // line with the digest of the exact bytes it piped — and nothing here
+    // branches on it: the decision below is the fact's own reader, and a
+    // boot whose load failed reports the guest as unable to decide per box
+    // exactly as a native host without the step does.
+    if guest::is_microvm_daemon() {
+        // NET-078's two source identities are the guest's own address on a
+        // guest — the cohort and the node plane share it — but the render is
+        // told them as the two inputs they are, never left to assume.
+        let identity = std::net::IpAddr::V4(minimald::net::DEFAULT_SUBNET.daemon_ip());
+        let render = minimald::net::classifier::GuestRender {
+            tree_root,
+            cohort_address: identity,
+            node_plane_address: identity,
+            ct_mark_mask: minimald::net::classifier::GUEST_CT_MARK_MASK,
+            mountinfo_override: None,
+        };
+        minimald::net::classifier::boot_guest_classifier(
+            guest::bring_up_loopback,
+            minimald::net::classifier::hold_probe_listeners,
+            || {
+                minimald::net::classifier::load_guest_table(
+                    std::path::Path::new(minimald::net::classifier::GUEST_BASH),
+                    std::path::Path::new(minimald::net::classifier::GUEST_NFT),
+                    &render,
+                )
+            },
+        );
+    }
+
+    // NET-079: the start-time fact this daemon answers every create with —
+    // whether this host can decide a host-address box's egress verdict per
+    // box, and why not when it cannot. Read here with its probe attached,
+    // because the fact it rests on is the table's *effect* (design §7.4) —
+    // a marker survives a reboot whose reload failed, a refusal does not —
+    // and the same reading is taken again before each host-address launch,
+    // which is the other thing a table can change between. The one info
+    // line a host that cannot decide per box owes names the cause, and the
+    // exact command that ends it when one can — the step's install for a
+    // host without the step or one whose marker outlived its table, nothing
+    // for a host that cannot confine a box, a probe that could not read the
+    // table, or a guest whose image never loaded the table — and says what
+    // this host does with the boxes, because the two hosts answer it
+    // differently: natively the step's and the mount's causes keep the
+    // exception and run the boxes unenforced, while the two probe causes
+    // refuse the deny-all box rather than run it on a refusal nothing
+    // enforces — and the guest refuses more, the deny-all box on a table
+    // that is not loaded, every box on a tree that cannot confine — so the
+    // daemon's log carries what a session's start is about to tell the
+    // person in the terminal, and stays quiet on a host that decides, which
+    // is not a state to report.
+    let classifier_decision = minimald::net::classifier::decide_now(
+        tree_root,
+        sandbox2::classifier::own_mountinfo().as_deref(),
+        guest::is_microvm_daemon(),
+    );
+    // The daemon's node half of per-box egress enforcement (NET-079): seeded
+    // here from the start-up read, so the daemon's first create answer
+    // already names this host, and refreshed by each host-address launch's
+    // own re-read — the state the create reply carries, the cause every
+    // surface's refusal gate answers over, and what lowers a box's own
+    // launch record to `none` when the host can no longer decide per box.
+    minimald::session_host::set_host_ip_enforcement_fact(&classifier_decision);
+    if let Some(cause) = classifier_decision.cause() {
+        tracing::info!(
+            tree = sandbox2::classifier::TREE_ROOT,
+            cause = cause.detail(),
+            install = ?cause.install_command(),
+            host_ip_enforcement = "none",
+            "this host cannot decide a host-address box's egress verdict \
+             per box, so {}",
+            cause.host_ip_box_outcome(guest::is_microvm_daemon())
+        );
     }
 
     // R1.5/R1.6: when the microVM config requested a data volume
@@ -793,15 +982,19 @@ async fn async_main() -> Result<(), MainError> {
         // not spawn gvproxy in-guest. The UDS path is DM2.
         in_microvm: cli.listen_args().unwrap().vsock,
         state_volume_mounted,
-        // The port the hostname proxy listens on when the deployment pins
-        // one; `None` tries the documented default and only when it is busy
-        // asks the OS for a free port (NET-024/NET-025).
-        hostname_proxy_port: cli.listen_args().unwrap().hostname_proxy_port,
-        // The answerer's port, given the same treatment.
-        zone_answerer_port: cli.listen_args().unwrap().zone_answerer_port,
-        // The daemon derives its switch /24 from its instance id (NET-027);
-        // no CLI flag pins one yet.
+        // The node ports, resolved once above: the ones the VM host handed
+        // in a microVM, the CLI's otherwise; `None` tries the documented
+        // default and only when it is busy asks the OS for a free port
+        // (NET-024/NET-025).
+        hostname_proxy_port,
+        zone_answerer_port,
+        // No CLI flag pins the switch /24 yet (NET-027): it is derived from
+        // the persisted daemon identity on native Linux, or from the
+        // per-start instance id in a microVM.
         switch_subnet_octet: None,
+        // Per instance, so each `--instance-num` on one state root keeps
+        // its own identity and with it its own /24 across restarts.
+        daemon_identity_dir: Some(cli.client_instance_dir()),
         // NET-077: the deployment's opt-out of the deny-all egress default —
         // the one daemon-side knob the default has.
         deny_all_opt_out: cli
@@ -1085,8 +1278,13 @@ mod tests {
                 mk_mount_state_volume: None,
                 rlimit_nofile: None,
                 timekeep_listener_port: None,
+                // The CLI's own defaults: no pinned ports, and the shipped
+                // egress default stays in force.
+                hostname_proxy_port: None,
+                zone_answerer_port: None,
                 detach: false,
                 gvproxy_bin: None,
+                egress_deny_all_opt_out: false,
             }),
             global_args: GlobalArgs {
                 minimal_state_dir: Some(CwdRelative::from(

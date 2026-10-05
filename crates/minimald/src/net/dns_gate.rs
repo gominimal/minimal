@@ -6,6 +6,20 @@
 //! gate is what turns "the box allows `github.com`" into "the box reaches
 //! the addresses `github.com` resolved to, and nothing else".
 //!
+//! Two tables hold that admission now, one per leg of the path a box's
+//! frames take (NET-081). On a VM-backed host the *deciding* copy is the
+//! host-side one, `minvmd`'s `net::dns_pins`: the box's frames reach it
+//! outside the VM, and it decides an undeclared destination against the DNS
+//! replies the box's own lookups received — filled from the same answers,
+//! held to the same intersection and the same numbers, all of them read
+//! from the one place both legs hold them, [`sessions::core::egress`] — so
+//! nothing inside the VM, not even a relay replaced with a hostile one,
+//! can widen a box's destinations. This gate is then the *precision* copy
+//! inside the VM: it still intercepts the box's queries, answers the
+//! record types v1 does not carry (NET-136) itself, and pins from the same
+//! replies under the same rules, so the decision is exact at the relay for
+//! the path the box actually rides.
+//!
 //! Three jobs, one per requirement:
 //!
 //! * **Pinning** (NET-066) — every DNS reply from the box's own resolver
@@ -57,6 +71,43 @@
 //! other way would turn every deny-all box into a resolve-anything box,
 //! which is the opposite of what NET-063 established.
 //!
+//! The box zone is the one carve-out (NET-072): a sibling's
+//! `<box>.min.internal` resolves with no entry, because every attached
+//! box's name is registered in that zone by the daemon itself — the grant
+//! is the daemon's, not the box's policy's. The carve-out is the fabric
+//! plane's alone, and it is exact in both directions: a zone answer is
+//! admitted inside the plane and nowhere else, so a reply to a zone name
+//! that carries any other address — the A records of an upstream path the
+//! question reached, RFC 1918, a public host — is refused by the rebinding
+//! intersection like any other infrastructure answer and pins nothing.
+//!
+//! And the carve-out is the *resolution's* alone: a zone answer is
+//! validated by that intersection and never enters the pin table. The
+//! design's admission windows come from `egress.allow_dns_hosts` matches
+//! alone (§5.3), and a zone answer that became a pin would be a
+//! name-scoped grant of a sibling's lease — the one thing the connect-time
+//! half of NET-073 exists to refuse. A sibling is reached by a CIDR entry
+//! the box declared in `allow_subnets`, and what the zone's answer grants
+//! is the name's resolution, nothing more: the connection to it is decided
+//! by the resolving box's own egress rules and the target's ingress ones,
+//! never by a pin.
+//!
+//! The zone's host row is the one zone answer that never reaches the
+//! intersection (NET-003): inside a box, `host.min.internal` answers with
+//! the switch's NAT'd host alias — an address the infrastructure deny set
+//! names in its fixed range, because it is infrastructure by design — so
+//! its reply passes through, pins nothing, and warns nothing. The
+//! intersection would refuse the answer the spec mandates and the limiter
+//! would write a false infrastructure refusal for every box that resolves
+//! the host; refusing the *reach* is right — reach over the name is local
+//! reach under the box's egress rules, decided at connect by the frame
+//! verdict, never by a pin — and skipping the pass keeps that verdict the
+//! only decider without logging the lookup as a violation.
+//!
+//! What a box may then *do* with an admitted answer is the connect-time
+//! conjunction (NET-073): the sibling's ingress rules beside the resolving
+//! box's own egress ones.
+//!
 //! ## The window, and the one place this gate departs from design §5.3
 //!
 //! §5.3 defines the admission window as TTL-bounded — an answer holds for
@@ -100,18 +151,26 @@
 //!   caching resolver either discards (back to no negative cache) or
 //!   treats as a broken reply, which is a worse outcome than the honest
 //!   empty answer that keeps `getaddrinfo` degrading to IPv4.
-//! * Reply matching is loose, and the source check is the whole defence:
-//!   the gate reads a reply's first question for the name and nothing
-//!   else — not the query id, not the qtype, and not whether the box ever
-//!   asked the question. A forged reply from the resolver's address —
+//! * Reply matching here is loose, and the source check is the whole defence
+//!   this gate keeps: it reads a reply's first question for the name and
+//!   nothing else — not the query id, not the qtype, and not whether the box
+//!   ever asked the question. A forged reply from the resolver's address —
 //!   hairpinned through the switch by a peer — could pin an
 //!   attacker-chosen address, and that defence is the relay's own
 //!   source-address check (NET-084), which is what stops any non-lease
 //!   source from imitating the resolver; until it is in force, this gate
 //!   inherits that hole rather than widening it, since it admits nothing
 //!   the box could not already have reached by resolving through the real
-//!   resolver. Matching the id would need per-query state on the egress leg
-//!   for a check that does not change what the box can reach.
+//!   resolver. The deciding copy does not share it: the host-side table
+//!   above records each of the box's own outstanding queries on its egress
+//!   leg — the question, the transaction id, and the port the query left
+//!   from — and a reply pins there only by answering one, consuming the
+//!   entry, so a forged or replayed reply pins nothing on the host; its
+//!   entrance is closed there too, where a reply-shaped frame on the
+//!   guest→switch leg is decided like any other frame and pins nothing.
+//!   This gate keeps the loose match as the precision copy: it adds no
+//!   per-query state of its own, and on a VM-backed host the reach a reply
+//!   buys is the host's decision to make, not this one's.
 //! * DNS over TCP is not carried. A deny-all box's TCP to the resolver is
 //!   dropped by the frame verdict, so a `TC=1` answer cannot be retried
 //!   over TCP and that resolution fails. Not a rebinding vector — the gate
@@ -157,7 +216,12 @@ const COMPONENT: &str = "dns-gate";
 /// 600 s, capped at 24 h); the module doc states that departure and its
 /// reason. An established flow does not depend on it at all — see
 /// [`admits_flow`].
-pub(crate) const ADMISSION_WINDOW: Duration = Duration::from_secs(5 * 60);
+///
+/// This leg does not own the number: both admission tables hold the same
+/// window, and both read it from the one place it lives,
+/// [`sessions::core::egress::DNS_ADMISSION_WINDOW`], so a pin can never
+/// outlive its window on one leg while it lives on in the other.
+pub(crate) const ADMISSION_WINDOW: Duration = sessions::core::egress::DNS_ADMISSION_WINDOW;
 
 /// Design §5.3's cap on a name's admitted addresses: at most this many per
 /// name per family, fail closed. A reply whose A records run past the cap
@@ -169,7 +233,10 @@ pub(crate) const ADMISSION_WINDOW: Duration = Duration::from_secs(5 * 60);
 /// rather than to what its resolver chose to say. Only IPv4 addresses are
 /// ever admitted here (AAAA is answered NODATA, NET-136), so the family
 /// half of the cap is the IPv4 half alone.
-const MAX_ADDRESSES_PER_NAME: usize = 32;
+///
+/// Both admission tables hold the same cap, read from
+/// [`sessions::core::egress::DNS_MAX_ADDRESSES_PER_NAME`].
+const MAX_ADDRESSES_PER_NAME: usize = sessions::core::egress::DNS_MAX_ADDRESSES_PER_NAME;
 
 /// Sweep expired admissions once the table crosses this many entries — the
 /// per-box backstop behind the per-name cap, bounding memory without a
@@ -195,7 +262,10 @@ const TCP_RST: u8 = 0x04;
 /// (`tcp_flags` is zero for it). The bound exists so a flow the box leaked
 /// cannot hold its pin for the rest of the box's uptime, which ends the whole
 /// table anyway.
-const FLOW_IDLE_CAP: Duration = Duration::from_secs(24 * 60 * 60);
+///
+/// Both admission tables hold the same retention cap, read from
+/// [`sessions::core::egress::DNS_FLOW_IDLE_CAP`].
+const FLOW_IDLE_CAP: Duration = sessions::core::egress::DNS_FLOW_IDLE_CAP;
 
 /// Sweep idle flows once the table crosses this many entries: the bound's
 /// *memory* half, reclaiming entries no frame ever comes back to look up.
@@ -249,6 +319,16 @@ pub(crate) struct DnsGate {
     /// The infrastructure deny set the intersection subtracts from every
     /// answer (design §5.3, NET-067).
     infrastructure: InfrastructureDenySet,
+    /// The subnet's host-alias address — the answer the zone's host row
+    /// (`host.min.internal`, NET-003) carries inside a box, and the one
+    /// the deny set above names in its fixed range, because the alias is
+    /// infrastructure by design. The row's reply never reaches the
+    /// intersection ([`Self::observe_response`]): the mandated answer would
+    /// be refused and warned as infrastructure, while the reach it grants
+    /// was never the intersection's to give — reach over the name is local
+    /// reach under the box's own egress rules, decided at connect by the
+    /// frame verdict, never by a pin.
+    host_alias: [u8; 4],
     /// The addresses admitted by resolution, each with the name that
     /// admitted it — §5.3's cap is per name, so the owner is what the cap
     /// counts — and the instant its window ends.
@@ -286,12 +366,16 @@ fn normalized(name: &str) -> String {
 impl DnsGate {
     /// Builds one box's gate at attach: the names its policy declared
     /// (normalized), the compiled egress rules the intersection reads, the
-    /// switch's infrastructure deny set, and the session's shared limiter.
+    /// switch's infrastructure deny set, the subnet's host-alias address
+    /// (the answer the zone's host row carries, NET-003 — the one address
+    /// the deny set names that the gate passes through without a refusal),
+    /// and the session's shared limiter.
     pub(crate) fn new(
         label: &str,
         policy: Option<&sessions::EgressPolicy>,
         rules: EgressRules,
         infrastructure: InfrastructureDenySet,
+        host_alias: [u8; 4],
         limiter: Arc<PolicyWarnLimiter>,
     ) -> Self {
         Self {
@@ -300,6 +384,7 @@ impl DnsGate {
                 .map(|hosts| hosts.iter().map(|host| normalized(host)).collect()),
             rules,
             infrastructure,
+            host_alias,
             admitted: Mutex::new(HashMap::new()),
             flows: Mutex::new(HashMap::new()),
             window: ADMISSION_WINDOW,
@@ -326,12 +411,18 @@ impl DnsGate {
         self.flow_idle_cap = cap;
     }
 
-    /// Whether `name` is one the box's policy allowed — the trigger for
-    /// pinning. An undeclared allowlist allows no name.
+    /// Whether `name` is one whose replies this gate processes: a name the
+    /// box's `allow_dns_hosts` declared, or a box-zone name (NET-072), where
+    /// every attached box's name is registered by the daemon itself so a
+    /// sibling resolves with no entry of the box's own. Processing is not
+    /// pinning — a declared name's answers are pinned for their window
+    /// (§5.3), while a zone answer is validated and never pinned (see the
+    /// module doc).
     fn allows_name(&self, name: &str) -> bool {
         self.names
             .as_ref()
             .is_some_and(|names| names.contains(name))
+            || super::dns::is_zone_name(name)
     }
 
     /// The egress leg, NET-136: whether the datagram the box sent to `dst`
@@ -401,8 +492,11 @@ impl DnsGate {
     /// The ingress leg, NET-066 and NET-067: observes a datagram from `src`,
     /// and when it is a reply from this box's own resolver answering a query
     /// for a name the box allowed, splits its A answers by the rebinding
-    /// intersection — the survivors are admitted for the window, and each
-    /// refusal logs the name and the answer through the limiter.
+    /// intersection — the survivors of an ordinary name are admitted for the
+    /// window, each refusal logs the name and the answer through the limiter,
+    /// and a box-zone answer is validated by that same intersection and pins
+    /// nothing (NET-072: the carve-out is the resolution's alone; see the
+    /// module doc).
     ///
     /// Every failure mode is quiet by design: a datagram that is not from
     /// the resolver, not a reply, not parseable, or carrying no question
@@ -460,13 +554,51 @@ impl DnsGate {
                 _ => None,
             })
             .collect();
+        // The zone's host row (NET-003) is the one zone answer that names an
+        // infrastructure address by design: inside a box, `host.min.internal`
+        // answers with the switch's NAT'd host alias, which the deny set's
+        // fixed range names — so the intersection would refuse the mandated
+        // answer and the limiter would write a false infrastructure refusal
+        // for every box that resolves the host. The row's reply skips the
+        // pass entirely: it passes through (as every reply does), pins
+        // nothing, warns nothing — the reach it grants was never the
+        // intersection's to give (see the module doc). A reply to the row's
+        // name that carries any other address is not the row, and the
+        // intersection refuses it below like any other subverted zone answer.
+        if asked == super::switch::HOST_MIN_INTERNAL
+            && answers.iter().all(|answer| *answer == self.host_alias)
+        {
+            return;
+        }
+        let zone = super::dns::is_zone_name(&asked);
         let split = egress::rebinding_intersection(
             &answers,
+            zone,
             self.rules.allow_subnets(),
             self.rules.deny_subnets(),
             &self.infrastructure,
         );
-        self.admit(&asked, &split.admitted, now);
+        // A zone answer is validated by the intersection above — each
+        // refusal below is logged like any other — and never pinned: the
+        // carve-out is the resolution's alone (NET-072), and reach to a
+        // sibling is the connect-time conjunction's to give (NET-073),
+        // decided by the box's declared subnets, never by a name's answer.
+        // An ordinary name's survivors keep their §5.3 window.
+        if zone {
+            if !split.admitted.is_empty() {
+                let addresses: Vec<Ipv4Addr> =
+                    split.admitted.iter().copied().map(Ipv4Addr::from).collect();
+                tracing::debug!(
+                    component = COMPONENT,
+                    session_id = %self.label,
+                    name = %asked,
+                    ?addresses,
+                    "validated a box-zone answer; it pins nothing, reach is decided at connect"
+                );
+            }
+        } else {
+            self.admit(&asked, &split.admitted, now);
+        }
         for (address, refusal) in split.refused {
             self.limiter.warn_dns_refusal(
                 &self.label,
@@ -653,7 +785,13 @@ impl DnsGate {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    // `pub(crate)`: the switch's tests drive the box-zone connect proof
+    // (NET-073) through the same DNS builders this module's proofs use — a
+    // sibling's name has to be resolved before the conjunction it rides on
+    // can be observed — so the builders are shared rather than copied, the
+    // same arrangement the switch's relay harness already runs in the other
+    // direction.
     use super::*;
     use crate::net::switch::tests::{
         ACK, LEASE, RelayHarness, SYN, arp_frame, egress_tcp_frame, egress_tcp_segment,
@@ -672,8 +810,17 @@ mod tests {
 
     /// The default switch subnet's gateway: the resolver every rule set and
     /// frame below is keyed to, the one the carve-out admits and this gate
-    /// watches (100.64.0.1).
-    const RESOLVER: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 1);
+    /// watches (100.64.0.1). `pub(crate)`: the connect proof's sibling
+    /// resolution is keyed to the same resolver.
+    pub(crate) const RESOLVER: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 1);
+
+    /// The default switch subnet's host alias (its `broadcast - 1`): the
+    /// address `host.min.internal` answers a box with (NET-003), the one the
+    /// infrastructure deny set names in its fixed range and the host-row
+    /// carve-out is keyed to — the same derivation the relay harness's gates
+    /// are built with, so these fixtures and the relay-level proofs agree on
+    /// what the row's answer is.
+    const HOST_ALIAS: Ipv4Addr = Ipv4Addr::new(100, 64, 255, 254);
 
     /// The box that allows `github.com` and, by address, nothing else: TCP
     /// declared, no subnets, the one name — the proof sentence's box.
@@ -686,6 +833,33 @@ mod tests {
                 deny_subnets: None,
             }),
             ingress: None,
+            credentialed_upstream: None,
+        }
+    }
+
+    /// The box that allows the toolchain's remote hosts and, by address,
+    /// nothing else: TCP declared, no subnets, only `egress.allow_dns_hosts`
+    /// (NET-068's hostname-only allowlist).
+    ///
+    /// The TCP-only protocol rule does not block DNS resolution: the relay's
+    /// verdict carves out UDP/53 to the resolver before it checks protocol
+    /// rules (NET-079), so `allow_protocols: Some([Tcp])` still lets the box
+    /// resolve every allowed name.
+    fn toolchain_hosts_egress() -> sessions::SessionPolicy {
+        sessions::SessionPolicy {
+            egress: Some(sessions::EgressPolicy {
+                allow_protocols: Some(vec![sessions::IpProto::Tcp]),
+                allow_subnets: Some(Vec::new()),
+                allow_dns_hosts: Some(
+                    sessions::NET068_TOOLCHAIN_EGRESS_HOSTS
+                        .iter()
+                        .map(|h| (*h).to_string())
+                        .collect(),
+                ),
+                deny_subnets: None,
+            }),
+            ingress: None,
+            credentialed_upstream: None,
         }
     }
 
@@ -703,6 +877,7 @@ mod tests {
                 deny_subnets: None,
             }),
             ingress: None,
+            credentialed_upstream: None,
         }
     }
 
@@ -719,13 +894,14 @@ mod tests {
                 deny_subnets: Some(vec!["10.9.9.0/24".to_string()]),
             }),
             ingress: None,
+            credentialed_upstream: None,
         }
     }
 
     /// An Ethernet II + IPv4 + UDP frame carrying `payload` from
     /// `src`:`src_port` to `dst`:`dst_port`, with honest total lengths — the
     /// shape [`udp_datagram`] reads.
-    fn udp_payload_frame(
+    pub(crate) fn udp_payload_frame(
         src: Ipv4Addr,
         src_port: u16,
         dst: Ipv4Addr,
@@ -764,13 +940,13 @@ mod tests {
 
     /// A standard DNS query datagram for `name` of `rtype` (the answerer's
     /// encoder, so the gate reads exactly what a real resolver stack sends).
-    fn dns_query(name: &str, rtype: RecordType) -> Vec<u8> {
+    pub(crate) fn dns_query(name: &str, rtype: RecordType) -> Vec<u8> {
         crate::net::answerer::encode_query(name, rtype)
     }
 
     /// A DNS reply datagram from the resolver: the id of a real exchange, the
     /// question echoed, and one A record per `answer`.
-    fn dns_response(name: &str, answers: &[Ipv4Addr]) -> Vec<u8> {
+    pub(crate) fn dns_response(name: &str, answers: &[Ipv4Addr]) -> Vec<u8> {
         let qname = Name::from_utf8(name).expect("the query name parses");
         let mut response = Message::response(0x522a, OpCode::Query);
         response.metadata.message_type = MessageType::Response;
@@ -783,7 +959,7 @@ mod tests {
 
     /// One frame as the switch side of the relay carries it: the 2-byte LE
     /// length prefix the ingress leg reads.
-    fn wire_frame(frame: &[u8]) -> Vec<u8> {
+    pub(crate) fn wire_frame(frame: &[u8]) -> Vec<u8> {
         let mut wire = Vec::with_capacity(2 + frame.len());
         wire.extend_from_slice(&(frame.len() as u16).to_le_bytes());
         wire.extend_from_slice(frame);
@@ -794,7 +970,7 @@ mod tests {
     /// nonblocking box end until it arrives: the test runtime is
     /// current-thread, so the box end is never blocked on, only polled
     /// between yields.
-    async fn read_box_frame(harness: &RelayHarness) -> io::Result<Vec<u8>> {
+    pub(crate) async fn read_box_frame(harness: &RelayHarness) -> io::Result<Vec<u8>> {
         crate::net::switch::set_nonblocking(harness.box_end.as_raw_fd())?;
         let mut buf = vec![0u8; 1600];
         for _ in 0..500 {
@@ -813,7 +989,8 @@ mod tests {
     }
 
     /// A fresh gate over `policy`, on the default switch's resolver and
-    /// infrastructure set, for the unit tests that drive the gate directly.
+    /// infrastructure set and host alias, for the unit tests that drive the
+    /// gate directly.
     fn gate_for(policy: &sessions::SessionPolicy) -> DnsGate {
         let label = LEASE.to_string();
         DnsGate::new(
@@ -824,7 +1001,8 @@ mod tests {
                 RESOLVER.octets(),
                 LEASE.octets(),
             ),
-            InfrastructureDenySet::new(RESOLVER.octets(), [100, 64, 0, 254]),
+            InfrastructureDenySet::new(RESOLVER.octets(), HOST_ALIAS.octets()),
+            HOST_ALIAS.octets(),
             Arc::new(PolicyWarnLimiter::new()),
         )
     }
@@ -852,6 +1030,7 @@ mod tests {
                 deny_subnets: None,
             }),
             ingress: None,
+            credentialed_upstream: None,
         };
         let gate = gate_for(&two_names);
         let now = Instant::now();
@@ -1050,6 +1229,150 @@ mod tests {
             !gate.admits_destination([198, 51, 100, 7], t0),
             "an address the box never resolved is not admitted"
         );
+    }
+
+    /// NET-068: a hostname-only allowlist naming the toolchain's remote hosts
+    /// admits every resolved address for those names and for nothing else.
+    /// Each allowed name's reply is forwarded to the box, its answers are
+    /// pinned, and TCP flows to those addresses complete; an equally resolved
+    /// address for a name outside the allowlist is refused.
+    #[tokio::test]
+    async fn toolchain_hosts_admitted_by_gate() {
+        let mut harness = spawn_test_relay(&toolchain_hosts_egress());
+
+        // Every allowed toolchain host resolves, gets its reply forwarded, and
+        // has its addresses pinned. We use one representative address per name
+        // — the gate treats each name independently (per-name cap and matching),
+        // so the shape is the same for every host.
+        let toolchain = [
+            ("github.com.", Ipv4Addr::new(140, 82, 121, 3)),
+            ("codeload.github.com.", Ipv4Addr::new(140, 82, 113, 10)),
+            (
+                "raw.githubusercontent.com.",
+                Ipv4Addr::new(185, 199, 108, 133),
+            ),
+            ("registry.npmjs.org.", Ipv4Addr::new(104, 16, 26, 34)),
+            ("pypi.org.", Ipv4Addr::new(151, 101, 128, 223)),
+            ("files.pythonhosted.org.", Ipv4Addr::new(146, 75, 38, 223)),
+            ("registry-1.docker.io.", Ipv4Addr::new(44, 205, 64, 79)),
+            ("auth.docker.io.", Ipv4Addr::new(3, 94, 213, 199)),
+            (
+                "production.cloudflare.docker.com.",
+                Ipv4Addr::new(104, 16, 124, 175),
+            ),
+            (
+                "production.cloudfront.docker.com.",
+                Ipv4Addr::new(18, 238, 238, 89),
+            ),
+        ];
+        // The names here pair each host with a representative address, so
+        // they cannot be read off the shared constant; they are held to it
+        // instead, so a host added there fails here until it is exercised.
+        let exercised: Vec<&str> = toolchain
+            .iter()
+            .map(|(name, _)| name.trim_end_matches('.'))
+            .collect();
+        assert_eq!(
+            exercised,
+            sessions::NET068_TOOLCHAIN_EGRESS_HOSTS,
+            "every NET-068 toolchain host is exercised, in the constant's order"
+        );
+        for (index, (name, address)) in toolchain.iter().enumerate() {
+            // A unique source port per name so the DNS conntrack windows do not collide.
+            let src_port = 40000 + u16::try_from(index).unwrap();
+
+            let query = udp_payload_frame(
+                LEASE,
+                src_port,
+                RESOLVER,
+                53,
+                &dns_query(name, RecordType::A),
+            );
+            harness.box_end.write_all(&query).unwrap();
+            let forwarded =
+                tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+                    .await
+                    .expect("the query is forwarded")
+                    .expect("the switch side stays open");
+            assert_eq!(
+                forwarded, query,
+                "query for {name} reaches the resolver verbatim"
+            );
+
+            let response = dns_response(name, &[*address]);
+            let response_frame = udp_payload_frame(RESOLVER, 53, LEASE, src_port, &response);
+            harness
+                .switch
+                .write_all(&wire_frame(&response_frame))
+                .await
+                .unwrap();
+            let passed = read_box_frame(&harness)
+                .await
+                .expect("the reply itself passes through to the box");
+            assert_eq!(
+                passed, response_frame,
+                "reply for {name} is never kept from the box"
+            );
+
+            // The pinned address completes a TCP flow — the only thing the
+            // toolchain needs from each allowed name. Use a distinct, bounded
+            // ephemeral source port so each flow is separate in the conntrack.
+            let tcp_src_port = 50000 + u16::try_from(index).unwrap();
+            let connect = egress_tcp_segment(LEASE, tcp_src_port, *address, 443, SYN);
+            harness.box_end.write_all(&connect).unwrap();
+            let out =
+                tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+                    .await
+                    .expect("a toolchain address is reachable for the window")
+                    .expect("the switch side stays open");
+            assert_eq!(out, connect, "{address} resolved from {name} is admitted");
+        }
+
+        // An address resolved for a name the box did not declare is not
+        // admitted. Under the shipped interim, the query is forwarded and only
+        // the resulting pin is withheld; the architecture's design would refuse
+        // the resolution itself. Either way the TCP flow is dropped, so the
+        // assertion holds for both behaviours.
+        let undeclared_query = udp_payload_frame(
+            LEASE,
+            41000,
+            RESOLVER,
+            53,
+            &dns_query("not-in-allowlist.example.", RecordType::A),
+        );
+        harness.box_end.write_all(&undeclared_query).unwrap();
+        let forwarded =
+            tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+                .await
+                .expect("query for an undeclared name is forwarded")
+                .expect("the switch side stays open");
+        assert_eq!(
+            forwarded, undeclared_query,
+            "resolution itself is never blocked, only the resulting pin"
+        );
+        let response = dns_response(
+            "not-in-allowlist.example.",
+            &[Ipv4Addr::new(198, 51, 100, 7)],
+        );
+        let response_frame = udp_payload_frame(RESOLVER, 53, LEASE, 41000, &response);
+        harness
+            .switch
+            .write_all(&wire_frame(&response_frame))
+            .await
+            .unwrap();
+        let _ = read_box_frame(&harness)
+            .await
+            .expect("the undeclared name's reply passes through");
+
+        let undeclared_connect = egress_tcp_frame(LEASE, Ipv4Addr::new(198, 51, 100, 7), 443);
+        let sentinel = arp_frame(LEASE);
+        harness.box_end.write_all(&undeclared_connect).unwrap();
+        harness.box_end.write_all(&sentinel).unwrap();
+        let next = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+            .await
+            .expect("the relay keeps deciding")
+            .expect("the switch side stays open");
+        assert_eq!(next, sentinel, "an undeclared name's address is refused");
     }
 
     /// Design §5.3's conntrack-aware retention, with NET-066's window as its
@@ -1366,6 +1689,9 @@ mod tests {
                 dst: SocketAddrV4::new(PINNED, 443),
                 proto: crate::net::switch::IPPROTO_UDP,
                 tcp_flags: 0,
+                seq: 0,
+                ack: 0,
+                payload_len: 0,
             },
             PINNED.octets(),
         );
@@ -1494,6 +1820,9 @@ mod tests {
                 dst: SocketAddrV4::new(PINNED, 443),
                 proto: crate::net::switch::IPPROTO_TCP,
                 tcp_flags: ACK,
+                seq: 0,
+                ack: 0,
+                payload_len: 0,
             },
             PINNED.octets(),
         );
@@ -1589,6 +1918,311 @@ mod tests {
             .expect("the relay keeps deciding")
             .expect("the switch side stays open");
         assert_eq!(last, sentinel, "the infrastructure deny set is refused");
+    }
+
+    /// The completed infrastructure deny set, on this leg too (the
+    /// architecture review's condition, beside NET-067): an allowed name that
+    /// answers this host's own address — `0.0.0.0` names the host itself, so
+    /// the range it heads is loopback's neighbour — or a multicast group is
+    /// refused before its answer can become a pin, and each refusal is logged
+    /// in the shared format under its own key: the name, the answer and the
+    /// rule. Neither the refusal nor the frame verdict a connection to those
+    /// addresses meets is decided by any rule the box's declaration names —
+    /// had the intersection admitted them, the pin would have lifted the
+    /// undeclared-destination drop — so the sentinel after each connection is
+    /// the pin's own absence made visible.
+    #[tokio::test]
+    async fn this_host_and_multicast_answers_are_refused_and_logged() {
+        let capture = captured_log();
+        let mut harness = spawn_test_relay(&denied_range_egress());
+
+        // Two names, because a refusal's key is the name: this host's own
+        // address and a multicast group, each heard on its own line.
+        for (name, refused) in [
+            ("example.com.", Ipv4Addr::UNSPECIFIED),
+            ("other.example.", Ipv4Addr::new(224, 0, 0, 1)),
+        ] {
+            let query =
+                udp_payload_frame(LEASE, 40000, RESOLVER, 53, &dns_query(name, RecordType::A));
+            harness.box_end.write_all(&query).unwrap();
+            let forwarded =
+                tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+                    .await
+                    .expect("the query is forwarded")
+                    .expect("the switch side stays open");
+            assert_eq!(forwarded, query);
+            let reply =
+                udp_payload_frame(RESOLVER, 53, LEASE, 40000, &dns_response(name, &[refused]));
+            harness.switch.write_all(&wire_frame(&reply)).await.unwrap();
+            let passed = read_box_frame(&harness)
+                .await
+                .expect("the reply itself passes through: resolution is honest");
+            assert_eq!(passed, reply);
+        }
+
+        let logged = capture.contents();
+        for expected in [
+            "an allowed name resolved into a refused range",
+            "rule_matched=\"dns-rebinding-infrastructure\"",
+            "name=\"example.com\"",
+            "answer=0.0.0.0",
+            "name=\"other.example\"",
+            "answer=224.0.0.1",
+        ] {
+            assert!(
+                logged.contains(expected),
+                "the refusal line must carry {expected:?}: {logged}"
+            );
+        }
+
+        // And neither answer bought reach: the connection to each is the
+        // relay's drop, whatever a pin would have lifted for it.
+        for refused in [Ipv4Addr::UNSPECIFIED, Ipv4Addr::new(224, 0, 0, 1)] {
+            let frame = egress_tcp_frame(LEASE, refused, 443);
+            let sentinel = arp_frame(LEASE);
+            harness.box_end.write_all(&frame).unwrap();
+            harness.box_end.write_all(&sentinel).unwrap();
+            let next =
+                tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+                    .await
+                    .expect("the relay keeps deciding")
+                    .expect("the switch side stays open");
+            assert_eq!(
+                next, sentinel,
+                "an answer inside the completed infrastructure set never became a pin"
+            );
+        }
+    }
+
+    /// NET-072: a box-zone name resolves with no `egress.allow_dns_hosts`
+    /// entry for it — every attached box's name is registered in the zone by
+    /// the daemon itself, so the grant is the daemon's and not the resolving
+    /// box's policy's — and the answer is *validated*, never pinned: the
+    /// fabric plane, which the infrastructure deny set refuses for every
+    /// name outside the zone, is carved out for the zone and is the whole of
+    /// its answer's reach, while the reach to the lease it named stays the
+    /// connecting box's declared subnets' to give, never a name's — so the
+    /// connection to it is refused as any undeclared destination, and the
+    /// pin table holds no entry for it. The zone's host row is the one zone
+    /// answer that never meets the intersection (NET-003):
+    /// `host.min.internal` answers with the switch's NAT'd host alias, an
+    /// infrastructure address by design, so its reply passes through with no
+    /// refusal line and nothing admitted. The carve-out is the zone's alone:
+    /// an ordinary name still needs its own entry, and a lookalike that
+    /// merely ends in the zone's words pins nothing. Resolution itself
+    /// stays honest in every case — each reply passes through to the box.
+    #[tokio::test]
+    async fn box_zone_resolution_needs_no_allow_entry() {
+        // The box that allows `github.com` and, by address, nothing else: no
+        // entry anywhere names the sibling, and no subnet declares its lease.
+        let mut harness = spawn_test_relay(&github_only_egress());
+        // A sibling's lease — an address in the switch's plane, refused for
+        // every answer to a name outside the box zone.
+        let sibling = Ipv4Addr::new(100, 64, 0, 11);
+
+        // The box resolves the sibling by name: the query rides the resolver
+        // carve-out and reaches the switch verbatim.
+        let query = udp_payload_frame(
+            LEASE,
+            40000,
+            RESOLVER,
+            53,
+            &dns_query("box-b.min.internal.", RecordType::A),
+        );
+        harness.box_end.write_all(&query).unwrap();
+        let forwarded =
+            tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+                .await
+                .expect("the query is forwarded")
+                .expect("the switch side stays open");
+        assert_eq!(forwarded, query);
+
+        // The resolver answers with the sibling's lease. The reply passes
+        // through to the box — resolution is honest, and it is the connection
+        // that is governed — while the zone's carve-out validates the answer:
+        // in the plane, so nothing about it is refused, and pinned nowhere.
+        let response = dns_response("box-b.min.internal.", &[sibling]);
+        let response_frame = udp_payload_frame(RESOLVER, 53, LEASE, 40000, &response);
+        harness
+            .switch
+            .write_all(&wire_frame(&response_frame))
+            .await
+            .unwrap();
+        let passed = read_box_frame(&harness)
+            .await
+            .expect("the reply itself passes through");
+        assert_eq!(passed, response_frame, "a reply is never kept from the box");
+
+        // The answer created no pin, so the connection to the lease it named
+        // is refused exactly as any undeclared destination — the sentinel
+        // stands in for it. The carve-out is the resolution's alone: what the
+        // zone's answer granted is the name's resolution, and the reach to
+        // the sibling is the box's declared subnets' to give at connection
+        // time, never a pin's (NET-073).
+        let connect = egress_tcp_frame(LEASE, sibling, 8080);
+        let sentinel = arp_frame(LEASE);
+        harness.box_end.write_all(&connect).unwrap();
+        harness.box_end.write_all(&sentinel).unwrap();
+        let next = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+            .await
+            .expect("the relay keeps deciding")
+            .expect("the switch side stays open");
+        assert_eq!(
+            next, sentinel,
+            "a zone answer is never admitted as reach: it pinned nothing"
+        );
+
+        // And the pin table says so outright: the same reply observed on a
+        // gate of the same policy enters no admission window for the lease —
+        // the negative the relay-level refusal above stands on.
+        let gate = gate_for(&github_only_egress());
+        let now = Instant::now();
+        gate.observe_response(
+            &SocketAddrV4::new(RESOLVER, DNS_PORT),
+            &dns_response("box-b.min.internal.", &[sibling]),
+            now,
+        );
+        assert!(
+            !gate.admits_flow(sibling.octets(), None, now),
+            "a zone answer enters the pin table for no window"
+        );
+
+        // The contrast that names whose entries the box *did* declare: the
+        // same gate pins github.com's answer for its window, so the zone
+        // answer's refusal above is the carve-out's, not the gate's.
+        let pinned = Ipv4Addr::new(140, 82, 121, 3);
+        gate.observe_response(
+            &SocketAddrV4::new(RESOLVER, DNS_PORT),
+            &dns_response("github.com.", &[pinned]),
+            now,
+        );
+        assert!(
+            gate.admits_flow(pinned.octets(), None, now),
+            "a declared name's answer keeps its window"
+        );
+
+        // The zone's host row (NET-003) is the one zone answer the
+        // intersection never sees: inside a box, `host.min.internal` answers
+        // with the switch's NAT'd host alias — an infrastructure address by
+        // design, named in the deny set's fixed range — so the mandated reply
+        // passes through, emits no refusal line, and admits nothing. Reach
+        // over the name is local reach under the box's own egress rules,
+        // decided at connect by the frame verdict, never by a pin.
+        let capture = captured_log();
+        let refusal_lines = || {
+            capture
+                .contents()
+                .matches("an allowed name resolved into a refused range")
+                .count()
+        };
+        let before = refusal_lines();
+        let host_query = udp_payload_frame(
+            LEASE,
+            40002,
+            RESOLVER,
+            53,
+            &dns_query("host.min.internal.", RecordType::A),
+        );
+        harness.box_end.write_all(&host_query).unwrap();
+        let host_forwarded =
+            tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+                .await
+                .expect("the host row's query is forwarded")
+                .expect("the switch side stays open");
+        assert_eq!(
+            host_forwarded, host_query,
+            "the host row's lookup rides the resolver carve-out like any other"
+        );
+        // The row's answer is the attached switch's host alias — the same
+        // derivation the gate was built with, never a second spelling of it.
+        let alias = crate::net::SwitchSubnet::default().host_alias();
+        assert_eq!(alias, HOST_ALIAS, "the default subnet's host alias");
+        let host_reply = udp_payload_frame(
+            RESOLVER,
+            53,
+            LEASE,
+            40002,
+            &dns_response("host.min.internal.", &[alias]),
+        );
+        harness
+            .switch
+            .write_all(&wire_frame(&host_reply))
+            .await
+            .unwrap();
+        let host_passed = read_box_frame(&harness)
+            .await
+            .expect("the host row's reply passes through");
+        assert_eq!(
+            host_passed, host_reply,
+            "a reply is never kept from the box, the host row's included"
+        );
+        assert_eq!(
+            refusal_lines(),
+            before,
+            "the mandated host lookup is not logged as a refusal: {}",
+            capture.contents()
+        );
+
+        // And nothing was admitted: the connection to the alias is refused
+        // exactly as any undeclared destination — the carve-out never made
+        // the host a pin — the sentinel standing in for it.
+        let to_host = egress_tcp_frame(LEASE, alias, 8080);
+        let sentinel = arp_frame(LEASE);
+        harness.box_end.write_all(&to_host).unwrap();
+        harness.box_end.write_all(&sentinel).unwrap();
+        let next = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+            .await
+            .expect("the relay keeps deciding")
+            .expect("the switch side stays open");
+        assert_eq!(
+            next, sentinel,
+            "the host row's answer is never admitted as reach"
+        );
+
+        // The carve-out is the zone's alone. An ordinary name with no entry
+        // resolves — the reply passes through — but admits nothing; and a
+        // lookalike that merely *ends in* the zone's words is no more a zone
+        // name than any other, so the plane refuses its answer too. In both
+        // cases the connection is refused, the sentinel standing in for
+        // everything the relay decided before it.
+        for (name, answer) in [
+            ("example.com.", Ipv4Addr::new(203, 0, 113, 9)),
+            (
+                "box-b.min.internal.example.com.",
+                Ipv4Addr::new(100, 64, 0, 12),
+            ),
+        ] {
+            let query =
+                udp_payload_frame(LEASE, 40001, RESOLVER, 53, &dns_query(name, RecordType::A));
+            harness.box_end.write_all(&query).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+                .await
+                .expect("the query is forwarded")
+                .expect("the switch side stays open");
+            let response_frame =
+                udp_payload_frame(RESOLVER, 53, LEASE, 40001, &dns_response(name, &[answer]));
+            harness
+                .switch
+                .write_all(&wire_frame(&response_frame))
+                .await
+                .unwrap();
+            let _ = read_box_frame(&harness)
+                .await
+                .expect("the reply itself passes through");
+            let denied = egress_tcp_frame(LEASE, answer, 443);
+            let sentinel = arp_frame(LEASE);
+            harness.box_end.write_all(&denied).unwrap();
+            harness.box_end.write_all(&sentinel).unwrap();
+            let next =
+                tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+                    .await
+                    .expect("the relay keeps deciding")
+                    .expect("the switch side stays open");
+            assert_eq!(
+                next, sentinel,
+                "{name} pinned nothing: its answer stays refused"
+            );
+        }
     }
 
     /// NET-067's log: each refused answer says the name and the address, in
@@ -1899,6 +2533,7 @@ mod tests {
                 deny_subnets: None,
             }),
             ingress: None,
+            credentialed_upstream: None,
         };
         let mut harness = spawn_test_relay(&policy);
 

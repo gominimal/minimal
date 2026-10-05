@@ -60,6 +60,21 @@ record_has() {
     awk -v c="$1" -v p="$2" '$1==c && $2==p {hit=1} END{exit !hit}' "$3"
 }
 
+# record_has_comp <component> <record> — true when the install record lists the
+# named component at any path (used to assert every VM-stack part is recorded).
+record_has_comp() {
+    awk -v c="$1" '$1==c {hit=1} END{exit !hit}' "$2"
+}
+
+# manifest_has <component> <os> <arch> [manifest] — true when the release
+# component table holds a row for that component/os/arch. The default manifest
+# is the one the installer just fetched.
+manifest_has() {
+    _mh="${4:-$mock/versions/v1/components}"
+    awk -v c="$1" -v o="$2" -v a="$3" \
+        '!/^#/ && NF && $1==c && $2==o && $3==a {hit=1} END{exit !hit}' "$_mh"
+}
+
 # The harness computes expected hashes with whatever SHA-256 tool the host has.
 # macOS ships `shasum`, not `sha256sum`, so pick portably (same order the
 # installer under test uses) — otherwise the macOS lane fails in the harness
@@ -141,13 +156,34 @@ MOCKEOF
 # artifacts are runnable sh scripts that answer `completions install <shell>`,
 # because the installer installs completions by executing the installed bin/min
 # (R9.3); the other artifacts stay opaque bodies.
-printf 'linux-amd64-minimald-body\n'  >"$mock/versions/v1/minimald-linux-amd64"
+# Linux amd64 release artifacts, including the VM stack (NET-048).
+printf 'linux-amd64-minimald-body\n'     >"$mock/versions/v1/minimald-linux-amd64"
 write_min_stub "$mock/versions/v1/minimal-linux-amd64"  linux-amd64
-write_min_stub "$mock/versions/v1/minimal-darwin-arm64" darwin-arm64
-printf 'darwin-arm64-rootfs-body\n'   >"$mock/versions/v1/rootfs-arm64.img"
+# The answerer NET-122's advisory copies from beside min (NET-122).
+printf 'linux-amd64-answerer-body\n'    >"$mock/versions/v1/min-answerer-linux-amd64"
+printf 'linux-amd64-minvmd-body\n'       >"$mock/versions/v1/minvmd-linux-amd64"
+printf 'linux-amd64-initramfs-body\n'   >"$mock/versions/v1/initramfs-amd64.cpio"
+printf 'linux-amd64-rootfs-body\n'      >"$mock/versions/v1/rootfs-amd64.img"
+printf 'linux-amd64-vmlinuz-body\n'     >"$mock/versions/v1/vmlinuz-amd64"
 # The switch binary the daemon spawns for own-IP sessions (NET-041); shipped
-printf 'mock-gvproxy-switch-body\n'  >"$mock/versions/v1/gvproxy-min-linux-amd64"
+printf 'mock-gvproxy-switch-body\n'      >"$mock/versions/v1/gvproxy-min-linux-amd64"
 # as bin/gvproxy-min so the installer has a row to verify.
+
+# Linux arm64 release artifacts, including the VM stack (NET-050).
+printf 'linux-arm64-minimald-body\n'    >"$mock/versions/v1/minimald-linux-arm64"
+write_min_stub "$mock/versions/v1/minimal-linux-arm64" linux-arm64
+printf 'linux-arm64-answerer-body\n'    >"$mock/versions/v1/min-answerer-linux-arm64"
+printf 'linux-arm64-minvmd-body\n'      >"$mock/versions/v1/minvmd-linux-arm64"
+printf 'linux-arm64-initramfs-body\n'    >"$mock/versions/v1/initramfs-arm64.cpio"
+printf 'linux-arm64-rootfs-body\n'       >"$mock/versions/v1/rootfs-arm64.img"
+printf 'linux-arm64-vmlinuz-body\n'      >"$mock/versions/v1/vmlinuz-arm64"
+printf 'mock-gvproxy-switch-arm64-body\n' >"$mock/versions/v1/gvproxy-min-linux-arm64"
+
+# macOS arm64 guest payload (kept distinct from the linux arm64 rootfs so each
+# architecture is exercised with its own artifact and hash).
+write_min_stub "$mock/versions/v1/minimal-darwin-arm64" darwin-arm64
+printf 'darwin-arm64-answerer-body\n'    >"$mock/versions/v1/min-answerer-macos-arm64"
+printf 'darwin-arm64-rootfs-body\n'      >"$mock/versions/v1/rootfs-darwin-arm64.img"
 
 # AppArmor components: noarch text (the loader is a runnable stub here), shipped
 # to Linux hosts under the data prefix (see stage-release.sh).
@@ -155,14 +191,32 @@ printf 'mock-apparmor-profile-body\n'  >"$mock/versions/v1/minimald.apparmor"
 printf 'mock-apparmor-tunable-body\n'  >"$mock/versions/v1/minimald.apparmor-tunable"
 printf '#!/bin/sh\n# mock apparmor loader\n' >"$mock/versions/v1/install-apparmor-profile.sh"
 
+# Hashes for every artifact referenced by the component table below.
 h_minimald="$(hash_file "$mock/versions/v1/minimald-linux-amd64")"
 h_minimal="$(hash_file "$mock/versions/v1/minimal-linux-amd64")"
+h_answerer="$(hash_file "$mock/versions/v1/min-answerer-linux-amd64")"
+h_minvmd="$(hash_file "$mock/versions/v1/minvmd-linux-amd64")"
+h_initramfs="$(hash_file "$mock/versions/v1/initramfs-amd64.cpio")"
+h_rootfs="$(hash_file "$mock/versions/v1/rootfs-amd64.img")"
+h_vmlinuz="$(hash_file "$mock/versions/v1/vmlinuz-amd64")"
+h_gvmin="$(hash_file "$mock/versions/v1/gvproxy-min-linux-amd64")"
+
+h_minimald_arm="$(hash_file "$mock/versions/v1/minimald-linux-arm64")"
+h_minimal_arm="$(hash_file "$mock/versions/v1/minimal-linux-arm64")"
+h_answerer_arm="$(hash_file "$mock/versions/v1/min-answerer-linux-arm64")"
+h_minvmd_arm="$(hash_file "$mock/versions/v1/minvmd-linux-arm64")"
+h_initramfs_arm="$(hash_file "$mock/versions/v1/initramfs-arm64.cpio")"
+h_rootfs_arm="$(hash_file "$mock/versions/v1/rootfs-arm64.img")"
+h_vmlinuz_arm="$(hash_file "$mock/versions/v1/vmlinuz-arm64")"
+h_gvmin_arm="$(hash_file "$mock/versions/v1/gvproxy-min-linux-arm64")"
+
 h_dmin="$(hash_file "$mock/versions/v1/minimal-darwin-arm64")"
-h_rootfs="$(hash_file "$mock/versions/v1/rootfs-arm64.img")"
+h_danswerer="$(hash_file "$mock/versions/v1/min-answerer-macos-arm64")"
+h_drootfs="$(hash_file "$mock/versions/v1/rootfs-darwin-arm64.img")"
+
 h_aaprof="$(hash_file "$mock/versions/v1/minimald.apparmor")"
 h_aatun="$(hash_file "$mock/versions/v1/minimald.apparmor-tunable")"
 h_aaload="$(hash_file "$mock/versions/v1/install-apparmor-profile.sh")"
-h_gvmin="$(hash_file "$mock/versions/v1/gvproxy-min-linux-amd64")"
 
 printf 'v1\n' >"$mock/stable"
 
@@ -172,26 +226,68 @@ write_manifest() {
         printf '# format: %s\n' "$fmt"
         printf '# component   os      arch    version   sha256   kind   dest   src\n'
         printf '\n'
+        # Linux amd64: full CLI, daemon, switch, and VM host stack (NET-048).
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
             minimald linux amd64 v1 "$h_minimald" file bin/minimald versions/v1/minimald-linux-amd64
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
             minimal linux amd64 v1 "$h_minimal" file bin/min versions/v1/minimal-linux-amd64
+        # The answerer installs beside min on every platform min ships for
+        # (NET-122); the installed copy is only the advisory's copy source.
+        printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+            min-answerer linux amd64 v1 "$h_answerer" file bin/min-answerer versions/v1/min-answerer-linux-amd64
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
             gvproxy-min linux amd64 v1 "$h_gvmin" file bin/gvproxy-min versions/v1/gvproxy-min-linux-amd64
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+            minvmd linux amd64 v1 "$h_minvmd" file bin/minvmd versions/v1/minvmd-linux-amd64
+        printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+            initramfs linux amd64 v1 "$h_initramfs" file data/initramfs.cpio versions/v1/initramfs-amd64.cpio
+        printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+            rootfs linux amd64 v1 "$h_rootfs" file data/rootfs.img versions/v1/rootfs-amd64.img
+        printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+            vmlinuz linux amd64 v1 "$h_vmlinuz" file data/vmlinuz versions/v1/vmlinuz-amd64
+        # Linux arm64: the same VM host stack must ship for arm64 (NET-050).
+        printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+            minimald linux arm64 v1 "$h_minimald_arm" file bin/minimald versions/v1/minimald-linux-arm64
+        printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+            minimal linux arm64 v1 "$h_minimal_arm" file bin/min versions/v1/minimal-linux-arm64
+        printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+            min-answerer linux arm64 v1 "$h_answerer_arm" file bin/min-answerer versions/v1/min-answerer-linux-arm64
+        printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+            gvproxy-min linux arm64 v1 "$h_gvmin_arm" file bin/gvproxy-min versions/v1/gvproxy-min-linux-arm64
+        printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+            minvmd linux arm64 v1 "$h_minvmd_arm" file bin/minvmd versions/v1/minvmd-linux-arm64
+        printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+            initramfs linux arm64 v1 "$h_initramfs_arm" file data/initramfs.cpio versions/v1/initramfs-arm64.cpio
+        printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+            rootfs linux arm64 v1 "$h_rootfs_arm" file data/rootfs.img versions/v1/rootfs-arm64.img
+        printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+            vmlinuz linux arm64 v1 "$h_vmlinuz_arm" file data/vmlinuz versions/v1/vmlinuz-arm64
+        # macOS arm64: VM host stack is macOS-native, guest payload is arm64.
+        printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
             minimal darwin arm64 v1 "$h_dmin" file bin/min versions/v1/minimal-darwin-arm64
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
-            rootfs darwin arm64 v1 "$h_rootfs" file data/rootfs.img versions/v1/rootfs-arm64.img
+            min-answerer darwin arm64 v1 "$h_danswerer" file bin/min-answerer versions/v1/min-answerer-macos-arm64
+        printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+            rootfs darwin arm64 v1 "$h_drootfs" file data/rootfs.img versions/v1/rootfs-darwin-arm64.img
+        # AppArmor support files ship to every Linux arch.
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
             apparmor-profile linux amd64 v1 "$h_aaprof" file data/apparmor/minimald versions/v1/minimald.apparmor
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+            apparmor-profile linux arm64 v1 "$h_aaprof" file data/apparmor/minimald versions/v1/minimald.apparmor
+        printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
             apparmor-tunable linux amd64 v1 "$h_aatun" file data/apparmor/tunables/minimald versions/v1/minimald.apparmor-tunable
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+            apparmor-tunable linux arm64 v1 "$h_aatun" file data/apparmor/tunables/minimald versions/v1/minimald.apparmor-tunable
+        printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
             apparmor-installer linux amd64 v1 "$h_aaload" file data/apparmor/install-apparmor-profile.sh versions/v1/install-apparmor-profile.sh
+        printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+            apparmor-installer linux arm64 v1 "$h_aaload" file data/apparmor/install-apparmor-profile.sh versions/v1/install-apparmor-profile.sh
         # Symlink rows (R5.6): sha256 is the `-` placeholder, src is the link
         # target relative to dest's directory.
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
             git-remote-min linux amd64 v1 - symlink bin/git-remote-min min
+        printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+            git-remote-min linux arm64 v1 - symlink bin/git-remote-min min
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
             git-remote-min darwin arm64 v1 - symlink bin/git-remote-min min
     } >"$mock/versions/v1/components"
@@ -589,7 +685,7 @@ case_prefix_resolution() {
         printf '# format: 1\n'
         printf '# c o a v s k d s\n'
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
-            rootfs linux amd64 v1 "$h_rootfs" file data/rootfs.img versions/v1/rootfs-arm64.img
+            rootfs linux amd64 v1 "$h_rootfs" file data/rootfs.img versions/v1/rootfs-amd64.img
     } >"$mock/versions/v1/components"
     H5="$root/h5"; mkdir -p "$H5"
     run datadest "$H5"
@@ -607,7 +703,7 @@ case_prefix_resolution() {
         printf '# format: 1\n'
         printf '# c o a v s k d s\n'
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
-            libkrun linux amd64 v1 "$h_rootfs" file lib/libkrun.1.dylib versions/v1/rootfs-arm64.img
+            libkrun linux amd64 v1 "$h_rootfs" file lib/libkrun.1.dylib versions/v1/rootfs-amd64.img
     } >"$mock/versions/v1/components"
     H6="$root/h6"; mkdir -p "$H6"
     run libdest "$H6"
@@ -1078,7 +1174,7 @@ case_darwin_dequarantine() {
         printf '# format: 1\n'
         printf '# c o a v s k d s\n'
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
-            libkrun darwin arm64 v1 "$h_rootfs" file lib/libkrun.1.dylib versions/v1/rootfs-arm64.img
+            libkrun darwin arm64 v1 "$h_drootfs" file lib/libkrun.1.dylib versions/v1/rootfs-darwin-arm64.img
     } >"$mock/versions/v1/components"
     : >"$root/xattr.calls"
     HDL="$root/hdl"; mkdir -p "$HDL"
@@ -1270,7 +1366,7 @@ case_uninstall() {
         printf '# format: 1\n'
         printf '# c o a v s k d s\n'
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
-            rootfs linux amd64 v1 "$h_rootfs" file data/rootfs.img versions/v1/rootfs-arm64.img
+            rootfs linux amd64 v1 "$h_rootfs" file data/rootfs.img versions/v1/rootfs-amd64.img
     } >"$mock/versions/v1/components"
     HUD="$root/hud"; mkdir -p "$HUD"
     run u_datadump_install "$HUD"
@@ -1385,7 +1481,7 @@ case_installer_switch_binary_executable() {
         printf '# format: 1\n'
         printf '# c o a v s k d s\n'
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
-            rootfs linux amd64 v1 "$h_rootfs" file data/rootfs.img versions/v1/rootfs-arm64.img
+            rootfs linux amd64 v1 "$h_rootfs" file data/rootfs.img versions/v1/rootfs-amd64.img
     } >"$mock/versions/v1/components"
     HY="$root/hy"; mkdir -p "$HY"
     run sw_noship "$HY"
@@ -1416,6 +1512,626 @@ case_installer_switch_binary_executable() {
     cp "$root/good-components" "$mock/versions/v1/components"   # restore
 }
 
+# --- NET-079: the host classifier tree --------------------------------------
+# install-host-classifier.sh is the privileged step that lays out the cgroup
+# tree minimald and its boxes are placed in, on a native host. CI cannot mount
+# cgroup2, so the case drives the script against a stand-in mount table through
+# its MINIMAL_OVERRIDE_CGROUP_MOUNTINFO seam, with stubbed `chown` and `nft`
+# recording their own argv, over a tree rooted in a temp dir: what is pinned
+# is the decision sequence a root run would take on the real mount — refuse an
+# undelegated hierarchy, refuse another namespace's view, delegate the slice
+# and every cgroup it lays out whole (each directory plus cgroup.procs,
+# cgroup.threads and cgroup.subtree_control, the cohort's two subtrees
+# included), leave the cgroup2 mount root above the slice root-owned, refuse
+# to render the cohort's two source identities half-done, load exactly one
+# packet-filter transaction that replaces the table rather than adding to
+# it, remove the presence marker before the load and write it again only
+# after, and print the very transaction it loads under --print-ruleset. The
+# one fact the stand-in cannot stand in for
+# is the kernel: it makes a cgroup's files at mkdir and dissolves them with the
+# cgroup at rmdir, so the case drops the modeled ones wherever a real rmdir
+# would have taken the cgroup too.
+case_host_classifier_tree_installed() {
+    command -v bash >/dev/null 2>&1 || {
+        echo "install_test: bash not found; skipping host_classifier_tree_installed" >&2
+        return 0
+    }
+    hc="$here/install-host-classifier.sh"
+    if [ ! -f "$hc" ]; then bad "install-host-classifier.sh is missing"; return 0; fi
+
+    cg="$root/cg"                      # the stand-in cgroup2 mountpoint
+    tree="$cg/minimald.slice"          # the tree the script installs
+    me="$(id -u)"
+
+    # Stand-in mount tables. Field 4 is the mount's root within the
+    # filesystem: "/" in the host's initial cgroup namespace, something else
+    # inside a container that mounts cgroup2 into its own — the case the
+    # script must refuse, or the tree would be created inside that namespace.
+    printf '38 30 0:25 / %s rw,nosuid,nodev,noexec,relatime - cgroup2 cgroup2 rw,nsdelegate\n' "$cg" >"$root/mi-on"
+    printf '38 30 0:25 / %s rw,nosuid,nodev,noexec,relatime - cgroup2 cgroup2 rw\n' "$cg" >"$root/mi-off"
+    printf '38 30 0:25 /inner %s rw,nosuid,nodev,noexec,relatime - cgroup2 cgroup2 rw,nsdelegate\n' "$cg" >"$root/mi-nested"
+    printf '38 30 0:26 / %s rw,relatime - ext4 /dev/root rw\n' "$root" >"$root/mi-none"
+
+    # A recording chown stub: delegation is the point of the install, and on
+    # the stand-in filesystem the caller owns the files anyway, so the case
+    # reads what the script chowned rather than inferring it from their owner.
+    # It records and exits 0 without exec'ing the real chown: on the host this
+    # script installs on that chown runs as root, which CI's unprivileged
+    # lanes cannot stage, and where it lives is host-specific (/usr/bin on
+    # Linux, /usr/sbin on macOS), so exec'ing it would break the macOS lane
+    # while asserting nothing the case needs — the recorded argv is the whole
+    # delegation decision.
+    hcbin="$root/hcbin"; mkdir -p "$hcbin"
+    chown_calls="$root/chown.calls"; : >"$chown_calls"
+    cat >"$hcbin/chown" <<'STUB'
+#!/bin/sh
+printf '%s\n' "$*" >>"$CHOWN_CALLS"
+STUB
+    chmod +x "$hcbin/chown"
+
+    # A recording nft stub, in the chown stub's image: the step's second half
+    # is the packet-filter table, and what CI can pin of it without the
+    # capability to load one is the decision sequence — the transaction file
+    # that replaces the table, loaded exactly once, and the marker only
+    # after. The `-f` argument's file is captured whole: the case and the
+    # daemon's own ruleset tests read the transaction the step rendered.
+    # NFT_FAIL makes the load die, for the case that a failed re-load must
+    # leave no marker behind it. `list ruleset` serves the listing NFT_RULESET
+    # names, because the step now reads the ruleset it is about to load over
+    # — the scan for a ct-mark user of its bits is a real call, and the
+    # fixture is how a conflict is staged. Any other `list` says absent: no
+    # stand-in kernel holds a table, so the uninstall probes once, skips its
+    # delete, and reports nothing removed.
+    nft_calls="$root/nft.calls"; : >"$nft_calls"
+    nft_input="$root/nft.input"; : >"$nft_input"
+    cat >"$hcbin/nft" <<'STUB'
+#!/bin/sh
+printf '%s\n' "$*" >>"$NFT_CALLS"
+if [ "$1" = "-f" ] && [ -n "${2:-}" ]; then
+    cat "$2" >>"$NFT_INPUT"
+    exit "${NFT_FAIL:-0}"
+fi
+if [ "$1" = "list" ] && [ "$2" = "ruleset" ]; then
+    cat "${NFT_RULESET:-/dev/null}"
+    exit 0
+fi
+[ "$1" = "list" ] && exit 1
+exit 0
+STUB
+    chmod +x "$hcbin/nft"
+
+    # run_hc <label> <mountinfo> [args...] ; sets rc, captures output in $OUT.
+    run_hc() {
+        label="$1"; mi="$2"; shift 2
+        OUT="$root/hc.$label"
+        set +e
+        env -i \
+            PATH="$hcbin:/usr/bin:/bin" \
+            CHOWN_CALLS="$chown_calls" \
+            NFT_CALLS="$nft_calls" \
+            NFT_INPUT="$nft_input" \
+            NFT_FAIL="${NFT_FAIL:-0}" \
+            NFT_RULESET="${NFT_RULESET:-}" \
+            MINIMAL_OVERRIDE_CGROUP_MOUNTINFO="$mi" \
+            bash "$hc" --root "$tree" "$@" </dev/null >"$OUT" 2>&1
+        rc=$?
+        set -e
+    }
+
+    # drop_cgroup_files <cgroup-dir> — what the kernel does at rmdir on the
+    # real mount: a cgroup's cgroup.procs, cgroup.threads and
+    # cgroup.subtree_control belong to the cgroup and go with it, while the
+    # stand-in is a plain directory that keeps them and would make every
+    # rmdir below fail for the stand-in's own reason, not the one pinned.
+    drop_cgroup_files() {
+        rm -f "$1/cgroup.procs" "$1/cgroup.threads" "$1/cgroup.subtree_control"
+    }
+
+    # --- Before the install: --check reports the missing tree, makes nothing.
+    run_hc pre_check "$root/mi-on" --check --user "$me"
+    check 1 "$rc" "check exits 1 before the tree exists"
+    want_ok "check names the tree it cannot find" grep -q "does not exist" "$OUT"
+    want_ok "check advises the install, not a re-check" grep -q "install it: sudo" "$OUT"
+    want_ok "the pre-install hint names the cohort's identity flag" \
+        grep -q -- "--cohort-address <cohort address>" "$OUT"
+    want_ok "the pre-install hint names the node plane's identity flag too" \
+        grep -q -- "--node-plane-address <node-plane address>" "$OUT"
+    want_err "check creates nothing" test -e "$tree"
+
+    # --- Refusals: every one of them dies before a directory is made.
+    run_hc no_nsdelegate "$root/mi-off" --user "$me"
+    check 1 "$rc" "install dies on a cgroup2 mount without nsdelegate"
+    want_ok "the refusal names nsdelegate" grep -q "nsdelegate" "$OUT"
+    want_err "an undelegated hierarchy gets no tree" test -e "$tree"
+
+    run_hc unmounted "$root/mi-none" --user "$me"
+    check 1 "$rc" "install dies when no cgroup2 mount covers the tree"
+    want_ok "the refusal names the hierarchy it needs" grep -q "cgroup2 mount" "$OUT"
+
+    run_hc nested_ns "$root/mi-nested" --user "$me"
+    check 1 "$rc" "install dies inside another cgroup namespace's view"
+    want_ok "the refusal names the namespace" grep -q "another cgroup namespace" "$OUT"
+
+    run_hc nested_check "$root/mi-nested" --check --user "$me"
+    check 1 "$rc" "check reports the namespace view too"
+    want_ok "check names the mount's root within it" grep -q "root /inner" "$OUT"
+
+    run_hc no_owner "$root/mi-on"
+    check 1 "$rc" "install dies without an account to delegate to"
+    want_ok "the refusal asks for --user" grep -q -- "--user NAME" "$OUT"
+
+    run_hc root_owner "$root/mi-on" --user root
+    check 1 "$rc" "install refuses to delegate to root"
+    want_ok "the refusal says what delegating to root means" \
+        grep -q "same as not delegating" "$OUT"
+
+    run_hc bogus_owner "$root/mi-on" --user no-such-account-net079
+    check 1 "$rc" "install dies for an unknown account"
+    want_ok "the refusal names the account" grep -q "no such account" "$OUT"
+    want_err "a bad account still creates nothing" test -e "$tree"
+
+    # --- The two source identities are required, together: a table that
+    # refuses a deny-all box's connections while its cohort keeps the host's
+    # own source identity is half of the classification, so the step refuses
+    # to render half of it — with either missing, and with both missing.
+    run_hc no_identity "$root/mi-on" --user "$me"
+    check 1 "$rc" "install dies without the two source identities"
+    want_ok "the refusal names the flag it needs" \
+        grep -q -- "--cohort-address ADDR" "$OUT"
+    want_ok "the refusal names the other flag too" \
+        grep -q -- "--node-plane-address ADDR" "$OUT"
+    want_err "no identities, no tree" test -e "$tree"
+
+    run_hc half_identity "$root/mi-on" --user "$me" --cohort-address 100.72.0.9
+    check 1 "$rc" "install dies with one of the two identities missing"
+    want_ok "the refusal says they go together" grep -q "both source identities" "$OUT"
+    want_err "half an identity still creates nothing" test -e "$tree"
+
+    # --- The install: the slice, its daemon leaf, the cohort's two subtrees,
+    # and the whole v2 contract delegated to the account minimald runs as.
+    run_hc install "$root/mi-on" --user "$me" \
+        --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
+    check 0 "$rc" "install exits 0 on a delegated cgroup2 mount"
+    want_ok "the daemon leaf exists" test -d "$tree/daemon"
+    want_ok "the box cohort exists"   test -d "$tree/boxes"
+    want_ok "the deny subtree exists"  test -d "$tree/boxes/deny"
+    want_ok "the allow subtree exists" test -d "$tree/boxes/allow"
+    want_ok "the table's marker exists once the transaction succeeded" \
+        test -d "$tree/classifier-table"
+    want_ok "install names the tree it laid out"   grep -q "installed the classifier tree" "$OUT"
+    want_ok "install names the delegated account" grep -q "delegated to" "$OUT"
+    want_ok "install names the contract it delegated" grep -q "v2 contract" "$OUT"
+    want_ok "install says what a daemon in the slice does per launch, not on its next start" \
+        grep -q "once minimald is in the slice, each box it launches" "$OUT"
+    want_ok "install names the loaded table" grep -q "loaded the classifier table" "$OUT"
+    want_ok "install names the marker minimald probes" \
+        grep -q "presence marker at $tree/classifier-table" "$OUT"
+    want_ok "the slice's cgroup.procs is there for the daemon to write" \
+        test -e "$tree/cgroup.procs"
+    want_ok "the daemon leaf's cgroup.procs is there for --pid to write" \
+        test -e "$tree/daemon/cgroup.procs"
+    # Delegation handed over each cgroup whole — its directory plus
+    # cgroup.procs, cgroup.threads and cgroup.subtree_control, because a
+    # migration into a leaf needs write access to the common ancestor's
+    # cgroup.procs, and that ancestor is the slice itself — and never
+    # reached above the slice: a box runs as the daemon's uid, so a mount
+    # root owned by that account is every cgroup on the host. The two
+    # subtrees are delegated like the cohort they live under.
+    _o="$(id -u):$(id -g)"
+    _want=""
+    for _cg in "" "/daemon" "/boxes" "/boxes/deny" "/boxes/allow"; do
+        for _f in cgroup.procs cgroup.threads cgroup.subtree_control; do
+            _want="$_want$_o $tree$_cg/$_f "
+        done
+        _want="$_want$_o $tree$_cg "
+    done
+    # One recorded call per line, compared as one line: the file is the stub's
+    # ledger, not a shell variable, so fold it rather than word-split it.
+    _got="$(awk '{printf "%s%s", sep, $0; sep = " "}' "$chown_calls")"
+    check "${_want% }" "$_got" \
+        "delegation reached the slice and every leaf whole, never above the slice"
+    # The one packet-filter transaction, loaded exactly once, and nothing
+    # per-box in it — every rule is keyed on a cgroup path. The daemon's own
+    # ruleset tests read the same input in depth; this pins what the step
+    # decided, at the layer the installer owns: the transaction replaces the
+    # table rather than adding to it, the cohort's two identities, the
+    # answerer as the deny subtree's one destination, and the retarget that
+    # makes the answerer the destination a deny-all box's lookups reach.
+    want_ok "the step loaded one transaction, exactly once" \
+        [ "$(grep -c '^-f ' "$nft_calls")" -eq 1 ]
+    want_ok "the step probes for no previous table: the transaction deletes it in-batch" \
+        [ "$(grep -c '^list table' "$nft_calls")" -eq 0 ]
+    want_ok "the transaction replaces the table: it declares what it deletes" \
+        grep -q '^add table inet minimal_class$' "$nft_input"
+    want_ok "the delete travels with the definition, before it" \
+        awk '/^delete table inet minimal_class$/ {d = NR}
+             /^table inet minimal_class \{/ {t = NR}
+             END {exit !(d && t && d < t)}' "$nft_input"
+    want_ok "the transaction keys its deny rule on the deny subtree" \
+        grep -q 'cgroupv2 level 3 "minimald.slice/boxes/deny" jump deny_out' "$nft_input"
+    # deny_out's first rule is pinned as the exact line it must be: the
+    # reply leg of a connection someone else opened to the box — the
+    # hostname proxy's to its loopback listener — is admitted, and nothing
+    # the box itself originates is, so the refusal falls on it.
+    check "$(awk '/chain deny_out \{/ {ch = 1; next}
+                  ch && /^\}/ {exit}
+                  ch && NF {sub(/^[ \t]+/, ""); print; exit}' "$nft_input")" \
+          "ct state established,related ct direction reply accept" \
+          "deny_out admits the reply direction only as its first rule"
+    want_err "the deny chain admits no direction-less flow: what the box \
+originates is refused" \
+        grep -q 'ct state established,related accept' "$nft_input"
+    want_ok "the deny rule admits the answerer by address and port only" \
+        grep -q 'ip daddr 127.0.0.1 udp dport 7656 accept' "$nft_input"
+    want_ok "the deny subtree's DNS-port lookups are retargeted onto the answerer" \
+        grep -q 'level 3 "minimald.slice/boxes/deny" ip daddr 127.0.0.1 udp dport 53 dnat ip to 127.0.0.1:7656' "$nft_input"
+    want_ok "the retarget runs at dstnat, before the filter chain decides" \
+        grep -q 'type nat hook output priority dstnat' "$nft_input"
+    want_ok "the deny rule refuses actively, never a silent drop" \
+        grep -q 'reject with icmpx admin-prohibited' "$nft_input"
+    # NET-078, translated: classification and translation are two chains,
+    # because the kernel admits a socket-cgroup match only before
+    # postrouting — a rule keyed on one there has never been loadable. The
+    # classify chain runs at output's mangle priority, classes only a
+    # connection that is new, and writes only the mask's two bits (the `and
+    # ~mask or bit` shape, so bits another component classes with survive);
+    # the slice's rule is guarded by the mask so it never re-decides a flow
+    # the boxes rule already classed. The postrouting chain reads the mark,
+    # never a socket, and gives the two planes their distinct sources.
+    want_ok "the classify chain runs at output's mangle priority, ahead of the filter" \
+        grep -q 'type filter hook output priority mangle' "$nft_input"
+    want_ok "the cohort is classed by its subtree on a new connection, its bit written" \
+        grep -q 'ct state new socket cgroupv2 level 2 "minimald.slice/boxes" ct mark set ct mark and 0xcfffffff or 0x10000000' "$nft_input"
+    want_ok "the slice's rule is guarded by the mask, so the boxes rule's mark is final" \
+        grep -q 'ct state new ct mark and 0x30000000 == 0 socket cgroupv2 level 1 "minimald.slice" ct mark set ct mark and 0xcfffffff or 0x20000000' "$nft_input"
+    want_err "no postrouting rule matches a socket: the kernel refuses one there" \
+        awk '/chain postrouting \{/ {p = 1; next}
+             p && /^\}/ {exit}
+             p && /socket/ {found = 1}
+             END {exit found ? 0 : 1}' "$nft_input"
+    want_ok "the cohort leaves as its own address, translated by its ct-mark bit, loopback excluded" \
+        grep -q 'ct mark and 0x30000000 == 0x10000000 oifname != "lo" snat ip to 100.72.0.9' "$nft_input"
+    want_ok "the node plane leaves as its own address, translated by its own bit" \
+        grep -q 'ct mark and 0x30000000 == 0x20000000 oifname != "lo" snat ip to 100.72.0.1' "$nft_input"
+    # The scan is a real decision, not a decoration: the step read the
+    # ruleset it was about to load over, and recorded the two bits it chose
+    # beside the marker the daemon probes.
+    want_ok "the step read the ruleset it loads over, exactly once" \
+        [ "$(grep -c '^list ruleset' "$nft_calls")" -eq 1 ]
+    want_ok "the install records the ct-mark mask beside the marker" \
+        test -d "$tree/ct-mark-mask-0x30000000"
+
+    # --- --print-ruleset prints the same transaction the install loaded:
+    # the daemon's own ruleset tests read this mode, so the two spellings
+    # cannot drift.
+    run_hc print_ruleset "$root/mi-on" --print-ruleset \
+        --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
+    check 0 "$rc" "--print-ruleset exits 0"
+    check "$(cat "$nft_input")" "$(cat "$OUT")" \
+        "print-ruleset prints exactly the transaction the install loaded"
+
+    run_hc installed_check "$root/mi-on" --check --user "$me"
+    check 0 "$rc" "check exits 0 once the tree is installed"
+    want_ok "check reports the delegation it verified" grep -q "delegated:" "$OUT"
+    want_ok "check names the contract it verified" grep -q "cgroup.threads" "$OUT"
+    want_ok "check says what stays root-owned" grep -q "stays root-owned" "$OUT"
+    want_ok "check reports the table's marker" grep -q "classifier-table" "$OUT"
+    want_ok "check reports the recorded ct-mark mask" grep -q "ct-mark:  0x30000000" "$OUT"
+
+    # --user takes an account name too, resolved to the same uid and group;
+    # only when the caller's uid has a passwd entry to name it by (a cross
+    # container runs as the host's uid, which has none).
+    if me_name="$(id -un 2>/dev/null)"; then
+        run_hc named_check "$root/mi-on" --check --user "$me_name"
+        check 0 "$rc" "check by account name verifies the same delegation"
+    fi
+
+    # A numeric uid that is neither an account nor the caller has no group
+    # to delegate to: refused, never handed the caller's group.
+    stranger=4000000000
+    if ! id -g "$stranger" >/dev/null 2>&1 && [ "$stranger" != "$(id -u)" ]; then
+        run_hc stranger_check "$root/mi-on" --check --user "$stranger"
+        check 1 "$rc" "check refuses a numeric uid with no account behind it"
+        want_ok "the refusal names the uid" grep -q "no account with uid $stranger" "$OUT"
+    fi
+
+    # --- A re-install whose transaction dies leaves no marker: the step
+    # removes it before the load and writes it only after, so the daemon
+    # reads a host that decides nothing per box rather than a marker that
+    # vouches for a table this step did not render. The tree's half is
+    # already done, and stays.
+    NFT_FAIL=1
+    run_hc reload_failed "$root/mi-on" --user "$me" \
+        --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
+    check 1 "$rc" "a re-install whose nft transaction dies exits 1"
+    want_err "a failed re-load leaves no marker" test -e "$tree/classifier-table"
+    want_err "a failed re-load leaves no ct-mark mask record either" \
+        test -e "$tree/ct-mark-mask-0x30000000"
+    want_ok "the failure says neither the marker nor its record was written" \
+        grep -q "neither the marker nor its ct-mark mask record was written" "$OUT"
+    want_ok "the tree itself survives a failed re-load" test -d "$tree/boxes/deny"
+    NFT_FAIL=0
+    run_hc reloaded "$root/mi-on" --user "$me" \
+        --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
+    check 0 "$rc" "the next good re-install exits 0"
+    want_ok "the next good re-install restores the marker" \
+        test -d "$tree/classifier-table"
+    want_ok "the next good re-install restores the mask record beside it" \
+        test -d "$tree/ct-mark-mask-0x30000000"
+
+    # --- The ct-mark bits are a shared namespace: a component already
+    # classing with one of them would be silently overwritten by the
+    # classify chain (and would overwrite it back), so the step reads the
+    # ruleset it is about to load over and refuses, naming the rule and the
+    # override. The fixture's rule is the stand-in for that component; the
+    # escape is --ct-mark-mask naming bits nobody else classes with, and it
+    # must be recorded, not just rendered.
+    nft_ruleset_fixture="$root/nft-ruleset-conflict"
+    printf 'table inet other_component {\n    chain classify {\n        ct mark set ct mark or 0x10000000\n    }\n}\n' \
+        >"$nft_ruleset_fixture"
+    NFT_RULESET="$nft_ruleset_fixture"
+    run_hc conflict "$root/mi-on" --user "$me" \
+        --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
+    check 1 "$rc" "the install refuses to load over a ct-mark user of its bits"
+    want_ok "the refusal names the conflicting rule itself" \
+        grep -q 'ct mark set ct mark or 0x10000000' "$OUT"
+    want_ok "the refusal names the override it would take instead" \
+        grep -q -- "--ct-mark-mask <two contiguous bits nothing else classes with>" "$OUT"
+    want_ok "the refusal dies before touching anything: the previous marker \
+still vouches for the table it loaded" \
+        test -d "$tree/classifier-table"
+    run_hc conflict_escaped "$root/mi-on" --user "$me" \
+        --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1 \
+        --ct-mark-mask 0x0000c000
+    check 0 "$rc" "an install with non-overlapping bits escapes the conflict"
+    want_ok "the escape renders its own bits, both identities on them" \
+        grep -q 'ct mark and 0x0000c000 == 0x00004000 oifname != "lo" snat ip to 100.72.0.9' "$nft_input"
+    want_ok "the escape records the bits it chose" \
+        test -d "$tree/ct-mark-mask-0x0000c000"
+    want_err "the escape left no record of the refused mask" \
+        test -e "$tree/ct-mark-mask-0x30000000"
+    run_hc conflict_back "$root/mi-on" --user "$me" \
+        --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
+    check 1 "$rc" "the next default-mask install refuses again"
+    NFT_RULESET=
+
+    # --- --ct-mark-mask is validated before anything is made: exactly two
+    # contiguous set bits inside the 32 a connection mark holds, nothing
+    # else, each refused with the reason. A rule classing on one bit is no
+    # classification of two identities, three is a spelling mistake, two
+    # that are not adjacent is a mis-typed pair, and a bit the kernel cannot
+    # hold is not a mask this step can render. A value that is not
+    # hexadecimal at all is refused for that reason, its own.
+    for bad_mask in 0x10000000 0x70000000 0x50000000 0x100000000 0x0 0x3000000f; do
+        run_hc "bad_mask_$bad_mask" "$root/mi-on" --user "$me" \
+            --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1 \
+            --ct-mark-mask "$bad_mask"
+        check 1 "$rc" "--ct-mark-mask $bad_mask is refused"
+        want_ok "the refusal of $bad_mask says what a mask is" \
+            grep -q -- "--ct-mark-mask must name" "$OUT"
+        want_err "the refused mask $bad_mask made nothing" \
+            test -e "$tree/ct-mark-mask-$bad_mask"
+    done
+    for bad_mask in not-hex 30000000 0xzz; do
+        run_hc "bad_mask_$bad_mask" "$root/mi-on" --user "$me" \
+            --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1 \
+            --ct-mark-mask "$bad_mask"
+        check 1 "$rc" "--ct-mark-mask $bad_mask is refused for its spelling"
+        want_ok "the refusal of $bad_mask names the spelling it needs" \
+            grep -q -- "--ct-mark-mask needs a" "$OUT"
+        want_err "the refused mask $bad_mask made nothing" \
+            test -e "$tree/ct-mark-mask-$bad_mask"
+    done
+
+    # --- Uninstall: the tree comes away whole — the two subtrees and the
+    # table's marker with it — but a leaf the script did not place (a live
+    # session's) stops it rather than tearing the box down. The kernel
+    # dissolves a cgroup's own files with it, so the case drops the modeled
+    # ones first and the rmdir rehearsed is the real one.
+    drop_cgroup_files "$tree"
+    drop_cgroup_files "$tree/daemon"
+    drop_cgroup_files "$tree/boxes"
+    drop_cgroup_files "$tree/boxes/deny"
+    drop_cgroup_files "$tree/boxes/allow"
+    run_hc uninstall "$root/mi-on" --uninstall
+    check 0 "$rc" "uninstall removes the installed tree"
+    want_err "uninstall leaves no tree behind" test -e "$tree"
+
+    run_hc reinstalled "$root/mi-on" --user "$me" \
+        --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
+    check 0 "$rc" "install after an uninstall exits 0"
+
+    # --- --pid: the daemon's first hop into the slice is the one migration
+    # the delegated account cannot make itself — the common ancestor of the
+    # cgroup a daemon starts in and the slice is the root-owned hierarchy
+    # root — so the installer offers to make it for the running daemon.
+    run_hc place "$root/mi-on" --pid "$$"
+    check 0 "$rc" "--pid places the running daemon in its leaf"
+    want_ok "the daemon leaf holds exactly that pid" \
+        grep -qx "$$" "$tree/daemon/cgroup.procs"
+    want_ok "the placement names the leaf it wrote" grep -q "placed .* in .*daemon" "$OUT"
+    want_ok "the placement says it takes effect on the next launch, not the next start" \
+        grep -q "per launch" "$OUT"
+    want_ok "the placement says a plain restart loses it" \
+        grep -q "Delegate=yes unit" "$OUT"
+
+    run_hc place_dead "$root/mi-on" --pid 999999999
+    check 1 "$rc" "--pid dies for a process that does not exist"
+    want_ok "the refusal names the pid it could not find" \
+        grep -q "no process 999999999" "$OUT"
+
+    run_hc place_nonnumeric "$root/mi-on" --pid not-a-pid
+    check 1 "$rc" "--pid dies for a pid that is not one"
+    want_ok "the refusal asks for a numeric process id" \
+        grep -q "numeric process id" "$OUT"
+
+    drop_cgroup_files "$tree"
+    drop_cgroup_files "$tree/daemon"
+    drop_cgroup_files "$tree/boxes"
+    drop_cgroup_files "$tree/boxes/deny"
+    drop_cgroup_files "$tree/boxes/allow"
+    mkdir "$tree/boxes/deny/a-session"
+    run_hc uninstall_live "$root/mi-on" --uninstall
+    check 1 "$rc" "uninstall dies while a box leaf survives"
+    want_ok "the refusal says what is holding the tree" grep -q "stop minimald" "$OUT"
+    want_ok "the live leaf survives the refused uninstall" test -d "$tree/boxes/deny/a-session"
+    rm -rf "$tree"   # the sweep this case alone owns; the refused uninstall could not
+
+    # --- --pid with no tree to place into names the step that is missing.
+    run_hc place_no_tree "$root/mi-on" --pid "$$"
+    check 1 "$rc" "--pid dies when the tree is not installed"
+    want_ok "the refusal names the install it still needs" \
+        grep -q "is not installed" "$OUT"
+
+    # --- --help prints the script's own header as its usage.
+    run_hc help "$root/mi-on" --help
+    check 0 "$rc" "--help exits 0"
+    want_ok "usage shows the sudo form" grep -q "sudo scripts/install-host-classifier.sh" "$OUT"
+    want_ok "usage shows the unprivileged --check" grep -q -- "--check" "$OUT"
+    want_ok "usage shows the unprivileged --print-ruleset" grep -q -- "--print-ruleset" "$OUT"
+    want_ok "usage shows the --pid step" grep -q -- "--pid PID" "$OUT"
+    want_ok "usage shows the ct-mark mask override" grep -q -- "--ct-mark-mask" "$OUT"
+
+    # --- Without the rehearsal seam the script demands root, like the other
+    # privileged loaders; nothing is created either way.
+    OUT="$root/hc.rootcheck"
+    set +e
+    env -i PATH="/usr/bin:/bin" bash "$hc" --root "$tree" --user "$me" </dev/null >"$OUT" 2>&1
+    rc=$?
+    set -e
+    want_err "an unprivileged real-host run creates nothing" test -e "$tree"
+    if [ "$(id -u)" -eq 0 ]; then
+        ok "root check skipped: this harness already runs as root"
+    else
+        check 1 "$rc" "an unprivileged real-host run dies"
+        want_ok "the refusal asks for sudo" grep -q "must run as root" "$OUT"
+    fi
+}
+
+# --- NET-048 / NET-050: Linux amd64 and arm64 releases ship the VM stack -----
+# The proof is the release components table itself: every Linux architecture
+# carries minvmd, the guest kernel, initramfs, rootfs image, and the switch.
+# Each architecture installs under the uname stub into its own home, then we
+# assert the files land on disk and are recorded.
+case_linux_vm_stack() {
+    _arch="$1"
+    case "$_arch" in
+        amd64) _uname_m=x86_64 ;;
+        arm64) _uname_m=arm64 ;;
+        *) bad "case_linux_vm_stack: unknown arch '$_arch'"; return ;;
+    esac
+
+    H_VM="$root/h_vm_$_arch"; mkdir -p "$H_VM"
+
+    # Manifest proof: the release component table must list every VM-stack
+    # part for linux/$_arch. If a row is missing the failure names the
+    # component and architecture.
+    for _comp in minvmd initramfs rootfs vmlinuz gvproxy-min; do
+        want_ok "manifest ships $_comp for linux/$_arch" \
+            manifest_has "$_comp" linux "$_arch"
+    done
+
+    PLAT_M="$_uname_m"
+    reset_dl
+    run "vm_${_arch}_install" "$H_VM"
+    PLAT_M=x86_64
+    check 0 "$rc" "$_arch install with VM stack exits 0"
+
+    # The installer must have placed every VM-stack component for this arch.
+    want_ok "$_arch minvmd installed and executable" test -x "$H_VM/bin/minvmd"
+    want_ok "$_arch initramfs installed to data" test -f "$H_VM/xdg-data/minimal/initramfs.cpio"
+    want_ok "$_arch rootfs installed to data" test -f "$H_VM/xdg-data/minimal/rootfs.img"
+    want_ok "$_arch vmlinuz installed to data" test -f "$H_VM/xdg-data/minimal/vmlinuz"
+    want_ok "$_arch switch binary installed and executable" test -x "$H_VM/bin/gvproxy-min"
+
+    # Each one appears in the install record so --uninstall can remove it.
+    _rec="$H_VM/xdg-state/minimal/installed"
+    for _comp in minvmd initramfs rootfs vmlinuz gvproxy-min; do
+        want_ok "$_arch install record lists $_comp" \
+            record_has_comp "$_comp" "$_rec"
+    done
+
+    # Observability: the installer output names every component it found.
+    for _comp in minvmd initramfs rootfs vmlinuz; do
+        want_ok "$_arch installer printed $_comp status" \
+            grep -qE "^  $_comp +(installed|current)" "$OUT"
+    done
+    want_ok "$_arch installer verified the switch binary" \
+        grep -qE "^  switch-binary +(verified|current)" "$OUT"
+}
+
+case_linux_amd64_manifest_ships_vm_stack() { case_linux_vm_stack amd64; }
+case_linux_arm64_manifest_ships_vm_stack() { case_linux_vm_stack arm64; }
+
+# --- NET-122: the answerer ships beside min on every platform, as the copy
+# source the session advisory's privileged step copies from. The installer
+# places it with the same rules as the other binaries and writes no unit or
+# plist naming the user-prefix path — the advisory's one privileged command is
+# the only thing that ever installs the answerer service.
+case_answerer_source_installed() {
+    # linux/amd64: beside min, executable, byte-exact, recorded.
+    H_A1="$root/h_ans_amd64"; mkdir -p "$H_A1"
+    run ans_amd64_install "$H_A1"
+    check 0 "$rc" "amd64 install with the answerer row exits 0"
+    want_ok "amd64: the answerer installs beside min" test -f "$H_A1/bin/min-answerer"
+    want_ok "amd64: beside the installed min itself" test -f "$H_A1/bin/min"
+    want_ok "amd64: the answerer is executable like every bin row" test -x "$H_A1/bin/min-answerer"
+    check "$h_answerer" "$(hash_file "$H_A1/bin/min-answerer")" \
+        "amd64: installed answerer matches the manifest hash"
+    want_ok "amd64: the installer printed the answerer status" \
+        grep -qE "^  min-answerer +(installed|current)" "$OUT"
+    _rec="$H_A1/xdg-state/minimal/installed"
+    want_ok "amd64: the answerer is recorded at its user-prefix path" \
+        record_has min-answerer "$H_A1/bin/min-answerer" "$_rec"
+    # The installed copy is only the copy source: no unit or plist was
+    # written, and no record row names a service-manager path or the
+    # root-owned program path.
+    # shellcheck disable=SC2016  # $1 is expanded by the inner sh, not here
+    want_err "no unit or plist file was written" \
+        sh -c 'find "$1" \( -name "*.plist" -o -name "*.service" -o -name "*.socket" \) -print | grep -q .' sh "$H_A1"
+    # shellcheck disable=SC2016  # $2 is awk's second field, not a shell parameter
+    want_ok "no record row names a unit, plist, or root-owned answerer path" \
+        awk '$2 ~ /(systemd|launchd|PrivilegedHelperTools|zone-answerer)/ {bad=1} END{exit bad ? 1 : 0}' "$_rec"
+
+    # An upgrade replaces it like the other binaries: a new release's answerer
+    # bytes alone re-download and land.
+    printf 'linux-amd64-answerer-body-v2\n' >"$mock/versions/v1/min-answerer-linux-amd64-v2"
+    h_answerer2="$(hash_file "$mock/versions/v1/min-answerer-linux-amd64-v2")"
+    awk -v h="$h_answerer2" \
+        '$1=="min-answerer" && $2=="linux" && $3=="amd64" {$5=h; $8="versions/v1/min-answerer-linux-amd64-v2"} {print}' \
+        "$root/good-components" >"$mock/versions/v1/components"
+    reset_dl
+    run ans_amd64_upgrade "$H_A1"
+    check 0 "$rc" "answerer upgrade install exits 0"
+    check 1 "$(downloads)" "a new manifest hash re-downloads the answerer alone"
+    check "$h_answerer2" "$(hash_file "$H_A1/bin/min-answerer")" \
+        "the upgraded answerer replaced the installed copy"
+    cp "$root/good-components" "$mock/versions/v1/components"   # restore
+
+    # linux/arm64: its own row and bytes.
+    PLAT_M=arm64
+    H_A2="$root/h_ans_arm64"; mkdir -p "$H_A2"
+    run ans_arm64_install "$H_A2"
+    check 0 "$rc" "arm64 install with the answerer row exits 0"
+    check "$h_answerer_arm" "$(hash_file "$H_A2/bin/min-answerer")" \
+        "arm64: the answerer installs beside min"
+    PLAT_M=x86_64
+
+    # darwin/arm64: beside min, dequarantined like every other bin row,
+    # recorded at the user prefix.
+    PLAT_S=Darwin; PLAT_M=arm64
+    : >"$root/xattr.calls"
+    H_A3="$root/h_ans_darwin"; mkdir -p "$H_A3"
+    run ans_darwin_install "$H_A3"
+    check 0 "$rc" "darwin install with the answerer row exits 0"
+    want_ok "darwin: the answerer installs beside min" test -f "$H_A3/bin/min-answerer"
+    want_ok "darwin: quarantine stripped from the answerer bin (xattr)" \
+        grep -q "/bin/min-answerer\.tmp" "$root/xattr.calls"
+    want_ok "darwin: the answerer is recorded at its user-prefix path" \
+        record_has min-answerer "$H_A3/bin/min-answerer" "$H_A3/xdg-state/minimal/installed"
+    PLAT_S=Linux; PLAT_M=x86_64
+}
+
 # --- Case dispatch -----------------------------------------------------------
 # Every scenario group above is one named case. No argument runs them all, in
 # the order the linear script used to have; one argument runs exactly that
@@ -1437,6 +2153,10 @@ case_for() {
         uninstall)                          case_uninstall ;;
         gvproxy_rename_migration)           case_gvproxy_rename_migration ;;
         installer_switch_binary_executable) case_installer_switch_binary_executable ;;
+        host_classifier_tree_installed)  case_host_classifier_tree_installed ;;
+        answerer_source_installed)      case_answerer_source_installed ;;
+        linux_amd64_manifest_ships_vm_stack) case_linux_amd64_manifest_ships_vm_stack ;;
+        linux_arm64_manifest_ships_vm_stack) case_linux_arm64_manifest_ships_vm_stack ;;
         *)
             echo "install_test: unknown case '$1' (known cases listed in the dispatch)" >&2
             exit 2
@@ -1448,7 +2168,9 @@ case "${1:-}" in
         for _c in install apparmor apparmor_uninstall checksum_mismatch \
             target_validation prefix_resolution install_record daemon_stop \
             shell_integration darwin_dequarantine uninstall \
-            gvproxy_rename_migration installer_switch_binary_executable; do
+            gvproxy_rename_migration installer_switch_binary_executable \
+            host_classifier_tree_installed answerer_source_installed \
+            linux_amd64_manifest_ships_vm_stack linux_arm64_manifest_ships_vm_stack; do
             case_for "$_c"
         done
         ;;

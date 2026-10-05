@@ -34,7 +34,7 @@ pub use mfile_search_strategy::MFileSearchStrategy;
 mod project_setup;
 pub use project_setup::ProjectSetup;
 
-pub use env::{Env, PatchHome, interpolate_task_strings};
+pub use env::{Env, PatchHome, WdLayout, interpolate_task_strings};
 use tokio::sync::Semaphore;
 use toml_edit::{Array, DocumentMut, Item, TableLike, Value};
 
@@ -73,11 +73,73 @@ pub trait PackageSelection {
                 .unwrap()
                 .map(|n| match g.by_name(n) {
                     Some(bsr) => Ok(*bsr),
-                    None => Err(Error::Other(anyhow!("No such package: {}", n))),
+                    None => Err(Error::Other(anyhow!(package_not_found_message(g, n)))),
                 })
                 .collect::<Result<_, _>>()
         }
     }
+}
+
+/// Builds the `No such package` error message, suggesting close package
+/// names when any exist.
+fn package_not_found_message(g: &Graph, input: &str) -> String {
+    let suggestions = package_suggestions(g, input);
+    // Show the name the suggestions were computed from, not stray padding.
+    let input = input.trim();
+    if suggestions.is_empty() {
+        format!(
+            "No such package: {} (try 'min package search {}')",
+            input, input
+        )
+    } else {
+        format!(
+            "No such package: {} (did you mean: {}?)",
+            input,
+            suggestions.join(", ")
+        )
+    }
+}
+
+/// Collects up to three package names close to `input`, preferring names
+/// that share a prefix with the input before fuzzier matches.
+fn package_suggestions(g: &Graph, input: &str) -> Vec<String> {
+    use common::fuzzy_search::fuzzy_match;
+
+    let input = input.trim().to_lowercase();
+    // An empty name is a prefix of every package, so it has no close match.
+    if input.is_empty() {
+        return Vec::new();
+    }
+    let mut exact: Vec<&str> = Vec::new();
+    let mut prefix_of_input: Vec<&str> = Vec::new();
+    let mut input_prefix_of: Vec<&str> = Vec::new();
+    let mut fuzzy: Vec<(&str, common::fuzzy_search::SearchMatch)> = Vec::new();
+
+    for name in g.names() {
+        let lower = name.to_lowercase();
+        if lower == input {
+            exact.push(name);
+        } else if input.starts_with(&lower) {
+            prefix_of_input.push(name);
+        } else if lower.starts_with(&input) {
+            input_prefix_of.push(name);
+        } else if let Some(m) = fuzzy_match(&input, name) {
+            fuzzy.push((name, m));
+        }
+    }
+
+    exact.sort_unstable();
+    prefix_of_input.sort_by_key(|n| (n.len(), *n));
+    input_prefix_of.sort_by_key(|n| (n.len(), *n));
+    fuzzy.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+
+    let mut candidates: Vec<String> = Vec::with_capacity(3);
+    candidates.extend(exact.into_iter().map(str::to_string));
+    candidates.extend(prefix_of_input.into_iter().map(str::to_string));
+    candidates.extend(input_prefix_of.into_iter().map(str::to_string));
+    candidates.extend(fuzzy.into_iter().map(|(n, _)| n.to_string()));
+    candidates.truncate(3);
+    candidates
 }
 
 impl PackageSelection for Vec<String> {
@@ -894,6 +956,7 @@ impl Context {
             packages,
             std::sync::Arc::new(sandbox2::HostNet),
             home,
+            WdLayout::BoundDir,
         )
         .await
     }
@@ -907,6 +970,11 @@ impl Context {
     /// `home` is the directory `~/`-rooted patch paths expand against; see
     /// [`PatchHome`] for why every caller states it rather than letting
     /// the conversion read the ambient one.
+    ///
+    /// `wd_layout` chooses how the sandbox's working directory is laid out;
+    /// see [`WdLayout`]. Callers that run a task inside a session pass
+    /// [`WdLayout::Session`] so the task sees `/workbench` and `/home` rather
+    /// than the daemon's internal tree.
     // Left positional: public library API; `make_env` already forwards here, so
     // a struct would only relocate the same argument list.
     #[allow(clippy::too_many_arguments)]
@@ -921,6 +989,7 @@ impl Context {
         packages: S,
         network: std::sync::Arc<dyn sandbox2::Network>,
         home: PatchHome,
+        wd_layout: WdLayout,
     ) -> Result<env::Env<'a>, Error> {
         let mfile = self.minimal_file();
 
@@ -995,6 +1064,7 @@ impl Context {
                 state_base_dir,
                 transitives: transitive_deps,
                 cwd: wd,
+                wd_layout,
                 patches,
                 home,
                 env_vars,
@@ -1148,7 +1218,7 @@ impl Context {
         match mode {
             AddDepMode::BuildPackages => {
                 if let Some(h) = doc["stack"].as_table_mut() {
-                    did_edit |= upsert_toml_packages_list(h, "build_packages", &resolved);
+                    did_edit |= upsert_toml_packages_list(h, "build_packages", &resolved)?;
                     println!("Added {} to stack.build_packages", resolved.join(", "));
                 } else {
                     return Err(Error::Other(anyhow!(
@@ -1158,7 +1228,7 @@ impl Context {
             }
             AddDepMode::RuntimePackages => {
                 if let Some(h) = doc["stack"].as_table_mut() {
-                    did_edit |= upsert_toml_packages_list(h, "runtime_packages", &resolved);
+                    did_edit |= upsert_toml_packages_list(h, "runtime_packages", &resolved)?;
                     println!("Added {} to stack.runtime_packages", resolved.join(", "));
                 } else {
                     return Err(Error::Other(anyhow!(
@@ -1171,7 +1241,7 @@ impl Context {
                     && let Some(t) = tasks.get_mut(&name)
                     && let Some(t) = t.as_table_mut()
                 {
-                    did_edit |= upsert_toml_packages_list(t, "packages", &resolved);
+                    did_edit |= upsert_toml_packages_list(t, "packages", &resolved)?;
                     println!("Added {} to tasks.{}.packages", resolved.join(", "), name);
                 } else {
                     return Err(Error::Other(anyhow!(
@@ -1182,7 +1252,7 @@ impl Context {
             }
             AddDepMode::SessionPackages => {
                 if let Some(h) = doc["session"].as_table_mut() {
-                    did_edit |= upsert_toml_packages_list(h, "packages", &resolved);
+                    did_edit |= upsert_toml_packages_list(h, "packages", &resolved)?;
                 } else {
                     doc.insert(
                         "session",
@@ -1218,28 +1288,94 @@ pub enum AddDepMode {
     SessionPackages,
 }
 
-fn upsert_toml_packages_list<T: TableLike>(t: &mut T, key: &str, upsert: &[String]) -> bool {
+fn upsert_toml_packages_list<T: TableLike>(
+    t: &mut T,
+    key: &str,
+    upsert: &[String],
+) -> Result<bool, Error> {
     if let Some(bp) = t.get_mut(key) {
-        let mut existing: Vec<_> = bp
-            .as_array()
-            .unwrap()
+        let arr = bp.as_array_mut().ok_or_else(|| {
+            Error::Other(anyhow!(
+                "`{key}` in minimal.toml must be an array of package names"
+            ))
+        })?;
+
+        let mut existing: Vec<String> = arr
             .iter()
-            .map(|i| i.as_str().unwrap())
-            .collect();
+            .map(|i| {
+                i.as_str().map(str::to_owned).ok_or_else(|| {
+                    Error::Other(anyhow!(
+                        "`{key}` in minimal.toml must be an array of package names"
+                    ))
+                })
+            })
+            .collect::<Result<_, _>>()?;
+
+        // For multi-line arrays, copy the last element's prefix decor so pushed
+        // elements land on their own line with matching indentation.
+        let last_prefix = arr
+            .iter()
+            .last()
+            .and_then(|v| v.decor().prefix())
+            .and_then(|p| p.as_str())
+            .and_then(|s| s.rfind('\n').map(|i| s[i..].to_owned()));
 
         let mut did_edit = false;
-        upsert.iter().for_each(|p| {
-            if !existing.contains(&p.as_str()) {
-                existing.push(p);
+        for p in upsert {
+            if !existing.iter().any(|e| e == p) {
+                let mut value = Value::from(p.as_str());
+                if let Some(prefix) = &last_prefix {
+                    let carried = if did_edit {
+                        String::new()
+                    } else {
+                        detach_array_close(arr)
+                    };
+                    value.decor_mut().set_prefix(carried + prefix);
+                }
+                arr.push(value);
+                existing.push(p.clone());
                 did_edit = true;
             }
-        });
-        *bp = Item::Value(Value::Array(Array::from_iter(existing)));
-        did_edit
+        }
+        Ok(did_edit)
     } else {
         t.insert(key, Item::Value(Value::Array(Array::from_iter(upsert))));
-        true
+        Ok(true)
     }
+}
+
+/// Prepares a multi-line array for appending after its last element.
+///
+/// Whatever follows the last element up to its final line break, such as a
+/// same-line comment, is cut out and returned so the caller can put it ahead of
+/// the appended element and keep it on the old last element's line. The final
+/// line break and anything after it become the array's trailing text, so the
+/// appended element closes the array the same way the old last element did.
+/// Without a trailing comma that text sits in the last element's suffix,
+/// otherwise in the array's trailing.
+fn detach_array_close(arr: &mut Array) -> String {
+    let trailing = arr.trailing().as_str().unwrap_or_default().to_owned();
+    let suffix = arr
+        .iter()
+        .last()
+        .and_then(|v| v.decor().suffix())
+        .and_then(|s| s.as_str())
+        .filter(|s| s.contains('\n'))
+        .map(str::to_owned);
+    let (tail, rest) = match suffix {
+        Some(suffix) => {
+            if let Some(last) = arr.iter_mut().last() {
+                last.decor_mut().set_suffix("");
+            }
+            (suffix, trailing)
+        }
+        None => (trailing, String::new()),
+    };
+    let Some(i) = tail.rfind('\n') else {
+        return String::new();
+    };
+    arr.set_trailing(format!("{}{rest}", &tail[i..]));
+    tail[..i].trim_end().to_owned()
 }
 
 #[cfg(test)]
@@ -1617,6 +1753,139 @@ mod tests {
     }
 
     #[test]
+    fn upsert_packages_preserves_multiline_layout() {
+        let mut doc = indoc! {r#"
+            packages = [
+              "base", # essential
+              "vim",
+              "git",
+            ]
+        "#}
+        .parse::<DocumentMut>()
+        .unwrap();
+
+        assert!(
+            upsert_toml_packages_list(doc.as_table_mut(), "packages", &["python".to_string()])
+                .unwrap()
+        );
+
+        assert_eq!(
+            doc.to_string(),
+            indoc! {r#"
+                packages = [
+                  "base", # essential
+                  "vim",
+                  "git",
+                  "python",
+                ]
+            "#}
+        );
+    }
+
+    #[test]
+    fn upsert_packages_keeps_last_element_comment_in_place() {
+        let mut doc = indoc! {r#"
+            packages = [
+              "base",
+              "git", # pinned
+            ]
+        "#}
+        .parse::<DocumentMut>()
+        .unwrap();
+
+        assert!(
+            upsert_toml_packages_list(
+                doc.as_table_mut(),
+                "packages",
+                &["python".to_string(), "vim".to_string()]
+            )
+            .unwrap()
+        );
+
+        assert_eq!(
+            doc.to_string(),
+            indoc! {r#"
+                packages = [
+                  "base",
+                  "git", # pinned
+                  "python",
+                  "vim",
+                ]
+            "#}
+        );
+    }
+
+    #[test]
+    fn upsert_packages_without_trailing_comma() {
+        let mut doc = indoc! {r#"
+            packages = [
+              "base",
+              "git"
+            ]
+            tools = [
+              "base",
+              "git" # pinned
+            ]
+        "#}
+        .parse::<DocumentMut>()
+        .unwrap();
+
+        for key in ["packages", "tools"] {
+            assert!(
+                upsert_toml_packages_list(doc.as_table_mut(), key, &["python".to_string()])
+                    .unwrap()
+            );
+        }
+
+        assert_eq!(
+            doc.to_string(),
+            indoc! {r#"
+                packages = [
+                  "base",
+                  "git",
+                  "python"
+                ]
+                tools = [
+                  "base",
+                  "git", # pinned
+                  "python"
+                ]
+            "#}
+        );
+    }
+
+    #[test]
+    fn upsert_packages_keeps_single_line() {
+        let mut doc = "packages = [\"base\", \"vim\"]\n"
+            .parse::<DocumentMut>()
+            .unwrap();
+
+        assert!(
+            upsert_toml_packages_list(doc.as_table_mut(), "packages", &["python".to_string()])
+                .unwrap()
+        );
+
+        assert_eq!(
+            doc.to_string(),
+            "packages = [\"base\", \"vim\", \"python\"]\n"
+        );
+    }
+
+    #[test]
+    fn upsert_packages_errors_on_non_array() {
+        let mut doc = "packages = \"base\"\n".parse::<DocumentMut>().unwrap();
+
+        let err =
+            upsert_toml_packages_list(doc.as_table_mut(), "packages", &["python".to_string()])
+                .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "`packages` in minimal.toml must be an array of package names"
+        );
+    }
+
+    #[test]
     #[ignore] // Do not run in github- does not support nested namespaces
     fn task_resolve_string_interpolation() {
         let (cache, state) = (tempdir().unwrap(), tempdir().unwrap());
@@ -1687,5 +1956,91 @@ mod tests {
                 },]
             );
         });
+    }
+
+    /// Builds a small graph containing the named packages for the
+    /// package-not-found suggestion tests.
+    fn suggestion_graph(names: &[&str]) -> Graph {
+        let mut opts = decode::LoadOptions::for_test();
+        opts.minimal_lib_path = std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
+            .join("../stdlib/minimal-ncl");
+
+        let specs = names
+            .iter()
+            .map(|n| format!("({{ name = \"{n}\", build_deps = [], cmd = \"\" }} | BuildSpec)"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let layer = decode::Layer::new_for_test_with(
+            format!("let {{BuildSpec, ..}} = import \"minimal.ncl\" in [{specs}]"),
+            &opts,
+        )
+        .unwrap_or_else(|e| {
+            e.report_to_stderr();
+            panic!("spec parsing failed");
+        });
+
+        Graph::new().ingest(layer).unwrap()
+    }
+
+    #[test]
+    fn package_not_found_suggests_prefix_of_input() {
+        let graph = suggestion_graph(&["node", "python"]);
+        let err = vec!["nodejs".to_string()].as_bsrs(&graph).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "No such package: nodejs (did you mean: node?)"
+        );
+    }
+
+    #[test]
+    fn empty_package_name_gets_no_suggestions() {
+        let graph = suggestion_graph(&["node", "python"]);
+        assert!(package_suggestions(&graph, "").is_empty());
+        assert!(package_suggestions(&graph, "  ").is_empty());
+    }
+
+    #[test]
+    fn package_not_found_suggests_fuzzy_match() {
+        let graph = suggestion_graph(&["node", "python"]);
+        let err = vec!["pyhton".to_string()].as_bsrs(&graph).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "No such package: pyhton (did you mean: python?)"
+        );
+    }
+
+    #[test]
+    fn package_not_found_without_candidates_suggests_search() {
+        let graph = suggestion_graph(&["node", "python"]);
+        let err = vec!["zzzz".to_string()].as_bsrs(&graph).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "No such package: zzzz (try 'min package search zzzz')"
+        );
+    }
+
+    #[test]
+    fn package_not_found_suggests_case_insensitive_match() {
+        let graph = suggestion_graph(&["Python"]);
+        let err = vec!["python".to_string()].as_bsrs(&graph).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "No such package: python (did you mean: Python?)"
+        );
+    }
+
+    #[test]
+    fn package_not_found_suggests_exact_name_for_other_case() {
+        let graph = suggestion_graph(&["node", "nodejs", "python"]);
+        for input in ["NODE", "Node", "node "] {
+            let err = vec![input.to_string()].as_bsrs(&graph).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "No such package: {} (did you mean: node, nodejs?)",
+                    input.trim()
+                )
+            );
+        }
     }
 }

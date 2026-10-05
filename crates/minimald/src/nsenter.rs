@@ -246,9 +246,25 @@ pub enum NsenterError {
         source: nix::Error,
     },
 
-    /// The injected program could not be started. `ENOMEM` from the fork means
-    /// the sandbox's PID namespace has no live init left to reparent to — the
-    /// session shell exited while we were joining.
+    /// The shim could not move itself into a deny-all box's classifier leaf
+    /// before joining its namespaces. The join is the one write that must
+    /// precede `setns` (see [`shim_main`]), and for a deny-all box it is also
+    /// the one placement a verdict cannot survive failing: a process left
+    /// outside the leaf runs where nothing refuses its connections, so the
+    /// injected run stops rather than silently run unenforced. For any other
+    /// leaf the same failure is advisory (NET-079's exception) and never
+    /// yields this error.
+    #[error("joining the deny-all box's classifier leaf {}", leaf.display())]
+    JoinDenyLeaf {
+        leaf: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// The injected program could not be started for a reason a shell would
+    /// not report as its own (those are exit codes 127/126). `ENOMEM` from the
+    /// fork means the sandbox's PID namespace has no live init left to
+    /// reparent to — the session shell exited while we were joining.
     #[error("spawning {program:?} inside the session")]
     Spawn {
         program: PathBuf,
@@ -349,6 +365,9 @@ pub struct Injection {
     env: Option<BTreeMap<String, String>>,
     shim_exe: Option<PathBuf>,
     seal_none_box: bool,
+    /// The box's classifier leaf (NET-079), joined before the namespaces.
+    /// `None` on a host that places no box.
+    leaf: Option<sandbox2::config::ClassifierLeaf>,
 }
 
 impl Injection {
@@ -369,6 +388,7 @@ impl Injection {
             env: None,
             shim_exe: None,
             seal_none_box: false,
+            leaf: None,
         }
     }
 
@@ -404,9 +424,37 @@ impl Injection {
     }
 
     /// Mark this injection as entering a none box, so the shim reinstalls the
-    /// socket-family seccomp filter after joining the namespaces.
+    /// none plan's full socket-family seal — every family but the ones the
+    /// box's own network namespace confines (`AF_UNIX`, `AF_INET`,
+    /// `AF_INET6`, `AF_NETLINK`) — after joining the namespaces.  That seal
+    /// applies only when the injection joins the box's own network namespace;
+    /// one that does not falls back to `AF_UNIX` alone
+    /// ([`injection_socket_filter`]).
+    ///
+    /// Every injection is sealed: without this marker the shim reinstalls the
+    /// confined-families seal, the one every networked box launches under,
+    /// which admits the families the box's own network namespace confines
+    /// and refuses the rest.  Either way the filter installed at launch is
+    /// inherited by children of the filtered process only, and an injected
+    /// process joins the namespaces later.
     pub fn seal_none_box(mut self) -> Self {
         self.seal_none_box = true;
+        self
+    }
+
+    /// Joins the box's classifier leaf before joining its namespaces.
+    ///
+    /// The leaf is the cgroup the box's egress verdict is decided on, and the
+    /// one the injected process must share with the box it joins. The join is
+    /// the shim's own — and it happens *before* `setns`, the only place it
+    /// can: the box's cgroup namespace is rooted at its own leaf, and from
+    /// inside it that root is not writable — with `nsdelegate` mounted the
+    /// root's `cgroup.procs` is a delegation boundary, and the empty tmpfs
+    /// the box mounts over the tree it joined through leaves no path to
+    /// write a migration to at all. Writing the shim's pid from the daemon's
+    /// namespaces puts it, and the program it forks, in the leaf.
+    pub fn with_classifier_leaf(mut self, leaf: sandbox2::config::ClassifierLeaf) -> Self {
+        self.leaf = Some(leaf);
         self
     }
 
@@ -461,6 +509,21 @@ impl Injection {
         if self.seal_none_box {
             cmd.arg("--seal-none-box");
         }
+        if let Some(leaf) = &self.leaf {
+            cmd.arg("--classifier-leaf").arg(leaf.dir());
+        }
+        // One debug line per injection naming the seal the joined process will
+        // run under (observability). Resolved through the filters rather than
+        // restated here, so the log names exactly what the shim installs; the
+        // shim itself has no tracing subscriber — it is the daemon re-exec'd
+        // before its runtime is built.
+        let seal = injection_socket_filter(self.seal_none_box, &namespaces).seal;
+        tracing::debug!(
+            leader_pid = self.leader_pid,
+            program = %self.program.to_string_lossy(),
+            socket_seal = %seal,
+            "nsenter injection: joining the box under its socket-family seal"
+        );
         if let Some(env) = self.env {
             // The shim needs nothing from the daemon's environment — it holds
             // its pidfd on a descriptor and everything else in argv — so this
@@ -521,11 +584,24 @@ pub struct ShimArgs {
     chdir: Option<PathBuf>,
 
     /// When present, the target session is a none box and the shim must
-    /// re-install its socket-family seccomp filter after joining the namespaces.
-    /// The filter is inherited by children of the filtered process, but an
-    /// injected process joins the namespaces later and must load it itself.
+    /// re-install its full socket-family seal after joining the namespaces —
+    /// unix, inet, inet6 and netlink admitted when the join enters the box's
+    /// own network namespace, `AF_UNIX` alone when it does not. When absent the shim re-installs the
+    /// confined-families seal, the one every other box launches under, which
+    /// admits the families the box's namespace confines and refuses the
+    /// rest.  Either way the filter is inherited by children of the filtered
+    /// process, but an injected process joins the namespaces later and must
+    /// load it itself.
     #[arg(long)]
     seal_none_box: bool,
+
+    /// The classifier leaf of the box being joined, so the shim can move
+    /// itself into it **before** `setns` — the write has to happen from the
+    /// daemon's namespaces, where the leaf is reachable; see
+    /// [`Injection::with_classifier_leaf`]. Absent on a host that places no
+    /// box, whose injections join nothing but the namespaces.
+    #[arg(long)]
+    classifier_leaf: Option<PathBuf>,
 
     /// The program to run inside the session, followed by its arguments.
     #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
@@ -546,14 +622,61 @@ pub struct ShimArgs {
 ///
 /// # Errors
 ///
-/// [`NsenterError::Setns`] if the namespaces cannot be joined, and
-/// [`NsenterError::Spawn`] if the program cannot be started inside them.
+/// [`NsenterError::JoinDenyLeaf`] if the box is deny-all and its classifier
+/// leaf cannot be joined, [`NsenterError::Setns`] if the namespaces cannot be
+/// joined, [`NsenterError::Spawn`] if the program cannot be started for a
+/// reason a shell would not report, and [`NsenterError::Wait`] if the started
+/// program cannot be reaped. A program that is missing, not executable, or not
+/// an executable format is reported on stderr and returned as the shell's exit
+/// code (127/126) rather than as an error.
 pub fn shim_main(args: ShimArgs) -> Result<i32, NsenterError> {
     // SAFETY: `command_in_session` placed a pidfd on this descriptor and it
     // survived the exec; nothing else in this freshly-exec'd process owns it.
     // A wrong `--pidfd` yields a closed or unrelated descriptor, which fails
     // `setns` with EBADF/EINVAL rather than doing damage.
     let pidfd = unsafe { OwnedFd::from_raw_fd(args.pidfd) };
+
+    // NET-079: join the box's classifier leaf before its namespaces. This is
+    // the one write that has to happen *before* `setns`: the box's cgroup
+    // namespace is rooted at its own leaf, and from inside it that root is
+    // not writable — with `nsdelegate` mounted the root's `cgroup.procs` is
+    // a delegation boundary, and the empty tmpfs the box mounts over the
+    // tree it joined through leaves no path to write a migration to. Writing
+    // our pid here, from the daemon's own namespaces, moves this shim into
+    // the leaf, and the program forked below inherits it with everything
+    // else.
+    //
+    // Fatal for a deny leaf, advisory for any other: a process that stays
+    // out of a deny-all box's leaf is a process of a box whose declaration
+    // admits nothing running where nothing refuses its connections — the
+    // one placement failure a verdict cannot survive, so the injected run
+    // stops rather than silently run unenforced. Any other leaf is the
+    // cohort's identity alone, and a host that cannot place an injected
+    // process does not refuse it on that ground (NET-079's exception): it
+    // runs in the daemon's leaf instead, and the box's own processes are
+    // placed either way. This shim has no logger (it runs before any
+    // runtime is built), so the failure goes to the inherited stderr, which
+    // is the daemon's.
+    if let Some(leaf) = &args.classifier_leaf {
+        let leaf = sandbox2::config::ClassifierLeaf::new(leaf);
+        if let Err(source) = sandbox2::classifier::place_pid(&leaf.procs(), std::process::id()) {
+            if leaf.is_deny() {
+                eprintln!(
+                    "minimald: joining the deny-all box's classifier leaf {}: {source}",
+                    leaf.dir().display()
+                );
+                return Err(NsenterError::JoinDenyLeaf {
+                    leaf: leaf.dir().to_path_buf(),
+                    source,
+                });
+            }
+            eprintln!(
+                "minimald: joining the session's classifier leaf {}: {source}",
+                leaf.dir().display()
+            );
+        }
+    }
+
     if !args.join.is_empty() {
         // One call for the whole set: the kernel installs the user namespace
         // first and validates the rest against the credentials that gives us,
@@ -590,10 +713,11 @@ pub fn shim_main(args: ShimArgs) -> Result<i32, NsenterError> {
 
     // Resolved here, before the fork: building the filter allocates, and the
     // first `OnceLock` access is what builds it. Only the `&'static` result
-    // crosses into the child.
-    let none_box_filter = args
-        .seal_none_box
-        .then(sandbox2::socket_family_filter_for_none_box);
+    // crosses into the child. Every injection is sealed — the none box's
+    // full seal (unix-only unless the join entered the box's own network
+    // namespace), or the confined-families seal every other box launches
+    // under.
+    let socket_family_filter = injection_socket_filter(args.seal_none_box, &args.join);
 
     // SAFETY: the closures run in the forked child between `fork` and `exec`,
     // where only async-signal-safe calls are legal. `prctl` and the raw
@@ -637,25 +761,38 @@ pub fn shim_main(args: ShimArgs) -> Result<i32, NsenterError> {
             sandbox2::assume_box_credentials()
         });
 
-        if let Some(filter) = none_box_filter {
-            cmd.pre_exec(move || {
-                // Re-install the none-box socket-family filter.  The filter
-                // installed at sandbox launch is inherited by children of the
-                // filtered process, but this injected process joins the
-                // namespaces later and must load it itself.
-                // SAFETY: `filter` is a `&'static` owned by the process-wide
-                // OnceLock, valid and immutable for the program's lifetime.
-                sandbox2::install_socket_family_filter(filter)?;
-                Ok(())
-            });
-        }
+        cmd.pre_exec(move || {
+            // Re-install the box's socket-family seal — the none box's full
+            // seal, or the confined-families seal every other box launches
+            // under.  The filter installed at sandbox launch is inherited by
+            // children of the filtered process, but this injected process
+            // joins the namespaces later and must load it itself.
+            // SAFETY: `filter` is a `&'static` owned by the process-wide
+            // OnceLock, valid and immutable for the program's lifetime.
+            sandbox2::install_socket_family_filter(socket_family_filter)?;
+            Ok(())
+        });
     }
 
     let program = PathBuf::from(program);
-    let mut child = cmd.spawn().map_err(|source| NsenterError::Spawn {
-        program: program.clone(),
-        source,
-    })?;
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(source) => {
+            // The child's `chdir` fails with the same `ENOENT` as a missing
+            // program; a missing working directory is not "command not found".
+            let chdir_missing = spawn_failed_on_missing_chdir(&source, args.chdir.as_deref());
+            let mapped = if chdir_missing {
+                None
+            } else {
+                spawn_failure_code_and_message(&source)
+            };
+            let Some((code, msg)) = mapped else {
+                return Err(NsenterError::Spawn { program, source });
+            };
+            eprintln!("{program}: {msg}", program = program.display());
+            return Ok(code);
+        }
+    };
     let status = child.wait().map_err(|source| NsenterError::Wait {
         program: program.clone(),
         source,
@@ -669,9 +806,129 @@ pub fn shim_main(args: ShimArgs) -> Result<i32, NsenterError> {
         .unwrap_or(1))
 }
 
+/// Maps a failed `spawn` to the shell's exit-code and message conventions:
+/// `ENOENT` is "command not found" (127), `EACCES` is "permission denied"
+/// (126), and `ENOEXEC` is "cannot execute" (126). Any other failure — a
+/// fork's `ENOMEM`, or an `EPERM` from a `pre_exec` hook, included — is not the
+/// program's to report, so it is `None` and stays a [`NsenterError::Spawn`].
+/// `EACCES` is matched by errno rather than [`std::io::ErrorKind::PermissionDenied`],
+/// which also covers `EPERM`.
+///
+/// The message is the plain text a shell would print, without the debug
+/// wrapper `main` adds to [`NsenterError`] — a script must be able to tell
+/// "not found" from the command's own failure.
+fn spawn_failure_code_and_message(source: &std::io::Error) -> Option<(i32, String)> {
+    match source.raw_os_error()? {
+        libc::ENOENT => Some((127, "command not found".to_string())),
+        libc::EACCES => Some((126, "permission denied".to_string())),
+        libc::ENOEXEC => Some((126, format!("cannot execute: {source}"))),
+        _ => None,
+    }
+}
+
+/// Whether a failed `spawn` is the child's `chdir` failing on a missing
+/// working directory rather than the program itself being missing. Only
+/// `ENOENT` is ambiguous between the two — `EACCES` and `ENOEXEC` are the
+/// program's own failure whichever syscall raised them, so they map
+/// unconditionally and never route through this discriminator.
+fn spawn_failed_on_missing_chdir(source: &std::io::Error, chdir: Option<&Path>) -> bool {
+    source.raw_os_error() == Some(libc::ENOENT) && chdir.is_some_and(|dir| !dir.is_dir())
+}
+
+/// The socket-family filter an injected process installs after joining a
+/// box.  A none box's relaxed seal admits inet and netlink only because the
+/// box's own network namespace confines them, so it applies only when the
+/// join enters that namespace (`join` names `Net`); an injection that stays
+/// in the daemon's namespace gets the unix-only seal instead, fail closed
+/// ([`sandbox2::SocketSeal::in_netns`]).
+fn injection_socket_filter(
+    seal_none_box: bool,
+    join: &[Namespace],
+) -> &'static sandbox2::SocketFamilyFilter {
+    if seal_none_box {
+        let joins_box_netns = join.contains(&Namespace::Net);
+        sandbox2::socket_family_filter_for_seal(
+            sandbox2::SocketSeal::Full.in_netns(joins_box_netns),
+        )
+    } else {
+        sandbox2::socket_family_filter_for_confined_families()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A failed spawn maps to the shell's exit-code and message conventions:
+    /// `ENOENT` is "command not found" (127), `EACCES` is "permission denied"
+    /// (126), and `ENOEXEC` is "cannot execute" (126). Anything else, such as
+    /// the fork's `ENOMEM` or a `pre_exec` hook's `EPERM`, is left to
+    /// [`NsenterError::Spawn`].
+    #[test]
+    fn spawn_failures_map_to_shell_exit_codes_and_messages() {
+        let not_found = std::io::Error::from_raw_os_error(libc::ENOENT);
+        let (code, msg) = spawn_failure_code_and_message(&not_found).unwrap();
+        assert_eq!(code, 127);
+        assert_eq!(msg, "command not found");
+
+        let denied = std::io::Error::from_raw_os_error(libc::EACCES);
+        let (code, msg) = spawn_failure_code_and_message(&denied).unwrap();
+        assert_eq!(code, 126);
+        assert_eq!(msg, "permission denied");
+
+        let no_exec = std::io::Error::from_raw_os_error(libc::ENOEXEC);
+        let (code, msg) = spawn_failure_code_and_message(&no_exec).unwrap();
+        assert_eq!(code, 126);
+        assert!(msg.starts_with("cannot execute: "), "got {msg:?}");
+
+        let fork_failed = std::io::Error::from_raw_os_error(libc::ENOMEM);
+        assert_eq!(spawn_failure_code_and_message(&fork_failed), None);
+
+        let hook_refused = std::io::Error::from_raw_os_error(libc::EPERM);
+        assert_eq!(spawn_failure_code_and_message(&hook_refused), None);
+    }
+
+    /// Only `ENOENT` is ambiguous between a missing program and a missing
+    /// working directory. An `EACCES` from `chdir` (an inaccessible cwd) is
+    /// the program's own failure and must not be swallowed by the
+    /// missing-chdir discriminator, so it still maps to 126.
+    #[test]
+    fn missing_chdir_discriminator_only_swallows_enoent() {
+        let missing = std::io::Error::from_raw_os_error(libc::ENOENT);
+        let denied = std::io::Error::from_raw_os_error(libc::EACCES);
+        let no_exec = std::io::Error::from_raw_os_error(libc::ENOEXEC);
+        let chdir = Some(Path::new("/definitely/not/here"));
+
+        assert!(spawn_failed_on_missing_chdir(&missing, chdir));
+        assert!(!spawn_failed_on_missing_chdir(&missing, None));
+        assert!(!spawn_failed_on_missing_chdir(&denied, chdir));
+        assert!(!spawn_failed_on_missing_chdir(&no_exec, chdir));
+    }
+
+    /// The fail-closed gate on the injection path: a none-box injection
+    /// gets the relaxed none seal only when it joins the box's network
+    /// namespace, and the unix-only seal when the join set leaves `Net` out.
+    #[test]
+    fn none_injection_relaxes_only_when_joining_the_box_netns() {
+        use sandbox2::SocketSeal;
+        let with_net = [Namespace::User, Namespace::Mnt, Namespace::Net];
+        let without_net = [Namespace::User, Namespace::Mnt];
+        assert_eq!(
+            injection_socket_filter(true, &with_net).seal,
+            SocketSeal::Full
+        );
+        assert_eq!(
+            injection_socket_filter(true, &without_net).seal,
+            SocketSeal::UnixOnly,
+            "a none-box injection outside the box's netns must keep the unix-only seal"
+        );
+        for join in [&with_net[..], &without_net[..]] {
+            assert_eq!(
+                injection_socket_filter(false, join).seal,
+                SocketSeal::ConfinedFamilies
+            );
+        }
+    }
 
     /// A process whose only child is known: `sh` prints the PID of the
     /// background `sleep` it forked, so the expected answer arrives on stdout
@@ -693,6 +950,19 @@ mod tests {
             .expect("reading the child pid");
         let child_pid = out.trim().parse().expect("sh printed a pid");
         (sh, child_pid)
+    }
+
+    /// Every box unshares its own IPC namespace, so a process injected into a
+    /// box has to be able to join it: the joinable set includes IPC, and
+    /// [`namespaces_to_join`] picks it up wherever the box's differs from ours.
+    #[test]
+    fn the_ipc_namespace_is_one_an_injected_process_joins() {
+        assert!(
+            Namespace::ALL.contains(&Namespace::Ipc),
+            "an injected process must join its box's IPC namespace"
+        );
+        assert_eq!(Namespace::Ipc.proc_name(), "ipc");
+        assert_eq!(Namespace::Ipc.clone_flag(), CloneFlags::CLONE_NEWIPC);
     }
 
     #[test]
@@ -794,6 +1064,53 @@ mod tests {
         assert!(
             matches!(resolved, Err(NsenterError::NoSessionLeader { .. })),
             "expected NoSessionLeader, got {resolved:?}"
+        );
+    }
+
+    /// The leaf an injection joins travels on the shim's argv, so the one
+    /// process that can write it — the shim, before it joins the namespaces
+    /// — knows where to go. Opt-in: a host that places no box sends no flag,
+    /// and the injection joins nothing but the namespaces.
+    #[test]
+    fn the_classifier_leaf_travels_on_the_shims_argv_when_one_is_set() {
+        let leaf =
+            sandbox2::config::ClassifierLeaf::new("/sys/fs/cgroup/minimald.slice/boxes/allow/b");
+        let shim = tempfile::NamedTempFile::new().expect("a temp file to stand in for the shim");
+
+        let mut sleep = Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawning /bin/sleep");
+        let target = sleep.id();
+        let unplaced = Injection::new(target, "/bin/true", Vec::<&str>::new())
+            .with_shim(shim.path())
+            .command();
+        let placed = Injection::new(target, "/bin/true", Vec::<&str>::new())
+            .with_shim(shim.path())
+            .with_classifier_leaf(leaf.clone())
+            .command();
+
+        let _ = sleep.kill();
+        let _ = sleep.wait();
+
+        let argv = |cmd: std::process::Command| -> Vec<OsString> {
+            cmd.get_args().map(OsString::from).collect()
+        };
+        let bare = argv(unplaced.expect("building the command without a leaf"));
+        assert!(
+            !bare.contains(&OsString::from("--classifier-leaf")),
+            "a host that places no box sends no flag: {bare:?}"
+        );
+        let joined = argv(placed.expect("building the command with a leaf"));
+        let at = joined
+            .iter()
+            .position(|arg| arg == "--classifier-leaf")
+            .expect("the leaf is named on the shim's argv");
+        assert_eq!(
+            joined[at + 1],
+            OsString::from(leaf.dir().as_os_str()),
+            "the flag carries the leaf's directory, whose cgroup.procs the \
+             shim writes its pid to"
         );
     }
 }

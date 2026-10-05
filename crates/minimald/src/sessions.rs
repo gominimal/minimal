@@ -12,6 +12,8 @@ use common::SpecHash;
 use paths::DaemonAbsPath;
 use sessions::SessionId;
 #[cfg(target_os = "linux")]
+use std::collections::BTreeSet;
+#[cfg(target_os = "linux")]
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 #[cfg(target_os = "linux")]
@@ -20,7 +22,9 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 
 pub(crate) mod composables;
 #[cfg(test)]
-use composables::{ProjectResolution, build_composables, run_composer};
+use composables::{
+    ProjectResolution, build_composables, resolve_project_ctx_and_graph, run_compose, run_composer,
+};
 
 /// A short summary of the metadata of a session.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,6 +60,24 @@ impl From<SessionKeyPredicate> for RecordPredicate {
 /// Transport / internal error when communicating with the sessions actor.
 type SessionsError = std::io::Error;
 
+/// NET-079's observability, for the create path's half of the refusal: how
+/// many creates this daemon has refused because a host-address box's
+/// declaration named rules the classifier cannot enforce while the host
+/// decided per box. Process-global like the fact it reads — the count is
+/// the daemon's, not a session's — and only counted here: a launch
+/// refused on the same ground is that launch's own refusal, logged beside
+/// the box it refused, never a create this counter saw.
+static REFUSED_UNENFORCEABLE_CREATES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Reads how many creates this daemon has refused over an unenforceable
+/// host-address declaration — the counter's surface, for a diagnostics
+/// pass or a test that wants the count itself rather than the log line
+/// each refusal also writes.
+pub(crate) fn refused_unenforceable_creates() -> u64 {
+    REFUSED_UNENFORCEABLE_CREATES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Assemble a [`sessions::Record`] from the out-of-band session
 /// config and the SSH-supplied username, then validate its policy.
 /// Returns `Err(io::InvalidInput)` if the policy is incompatible
@@ -78,12 +100,21 @@ fn build_record(
         project_path: config.project_path,
         network: config.network,
         policy: config.policy,
+        // The handed addresses ride the record: the attach path reads the
+        // switch address back out of it, so a re-attach — after a restart
+        // included — reuses the address the host table still holds instead
+        // of drawing a new one the row would not match.
+        box_addresses: config.box_addresses,
         status,
         hooks_enabled: config.hooks_enabled,
+        // Daemon-owned from its first line: a create holds no launch's
+        // outcome to record, and the key a client might assert in `attrs`
+        // is stripped above, so only a launch ever writes this field.
+        host_ip_enforcement: None,
         attrs: config.attrs,
     };
     record
-        .validate_policy()
+        .validate_new_policy()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     Ok(record)
 }
@@ -198,6 +229,20 @@ pub struct Manager {
     #[cfg(target_os = "linux")]
     hostnames: Arc<RwLock<crate::net::dns::HostnameRegistry>>,
 
+    /// The answerer's lease book for this host (NET-010): the durable record
+    /// of which published namespace — a box or the node — holds which granted
+    /// address of the reserved local range, one record per host, written
+    /// through by every daemon on it. It is the address half of a publish, as
+    /// the registry beside it is the name half: a session's own-address box
+    /// asks it at finalize and returns its address at destroy, holding it
+    /// through its `SessionConfig`. Every ask is a synchronous
+    /// read-modify-write under the record's own lock file, so two daemons on
+    /// one host are serialized by the file system rather than by each other —
+    /// no daemon asks another for an address, and none self-assigns (design
+    /// §7.1).
+    #[cfg(target_os = "linux")]
+    loopback: Arc<crate::net::dns::LoopbackLeaseBook>,
+
     /// Whether this daemon opted out of the deny-all egress default
     /// (NET-077), threaded from the server config into every session actor
     /// so each one resolves its own effective egress (NET-074) the same way
@@ -243,28 +288,262 @@ impl Manager {
         // daemons on one host mint distinct names and route both sets at the
         // same time (NET-027) instead of the second daemon's registrations
         // overwriting the first's under the shared `local` label.
+        //
+        // The registry and the lease book are one publish's two halves, built
+        // beside each other: the book is the answerer's record of the
+        // addresses granted on this host (NET-010's arbitration, design §7.1),
+        // the registry the names that answer them. Allocation in the reserved
+        // local range is host-global and arbitrated through that record, so
+        // this daemon asks it rather than carving the range for itself — and
+        // the same record is what a restarted daemon re-derives its live
+        // grants from, rather than starting from an empty table: the sweep
+        // below frees the grants of boxes whose sessions are gone, and every
+        // box that is still live keeps its line for its resumed session to
+        // re-register with.
+        //
+        // A VM daemon asks for one address for its *node* before any box does
+        // (NET-129: "one allocated address per VM node") — the address its
+        // host-address boxes answer at. A native node's address is the host
+        // loopback itself, which it already owns.
         #[cfg(target_os = "linux")]
-        let hostnames = {
+        let (hostnames, loopback) = {
+            // This daemon's start, on the record's own clock: the stamp the
+            // sweep's race guard reads. A grant another daemon on this host
+            // makes from this moment on — most importantly for a session
+            // whose record the liveness snapshot below was read without —
+            // is never this sweep's to free, so a stopped host's fresh
+            // grants survive this daemon's start rather than being read as
+            // dead by a snapshot that predates them.
+            let daemon_start = crate::net::dns::unix_now_secs();
             let switch = net_switch.lock().await;
-            let on_switch = matches!(
-                switch.transport(),
-                crate::net::SwitchTransport::HostShuttle { .. }
-            );
-            Arc::new(RwLock::new(crate::net::dns::HostnameRegistry::new(
-                switch.host_id().to_owned(),
-                on_switch,
-            )))
+            let transport = switch.transport();
+            let on_switch = matches!(transport, crate::net::SwitchTransport::HostShuttle { .. });
+            // The daemon-start bind probe (NET-123's obligation): the
+            // addresses the book grants are only publishable where the
+            // reserved local range binds, so the probe is run once here —
+            // over the host the publishes will bind on — and its verdict
+            // gates every grant. Which host that is depends on where this
+            // daemon's forwarder lives: a native daemon spawns its gvproxy
+            // itself, so its own loopback is the publish surface and the
+            // local bind probe is the honest one; a daemon on the gvproxy
+            // switch is inside a microVM, and its forwarder binds the
+            // *host's* loopback — a machine the guest cannot see, and whose
+            // verdict its own `lo` would lie about, since the guest carries
+            // the whole `127/8` whatever the host carries. So that shape
+            // conducts the same whole-range walk through the forwarder
+            // itself, over the same shuttle the publishes ride: the bind is
+            // the only question that decides whether an address is
+            // publishable, and the forwarder is the only thing that can do
+            // the binding there. Either arm is the real probe, never the
+            // session-start stand-in `rpc.rs`'s tests install: the stand-in
+            // is process-global, and a daemon built in one test must not see
+            // another test's absent verdict.
+            //
+            // The two arms are not equally cheap, and only the cheap one is
+            // waited on. The local bind probe answers in microseconds, so it
+            // is read here, on the way to the book. The forwarder-conducted
+            // walk is two request/response rounds per address of the range on
+            // one control channel, and a channel that does not answer takes
+            // seconds to say so — long enough that awaiting it here would put
+            // it on `Manager::init`'s critical path, which is the one path
+            // `Server::run` waits on before it starts *accepting*: a guest
+            // daemon that held its own SSH accept for the host's loopback
+            // verdict would make every `minvmd stop` race the probe instead
+            // of reaching the daemon behind it. So that arm is spawned here
+            // and its verdict applied when it lands
+            // (`land_range_verdict`): the book opens on the pending verdict
+            // (no box publishes at an address nothing has vouched for; a
+            // namespace the record already names keeps its line, and the
+            // present landing restores it, NET-013) and the walk, once it
+            // has an answer, both un-withholds and hands the node its
+            // address, and re-points the publishes the window left
+            // standing — a hand the landing overrules moves onto the
+            // interim, an interim ask the landing upgrades to a grant or
+            // its hand — so no box holds an address the landed
+            // verdict contradicts, and the interim never outstays the
+            // window that made it.
+            let (probe, shuttle) = match transport {
+                crate::net::SwitchTransport::HostShuttle { cid, port } => (None, Some((cid, port))),
+                _ => (
+                    Some(
+                        tokio::task::spawn_blocking(crate::net::loopback::probe)
+                            .await
+                            .unwrap_or_else(|join_error| {
+                                tracing::warn!(
+                                    error = %join_error,
+                                    "the daemon-start loopback probe was lost; \
+                                     reading the range absent",
+                                );
+                                crate::net::loopback::RangeProbe::failed_to_run()
+                            }),
+                    ),
+                    None,
+                ),
+            };
+            if let Some(probe) = probe.as_ref() {
+                tracing::info!(
+                    surface = probe.surface(),
+                    interim = probe.interim(),
+                    first_failure = ?probe.first_failure,
+                    "daemon-start loopback probe picked the publish surface",
+                );
+            }
+            let present = probe.as_ref().is_some_and(|probe| probe.present());
+            // The state the book opens on. Where a probe ran, its answer is
+            // the host's: a native daemon's own loopback is its publish
+            // surface, so it measures the range itself on the way here. The
+            // one arm that leaves `probe` unset — the gvproxy switch above —
+            // is the daemon that cannot measure its own, so its book opens
+            // pending and the spawned walk below lands the verdict. That a
+            // book can be open without one is the whole reason the verdict is
+            // a state and not a fact.
+            let verdict = match (&probe, present) {
+                (None, _) => crate::net::dns::RangeVerdict::Pending,
+                (Some(_), true) => crate::net::dns::RangeVerdict::Present,
+                (Some(_), false) => crate::net::dns::RangeVerdict::Absent,
+            };
+            // The answerer's record for this host, under the state root every
+            // daemon instance on it shares. Unreadable records withhold
+            // grants (never guess an address another namespace may hold);
+            // absent ranges grant nothing, the interim's business.
+            let book = crate::net::dns::LoopbackLeaseBook::open(&minimal_state_dir, verdict)?;
+            let swept = book.release_dead_boxes(&live_session_ids(&store).await?, daemon_start);
+            if !swept.is_empty() {
+                tracing::info!(
+                    addresses = ?swept,
+                    "released loopback leases whose sessions are gone from the store",
+                );
+            }
+            // The collision report the record's own arbitration cannot make
+            // (NET-010, reported like a port collision): every
+            // reserved-range address a live publish holds on this host that
+            // this record does not name. That is the shape a second state
+            // root produces — its daemon grants an address this root's
+            // record already gave out, neither record naming the other's
+            // grants, and the collision being on the address means no bind
+            // ever fails to tell either daemon. Advisory: a warn per
+            // address, the operator's signal to separate the roots or land
+            // the host-side arbiter that closes the gap. This is the
+            // daemon-start half — over whatever was live before this daemon
+            // came up; the session-start half
+            // (`Session::report_unrecorded_publishes`) catches the grants a
+            // second root makes after it.
+            for address in book.unrecorded_publishes() {
+                crate::net::dns::warn_publish_collision(address);
+            }
+            // The node's own address (NET-129): a native node's is the host
+            // loopback it already owns, and a VM node's is a grant the range
+            // verdict gates — so on a VM node it is the spawned walk's to
+            // make, not this block's, and the registry opens on the interim
+            // address a withheld grant falls back to (`new`'s own default,
+            // named here because it is the interim, not an omission).
+            let registry =
+                crate::net::dns::HostnameRegistry::new(switch.host_id().to_owned(), on_switch)
+                    .with_node_address(Ipv4Addr::LOCALHOST);
+            let hostnames: Arc<RwLock<crate::net::dns::HostnameRegistry>> =
+                Arc::new(RwLock::new(registry));
+            let loopback = Arc::new(book);
+            if let Some((cid, port)) = shuttle {
+                // Spawned after the sweep above, so the node's grant cannot
+                // race the daemon-start liveness pass that frees dead boxes'
+                // lines; the book's own flock serializes it against every
+                // other ask either way. Holds only `Arc`s, so a daemon that
+                // shuts down mid-walk leaves it to land on a closed book —
+                // grants then withhold, the shutdown-time answer anyway.
+                //
+                // The blocking work below — the book's std-Mutex'd flock and
+                // the registry's std RwLock, not the awaited walk — is a
+                // deliberate choice, not an oversight: it is the same class
+                // of ask a session actor's own `lease_loopback_address`
+                // makes on the same runtime, and both are bounded by the
+                // other holders' critical sections (a small-file
+                // read-modify-write, a registry read), so neither parks a
+                // worker for an unbounded length. `spawn_blocking` would move
+                // the ask but not shorten it, and would add a thread whose
+                // whole job is to wait on a lock the actor path already waits
+                // on inline.
+                //
+                // The landing runs on this spawned task — off the manager's
+                // mailbox and off every session actor's — so nothing orders
+                // it against a destroy, a stop, or a rename. The present
+                // arm's apply ([`apply_interim_upgrade`]) therefore re-checks
+                // each box under the registry's write lock before it
+                // publishes, and releases a grant drawn for a box whose
+                // publish is gone.
+                let book = Arc::clone(&loopback);
+                let registry = Arc::clone(&hostnames);
+                tokio::spawn(async move {
+                    let probe = crate::net::policy::probe_publish_surface(
+                        &crate::net::policy::ControlChannel::Vsock { cid, port },
+                    )
+                    .await;
+                    tracing::info!(
+                        via = "forwarder",
+                        surface = probe.surface(),
+                        interim = probe.interim(),
+                        first_failure = ?probe.first_failure,
+                        "the daemon-start range probe walked the forwarder's loopback \
+                         and picked the publish surface",
+                    );
+                    land_range_verdict(
+                        &book,
+                        &registry,
+                        if probe.present() {
+                            crate::net::dns::RangeVerdict::Present
+                        } else {
+                            crate::net::dns::RangeVerdict::Absent
+                        },
+                    );
+                    if !probe.present() {
+                        tracing::warn!(
+                            first_failure = ?probe.first_failure,
+                            "the reserved local range is absent on the publish surface; \
+                             publishing boxes on the 127.0.0.1 interim",
+                        );
+                        return;
+                    }
+                    let node = match book.grant(crate::net::dns::LeaseNamespace::Node) {
+                        crate::net::dns::LoopbackGrant::Granted(address) => address,
+                        crate::net::dns::LoopbackGrant::RecordUnavailable => {
+                            // The shutdown shape: a daemon that went down
+                            // mid-walk has closed its book, and the grant that
+                            // comes back is the closed book's, not a fault on
+                            // the host — the manager stops every session
+                            // before it closes, so there is nothing left to
+                            // publish an interim for either. An unreadable
+                            // record lands here too, said at the same level:
+                            // neither is a verdict about this host's range.
+                            tracing::debug!(
+                                grant = ?crate::net::dns::LoopbackGrant::RecordUnavailable,
+                                "the node's own loopback address was not granted — \
+                                 the book was closed for shutdown, or its record could \
+                                 not be read or written",
+                            );
+                            return;
+                        }
+                        other => {
+                            tracing::warn!(
+                                grant = ?other,
+                                "the node's own loopback address was not granted; \
+                                 publishing host-address boxes on the 127.0.0.1 interim",
+                            );
+                            return;
+                        }
+                    };
+                    registry
+                        .write()
+                        .expect("hostname registry lock poisoned")
+                        .set_node_address(node);
+                });
+            }
+            (hostnames, loopback)
         };
-        // This daemon's slice of the reserved local range is a pure function
-        // of its own slice octet — see [`LoopbackAllocator`], and the
-        // daemon-start line in `crate::server` that logs it (NET-027). It is
-        // not held here: the publish path that spends these addresses
-        // (NET-010/NET-129) is what will own the allocator, and it is another
-        // task's.
         let handle = ManagerHandle {
             sender,
             #[cfg(target_os = "linux")]
             hostnames: Arc::clone(&hostnames),
+            #[cfg(all(test, target_os = "linux"))]
+            loopback: Arc::clone(&loopback),
         };
         // A non-owning path back to this actor, handed to each spawned session
         // so its binding can request destruction (see `weak_self`).
@@ -281,6 +560,8 @@ impl Manager {
             net_switch,
             #[cfg(target_os = "linux")]
             hostnames,
+            #[cfg(target_os = "linux")]
+            loopback,
             deny_all_opt_out,
         };
 
@@ -289,125 +570,297 @@ impl Manager {
     }
 }
 
-/// The address-assignment side of the daemon-scoped switch: which slice of
-/// the reserved local range ([`crate::net::dns::RESERVED_LOCAL_RANGE`])
-/// this daemon's published boxes come from.
-///
-/// The range is host-global — every daemon on the machine draws from the
-/// same `127.64.0.0/24` — so the slice a daemon draws from must be a
-/// function of **its own** identity (the same per-daemon identity that
-/// names its zone, NET-027), never a constant two daemons would both start
-/// at. That identity is the daemon's *slice octet*: the octet a deployment
-/// pins, else the one its instance id derives
-/// (`crate::server::octet_for_daemon_id`). On a native host the octet is
-/// also the third octet of the /24 this daemon's own gvproxy runs on, so a
-/// daemon's switch leases and its publish slice move together; a daemon in
-/// a microVM does **not** own its switch (its boxes tap the gvproxy
-/// `minvmd` runs, on the default /16 every VM on the host shares), so its
-/// slice is keyed by the octet alone and two VM daemons on one host still
-/// draw from two different slices — the primary NET-027 case. Keying the
-/// slice on the switch *subnet* instead would collapse every microVM
-/// daemon onto the default subnet's octet, and with it onto one shared
-/// slice. The daemon's start line reads exactly this function to name the
-/// slice in its log (see `crate::server`), so a reader of two daemons'
-/// logs can compare the two slices — and see the wrap-around
-/// [`LoopbackAllocator::for_slice_octet`] names where it lands the pair
-/// on one.
-///
-/// The full arbitration is NET-010's host-global allocation; this is the
-/// per-daemon half of it. The publish path that **spends** these addresses
-/// (NET-129) is another task's and is not wired yet — until it lands,
-/// nothing calls [`LoopbackAllocator::allocate`], and the manager holds no
-/// allocator of its own.
-///
-/// The carve-out itself is not restated here: the constructor reads its
-/// slice from the switch crate's default address plan, the same one that
-/// pairs each slice with the switch a daemon of that octet runs, so there
-/// is one definition of the `/27`s and this type owns only the cursor
-/// inside the slice it is handed.
+/// One box's move off the `127.0.0.1` interim, as the present landing's
+/// sweep draws it: the box (`session`, `name`, `ports`) and the address it
+/// is to move to — its own hand for a box a creator handed one (`hand`,
+/// never a grant drawn from the pool: a hand is only ever replaced by
+/// `127.0.0.1`, and the attach path's forwards name the hand as their
+/// `local`), a grant the answerer just leased for a box nobody handed an
+/// address.
 #[cfg(target_os = "linux")]
-#[derive(Debug)]
-pub struct LoopbackAllocator {
-    /// The slice's first address, as a `u32` so hand-out is `next += 1`.
-    first: u32,
-    /// The slice's last address, inclusive.
-    last: u32,
-    /// The next address to hand out. Only ever advances — a published box
-    /// holds its address for its whole life, so reuse would collide with a
-    /// name that is still routed.
-    next: u32,
+pub(crate) struct InterimUpgrade {
+    /// The session whose box the move re-publishes.
+    pub(crate) session: SessionId,
+    /// The box name the move re-registers.
+    pub(crate) name: String,
+    /// The ports the box's declaration publishes.
+    pub(crate) ports: BTreeSet<u16>,
+    /// The address the box moves to.
+    pub(crate) address: Ipv4Addr,
+    /// Whether `address` is the box's own hand rather than a grant the
+    /// landing drew — the arm that discards a move must not release a hand
+    /// it never drew.
+    pub(crate) hand: bool,
 }
 
-/// How many slices the reserved local range holds — exactly as many switches
-/// as the switch crate's default address plan serves on one host, since it
-/// carves the range one slice per switch
-/// ([`switch::AddressPlan::switch_capacity`]; a /24 into `/27`s, eight). A
-/// slice octet mod this many indexes every slice there is. `pub(crate)` for
-/// the daemon-start tests, which assert two daemons' slices against exactly
-/// this wrap-around.
+/// Lands a range verdict the way the deferred walk lands it
+/// ([`crate::sessions::Manager::init`]'s spawned probe): the state moves
+/// first, then the arm that follows it runs over the publishes the old
+/// verdict left standing — the one moment a verdict's landing has effects
+/// beside the atomic it sets, and the reason the walk cannot simply store
+/// its answer.
+///
+/// An **absent** landing moves every own-address publish standing inside the
+/// reserved local range onto the `127.0.0.1` interim (NET-123): the surface
+/// cannot bind what those boxes hold, so their attach would fail at it until
+/// destroy. The landing is the one moment the daemon holds both facts — the
+/// verdict and every publish it contradicts — so it re-publishes each such
+/// box at the interim, name and route with it, and the box's attach binds
+/// where the surface listens instead of failing until destroy. The arm is
+/// a belt behind the pending window's gate: no production path publishes a
+/// reserved-range address under anything but a landed present verdict — a
+/// hand waits for one or stands at the interim, and a resumed box the
+/// record already names is answered with the interim until the present
+/// landing restores its recorded address — so a publish this arm finds is
+/// one a verdict vouched for and a later landing contradicts.
+///
+/// A **present** landing moves every own-address publish standing at the
+/// interim onto the address it is owed: its own hand for a box a creator
+/// handed one, a grant the answerer just leased for a box nobody handed an
+/// address. The interim is the ask's own answer for a verdict that had not
+/// landed, never an address the box owns, so the landing that replaces the
+/// verdict is the moment those asks upgrade — without it the box would
+/// stand at `127.0.0.1` until destroy. The move is drawn in two halves
+/// ([`draw_interim_upgrades`], [`apply_interim_upgrade`]) because the draw
+/// runs outside every registry lock — the ask is a read-modify-write of the
+/// answerer's record under its own lock file — and the box can die inside
+/// that window: the apply re-checks, under the write lock, that the box
+/// still holds its name and still stands at the interim, and a box that
+/// does not has nothing published — names are first-writer-owned, so a
+/// destroyed box's re-registered name would block the next box that takes
+/// it — and, when its publish is gone (the destroyed box), its drawn grant
+/// released unpublished.
+///
+/// The verdict is set **before** either arm runs, so a registration racing
+/// the landing reads the landed verdict: its hand is gated by
+/// [`crate::net::dns::LoopbackLeaseBook::vouches_for`] — and a hand that
+/// meets it unvouched is woken by the landing's broadcast, inside the
+/// daemon's one verdict deadline it waits bounded by
+/// ([`crate::net::dns::LoopbackLeaseBook::await_vouch_for`]), or re-reads
+/// the verdict under the registry's write lock before it publishes — its
+/// ask by the verdict's own arm, and each sweep only re-publishes what
+/// still stands.
 #[cfg(target_os = "linux")]
-pub(crate) const LOOPBACK_SLICES: u32 = ::switch::DEFAULT_ADDRESS_PLAN.switch_capacity() as u32;
+fn land_range_verdict(
+    book: &crate::net::dns::LoopbackLeaseBook,
+    registry: &RwLock<crate::net::dns::HostnameRegistry>,
+    verdict: crate::net::dns::RangeVerdict,
+) {
+    book.set_range_verdict(verdict);
+    match verdict {
+        crate::net::dns::RangeVerdict::Present => {
+            for upgrade in draw_interim_upgrades(book, registry) {
+                apply_interim_upgrade(book, registry, &upgrade);
+            }
+        }
+        crate::net::dns::RangeVerdict::Absent => {
+            // The boxes the window published at reserved-range addresses:
+            // the surface cannot bind what they hold, and their attach
+            // would fail at it until destroy. One registry lock across the
+            // sweep, so no answer reads a half-moved table.
+            let mut reg = registry.write().expect("hostname registry lock poisoned");
+            for (session, name, from, ports) in reg.own_publishes_in_reserved_range() {
+                tracing::warn!(
+                    session_id = %session,
+                    session_name = &name,
+                    from = %from,
+                    to = %Ipv4Addr::LOCALHOST,
+                    action = "loopback-range-absent-box",
+                    "a box's publish stood inside the reserved local range; \
+                     the range is absent on the publish surface, so the \
+                     publish — name and route with it — moves to the \
+                     127.0.0.1 interim",
+                );
+                reg.publish_own_address(session, &name, Ipv4Addr::LOCALHOST, ports.clone());
+                reg.register_own_ip(session, &name, ports);
+            }
+        }
+        // The state a book opens on and the state a test re-opens it in:
+        // nothing has been published under it to sweep.
+        crate::net::dns::RangeVerdict::Pending => {}
+    }
+}
 
+/// The present landing's first half: enumerate the boxes standing at the
+/// interim under a read lock, then — outside every registry lock — draw the
+/// address each is to move to, the hand a creator gave it or a grant the
+/// answerer just leased. Split from the apply because the draw's grant is a
+/// read-modify-write of the answerer's record under its lock file, and the
+/// registry is what every DNS answer this daemon serves reads; the apply
+/// re-checks under the write lock what the box is *now*, because the window
+/// between the two halves is long enough for a box to die in.
+///
+/// A grant withheld at the draw leaves the box at the interim — the
+/// surface's own answer again, said out loud — and its next finalize
+/// re-asks. A hand the (just-landed) present verdict does not vouch for is
+/// not moved at all: the same gate the registration path reads.
 #[cfg(target_os = "linux")]
-impl LoopbackAllocator {
-    /// The slice of the reserved local range for a daemon whose slice octet
-    /// is `octet`: one /27, indexed by `octet % `[`LOOPBACK_SLICES`] — the
-    /// octet a native daemon's own `100.64.x.0/24` switch differs in, and
-    /// the one a microVM daemon's instance id derives, since its switch
-    /// (the host's default /16, which `minvmd` renders) is the same for
-    /// every VM on the host and cannot differ. Two daemons whose octets
-    /// differ therefore hand out disjoint addresses, except across the
-    /// wrap-around this doc exists to name: octets that differ by a
-    /// multiple of [`LOOPBACK_SLICES`] index one shared slice, so those
-    /// two daemons hand out the same addresses — a pair of derived octets
-    /// lands there about one time in eight. The daemon's start line
-    /// prints the slice's range, so the wrap is visible rather than
-    /// hidden (two daemons' logs carry the same `loopback_slice`), and
-    /// NET-010's host-global allocation is what arbitrates when it binds.
-    ///
-    /// The slice it lands on is the switch crate's own carve-out, read from
-    /// the plan rather than recomputed here — the same slice the plan pairs
-    /// with the switch a daemon of this octet runs, so a daemon's published
-    /// addresses can never fall outside the pairing the plan guarantees.
-    #[must_use]
-    pub fn for_slice_octet(octet: u8) -> Self {
-        let plan = ::switch::DEFAULT_ADDRESS_PLAN;
-        let index = u32::from(octet) % LOOPBACK_SLICES;
-        let slice = plan
-            .switch_slice(index as usize)
-            .expect("a wrapped octet always indexes a slice the plan serves")
-            .loopback();
-        Self {
-            first: u32::from(slice.first()),
-            last: u32::from(slice.last()),
-            next: u32::from(slice.first()),
+pub(crate) fn draw_interim_upgrades(
+    book: &crate::net::dns::LoopbackLeaseBook,
+    registry: &RwLock<crate::net::dns::HostnameRegistry>,
+) -> Vec<InterimUpgrade> {
+    let standing = registry
+        .read()
+        .expect("hostname registry lock poisoned")
+        .interim_own_publishes();
+    let mut drawn = Vec::new();
+    for publish in standing {
+        // A box a creator handed an address moves back to it, never to a
+        // grant from the pool: the hand is the host-side table's row, the
+        // address the attach path's expose requests name, and a hand is
+        // only ever replaced by `127.0.0.1` — so the landing's move for it
+        // is the return, not a substitution, and a hand the verdict does
+        // not vouch for leaves the box where it is, never drawing a grant.
+        if let Some(hand) = publish.hand {
+            if book.vouches_for(hand) {
+                drawn.push(InterimUpgrade {
+                    session: publish.session,
+                    name: publish.name,
+                    ports: publish.ports,
+                    address: hand,
+                    hand: true,
+                });
+            }
+            continue;
+        }
+        match book.grant(crate::net::dns::LeaseNamespace::Box {
+            session: publish.session,
+        }) {
+            crate::net::dns::LoopbackGrant::Granted(address) => drawn.push(InterimUpgrade {
+                session: publish.session,
+                name: publish.name,
+                ports: publish.ports,
+                address,
+                hand: false,
+            }),
+            // A grant withheld at the draw leaves the box at the interim
+            // — the surface's own answer again — and its next finalize
+            // re-asks.
+            granted => tracing::warn!(
+                session_id = %publish.session,
+                session_name = &publish.name,
+                grant = ?granted,
+                action = "loopback-lease-withheld",
+                "the verdict landed present but the box's re-ask was \
+                 refused; it keeps the 127.0.0.1 interim it stands on"
+            ),
         }
     }
+    drawn
+}
 
-    /// The next address to publish a box at, or `None` once this daemon's
-    /// slice is spent. Never reuses: a withdrawn name's address stays
-    /// retired until the daemon restarts.
-    ///
-    /// No caller yet, on purpose: the publish path that spends these
-    /// addresses (NET-129, arbitrated host-globally by NET-010) is another
-    /// task's, and it — not the daemon's start line — is what will call
-    /// this. Until it lands the slice is derived and announced, never drawn
-    /// from.
-    #[allow(dead_code)] // The publish path (NET-129/NET-010) is another task's.
-    pub fn allocate(&mut self) -> Option<Ipv4Addr> {
-        if self.next > self.last {
-            return None;
-        }
-        let addr = Ipv4Addr::from(self.next);
-        self.next += 1;
-        Some(addr)
+/// The present landing's second half: re-publish one drawn box at the
+/// address it was drawn — under the write lock, and only if the box still
+/// exists. The draw ran outside every registry lock, so between it and this
+/// the box may have been stopped or destroyed, its name taken over by a
+/// rename or a later session, or its publish moved off the interim by its
+/// own next registration; names are first-writer-owned, so any of those
+/// means the move publishes nothing. `true` when the move was made, `false`
+/// when it was discarded. A discarded box whose publish is gone — the
+/// destroyed box — has the drawn grant released back through the
+/// answerer's channel, outside the registry's lock the same way the draw
+/// took it, so a dead box's landing cannot spend an address the pool would
+/// then hold spoken for. One whose publish still stands keeps the grant:
+/// the grant is idempotent by namespace, so a box that moved off the
+/// interim through its own re-registration stands at the very address the
+/// draw recorded, and a stopped or renamed one is answered with it at its
+/// next registration; releasing it would free an address a live box holds.
+///
+/// The re-check is a runtime one, not an ordering argument: the landing
+/// runs on the deferred walk's own spawned task
+/// ([`crate::sessions::Manager::init`]), never through the manager's
+/// mailbox or a session actor's, so a destroy can land anywhere between
+/// the draw's enumeration, its grant, and this apply.
+#[cfg(target_os = "linux")]
+pub(crate) fn apply_interim_upgrade(
+    book: &crate::net::dns::LoopbackLeaseBook,
+    registry: &RwLock<crate::net::dns::HostnameRegistry>,
+    upgrade: &InterimUpgrade,
+) -> bool {
+    // The re-check, and the move, under the one write lock: no answer reads
+    // a half-moved table, and no other registration can slip between the
+    // check and the publish.
+    let (applied, publish_gone) = {
+        let mut reg = registry.write().expect("hostname registry lock poisoned");
+        let standing = reg.published_own_address(upgrade.session);
+        let box_still_exists = reg.name_held_by(upgrade.session, &upgrade.name)
+            && standing == Some(Ipv4Addr::LOCALHOST);
+        let applied = if !box_still_exists {
+            false
+        } else {
+            // The move is said out loud, naming the box and both addresses
+            // (NET-123 §7.1): the interim was a publishable stand-in, the
+            // move is the box taking the address it was owed.
+            tracing::warn!(
+                session_id = %upgrade.session,
+                session_name = &upgrade.name,
+                from = %Ipv4Addr::LOCALHOST,
+                to = %upgrade.address,
+                action = "loopback-range-present-box",
+                "the verdict landed present; a box standing on the \
+                 127.0.0.1 interim moves to the address it is owed — its \
+                 own hand for a handed box, a grant the answerer leased it"
+            );
+            reg.publish_own_address(
+                upgrade.session,
+                &upgrade.name,
+                upgrade.address,
+                upgrade.ports.clone(),
+            );
+            reg.register_own_ip(upgrade.session, &upgrade.name, upgrade.ports.clone());
+            true
+        };
+        (applied, standing.is_none())
+    };
+    if applied {
+        return true;
     }
+    // The discard: publish nothing, and hand the drawn grant back only when
+    // the box's publish is gone — the destroyed box. A box still standing
+    // somewhere keeps the grant (see the doc above). A hand is never
+    // released — it was never drawn from the pool, and the host-side table's
+    // row keeps it whatever this daemon does. The release runs outside the
+    // registry's lock, the same order the draw's grant took it in; its
+    // answer says which call actually took the line, the discard's or a
+    // destroy that got there first.
+    let released = if upgrade.hand || !publish_gone {
+        None
+    } else {
+        book.release(crate::net::dns::LeaseNamespace::Box {
+            session: upgrade.session,
+        })
+    };
+    tracing::warn!(
+        session_id = %upgrade.session,
+        session_name = &upgrade.name,
+        from = %Ipv4Addr::LOCALHOST,
+        to = %upgrade.address,
+        released = ?released,
+        action = "loopback-lease-discarded",
+        "the box moved or died inside the landing's window; the publish it \
+         stood on is not moved, and the grant drawn for a destroyed box is \
+         released unpublished"
+    );
+    false
+}
 
-    /// The slice this daemon draws from, first and last address inclusive.
-    #[must_use]
-    pub fn range(&self) -> (Ipv4Addr, Ipv4Addr) {
-        (Ipv4Addr::from(self.first), Ipv4Addr::from(self.last))
+/// The ids of every session record the store holds: the store's whole live
+/// set, not this daemon's. The session store lives under the shared state
+/// root, so every daemon instance on the host reads the same set — which is
+/// what makes a box's session id a host-global key, and the answerer's
+/// start-time sweep ([`crate::net::dns::LoopbackLeaseBook::release_dead_boxes`])
+/// a verdict about the *host*, not about which daemon happened to restart:
+/// a grant is dead exactly when its session is gone from the store, however
+/// many daemons are running.
+#[cfg(target_os = "linux")]
+async fn live_session_ids(
+    store: &crate::store::StoreHandle,
+) -> Result<BTreeSet<SessionId>, std::io::Error> {
+    let mut live = BTreeSet::new();
+    for handle in store.handles().await? {
+        live.insert(*handle.id());
     }
+    Ok(live)
 }
 
 /// Delete on-disk records whose status is unresumable after a
@@ -530,6 +983,8 @@ impl Manager {
             deny_all_opt_out: self.deny_all_opt_out,
             #[cfg(target_os = "linux")]
             hostnames: Arc::clone(&self.hostnames),
+            #[cfg(target_os = "linux")]
+            loopback: Arc::clone(&self.loopback),
         }
     }
 
@@ -556,6 +1011,38 @@ impl Manager {
                 std::io::ErrorKind::ConnectionRefused,
                 "in shutdown",
             ));
+        }
+        // NET-079: a host that decides per box refuses a host-address
+        // declaration naming rules its classifier cannot enforce — a denied
+        // range, a narrowing allow list — and refuses it here, before
+        // anything is allocated: no record, no id, no name held, no actor
+        // spawned. The host's state is the daemon's one node fact, read
+        // exactly as the create response reads it — a create is not a place
+        // that decides a box, so it re-probes nothing itself — and the
+        // same `can_decide_per_box` the launch that follows re-reads for
+        // its own gate; a host that cannot decide per box answers `false`
+        // and the create falls through to the exception whole — the box is
+        // created, runs unenforced and is recorded as such, never refused
+        // on this ground. Own-address boxes are untouched here: their
+        // declarations are enforced on the address the box holds, so the
+        // gate is the host-address mode's alone.
+        if let Some(rules) = crate::net::classifier::refuses_unenforceable_declaration(
+            config.network,
+            crate::session_host::host_ip_enforcement_fact().can_decide_per_box(),
+            config.policy.egress.as_ref(),
+        ) {
+            let refusal = crate::net::classifier::unenforceable_declaration_refusal(&rules);
+            REFUSED_UNENFORCEABLE_CREATES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::info!(
+                session_name = ?config.name,
+                network_mode = ?config.network,
+                host_ip_enforcement = %minimald_rpc::HostIpEnforcement::PerBox.machine_str(),
+                refused_unenforceable_creates = refused_unenforceable_creates(),
+                refusal = %refusal,
+                "refused a create whose host-address declaration names rules \
+                 this host's classifier cannot enforce"
+            );
+            return Err(refusal);
         }
         // Allocate the record up front: `store.create` assigns the id and
         // catches a name collision (`AlreadyExists`) before any actor exists.
@@ -810,7 +1297,9 @@ impl Manager {
                     self.in_shutdown = true;
                     // Stop live sessions. Each actor kills its host and
                     // withdraws its own PTask hostname (R3.5) on the way
-                    // down; records are kept — shutdown is not deletion.
+                    // down; records — and, with them, the loopback grants
+                    // their boxes would resume at — are kept, since shutdown
+                    // is not deletion.
                     for hnd in self.running.values() {
                         hnd.stop().await;
                     }
@@ -820,6 +1309,14 @@ impl Manager {
                     // the post-drain quiesce (R2.1 syncfs + unmount) fail
                     // EBUSY, leaving the ext4 journal dirty on clean stops.
                     self.daemon_ctx.release_cache_read_tracker();
+                    #[cfg(target_os = "linux")]
+                    // And the answerer's lease book's lock-file fd — the one
+                    // descriptor the book holds open, on the same state
+                    // volume, for the same quiesce contract. Read-only, so
+                    // it holds no journal back on its own, but the contract
+                    // is that the stop leaves *no* descriptor of the
+                    // daemon's on the volume.
+                    self.loopback.close();
                     Ok(Ok(()))
                 })
                 .await
@@ -843,6 +1340,12 @@ pub struct ManagerHandle {
     /// through the actor mainloop.
     #[cfg(target_os = "linux")]
     hostnames: Arc<RwLock<crate::net::dns::HostnameRegistry>>,
+    /// The actor's lease book, held only for the one test seam below: a test
+    /// that needs this daemon to be in the state a daemon whose deferred
+    /// probe is still walking holds its book in. Production callers reach
+    /// the book through the manager actor, which owns it.
+    #[cfg(all(test, target_os = "linux"))]
+    loopback: Arc<crate::net::dns::LoopbackLeaseBook>,
 }
 
 /// A non-owning handle to the [`Manager`] actor.
@@ -859,6 +1362,10 @@ pub struct WeakManagerHandle {
     /// keep the actor alive (only live senders do).
     #[cfg(target_os = "linux")]
     hostnames: Arc<RwLock<crate::net::dns::HostnameRegistry>>,
+    /// Mirrors [`ManagerHandle::loopback`], for the same reason: the test seam
+    /// must survive an upgrade.
+    #[cfg(all(test, target_os = "linux"))]
+    loopback: Arc<crate::net::dns::LoopbackLeaseBook>,
 }
 
 impl WeakManagerHandle {
@@ -870,6 +1377,8 @@ impl WeakManagerHandle {
             sender: self.sender.upgrade()?,
             #[cfg(target_os = "linux")]
             hostnames: Arc::clone(&self.hostnames),
+            #[cfg(all(test, target_os = "linux"))]
+            loopback: Arc::clone(&self.loopback),
         })
     }
 }
@@ -936,6 +1445,8 @@ impl ManagerHandle {
             sender: self.sender.downgrade(),
             #[cfg(target_os = "linux")]
             hostnames: Arc::clone(&self.hostnames),
+            #[cfg(all(test, target_os = "linux"))]
+            loopback: Arc::clone(&self.loopback),
         }
     }
 
@@ -946,6 +1457,72 @@ impl ManagerHandle {
     #[must_use]
     pub fn hostnames(&self) -> Arc<RwLock<crate::net::dns::HostnameRegistry>> {
         Arc::clone(&self.hostnames)
+    }
+
+    /// Puts this daemon's verdict over the reserved local range back in the
+    /// state a daemon whose forwarder-conducted probe is still walking holds
+    /// its book in ([`crate::net::dns::RangeVerdict::Pending`]) — the window a
+    /// microVM daemon is already serving RPCs in, and the one a box resumed
+    /// by the first of them must still be answered in (NET-013).
+    ///
+    /// Test-only: no production path needs to *un-know* a verdict it has, and
+    /// one that did would want a message, not a setter.
+    ///
+    /// The daemon's one verdict deadline restarts with it, as it does for a
+    /// daemon that has just started, so the window is the full
+    /// [`crate::net::dns::HAND_VERDICT_WAIT`] however long the harness took
+    /// to come up.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn hold_range_verdict_pending(&self) {
+        self.loopback
+            .set_range_verdict(crate::net::dns::RangeVerdict::Pending);
+        self.loopback
+            .reset_hand_verdict_deadline(crate::net::dns::HAND_VERDICT_WAIT.as_millis() as u64);
+    }
+
+    /// Lands a range verdict with the arms the deferred walk runs when it
+    /// lands one — the state change and the re-publishes that follow it — so
+    /// a test drives the window's endings the way the walk does.
+    /// [`Self::hold_range_verdict_pending`] opens the window; this closes it,
+    /// over whatever the window published.
+    ///
+    /// Test-only: the production path that lands a verdict is the walk
+    /// itself, and it lands the probe's answer, never a test's.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn land_range_verdict(&self, verdict: crate::net::dns::RangeVerdict) {
+        land_range_verdict(&self.loopback, &self.hostnames, verdict);
+    }
+
+    /// The daemon's answerer lease book, for the tests that drive a
+    /// landing's two halves apart — the draw and the apply between which a
+    /// box can die — the way the walk's single landing never does.
+    ///
+    /// Test-only: production code reaches the book through the paths that
+    /// ask it, not by handle.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn loopback_book(&self) -> &std::sync::Arc<crate::net::dns::LoopbackLeaseBook> {
+        &self.loopback
+    }
+
+    /// Moves the daemon's one verdict deadline to `millis` from now, so a
+    /// test proves the expiry shape — the interim published when the
+    /// deadline runs out — without paying the real deadline, or holds the
+    /// window open long enough to tell a registration that waited from one
+    /// that did not.
+    ///
+    /// Test-only: no production path changes a deadline it is itself bounded
+    /// by.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn reset_hand_verdict_deadline(&self, millis: u64) {
+        self.loopback.reset_hand_verdict_deadline(millis);
+    }
+
+    /// How many registrations are waiting on the range verdict right now
+    /// ([`crate::net::dns::LoopbackLeaseBook::verdict_waiters`]), so a test
+    /// lands the verdict only once a registration provably waits for it.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn verdict_waiters(&self) -> usize {
+        self.loopback.verdict_waiters()
     }
 
     /// Lists the sessions known to this (minimald) instance.
@@ -1248,6 +1825,7 @@ pub(crate) mod tests {
             project_path: HostAbsPath::try_new("/proj").unwrap(),
             network: sessions::NetworkMode::default(),
             policy: Default::default(),
+            box_addresses: None,
             hooks_enabled: true,
             attrs: Default::default(),
         }
@@ -1947,11 +2525,10 @@ pub(crate) mod tests {
     /// nowhere (yet), and the session persists `Active` on the
     /// empty-contribution fast path.
     ///
-    /// The graph-resolution outcome isn't observed by the test —
-    /// depending on how `Graph::new_from_chain` handles a bare
-    /// `minimal.toml` in a scratch dir, it may return an empty
-    /// graph or an error. Either branch must leave `CreateSession`
-    /// returning `Ready`; that's the invariant guarded here.
+    /// The bare `minimal.toml` fixture must resolve to a graph:
+    /// a graph-resolution error now fails `configure_loadout`, so
+    /// `CreateSession` returning `Ready` here also proves the
+    /// fixture's graph resolves.
     /// Guards against a regression where the mfile parse or graph
     /// pipeline breaks creation for real projects. Once composition
     /// consumes the parsed mfile + graph, this test evolves.
@@ -2200,16 +2777,14 @@ pub(crate) mod tests {
         assert!(packages.is_empty(), "NoMFile → no PackageComposables");
     }
 
-    /// [`build_composables`] with an [`ProjectResolution::MFileOnly`]
-    /// carrying a `[session]` block produces a [`ProjectComposable`];
-    /// package composables stay empty because the graph is absent.
-    /// The MFileOnly path exercises the "graph resolve failed but
-    /// project still declares packages" branch — project packages
-    /// don't get their own PackageComposables, they just wait for
-    /// the composer to see them via the ProjectComposable's
-    /// contribution.
+    /// [`build_composables`] on a resolved project stamps every
+    /// project-contributed package with `Source::Project` naming the
+    /// *declared* project path, not the per-session workspace the
+    /// mfile was read out of. The hooks policy matches projects by
+    /// this path and every error message quotes it, so a per-session
+    /// value would be unmatchable and unrecognizable.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn build_composables_mfile_only_yields_project_composable_and_no_packages() {
+    async fn build_composables_project_provenance_names_declared_path() {
         use std::io::Write;
 
         let project = TempDir::new().unwrap();
@@ -2218,8 +2793,6 @@ pub(crate) mod tests {
         writeln!(f, "[session]\npackages = [\"cargo\"]").unwrap();
         drop(f);
 
-        // Build a `Context` directly (no graph); the manager sets
-        // the same shape internally on the MFileOnly branch.
         let cache = TempDir::new().unwrap();
         let state = TempDir::new().unwrap();
         let mctx_config = mctx::ConfigBuilder::new()
@@ -2229,37 +2802,26 @@ pub(crate) mod tests {
             .build()
             .unwrap();
         let daemon = std::sync::Arc::new(mctx::DaemonContext::init(mctx_config).unwrap());
-        let mfile = mctx::MFileSearchStrategy::Override(project.path().to_path_buf())
-            .find_mfile()
-            .unwrap();
-        let ctx = mctx::Context::from_daemon(daemon, mfile);
 
         let path = DaemonAbsPath::try_new(project.path().to_str().unwrap()).unwrap();
-        let (project_composable, packages) = build_composables(
+        let resolution = resolve_project_ctx_and_graph(&daemon, &path)
+            .expect("a stdlib-only mfile resolves offline");
+        assert!(
+            matches!(resolution, ProjectResolution::Full(..)),
+            "an mfile on disk with a resolvable graph → Full",
+        );
+        let (project_composable, _packages) = build_composables(
             &path,
             &declared_path(),
-            &ProjectResolution::MFileOnly(ctx),
+            &resolution,
             &WireContribution::default(),
             true,
         )
         .unwrap();
-        assert!(
-            project_composable.is_some(),
-            "MFileOnly with [session] block → ProjectComposable present",
-        );
-        assert!(
-            packages.is_empty(),
-            "MFileOnly → no PackageComposables (no graph to walk)",
-        );
 
-        // Provenance names the project as the *user* knows it, not the
-        // per-session workspace the mfile was read out of. The hooks
-        // policy matches projects by this path and every error message
-        // quotes it, so a per-session value would be unmatchable and
-        // unrecognizable — see `build_composables`.
         use sessions::core::compose::Composable as _;
         let contribution = project_composable
-            .unwrap()
+            .expect("[session] block → ProjectComposable present")
             .contribute(&|_| Err(std::env::VarError::NotPresent))
             .expect("the fixture's [session] block contributes cleanly");
         let sources: Vec<_> = contribution
@@ -2278,6 +2840,58 @@ pub(crate) mod tests {
                 "provenance should name the declared project path, not the workspace",
             );
         }
+    }
+
+    /// A project whose `minimal.toml` demands a newer standard
+    /// library than the daemon ships fails graph resolution, and
+    /// [`run_compose`] surfaces that as an `InvalidInput` error
+    /// rather than silently dropping every package contribution.
+    /// Regression guard for the `MFileOnly` fallback, which let
+    /// `min session activate` succeed (exit 0) while the session
+    /// came up missing all package material.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_compose_returns_invalid_input_when_graph_resolution_fails() {
+        use std::io::Write;
+
+        let project = TempDir::new().unwrap();
+        let mfile_path = project.path().join(mfile::MFILE_NAME);
+        let mut f = std::fs::File::create(&mfile_path).unwrap();
+        writeln!(
+            f,
+            "[stdlib]\nminimum_version = \"999.0.0\"\n\n[session]\npackages = [\"cargo\"]"
+        )
+        .unwrap();
+        drop(f);
+
+        let cache = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        let mctx_config = mctx::ConfigBuilder::new()
+            .with_cache_dir(cache.path())
+            .with_state_dir(state.path())
+            .with_daemon_id("test".to_string())
+            .build()
+            .unwrap();
+        let daemon = std::sync::Arc::new(mctx::DaemonContext::init(mctx_config).unwrap());
+
+        let path = DaemonAbsPath::try_new(project.path().to_str().unwrap()).unwrap();
+        let err = run_compose(
+            &daemon,
+            &path,
+            &declared_path(),
+            WireContribution::default(),
+            true,
+        )
+        .expect_err("an outdated stdlib must fail the compose, not degrade");
+        assert_eq!(
+            err.kind(),
+            ErrorKind::InvalidInput,
+            "graph-resolution failure should surface as InvalidInput, got {err:?}",
+        );
+        assert!(
+            err.to_string()
+                .contains("newer version of the standard library needed"),
+            "the error should carry the graph's own diagnostic, got {err}",
+        );
     }
 
     /// [`run_composer`] with an empty client contribution and no
@@ -2374,74 +2988,6 @@ pub(crate) mod tests {
         assert!(
             err.to_string().contains("no-such-output"),
             "the error must name the output that was asked for, got {err}"
-        );
-    }
-
-    /// NET-027's address half: each daemon's loopback allocator draws from
-    /// the slice of the reserved local range its own slice octet indexes —
-    /// for a native daemon the third octet of its own gvproxy's /24, for a
-    /// microVM daemon the octet its instance id derives, since its switch is
-    /// the host's default /16 and is the same for every VM on the host. Two
-    /// daemons whose octets differ draw from disjoint ranges — save octets
-    /// that differ by a multiple of the slice count, which index one
-    /// shared slice (the wrap the last assertion pins) — and every address
-    /// one hands out stays inside its own.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn loopback_allocators_follow_the_daemon_s_slice_octet() {
-        // A native daemon on its own /24, a VM daemon whose id derived the
-        // same octet, and a second daemon on the octet next door.
-        let daemon_a = LoopbackAllocator::for_slice_octet(1);
-        let daemon_b = LoopbackAllocator::for_slice_octet(9);
-        let daemon_c = LoopbackAllocator::for_slice_octet(0);
-
-        let (first_a, last_a) = daemon_a.range();
-        let (first_b, last_b) = daemon_b.range();
-        let (first_c, last_c) = daemon_c.range();
-        assert_ne!(
-            first_a, first_c,
-            "two daemons must not draw from the same slice"
-        );
-        assert!(
-            first_c > last_a || first_a > last_c,
-            "the slices must be disjoint: {}..={} and {}..={}",
-            first_a,
-            last_a,
-            first_c,
-            last_c
-        );
-        // Octets 1 and 9 are eight slices apart, so they wrap onto the same
-        // one — the documented wrap-around NET-010's host-global allocation
-        // is the layer that arbitrates; it must stay a wrap, not a widening.
-        assert_eq!(
-            (first_a, last_a),
-            (first_b, last_b),
-            "octets eight slices apart must share a slice, not split one"
-        );
-        for addr in [first_a, last_a, first_b, last_b, first_c, last_c] {
-            assert_eq!(
-                addr.octets()[0],
-                127,
-                "every published address stays in the reserved local range"
-            );
-        }
-
-        // Hand-out never reuses and never leaves the slice.
-        let mut allocator = daemon_a;
-        let mut handed = std::collections::BTreeSet::new();
-        while let Some(addr) = allocator.allocate() {
-            assert!(handed.insert(addr), "an address is handed out once");
-            assert!(addr >= first_a && addr <= last_a, "inside the slice");
-        }
-        assert_eq!(
-            handed.len(),
-            32,
-            "a /27 slice holds 32 published addresses' worth of room"
-        );
-        assert_eq!(
-            allocator.allocate(),
-            None,
-            "a spent slice yields no more addresses"
         );
     }
 }

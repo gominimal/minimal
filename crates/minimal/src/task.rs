@@ -16,7 +16,7 @@
 //! refactored out of it: a few duplicated lines of glue keep
 //! `cmd_activate`'s diff at zero.
 
-use std::io::IsTerminal as _;
+use std::io::{IsTerminal as _, Read as _};
 
 use anyhow::{Context as _, bail};
 use tokio::io::AsyncWriteExt as _;
@@ -55,16 +55,17 @@ fn exit_outcome(code: Option<u32>) -> Result<(), anyhow::Error> {
     }
 }
 
-/// The exec request a task run sends: the task, plus the owns-box flag —
-/// set unless `--keep` retains the session (NET-131). The flag is what moves
-/// the destroy off this client: with it set, the daemon ends the session
-/// once the task's exit status is on the wire, whether or not this process
-/// is still there. `--keep` withholds it, because a kept session is meant to
-/// outlive the run — its end stays with whoever holds it.
-fn task_run_request(task: &str, keep: bool) -> minimald_rpc::exec::ExecRequest {
+/// The exec request a task run sends: the task, its declared arguments, plus
+/// the owns-box flag — set unless `--keep` retains the session (NET-131). The
+/// flag is what moves the destroy off this client: with it set, the daemon
+/// ends the session once the task's exit status is on the wire, whether or
+/// not this process is still there. `--keep` withholds it, because a kept
+/// session is meant to outlive the run — its end stays with whoever holds it.
+fn task_run_request(task: &str, args: &[String], keep: bool) -> minimald_rpc::exec::ExecRequest {
     minimald_rpc::exec::ExecRequest::TaskRun {
         task: task.to_string(),
         owns_box: !keep,
+        args: args.to_vec(),
     }
 }
 
@@ -445,14 +446,14 @@ fn arm_task_run_interrupt(
 ///
 /// stdin is pumped into the channel only when it is NOT a terminal: a piped
 /// stdin EOFs and half-closes the channel like the git helper's does, but a
-/// terminal stdin never EOFs — and tokio's stdin is an uncancellable
-/// blocking read that would hold the runtime open after the task exits — so
-/// a terminal caller half-closes immediately and a stdin-reading task sees
-/// EOF instead of hanging. The upshot: tasks run non-interactively; stdin
-/// content reaches the task only when piped. That is not just the tokio
-/// constraint — the daemon's exec channel has no PTY (only the shell path
-/// does), so interactive tasks are structurally unsupported here anyway;
-/// interactive work belongs in `min session attach`.
+/// terminal stdin never EOFs — and a blocking stdin read cannot be
+/// cancelled once the task exits — so a terminal caller half-closes
+/// immediately and a stdin-reading task sees EOF instead of hanging. The
+/// upshot: tasks run non-interactively; stdin content reaches the task only
+/// when piped. That is not just the cancellation constraint — the daemon's
+/// exec channel has no PTY (only the shell path does), so interactive tasks
+/// are structurally unsupported here anyway; interactive work belongs in
+/// `min session attach`.
 async fn bridge_exec(
     mut channel: russh::Channel<russh::client::Msg>,
 ) -> Result<Option<u32>, anyhow::Error> {
@@ -461,12 +462,35 @@ async fn bridge_exec(
         None
     } else {
         let mut to_channel = channel.make_writer();
+        // Read stdin on a detached thread, not `tokio::io::stdin()`: the
+        // latter parks a blocking `read(0)` on tokio's blocking pool, which
+        // `pump.abort()` cannot interrupt — so a piped stdin whose writer
+        // stays open would hold the runtime open forever after the task
+        // exits. A detached thread is abandoned on exit instead of awaited.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+        std::thread::spawn(move || {
+            let mut stdin = std::io::stdin();
+            let mut buf = [0u8; 8192];
+            loop {
+                match stdin.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if tx.blocking_send(buf[..n].to_vec()).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
         // Both results are deliberately dropped: the remote side may close
         // the channel before consuming all our input, and that surfaces
         // through the channel loop below, not here.
         Some(tokio::spawn(async move {
-            let mut stdin = tokio::io::stdin();
-            let _ = tokio::io::copy(&mut stdin, &mut to_channel).await;
+            while let Some(chunk) = rx.recv().await {
+                if to_channel.write_all(&chunk).await.is_err() {
+                    break;
+                }
+            }
             let _ = to_channel.shutdown().await;
         }))
     };
@@ -597,6 +621,7 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
         project_path: abs_path.clone(),
         network: sessions::NetworkMode::HostNet,
         policy: sessions::SessionPolicy::default(),
+        box_addresses: None,
         // Same default as an activate with no flags, matching the
         // loadout handling below. `min task run` has no `--no-hooks` of
         // its own; a `--keep` session is attachable later, so its hooks
@@ -843,7 +868,7 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     let outcome = match client
         .open_session_exec_channel(
             id,
-            &task_run_request(&args.task, args.keep).encode(),
+            &task_run_request(&args.task, &args.args, args.keep).encode(),
             &task_env,
         )
         .await
@@ -987,24 +1012,26 @@ mod tests {
         use minimald_rpc::exec::ExecRequest;
 
         // A normal run: the request names the box as the run's own.
-        let req = task_run_request("build", false);
+        let req = task_run_request("build", &[], false);
         assert_eq!(
             req,
             ExecRequest::TaskRun {
                 task: "build".to_string(),
-                owns_box: true
+                owns_box: true,
+                args: vec![],
             }
         );
         // The flag is carried, not inferred: it survives the wire.
         assert_eq!(ExecRequest::parse(&req.encode()), Ok(req.clone()));
 
         // `--keep` keeps the box: no owns-box flag, nothing ends it here.
-        let kept = task_run_request("build", true);
+        let kept = task_run_request("build", &[], true);
         assert_eq!(
             kept,
             ExecRequest::TaskRun {
                 task: "build".to_string(),
-                owns_box: false
+                owns_box: false,
+                args: vec![],
             }
         );
         assert_eq!(ExecRequest::parse(&kept.encode()), Ok(kept));
@@ -1544,6 +1571,7 @@ mod tests {
             task: "deploy".into(),
             path: None,
             keep: false,
+            args: vec![],
         };
 
         let err = cmd_task_run(&global, args)
@@ -1590,6 +1618,7 @@ mod tests {
             task: "build".into(),
             path: None,
             keep: false,
+            args: vec![],
         };
 
         let err = cmd_task_run(&global, args)
@@ -1644,6 +1673,7 @@ mod tests {
             task: "build".into(),
             path: None,
             keep: false,
+            args: vec![],
         };
 
         let err = cmd_task_run(&global, args)

@@ -13,6 +13,15 @@ on:
         branches: ["main", "release/**"]
     pull_request:
         branches: ["main", "release/**"]
+    # A merge-queue build runs ONLY the ci-macos-success aggregator, which
+    # reports green with every gating job skipped. ci-macos-success is a
+    # required check, so the queue still needs this trigger to see it, but the
+    # lane's work happens on the PR run (path-filtered) and on the push to main
+    # after the merge, which runs the full lane. The single self-hosted runner
+    # is the queue's bottleneck, and queue builds have not caught a macOS
+    # failure the PR run missed.
+    merge_group:
+        branches: ["main", "release/**"]
     workflow_dispatch:
     # Reusable so the nightly test tier can run the macOS/HVF e2e on a schedule
     # (nightly-tests.yml `macos-e2e`). On a scheduled call `github.event_name`
@@ -43,6 +52,8 @@ permissions:
 
 jobs:
     changes:
+        # Merge-queue builds run only the aggregator; see `merge_group` above.
+        if: github.event_name != 'merge_group'
         runs-on: ubuntu-latest
         timeout-minutes: 5
         outputs:
@@ -85,7 +96,7 @@ jobs:
 
     artifacts:
         needs: [changes]
-        if: github.event_name != 'pull_request' || needs.changes.outputs.macos == 'true'
+        if: github.event_name != 'merge_group' && (github.event_name != 'pull_request' || needs.changes.outputs.macos == 'true')
         # Build the `minimal` CLI from THIS repo's sources, then materialize the
         # guest kernel + rootfs against the repo's own .minimal/minimal.toml. Both
         # are cache pulls keyed by the pinned upstream commit (not compiles): the
@@ -103,13 +114,19 @@ jobs:
               # target/ cache routinely exceed the ~14 GB free on a fresh
               # GitHub-hosted Ubuntu runner. `remove_tool_cache: true`
               # reclaims /opt/hostedtoolcache (~14 GB); the dtolnay Toolchain
-              # step below reinstalls the Rust toolchain we actually need.
+              # step below reinstalls the Rust toolchain we actually need. The
+              # Android SDK is removed by the next step instead.
               uses: endersonmenezes/free-disk-space@2a22f8c59cae9cddae7194b33e6b92d023b2b4b8 # v4.0.0
               with:
-                  remove_android: true
+                  remove_android: false
                   remove_dotnet: true
                   remove_haskell: true
                   remove_tool_cache: true
+            - name: Remove the Android SDK in the background
+              # ~11 GB in many small files: deleting it in the foreground costs
+              # 50-130 s. Detached, it finishes while the toolchain installs and
+              # the cache restores, before the build needs the space.
+              run: setsid nohup sudo rm -rf /usr/local/lib/android >/dev/null 2>&1 &
             - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
               with:
                   persist-credentials: false
@@ -150,7 +167,7 @@ jobs:
                   arch: aarch64
                   channel: unstable
             - name: Install cross
-              uses: taiki-e/install-action@4076c08d76dba979c11a7285295b0716c1d67908 # v2
+              uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2
               with:
                   tool: cross
             - name: Build guest initramfs (minimald as /init)
@@ -237,6 +254,7 @@ jobs:
         # as pass, so this does not wedge the required check.
         if: >-
             ${{ vars.RUN_MACOS_CI != 'false'
+            && github.event_name != 'merge_group'
             && (github.event_name != 'pull_request'
                 || (needs.changes.outputs.macos == 'true'
                     && github.event.pull_request.head.repo.full_name == github.repository)) }}
@@ -268,7 +286,7 @@ jobs:
                   name: mac-testbed
                   path: ${{ runner.temp }}/testbed
             - name: Install nextest
-              uses: taiki-e/install-action@4076c08d76dba979c11a7285295b0716c1d67908 # v2
+              uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2
               with:
                   tool: nextest
             - name: Unpack testbed + resolve paths
@@ -441,7 +459,7 @@ jobs:
         # macOS-sensitive crates; widen to --workspace once the tree is
         # mac-buildable. Kept lean (private repo: macOS minutes bill at 10x).
         needs: [changes]
-        if: github.event_name != 'pull_request' || needs.changes.outputs.macos == 'true'
+        if: github.event_name != 'merge_group' && (github.event_name != 'pull_request' || needs.changes.outputs.macos == 'true')
         runs-on: macos-latest
         timeout-minutes: 45
         env:
@@ -459,7 +477,7 @@ jobs:
                   toolchain: stable
                   components: clippy
             - name: Cache cargo registry and build artifacts
-              uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+              uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2 # zizmor: ignore[cache-poisoning] test-only lane, nothing published; save-if keeps every non-main ref read-only
               with:
                   shared-key: mac-unit
                   # PR branches restore but never save, so PR churn cannot
@@ -469,7 +487,7 @@ jobs:
             - name: Provision libkrun (pinned own build)
               uses: ./.github/actions/setup-libkrun-macos
             - name: Install nextest
-              uses: taiki-e/install-action@4076c08d76dba979c11a7285295b0716c1d67908 # v2
+              uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2
               with:
                   tool: nextest
             - name: Clippy (minvmd)

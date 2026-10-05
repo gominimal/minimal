@@ -391,8 +391,12 @@ mod tests {
             project_path: HostAbsPath::try_new("/home/alice/proj").unwrap(),
             network: NetworkMode::default(),
             policy: Default::default(),
+            box_addresses: None,
             hooks_enabled: true,
             status: SessionStatus::default(),
+            // No launch has recorded anything: these records are built
+            // straight from disk-side seeds, never launched.
+            host_ip_enforcement: None,
             attrs: Default::default(),
         }
     }

@@ -503,6 +503,91 @@ impl sandbox2::Channel for EnvChannel<'_> {
     }
 }
 
+/// How the sandbox's working directory is laid out.
+///
+/// The default mirrors host paths one-for-one ([`WdSetup::BoundDir`]): the
+/// working directory is the host directory named by [`EnvArgs::cwd`], and
+/// `~/`-rooted patch paths expand against [`EnvArgs::home`]. A session
+/// instead owns its layout outright ([`WdSetup::Session`]): the working
+/// directory is mounted at `/workbench` and the home at `/home`, so a task
+/// run by the daemon sees the same paths the interactive session does rather
+/// than the daemon's internal tree.
+///
+/// [`WdSetup`]: sandbox2::config::WdSetup
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum WdLayout {
+    /// Mirror host paths one-for-one; the working directory is [`EnvArgs::cwd`].
+    #[default]
+    BoundDir,
+    /// Use the session layout: `working` at `/workbench`, `home` at `/home`.
+    Session {
+        /// The host directory mounted at `/home`.
+        home: PathBuf,
+        /// The host directory mounted at `/workbench`.
+        working: PathBuf,
+    },
+}
+
+/// Applies the working-directory layout to a fresh sandbox config.
+///
+/// [`WdLayout::BoundDir`] mirrors host paths one-for-one: the working
+/// directory is `cwd` and `home` (when present) is the `$HOME` the sandbox
+/// reports. [`WdLayout::Session`] owns its layout outright, mounting `home`
+/// at `/home` and `working` at `/workbench`. The `fs_mappings` apply under
+/// both layouts with their declared modes; under the session layout a mapping
+/// whose host path lies inside `home` or `working` is retargeted to the same
+/// place under `/home` or `/workbench` (see [`session_mapping`]).
+fn apply_wd_layout(
+    config: sandbox2::config::Config,
+    layout: &WdLayout,
+    cwd: &Path,
+    home: Option<&Path>,
+    fs_mappings: Vec<common::FsMapping>,
+) -> sandbox2::config::Config {
+    match layout {
+        WdLayout::BoundDir => config
+            .with_wd(cwd.to_path_buf(), false, fs_mappings)
+            .with_home(home.map(Path::to_path_buf)),
+        WdLayout::Session { home, working } => {
+            let fs_mappings = fs_mappings
+                .into_iter()
+                .map(|m| session_mapping(m, home, working))
+                .collect();
+            config.with_session_dirs_mapped(home.clone(), working.clone(), fs_mappings)
+        }
+    }
+}
+
+/// Retargets one file mapping for the session layout.
+///
+/// The session home is mounted at `/home` and the working directory at
+/// `/workbench`, so a mapping whose host path is inside either one lands at
+/// the matching path under that mount; the more specific of the two wins
+/// when one directory is nested in the other. Any other mapping keeps the
+/// sandbox path it already had.
+fn session_mapping(mut m: common::FsMapping, home: &Path, working: &Path) -> common::FsMapping {
+    if m.sandbox_path.is_some() {
+        return m;
+    }
+    let mut bases = [
+        (home, sandbox2::SESSION_HOME),
+        (working, sandbox2::SESSION_DEFAULT_WD),
+    ];
+    bases.sort_by_key(|(base, _)| std::cmp::Reverse(base.as_os_str().len()));
+    let host = Path::new(&m.host_path);
+    if let Some((rel, mount)) = bases
+        .iter()
+        .find_map(|(base, mount)| Some((host.strip_prefix(base).ok()?, *mount)))
+    {
+        m.sandbox_path = Some(if rel.as_os_str().is_empty() {
+            format!("/{mount}")
+        } else {
+            format!("/{mount}/{}", rel.display())
+        });
+    }
+    m
+}
+
 /// The arguments used to construct a runtime environment.
 pub struct EnvArgs<'a> {
     /// A symbolic name for the environment. For tasks, this is the task name.
@@ -514,6 +599,8 @@ pub struct EnvArgs<'a> {
     pub state_base_dir: PathBuf,
     /// The working directory to map.
     pub cwd: PathBuf,
+    /// How the working directory is laid out; see [`WdLayout`].
+    pub wd_layout: WdLayout,
     /// Any additional pinhole bind mounts / file mappings.
     pub patches: Option<&'a EnvPatches>,
     /// The home directory `~/`-rooted patch paths expand against, and that
@@ -587,6 +674,65 @@ fn declared_by(packages: &BTreeMap<String, String>, declared: &str, task: &str) 
         Some(p) => format!("package `{p}`"),
         None => format!("task `{task}`"),
     }
+}
+
+/// One declared patch entry that shares an expanded host path with
+/// possibly other entries. A directory mapping and a file mapping can
+/// expand to the same path — `Config::validate` processes directories
+/// first, so a missing read-write directory is created there and a
+/// later file mapping at the same path then fails as "directory mapped
+/// as a file". Carrying `is_file`/`read_only` alongside the declaration
+/// lets [`attribute_fs_mapping_error`] pick the entry that actually
+/// caused a given failure instead of an arbitrary one sharing its path.
+struct DeclaredMapping<'a> {
+    declared: &'a String,
+    is_file: bool,
+    read_only: bool,
+}
+
+/// Attributes a sandbox fs-mapping failure to the declaration behind the
+/// expanded path it names, so "create mapped file /.claude.json: EROFS" on
+/// its own sends nobody anywhere useful (#1204). A read-only mapping is never
+/// created, so a missing source surfaces as `"fs mapping"` and gets a distinct
+/// message; creation failures keep the existing wording.
+///
+/// When several declarations expand to the same path, the match is narrowed
+/// by mirroring the check in `Config::validate` that produced `op`, falling
+/// back to the first declaration when nothing narrows it (the common case:
+/// exactly one declaration at that path).
+fn attribute_fs_mapping_error(
+    e: &sandbox2::Error,
+    declarations: &BTreeMap<String, Vec<DeclaredMapping<'_>>>,
+    fs_mapping_packages: &BTreeMap<String, String>,
+    task: &str,
+) -> Option<Error> {
+    let sandbox2::Error::IO(op, path, io_err) = e else {
+        return None;
+    };
+    let candidates = path.to_str().and_then(|p| declarations.get(p))?;
+    let declared = match *op {
+        // A read-only mapping is never created, so a missing source is
+        // always the read-only side of a collision.
+        "fs mapping" => candidates.iter().find(|c| c.read_only),
+        "create mapped file" => candidates.iter().find(|c| c.is_file && !c.read_only),
+        "create mapped dir" => candidates.iter().find(|c| !c.is_file && !c.read_only),
+        // "directory mapped as a file": the failing side is whichever
+        // declaration named this path as a file.
+        "stat fs mapping" if io_err.kind() == std::io::ErrorKind::AlreadyExists => {
+            candidates.iter().find(|c| c.is_file)
+        }
+        _ => None,
+    }
+    .or_else(|| candidates.first())?
+    .declared;
+    let by = declared_by(fs_mapping_packages, declared, task);
+    let msg = match *op {
+        "fs mapping" => {
+            format!("{e}; read-only patch source `{declared}` does not exist (declared by {by})")
+        }
+        _ => format!("{e}; mapped in by {by}, which declares it as `{declared}`"),
+    };
+    Some(Error::Other(anyhow::anyhow!(msg)))
 }
 
 /// The home directory this environment's `~/`-rooted patch paths expand
@@ -700,23 +846,48 @@ impl<'a> Env<'a> {
                 declared_by(&fs_mapping_packages, &e.declared, args.name)
             ))
         })?;
-        // Expanded path → the declaration behind it. sandbox2 only ever sees
-        // the expanded form, so its "create mapped file" failures name a path
-        // nobody wrote down; this puts the package and its `~/`-rooted
-        // declaration back into the message.
-        let declarations: BTreeMap<String, &String> = fs_mapping_packages
-            .keys()
-            .filter_map(|declared| {
+        // Expanded path → the declaration(s) behind it. sandbox2 only ever
+        // sees the expanded form, so its fs-mapping failures name a path
+        // nobody wrote down; this puts the `~/`-rooted declaration back
+        // into the message. A path can carry more than one declaration (a
+        // dir mapping and a file mapping can expand to the same path), so
+        // every declaration at a path is kept, for
+        // [`attribute_fs_mapping_error`] to pick among. Built from the
+        // merged patch set so the task's own `patch` table is covered
+        // alongside package-declared mappings.
+        let declarations: BTreeMap<String, Vec<DeclaredMapping<'_>>> = patch
+            .dir
+            .iter()
+            .map(|(declared, setting)| (declared, false, setting))
+            .chain(
+                patch
+                    .file
+                    .iter()
+                    .map(|(declared, setting)| (declared, true, setting)),
+            )
+            .filter_map(|(declared, is_file, setting)| {
                 Some((
                     EnvPatches::expand_home(declared, home.as_deref()).ok()?,
-                    declared,
+                    DeclaredMapping {
+                        declared,
+                        is_file,
+                        read_only: matches!(setting, mfile::PatchSetting::ReadOnly),
+                    },
                 ))
             })
-            .collect();
+            .fold(BTreeMap::new(), |mut declarations, (expanded, mapping)| {
+                declarations.entry(expanded).or_default().push(mapping);
+                declarations
+            });
 
-        let mut config = sandbox2::config::Config::new(args.name)
-            .with_wd(args.cwd.clone(), false, fs_mappings)
-            .with_home(home.clone())
+        let mut config = apply_wd_layout(
+            sandbox2::config::Config::new(args.name),
+            &args.wd_layout,
+            &args.cwd,
+            home.as_deref(),
+            fs_mappings,
+        );
+        config = config
             .with_rootfs(
                 args.transitives
                     .keys()
@@ -757,20 +928,8 @@ impl<'a> Env<'a> {
             )
             .await
             .map_err(|e| {
-                // Sandbox setup creates every mapped file it doesn't find. If
-                // that failed on a path we mapped in, say whose declaration it
-                // was — "create mapped file /.claude.json: EROFS" on its own
-                // sends nobody anywhere useful (#1204).
-                let sandbox2::Error::IO(_, path, _) = &e else {
-                    return e.into();
-                };
-                match path.to_str().and_then(|p| declarations.get(p)) {
-                    Some(declared) => Error::Other(anyhow::anyhow!(
-                        "{e}; mapped in by {}, which declares it as `{declared}`",
-                        declared_by(&fs_mapping_packages, declared, args.name)
-                    )),
-                    None => e.into(),
-                }
+                attribute_fs_mapping_error(&e, &declarations, &fs_mapping_packages, args.name)
+                    .unwrap_or_else(|| e.into())
             })?;
         for want_dir in state_dirs {
             std::fs::create_dir_all(args.state_base_dir.join(&want_dir)).map_err(|e| {
@@ -1014,6 +1173,186 @@ mod tests {
             declared_by(&packages, "~/.npmrc", "test"),
             "task `test`",
             "a path no package declared came from the task's own patch table"
+        );
+    }
+
+    /// The working-directory layout choice is what routes a task into the
+    /// session layout (`/workbench` + `/home`) instead of the bound-dir
+    /// layout that mirrors the daemon's internal tree path. `apply_wd_layout`
+    /// is the single branch both callers go through, so asserting its two
+    /// outcomes pins the fix without needing a full sandbox launch.
+    #[test]
+    fn wd_layout_selects_session_or_bound_dir() {
+        let session = apply_wd_layout(
+            sandbox2::config::Config::new("task"),
+            &WdLayout::Session {
+                home: PathBuf::from("/var/lib/minimal/sessions/s1/home"),
+                working: PathBuf::from("/var/lib/minimal/sessions/s1/tree"),
+            },
+            Path::new("/var/lib/minimal/sessions/s1/tree"),
+            None,
+            vec![],
+        );
+        assert_eq!(session.command_cwd().unwrap(), "/workbench");
+        assert_eq!(session.sandbox_home(), "/home");
+
+        let bound = apply_wd_layout(
+            sandbox2::config::Config::new("task"),
+            &WdLayout::BoundDir,
+            Path::new("/var/lib/minimal/sessions/s1/tree"),
+            Some(Path::new("/home/dev")),
+            vec![],
+        );
+        assert_eq!(
+            bound.command_cwd().unwrap(),
+            "/var/lib/minimal/sessions/s1/tree"
+        );
+        assert_eq!(bound.sandbox_home(), "/home/dev");
+    }
+
+    /// A task's `patch` table still applies under the session layout: every
+    /// mapping reaches sandbox2 with its declared mode, a mapping inside the
+    /// session home or tree is retargeted under `/home` or `/workbench`, and
+    /// any other absolute path (a host socket) keeps its own path.
+    #[test]
+    fn session_layout_keeps_and_retargets_fs_mappings() {
+        let mapping = |host_path: &str, read_only: bool, is_file: bool| common::FsMapping {
+            host_path: host_path.to_string(),
+            sandbox_path: None,
+            read_only,
+            is_file,
+            create_if_missing: !read_only,
+        };
+        let home = "/var/lib/minimal/sessions/s1/home";
+        let working = "/var/lib/minimal/sessions/s1/tree";
+        let config = apply_wd_layout(
+            sandbox2::config::Config::new("task"),
+            &WdLayout::Session {
+                home: PathBuf::from(home),
+                working: PathBuf::from(working),
+            },
+            Path::new(working),
+            None,
+            vec![
+                mapping(&format!("{home}/.config/railway"), true, false),
+                mapping(&format!("{home}/.claude.json"), false, true),
+                mapping(&format!("{working}/target"), false, false),
+                mapping("/var/run/docker.sock", false, true),
+            ],
+        );
+        let sandbox2::config::WdSetup::Session { fs_mappings, .. } = &config.wd else {
+            panic!("expected the session layout, got {:?}", config.wd);
+        };
+        let placed: Vec<(String, bool)> = fs_mappings
+            .iter()
+            .map(|m| (m.path_in_sandbox(), m.read_only))
+            .collect();
+        assert_eq!(
+            placed,
+            vec![
+                ("/home/.config/railway".to_string(), true),
+                ("/home/.claude.json".to_string(), false),
+                ("/workbench/target".to_string(), false),
+                ("/var/run/docker.sock".to_string(), false),
+            ]
+        );
+        assert_eq!(fs_mappings[0].host_path, format!("{home}/.config/railway"));
+    }
+
+    /// A missing read-only patch source surfaces as `"fs mapping"` and must
+    /// name the declaration and its owner; a creation failure keeps the
+    /// existing wording. The task's own `patch` table is attributed to the
+    /// task, not a package.
+    #[test]
+    fn attribute_fs_mapping_error_names_the_declaration() {
+        let declared = "~/.aws".to_string();
+        let declarations = BTreeMap::from_iter([(
+            "/home/dev/.aws".to_string(),
+            vec![DeclaredMapping {
+                declared: &declared,
+                is_file: false,
+                read_only: true,
+            }],
+        )]);
+        let packages = BTreeMap::new();
+
+        let missing = sandbox2::Error::IO(
+            "fs mapping",
+            PathBuf::from("/home/dev/.aws"),
+            std::io::Error::from(std::io::ErrorKind::NotFound),
+        );
+        let msg = format!(
+            "{}",
+            attribute_fs_mapping_error(&missing, &declarations, &packages, "deploy")
+                .expect("a missing read-only source must be attributed")
+        );
+        assert!(
+            msg.contains("read-only patch source `~/.aws` does not exist"),
+            "missing read-only source must be named, got: {msg}"
+        );
+        assert!(
+            msg.contains("declared by task `deploy`"),
+            "task-own patch entry must be attributed to the task, got: {msg}"
+        );
+
+        let create = sandbox2::Error::IO(
+            "create mapped file",
+            PathBuf::from("/home/dev/.aws"),
+            std::io::Error::from(std::io::ErrorKind::ReadOnlyFilesystem),
+        );
+        let msg = format!(
+            "{}",
+            attribute_fs_mapping_error(&create, &declarations, &packages, "deploy")
+                .expect("a creation failure must be attributed")
+        );
+        assert!(
+            msg.contains("mapped in by task `deploy`, which declares it as `~/.aws`"),
+            "creation failure keeps the existing wording, got: {msg}"
+        );
+    }
+
+    /// A directory mapping and a file mapping that expand to the same path
+    /// collide when the directory is created first: `Config::validate`
+    /// reports "directory mapped as a file" against the *file* mapping. The
+    /// message must name the file declaration, not the directory one, even
+    /// though both share the same host path.
+    #[test]
+    fn attribute_fs_mapping_error_disambiguates_dir_file_collision() {
+        let dir_declared = "~/shared".to_string();
+        let file_declared = "/home/dev/shared".to_string();
+        let declarations = BTreeMap::from_iter([(
+            "/home/dev/shared".to_string(),
+            vec![
+                DeclaredMapping {
+                    declared: &dir_declared,
+                    is_file: false,
+                    read_only: false,
+                },
+                DeclaredMapping {
+                    declared: &file_declared,
+                    is_file: true,
+                    read_only: true,
+                },
+            ],
+        )]);
+        let packages = BTreeMap::new();
+
+        let collision = sandbox2::Error::IO(
+            "stat fs mapping",
+            PathBuf::from("/home/dev/shared"),
+            std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "directory mapped as a file",
+            ),
+        );
+        let msg = format!(
+            "{}",
+            attribute_fs_mapping_error(&collision, &declarations, &packages, "deploy")
+                .expect("a dir/file collision must be attributed")
+        );
+        assert!(
+            msg.contains(&format!("declares it as `{file_declared}`")),
+            "collision must name the file mapping, not the directory one, got: {msg}"
         );
     }
 

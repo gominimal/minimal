@@ -5,10 +5,19 @@
 //! concurrent lifecycle transitions; if the lock cannot be acquired the command
 //! exits with code 2 (lock contention).
 //!
+//! With `--row <name>` it reads one box's row through the control socket
+//! instead (NET-138) and prints the read-only row verb's reply.
+//!
 //! Exit codes:
-//! - 0 — daemon is Running
-//! - 1 — daemon is stopped (or not yet provisioned)
+//! - 0 — daemon is Running, or a `--row` read answered with a live box's row
+//! - 1 — daemon is stopped (or not yet provisioned), or a `--row` read
+//!   answered with the no-row marker
 //! - 2 — lock contention; another process is transitioning state
+
+use std::io::{BufRead as _, BufReader, Write as _};
+use std::os::unix::net::UnixStream;
+use std::path::Path;
+use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use serde::Serialize;
@@ -16,6 +25,7 @@ use serde::Serialize;
 use crate::lifecycle::Lifecycle;
 use crate::metrics::VmMetrics;
 use crate::state::{State, StateDir};
+use minimald_rpc::{BoxControlReply, BoxControlRequest, BoxRow, ReadRowRequest};
 
 /// Exit classification returned by [`run`].
 #[derive(Debug, PartialEq, Eq)]
@@ -26,6 +36,10 @@ pub enum StatusExit {
     Stopped,
     /// Could not acquire the advisory read lock — exit code 2.
     LockContention,
+    /// A `--row` read answered with a live box's row — exit code 0.
+    Row,
+    /// A `--row` read answered with the no-row marker — exit code 1.
+    NoRow,
 }
 
 impl StatusExit {
@@ -35,6 +49,8 @@ impl StatusExit {
             Self::Running => 0,
             Self::Stopped => 1,
             Self::LockContention => 2,
+            Self::Row => 0,
+            Self::NoRow => 1,
         }
     }
 }
@@ -42,8 +58,124 @@ impl StatusExit {
 /// Run the `status` subcommand.
 ///
 /// `json`: if true, print a JSON object; otherwise print a human-readable line.
-pub fn run(json: bool) -> Result<StatusExit> {
-    run_with_state_dir(json, StateDir::default_path())
+/// `row`: when `Some(name)`, print the read-only row verb's reply for that
+/// box's row instead of the lifecycle report.
+pub fn run(json: bool, row: Option<String>) -> Result<StatusExit> {
+    match row {
+        Some(name) => run_row_read(json, &name),
+        None => run_with_state_dir(json, StateDir::default_path()),
+    }
+}
+
+/// How long the row read waits for the daemon's one reply line before
+/// giving up on the socket: the daemon answers the read-only verb from
+/// memory, so a read that outlives this is a daemon that is not answering.
+const ROW_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// What a `--row` read answered: the row a live box holds, or the no-row
+/// marker for a name no live box holds.
+enum RowRead {
+    /// The read-only row verb's answer for a live box.
+    Row(BoxRow),
+    /// The read-only row verb's answer for a name no live box holds.
+    NoRow { name: String },
+}
+
+/// Run a `--row <name>` read (NET-138): ask the VM host daemon for the box's
+/// row over its control socket, print the reply, and classify the exit — a
+/// row is 0, the no-row marker 1 — so a script can watch a box's row go
+/// without parsing the reply.
+fn run_row_read(json: bool, name: &str) -> Result<StatusExit> {
+    let sock_path = crate::control::resolve_control_sock()
+        .context("resolving the VM host daemon's control socket")?;
+    let reply = read_box_row(&sock_path, name)?;
+    let read = match reply {
+        BoxControlReply::Row(row) => RowRead::Row(row),
+        BoxControlReply::NoRow { name, .. } => RowRead::NoRow { name },
+        // The reply shapes are disjoint, so this arm is a daemon speaking
+        // another verb's answer to the read — not the row asked for.
+        other => anyhow::bail!(
+            "the VM host daemon answered the row read for {name:?} with another \
+             verb's reply: {other:?}"
+        ),
+    };
+    println!("{}", row_read_text(&read, json)?);
+    Ok(match read {
+        RowRead::Row(_) => StatusExit::Row,
+        RowRead::NoRow { .. } => StatusExit::NoRow,
+    })
+}
+
+/// Ask the daemon for the box's row: one JSON request line in, one JSON
+/// reply line back, the control protocol's own exchange — so the read
+/// answers what the daemon's table holds, never what this process could
+/// derive from the state dir.
+fn read_box_row(sock_path: &Path, name: &str) -> Result<BoxControlReply> {
+    let mut stream = UnixStream::connect(sock_path).with_context(|| {
+        format!(
+            "connecting the VM host daemon's control socket at {}",
+            sock_path.display()
+        )
+    })?;
+    stream
+        .set_read_timeout(Some(ROW_READ_TIMEOUT))
+        .context("setting the row read's reply timeout")?;
+    let mut line = serde_json_lenient::to_string(&BoxControlRequest::ReadRow(ReadRowRequest {
+        name: name.to_string(),
+    }))
+    .context("serialising the row read request")?;
+    line.push('\n');
+    stream
+        .write_all(line.as_bytes())
+        .context("writing the row read request")?;
+    let mut reply = String::new();
+    BufReader::new(&mut stream)
+        .read_line(&mut reply)
+        .context("reading the row read reply")?;
+    if reply.trim().is_empty() {
+        anyhow::bail!(
+            "the VM host daemon closed its control socket without answering the row read"
+        );
+    }
+    serde_json_lenient::from_str(reply.trim())
+        .with_context(|| format!("the VM host daemon's row read reply did not parse: {reply}"))
+}
+
+/// The reply's printed text: the `--json` document or the human line, as
+/// the reply's own shape either way — the row with the facts the host holds
+/// about the box, the no-row marker with the name asked about.
+fn row_read_text(read: &RowRead, json: bool) -> Result<String> {
+    match read {
+        RowRead::Row(row) if json => {
+            Ok(serde_json_lenient::to_string(row).context("serialising the box row")?)
+        }
+        RowRead::NoRow { name } if json => {
+            Ok(serde_json_lenient::to_string(&BoxControlReply::NoRow {
+                name: name.clone(),
+                no_row: true,
+            })
+            .context("serialising the no-row marker")?)
+        }
+        RowRead::Row(row) => Ok(format!(
+            "box {} switch {} allow [{}] declared [{}] runtime [{}]",
+            row.name,
+            row.switch_address,
+            row.egress_allow_list.join(","),
+            ports_text(&row.declared_ports),
+            ports_text(&row.runtime_ports),
+        )),
+        RowRead::NoRow { name } => Ok(format!("no row for {name}")),
+    }
+}
+
+/// A port list's human spelling: comma-separated, no brackets — the line
+/// adds those.
+fn ports_text(ports: &[u16]) -> String {
+    ports
+        .iter()
+        .map(|port| port.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn run_with_state_dir(json: bool, dir: std::path::PathBuf) -> Result<StatusExit> {
@@ -346,5 +478,98 @@ mod tests {
             "metrics must be present when running"
         );
         assert_eq!(v["metrics"]["resident_bytes"], 1024 * 1024 * 1024u64);
+    }
+
+    /// A live row as the row read's tests hold it: the shape the read-only
+    /// verb answers with.
+    fn live_row() -> minimald_rpc::BoxRow {
+        minimald_rpc::BoxRow {
+            name: "web".to_string(),
+            switch_address: "100.64.0.9".parse().unwrap(),
+            egress_allow_list: vec!["10.0.0.0/8".to_string()],
+            declared_ports: vec![8080],
+            runtime_ports: vec![3000, 3001],
+        }
+    }
+
+    /// The no-row marker's own document shape, so the `--json` text parses
+    /// back as the marker and not as a guess at its fields.
+    #[derive(serde::Deserialize)]
+    struct NoRowShape {
+        name: String,
+        no_row: bool,
+    }
+
+    #[test]
+    fn row_read_text_names_the_row_and_the_no_row_marker() {
+        let row = RowRead::Row(live_row());
+        assert_eq!(
+            row_read_text(&row, false).unwrap(),
+            "box web switch 100.64.0.9 allow [10.0.0.0/8] declared [8080] runtime [3000,3001]",
+            "the human line carries every fact the row read answers with"
+        );
+        let json: minimald_rpc::BoxRow =
+            serde_json_lenient::from_str(&row_read_text(&row, true).unwrap()).unwrap();
+        assert_eq!(json, live_row(), "the --json text is the row's own shape");
+
+        let no_row = RowRead::NoRow {
+            name: "web".to_string(),
+        };
+        assert_eq!(
+            row_read_text(&no_row, false).unwrap(),
+            "no row for web",
+            "the human line says the name asked about has no row"
+        );
+        let json: NoRowShape =
+            serde_json_lenient::from_str(&row_read_text(&no_row, true).unwrap()).unwrap();
+        assert_eq!(json.name, "web");
+        assert!(json.no_row, "the marker keeps the shape its own");
+    }
+
+    #[test]
+    fn row_read_sends_the_read_and_parses_the_answer() {
+        // Serve one canned reply the way the daemon's own control socket
+        // answers: one request line in, one reply line back.
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("control.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let (sent_tx, sent_rx) = std::sync::mpsc::channel::<String>();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            std::io::BufReader::new(&mut stream)
+                .read_line(&mut line)
+                .unwrap();
+            sent_tx.send(line).unwrap();
+            let mut reply =
+                serde_json_lenient::to_string(&minimald_rpc::BoxControlReply::Row(live_row()))
+                    .unwrap();
+            reply.push('\n');
+            use std::io::Write as _;
+            stream.write_all(reply.as_bytes()).unwrap();
+        });
+        let answered = read_box_row(&sock, "web").unwrap();
+        server.join().unwrap();
+
+        let sent: minimald_rpc::BoxControlRequest =
+            serde_json_lenient::from_str(&sent_rx.recv().unwrap())
+                .expect("the row read's request line parses as the control protocol");
+        match sent {
+            minimald_rpc::BoxControlRequest::ReadRow(request) => assert_eq!(
+                request.name, "web",
+                "the read asks about the name it was given"
+            ),
+            other => panic!("the row read sent {other:?}"),
+        }
+        match answered {
+            minimald_rpc::BoxControlReply::Row(row) => {
+                assert_eq!(
+                    row.switch_address,
+                    "100.64.0.9".parse::<std::net::Ipv4Addr>().unwrap()
+                );
+                assert_eq!(row.runtime_ports, vec![3000, 3001]);
+            }
+            other => panic!("the row read parsed {other:?}"),
+        }
     }
 }

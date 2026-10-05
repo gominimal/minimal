@@ -1,5 +1,6 @@
 [package]
 name = "mctx"
+description = "Top-level 'minimal context' API tying configuration, decoding, graph, and cache together."
 version = "0.0.1"
 rust-version.workspace = true
 license.workspace = true
@@ -38,6 +39,7 @@ orchestrator.workspace = true
 stdlib.workspace = true
 
 [dev-dependencies]
+decode.workspace = true
 indoc.workspace = true
 serial_test.workspace = true
 

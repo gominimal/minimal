@@ -12,7 +12,7 @@
 //! owns its own raw-mode handling and fuzzy-filters by default.
 
 use std::fmt;
-use std::io::{IsTerminal as _, Write as _};
+use std::io::{IsTerminal as _, Write};
 
 use anyhow::Context as _;
 use minimald_rpc::ListSessionsEntry;
@@ -107,18 +107,28 @@ pub(crate) fn client_must_unwind(status: &std::process::ExitStatus) -> bool {
 /// mouse moves. Once ssh has exited normally the daemon is known to have
 /// spoken for itself, and the caller [`disarm`](Self::disarm)s: see
 /// [`client_must_unwind`] for why writing anyway is not free.
-pub(crate) struct TerminalUnwind {
+pub(crate) struct TerminalUnwind<W: Write = std::io::Stdout> {
     /// Whether the guard still owes the terminal anything on drop. Starts as
     /// "is there a terminal to write to at all" — a redirected stdout gets
     /// nothing, since the bytes would be data in whatever captured it and a
     /// pipe has no modes to restore — and is cleared by [`Self::disarm`].
     armed: bool,
+    /// The real terminal: stdout in production.
+    out: W,
 }
 
 impl TerminalUnwind {
     pub(crate) fn arm() -> Self {
+        Self::arm_on(std::io::stdout(), std::io::stdout().is_terminal())
+    }
+}
+
+impl<W: Write> TerminalUnwind<W> {
+    /// Arm over `out`, which `is_terminal` says is a terminal (or not).
+    pub(crate) fn arm_on(out: W, is_terminal: bool) -> Self {
         Self {
-            armed: std::io::stdout().is_terminal(),
+            armed: is_terminal,
+            out,
         }
     }
 
@@ -131,16 +141,15 @@ impl TerminalUnwind {
     }
 }
 
-impl Drop for TerminalUnwind {
+impl<W: Write> Drop for TerminalUnwind<W> {
     fn drop(&mut self) {
         if !self.armed {
             return;
         }
         // Best-effort: this runs on the way out of an attach, and a terminal
         // that cannot be written to is already beyond repair.
-        let mut out = std::io::stdout();
-        let _ = out.write_all(&terminal_unwind_bytes());
-        let _ = out.flush();
+        let _ = self.out.write_all(&terminal_unwind_bytes());
+        let _ = self.out.flush();
     }
 }
 
@@ -231,6 +240,144 @@ pub(crate) fn created_from_suffix(entry: &ListSessionsEntry, cwd: &paths::HostAb
 /// non-interactive error path.
 pub(crate) fn can_pick_interactively() -> bool {
     std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+}
+
+/// A box name resolved to the VM that owns it (NET-058): everything a caller
+/// needs to act on a box from its name alone — the VM's name, the socket its
+/// daemon serves, and the record the name resolved to there.
+#[derive(Debug)]
+pub(crate) struct ResolvedBoxVm {
+    /// The VM that owns the name, as `min ls` shows it.
+    pub vm: String,
+    /// That VM's daemon socket.
+    pub sock: std::path::PathBuf,
+    /// The record the name resolved to on that VM.
+    pub record: sessions::Record,
+}
+
+/// Resolve the VM that owns a box name from the name alone (NET-058), across
+/// every VM's socket: the shared resolution `min session attach` reaches for
+/// when the selected VM's daemon does not know the name, and the one a
+/// box-naming verb reaches for when it must not ask for a global flag — `min
+/// net expose` reuses this once it lands.
+///
+/// `Ok(None)` when no VM owns the name, so the caller reports its own
+/// original error (the selected VM's — usually the more useful of the two).
+/// An explicit `--vm` pins where to look, so it resolves nothing: the
+/// operator chose, and a resolution across the others would override that
+/// choice. A VM that is not running cannot own the name — an answer given
+/// without a word, since finding a stopped VM is the normal case on a host
+/// with several — and a VM whose daemon answers nothing is skipped with a
+/// warning, so the name is resolved from the VMs that did answer. Each look
+/// is leashed ([`crate::client::PROBE_TIMEOUT`]): the loop spans every VM on
+/// the host, and a wedged one must not hold an attach for the stacked
+/// connect, handshake and RPC deadlines (~72 s each).
+///
+/// The daemon that owns the name is version-gated on the very reply that
+/// named it, so a skewed VM can never be reached *through* a resolution even
+/// though the probes that do not find the name pass it ungated (the same
+/// ride-along shape [`crate::cmd::resolve_session_version_gated`]'s callers
+/// use).
+pub(crate) async fn resolve_box_vm(
+    global: &crate::GlobalArgs,
+    name: &str,
+) -> Result<Option<ResolvedBoxVm>, anyhow::Error> {
+    if global.vm.is_some() {
+        return Ok(None);
+    }
+    let vms =
+        crate::client::enumerate_vm_sockets(global.minimal_dir.as_deref(), global.use_minvmd())?;
+    let mut owners: Vec<ResolvedBoxVm> = Vec::new();
+    for vm in vms {
+        // A VM that is not running cannot own the name. The check is free, so
+        // it is made first; the probe classifies the cases it cannot see — a
+        // socket that vanished mid-walk reads the same as one never bound.
+        if !vm.sock.exists() {
+            continue;
+        }
+        #[expect(
+            clippy::map_err_ignore,
+            reason = "the elapsed marker carries nothing the message lacks"
+        )]
+        let look = tokio::time::timeout(crate::client::PROBE_TIMEOUT, box_record_on(&vm, name))
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "the daemon did not answer within {:?}",
+                    crate::client::PROBE_TIMEOUT
+                )
+            });
+        match look {
+            Ok(Ok(Some(record))) => owners.push(ResolvedBoxVm {
+                vm: vm.vm,
+                sock: vm.sock,
+                record,
+            }),
+            Ok(Ok(None)) => {}
+            // VMs that could not be looked at are named, not silent: a
+            // resolution that quietly could not look would read as "no such
+            // box".
+            Ok(Err(e)) | Err(e) => eprintln!(
+                "warning: could not look for '{name}' in VM {}: {e:#}",
+                vm.vm
+            ),
+        }
+    }
+    match owners.len() {
+        0 => Ok(None),
+        1 => {
+            let resolved = owners.pop().expect("the one owner");
+            tracing::debug!(box = name, vm = %resolved.vm, "box name resolved to a VM");
+            Ok(Some(resolved))
+        }
+        // Two VMs can both own the name, and picking one silently would send
+        // an attach into a project the operator may not have meant. The flag
+        // is the disambiguator, so the error names both and points at it.
+        _ => Err(anyhow::anyhow!(
+            "box name '{name}' exists on more than one VM ({}); name the one you mean with --vm",
+            owners
+                .iter()
+                .map(|owner| owner.vm.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
+/// Look `name` up on one VM's daemon: its record when that daemon owns the
+/// name, `None` when it does not — and `None` when the VM is not running,
+/// which is the same answer to the caller: a VM that is down cannot own the
+/// name, and finding a stopped VM is the normal case on a host with several.
+///
+/// This is a VM this process did not select — a resolution spans every VM it
+/// can see — so the connect is a probe: one attempt, no retry window. The
+/// window belongs to the VM the operator asked for; a stopped VM's stale
+/// `ssh.sock` must not collect it from every name resolution on the host.
+/// The owning daemon is gated on the very reply that named it; the probe
+/// that finds nothing stays ungated, exactly like the dashboard's listing of
+/// a skewed daemon.
+async fn box_record_on(
+    vm: &crate::client::VmSocket,
+    name: &str,
+) -> Result<Option<sessions::Record>, anyhow::Error> {
+    let mut client = match crate::client::Client::probe(&vm.sock).await {
+        Ok(client) => client,
+        Err(crate::client::ProbeRefusal::NotRunning) => return Ok(None),
+        Err(crate::client::ProbeRefusal::Unreachable(e)) => {
+            return Err(e.context(format!(
+                "Failed to connect to the daemon at {}",
+                vm.sock.display()
+            )));
+        }
+    };
+    let resp = crate::cmd::get_session_record(&mut client, name).await?;
+    match resp.record {
+        Some(record) => {
+            crate::client::ensure_version_reported(resp.daemon_version.as_deref())?;
+            Ok(Some(record))
+        }
+        None => Ok(None),
+    }
 }
 
 /// A pickable session. `Display` renders the row the user sees and fuzzy-
@@ -444,6 +591,7 @@ mod tests {
             project_path: Some(HostAbsPath::try_new(path).unwrap()),
             status,
             git: None,
+            host_ip_enforcement: None,
             attrs: None,
         }
     }
@@ -457,6 +605,7 @@ mod tests {
             project_path: None,
             status,
             git: None,
+            host_ip_enforcement: None,
             attrs: None,
         }
     }

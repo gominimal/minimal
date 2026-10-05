@@ -304,6 +304,18 @@ impl Index {
         self.name_to_id.get(name.as_ref())
     }
 
+    /// Returns the session ID whose name folds to `name` under ASCII
+    /// case-insensitivity, if any. Session names are unique under the same
+    /// fold the box hostname uses, so a name that differs from an existing
+    /// one only by letter case is a collision.
+    pub fn find_by_name_folded<S: AsRef<str>>(&self, name: S) -> Option<&SessionId> {
+        let name = name.as_ref();
+        self.name_to_id
+            .iter()
+            .find(|(existing, _)| existing.eq_ignore_ascii_case(name))
+            .map(|(_, id)| id)
+    }
+
     /// Returns the session ID corresponding to the given short name, if known.
     pub fn find_by_short<S: AsRef<str>>(&self, name: S) -> Option<&SessionId> {
         self.short_to_id.get(name.as_ref())
@@ -656,7 +668,7 @@ impl DiskLoader {
                 continue;
             }
             if let Some(name) = &record.name
-                && self.index.name_to_id.contains_key(name)
+                && self.index.find_by_name_folded(name).is_some()
             {
                 tracing::warn!(
                     short = %short,
@@ -757,6 +769,13 @@ impl DiskLoader {
     }
 }
 
+/// Session names that collide with infrastructure names once the daemon
+/// renders them into box names (`<name>.min.internal`): `host` is the zone's
+/// fixed host row, `local` is the legacy three-label form's host-id label,
+/// and `localhost` is the loopback name. Refused under ASCII case folding
+/// because box names are lower-cased.
+const RESERVED_SESSION_NAMES: [&str; 3] = ["host", "local", "localhost"];
+
 /// Reject a session name that would break a downstream output contract.
 ///
 /// `complete-session-str` emits one `value<TAB>description` line per session
@@ -764,7 +783,10 @@ impl DiskLoader {
 /// tab or newline in particular — splits one row into several, and an empty
 /// or whitespace-padded name is useless as an addressable handle. Enforced
 /// here beside the name-collision check so both name writers (`create` for
-/// `activate --name`, `save` for `rename`) share one gate.
+/// `activate --name`, `save` for `rename`) share one gate. The name must
+/// also be a single DNS label (ASCII letters, digits and `-`, 1 to 63
+/// octets, no `-` at either end) because the daemon renders it into
+/// `<name>.min.internal`.
 fn validate_session_name(name: &str) -> Result<(), std::io::Error> {
     let invalid = |msg: &str| {
         std::io::Error::new(
@@ -781,6 +803,23 @@ fn validate_session_name(name: &str) -> Result<(), std::io::Error> {
     if name.chars().any(char::is_control) {
         return Err(invalid("must not contain control characters"));
     }
+    if let Some(reserved) = RESERVED_SESSION_NAMES
+        .iter()
+        .find(|reserved| name.eq_ignore_ascii_case(reserved))
+    {
+        return Err(invalid(&format!("`{reserved}` is reserved")));
+    }
+    // Session names are rendered into `<name>.min.internal` box names, so a
+    // name must be a single DNS label: ASCII letters, digits and `-`, 1 to 63
+    // octets, not starting or ending with `-`.
+    let is_ldh = |c: char| c.is_ascii_alphanumeric() || c == '-';
+    if name.len() > 63 || !name.chars().all(is_ldh) || name.starts_with('-') || name.ends_with('-')
+    {
+        return Err(invalid(
+            "must be a DNS label: ASCII letters, digits and `-`, \
+             1 to 63 characters, not starting or ending with `-`",
+        ));
+    }
     Ok(())
 }
 
@@ -791,10 +830,17 @@ impl Loader for DiskLoader {
     fn create(&mut self, mut record: Record) -> Result<Self::Key, std::io::Error> {
         if let Some(name) = &record.name {
             validate_session_name(name)?;
-            if self.index.name_to_id.contains_key(name) {
+            if let Some(existing_id) = self.index.find_by_name_folded(name) {
+                let existing = self
+                    .index
+                    .name_by_id(existing_id)
+                    .map_or(name.as_str(), String::as_str);
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::AlreadyExists,
-                    format!("a session with name `{name}` already exists"),
+                    format!(
+                        "a session named `{existing}` already exists \
+                         (session names are case-insensitive)"
+                    ),
                 ));
             }
         }
@@ -897,15 +943,23 @@ impl Loader for DiskLoader {
             validate_session_name(name)?;
         }
 
-        // Collision check: if the new name belongs to a *different*
-        // session, refuse. Same-id same-name is a no-op, not a collision.
+        // Collision check: if the new name folds to a *different*
+        // session's name, refuse. Same-id same-name is a no-op, not a
+        // collision.
         if let Some(name) = &new_name
-            && let Some(other_id) = self.index.find_by_name(name).copied()
+            && let Some(other_id) = self.index.find_by_name_folded(name).copied()
             && other_id != id
         {
+            let existing = self
+                .index
+                .name_by_id(&other_id)
+                .map_or(name.as_str(), String::as_str);
             return Err(std::io::Error::new(
                 AlreadyExists,
-                format!("a session with the name `{name}` already exists"),
+                format!(
+                    "a session named `{existing}` already exists \
+                     (session names are case-insensitive)"
+                ),
             ));
         }
 
@@ -1115,10 +1169,21 @@ mod tests {
                 None,
             ),
             status: SessionStatus::default(),
-            // Deliberately the non-default (`--no-hooks`): `true` is the
-            // serde default, so a fixture using it would round-trip
+            // Deliberately the non-default shapes: `hooks_enabled: false`
+            // and a present `box_addresses` are both serde defaults to
+            // `None`/`true`, so a fixture using those would round-trip
             // green even if the field were dropped on write.
             hooks_enabled: false,
+            box_addresses: Some(crate::BoxAddresses {
+                switch_address: std::net::Ipv4Addr::new(100, 64, 0, 2),
+                loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 0),
+            }),
+            // `None` is the honest value for this own-address record: only a
+            // host-address box's launch ever writes the field, so a
+            // `Some` here would model a record no daemon writes. The
+            // round-trip of a `Some` is proved at the daemon's own launch
+            // record, which a client reads back through `GetSessionRecord`.
+            host_ip_enforcement: None,
             attrs: [("color".to_string(), "blue".to_string())]
                 .into_iter()
                 .collect(),
@@ -1189,9 +1254,42 @@ mod tests {
     }
 
     #[test]
+    fn create_errors_on_case_only_name_collision() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        loader.create(sample_record()).unwrap();
+        let mut record = sample_record();
+        record.name = Some("MY-SESSION".to_string());
+        assert_eq!(
+            loader.create(record).err().map(|e| e.kind()),
+            Some(ErrorKind::AlreadyExists)
+        );
+    }
+
+    #[test]
     fn validate_session_name_accepts_ordinary_names() {
         assert!(validate_session_name("debug-qa").is_ok());
-        assert!(validate_session_name("my session").is_ok());
+        assert!(validate_session_name("my-session").is_ok());
+        assert!(validate_session_name("a".repeat(63).as_str()).is_ok());
+    }
+
+    #[test]
+    fn validate_session_name_rejects_non_ldh_labels() {
+        for bad in [
+            "bad name/y",
+            "dot.ted.name",
+            "Ünï-cødé",
+            "-leading",
+            "trailing-",
+            "a".repeat(64).as_str(),
+        ] {
+            assert_eq!(
+                validate_session_name(bad).err().map(|e| e.kind()),
+                Some(ErrorKind::InvalidInput),
+                "expected `{bad:?}` to be rejected",
+            );
+        }
     }
 
     #[test]
@@ -1206,6 +1304,90 @@ mod tests {
     }
 
     #[test]
+    fn validate_session_name_rejects_reserved_names() {
+        for bad in ["host", "local", "localhost", "HOST", "Localhost"] {
+            assert_eq!(
+                validate_session_name(bad).err().map(|e| e.kind()),
+                Some(ErrorKind::InvalidInput),
+                "expected `{bad:?}` to be rejected",
+            );
+        }
+    }
+
+    #[test]
+    fn validate_session_name_accepts_names_containing_reserved_words() {
+        validate_session_name("host-a").unwrap();
+        validate_session_name("my-localhost").unwrap();
+        validate_session_name("localdev").unwrap();
+    }
+
+    #[test]
+    fn create_rejects_a_reserved_name_and_creates_no_session_dir() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        let mut record = sample_record();
+        record.name = Some("host".to_string());
+        assert_eq!(
+            loader.create(record).err().map(|e| e.kind()),
+            Some(ErrorKind::InvalidInput)
+        );
+        // No session directory was created for the rejected name.
+        assert!(loader.keys().next().is_none());
+    }
+
+    #[test]
+    fn rename_to_a_reserved_name_fails_and_keeps_the_old_one() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        let key = loader.create(sample_record()).unwrap();
+        assert_eq!(
+            loader
+                .rename(&key, "Local".to_string())
+                .err()
+                .map(|e| e.kind()),
+            Some(ErrorKind::InvalidInput)
+        );
+        // The failed rename left the original name intact.
+        assert_eq!(loader.find_by_name("my-session").unwrap(), Some(key));
+    }
+
+    #[test]
+    fn save_of_an_unchanged_reserved_named_record_succeeds() {
+        let tmp = TempDir::new().unwrap();
+        let root = loader_dir(&tmp);
+
+        // Plant a record already named `host` directly on disk (create
+        // refuses it now), then reopen so self-heal indexes it.
+        let orphan_short = "zzzzz";
+        let orphan_dir = root.as_utf8_path().join("sessions").join(orphan_short);
+        std::fs::create_dir_all(orphan_dir.as_std_path()).unwrap();
+        let mut orphan_record = sample_record();
+        orphan_record.id = SessionId(uuid::Uuid::from_u128(0xDEAD_BEEF));
+        orphan_record.name = Some("host".to_string());
+        std::fs::write(
+            orphan_dir.join("record.json").as_std_path(),
+            serde_json_lenient::to_vec(&orphan_record).unwrap(),
+        )
+        .unwrap();
+
+        let mut loader = DiskLoader::new(root).unwrap();
+        let key = loader.find_by_name("host").unwrap().expect("re-indexed");
+
+        // Re-saving the unchanged record (e.g. a status promotion) must not
+        // re-validate the reserved name.
+        let mut promoted = loader.get(&key).unwrap().record().clone();
+        promoted.status = SessionStatus::Active;
+        loader.save(&key, &promoted).unwrap();
+
+        assert_eq!(
+            loader.get(&key).unwrap().record().status,
+            SessionStatus::Active,
+        );
+    }
+
+    #[test]
     fn create_rejects_a_control_character_name() {
         let tmp = TempDir::new().unwrap();
         let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
@@ -1216,6 +1398,23 @@ mod tests {
             loader.create(record).err().map(|e| e.kind()),
             Some(ErrorKind::InvalidInput)
         );
+    }
+
+    #[test]
+    fn create_rejects_a_non_ldh_name_and_creates_no_session_dir() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        for bad in ["bad name/y", "dot.ted.name", "Ünï-cødé", "-lead", "trail-"] {
+            let mut record = sample_record();
+            record.name = Some(bad.to_string());
+            assert_eq!(
+                loader.create(record).err().map(|e| e.kind()),
+                Some(ErrorKind::InvalidInput),
+                "expected `{bad:?}` to be rejected",
+            );
+        }
+        assert!(loader.keys().next().is_none());
     }
 
     #[test]
@@ -1237,6 +1436,92 @@ mod tests {
             loader.get(&key).unwrap().record().name.as_deref(),
             Some("my-session"),
             "a rejected rename must leave the original name intact"
+        );
+    }
+
+    #[test]
+    fn rename_rejects_a_non_ldh_name_and_keeps_the_old_one() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        let key = loader.create(sample_record()).unwrap();
+        assert_eq!(
+            loader
+                .rename(&key, "dot.ted.name".to_string())
+                .err()
+                .map(|e| e.kind()),
+            Some(ErrorKind::InvalidInput)
+        );
+        assert_eq!(
+            loader.get(&key).unwrap().record().name.as_deref(),
+            Some("my-session"),
+            "a rejected rename must leave the original name intact"
+        );
+    }
+
+    #[test]
+    fn rename_of_a_legacy_invalid_named_session_to_a_valid_name_succeeds() {
+        let tmp = TempDir::new().unwrap();
+        let root = loader_dir(&tmp);
+
+        // Plant a record with a pre-existing invalid name directly on disk
+        // (create refuses it now), then reopen so self-heal indexes it.
+        let orphan_short = "zzzzz";
+        let orphan_dir = root.as_utf8_path().join("sessions").join(orphan_short);
+        std::fs::create_dir_all(orphan_dir.as_std_path()).unwrap();
+        let mut orphan_record = sample_record();
+        orphan_record.id = SessionId(uuid::Uuid::from_u128(0xDEAD_BEEF));
+        orphan_record.name = Some("bad name/y".to_string());
+        std::fs::write(
+            orphan_dir.join("record.json").as_std_path(),
+            serde_json_lenient::to_vec(&orphan_record).unwrap(),
+        )
+        .unwrap();
+
+        let mut loader = DiskLoader::new(root).unwrap();
+        let key = loader
+            .find_by_name("bad name/y")
+            .unwrap()
+            .expect("re-indexed");
+
+        loader.rename(&key, "good-name".to_string()).unwrap();
+        assert_eq!(
+            loader.get(&key).unwrap().record().name.as_deref(),
+            Some("good-name"),
+        );
+    }
+
+    #[test]
+    fn loading_a_store_with_a_legacy_invalid_name_succeeds() {
+        let tmp = TempDir::new().unwrap();
+        let root = loader_dir(&tmp);
+
+        let orphan_short = "zzzzz";
+        let orphan_dir = root.as_utf8_path().join("sessions").join(orphan_short);
+        std::fs::create_dir_all(orphan_dir.as_std_path()).unwrap();
+        let mut orphan_record = sample_record();
+        orphan_record.id = SessionId(uuid::Uuid::from_u128(0xDEAD_BEEF));
+        orphan_record.name = Some("dot.ted.name".to_string());
+        std::fs::write(
+            orphan_dir.join("record.json").as_std_path(),
+            serde_json_lenient::to_vec(&orphan_record).unwrap(),
+        )
+        .unwrap();
+
+        let mut loader = DiskLoader::new(root).unwrap();
+        let key = loader
+            .find_by_name("dot.ted.name")
+            .unwrap()
+            .expect("re-indexed");
+
+        // Re-saving the record with its legacy name unchanged (e.g. a status
+        // promotion) must not re-validate the name.
+        let mut promoted = loader.get(&key).unwrap().record().clone();
+        promoted.status = SessionStatus::Active;
+        loader.save(&key, &promoted).unwrap();
+        assert_eq!(
+            loader.get(&key).unwrap().record().status,
+            SessionStatus::Active,
         );
     }
 
@@ -1366,6 +1651,47 @@ mod tests {
         );
         // The failed rename left the original name intact.
         assert_eq!(loader.find_by_name("my-session").unwrap(), Some(first));
+    }
+
+    #[test]
+    fn rename_errors_on_case_only_name_collision() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        let first = loader.create(sample_record()).unwrap();
+        loader
+            .create({
+                let mut record = sample_record();
+                record.name = Some("other".to_string());
+                record
+            })
+            .unwrap();
+
+        // "OTHER" folds to "other", so renaming the first session onto it fails.
+        assert_eq!(
+            loader
+                .rename(&first, "OTHER".to_string())
+                .err()
+                .map(|e| e.kind()),
+            Some(ErrorKind::AlreadyExists)
+        );
+        // The failed rename left the original name intact.
+        assert_eq!(loader.find_by_name("my-session").unwrap(), Some(first));
+    }
+
+    #[test]
+    fn rename_to_own_case_variant_succeeds() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        let key = loader.create(sample_record()).unwrap();
+        loader.rename(&key, "MY-SESSION".to_string()).unwrap();
+
+        assert_eq!(
+            loader.get(&key).unwrap().record().name.as_deref(),
+            Some("MY-SESSION")
+        );
+        assert_eq!(loader.find_by_name("MY-SESSION").unwrap(), Some(key));
     }
 
     #[test]
@@ -1926,6 +2252,43 @@ mod tests {
         // not in the index.
         assert_eq!(loader.find_by_id(&a_id).unwrap(), Some(a_key));
         assert_eq!(loader.find_by_id(&orphan_record.id).unwrap(), None);
+        // The orphan dir is left on disk for manual triage.
+        assert!(
+            session_dir_path(&root, orphan_short).exists(),
+            "orphan dir should be preserved for triage",
+        );
+    }
+
+    #[test]
+    fn self_heal_skips_orphan_with_case_only_name_collision() {
+        let tmp = TempDir::new().unwrap();
+        let root = loader_dir(&tmp);
+
+        // First session: created normally, claims "my-session".
+        let mut loader = DiskLoader::new(root.clone()).unwrap();
+        let a_key = loader.create(sample_record()).unwrap();
+        let a_id = *a_key.id();
+        drop(loader);
+
+        // Plant an orphan whose name differs from the live one only in
+        // ASCII case. The short is outside `create()`'s format so it can
+        // never collide with the real session's dir.
+        let orphan_short = "zzzzz";
+        let orphan_dir = root.as_utf8_path().join("sessions").join(orphan_short);
+        std::fs::create_dir_all(orphan_dir.as_std_path()).unwrap();
+        let mut orphan_record = sample_record();
+        orphan_record.id = SessionId(uuid::Uuid::from_u128(0xDEAD_BEEF));
+        orphan_record.name = Some("MY-SESSION".to_string());
+        let record_file = orphan_dir.join("record.json");
+        let buf = serde_json_lenient::to_vec(&orphan_record).unwrap();
+        std::fs::write(record_file.as_std_path(), buf).unwrap();
+
+        let loader = DiskLoader::new(root.clone()).unwrap();
+        // The live session still resolves; the case-colliding orphan is not
+        // indexed.
+        assert_eq!(loader.find_by_id(&a_id).unwrap(), Some(a_key));
+        assert_eq!(loader.find_by_id(&orphan_record.id).unwrap(), None);
+        assert_eq!(loader.find_by_name("MY-SESSION").unwrap(), None);
         // The orphan dir is left on disk for manual triage.
         assert!(
             session_dir_path(&root, orphan_short).exists(),

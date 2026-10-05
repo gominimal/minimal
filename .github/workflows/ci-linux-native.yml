@@ -25,6 +25,8 @@ on:
     branches: ["main", "release/**"]
   pull_request:
     branches: ["main", "release/**"]
+  merge_group:
+    branches: ["main", "release/**"]
   workflow_dispatch:
 
 env:
@@ -156,7 +158,7 @@ jobs:
         # commit; carry it across runs so the e2e isn't dominated by pulls.
         # The e2e script resets XDG_STATE_HOME/XDG_RUNTIME_DIR but leaves
         # XDG_CACHE_HOME alone for exactly this reason.
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6 # zizmor: ignore[cache-poisoning] test-only e2e lane, nothing published; the entry is package pulls keyed by the pinned upstream commit
         with:
           path: ~/.cache/minimal
           key: native-e2e-minimal-cache-${{ hashFiles('.minimal/minimal.toml') }}
@@ -196,7 +198,7 @@ jobs:
       - name: Install nextest
         # Convention selection is a nextest filterset (binary(/_root_integration$/));
         # cargo test cannot select test targets by pattern.
-        uses: taiki-e/install-action@4076c08d76dba979c11a7285295b0716c1d67908 # v2
+        uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2
         with:
           tool: nextest
       - name: Enable unprivileged user namespaces

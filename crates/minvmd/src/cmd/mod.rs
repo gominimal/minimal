@@ -1,5 +1,6 @@
 //! CLI subcommand implementations for `minvmd`.
 
+pub mod answerer;
 pub mod boot;
 pub mod config;
 pub mod run;
@@ -390,21 +391,37 @@ pub(crate) fn read_ready_beacon<R: std::io::BufRead>(
                         tracing::warn!(error = %e, "failed to parse SSH host key from beacon");
                     }
                     Ok(pubkey) => {
+                        // Key the known_hosts entry on the alias ssh connects
+                        // with (`local-minvmd0` for the default VM,
+                        // `<vm>.local-minvmd0` for a named VM) rather than a
+                        // fixed provider-instance name. The path is always
+                        // `<provider dir>/known_hosts`, so a missing alias is
+                        // a programming error.
+                        let host_alias = known_hosts_path.parent().and_then(paths::ssh_host_alias);
+                        debug_assert!(
+                            host_alias.is_some(),
+                            "known_hosts path {} has no provider-dir parent",
+                            known_hosts_path.display(),
+                        );
+                        let Some(host_alias) = host_alias else {
+                            tracing::warn!(
+                                path = %known_hosts_path.display(),
+                                "known_hosts path has no provider-dir parent; skipping key write",
+                            );
+                            return Ok(BootBeacon::Ready);
+                        };
                         // `learn_known_hosts_path` appends unconditionally; drop
                         // any prior entry for this host first so the file records
                         // exactly one current key instead of growing a line per
                         // spawn (#782). Best-effort: a prune failure must not
                         // abort boot (R2.3).
-                        if let Err(e) = paths::prune_known_hosts_entries(
-                            known_hosts_path,
-                            &paths::provider_instance_name(paths::ProviderKind::Minvmd, 0),
-                            22,
-                        ) {
+                        if let Err(e) =
+                            paths::prune_known_hosts_entries(known_hosts_path, &host_alias, 22)
+                        {
                             tracing::warn!(error = %e, "failed to prune stale known_hosts entries");
                         }
                         match russh::keys::known_hosts::learn_known_hosts_path(
-                            // TODO: pass instance_num through once multi-instance is needed
-                            &paths::provider_instance_name(paths::ProviderKind::Minvmd, 0),
+                            &host_alias,
                             22,
                             &pubkey,
                             known_hosts_path,
@@ -559,7 +576,13 @@ mod beacon_tests {
         let mut reader = Cursor::new(beacon.into_bytes());
 
         let tmp = tempfile::tempdir().unwrap();
-        let known_hosts_path = tmp.path().join("known_hosts");
+        // Default-VM layout: the known_hosts file sits directly in the
+        // provider-instance dir, so the alias is its basename.
+        let known_hosts_path = tmp
+            .path()
+            .join("providers")
+            .join("local-minvmd0")
+            .join("known_hosts");
 
         read_ready_beacon(&mut reader, &known_hosts_path)
             .expect("read_ready_beacon must succeed with valid beacon");
@@ -573,6 +596,40 @@ mod beacon_tests {
         assert!(
             contents.contains(&openssh),
             "known_hosts must contain the beacon public key, got: {contents:?}"
+        );
+    }
+
+    #[test]
+    fn read_ready_beacon_keys_named_vm_on_its_alias() {
+        use russh::keys::{Algorithm, PrivateKey, key::safe_rng};
+
+        let key = PrivateKey::random(&mut safe_rng(), Algorithm::Ed25519).unwrap();
+        let pubkey = key.public_key();
+        let openssh = pubkey.to_openssh().unwrap();
+
+        let beacon = format!("READY\n{openssh}\n");
+        let mut reader = Cursor::new(beacon.into_bytes());
+
+        let tmp = tempfile::tempdir().unwrap();
+        // Named-VM layout: the known_hosts file sits in the per-name
+        // subdirectory, so the alias is the VM name namespaced under the
+        // provider-instance name.
+        let known_hosts_path = tmp
+            .path()
+            .join("providers")
+            .join("local-minvmd0")
+            .join("alpha")
+            .join("known_hosts");
+
+        read_ready_beacon(&mut reader, &known_hosts_path)
+            .expect("read_ready_beacon must succeed with valid beacon");
+
+        let contents =
+            std::fs::read_to_string(&known_hosts_path).expect("known_hosts file must be created");
+        assert!(
+            contents.contains("alpha.local-minvmd0 "),
+            "known_hosts must key the entry on the namespaced alias \
+             'alpha.local-minvmd0', got: {contents:?}"
         );
     }
 

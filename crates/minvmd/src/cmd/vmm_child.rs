@@ -16,6 +16,10 @@
 //! 5. Registers the marker socket for `VSOCK_MARKER_PORT` (guest→host): the
 //!    guest workload connects to that vsock port and writes `READY\n`, which
 //!    libkrun bridges to the host UNIX socket where the parent listens.
+//!    When the parent also bound the guest report door (T94), its path
+//!    arrives as `MINVMD_GUEST_REPORT_SOCK` and is registered for
+//!    `VM_HOST_BOX_REPORT_PORT` the same way, so the in-VM daemon's port
+//!    reports reach the VM host daemon's host-held grant.
 //! 6. On macOS, registers the timekeep socket for `VSOCK_TIMEKEEP_PORT`
 //!    (host→guest) and starts the thread that sends the host wall clock to the
 //!    guest, so a host suspend does not leave the guest clock frozen
@@ -44,6 +48,16 @@ fn run_vmm() -> Result<()> {
     use crate::image::{resolve_initramfs_path, resolve_kernel_path, resolve_rootfs_path};
     use crate::krun::Context;
     use crate::vm::VmConfig;
+
+    // The VMM child inherits the parent's default 256-fd soft limit, but a
+    // burst of `min session exec` opens one vsock connection per exec and
+    // libkrun holds each closed connection ~5 s before freeing it, so a burst
+    // exhausts the limit and every exec fails for those 5 s. Widen the limit
+    // before any fd-heavy work; best-effort, since a VM that boots with the
+    // default limit beats one that does not boot.
+    if let Err(e) = raise_nofile_limit(DEFAULT_VMM_NOFILE_LIMIT) {
+        tracing::warn!(error = %e, "cannot raise RLIMIT_NOFILE; the VM keeps its inherited limit");
+    }
 
     let kernel = resolve_kernel_path().context("resolving kernel path")?;
     let rootfs = resolve_rootfs_path().context("resolving rootfs path")?;
@@ -112,6 +126,20 @@ fn run_vmm() -> Result<()> {
     ctx.add_vsock_port(VSOCK_MARKER_PORT, &marker_sock)
         .context("registering READY-marker vsock port")?;
 
+    // The guest report door's vsock port (T94, NET-138): the parent binds
+    // the door and hands its path here, and this registration is what
+    // bridges the in-VM daemon's port reports to it — so it is made only
+    // when the parent bound a door, which is what the env names. A
+    // supervisor with no door (a bind failure, or a supervisor that binds
+    // no box table) hands no env, and the guest's runtime publishes then
+    // fail their reports instead of being recorded.
+    if let Some(guest_report_sock) =
+        std::env::var_os(crate::control::GUEST_REPORT_SOCK_ENV).filter(|path| !path.is_empty())
+    {
+        ctx.add_vsock_port(minimald_rpc::VM_HOST_BOX_REPORT_PORT, &guest_report_sock)
+            .context("registering the guest report door's vsock port")?;
+    }
+
     // Host wall-clock updates (host→guest, `crate::timekeep`), macOS only.
     //
     // Best-effort: a VM that boots with a drifting clock beats one that does
@@ -134,6 +162,63 @@ fn run_vmm() -> Result<()> {
     // error so the parent can observe the child's non-zero exit.
     let err = ctx.start_enter();
     bail!("krun_start_enter returned unexpectedly: {err}");
+}
+
+/// Soft and hard `RLIMIT_NOFILE` the VMM child installs for itself. The child
+/// inherits the parent's default 256-fd soft limit, but a burst of
+/// `min session exec` opens one vsock connection per exec and libkrun holds
+/// each closed connection ~5 s before freeing it, so a burst exhausts the
+/// limit and every exec fails for those 5 s. 64 Ki covers the fd-hungry cases
+/// while staying well under the `fs.nr_open` ceiling.
+#[cfg(minvmd_libkrun)]
+const DEFAULT_VMM_NOFILE_LIMIT: u64 = 65536;
+
+/// Raises `RLIMIT_NOFILE`, soft and hard, to `limit`; returns the soft limit in
+/// force afterwards, which can be below `limit` (see the fallback).
+#[cfg(minvmd_libkrun)]
+fn raise_nofile_limit(limit: u64) -> std::io::Result<u64> {
+    let current = get_nofile_limit()?;
+    let target = limit as libc::rlim_t;
+    if current.rlim_cur >= target {
+        return Ok(current.rlim_cur);
+    }
+
+    // The kernel rejects a hard limit above `fs.nr_open` outright rather than
+    // clamping, so an overshooting request fails wholesale. Fall back to the
+    // hard limit we already have — no privilege needed — instead of leaving the
+    // 256-fd default in place.
+    if set_nofile_limit(target, target).is_err() {
+        set_nofile_limit(current.rlim_max, current.rlim_max)?;
+    }
+
+    Ok(get_nofile_limit()?.rlim_cur)
+}
+
+#[cfg(minvmd_libkrun)]
+fn get_nofile_limit() -> std::io::Result<libc::rlimit> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `limit` is a live `rlimit`, which is exactly what the kernel
+    // writes through the pointer.
+    let rc = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) };
+    (rc == 0)
+        .then_some(limit)
+        .ok_or_else(std::io::Error::last_os_error)
+}
+
+#[cfg(minvmd_libkrun)]
+fn set_nofile_limit(soft: libc::rlim_t, hard: libc::rlim_t) -> std::io::Result<()> {
+    let limit = libc::rlimit {
+        rlim_cur: soft,
+        rlim_max: hard,
+    };
+    // SAFETY: `limit` is a live `rlimit` the kernel only reads from.
+    let rc = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const limit) };
+    (rc == 0)
+        .then_some(())
+        .ok_or_else(std::io::Error::last_os_error)
 }
 
 /// Register the host→guest timekeep bridge and start the sender thread.

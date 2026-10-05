@@ -26,10 +26,49 @@ pub const DISK_SYNC_ENV: &str = "MINVMD_DISK_SYNC";
 /// see `kernel_cmdline` for both.
 pub const GUEST_LOG_ENV: &str = "RUST_LOG";
 
+/// The environment variable the supervisor (`cmd/run`) hands the VMM child
+/// the node's proxy port in. The child is a separate process, so the env is
+/// the transport — the same vector the marker-socket path rides — and the
+/// backend appends the value to the kernel command line for the guest to
+/// read (see `HOSTNAME_PROXY_PORT_TOKEN`).
+pub(crate) const NODE_PROXY_PORT_ENV: &str = "MINVMD_NODE_PROXY_PORT";
+
+/// The boot token the node's hostname-proxy port rides to the guest on. The
+/// kernel starts `/init` with an empty environment, so the boot line is the
+/// only vector: unrecognized `KEY=VALUE` tokens reach init as env vars (the
+/// same vector `RUST_LOG` rides), and the guest daemon binds the port as
+/// handed (NET-025).
+const HOSTNAME_PROXY_PORT_TOKEN: &str = "MINIMALD_HOSTNAME_PROXY_PORT";
+
+/// The environment variable the supervisor hands the VMM child this boot's
+/// publish generation in (T93), beside [`NODE_PROXY_PORT_ENV`] and by the
+/// same transport: a token the supervisor draws fresh for every boot it
+/// spawns, so a publish report can be told apart from a killed boot's even
+/// when both boots were handed the same port.
+pub(crate) const PUBLISH_GENERATION_ENV: &str = "MINVMD_PUBLISH_GENERATION";
+
+/// The boot token the publish generation rides to the guest on, beside the
+/// port's token: the guest daemon echoes it in every publish report.
+/// Mirrors minimald's `HANDED_PUBLISH_GENERATION_TOKEN` — keep the two in
+/// step.
+const PUBLISH_GENERATION_TOKEN: &str = "MINIMALD_PUBLISH_GENERATION";
+
 /// Kernel command line every microVM boots with: the console the guest's
-/// stdout/stderr reaches the host boot log through. `kernel_cmdline` extends it;
-/// nothing else in the boot line is optional.
-const BASE_KERNEL_CMDLINE: &str = "console=hvc0";
+/// stdout/stderr reaches the host boot log through, and IPv6 disabled (the v1
+/// network posture is IPv4-only — design §4.2 keeps IPv6 ULA dual-stack as a
+/// later additive, which retires the parameter when it lands). `ipv6.disable=1`
+/// is the `ipv6` module's `disable` parameter (`net/ipv6/af_inet6.c`); the
+/// kernel parses it for built-in and loadable alike, and `inet6_init` returns
+/// before registering anything, so the guest's IPv6 stack never comes up: no
+/// interface configures an IPv6 address and the route table never gains an
+/// IPv6 entry, loopback included — nothing inside the escape boundary gets a
+/// v6 family to ride or for an egress verdict to decide. That is the inside
+/// half of the posture only: a guest kernel the attacker holds can be rebuilt
+/// with it, so the rule that survives an escape is the host-side egress gate
+/// dropping every foreign-family frame; this parameter removes the v6 family
+/// from inside the boundary, the gate is what enforces it. `kernel_cmdline`
+/// extends the line; nothing else in it is optional.
+const BASE_KERNEL_CMDLINE: &str = "console=hvc0 ipv6.disable=1";
 
 /// The kernel's `COMMAND_LINE_SIZE` — the buffer the boot line (including its
 /// NUL terminator) must fit in. 2048 on both arm64 and x86_64, the two
@@ -227,13 +266,22 @@ impl VmConfig {
         // runs its `/init` (no `root=`/`init=` cmdline). minimald-as-/init mounts
         // devtmpfs itself, then mounts the rootfs disk below and chroots into it.
         //
-        // The boot line also carries the host's RUST_LOG to the guest daemon as
-        // an environment variable: the kernel command line is the only vector,
-        // since the guest `/init` is minimald itself and the kernel starts it
-        // with an empty environment (see `kernel_cmdline`). Bound to a local so
-        // the &str handed to `set_kernel` outlives the call.
+        // The boot line also carries the host's RUST_LOG and the supervisor's
+        // node proxy port to the guest daemon as environment variables: the
+        // kernel command line is the only vector, since the guest `/init` is
+        // minimald itself and the kernel starts it with an empty environment
+        // (see `kernel_cmdline`). Bound to a local so the &str handed to
+        // `set_kernel` outlives the call.
         let rust_log = std::env::var(GUEST_LOG_ENV).ok();
-        let cmdline = kernel_cmdline(rust_log.as_deref());
+        let node_proxy_port = node_proxy_port_from_env()?;
+        let publish_generation = publish_generation_from_env()?;
+        let cmdline = kernel_cmdline(rust_log.as_deref(), node_proxy_port, publish_generation);
+        // The boot line at info, not debug: the kernel echoes it back as
+        // `Kernel command line: …` only once its console is up, and this is
+        // the one line that says what the guest was told to boot with — a
+        // missing or mistyped parameter (`ipv6.disable=1` among them) is
+        // diagnosable from the host before the guest says anything.
+        tracing::info!(cmdline = %cmdline, "composed the guest boot line");
         ctx.set_kernel(
             &self.kernel_path,
             crate::image::kernel_format(),
@@ -296,32 +344,44 @@ impl VmConfig {
         // new ones queue. Acceptable for v0.1 workloads (<10 concurrent).
         ctx.add_vsock_port2(crate::sock::VSOCK_BRIDGE_PORT, &uds_path, true)?;
 
-        // gvproxy shuttle bridge (extended to the root netns). The
-        // guest connects to AF_VSOCK CID 2 (the host) on
+        // gvproxy shuttle bridge, through the host-side egress gate (NET-081).
+        // The guest connects to AF_VSOCK CID 2 (the host) on
         // VSOCK_GVPROXY_SHUTTLE_PORT; with `listen = false` libkrun dials the
-        // host gvproxy `-listen` switch socket and splices the two, carrying raw
-        // L2 frames between a guest tap and the host gvproxy (the single gVisor
-        // stack). Registered for every VM, not just own-IP: the guest's root
-        // netns (the daemon) attaches a primary tap here for egress, and own-IP
-        // PTasks attach further taps as additional clients on the same switch.
-        // If the host gvproxy did not come up, the guest's connect simply fails
-        // and the relay reports no egress — boot is unaffected.
-        let switch_sock = crate::net::resolve_switch_sock()
+        // named host socket and splices the two, carrying raw L2 frames between
+        // a guest tap and the host. Since NET-081 the named socket is the
+        // **egress gate's**, not the switch's own: the gate — started by the
+        // switch runtime before the VM boots (see `crate::net`) — decides every
+        // frame against the host-side table of published namespaces
+        // (`crate::box_registry`) by the source address it carries, and relays
+        // only what the shared frame verdict admits on to the gvproxy switch (the
+        // single gVisor stack). Per-box egress rules are thereby applied **outside
+        // the VM**, where nothing inside the escape boundary can change them, and
+        // a frame whose source address no namespace holds is dropped outside the
+        // plan's lease block — everywhere, once the per-box default binds; under
+        // the announced interim this build ships, an in-plan source no row holds
+        // is admitted, every admit warned (`egress_gate` carries the phase and
+        // why). Registered for every VM, not just own-IP: the guest's root netns (the
+        // daemon) attaches a primary tap here for egress, and own-IP PTasks
+        // attach further taps as additional clients on the same switch. If the
+        // gate (or the switch behind it) did not come up, the guest's connect
+        // simply fails and the relay reports no egress — boot is unaffected.
+        let gate_sock = crate::net::resolve_gate_sock()
             .map_err(|source| crate::error::VmError::Io { source })?;
-        crate::sock::check_uds_path_len(&switch_sock)
+        crate::sock::check_uds_path_len(&gate_sock)
             .map_err(|source| crate::error::VmError::Io { source })?;
-        ctx.add_vsock_port2(crate::net::VSOCK_GVPROXY_SHUTTLE_PORT, &switch_sock, false)?;
+        ctx.add_vsock_port2(crate::net::VSOCK_GVPROXY_SHUTTLE_PORT, &gate_sock, false)?;
         tracing::info!(
             port = crate::net::VSOCK_GVPROXY_SHUTTLE_PORT,
-            switch_sock = %switch_sock.display(),
-            "registered gvproxy shuttle vsock bridge",
+            gate_sock = %gate_sock.display(),
+            "registered gvproxy shuttle vsock bridge behind the host-side egress gate",
         );
         Ok(())
     }
 }
 
 /// Build the guest kernel command line, forwarding `RUST_LOG` when the host has
-/// one worth forwarding.
+/// one worth forwarding and the node's proxy port when the supervisor handed
+/// it.
 ///
 /// The microVM's `/init` **is** minimald, so the kernel starts it with an empty
 /// environment — nothing from the host process crosses the VM boundary, and the
@@ -329,7 +389,13 @@ impl VmConfig {
 /// hands init every `KEY=VALUE` boot token it does not recognise itself
 /// (`init/main.c`: `unknown_bootoption` → `envp_init`), so `RUST_LOG=<value>` on
 /// the command line arrives as an environment variable and reaches minimald's
-/// `EnvFilter::try_from_default_env()`.
+/// `EnvFilter::try_from_default_env()`, and the proxy port arrives the same way
+/// (`node_proxy_port_from_env` reads it from the VMM child's env, where the
+/// supervisor put it — `cmd/run` assigns it before the boot, NET-025). The
+/// zone-answerer port is deliberately not handed: on a VM-backed host the
+/// in-VM daemon starts no answerer (NET-138) and the host's answerer serves the
+/// zone, so a token carrying an answerer port would be an admitted port with
+/// nothing behind it.
 ///
 /// Two things a caller setting `RUST_LOG` must know:
 ///
@@ -340,30 +406,57 @@ impl VmConfig {
 /// - The boot line is world-readable inside the guest as `/proc/cmdline`, so it
 ///   must never carry a secret.
 ///
-/// The value is injected rather than read from the process environment here, so
-/// this stays pure and unit-testable; the caller passes
-/// `std::env::var(GUEST_LOG_ENV).ok()`. A value that cannot survive the boot
-/// line is skipped (leaving [`BASE_KERNEL_CMDLINE`] byte-identical) with a
-/// warning, rather than corrupting the boot: whitespace would be split into
-/// separate boot tokens, an empty value carries nothing, and an over-long one
-/// would overrun [`COMMAND_LINE_SIZE`]. Commas are untouched —
-/// `info,russh=debug` is the normal form.
+/// The values are injected rather than read from the process environment here,
+/// so this stays pure and unit-testable; the caller passes
+/// `std::env::var(GUEST_LOG_ENV).ok()`, `node_proxy_port_from_env()` and
+/// `publish_generation_from_env()` — the boot's publish generation (T93),
+/// which the guest daemon echoes in its publish reports, rides beside the
+/// port and, like it, is never skipped. A
+/// `RUST_LOG` value that cannot survive the boot line is skipped (leaving the
+/// base line plus the port token byte-identical) with a warning, rather than
+/// corrupting the boot: whitespace would be split into separate boot tokens, an
+/// empty value carries nothing, and an over-long one would overrun
+/// [`COMMAND_LINE_SIZE`]. The port is never skipped — the guest binds it as
+/// handed — so its token counts against [`COMMAND_LINE_SIZE`] when the filter's
+/// length is judged. Commas are untouched — `info,russh=debug` is the normal
+/// form.
 // Only `apply` calls this, and `apply` needs libkrun; without it the crate is a
 // runtime-bailing stub, but the tests below still cover this on every target.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
-fn kernel_cmdline(rust_log: Option<&str>) -> Cow<'static, str> {
-    let Some(value) = rust_log else {
-        return Cow::Borrowed(BASE_KERNEL_CMDLINE);
+fn kernel_cmdline(
+    rust_log: Option<&str>,
+    proxy_port: Option<u16>,
+    publish_generation: Option<u64>,
+) -> Cow<'static, str> {
+    // The port rides the boot line first: base, then the port token, then the
+    // publish generation beside it, then the filter when one is forwarded.
+    let base_with_port = match (proxy_port, publish_generation) {
+        (Some(proxy), Some(generation)) => Cow::Owned(format!(
+            "{BASE_KERNEL_CMDLINE} {HOSTNAME_PROXY_PORT_TOKEN}={proxy} \
+             {PUBLISH_GENERATION_TOKEN}={generation}"
+        )),
+        (Some(proxy), None) => Cow::Owned(format!(
+            "{BASE_KERNEL_CMDLINE} {HOSTNAME_PROXY_PORT_TOKEN}={proxy}"
+        )),
+        (None, Some(generation)) => Cow::Owned(format!(
+            "{BASE_KERNEL_CMDLINE} {PUBLISH_GENERATION_TOKEN}={generation}"
+        )),
+        (None, None) => Cow::Borrowed(BASE_KERNEL_CMDLINE),
     };
 
-    // `<base> RUST_LOG=<value>`: the three extra bytes are the separating space,
-    // the `=`, and the NUL the kernel's buffer must also hold.
-    let total_len = BASE_KERNEL_CMDLINE.len() + GUEST_LOG_ENV.len() + value.len() + 3;
+    let Some(value) = rust_log else {
+        return base_with_port;
+    };
+
+    // `<base-with-ports> RUST_LOG=<value>`: the three extra bytes are the
+    // separating space, the `=`, and the NUL the kernel's buffer must also
+    // hold.
+    let joined = format!("{base_with_port} {GUEST_LOG_ENV}={value}");
     let rejection = if value.is_empty() {
         Some("value is empty")
     } else if value.contains(char::is_whitespace) {
         Some("value contains whitespace, which the kernel would split into separate boot tokens")
-    } else if total_len > COMMAND_LINE_SIZE {
+    } else if joined.len() + 1 > COMMAND_LINE_SIZE {
         Some("value would push the boot line past the kernel's COMMAND_LINE_SIZE")
     } else {
         None
@@ -378,9 +471,68 @@ fn kernel_cmdline(rust_log: Option<&str>) -> Cow<'static, str> {
                 "not forwarding the host log filter to the guest; the guest keeps minimald's \
                  default filter",
             );
-            Cow::Borrowed(BASE_KERNEL_CMDLINE)
+            base_with_port
         }
-        None => Cow::Owned(format!("{BASE_KERNEL_CMDLINE} {GUEST_LOG_ENV}={value}")),
+        None => Cow::Owned(joined),
+    }
+}
+
+/// Reads the node's proxy port the supervisor handed the VMM child in its env
+/// (see [`NODE_PROXY_PORT_ENV`]). Transport decoding only — the supervisor
+/// resolves the port once (override or selection, `cmd/run.rs`) and hands
+/// the one resolution down, so anything this decode cannot accept is a boot
+/// error naming the variable and the value, never a silent fallback that
+/// would let the guest select a port different from the one the node row
+/// registered. `Ok(None)` when the variable is absent — the boot does
+/// not run under the supervisor, and the guest daemon then selects its own
+/// ports, the pre-handoff behaviour. A `0` passes through: the guest's own
+/// handed-port policy reads it as "select one yourself".
+// Only `apply` calls this; see `kernel_cmdline` for the cfg note.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn node_proxy_port_from_env() -> Result<Option<u16>, crate::error::VmError> {
+    node_proxy_port_from_raw(std::env::var(NODE_PROXY_PORT_ENV).ok().as_deref())
+}
+
+/// Decodes a handed node proxy port from its raw env value. A value that does
+/// not decode fails the boot naming the variable and the value.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn node_proxy_port_from_raw(proxy: Option<&str>) -> Result<Option<u16>, crate::error::VmError> {
+    let Some(raw) = proxy else {
+        return Ok(None);
+    };
+    match raw.trim().parse::<u16>() {
+        Ok(port) => Ok(Some(port)),
+        Err(_) => Err(crate::error::VmError::Io {
+            source: std::io::Error::other(format!(
+                "environment variable {NODE_PROXY_PORT_ENV} carries {raw:?}, which is not a port"
+            )),
+        }),
+    }
+}
+
+/// Reads this boot's publish generation the supervisor handed the VMM child
+/// (see [`PUBLISH_GENERATION_ENV`]). Strict like the port's decode: absent
+/// is a boot outside the supervisor (no token), and a value that is not a
+/// generation fails the boot naming the variable and the value.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn publish_generation_from_env() -> Result<Option<u64>, crate::error::VmError> {
+    publish_generation_from_raw(std::env::var(PUBLISH_GENERATION_ENV).ok().as_deref())
+}
+
+/// Decodes a handed publish generation from its raw env value.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn publish_generation_from_raw(raw: Option<&str>) -> Result<Option<u64>, crate::error::VmError> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    match raw.trim().parse::<u64>() {
+        Ok(generation) => Ok(Some(generation)),
+        Err(_) => Err(crate::error::VmError::Io {
+            source: std::io::Error::other(format!(
+                "environment variable {PUBLISH_GENERATION_ENV} carries {raw:?}, \
+                 which is not a publish generation"
+            )),
+        }),
     }
 }
 
@@ -432,57 +584,168 @@ mod tests {
     use super::*;
 
     #[test]
-    fn kernel_cmdline_without_a_host_filter_is_the_bare_console_line() {
-        // Byte-identical to the pre-forwarding boot line: no empty token, no
-        // trailing space.
-        assert_eq!(kernel_cmdline(None), "console=hvc0");
+    fn kernel_cmdline_without_a_host_filter_is_the_base_boot_line() {
+        // The base line exactly: console plus IPv6 disabled, no empty token,
+        // no trailing space.
+        assert_eq!(
+            kernel_cmdline(None, None, None),
+            "console=hvc0 ipv6.disable=1"
+        );
+    }
+
+    #[test]
+    fn guest_ipv6_disabled_no_v6_route() {
+        // Every boot line carries `ipv6.disable=1`, so the guest's IPv6 stack
+        // never comes up: no interface configures an IPv6 address and the
+        // route table never gains an IPv6 entry, loopback's ::1 included —
+        // nothing inside the escape boundary gets a v6 family to ride.
+        let lines = [
+            kernel_cmdline(None, None, None),
+            kernel_cmdline(Some("debug"), None, None),
+        ];
+        for line in lines {
+            let tokens: Vec<&str> = line.split_whitespace().collect();
+            assert!(
+                tokens.contains(&"ipv6.disable=1"),
+                "expected an `ipv6.disable=1` boot token, got: {line}"
+            );
+        }
     }
 
     #[test]
     fn kernel_cmdline_forwards_a_simple_filter() {
-        assert_eq!(kernel_cmdline(Some("debug")), "console=hvc0 RUST_LOG=debug");
+        assert_eq!(
+            kernel_cmdline(Some("debug"), None, None),
+            "console=hvc0 ipv6.disable=1 RUST_LOG=debug"
+        );
     }
 
     #[test]
     fn kernel_cmdline_preserves_comma_separated_directives() {
         // The normal form of a real filter; commas are legal in a boot token.
         assert_eq!(
-            kernel_cmdline(Some("info,russh=debug,minimald=debug")),
-            "console=hvc0 RUST_LOG=info,russh=debug,minimald=debug"
+            kernel_cmdline(Some("info,russh=debug,minimald=debug"), None, None),
+            "console=hvc0 ipv6.disable=1 RUST_LOG=info,russh=debug,minimald=debug"
         );
     }
 
     #[test]
     fn kernel_cmdline_skips_a_filter_containing_whitespace() {
         // The kernel would split these into separate boot tokens, silently
-        // corrupting the line, so the whole value is dropped.
-        assert_eq!(kernel_cmdline(Some("info, russh=debug")), "console=hvc0");
-        assert_eq!(kernel_cmdline(Some("info\trussh=debug")), "console=hvc0");
+        // corrupting the line, so the whole value is dropped — the base line
+        // still boots, IPv6 disabled.
+        assert_eq!(
+            kernel_cmdline(Some("info, russh=debug"), None, None),
+            "console=hvc0 ipv6.disable=1"
+        );
+        assert_eq!(
+            kernel_cmdline(Some("info\trussh=debug"), None, None),
+            "console=hvc0 ipv6.disable=1"
+        );
     }
 
     #[test]
     fn kernel_cmdline_skips_an_empty_filter() {
-        assert_eq!(kernel_cmdline(Some("")), "console=hvc0");
+        assert_eq!(
+            kernel_cmdline(Some(""), None, None),
+            "console=hvc0 ipv6.disable=1"
+        );
     }
 
     #[test]
     fn kernel_cmdline_skips_an_oversized_filter() {
         let huge = "minimald=trace,".repeat(500);
         assert!(huge.len() > COMMAND_LINE_SIZE);
-        assert_eq!(kernel_cmdline(Some(&huge)), "console=hvc0");
+        assert_eq!(
+            kernel_cmdline(Some(&huge), None, None),
+            "console=hvc0 ipv6.disable=1"
+        );
     }
 
     #[test]
     fn kernel_cmdline_forwards_the_longest_filter_that_fits_the_kernel_buffer() {
-        // `console=hvc0 RUST_LOG=` is 22 bytes, so a 2025-byte value yields a
-        // 2047-byte line that fills COMMAND_LINE_SIZE exactly once NUL-terminated.
-        let longest = "d".repeat(2025);
-        let line = kernel_cmdline(Some(&longest));
+        // `console=hvc0 ipv6.disable=1 RUST_LOG=` is 37 bytes, so a 2010-byte
+        // value yields a 2047-byte line that fills COMMAND_LINE_SIZE exactly
+        // once NUL-terminated.
+        let longest = "d".repeat(2010);
+        let line = kernel_cmdline(Some(&longest), None, None);
         assert_eq!(line.len(), COMMAND_LINE_SIZE - 1);
         assert!(line.ends_with(&longest));
 
         // One byte more must be skipped, not truncated.
-        assert_eq!(kernel_cmdline(Some(&"d".repeat(2026))), "console=hvc0");
+        assert_eq!(
+            kernel_cmdline(Some(&"d".repeat(2011)), None, None),
+            "console=hvc0 ipv6.disable=1"
+        );
+    }
+
+    #[test]
+    fn node_port_assigned_on_host_and_handed_to_daemon() {
+        // The port the supervisor handed lands on the boot line as the boot
+        // token the guest daemon reads, exactly as handed (the kernel hands
+        // unrecognized `KEY=VALUE` tokens to init as env vars). The answerer
+        // port never rides: on a VM-backed host the in-VM daemon starts no
+        // answerer (NET-138), so a token carrying one would be an admitted
+        // port with nothing behind it.
+        let handed = "console=hvc0 ipv6.disable=1 MINIMALD_HOSTNAME_PROXY_PORT=7654";
+        assert_eq!(kernel_cmdline(None, Some(7654), None), handed);
+        assert!(
+            !handed.contains("MINIMALD_ZONE_ANSWERER_PORT"),
+            "the boot line must not carry a zone-answerer port: {handed}"
+        );
+
+        // With both a filter and the port, the tokens share the line.
+        assert_eq!(
+            kernel_cmdline(Some("debug"), Some(7654), None),
+            "console=hvc0 ipv6.disable=1 MINIMALD_HOSTNAME_PROXY_PORT=7654 RUST_LOG=debug"
+        );
+
+        // A filter that would push the whole line past the buffer is skipped
+        // while the port still boots: the line keeps the handed port and
+        // drops the filter, rather than corrupting a token the guest binds.
+        let port_only = kernel_cmdline(None, Some(7654), None);
+        let oversized = "d".repeat(COMMAND_LINE_SIZE - port_only.len() - GUEST_LOG_ENV.len() - 1);
+        assert_eq!(
+            kernel_cmdline(Some(&oversized), Some(7654), None),
+            port_only,
+            "an oversized filter is skipped; the handed port still boots"
+        );
+
+        // The handoff decode is strict, because the supervisor resolves the
+        // port once and anything undecodable here would boot the guest onto a
+        // port different from the one the node row registered: the variable
+        // absent is the pre-handoff boot (no token), a value decodes, and a
+        // value that is not a port is a surfaced error naming the variable
+        // and the value.
+        assert_eq!(node_proxy_port_from_raw(None).unwrap(), None);
+        assert_eq!(node_proxy_port_from_raw(Some("7654")).unwrap(), Some(7654));
+        let garbage = node_proxy_port_from_raw(Some("no-port-here"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            garbage.contains(NODE_PROXY_PORT_ENV) && garbage.contains("no-port-here"),
+            "an undecodable value names the variable and the value, got: {garbage}"
+        );
+    }
+
+    #[test]
+    fn the_publish_generation_rides_the_boot_line_beside_the_port() {
+        // T93: the boot's publish generation travels the same way the port
+        // does, so the guest can echo it in every publish report.
+        assert_eq!(
+            kernel_cmdline(Some("debug"), Some(7654), Some(42)),
+            "console=hvc0 ipv6.disable=1 MINIMALD_HOSTNAME_PROXY_PORT=7654 \
+             MINIMALD_PUBLISH_GENERATION=42 RUST_LOG=debug"
+        );
+        assert_eq!(publish_generation_from_raw(None).unwrap(), None);
+        assert_eq!(publish_generation_from_raw(Some("42")).unwrap(), Some(42));
+        let garbage = publish_generation_from_raw(Some("not-a-generation"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            garbage.contains(PUBLISH_GENERATION_ENV) && garbage.contains("not-a-generation"),
+            "an undecodable value names the variable and the value, got: {garbage}"
+        );
     }
 
     #[test]

@@ -1,5 +1,6 @@
 [package]
 name = "minimald"
+description = "The session daemon: a russh SSH server that dispatches to per-subsystem mailbox actors (session manager, one actor per session, the session host, maintenance), owns the gvproxy switch, DNS and hostname proxy for own-address boxes, and runs as pid-1 inside the minvmd microVM."
 rust-version.workspace = true
 version.workspace = true
 edition.workspace = true
@@ -41,6 +42,13 @@ russh.workspace = true
 russh-sftp.workspace = true
 serde.workspace = true
 serde_json_lenient.workspace = true
+# Sha256 of exactly the bytes the guest's boot load pipes to nft (NET-079):
+# the digest the load logs so a render's bytes can be compared off-host
+# without re-rendering anything. Hashing only, same trait the native lane's
+# cargo-digester uses.
+sha2.workspace = true
+# The digest's lowercase-hex spelling, the same one the cache's sha256s use.
+hex.workspace = true
 sysinfo.workspace = true
 tar.workspace = true
 tempfile.workspace = true
@@ -97,6 +105,10 @@ lcache.workspace = true
 # Property tests over the request parsers (NET spec, tiers: the T1 lane adds
 # this dev-dependency; see `net/proxy.rs` for the first property test).
 proptest.workspace = true
+# The classifier's held probe listeners are this daemon's own process-global
+# state; tests that hold or read them (NET-079, `net/classifier.rs`) mark
+# themselves serial so no two of them race one set of listeners.
+serial_test.workspace = true
 
 # The guest (initramfs pid-1) boot path is Linux-only.
 [target.'cfg(target_os = "linux")'.dependencies]

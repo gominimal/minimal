@@ -3,8 +3,8 @@
 use anyhow::{Context as _, bail};
 use std::io::IsTerminal as _;
 use std::io::Write as _;
-use std::os::unix::process::CommandExt as _;
 use std::path::PathBuf;
+use tokio::io::AsyncReadExt as _;
 use tokio::io::AsyncWriteExt as _;
 
 // The version gate lives in `minimal-client`, next to the transport it guards,
@@ -22,6 +22,11 @@ mod list;
 mod net;
 mod project;
 mod session;
+
+// The Ctrl-C cleanup (`arm_activation_interrupt`) withdraws the row the
+// activation registered with the VM host daemon; the withdrawal lives with
+// the session commands, as does the provider-kind rule its gate keys on.
+use session::{daemon_provider_kind, vm_host_control_sock, withdraw_box_row};
 
 pub use admin::*;
 pub use list::*;
@@ -79,6 +84,10 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
         })) => cmd_net_forward(&cli.global_args, args).await,
         Some(Command::Dirs) => dirs::cmd_dirs(&cli.global_args),
         Some(Command::Bug(args)) => diag::cmd_bug(&cli.global_args, args).await,
+        Some(Command::Diag(diag::DiagArgs { command })) => match command {
+            diag::DiagCommand::Collect(args) => diag::cmd_bug(&cli.global_args, args).await,
+            diag::DiagCommand::Upload(args) => diag::cmd_diag_upload(args).await,
+        },
         #[cfg(feature = "remote-access")]
         Some(Command::Mesh(MeshArgs { command })) => match command {
             MeshCommand::Status => cmd_mesh_status(&cli.global_args).await,
@@ -89,7 +98,10 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
         Some(Command::Login(args)) => {
             cmd_login(&cli.global_args, args, &mut std::io::stdout().lock()).await
         }
-        Some(Command::Version) => cmd_version(&cli.global_args).await,
+        // Unlocked handle: `Stdout` takes its lock per write, so the lock is
+        // not held across the daemon handshake, where a spawned task's
+        // logging may need stdout too.
+        Some(Command::Version) => cmd_version(&cli.global_args, &mut std::io::stdout()).await,
         Some(Command::Spin(args)) => cmd_spin(&cli.global_args, args).await,
         Some(Command::Init(args)) => cmd_init(&cli.global_args, args)
             .await
@@ -115,9 +127,15 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
 /// existing session built from the same directory.
 pub(crate) const AUTOGEN_NAME_RETRIES: u32 = 8;
 
-/// Reduce a directory basename to the characters a session name should carry —
-/// ASCII alphanumerics plus `-`, `_`, `.`, lowercased — dropping everything
-/// else (spaces, unicode) so the minted handle is typable and clears
+/// Longest component [`sanitize_name_component`] returns, so a minted
+/// `task-<component>-<hex>` (the longest wrapper) stays inside the 63-octet
+/// DNS label `validate_session_name` requires.
+const NAME_COMPONENT_MAX: usize = 48;
+
+/// Reduce a directory basename to the characters a session name may carry —
+/// ASCII alphanumerics, lowercased, with `-`, `_` and `.` each mapped to `-` —
+/// dropping everything else (spaces, unicode) and capping the length, so the
+/// minted handle is typable and is a single DNS label that clears
 /// `validate_session_name`. Falls back to `session` when nothing survives.
 pub(crate) fn sanitize_name_component(basename: &str) -> String {
     let filtered: String = basename
@@ -126,13 +144,14 @@ pub(crate) fn sanitize_name_component(basename: &str) -> String {
             if c.is_ascii_alphanumeric() {
                 Some(c.to_ascii_lowercase())
             } else if matches!(c, '-' | '_' | '.') {
-                Some(c)
+                Some('-')
             } else {
                 None
             }
         })
+        .take(NAME_COMPONENT_MAX)
         .collect();
-    let trimmed = filtered.trim_matches(|c| matches!(c, '-' | '_' | '.'));
+    let trimmed = filtered.trim_matches('-');
     if trimmed.is_empty() {
         "session".to_string()
     } else {
@@ -659,6 +678,15 @@ pub(crate) fn arm_activation_interrupt(
     session_id: sessions::SessionId,
 ) -> ActivationInterrupt {
     let sock = client::resolve_socket_path(global.minimal_dir.as_deref(), global.use_minvmd());
+    // Resolved here, not inside the task: the withdrawal's socket is the
+    // same provider dir's, and the borrow must not cross the spawn. Keyed
+    // on the provider kind — the rule the socket resolution itself and the
+    // fabric display turn on — not on `use_minvmd()`, which is true only
+    // under an explicit `--provider local-minvmd`: on macOS every invocation
+    // is minvmd-backed with no flag at all, and a Ctrl-C that keyed on the
+    // flag would leave exactly that host's box row published.
+    let control_sock =
+        vm_host_control_sock(daemon_provider_kind(global), global.minimal_dir.as_deref());
     let task = tokio::spawn(async move {
         // Only the first Ctrl-C is intercepted; a second falls through to
         // the default disposition so a wedged cleanup can still be killed.
@@ -673,9 +701,22 @@ pub(crate) fn arm_activation_interrupt(
             && let Ok(mut client) = client::Client::connect(&sock).await
         {
             use minimald_rpc::{AbortSession, AbortSessionRequest};
+            // The record is fetched **before** the abort, which may take it
+            // with the session: it carries the pair the box's registration
+            // handed back (T66), whose row is withdrawn after the abort —
+            // the creator's withdrawal, best-effort. A session that
+            // registered no box (a task session, a native host) holds no
+            // pair, and the withdrawal stays silent for it.
+            let row = get_session_record(&mut client, &session_id.to_string())
+                .await
+                .ok()
+                .and_then(|resp| resp.record);
             let _ = client
                 .oneshot_rpc::<AbortSession>(AbortSessionRequest { id: session_id })
                 .await;
+            if let Some(record) = row {
+                withdraw_box_row(control_sock, record.name.as_deref(), record.box_addresses).await;
+            }
         }
         std::process::exit(130);
     });

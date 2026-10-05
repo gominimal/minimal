@@ -178,6 +178,11 @@ MUXER = { inherit = true }               # inherit from the host env
 ```
 
 - A **literal** string sets the variable to that value.
+- `PATH` is the one exception to literal values. A `PATH` that contains
+  `$PATH` or `${PATH}` expands that reference to the session's default
+  `PATH`. So `PATH = "/opt/bin:$PATH"` puts `/opt/bin` before the default
+  directories instead of replacing them. A `PATH` without a reference stays
+  verbatim, and every other variable stays literal.
 - `{ inherit = true }` passes the variable through from the environment of
   the `min` process on the host. If the host does not have it set, the
   variable is dropped from the session (with a warning) rather than failing
@@ -243,6 +248,13 @@ so list entries only make sense with per-entry dests or glob entries):
   with `~/`.
 - Glob patterns must have a literal directory prefix to walk from:
   `~/dotfiles/**/*.lua` is fine, a bare `**/*.pem` is rejected.
+- A plain directory path (no glob metacharacters) is shorthand for
+  `dir/**/*`: `source = "~/dotfiles"` copies the whole tree. Common
+  VCS and dependency directories (`.git`, `.hg`, `.svn`, `CVS`, `.jj`,
+  `node_modules`) are excluded by default, and the total size of a
+  plain-directory source is capped at 100 MiB — a larger tree fails the
+  activation rather than being copied silently. Use an explicit glob to
+  narrow the copy.
 - `..` components are rejected wherever they appear.
 - A source path that does not exist on the host is dropped with a warning
   at activation rather than failing it, so opportunistically patching a
@@ -317,9 +329,10 @@ Details worth knowing:
 - The name is **reserved** here: a loadout that also declares a
   `LOADOUT_ROOT` variable still patches from its own directory. The variable
   reaches the session normally -- only patch sources ignore it.
-- `$LOADOUT_ROOT` alone names a directory, and a patch source matches files,
-  so it patches in nothing. Write `$LOADOUT_ROOT/**/*` to take the whole
-  tree.
+- `$LOADOUT_ROOT` alone names a directory, which is a plain-directory
+  source: it copies the whole tree (equivalent to `$LOADOUT_ROOT/**/*`),
+  with the default VCS/dependency directory excludes and the 100 MiB size
+  cap applied. Write an explicit glob to narrow the copy.
 - The directory is optional. A loadout that never references it does not
   need one, and -- like any other source -- a path that isn't there is
   skipped with a warning rather than failing the activation.
@@ -452,7 +465,7 @@ from two flags:
 
 | Flag | Description |
 |------|-------------|
-| `--loadout <NAME>` | Apply `<config>/minimal/loadouts/<NAME>.toml`. Repeatable. If given, the config file's `default_loadouts` are ignored |
+| `--loadout <NAME>` | Apply the named loadout from `<config>/minimal/loadouts/<NAME>.toml` or `<config>/minimal/loadouts/<NAME>/loadout.toml`. Repeatable. If given, the config file's `default_loadouts` are ignored |
 | `--no-loadouts` | Apply no loadouts at all. Conflicts with `--loadout` |
 
 Resolution order:

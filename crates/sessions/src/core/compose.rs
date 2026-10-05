@@ -1621,16 +1621,25 @@ pub(crate) fn expand_patch_sources(
         .map(|pp| {
             let (patch, provenance, follow_override) = pp.into_parts();
             let loadout_root = anchors.loadout_root(&provenance);
+            let project_root = match &provenance {
+                Source::Project { path } => Some(path.as_str()),
+                _ => None,
+            };
             let pattern_anchors = crate::core::expansion::Anchors::home(anchors.home)
-                .with_loadout_root(loadout_root.as_ref().map(paths::HostAbsPath::as_str));
-            let source =
-                crate::core::expansion::expand_source(patch.source(), gated_vars, pattern_anchors)?;
+                .with_loadout_root(loadout_root.as_ref().map(paths::HostAbsPath::as_str))
+                .with_project_root(project_root);
+            let (source, plain_directory) = crate::core::expansion::expand_source_with_plain_dir(
+                patch.source(),
+                gated_vars,
+                pattern_anchors,
+            )?;
             let follow_symlinks = follow_override.unwrap_or(default_follow_symlinks);
             Ok(ExpandedProvenancedPatch {
                 source,
                 dest: patch.dest().clone(),
                 provenance,
                 follow_symlinks,
+                plain_directory,
             })
         })
         .collect()

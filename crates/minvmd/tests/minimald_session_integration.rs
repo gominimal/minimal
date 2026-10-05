@@ -23,7 +23,10 @@
 
 #![cfg(minvmd_libkrun)]
 
+mod common;
+
 use std::io::{BufRead, BufReader};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -58,8 +61,8 @@ const MINIMAL_SESSION_ID_ENV: &str = "MINIMAL_SESSION_ID";
 /// Returns true if the e2e suite is enabled (`MINVMD_E2E=1`), asserting the
 /// required env vars are present when so.
 fn e2e_enabled() -> bool {
-    if std::env::var("MINVMD_E2E").as_deref() != Ok("1") {
-        eprintln!("minimald_session_integration: MINVMD_E2E != 1, skipping");
+    if !common::e2e() {
+        common::skip_or_fail("minimald_session_integration", "MINVMD_E2E != 1");
         return false;
     }
     for var in &[
@@ -84,8 +87,7 @@ struct Guest {
 
 impl Drop for Guest {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        common::kill_group(&mut self.child);
     }
 }
 
@@ -104,6 +106,10 @@ impl Guest {
             // minimald boots as the initramfs `/init` (MINVMD_INITRAMFS, set by
             // the caller); the rootfs stays generic.
             .env("XDG_STATE_HOME", state.path())
+            // Its own process group, so teardown reaches the VMM child too;
+            // stdin off the terminal, or libkrun's console setup stops the group.
+            .process_group(0)
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
@@ -123,8 +129,7 @@ impl Guest {
         });
 
         if !rx.recv_timeout(BOOT_TIMEOUT).unwrap_or(false) {
-            let _ = child.kill();
-            let _ = child.wait();
+            common::kill_group(&mut child);
             panic!(
                 "minimald_session_integration: no 'vm-up' within {} s; are \
                  MINVMD_KERNEL_PATH/MINVMD_ROOTFS_PATH/MINVMD_INITRAMFS set correctly \
@@ -180,6 +185,7 @@ async fn minimald_exec_over_bridge() {
         let task = minimald_rpc::exec::ExecRequest::TaskRun {
             task: "echo_ok".to_string(),
             owns_box: false,
+            args: vec![],
         }
         .encode();
         result = run_session_exec(&guest.sock_path, Some(&mfile), &task).await;
@@ -276,6 +282,7 @@ async fn run_session_exec(
                     .map_err(|e| format!("project_path: {e}"))?,
                 network: sessions::NetworkMode::default(),
                 policy: Default::default(),
+                box_addresses: None,
                 // The serde default, and what every non-`--no-hooks`
                 // activation sends. This session only runs an exec, so
                 // it declares no hooks either way.

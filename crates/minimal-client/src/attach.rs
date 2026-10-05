@@ -1,11 +1,14 @@
 //! Building the `ssh` invocation for attaching to a session.
 //!
-//! Shared between the `min session attach` CLI path (which `exec()`s the
-//! command, replacing itself) and the `min dash` TUI (which spawns it as a
-//! child while the TUI is suspended and resumes when ssh exits).
+//! Shared between the `min session attach` CLI path and the `min dash` TUI
+//! (which suspends itself around the attach). Both run the interactive
+//! attach through the client-owned terminal relay
+//! ([`run_interactive_attach`]); the CLI's exec path runs the command
+//! itself, with no pty of its own.
 
 use std::path::Path;
 
+use crate::tty_relay;
 use anyhow::Context as _;
 
 /// Read and validate the session-key config, returning the resolved
@@ -78,10 +81,9 @@ pub fn host_key_opts(known_hosts: &Path) -> [String; 2] {
 /// this function never has to guess what a caller meant.
 ///
 /// The interactive path (`wire: None`) forces a PTY with `-tt` — the
-/// daemon's shell_request handler mints the PTY-backed session shell, and
-/// ssh handles termios/PTY management. The caller decides how to run the
-/// command: `min session attach` `exec()`s it, `min dash` spawns it as a
-/// child while suspended.
+/// daemon's shell_request handler mints the PTY-backed session shell. Its
+/// callers run the command through [`run_interactive_attach`], which owns
+/// the user's terminal and relays it to ssh over a local pty.
 ///
 /// `session_keys` negotiates the configurable detach/forward chord per
 /// channel: when `Some`, each resolved key is sent as an env var (with a
@@ -182,13 +184,14 @@ pub fn attach_command(
     }
 
     // The SSH host identity must match the known_hosts entry the daemon wrote,
-    // which it keys on the provider-instance name — the provider dir's basename
-    // (`local-minimald<N>` / `local-minvmd<N>`). Derive it from the socket path
-    // so the client and daemon can never disagree on the name.
+    // which it keys on [`paths::ssh_host_alias`] (`local-minimald<N>` /
+    // `local-minvmd<N>` for the default VM, `<vm>.local-minvmd<N>` for a named
+    // VM).
+    // Derive it from the socket path so the client and daemon can never
+    // disagree on the name.
     let host_alias = sock
         .parent()
-        .and_then(std::path::Path::file_name)
-        .and_then(|n| n.to_str())
+        .and_then(paths::ssh_host_alias)
         .context("daemon socket path has no provider-dir parent")?;
     ssh.arg(host_alias);
 
@@ -199,6 +202,56 @@ pub fn attach_command(
     }
 
     Ok(ssh)
+}
+
+/// Run an interactive attach (`wire: None`) through the client-owned
+/// [relay](tty_relay) on the real terminal ([`tty_relay::RealTty::acquire`]):
+/// ssh goes on the slave end of a pty pair, the relay keeps the real
+/// terminal in ssh's own raw set, restores its attach-start termios on every
+/// exit path, and returns ssh's exit status unchanged, death by a signal
+/// included. The termios is restored by the time this returns, so any
+/// unwind codes the caller still owes the terminal land on a cooked tty.
+///
+/// `suspend` is the hook a prompt uses to borrow the real terminal
+/// mid-attach (the dynamic-ingress `ask` flow, NET-045): it runs on its
+/// own thread for the duration of the attach with a
+/// [`tty_relay::RelayHandle`], whose `suspend` hands the terminal over
+/// (attach-start termios, session output buffered) and whose `resume`
+/// takes it back. The hook thread is not joined: an attach that ends
+/// while a prompt is up still exits with ssh's status, and every handle
+/// call after that is a no-op or an error. `None` for callers that just
+/// attach: the CLI and the TUI today.
+///
+/// The exec path (`wire: Some`) never comes here: the caller runs ssh
+/// itself, with no relay and no pty.
+pub fn run_interactive_attach(
+    ssh: std::process::Command,
+    suspend: Option<tty_relay::SuspendHook>,
+) -> Result<std::process::ExitStatus, anyhow::Error> {
+    let real = tty_relay::RealTty::acquire()
+        .context("the interactive attach needs a terminal, but none could be taken")?;
+    run_interactive_attach_on(ssh, real, suspend)
+}
+
+/// [`run_interactive_attach`] on a terminal the caller already holds.
+pub fn run_interactive_attach_on(
+    ssh: std::process::Command,
+    real: tty_relay::RealTty,
+    suspend: Option<tty_relay::SuspendHook>,
+) -> Result<std::process::ExitStatus, anyhow::Error> {
+    let relay = tty_relay::Relay::start(ssh, real)?;
+    if let Some(hook) = suspend {
+        let handle = relay.handle();
+        // A hook that cannot get a thread just never prompts; the attach
+        // itself is unaffected.
+        if let Err(e) = std::thread::Builder::new()
+            .name("tty-relay-suspend-hook".into())
+            .spawn(move || hook(&handle))
+        {
+            tracing::warn!("tty relay: could not start the suspend hook: {e}");
+        }
+    }
+    relay.join(None)
 }
 
 /// The single command string to hand `ssh`, or `None` for the interactive
@@ -233,6 +286,41 @@ pub fn remote_command(command: &[String]) -> Option<String> {
     }
 }
 
+/// The largest encoded exec command `min session exec` will hand to ssh.
+///
+/// Linux caps a single argument at `MAX_ARG_STRLEN` (128 KiB), so a command
+/// that large already fails with `E2BIG` on the box; larger still, the exec
+/// request exceeds the SSH transport's packet limit and tears the connection
+/// down instead of erroring, leaving the client with ssh's rc 255 — the same
+/// status a command's own `exit 255` produces. Refusing here, before ssh is
+/// contacted, keeps the failure a clear client-side error.
+///
+/// The limit applies to the whole encoded wire for both forms on purpose. A
+/// multi-word argv is stricter than it needs to be for `E2BIG` alone, since
+/// each word is its own `execve` argument, but the whole wire still rides in
+/// one SSH exec request and must fit the transport's packet limit. Do not
+/// relax this into a per-word check without also bounding the packet.
+pub const MAX_EXEC_COMMAND_BYTES: usize = 128 * 1024;
+
+/// Encode a command for the wire, refusing one that exceeds
+/// [`MAX_EXEC_COMMAND_BYTES`].
+///
+/// Returns the encoded command when it fits, or an error naming the size and
+/// pointing large data at stdin or a file under `/workbench`.
+pub fn checked_remote_command(command: &[String]) -> anyhow::Result<Option<String>> {
+    let wire = remote_command(command);
+    if let Some(wire) = wire.as_deref()
+        && wire.len() >= MAX_EXEC_COMMAND_BYTES
+    {
+        anyhow::bail!(
+            "the command is {} bytes once encoded; min session exec needs it under {} KiB once encoded; pass large data on stdin or in a file under /workbench",
+            wire.len(),
+            MAX_EXEC_COMMAND_BYTES / 1024,
+        );
+    }
+    Ok(wire)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,6 +336,43 @@ mod tests {
             .collect();
         assert!(args.iter().any(|a| a == "-tt"));
         assert_eq!(args.last().map(String::as_str), Some("local-minimald0"));
+        assert!(
+            args.iter()
+                .any(|a| a.starts_with("ProxyCommand=") && a.contains("proxy --socket"))
+        );
+    }
+
+    /// The exec path (`wire: Some`) is not the relay's: its command carries
+    /// no stdio of its own (ssh inherits whatever the caller does not
+    /// override) and no `-tt` forces a pty.
+    #[test]
+    fn exec_path_keeps_inherited_stdio() {
+        let sock = PathBuf::from("/tmp/x/providers/local-minimald0/ssh.sock");
+        let cmd = attach_command(&sock, sessions::SessionId::nil(), Some("wire"), None).unwrap();
+        let args: Vec<_> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(!args.iter().any(|a| a == "-tt"));
+        assert_eq!(args.last().map(String::as_str), Some("wire"));
+        // `Command`'s alternate Debug names every stdio override set on it.
+        let debug = format!("{cmd:#?}");
+        for stdio in ["stdin", "stdout", "stderr"] {
+            assert!(!debug.contains(stdio), "{stdio} overridden: {debug}");
+        }
+    }
+
+    /// A named VM's socket nests under a per-name subdirectory, so the ssh
+    /// host is the VM name namespaced under the provider-instance name.
+    #[test]
+    fn attach_command_targets_a_named_vm_alias() {
+        let sock = PathBuf::from("/tmp/x/providers/local-minvmd0/alpha/ssh.sock");
+        let cmd = attach_command(&sock, sessions::SessionId::nil(), None, None).unwrap();
+        let args: Vec<_> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args.last().map(String::as_str), Some("alpha.local-minvmd0"));
         assert!(
             args.iter()
                 .any(|a| a.starts_with("ProxyCommand=") && a.contains("proxy --socket"))
@@ -323,6 +448,33 @@ mod tests {
                 "min --version".to_string()
             ))
         );
+    }
+
+    /// A command just under the limit encodes and passes the guard; one byte
+    /// over is refused with the size in the message, before any ssh command is
+    /// built.
+    #[test]
+    fn checked_remote_command_refuses_an_oversized_command() {
+        // A lone argument encodes as `min://shell <cmd>`; size the payload so
+        // the wire lands exactly on the boundary.
+        let prefix_len = "min://shell ".len();
+        let under = "x".repeat(MAX_EXEC_COMMAND_BYTES - prefix_len - 1);
+        let wire = checked_remote_command(&[under]).unwrap().unwrap();
+        assert_eq!(wire.len(), MAX_EXEC_COMMAND_BYTES - 1);
+
+        // The per-argument limit includes the terminating NUL, so a wire of
+        // exactly the limit still fails with E2BIG once ssh execs it. Refuse
+        // the boundary too, not just lengths above it.
+        let at_limit = "x".repeat(MAX_EXEC_COMMAND_BYTES - prefix_len);
+        let boundary_wire = remote_command(std::slice::from_ref(&at_limit)).unwrap();
+        assert_eq!(boundary_wire.len(), MAX_EXEC_COMMAND_BYTES);
+        assert!(checked_remote_command(&[at_limit]).is_err());
+
+        let over = "x".repeat(MAX_EXEC_COMMAND_BYTES - prefix_len + 1);
+        let err = checked_remote_command(&[over]).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("needs it under 128 KiB once encoded"));
+        assert!(msg.contains(&format!("{} bytes", MAX_EXEC_COMMAND_BYTES + 1)));
     }
 
     /// The interactive attach path negotiates the session-key config: each

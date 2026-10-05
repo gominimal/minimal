@@ -193,11 +193,14 @@ fn sudo(args: &[&str]) -> Output {
 /// allowed and `AF_INET`, `AF_INET6`, and `AF_VSOCK` are refused with
 /// `EAFNOSUPPORT`.  With argument `hold` it reports its working directory and
 /// `SHELL` on stdout, then sleeps forever so the sandbox stays alive for
-/// attach tests; with argument `attach` it checks that `AF_UNIX` is still
+/// attach tests; with argument `caps` it reports its identity and capability
+/// sets and the errno of a raw socket, an ordinary stream socket, and a vsock
+/// socket; with argument `attach` it checks that `AF_UNIX` is still
 /// usable inside an injected process and reports the same two lines.
 const SOCKET_PROBE_C: &str = r#"
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <arpa/inet.h>
 #include <errno.h>
 #include <unistd.h>
 #include <stdlib.h>
@@ -243,6 +246,13 @@ int main(int argc, char **argv) {
         fd = socket(AF_INET, SOCK_STREAM, 0);
         printf("stream_socket_errno: %d\n", fd >= 0 ? 0 : errno);
         if (fd >= 0) close(fd);
+
+        /* The namespace-bypass family: it reaches the host whatever network
+         * namespace the caller sits in, so the seal every box runs under
+         * refuses it even in a networked box whose inet sockets stay. */
+        fd = socket(AF_VSOCK, SOCK_STREAM, 0);
+        printf("vsock_socket_errno: %d\n", fd >= 0 ? 0 : errno);
+        if (fd >= 0) close(fd);
         fflush(stdout);
         return 0;
     }
@@ -253,8 +263,8 @@ int main(int argc, char **argv) {
         close(fd);
 
         fd = socket(AF_INET, SOCK_STREAM, 0);
-        if (fd >= 0) { close(fd); fprintf(stderr, "AF_INET after attach unexpectedly succeeded\n"); return 21; }
-        if (errno != EAFNOSUPPORT) { fprintf(stderr, "AF_INET after attach wrong errno %d\n", errno); return 22; }
+        if (fd < 0) { perror("AF_INET after attach"); return 21; }
+        close(fd);
 
         fd = socket(AF_VSOCK, SOCK_STREAM, 0);
         if (fd >= 0) { close(fd); fprintf(stderr, "AF_VSOCK after attach unexpectedly succeeded\n"); return 23; }
@@ -269,12 +279,71 @@ int main(int argc, char **argv) {
     close(fd);
 
     fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd >= 0) { close(fd); fprintf(stderr, "AF_INET unexpectedly succeeded\n"); return 2; }
-    if (errno != EAFNOSUPPORT) { fprintf(stderr, "AF_INET wrong errno %d\n", errno); return 3; }
+    if (fd < 0) { perror("AF_INET"); return 2; }
+    close(fd);
 
     fd = socket(AF_INET6, SOCK_STREAM, 0);
-    if (fd >= 0) { close(fd); fprintf(stderr, "AF_INET6 unexpectedly succeeded\n"); return 4; }
-    if (errno != EAFNOSUPPORT) { fprintf(stderr, "AF_INET6 wrong errno %d\n", errno); return 5; }
+    if (fd < 0) { perror("AF_INET6"); return 4; }
+    close(fd);
+
+    /* Bind and connect on 127.0.0.1 must succeed: loopback is inside the
+     * box, and the none seal admits the inet family its namespace confines. */
+    {
+        int listener = socket(AF_INET, SOCK_STREAM, 0);
+        if (listener < 0) { perror("AF_INET listener"); return 11; }
+        struct sockaddr_in lo = {0};
+        lo.sin_family = AF_INET;
+        lo.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        lo.sin_port = 0; /* ephemeral */
+        if (bind(listener, (struct sockaddr *)&lo, sizeof lo) < 0) {
+            perror("bind 127.0.0.1");
+            close(listener);
+            return 12;
+        }
+        if (listen(listener, 1) < 0) {
+            perror("listen 127.0.0.1");
+            close(listener);
+            return 13;
+        }
+        socklen_t lo_len = sizeof lo;
+        if (getsockname(listener, (struct sockaddr *)&lo, &lo_len) < 0) {
+            perror("getsockname 127.0.0.1");
+            close(listener);
+            return 14;
+        }
+        int conn = socket(AF_INET, SOCK_STREAM, 0);
+        if (conn < 0) { perror("AF_INET connector"); close(listener); return 15; }
+        if (connect(conn, (struct sockaddr *)&lo, sizeof lo) < 0) {
+            perror("connect 127.0.0.1");
+            close(conn);
+            close(listener);
+            return 16;
+        }
+        close(conn);
+        close(listener);
+    }
+
+    /* A connect to a non-loopback address must fail: the none box's network
+     * namespace has no route to anything but lo. */
+    {
+        struct sockaddr_in addr = {0};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = 0x08080808; /* 8.8.8.8 */
+        addr.sin_port = htons(53);
+        fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) { perror("AF_INET for connect"); return 8; }
+        if (connect(fd, (struct sockaddr *)&addr, sizeof addr) == 0) {
+            close(fd);
+            fprintf(stderr, "connect to 8.8.8.8 unexpectedly succeeded\n");
+            return 9;
+        }
+        if (errno != ENETUNREACH) {
+            fprintf(stderr, "connect to 8.8.8.8 wrong errno %d (expected ENETUNREACH %d)\n", errno, ENETUNREACH);
+            close(fd);
+            return 10;
+        }
+        close(fd);
+    }
 
     fd = socket(AF_VSOCK, SOCK_STREAM, 0);
     if (fd >= 0) { close(fd); fprintf(stderr, "AF_VSOCK unexpectedly succeeded\n"); return 6; }
@@ -373,10 +442,13 @@ fn proc_session_and_tty(pid: u32) -> (u32, i32) {
 }
 
 /// NET-038. A none box refuses every socket family that reaches outside the
-/// sandbox, `AF_VSOCK` included.  The test builds a real sandbox with an
-/// isolated `NetPlan`, installs the production socket-family filter, and runs
-/// a static probe inside that asserts `AF_INET`, `AF_INET6`, and `AF_VSOCK`
-/// all fail with `EAFNOSUPPORT` while `AF_UNIX` still works.
+/// sandbox, `AF_VSOCK` included, while its own loopback stays usable.  The
+/// test builds a real sandbox with an isolated `NetPlan`, installs the
+/// production socket-family filter, and runs a static probe inside that
+/// asserts `AF_INET` and `AF_INET6` sockets open, a bind-and-connect on
+/// `127.0.0.1` succeeds, a connect to a non-loopback address fails with
+/// `ENETUNREACH`, and `AF_VSOCK` fails with `EAFNOSUPPORT` while `AF_UNIX`
+/// still works.
 ///
 /// The plan comes from the production provider, not the `NetPlan::none()`
 /// constructor: `network_for(NetworkMode::NoNet)` maps every no-net consumer
@@ -450,8 +522,9 @@ async fn network_none_blocks_all_outside_sockets() {
 /// box the way the session host launches a real one — `set_session_leader()`
 /// before the command is built, a pty slave on the box's stdin — injects a
 /// second process into its namespaces with the production nsenter shim, and
-/// verifies that the injected process can still create an `AF_UNIX` socket —
-/// the local family the minenv socket and `min` helper rely on.
+/// verifies that the injected process can still create `AF_UNIX` and `AF_INET`
+/// sockets — the local families the minenv socket and `min` helper rely on —
+/// while `AF_VSOCK` stays refused.
 ///
 /// Driving the session-leader runctl is what makes this a launch-path proof:
 /// the none-box launch swaps the built command for a seccomp closure, and if
@@ -969,12 +1042,14 @@ impl Drop for LiveBox {
 /// with the box's credentials, so joining a box is not a way around the
 /// posture every box process already execs with.
 ///
-/// The box is an *open* one (a host plan, no socket-family filter), so the
-/// only thing that can refuse the injected process a raw socket is the missing
-/// capability: the refusal this proof pins is the one NET-083 is about. The
-/// hold process keeps the box alive for the injection and reports first,
-/// which is also how the proof tells a launch that never reached the program
-/// (exit 125 in hakoniwa's mount setup, no report) from one that did.
+/// The box is an *open* one (a host plan), sealed to the families its own
+/// network namespace confines — the inet family the probe's raw and stream
+/// sockets use is on that list — so the only thing that can refuse the
+/// injected process a raw socket is the missing capability: the refusal this
+/// proof pins is the one NET-083 is about. The hold process keeps the box
+/// alive for the injection and reports first, which is also how the proof
+/// tells a launch that never reached the program (exit 125 in hakoniwa's
+/// mount setup, no report) from one that did.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn injected_process_lacks_cap_net_raw() {
     if let Some(reason) = sandbox2::user_namespaces_restriction() {
@@ -1099,9 +1174,9 @@ async fn injected_process_lacks_cap_net_raw() {
     let report = parse_report(&String::from_utf8_lossy(&output.stdout));
     assert_box_credentials(&report, "the injected process");
 
-    // The capability-dependent operation itself. An open box's network is the
-    // host's and carries no family filter, so a raw socket refused with
-    // anything but EPERM is a capability that survived the join.
+    // The capability-dependent operation itself. The box's confined-families
+    // seal admits the inet family, so a raw socket refused with anything but
+    // EPERM is a capability that survived the join, not the seal's work.
     let raw = reported_errno(&report, "raw_socket_errno", "the injected process");
     assert_eq!(
         raw,
@@ -1114,6 +1189,189 @@ async fn injected_process_lacks_cap_net_raw() {
         stream, 0,
         "the injected process must still be able to open an ordinary socket: \
          the box's posture denies capabilities, not networking"
+    );
+}
+
+/// NET-137, the joined-process half: a process the daemon injects into a
+/// running box carries the box's socket-family seal. The filter installed at
+/// launch is inherited by children of the filtered process only, so the
+/// injection shim reinstalls it after joining — the none plan's full seal for
+/// a none box, and for every other box the confined-families seal, which
+/// admits the families the box's network namespace confines and refuses
+/// everything else, `AF_VSOCK` included, while keeping the box's own
+/// sockets.
+///
+/// The box here is a networked one (a host plan), so the injection runs the
+/// shim's default — the confined-families seal, exactly as
+/// `command_in_session` sends it for every box that is not a none box. The
+/// assertions are that the injected process is refused `AF_VSOCK` while its
+/// `AF_INET` stream sockets still work: an injection with no filter would
+/// have created the vsock socket whenever the kernel itself can (the
+/// host-side control below runs the same probe unfiltered), and the full
+/// none seal would have refused the stream socket too. The hold process
+/// keeps the box alive for the injection and reports first, which is also
+/// how the proof tells a launch that never reached the program (exit 125 in
+/// hakoniwa's mount setup, no report) from one that did.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn joined_process_refuses_namespace_bypass_families() {
+    if let Some(reason) = sandbox2::user_namespaces_restriction() {
+        eprintln!(
+            "skipping joined_process_refuses_namespace_bypass_families: this \
+             host denies the unprivileged user namespace every sandbox starts \
+             by unsharing: {reason}"
+        );
+        return;
+    }
+    announce_to_the_runner("joined_process_refuses_namespace_bypass_families");
+    use minimald::nsenter::{Injection, session_leader_pid};
+    use std::io::{BufRead as _, Read as _};
+
+    let proofs = proof_base_dir();
+    let no_base_dir = format!("base temp dir under {}", proofs.display());
+    let base = tempfile::tempdir_in(&proofs).expect(&no_base_dir);
+    let probe = compile_socket_probe(base.path());
+
+    // The control: the same probe reporting its socket errnos host-side,
+    // unfiltered — so the refusal the box is held to below is the seal's, not
+    // what a kernel without vsock support answers to everything.
+    let control = Command::new(&probe)
+        .arg("caps")
+        .output()
+        .expect("running the host-side control probe");
+    assert!(
+        control.status.success(),
+        "the host-side control probe failed: {:?}",
+        control.status.code(),
+    );
+    let control_report = parse_report(&String::from_utf8_lossy(&control.stdout));
+    let host_vsock = reported_errno(&control_report, "vsock_socket_errno", "the control process");
+    if host_vsock != 0 {
+        eprintln!(
+            "note: this kernel creates no AF_VSOCK sockets unfiltered (errno \
+             {host_vsock}), so the refusal the box is held to is also what it \
+             already answers; the stream socket below still separates the \
+             confined seal from the full one"
+        );
+    }
+
+    let source = base.path().join("rootfs-src");
+    probe_rootfs(&source, &probe);
+
+    let config = Config::new("join-vsock")
+        .with_rootfs(std::iter::once(SandboxMapped::Dir(source)))
+        .with_dns(false)
+        .with_plan(NetPlan::host());
+    let no_sandbox_dir = format!("sandbox temp dir under {}", proofs.display());
+    let sandbox_base = tempfile::tempdir_in(&proofs).expect(&no_sandbox_dir);
+    let mut sandbox = config
+        .build(sandbox_base.path().join("sandbox"), ())
+        .await
+        .expect("building the host-address box");
+    let plan = sandbox.built_in_plan();
+    let container = sandbox
+        .new_container(&plan)
+        .expect("building the host-address container");
+
+    let mut hold = sandbox
+        .command(
+            &container,
+            "/usr/bin/probe",
+            ["hold"],
+            std::iter::empty::<(&str, &str)>(),
+        )
+        .expect("building hold command");
+    hold.stdout(hakoniwa::Stdio::MakePipe);
+    hold.stderr(hakoniwa::Stdio::MakePipe);
+    let mut child = hold
+        .spawn()
+        .expect("spawning hold process in host-address box");
+
+    // The hold report is what proves the launch reached the program the
+    // injection is aimed at; a host that cannot build the box exits 125 in
+    // hakoniwa's mount setup, before any report.
+    let hold_stdout = child.stdout.take().expect("hold process stdout pipe");
+    let mut hold_stderr = child.stderr.take().expect("hold process stderr pipe");
+    let mut guard = LiveBox::new(child);
+    let hold_report = tokio::time::timeout(
+        Duration::from_secs(30),
+        tokio::task::spawn_blocking(move || {
+            std::io::BufReader::new(hold_stdout)
+                .lines()
+                .take(2)
+                .collect::<Result<Vec<String>, _>>()
+                .expect("reading the hold process report")
+        }),
+    )
+    .await
+    .expect("hold process report timed out")
+    .expect("spawn_blocking join");
+    if !hold_report
+        .first()
+        .is_some_and(|line| line.starts_with("cwd="))
+    {
+        let end = guard.stop();
+        let mut stderr = Vec::new();
+        let _drained = hold_stderr.read_to_end(&mut stderr);
+        panic!(
+            "the hold process did not report: {hold_report:?}\nstatus: {end:?}\nstderr: {}",
+            String::from_utf8_lossy(&stderr)
+        );
+    }
+
+    let leader =
+        session_leader_pid(guard.child_id()).expect("resolving the host-address box's program pid");
+    guard.holds(leader);
+
+    let injection = Injection::new(leader, "/usr/bin/probe", ["caps"])
+        .with_shim(shim())
+        .with_cwd(sandbox.command_cwd().expect("resolving sandbox cwd"))
+        .with_env(sandbox.command_env());
+    let output = tokio::time::timeout(
+        Duration::from_secs(30),
+        tokio::task::spawn_blocking(move || {
+            injection
+                .command()
+                .expect("building injection command")
+                .output()
+                .expect("running injected seal probe")
+        }),
+    )
+    .await
+    .expect("injected seal probe timed out")
+    .expect("spawn_blocking join");
+
+    // Stop the box the proof no longer needs, the way the capability proof
+    // does: SIGKILL to the supervisor — which the program dies from — then
+    // the reap.
+    let _stopped = guard.stop();
+
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        output.status.success(),
+        "seal probe injected into a host-address box failed: status={:?}\nstderr={stderr}",
+        output.status.code(),
+    );
+    let report = parse_report(&String::from_utf8_lossy(&output.stdout));
+    assert_box_credentials(&report, "the injected process");
+
+    // The seal: the family the box's network namespace does not confine is
+    // refused, with the same EAFNOSUPPORT the launch-installed filter answers.
+    let vsock = reported_errno(&report, "vsock_socket_errno", "the injected process");
+    assert_eq!(
+        vsock,
+        libc::EAFNOSUPPORT,
+        "the injected process must be refused the namespace-bypass family by \
+         the seal the shim reinstalls, not left unfiltered"
+    );
+    // ...while the box's own sockets keep working: the confined-families
+    // seal, not the none seal, is what the shim installs for a networked box.
+    let stream = reported_errno(&report, "stream_socket_errno", "the injected process");
+    assert_eq!(
+        stream, 0,
+        "the injected process must keep its ordinary sockets: the \
+         confined-families seal admits the box's own families, and a refusal \
+         here would be the none seal installed where the confined one \
+         belongs"
     );
 }
 
@@ -1204,6 +1462,7 @@ async fn netns_ownip_ptask_to_ptask() {
             dynamic_ingress: None,
         }),
         egress: None,
+        credentialed_upstream: None,
     };
     let mut b = Ptask::provision("peer-b", lease_b, subnet, &sock, &b_policy).await;
 
@@ -1294,6 +1553,7 @@ async fn netns_ingress_static_port_mapping_exposes_then_unexposes() {
             dynamic_ingress: None,
         }),
         egress: None,
+        credentialed_upstream: None,
     };
     let mut ptask = Ptask::provision("ingress", lease, subnet, &sock, &gate_policy).await;
 
@@ -1312,9 +1572,18 @@ async fn netns_ingress_static_port_mapping_exposes_then_unexposes() {
         dynamic_ingress: None,
     };
     let control = ControlChannel::Unix(sock.clone());
-    let exposed = apply_ingress(&control, lease.ip, &ingress)
-        .await
-        .expect("apply ingress");
+    // Published on the node's shared loopback address — the shared-address
+    // lane this proof has always exercised — so the host connect below, to
+    // 127.0.0.1:EXTERNAL, is the address the forward is bound on.
+    let exposed = apply_ingress(
+        &control,
+        std::net::Ipv4Addr::LOCALHOST,
+        lease.ip,
+        &ingress,
+        None,
+    )
+    .await
+    .expect("apply ingress");
 
     // From the host, connect to 127.0.0.1:EXTERNAL; gvproxy forwards the
     // connection into the PTask's listener over the switch. Retry until the
@@ -1435,10 +1704,16 @@ impl Ptask {
             sudo_ok("configure PTask tap", &strs);
         }
 
-        let gate = SessionGate::for_session(lease.ip.to_string(), lease.ip, policy, subnet);
-        let relay = attach_to_switch(fd, api_sock, Some(gate), lease.ip, subnet)
-            .await
-            .expect("attach tap to switch");
+        let gate = SessionGate::for_session(lease.ip.to_string(), lease.ip, policy, subnet, None);
+        let relay = attach_to_switch(
+            fd,
+            api_sock,
+            Some(std::sync::Arc::new(gate)),
+            lease.ip,
+            subnet,
+        )
+        .await
+        .expect("attach tap to switch");
 
         Self {
             netns_pid,

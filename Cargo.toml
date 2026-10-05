@@ -23,6 +23,7 @@ members = [
     "crates/minimald",
     "crates/minimald-rpc",
     "crates/minvmd",
+    "crates/min-answerer",
     "crates/mlog",
     "crates/remote-client",
     "crates/remote-proto",
@@ -57,7 +58,7 @@ package.rust-version = "1.95"
 # (scripts/next-version.sh). `scripts/next-version.sh --check` (the
 # workspace `package_version` test, `just check-version`) fails the PR that
 # leaves it stale or not strictly greater than the newest v* tag.
-package.version = "0.6.0"
+package.version = "0.7.0"
 
 # Workspace lint policy. A crate opts in with `[lints] workspace = true`.
 #
@@ -167,17 +168,17 @@ json-subscriber = "0.3"
 libc = "0.2"
 lzma-rs = "0.3"
 
-# Tracked as a git rev, not the crates.io release: crates.io lags master by a
-# long way (0.18.0 is the newest published, and master has moved well past it).
-# Bump the rev to pick up upstream fixes; revisit crates.io only once its
-# releases catch up. Current rev is master @ 2026-08-03.
-nickel-lang-core = { git = "https://github.com/nickel-lang/nickel.git", rev = "21decd294fe404d67d1545d11563016af6ea4090", default-features = false, features = ["format"] }
+# From crates.io, not a git rev: the published nickel-lang-parser ships its
+# LALRPOP grammar pre-generated, while a git checkout regenerates it in the
+# build script on every cold build (minutes, far longer under emulated cross
+# builds). Prefer waiting for a release over pinning a git rev again.
+nickel-lang-core = { version = "0.19", default-features = false, features = ["format"] }
 
-opentelemetry-semantic-conventions = "0.32"
+opentelemetry-semantic-conventions = "0.33"
 # `socket` + `time`: the guest's vsock timekeep listener binds an AF_VSOCK
 # datagram socket and steps CLOCK_REALTIME from the host's updates.
 nix = { version = "0.31", features = ["fs", "sched", "socket", "time", "user"] }
-nutype = { version = "0.7", features = ["serde"] }
+nutype = { version = "0.8", features = ["serde"] }
 object = { version = "0.40", default-features = false, features = ["archive", "elf", "read_core", "std"] }
 oci-spec = "0.10"
 path-absolutize = "4.0"
@@ -205,6 +206,14 @@ sha2 = "0.11"
 shlex = "2.0"
 size = "0.5"
 smallvec = {version = "1.15", features = ["serde"]}
+# The userspace TCP/IP stack the Box Egress Proxy's host leg runs over
+# (`net::bep_host` in `minvmd`): Ethernet medium, IPv4, and the TCP/UDP/ICMP
+# sockets the proxy terminates, with the interface's address capacity pinned
+# to the leg's own address. Default features stay off: no IPv6 (the VM host
+# path is IPv4-only, NET-082), no DHCP/DNS/mDNS, no 6LoWPAN, and no phy
+# adapters — the frames arrive over the shuttle's channels, not a host
+# interface.
+smoltcp = { version = "0.14", default-features = false, features = ["std", "medium-ethernet", "proto-ipv4", "socket-tcp", "socket-udp", "socket-icmp", "iface-max-addr-count-4"] }
 sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 tar = "0.4"
 tempfile = "3.27"
