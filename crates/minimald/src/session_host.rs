@@ -505,6 +505,12 @@ struct Binding {
     /// Daemon-side directory the save-then-delete lane archives into
     /// (`<minimal_state_dir>/archives`). Created on demand at save time.
     archives_dir: std::path::PathBuf,
+    /// Whether this session runs on a VM-backed host (NET-045): a binding
+    /// there never renders an ask dialog — the human attached to the host
+    /// daemon answers those, through the host door, not through this
+    /// channel — so an ask that reaches a VM-backed binding fails closed
+    /// instead of rendering. A native binding renders as it always did.
+    vm_hosted: bool,
     /// Cancelled by the host when it sheds this binding (see
     /// [`Host::shed_binding`]). A separate signal rather than a
     /// [`BindingMsg`], because a binding is shed exactly when its mailbox is
@@ -562,6 +568,7 @@ impl Binding {
         delta: Option<Arc<DeltaSource>>,
         name: String,
         archives_dir: std::path::PathBuf,
+        vm_hosted: bool,
     ) -> BindingSlot {
         let (tx, rx) = mpsc::channel(4);
         let shed = CancellationToken::new();
@@ -575,6 +582,7 @@ impl Binding {
             delta,
             name,
             archives_dir,
+            vm_hosted,
             shed: shed.clone(),
         };
 
@@ -624,6 +632,25 @@ impl Binding {
         let mut pending_asks: VecDeque<(u16, oneshot::Sender<AskAnswer>)> = VecDeque::new();
         let exit_reason = loop {
             if let Some((port, reply)) = pending_asks.pop_front() {
+                // NET-045: a VM-backed host's human is attached to the host
+                // daemon, not to this channel — the ask's dialog, its answer
+                // and its record all belong on the host side of the door, and
+                // this session's own expose path asks there. An ask that
+                // reaches a VM-backed binding anyway fails closed right here
+                // rather than rendering a dialog in the guest: the reply
+                // sender drops, the host reads no answer, and the ask ends
+                // the daemon's own typed fail-closed refusal.
+                if self.vm_hosted {
+                    tracing::warn!(
+                        port,
+                        "an ask reached a VM-backed host's binding; failing it \
+                         closed rather than rendering a dialog the host door owns"
+                    );
+                    // `reply` drops with this turn — the dropped sender is
+                    // the nobody-attached answer, and the next queued ask,
+                    // if one was handed in too, takes the same way out.
+                    continue;
+                }
                 tracing::info!(
                     port,
                     "asking the attached client to allow a runtime port publish"
@@ -2273,6 +2300,11 @@ pub(crate) struct Host<P: SessionProcess, G: SessionGuard> {
     // The session's display name, handed to each binding so the shell-exit
     // prompt's save-then-delete lane can name its archive.
     session_name: String,
+
+    // Whether this session runs on a VM-backed host (NET-045), handed to
+    // each binding so an ask that reaches it fails closed instead of
+    // rendering a dialog the host door owns.
+    vm_hosted: bool,
 
     /// The attached terminal's facts as of the latest attach, layered over the
     /// session's own environment for everything this host runs in the sandbox
@@ -4895,6 +4927,11 @@ pub(crate) struct HostParams {
     pub session_id: sessions::SessionId,
     pub composition: Option<Arc<sessions::core::compose::Composition>>,
     pub connection_env: ConnectionEnv,
+    /// Whether this session runs on a VM-backed host (NET-045): set from the
+    /// switch's transport at launch, so every binding the host spawns knows
+    /// an ask reaching it belongs to the host door, not to a dialog this
+    /// side would render.
+    pub vm_hosted: bool,
     /// The session's hostname-registry marker (NET-128): the host marks the
     /// box's name running when it takes over and stopped when it exits, so a
     /// name the box shares with its node answers NODATA while a dead box's
@@ -5166,6 +5203,7 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
             session_id,
             composition,
             connection_env,
+            vm_hosted,
             #[cfg(target_os = "linux")]
             name_marker,
         } = params;
@@ -5290,6 +5328,7 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
             workspace_root,
             session_name,
             archives_dir,
+            vm_hosted,
             connection_env,
             home_dir,
             seal_injection,
@@ -6053,6 +6092,7 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
             self.delta.clone(),
             self.session_name.clone(),
             self.archives_dir.clone(),
+            self.vm_hosted,
         )
         .await;
 

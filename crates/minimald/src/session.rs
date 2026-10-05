@@ -2383,8 +2383,14 @@ impl Session {
     }
 
     /// Routes a runtime port-publish request the box decided `ask` to whoever
-    /// is attached (NET-045): the host's binding renders the exit prompt's own
-    /// dialog, and the human's answer decides the request.
+    /// can answer it (NET-045): on a native host that is the human attached to
+    /// the session's own binding, which renders the exit prompt's own dialog;
+    /// on a VM-backed host it is the human attached to the *host* — the ask is
+    /// carried to the VM host daemon's door, which holds it pending, offers it
+    /// to the host's attached client, and answers with whichever way the
+    /// human's answer ended it. The guest renders no prompt of its own and
+    /// answers nothing: the dialog's text and the human's answer both stay on
+    /// the host side of the door, where the row and the audit live.
     ///
     /// The ask itself runs off the actor, on a spawned task: the human's
     /// answer is the only bound it has, and parking the actor on it would
@@ -2405,11 +2411,10 @@ impl Session {
             Result<minimald_rpc::LiveMapping, crate::net::policy::ExposeFailure>,
         >,
     ) {
-        // The dialog needs a host with somebody attached to render it. No
-        // host running means the same thing as nobody attached — there is no
-        // human to ask — so it is answered fail-closed right here rather than
-        // routed to a continuation that would only come back with the same
-        // answer.
+        // The ask needs a host with somebody behind it. No host running
+        // means the same thing as nobody attached — there is no human to
+        // ask — so it is answered fail-closed right here rather than routed
+        // to a continuation that would only come back with the same answer.
         let host = match &self.inner {
             SessionInner::Active {
                 host: Some((host, _)),
@@ -2430,6 +2435,49 @@ impl Session {
                 return;
             }
         };
+        // Which human the ask goes to, read off the same channel every port
+        // report rides: a session with a VM host daemon's door asks there,
+        // and a session without one asks its own binding. The row the door's
+        // ask is keyed by is the box's switch address — the same one the
+        // publish half names below — resolved here, before the record parks,
+        // because a door with no row to name asks nothing: answered
+        // fail-closed the same way a host that is not running is, never
+        // routed to a continuation that would only come back with it.
+        let control = self.switch_control().await;
+        let through_door = crate::net::listeners::has_report_door(&control);
+        let switch_address = if through_door {
+            let registry = self
+                .hostnames
+                .read()
+                .expect("hostname registry lock poisoned");
+            match record.box_addresses {
+                Some(addresses) => Some(addresses.switch_address),
+                None => registry.own_lease(record.id),
+            }
+        } else {
+            None
+        };
+        if through_door && switch_address.is_none() {
+            tracing::warn!(
+                session_id = %record.id,
+                name = ?record.name,
+                port,
+                "an ask-decided publish had no switch address to ask its row on; \
+                 failing it closed"
+            );
+            self.answer_expose(
+                &box_name,
+                port,
+                sessions::DynamicIngress::Ask,
+                crate::audit::DecidedBy::Daemon,
+                Err(crate::net::policy::ExposeFailure::Refused(
+                    crate::net::policy::ExposeRefusal::AskNeedsAnswer,
+                )),
+                reply,
+            )
+            .await;
+            return;
+        }
         // Minted before the park, not derived from the port: two asks can
         // share a port, and the continuation below keys on this so each
         // answer reaches the ask it answers however their answers arrive.
@@ -2444,7 +2492,58 @@ impl Session {
         });
         let weak = self.weak_self.clone();
         tokio::spawn(async move {
-            let answer = host.ask_expose(port).await;
+            // The door is asked first and once: its admit mints a host-side
+            // ask id of its own, so a retry would ask the human twice for
+            // one publish. A held reply that never comes back — the shuttle
+            // dropping it, the host daemon going away — is the ask's own
+            // fail-closed answer below, exactly like a refusal that is not
+            // the human's no.
+            let answer = if let Some(switch_address) = switch_address {
+                match crate::net::listeners::report_ask_admit(&control, switch_address, port).await
+                {
+                    // The human said allow, and the host's row already holds
+                    // the port: the publish half below re-reports it to the
+                    // same door — idempotently, the door's admit is — and
+                    // binds.
+                    Ok(minimald_rpc::AskAdmitOutcome::Admitted { .. }) => {
+                        Some(session_host::AskAnswer::Allowed)
+                    }
+                    // The human said deny — or keyed a cancel, which means
+                    // the same thing — the box's own deny answer, now in the
+                    // human's hand, exactly as the binding's dialog answers.
+                    Ok(minimald_rpc::AskAdmitOutcome::Refused {
+                        reason: minimald_rpc::AskRefused::Denied,
+                        ..
+                    }) => Some(session_host::AskAnswer::Refused),
+                    // Every other end — nobody attached to the host, no
+                    // terminal to render on, a queue that would not hold
+                    // the ask, a withdrawal — is not an answer, and records
+                    // no answer: the ask fails closed, decided by the
+                    // daemon, the way the unwanted branch always does.
+                    Ok(minimald_rpc::AskAdmitOutcome::Refused { reason, .. }) => {
+                        tracing::warn!(
+                            port,
+                            reason = ?reason,
+                            "the VM host daemon did not allow the ask; the \
+                             publish fails closed"
+                        );
+                        None
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            port,
+                            error = %error,
+                            "the ask admit never came back from the VM host \
+                             daemon; the publish fails closed"
+                        );
+                        None
+                    }
+                }
+            } else {
+                // A native host's human is on the binding: the dialog is the
+                // ask, and its answer is the human's, exactly as before.
+                host.ask_expose(port).await
+            };
             // A session that already went away has already answered its
             // pending asks fail-closed (`stop_running`), so a handle that
             // will not promote is the normal end of a late answer.
@@ -3480,6 +3579,15 @@ impl Session {
                 // they write to and the process whose namespaces they join.
                 composition: self.composition(),
                 connection_env,
+                // Whether the host runs inside a VM (NET-045): read off the
+                // switch's transport, the same shape every VM-side report
+                // derives from, so each binding the host spawns knows an
+                // ask reaching it belongs to the host door and fails closed
+                // rather than rendering a dialog the guest must not own.
+                vm_hosted: matches!(
+                    self.switch_control().await,
+                    crate::net::policy::ControlChannel::Vsock { .. }
+                ),
                 // The host owns the box's name-lifecycle half (NET-128): its
                 // `mainloop` marks the name running on the way in and stopped
                 // on the way out, so a shared-address name answers NODATA while

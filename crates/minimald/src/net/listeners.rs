@@ -329,32 +329,101 @@ async fn report_exchange(
     request: &minimald_rpc::BoxControlRequest,
     deadline: tokio::time::Instant,
 ) -> io::Result<minimald_rpc::BoxControlReply> {
-    tokio::time::timeout_at(deadline, async {
-        match channel {
-            BoxReportChannel::Vsock { cid } => {
-                let stream = tokio_vsock::VsockStream::connect(tokio_vsock::VsockAddr::new(
-                    *cid,
-                    minimald_rpc::VM_HOST_BOX_REPORT_PORT,
-                ))
-                .await?;
-                report_round(stream, request).await
-            }
-            #[cfg(test)]
-            BoxReportChannel::Unix(door) => {
-                let stream = tokio::net::UnixStream::connect(door).await?;
-                report_round(stream, request).await
-            }
+    tokio::time::timeout_at(deadline, report_round_trip(channel, request))
+        .await
+        .map_err(|_elapsed| {
+            // The elapsed carries no cause of its own to report back: the bound
+            // itself is the failure, and the reason names it.
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the port report's reply did not arrive before its deadline",
+            )
+        })?
+}
+
+/// The dial and the one exchange it carries, unbounded: the caller owns
+/// every bound — the report retries under [`REPORT_DEADLINE`] because their
+/// reply can be lost, and an ask's held reply waits on a human, which no
+/// bound of ours may answer (NET-045). Both reach the same door, so both
+/// ride the same dial; only the patience differs, and the patience is the
+/// caller's.
+async fn report_round_trip(
+    channel: &BoxReportChannel,
+    request: &minimald_rpc::BoxControlRequest,
+) -> io::Result<minimald_rpc::BoxControlReply> {
+    match channel {
+        BoxReportChannel::Vsock { cid } => {
+            let stream = tokio_vsock::VsockStream::connect(tokio_vsock::VsockAddr::new(
+                *cid,
+                minimald_rpc::VM_HOST_BOX_REPORT_PORT,
+            ))
+            .await?;
+            report_round(stream, request).await
         }
-    })
-    .await
-    .map_err(|_elapsed| {
-        // The elapsed carries no cause of its own to report back: the bound
-        // itself is the failure, and the reason names it.
-        io::Error::new(
-            io::ErrorKind::TimedOut,
-            "the port report's reply did not arrive before its deadline",
-        )
-    })?
+        #[cfg(test)]
+        BoxReportChannel::Unix(door) => {
+            let stream = tokio::net::UnixStream::connect(door).await?;
+            report_round(stream, request).await
+        }
+    }
+}
+
+/// Whether the session at `control` has a VM host daemon's door to carry
+/// its runtime-port asks over (NET-045): a VM-backed session's human is
+/// attached to the host daemon, not to the session's own binding, so an
+/// ask-decided publish is asked there and the binding never renders it. A
+/// native host has no door — its binding renders the dialog, exactly as it
+/// always did. Derived from the same channel a port report derives, per
+/// call, so the tests' seeded doors reach the ask path exactly the report
+/// path's stand-ins reach theirs.
+pub(crate) fn has_report_door(control: &ControlChannel) -> bool {
+    box_report_channel(control).is_some()
+}
+
+/// Carry one runtime port-publish ask to the VM host daemon and hold for
+/// whichever way the human attached there ends it (NET-045): the request
+/// parks on the host's own ask book, the door offers it to the host's
+/// attached client, and this side's reply — [`AskAdmit`] — is the outcome
+/// the human's answer produced: admitted when they said yes, or the typed
+/// refusal a no, a cancellation, a full queue, or an unattached row leaves
+/// the ask with.
+///
+/// One attempt, and no deadline, on purpose. The admit is not idempotent
+/// the way a port report is — every [`AdmitAsk`] mints a fresh host-side
+/// ask id — so a retry would ask the human twice for one publish; and the
+/// ask ends by an answer or by its own cancellation, never by a timer,
+/// so a deadline here would be the timer that answers an ask. A transport
+/// that fails — the door refusing, the shuttle dropping the held reply —
+/// is the caller's [`Err`], and the caller is the publish's own fail-closed
+/// path.
+///
+/// A native host has no door and no attached host client to answer an ask:
+/// the caller is told so, rather than being handed an outcome nobody could
+/// have produced.
+pub(crate) async fn report_ask_admit(
+    control: &ControlChannel,
+    switch_address: Ipv4Addr,
+    port: u16,
+) -> io::Result<minimald_rpc::AskAdmitOutcome> {
+    let Some(channel) = box_report_channel(control) else {
+        return Err(io::Error::other(
+            "a native host has no attached client to answer an ask",
+        ));
+    };
+    let request = minimald_rpc::BoxControlRequest::AdmitAsk(minimald_rpc::AdmitAskRequest {
+        switch_address,
+        port,
+        proto: IpProto::Tcp,
+    });
+    match report_round_trip(&channel, &request).await {
+        Ok(minimald_rpc::BoxControlReply::AskAdmit(outcome)) => Ok(outcome),
+        Ok(other) => Err(io::Error::other(format!(
+            "the VM host daemon answered the ask with another verb's reply: {other:?}"
+        ))),
+        Err(error) => Err(io::Error::other(format!(
+            "the ask admit's held reply never arrived: {error}"
+        ))),
+    }
 }
 
 /// Report one runtime-published port as admitted to the VM host daemon

@@ -205,6 +205,7 @@ async fn a_shell_exit_reaches_the_binding_with_the_reaped_exit_reason() {
             session_id: sessions::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
+            vm_hosted: false,
             #[cfg(target_os = "linux")]
             name_marker: None,
         },
@@ -264,6 +265,7 @@ async fn a_stalled_binding_does_not_wedge_the_host_loop() {
             session_id: sessions::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
+            vm_hosted: false,
             #[cfg(target_os = "linux")]
             name_marker: None,
         },
@@ -413,6 +415,7 @@ impl FloodedAttach {
                 session_id: sessions::SessionId::nil(),
                 composition: None,
                 connection_env: ConnectionEnv::new(),
+                vm_hosted: false,
                 #[cfg(target_os = "linux")]
                 name_marker: None,
             },
@@ -641,6 +644,7 @@ async fn a_shell_exit_hands_the_binding_the_codes_that_leave_mouse_mode() {
             session_id: sessions::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
+            vm_hosted: false,
             #[cfg(target_os = "linux")]
             name_marker: None,
         },
@@ -703,6 +707,7 @@ async fn unwind_codes_narrow_to_what_the_screen_actually_set() {
             session_id: sessions::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
+            vm_hosted: false,
             #[cfg(target_os = "linux")]
             name_marker: None,
         },
@@ -753,6 +758,7 @@ async fn a_kill_tells_the_binding_nothing() {
             session_id: sessions::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
+            vm_hosted: false,
             #[cfg(target_os = "linux")]
             name_marker: None,
         },
@@ -1151,6 +1157,7 @@ async fn get_attrs_tracks_title_and_io_times() {
             session_id: sessions::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
+            vm_hosted: false,
             #[cfg(target_os = "linux")]
             name_marker: None,
         },
@@ -1228,6 +1235,7 @@ async fn kill_tears_down_host_and_reaps_process() {
             session_id: sessions::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
+            vm_hosted: false,
             #[cfg(target_os = "linux")]
             name_marker: None,
         },
@@ -1333,6 +1341,7 @@ async fn exit_releases_the_network() {
             session_id: sessions::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
+            vm_hosted: false,
             #[cfg(target_os = "linux")]
             name_marker: None,
         },
@@ -1388,6 +1397,7 @@ async fn detach_keystroke_holds_the_session_and_network() {
             session_id: sessions::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
+            vm_hosted: false,
             #[cfg(target_os = "linux")]
             name_marker: None,
         },
@@ -1490,6 +1500,7 @@ async fn stale_binding_generation_input_is_discarded() {
             session_id: sessions::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
+            vm_hosted: false,
             #[cfg(target_os = "linux")]
             name_marker: None,
         },
@@ -1621,6 +1632,7 @@ async fn hook_injections_carry_the_session_s_none_box_seal() {
                 session_id: sessions::SessionId::nil(),
                 composition: Some(bare_composition()),
                 connection_env: ConnectionEnv::new(),
+                vm_hosted: false,
                 #[cfg(target_os = "linux")]
                 name_marker: None,
             },
@@ -5525,6 +5537,7 @@ async fn ask_expose_without_a_binding_answers_no_one() {
             session_id: sessions::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
+            vm_hosted: false,
             #[cfg(target_os = "linux")]
             name_marker: None,
         },
