@@ -421,7 +421,7 @@ impl Guest {
     /// losing the whole log.
     fn boot_log(&self) -> String {
         match std::fs::read(&self.boot_log_path) {
-            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+            Ok(bytes) => strip_ansi(&String::from_utf8_lossy(&bytes)),
             Err(e) => format!("(no boot log at {}: {e})", self.boot_log_path.display()),
         }
     }
@@ -782,6 +782,28 @@ impl BoxSession {
 /// startup race the session harness documents. A refusal that is not the
 /// race — the guest refusing a deny-all box it cannot decide per box — fails
 /// every attempt with the same words and surfaces as this test's failure.
+/// The guest's console with its ANSI escape sequences removed. The daemon's
+/// tracing output is coloured, so a structured field reads
+/// `key\x1b[0m\x1b[2m=\x1b[0mvalue` on the console, and a plain `key=value`
+/// needle would never match it.
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            for c in chars.by_ref() {
+                if ('@'..='~').contains(&c) {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 async fn open_box(
     guest: &Guest,
     network: sessions::NetworkMode,
