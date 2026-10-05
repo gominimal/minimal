@@ -45,17 +45,45 @@ pub fn is_sensitive_key(key: &str) -> bool {
         .any(|part| stripped.contains(part))
 }
 
+/// Names a project prefix would admit but whose values are reported by name
+/// only, by every bundle producer: the telemetry exporter settings
+/// (`MINIMAL_OTEL_EXPORTER_OTLP_[TRACES_|LOGS_]ENDPOINT`, `..._HEADERS`, ...).
+/// An endpoint URL can carry userinfo or a token in its query, and a headers
+/// value is where a collector's `Authorization` or API key goes; neither name
+/// looks sensitive to the key-based rule.
+pub const ENV_VALUE_DENYLIST_PREFIXES: &[&str] = &["MINIMAL_OTEL_EXPORTER_OTLP_"];
+
+/// Name suffixes whose values are reported by name only, whatever the prefix:
+/// an OTLP-style `*_HEADERS` value carries credentials as `key=value` pairs.
+pub const ENV_VALUE_DENYLIST_SUFFIXES: &[&str] = &["_HEADERS"];
+
+/// Whether `name` is on the shared deny list ([`ENV_VALUE_DENYLIST_PREFIXES`],
+/// [`ENV_VALUE_DENYLIST_SUFFIXES`]): its value never travels, whatever a
+/// producer's allowlist says.
+#[must_use]
+pub fn is_env_value_denylisted(name: &str) -> bool {
+    ENV_VALUE_DENYLIST_PREFIXES
+        .iter()
+        .any(|p| name.starts_with(p))
+        || ENV_VALUE_DENYLIST_SUFFIXES
+            .iter()
+            .any(|s| name.ends_with(s))
+}
+
 /// Resolves an env-var name against a caller-supplied allowlist of exact names
 /// and name prefixes, fail-closed: a sensitive-shaped name always loses, even
-/// when the allowlist admits it. `MINIMALD_TOKEN` matches a project prefix but
-/// must never leave the machine.
+/// when the allowlist admits it (`MINIMALD_TOKEN` matches a project prefix but
+/// must never leave the machine), and so does a name on the shared deny list
+/// ([`is_env_value_denylisted`]: the telemetry exporter settings).
 ///
-/// The *mechanic* is here so every bundle producer resolves the allowlist the
-/// same way; the *data* — which names a given producer considers safe — stays
-/// with the caller, per this crate's mechanics-vs-policy split.
+/// The *mechanic* and the deny list are here so every bundle producer, the
+/// CLI and the daemon, resolves them the same way; the *data* — which names a
+/// given producer considers safe — stays with the caller, per this crate's
+/// mechanics-vs-policy split.
 #[must_use]
 pub fn is_env_value_allowlisted(name: &str, exact: &[&str], prefixes: &[&str]) -> bool {
     !is_sensitive_key(name)
+        && !is_env_value_denylisted(name)
         && (exact.contains(&name) || prefixes.iter().any(|p| name.starts_with(p)))
 }
 
@@ -487,10 +515,551 @@ fn find_sensitive_flag_value(input: &str) -> Option<CredentialMatch> {
     None
 }
 
+/// The OTLP exporter header variables, plain and `MINIMAL_`-prefixed, base
+/// and per signal (spec 25 TEL-042). Their values are credentials: an ingest
+/// key, a bearer token.
+pub const EXPORTER_HEADER_VARS: &[&str] = &[
+    "OTEL_EXPORTER_OTLP_HEADERS",
+    "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
+    "OTEL_EXPORTER_OTLP_LOGS_HEADERS",
+    "MINIMAL_OTEL_EXPORTER_OTLP_HEADERS",
+    "MINIMAL_OTEL_EXPORTER_OTLP_TRACES_HEADERS",
+    "MINIMAL_OTEL_EXPORTER_OTLP_LOGS_HEADERS",
+];
+
+/// The shortest header value [`scrub_spool_line`] replaces wherever it
+/// appears. A shorter value is no credential, and replacing every `1` or
+/// `on` in a spool line would make the line unreadable. A header value
+/// shorter than this is not value-matched at all: it relies on the
+/// attribute-name rule ([`is_credential_attribute_key`]) and the free-text
+/// scrub ([`scrub_secrets`]).
+pub const HEADER_VALUE_MIN: usize = 8;
+
+/// Every exporter header value configured in the variables `var` gives
+/// ([`EXPORTER_HEADER_VARS`], each `name=value[,name=value...]`), as written
+/// and percent-decoded, plus each whitespace-separated part of the decoded
+/// value (the bare `<token>` of `Bearer%20<token>`, which a record can hold
+/// without its scheme word), each at least [`HEADER_VALUE_MIN`] bytes long,
+/// longest first so a value that contains another is replaced whole.
+pub fn exporter_header_values(var: impl Fn(&str) -> Option<String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for name in EXPORTER_HEADER_VARS {
+        let Some(raw) = var(name) else { continue };
+        for pair in raw.split(',') {
+            let Some((_, value)) = pair.split_once('=') else {
+                continue;
+            };
+            let value = value.trim();
+            let decoded = percent_decode(value);
+            out.extend(decoded.split_whitespace().map(str::to_owned));
+            out.push(value.to_owned());
+            out.push(decoded);
+        }
+    }
+    order_header_values(out)
+}
+
+/// `values` without the ones shorter than [`HEADER_VALUE_MIN`], without
+/// duplicates, longest first (ties in byte order).
+fn order_header_values(mut values: Vec<String>) -> Vec<String> {
+    values.retain(|v| v.len() >= HEADER_VALUE_MIN);
+    values.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    values.dedup();
+    values
+}
+
+/// The header values to scrub from one spool file (TEL-044): the
+/// `collector`'s own `base` set, plus the exporter header values of the
+/// process that wrote the file, when that is known. mlog names a spool file
+/// `<service>-<pid>-<start_ms>[-<n>].jsonl`; while that pid is a live process
+/// whose environment this process may read (same user: `/proc/<pid>/environ`
+/// on Linux, `sysctl(KERN_PROCARGS2)` on macOS), its
+/// [`EXPORTER_HEADER_VARS`] count too. So a header that minvmd or the daemon
+/// was started with, and the shell running `min bug` lacks, is still found.
+/// A reused pid only adds values to replace, never removes one. On another
+/// OS, for a producer that has exited, or one whose environment the kernel
+/// refuses to show, the set is `base`, and the key-name rule in
+/// [`scrub_spool_line`] is what stands.
+#[must_use]
+pub fn spool_file_header_values(file_name: &str, base: &[String]) -> Vec<String> {
+    let mut out = base.to_vec();
+    if let Some(pid) = spool_file_pid(file_name) {
+        out.extend(process_exporter_header_values(pid));
+    }
+    order_header_values(out)
+}
+
+/// The pid in a spool file name (`<service>-<pid>-<start_ms>[-<n>].jsonl`):
+/// the digits after the first `-<digit>`, up to the next `-`.
+fn spool_file_pid(name: &str) -> Option<u32> {
+    let stem = name.strip_suffix(".jsonl")?;
+    let bytes = stem.as_bytes();
+    let at = bytes
+        .windows(2)
+        .position(|w| matches!(w, [b'-', d] if d.is_ascii_digit()))?;
+    let rest = stem.get(at + 1..)?;
+    let (pid, _) = rest.split_once('-')?;
+    pid.parse().ok()
+}
+
+/// The exporter header values in the environment process `pid` started with
+/// (`/proc/<pid>/environ`), empty when it cannot be read.
+#[cfg(target_os = "linux")]
+fn process_exporter_header_values(pid: u32) -> Vec<String> {
+    let Ok(environ) = std::fs::read(format!("/proc/{pid}/environ")) else {
+        return Vec::new();
+    };
+    environ_exporter_header_values(environ.split(|b| *b == 0))
+}
+
+/// The exporter header values in the environment process `pid` started with
+/// (`sysctl(KERN_PROCARGS2)`, which the kernel answers for a process of the
+/// same user), empty when it cannot be read. The kernel withholds the
+/// environment of Apple's platform binaries (`/bin/sh`, `/bin/sleep`; only
+/// their arguments come back), which are no telemetry producers; minimal's
+/// own binaries, ad hoc or hardened-runtime signed, show theirs (measured on
+/// macOS 26.6).
+#[cfg(target_os = "macos")]
+fn process_exporter_header_values(pid: u32) -> Vec<String> {
+    let Some(args) = procargs2(pid) else {
+        return Vec::new();
+    };
+    environ_exporter_header_values(procargs2_environ(&args))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn process_exporter_header_values(_pid: u32) -> Vec<String> {
+    Vec::new()
+}
+
+/// The exporter header values in a process environment given as its
+/// `KEY=value` entries (NUL-separated in `/proc/<pid>/environ` and in
+/// `KERN_PROCARGS2`); an entry that is not UTF-8 or has no `=` is skipped.
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn environ_exporter_header_values<'a>(entries: impl Iterator<Item = &'a [u8]>) -> Vec<String> {
+    let vars: Vec<(String, String)> = entries
+        .filter_map(|kv| {
+            let kv = std::str::from_utf8(kv).ok()?;
+            let (k, v) = kv.split_once('=')?;
+            Some((k.to_owned(), v.to_owned()))
+        })
+        .collect();
+    exporter_header_values(|name| {
+        vars.iter()
+            .find(|(k, v)| k == name && !v.is_empty())
+            .map(|(_, v)| v.clone())
+    })
+}
+
+/// Process `pid`'s `KERN_PROCARGS2` block, `None` when the kernel refuses
+/// it (another user's process, one that has exited, a restricted one).
+#[cfg(target_os = "macos")]
+fn procargs2(pid: u32) -> Option<Vec<u8>> {
+    let pid = libc::c_int::try_from(pid).ok()?;
+    let mut argmax: libc::c_int = 0;
+    let mut size = std::mem::size_of::<libc::c_int>();
+    let mut mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
+    // SAFETY: `mib` names the two-level integer sysctl `kern.argmax`, and
+    // `argmax`/`size` describe a writable `c_int` the kernel fills in.
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            2,
+            (&raw mut argmax).cast(),
+            &raw mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    let mut buf = vec![0u8; usize::try_from(argmax).ok().filter(|n| *n > 0)?];
+    let mut size = buf.len();
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+    // SAFETY: `buf` is writable for `size` bytes; the kernel writes at most
+    // that many and stores the length it wrote back into `size`.
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            buf.as_mut_ptr().cast(),
+            &raw mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    buf.truncate(size);
+    Some(buf)
+}
+
+/// The environment entries of a `KERN_PROCARGS2` block: a native-endian
+/// `int` argc, the executable path, NUL padding, `argc` NUL-terminated
+/// arguments, then the `KEY=value` environment strings up to the first
+/// empty one (the `apple[]` strings after it are not environment). A short
+/// or malformed block yields what it holds before the fault, never a panic.
+/// An empty first argument is taken for padding, and the first environment
+/// entry is then consumed as an argument: a value missed, never a wrong one.
+#[cfg(any(target_os = "macos", test))]
+fn procargs2_environ(buf: &[u8]) -> impl Iterator<Item = &[u8]> {
+    let argc = buf
+        .get(..4)
+        .and_then(|b| <[u8; 4]>::try_from(b).ok())
+        .map(i32::from_ne_bytes)
+        .and_then(|n| usize::try_from(n).ok());
+    let rest = argc.and(buf.get(4..)).unwrap_or_default();
+    let mut strings = rest.split(|b| *b == 0);
+    // The executable path, then its NUL padding.
+    strings.next();
+    let mut strings = strings.skip_while(|s| s.is_empty());
+    for _ in 0..argc.unwrap_or(0) {
+        strings.next();
+    }
+    strings.take_while(|s| !s.is_empty())
+}
+
+/// `s` with each `%XX` escape decoded; an escape that is not two hex digits
+/// stays as written, and bytes that do not decode to UTF-8 are replaced.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while let Some(&b) = bytes.get(i) {
+        let hex = bytes
+            .get(i + 1..i + 3)
+            .and_then(|h| std::str::from_utf8(h).ok())
+            .and_then(|h| u8::from_str_radix(h, 16).ok());
+        match (b, hex) {
+            (b'%', Some(decoded)) => {
+                out.push(decoded);
+                i += 3;
+            }
+            _ => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// One spool line made safe to bundle (spec 25 TEL-044), before the free-text
+/// [`scrub_secrets`] runs over it as over any log line:
+///
+/// - each of `header_values` ([`exporter_header_values`]) is replaced
+///   wherever it appears, so an exporter header value never travels even
+///   when a span recorded it under a harmless name;
+/// - the line is read as OTLP/JSON, and an attribute (`{"key": k, "value":
+///   v}`) whose `k` trips [`is_credential_attribute_key`] (a secret-shaped
+///   or header-like name) has its `v` replaced by a placeholder string
+///   value. Free text cannot see these, as the value sits apart from its
+///   name;
+/// - a line that is not JSON (the torn first line of a tail cap, a torn
+///   write) is withheld whole: it cannot be read as attributes, so it
+///   cannot be scrubbed as them.
+pub fn scrub_spool_line<'a>(line: &'a str, header_values: &[String]) -> Cow<'a, str> {
+    if line.trim().is_empty() {
+        return Cow::Borrowed(line);
+    }
+    let mut text = Cow::Borrowed(line);
+    for value in header_values {
+        let placeholder = format!("<redacted:len={}>", value.len());
+        // The raw form, and the JSON-escaped form a value with `"` or `\`
+        // takes inside an OTLP/JSON string.
+        let escaped = serde_json_lenient::to_string(value.as_str())
+            .ok()
+            .and_then(|s| {
+                s.strip_prefix('"')
+                    .and_then(|s| s.strip_suffix('"'))
+                    .map(str::to_owned)
+            });
+        for form in std::iter::once(value.as_str()).chain(escaped.as_deref()) {
+            if !form.is_empty() && text.contains(form) {
+                text = Cow::Owned(text.replace(form, &placeholder));
+            }
+        }
+    }
+    let Ok(mut json) = serde_json_lenient::from_str::<Value>(&text) else {
+        return Cow::Owned(format!(
+            "<spool line withheld: not JSON, len={}>",
+            line.len()
+        ));
+    };
+    if !redact_otlp_attributes(&mut json) {
+        return text;
+    }
+    match serde_json_lenient::to_string(&json) {
+        Ok(s) => Cow::Owned(s),
+        Err(_) => Cow::Owned(format!(
+            "<spool line withheld: not re-encodable, len={}>",
+            line.len()
+        )),
+    }
+}
+
+/// Key-name parts that mark an attribute as a request header or a header
+/// list, matched case-insensitively, beyond [`is_sensitive_key`]'s: any
+/// header (OTel's `http.request.header.<name>`, a recorded `headers` list),
+/// a cookie, and the ingest-key header names collectors use that carry no
+/// sensitive word (`x-honeycomb-team`).
+const HEADER_KEY_PARTS: &[&str] = &["header", "cookie", "honeycomb-team"];
+
+/// Whether an OTLP attribute named `key` holds a credential-shaped value:
+/// [`is_sensitive_key`], or a header-like name ([`HEADER_KEY_PARTS`]). The
+/// spool scrub masks these whatever the bundling process's environment says,
+/// so a header a producer was started with is masked by its name even when
+/// its value is unknown here.
+#[must_use]
+pub fn is_credential_attribute_key(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    is_sensitive_key(key) || HEADER_KEY_PARTS.iter().any(|p| lower.contains(p))
+}
+
+/// Replaces, anywhere in `value`, the `value` of an OTLP attribute whose
+/// `key` trips [`is_credential_attribute_key`]. Returns whether anything
+/// changed.
+fn redact_otlp_attributes(value: &mut Value) -> bool {
+    match value {
+        Value::Object(map) => {
+            let sensitive = map
+                .get("key")
+                .and_then(Value::as_str)
+                .is_some_and(is_credential_attribute_key);
+            let mut changed = false;
+            if sensitive && let Some(v) = map.get_mut("value") {
+                let placeholder = redaction_placeholder(v);
+                if *v != serde_json_lenient::json!({ "stringValue": placeholder }) {
+                    *v = serde_json_lenient::json!({ "stringValue": placeholder });
+                    changed = true;
+                }
+            }
+            for (k, v) in map.iter_mut() {
+                if !(sensitive && k == "value") {
+                    changed |= redact_otlp_attributes(v);
+                }
+            }
+            changed
+        }
+        Value::Array(items) => items
+            .iter_mut()
+            .fold(false, |acc, v| redact_otlp_attributes(v) | acc),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json_lenient::json;
+
+    /// A header value holding `"` or `\` is found in its JSON-escaped form
+    /// too, which is how it appears inside an OTLP/JSON string.
+    #[test]
+    fn a_header_value_with_a_quote_or_backslash_is_replaced_in_its_json_form() {
+        let value = r#"tok"en\x"#.to_owned();
+        let line = format!(
+            r#"{{"resourceSpans":[{{"scopeSpans":[{{"spans":[{{"name":"s","attributes":[{{"key":"note","value":{{"stringValue":{}}}}}]}}]}}]}}]}}"#,
+            serde_json_lenient::to_string(&value).unwrap()
+        );
+        let out = scrub_spool_line(&line, std::slice::from_ref(&value));
+        assert!(!out.contains(r#"tok\"en"#), "escaped value survived: {out}");
+        assert!(!out.contains("tok"), "value survived: {out}");
+        assert!(out.contains("<redacted:len="), "no placeholder: {out}");
+    }
+
+    /// TEL-044: a spool line keeps neither an exporter header value (even
+    /// under a harmless attribute name, and the bare token of a
+    /// `scheme%20token` value too) nor the value of a secret-shaped or
+    /// header-like attribute, and a line that is not JSON is withheld whole.
+    #[test]
+    fn a_spool_line_loses_header_values_and_secret_attributes() {
+        let headers = exporter_header_values(|name| {
+            (name == "MINIMAL_OTEL_EXPORTER_OTLP_HEADERS")
+                .then(|| "x-honeycomb-team=hcaik_s3cr3tINGEST,x-short=1".to_owned())
+        });
+        assert_eq!(headers, vec!["hcaik_s3cr3tINGEST".to_owned()]);
+        let bearer = exporter_header_values(|name| {
+            (name == "OTEL_EXPORTER_OTLP_HEADERS")
+                .then(|| "authorization=Bearer%20bareTOKEN12345".to_owned())
+        });
+        let line = r#"{"resourceSpans":[{"scopeSpans":[{"spans":[{"name":"s","attributes":[{"key":"note","value":{"stringValue":"got bareTOKEN12345 back"}}]}]}]}]}"#;
+        let out = scrub_spool_line(line, &bearer);
+        assert!(
+            !out.contains("bareTOKEN12345"),
+            "bare token survived: {out}"
+        );
+        let line = r#"{"resourceSpans":[{"scopeSpans":[{"spans":[{"name":"s","attributes":[{"key":"http.request.header.x-honeycomb-team","value":{"arrayValue":{"values":[{"stringValue":"unknownKEY777"}]}}},{"key":"otel.headers","value":{"stringValue":"x-team=unknownKEY888"}},{"key":"x-honeycomb-team","value":{"stringValue":"unknownKEY999"}}]}]}]}]}"#;
+        let out = scrub_spool_line(line, &[]);
+        for v in ["unknownKEY777", "unknownKEY888", "unknownKEY999"] {
+            assert!(!out.contains(v), "a header-like attribute kept {v}: {out}");
+        }
+        let line = r#"{"resourceSpans":[{"scopeSpans":[{"spans":[{"name":"cmd","attributes":[{"key":"note","value":{"stringValue":"hcaik_s3cr3tINGEST"}},{"key":"db.api_token","value":{"stringValue":"plainwords"}},{"key":"cmd.name","value":{"stringValue":"build"}}]}]}]}]}"#;
+        let out = scrub_spool_line(line, &headers);
+        assert!(!out.contains("hcaik_s3cr3tINGEST"), "{out}");
+        assert!(!out.contains("plainwords"), "{out}");
+        assert!(out.contains("\"build\""), "harmless values stay: {out}");
+        assert!(out.contains("db.api_token"), "the name stays: {out}");
+        let torn = r#"Value":"plainwords"}]}"#;
+        assert!(!scrub_spool_line(torn, &headers).contains("plainwords"));
+        assert_eq!(scrub_spool_line(r#"{"a":1}"#, &headers), r#"{"a":1}"#);
+    }
+
+    /// A producer's header set: a spool file's pid names the
+    /// process that wrote it, and while that process runs (same user;
+    /// `/proc` on Linux, `KERN_PROCARGS2` on macOS) its exporter headers are
+    /// scrubbed too, though the collecting process's own environment has
+    /// none.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_live_producers_headers_are_scrubbed_from_its_spool_file() {
+        // On macOS the producer must not be an Apple platform binary (the
+        // kernel withholds those environments): this test binary stands in,
+        // running only `producer_stand_in`.
+        #[cfg(target_os = "linux")]
+        let mut producer = std::process::Command::new("sleep");
+        #[cfg(target_os = "linux")]
+        producer.arg("30");
+        #[cfg(target_os = "macos")]
+        let mut producer = std::process::Command::new(std::env::current_exe().unwrap());
+        #[cfg(target_os = "macos")]
+        producer
+            .args(["--exact", "redact::tests::producer_stand_in", "--ignored"])
+            .env(STAND_IN_ENV, "1");
+        let mut child = producer
+            .env_clear()
+            .env(
+                "MINIMAL_OTEL_EXPORTER_OTLP_HEADERS",
+                "x-honeycomb-team=producerONLY4242",
+            )
+            .spawn()
+            .unwrap();
+        let name = format!("minvmd-{}-1700000000000-2.jsonl", child.id());
+        let values = spool_file_header_values(&name, &[]);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(values, vec!["producerONLY4242".to_owned()]);
+        let line = r#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[{"body":{"stringValue":"sent producerONLY4242"}}]}]}]}"#;
+        let out = scrub_spool_line(line, &values);
+        assert!(!out.contains("producerONLY4242"), "{out}");
+    }
+
+    /// Set on the macOS stand-in producer, which then sleeps.
+    #[cfg(target_os = "macos")]
+    const STAND_IN_ENV: &str = "DIAGNOSTICS_PRODUCER_STAND_IN";
+
+    /// Not a test: the process `a_live_producers_headers_are_scrubbed_from_its_spool_file`
+    /// spawns on macOS (this binary, with [`STAND_IN_ENV`] set) to stand in
+    /// for a producer. Run on its own it returns at once.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "a stand-in process for a_live_producers_headers_are_scrubbed_from_its_spool_file"]
+    fn producer_stand_in() {
+        if std::env::var_os(STAND_IN_ENV).is_some() {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+        }
+    }
+
+    /// macOS: a `KERN_PROCARGS2` block is read for its
+    /// environment only — not the executable path, its padding, the
+    /// arguments (one of which looks like a header setting here) or the
+    /// `apple[]` strings after the environment. Runs on every OS: the
+    /// block is built by hand.
+    #[test]
+    fn a_procargs2_block_yields_only_its_environment() {
+        let mut block = 2i32.to_ne_bytes().to_vec();
+        block.extend_from_slice(b"/usr/bin/sleep\0\0\0\0");
+        block.extend_from_slice(b"sleep\0MINIMAL_OTEL_EXPORTER_OTLP_HEADERS=k=argvVALUE123\0");
+        block.extend_from_slice(
+            b"HOME=/Users/x\0OTEL_EXPORTER_OTLP_HEADERS=x-honeycomb-team=envVALUE4567\0",
+        );
+        block.extend_from_slice(b"\0ptr_munge=OTEL_EXPORTER_OTLP_HEADERS=k=appleVALUE89\0\0");
+        let env: Vec<&[u8]> = procargs2_environ(&block).collect();
+        assert_eq!(
+            env,
+            [
+                &b"HOME=/Users/x"[..],
+                b"OTEL_EXPORTER_OTLP_HEADERS=x-honeycomb-team=envVALUE4567"
+            ]
+        );
+        assert_eq!(
+            environ_exporter_header_values(procargs2_environ(&block)),
+            ["envVALUE4567"]
+        );
+        for short in [&b""[..], b"\x02\0", b"\xff\xff\xff\xff/x\0A=b\0"] {
+            assert_eq!(procargs2_environ(short).count(), 0, "{short:?}");
+        }
+        let mut cut = 5i32.to_ne_bytes().to_vec();
+        cut.extend_from_slice(b"/x\0a\0b");
+        assert_eq!(procargs2_environ(&cut).count(), 0, "a truncated block");
+    }
+
+    /// The live-process read on the remaining OSes is empty: only `base`
+    /// and the key-name rule stand there.
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[test]
+    fn elsewhere_a_producers_environment_is_not_read() {
+        assert!(process_exporter_header_values(std::process::id()).is_empty());
+    }
+
+    #[test]
+    fn a_spool_file_names_its_producers_pid() {
+        assert_eq!(spool_file_pid("minvmd-42-1700000000000.jsonl"), Some(42));
+        assert_eq!(
+            spool_file_pid("minimal-cli-7-1700000000000-3.jsonl"),
+            Some(7)
+        );
+        assert_eq!(spool_file_pid("report.jsonl"), None);
+        assert_eq!(spool_file_pid("minvmd-42.jsonl"), None);
+        let base = vec!["shellVALUE123".to_owned()];
+        assert_eq!(
+            spool_file_header_values("report.jsonl", &base),
+            base,
+            "an unknown producer keeps the collector's set"
+        );
+    }
+
+    /// The shared deny list holds for every producer's allowlist.
+    #[test]
+    fn exporter_settings_are_denied_whatever_the_allowlist() {
+        for name in [
+            "MINIMAL_OTEL_EXPORTER_OTLP_ENDPOINT",
+            "MINIMAL_OTEL_EXPORTER_OTLP_LOGS_HEADERS",
+            "MINIMALD_SOMETHING_HEADERS",
+        ] {
+            assert!(is_env_value_denylisted(name), "{name}");
+            assert!(
+                !is_env_value_allowlisted(name, &[name], &["MINIMAL"]),
+                "{name}"
+            );
+        }
+        assert!(is_env_value_allowlisted(
+            "MINIMAL_TELEMETRY",
+            &[],
+            &["MINIMAL_"]
+        ));
+    }
+
+    #[test]
+    fn header_values_are_read_as_written_and_percent_decoded() {
+        let got = exporter_header_values(|name| {
+            (name == "OTEL_EXPORTER_OTLP_TRACES_HEADERS")
+                .then(|| "authorization=Bearer%20abcdefgh".to_owned())
+        });
+        assert_eq!(
+            got,
+            vec![
+                "Bearer%20abcdefgh".to_owned(),
+                "Bearer abcdefgh".to_owned(),
+                "abcdefgh".to_owned(),
+            ],
+            "as written, decoded, and the token without its scheme word"
+        );
+        // `Bearer` alone is shorter than HEADER_VALUE_MIN and is not kept.
+        assert!(!got.iter().any(|v| v == "Bearer"));
+    }
 
     #[test]
     fn sensitive_keys_match_case_insensitively() {

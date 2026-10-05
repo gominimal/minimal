@@ -422,6 +422,263 @@ pub async fn logs(
     .await
 }
 
+/// The host-side telemetry spool: the CLI's and minvmd's records (spec 25
+/// TEL-044). One directory is read, [`spool_dir`] resolved from `min bug`'s
+/// own environment and state directory: its `MINIMAL_OTEL_SPOOL_DIR` when
+/// set, else `<state>/telemetry/spool`. A producer picks its directory from
+/// its own environment, so a minvmd or CLI whose `MINIMAL_OTEL_SPOOL_DIR`
+/// (a systemd unit's, say) or state directory differs from `min bug`'s
+/// wrote elsewhere, and its files are not collected; `host/telemetry.json`
+/// names the directory read ([`SPOOL_DIR_NOTE`]). The daemon's spool
+/// travels in its own nested bundle. The newest [`LOG_FILES_PER_PREFIX`]
+/// `*.jsonl` files of each producer ([`diagnostics::spool::producer`]), each
+/// tail-capped and line-scrubbed like a log, behind the same symlink guards
+/// ([`spool_in`]).
+pub async fn spool(
+    w: &mut BundleWriter,
+    paths: &DiagPaths,
+    tail_bytes: u64,
+) -> Result<(), anyhow::Error> {
+    let dir = spool_dir(paths, std::env::var_os("MINIMAL_OTEL_SPOOL_DIR"));
+    let headers = diagnostics::redact::exporter_header_values(|n| std::env::var(n).ok());
+    spool_in(w, &dir, tail_bytes, &headers).await
+}
+
+/// The spool directory `min bug` reads: `override_dir`, the value of
+/// `MINIMAL_OTEL_SPOOL_DIR` in `min bug`'s own environment, when set and not
+/// empty, else `<state>/telemetry/spool`. mlog's writer applies the same
+/// rule, but each producer to its own environment and state directory, so
+/// this is where processes that share `min bug`'s settings wrote, not
+/// every spool on the host.
+pub fn spool_dir(paths: &DiagPaths, override_dir: Option<std::ffi::OsString>) -> PathBuf {
+    match override_dir {
+        Some(d) if !d.is_empty() => PathBuf::from(d),
+        _ => paths.state.join("telemetry").join("spool"),
+    }
+}
+
+/// [`diagnostics::spool::collect`] with the host bundle's policy: the newest
+/// [`LOG_FILES_PER_PREFIX`] files of each producer, so a chatty minvmd cannot
+/// push the CLI's only file out of the bundle.
+async fn spool_in(
+    w: &mut BundleWriter,
+    dir: &Path,
+    tail_bytes: u64,
+    header_values: &[String],
+) -> Result<(), anyhow::Error> {
+    diagnostics::spool::collect(
+        w,
+        dir,
+        tail_bytes,
+        diagnostics::spool::SpoolKeep::NewestPerProducer(LOG_FILES_PER_PREFIX),
+        header_values,
+        "no spool directory — telemetry never ran on this host",
+    )
+    .await
+}
+
+// ── host/telemetry.json ──────────────────────────────────────────────────────
+
+/// What telemetry was set to in the `min bug` process's environment when the
+/// bundle was collected (spec 25 TEL-051): the switch and the variable that
+/// decided it, each signal's exporter, each endpoint as its origin only (the
+/// TEL-040 form), the spool, and the trace id of the newest `cmd` span the
+/// CLI spooled. This is the CLI's state as the shell running `min bug` sets
+/// it, not the whole host's: a daemon or minvmd keeps the switches it was
+/// started with (TEL-009), so it can export while this says off, or the
+/// reverse; [`Self::source`] says so in the file. Nothing here is a
+/// credential: no header, no endpoint path or query.
+#[derive(Debug, Serialize)]
+pub struct TelemetryState {
+    /// Whose state this is: always [`TELEMETRY_STATE_SOURCE`].
+    pub source: &'static str,
+    /// The opt-in: `MINIMAL_TELEMETRY` truthy and no veto.
+    pub enabled: bool,
+    /// The variable that settled [`Self::enabled`]: `DO_NOT_TRACK` or
+    /// `OTEL_SDK_DISABLED` when either vetoes, else `MINIMAL_TELEMETRY`.
+    pub decided_by: &'static str,
+    pub traces: SignalState,
+    pub logs: SignalState,
+    /// Finished records are spooled locally.
+    pub spool: bool,
+    /// The spool directory the bundle read ([`spool_dir`]).
+    pub spool_dir: PathBuf,
+    /// Always [`SPOOL_DIR_NOTE`]: [`Self::spool_dir`] is the only spool
+    /// directory read.
+    pub spool_dir_note: &'static str,
+    /// The `traceId` of the newest `cmd` span in the CLI's spool files.
+    pub newest_cmd_trace_id: Option<String>,
+}
+
+/// One signal's part of a [`TelemetryState`].
+#[derive(Debug, Serialize)]
+pub struct SignalState {
+    /// The signal is exported to [`Self::endpoint`].
+    pub exporting: bool,
+    /// The signal's exporter variable is `none`.
+    pub exporter_none: bool,
+    /// The endpoint's `scheme://host[:port]`, never its userinfo, path,
+    /// query or fragment (TEL-040).
+    pub endpoint: Option<String>,
+    /// The configured endpoint was refused, so the signal is not exported.
+    pub refused: bool,
+}
+
+/// [`TelemetryState::spool_dir_note`]: the bundle reads one spool
+/// directory, and a spool another process pinned elsewhere is not in it.
+pub const SPOOL_DIR_NOTE: &str = "the only spool directory read: MINIMAL_OTEL_SPOOL_DIR from the \
+     min bug process environment, else <state>/telemetry/spool; a spool another process placed \
+     elsewhere through its own environment is not collected";
+
+/// [`TelemetryState::source`]: the record is the `min bug` process's own
+/// environment, not the daemon's or minvmd's.
+pub const TELEMETRY_STATE_SOURCE: &str =
+    "min bug process environment (a daemon or minvmd may run with other settings)";
+
+pub async fn telemetry(w: &mut BundleWriter, paths: &DiagPaths) -> Result<(), anyhow::Error> {
+    let state = telemetry_state(paths, |n| std::env::var_os(n)).await;
+    let json = serde_json_lenient::to_vec_pretty(&state).context("serializing telemetry state")?;
+    w.add_bytes("host/telemetry.json", &json, Redaction::None)
+        .await
+}
+
+/// [`TelemetryState`] over the variables `var` gives. The exporter, endpoint
+/// and spool decision is mlog's own ([`mlog::otel::guest_exports`]). The
+/// switch's deciding variable mirrors mlog's private `Switches::enabled`,
+/// which mlog does not export; `the_mirrored_switch_agrees_with_mlog` holds
+/// the two together.
+async fn telemetry_state(
+    paths: &DiagPaths,
+    var: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> TelemetryState {
+    let set = |name: &str| var(name).is_some_and(|v| !v.is_empty());
+    let text = |name: &str| var(name).and_then(|v| v.into_string().ok());
+    let (enabled, decided_by) = if set("DO_NOT_TRACK") {
+        (false, "DO_NOT_TRACK")
+    } else if text("OTEL_SDK_DISABLED").is_some_and(|v| v.eq_ignore_ascii_case("true")) {
+        (false, "OTEL_SDK_DISABLED")
+    } else {
+        let on = text("MINIMAL_TELEMETRY").is_some_and(|v| {
+            ["1", "true", "yes", "on"]
+                .iter()
+                .any(|t| v.eq_ignore_ascii_case(t))
+        });
+        (on, "MINIMAL_TELEMETRY")
+    };
+    let exports = mlog::otel::guest_exports(|n| text(n));
+    let signal = |s: &mlog::otel::GuestSignal| SignalState {
+        exporting: matches!(s.url, Some(Ok(_))),
+        exporter_none: s.off,
+        endpoint: match &s.url {
+            Some(Ok(u)) => url::Url::parse(u)
+                .ok()
+                .map(|u| u.origin().ascii_serialization()),
+            _ => None,
+        },
+        refused: matches!(s.url, Some(Err(_))),
+    };
+    let dir = spool_dir(paths, var("MINIMAL_OTEL_SPOOL_DIR"));
+    TelemetryState {
+        source: TELEMETRY_STATE_SOURCE,
+        enabled,
+        decided_by,
+        traces: signal(&exports.traces),
+        logs: signal(&exports.logs),
+        spool: exports.spool,
+        newest_cmd_trace_id: newest_cmd_trace_id(&dir).await,
+        spool_dir: dir,
+        spool_dir_note: SPOOL_DIR_NOTE,
+    }
+}
+
+/// The most a trace-id lookup reads from the end of one spool file.
+const TRACE_LOOKUP_TAIL: u64 = 1 << 20;
+
+/// The `traceId` of the newest `cmd` span (by `endTimeUnixNano`) in the
+/// newest of the CLI's spool files that holds one. It reads at most the
+/// newest [`LOG_FILES_PER_PREFIX`] files, [`TRACE_LOOKUP_TAIL`] bytes of
+/// each, through the bundle's no-follow open. A line that is not JSON is
+/// passed over.
+async fn newest_cmd_trace_id(dir: &Path) -> Option<String> {
+    use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
+    let mut rd = tokio::fs::read_dir(dir).await.ok()?;
+    let mut files: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+    while let Ok(Some(entry)) = rd.next_entry().await {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.ends_with(".jsonl") || diagnostics::spool::producer(&name) != "minimal-cli" {
+            continue;
+        }
+        if let Ok(m) = tokio::fs::symlink_metadata(entry.path()).await
+            && m.is_file()
+        {
+            files.push((m.modified().unwrap_or(UNIX_EPOCH), entry.path()));
+        }
+    }
+    files.sort_by_key(|f| std::cmp::Reverse(f.0));
+    for (_, path) in files.into_iter().take(LOG_FILES_PER_PREFIX) {
+        let Ok((mut file, meta)) = open_regular_nofollow(&path).await else {
+            continue;
+        };
+        if meta.len() > TRACE_LOOKUP_TAIL {
+            let back = i64::try_from(TRACE_LOOKUP_TAIL).unwrap_or(i64::MAX);
+            if file.seek(std::io::SeekFrom::End(-back)).await.is_err() {
+                continue;
+            }
+        }
+        let mut bytes = Vec::new();
+        if (&mut file)
+            .take(TRACE_LOOKUP_TAIL)
+            .read_to_end(&mut bytes)
+            .await
+            .is_err()
+        {
+            continue;
+        }
+        if let Some(id) = newest_cmd_trace_id_in(&String::from_utf8_lossy(&bytes)) {
+            return Some(id);
+        }
+    }
+    None
+}
+
+/// [`newest_cmd_trace_id`] over one file's text.
+fn newest_cmd_trace_id_in(text: &str) -> Option<String> {
+    use serde_json_lenient::Value;
+    let end = |s: &Value| match s.get("endTimeUnixNano") {
+        Some(Value::String(n)) => n.parse::<u64>().unwrap_or(0),
+        Some(n) => n.as_u64().unwrap_or(0),
+        None => 0,
+    };
+    let mut best: Option<(u64, String)> = None;
+    for line in text.lines() {
+        let Ok(v) = serde_json_lenient::from_str::<Value>(line) else {
+            continue;
+        };
+        let spans = v
+            .get("resourceSpans")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|r| r.get("scopeSpans").and_then(Value::as_array))
+            .flatten()
+            .filter_map(|s| s.get("spans").and_then(Value::as_array))
+            .flatten();
+        for span in spans {
+            if span.get("name").and_then(Value::as_str) != Some("cmd") {
+                continue;
+            }
+            let Some(id) = span.get("traceId").and_then(Value::as_str) else {
+                continue;
+            };
+            let t = end(span);
+            if best.as_ref().is_none_or(|(b, _)| t >= *b) {
+                best = Some((t, id.to_owned()));
+            }
+        }
+    }
+    best.map(|(_, id)| id)
+}
+
 /// Records the skips [`logs`] held back, now that the provider loop has said
 /// whether the daemon's own logs reached the bundle another way.
 ///
@@ -1224,5 +1481,384 @@ mod tests {
             volume["allocated_bytes"].as_u64().unwrap() >= 4096,
             "the written block must be counted: {volume}"
         );
+    }
+
+    /// The host bundle carries the CLI's and minvmd's spool records
+    /// (spec 25 TEL-044) as the newest `*.jsonl` files under
+    /// `telemetry/spool/`, and nothing else from that directory.
+    #[tokio::test]
+    async fn bundle_carries_the_host_telemetry_spool() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = tmp.path().join("state");
+        let spool_dir = state.join("telemetry").join("spool");
+        std::fs::create_dir_all(&spool_dir).unwrap();
+        std::fs::write(
+            spool_dir.join("minimal-cli-1-1.jsonl"),
+            b"{\"resourceSpans\":[{\"scopeSpans\":[{\"spans\":[{\"name\":\"cmd\"}]}]}]}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            spool_dir.join("minvmd-2-1.jsonl"),
+            b"{\"resourceLogs\":[]}\n",
+        )
+        .unwrap();
+        std::fs::write(spool_dir.join("notes.txt"), b"not a spool file").unwrap();
+        let paths = DiagPaths {
+            config: tmp.path().join("config"),
+            state: state.clone(),
+            cache: tmp.path().join("cache"),
+            mesh_enrolment: tmp.path().join("mesh"),
+            cwd: tmp.path().to_path_buf(),
+        };
+        let out = tmp.path().join("bundle.tar.zst");
+        let mut w = BundleWriter::create(&out, "root", "test").await.unwrap();
+        spool(&mut w, &paths, 1 << 20).await.unwrap();
+        w.finish(chrono::Utc::now(), std::time::Duration::ZERO)
+            .await
+            .unwrap();
+        let files = unpack(&out, "root").await;
+        let cli = files
+            .get("telemetry/spool/minimal-cli-1-1.jsonl")
+            .unwrap_or_else(|| panic!("missing the CLI spool: {:?}", files.keys()));
+        assert!(std::str::from_utf8(cli).unwrap().contains("resourceSpans"));
+        assert!(files.contains_key("telemetry/spool/minvmd-2-1.jsonl"));
+        assert!(
+            !files.contains_key("telemetry/spool/notes.txt"),
+            "only *.jsonl spool files travel"
+        );
+    }
+
+    /// `MINIMAL_OTEL_SPOOL_DIR` names the spool (the writer's rule), the
+    /// state directory is the default, and an empty value is unset.
+    #[test]
+    fn spool_dir_honours_the_override() {
+        let paths = DiagPaths {
+            config: PathBuf::from("/c"),
+            state: PathBuf::from("/s"),
+            cache: PathBuf::from("/k"),
+            mesh_enrolment: PathBuf::from("/m"),
+            cwd: PathBuf::from("/w"),
+        };
+        assert_eq!(spool_dir(&paths, None), PathBuf::from("/s/telemetry/spool"));
+        assert_eq!(
+            spool_dir(&paths, Some("".into())),
+            PathBuf::from("/s/telemetry/spool")
+        );
+        assert_eq!(
+            spool_dir(&paths, Some("/elsewhere/spool".into())),
+            PathBuf::from("/elsewhere/spool")
+        );
+    }
+
+    /// The cap is per producer: six newer minvmd files do not push the
+    /// CLI's older file out, and the oldest minvmd file is the one dropped.
+    #[tokio::test]
+    async fn spool_keeps_the_newest_files_of_each_producer() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let spool_dir = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&spool_dir).unwrap();
+        let base =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let put = |name: &str, age_s: u64| {
+            let p = spool_dir.join(name);
+            std::fs::write(&p, b"{}\n").unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&p)
+                .unwrap()
+                .set_modified(base - std::time::Duration::from_secs(age_s))
+                .unwrap();
+        };
+        put("minimal-cli-7-1700000000000.jsonl", 100);
+        for n in 0..6u64 {
+            put(&format!("minvmd-9-1700000000000-{}.jsonl", n + 1), 60 - n);
+        }
+        let out = tmp.path().join("bundle.tar.zst");
+        let mut w = BundleWriter::create(&out, "root", "test").await.unwrap();
+        spool_in(&mut w, &spool_dir, 1 << 20, &[]).await.unwrap();
+        w.finish(chrono::Utc::now(), std::time::Duration::ZERO)
+            .await
+            .unwrap();
+        let files = unpack(&out, "root").await;
+        assert!(
+            files.contains_key("telemetry/spool/minimal-cli-7-1700000000000.jsonl"),
+            "the older CLI file survives minvmd's churn: {:?}",
+            files.keys()
+        );
+        let minvmd: Vec<_> = files
+            .keys()
+            .filter(|k| k.starts_with("telemetry/spool/minvmd-"))
+            .collect();
+        assert_eq!(minvmd.len(), LOG_FILES_PER_PREFIX, "{minvmd:?}");
+        assert!(
+            !files.contains_key("telemetry/spool/minvmd-9-1700000000000-1.jsonl"),
+            "the oldest minvmd file is the one dropped: {:?}",
+            files.keys()
+        );
+    }
+
+    /// TEL-044's two security claims over the host spool collector: a spool
+    /// line holding the configured exporter header value (under a harmless
+    /// attribute name) and a secret-shaped attribute reaches the bundle
+    /// without either value.
+    #[tokio::test]
+    async fn a_host_bundle_never_carries_a_header_value_or_a_secret_attribute() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let spool_dir = tmp.path().join("spool");
+        std::fs::create_dir_all(&spool_dir).unwrap();
+        std::fs::write(
+            spool_dir.join("minimal-cli-1-1.jsonl"),
+            concat!(
+                r#"{"resourceSpans":[{"scopeSpans":[{"spans":[{"name":"cmd","attributes":["#,
+                r#"{"key":"note","value":{"stringValue":"hcaik_s3cr3tINGEST"}},"#,
+                r#"{"key":"vendor.api_key","value":{"stringValue":"opensesame"}},"#,
+                r#"{"key":"cmd.name","value":{"stringValue":"build"}}]}]}]}]}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        let headers = diagnostics::redact::exporter_header_values(|n| {
+            (n == "MINIMAL_OTEL_EXPORTER_OTLP_HEADERS")
+                .then(|| "x-honeycomb-team=hcaik_s3cr3tINGEST".to_owned())
+        });
+        let out = tmp.path().join("bundle.tar.zst");
+        let mut w = BundleWriter::create(&out, "root", "test").await.unwrap();
+        spool_in(&mut w, &spool_dir, 1 << 20, &headers)
+            .await
+            .unwrap();
+        w.finish(chrono::Utc::now(), std::time::Duration::ZERO)
+            .await
+            .unwrap();
+        let files = unpack(&out, "root").await;
+        let body = std::str::from_utf8(&files["telemetry/spool/minimal-cli-1-1.jsonl"]).unwrap();
+        assert!(body.contains("\"build\""), "the record travels: {body}");
+        for (path, bytes) in &files {
+            let text = String::from_utf8_lossy(bytes);
+            assert!(
+                !text.contains("hcaik_s3cr3tINGEST"),
+                "header value in {path}"
+            );
+            assert!(!text.contains("opensesame"), "secret attribute in {path}");
+        }
+    }
+
+    /// TEL-044 per producer: a header that only the producer's
+    /// environment holds (minvmd started with it, the `min bug` shell
+    /// without it) is scrubbed from that producer's spool file while the
+    /// producer runs. Linux reads the producer's environment through /proc;
+    /// the macOS read (`sysctl(KERN_PROCARGS2)`) is proved in `diagnostics`
+    /// (`a_live_producers_headers_are_scrubbed_from_its_spool_file`), since
+    /// the kernel there withholds a platform binary's environment and this
+    /// test's `sleep` producer is one.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_producers_own_header_value_never_reaches_the_host_bundle() {
+        let mut producer = std::process::Command::new("sleep")
+            .arg("30")
+            .env(
+                "OTEL_EXPORTER_OTLP_HEADERS",
+                "authorization=Bearer%20minvmdONLYtoken42",
+            )
+            .spawn()
+            .unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let spool_dir = tmp.path().join("spool");
+        std::fs::create_dir_all(&spool_dir).unwrap();
+        let name = format!("minvmd-{}-1700000000000.jsonl", producer.id());
+        std::fs::write(
+            spool_dir.join(&name),
+            concat!(
+                r#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[{"body":{"stringValue":"sent minvmdONLYtoken42"},"#,
+                r#""attributes":[{"key":"vm","value":{"stringValue":"keep-me"}}]}]}]}]}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        let out = tmp.path().join("bundle.tar.zst");
+        let mut w = BundleWriter::create(&out, "root", "test").await.unwrap();
+        spool_in(&mut w, &spool_dir, 1 << 20, &[]).await.unwrap();
+        producer.kill().unwrap();
+        producer.wait().unwrap();
+        w.finish(chrono::Utc::now(), std::time::Duration::ZERO)
+            .await
+            .unwrap();
+        let files = unpack(&out, "root").await;
+        let body = std::str::from_utf8(&files[&format!("telemetry/spool/{name}")]).unwrap();
+        assert!(body.contains("keep-me"), "the record travels: {body}");
+        assert!(!body.contains("minvmdONLYtoken42"), "{body}");
+    }
+
+    fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<std::ffi::OsString> {
+        let pairs: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect();
+        move |n| pairs.iter().find(|(k, _)| k == n).map(|(_, v)| v.into())
+    }
+
+    /// TEL-051: the bundle records the switch and the variable that decided
+    /// it, each signal's exporter, each endpoint as its origin only, the
+    /// spool, and the trace id of the newest `cmd` span in the CLI spool.
+    #[tokio::test]
+    async fn the_bundle_records_the_telemetry_state() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let spool_dir = tmp.path().join("spool");
+        std::fs::create_dir_all(&spool_dir).unwrap();
+        std::fs::write(
+            spool_dir.join("minimal-cli-1-1.jsonl"),
+            concat!(
+                r#"{"resourceSpans":[{"scopeSpans":[{"spans":[{"traceId":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","name":"cmd","endTimeUnixNano":"200"}]}]}]}"#,
+                "\n",
+                r#"{"resourceSpans":[{"scopeSpans":[{"spans":[{"traceId":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","name":"cmd","endTimeUnixNano":"300"},{"traceId":"cccccccccccccccccccccccccccccccc","name":"rpc","endTimeUnixNano":"400"}]}]}]}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        let paths = paths(tmp.path());
+        let dir = spool_dir.to_str().unwrap();
+        let state = telemetry_state(
+            &paths,
+            env_of(&[
+                ("MINIMAL_TELEMETRY", "1"),
+                ("MINIMAL_OTEL_SPOOL_DIR", dir),
+                (
+                    "MINIMAL_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+                    "https://u:p@collector.example:4318/ingest/abc?key=v",
+                ),
+                ("MINIMAL_OTEL_EXPORTER_OTLP_HEADERS", "x-key=s3cr3tvalue"),
+                ("MINIMAL_OTEL_LOGS_EXPORTER", "none"),
+            ]),
+        )
+        .await;
+        assert!(state.enabled);
+        assert_eq!(state.source, TELEMETRY_STATE_SOURCE, "whose state it is");
+        assert_eq!(state.decided_by, "MINIMAL_TELEMETRY");
+        assert!(state.traces.exporting);
+        assert_eq!(
+            state.traces.endpoint.as_deref(),
+            Some("https://collector.example:4318")
+        );
+        assert!(!state.logs.exporting && state.logs.exporter_none);
+        assert!(state.spool);
+        assert_eq!(state.spool_dir, spool_dir);
+        assert_eq!(state.spool_dir_note, SPOOL_DIR_NOTE);
+        assert_eq!(
+            state.newest_cmd_trace_id.as_deref(),
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        );
+        let json = serde_json_lenient::to_string(&state).unwrap();
+        for leak in ["u:p", "ingest", "key=v", "s3cr3tvalue"] {
+            assert!(!json.contains(leak), "{leak} in {json}");
+        }
+
+        let off = telemetry_state(
+            &paths,
+            env_of(&[("MINIMAL_TELEMETRY", "1"), ("DO_NOT_TRACK", "0")]),
+        )
+        .await;
+        assert!(!off.enabled && !off.spool && !off.traces.exporting);
+        assert_eq!(off.decided_by, "DO_NOT_TRACK");
+        assert_eq!(off.newest_cmd_trace_id, None);
+
+        // A base endpoint with a query is refused (mlog's rule): recorded as
+        // refused, with no endpoint.
+        let refused = telemetry_state(
+            &paths,
+            env_of(&[
+                ("MINIMAL_TELEMETRY", "1"),
+                (
+                    "MINIMAL_OTEL_EXPORTER_OTLP_ENDPOINT",
+                    "https://c.example/x?k=v",
+                ),
+            ]),
+        )
+        .await;
+        assert!(refused.traces.refused && !refused.traces.exporting);
+        assert_eq!(refused.traces.endpoint, None);
+    }
+
+    /// TEL-051: the bundle reads one spool directory, the one `min bug`'s
+    /// own environment names, and says so. A spool a producer pinned through
+    /// its own `MINIMAL_OTEL_SPOOL_DIR` stays out, and `host/telemetry.json`
+    /// records the directory read with [`SPOOL_DIR_NOTE`].
+    #[tokio::test]
+    async fn a_spool_pinned_only_in_another_process_is_not_collected() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let line = concat!(
+            r#"{"resourceSpans":[{"scopeSpans":[{"spans":[{"traceId":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","name":"cmd","endTimeUnixNano":"1"}]}]}]}"#,
+            "\n"
+        );
+        let ours = tmp.path().join("ours");
+        let theirs = tmp.path().join("pinned-by-a-unit");
+        for d in [&ours, &theirs] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(ours.join("minimal-cli-1-1.jsonl"), line).unwrap();
+        std::fs::write(theirs.join("minvmd-2-1.jsonl"), line).unwrap();
+
+        let paths = paths(tmp.path());
+        let vars = [("MINIMAL_OTEL_SPOOL_DIR", ours.to_str().unwrap())];
+        let env = env_of(&vars);
+        let out = tmp.path().join("bundle.tar.zst");
+        let mut w = BundleWriter::create(&out, "root", "test").await.unwrap();
+        spool_in(
+            &mut w,
+            &spool_dir(&paths, env("MINIMAL_OTEL_SPOOL_DIR")),
+            1 << 20,
+            &[],
+        )
+        .await
+        .unwrap();
+        w.finish(chrono::Utc::now(), std::time::Duration::ZERO)
+            .await
+            .unwrap();
+        let files = unpack(&out, "root").await;
+        assert!(files.contains_key("telemetry/spool/minimal-cli-1-1.jsonl"));
+        assert!(
+            !files.keys().any(|k| k.contains("minvmd-2-1")),
+            "only the directory min bug resolves is read: {:?}",
+            files.keys()
+        );
+
+        let state = telemetry_state(&paths, env).await;
+        assert_eq!(state.spool_dir, ours);
+        let json = serde_json_lenient::to_string(&state).unwrap();
+        assert!(
+            json.contains(&format!("\"spool_dir_note\":\"{SPOOL_DIR_NOTE}\"")),
+            "{json}"
+        );
+    }
+
+    /// The deciding-variable mirror in [`telemetry_state`] says on exactly
+    /// where mlog's own decision spools (with no exporter set to `none`,
+    /// spooling is the switch).
+    #[tokio::test]
+    async fn the_mirrored_switch_agrees_with_mlog() {
+        let paths = paths(Path::new("/nonexistent"));
+        let cases: &[&[(&str, &str)]] = &[
+            &[],
+            &[("MINIMAL_TELEMETRY", "1")],
+            &[("MINIMAL_TELEMETRY", "TRUE")],
+            &[("MINIMAL_TELEMETRY", "yes")],
+            &[("MINIMAL_TELEMETRY", "0")],
+            &[("MINIMAL_TELEMETRY", "maybe")],
+            &[("MINIMAL_TELEMETRY", "1"), ("DO_NOT_TRACK", "false")],
+            &[("MINIMAL_TELEMETRY", "1"), ("OTEL_SDK_DISABLED", "TRUE")],
+            &[("MINIMAL_TELEMETRY", "1"), ("OTEL_SDK_DISABLED", "1")],
+        ];
+        for case in cases {
+            let state = telemetry_state(&paths, env_of(case)).await;
+            let var = env_of(case);
+            let mlog_on =
+                mlog::otel::guest_exports(|n| var(n).and_then(|v| v.into_string().ok())).spool;
+            assert_eq!(state.enabled, mlog_on, "{case:?}");
+        }
+    }
+
+    #[test]
+    fn a_trace_lookup_passes_over_torn_lines() {
+        let text = "torn\"}]}\n{\"resourceSpans\":[{\"scopeSpans\":[{\"spans\":[{\"traceId\":\"dd\",\"name\":\"cmd\"}]}]}]}\n";
+        assert_eq!(newest_cmd_trace_id_in(text).as_deref(), Some("dd"));
+        assert_eq!(newest_cmd_trace_id_in("{}\n"), None);
     }
 }
