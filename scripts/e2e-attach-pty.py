@@ -29,6 +29,19 @@ to fire `on_detach`):
                     SHELL then survives, which is what a test of re-attaching
                     to a still-running shell needs: `exit` ends that shell,
                     and the next attach mints a new one.
+  E2E_PTY_ASK       answer a runtime port-publish ask the attached human is
+                    shown: `allow` selects Allow (Down then Enter — Deny
+                    stands highlighted), `deny` takes the highlighted Deny
+                    (Enter). The ask's dialog (session_host.rs `ask_prompt`,
+                    NET-045) renders on the attached terminal exactly the way
+                    the session-exit prompt does, so it too can only be
+                    answered through a real pty: bytes typed ahead of the
+                    dialog are consumed by the shell before the dialog
+                    stands. One ask per attach — the request itself may come
+                    from anywhere (an exec'd `min net expose` inside the box
+                    routes the dialog to whoever is attached), so a caller
+                    keeps the attach alive (its `E2E_PTY_COMMANDS` running
+                    `sleep`, say) and drives the request from outside.
 
 The terminal-relay proof (the client relays the attached terminal to ssh
 through a local pty) adds a second stage, run once the command stream goes
@@ -105,6 +118,18 @@ if answer not in ANSWER_LABEL_PREFIX:
     sys.stderr.write(f"e2e-attach-pty: unknown E2E_PTY_ANSWER {answer!r}\n")
     sys.exit(2)
 
+# The runtime port-publish ask's own prompt (session_host.rs `ASK_PROMPT`), the
+# frame the answer below keys on: the lead-in ("... asks to publish port N.")
+# then the Select with Deny highlighted. The two answers are the keystrokes
+# the daemon's own test driver sends (`session_host/tests.rs` `answer_ask_on`):
+# Down lands on Allow, Enter takes the row; a bare Enter takes the highlighted
+# Deny. One ask per attach — a second dialog would park unanswered.
+ASK_PROMPT = b"Allow the publish to the host?"
+ASK_KEYS = {"allow": b"\x1b[B\r", "deny": b"\r"}
+ask = os.environ.get("E2E_PTY_ASK")
+if ask is not None and ask not in ASK_KEYS:
+    sys.stderr.write(f"e2e-attach-pty: unknown E2E_PTY_ASK {ask!r}\n")
+    sys.exit(2)
 
 def size_env(name, default):
     raw = os.environ.get(name)
@@ -248,6 +273,7 @@ if pid == 0:  # child
 
 buf = bytearray()
 answered = False
+ask_answered = False
 failed = False
 
 
@@ -370,6 +396,14 @@ try:
                 )
                 failed = True
                 break
+        # The publish ask can come from anywhere — an exec'd `min net expose`
+        # inside the box routes its dialog to whoever is attached — so, like
+        # the exit prompt, it is answered reactively: watch for the dialog's
+        # frame, not for the caller's keystrokes, and answer it once, with the
+        # daemon's own test-driver keystrokes for that stance.
+        if ask and not ask_answered and ASK_PROMPT in bytes(buf):
+            os.write(fd, ASK_KEYS[ask])
+            ask_answered = True
 finally:
     # Don't let a hung attach wedge the lane.
     try:
