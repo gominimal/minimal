@@ -1341,6 +1341,22 @@ fn warn_refused(node: &str, refused: &[RefusedRow]) {
 /// (`PortHeldNoChannel`, the state its readers spell "this host's names
 /// are not answered") and one first-entry warn carries `why`, because the
 /// same fault re-decided every pass needs one line, not a wall of them.
+/// A publish whose channel closed: this daemon holds no socket at the hook
+/// port while it publishes, so the loss is not [`surface_error`]'s "port held
+/// with no channel". The status reads `Starting` until the acquisition
+/// reconnects or hosts, and the warn names the loss once per streak.
+fn surface_channel_lost(status: &AnswererStatus, erroring: &mut bool, why: &str) {
+    if !*erroring {
+        *erroring = true;
+        tracing::warn!(
+            component = COMPONENT,
+            why,
+            "the zone answerer's channel closed under this daemon's publish; reconnecting"
+        );
+    }
+    status.set(minimald_rpc::ZoneAnswererStatus::Starting);
+}
+
 fn surface_error(status: &AnswererStatus, port: u16, erroring: &mut bool, why: &str) {
     if !*erroring {
         *erroring = true;
@@ -1632,7 +1648,6 @@ async fn acquire_at(
                     &mut commands,
                     published.registration,
                     &status,
-                    hook_port,
                     &node,
                     &mut erroring,
                     &shutdown,
@@ -1722,6 +1737,7 @@ async fn acquire_at(
                     &status,
                     &mut erroring,
                     &mut carve_out_said,
+                    &mut unit_warned,
                     &shutdown,
                 )
                 .await;
@@ -1782,13 +1798,11 @@ async fn wait_out_commands(
 /// shutdown. Returns whether the connection is still held — `false` is the
 /// withdrawal, and the registration drops with the return: the
 /// connection's end is the whole withdrawal.
-#[expect(clippy::too_many_arguments, reason = "the loop's own state, threaded")]
 async fn hold_the_publish(
     registry: &Arc<std::sync::RwLock<HostnameRegistry>>,
     commands: &mut mpsc::Receiver<HandoverCommand>,
     mut registration: Registration,
     status: &AnswererStatus,
-    hook_port: u16,
     node: &str,
     erroring: &mut bool,
     shutdown: &CancellationToken,
@@ -1816,9 +1830,8 @@ async fn hold_the_publish(
                         recheck_at = tokio::time::Instant::now() + PORT_RECHECK;
                     }
                     Err(error) => {
-                        surface_error(
+                        surface_channel_lost(
                             status,
-                            hook_port,
                             erroring,
                             &format!(
                                 "the answerer's end of the channel closed while holding the \
@@ -1835,9 +1848,8 @@ async fn hold_the_publish(
                 // which is what keeps a service restart a short absence.
                 // Anything the peek could not say reads as the same loss.
                 if !registration.answerer_alive().unwrap_or(false) {
-                    surface_error(
+                    surface_channel_lost(
                         status,
-                        hook_port,
                         erroring,
                         "the answerer's end of the channel closed (a service restart)",
                     );
@@ -1846,9 +1858,8 @@ async fn hold_the_publish(
                 let rows = zone_rows_of(registry);
                 if rows != last {
                     if let Err(error) = registration.send(rows.clone()).await {
-                        surface_error(
+                        surface_channel_lost(
                             status,
-                            hook_port,
                             erroring,
                             &format!(
                                 "the answerer's end of the channel closed while holding the \
@@ -1894,6 +1905,7 @@ async fn host_the_interim(
     status: &AnswererStatus,
     erroring: &mut bool,
     carve_out_said: &mut Option<String>,
+    unit_warned: &mut bool,
     shutdown: &CancellationToken,
 ) {
     let mut socket = Some(socket);
@@ -2087,7 +2099,7 @@ async fn host_the_interim(
                                         status,
                                         &published.holder,
                                         &paths.marker,
-                                        &mut false,
+                                        unit_warned,
                                     )
                                     .await;
                                     recheck_live_carve_outs(
@@ -2105,7 +2117,6 @@ async fn host_the_interim(
                                         commands,
                                         published.registration,
                                         status,
-                                        hook_port,
                                         node,
                                         erroring,
                                         shutdown,
