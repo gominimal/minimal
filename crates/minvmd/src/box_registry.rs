@@ -806,30 +806,27 @@ pub(crate) const PENDING_ASKS_PER_ROW: usize = 8;
 
 /// Mints the id one pending ask is named by (NET-045): one UUIDv4 — all
 /// random, no timestamp, because an ask is an event, not an entity with a
-/// creation order to keep — drawn fresh at each ask, with its bytes from
-/// the host's OS CSPRNG and from nothing the guest could observe, predict
-/// or arrange. Never carried by any client: the offer hands the id to the
-/// attached host client, the recorded answer carries it back, and an
-/// answer for an id this process never minted is refused — so a recorded
-/// yes can be spent by exactly the one admit it answers and never
-/// replayed. Ids are never reused: a consumed id is gone for good.
+/// creation order to keep — with its bytes from the host's OS CSPRNG and
+/// from nothing the guest could observe, predict or arrange. The offer
+/// hands the id to the attached host client and the recorded answer
+/// carries it back; an answer for an id the book does not hold pending is
+/// refused, and a resolved id leaves the book for good, so no id is ever
+/// answered twice.
 fn mint_ask_id() -> minimald_rpc::AskId {
     minimald_rpc::AskId::from_bytes(uuid::Uuid::new_v4().into_bytes())
 }
 
-/// One pending ask's registration-frozen facts (NET-045): everything a
-/// dialog, a log line and an audit line name the ask by, copied from the
-/// host row at record time. The host-sourced facts alone — never anything
-/// the ask's request carried past the row key, the port and the protocol,
-/// because the guest can raise a question but neither phrase it nor
-/// answer it: the offer's dialog text is built from these fields and
-/// nothing else.
-#[derive(Debug, Clone)]
+/// One pending ask's host-sourced facts (NET-045): what a dialog, a log
+/// line and an audit line name the ask by. The name, the box id and the
+/// switch address are copied from the host row at record time; the port
+/// and the protocol are the two fields the guest's ask carries. Nothing
+/// else the guest could say reaches them, so the offer's dialog text is
+/// built from the host row alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AskFacts {
     /// The box's name, from the host's own row.
     pub(crate) name: String,
-    /// The row's box id — the host-minted identity the offer keys its
-    /// subscription by.
+    /// The row's box id: the host-minted identity clients subscribe by.
     pub(crate) box_id: BoxId,
     /// The row's switch address: the ask's own row key.
     pub(crate) switch_address: Ipv4Addr,
@@ -839,54 +836,184 @@ pub(crate) struct AskFacts {
     pub(crate) proto: IpProto,
 }
 
-/// One pending ask, as the ask book holds it: the host-sourced facts of
-/// the dialog it offers, and the guest's reply channel — the outcome a
-/// recorded answer or a cancellation resolves it with is sent here, once,
-/// by whichever end arrives first. No timer ever touches it: the ask ends
-/// by an answer or a cancellation, and nothing else.
-struct PendingAsk {
-    facts: AskFacts,
-    /// The sending end of the guest's outcome channel, taken by whichever
-    /// end resolves the ask; `None` once it is.
-    reply: Option<std::sync::mpsc::Sender<minimald_rpc::AskAdmitOutcome>>,
+impl AskFacts {
+    /// The offer an attached client renders its dialog from.
+    fn offer(&self, ask_id: minimald_rpc::AskId) -> minimald_rpc::BoxControlReply {
+        minimald_rpc::BoxControlReply::PendingAskOffer(minimald_rpc::PendingAskOffer {
+            ask_id,
+            box_id: minimald_rpc::BoxId::from_bytes(self.box_id),
+            name: self.name.clone(),
+            port: self.port,
+            proto: self.proto,
+        })
+    }
 }
 
-/// One attached host client's subscription (NET-045): the push channel its
-/// writer thread reads — one offered ask or dismissal per push — keyed by
-/// an id so the client's own detach removes exactly its own entry.
+/// One pending ask as the book holds it: its facts and the sending end of
+/// the guest's outcome channel. The end is sent once, by whichever of an
+/// answer or a cancellation removes the ask from the book first. No timer
+/// ever touches it.
+struct PendingAsk {
+    facts: AskFacts,
+    reply: std::sync::mpsc::Sender<minimald_rpc::AskAdmitOutcome>,
+}
+
+/// One attached host client's subscription: the push channel its serving
+/// thread writes to the client, keyed by an id so the client's own detach
+/// removes exactly its own entry. Only the detach removes an entry; a push
+/// that fails is not counted as delivered, and the client's serving thread
+/// unsubscribes it on its way out.
 struct AskSubscriber {
     id: u64,
     pushes: std::sync::mpsc::Sender<minimald_rpc::BoxControlReply>,
 }
 
-/// The host's record of pending asks (NET-045) — the ask book — held by
-/// the registry beside the rows it asks about. Three facts, one lock:
+/// The host's record of pending asks (NET-045), held by the registry beside
+/// the rows it asks about:
 ///
-/// * the pending asks by their host-minted [`minimald_rpc::AskId`] — a
-///   pending ask is an unresolved one; resolution removes it, so the first
-///   recorded answer is the only one an id ever takes;
-/// * each row's queue of them in arrival order, the front the one
-///   offered — one dialog at a time per row, the rest waiting behind it
-///   within [`PENDING_ASKS_PER_ROW`];
+/// * the pending asks by their host-minted id; resolving an ask removes it,
+///   so the first recorded answer is the only one an id ever takes;
+/// * each row's queue of them in arrival order, keyed by switch address.
+///   The front is the one offered: one dialog at a time per row, the rest
+///   waiting behind it within [`PENDING_ASKS_PER_ROW`];
 /// * the attached host clients by the box id of the row each subscribed
-///   to — never a name — because the offer is the row's own fact and a
-///   guest-reported name is not.
+///   to, never a name.
 ///
-/// Every path through this book takes the row lock first and this one
-/// second (the row's own registration-frozen facts are read under the row
-/// lock, then the book's state under its own), so a registration and an
-/// ask never cycle; the row's runtime lock, when a recorded yes takes it,
-/// is innermost.
-#[derive(Debug, Default)]
+/// Lock order: a path that reads the rows takes the row lock first and the
+/// book second, and no path takes them the other way round; a recorded
+/// yes takes the row's runtime lock innermost.
+#[derive(Default)]
 struct AskBook {
     pending: std::collections::HashMap<minimald_rpc::AskId, PendingAsk>,
-    rows: std::collections::HashMap<[u8; 4], VecDeque<minimald_rpc::AskId>>,
+    queues: std::collections::HashMap<[u8; 4], VecDeque<minimald_rpc::AskId>>,
     subscribers: std::collections::HashMap<BoxId, Vec<AskSubscriber>>,
     next_subscriber: u64,
 }
 
-/// An ask the host has offered to attached clients (NET-045): what the
-/// door logs the offer from and the audit line records.
+/// Counts, not contents: the reply and push channels have no useful debug
+/// form, and the ids and facts are what the log lines carry.
+impl std::fmt::Debug for AskBook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AskBook")
+            .field("pending", &self.pending.len())
+            .field("rows", &self.queues.len())
+            .field("subscribed_boxes", &self.subscribers.len())
+            .finish()
+    }
+}
+
+impl AskBook {
+    /// Push `message` to the clients attached to `box_id` — every one, or
+    /// only the subscriber `only` names — and answer how many took it.
+    fn push(
+        &self,
+        box_id: &BoxId,
+        message: &minimald_rpc::BoxControlReply,
+        only: Option<u64>,
+    ) -> usize {
+        self.subscribers.get(box_id).map_or(0, |clients| {
+            clients
+                .iter()
+                .filter(|client| only.is_none_or(|id| client.id == id))
+                .filter(|client| client.pushes.send(message.clone()).is_ok())
+                .count()
+        })
+    }
+
+    /// Whether any client is attached to `box_id`.
+    fn has_client(&self, box_id: &BoxId) -> bool {
+        self.subscribers
+            .get(box_id)
+            .is_some_and(|clients| !clients.is_empty())
+    }
+
+    /// Offer the ask at the front of the row's queue to every attached
+    /// client, when the queue holds one.
+    fn offer_front(&self, switch_address: Ipv4Addr) -> Option<AskOffered> {
+        let ask_id = *self.queues.get(&switch_address.octets())?.front()?;
+        let facts = &self.pending.get(&ask_id)?.facts;
+        let offered_to = self.push(&facts.box_id, &facts.offer(ask_id), None);
+        Some(AskOffered {
+            ask_id,
+            facts: facts.clone(),
+            offered_to,
+        })
+    }
+
+    /// End one pending ask with `outcome`: remove it from the book and its
+    /// row's queue, answer the guest's held reply, dismiss the dialogs still
+    /// showing it, and offer the row's next queued ask when the ended one
+    /// was the row's offered dialog. `None` when the book does not hold the
+    /// ask: it was already answered, cancelled, or never minted.
+    fn end(
+        &mut self,
+        ask_id: minimald_rpc::AskId,
+        outcome: impl FnOnce(&AskFacts) -> minimald_rpc::AskAdmitOutcome,
+    ) -> Option<AskEnded> {
+        let pending = self.pending.remove(&ask_id)?;
+        let key = pending.facts.switch_address.octets();
+        let mut was_front = false;
+        if let Some(queue) = self.queues.get_mut(&key) {
+            was_front = queue.front() == Some(&ask_id);
+            queue.retain(|queued| *queued != ask_id);
+            if queue.is_empty() {
+                self.queues.remove(&key);
+            }
+        }
+        let outcome = outcome(&pending.facts);
+        // The guest may already be gone; its connection's end is its own
+        // cancellation, and there is nothing left to tell it.
+        let _ = pending.reply.send(outcome);
+        let dismissed = if was_front {
+            self.push(
+                &pending.facts.box_id,
+                &minimald_rpc::BoxControlReply::PendingAskDismissed {
+                    ask_id,
+                    dismissed: true,
+                },
+                None,
+            )
+        } else {
+            0
+        };
+        let offered_next = if was_front {
+            self.offer_front(pending.facts.switch_address)
+        } else {
+            None
+        };
+        Some(AskEnded {
+            ask_id,
+            facts: pending.facts,
+            outcome,
+            dismissed,
+            offered_next,
+        })
+    }
+
+    /// End every pending ask the predicate selects as cancelled.
+    fn cancel_where(&mut self, select: impl Fn(&AskFacts) -> bool) -> Vec<AskEnded> {
+        let ids: Vec<minimald_rpc::AskId> = self
+            .pending
+            .iter()
+            .filter(|(_, pending)| select(&pending.facts))
+            .map(|(ask_id, _)| *ask_id)
+            .collect();
+        ids.into_iter()
+            .filter_map(|ask_id| self.end(ask_id, |_| cancelled(ask_id)))
+            .collect()
+    }
+}
+
+/// The cancelled end of `ask_id`.
+fn cancelled(ask_id: minimald_rpc::AskId) -> minimald_rpc::AskAdmitOutcome {
+    minimald_rpc::AskAdmitOutcome::Refused {
+        ask_id,
+        reason: minimald_rpc::AskRefused::Cancelled,
+    }
+}
+
+/// An ask offered to the clients attached to its row (NET-045): what the
+/// door's log and audit lines record the offer by.
 #[derive(Debug, Clone)]
 pub(crate) struct AskOffered {
     /// The ask's own id.
@@ -897,96 +1024,69 @@ pub(crate) struct AskOffered {
     pub(crate) offered_to: usize,
 }
 
-/// An ask the host recorded (NET-045): the id it was minted under and the
-/// facts the door logs it by, with `offered_to` saying whether it became
-/// the row's offered dialog at once — `Some(count)` — or waits behind the
-/// one the row already holds open — `None`, until a later offer reaches
-/// it.
+/// An ask the book recorded pending (NET-045). `offered` is the offer when
+/// the ask became the row's offered dialog at once, and `None` when it
+/// waits behind the one the row already holds open; it is offered when it
+/// reaches the front, by whichever path ends the ask ahead of it.
 #[derive(Debug)]
 pub(crate) struct AskRecorded {
+    /// The ask's host-minted id.
     pub(crate) ask_id: minimald_rpc::AskId,
+    /// The ask's host-sourced facts.
     pub(crate) facts: AskFacts,
-    pub(crate) offered_to: Option<usize>,
+    /// The offer, when the ask is the row's offered dialog.
+    pub(crate) offered: Option<AskOffered>,
 }
 
-/// Why the host refused to record an ask (NET-045): the typed end the
-/// exposure's refusal names, with the ask's minted id and — where a row
-/// exists to source them — the host facts the refusal's log and audit
-/// lines carry.
+/// Why the book refused to record an ask (NET-045): the minted id the
+/// refusal is audited under, the host row's facts where a row exists at the
+/// named address, and the typed reason the guest's exposure is refused
+/// with.
 #[derive(Debug)]
 pub(crate) struct AskRecordRefusal {
+    /// The id minted for the refused ask; never offered, never answerable.
     pub(crate) ask_id: minimald_rpc::AskId,
-    /// The host row's facts, where one exists at the named address; a
-    /// no-row refusal has none to carry.
+    /// The host row's facts; `None` when no row is held at the address.
     pub(crate) facts: Option<AskFacts>,
+    /// Why the ask was refused.
     pub(crate) reason: minimald_rpc::AskRefused,
 }
 
-/// The recorded answer's result (NET-045): the ask's host-sourced facts,
-/// the outcome the exposure's held reply was answered with, how many other
-/// dialogs the answer dismissed, and the offer of the row's next queued
-/// ask, when one waited behind the answered one.
+/// A pending ask's end (NET-045), by a recorded answer or a cancellation:
+/// the outcome the guest's held reply was answered with, how many dialogs
+/// were dismissed, and the row's next ask when one was offered in its
+/// place.
 #[derive(Debug)]
-pub(crate) struct AskAnswered {
+pub(crate) struct AskEnded {
+    /// The ended ask's id.
     pub(crate) ask_id: minimald_rpc::AskId,
+    /// The ended ask's host-sourced facts.
     pub(crate) facts: AskFacts,
-    pub(crate) answer: minimald_rpc::AskAnswer,
+    /// The outcome the guest's held reply was answered with.
     pub(crate) outcome: minimald_rpc::AskAdmitOutcome,
-    /// How many attached clients the answered dialog was dismissed from.
+    /// How many attached clients the ended dialog was dismissed from.
     pub(crate) dismissed: usize,
-    /// The row's next queued ask, offered now that the answered one ended.
-    pub(crate) offered_next: Option<AskOffered>,
-}
-
-/// A cancelled ask's result (NET-045): the facts the cancellation's audit
-/// line carries, beside the outcome the exposure's held reply was
-/// answered with and the offer of the row's next queued ask when the
-/// cancelled one was the offered dialog.
-#[derive(Debug)]
-pub(crate) struct AskCancelled {
-    pub(crate) facts: AskFacts,
-    pub(crate) outcome: minimald_rpc::AskAdmitOutcome,
-    /// How many attached clients the cancelled dialog was dismissed from.
-    pub(crate) dismissed: usize,
-    /// The row's next queued ask, offered now that the cancelled one
-    /// ended, when one waited behind it and clients remain to offer it to.
+    /// The row's next queued ask, offered now that this one ended.
     pub(crate) offered_next: Option<AskOffered>,
 }
 
 impl BoxRegistry {
-    /// Whether a live row holds `id` (NET-045): the ask subscription's
-    /// validation. A subscription is to a *row's* box id — an id an
-    /// attachment still holds but no row does names a box this table no
-    /// longer serves, and there is nothing to subscribe to.
-    pub(crate) fn holds_row_with_box_id(&self, id: BoxId) -> bool {
-        let rows = self
-            .rows
-            .read()
-            .expect("the row lock is never held across a panic, so it cannot be poisoned");
-        rows.values().any(|record| record.box_id == id)
-    }
-
-    /// Record the in-VM daemon's ask (NET-045): mint the ask's id, park it
-    /// in the row's queue, and — when it is the row's offered dialog —
-    /// offer it to every host client attached to the row's box id. The
-    /// guest's reply channel is taken here: no timer ever resolves it, so
-    /// the exposure's held connection waits until an answer or a
-    /// cancellation ends the ask.
+    /// Record the in-VM daemon's ask (NET-045): mint the ask's id, check the
+    /// ask against the host row, queue it on the row, and offer it to every
+    /// client attached to the row's box id when it is the row's front.
+    /// `reply` is the sending end of the guest's outcome channel; the book
+    /// sends the ask's end on it once, on the first answer or cancellation,
+    /// and never on a timer.
     ///
-    /// The host decides before the ask is asked, the same order the
-    /// native path decides in: a row must exist ([`AskRefused::NoRow`),
-    /// its stance must be `ask` ([`AskRefused::StanceNotAsk`]), the
-    /// port must be inside the grant's range
-    /// ([`AskRefused::OutsideGrant`]) — so no dialog is ever offered for
-    /// a publish the grant would refuse anyway — a client must be
-    /// attached to answer ([`AskRefused::NoClient`], the native path's
-    /// fail-closed refusal, refused at once here because there is no one
-    /// to offer the ask to), and the row's queue must be inside its
-    /// bound ([`AskRefused::QueueFull`]).
-    ///
-    /// `reply` is the sending end of the exposure's outcome channel: the
-    /// book keeps it and sends the ask's end — [`AskAdmitOutcome`] —
-    /// once, on the first answer or cancellation, never on a timer.
+    /// The checks, in order: a row is held at the address
+    /// ([`minimald_rpc::AskRefused::NoRow`]); its stance is `ask`
+    /// ([`minimald_rpc::AskRefused::StanceNotAsk`]); its range admits the
+    /// port ([`minimald_rpc::AskRefused::OutsideGrant`]), so no client is
+    /// asked about a publish the grant would refuse anyway; a client is
+    /// attached to answer ([`minimald_rpc::AskRefused::NoClient`]); and the
+    /// row's queue is inside its bound
+    /// ([`minimald_rpc::AskRefused::QueueFull`]). A refusal records nothing
+    /// and drops `reply` unsent: the refusal is the caller's answer.
     pub(crate) fn record_ask(
         &self,
         switch_addr: Ipv4Addr,
@@ -994,22 +1094,18 @@ impl BoxRegistry {
         proto: IpProto,
         reply: std::sync::mpsc::Sender<minimald_rpc::AskAdmitOutcome>,
     ) -> Result<AskRecorded, AskRecordRefusal> {
-        // The row lock first, the ask book second — the order every ask
-        // path takes, so a registration and an ask never cycle.
+        let ask_id = mint_ask_id();
+        let refuse = |facts: Option<AskFacts>, reason| AskRecordRefusal {
+            ask_id,
+            facts,
+            reason,
+        };
         let rows = self
             .rows
             .read()
             .expect("the row lock is never held across a panic, so it cannot be poisoned");
-        // The id is minted before the checks: every refusal names the ask
-        // it refused by an id this process drew, and a minted id is never
-        // reused — a refused ask's id is simply never heard of again.
-        let ask_id = mint_ask_id();
         let Some(record) = rows.get(&switch_addr.octets()) else {
-            return Err(AskRecordRefusal {
-                ask_id,
-                facts: None,
-                reason: minimald_rpc::AskRefused::NoRow,
-            });
+            return Err(refuse(None, minimald_rpc::AskRefused::NoRow));
         };
         let facts = AskFacts {
             name: record.name().to_string(),
@@ -1019,95 +1115,64 @@ impl BoxRegistry {
             proto,
         };
         if record.dynamic_ingress() != DynamicIngress::Ask {
-            return Err(AskRecordRefusal {
-                ask_id,
-                facts: Some(facts),
-                reason: minimald_rpc::AskRefused::StanceNotAsk,
-            });
+            return Err(refuse(Some(facts), minimald_rpc::AskRefused::StanceNotAsk));
         }
-        let range = record.dynamic_range();
-        if !range.is_some_and(|(low, high)| port >= low && port <= high) {
-            return Err(AskRecordRefusal {
-                ask_id,
-                facts: Some(facts),
-                reason: minimald_rpc::AskRefused::OutsideGrant,
-            });
+        if !in_range(record.dynamic_range(), port) {
+            return Err(refuse(Some(facts), minimald_rpc::AskRefused::OutsideGrant));
         }
         let mut book = self
             .asks
             .lock()
             .expect("the ask book's lock is never held across a panic");
-        // No attached client at the time of the ask: the ask is refused
-        // at once — the native path's fail-closed refusal, this side of
-        // the bridge. An ask that no one can answer must not park the
-        // exposure behind a dialog that will never be seen.
-        if book
-            .subscribers
-            .get(&facts.box_id)
-            .is_none_or(|clients| clients.is_empty())
-        {
-            return Err(AskRecordRefusal {
-                ask_id,
-                facts: Some(facts),
-                reason: minimald_rpc::AskRefused::NoClient,
-            });
+        drop(rows);
+        if !book.has_client(&facts.box_id) {
+            return Err(refuse(Some(facts), minimald_rpc::AskRefused::NoClient));
         }
-        let queue = book.rows.entry(facts.switch_address.octets()).or_default();
+        let queue = book.queues.entry(switch_addr.octets()).or_default();
         if queue.len() >= PENDING_ASKS_PER_ROW {
-            return Err(AskRecordRefusal {
-                ask_id,
-                facts: Some(facts),
-                reason: minimald_rpc::AskRefused::QueueFull,
-            });
+            return Err(refuse(Some(facts), minimald_rpc::AskRefused::QueueFull));
         }
-        let is_front = queue.front() == Some(&ask_id);
+        let is_front = queue.is_empty();
         queue.push_back(ask_id);
         book.pending.insert(
             ask_id,
             PendingAsk {
                 facts: facts.clone(),
-                reply: Some(reply),
+                reply,
             },
         );
-        let offered_to = if is_front {
-            Some(Self::offer_ask(&mut book, ask_id).offered_to)
+        let offered = if is_front {
+            book.offer_front(switch_addr)
         } else {
-            // Queued behind the row's offered dialog: it is offered —
-            // and audited as offered — when it reaches the front.
             None
         };
         Ok(AskRecorded {
             ask_id,
             facts,
-            offered_to,
+            offered,
         })
     }
 
-    /// Record a host client's answer for one pending ask (NET-045): the
-    /// first answer recorded for an ask is the only one it takes — the
-    /// ask is consumed here, before its outcome is decided, so a later
-    /// answer for the same id finds no pending ask and is refused.
+    /// Record a host client's answer for one pending ask (NET-045). The ask
+    /// is removed from the book before its outcome is decided, so the first
+    /// answer is the only one it takes and a second finds nothing.
     ///
-    /// A yes records the ask's port into the row the table holds now —
-    /// within the grant's stance and range, idempotent when the row
-    /// already holds the port — and the exposure's held reply is answered
-    /// [`AskAdmitOutcome::Admitted`]: the one reply a publish may go
-    /// ahead on. A no and a no-tty record nothing and clear the ask
-    /// ([`AskRefused::Denied`], [`AskRefused::NoTty`]): nothing is stored
-    /// that could later count as a yes. The other dialogs still holding
-    /// the offer are dismissed, and the row's next queued ask — when one
-    /// waited behind this one — is offered.
+    /// A yes records the ask's port in the row the table holds now, inside
+    /// the grant ([`record_ask_yes`]), and answers the guest's held reply
+    /// [`minimald_rpc::AskAdmitOutcome::Admitted`]: that reply is the one
+    /// admit the yes is consumed by. A no and a no-tty record nothing: the
+    /// ask leaves the book, and nothing is stored that could later count as
+    /// a yes.
     ///
     /// # Errors
     ///
-    /// [`minimald_rpc::AskId`] — the id is unknown, cancelled or already
-    /// consumed: an answer for an ask this book does not hold records
-    /// nothing and resolves nothing.
+    /// `Err(())` when the book holds no pending ask under `ask_id`: it is
+    /// unknown, cancelled, or already answered. Nothing is recorded.
     pub(crate) fn record_ask_answer(
         &self,
         ask_id: minimald_rpc::AskId,
         answer: minimald_rpc::AskAnswer,
-    ) -> Result<AskAnswered, minimald_rpc::AskId> {
+    ) -> Result<AskEnded, ()> {
         let rows = self
             .rows
             .read()
@@ -1116,17 +1181,8 @@ impl BoxRegistry {
             .asks
             .lock()
             .expect("the ask book's lock is never held across a panic");
-        // Consume the ask before anything else: the first answer wins,
-        // and the second — whatever it says — finds no pending ask here.
-        let Some(pending) = book.pending.remove(&ask_id) else {
-            return Err(ask_id);
-        };
-        let facts = pending.facts;
-        if let Some(queue) = book.rows.get_mut(&facts.switch_address.octets()) {
-            queue.retain(|queued| *queued != ask_id);
-        }
-        let outcome = match answer {
-            minimald_rpc::AskAnswer::Yes => match record_ask_yes(&rows, &facts) {
+        book.end(ask_id, |facts| match answer {
+            minimald_rpc::AskAnswer::Yes => match record_ask_yes(&rows, facts) {
                 Ok(()) => minimald_rpc::AskAdmitOutcome::Admitted {
                     ask_id,
                     port: facts.port,
@@ -1142,312 +1198,148 @@ impl BoxRegistry {
                 ask_id,
                 reason: minimald_rpc::AskRefused::NoTty,
             },
-        };
-        // The exposure's held reply: best-effort by design — the sending
-        // end is the ask's own channel, and a client whose connection
-        // already ended has its own cancellation to answer it.
-        if let Some(reply) = pending.reply {
-            let _ = reply.send(outcome);
-        }
-        let dismissed = Self::dismiss_ask(&mut book, &facts.box_id, ask_id);
-        let offered_next = Self::offer_next(&mut book, &facts.switch_address);
-        Ok(AskAnswered {
-            ask_id,
-            facts,
-            answer,
-            outcome,
-            dismissed,
-            offered_next,
         })
+        .ok_or(())
     }
 
-    /// Cancel one pending ask (NET-045): the guest's own connection ended —
-    /// it no longer wants the publish — so the ask is cleared, the
-    /// exposure's held reply answered
-    /// [`minimald_rpc::AskRefused::Cancelled`], the other dialogs
-    /// dismissed, and the row's next queued ask offered. `None` when the
-    /// ask is already ended: a cancellation is not an answer and never
-    /// undoes one.
-    pub(crate) fn cancel_ask(&self, ask_id: minimald_rpc::AskId) -> Option<AskCancelled> {
-        let mut book = self
-            .asks
+    /// Cancel one pending ask (NET-045): the guest withdrew it — its
+    /// connection ended — so the ask leaves the book unanswered and its
+    /// dialogs are dismissed. `None` when the ask already ended: a
+    /// cancellation never undoes an answer.
+    pub(crate) fn cancel_ask(&self, ask_id: minimald_rpc::AskId) -> Option<AskEnded> {
+        self.asks
             .lock()
-            .expect("the ask book's lock is never held across a panic");
-        let pending = book.pending.remove(&ask_id)?;
-        let facts = pending.facts;
-        if let Some(queue) = book.rows.get_mut(&facts.switch_address.octets()) {
-            queue.retain(|queued| *queued != ask_id);
-        }
-        let outcome = minimald_rpc::AskAdmitOutcome::Refused {
-            ask_id,
-            reason: minimald_rpc::AskRefused::Cancelled,
-        };
-        if let Some(reply) = pending.reply {
-            let _ = reply.send(outcome);
-        }
-        let dismissed = Self::dismiss_ask(&mut book, &facts.box_id, ask_id);
-        let offered_next = Self::offer_next(&mut book, &facts.switch_address);
-        Some(AskCancelled {
-            facts,
-            outcome,
-            dismissed,
-            offered_next,
-        })
+            .expect("the ask book's lock is never held across a panic")
+            .end(ask_id, |_| cancelled(ask_id))
     }
 
-    /// Cancel every pending ask a row holds (NET-045) — the row's
-    /// withdrawal's own cancellation path: with no row there is no grant
-    /// to admit the ask's port under, so every ask it still holds ends
-    /// [`minimald_rpc::AskRefused::Cancelled`] and the dialogs still
-    /// offering them are dismissed.
-    pub(crate) fn cancel_asks_for_row(&self, switch_addr: Ipv4Addr) -> Vec<AskCancelled> {
-        let mut book = self
-            .asks
+    /// Cancel every pending ask the row at `switch_addr` holds (NET-045):
+    /// the row's withdrawal takes the grant the asks would publish under,
+    /// so each ends cancelled and the guest's exposure is refused.
+    fn cancel_asks_for_row(&self, switch_addr: Ipv4Addr) -> Vec<AskEnded> {
+        self.asks
             .lock()
-            .expect("the ask book's lock is never held across a panic");
-        let Some(queued) = book.rows.remove(&switch_addr.octets()) else {
-            return Vec::new();
-        };
-        queued
-            .into_iter()
-            .filter_map(|ask_id| {
-                let pending = book.pending.remove(&ask_id)?;
-                let outcome = minimald_rpc::AskAdmitOutcome::Refused {
-                    ask_id,
-                    reason: minimald_rpc::AskRefused::Cancelled,
-                };
-                if let Some(reply) = pending.reply {
-                    let _ = reply.send(outcome);
-                }
-                let facts = pending.facts;
-                let dismissed = Self::dismiss_ask(&mut book, &facts.box_id, ask_id);
-                Some(AskCancelled {
-                    facts,
-                    outcome,
-                    dismissed,
-                    offered_next: None,
-                })
-            })
-            .collect()
+            .expect("the ask book's lock is never held across a panic")
+            .cancel_where(|facts| facts.switch_address == switch_addr)
     }
 
-    /// Register an attached host client's subscription to a row's pending
-    /// asks (NET-045), keyed by the row's box id — never a name — and
-    /// answer the subscription's own id, for the client's detach to end
-    /// exactly its own. The row's standing offered ask, when one is
-    /// offered as this client attaches, is pushed to the new client: an
-    /// ask is offered to every host client attached to the row.
-    ///
-    /// # Errors
-    ///
-    /// [`AskFacts`] — no live row holds the box id, so there is nothing
-    /// to subscribe to and no dialog would ever arrive.
+    /// Subscribe an attached host client to the pending asks of the row
+    /// holding `box_id` (NET-045): keyed by the host-minted box id, never a
+    /// name. Answers the subscription's id, for the detach to end exactly
+    /// this subscription, and the row's standing offered ask, pushed to this
+    /// client alone so a client attaching mid-ask sees the open dialog.
+    /// `None` when no live row holds `box_id`: there is nothing to subscribe
+    /// to.
     pub(crate) fn subscribe_asks(
         &self,
         box_id: BoxId,
         pushes: std::sync::mpsc::Sender<minimald_rpc::BoxControlReply>,
-    ) -> Result<(u64, Option<AskOffered>), ()> {
+    ) -> Option<(u64, Option<AskOffered>)> {
         let rows = self
             .rows
             .read()
             .expect("the row lock is never held across a panic, so it cannot be poisoned");
-        let row = rows
+        let switch_address = rows
             .values()
-            .find(|record| record.box_id == box_id)
-            .ok_or(())?;
-        let switch_address = row.switch_addr();
-        drop(rows);
+            .find(|record| record.box_id == box_id)?
+            .switch_addr();
         let mut book = self
             .asks
             .lock()
             .expect("the ask book's lock is never held across a panic");
+        drop(rows);
         let id = book.next_subscriber;
         book.next_subscriber += 1;
         book.subscribers
             .entry(box_id)
             .or_default()
             .push(AskSubscriber { id, pushes });
-        // The row's standing offered ask: the dialog a client attaching
-        // mid-ask would otherwise never see, offered to this client alone
-        // — every other attached client already holds it.
         let standing = book
-            .rows
+            .queues
             .get(&switch_address.octets())
             .and_then(|queue| queue.front().copied())
-            .map(|ask_id| Self::offer_ask_to(&mut book, ask_id, id));
-        Ok((id, standing))
+            .and_then(|ask_id| {
+                let facts = book.pending.get(&ask_id)?.facts.clone();
+                let offered_to = book.push(&box_id, &facts.offer(ask_id), Some(id));
+                Some(AskOffered {
+                    ask_id,
+                    facts,
+                    offered_to,
+                })
+            });
+        Some((id, standing))
     }
 
-    /// End a host client's subscription (NET-045): remove exactly the
-    /// client's own entry, and — when it was the last client attached to
-    /// the box — cancel the box's pending asks: an ask no one can answer
-    /// must not park an exposure behind a dialog that will never be seen.
-    /// The cancelled asks' facts come back for the caller's audit lines.
-    pub(crate) fn unsubscribe_asks(&self, box_id: BoxId, subscriber: u64) -> Vec<AskCancelled> {
+    /// End one client's subscription (NET-045). When it was the last client
+    /// attached to the box, every pending ask the box holds is cancelled:
+    /// nobody is left to answer, and an ask must not hold the exposure
+    /// behind a dialog nobody can see. The cancelled asks come back for the
+    /// caller's log lines; their audit lines are the guests' own serving
+    /// threads', which receive the cancellation.
+    pub(crate) fn unsubscribe_asks(&self, box_id: BoxId, subscriber: u64) -> Vec<AskEnded> {
         let mut book = self
             .asks
             .lock()
             .expect("the ask book's lock is never held across a panic");
-        let Some(clients) = book.subscribers.get_mut(&box_id) else {
-            return Vec::new();
-        };
-        clients.retain(|client| client.id != subscriber);
-        if clients.is_empty() {
-            book.subscribers.remove(&box_id);
-            return self.cancel_asks_for_box_locked(&mut book, box_id);
-        }
-        Vec::new()
-    }
-
-    /// [`Self::cancel_asks_for_box`] under a book the caller already holds:
-    /// the last-detach path runs inside the unsubscribe that found it.
-    fn cancel_asks_for_box_locked(&self, book: &mut AskBook, box_id: BoxId) -> Vec<AskCancelled> {
-        let cancelled_ids: Vec<minimald_rpc::AskId> = book
-            .pending
-            .iter()
-            .filter(|(_, pending)| pending.facts.box_id == box_id)
-            .map(|(ask_id, _)| *ask_id)
-            .collect();
-        cancelled_ids
-            .into_iter()
-            .filter_map(|ask_id| {
-                let pending = book.pending.remove(&ask_id)?;
-                let facts = pending.facts;
-                if let Some(queue) = book.rows.get_mut(&facts.switch_address.octets()) {
-                    queue.retain(|queued| *queued != ask_id);
-                }
-                let outcome = minimald_rpc::AskAdmitOutcome::Refused {
-                    ask_id,
-                    reason: minimald_rpc::AskRefused::Cancelled,
-                };
-                if let Some(reply) = pending.reply {
-                    let _ = reply.send(outcome);
-                }
-                Some(AskCancelled {
-                    facts,
-                    outcome,
-                    dismissed: 0,
-                    offered_next: None,
-                })
-            })
-            .collect()
-    }
-
-    /// Offer the row's next queued ask (NET-045), when one waits behind
-    /// the front that just ended: the front is the offered dialog, so the
-    /// ask behind it is offered now — to every client attached to its
-    /// box, and audited as offered where the door reads this result.
-    fn offer_next(book: &mut AskBook, switch_addr: &Ipv4Addr) -> Option<AskOffered> {
-        let ask_id = book.rows.get(switch_addr.octets())?.front().copied()?;
-        Some(Self::offer_ask(book, ask_id))
-    }
-
-    /// Offer one pending ask to every client attached to its box
-    /// (NET-045): the offer carries the host row's own facts — the box's
-    /// name, the port, the protocol — and nothing the ask's request
-    /// carried past its row key, because the dialog the client renders is
-    /// built from these alone. Senders whose client is already gone are
-    /// pruned by the send itself.
-    fn offer_ask(book: &mut AskBook, ask_id: minimald_rpc::AskId) -> AskOffered {
-        Self::offer_ask_to(book, ask_id, u64::MAX)
-    }
-
-    /// Offer one pending ask to one attached client — `u64::MAX` for every
-    /// client attached to the ask's box, the client's own id for the
-    /// subscription's standing offer. [`AskOffered::offered_to`] counts
-    /// the pushes that a client took.
-    fn offer_ask_to(book: &mut AskBook, ask_id: minimald_rpc::AskId, only: u64) -> AskOffered {
-        let pending = &book.pending[&ask_id];
-        let offer = minimald_rpc::BoxControlReply::PendingAskOffer(minimald_rpc::PendingAskOffer {
-            ask_id,
-            box_id: minimald_rpc::BoxId::from_bytes(pending.facts.box_id),
-            name: pending.facts.name.clone(),
-            port: pending.facts.port,
-            proto: pending.facts.proto,
-        });
-        let box_id = pending.facts.box_id;
-        let mut offered_to = 0;
         if let Some(clients) = book.subscribers.get_mut(&box_id) {
-            clients.retain(|client| {
-                let take = only == u64::MAX || client.id == only;
-                if take && client.pushes.send(offer.clone()).is_ok() {
-                    offered_to += 1;
-                    return true;
-                }
-                !take
-            });
+            clients.retain(|client| client.id != subscriber);
             if clients.is_empty() {
                 book.subscribers.remove(&box_id);
             }
         }
-        let pending = &book.pending[&ask_id];
-        AskOffered {
-            ask_id,
-            facts: pending.facts.clone(),
-            offered_to,
+        if book.has_client(&box_id) {
+            return Vec::new();
         }
+        book.cancel_where(|facts| facts.box_id == box_id)
     }
 
-    /// Dismiss an ended ask from every client still holding its offer
-    /// (NET-045): the first recorded answer wins, and every other dialog
-    /// is told so — the client takes its rendering down and answers
-    /// nothing. Returns how many clients the dismissal reached.
-    fn dismiss_ask(book: &mut AskBook, box_id: &BoxId, ask_id: minimald_rpc::AskId) -> usize {
-        let dismissal = minimald_rpc::BoxControlReply::PendingAskDismissed {
-            ask_id,
-            dismissed: true,
-        };
-        let mut dismissed = 0;
-        if let Some(clients) = book.subscribers.get_mut(box_id) {
-            clients.retain(|client| {
-                if client.pushes.send(dismissal.clone()).is_ok() {
-                    dismissed += 1;
-                    return true;
-                }
-                false
-            });
-            if clients.is_empty() {
-                book.subscribers.remove(box_id);
-            }
-        }
-        dismissed
+    /// How many asks the book holds pending: the tests' view that an ask
+    /// ended and left nothing behind.
+    #[cfg(test)]
+    pub(crate) fn pending_ask_count(&self) -> usize {
+        self.asks
+            .lock()
+            .expect("the ask book's lock is never held across a panic")
+            .pending
+            .len()
     }
 }
 
-/// Record a pending ask's answered yes into the row the table holds now
-/// (NET-045): the port joins the row's runtime-admitted set — the same
-/// set the in-VM daemon's reports fill under `allow` — within the grant's
-/// stance and range, idempotent when the row already holds the port.
+/// Whether `range`, inclusive at both ends, admits `port`; an absent range
+/// admits nothing.
+fn in_range(range: Option<(u16, u16)>, port: u16) -> bool {
+    range.is_some_and(|(low, high)| (low..=high).contains(&port))
+}
+
+/// Record an answered yes's port in the row the table holds now (NET-045):
+/// the port joins the row's runtime-admitted set, the same set the in-VM
+/// daemon's reports fill under `allow`, and a port the row already holds
+/// is recorded already.
 ///
-/// The row is looked up fresh: the ask's own row was resolved at record
-/// time and rows are registration-frozen, but the yes answers against the
-/// row the table holds at answer time, and a re-registered row is a new
-/// box the human was not asked about. The cap and the rate the report
-/// path answers to do not apply: they bound a guest's report storm
-/// (NET-138), while a recorded yes is the host's own decision at human
-/// pace, and its bounds are the ask queue and the dialog.
+/// The row is looked up again at answer time and checked again: a row
+/// withdrawn and registered anew at the address is another box the human
+/// was not asked about. The report path's cap and rate bound a guest's
+/// report storm (NET-138); a yes is the host's own decision at human pace,
+/// bounded by the ask queue and the dialog, so neither applies.
 ///
 /// # Errors
 ///
-/// [`minimald_rpc::AskRefused`] — the row is gone
-/// ([`AskRefused::NoRow`]), its stance is no longer `ask`
-/// ([`AskRefused::StanceNotAsk`]), or the grant's range admits the port
-/// no longer ([`AskRefused::OutsideGrant`]): the yes records nothing and
-/// the exposure's publish unwinds.
+/// The row is gone or is another box ([`minimald_rpc::AskRefused::NoRow`]),
+/// its stance is no longer `ask` ([`minimald_rpc::AskRefused::StanceNotAsk`]),
+/// or its range no longer admits the port
+/// ([`minimald_rpc::AskRefused::OutsideGrant`]). Nothing is recorded.
 fn record_ask_yes(
     rows: &std::sync::RwLockReadGuard<'_, Rows>,
     facts: &AskFacts,
 ) -> Result<(), minimald_rpc::AskRefused> {
     let record = rows
         .get(&facts.switch_address.octets())
+        .filter(|record| record.box_id == facts.box_id)
         .ok_or(minimald_rpc::AskRefused::NoRow)?;
     if record.dynamic_ingress() != DynamicIngress::Ask {
         return Err(minimald_rpc::AskRefused::StanceNotAsk);
     }
-    if !record
-        .dynamic_range()
-        .is_some_and(|(low, high)| facts.port >= low && facts.port <= high)
-    {
+    if !in_range(record.dynamic_range(), facts.port) {
         return Err(minimald_rpc::AskRefused::OutsideGrant);
     }
     let reported = RuntimePort {
@@ -1458,12 +1350,9 @@ fn record_ask_yes(
         .runtime_ports
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if runtime.ports.contains(&reported) {
-        // Idempotent, the same answer the report path gives a re-admit: a
-        // yes for a port the row already holds records it and publishes.
-        return Ok(());
+    if !runtime.ports.contains(&reported) {
+        runtime.ports.push(reported);
     }
-    runtime.ports.push(reported);
     Ok(())
 }
 
@@ -2002,10 +1891,24 @@ impl BoxRegistry {
         Ok(removed)
     }
 
-    /// Retires a removed row's side facts: its stopped mark is stale with
-    /// the row gone, and the change is a ping like any other.
+    /// Retires a removed row's side facts: its pending asks are cancelled
+    /// (NET-045), its stopped mark is stale with the row gone, and the
+    /// change is a ping like any other.
     fn retired(&self, removed: &Option<Arc<BoxRecord>>) {
         if let Some(record) = removed {
+            // The row's pending asks go with it (NET-045): with no grant
+            // left to publish under, each ends cancelled, and its guest's
+            // serving thread audits the cancellation it receives.
+            for ended in self.cancel_asks_for_row(record.switch_addr) {
+                tracing::info!(
+                    ask_id = %ended.ask_id,
+                    box = %ended.facts.name,
+                    port = ended.facts.port,
+                    proto = %ended.facts.proto,
+                    dismissed = ended.dismissed,
+                    "cancelled a pending ask: its box's row was withdrawn"
+                );
+            }
             self.stopped
                 .write()
                 .expect(
