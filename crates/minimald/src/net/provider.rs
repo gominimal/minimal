@@ -240,7 +240,12 @@ impl OwnAddressReporter {
 /// because the host-side table's row is keyed by it. A task launch passes
 /// `None` deliberately — the task's sandbox is not the box the registration
 /// named, and attaching it at the box's address would key its frames to the
-/// session's row.
+/// session's row. `decision` carries the verdict decision this launch itself
+/// read for the box before it reserved anything (NET-079) — the launch's own
+/// fresh fact, never another launch's, which a process-wide memo left a
+/// concurrent launch free to read in its place. A task launch passes `None`
+/// deliberately too: it places no classifier leaf, so there is no per-box
+/// verdict for its plan to follow.
 pub(crate) fn network_for(
     mode: NetworkMode,
     switch: &Arc<Mutex<SwitchClient>>,
@@ -248,6 +253,7 @@ pub(crate) fn network_for(
     policy: Option<sessions::SessionPolicy>,
     own_address: Option<OwnAddressReporter>,
     box_addresses: Option<sessions::BoxAddresses>,
+    decision: Option<crate::net::classifier::Decision>,
 ) -> Arc<dyn Network> {
     match mode {
         NetworkMode::HostNet => Arc::new(HostIpAddressNetwork {
@@ -258,6 +264,11 @@ pub(crate) fn network_for(
             // so the plan the box is built around is the one its own
             // verdict decides.
             verdict: host_address_verdict(policy.as_ref().and_then(|p| p.egress.as_ref())),
+            // NET-079: the decision this launch itself read, fresh before
+            // it — the box's own verdict fact, carried in rather than
+            // memoized, so the plan below follows this launch's reading and
+            // never a concurrent launch's.
+            decision,
         }),
         NetworkMode::OwnIp => Arc::new(OwnIpNetwork {
             switch: Arc::clone(switch),
@@ -288,6 +299,13 @@ struct HostIpAddressNetwork {
     /// destination. Decided before the box's first process exists, like the
     /// leaf itself, because the plan is built before the spawn.
     verdict: sandbox2::config::Verdict,
+    /// The verdict decision this launch read before it reserved the plan
+    /// (NET-079) — carried in by the launch that builds the plan, so the
+    /// plan follows its own launch's reading and never a concurrent
+    /// launch's, which a process-wide memo let a later launch overwrite in
+    /// its place. `None` for a task launch: it places no classifier leaf,
+    /// so there is no per-box verdict for its plan to follow.
+    decision: Option<crate::net::classifier::Decision>,
 }
 
 impl std::fmt::Debug for HostIpAddressNetwork {
@@ -335,14 +353,52 @@ impl Network for HostIpAddressNetwork {
                 // with its `port` directive (NET-122, design §7.1), and it
                 // stays the answerer's own, not the plan's.
                 if self.verdict == sandbox2::config::Verdict::Deny {
-                    return Ok(NetPlan::host().with_resolver(Resolver::Nameservers(vec![
-                        crate::net::classifier::ANSWERER_ADDRESS,
-                    ])));
+                    // Over a table that decides per box, the carve-out it
+                    // loaded must name the answerer actually serving: a
+                    // stale target, or no answerer at all, refuses the box
+                    // (NET-079), and the resolver is the live bind's own
+                    // address, never a constant.
+                    let live = crate::net::classifier::live_answerer();
+                    if let Some(decision) = self
+                        .decision
+                        .as_ref()
+                        .filter(|decision| decision.can_decide_per_box())
+                        && let Some(refusal) = crate::net::classifier::stale_carve_out_refusal(
+                            decision.carve_out(),
+                            live,
+                        )
+                    {
+                        return Err(NetworkError::new(std::io::Error::other(refusal)));
+                    }
+                    let answerer = match live {
+                        Some(std::net::SocketAddr::V4(bound)) => *bound.ip(),
+                        _ => crate::net::classifier::ANSWERER_ADDRESS,
+                    };
+                    return Ok(NetPlan::host().with_resolver(Resolver::Nameservers(vec![answerer])));
                 }
                 // Native host: the namespace the box shares is the host's own,
                 // so the sandbox layer's plan answers `host.min.internal` from
                 // `/etc/hosts` at the host's loopback.
                 return sandbox2::HostNet.plan().await;
+            }
+            // NET-079: a VM host that decides per box gives a deny-all
+            // host-address box no resolver. The node's DNS layer applies no
+            // per-box name rule to host-address boxes, so the guest's table
+            // carves nothing out for it and its DNS to the gateway is refused
+            // like any other destination (follow-up gominimal/inbox#897).
+            // The decision is the launch's own, carried in when the plan was
+            // built: a guest whose boot's check or load failed, whose table
+            // is gone behind its marker, or whose probe did not read a
+            // refusal falls through to the node's DNS layer below, exactly
+            // as before this host could decide — and a concurrent launch's
+            // reading can never stand in for it.
+            if self.verdict == sandbox2::config::Verdict::Deny
+                && self
+                    .decision
+                    .as_ref()
+                    .is_some_and(|decision| decision.can_decide_per_box())
+            {
+                return Ok(NetPlan::host().with_resolver(Resolver::Nameservers(Vec::new())));
             }
             // NET-003: on a VM host, 127.0.0.1 in the namespace a host-address
             // box shares is the guest's loopback, not the host's, and the host
@@ -628,7 +684,7 @@ mod tests {
     async fn every_mode_gets_its_provider() {
         let switch = counting_switch();
 
-        let host = network_for(NetworkMode::HostNet, &switch, "s", None, None, None)
+        let host = network_for(NetworkMode::HostNet, &switch, "s", None, None, None, None)
             .plan()
             .await
             .unwrap();
@@ -642,14 +698,14 @@ mod tests {
             &Resolver::Nameservers(vec![crate::net::SwitchSubnet::default().dns_server()])
         );
 
-        let no_net = network_for(NetworkMode::NoNet, &switch, "s", None, None, None)
+        let no_net = network_for(NetworkMode::NoNet, &switch, "s", None, None, None, None)
             .plan()
             .await
             .unwrap();
         assert!(no_net.isolates_netns() && no_net.tap().is_none());
         assert_eq!(no_net.resolver(), &Resolver::None);
 
-        let own_ip = network_for(NetworkMode::OwnIp, &switch, "s", None, None, None);
+        let own_ip = network_for(NetworkMode::OwnIp, &switch, "s", None, None, None, None);
         assert!(own_ip.plan().await.unwrap().isolates_netns());
         assert_eq!(switch.lock().await.attached(), 1, "own-IP takes a lease");
         own_ip.abandon().await;
@@ -720,7 +776,7 @@ mod tests {
         let switch = counting_switch();
         let before = switch.lock().await.attached();
 
-        let net = network_for(NetworkMode::OwnIp, &switch, "s", None, None, None);
+        let net = network_for(NetworkMode::OwnIp, &switch, "s", None, None, None, None);
         net.plan().await.expect("planning leases an address");
         assert_eq!(switch.lock().await.attached(), before + 1);
 
@@ -759,6 +815,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
                 )
             })
             .collect();
@@ -784,7 +841,7 @@ mod tests {
     async fn host_ip_box_resolves_through_node_dns_layer() {
         let subnet = crate::net::SwitchSubnet::default();
         let switch = counting_switch();
-        let plan = network_for(NetworkMode::HostNet, &switch, "s", None, None, None)
+        let plan = network_for(NetworkMode::HostNet, &switch, "s", None, None, None, None)
             .plan()
             .await
             .expect("host-address plans do not fail");
@@ -807,6 +864,71 @@ mod tests {
             TapMechanism::InNamespace,
         );
         assert_eq!(plan.resolver(), own.resolver());
+    }
+
+    /// NET-079 natively: over a table that decides per box, a deny-all box's
+    /// plan follows the live answerer bind — its resolver is the bind's own
+    /// address while the table's recorded carve-out names that bind, and the
+    /// plan refuses the box as a stale carve-out once it does not. A box that
+    /// is not deny-all is unaffected.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn carve_out_targets_live_answerer_bind_in_the_box_plan() {
+        use crate::net::classifier::{Decision, clear_live_answerer, set_live_answerer};
+
+        let deny_all = Some(sessions::SessionPolicy::new(
+            Some(sessions::EgressPolicy::deny_all()),
+            None,
+        ));
+        let native = Arc::new(Mutex::new(SwitchClient::new(
+            "/usr/bin/gvproxy",
+            "/run/minimal/gvproxy",
+        )));
+        let recorded = std::net::SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 7656);
+        let decision = Decision::decided().with_carve_out(Some(recorded));
+        let plan = |policy| {
+            network_for(
+                NetworkMode::HostNet,
+                &native,
+                "s",
+                policy,
+                None,
+                None,
+                Some(decision.clone()),
+            )
+        };
+
+        set_live_answerer(std::net::SocketAddr::V4(recorded));
+        let live = plan(deny_all.clone())
+            .plan()
+            .await
+            .expect("a carve-out naming the live bind plans the box");
+        assert_eq!(
+            live.resolver(),
+            &Resolver::Nameservers(vec![*recorded.ip()]),
+            "the resolver is the live bind's address"
+        );
+
+        set_live_answerer(std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            7700,
+        ));
+        let stale = plan(deny_all.clone()).plan().await;
+        let refusal = stale.expect_err("a carve-out naming another bind is stale");
+        assert!(
+            refusal.to_string().contains("stale carve-out"),
+            "the plan refuses the box as a stale carve-out: {refusal}"
+        );
+
+        clear_live_answerer();
+        assert!(
+            plan(deny_all).plan().await.is_err(),
+            "no live answerer refuses the deny-all box"
+        );
+        assert!(
+            plan(None).plan().await.is_ok(),
+            "a box that is not deny-all is unaffected"
+        );
     }
 
     /// NET-079: on a native host, a deny-all host-address box resolves through
@@ -833,6 +955,7 @@ mod tests {
             &native,
             "s",
             deny_all.clone(),
+            None,
             None,
             None,
         )
@@ -877,16 +1000,18 @@ mod tests {
 
         // A box that is not deny-all inherits the host's resolver: no verdict
         // of its own, no carve-out to be routed through.
-        let plain = network_for(NetworkMode::HostNet, &native, "s", None, None, None)
+        let plain = network_for(NetworkMode::HostNet, &native, "s", None, None, None, None)
             .plan()
             .await
             .expect("host-address plans do not fail");
         assert_eq!(plain.resolver(), &Resolver::Host);
 
-        // On a VM host the deny verdict changes nothing here: the namespace
-        // the box shares is the guest's, and the node's DNS layer answers it.
+        // On a VM host the deny verdict alone changes nothing here: the
+        // namespace the box shares is the guest's, and — with no decision
+        // carried in — nothing decides per box, so the node's DNS layer
+        // answers it. The decided case is the test below.
         let vm = counting_switch();
-        let guest_plan = network_for(NetworkMode::HostNet, &vm, "s", deny_all, None, None)
+        let guest_plan = network_for(NetworkMode::HostNet, &vm, "s", deny_all, None, None, None)
             .plan()
             .await
             .expect("host-address plans do not fail");
@@ -894,6 +1019,114 @@ mod tests {
             guest_plan.resolver(),
             &Resolver::Nameservers(vec![crate::net::SwitchSubnet::default().dns_server()]),
             "a VM host's deny-all box resolves through the node's DNS layer"
+        );
+    }
+
+    /// NET-079 on a VM host: the plan a deny-all host-address box gets follows
+    /// its launch's own decision — a guest that decided per box gives the box
+    /// no resolver, because the guest's table renders no resolver carve-out
+    /// (follow-up gominimal/inbox#897); a guest that decided nothing —
+    /// a boot whose check or load failed, a table gone behind its marker, a
+    /// probe that read no refusal — keeps the node's DNS layer, exactly as
+    /// before it could decide. The decision is a parameter the launch passes
+    /// in, the very value its own reader read: the same box on the same host
+    /// follows whichever decision its own launch hands the plan, a later
+    /// launch can never read an earlier one's in its place, and a box that
+    /// is not deny-all needs no carve-out enforced, so no decision changes
+    /// its resolver.
+    #[tokio::test]
+    async fn guest_deny_all_renders_no_resolver_carve_out_in_the_box_plan() {
+        use crate::net::classifier::{Cause, Decision};
+
+        let deny_all = Some(sessions::SessionPolicy::new(
+            Some(sessions::EgressPolicy::deny_all()),
+            None,
+        ));
+        let switch = counting_switch();
+        let subnet = crate::net::SwitchSubnet::default();
+        let plan = |policy, decision| {
+            network_for(
+                NetworkMode::HostNet,
+                &switch,
+                "s",
+                policy,
+                None,
+                None,
+                decision,
+            )
+        };
+
+        // Undecided — a launch that read an undecidable cause: the box
+        // resolves through the node's DNS layer at the switch gateway, the
+        // resolver it had before its guest could decide anything.
+        let undecidable = plan(
+            deny_all.clone(),
+            Some(Decision::undecidable(Cause::GuestTableNotLoaded)),
+        )
+        .plan()
+        .await
+        .expect("host-address plans do not fail");
+        assert_eq!(
+            undecidable.resolver(),
+            &Resolver::Nameservers(vec![subnet.dns_server()]),
+            "a guest that decides nothing keeps the node's DNS layer"
+        );
+
+        // Decided per box: the same box gets no resolver — the guest's table
+        // carves none out, so there is nothing its lookups may reach.
+        let decided = plan(deny_all.clone(), Some(Decision::decided()))
+            .plan()
+            .await
+            .expect("host-address plans do not fail");
+        assert_eq!(
+            decided.resolver(),
+            &Resolver::Nameservers(Vec::new()),
+            "a guest that decides per box gives a deny-all box no resolver"
+        );
+
+        // A launch that read no decision at all — a plan built before its
+        // reader ran, or a task launch, which places no leaf to read one
+        // over — decides nothing either.
+        let unread = plan(deny_all.clone(), None)
+            .plan()
+            .await
+            .expect("host-address plans do not fail");
+        assert_eq!(
+            unread.resolver(),
+            &Resolver::Nameservers(vec![subnet.dns_server()]),
+            "a launch that read no decision keeps the node's DNS layer"
+        );
+
+        // The decision is the launch's own parameter, never a default kept
+        // between them: the next launch that reads an undecidable decision
+        // falls back again, with no earlier launch's decided reading left
+        // standing for it to inherit.
+        let again = plan(
+            deny_all,
+            Some(Decision::undecidable(Cause::GuestTableNotLoaded)),
+        )
+        .plan()
+        .await
+        .expect("host-address plans do not fail");
+        assert_eq!(
+            again.resolver(),
+            &Resolver::Nameservers(vec![subnet.dns_server()]),
+            "the decision is read per launch: a later undecidable reading \
+             falls back to the node's DNS layer"
+        );
+
+        // And the gate is the decision over a verdict that needs one: a box
+        // that is not deny-all runs unenforced whatever the host decided, so
+        // its resolver is the node's either way.
+        let plain = plan(None, Some(Decision::decided()))
+            .plan()
+            .await
+            .expect("host-address plans do not fail");
+        assert_eq!(
+            plain.resolver(),
+            &Resolver::Nameservers(vec![subnet.dns_server()]),
+            "a box that is not deny-all has no carve-out to resolve through, \
+             decided or not"
         );
     }
 
@@ -983,7 +1216,7 @@ mod tests {
             "/usr/bin/gvproxy",
             "/run/minimal/gvproxy",
         )));
-        let plan = network_for(NetworkMode::HostNet, &native, "s", None, None, None)
+        let plan = network_for(NetworkMode::HostNet, &native, "s", None, None, None, None)
             .plan()
             .await
             .unwrap();
@@ -999,7 +1232,7 @@ mod tests {
 
         // VM-host host-address: the node's DNS layer answers the same name.
         let vm = counting_switch();
-        let plan = network_for(NetworkMode::HostNet, &vm, "s", None, None, None)
+        let plan = network_for(NetworkMode::HostNet, &vm, "s", None, None, None, None)
             .plan()
             .await
             .unwrap();
