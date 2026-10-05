@@ -209,7 +209,7 @@ meet the policy yet.
 | Artifact | How the release run tests it |
 | --- | --- |
 | Linux amd64 `min`, `minimald`, `minvmd`, `gvproxy-min` | `smoke-linux-amd64` runs the session e2e on the host daemon. `smoke-linux-kvm` runs it in a KVM microVM. |
-| `min-answerer` (every platform that has `min`) | [`scripts/dist-build.sh`](../../scripts/dist-build.sh) runs the link gate ([`scripts/check-answerer-links.sh`](../../scripts/check-answerer-links.sh)) on the binary it built. **Gap:** the frozen release workflow does not build, sign, or upload it yet. Until a code owner applies the workflow patch, the stage treats the artifact as optional and a release goes out without it (gominimal/inbox#899). |
+| `min-answerer` (every platform that has `min`) | [`scripts/dist-build.sh`](../../scripts/dist-build.sh) runs the link gate ([`scripts/check-answerer-links.sh`](../../scripts/check-answerer-links.sh)) on the binary it built. The release workflow runs the gate again on every renamed and signed artifact before upload. On macOS it also checks the signature against the designated requirement that `min` uses. |
 | amd64 guest kernel, rootfs, and initramfs | `smoke-linux-kvm` boots them. |
 | arm64 guest kernel, rootfs, and initramfs | `smoke-macos` boots them. |
 | macOS arm64 `min`, `minvmd`, `libkrun.1.dylib`, `gvproxy-min` | `smoke-macos` runs the session e2e with the signed files in the installer layout. **Gap:** when the `RUN_MACOS_CI` variable is `false`, this job skips and the run counts the skip as a pass. |
@@ -291,13 +291,13 @@ whose `package.version` is stale or not above the newest `v*` tag.
   The job checks that each binary is static and that `minvmd` contains the
   KVM backend.
 - `build-release-macos-arm64` runs on the self-hosted Apple Silicon runner
-  when `RUN_MACOS_CI` is not `false`. It builds `minvmd` and `min`, changes
-  the libkrun link path in `minvmd` to `@rpath`
+  when `RUN_MACOS_CI` is not `false`. It builds `minvmd`, `min`, and
+  `min-answerer`, changes the libkrun link path in `minvmd` to `@rpath`
   ([`scripts/rewrite-macos-linkage.sh`](../../scripts/rewrite-macos-linkage.sh)),
-  and checks that `min` links only system libraries. It signs both binaries
-  with the Developer ID, the hardened runtime, and a timestamp. Then it
-  notarizes `min`, `minvmd`, and `min-answerer`. See
-  the **Notarization** paragraph below.
+  and checks that `min` and `min-answerer` link only system libraries. It
+  signs `minvmd`, `min`, and `min-answerer` with the Developer ID, the
+  hardened runtime, and a timestamp. Then it notarizes all of them. See the
+  **Notarization** paragraph below.
 - `build-libkrun-macos-arm64` builds the `libkrun.1.dylib` for macOS users on
   a hosted runner. `sign-macos-artifacts` signs it and the macOS `gvproxy`
   with the Developer ID on the self-hosted runner.
@@ -335,20 +335,19 @@ half of the work:
 - [`scripts/install.sh`](../../scripts/install.sh) installs it beside `min`
   and replaces it on upgrade, like every other `bin` row.
 
-*Optional until the workflow builds it.* Because the release workflow does
-not build or upload `min-answerer` yet, `stage-release.sh` and `package-nfpm.sh`
-accept a missing `min-answerer` artifact with a warning that names the
-omitted row. They stage or package all other artifacts. A release staged
-without it gives no `min-answerer` to the host. The advisory then shows the
-state `this release ships no min-answerer; the answerer service step is
-unavailable` and does not offer the step. This state is temporary.
-gominimal/inbox#899 tracks the removal of both optional lists after the
-workflow uploads the artifact on every platform.
+*Still optional in the scripts.* The release workflow uploads `min-answerer`
+on every platform, but `stage-release.sh` and `package-nfpm.sh` still accept
+a missing `min-answerer` artifact with a warning that names the omitted row.
+They stage or package all other artifacts. A release staged without it gives
+no `min-answerer` to the host. The advisory then shows the state `this release
+ships no min-answerer; the answerer service step is unavailable` and does not
+offer the step. Both optional lists go after a release publishes the
+artifact on every platform.
 
 *Identity model.* Each check runs where it has meaning:
 
 - **The release proves link-cleanliness.** The link gate runs on the binary
-  that `dist-build.sh` built. The workflow patch runs it again on every signed
+  that `dist-build.sh` built. The release workflow runs it again on every signed
   and renamed artifact, as the last check before upload. The uploaded bytes
   are then the bytes that the gate checked. The user's machine does not run
   the gate.
@@ -379,12 +378,9 @@ workflow uploads the artifact on every platform.
   again. Then it renames the copy into place. Only after that does it write
   the unit or property list that names the copy.
 
-The workflow half is a change that a code owner must apply, because
-[`.github/workflows/`](../../.github/workflows/) is frozen and CODEOWNER-gated.
-The body of the pull request that added this section contains the change as
-a unified diff to `release.yml`. That patch is the needs-human item that
-blocks the first release that offers the answerer service step. It follows
-the steps that the other binaries have:
+The release workflow
+([`.github/workflows/release.yml`](../../.github/workflows/release.yml))
+handles `min-answerer` with the same steps that the other binaries have:
 
 - `build-release-linux-{amd64,arm64}`: the shared entry point builds and
   link-gates `min-answerer` already. The rename step adds
