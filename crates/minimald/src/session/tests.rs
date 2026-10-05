@@ -5623,7 +5623,7 @@ async fn expose_allow_publishes_and_lists() {
 /// reads is handed to the test over `requests`, and each reply it writes is
 /// the test's own word on `replies`, so a test can answer a report, refuse
 /// it, or hold it — and observe a publish waiting on the answer.
-async fn fake_report_door(
+pub(crate) async fn fake_report_door(
     door: impl Into<std::path::PathBuf>,
 ) -> (
     tokio::task::JoinHandle<()>,

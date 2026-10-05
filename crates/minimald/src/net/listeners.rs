@@ -357,6 +357,85 @@ async fn report_exchange(
     })?
 }
 
+/// Whether a publish over `control` answers to a VM host daemon (T94,
+/// NET-138): the control channel is the VM's host shuttle, so the box's
+/// row and its grant are held outside the VM. A native host answers `false`
+/// and keeps every decision in this daemon, its ask dialog included.
+pub(crate) fn reports_to_vm_host(control: &ControlChannel) -> bool {
+    box_report_channel(control).is_some()
+}
+
+/// Raise one ask with the VM host daemon (NET-045): an expose decided `ask`
+/// on a VM-backed host is answered by the human attached on the host, not
+/// by a dialog this daemon renders, so the ask crosses the report door as
+/// the row key, the port and the protocol — nothing else, because the guest
+/// can raise a question but neither phrase it nor answer it — and the
+/// door's reply is the ask's end.
+///
+/// The dial is bounded by [`REPORT_DEADLINE`]; the reply is not: no timer
+/// answers an ask, so the connection is held until the host's ask ends by
+/// an answer or a cancellation. Dropping the future closes the connection,
+/// which the host takes as this ask's withdrawal.
+///
+/// # Errors
+///
+/// The door could not be dialled, closed without answering, or answered
+/// with something other than the ask's end; a native host has no door at
+/// all. Each is an ask nobody answered, and the caller fails it closed.
+pub(crate) async fn report_ask(
+    control: &ControlChannel,
+    switch_address: Ipv4Addr,
+    port: u16,
+) -> io::Result<minimald_rpc::AskAdmitOutcome> {
+    let Some(channel) = box_report_channel(control) else {
+        return Err(io::Error::other(
+            "a native host has no VM host daemon to raise an ask with",
+        ));
+    };
+    let request = minimald_rpc::BoxControlRequest::AdmitAsk(minimald_rpc::AdmitAskRequest {
+        switch_address,
+        port,
+        proto: IpProto::Tcp,
+    });
+    let dial_timeout = |_elapsed| {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            "the VM host daemon's report door did not accept the ask before its deadline",
+        )
+    };
+    let reply = match &channel {
+        BoxReportChannel::Vsock { cid } => {
+            let stream = tokio::time::timeout(
+                REPORT_DEADLINE,
+                tokio_vsock::VsockStream::connect(tokio_vsock::VsockAddr::new(
+                    *cid,
+                    minimald_rpc::VM_HOST_BOX_REPORT_PORT,
+                )),
+            )
+            .await
+            .map_err(dial_timeout)??;
+            report_round(stream, &request).await?
+        }
+        #[cfg(test)]
+        BoxReportChannel::Unix(door) => {
+            let stream =
+                tokio::time::timeout(REPORT_DEADLINE, tokio::net::UnixStream::connect(door))
+                    .await
+                    .map_err(dial_timeout)??;
+            report_round(stream, &request).await?
+        }
+    };
+    match reply {
+        minimald_rpc::BoxControlReply::AskAdmit(outcome) => Ok(outcome),
+        minimald_rpc::BoxControlReply::Error { error } => Err(io::Error::other(format!(
+            "the VM host daemon refused the ask: {error}"
+        ))),
+        other => Err(io::Error::other(format!(
+            "the VM host daemon answered the ask with another verb's reply: {other:?}"
+        ))),
+    }
+}
+
 /// Report one runtime-published port as admitted to the VM host daemon
 /// (T94, NET-138): the publish's host-side half — the grant the box's
 /// registration holds decides the report, and a report it refuses comes
