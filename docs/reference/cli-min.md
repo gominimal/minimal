@@ -141,6 +141,12 @@ Attaches to an existing session, identified by UUID or session name. When
 working directory (or the only existing session) and opens an interactive
 picker if the choice is ambiguous (`--no-input` errors instead).
 
+`min session attach` exits 0 when you detach or the session's shell exits.
+It prints a one-line notice and exits 254 when the daemon ends the attach.
+That happens when someone destroys the session, another connection attaches
+to it, or the daemon shuts down. It exits 255 when the connection fails, or
+when the daemon disconnects a terminal that stopped keeping up with output.
+
 ### `session exec`
 
 ```
@@ -149,6 +155,9 @@ min session exec <SESSION> <COMMAND>...
 
 Runs a command in an existing session, non-interactively, relaying its
 stdout, stderr and exit code.
+When a daemon shutdown stops the command, `min` prints
+`minimald is shutting down; the command was stopped` on stderr and exits with
+the command's own status.
 
 How `COMMAND` is read depends on how many arguments you give it:
 

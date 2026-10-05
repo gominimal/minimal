@@ -970,13 +970,15 @@ impl<S: Exec> ExecTask<S> {
         let pump = spawn(pump_channel_input(msgs, stdin_tx, client_lost_tx));
 
         let stream = self.exec.exec(self.session.clone());
-        let exit_status = bridge(
+        let mngr = self.serv.sessions_manager().await;
+        let exit_status = bridge_noting_shutdown(
             self.channel_id,
             stream,
             &mut stdin_rx,
             &mut w,
             &mut e,
             client_lost_rx,
+            || mngr.is_shutting_down(),
         )
         .await;
 
@@ -990,6 +992,40 @@ impl<S: Exec> ExecTask<S> {
         let _ = ws.close().await; // needed to release the remote
         exit_status
     }
+}
+
+/// The line an exec the daemon's shutdown ended leaves on stderr, so the
+/// client is told why its command stopped rather than handed a bare 137.
+const SHUTDOWN_NOTICE: &[u8] = b"minimald is shutting down; the command was stopped\n";
+
+/// Runs [`bridge`] and, when the daemon's shutdown is what ended it, writes
+/// [`SHUTDOWN_NOTICE`] to `e` before returning the exit status.
+///
+/// `shutting_down` is asked once the bridge returns. It reads the sessions
+/// manager's shutdown state, which is set before the manager stops any box,
+/// rather than the server's shutdown token, which is cancelled only after the
+/// manager is done and so after the command is already gone.
+async fn bridge_noting_shutdown<S, P, R, W, E>(
+    channel_id: impl Display + Clone,
+    stream: S,
+    r: &mut R,
+    w: &mut W,
+    e: &mut E,
+    client_lost: watch::Receiver<bool>,
+    shutting_down: impl FnOnce() -> bool,
+) -> u32
+where
+    P: Process,
+    S: Stream<Item = io::Result<P>> + Unpin,
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+    E: AsyncWrite + Unpin,
+{
+    let exit_status = bridge(channel_id, stream, r, w, e, client_lost).await;
+    if shutting_down() {
+        let _ = e.write_all(SHUTDOWN_NOTICE).await;
+    }
+    exit_status
 }
 
 /// Forwards the SSH channel's read half into the exec's stdin pipe and
@@ -2447,8 +2483,8 @@ pub(crate) mod testing {
 mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
 
-    use super::bridge;
     use super::testing::{MockEndpoints, build_mock, build_mock_seq};
+    use super::{bridge, bridge_noting_shutdown};
 
     /// A never-firing client-loss signal for tests that exercise the
     /// bridge without modelling a disconnect.
@@ -2865,6 +2901,67 @@ mod tests {
         assert_eq!(err, b"err!");
 
         assert!(!ctrl.was_killed());
+    }
+
+    /// An exec the daemon's shutdown ends tells the client why on stderr,
+    /// after whatever the command itself wrote there, and still reports the
+    /// command's own status. One that ends outside a shutdown gets no notice.
+    #[tokio::test]
+    async fn an_exec_ended_by_shutdown_writes_the_notice_to_stderr() {
+        for shutting_down in [true, false] {
+            let (
+                process,
+                MockEndpoints {
+                    stdin_reader: _stdin_reader,
+                    stdout_writer,
+                    mut stderr_writer,
+                    ctrl,
+                },
+            ) = build_mock();
+
+            let (closed_stdin_w, mut bridge_stdin) = duplex(64);
+            drop(closed_stdin_w);
+            let (mut bridge_stdout, _client_stdout) = duplex(64 * 1024);
+            let (mut bridge_stderr, mut client_stderr) = duplex(64 * 1024);
+
+            let bridge_task = tokio::spawn(async move {
+                let exit = bridge_noting_shutdown(
+                    "test",
+                    process,
+                    &mut bridge_stdin,
+                    &mut bridge_stdout,
+                    &mut bridge_stderr,
+                    client_lost(),
+                    || shutting_down,
+                )
+                .await;
+                (exit, bridge_stderr)
+            });
+
+            stderr_writer.write_all(b"err!").await.unwrap();
+            drop(stderr_writer);
+            drop(stdout_writer);
+            // What a box killed by the shutdown reports: 128 + SIGKILL.
+            ctrl.signal_exit(137).await;
+
+            let (exit, bridge_stderr) = bridge_task.await.unwrap();
+            assert_eq!(exit, 137, "the command's own status passes through");
+            drop(bridge_stderr);
+
+            let mut err = Vec::new();
+            client_stderr.read_to_end(&mut err).await.unwrap();
+            let expected: &[u8] = if shutting_down {
+                b"err!minimald is shutting down; the command was stopped\n"
+            } else {
+                b"err!"
+            };
+            assert_eq!(
+                err,
+                expected,
+                "shutting down: {shutting_down}; stderr was {:?}",
+                String::from_utf8_lossy(&err),
+            );
+        }
     }
 
     /// When the SSH-channel write side fails, the bridge must call
