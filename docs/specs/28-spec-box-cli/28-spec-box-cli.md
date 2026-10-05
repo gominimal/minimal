@@ -68,15 +68,15 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
   tier:     T0
   verify:   cargo nextest run -p minimal show_and_prune_dry_run_report_disk
 
-- **BCLI-007** WHEN `min session attach` or `min box resume` targets a stopped or exited box whose spec sets `pty_enabled` THE SYSTEM SHALL resume it as BOX-025 defines.
+- **BCLI-007** WHEN `min box attach`, `min session attach` or `min box resume` targets a stopped or exited box whose spec sets `pty_enabled` THE SYSTEM SHALL resume it as BOX-025 defines.
   <!-- split from BOX-025: which verbs resume; the resume itself stays in BOX -->
   tier:     T0
-  verify:   cargo nextest run -p minimal session_attach_and_box_resume_resume_stopped_session
-  - IF `min session attach` or `min box resume` would resume a box whose spec sets `pty_enabled` and whose name a running box on the same host holds THEN THE SYSTEM SHALL report BOX-025's refusal with exit 2, naming the running box, in the order BOX-025 states. Its hint says to rename the running box with `min box rename`, or to resume this box by its `box_id` after renaming it, and notes that another box may also hold a volume this box declares, which BVOL-013 then refuses with exit 5.
+  verify:   cargo nextest run -p minimal attach_and_resume_verbs_resume_stopped_pty_box
+  - IF `min box attach`, `min session attach` or `min box resume` would resume a box whose spec sets `pty_enabled` and whose name a running box on the same host holds THEN THE SYSTEM SHALL report BOX-025's refusal with exit 2, naming the running box, in the order BOX-025 states. Its hint says to rename the running box with `min box rename`, or to resume this box by its `box_id` after renaming it, and notes that another box may also hold a volume this box declares, which BVOL-013 then refuses with exit 5.
     tier:   T0
     verify: cargo nextest run -p minimal resume_name_conflict_exit2_names_holder
 
-- **BCLI-009** IF `min session attach` or `min box resume` would restart the processes of a stopped or exited box whose spec does not set `pty_enabled` THEN THE SYSTEM SHALL report BOX-030's refusal with exit 2 naming `min task run`, in the order BOX-025 states, so a non-PTY resume whose name a running box holds reports this refusal and not BCLI-007's name hint.
+- **BCLI-009** IF `min box attach`, `min session attach` or `min box resume` would restart the processes of a stopped or exited box whose spec does not set `pty_enabled` THEN THE SYSTEM SHALL report BOX-030's refusal with exit 2 naming `min task run`, in the order BOX-025 states, so a non-PTY resume whose name a running box holds reports this refusal and not BCLI-007's name hint.
   <!-- was the sub-bullet of BOX-030; the refusal itself returned to BOX-030 in cycle 4. Identity re-establishment under enrollment is Gatehouse §6.3.3's and composes with this (see Design reasoning) -->
   tier:     T0
   verify:   cargo nextest run -p minimal resume_non_pty_box_exit2_names_run
@@ -201,18 +201,18 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
     tier:   T0
     verify: cargo nextest run -p minimal session_start_off_tty_exit2_names_detach
 
-- **BCLI-030** THE SYSTEM SHALL provide `min session list|start|attach|stop|rm` and `min task run|list|logs|stop|rm` as aliases of the `min box` forms, filtered to boxes of that type, except `min session attach` (BCLI-032), the one session-specific verb the architecture's Type nouns name, which has no `min box` form.
+- **BCLI-030** THE SYSTEM SHALL provide `min session list|start|attach|stop|rm` and `min task run|list|logs|stop|rm` as aliases of the `min box` forms, filtered to boxes of that type, `min session attach` included (BCLI-032).
   <!-- was BOX-148 -->
   tier:     T0
   verify:   cargo nextest run -p minimal type_noun_verbs_alias_box_forms
 
-- **BCLI-032** WHEN `min session attach <box>` targets a box whose spec sets `pty_enabled` THE SYSTEM SHALL re-attach its PTY.
+- **BCLI-032** WHEN `min session attach <box>` runs THE SYSTEM SHALL behave as `min box attach <box>` (BCLI-068), filtered to boxes of type `session`.
   <!-- was BOX-093 -->
   tier:     T0
-  verify:   cargo nextest run -p minimal session_attach_reattaches_pty_box
-  - IF `min session attach` targets a box without `pty_enabled` THEN THE SYSTEM SHALL fail with exit 2.
+  verify:   cargo nextest run -p minimal session_attach_is_box_attach_filtered_to_sessions
+  - IF `min session attach` targets a box without `pty_enabled` THEN THE SYSTEM SHALL report BCLI-068's refusal for a box without a PTY.
     tier:   T0
-    verify: cargo nextest run -p minimal session_attach_non_pty_exit2
+    verify: cargo nextest run -p minimal session_attach_non_pty_reports_box_attach_refusal
 
 - **BCLI-033** THE SYSTEM SHALL emit `-o json` and `-o jsonl` output under the versioned schemas `min/v1/box`, `min/v1/event` and `min/v1/error`.
   <!-- was BOX-095 -->
@@ -255,9 +255,15 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
   tier:     T0
   verify:   cargo nextest run -p minimal box_show_lists_live_execs
 
-- **BCLI-068** WHEN `min box attach <box> --exec <exec-id>` names a live PTY exec in the box THE SYSTEM SHALL re-attach the caller's terminal to that exec as BOX-149 defines, resolving the exec id against the live exec ids BOX-159 returns.
+- **BCLI-068** WHEN `min box attach <box>` runs without `--exec` against a box whose spec sets `pty_enabled` THE SYSTEM SHALL re-attach the caller's terminal to the box's PTY.
   tier:     T0
-  verify:   cargo nextest run -p minimal box_attach_exec_reattaches_live_pty_exec
+  verify:   cargo nextest run -p minimal box_attach_reattaches_pty_box
+  - IF `min box attach <box>` runs without `--exec` against a box whose spec does not set `pty_enabled` THEN THE SYSTEM SHALL fail with exit 2, naming `min box logs <box>`.
+    tier:   T0
+    verify: cargo nextest run -p minimal box_attach_non_pty_box_exit2_names_logs
+  - WHEN `min box attach <box> --exec <exec-id>` names a live PTY exec in the box THE SYSTEM SHALL re-attach the caller's terminal to that exec as BOX-149 defines, resolving the exec id against the live exec ids BOX-159 returns.
+    tier:   T0
+    verify: cargo nextest run -p minimal box_attach_exec_reattaches_live_pty_exec
   - IF the exec id names no exec in the box THEN THE SYSTEM SHALL fail with exit 4, naming the exec id.
     tier:   T0
     verify: cargo nextest run -p minimal box_attach_exec_unknown_id_exit4_names_id
@@ -375,7 +381,7 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
 
 **The grammar is a sibling of the model.** The owner split the grammar out of BOX on 2026-09-25. The model lands first because the networking and egress-proxy specs bind to the box spec and record, not to verbs, and are blocked until it exists; the grammar is scheduled and reviewed separately; and a client other than the CLI binds to the model, so BOX states its behaviour as operations and this spec maps verbs onto them. Every requirement here was moved from BOX with its text, tier and test, and the comment under each names its BOX id. The exec operations (running the command in the box, client loss, stopping an exec, its events and `exec_enabled`) are daemon behaviour and live in BOX as BOX-149 to BOX-153; BCLI-053, BCLI-055 to BCLI-057 and BCLI-068 are only the verbs and flags that drive them.
 
-**The grammar specifies the long forms; daily shortcuts are design work.** The owner decided on 2026-10-05 that this spec specifies the `min box` verbs and the type nouns, which tie to the domain model, and not the daily shortcuts `min shell`, `min run`, `min attach` and `min ls`, which are user-experience design built on that grammar from design work and user journeys. Requirements whose triggers included a shortcut keep their long-form trigger: `min session attach` for `min attach` (BCLI-007, BCLI-009, BCLI-032) and `min task run` for `min run` (BCLI-010, BCLI-014, BCLI-066). BCLI-008, BCLI-031 and BCLI-065 (`min shell`), BCLI-045 (`min ls`) and BCLI-054 (`min attach --exec`) had no long form and are removed; their numbers stay unused. The owner decided on 2026-10-05 that re-attaching a detached PTY exec gets a long form, `min box attach <box> --exec <exec-id>` (BCLI-068), rather than no verb, because without it a PTY exec whose client left could not be reached again. The aliases for today's spellings (BCLI-042) stay, because they are migration rather than design. The architecture's command tree still names the shortcuts, and dropping that line is an architecture follow-up; the same follow-up adds `min box attach`, which the tree lacks.
+**The grammar specifies the long forms; daily shortcuts are design work.** The owner decided on 2026-10-05 that this spec specifies the `min box` verbs and the type nouns, which tie to the domain model, and not the daily shortcuts `min shell`, `min run`, `min attach` and `min ls`, which are user-experience design built on that grammar from design work and user journeys. Requirements whose triggers included a shortcut keep their long-form trigger: `min box attach` and its filtered form `min session attach` for `min attach` (BCLI-007, BCLI-009, BCLI-032, BCLI-068) and `min task run` for `min run` (BCLI-010, BCLI-014, BCLI-066). BCLI-008, BCLI-031 and BCLI-065 (`min shell`), BCLI-045 (`min ls`) and BCLI-054 (`min attach --exec`) had no long form and are removed; their numbers stay unused. The owner decided on 2026-10-05 that re-attaching a detached PTY exec gets a long form, `min box attach <box> --exec <exec-id>` (BCLI-068), rather than no verb, because without it a PTY exec whose client left could not be reached again. Attach's bare form, `min box attach <box>`, re-attaches the box's own PTY, as every other verb's bare form targets the box, and `min session attach` is its type-noun filtered form (BCLI-032). The aliases for today's spellings (BCLI-042) stay, because they are migration rather than design. The architecture's command tree still names the shortcuts, and dropping that line is an architecture follow-up; the same follow-up adds `min box attach`, bare and with `--exec`, which the tree lacks, with `session attach` as its alias.
 
 **The listing's columns are a floor.** The owner decided on 2026-10-05 that the six columns BCLI-001 names are a minimum: banners and further columns, which today's listing prints, are unconstrained, while the `-o json` schema stays exact so scripts bind to it.
 
