@@ -67,7 +67,18 @@ async fn run() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let registry = tracing_subscriber::registry().with(filter);
+    // OTel export (opt-in: MINIMAL_TELEMETRY=1 plus an OTLP endpoint; see
+    // mlog::otel): the layers are None when off and carry their own
+    // info-level filter when on; the console keeps its own filter, with the
+    // OTel SDK's errors silenced.
+    mlog::otel::init("minimal-cli");
+    // A CLI lives for one command: its exit flush is short, so a collector
+    // that is down or silent never shows in a command's wall time.
+    mlog::otel::set_exit_flush(mlog::otel::CLI_EXIT_FLUSH);
+    let filter = mlog::otel::quiet(filter);
+    let registry = tracing_subscriber::registry()
+        .with(mlog::otel::span_layer())
+        .with(mlog::otel::log_layer());
     // `min dash` owns the terminal (alternate screen); a log line landing on
     // stdout/stderr would corrupt the frame. Log to <state>/dash.log
     // instead, discarding if the state dir can't be written.
@@ -97,25 +108,37 @@ async fn run() -> ExitCode {
             }
         };
         registry
-            .with(fmt::layer().with_writer(log).with_ansi(false))
+            .with(
+                fmt::layer()
+                    .with_writer(log)
+                    .with_ansi(false)
+                    .with_filter(filter),
+            )
             .init();
     } else if stdout_is_data_contract(&cli.command) {
         registry
-            .with(console_layer(
-                std::io::stderr,
-                std::io::stderr().is_terminal(),
-                !rust_log_set,
-            ))
+            .with(
+                console_layer(
+                    std::io::stderr,
+                    std::io::stderr().is_terminal(),
+                    !rust_log_set,
+                )
+                .with_filter(filter),
+            )
             .init();
     } else {
         registry
-            .with(console_layer(
-                ot::StderrWriter::new,
-                std::io::stderr().is_terminal(),
-                !rust_log_set,
-            ))
+            .with(
+                console_layer(
+                    ot::StderrWriter::new,
+                    std::io::stderr().is_terminal(),
+                    !rust_log_set,
+                )
+                .with_filter(filter),
+            )
             .init();
     }
+    mlog::otel::report_init();
 
     // The output mode the run is under, read before the CLI is consumed:
     // the error path keys on it (below), so a machine-output run answers a
@@ -126,7 +149,11 @@ async fn run() -> ExitCode {
     // pipe from any other command (e.g. a daemon socket) is a real failure.
     let quiet_on_closed_pipe = matches!(cli.command, Some(minimal::Command::Version));
 
-    if let Err(e) = minimal::run(cli).await {
+    let result = minimal::run(cli).await;
+    // Flush exported telemetry (bounded; a no-op when export is off). What
+    // the bound cuts off is in the spool already.
+    mlog::otel::shutdown(mlog::otel::CLI_EXIT_FLUSH);
+    if let Err(e) = result {
         // A task's non-zero exit (`min task run`) is a status to relay, not
         // an error to print — the task's own output already streamed through
         // (the git-remote helper's ExitCode precedent).

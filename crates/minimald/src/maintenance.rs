@@ -117,7 +117,14 @@ impl Maintenance {
                     None => break,
                     Some(MaintenanceMessage::CleanNow { older_than, events, responder }) => {
                         let older_than = older_than.unwrap_or(UNUSED_FOR);
-                        let report = clean(&self.state, older_than, events).await;
+                        // A clean is daemon-internal work: give it a span of its own, so the
+                        // session-manager messages it sends (List, then GetSession per active
+                        // session) are its children instead of a root trace each.
+                        let report = tracing::Instrument::instrument(
+                            clean(&self.state, older_than, events),
+                            tracing::info_span!("maintenance.clean", trigger = "request"),
+                        )
+                        .await;
                         // The trim finishes before the caller is answered: a
                         // reply means the whole reclaim is done, on the host's
                         // disk as well as inside the guest. Answering early
@@ -138,7 +145,11 @@ impl Maintenance {
                     // Nobody is waiting on this one; `clean` logged the outcome.
                     // The trim runs regardless of the clean's outcome, so a
                     // failed sweep does not strand earlier-freed extents.
-                    let _report = clean(&self.state, UNUSED_FOR, None).await;
+                    let _report = tracing::Instrument::instrument(
+                        clean(&self.state, UNUSED_FOR, None),
+                        tracing::info_span!("maintenance.clean", trigger = "tick"),
+                    )
+                    .await;
                     trim_state_volume_if_mounted(&self.state).await;
                     next_tick = Instant::now() + CLEAN_INTERVAL;
                     // The clean just trimmed; reset the standalone trim timer
@@ -226,7 +237,12 @@ pub(crate) fn spawn(state: ServerStateHandle, shutdown: CancellationToken) -> Ma
         #[cfg(test)]
         standalone_trims: Default::default(),
     };
-    let abort = tokio::spawn(actor.mainloop()).abort_handle();
+    // Lives until shutdown: a root of its own (see `traced::spawn_detached`).
+    let abort = crate::traced::spawn_detached(
+        tracing::info_span!(parent: None, "maintenance"),
+        actor.mainloop(),
+    )
+    .abort_handle();
 
     MaintenanceHandle { sender, abort }
 }
@@ -266,7 +282,7 @@ async fn clean(
     let daemon_ctx = state.daemon_context().await;
     let cache = daemon_ctx.local_cache();
     let (tx, rx) = event_chan::unbounded();
-    let renderer = tokio::spawn(log_events(rx, relay));
+    let renderer = crate::traced::spawn(log_events(rx, relay));
 
     let op = CleanCache {
         older_than,
@@ -288,7 +304,7 @@ async fn clean(
     // error is rendered in there too — `op::Error` is a large enum, and only
     // its message crosses back.
     let result =
-        tokio::task::spawn_blocking(move || op.run(&cache).map_err(|e| e.to_string())).await;
+        crate::traced::spawn_blocking(move || op.run(&cache).map_err(|e| e.to_string())).await;
     let _ = renderer.await;
 
     match result {
@@ -345,7 +361,7 @@ async fn trim_state_volume_if_mounted(state: &ServerStateHandle) {
     let mountpoint = state.minimal_state_dir().await;
     // `FITRIM` walks the whole filesystem's block groups; like the clean
     // itself, that belongs on the blocking pool.
-    let trim = tokio::task::spawn_blocking(move || {
+    let trim = crate::traced::spawn_blocking(move || {
         crate::guest::trim_state_volume(mountpoint.as_utf8_path().as_str())
     });
     match trim.await {
@@ -517,7 +533,7 @@ mod tests {
             shutdown: shutdown.clone(),
             standalone_trims: standalone_trims.clone(),
         };
-        let task = tokio::spawn(actor.mainloop());
+        let task = crate::traced::spawn(actor.mainloop());
 
         // The paused clock auto-advances while the runtime is idle, so this
         // walks virtual time forward until the arm has fired twice. The next
@@ -534,5 +550,79 @@ mod tests {
 
         shutdown.cancel();
         task.await.unwrap();
+    }
+
+    /// TEL-027: a periodic clean (the timer's, nobody asked)
+    /// runs in a root of its own: `maintenance.clean` under the actor's
+    /// `maintenance` span, which has no parent, whatever span was current
+    /// when the daemon started the actor. Time is paused, so the startup
+    /// delay passes at once.
+    #[tokio::test(start_paused = true)]
+    async fn a_periodic_clean_runs_in_a_root_span() {
+        use tracing::Instrument as _;
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let log = crate::test_harness::SpanLog::default();
+        let _g = tracing::subscriber::set_default(tracing_subscriber::registry().with(log.clone()));
+        let (_dir, _state, _maintenance) = daemon().instrument(tracing::info_span!("boot")).await;
+        let ticked = || !log.find("maintenance.clean", "trigger", "tick").is_empty();
+        for _ in 0..20 {
+            if ticked() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        }
+        let clean = log.one("maintenance.clean", "trigger", "tick");
+        let actor = log
+            .parent_of(&clean)
+            .expect("the clean runs in the actor's span");
+        assert_eq!(actor.name, "maintenance");
+        assert!(
+            actor.parent.is_none(),
+            "the actor's span is a root: {actor:?}"
+        );
+    }
+
+    /// TEL-027: a clean a request asked for (`mip cache clean`,
+    /// the CleanCache RPC) runs under the maintenance actor's root too, never
+    /// in the requester's trace: `maintenance.clean` (`trigger=request`) is
+    /// the `maintenance` root's child, and the session lookup it makes starts
+    /// no span in the caller's trace.
+    #[tokio::test]
+    async fn a_requested_clean_runs_under_the_maintenance_root() {
+        use tracing::Instrument as _;
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let log = crate::test_harness::SpanLog::default();
+        let _g = tracing::subscriber::set_default(tracing_subscriber::registry().with(log.clone()));
+        let (_dir, _state, maintenance) = daemon().await;
+        let request = tracing::info_span!(
+            "rpc",
+            trace_id = tracing::field::Empty,
+            span_id = tracing::field::Empty,
+            parent_span_id = tracing::field::Empty,
+        );
+        let ctx = minimald_rpc::trace::TraceContext::parse_traceparent(
+            "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+        );
+        crate::exec::adopt_trace(&request, ctx);
+        maintenance
+            .clean_now(None, None)
+            .instrument(request)
+            .await
+            .unwrap();
+        let clean = log.one("maintenance.clean", "trigger", "request");
+        let actor = log
+            .parent_of(&clean)
+            .expect("the clean runs in the actor's span");
+        assert_eq!(actor.name, "maintenance");
+        assert!(
+            actor.parent.is_none(),
+            "the actor's span is a root: {actor:?}"
+        );
+        let list = log.one("sessions.manager.message", "kind", "List");
+        assert_ne!(
+            list.field("trace_id"),
+            Some("0af7651916cd43dd8448eb211c80319c"),
+            "the clean's session lookup is not in the caller's trace: {list:?}"
+        );
     }
 }

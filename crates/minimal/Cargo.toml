@@ -53,12 +53,14 @@ hex.workspace = true
 # Workspace-declared with `std` only — no runtime feature, the codec is
 # enough; the datagram is this crate's own UdpSocket.
 hickory-proto.workspace = true
-nix.workspace = true
+# `signal`: `min net forward` dies of the SIGTERM it caught (cmd::die_of).
+nix = { workspace = true, features = ["signal"] }
 mctx.workspace = true
 mfile.workspace = true
 minimal-client.workspace = true
 minimal-tui.workspace = true
 minimald-rpc.workspace = true
+mlog.workspace = true
 op.workspace = true
 paths.workspace = true
 # `min diag upload` hands a bundle to the diag portal: two requests, HTTPS.

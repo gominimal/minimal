@@ -154,7 +154,7 @@ async fn stream_diag_bundle(s: &ServerStateHandle, c: &mut RuChannel<Msg>) -> Re
     let (tx, mut rx) = tokio::io::duplex(PIPE_BUF);
     let build = {
         let s = s.clone();
-        tokio::task::spawn(async move { build_bundle(&s, &req, tx).await })
+        crate::traced::spawn(async move { Box::pin(build_bundle(&s, &req, tx)).await })
     };
 
     let mut writer = c.make_writer();
@@ -561,7 +561,7 @@ async fn state_listing<W: BundleSink>(
     // so a wedged filesystem strands a blocking thread and not the worker whose
     // collect_step! timeout is the failsafe.
     let dir = state_dir.to_path_buf();
-    let listing = tokio::task::spawn_blocking(move || {
+    let listing = crate::traced::spawn_blocking(move || {
         diagnostics::listing_pruned(&dir, LISTING_MAX_ENTRIES, is_content_store_entry)
     })
     .await
