@@ -762,6 +762,30 @@ mnl() {
   fi
 }
 
+# mnl hands the staged switch only to a daemon its own call autospawns. A
+# daemon an earlier case spawned some other way (proof_hostnames_recover's
+# pinned `minimald run --detach`) resolves gvproxy without the prefix and
+# falls back to the system path, so every own-IP box it plans fails to spawn.
+# A case that needs a native own-IP box stops whatever daemon it inherits, so
+# its first mnl call autospawns one that carries the switch, the way
+# proof_own_ip's first call does. A no-op where nothing was staged.
+native_switch_daemon() {
+  [ -n "$E2E_NATIVE_SWITCH_DIR" ] || return 0
+  mnl stop --force >/dev/null 2>&1 || true
+}
+
+# Whether an exec gate's failure ($1, its captured output) is the daemon
+# failing to spawn the gvproxy switch, not the host failing to run a sandbox.
+# That fault is never a skip: on a lane with a switch provisioned
+# (E2E_NATIVE_SWITCH) the box was meant to run, so the case fails, naming the
+# switch. Prints the error and returns 0 when it is that fault.
+switch_spawn_fault() {
+  grep -q 'spawning gvproxy' "$1" 2>/dev/null || return 1
+  echo "::error::the daemon could not spawn the gvproxy switch for an own-IP box (E2E_NATIVE_SWITCH='$E2E_NATIVE_SWITCH', E2E_NATIVE_SWITCH_DIR='$E2E_NATIVE_SWITCH_DIR'): the switch is missing from where the daemon looked, not a host that cannot run a sandbox"
+  echo "  (exec: $(head -n1 "$1" 2>/dev/null || true))"
+  return 0
+}
+
 # A case this lane cannot run: one named line, and the case counted in the
 # lane summary as NOT RUN, so a whole-lane pass never hides it.
 # $1: the case. $2: why.
@@ -16148,6 +16172,7 @@ PY
   assert_vm_refuses_dynamic_stance ask "$mnx_allow_name" mnx-ask \
     --dynamic-range "$mnx_lo-$mnx_hi"
   else
+  native_switch_daemon
   MNX_SEED_DIR="$(hook_mktemp /tmp/mnlxe.XXXXXX)"
   hook_seed_preamble > "$MNX_SEED_DIR/minimal.toml"
   mkdir "$MNX_SEED_DIR/.git"
@@ -16169,6 +16194,7 @@ PY
   mnx_can_skip() { [ -z "${CI:-}" ] && [ -z "$E2E_VM" ]; }
   if ! mnl session exec "$mnx_sid" 'true' >"$WORK/mnx-execgate.err" 2>&1 \
      && ! { sleep 1; mnl session exec "$mnx_sid" 'true' >"$WORK/mnx-execgate.err" 2>&1; }; then
+    switch_spawn_fault "$WORK/mnx-execgate.err" && fail
     if mnx_can_skip; then
       echo "::warning::min net expose case SKIPPED — this host cannot run a session sandbox"
       echo "  (exec: $(head -n1 "$WORK/mnx-execgate.err" 2>/dev/null || true))"
@@ -16462,6 +16488,7 @@ proof_listen_published_port_reaches_peer_and_host() {
       --ingress "$lp_ctl_port:$lp_ctl_port" --dynamic-range "$lp_lo-$lp_hi"
     lp_stance="deny"
   fi
+  native_switch_daemon
   LP_SEED_DIR="$(hook_mktemp /tmp/mnllp.XXXXXX)"
   hook_seed_preamble > "$LP_SEED_DIR/minimal.toml"
   mkdir "$LP_SEED_DIR/.git"
@@ -16483,6 +16510,7 @@ proof_listen_published_port_reaches_peer_and_host() {
   lp_can_skip() { [ -z "${CI:-}" ] && [ -z "$E2E_VM" ]; }
   if ! mnl session exec "$lp_sid" 'true' >"$WORK/lp-execgate.err" 2>&1 \
      && ! { sleep 1; mnl session exec "$lp_sid" 'true' >"$WORK/lp-execgate.err" 2>&1; }; then
+    switch_spawn_fault "$WORK/lp-execgate.err" && fail
     if lp_can_skip; then
       echo "::warning::listen-published port case SKIPPED — this host cannot run a session sandbox"
       echo "  (exec: $(head -n1 "$WORK/lp-execgate.err" 2>/dev/null || true))"
@@ -17033,7 +17061,10 @@ proof_expose_from_inside_box() {
   # names the address it bound. The audit log needs no pin: it is a file the
   # daemon appends whatever the filter. This is a native lane by the split
   # above, so its log is this host's (hook_log_readable).
-  mnl stop >/dev/null 2>&1 || true # a standalone run has no daemon yet
+  # --force: an unforced stop refuses while an earlier case's box lives, and
+  # the daemon it leaves up would carry neither this filter nor the switch
+  # prefix mnl hands an autospawn (native_switch_daemon).
+  mnl stop --force >/dev/null 2>&1 || true # a standalone run has no daemon yet
   eib_saved_rust_log="${RUST_LOG:-}"
   export RUST_LOG="warn,minimald::session=info"
   eib_restore_log() {
@@ -17142,6 +17173,7 @@ PY
   eib_can_skip() { [ -z "${CI:-}" ] && [ -z "$E2E_VM" ]; }
   if ! mnl session exec "$eib_allow_sid" 'true' >"$WORK/eib-execgate.err" 2>&1 \
      && ! { sleep 1; mnl session exec "$eib_allow_sid" 'true' >"$WORK/eib-execgate.err" 2>&1; }; then
+    if switch_spawn_fault "$WORK/eib-execgate.err"; then eib_restore_log; fail; fi
     if eib_can_skip; then
       echo "::warning::expose from inside the box case SKIPPED — this host cannot run a session sandbox"
       echo "  (exec: $(head -n1 "$WORK/eib-execgate.err" 2>/dev/null || true))"
