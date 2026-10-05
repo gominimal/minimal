@@ -13,7 +13,16 @@ async-compression.workspace = true
 async-tar.workspace = true
 constcat.workspace = true
 indicatif.workspace = true
+# `libc` is only for the winsize ioctls (TIOCGWINSZ/TIOCSWINSZ) in
+# `tty_relay`: nix has no winsize helpers, and minimald's pty module set
+# the same precedent.
+libc.workspace = true
 minimald-rpc.workspace = true
+# `term` for openpty + termios, `poll` for the relay's poll(2) loop.  nix
+# 0.31 gates its signal API (SigAction/killpg/raise) behind a `signal`
+# feature this task does not add, so the relay wires its SIGWINCH/SIGINT/
+# SIGTERM/SIGHUP handlers over `libc` instead.
+nix = { workspace = true, features = ["term", "poll"] }
 ot.workspace = true
 paths.workspace = true
 russh.workspace = true
