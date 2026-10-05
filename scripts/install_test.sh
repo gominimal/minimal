@@ -1541,7 +1541,7 @@ case_host_classifier_tree_installed() {
 
     cg="$root/cg"                      # the stand-in cgroup2 mountpoint
     tree="$cg/minimald.slice"          # the tree the script installs
-    me="$(id -un)"
+    me="$(id -u)"
 
     # Stand-in mount tables. Field 4 is the mount's root within the
     # filesystem: "/" in the host's initial cgroup namespace, something else
@@ -1817,6 +1817,23 @@ originates is refused" \
     want_ok "check says what stays root-owned" grep -q "stays root-owned" "$OUT"
     want_ok "check reports the table's marker" grep -q "classifier-table" "$OUT"
     want_ok "check reports the recorded ct-mark mask" grep -q "ct-mark:  0x30000000" "$OUT"
+
+    # --user takes an account name too, resolved to the same uid and group;
+    # only when the caller's uid has a passwd entry to name it by (a cross
+    # container runs as the host's uid, which has none).
+    if me_name="$(id -un 2>/dev/null)"; then
+        run_hc named_check "$root/mi-on" --check --user "$me_name"
+        check 0 "$rc" "check by account name verifies the same delegation"
+    fi
+
+    # A numeric uid that is neither an account nor the caller has no group
+    # to delegate to: refused, never handed the caller's group.
+    stranger=4000000000
+    if ! id -g "$stranger" >/dev/null 2>&1 && [ "$stranger" != "$(id -u)" ]; then
+        run_hc stranger_check "$root/mi-on" --check --user "$stranger"
+        check 1 "$rc" "check refuses a numeric uid with no account behind it"
+        want_ok "the refusal names the uid" grep -q "no account with uid $stranger" "$OUT"
+    fi
 
     # --- A re-install whose transaction dies leaves no marker: the step
     # removes it before the load and writes it only after, so the daemon
