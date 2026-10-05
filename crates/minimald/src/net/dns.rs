@@ -370,8 +370,26 @@ struct OwnPublished {
     ports: BTreeSet<u16>,
     /// The ports of `ports` another box at the same address held first: the
     /// box yields them (first-come), so its attach binds no forward for
-    /// them and the box stays usable.
-    yielded: Vec<SharedPortCollision>,
+    /// them and the box stays usable — each with its holder's stable id,
+    /// because a yield is a snapshot of its own publish and stands only
+    /// while its holder still holds the port at this address
+    /// ([`HostnameRegistry::yield_stands`]): a holder destroyed, or moved
+    /// to an address of its own, hands the port of record back to the box
+    /// that yielded, so no stale yield masks the port's next collision.
+    yielded: Vec<YieldedPort>,
+}
+
+/// A port a box yields at its shared address (NET-129, first-come), with
+/// the stable id of the box that held it when the yield was recorded — the
+/// half a later read needs: the holder's publish may be gone by then, and
+/// only the id tells a yield that still stands from one whose holder was
+/// destroyed, or moved to an address of its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct YieldedPort {
+    /// The port both boxes publish at.
+    port: u16,
+    /// The session whose box held the port when the yield was recorded.
+    holder: SessionId,
 }
 
 /// A same-address port collision a publish found (NET-129): a port two boxes
@@ -979,6 +997,11 @@ impl HostnameRegistry {
     /// later box ([`Self::shared_port_collisions`]), so its attach skips the
     /// yielded forwards instead of failing on a bind the forwarder refuses,
     /// and a re-publish of the holder does not turn the collision around.
+    /// First-come holds only while the holder's publish stands: a holder
+    /// destroyed, or moved to an address of its own, vacates the yields it
+    /// was recorded with, so the box that yielded holds the port of record
+    /// again — its next attach binds the port, and the next box to publish
+    /// it collides with *it* instead of binding over its name unreported.
     pub fn publish_own_address(
         &mut self,
         session_id: SessionId,
@@ -986,7 +1009,14 @@ impl HostnameRegistry {
         address: Ipv4Addr,
         ports: BTreeSet<u16>,
     ) -> Vec<SharedPortCollision> {
-        let collisions = self.own_address_collisions(session_id, address, &ports);
+        let yielded = self.own_address_collisions(session_id, address, &ports);
+        let collisions = yielded
+            .iter()
+            .map(|y| SharedPortCollision {
+                port: y.port,
+                other: self.own_holder_name(y.holder),
+            })
+            .collect::<Vec<_>>();
         for collision in &collisions {
             tracing::warn!(
                 session_id = %session_id,
@@ -1003,7 +1033,7 @@ impl HostnameRegistry {
             OwnPublished {
                 address,
                 ports,
-                yielded: collisions.clone(),
+                yielded,
             },
         );
         collisions
@@ -1011,46 +1041,94 @@ impl HostnameRegistry {
 
     /// The ports a box yields at its shared address, each with the box that
     /// holds it (NET-129, first-come): the collisions its last publish
-    /// recorded. Empty for a box with no publish, or one that holds every
-    /// port it declares. The attach path skips these forwards, and the
-    /// session reports them.
+    /// recorded, of the ones that still stand — a holder whose publish is
+    /// gone (destroyed, or moved to an address of its own) has handed the
+    /// port back, so the yield stops counting and the box's attach binds
+    /// the port instead of skipping it. Empty for a box with no publish, or
+    /// one that holds every port it declares. The attach path skips these
+    /// forwards, and the session reports them.
     #[must_use]
     pub fn shared_port_collisions(&self, session_id: SessionId) -> Vec<SharedPortCollision> {
         self.own_published
             .get(&session_id)
-            .map(|own| own.yielded.clone())
+            .map(|own| {
+                own.yielded
+                    .iter()
+                    .filter(|y| self.yield_stands(y, own.address))
+                    .map(|y| SharedPortCollision {
+                        port: y.port,
+                        other: self.own_holder_name(y.holder),
+                    })
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
     /// The collision list between `session_id`/address/ports and every other
-    /// recorded own-address publish sharing the same address and a port.
-    /// A port another box itself yields is not held by that box, so it is no
-    /// collision: the holder stays the holder when it publishes again.
+    /// recorded own-address publish sharing the same address and a port,
+    /// each with the holder's stable id. A port another box itself yields
+    /// is not held by that box, so it is no collision — but only a yield
+    /// that still stands says so ([`Self::yields_port_standing`]): the
+    /// holder stays the holder when it publishes again, and a box whose
+    /// holder's publish is gone holds the port of record itself, so the
+    /// collision is reported against it, never masked.
     fn own_address_collisions(
         &self,
         session_id: SessionId,
         address: Ipv4Addr,
         ports: &BTreeSet<u16>,
-    ) -> Vec<SharedPortCollision> {
+    ) -> Vec<YieldedPort> {
         self.own_published
             .iter()
             .filter(|(other, own)| **other != session_id && own.address == address)
             .flat_map(|(other, own)| {
-                let other_name = self
-                    .by_session
-                    .values()
-                    .find(|registration| registration.id == *other)
-                    .map(|registration| registration.hostname.to_string())
-                    .unwrap_or_else(|| other.to_string());
                 own.ports
                     .intersection(ports)
-                    .filter(|port| !own.yielded.iter().any(|y| y.port == **port))
-                    .map(move |port| SharedPortCollision {
+                    .filter(|port| !self.yields_port_standing(own, **port))
+                    .map(move |port| YieldedPort {
                         port: *port,
-                        other: other_name.clone(),
+                        holder: *other,
                     })
             })
             .collect()
+    }
+
+    /// Whether `own`'s publish still yields `port` to the box that held it
+    /// (NET-129, first-come): a recorded yield counts only while it stands
+    /// ([`Self::yield_stands`]). The holder's own re-publish is the case the
+    /// answer exists for — the holder must stay the holder beside a box
+    /// still yielding to it — and a holder whose publish is gone is the
+    /// case it closes: the box that yielded holds the port of record again,
+    /// so the port's next collision is reported against it instead of a
+    /// stale yield masking it and letting a third box bind over a name that
+    /// still claims the port.
+    fn yields_port_standing(&self, own: &OwnPublished, port: u16) -> bool {
+        own.yielded
+            .iter()
+            .any(|y| y.port == port && self.yield_stands(y, own.address))
+    }
+
+    /// Whether the holder a yield records still holds the port it names:
+    /// its publish still stands at the yielder's address and still declares
+    /// the port. A yield is a snapshot of its own publish, and this is the
+    /// check that keeps it honest between publishes — the holder's destroy
+    /// ([`Self::unpublish_own_address`]) or its move to an address of its
+    /// own is the moment a yield stops standing, without waiting for the
+    /// box that yielded to publish again.
+    fn yield_stands(&self, y: &YieldedPort, at: Ipv4Addr) -> bool {
+        self.own_published
+            .get(&y.holder)
+            .is_some_and(|holder| holder.address == at && holder.ports.contains(&y.port))
+    }
+
+    /// The name a collision report names its other box by: its current
+    /// registered box name, or its stable id when nothing answers for it.
+    fn own_holder_name(&self, holder: SessionId) -> String {
+        self.by_session
+            .values()
+            .find(|registration| registration.id == holder)
+            .map(|registration| registration.hostname.to_string())
+            .unwrap_or_else(|| holder.to_string())
     }
 
     /// The address a session's box publishes at, if it has one — for the
@@ -1078,7 +1156,12 @@ impl HostnameRegistry {
     /// whose publish is gone stops answering at the address: its name is
     /// withdrawn by [`Self::deregister`] in the same deregister. The box's
     /// recorded hand goes with the publish: a landing's sweep must not find
-    /// a hand for a box that no longer exists.
+    /// a hand for a box that no longer exists. The ports it held are
+    /// handed back with it: a yield stands only on its holder's publish
+    /// ([`Self::yield_stands`]), so every box still yielding one of them to
+    /// this box holds that port of record again — the collision a third box
+    /// publishing it reads is against the yielder, and the yielder's next
+    /// attach binds the port instead of skipping it.
     pub fn unpublish_own_address(&mut self, session_id: SessionId) -> Option<Ipv4Addr> {
         self.stopped.remove(&session_id);
         self.hands.remove(&session_id);
@@ -2896,6 +2979,135 @@ mod tests {
         // The box's publish going away takes its record with it.
         reg.unpublish_own_address(second);
         assert!(reg.shared_port_collisions(second).is_empty());
+    }
+
+    /// NET-129's first-come holds only while the holder's publish stands:
+    /// a yield is a snapshot of its own publish, and a holder's destroy
+    /// never touches the yielder's record, so a yield left standing on a
+    /// destroyed holder would mask the port's next collision. The ports the
+    /// holder was destroyed holding return to the boxes that yielded them:
+    /// they hold them of record again, so a third box publishing one
+    /// collides with *the yielder*, is reported, and its attach skips the
+    /// forward — a stale yield would instead mask the collision, let the
+    /// third box bind a forward over a name that still claims the port, and
+    /// leave the yielder serving nothing.
+    #[test]
+    fn a_destroyed_holder_hands_the_yielded_port_back_to_the_yielder() {
+        let node = Ipv4Addr::new(127, 0, 64, 200);
+        let mut reg = HostnameRegistry::new("dev", false).with_node_address(node);
+        let first = id("1");
+        let second = id("2");
+        let third = id("3");
+        let port = BTreeSet::from([8080u16]);
+
+        // The shared address as the PR leaves it: `first` holds 8080,
+        // `second` yielded it.
+        reg.publish_own_address(first, "first", node, port.clone());
+        reg.register_own_ip(first, "first", port.clone());
+        assert_eq!(
+            reg.publish_own_address(second, "second", node, port.clone()),
+            vec![SharedPortCollision {
+                port: 8080,
+                other: "first.min.internal".to_string(),
+            }],
+            "the later box yields the port the first box holds"
+        );
+        reg.register_own_ip(second, "second", port.clone());
+
+        // The holder is destroyed while the yielder is still registered. Its
+        // publish is gone, so the yield that named it stops standing: the
+        // yielder holds the port of record again and reports no yield.
+        reg.unpublish_own_address(first);
+        assert!(
+            reg.shared_port_collisions(second).is_empty(),
+            "a yield to a destroyed holder stops counting: the yielder \
+             holds the port of record again, so its next attach binds it"
+        );
+
+        // The third box publishes the same port: the collision is with the
+        // yielder — reported, never masked by the yield it no longer
+        // stands on — and the third box yields in turn.
+        assert_eq!(
+            reg.publish_own_address(third, "third", node, port.clone()),
+            vec![SharedPortCollision {
+                port: 8080,
+                other: "second.min.internal".to_string(),
+            }],
+            "the third box collides with the box that yielded, not with \
+             the box the stale yield still named"
+        );
+        reg.register_own_ip(third, "third", port.clone());
+        assert_eq!(
+            reg.shared_port_collisions(third),
+            vec![SharedPortCollision {
+                port: 8080,
+                other: "second.min.internal".to_string(),
+            }],
+            "the third box records its yield against the live claimant"
+        );
+
+        // The yielder publishes again: it holds the port now — the third
+        // box yields to it — so it neither yields nor collides, and its
+        // next attach binds the forward the holder's destroy freed.
+        assert!(
+            reg.publish_own_address(second, "second", node, port.clone())
+                .is_empty(),
+            "the box that yielded to the destroyed holder holds the port \
+             of record and collides with nothing"
+        );
+    }
+
+    /// The other half of the same rule: a holder that *moves* to an address
+    /// of its own — the present landing's sweep off the `127.0.0.1`
+    /// interim — takes the yields it was recorded with it, exactly as a
+    /// destroy does. The box left at the shared address holds the port of
+    /// record again, so the next box to publish it there collides with it
+    /// and yields, instead of a stale yield masking the collision.
+    #[test]
+    fn a_holder_moved_to_its_own_address_hands_the_yielded_port_back() {
+        let node = Ipv4Addr::new(127, 0, 64, 200);
+        let mut reg = HostnameRegistry::new("dev", false).with_node_address(node);
+        let first = id("1");
+        let second = id("2");
+        let third = id("3");
+        let port = BTreeSet::from([8080u16]);
+
+        // Two boxes at the shared address: the first holds the port, the
+        // second yields it.
+        reg.publish_own_address(first, "first", node, port.clone());
+        reg.register_own_ip(first, "first", port.clone());
+        assert_eq!(
+            reg.publish_own_address(second, "second", node, port.clone()),
+            vec![SharedPortCollision {
+                port: 8080,
+                other: "first.min.internal".to_string(),
+            }]
+        );
+        reg.register_own_ip(second, "second", port.clone());
+
+        // The holder moves to an address of its own — the sweep's re-publish
+        // at the hand, a destroy's equal for everything left behind.
+        assert!(
+            reg.publish_own_address(first, "first", Ipv4Addr::new(127, 0, 64, 9), port.clone())
+                .is_empty(),
+            "a publish at an address of its own collides with nothing"
+        );
+        assert!(
+            reg.shared_port_collisions(second).is_empty(),
+            "the yield's holder no longer publishes at this address, so \
+             the yield stops standing and the box holds the port of record"
+        );
+
+        // The third box publishing the port at the shared address collides
+        // with the box the move left holding it, and yields.
+        assert_eq!(
+            reg.publish_own_address(third, "third", node, port),
+            vec![SharedPortCollision {
+                port: 8080,
+                other: "second.min.internal".to_string(),
+            }],
+            "the moved holder's stale yield does not mask the live claim"
+        );
     }
 
     /// The deprecated three-label form resolves to the same entry as the
