@@ -2011,6 +2011,14 @@ async fn a_failing_activate_hook_blocks_the_session() {
         error.contains("test"),
         "the error should name where the hook was declared: {error}",
     );
+    assert!(
+        error.contains("exited with status 3"),
+        "the error should describe the failure in words: {error}",
+    );
+    assert!(
+        !error.contains("Failed {"),
+        "the error should not leak debug formatting: {error}",
+    );
     // The gate that matters: not attachable.
     assert_ne!(
         record_status(&mut client, id).await,

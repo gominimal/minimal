@@ -157,6 +157,25 @@
 #                                    declaration — and answers the
 #                                    no-row marker within 20 s of the
 #                                    box's destroy
+#   expose_from_inside_box
+#                                    NET-043/045/046/047: 'min net expose
+#                                    3000' from inside the box, every stance
+#                                    end to end — allow publishes at the
+#                                    address the daemon's expose record
+#                                    names (the pending contract pinned:
+#                                    bound and listed, honestly not yet
+#                                    reachable, T97's to flip), ask routes
+#                                    its dialog to a human attached through
+#                                    a real pty and publishes on their
+#                                    Allow, records nothing on their deny,
+#                                    fails closed with its own typed error
+#                                    when nobody is attached, deny refuses
+#                                    with the stance's own words, and every
+#                                    decision carries its line in the
+#                                    daemon's audit log; a VM lane runs the
+#                                    allow legs through the VM host daemon's
+#                                    admission (T94) and asserts the ask
+#                                    create's typed refusal instead (T96)
 #   proxy_refuses_like_direct        the proxy refuses exactly as the switch
 #                                    does: paired direct/proxied attempts,
 #                                    h2 closed, h2c stripped (NET-069..071, 135)
@@ -347,6 +366,7 @@ RANGE_RESOLVER_BEFORE="" # the resolver file's prior bytes, when it had any; res
 ANSWERER_SERVICE_CHANNEL="" # set when a proof ran an advisory that installs the answerer service: its channel path; gates the service teardown
 BN_SEED_DIR="" # seeded by the browser-path proof below; removed on teardown
 E2E_NOT_RUN="" # the cases this lane could not run, named by `not_run`; the lane summary counts them
+E2E_KNOWN_GAP="" # the checks carried against a known product gap, named by `known_gap`; counted likewise
 ASR_SEED_DIR="" # seeded by the answerer-service proof below; removed on teardown
 ASR_STATE2_DIR="" # that proof's second node's state base; stopped on teardown
 ASR_REVERT_LINK="" # the link that proof's advisory pointed the host resolver at; reverted on teardown
@@ -511,8 +531,14 @@ chmod 700 "$XDG_RUNTIME_DIR"
 # that variable means "a VM-style switch on the default 100.64/16 is wired",
 # and the proofs gated on it hardcode that subnet's reserved addresses,
 # while a native minimald runs a per-daemon /24 (minimald server.rs,
-# switch_subnet_for). Only proof_own_ip and
-# proof_own_ip_egress_declared_and_enforced accept this signal. Nor is
+# switch_subnet_for). The own-IP proofs and the runtime-publish proofs
+# accept this signal: proof_own_ip,
+# proof_own_ip_egress_declared_and_enforced,
+# proof_min_net_expose_publishes_lists_and_refuses,
+# proof_listen_published_port_reaches_peer_and_host and
+# proof_expose_from_inside_box — the latter three taking the switch's own
+# address from the daemon's expose record or its answer, never from the
+# 100.64/16 constants a VM switch guarantees. Nor is
 # MINIMAL_BIN exported: every MINIMAL_BIN in this file is call-local by
 # design (the browser-path proof reads the lane's own prefix), so mnl
 # hands the staged dir to the autospawned daemon per call instead. VM
@@ -753,12 +779,46 @@ mnl() {
   fi
 }
 
+# mnl hands the staged switch only to a daemon its own call autospawns. A
+# daemon an earlier case spawned some other way (proof_hostnames_recover's
+# pinned `minimald run --detach`) resolves gvproxy without the prefix and
+# falls back to the system path, so every own-IP box it plans fails to spawn.
+# A case that needs a native own-IP box stops whatever daemon it inherits, so
+# its first mnl call autospawns one that carries the switch, the way
+# proof_own_ip's first call does. A no-op where nothing was staged.
+native_switch_daemon() {
+  [ -n "$E2E_NATIVE_SWITCH_DIR" ] || return 0
+  mnl stop --force >/dev/null 2>&1 || true
+}
+
+# Whether an exec gate's failure ($1, its captured output) is the daemon
+# failing to spawn the gvproxy switch, not the host failing to run a sandbox.
+# That fault is never a skip: on a lane with a switch provisioned
+# (E2E_NATIVE_SWITCH) the box was meant to run, so the case fails, naming the
+# switch. Prints the error and returns 0 when it is that fault.
+switch_spawn_fault() {
+  grep -q 'spawning gvproxy' "$1" 2>/dev/null || return 1
+  echo "::error::the daemon could not spawn the gvproxy switch for an own-IP box (E2E_NATIVE_SWITCH='$E2E_NATIVE_SWITCH', E2E_NATIVE_SWITCH_DIR='$E2E_NATIVE_SWITCH_DIR'): the switch is missing from where the daemon looked, not a host that cannot run a sandbox"
+  echo "  (exec: $(head -n1 "$1" 2>/dev/null || true))"
+  return 0
+}
+
 # A case this lane cannot run: one named line, and the case counted in the
 # lane summary as NOT RUN, so a whole-lane pass never hides it.
 # $1: the case. $2: why.
 not_run() {
   echo "$1: NOT RUN ($2)"
   E2E_NOT_RUN="$E2E_NOT_RUN $1"
+}
+
+# A check a case carries against a known product gap: one named line citing
+# the issue that closes it, and the gap counted in the lane summary as KNOWN
+# GAP, so a whole-lane pass never hides it. The check turns into a hard
+# assertion when that issue lands.
+# $1: the case. $2: what is missing, with the issue.
+known_gap() {
+  echo "$1: KNOWN GAP ($2)"
+  E2E_KNOWN_GAP="$E2E_KNOWN_GAP $1"
 }
 
 teardown() {
@@ -4219,6 +4279,10 @@ if [ -n "${MINVMD_GVPROXY_BIN:-}" ] && [ -x "$MINVMD_GVPROXY_BIN" ]; then
   fi_gvproxy="$MINVMD_GVPROXY_BIN"
 elif [ -x "$ROOT/.scratch/gvproxy" ]; then
   fi_gvproxy="$ROOT/.scratch/gvproxy"
+elif [ -x "$WORK/gvproxy-bin/gvproxy-min" ]; then
+  # The native lane's provisioning already staged the same pinned switch
+  # (same lock) at the top of this run — the fetch is once per run.
+  fi_gvproxy="$WORK/gvproxy-bin/gvproxy-min"
 else
   mkdir -p "$WORK/fresh-install"
   if ! "$ROOT/scripts/fetch-gvproxy.sh" "$WORK/fresh-install/gvproxy" \
@@ -6258,6 +6322,122 @@ echo "::endgroup::"
 }
 
 # ---------------------------------------------------------------------------
+# Terminal relay proof (every lane). The interactive attach no longer hands
+# the user's terminal to ssh: the client keeps it, in ssh's own raw set, and
+# relays it to ssh through a local pty. Nothing a user does at an attached
+# terminal may notice. Each attach below runs through a REAL pty
+# (scripts/e2e-attach-pty.py), on a session of its own:
+#   1. a resize while attached is what `stty size` reports in the session,
+#      then the detach chord detaches,
+#   2. a re-attach finds the session, a large paste arrives intact and in
+#      order (checksummed on both sides), and the session-exit prompt still
+#      answers ("keep"),
+#   3. killing the ssh transport mid-attach (the `min proxy` ProxyCommand,
+#      as a dropped connection) exits 255 and leaves the terminal's termios
+#      (its `stty -g`) exactly as it was before the attach,
+#   4. the session outlives the drop, and the exit prompt answers "Delete".
+proof_tty_relay() {
+echo "::group::terminal relay (resize, paste, detach + re-attach, transport drop, exit prompt)"
+local relay_sid relay_out relay_paste relay_sum
+# shellcheck disable=SC2086
+relay_sid="$(cd "$PROJECT_DIR" && mnl session activate . --name e2e-relay ${E2E_ACTIVATE_ARGS:-} 2>"$WORK/relay-activate.err")" || {
+  echo "::error::activation for the terminal relay proof failed"
+  echo "--- stderr ---"; cat "$WORK/relay-activate.err" 2>/dev/null || true
+  fail
+}
+relay_sid="$(printf '%s\n' "$relay_sid" | tail -n1 | tr -d '\r')"
+
+# 1. Resize, then the detach chord. The typed line echoes as
+# `RELAY_SIZE[%s]`; only the shell's output carries the size itself.
+# shellcheck disable=SC2016 # `$(stty size)` must run in the SESSION's shell.
+# shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
+relay_out="$(E2E_PTY_COMMANDS='echo RELAY_READY' E2E_PTY_SIZE='24 80' E2E_PTY_RESIZE='41 117' \
+  E2E_PTY_AFTER='printf "RELAY_SIZE[%s]\n" "$(stty size)"' E2E_PTY_DETACH=1 \
+  python3 "$ROOT/scripts/e2e-attach-pty.py" - \
+  min ${E2E_MINIMAL_ARGS:-} session attach "$relay_sid" 2>"$WORK/relay-resize.err")" || {
+  echo "::error::the resize-and-detach attach through the relay failed"
+  echo "--- transcript ---"; printf '%s\n' "$relay_out"
+  echo "--- stderr ---"; cat "$WORK/relay-resize.err" 2>/dev/null || true
+  fail
+}
+if [[ "$relay_out" != *"RELAY_SIZE[41 117]"* ]]; then
+  echo "::error::a resize of the attached terminal did not reach the session's 'stty size'"
+  echo "--- transcript ---"; printf '%s\n' "$relay_out"
+  fail
+fi
+if ! mnl ls --raw 2>/dev/null | grep -Fqx "$relay_sid"; then
+  echo "::error::the session is gone after the detach chord"
+  fail
+fi
+echo "resize reached the session; the detach chord detached"
+
+# 2. Re-attach, paste ~140 KB of numbered lines into `cat`, end it with
+# ctrl-D, and compare checksums. The paste is written while the session's
+# echo is read, as a terminal emulator would.
+relay_paste="$WORK/relay-paste.txt"
+for i in $(seq 1 2000); do
+  printf 'RELAY_PASTE %05d the quick brown fox jumps over the lazy dog %05d\n' "$i" "$i"
+done >"$relay_paste"
+relay_sum="$(cksum <"$relay_paste" | tr -s ' ')"
+# shellcheck disable=SC2016 # `$(cksum ...)` must run in the SESSION's shell.
+# shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
+relay_out="$(E2E_PTY_COMMANDS='cat > /home/relay-paste' E2E_PTY_PASTE_FILE="$relay_paste" \
+  E2E_PTY_AFTER="$(printf '\004')"'printf "PASTE_SUM[%s]\n" "$(cksum < /home/relay-paste | tr -s " ")"
+exit' E2E_PTY_ANSWER=keep \
+  python3 "$ROOT/scripts/e2e-attach-pty.py" - \
+  min ${E2E_MINIMAL_ARGS:-} session attach "$relay_sid" 2>"$WORK/relay-paste.err")" || {
+  echo "::error::the paste attach through the relay failed"
+  echo "--- transcript (tail) ---"; printf '%s\n' "$relay_out" | tail -n 40
+  echo "--- stderr ---"; cat "$WORK/relay-paste.err" 2>/dev/null || true
+  fail
+}
+if [[ "$relay_out" != *"PASTE_SUM[$relay_sum]"* ]]; then
+  echo "::error::a large paste did not arrive intact and in order (want cksum '$relay_sum')"
+  echo "--- transcript (tail) ---"; printf '%s\n' "$relay_out" | tail -n 40
+  fail
+fi
+if ! mnl ls --raw 2>/dev/null | grep -Fqx "$relay_sid"; then
+  echo "::error::the session is gone after answering the exit prompt with 'keep'"
+  fail
+fi
+echo "re-attach found the session; a $(wc -c <"$relay_paste" | tr -d ' ')-byte paste arrived intact; the exit prompt answered"
+
+# 3. Kill the transport mid-attach.
+# shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
+relay_out="$(E2E_PTY_COMMANDS='echo RELAY_BEFORE_DROP' E2E_PTY_KILL_TRANSPORT=1 E2E_PTY_EXPECT_EXIT=255 \
+  python3 "$ROOT/scripts/e2e-attach-pty.py" - \
+  min ${E2E_MINIMAL_ARGS:-} session attach "$relay_sid" 2>"$WORK/relay-drop.err")" || {
+  echo "::error::the transport-drop attach did not exit 255"
+  echo "--- transcript ---"; printf '%s\n' "$relay_out"
+  echo "--- stderr ---"; cat "$WORK/relay-drop.err" 2>/dev/null || true
+  fail
+}
+if [[ "$relay_out" != *OUTER_STTY_UNCHANGED* ]]; then
+  echo "::error::a dropped transport left the terminal's termios changed"
+  echo "--- transcript ---"; printf '%s\n' "$relay_out"
+  fail
+fi
+echo "a dropped transport exited 255 and left the terminal's stty -g unchanged"
+
+# 4. The session outlived the drop; leave it through the exit prompt.
+# shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
+relay_out="$(E2E_PTY_COMMANDS='echo RELAY_AFTER_DROP
+exit' python3 "$ROOT/scripts/e2e-attach-pty.py" - \
+  min ${E2E_MINIMAL_ARGS:-} session attach "$relay_sid" 2>"$WORK/relay-exit.err")" || {
+  echo "::error::the attach after the transport drop failed"
+  echo "--- transcript ---"; printf '%s\n' "$relay_out"
+  echo "--- stderr ---"; cat "$WORK/relay-exit.err" 2>/dev/null || true
+  fail
+}
+if mnl ls --raw 2>/dev/null | grep -Fqx "$relay_sid"; then
+  echo "::error::session $relay_sid still listed after answering 'Delete' at the exit prompt"
+  fail
+fi
+echo "terminal relay OK"
+echo "::endgroup::"
+}
+
+# ---------------------------------------------------------------------------
 # Session-sandbox proof (every lane). Everything above proves the lifecycle;
 # this forks a real sandbox and proves the in-sandbox `min add`. A session is
 # interactive by design, so we drive it like a real user through a REAL pty
@@ -7778,6 +7958,10 @@ proof_box_name_resolves_natively_without_proxy() {
       cp "$MINVMD_GVPROXY_BIN" "$bn_bin/gvproxy-min"
     elif [ -x "$ROOT/.scratch/gvproxy" ]; then
       cp "$ROOT/.scratch/gvproxy" "$bn_bin/gvproxy-min"
+    elif [ -x "$WORK/gvproxy-bin/gvproxy-min" ]; then
+      # The native lane's provisioning already staged the same pinned switch
+      # (same lock) at the top of this run — the fetch is once per run.
+      cp "$WORK/gvproxy-bin/gvproxy-min" "$bn_bin/gvproxy-min"
     elif [ -x "$WORK/fresh-install/gvproxy" ]; then
       # An earlier case in this same run already fetched the same pinned
       # switch (the fresh-install proof's fetch, same lock) — the fetch is
@@ -16206,8 +16390,8 @@ proof_min_net_expose_publishes_lists_and_refuses() {
   local mnx_marker="MNX_EXPOSE_OK"
   local MNX_SEED_DIR="" MNX_DENY_SEED_DIR=""
 
-  if [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
-    echo "min net expose SKIPPED (no MINVMD_GVPROXY_BIN: this target has no switch, so a box has no address to publish at)"
+  if [ -z "${MINVMD_GVPROXY_BIN:-}" ] && [ -z "$E2E_NATIVE_SWITCH" ]; then
+    echo "min net expose SKIPPED (no switch: neither MINVMD_GVPROXY_BIN (VM) nor E2E_NATIVE_SWITCH (native) is set — a box has no address to publish at)"
     echo "::endgroup::"
     return 0
   fi
@@ -16294,6 +16478,7 @@ PY
     assert_vm_refuses_dynamic_stance ask "$mnx_allow_name" mnx-ask \
       --dynamic-range "$mnx_lo-$mnx_hi"
   fi
+  native_switch_daemon
   MNX_SEED_DIR="$(hook_mktemp /tmp/mnlxe.XXXXXX)"
   hook_seed_preamble > "$MNX_SEED_DIR/minimal.toml"
   mkdir "$MNX_SEED_DIR/.git"
@@ -16315,6 +16500,7 @@ PY
   mnx_can_skip() { [ -z "${CI:-}" ] && [ -z "$E2E_VM" ]; }
   if ! mnl session exec "$mnx_sid" 'true' >"$WORK/mnx-execgate.err" 2>&1 \
      && ! { sleep 1; mnl session exec "$mnx_sid" 'true' >"$WORK/mnx-execgate.err" 2>&1; }; then
+    switch_spawn_fault "$WORK/mnx-execgate.err" && fail
     if mnx_can_skip; then
       echo "::warning::min net expose case SKIPPED — this host cannot run a session sandbox"
       echo "  (exec: $(head -n1 "$WORK/mnx-execgate.err" 2>/dev/null || true))"
@@ -16577,8 +16763,8 @@ proof_listen_published_port_reaches_peer_and_host() {
   local lp_stance="allow"            # the target's stance, on every lane
   local LP_SEED_DIR="" LP_PEER_SEED_DIR=""
 
-  if [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
-    echo "listen-published port SKIPPED (no MINVMD_GVPROXY_BIN: this target has no switch, so a box has no address to publish at)"
+  if [ -z "${MINVMD_GVPROXY_BIN:-}" ] && [ -z "$E2E_NATIVE_SWITCH" ]; then
+    echo "listen-published port SKIPPED (no switch: neither MINVMD_GVPROXY_BIN (VM) nor E2E_NATIVE_SWITCH (native) is set — a box has no address to publish at)"
     echo "::endgroup::"
     return 0
   fi
@@ -16599,6 +16785,7 @@ proof_listen_published_port_reaches_peer_and_host() {
     fi
   done
 
+  native_switch_daemon
   LP_SEED_DIR="$(hook_mktemp /tmp/mnllp.XXXXXX)"
   hook_seed_preamble > "$LP_SEED_DIR/minimal.toml"
   mkdir "$LP_SEED_DIR/.git"
@@ -16620,6 +16807,7 @@ proof_listen_published_port_reaches_peer_and_host() {
   lp_can_skip() { [ -z "${CI:-}" ] && [ -z "$E2E_VM" ]; }
   if ! mnl session exec "$lp_sid" 'true' >"$WORK/lp-execgate.err" 2>&1 \
      && ! { sleep 1; mnl session exec "$lp_sid" 'true' >"$WORK/lp-execgate.err" 2>&1; }; then
+    switch_spawn_fault "$WORK/lp-execgate.err" && fail
     if lp_can_skip; then
       echo "::warning::listen-published port case SKIPPED — this host cannot run a session sandbox"
       echo "  (exec: $(head -n1 "$WORK/lp-execgate.err" 2>/dev/null || true))"
@@ -16928,17 +17116,19 @@ proof_listen_published_port_reaches_peer_and_host() {
     esac
     sleep 0.25
   done
-  if [ -z "$lp_live" ]; then
-    case "$lp_policy" in
-      *"live ingress (published at runtime)"*)
-        echo "::error::the target's policy carries a live-ingress section the row poll never matched — the listen published and this case's row pattern is wrong"
-        ;;
-      *)
-        echo "::error::the in-range listen on port $lp_listen_port was never listed as published — the watcher did not publish what the allow stance allows (NET-016)"
-        ;;
-    esac
-    printf '%s\n' "$lp_policy" | sed 's/^/  /'
-    fail
+  # An in-range listen under allow is a dynamic ingress request, so NET-044
+  # owes its row in `min session policy`. The watcher commits only to the
+  # box's publications today, never to the runtime-ingress table the policy
+  # renders: a known gap, carried as one until gominimal/inbox#912 lands and
+  # this turns into a hard assertion. The peer and host legs below prove
+  # the publish itself (NET-016) — on a VM lane, through the VM host
+  # daemon's admission (T94).
+  if [ -n "$lp_live" ]; then
+    echo "listen: the in-range listen on port $lp_listen_port is listed as published in min session policy (NET-044)"
+  else
+    known_gap listen_published_port_reaches_peer_and_host \
+      "the in-range listen on port $lp_listen_port is not listed in min session policy, NET-044 — https://github.com/gominimal/inbox/issues/912"
+    lp_live=1
   fi
 
   if [ -n "$lp_live" ] && [ -n "$lp_peer_host" ]; then
@@ -16979,19 +17169,52 @@ proof_listen_published_port_reaches_peer_and_host() {
     echo "the published listen answers on the host loopback at the address its name resolves to (NET-016)"
   fi
 
+  # ---- the audit: the allow decision has its decisions.log line (NET-046) --
+  # The watcher writes no decision record today; carried as a known gap until
+  # gominimal/inbox#912 lands, when this turns into a hard assertion.
+  if python3 - "$lp_target_name" "$lp_listen_port" \
+      "$XDG_STATE_HOME/minimal/audit/decisions.log" <<'PY'
+import json
+import sys
+
+box, port, path = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+try:
+    with open(path) as log:
+        for line in log:
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+            if record.get("box") == box and record.get("port") == port:
+                print(f"  {line.strip()}")
+                sys.exit(0)
+except FileNotFoundError:
+    pass
+sys.exit(1)
+PY
+  then
+    echo "audit: the listen's allow decision has its decisions.log line (NET-046)"
+  else
+    known_gap listen_published_port_reaches_peer_and_host \
+      "no decisions.log line for the in-range listen on port $lp_listen_port, NET-046 — https://github.com/gominimal/inbox/issues/912"
+  fi
+
   # ---- the close: the publication withdraws with the listener -------------
   # shellcheck disable=SC2016 # `$(cat /home/lp.pid)` must expand in the SESSION's shell, not here.
   mnl session exec "$lp_sid" 'kill "$(cat /home/lp.pid)"' >/dev/null 2>&1 \
     || { echo "::error::could not stop the in-box listener on port $lp_listen_port"; fail; }
   # The withdrawal is the watcher's own next poll of the box, so the peer's
   # GET polls until the refusal stands — bounded by the same cadence the
-  # publish leg just proved on this box.
+  # publish leg just proved on this box. Until that poll, the standing
+  # publication accepts the connect and resets it against the closed backend
+  # (curl exit 56), so only the refusal (7) ends the poll early.
   lp_refused=""
+  lp_close_start="$(now_ms)"
   for _ in $(seq 1 60); do
     lp_peer_get "$lp_listen_port"
     if [ "$lp_rc" -ne 0 ] || [ "$lp_status" != "200" ]; then
       lp_refused=1
-      break
+      [ "$lp_rc" -eq 7 ] && break
     fi
     sleep 0.25
   done
@@ -17005,7 +17228,7 @@ proof_listen_published_port_reaches_peer_and_host() {
     cat "$WORK/lp-peer.err" 2>/dev/null || true
     fail
   fi
-  echo "peer, after the close: the same GET -> connection refused (curl exit $lp_rc) — the listen's publication withdrew with its listener (NET-017)"
+  echo "peer, after the close: the same GET -> connection refused (curl exit $lp_rc) $(( $(now_ms) - lp_close_start ))ms after the kill — the listen's publication withdrew with its listener (NET-017)"
   if [ "$lp_host_reach" != "asserted" ]; then
     echo "host probe, after the close: SKIPPED ($lp_ans_why)"
   else
@@ -17044,6 +17267,676 @@ proof_listen_published_port_reaches_peer_and_host() {
   else
     echo "listen-published port OK (in-range listen published with no expose${E2E_VM:+ through the admission of the VM host daemon}: the peer reached it and the close withdrew it; the out-of-range listen reached neither client, the declared control answered first, and the host probe's legs are $lp_host_reach: $lp_ans_why)"
   fi
+  echo "::endgroup::"
+}
+
+# ---------------------------------------------------------------------------
+# `min net expose` from inside the box, end to end (NET-043, NET-045, NET-046,
+# NET-047): the request a process in the box sends with the CLI's own helper,
+# every stance a box's create can name, and the two records every decision
+# owes. On the native lane the case runs whole:
+#
+#   * an allow box — `min net expose 3000` publishes, the reply names the
+#     address the box's forward bound, the publish's own record (the one
+#     info line NET-044's observability owes every decided request; the
+#     NET-040 attach record names only a create's declared mappings, and
+#     this box declares none) records the same address, and the host's own
+#     probe at that address meets the contract NET-047 pins for a
+#     runtime-only port: the publish is BOUND on the host, but the box's
+#     relay gate has not admitted it — the gate's set is the declared ports
+#     plus the listen watcher's publishes (switch.rs `admits_tcp`), and an
+#     expose publishes without admitting, so the live row reads
+#     `(pending; not yet reachable)` and a host connect delivers nothing of
+#     the box. The listener stands inside the box first, so the refusal
+#     cannot be blamed on a port nothing answers for. The reach itself —
+#     the gate growing to admit runtime publishes — is T97's work
+#     (gominimal/minimal#1897), and this case asserts today's contract so
+#     that task has a leg to flip;
+#   * an ask box, answered YES through a real pty attach
+#     (scripts/e2e-attach-pty.py, `E2E_PTY_ASK=allow`) — the request is
+#     driven from an exec OUTSIDE the attach, so the dialog reaching the
+#     attached terminal is NET-045's routing, not a caller answering its
+#     own question; the attached human's Allow publishes, and the
+#     transcript carries the dialog that rendered;
+#   * an ask box, answered NO the same way — nothing publishes: no live
+#     row, no expose record, and the typed deny on the asker's stderr;
+#   * an ask box with nobody attached — the typed fail-closed refusal,
+#     decided by the daemon (an exec creates no binding to render a
+#     dialog; only an attach does);
+#   * a deny box — the typed deny the stance spells.
+#
+# Every decision's own line in the daemon's audit log (NET-046,
+# `$XDG_STATE_HOME/minimal/audit/decisions.log`) is asserted beside the leg
+# that produced it — the decision, who actually decided it, the outcome, and
+# the typed reason where one was said — and printed, so the case's transcript
+# carries each request, its decision and its record. The `min bug` bundle a
+# failing run writes ships the audit tail (diag.rs' audit collector) beside
+# the daemon log tail, so a lane that cannot read this case's prints still
+# carries both records.
+#
+# The lane split is the mnx case's: a VM lane cannot hold an allow/ask stance
+# until T97 (gominimal/minimal#1897), so there the case asserts the create's
+# typed refusal of both (T82's `assert_vm_refuses_dynamic_stance`) and the
+# positive legs are that task's to add.
+proof_expose_from_inside_box() {
+  echo "::group::min net expose from inside the box: allow publishes, ask asks the attached human, deny and nobody-attached refuse, and every decision is audited (NET-043, NET-045, NET-046, NET-047)"
+
+  local eib_allow_sid="" eib_yes_sid="" eib_no_sid="" eib_nobody_sid="" eib_deny_sid=""
+  local eib_out="" eib_rc="" eib_err="" eib_addr="" eib_log="" eib_rec="" eib_hrc="" eib_hms=""
+  local eib_rec_addr="" eib_t0="" eib_t1=""
+  local eib_policy="" eib_pid="" eib_prc="" eib_live="" eib_listening="" eib_hstatus="" eib_body=""
+  local eib_allow_name="e2e-inside-allow" eib_yes_name="e2e-inside-ask-yes"
+  local eib_no_name="e2e-inside-ask-no" eib_nobody_name="e2e-inside-ask-nobody"
+  local eib_deny_name="e2e-inside-deny"
+  local eib_port=3000                  # the port every box asks for
+  local eib_lo=3000 eib_hi=3005        # the range every create declares
+  local eib_marker="INSIDE_EXPOSE_OK"  # what the allow box's responder answers with
+  local eib_saved_rust_log=""
+  local EIB_ALLOW_SEED_DIR="" EIB_YES_SEED_DIR="" EIB_NO_SEED_DIR=""
+  local EIB_NOBODY_SEED_DIR="" EIB_DENY_SEED_DIR=""
+
+  if [ -z "${MINVMD_GVPROXY_BIN:-}" ] && [ -z "$E2E_NATIVE_SWITCH" ]; then
+    echo "expose from inside the box SKIPPED (no switch: neither MINVMD_GVPROXY_BIN (VM) nor E2E_NATIVE_SWITCH (native) is set — a box has no address to publish at)"
+    echo "::endgroup::"
+    return 0
+  fi
+  if [ ! -c /dev/net/tun ]; then
+    echo "expose from inside the box SKIPPED (no /dev/net/tun on this host: an own-IP box cannot open its in-namespace tap; runs for real on a host that has the device)"
+    echo "::endgroup::"
+    return 0
+  fi
+
+  # ---- a VM lane: the typed create refusal is the assertion (T82) ----------
+  # Both stances that could publish are refused at the create, before any box
+  # exists (gominimal/minimal#1897); the positive legs are T97's to add there.
+  if [ -n "${E2E_VM:-}" ]; then
+    assert_vm_refuses_dynamic_stance allow "$eib_allow_name" eib-inside-allow \
+      --dynamic-range "$eib_lo-$eib_hi"
+    assert_vm_refuses_dynamic_stance ask "$eib_yes_name" eib-inside-ask \
+      --dynamic-range "$eib_lo-$eib_hi"
+    echo "expose from inside the box OK on a VM lane (allow and ask refused at the create with the typed T82 reason; the positive legs land with T97, gominimal/minimal#1897)"
+    echo "::endgroup::"
+    return 0
+  fi
+
+  # The record the runtime publish owes (NET-044's observability: one info
+  # line per request, the session actor's `answer_expose` line) rides the
+  # daemon's log at info under a module the lane's `warn` filter drops, so
+  # the daemon restarts under a pin that carries it and the lane's filter
+  # goes back to afterwards. The NET-040 attach record is NOT this case's:
+  # it names only the mappings a create declared, and every box here declares
+  # none — so the publish's own line is the one record on the host that
+  # names the address it bound. The audit log needs no pin: it is a file the
+  # daemon appends whatever the filter. This is a native lane by the split
+  # above, so its log is this host's (hook_log_readable).
+  # --force: an unforced stop refuses while an earlier case's box lives, and
+  # the daemon it leaves up would carry neither this filter nor the switch
+  # prefix mnl hands an autospawn (native_switch_daemon).
+  mnl stop --force >/dev/null 2>&1 || true # a standalone run has no daemon yet
+  eib_saved_rust_log="${RUST_LOG:-}"
+  export RUST_LOG="warn,minimald::session=info"
+  eib_restore_log() {
+    if [ -n "$eib_saved_rust_log" ]; then export RUST_LOG="$eib_saved_rust_log"; else unset RUST_LOG; fi
+  }
+  eib_daemon_log() {
+    find "$XDG_STATE_HOME/minimal/logs" -name 'minimald.log.*' -type f 2>/dev/null \
+      | sort | tail -n1
+  }
+  # The publish's own record (the one info line a decided request owes,
+  # `answer_expose`'s): the one line on the host naming the address the
+  # forward bound. Each field is matched on its own — the file sink's key
+  # order is the subscriber's, not the record's — and the port, a JSON
+  # number, is matched with the delimiter that ends it, so a longer number
+  # sharing the prefix cannot. $1 = the log file, $2 = the box name, $3 =
+  # the port; prints the newest published record, nothing when none names
+  # the box.
+  eib_publish_record() {
+    grep -h -- 'dynamic ingress expose' "$1" 2>/dev/null \
+      | grep -F -- "\"name\":\"$2\"" | grep -E -- "\"port\":$3[,}]" \
+      | grep -F -- '"outcome":"published"' | tail -n1
+  }
+
+  # The audit record a decision owes (NET-046): argv-driven like the mnx
+  # case's json assert (a heredoc IS the interpreter's stdin), matching by
+  # box and port so each leg asserts the fields its own decision produced —
+  # the decision the stance made, who actually decided it, the outcome, and
+  # the typed reason where one was said ('-' where none was). Every record
+  # it checks is printed, so the case's transcript carries the decision
+  # beside the request that produced it.
+  eib_audit_assert() { # $1 box, $2 port, $3 decision, $4 decided_by, $5 outcome, $6 reason ('-' when none)
+    python3 - "$1" "$2" "$3" "$4" "$5" "$6" \
+      "$XDG_STATE_HOME/minimal/audit/decisions.log" <<'PY'
+import json
+import sys
+
+box, port, decision, decided_by, outcome = sys.argv[1:6]
+reason = None if sys.argv[6] == "-" else sys.argv[6]
+path = sys.argv[7]
+want = int(port)
+records = []
+try:
+    with open(path) as log:
+        for line in log:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue  # a writer mid-append; its record is not this read's
+            if record.get("box") == box and record.get("port") == want:
+                records.append(record)
+except FileNotFoundError:
+    print(f"no audit log at {path}", file=sys.stderr)
+    sys.exit(1)
+problems = []
+if not records:
+    problems.append(
+        f"no record names box {box!r} port {want} — the decision was never audited (NET-046)"
+    )
+for record in records:
+    if record.get("decision") != decision:
+        problems.append(f"decision is {record.get('decision')!r}, not {decision!r}")
+    if record.get("decided_by") != decided_by:
+        problems.append(
+            f"decided_by is {record.get('decided_by')!r}, not {decided_by!r}"
+        )
+    if record.get("outcome") != outcome:
+        problems.append(f"outcome is {record.get('outcome')!r}, not {outcome!r}")
+    got = record.get("reason")
+    if got != reason:
+        problems.append(f"reason is {got!r}, not {reason!r}")
+    print(
+        f"audit: box {record.get('box')} port {record.get('port')}"
+        f" decision={record.get('decision')} decided_by={record.get('decided_by')}"
+        f" outcome={record.get('outcome')} reason={record.get('reason')}"
+    )
+if problems:
+    for line in problems:
+        print(line, file=sys.stderr)
+    sys.exit(1)
+PY
+  }
+
+  # ---- the allow box: the publish, its recorded address, the pending gate ---
+  EIB_ALLOW_SEED_DIR="$(hook_mktemp /tmp/mnleia.XXXXXX)"
+  hook_seed_preamble > "$EIB_ALLOW_SEED_DIR/minimal.toml"
+  mkdir "$EIB_ALLOW_SEED_DIR/.git"
+  eib_allow_sid="$(cd "$EIB_ALLOW_SEED_DIR" && mnl session activate . --no-prompt \
+    --name "$eib_allow_name" --network own_ip \
+    --dynamic-ingress allow --dynamic-range "$eib_lo-$eib_hi" \
+    2>"$WORK/eib-allow-activate.err")" || {
+    echo "::error::'min session activate --network own_ip --dynamic-ingress allow --dynamic-range $eib_lo-$eib_hi' failed for the allow box"
+    echo "--- stderr ---"; cat "$WORK/eib-allow-activate.err" 2>/dev/null || true
+    eib_restore_log
+    fail
+  }
+  eib_allow_sid="$(printf '%s\n' "$eib_allow_sid" | tail -n1 | tr -d '\r')"
+  echo "allow box: $eib_allow_sid ($eib_allow_name, dynamic ingress allow over $eib_lo-$eib_hi)"
+
+  # The capability gate the exec-driving proofs run, for the same reasons: a
+  # host that is itself a sandbox denies the nested namespaces a box needs,
+  # and no probe inside a box can run. A skip is honest only on a developer
+  # host; a lane that exists to run these assertions fails here instead.
+  eib_can_skip() { [ -z "${CI:-}" ] && [ -z "$E2E_VM" ]; }
+  if ! mnl session exec "$eib_allow_sid" 'true' >"$WORK/eib-execgate.err" 2>&1 \
+     && ! { sleep 1; mnl session exec "$eib_allow_sid" 'true' >"$WORK/eib-execgate.err" 2>&1; }; then
+    if switch_spawn_fault "$WORK/eib-execgate.err"; then eib_restore_log; fail; fi
+    if eib_can_skip; then
+      echo "::warning::expose from inside the box case SKIPPED — this host cannot run a session sandbox"
+      echo "  (exec: $(head -n1 "$WORK/eib-execgate.err" 2>/dev/null || true))"
+      echo "  on CI or a VM lane this gate fails instead"
+      mnl session destroy --force "$eib_allow_sid" >/dev/null 2>&1 || true
+      rm -rf "$EIB_ALLOW_SEED_DIR"
+      eib_restore_log
+      echo "::endgroup::"
+      return 0
+    fi
+    echo "::error::this lane cannot run a session sandbox, so no probe inside a box can run: nothing this case asserts can be asserted"
+    echo "  (exec: $(head -n1 "$WORK/eib-execgate.err" 2>/dev/null || true))"
+    eib_restore_log
+    fail
+  fi
+  mnl session exec "$eib_allow_sid" 'test -x /usr/bin/min' >/dev/null 2>&1 \
+    || { echo "::error::the allow box has no min helper at /usr/bin/min (the daemon installs one in every box)"; eib_restore_log; fail; }
+  mnl session exec "$eib_allow_sid" 'test -x /usr/bin/socat' >/dev/null 2>&1 \
+    || { echo "::error::the allow box has no socat at /usr/bin/socat (a launcher baseline package — every box ships one)"; eib_restore_log; fail; }
+
+  # The request itself, sent from inside the box with its own helper.
+  mnl session exec "$eib_allow_sid" "/usr/bin/min net expose $eib_port" \
+    >"$WORK/eib-allow-expose.out" 2>"$WORK/eib-allow-expose.err"
+  eib_rc=$?
+  eib_out="$(cat "$WORK/eib-allow-expose.out" 2>/dev/null)"
+  eib_err="$(tr '\n' ' ' < "$WORK/eib-allow-expose.err" 2>/dev/null)"
+  echo "expose: min net expose $eib_port in the allow box -> exit $eib_rc: ${eib_out:-<no reply>}${eib_err:+ [$eib_err]}"
+  if [ "$eib_rc" -ne 0 ]; then
+    echo "::error::the allow box's expose failed — the box was created allow over $eib_lo-$eib_hi and asked for $eib_port (got: '$eib_err')"
+    cat "$WORK/eib-allow-expose.err" 2>/dev/null || true
+    eib_restore_log
+    fail
+  fi
+  case "$eib_out" in
+    "published port $eib_port at "*":$eib_port; not yet reachable") ;;
+    "published port $eib_port at "*":$eib_port") ;;
+    *)
+      echo "::error::the expose's reply is not a publish line naming the port and its address (got: '$eib_out')"
+      eib_restore_log
+      fail
+      ;;
+  esac
+  echo "the allow stance published: $eib_out (NET-043)"
+  eib_addr="$(printf '%s\n' "$eib_out" | sed -n "s/^published port $eib_port at \(.*\):$eib_port.*/\1/p")"
+
+  # The address the daemon recorded for the publish: the publish's own
+  # record (the one info line the request owed) is the one place on the host
+  # that names it, and the reply the box read must name the same address —
+  # the box's own word and the daemon's record agree, or one of them is
+  # wrong.
+  eib_log="$(eib_daemon_log)"
+  eib_rec=""
+  for _ in $(seq 1 10); do
+    eib_rec="$(eib_publish_record "$eib_log" "$eib_allow_name" "$eib_port")"
+    [ -n "$eib_rec" ] && break
+    sleep 0.25
+  done
+  if [ -z "$eib_rec" ]; then
+    echo "::error::no publish record in the daemon log names the allow box — the publish has no recorded address (NET-044)"
+    echo "--- daemon log (tail) ---"; tail -20 "$eib_log" 2>/dev/null || true
+    eib_restore_log
+    fail
+  fi
+  # The record's `local` is the whole address the forward bound — host and
+  # port, the same string the reply printed — so the host probe below reads
+  # it as the URL it is.
+  eib_rec_addr="$(printf '%s\n' "$eib_rec" | sed -n 's/.*"local":"\([0-9][0-9.]*:[0-9]*\)".*/\1/p')"
+  echo "daemon log: $eib_rec"
+  if [ -n "$eib_addr" ] && [ "$eib_addr:$eib_port" != "$eib_rec_addr" ]; then
+    echo "::error::the reply named $eib_addr:$eib_port but the daemon recorded ${eib_rec_addr:-no address} — the box was told a different address than the one its forward bound"
+    eib_restore_log
+    fail
+  fi
+  echo "recorded address: the daemon's publish record and the reply agree on $eib_rec_addr (NET-044)"
+
+  # The listener inside the box, started after the publish the way the mnx
+  # case starts its own: its own direct answer proves the port answers
+  # inside the box, so the host probe below cannot blame a port nothing
+  # listens on — and the watcher that sees the LISTEN settles it against the
+  # publication the expose already holds, without admitting it at the gate
+  # (listeners.rs: "left a listening port the runtime expose already
+  # published"), so the pending contract below is the gate's, not the
+  # listener's absence.
+  mnl session exec "$eib_allow_sid" \
+    "body=$eib_marker; printf \"HTTP/1.1 200 OK\r\nContent-Length: \${#body}\r\nConnection: close\r\n\r\n%s\" \"\$body\" > /home/eib-http200" \
+    >/dev/null 2>"$WORK/eib-allow-responder.err" \
+    || { echo "::error::could not write the in-box responder's response"; cat "$WORK/eib-allow-responder.err" 2>/dev/null || true; eib_restore_log; fail; }
+  mnl session exec "$eib_allow_sid" \
+    "nohup /usr/bin/socat TCP-LISTEN:$eib_port,reuseaddr,fork SYSTEM:\"cat /home/eib-http200\" >/dev/null 2>&1 &" \
+    >/dev/null 2>>"$WORK/eib-allow-responder.err" \
+    || { echo "::error::could not start the in-box responder on port $eib_port"; cat "$WORK/eib-allow-responder.err" 2>/dev/null || true; eib_restore_log; fail; }
+  eib_listening=""
+  for _ in $(seq 1 40); do
+    if [ "$(mnl session exec "$eib_allow_sid" \
+      "curl -sS --max-time 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:$eib_port/" \
+      2>/dev/null || true)" = "200" ]; then
+      eib_listening=1
+      break
+    fi
+    sleep 0.25
+  done
+  if [ -z "$eib_listening" ]; then
+    echo "::error::the in-box responder on port $eib_port never answered a direct curl — the host probe below could not be told from a listener that never started"
+    echo "--- socat exec stderr ---"; cat "$WORK/eib-allow-responder.err" 2>/dev/null || true
+    eib_restore_log
+    fail
+  fi
+  echo "listener: socat now serves port $eib_port inside the allow box (its own loopback answers $eib_marker)"
+
+  # The host's own probe at the recorded address — the pinned contract for a
+  # runtime-only publish (NET-047): the forward is BOUND on the host at the
+  # recorded address, but the box's relay gate has not admitted the port, so
+  # the connection is the relay's to answer, not the box's. Asserted as what
+  # the tree pins — never a delivered answer — with the mode the refusal took
+  # reported beside it; the reach is T97's to add (gominimal/minimal#1897),
+  # and its landing flips this leg to the delivered marker.
+  eib_t0=$(now_ms)
+  env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy \
+    -u ALL_PROXY -u all_proxy -u NO_PROXY -u no_proxy \
+    curl -sS --max-time 8 -o "$WORK/eib-host.body" -w '%{http_code}' \
+    "http://$eib_rec_addr/" >"$WORK/eib-host.out" 2>"$WORK/eib-host.err"
+  eib_hrc=$?
+  eib_t1=$(now_ms)
+  eib_hms=$((eib_t1 - eib_t0))
+  eib_hstatus="$(tail -n1 "$WORK/eib-host.out" 2>/dev/null | tr -d '\r\n')"
+  eib_body="$(cat "$WORK/eib-host.body" 2>/dev/null || true)"
+  echo "host probe: GET http://$eib_rec_addr/ -> curl exit $eib_hrc in ${eib_hms}ms (status ${eib_hstatus:-none}) — bound at the recorded address, and the relay gate has not admitted it (NET-047's pending contract)"
+  if [ "$eib_hrc" -eq 0 ] || [ "$eib_hstatus" = "200" ]; then
+    echo "::error::the host probe reached the allow box's runtime publish — the gate admitted a port no declaration names and no watcher published (NET-047)"
+    eib_restore_log
+    fail
+  fi
+  if printf '%s' "$eib_body" | grep -qF "$eib_marker"; then
+    echo "::error::the host probe delivered the box's marker through a runtime publish the gate has not admitted (NET-047)"
+    eib_restore_log
+    fail
+  fi
+
+  # The publish listed beside the declaration, read the way a person reads it
+  # (NET-044): the live row carries the pending reading, spelled as the
+  # rendering pins it, until the gate admits the port.
+  eib_policy="$(mnl session policy "$eib_allow_sid" 2>"$WORK/eib-allow-policy.err")" \
+    || { echo "::error::'min session policy' failed for the allow box"; cat "$WORK/eib-allow-policy.err" 2>/dev/null || true; eib_restore_log; fail; }
+  echo "--- min session policy (text, the allow box) ---"; printf '%s\n' "$eib_policy" | sed 's/^/  /'
+  case "$eib_policy" in
+    *":$eib_port → :$eib_port  (pending; not yet reachable)"*) ;;
+    *)
+      echo "::error::the live row for :$eib_port does not read '(pending; not yet reachable)' — the runtime publish is listed as reachable before the gate admitted it (NET-044, NET-047)"
+      eib_restore_log
+      fail
+      ;;
+  esac
+  echo "policy (text): one live row for :$eib_port, reading (pending; not yet reachable) — bound, listed, and honestly not reachable yet (NET-044, NET-047)"
+
+  if ! eib_audit_assert "$eib_allow_name" "$eib_port" allow box-policy published - \
+      >"$WORK/eib-allow-audit.out" 2>"$WORK/eib-allow-audit.err"; then
+    echo "::error::the allow box's publish has no matching audit record (NET-046)"
+    cat "$WORK/eib-allow-audit.out" "$WORK/eib-allow-audit.err" 2>/dev/null || true
+    eib_restore_log
+    fail
+  fi
+  sed 's/^/  /' "$WORK/eib-allow-audit.out" 2>/dev/null || true
+
+  # ---- the ask box, answered yes by the attached human (NET-045) -----------
+  # The attach: a REAL pty (the sandbox case's driver), held open by a sleep
+  # and detached through the exit menu's keep lane when the commands end. The
+  # request is driven from an exec OUTSIDE the attach once the terminal is
+  # live, so the dialog that renders on the attached terminal is the ask
+  # ROUTED there (NET-045), and the driver answers it the way the daemon's
+  # own test driver does (E2E_PTY_ASK=allow: Down off the highlighted Deny,
+  # then Enter).
+  EIB_YES_SEED_DIR="$(hook_mktemp /tmp/mnleiy.XXXXXX)"
+  hook_seed_preamble > "$EIB_YES_SEED_DIR/minimal.toml"
+  mkdir "$EIB_YES_SEED_DIR/.git"
+  eib_yes_sid="$(cd "$EIB_YES_SEED_DIR" && mnl session activate . --no-prompt \
+    --name "$eib_yes_name" --network own_ip \
+    --dynamic-ingress ask --dynamic-range "$eib_lo-$eib_hi" \
+    2>"$WORK/eib-yes-activate.err")" || {
+    echo "::error::'min session activate --network own_ip --dynamic-ingress ask --dynamic-range $eib_lo-$eib_hi' failed for the ask box"
+    echo "--- stderr ---"; cat "$WORK/eib-yes-activate.err" 2>/dev/null || true
+    eib_restore_log
+    fail
+  }
+  eib_yes_sid="$(printf '%s\n' "$eib_yes_sid" | tail -n1 | tr -d '\r')"
+  echo "ask box (yes): $eib_yes_sid ($eib_yes_name, dynamic ingress ask over $eib_lo-$eib_hi)"
+  # shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
+  E2E_PTY_COMMANDS='> /home/eib-yes-live
+sleep 20
+exit' E2E_PTY_ASK=allow E2E_PTY_ANSWER=keep \
+    python3 "$ROOT/scripts/e2e-attach-pty.py" - min ${E2E_MINIMAL_ARGS:-} session attach "$eib_yes_sid" \
+    >"$WORK/eib-yes-attach.out" 2>"$WORK/eib-yes-attach.err" &
+  eib_pid=$!
+  eib_live=""
+  for _ in $(seq 1 40); do
+    if mnl session exec "$eib_yes_sid" 'test -e /home/eib-yes-live' >/dev/null 2>&1; then
+      eib_live=1
+      break
+    fi
+    sleep 0.25
+  done
+  if [ -z "$eib_live" ]; then
+    echo "::error::the pty attach to the ask box never reached its shell (no /home/eib-yes-live after 10s)"
+    kill "$eib_pid" 2>/dev/null || true
+    wait "$eib_pid" 2>/dev/null || true
+    echo "--- transcript ---"; cat "$WORK/eib-yes-attach.out" 2>/dev/null || true
+    echo "--- stderr ---"; cat "$WORK/eib-yes-attach.err" 2>/dev/null || true
+    eib_restore_log
+    fail
+  fi
+  echo "attach: the ask box's terminal is live (a human can be asked)"
+  mnl session exec "$eib_yes_sid" "/usr/bin/min net expose $eib_port" \
+    >"$WORK/eib-yes-expose.out" 2>"$WORK/eib-yes-expose.err"
+  eib_rc=$?
+  eib_out="$(cat "$WORK/eib-yes-expose.out" 2>/dev/null)"
+  eib_err="$(tr '\n' ' ' < "$WORK/eib-yes-expose.err" 2>/dev/null)"
+  echo "expose: min net expose $eib_port in the ask box (somebody attached) -> exit $eib_rc: ${eib_out:-<no reply>}${eib_err:+ [$eib_err]}"
+  wait "$eib_pid"
+  eib_prc=$?
+  if [ "$eib_prc" -ne 0 ]; then
+    echo "::error::the pty attach to the ask box failed (NET-045)"
+    echo "--- transcript ---"; cat "$WORK/eib-yes-attach.out" 2>/dev/null || true
+    echo "--- stderr ---"; cat "$WORK/eib-yes-attach.err" 2>/dev/null || true
+    eib_restore_log
+    fail
+  fi
+  echo "--- the attached terminal (the ask dialog the request routed there, and its answer) ---"
+  sed 's/^/  /' "$WORK/eib-yes-attach.out" 2>/dev/null || true
+  if ! grep -qF "asks to publish port $eib_port." "$WORK/eib-yes-attach.out" 2>/dev/null; then
+    echo "::error::the ask dialog never rendered on the attached terminal — the request was not routed to the attached human (NET-045)"
+    eib_restore_log
+    fail
+  fi
+  if [ "$eib_rc" -ne 0 ]; then
+    echo "::error::the ask box's expose failed with a human attached answering Allow (got: '$eib_err')"
+    cat "$WORK/eib-yes-expose.err" 2>/dev/null || true
+    eib_restore_log
+    fail
+  fi
+  case "$eib_out" in
+    "published port $eib_port at "*":$eib_port; not yet reachable") ;;
+    "published port $eib_port at "*":$eib_port") ;;
+    *)
+      echo "::error::the answered-yes expose's reply is not a publish line naming the port and its address (got: '$eib_out')"
+      eib_restore_log
+      fail
+      ;;
+  esac
+  echo "the attached human's Allow published: $eib_out (NET-045)"
+  if ! eib_audit_assert "$eib_yes_name" "$eib_port" ask attached-human published - \
+      >"$WORK/eib-yes-audit.out" 2>"$WORK/eib-yes-audit.err"; then
+    echo "::error::the answered-yes ask has no matching audit record — the human's decision was never audited (NET-046)"
+    cat "$WORK/eib-yes-audit.out" "$WORK/eib-yes-audit.err" 2>/dev/null || true
+    eib_restore_log
+    fail
+  fi
+  sed 's/^/  /' "$WORK/eib-yes-audit.out" 2>/dev/null || true
+
+  # ---- the ask box, answered no by the attached human ----------------------
+  # The same attach and the same outside request, answered with the Enter the
+  # highlighted Deny stands for (E2E_PTY_ASK=deny): the human's own deny, and
+  # nothing publishes — no live row, no expose record, the typed deny on the
+  # asker's stderr, and the decision's own audit line.
+  EIB_NO_SEED_DIR="$(hook_mktemp /tmp/mnlein.XXXXXX)"
+  hook_seed_preamble > "$EIB_NO_SEED_DIR/minimal.toml"
+  mkdir "$EIB_NO_SEED_DIR/.git"
+  eib_no_sid="$(cd "$EIB_NO_SEED_DIR" && mnl session activate . --no-prompt \
+    --name "$eib_no_name" --network own_ip \
+    --dynamic-ingress ask --dynamic-range "$eib_lo-$eib_hi" \
+    2>"$WORK/eib-no-activate.err")" || {
+    echo "::error::'min session activate --network own_ip --dynamic-ingress ask --dynamic-range $eib_lo-$eib_hi' failed for the second ask box"
+    echo "--- stderr ---"; cat "$WORK/eib-no-activate.err" 2>/dev/null || true
+    eib_restore_log
+    fail
+  }
+  eib_no_sid="$(printf '%s\n' "$eib_no_sid" | tail -n1 | tr -d '\r')"
+  echo "ask box (no): $eib_no_sid ($eib_no_name, dynamic ingress ask over $eib_lo-$eib_hi)"
+  # shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
+  E2E_PTY_COMMANDS='> /home/eib-no-live
+sleep 20
+exit' E2E_PTY_ASK=deny E2E_PTY_ANSWER=keep \
+    python3 "$ROOT/scripts/e2e-attach-pty.py" - min ${E2E_MINIMAL_ARGS:-} session attach "$eib_no_sid" \
+    >"$WORK/eib-no-attach.out" 2>"$WORK/eib-no-attach.err" &
+  eib_pid=$!
+  eib_live=""
+  for _ in $(seq 1 40); do
+    if mnl session exec "$eib_no_sid" 'test -e /home/eib-no-live' >/dev/null 2>&1; then
+      eib_live=1
+      break
+    fi
+    sleep 0.25
+  done
+  if [ -z "$eib_live" ]; then
+    echo "::error::the pty attach to the second ask box never reached its shell (no /home/eib-no-live after 10s)"
+    kill "$eib_pid" 2>/dev/null || true
+    wait "$eib_pid" 2>/dev/null || true
+    echo "--- transcript ---"; cat "$WORK/eib-no-attach.out" 2>/dev/null || true
+    echo "--- stderr ---"; cat "$WORK/eib-no-attach.err" 2>/dev/null || true
+    eib_restore_log
+    fail
+  fi
+  echo "attach: the second ask box's terminal is live (a human can be asked)"
+  mnl session exec "$eib_no_sid" "/usr/bin/min net expose $eib_port" \
+    >"$WORK/eib-no-expose.out" 2>"$WORK/eib-no-expose.err"
+  eib_rc=$?
+  eib_out="$(cat "$WORK/eib-no-expose.out" 2>/dev/null)"
+  eib_err="$(tr '\n' ' ' < "$WORK/eib-no-expose.err" 2>/dev/null)"
+  echo "expose: min net expose $eib_port in the second ask box (somebody attached) -> exit $eib_rc: ${eib_err:-<no error>}"
+  wait "$eib_pid"
+  eib_prc=$?
+  if [ "$eib_prc" -ne 0 ]; then
+    echo "::error::the pty attach to the second ask box failed (NET-045)"
+    echo "--- transcript ---"; cat "$WORK/eib-no-attach.out" 2>/dev/null || true
+    echo "--- stderr ---"; cat "$WORK/eib-no-attach.err" 2>/dev/null || true
+    eib_restore_log
+    fail
+  fi
+  echo "--- the attached terminal (the ask dialog the request routed there, and its answer) ---"
+  sed 's/^/  /' "$WORK/eib-no-attach.out" 2>/dev/null || true
+  if ! grep -qF "asks to publish port $eib_port." "$WORK/eib-no-attach.out" 2>/dev/null; then
+    echo "::error::the ask dialog never rendered on the second ask box's terminal — the request was not routed to the attached human (NET-045)"
+    eib_restore_log
+    fail
+  fi
+  if [ "$eib_rc" -eq 0 ]; then
+    echo "::error::the answered-no ask published — the human's deny must refuse it (got: '$eib_out')"
+    cat "$WORK/eib-no-expose.out" 2>/dev/null || true
+    eib_restore_log
+    fail
+  fi
+  case "$eib_err" in
+    *"dynamic ingress is denied for this box"*) ;;
+    *) echo "::error::the answered-no refusal does not say dynamic ingress is denied for the box (got: '$eib_err')"; eib_restore_log; fail ;;
+  esac
+  echo "the attached human's deny refused the publish: $eib_err (NET-045)"
+  eib_policy="$(mnl session policy "$eib_no_sid" 2>"$WORK/eib-no-policy.err")" \
+    || { echo "::error::'min session policy' failed for the second ask box"; cat "$WORK/eib-no-policy.err" 2>/dev/null || true; eib_restore_log; fail; }
+  echo "--- min session policy (text, the second ask box) ---"; printf '%s\n' "$eib_policy" | sed 's/^/  /'
+  case "$eib_policy" in
+    *"live ingress (published at runtime)"*)
+      echo "::error::the answered-no ask box lists a live ingress row — a publish the human denied must record nothing (NET-044)"
+      eib_restore_log
+      fail
+      ;;
+  esac
+  if [ -n "$(eib_publish_record "$eib_log" "$eib_no_name" "$eib_port")" ]; then
+    echo "::error::the daemon's log carries a publish record for the answered-no ask box — nothing was bound, so nothing may be recorded (NET-044)"
+    eib_restore_log
+    fail
+  fi
+  echo "records nothing: no live row, no publish record — the deny stood (NET-044, NET-045)"
+  if ! eib_audit_assert "$eib_no_name" "$eib_port" ask attached-human refused \
+      "dynamic ingress is denied for this box" \
+      >"$WORK/eib-no-audit.out" 2>"$WORK/eib-no-audit.err"; then
+    echo "::error::the answered-no ask has no matching audit record — the human's denial was never audited (NET-046)"
+    cat "$WORK/eib-no-audit.out" "$WORK/eib-no-audit.err" 2>/dev/null || true
+    eib_restore_log
+    fail
+  fi
+  sed 's/^/  /' "$WORK/eib-no-audit.out" 2>/dev/null || true
+
+  # ---- the ask box with nobody attached: the fail-closed refusal -----------
+  # An exec creates no binding to render a dialog on (only an attach does), so
+  # the ask is answered fail-closed by the daemon, with its own typed reason.
+  EIB_NOBODY_SEED_DIR="$(hook_mktemp /tmp/mnleib.XXXXXX)"
+  hook_seed_preamble > "$EIB_NOBODY_SEED_DIR/minimal.toml"
+  mkdir "$EIB_NOBODY_SEED_DIR/.git"
+  eib_nobody_sid="$(cd "$EIB_NOBODY_SEED_DIR" && mnl session activate . --no-prompt \
+    --name "$eib_nobody_name" --network own_ip \
+    --dynamic-ingress ask --dynamic-range "$eib_lo-$eib_hi" \
+    2>"$WORK/eib-nobody-activate.err")" || {
+    echo "::error::'min session activate --network own_ip --dynamic-ingress ask --dynamic-range $eib_lo-$eib_hi' failed for the third ask box"
+    echo "--- stderr ---"; cat "$WORK/eib-nobody-activate.err" 2>/dev/null || true
+    eib_restore_log
+    fail
+  }
+  eib_nobody_sid="$(printf '%s\n' "$eib_nobody_sid" | tail -n1 | tr -d '\r')"
+  echo "ask box (nobody attached): $eib_nobody_sid ($eib_nobody_name, dynamic ingress ask over $eib_lo-$eib_hi, never attached)"
+  mnl session exec "$eib_nobody_sid" "/usr/bin/min net expose $eib_port" \
+    >"$WORK/eib-nobody-expose.out" 2>"$WORK/eib-nobody-expose.err"
+  eib_rc=$?
+  eib_out="$(cat "$WORK/eib-nobody-expose.out" 2>/dev/null)"
+  eib_err="$(tr '\n' ' ' < "$WORK/eib-nobody-expose.err" 2>/dev/null)"
+  echo "expose: min net expose $eib_port in the third ask box (nobody attached) -> exit $eib_rc: ${eib_err:-<no error>}"
+  if [ "$eib_rc" -eq 0 ]; then
+    echo "::error::the nobody-attached ask published — an ask with no human to answer it must fail closed (got: '$eib_out')"
+    cat "$WORK/eib-nobody-expose.out" 2>/dev/null || true
+    eib_restore_log
+    fail
+  fi
+  case "$eib_err" in
+    *"dynamic ingress is set to ask and nobody is attached to answer"*) ;;
+    *) echo "::error::the nobody-attached refusal does not say the ask failed closed with nobody attached (got: '$eib_err')"; eib_restore_log; fail ;;
+  esac
+  echo "nobody attached: refused with its own typed error, decided by the daemon (NET-045)"
+  if ! eib_audit_assert "$eib_nobody_name" "$eib_port" ask daemon refused \
+      "dynamic ingress is set to ask and nobody is attached to answer" \
+      >"$WORK/eib-nobody-audit.out" 2>"$WORK/eib-nobody-audit.err"; then
+    echo "::error::the nobody-attached ask has no matching audit record (NET-046)"
+    cat "$WORK/eib-nobody-audit.out" "$WORK/eib-nobody-audit.err" 2>/dev/null || true
+    eib_restore_log
+    fail
+  fi
+  sed 's/^/  /' "$WORK/eib-nobody-audit.out" 2>/dev/null || true
+
+  # ---- the deny box: the stance's own refusal ------------------------------
+  EIB_DENY_SEED_DIR="$(hook_mktemp /tmp/mnleid.XXXXXX)"
+  hook_seed_preamble > "$EIB_DENY_SEED_DIR/minimal.toml"
+  mkdir "$EIB_DENY_SEED_DIR/.git"
+  eib_deny_sid="$(cd "$EIB_DENY_SEED_DIR" && mnl session activate . --no-prompt \
+    --name "$eib_deny_name" --network own_ip \
+    --dynamic-ingress deny --dynamic-range "$eib_lo-$eib_hi" \
+    2>"$WORK/eib-deny-activate.err")" || {
+    echo "::error::'min session activate --network own_ip --dynamic-ingress deny --dynamic-range $eib_lo-$eib_hi' failed for the deny box"
+    echo "--- stderr ---"; cat "$WORK/eib-deny-activate.err" 2>/dev/null || true
+    eib_restore_log
+    fail
+  }
+  eib_deny_sid="$(printf '%s\n' "$eib_deny_sid" | tail -n1 | tr -d '\r')"
+  echo "deny box: $eib_deny_sid ($eib_deny_name, dynamic ingress deny over $eib_lo-$eib_hi)"
+  mnl session exec "$eib_deny_sid" "/usr/bin/min net expose $eib_port" \
+    >"$WORK/eib-deny-expose.out" 2>"$WORK/eib-deny-expose.err"
+  eib_rc=$?
+  eib_out="$(cat "$WORK/eib-deny-expose.out" 2>/dev/null)"
+  eib_err="$(tr '\n' ' ' < "$WORK/eib-deny-expose.err" 2>/dev/null)"
+  echo "expose: min net expose $eib_port in the deny box -> exit $eib_rc: ${eib_err:-<no error>}"
+  if [ "$eib_rc" -eq 0 ]; then
+    echo "::error::the deny box's expose succeeded — a box created --dynamic-ingress deny must refuse every ask"
+    cat "$WORK/eib-deny-expose.out" 2>/dev/null || true
+    eib_restore_log
+    fail
+  fi
+  case "$eib_err" in
+    *"dynamic ingress is denied for this box"*) ;;
+    *) echo "::error::the deny box's refusal does not say dynamic ingress is denied for the box (got: '$eib_err')"; eib_restore_log; fail ;;
+  esac
+  echo "deny box: refused with the deny the stance spells (NET-043)"
+  if ! eib_audit_assert "$eib_deny_name" "$eib_port" deny box-policy refused \
+      "dynamic ingress is denied for this box" \
+      >"$WORK/eib-deny-audit.out" 2>"$WORK/eib-deny-audit.err"; then
+    echo "::error::the deny box's refusal has no matching audit record (NET-046)"
+    cat "$WORK/eib-deny-audit.out" "$WORK/eib-deny-audit.err" 2>/dev/null || true
+    eib_restore_log
+    fail
+  fi
+  sed 's/^/  /' "$WORK/eib-deny-audit.out" 2>/dev/null || true
+
+  eib_restore_log
+  mnl session destroy --force "$eib_allow_sid" >/dev/null 2>&1 || true
+  mnl session destroy --force "$eib_yes_sid" >/dev/null 2>&1 || true
+  mnl session destroy --force "$eib_no_sid" >/dev/null 2>&1 || true
+  mnl session destroy --force "$eib_nobody_sid" >/dev/null 2>&1 || true
+  mnl session destroy --force "$eib_deny_sid" >/dev/null 2>&1 || true
+  rm -rf "$EIB_ALLOW_SEED_DIR" "$EIB_YES_SEED_DIR" "$EIB_NO_SEED_DIR" \
+    "$EIB_NOBODY_SEED_DIR" "$EIB_DENY_SEED_DIR"
+  echo "expose from inside the box OK (allow published at the recorded address and listed pending; the attached human's Allow published and their deny refused it; nobody attached and the deny box were refused with their own typed errors; every decision carries its audit line)"
   echo "::endgroup::"
 }
 
@@ -19604,6 +20497,7 @@ case "${1:-}" in
     proof_task_run
     proof_hooks
     proof_skip_scaffold
+    proof_tty_relay
     proof_sandbox
     proof_restart
     proof_own_ip_box_registers_with_the_vm_host_without_a_provider_flag
@@ -19641,6 +20535,7 @@ case "${1:-}" in
     proof_port_publishes_on_listen_and_box_outlives_client
     proof_min_net_expose_publishes_lists_and_refuses
     proof_listen_published_port_reaches_peer_and_host
+    proof_expose_from_inside_box
     proof_proxy_refuses_like_direct
     proof_retired_surfaces_gone
     proof_switch_steers_proxy_mac_frames_to_the_host_stack
@@ -19675,7 +20570,7 @@ case "${1:-}" in
     proof_daemon_fetch_under_deny_all_host_address_box
     ;;
   lifecycle | session_exec | session_rename | session_outbound_request | own_ip | own_ip_egress_declared_and_enforced | task_run | hooks \
-    | skip_scaffold | sandbox | restart | fresh_install_own_ip_ingress_publishes_loopback \
+    | skip_scaffold | tty_relay | sandbox | restart | fresh_install_own_ip_ingress_publishes_loopback \
     | own_ip_box_registers_with_the_vm_host_without_a_provider_flag \
     | vm_host_row_read_tracks_create_and_destroy \
     | network_posture_from_stock_install | native_resolution_without_proxy_env \
@@ -19688,6 +20583,7 @@ case "${1:-}" in
     | port_publishes_on_listen_and_box_outlives_client \
     | min_net_expose_publishes_lists_and_refuses \
     | listen_published_port_reaches_peer_and_host \
+    | expose_from_inside_box \
     | proxy_refuses_like_direct | retired_surfaces_gone \
     | fresh_linux_kvm_activate_local_minvmd | fresh_arm64_kvm_activate_local_minvmd \
     | linux_stock_install_runs_vm_boxes | two_named_vms_on_one_machine \
@@ -19707,7 +20603,7 @@ case "${1:-}" in
     echo "usage: $0 [case]"
     echo "  no argument: every proof, in the whole-lane order"
     echo "  cases: lifecycle session_exec session_rename session_outbound_request own_ip own_ip_egress_declared_and_enforced task_run hooks"
-    echo "         skip_scaffold sandbox restart fresh_install_own_ip_ingress_publishes_loopback"
+    echo "         skip_scaffold tty_relay sandbox restart fresh_install_own_ip_ingress_publishes_loopback"
     echo "         own_ip_box_registers_with_the_vm_host_without_a_provider_flag"
     echo "         vm_host_row_read_tracks_create_and_destroy"
     echo "         network_posture_from_stock_install native_resolution_without_proxy_env"
@@ -19722,6 +20618,7 @@ case "${1:-}" in
     echo "         port_publishes_on_listen_and_box_outlives_client"
     echo "         min_net_expose_publishes_lists_and_refuses"
     echo "         listen_published_port_reaches_peer_and_host"
+    echo "         expose_from_inside_box"
     echo "         proxy_refuses_like_direct retired_surfaces_gone"
     echo "         switch_steers_proxy_mac_frames_to_the_host_stack switch_answers_no_arp_for_the_proxy_address"
     echo "         two_named_vms_on_one_machine"
@@ -19742,5 +20639,8 @@ esac
 # as passed: the OK line below says what ran, this one what did not.
 if [ -n "$E2E_NOT_RUN" ]; then
   echo "session e2e: $(printf '%s\n' "$E2E_NOT_RUN" | wc -w | tr -d ' ') case(s) NOT RUN:$E2E_NOT_RUN"
+fi
+if [ -n "$E2E_KNOWN_GAP" ]; then
+  echo "session e2e: $(printf '%s\n' "$E2E_KNOWN_GAP" | wc -w | tr -d ' ') KNOWN GAP check(s):$E2E_KNOWN_GAP"
 fi
 echo "session e2e OK"
