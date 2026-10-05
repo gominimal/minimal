@@ -350,6 +350,7 @@ RANGE_RESOLVER_BEFORE="" # the resolver file's prior bytes, when it had any; res
 ANSWERER_SERVICE_CHANNEL="" # set when a proof ran an advisory that installs the answerer service: its channel path; gates the service teardown
 BN_SEED_DIR="" # seeded by the browser-path proof below; removed on teardown
 E2E_NOT_RUN="" # the cases this lane could not run, named by `not_run`; the lane summary counts them
+E2E_KNOWN_GAP="" # the checks carried against a known product gap, named by `known_gap`; counted likewise
 ASR_SEED_DIR="" # seeded by the answerer-service proof below; removed on teardown
 ASR_STATE2_DIR="" # that proof's second node's state base; stopped on teardown
 ASR_REVERT_LINK="" # the link that proof's advisory pointed the host resolver at; reverted on teardown
@@ -792,6 +793,16 @@ switch_spawn_fault() {
 not_run() {
   echo "$1: NOT RUN ($2)"
   E2E_NOT_RUN="$E2E_NOT_RUN $1"
+}
+
+# A check a case carries against a known product gap: one named line citing
+# the issue that closes it, and the gap counted in the lane summary as KNOWN
+# GAP, so a whole-lane pass never hides it. The check turns into a hard
+# assertion when that issue lands.
+# $1: the case. $2: what is missing, with the issue.
+known_gap() {
+  echo "$1: KNOWN GAP ($2)"
+  E2E_KNOWN_GAP="$E2E_KNOWN_GAP $1"
 }
 
 teardown() {
@@ -16846,10 +16857,18 @@ proof_listen_published_port_reaches_peer_and_host() {
     fi
     echo "in range under deny: no live row through the watcher's own polls, and the peer refused (curl exit $lp_rc) — the deny stance published nothing (NET-016)"
   else
-    # The watcher commits to the box's publications, not to the runtime-ingress
-    # table `min session policy` lists (that table is `min net expose`'s), so a
-    # listen publication is not listed there. NET-016 asks for reach, not a
-    # listing: the peer and host legs below prove the publish.
+    # An in-range listen under allow is a dynamic ingress request, so NET-044
+    # owes its row in `min session policy`. The watcher commits only to the
+    # box's publications today, never to the runtime-ingress table the policy
+    # renders: a known gap, carried as one until gominimal/inbox#912 lands and
+    # this turns into a hard assertion. The peer and host legs below prove
+    # the publish itself (NET-016).
+    if [ -n "$lp_live" ]; then
+      echo "listen: the in-range listen on port $lp_listen_port is listed as published in min session policy (NET-044)"
+    else
+      known_gap listen_published_port_reaches_peer_and_host \
+        "the in-range listen on port $lp_listen_port is not listed in min session policy, NET-044 — https://github.com/gominimal/inbox/issues/912"
+    fi
     lp_live=1
   fi
 
@@ -16891,6 +16910,36 @@ proof_listen_published_port_reaches_peer_and_host() {
     echo "the published listen answers on the host loopback at the address its name resolves to (NET-016)"
   fi
 
+  # ---- the audit: the allow decision has its decisions.log line (NET-046) --
+  # The watcher writes no decision record today; carried as a known gap until
+  # gominimal/inbox#912 lands, when this turns into a hard assertion.
+  if python3 - "$lp_target_name" "$lp_listen_port" \
+      "$XDG_STATE_HOME/minimal/audit/decisions.log" <<'PY'
+import json
+import sys
+
+box, port, path = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+try:
+    with open(path) as log:
+        for line in log:
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+            if record.get("box") == box and record.get("port") == port:
+                print(f"  {line.strip()}")
+                sys.exit(0)
+except FileNotFoundError:
+    pass
+sys.exit(1)
+PY
+  then
+    echo "audit: the listen's allow decision has its decisions.log line (NET-046)"
+  else
+    known_gap listen_published_port_reaches_peer_and_host \
+      "no decisions.log line for the in-range listen on port $lp_listen_port, NET-046 — https://github.com/gominimal/inbox/issues/912"
+  fi
+
   # ---- the close: the publication withdraws with the listener -------------
   # shellcheck disable=SC2016 # `$(cat /home/lp.pid)` must expand in the SESSION's shell, not here.
   mnl session exec "$lp_sid" 'kill "$(cat /home/lp.pid)"' >/dev/null 2>&1 \
@@ -16901,6 +16950,7 @@ proof_listen_published_port_reaches_peer_and_host() {
   # publication accepts the connect and resets it against the closed backend
   # (curl exit 56), so only the refusal (7) ends the poll early.
   lp_refused=""
+  lp_close_start="$(now_ms)"
   for _ in $(seq 1 60); do
     lp_peer_get "$lp_listen_port"
     if [ "$lp_rc" -ne 0 ] || [ "$lp_status" != "200" ]; then
@@ -16919,7 +16969,7 @@ proof_listen_published_port_reaches_peer_and_host() {
     cat "$WORK/lp-peer.err" 2>/dev/null || true
     fail
   fi
-  echo "peer, after the close: the same GET -> connection refused (curl exit $lp_rc) — the listen's publication withdrew with its listener (NET-017)"
+  echo "peer, after the close: the same GET -> connection refused (curl exit $lp_rc) $(( $(now_ms) - lp_close_start ))ms after the kill — the listen's publication withdrew with its listener (NET-017)"
   if [ "$lp_host_reach" != "asserted" ]; then
     echo "host probe, after the close: SKIPPED ($lp_ans_why)"
   else
@@ -20324,5 +20374,8 @@ esac
 # as passed: the OK line below says what ran, this one what did not.
 if [ -n "$E2E_NOT_RUN" ]; then
   echo "session e2e: $(printf '%s\n' "$E2E_NOT_RUN" | wc -w | tr -d ' ') case(s) NOT RUN:$E2E_NOT_RUN"
+fi
+if [ -n "$E2E_KNOWN_GAP" ]; then
+  echo "session e2e: $(printf '%s\n' "$E2E_KNOWN_GAP" | wc -w | tr -d ' ') KNOWN GAP check(s):$E2E_KNOWN_GAP"
 fi
 echo "session e2e OK"
