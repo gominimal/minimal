@@ -1,7 +1,7 @@
 [upstream]
 dir = "../fakepkgs"
 
-[harness]
+[stack]
 use = "fake-stack"
 build_packages = ["extra-build-pkg"]
 runtime_packages = ["extra-runtime-pkg"]

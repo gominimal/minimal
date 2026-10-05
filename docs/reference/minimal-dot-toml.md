@@ -97,10 +97,9 @@ The `[stack]` section configures the [stack](../concepts/stacks.md) to use for b
 See [stack specs](./stack-specs.md) for how stacks themselves are defined.
 
 `use` is an accepted alias for the canonical `name` key, and both parse.
-`[harness]` is a deprecated alias for `[stack]`, pending removal after
-July 2026. Prefer `[stack]` in new configs. A file that uses `[harness]` loads
-with a warning to rename it to `[stack]`, and a file that sets both is an
-error.
+`[harness]`, the name of this section before v0.5.0, is no longer accepted:
+a file that still uses it warns that the key is unknown, so rename the
+section to `[stack]`.
 
 The environment variables and packages configured on a stack are inherited on all tasks in this repository.
 

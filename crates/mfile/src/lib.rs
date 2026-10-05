@@ -848,13 +848,7 @@ pub enum Layout {
 }
 
 /// The loaded representation of the `minimal.toml` file.
-///
-/// `remote = "Self"` turns the derives into inherent `File::serialize` /
-/// `File::deserialize` functions, so the trait impls below can fold the
-/// deprecated `[harness]` table into `stack` on every load path (disk, bytes,
-/// and wire alike).
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
-#[serde(remote = "Self")]
 pub struct File {
     /// The previous link in the software supply chain.
     #[serde(alias = "base")]
@@ -866,18 +860,12 @@ pub struct File {
     #[serde(default, alias = "default")]
     pub defaults: Defaults,
     /// The stack configured on this repository, if any.
+    ///
+    /// `[harness]`, the pre-v0.5.0 name of this table, no longer parses: it
+    /// warns as an unknown field and sets no stack, so an old config has to
+    /// rename the table.
     #[serde(default)]
     pub stack: Option<Stack>,
-    /// The deprecated spelling of `[stack]`. Deserialization moves it into
-    /// `stack` and sets `deprecated_harness`, so it is always `None` after a
-    /// load.
-    ///
-    /// TODO: Remove `[harness]` support after July 2026.
-    #[serde(default, skip_serializing)]
-    harness: Option<Stack>,
-    /// Whether `stack` was spelled `[harness]`, for the deprecation warning.
-    #[serde(skip)]
-    deprecated_harness: bool,
 
     /// Task definitions, invoked with `minimal run <task name>`.
     // CodeRabbit flagged this `HashMap` -> `BTreeMap` swap as a breaking API
@@ -921,28 +909,6 @@ pub struct File {
     layout: Option<Layout>,
 }
 
-impl serde::Serialize for File {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        File::serialize(self, serializer)
-    }
-}
-
-impl<'de> serde::Deserialize<'de> for File {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let mut file = File::deserialize(deserializer)?;
-        if let Some(harness) = file.harness.take() {
-            if file.stack.is_some() {
-                return Err(serde::de::Error::custom(
-                    "both [stack] and [harness] are set; [harness] is a deprecated name for [stack], so remove it",
-                ));
-            }
-            file.stack = Some(harness);
-            file.deprecated_harness = true;
-        }
-        Ok(file)
-    }
-}
-
 /// Maps a key that is unknown at the top level of an mfile to the nesting
 /// path where it is actually valid, when there is one. `lifecycle_hooks` is
 /// top-level in a loadout but nests under `[session]` in a project mfile, so a
@@ -951,6 +917,9 @@ impl<'de> serde::Deserialize<'de> for File {
 fn misplaced_top_level_key(key: &str) -> Option<&'static str> {
     match key {
         "lifecycle_hooks" => Some("[[session.lifecycle_hooks]]"),
+        // The pre-v0.5.0 name of `[stack]`, which stopped parsing: point a
+        // straggler config at the rename, not at the upgrade hint.
+        "harness" => Some("[stack]"),
         _ => None,
     }
 }
@@ -1134,10 +1103,6 @@ impl File {
             {
                 return;
             }
-        }
-
-        if self.deprecated_harness {
-            tracing::warn!("`[harness]` is deprecated; rename it to `[stack]` in {MFILE_NAME}");
         }
 
         let mut was_unknown_fields = false;
@@ -1549,8 +1514,6 @@ mod tests {
                 ]))),
                 defaults: Default::default(),
                 stack: None,
-                harness: None,
-                deprecated_harness: false,
                 tasks: [(
                     "test".to_string(),
                     Task {
@@ -2550,22 +2513,13 @@ mod tests {
         drop(guard);
     }
 
-    /// `[harness]` loads as `[stack]`, and the disk load warns once that it is
-    /// deprecated, naming `[stack]` as the replacement.
+    /// `[harness]` is the pre-v0.5.0 name of `[stack]` and no longer parses:
+    /// the stack it names is ignored, and the load points at `[stack]`
+    /// instead of the generic upgrade hint.
     #[test]
-    fn harness_loads_as_stack_and_warns_deprecated() {
-        let body = "name = \"shell\"\nbuild_packages = [\"gcc\"]\n";
-        let via_stack: File = toml::from_str(&format!("[stack]\n{body}")).unwrap();
-        let via_harness: File = toml::from_str(&format!("[harness]\n{body}")).unwrap();
-        assert!(via_stack.stack.is_some());
-        assert_eq!(via_harness.stack, via_stack.stack);
-
-        // Serializing never writes the deprecated spelling back out.
-        let out = toml::to_string(&via_harness).unwrap();
-        assert!(out.contains("[stack]") && !out.contains("harness"), "{out}");
-
+    fn harness_table_no_longer_parses() {
         let dir = tempdir().unwrap();
-        std::fs::write(dir.path().join(MFILE_NAME), format!("[harness]\n{body}")).unwrap();
+        std::fs::write(dir.path().join(MFILE_NAME), "[harness]\nuse = \"rust\"\n").unwrap();
 
         let capture = CaptureWriter::default();
         let subscriber = tracing_subscriber::fmt()
@@ -2574,27 +2528,17 @@ mod tests {
             .finish();
         let guard = tracing::subscriber::set_default(subscriber);
         let file = File::from_dir(dir.path()).unwrap();
-        file.validate().unwrap();
         drop(guard);
 
-        assert_eq!(file.stack, via_stack.stack);
+        assert!(file.stack.is_none());
         let out = capture.contents();
-        let deprecated: Vec<_> = out
-            .lines()
-            .filter(|l| l.contains("`[harness]` is deprecated; rename it to `[stack]`"))
-            .collect();
-        assert_eq!(deprecated.len(), 1, "{out}");
-        assert!(!out.contains("update to a newer version"), "{out}");
-    }
-
-    #[test]
-    fn harness_and_stack_together_is_an_error() {
-        let err = toml::from_str::<File>("[stack]\nname = \"a\"\n\n[harness]\nname = \"b\"\n")
-            .expect_err("both [stack] and [harness] must be refused");
         assert!(
-            err.to_string().contains("both [stack] and [harness]"),
-            "{err}"
+            out.contains(
+                "harness is unknown at the top level of minimal.toml; did you mean [stack]?"
+            ),
+            "{out}"
         );
+        assert!(!out.contains("update to a newer version"), "{out}");
     }
 
     /// A task with two action keys is refused with an error naming the task
