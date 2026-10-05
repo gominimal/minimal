@@ -200,7 +200,12 @@ def transport_pids(root):
     while stack:
         for kid in children.get(stack.pop(), []):
             stack.append(kid)
-            if " proxy --socket " in f" {commands.get(kid, '')} ":
+            command = commands.get(kid, "")
+            # ssh's own command line names the ProxyCommand too; only the
+            # proxy process itself is the transport.
+            if os.path.basename(command.split(" ", 1)[0]) == "ssh":
+                continue
+            if " proxy --socket " in f" {command} ":
                 found.append(kid)
     return found
 
