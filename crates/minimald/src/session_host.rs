@@ -4622,6 +4622,12 @@ impl SessionLauncher for SandboxLauncher {
         }
         let listen_plan = match (lease, published, gate) {
             (Some(lease), Some(published), Some(gate)) => {
+                tracing::debug!(
+                    session = %session_label,
+                    %lease,
+                    %published,
+                    "built the box's listen plan"
+                );
                 let switch = net_switch.lock().await;
                 let control = match switch.transport() {
                     crate::net::SwitchTransport::LocalSpawn => {

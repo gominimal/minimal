@@ -893,6 +893,13 @@ impl ListenWatcher {
     #[must_use]
     pub fn start(plan: ListenPlan, leader: Leader) -> Self {
         let (stop, mut stop_rx) = watch::channel(false);
+        tracing::debug!(
+            session = %plan.box_name,
+            lease = %plan.lease,
+            published = %plan.published,
+            leader = ?leader,
+            "listen watcher started"
+        );
         let task = tokio::spawn(async move {
             let mut state = WatchState::new(plan, leader);
             loop {
@@ -977,6 +984,14 @@ struct WatchState {
     /// ends the streak is the resolution's own: the publications the leader
     /// it found makes.
     reported_leader_refusal: bool,
+    /// Whether the streak of polls that could not read the box's socket
+    /// table has been said already — once per streak, the leader's own
+    /// discipline.
+    reported_read_failure: bool,
+    /// The listening ports the last table read named, for the debug line
+    /// a change in them owes (so a poll that sees the same set says
+    /// nothing).
+    last_seen: HashSet<u16>,
     /// The listening ports the last read settled — published, declined by
     /// the rules, a declaration's own, or another surface's standing
     /// publication. A port whose publication failed to bind, and a port
@@ -1068,6 +1083,8 @@ impl WatchState {
             plan,
             leader,
             reported_leader_refusal: false,
+            reported_read_failure: false,
+            last_seen: HashSet::new(),
             listening: HashSet::new(),
             forwards: HashMap::new(),
             backoff: HashMap::new(),
@@ -1095,6 +1112,12 @@ impl WatchState {
                         // one — is over, and a later refusal is a streak of
                         // its own.
                         self.reported_leader_refusal = false;
+                        tracing::debug!(
+                            session = %self.plan.box_name,
+                            container_pid,
+                            leader,
+                            "resolved the box's leader for its listening sockets"
+                        );
                         self.leader = Leader::Resolved(leader);
                         Some(leader)
                     }
@@ -1140,16 +1163,34 @@ impl WatchState {
                 // shell has exited, and the host stops the watcher with
                 // the session. Keep the last diff rather than publishing
                 // or withdrawing on a table that could not be read: the
-                // stop withdraws everything still standing.
-                tracing::debug!(
-                    session = %self.plan.box_name,
-                    leader,
-                    error = %e,
-                    "reading the box's listening sockets"
-                );
+                // stop withdraws everything still standing. Said once per
+                // streak at warn: a box whose table cannot be read
+                // publishes no listen at all.
+                if !self.reported_read_failure {
+                    self.reported_read_failure = true;
+                    tracing::warn!(
+                        session = %self.plan.box_name,
+                        leader,
+                        error = %e,
+                        "reading the box's listening sockets failed; retrying on every poll"
+                    );
+                }
                 return;
             }
         };
+        self.reported_read_failure = false;
+        if listening != self.last_seen {
+            let mut ports: Vec<u16> = listening.iter().copied().collect();
+            ports.sort_unstable();
+            tracing::debug!(
+                session = %self.plan.box_name,
+                leader,
+                lease = %self.plan.lease,
+                ports = ?ports,
+                "the box's listening sockets that a forward to its lease can reach"
+            );
+            self.last_seen = listening.clone();
+        }
         // The diff is taken before anything mutates, so a publication made
         // here cannot be seen by the withdrawal beside it.
         let appeared: Vec<u16> = listening.difference(&self.listening).copied().collect();
@@ -1277,7 +1318,14 @@ impl WatchState {
         // not a publication of this listener (its forward would never
         // answer the protocol the watcher dials), so the verdict falls to
         // the rules rather than answering `Declared` transport-blind.
-        match self.plan.gate.listen_verdict(IpProto::Tcp, port) {
+        let verdict = self.plan.gate.listen_verdict(IpProto::Tcp, port);
+        tracing::debug!(
+            session = %self.plan.box_name,
+            port,
+            verdict = ?verdict,
+            "listen verdict for a port that appeared"
+        );
+        match verdict {
             ListenVerdict::Publish => {
                 if self.forwards.contains_key(&port) {
                     // The port's listener closed, the withdrawal's unexpose
@@ -1452,6 +1500,15 @@ impl WatchState {
                                     .await;
                                     return Appearance::Settled;
                                 }
+                                tracing::debug!(
+                                    session = %self.plan.box_name,
+                                    port,
+                                    lease = %self.plan.lease,
+                                    gate = ?Arc::as_ptr(&self.plan.gate),
+                                    is_live_gate = crate::net::switch::live_gate(self.plan.lease)
+                                        .is_some_and(|live| Arc::ptr_eq(&live, &self.plan.gate)),
+                                    "admitting a listen-published port at the box's gate"
+                                );
                                 self.plan.gate.admit_published(port);
                                 self.forwards.insert(port, mapping);
                                 tracing::info!(
@@ -1529,13 +1586,29 @@ impl WatchState {
                         "the stance allows it but the verdict did not".to_string()
                     }
                 };
-                tracing::info!(
-                    session = %self.plan.box_name,
-                    port,
-                    verdict = "not permitted",
-                    reason = %reason,
-                    "left a listening port unpublished"
-                );
+                // Out of range is the one refusal a box whose stance is
+                // allow with a range can draw: said at warn, so a listen the
+                // box's declaration could have published is never quiet.
+                if matches!(
+                    self.plan.gate.dynamic_verdict(port),
+                    sessions::core::egress::DynamicPortVerdict::OutOfRange { .. }
+                ) {
+                    tracing::warn!(
+                        session = %self.plan.box_name,
+                        port,
+                        verdict = "not permitted",
+                        reason = %reason,
+                        "left a listening port unpublished"
+                    );
+                } else {
+                    tracing::info!(
+                        session = %self.plan.box_name,
+                        port,
+                        verdict = "not permitted",
+                        reason = %reason,
+                        "left a listening port unpublished"
+                    );
+                }
                 Appearance::Settled
             }
         }
