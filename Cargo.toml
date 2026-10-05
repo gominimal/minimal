@@ -175,6 +175,13 @@ lzma-rs = "0.3"
 nickel-lang-core = { version = "0.19", default-features = false, features = ["format"] }
 
 opentelemetry-semantic-conventions = "0.33"
+# OTLP export (spec 25, telemetry); all opt-in at runtime.
+opentelemetry = "0.33"
+opentelemetry_sdk = "0.33"
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["trace", "logs", "http-proto", "reqwest-blocking-client"] }
+opentelemetry-http = { version = "0.33", default-features = false }
+opentelemetry-appender-tracing = "0.33"
+tracing-opentelemetry = "0.34"
 # `socket` + `time`: the guest's vsock timekeep listener binds an AF_VSOCK
 # datagram socket and steps CLOCK_REALTIME from the host's updates.
 nix = { version = "0.31", features = ["fs", "sched", "socket", "time", "user"] }
@@ -200,6 +207,7 @@ proptest = "1"
 resolv-conf = "0.7"
 russh = { version = "0.63", default-features = false, features = ["aws-lc-rs", "flate2"] }
 russh-sftp = "2.4"
+serde_json = { version = "1" }
 serde_json_lenient = { version = "0.2" }
 serial_test = "4"
 sha2 = "0.11"
