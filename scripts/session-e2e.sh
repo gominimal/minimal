@@ -16938,7 +16938,7 @@ proof_listen_published_port_reaches_peer_and_host() {
     echo "::endgroup::"
     return 0
   fi
-  if [ ! -c /dev/net/tun ]; then
+  if [ -z "${E2E_VM:-}" ] && [ ! -c /dev/net/tun ]; then
     echo "listen-published port SKIPPED (no /dev/net/tun on this host: an own-IP box cannot open its in-namespace tap; runs for real on a host that has the device)"
     echo "::endgroup::"
     return 0
