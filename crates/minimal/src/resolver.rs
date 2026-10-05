@@ -829,11 +829,6 @@ pub(crate) enum AnswererStep {
         /// Why the step is unavailable.
         reason: String,
     },
-    /// The host is not offered the step: a native host, whose in-daemon
-    /// answerer stays the interim until the native channel client lands.
-    /// Nothing to say and nothing to install, so the advisory's quiet arm
-    /// does not wait on it.
-    NotOffered,
 }
 
 impl AnswererStep {
@@ -843,12 +838,7 @@ impl AnswererStep {
     /// advisory re-surfaces until the host service exists, and
     /// re-surfaces again the moment the installed copy falls behind.
     pub(crate) fn holds(&self) -> bool {
-        matches!(self, AnswererStep::Installed | AnswererStep::NotOffered)
-    }
-
-    /// Whether the advisory offers this host the answerer step at all.
-    pub(crate) fn offered(&self) -> bool {
-        !matches!(self, AnswererStep::NotOffered)
+        matches!(self, AnswererStep::Installed)
     }
 }
 
@@ -1014,9 +1004,10 @@ pub(crate) struct AnswererInstall {
     /// with on macOS ([`VerifiedSource::requirement`]); `None` renders no
     /// signature re-check.
     pub requirement: Option<String>,
-    /// The control sockets of the VM host daemons the step asks to release
-    /// the hook port: this CLI's own state dir's daemon and its named VMs'.
-    /// Empty when none is known — the step then starts the unit directly.
+    /// The control sockets of the daemons the step asks to release the hook
+    /// port: this CLI's own state dir's — its VM host daemons, the default
+    /// VM and its named VMs, or its native daemon. Empty when none is known
+    /// — the step then starts the unit directly.
     pub controls: Vec<String>,
 }
 
@@ -1082,7 +1073,8 @@ pub(crate) const TEST_ANSWERER_SOURCE: &str = "/opt/minimal-test/bin/min-answere
 
 /// The control sockets the answerer step asks to release the hook port,
 /// set by the session start that renders the advisory (its own state dir's
-/// VM host daemons, default VM and named VMs alike).
+/// daemons: the VM host daemons, default VM and named VMs alike, or the
+/// native daemon).
 static HANDOVER_CONTROLS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
 /// Records the control sockets the next render's answerer step releases.
@@ -1117,7 +1109,8 @@ pub(crate) fn answerer_install(verified: &VerifiedSource) -> Option<AnswererInst
             value,
             "the answerer service step is left out of the advisory: a path it would carry \
              holds a quote, `$`, a backtick, a backslash or a line break, which the privileged \
-             command cannot quote safely; the VM host daemon keeps the interim answerer"
+             command cannot quote safely; the daemon hosting the session keeps the interim \
+             answerer"
         );
         return None;
     }
@@ -1326,7 +1319,7 @@ where
     F: FnOnce(String) -> Fut,
     Fut: std::future::Future<Output = Result<Option<String>, SourceProblem>>,
 {
-    if !step.offered() || step.holds() {
+    if step.holds() {
         return step;
     }
     let pinned = match source {
@@ -2543,7 +2536,7 @@ fn answerer_fact(answerer: &AnswererStep, carried: bool) -> Option<String> {
         }
     };
     match answerer {
-        AnswererStep::Installed | AnswererStep::NotOffered => None,
+        AnswererStep::Installed => None,
         AnswererStep::Absent => Some(format!(
             "the box-zone answerer is not installed as a host service, so the zone answers \
              only while a session holds it{}",
@@ -2763,7 +2756,7 @@ pub(crate) fn advisory_at(
         AnswererStep::SourceVerified { source, .. } => answerer_install(source),
         _ => None,
     };
-    if answerer.offered() && !answerer.holds() && install.is_none() {
+    if !answerer.holds() && install.is_none() {
         facts.push(match answerer {
             // The identity check refused the copy source: the reason names
             // the check that failed.
@@ -3633,7 +3626,6 @@ mod tests {
             );
         }
         assert_eq!(answerer_fact(&AnswererStep::Installed, true), None);
-        assert_eq!(answerer_fact(&AnswererStep::NotOffered, false), None);
     }
 
     #[test]
@@ -6183,7 +6175,7 @@ mod tests {
                 reason: reason.to_string(),
             }
         );
-        assert!(refused.offered() && !refused.holds());
+        assert!(!refused.holds(), "a refused source leaves the step to do");
         let advisory = advise(&refused).expect("a refused source still advises");
         assert!(
             advisory.contains(&format!(
@@ -6288,8 +6280,8 @@ mod tests {
             "{unreadable:?}"
         );
 
-        // A held or not-offered step is not touched: no source is checked.
-        for step in [AnswererStep::Installed, AnswererStep::NotOffered] {
+        // A held step is not touched: no source is checked.
+        for step in [AnswererStep::Installed] {
             let untouched =
                 answerer_step_with_source(step.clone(), Some(source.clone()), |_| async {
                     panic!("a step that holds checks no source")
@@ -6790,12 +6782,44 @@ mod tests {
         assert!(sh_parses(&direct), "{direct}");
     }
 
-    /// A native host is not offered the answerer step: the advisory names
-    /// the resolver step alone, and once the resolver routes the zone it
-    /// falls quiet — the in-daemon answerer stays the interim there.
+    /// NET-122's host service on a native host: the advisory offers the
+    /// same privileged step a VM-backed host gets — the root-owned copy of
+    /// `min-answerer`, released out of the daemon serving this session and
+    /// then started as the manager-held answerer — and the socket the
+    /// command asks to release is the native daemon's own, the control
+    /// socket beside its ssh socket in the Minimald provider dir this
+    /// CLI's state dir resolves. The advisory goes quiet only once the
+    /// service holds the zone, never when the resolver step alone is done.
     #[test]
-    fn native_advisory_omits_the_answerer_step() {
+    fn native_advisory_installs_manager_held_answerer() {
+        // The control socket a native session start records, by the same
+        // rule the start itself uses: beside the daemon's ssh socket.
+        let native_control = crate::cmd::control_sock_beside(
+            &crate::client::resolve_socket_path(
+                Some(std::path::Path::new("/state/minimal")),
+                false,
+            )
+            .expect("the native daemon's ssh socket"),
+        )
+        .expect("the control socket beside it");
+        assert_eq!(
+            native_control,
+            std::path::Path::new("/state/minimal/providers/local-minimald0/control.sock"),
+            "the native daemon's control socket sits in the Minimald provider dir"
+        );
+        set_handover_controls(vec![native_control.display().to_string()]);
+        struct ControlsReset;
+        impl Drop for ControlsReset {
+            fn drop(&mut self) {
+                set_handover_controls(Vec::new());
+            }
+        }
+        let _reset = ControlsReset;
+
         let port = 15353;
+        // A host without the service: the step is offered, and the
+        // command asks the native daemon to release the interim before the
+        // manager-held answerer takes the port.
         let unconfigured = Hook::absent("test", "no hook for the zone");
         let advisory = advisory_at(
             &unconfigured,
@@ -6803,19 +6827,44 @@ mod tests {
             false,
             None,
             &RangeStep::not_needed(),
-            &AnswererStep::NotOffered,
+            &verified(AnswererStep::Absent),
             None,
         )
-        .expect("an unconfigured native host is advised");
+        .expect("a native host without the answerer service is advised");
         assert!(
-            advisory.contains("Configure the host's resolver for the zone with:"),
-            "{advisory}"
+            advisory.contains("not installed as a host service")
+                && advisory.contains("install the box-zone answerer service"),
+            "the native advisory offers the answerer service step: {advisory}"
         );
         assert!(
-            !advisory.contains("answerer") && !advisory.contains(ANSWERER_UNIT_LABEL),
-            "the native advisory offers no answerer step: {advisory}"
+            advisory.contains(&command(port, verified_install().as_ref())),
+            "the command is the step's own render: {advisory}"
         );
-        assert!(advisory.contains(&linux_command(port, None)) || cfg!(target_os = "macos"));
+        assert!(
+            advisory.contains(&native_control.display().to_string()),
+            "the command names the native daemon's control socket: {advisory}"
+        );
+        let release_at = advisory
+            .find("release --control")
+            .expect("the native daemon is asked to release the hook port");
+        #[cfg(target_os = "macos")]
+        let start_at = advisory
+            .find(&format!("launchctl bootstrap system {ANSWERER_PLIST_PATH}"))
+            .expect("the service is loaded into launchd");
+        #[cfg(not(target_os = "macos"))]
+        let start_at = advisory
+            .find(&format!(
+                "systemctl start --no-block {ANSWERER_UNIT_LABEL}.socket"
+            ))
+            .expect("the socket unit is started");
+        assert!(
+            release_at < start_at,
+            "release the interim before the service takes the port: {advisory}"
+        );
+
+        // The resolver step alone no longer quiets a native host: with the
+        // hook routing and the range present, the advisory still names the
+        // missing service, and goes quiet only once it holds the zone.
         assert!(
             advisory_at(
                 &routing_hook(),
@@ -6823,11 +6872,25 @@ mod tests {
                 false,
                 Some(true),
                 &RangeStep::not_needed(),
-                &AnswererStep::NotOffered,
+                &verified(AnswererStep::Absent),
+                None,
+            )
+            .is_some(),
+            "a routing hook does not quiet a native host without the service"
+        );
+        assert!(
+            advisory_at(
+                &routing_hook(),
+                port,
+                false,
+                Some(true),
+                &RangeStep::not_needed(),
+                &AnswererStep::Installed,
                 None,
             )
             .is_none(),
-            "the native advisory falls quiet once the resolver step is done"
+            "the native advisory goes quiet once the answerer service is \
+             manager-held"
         );
     }
 

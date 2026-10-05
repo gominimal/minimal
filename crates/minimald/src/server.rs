@@ -760,6 +760,12 @@ impl ServerStateHandle {
         self.0.lock().await.zone_answerer_port = Some(port);
     }
 
+    /// Forgets the answerer's port: nothing this daemon can name answers
+    /// for it now (a publish whose service bind could not be read).
+    pub(crate) async fn clear_zone_answerer_port(&self) {
+        self.0.lock().await.zone_answerer_port = None;
+    }
+
     /// The port the box-zone answerer listens on (UDP), or `None` while it
     /// is still coming up. Filled beside [`Self::hostname_proxy_port`] on
     /// the `ListSessions` and `CreateSession` replies so a client can name
@@ -815,6 +821,15 @@ impl ServerStateHandle {
     /// root every diagnostic collector reads from).
     pub(crate) async fn minimal_state_dir(&self) -> DaemonAbsPath {
         self.0.lock().await.config.minimal_state_dir.clone()
+    }
+
+    /// The daemon's identity dir — the provider instance dir it runs under,
+    /// whose canonical path is the node id its channel client publishes
+    /// under (`main`'s `client_instance_dir`). `None` for a daemon with no
+    /// identity dir configured (a harness server): its node id falls back
+    /// to the state dir, unique to the instance all the same.
+    pub(crate) async fn daemon_identity_dir(&self) -> Option<DaemonAbsPath> {
+        self.0.lock().await.config.daemon_identity_dir.clone()
     }
 
     /// Whether this daemon is the in-VM instance rather than a native one.
@@ -1187,12 +1202,17 @@ async fn reap_unfinalized_sessions(state: &ServerStateHandle, ids: Vec<::session
 ///
 /// Each startup — the bind, and in a microVM the host-loopback publish —
 /// runs on a detached task that retries with backoff until it succeeds
-/// ([`drive_proxy_until_serving`], [`drive_answerer_until_serving`], NET-021)
-/// and then clears the unavailable note `min ls` warns from (NET-022).
-/// Nothing here is awaited: a listener whose port some other process holds
-/// must not hold the SSH accept loop hostage — the daemon starts serving
-/// regardless, reports the reason on its state, and the listener comes up on
-/// its own once the address frees.
+/// ([`drive_proxy_until_serving`], NET-021) and then clears the unavailable
+/// note `min ls` warns from (NET-022). Nothing here is awaited: a listener
+/// whose port some other process holds must not hold the SSH accept loop
+/// hostage — the daemon starts serving regardless, reports the reason on its
+/// state, and the listener comes up on its own once the address frees.
+///
+/// The answerer's native startup is not a bind at all but the acquisition
+/// ([`crate::net::answerer::acquire`], NET-122): the same detached rule, a
+/// different decision — publish this daemon's rows into the manager-held
+/// answerer over the machine-global channel, host the interim only while
+/// nothing serves, never both — described at its own site.
 #[cfg(target_os = "linux")]
 async fn start_host_proxies(
     state: &ServerStateHandle,
@@ -1201,8 +1221,6 @@ async fn start_host_proxies(
     zone_answerer_port: Option<u16>,
 ) {
     use std::net::{IpAddr, Ipv4Addr};
-
-    use crate::net::answerer::{AnswerScope, ZoneAnswerer};
 
     // DM1 (in-VM): bind 0.0.0.0 so the listener comes up regardless of whether
     // eth0 has finished coming up, then publish the port on the host loopback via
@@ -1238,9 +1256,7 @@ async fn start_host_proxies(
 
     // The box-zone answerer (UDP), beside the hostname proxy — on a native
     // host only: the loopback answerer the host's resolver is routed to for
-    // `*.min.internal` (design §7.1, NET-009). Same bind rule as the proxies
-    // and the same configured/default/selected port treatment; the on-machine
-    // gate is the answerer's own (loopback peers, NET-006).
+    // `*.min.internal` (design §7.1, NET-009).
     //
     // A daemon inside a microVM starts no answerer and publishes none
     // through the forwarder: on a VM-backed host the zone is the VM host
@@ -1254,18 +1270,34 @@ async fn start_host_proxies(
     if in_microvm {
         return;
     }
-    let answerer = ZoneAnswerer::new(
-        state.sessions_manager().await.hostnames(),
-        AnswerScope::Native,
-    );
-    tokio::spawn(drive_answerer_until_serving(
+    // Native (NET-122): the zone is answered by the machine's *one*
+    // answerer, and this daemon is its client before it is its host. The
+    // acquisition below decides publish-or-host — publish this daemon's
+    // rows into the manager-held `min-answerer` service over the
+    // machine-global channel when its channel answers, host the
+    // single-operator interim itself only while no channel answers and
+    // the hook port is free, never both — and its status cell feeds the
+    // control socket beside it, the same door `minvmd`'s answerer serves
+    // its own release handover on. The bind is the hook port the
+    // deployment pinned (NET-024) or the answerer's documented default;
+    // unlike the proxies there is no select-when-busy for the answerer
+    // (the port is the address the host's resolver is routed to, and a
+    // second one beside it answers nothing the first would not), so a
+    // held hook port is a surfaced error, never a move.
+    let answerer_status = crate::net::answerer::AnswererStatus::starting();
+    if let Err(error) = crate::rpc::spawn_answerer_control(state, answerer_status.clone()).await {
+        tracing::warn!(
+            component = "zone-answerer",
+            %error,
+            "could not bind the answerer control socket; release and release-cancel requests \
+             will not reach this daemon"
+        );
+    }
+    let hook_port = zone_answerer_port.unwrap_or(crate::net::answerer::ANSWERER_PORT);
+    tokio::spawn(crate::net::answerer::acquire(
         state.clone(),
-        answerer,
-        bind_base,
-        ProxyPort::from_config(zone_answerer_port, crate::net::answerer::ANSWERER_PORT),
-        in_microvm,
-        HostExpose::Shuttle,
-        RetryBackoff::production(),
+        hook_port,
+        answerer_status,
     ));
 }
 
@@ -2108,7 +2140,16 @@ pub(crate) async fn drive_proxy_until_serving(
 
 /// Drives the box-zone answerer to serving, the same two gates, the same
 /// backoff, the same [`ProxyPort`] policy and the same publication walk the
-/// routing proxies take ([`drive_proxy_until_serving`], NET-021): binds at
+/// routing proxies take ([`drive_proxy_until_serving`], NET-021). Retained
+/// for the test helpers that hold an address and watch the retry recover
+/// ([`retry_zone_answerer_until_serving`], and the tests that drive it
+/// directly): the daemon's own answerer start is the acquisition now
+/// (NET-122, [`crate::net::answerer::acquire`]), which decides
+/// publish-or-host over the machine-global channel instead of binding
+/// unconditionally, so nothing in a production daemon's start reaches
+/// this drive.
+///
+/// Binds at
 /// `bind_base` on `port`, and — in a microVM (DM1), where the socket binds
 /// inside the guest — publishes the port on the host loopback through the
 /// gvproxy forwarder's **UDP** path, the transport the host resolver's
@@ -2142,6 +2183,7 @@ pub(crate) async fn drive_proxy_until_serving(
 /// no caller: the zone on a VM-backed host is the VM host daemon's host
 /// answerer's to serve (NET-138), never a guest's.
 #[cfg(target_os = "linux")]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) async fn drive_answerer_until_serving<T: crate::net::answerer::Zone>(
     state: ServerStateHandle,
     answerer: crate::net::answerer::ZoneAnswerer<T>,
