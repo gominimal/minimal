@@ -5786,6 +5786,12 @@ async fn ask_no_or_no_tty_records_nothing() {
         Some((3000, 3999)),
     )
     .await;
+    // The box runs, with no guest binding: on a VM-backed host the ask is
+    // the host's to put to its attached client, never this daemon's.
+    handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("the ask box launches its host");
     let (forwarder, served, _door, mut requests, replies) = vm_backed_ask_box(&handle).await;
 
     for (reason, expected) in [
