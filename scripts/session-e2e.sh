@@ -131,11 +131,7 @@
 #                                    renderings list the runtime publish
 #                                    beside the declaration, and
 #                                    out-of-range and deny asks are
-#                                    refused with their own typed errors;
-#                                    a VM lane also asserts the ask
-#                                    create's typed refusal (T96: the
-#                                    answered ask must be recorded in
-#                                    the host-held row first)
+#                                    refused with their own typed errors
 #   listen_published_port_reaches_peer_and_host
 #                                    NET-016/017: a listen inside the
 #                                    declared range publishes with no
@@ -172,10 +168,14 @@
 #                                    when nobody is attached, deny refuses
 #                                    with the stance's own words, and every
 #                                    decision carries its line in the
-#                                    daemon's audit log; a VM lane runs the
-#                                    allow legs through the VM host daemon's
-#                                    admission (T94) and asserts the ask
-#                                    create's typed refusal instead (T96)
+#                                    daemon's audit log; a VM lane asks the
+#                                    human attached on the host instead: the
+#                                    VM host daemon offers the ask to the
+#                                    pty attach, whose Allow publishes and
+#                                    whose deny records nothing (a later
+#                                    expose asks again), nobody attached is
+#                                    refused, and each outcome is a line in
+#                                    the host's own audit log
 #   proxy_refuses_like_direct        the proxy refuses exactly as the switch
 #                                    does: paired direct/proxied attempts,
 #                                    h2 closed, h2c stripped (NET-069..071, 135)
@@ -16649,44 +16649,6 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
 }
 
 # ---------------------------------------------------------------------------
-# The refusal a VM-backed create still gives an ask stance, held as one
-# helper so the dynamic-ingress proof asserts the same words. An allow
-# create stands on a VM-backed host now (T94): the publish it makes rides
-# the bridged guest report door to the VM host daemon, which admits it
-# against the host-held grant the create registered. An ask is not there
-# yet — the port the attached human answers yes to must be recorded in the
-# host-held row by the client (NET-138), and until that answered-ask carry
-# reaches the host table (T96) the CLI refuses the create before any box
-# exists, and the VM lanes assert exactly that refusal — never a skip.
-VM_DYNAMIC_ASK_REFUSAL="dynamic ingress ask is not yet supported on VM-backed hosts (T96: the answered ask must be recorded in the host-held row)"
-assert_vm_refuses_dynamic_stance() { # $1 = stance (ask), $2 = box name, $3 = label for files; rest = extra activate flags
-  local stance="$1" name="$2" label="$3" seed="" out="" rc=0
-  shift 3
-  seed="$(hook_mktemp /tmp/mnlvr.XXXXXX)"
-  hook_seed_preamble > "$seed/minimal.toml"
-  mkdir "$seed/.git"
-  out="$(cd "$seed" && mnl session activate . --no-prompt \
-    --name "$name" --network own_ip "$@" --dynamic-ingress "$stance" \
-    2>"$WORK/$label-vmrefusal.err")" || rc=$?
-  rm -rf "$seed"
-  if [ "$rc" -eq 0 ]; then
-    echo "::error::the VM-backed create accepted --dynamic-ingress $stance (printed '$out') — an ask stance is refused before any box exists until the answered ask reaches the host-held row (T96)"
-    mnl session destroy --force "$(printf '%s\n' "$out" | tail -n1 | tr -d '\r')" >/dev/null 2>&1 || true
-    fail
-  fi
-  if ! grep -qF "$VM_DYNAMIC_ASK_REFUSAL" "$WORK/$label-vmrefusal.err"; then
-    echo "::error::the VM-backed create refused --dynamic-ingress $stance without the typed reason (want: '$VM_DYNAMIC_ASK_REFUSAL')"
-    echo "--- stderr ---"; cat "$WORK/$label-vmrefusal.err" 2>/dev/null || true
-    fail
-  fi
-  if mnl ls 2>/dev/null | grep -qF "$name"; then
-    echo "::error::the refused create for $name left a session behind — the refusal must come before any box exists"
-    fail
-  fi
-  echo "VM lane: --dynamic-ingress $stance refused before any box existed, with the typed reason: $VM_DYNAMIC_ASK_REFUSAL"
-}
-
-# ---------------------------------------------------------------------------
 # A runtime expose, decided and listed end to end (NET-043, NET-044). The
 # dynamic_ingress stance a box is CREATED with — the CLI's
 # `--dynamic-ingress`/`--dynamic-range` flags, this tree's one host-side way
@@ -16710,12 +16672,9 @@ assert_vm_refuses_dynamic_stance() { # $1 = stance (ask), $2 = box name, $3 = la
 # reports it over the bridged guest report door and the VM host daemon
 # admits it against the host-held grant the create registered (T94) —
 # the same publish, the same reply, the same listing, decided by a host
-# gate instead of the stance alone. A VM lane still owes the ask create's
-# typed refusal (`assert_vm_refuses_dynamic_stance` above): the answered
-# ask's carry to the host-held row is T96's, so the create says so up
-# front. The deny box declares the same range on every lane, so its
-# listing carries a declared stance and range with no live publication —
-# the fail-closed half both lanes read.
+# gate instead of the stance alone. The deny box declares the same range
+# on every lane, so its listing carries a declared stance and range with no
+# live publication — the fail-closed half both lanes read.
 proof_min_net_expose_publishes_lists_and_refuses() {
   echo "::group::min net expose publishes what the stance allows, lists the publication, and refuses the rest (NET-043, NET-044)"
 
@@ -16816,16 +16775,6 @@ if problems:
 PY
   }
 
-  # ---- the ask create's typed refusal, the one stance a VM lane cannot
-  # keep yet: the port the attached human answers yes to must be recorded
-  # in the host-held row by the client (NET-138), and until that answered
-  # ask reaches the host table (T96) the create refuses before any box
-  # exists. An allow create stands on every lane — the arm below publishes
-  # through whatever gate the lane has.
-  if [ -n "${E2E_VM:-}" ]; then
-    assert_vm_refuses_dynamic_stance ask "$mnx_allow_name" mnx-ask \
-      --dynamic-range "$mnx_lo-$mnx_hi"
-  fi
   native_switch_daemon
   MNX_SEED_DIR="$(hook_mktemp /tmp/mnlxe.XXXXXX)"
   hook_seed_preamble > "$MNX_SEED_DIR/minimal.toml"
@@ -17047,7 +16996,7 @@ PY
   mnl session destroy --force "$mnx_deny_sid" >/dev/null 2>&1 || true
   rm -rf "$MNX_SEED_DIR" "$MNX_DENY_SEED_DIR"
   if [ -n "${E2E_VM:-}" ]; then
-    echo "min net expose publishes, lists and refuses OK on a VM lane (the in-range expose published through the VM host daemon's admission and is listed on both policy renderings; out-of-range and deny asks refused with their own typed errors; the ask create refused with the typed T96 reason; the deny box listed nothing on both renderings)"
+    echo "min net expose publishes, lists and refuses OK on a VM lane (the in-range expose published through the VM host daemon's admission and is listed on both policy renderings; out-of-range and deny asks refused with their own typed errors; the deny box listed nothing on both renderings)"
   else
     echo "min net expose publishes, lists and refuses OK (in-range publish listed on both policy renderings; out-of-range and deny asks refused with their own typed errors; the deny box listed nothing on both renderings)"
   fi
@@ -17680,6 +17629,183 @@ PY
 }
 
 # ---------------------------------------------------------------------------
+# The ask legs of `proof_expose_from_inside_box` on a VM lane (NET-045): the
+# human who answers a VM-backed box's ask is the one attached on the HOST.
+# The in-VM daemon raises the ask with the VM host daemon, which offers it
+# to the host client attached to the box's row: the `min session attach`
+# relay, driven here through a real pty (scripts/e2e-attach-pty.py), which
+# suspends itself and renders the dialog with the native dialog's own frame,
+# so the pty driver answers it the same way. Every outcome is a line in the
+# VM host daemon's own owner-only audit log, read here on the host:
+#   * answered yes: the expose publishes, and the audit records `yes`;
+#   * answered no: nothing publishes, no live row, the audit records `no`,
+#     and a later expose asks again — a new ask, refused for no client here,
+#     never a stored answer;
+#   * nobody attached: refused with the typed nobody-attached error, and the
+#     audit records `refused_no_client`.
+# $1 = port, $2 = range low, $3 = range high, $4 = yes box, $5 = no box,
+# $6 = nobody box. Echoes the sessions it created on fd 3, for the caller's
+# teardown.
+eib_vm_ask_legs() {
+  local port="$1" lo="$2" hi="$3" yes_name="$4" no_name="$5" nobody_name="$6"
+  local host_audit="$XDG_STATE_HOME/minimal/providers/local-minvmd0/audit/box-admissions.log"
+  local rc=0 out="" err="" policy="" before=0 after=0
+  local yes_sid="" no_sid="" nobody_sid=""
+
+  # The host audit line for an ask outcome: event ask, the outcome, the box
+  # and the port, read from the VM host daemon's own log.
+  vm_ask_audited() { # $1 box, $2 outcome
+    grep -F '"event":"ask"' "$host_audit" 2>/dev/null \
+      | grep -F "\"outcome\":\"$2\"" \
+      | grep -F "\"box\":\"$1\"" \
+      | grep -cF "\"port\":$port"
+  }
+  vm_ask_box() { # $1 name; echoes the session id
+    local box_seed=""
+    box_seed="$(hook_mktemp /tmp/mnleva.XXXXXX)"
+    hook_seed_preamble > "$box_seed/minimal.toml"
+    mkdir "$box_seed/.git"
+    if ! (cd "$box_seed" && mnl session activate . --no-prompt \
+        --name "$1" --network own_ip \
+        --dynamic-ingress ask --dynamic-range "$lo-$hi" \
+        2>"$WORK/eib-vm-$1-activate.err") >"$WORK/eib-vm-$1-activate.out"; then
+      echo "::error::the VM-backed ask create for $1 failed — an ask stance stands on a VM-backed host (NET-045)" >&2
+      cat "$WORK/eib-vm-$1-activate.err" >&2 2>/dev/null || true
+      rm -rf "$box_seed"
+      return 1
+    fi
+    rm -rf "$box_seed"
+    tail -n1 "$WORK/eib-vm-$1-activate.out" | tr -d '\r'
+  }
+  # The attached human answers $2 (allow|deny) to the ask an exec outside
+  # the attach raises; echoes the expose's exit code.
+  vm_ask_answered() { # $1 sid, $2 allow|deny, $3 label
+    local a_pid="" a_live="" a_rc=0
+    # shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
+    E2E_PTY_COMMANDS="> /home/eib-$3-live
+sleep 20
+exit" E2E_PTY_ASK="$2" E2E_PTY_ANSWER=keep \
+      python3 "$ROOT/scripts/e2e-attach-pty.py" - min ${E2E_MINIMAL_ARGS:-} session attach "$1" \
+      >"$WORK/eib-vm-$3-attach.out" 2>"$WORK/eib-vm-$3-attach.err" &
+    a_pid=$!
+    for _ in $(seq 1 60); do
+      if mnl session exec "$1" "test -e /home/eib-$3-live" >/dev/null 2>&1; then
+        a_live=1
+        break
+      fi
+      sleep 0.25
+    done
+    if [ -z "$a_live" ]; then
+      kill "$a_pid" 2>/dev/null || true
+      wait "$a_pid" 2>/dev/null || true
+      echo "::error::the pty attach to $1 never reached its shell" >&2
+      cat "$WORK/eib-vm-$3-attach.out" "$WORK/eib-vm-$3-attach.err" >&2 2>/dev/null || true
+      return 1
+    fi
+    mnl session exec "$1" "/usr/bin/min net expose $port" \
+      >"$WORK/eib-vm-$3-expose.out" 2>"$WORK/eib-vm-$3-expose.err" || a_rc=$?
+    if ! wait "$a_pid"; then
+      echo "::error::the pty attach to $1 failed (NET-045)" >&2
+      cat "$WORK/eib-vm-$3-attach.out" "$WORK/eib-vm-$3-attach.err" >&2 2>/dev/null || true
+      return 1
+    fi
+    echo "--- the attached host terminal ($3: the ask the VM host daemon offered, and its answer) ---" >&2
+    sed 's/^/  /' "$WORK/eib-vm-$3-attach.out" >&2 2>/dev/null || true
+    if ! grep -qF "asks to publish port $port/tcp." "$WORK/eib-vm-$3-attach.out" 2>/dev/null; then
+      echo "::error::the host-side ask dialog never rendered on the attached terminal — the VM host daemon did not offer the ask to the attached client (NET-045)" >&2
+      return 1
+    fi
+    echo "$a_rc"
+  }
+
+  # ---- answered yes: the attached human's Allow publishes ------------------
+  yes_sid="$(vm_ask_box "$yes_name")" || fail
+  echo "$yes_sid" >&3
+  echo "ask box (yes, VM lane): $yes_sid ($yes_name, ask over $lo-$hi)"
+  rc="$(vm_ask_answered "$yes_sid" allow vm-yes)" || fail
+  out="$(cat "$WORK/eib-vm-vm-yes-expose.out" 2>/dev/null)"
+  err="$(tr '\n' ' ' < "$WORK/eib-vm-vm-yes-expose.err" 2>/dev/null)"
+  echo "expose: min net expose $port in the ask box (attached on the host, Allow) -> exit $rc: ${out:-<no reply>}${err:+ [$err]}"
+  if [ "$rc" -ne 0 ]; then
+    echo "::error::the VM-backed ask box's expose failed with the host's attached human answering Allow (got: '$err')"
+    fail
+  fi
+  case "$out" in
+    "published port $port at "*) ;;
+    *) echo "::error::the answered-yes expose's reply is not a publish line (got: '$out')"; fail ;;
+  esac
+  if [ "$(vm_ask_audited "$yes_name" yes)" -lt 1 ]; then
+    echo "::error::the VM host daemon's audit log has no 'yes' line for $yes_name's ask on port $port"
+    grep -F '"event":"ask"' "$host_audit" 2>/dev/null || true
+    fail
+  fi
+  echo "the host's attached human's Allow published, and the host audit records yes (NET-045)"
+
+  # ---- answered no: nothing publishes, and a later expose asks again -------
+  no_sid="$(vm_ask_box "$no_name")" || fail
+  echo "$no_sid" >&3
+  echo "ask box (no, VM lane): $no_sid ($no_name, ask over $lo-$hi)"
+  rc="$(vm_ask_answered "$no_sid" deny vm-no)" || fail
+  err="$(tr '\n' ' ' < "$WORK/eib-vm-vm-no-expose.err" 2>/dev/null)"
+  echo "expose: min net expose $port in the ask box (attached on the host, Deny) -> exit $rc: ${err:-<no error>}"
+  if [ "$rc" -eq 0 ]; then
+    echo "::error::the answered-no ask published on a VM lane — the human's deny must refuse it"
+    fail
+  fi
+  case "$err" in
+    *"dynamic ingress is denied for this box"*) ;;
+    *) echo "::error::the answered-no refusal does not say dynamic ingress is denied (got: '$err')"; fail ;;
+  esac
+  policy="$(mnl session policy "$no_sid" 2>/dev/null)" || true
+  case "$policy" in
+    *"live ingress (published at runtime)"*)
+      echo "::error::the answered-no ask box lists a live ingress row on a VM lane — a deny records nothing"
+      fail
+      ;;
+  esac
+  if [ "$(vm_ask_audited "$no_name" no)" -lt 1 ]; then
+    echo "::error::the VM host daemon's audit log has no 'no' line for $no_name's ask on port $port"
+    grep -F '"event":"ask"' "$host_audit" 2>/dev/null || true
+    fail
+  fi
+  before="$(vm_ask_audited "$no_name" refused_no_client)"
+  rc=0
+  mnl session exec "$no_sid" "/usr/bin/min net expose $port" \
+    >/dev/null 2>"$WORK/eib-vm-no-again.err" || rc=$?
+  after="$(vm_ask_audited "$no_name" refused_no_client)"
+  if [ "$rc" -eq 0 ] || [ "$after" -le "$before" ]; then
+    echo "::error::a later expose after the deny did not ask again (exit $rc, refused_no_client lines $before -> $after): the deny must store nothing an expose could reuse"
+    cat "$WORK/eib-vm-no-again.err" 2>/dev/null || true
+    fail
+  fi
+  echo "the deny recorded nothing: no live row, the host audit records no, and a later expose asked again (NET-045)"
+
+  # ---- nobody attached: the fail-closed refusal ----------------------------
+  nobody_sid="$(vm_ask_box "$nobody_name")" || fail
+  echo "$nobody_sid" >&3
+  rc=0
+  mnl session exec "$nobody_sid" "/usr/bin/min net expose $port" \
+    >"$WORK/eib-vm-nobody.out" 2>"$WORK/eib-vm-nobody.err" || rc=$?
+  err="$(tr '\n' ' ' < "$WORK/eib-vm-nobody.err" 2>/dev/null)"
+  echo "expose: min net expose $port in the ask box (nobody attached on the host) -> exit $rc: ${err:-<no error>}"
+  if [ "$rc" -eq 0 ]; then
+    echo "::error::the nobody-attached ask published on a VM lane — it must fail closed"
+    fail
+  fi
+  case "$err" in
+    *"dynamic ingress is set to ask and nobody is attached to answer"*) ;;
+    *) echo "::error::the nobody-attached refusal does not say nobody is attached (got: '$err')"; fail ;;
+  esac
+  if [ "$(vm_ask_audited "$nobody_name" refused_no_client)" -lt 1 ]; then
+    echo "::error::the VM host daemon's audit log has no 'refused_no_client' line for $nobody_name"
+    fail
+  fi
+  echo "nobody attached on the host: refused with its own typed error, and the host audit records it (NET-045)"
+  echo "--- the VM host daemon's ask audit lines ---"
+  grep -F '"event":"ask"' "$host_audit" 2>/dev/null | sed 's/^/  /' || true
+}
+
+# ---------------------------------------------------------------------------
 # `min net expose` from inside the box, end to end (NET-043, NET-045, NET-046,
 # NET-047): the request a process in the box sends with the CLI's own helper,
 # every stance a box's create can name, and the two records every decision
@@ -17723,9 +17849,9 @@ PY
 # the daemon log tail, so a lane that cannot read this case's prints still
 # carries both records.
 #
-# The lane split: a VM lane holds an allow stance since T94 but not yet an
-# ask stance (T96), so there the case asserts the ask create's typed refusal
-# (`assert_vm_refuses_dynamic_stance`) and counts its positive legs NOT RUN,
+# The lane split: on a VM lane the ask is answered by the human attached on
+# the host (`eib_vm_ask_legs` above), and the allow and guest-audit legs,
+# which read this host's daemon log and audit file, are counted NOT RUN,
 # T97's to add (gominimal/minimal#1970).
 proof_expose_from_inside_box() {
   echo "::group::min net expose from inside the box: allow publishes, ask asks the attached human, deny and nobody-attached refuse, and every decision is audited (NET-043, NET-045, NET-046, NET-047)"
@@ -17755,20 +17881,25 @@ proof_expose_from_inside_box() {
     return 0
   fi
 
-  # ---- a VM lane: the ask create's typed refusal is the assertion ---------
-  # An allow create stands on a VM lane since T94 — its publish rides the VM
-  # host daemon's admission, which the mnx case proves there — but the ask
-  # create is still refused before any box exists, until the answered ask
-  # reaches the host-held row (T96). The allow legs below read the daemon's
-  # own log and audit file on this host, which a VM lane's guest daemon does
-  # not write here, so they are counted NOT RUN on a VM lane and land there
-  # with T97 (gominimal/minimal#1970).
+  # ---- a VM lane: the host's attached human answers the ask ---------------
+  # The ask legs run against the VM host daemon (NET-045): it offers the ask
+  # to the attach on the host and records every outcome in its own audit
+  # log. The allow and guest-audit legs below read the daemon's own log and
+  # audit file on this host, which a VM lane's guest daemon does not write
+  # here, so they are counted NOT RUN on a VM lane and land there with T97
+  # (gominimal/minimal#1970).
   if [ -n "${E2E_VM:-}" ]; then
-    assert_vm_refuses_dynamic_stance ask "$eib_yes_name" eib-inside-ask \
-      --dynamic-range "$eib_lo-$eib_hi"
+    local eib_vm_sids=""
+    eib_vm_sids="$WORK/eib-vm-sids"
+    : > "$eib_vm_sids"
+    eib_vm_ask_legs "$eib_port" "$eib_lo" "$eib_hi" \
+      "$eib_yes_name" "$eib_no_name" "$eib_nobody_name" 3>>"$eib_vm_sids"
+    while IFS= read -r eib_vm_sid; do
+      [ -n "$eib_vm_sid" ] && { mnl session destroy --force "$eib_vm_sid" >/dev/null 2>&1 || true; }
+    done < "$eib_vm_sids"
     not_run expose_from_inside_box \
-      "VM lane: the allow, answered-ask and audit legs read the host daemon's own log and audit file, which the guest daemon does not write here — T97, gominimal/minimal#1970"
-    echo "expose from inside the box OK on a VM lane (ask refused at the create with the typed T96 reason; the allow and audit legs are T97's on this lane)"
+      "VM lane: the allow and guest-audit legs read the host daemon's own log and audit file, which the guest daemon does not write here — T97, gominimal/minimal#1970"
+    echo "expose from inside the box OK on a VM lane (the host's attached human's Allow published, the deny recorded nothing and a later expose asked again, nobody attached was refused, every ask outcome is in the host audit; the allow and guest-audit legs are T97's on this lane)"
     echo "::endgroup::"
     return 0
   fi
