@@ -1909,6 +1909,15 @@ impl PublishedForwards {
             .map(|(_, addr, _, _)| *addr)
     }
 
+    /// The protocol the applied publish of `listener` was published in,
+    /// when one is in the ledger.
+    fn protocol_of(&self, listener: Listener) -> Option<u8> {
+        self.lock()
+            .iter()
+            .find(|(held, _, _, _)| *held == listener)
+            .map(|(_, _, _, proto)| *proto)
+    }
+
     /// Whether an applied publish's forward dials `addr` at `port`: the
     /// inside end of one of that box's live published mappings, the port
     /// every client's dial toward the box arrives at and the bound the
@@ -2017,7 +2026,15 @@ fn decide_control_request(
 ) -> Result<ControlDecision, RefusedRequest> {
     let mut dictionary = Vec::new();
     let rows = table.rows();
-    let Some(switch_rows) = switch_rows_of(&rows, &mut dictionary) else {
+    // The protocol the request publishes or retracts in: the runtime half
+    // of each row is keyed on (port, protocol), so only the runtime ports
+    // recorded under this protocol admit it. A zone-add carries no port.
+    let request_proto = match verb {
+        ControlVerb::Expose => published_protocol(body),
+        ControlVerb::Unexpose => retracted_protocol(body, forwards),
+        ControlVerb::DnsAdd => None,
+    };
+    let Some(switch_rows) = switch_rows_of(&rows, request_proto, &mut dictionary) else {
         return Err(RefusedRequest {
             rule: MALFORMED_PUBLISH_RULE,
             addr: None,
@@ -2079,7 +2096,18 @@ fn decide_control_request(
 /// — and then the rows' declared names, in switch-address order; `None` when
 /// the rows carry more distinct names than a `u8` index can name — a shape
 /// the honest registry cannot reach, refused closed.
-fn switch_rows_of(rows: &[Arc<BoxRecord>], dictionary: &mut Vec<String>) -> Option<Vec<SwitchRow>> {
+///
+/// The runtime half of each row is the runtime ports recorded under
+/// `request_proto` (NET-138): the row records (port, protocol) pairs, and
+/// the decision's records carry port numbers only, so the protocol is
+/// applied here — a port admitted for udp never admits a tcp publish at the
+/// same number. `None` (a zone-add, or a protocol the client does not spell)
+/// carries no runtime port.
+fn switch_rows_of(
+    rows: &[Arc<BoxRecord>],
+    request_proto: Option<u8>,
+    dictionary: &mut Vec<String>,
+) -> Option<Vec<SwitchRow>> {
     let mut seen: HashMap<String, u8> = HashMap::new();
     let mut switch_rows = Vec::with_capacity(rows.len());
     for record in rows {
@@ -2099,16 +2127,25 @@ fn switch_rows_of(rows: &[Arc<BoxRecord>], dictionary: &mut Vec<String>) -> Opti
             };
             names.push(index);
         }
-        // The row's runtime-published set — the ports the box's own listens
-        // published, the only ones a retraction at its address is applied
-        // for — is empty until listen-publishing (NET-016, NET-017) lands:
-        // today no guest retraction at a held address is applied, and a
-        // declared port's forward never is.
-        switch_rows.push(SwitchRow::of(
-            record.switch_addr().octets(),
-            record.admitted_ports().to_vec(),
-            names,
-        ));
+        // The row's admitted set for the publish decision (NET-138): the
+        // ports its declaration named plus the runtime ports the grant
+        // recorded — the set a publish at its address is admitted by, so a
+        // port the in-VM daemon reported inside the grant reaches the box
+        // through the gate for as long as the row holds it. The runtime
+        // half rides beside as the retraction's own set: a retraction of a
+        // runtime-published port is applied, while a declared port's
+        // forward never is (the declaration is not the box's runtime fact
+        // to retract).
+        let runtime = match request_proto {
+            Some(egress::IPPROTO_TCP) => record.runtime_port_numbers_in(sessions::IpProto::Tcp),
+            Some(egress::IPPROTO_UDP) => record.runtime_port_numbers_in(sessions::IpProto::Udp),
+            _ => Vec::new(),
+        };
+        let mut ports = record.admitted_ports().to_vec();
+        ports.extend(runtime.iter().copied());
+        switch_rows.push(
+            SwitchRow::of(record.switch_addr().octets(), ports, names).with_published(runtime),
+        );
     }
     Some(switch_rows)
 }
@@ -2512,6 +2549,17 @@ fn published_protocol(body: &[u8]) -> Option<u8> {
         "udp" => Some(egress::IPPROTO_UDP),
         _ => None,
     }
+}
+
+/// The protocol a retraction withdraws in: the one the ledger noted for the
+/// publish of the listener the retraction names — the protocol the
+/// publication was applied under, not the one the retraction spells. `None`
+/// for a body that does not parse or a listener no applied publish names —
+/// a retraction the decision refuses on its own terms.
+fn retracted_protocol(body: &[u8], forwards: &PublishedForwards) -> Option<u8> {
+    let parsed = serde_json_lenient::from_slice::<UnexposeBody>(body).ok()?;
+    let listener = loopback_listener(&parsed.local).ok()?;
+    forwards.protocol_of(listener)
 }
 
 /// Whether `addr` falls in [`RESERVED_LOCAL_RANGE`] — the block published
@@ -12070,6 +12118,176 @@ mod tests {
                 "the declared forward still publishes after its refused withdrawal"
             );
         }
+    }
+
+    /// NET-138: the gate's admitted set for a box is its declared ports
+    /// plus the runtime ports its row recorded — the half that makes a
+    /// port the in-VM daemon reported inside the grant reachable through
+    /// the gate. The publish of a runtime-admitted port is applied by the
+    /// row; a port inside the grant's range that no report recorded stays
+    /// refused; and once the withdrawal report removes the port, the same
+    /// publish is refused again — the admission lives exactly as long as
+    /// the row holds it.
+    #[tokio::test]
+    async fn admitted_runtime_port_reaches_the_box_through_the_gate() {
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register(
+            BoxRegistration::new("web", Ipv4Addr::from(LEASE), Ipv4Addr::LOCALHOST)
+                .with_admitted_ports([8080])
+                .with_dynamic_ingress(sessions::DynamicIngress::Allow, Some((3000, 3999))),
+        );
+        let mut h = gate_connected(registry.clone()).await;
+
+        // The in-VM daemon's report, inside the grant the registration
+        // holds — recorded by the host while the gate is already serving,
+        // so the row the gate decides by carries the port as its live
+        // runtime half.
+        registry
+            .admit_runtime_port(
+                Ipv4Addr::from(LEASE),
+                3000,
+                sessions::IpProto::Tcp,
+                std::time::Instant::now(),
+            )
+            .expect("the report is inside the grant the row holds");
+
+        // The publish of the runtime-admitted port — the mapping that makes
+        // it reachable — is applied: it reaches the switch whole, and the
+        // switch's answer reaches the guest back.
+        let expose = expose_request("127.0.0.1:3000", "100.64.0.9:3000", "tcp");
+        h.guest
+            .write_all(&expose)
+            .await
+            .expect("writing the runtime-admitted port's publish");
+        let mut spoken = vec![0u8; expose.len()];
+        read_within(&mut h.switch, &mut spoken).await;
+        assert_eq!(
+            spoken, expose,
+            "the runtime-admitted port's publish reached the switch"
+        );
+        let answer = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+        h.switch
+            .write_all(answer)
+            .await
+            .expect("writing gvproxy's answer");
+        let mut seen = vec![0u8; answer.len()];
+        read_within(&mut h.guest, &mut seen).await;
+        assert_eq!(seen, answer, "the publish's answer reaches the guest");
+
+        // A port inside the grant's range that no report recorded is not
+        // admitted — the report is the only way a runtime port enters the
+        // set — and its publish is refused at the row's address, before a
+        // byte reaches the switch.
+        let (mut guest, mut switch) = connect_control(&h).await;
+        let unreported = expose_request("127.0.0.1:3500", "100.64.0.9:3500", "tcp");
+        guest
+            .write_all(&unreported)
+            .await
+            .expect("writing the unreported port's publish");
+        wait_for_log(&h.log, "port_or_name=port 3500").await;
+        let logged = h.log.contents();
+        assert!(
+            logged.contains("rule_matched=\"egress-undeclared-publish-record\""),
+            "the refusal names its own class, got: {logged}"
+        );
+        assert!(
+            logged.contains("source=100.64.0.9"),
+            "the refusal names the box whose row refused the record, got: {logged}"
+        );
+        let mut probe = [0u8; 1];
+        match tokio::time::timeout(DEADLINE, switch.read(&mut probe)).await {
+            Ok(Ok(0)) => {}
+            Ok(Ok(n)) => panic!("{n} byte(s) of the refused publish reached the switch"),
+            Ok(Err(e)) => panic!("reading the switch end failed: {e}"),
+            Err(_) => panic!("the gate left the switch side hanging"),
+        }
+        expect_teardown(&mut guest).await;
+
+        // The withdrawal report removes the port, and the same publish is
+        // refused: the admission lives exactly as long as the row holds it.
+        // The refusal itself is the second one this box and rule asked for
+        // inside the drops' rate window, so its warn line is the window's to
+        // keep — the proof is behavioural: nothing of the publish reaches
+        // the switch, and the guest's side comes down.
+        registry.withdraw_runtime_port(Ipv4Addr::from(LEASE), 3000, sessions::IpProto::Tcp);
+        let row = h
+            .table
+            .by_source(LEASE)
+            .expect("the box's row is still published");
+        assert!(
+            row.runtime_port_numbers().is_empty(),
+            "the withdrawal report removed the row's runtime port: {:?}",
+            row.runtime_port_numbers()
+        );
+        let (mut guest, mut switch) = connect_control(&h).await;
+        guest
+            .write_all(&expose)
+            .await
+            .expect("writing the withdrawn port's publish");
+        expect_teardown(&mut guest).await;
+        let mut probe = [0u8; 1];
+        match tokio::time::timeout(DEADLINE, switch.read(&mut probe)).await {
+            Ok(Ok(0)) => {}
+            Ok(Ok(n)) => panic!(
+                "{n} byte(s) of the withdrawn port's publish reached the switch; \
+                 the admission outlived the row's hold on the port"
+            ),
+            Ok(Err(e)) => panic!("reading the switch end failed: {e}"),
+            Err(_) => panic!("the gate left the switch side hanging"),
+        }
+    }
+
+    /// NET-138: the gate keys a runtime admission on the (port, protocol)
+    /// pair the report named. A row that recorded 3000/udp admits the udp
+    /// publish of 3000 and refuses the tcp publish of the same number,
+    /// before a byte of it reaches the switch.
+    #[tokio::test]
+    async fn admitted_runtime_udp_port_does_not_admit_tcp() {
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register(
+            BoxRegistration::new("web", Ipv4Addr::from(LEASE), Ipv4Addr::LOCALHOST)
+                .with_dynamic_ingress(sessions::DynamicIngress::Allow, Some((3000, 3999))),
+        );
+        let mut h = gate_connected(registry.clone()).await;
+        registry
+            .admit_runtime_port(
+                Ipv4Addr::from(LEASE),
+                3000,
+                sessions::IpProto::Udp,
+                std::time::Instant::now(),
+            )
+            .expect("the udp report is inside the grant the row holds");
+
+        // The udp publish of the admitted pair reaches the switch.
+        let udp = expose_request("127.0.0.1:3000", "100.64.0.9:3000", "udp");
+        h.guest
+            .write_all(&udp)
+            .await
+            .expect("writing the udp publish");
+        let mut spoken = vec![0u8; udp.len()];
+        read_within(&mut h.switch, &mut spoken).await;
+        assert_eq!(spoken, udp, "the admitted udp publish reached the switch");
+
+        // The tcp publish of the same number is refused at the row's
+        // address: the udp admission is not a tcp one.
+        let (mut guest, mut switch) = connect_control(&h).await;
+        let tcp = expose_request("127.0.0.1:3000", "100.64.0.9:3000", "tcp");
+        guest
+            .write_all(&tcp)
+            .await
+            .expect("writing the tcp publish");
+        wait_for_log(&h.log, "rule_matched=\"egress-undeclared-publish-record\"").await;
+        let mut probe = [0u8; 1];
+        match tokio::time::timeout(DEADLINE, switch.read(&mut probe)).await {
+            Ok(Ok(0)) => {}
+            Ok(Ok(n)) => panic!(
+                "{n} byte(s) of the tcp publish reached the switch; a udp admission \
+                 admitted tcp"
+            ),
+            Ok(Err(e)) => panic!("reading the switch end failed: {e}"),
+            Err(_) => panic!("the gate left the switch side hanging"),
+        }
+        expect_teardown(&mut guest).await;
     }
 
     /// The interim's own teardowns keep working: a publish the interim

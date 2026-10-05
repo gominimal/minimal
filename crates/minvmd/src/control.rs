@@ -22,7 +22,31 @@
 //! outcome (T93): when the supervisor reached a cause that names why the
 //! proxy is not serving, the reply carries it (see
 //! [`ProxyPublishStatus`]), so the CLI's surfaces say *why*, not just that.
-//! The read touches no row and mutates nothing.
+//! The read touches no row and mutates nothing. The read-only row verb
+//! (`read_row`, NET-138) is the same shape again: one live box's row — its
+//! switch address, its derived egress allow-list, its declared and
+//! runtime-admitted ports — answered for a name a live box holds, and the
+//! no-row marker for one nothing holds. A destroyed box's row answers
+//! nothing, because a withdrawn row is gone, not archived.
+//!
+//! Two doors, because two peers (NET-138). The host's control socket takes
+//! the registrations, their withdrawals, and both read-only verbs; the
+//! second door — [`GUEST_CONTROL_SOCK_FILE`] — is the in-VM daemon's
+//! control channel, bridged to the guest over vsock at
+//! [`minimald_rpc::VM_HOST_BOX_REPORT_PORT`] (bound by T94 together with
+//! that bridge; this module serves its verbs but binds no socket for it
+//! yet), and it takes the port reports alone: `admit_port`, the guest's report that one of its boxes published
+//! a runtime port, and `withdraw_port`, its withdrawal. The verb decides
+//! which door answers it, never the peer: a registration that arrives on
+//! the guest's channel is refused the same way a port report that arrives
+//! on the host's is, because the host control socket's owner-only file
+//! mode is the read's access control and the box table's, and the guest
+//! channel's grant check — the stance, range, cap and rate the row's
+//! host-side registration holds — is the report's. Every admit and
+//! withdraw report answers one log line naming the box, the port, the
+//! reporting source and the outcome; every recorded admission appends a
+//! host-side copy to the daemon's own audit log
+//! (`audit/box-admissions.log`, in the same state dir the sockets live in).
 //!
 //! The socket lives beside the daemon's ssh socket in the provider-instance
 //! dir and is created with the same 0700-dir / 0600-socket posture the
@@ -55,16 +79,18 @@
 
 use std::collections::HashSet;
 use std::io::{Read, Write};
+use std::net::Ipv4Addr;
 use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use minimald_rpc::{
-    BoxAddresses, BoxControlReply, BoxControlRequest, ProxyDownCause, RegisterBoxRequest,
-    RegisteredBox, WithdrawBoxRequest, ZoneAnswererStatus,
+    AdmitPortRequest, BoxAddresses, BoxControlReply, BoxControlRequest, BoxRow, IpProto,
+    PortReportSource, ProxyDownCause, ReadRowRequest, RegisterBoxRequest, RegisteredBox,
+    WithdrawBoxRequest, WithdrawPortRequest, ZoneAnswererStatus,
 };
 
 use crate::box_registry::{BoxRegistry, ClientBoxSpec};
@@ -75,6 +101,58 @@ use crate::net::answerer::AnswererStatus;
 /// is shared with consumers that have no box table, and this name only
 /// means something where `minvmd` supervises one.
 pub const CONTROL_SOCK_FILE: &str = "control.sock";
+
+/// The in-VM daemon's control channel's file name, beside the control
+/// socket in the same provider-instance dir: the door the port reports
+/// (NET-138) arrive on, bridged to the guest over vsock at
+/// [`minimald_rpc::VM_HOST_BOX_REPORT_PORT`] — the one channel from inside
+/// the microVM that answers, because a report the grant refused must be
+/// refused *to the reporter* for the publish to unwind.
+pub const GUEST_CONTROL_SOCK_FILE: &str = "guest-control.sock";
+
+/// The audit log the daemon appends its host-side copy of each recorded
+/// admission to, relative to the provider dir the sockets live in — the
+/// daemon's own audit log, beside the state it keeps for the VM it
+/// serves.
+const AUDIT_LOG_RELATIVE_PATH: &str = "audit/box-admissions.log";
+
+/// The audit copy's timestamp shape: Unix seconds, the same spelling the
+/// daemon's own persisted state carries (`minvmd.toml`'s `started_at`), so
+/// every timestamp a bundle collects from this daemon reads one way.
+///
+/// A clock before the epoch answers `0`: the audit copy is best-effort —
+/// its loss is a warn line, never a failed report — and a timestamp that
+/// could not be taken is not a reason to lose the admission it names.
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or(0)
+}
+
+/// Which socket a request arrived on (NET-138): the door is the verb's
+/// access control. [`ControlDoor::Host`] is the host's own control socket,
+/// whose owner-only file mode is every row operation's and the read-only
+/// row verb's gate; [`ControlDoor::GuestReports`] is the in-VM daemon's
+/// channel, where the grant the row's registration holds — not the peer —
+/// decides what a report may record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ControlDoor {
+    /// The host's control socket, in the provider dir beside the ssh
+    /// socket: registrations, withdrawals, and both read-only verbs.
+    Host,
+    /// The in-VM daemon's control channel: the port reports alone. No
+    /// runtime socket serves it until T94 binds it with the vsock bridge;
+    /// the tests drive it directly.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the guest door is bound by T94 with the vsock bridge"
+        )
+    )]
+    GuestReports,
+}
 
 /// How long the server waits for a registration's one request line before
 /// dropping the connection. Generous against a slow starter; a hung client
@@ -348,13 +426,21 @@ pub fn resolve_control_sock() -> std::io::Result<PathBuf> {
 }
 
 /// Bind the control socket at `sock_path` and serve box control requests
-/// — registrations, their withdrawals, and the answerer-status read —
-/// against `boxes` on a dedicated thread, whose handle the caller holds for
-/// as long as the daemon lives.
+/// — registrations, their withdrawals, both read-only verbs — against
+/// `boxes` on a dedicated thread, whose handle the caller holds for as
+/// long as the daemon lives.
+///
+/// The in-VM daemon's report channel ([`GUEST_CONTROL_SOCK_FILE`]) is not
+/// bound here: T94 binds the guest door together with the vsock bridge at
+/// [`minimald_rpc::VM_HOST_BOX_REPORT_PORT`] (7352) that is its only peer.
+/// Until then the port-report verbs (`admit_port`, `withdraw_port`) are
+/// served only on [`ControlDoor::GuestReports`], which no runtime socket
+/// carries, so a report reaching the host's socket is refused as the
+/// wrong door.
 ///
 /// The bind happens on the calling thread so its failure surfaces to the
 /// supervisor's own startup error handling; only the accept loop moves to
-/// the thread. The socket gets the bridge socket's posture: path-length
+/// its thread. The socket gets the bridge socket's posture: path-length
 /// check (libkrun aborts on over-long socket paths), a 0700 parent dir, a
 /// stale socket removed, and 0600 on the socket itself.
 pub fn spawn(
@@ -372,25 +458,44 @@ pub fn spawn(
     crate::sock::remove_stale_socket(&sock_path)?;
     let listener = UnixListener::bind(&sock_path)?;
     crate::sock::enforce_socket_permissions(&sock_path)?;
+    // The audit copy's path, kept under the state dir the socket lives in;
+    // only the guest door appends to it, but every door carries it so the
+    // signature is one.
+    let audit_path = audit_log_path(&sock_path);
     std::thread::Builder::new()
         .name("minvmd-control".to_string())
-        .spawn(move || accept_loop(listener, boxes, answerer, proxy_publish))
+        .spawn(move || {
+            accept_loop(
+                listener,
+                boxes,
+                answerer,
+                proxy_publish,
+                ControlDoor::Host,
+                &audit_path,
+            )
+        })
 }
 
 /// Accept and serve box control requests until the daemon exits. One
-/// connection at a time: a request is a row's map write or removal, served
-/// serially so the table sees its requests in arrival order — and the
-/// status read rides the same serial turn.
+/// connection at a time per door: a request is a row's map write or
+/// removal, served serially so the table sees its requests in arrival
+/// order — and the status and row reads ride the same serial turn. The
+/// two doors are served on two threads, so a report the grant refuses
+/// never waits behind a registration.
 fn accept_loop(
     listener: UnixListener,
     boxes: BoxRegistry,
     answerer: AnswererStatus,
     proxy_publish: ProxyPublishStatus,
+    door: ControlDoor,
+    audit_path: &Path,
 ) {
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                if let Err(error) = serve_connection(stream, &boxes, &answerer, &proxy_publish) {
+                if let Err(error) =
+                    serve_connection(stream, &boxes, &answerer, &proxy_publish, door, audit_path)
+                {
                     tracing::debug!(error = %error, "box control connection failed");
                 }
             }
@@ -405,6 +510,8 @@ fn serve_connection(
     boxes: &BoxRegistry,
     answerer: &AnswererStatus,
     proxy_publish: &ProxyPublishStatus,
+    door: ControlDoor,
+    audit_path: &Path,
 ) -> std::io::Result<()> {
     let mut stream = stream;
     stream.set_read_timeout(Some(REGISTER_READ_TIMEOUT))?;
@@ -454,7 +561,15 @@ fn serve_connection(
         );
         return Ok(());
     }
-    serve_request(&mut stream, boxes, answerer, proxy_publish, request)
+    serve_request(
+        &mut stream,
+        boxes,
+        answerer,
+        proxy_publish,
+        door,
+        audit_path,
+        request,
+    )
 }
 
 /// Whether `peer_uid` is root connecting to a daemon that is not root's:
@@ -478,28 +593,39 @@ fn root_may_ask(request: &BoxControlRequest) -> bool {
 /// The verb dispatch is where the wire's parse refusal pays off: a line
 /// that names no verb this build knows never reaches the table at all, so
 /// a skewed client cannot make a withdraw look like a register (the
-/// [`minimald_rpc::BoxControlRequest`] docs carry that corner). The one
-/// read-only verb — the answerer's status — touches no row and mutates
-/// nothing: it answers the state the acquisition loop last wrote, under
-/// the same socket posture every verb here is served under (the v1 trust
-/// is the uid: the 0600 socket plus the peer-credential check every
-/// connection passes before its line is read).
+/// [`minimald_rpc::BoxControlRequest`] docs carry that corner). The
+/// read-only verbs — the answerer's status and the row read — touch no row
+/// and mutate nothing: they answer the state the acquisition loop last
+/// wrote and the table the registrations filled, under the same socket
+/// posture every verb here is served under (the v1 trust is the uid: the
+/// 0600 socket plus the peer-credential check every connection passes
+/// before its line is read).
+///
+/// The door is the verb's access control (NET-138): registrations,
+/// withdrawals and both reads answer only on the host's socket, whose
+/// owner-only file mode is the row read's gate, and the port reports
+/// answer only on the in-VM daemon's channel, where the grant the row's
+/// registration holds decides. A verb on the wrong door is refused with
+/// its reason — never parsed into the other door's posture, because the
+/// peer a door serves is exactly what the verb decides what it may do.
 fn serve_request(
     stream: &mut UnixStream,
     boxes: &BoxRegistry,
     answerer: &AnswererStatus,
     proxy_publish: &ProxyPublishStatus,
+    door: ControlDoor,
+    audit_path: &Path,
     request: BoxControlRequest,
 ) -> std::io::Result<()> {
-    match request {
-        BoxControlRequest::Register(request) => {
+    match (request, door) {
+        (BoxControlRequest::Register(request), ControlDoor::Host) => {
             register_and_reply(stream, boxes, answerer, request)
         }
-        BoxControlRequest::Withdraw(request) => {
+        (BoxControlRequest::Withdraw(request), ControlDoor::Host) => {
             withdraw_and_reply(stream, boxes, answerer, request)
         }
-        BoxControlRequest::AnswererStatus => {
-            // The one read-only verb answers the host facts the CLI's
+        (BoxControlRequest::AnswererStatus, ControlDoor::Host) => {
+            // The read-only status answers the host facts the CLI's
             // surfaces read (T93): why the hostname proxy is not serving
             // when the supervisor reached a cause that names it, and
             // otherwise the answerer's state as it always did — the
@@ -510,7 +636,16 @@ fn serve_request(
             };
             write_reply(stream, &reply)
         }
-        BoxControlRequest::ReleaseAnswerer => {
+        (BoxControlRequest::ReadRow(request), ControlDoor::Host) => {
+            read_row_and_reply(stream, boxes, request)
+        }
+        (BoxControlRequest::AdmitPort(request), ControlDoor::GuestReports) => {
+            admit_report_and_reply(stream, boxes, audit_path, request)
+        }
+        (BoxControlRequest::WithdrawPort(request), ControlDoor::GuestReports) => {
+            withdraw_report_and_reply(stream, boxes, request)
+        }
+        (BoxControlRequest::ReleaseAnswerer, ControlDoor::Host) => {
             let reply = answerer.release();
             tracing::info!(
                 acted = reply.acted,
@@ -525,7 +660,7 @@ fn serve_request(
                 },
             )
         }
-        BoxControlRequest::ReleaseAnswererCancel => {
+        (BoxControlRequest::ReleaseAnswererCancel, ControlDoor::Host) => {
             let reply = answerer.release_cancel();
             tracing::info!(
                 acted = reply.acted,
@@ -540,6 +675,62 @@ fn serve_request(
                 },
             )
         }
+        // The verb does not answer on this door: a registration or a read
+        // that arrives on the in-VM daemon's channel, or a port report
+        // that arrives on the host's socket, is refused naming the door
+        // that serves it — one warn line per refusal, because a verb on
+        // the wrong door is a client built against another posture, not a
+        // frame to drop silently.
+        (request, door) => refused_wrong_door(stream, &request, door),
+    }
+}
+
+/// Refuse a verb that arrived on a door that does not serve it (NET-138):
+/// one warn line and one error reply naming where the verb is served, so
+/// a client that dialed the wrong socket learns the door's rule rather
+/// than a generic refusal.
+fn refused_wrong_door(
+    stream: &mut UnixStream,
+    request: &BoxControlRequest,
+    door: ControlDoor,
+) -> std::io::Result<()> {
+    let verb = request_verb(request);
+    let (error, serves) = match door {
+        ControlDoor::Host => (
+            format!(
+                "the {verb} verb is served on the in-VM daemon's control channel, \
+                 not the host's control socket"
+            ),
+            "the host's control socket",
+        ),
+        ControlDoor::GuestReports => (
+            format!(
+                "the {verb} verb is served on the host's control socket, not the \
+                 in-VM daemon's control channel"
+            ),
+            "the in-VM daemon's control channel",
+        ),
+    };
+    tracing::warn!(
+        verb = %verb,
+        door = %serves,
+        "refused a box control verb on the door that does not serve it"
+    );
+    write_reply(stream, &BoxControlReply::Error { error })
+}
+
+/// The verb's own name, as a wrong-door refusal names it: the one spelling
+/// the tagged wire carries.
+fn request_verb(request: &BoxControlRequest) -> &'static str {
+    match request {
+        BoxControlRequest::Register(_) => "register",
+        BoxControlRequest::Withdraw(_) => "withdraw",
+        BoxControlRequest::AnswererStatus => "answerer_status",
+        BoxControlRequest::AdmitPort(_) => "admit_port",
+        BoxControlRequest::WithdrawPort(_) => "withdraw_port",
+        BoxControlRequest::ReadRow(_) => "read_row",
+        BoxControlRequest::ReleaseAnswerer => "release_answerer",
+        BoxControlRequest::ReleaseAnswererCancel => "release_answerer_cancel",
     }
 }
 
@@ -700,6 +891,11 @@ fn register_and_reply(
         ingress_ports: request.ingress_ports,
         egress: request.egress,
         credentialed_upstream: request.credentialed_upstream,
+        // The dynamic-ingress grant (NET-045, NET-138), from the same
+        // create inputs the session record holds: the stance and range the
+        // row holds every runtime port report against.
+        dynamic_ingress: request.dynamic_ingress,
+        dynamic_allowed_range: request.dynamic_allowed_range,
     };
     let loopback_addr = match answerer.allocate(&request.name) {
         Ok(address) => address,
@@ -815,6 +1011,226 @@ fn write_reply(stream: &mut UnixStream, reply: &BoxControlReply) -> std::io::Res
     stream.write_all(line.as_bytes())
 }
 
+/// Serve the in-VM daemon's admit report (NET-138, NET-045): record the
+/// reported port inside the grant the row's host-side registration holds,
+/// answer the row it recorded into, and write the host-side audit copy.
+/// One info line per recorded report and one warn line per refusal name
+/// the box, the port, the reporting source and the outcome — the lines a
+/// diagnostic bundle's daemon log tail is read for.
+///
+/// The refusal answers `Error` with the grant's own sentence, so the
+/// guest's publish unwinds on the check that refused it: nothing was
+/// recorded, and the in-VM mapping is the caller's to take down.
+fn admit_report_and_reply(
+    stream: &mut UnixStream,
+    boxes: &BoxRegistry,
+    audit_path: &Path,
+    request: AdmitPortRequest,
+) -> std::io::Result<()> {
+    let source = source_text(request.source);
+    let reply = match boxes.admit_runtime_port(
+        request.switch_address,
+        request.port,
+        request.proto,
+        std::time::Instant::now(),
+    ) {
+        Ok(record) => {
+            tracing::info!(
+                box = %record.name(),
+                switch_address = %request.switch_address,
+                port = request.port,
+                proto = %request.proto,
+                source = %source,
+                "recorded the box's runtime-admitted port in the host-held grant"
+            );
+            append_audit_copy(audit_path, &record, &request);
+            BoxControlReply::PortRecorded {
+                port: request.port,
+                proto: request.proto,
+            }
+        }
+        Err(refusal) => {
+            // Every refusal against the grant is a warn line, the box named
+            // where the row exists and the address standing in for it where
+            // nothing does.
+            tracing::warn!(
+                switch_address = %request.switch_address,
+                port = request.port,
+                proto = %request.proto,
+                source = %source,
+                reason = %refusal,
+                "refused the in-VM daemon's port report against the host-held grant"
+            );
+            BoxControlReply::Error {
+                error: refusal.to_string(),
+            }
+        }
+    };
+    write_reply(stream, &reply)
+}
+
+/// Serve the in-VM daemon's withdrawal report (NET-138): remove the
+/// reported port from the row's runtime set. Never refused — the cap and
+/// the rate are the admit path's bounds — and answered with the same
+/// `PortRecorded` reply whether the port was held or not, because a row
+/// that holds nothing the report names is already the report's goal
+/// state. One info line per report, the same shape the admit path's
+/// answers with.
+fn withdraw_report_and_reply(
+    stream: &mut UnixStream,
+    boxes: &BoxRegistry,
+    request: WithdrawPortRequest,
+) -> std::io::Result<()> {
+    let source = source_text(request.source);
+    let row = boxes.withdraw_runtime_port(request.switch_address, request.port, request.proto);
+    match &row {
+        Some(record) => tracing::info!(
+            box = %record.name(),
+            switch_address = %request.switch_address,
+            port = request.port,
+            proto = %request.proto,
+            source = %source,
+            "withdrew the box's runtime-admitted port from the host-held grant"
+        ),
+        None => tracing::info!(
+            switch_address = %request.switch_address,
+            port = request.port,
+            proto = %request.proto,
+            source = %source,
+            "no live row holds the withdrawn port; the grant's goal state already holds"
+        ),
+    }
+    write_reply(
+        stream,
+        &BoxControlReply::PortRecorded {
+            port: request.port,
+            proto: request.proto,
+        },
+    )
+}
+
+/// Serve the read-only row verb (NET-138): the live row the asked-for name
+/// resolves to under the identity rule — a box's id on the host is its
+/// name, exact, and liveness is the table's own fact — answered with its
+/// switch address, its derived egress allow-list, and its declared and
+/// runtime-admitted ports. A name no live box holds answers the no-row
+/// marker: a withdrawn row is gone, not archived, so a destroyed box's
+/// last row can never be read. The verb changes no state and writes no
+/// log line; the socket it answers on — the host's, whose owner-only file
+/// mode is its access control — is the verb's whole posture.
+fn read_row_and_reply(
+    stream: &mut UnixStream,
+    boxes: &BoxRegistry,
+    request: ReadRowRequest,
+) -> std::io::Result<()> {
+    let reply = match boxes.row_by_name(&request.name) {
+        Some(record) => BoxControlReply::Row(BoxRow {
+            name: record.name().to_string(),
+            switch_address: record.switch_addr(),
+            egress_allow_list: record.egress_allow_list().to_vec(),
+            declared_ports: record.admitted_ports().to_vec(),
+            runtime_ports: record.runtime_port_numbers(),
+        }),
+        None => BoxControlReply::NoRow {
+            name: request.name.clone(),
+            no_row: true,
+        },
+    };
+    write_reply(stream, &reply)
+}
+
+/// The reporting source as a log line names it: the one spelling the
+/// diagnostics name the three reporting sides by.
+fn source_text(source: PortReportSource) -> &'static str {
+    match source {
+        PortReportSource::Expose => "expose",
+        PortReportSource::Ask => "ask",
+        PortReportSource::Listen => "listen",
+    }
+}
+
+/// The audit copy's path, derived from the control socket's own dir: the
+/// provider-instance dir is this daemon's state for the VM it serves, so
+/// the log lives beside the sockets and the persisted state it speaks for.
+fn audit_log_path(sock_path: &Path) -> PathBuf {
+    match sock_path.parent() {
+        Some(dir) => dir.join(AUDIT_LOG_RELATIVE_PATH),
+        None => PathBuf::from(AUDIT_LOG_RELATIVE_PATH),
+    }
+}
+
+/// One recorded admission's host-side audit copy (NET-138): the same event
+/// the info line says, in the shape a tail and a diagnostic bundle's copy
+/// both parse — one JSON object per line, JSONL like the in-VM daemon's
+/// own audit log, so both ends of the report channel write the same form.
+#[derive(serde::Serialize)]
+struct AdmittedPortAudit {
+    /// When the report was recorded: Unix seconds.
+    ts: u64,
+    /// The box the port was recorded for — its name.
+    #[serde(rename = "box")]
+    box_name: String,
+    /// The row the port recorded into — its switch address, the key the
+    /// report carried.
+    switch_address: Ipv4Addr,
+    /// The recorded port.
+    port: u16,
+    /// The protocol the port was published under.
+    proto: IpProto,
+    /// Which side of the in-VM daemon reported it.
+    source: PortReportSource,
+}
+
+/// Append one recorded admission's host-side copy to the daemon's audit
+/// log. Best-effort by design: the report itself was already recorded —
+/// the row holds the port — so a copy that cannot be written is a warn
+/// line, never a failed report and never a rollback of the admission the
+/// grant already admitted. The parent dirs are created when absent (the
+/// first admission on a fresh state dir), and the append is a plain
+/// one-line write, since this file is host-side state the guest cannot
+/// reach. The file is created owner-only (0600), the posture the sockets
+/// beside it carry: it names every box and port a guest admitted.
+fn append_audit_copy(
+    path: &Path,
+    record: &Arc<crate::box_registry::BoxRecord>,
+    request: &AdmitPortRequest,
+) {
+    let line = AdmittedPortAudit {
+        ts: unix_now_secs(),
+        box_name: record.name().to_string(),
+        switch_address: request.switch_address,
+        port: request.port,
+        proto: request.proto,
+        source: request.source,
+    };
+    let Ok(json) = serde_json_lenient::to_string(&line) else {
+        // A plain struct of primitives serializes; this arm is unreachable
+        // in practice and costs nothing to keep honest.
+        tracing::warn!("the recorded admission's audit copy did not serialize");
+        return;
+    };
+    let written = (|| -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(path)?;
+        writeln!(file, "{json}")
+    })();
+    if let Err(error) = written {
+        tracing::warn!(
+            %error,
+            path = %path.display(),
+            "the recorded admission could not be copied to the host-side audit log"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::{BufRead, BufReader, Write};
@@ -893,7 +1309,39 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(2));
         }
+        spawn_guest_door(&sock_path, &boxes, &answerer, &proxy_publish)?;
         Ok((sock_path, handle, boxes, answerer, proxy_publish))
+    }
+
+    /// Serves [`ControlDoor::GuestReports`] on a test-only socket beside
+    /// `sock_path` — the runtime binds no guest door until T94 brings the
+    /// vsock bridge — so the per-door verb enforcement is driven with the
+    /// door value directly, through the same accept loop and audit path the
+    /// daemon's door will use.
+    fn spawn_guest_door(
+        sock_path: &std::path::Path,
+        boxes: &BoxRegistry,
+        answerer: &AnswererStatus,
+        proxy_publish: &ProxyPublishStatus,
+    ) -> std::io::Result<()> {
+        let guest_sock_path = sock_path.with_file_name(GUEST_CONTROL_SOCK_FILE);
+        let listener = UnixListener::bind(&guest_sock_path)?;
+        let audit_path = audit_log_path(sock_path);
+        let (boxes, answerer, proxy_publish) =
+            (boxes.clone(), answerer.clone(), proxy_publish.clone());
+        std::thread::Builder::new()
+            .name("minvmd-guest-control-test".to_string())
+            .spawn(move || {
+                accept_loop(
+                    listener,
+                    boxes,
+                    answerer,
+                    proxy_publish,
+                    ControlDoor::GuestReports,
+                    &audit_path,
+                )
+            })?;
+        Ok(())
     }
 
     /// A client that writes the request and reads the reply line back,
@@ -943,6 +1391,20 @@ mod tests {
                     "a registration is answered with the registered box, got the status {status:?}"
                 )
             }
+            BoxControlReply::Row(row) => {
+                panic!("a registration is answered with the registered box, got a row read {row:?}")
+            }
+            BoxControlReply::NoRow { name, .. } => {
+                panic!(
+                    "a registration is answered with the registered box, told no row is held for {name:?}"
+                )
+            }
+            BoxControlReply::PortRecorded { port, proto } => {
+                panic!(
+                    "a registration is answered with the registered box, got a port report's \
+                     reply for {port}/{proto:?}"
+                )
+            }
             BoxControlReply::AnswererRelease { detail, .. } => {
                 panic!("a box verb is never answered with a release reply, got {detail}")
             }
@@ -980,6 +1442,8 @@ mod tests {
                         deny_subnets: None,
                     }),
                     credentialed_upstream: None,
+                    dynamic_ingress: None,
+                    dynamic_allowed_range: None,
                 },
             )
             .expect("first registration is answered"),
@@ -1047,6 +1511,8 @@ mod tests {
                     ingress_ports: vec![5432],
                     egress: None,
                     credentialed_upstream: None,
+                    dynamic_ingress: None,
+                    dynamic_allowed_range: None,
                 },
             )
             .expect("second registration is answered"),
@@ -1088,6 +1554,8 @@ mod tests {
                     ingress_ports: Vec::new(),
                     egress: None,
                     credentialed_upstream: None,
+                    dynamic_ingress: None,
+                    dynamic_allowed_range: None,
                 },
             )
             .expect("server still serves after a refused request"),
@@ -1113,6 +1581,8 @@ mod tests {
                     deny_subnets: None,
                 }),
                 credentialed_upstream: None,
+                dynamic_ingress: None,
+                dynamic_allowed_range: None,
             })
             .expect("the default plan has addresses to allocate");
 
@@ -1167,6 +1637,8 @@ mod tests {
                 ingress_ports: Vec::new(),
                 egress: None,
                 credentialed_upstream: None,
+                dynamic_ingress: None,
+                dynamic_allowed_range: None,
             })
             .expect_err("an unplanned subnet has no slice to allocate from");
         assert!(
@@ -1210,6 +1682,8 @@ mod tests {
                         deny_subnets: None,
                     }),
                     credentialed_upstream: None,
+                    dynamic_ingress: None,
+                    dynamic_allowed_range: None,
                 },
             )
             .expect("the registration is answered"),
@@ -1247,6 +1721,15 @@ mod tests {
             }
             BoxControlReply::Status(status) => {
                 panic!("a withdrawal is answered with the pair, got the status {status:?}")
+            }
+            BoxControlReply::Row(..) => {
+                panic!("a withdrawal echoes the pair it went by, never a row")
+            }
+            BoxControlReply::NoRow { .. } => {
+                panic!("a withdrawal echoes the pair it went by, never a no-row marker")
+            }
+            BoxControlReply::PortRecorded { .. } => {
+                panic!("a withdrawal echoes the pair it went by, never a port report")
             }
             BoxControlReply::AnswererRelease { detail, .. } => {
                 panic!("a box verb is never answered with a release reply, got {detail}")
@@ -1293,6 +1776,8 @@ mod tests {
                     ingress_ports: Vec::new(),
                     egress: None,
                     credentialed_upstream: None,
+                    dynamic_ingress: None,
+                    dynamic_allowed_range: None,
                 },
             )
             .expect("the marker box is registered"),
@@ -1325,6 +1810,15 @@ mod tests {
                 }
                 BoxControlReply::Status(status) => {
                     panic!("a withdrawal must be refused, got the status {status:?}")
+                }
+                BoxControlReply::Row(..) => {
+                    panic!("a foreign pair's withdrawal must be refused, got a row")
+                }
+                BoxControlReply::NoRow { .. } => {
+                    panic!("a foreign pair's withdrawal must be refused, got a no-row marker")
+                }
+                BoxControlReply::PortRecorded { .. } => {
+                    panic!("a foreign pair's withdrawal must be refused, got a port report")
                 }
                 BoxControlReply::AnswererRelease { detail, .. } => {
                     panic!("a box verb is never answered with a release reply, got {detail}")
@@ -1366,6 +1860,15 @@ mod tests {
             }
             BoxControlReply::Status(status) => {
                 panic!("a repeat withdrawal echoes the pair, got the status {status:?}")
+            }
+            BoxControlReply::Row(..) => {
+                panic!("a repeat withdrawal echoes the pair, never a row")
+            }
+            BoxControlReply::NoRow { .. } => {
+                panic!("a repeat withdrawal echoes the pair, never a no-row marker")
+            }
+            BoxControlReply::PortRecorded { .. } => {
+                panic!("a repeat withdrawal echoes the pair, never a port report")
             }
             BoxControlReply::AnswererRelease { detail, .. } => {
                 panic!("a box verb is never answered with a release reply, got {detail}")
@@ -1481,6 +1984,8 @@ mod tests {
                     ingress_ports: Vec::new(),
                     egress: None,
                     credentialed_upstream: None,
+                    dynamic_ingress: None,
+                    dynamic_allowed_range: None,
                 },
             )
             .expect("a registration still answers around the read"),
@@ -1815,5 +2320,332 @@ mod tests {
         let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700);
         assert!(TestStream::connect(&sock_path).is_ok());
+    }
+
+    /// A box registered with the grant — the allow stance and its range — and
+    /// one admit report recorded through the guest door: the read-only row
+    /// verb answers the row's switch address, its derived egress allow-list
+    /// and its declared and runtime-admitted ports, the report answers one
+    /// info line naming the box, the port, the source and the outcome, and
+    /// the recorded admission's host-side copy lands in the daemon's own
+    /// audit log (NET-138).
+    #[test]
+    fn read_row_reports_switch_address_allow_list_and_ports() {
+        let capture = server_capture();
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (sock_path, _server, _registry, _answerer, _proxy_publish) =
+            spawn_server(dir.path()).expect("server binds");
+        let guest_sock_path = sock_path.with_file_name(GUEST_CONTROL_SOCK_FILE);
+        let web = handed(
+            register(
+                &sock_path,
+                &RegisterBoxRequest {
+                    name: "web".to_string(),
+                    ingress_ports: vec![8080, 9090],
+                    egress: Some(sessions::EgressPolicy {
+                        allow_protocols: Some(vec![sessions::IpProto::Tcp]),
+                        allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
+                        allow_dns_hosts: None,
+                        deny_subnets: None,
+                    }),
+                    credentialed_upstream: None,
+                    dynamic_ingress: Some(sessions::DynamicIngress::Allow),
+                    dynamic_allowed_range: Some((3000, 3999)),
+                },
+            )
+            .expect("the registration is answered"),
+        );
+
+        // The box's runtime publication, reported on the door the guest
+        // owns, within the grant the registration carried.
+        let recorded = control(
+            &guest_sock_path,
+            &BoxControlRequest::AdmitPort(AdmitPortRequest {
+                switch_address: web.switch_address,
+                port: 3000,
+                proto: sessions::IpProto::Tcp,
+                source: PortReportSource::Expose,
+            }),
+        )
+        .expect("the report is answered");
+        assert!(
+            matches!(
+                recorded,
+                BoxControlReply::PortRecorded {
+                    port: 3000,
+                    proto: sessions::IpProto::Tcp
+                }
+            ),
+            "a report within the grant is answered with the recorded port, got {recorded:?}"
+        );
+
+        // The read-only row verb: everything the host holds about the box.
+        let read = control(
+            &sock_path,
+            &BoxControlRequest::ReadRow(ReadRowRequest {
+                name: "web".to_string(),
+            }),
+        )
+        .expect("the read is answered");
+        let BoxControlReply::Row(row) = read else {
+            panic!("a live box's name answers its row, got {read:?}");
+        };
+        assert_eq!(row.name, "web");
+        assert_eq!(
+            row.switch_address, web.switch_address,
+            "the row answers with the switch address the registration handed back"
+        );
+        assert_eq!(
+            row.egress_allow_list,
+            vec!["10.0.0.0/8".to_string()],
+            "the allow-list is the declaration's own spelling: {row:?}"
+        );
+        assert_eq!(row.declared_ports, vec![8080, 9090]);
+        assert_eq!(
+            row.runtime_ports,
+            vec![3000],
+            "the recorded report is the row's one runtime port: {row:?}"
+        );
+
+        // One info line per recorded report: the box, the port, the
+        // reporting source and the outcome.
+        let log = capture.contents();
+        assert!(
+            log.contains("recorded the box's runtime-admitted port in the host-held grant"),
+            "the recorded report's line names the outcome: {log}"
+        );
+        assert!(
+            log.contains("box=web")
+                && log.contains("port=3000")
+                && log.contains("source=expose")
+                && log.contains(&format!("switch_address={}", web.switch_address)),
+            "the info line names the box, the port, the source and the row key: {log}"
+        );
+
+        // The host-side audit copy: one JSON line in the daemon's own audit
+        // log, naming the box, the row key, the port, the protocol and the
+        // source.
+        let audit = std::fs::read_to_string(dir.path().join(AUDIT_LOG_RELATIVE_PATH))
+            .expect("the audit copy exists beside the sockets");
+        assert!(
+            audit.contains(r#""box":"web""#)
+                && audit.contains(r#""port":3000"#)
+                && audit.contains(r#""proto":"tcp""#)
+                && audit.contains(r#""source":"expose""#)
+                && audit.contains(&format!(r#""switch_address":"{}""#, web.switch_address)),
+            "the audit line names the box, the row key, the port, the protocol and the \
+             source: {audit}"
+        );
+    }
+
+    /// The host-side audit copy is created owner-only (0600): it names
+    /// every box and port a guest admitted, so it carries the posture the
+    /// sockets beside it do.
+    #[test]
+    fn audit_copy_created_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let path = audit_log_path(&dir.path().join(CONTROL_SOCK_FILE));
+        let registry = BoxRegistry::new(SUBNET);
+        let record = registry.register(crate::box_registry::BoxRegistration::new(
+            "web",
+            Ipv4Addr::new(100, 64, 0, 9),
+            Ipv4Addr::LOCALHOST,
+        ));
+        append_audit_copy(
+            &path,
+            &record,
+            &AdmitPortRequest {
+                switch_address: record.switch_addr(),
+                port: 3000,
+                proto: sessions::IpProto::Tcp,
+                source: PortReportSource::Expose,
+            },
+        );
+        let mode = std::fs::metadata(&path)
+            .expect("the audit copy was created")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "the audit copy is owner-only, got {mode:o}");
+    }
+
+    /// The doors are the verb's access control (NET-138): the read-only row
+    /// verb is refused on the in-VM daemon's channel and an admit report is
+    /// refused on the host's socket — each refusal naming the door that
+    /// serves the verb — and neither refusal leaves a fact behind: the row
+    /// read over the host door carries no runtime port a refused report
+    /// named.
+    #[test]
+    fn read_row_refused_on_guest_channel() {
+        let capture = server_capture();
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (sock_path, _server, _registry, _answerer, _proxy_publish) =
+            spawn_server(dir.path()).expect("server binds");
+        let guest_sock_path = sock_path.with_file_name(GUEST_CONTROL_SOCK_FILE);
+        let web = handed(
+            register(
+                &sock_path,
+                &RegisterBoxRequest {
+                    name: "web".to_string(),
+                    ingress_ports: Vec::new(),
+                    egress: None,
+                    credentialed_upstream: None,
+                    dynamic_ingress: Some(sessions::DynamicIngress::Allow),
+                    dynamic_allowed_range: Some((3000, 3999)),
+                },
+            )
+            .expect("the registration is answered"),
+        );
+
+        // The row read on the guest door: refused, naming the host's
+        // control socket as the verb's own door.
+        let refused = control(
+            &guest_sock_path,
+            &BoxControlRequest::ReadRow(ReadRowRequest {
+                name: "web".to_string(),
+            }),
+        )
+        .expect("the wrong-door request is still answered");
+        assert!(
+            matches!(&refused, BoxControlReply::Error { error } if error.contains("the host's control socket")),
+            "the guest channel refuses the row read naming the door that serves it, got {refused:?}"
+        );
+
+        // A port report on the host door: refused the same way, and the
+        // port it named is not recorded.
+        let refused = control(
+            &sock_path,
+            &BoxControlRequest::AdmitPort(AdmitPortRequest {
+                switch_address: web.switch_address,
+                port: 3000,
+                proto: sessions::IpProto::Tcp,
+                source: PortReportSource::Listen,
+            }),
+        )
+        .expect("the wrong-door request is still answered");
+        assert!(
+            matches!(&refused, BoxControlReply::Error { error } if error.contains("the in-VM daemon's control channel")),
+            "the host socket refuses the report naming the door that serves it, got {refused:?}"
+        );
+        assert!(
+            !dir.path().join(AUDIT_LOG_RELATIVE_PATH).exists(),
+            "a refused report writes no audit copy"
+        );
+
+        // The row read over its own door still answers, with no runtime
+        // port the refused report named — the refusal recorded nothing.
+        let read = control(
+            &sock_path,
+            &BoxControlRequest::ReadRow(ReadRowRequest {
+                name: "web".to_string(),
+            }),
+        )
+        .expect("the read is answered");
+        let BoxControlReply::Row(row) = read else {
+            panic!("the row read still answers over its own door, got {read:?}");
+        };
+        assert!(
+            row.runtime_ports.is_empty(),
+            "a report the wrong door refused records nothing: {row:?}"
+        );
+
+        // Both wrong-door refusals are warn lines: a client speaking a verb
+        // on the wrong socket is a posture mismatch to see, not a silent
+        // drop.
+        let log = capture.contents();
+        assert!(
+            log.matches("refused a box control verb on the door that does not serve it")
+                .count()
+                >= 2,
+            "each wrong-door refusal is one warn line: {log}"
+        );
+    }
+
+    /// Liveness is the table's own fact (NET-138): a live box's name answers
+    /// its row, and once the session that registered it is destroyed — its
+    /// client's withdrawal, the pair proof — the same read answers no row,
+    /// never the destroyed box's last row. A name nothing ever held answers
+    /// the same marker.
+    #[test]
+    fn read_row_absent_for_destroyed_name() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (sock_path, _server, _registry, _answerer, _proxy_publish) =
+            spawn_server(dir.path()).expect("server binds");
+        let web = handed(
+            register(
+                &sock_path,
+                &RegisterBoxRequest {
+                    name: "web".to_string(),
+                    ingress_ports: vec![8080],
+                    egress: None,
+                    credentialed_upstream: None,
+                    dynamic_ingress: None,
+                    dynamic_allowed_range: None,
+                },
+            )
+            .expect("the registration is answered"),
+        );
+        let read = control(
+            &sock_path,
+            &BoxControlRequest::ReadRow(ReadRowRequest {
+                name: "web".to_string(),
+            }),
+        )
+        .expect("the read is answered");
+        assert!(
+            matches!(&read, BoxControlReply::Row(row) if row.name == "web"),
+            "a live box's name answers its row, got {read:?}"
+        );
+
+        // The destroyed session's client withdrawal: the pair the
+        // registration handed back.
+        let withdrawn = control(
+            &sock_path,
+            &BoxControlRequest::Withdraw(WithdrawBoxRequest {
+                name: "web".to_string(),
+                switch_address: web.switch_address,
+                loopback_address: web.loopback_address,
+            }),
+        )
+        .expect("the withdrawal is answered");
+        assert!(
+            matches!(withdrawn, BoxControlReply::Addresses(_)),
+            "the pair proof withdraws the row it created, got {withdrawn:?}"
+        );
+
+        // The same read: no row — the row is gone, not archived.
+        let read = control(
+            &sock_path,
+            &BoxControlRequest::ReadRow(ReadRowRequest {
+                name: "web".to_string(),
+            }),
+        )
+        .expect("the read is answered");
+        assert_eq!(
+            read,
+            BoxControlReply::NoRow {
+                name: "web".to_string(),
+                no_row: true
+            },
+            "a destroyed box's name answers the marker, never its last row"
+        );
+
+        // And a name nothing ever held answers the same marker.
+        let never = control(
+            &sock_path,
+            &BoxControlRequest::ReadRow(ReadRowRequest {
+                name: "ghost".to_string(),
+            }),
+        )
+        .expect("the read is answered");
+        assert_eq!(
+            never,
+            BoxControlReply::NoRow {
+                name: "ghost".to_string(),
+                no_row: true
+            },
+            "a name no live box holds answers no row"
+        );
     }
 }
