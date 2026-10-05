@@ -13,10 +13,31 @@ opentelemetry-semantic-conventions.workspace = true
 tracing.workspace = true
 tracing-appender.workspace = true
 tracing-subscriber.workspace = true
+opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true
+opentelemetry-otlp.workspace = true
+# The OTLP exporters' HTTP client (`otel::http_client`): the same reqwest that
+# opentelemetry-http implements `HttpClient` for. `rustls` keeps an `https`
+# endpoint working (the platform verifier) whatever else the build unifies.
+reqwest = { workspace = true, features = ["blocking", "rustls"] }
+# The `HttpClient` trait, for the client that keeps plain OTLP headers away
+# from a `MINIMAL_` endpoint (`otel::ExportClient`). opentelemetry-otlp already
+# depends on it at this version; the version sits with the other
+# opentelemetry entries in the workspace manifest.
+opentelemetry-http = { workspace = true, features = ["reqwest-blocking"] }
+opentelemetry-appender-tracing.workspace = true
+tracing-opentelemetry.workspace = true
+libc.workspace = true
 version.workspace = true
+paths.workspace = true
 
 [dev-dependencies]
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
+# The strict parser the shipper reads spool lines with: the test oracle for
+# the spool encoder, so the tests accept exactly what the consumer does.
+serde_json.workspace = true
 serde_json_lenient.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true
