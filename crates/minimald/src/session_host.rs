@@ -3327,12 +3327,12 @@ pub(crate) fn clear_classifier_reading_standin() {
 /// under test, where a stand-in reading may be installed over the same tree
 /// facts the test laid out.
 #[cfg(test)]
-fn classifier_reading(root: &std::path::Path) -> crate::net::classifier::Reading {
+fn classifier_reading(root: &std::path::Path, guest: bool) -> crate::net::classifier::Reading {
     let standin = CLASSIFIER_READING_STANDIN
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
-    standin.unwrap_or_else(|| crate::net::classifier::read_filter(root))
+    standin.unwrap_or_else(|| live_classifier_reading(root, guest))
 }
 
 /// The probe's reading the decision answers over: the live probe, always —
@@ -3340,8 +3340,20 @@ fn classifier_reading(root: &std::path::Path) -> crate::net::classifier::Reading
 /// test arm's lock is never compiled into a daemon that cannot install a
 /// stand-in.
 #[cfg(not(test))]
-fn classifier_reading(root: &std::path::Path) -> crate::net::classifier::Reading {
-    crate::net::classifier::read_filter(root)
+fn classifier_reading(root: &std::path::Path, guest: bool) -> crate::net::classifier::Reading {
+    live_classifier_reading(root, guest)
+}
+
+/// The live probe a launch reads: a guest connects to the listener its boot
+/// holds, so the port the probe is refused at is one the daemon held all
+/// along, never one bound for this reading (NET-079, design §7.4); a native
+/// host binds a listener per reading.
+fn live_classifier_reading(root: &std::path::Path, guest: bool) -> crate::net::classifier::Reading {
+    if guest {
+        crate::net::classifier::read_held_filter(root)
+    } else {
+        crate::net::classifier::read_filter(root)
+    }
 }
 
 /// The classifier fact every host-address launch reads the host for,
@@ -3377,7 +3389,7 @@ pub(crate) async fn re_read_classifier_fact(
     tokio::task::spawn_blocking(move || {
         let mountinfo = launch_mountinfo(mountinfo_knob);
         let decision = crate::net::classifier::decide(&root, mountinfo.as_deref(), guest, || {
-            classifier_reading(&root)
+            classifier_reading(&root, guest)
         });
         set_host_ip_enforcement_fact(&decision);
         (mountinfo, decision)
