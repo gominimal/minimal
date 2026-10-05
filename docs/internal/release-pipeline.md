@@ -209,7 +209,7 @@ meet the policy yet.
 | Artifact | How the release run tests it |
 | --- | --- |
 | Linux amd64 `min`, `minimald`, `minvmd`, `gvproxy-min` | `smoke-linux-amd64` runs the session e2e on the host daemon. `smoke-linux-kvm` runs it in a KVM microVM. |
-| `min-answerer` (every platform that has `min`) | [`scripts/dist-build.sh`](../../scripts/dist-build.sh) runs the link gate ([`scripts/check-answerer-links.sh`](../../scripts/check-answerer-links.sh)) on the binary it built. **Gap:** the frozen release workflow does not build, sign, notarize, or upload it yet. Until a code owner applies the workflow patch, the stage treats the artifact as optional and a release goes out without it (gominimal/inbox#899). |
+| `min-answerer` (every platform that has `min`) | [`scripts/dist-build.sh`](../../scripts/dist-build.sh) runs the link gate ([`scripts/check-answerer-links.sh`](../../scripts/check-answerer-links.sh)) on the binary it built. **Gap:** the frozen release workflow does not build, sign, or upload it yet. Until a code owner applies the workflow patch, the stage treats the artifact as optional and a release goes out without it (gominimal/inbox#899). |
 | amd64 guest kernel, rootfs, and initramfs | `smoke-linux-kvm` boots them. |
 | arm64 guest kernel, rootfs, and initramfs | `smoke-macos` boots them. |
 | macOS arm64 `min`, `minvmd`, `libkrun.1.dylib`, `gvproxy-min` | `smoke-macos` runs the session e2e with the signed files in the installer layout. **Gap:** when the `RUN_MACOS_CI` variable is `false`, this job skips and the run counts the skip as a pass. |
@@ -364,10 +364,15 @@ workflow uploads the artifact on every platform.
 - On both operating systems, the advisory then pins the SHA-256 of the bytes
   that it checked.
 - **The privileged step checks the root-owned copy again** (design §7.1,
-  post-install custody). The rendered root command stops if the destination
-  directory is not owned by root or if group or others can write to it. It
-  runs `install` to an exclusive `mktemp` name in that directory and hashes
-  the copy. If the hash is different, it removes the copy and exits with both
+  post-install custody). The rendered root command examines the destination
+  directory and each parent directory up to `/`. It stops at the first one
+  that is not owned by root, that group or others can write to, or that has
+  the sticky bit. The message names that directory. Without this check, a
+  user can rename a directory on the path between the check and the rename.
+  Both destinations pass on a stock host: `/Library/PrivilegedHelperTools` on
+  macOS and `/usr/local/lib/minimal` on Linux. The command then runs
+  `install` to an exclusive `mktemp` name in that directory and hashes the
+  copy. If the hash is different, it removes the copy and exits with both
   hashes in the message. On macOS it runs the `codesign -R` check on the copy
   again. Then it renames the copy into place. Only after that does it write
   the unit or property list that names the copy.
@@ -394,15 +399,12 @@ the steps that the other binaries have:
   entitlement, no `disable-library-validation`, no
   `allow-dyld-environment-variables`, and no JIT. The job then checks the
   signature with the designated requirement that `min` uses.
-- **Notarization**, new to the pipeline: the macOS job puts the signed
-  `min-answerer` in a zip file and submits it with
-  `xcrun notarytool submit --wait`. The step fails if the status is not
-  `Accepted`. The keychain profile is in the signing keychain, under the name
-  in the `NOTARY_KEYCHAIN_PROFILE` repository variable. A code owner must
-  create it. A bare binary cannot hold a stapled ticket, so Gatekeeper gets
-  the ticket online.
-- After notarization, the link gate runs again on the signed artifact, and
-  the job uploads it.
+- After the signature check, the link gate runs again on the signed
+  artifact, and the job uploads it.
+- The patch does not notarize `min-answerer`. The pipeline notarizes no
+  macOS binary today, and
+  [gominimal/inbox#900](https://github.com/gominimal/inbox/issues/900)
+  tracks notarization for all of them.
 - The release job and the stage-installer job stay the same. They collect
   artifacts by the platform-suffixed names, so the new names go into the
   GitHub Release, the `components` manifest, and the packages. The SHA-256
