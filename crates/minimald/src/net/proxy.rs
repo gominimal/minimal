@@ -442,6 +442,15 @@ where
         return write_status(&mut client, "400 Bad Request").await;
     }
 
+    // A head the proxy and the box could read two ways is refused before any
+    // route lookup or upstream dial: two `Host` fields could route by one and
+    // be served by the other (RFC 9112 §3.2), and `Content-Length` beside
+    // `Transfer-Encoding` could end the body in two places (RFC 9112 §6.1).
+    if let Some(reason) = ambiguous_head(&head) {
+        log_refusal(None, reason, "400 Bad Request");
+        return write_status(&mut client, "400 Bad Request").await;
+    }
+
     let Some(request) = parse_request(&head) else {
         log_refusal(None, "unparseable request head", "400 Bad Request");
         return write_status(&mut client, "400 Bad Request").await;
@@ -653,6 +662,29 @@ fn parse_request(head: &[u8]) -> Option<ParsedRequest<'_>> {
         kind: RequestKind::Forward,
         authority,
     })
+}
+
+/// Why a buffered request head is ambiguous, or `None` when it is not: more
+/// than one `Host` field (RFC 9112 §3.2 requires a `400`), or both
+/// `Content-Length` and `Transfer-Encoding` (RFC 9112 §6.1 bars an
+/// intermediary from forwarding it as it is). Header names match
+/// case-insensitively; the request line is not a header and is not consulted,
+/// and bytes past the end-of-head marker are never scanned.
+fn ambiguous_head(head: &[u8]) -> Option<&'static str> {
+    let lines = head_lines(head.get(..head_end(head)).unwrap_or_default());
+    let names: Vec<&[u8]> = lines
+        .iter()
+        .skip(1)
+        .filter_map(|line| header_parts(line).map(|(name, _)| name))
+        .collect();
+    let count = |want: &[u8]| names.iter().filter(|name| is_header(name, want)).count();
+    if count(b"host") > 1 {
+        Some("the request head has more than one Host header")
+    } else if count(b"content-length") > 0 && count(b"transfer-encoding") > 0 {
+        Some("the request head has both Content-Length and Transfer-Encoding")
+    } else {
+        None
+    }
 }
 
 /// Whether the buffered head opens with the HTTP/2 prior-knowledge preface's
@@ -3182,6 +3214,128 @@ mod tests {
             String::from_utf8_lossy(&response)
         );
         assert!(box_a_received.lock().unwrap().is_empty());
+    }
+
+    /// Drives one request head through the proxy toward a `web` box whose
+    /// port is a listener nothing answers on, returning the response, the
+    /// log lines, and whether the proxy dialed the box at all.
+    async fn drive_toward_unanswered_box(head: impl Fn(u16) -> String) -> (String, String, bool) {
+        let upstream = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = upstream.local_addr().unwrap().port();
+        let mut reg = HostnameRegistry::new(DEFAULT_HOST_ID, false);
+        reg.register_host_net(SessionId::nil(), "web");
+        let router = Router::new(Arc::new(reg), proxied_request_verdict);
+
+        let (buf, guard) = capture_logs();
+        let (mut client, proxy_side) = tokio::io::duplex(1024);
+        client.write_all(head(port).as_bytes()).await.unwrap();
+        handle_connection_io(proxy_side, None, &router)
+            .await
+            .unwrap();
+        drop(guard);
+
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        let dialed = tokio::time::timeout(Duration::from_millis(200), upstream.accept())
+            .await
+            .is_ok();
+        (
+            String::from_utf8_lossy(&response).into_owned(),
+            buf.contents(),
+            dialed,
+        )
+    }
+
+    /// A head with two `Host` fields is refused with `400` before any route
+    /// lookup or dial (RFC 9112 §3.2), and the refusal names its reason.
+    #[tokio::test]
+    async fn request_with_two_host_headers_is_refused_before_dialing() {
+        let (response, logged, dialed) = drive_toward_unanswered_box(|port| {
+            format!(
+                "GET / HTTP/1.1\r\nHost: web.min.internal:{port}\r\n\
+                 host: other.min.internal:{port}\r\n\r\n"
+            )
+        })
+        .await;
+        assert!(
+            response.starts_with("HTTP/1.1 400 Bad Request"),
+            "got: {response}"
+        );
+        assert!(
+            !dialed,
+            "the proxy must not dial the box for an ambiguous head"
+        );
+        assert!(
+            logged.contains("the request head has more than one Host header"),
+            "expected the refusal to be logged with its reason, got: {logged}"
+        );
+    }
+
+    /// A head carrying both `Content-Length` and `Transfer-Encoding` is
+    /// refused with `400` before any dial, never forwarded as it is
+    /// (RFC 9112 §6.1).
+    #[tokio::test]
+    async fn request_with_length_and_transfer_encoding_is_refused_before_dialing() {
+        let (response, logged, dialed) = drive_toward_unanswered_box(|port| {
+            format!(
+                "POST / HTTP/1.1\r\nHost: web.min.internal:{port}\r\n\
+                 Content-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"
+            )
+        })
+        .await;
+        assert!(
+            response.starts_with("HTTP/1.1 400 Bad Request"),
+            "got: {response}"
+        );
+        assert!(
+            !dialed,
+            "the proxy must not dial the box for an ambiguous head"
+        );
+        assert!(
+            logged.contains("the request head has both Content-Length and Transfer-Encoding"),
+            "expected the refusal to be logged with its reason, got: {logged}"
+        );
+    }
+
+    /// A head with one `Host` and one framing header is not ambiguous, and
+    /// still routes to its box.
+    #[tokio::test]
+    async fn request_with_one_host_and_one_framing_header_still_routes() {
+        let proxy_addr = spawn_two_box_proxy().await;
+        let (box_a_port, box_a_received) = spawn_recording_backend().await;
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        let request = format!(
+            "POST / HTTP/1.1\r\nHost: box-a.min.internal:{box_a_port}\r\n\
+             Content-Length: 4\r\n\r\nping"
+        );
+        client.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "got: {response}");
+        assert!(
+            String::from_utf8_lossy(&box_a_received.lock().unwrap()).contains("Host: box-a"),
+            "the box must receive the request"
+        );
+    }
+
+    /// Which heads `ambiguous_head` flags: header names match
+    /// case-insensitively, and the request line and body are not headers.
+    #[test]
+    fn ambiguous_head_flags_duplicate_host_and_dual_framing() {
+        assert!(ambiguous_head(b"GET / HTTP/1.1\r\nHost: a\r\nHOST: b\r\n\r\n").is_some());
+        assert!(
+            ambiguous_head(
+                b"POST / HTTP/1.1\r\nHost: a\r\ncontent-length: 1\r\n\
+                  transfer-encoding: chunked\r\n\r\n"
+            )
+            .is_some()
+        );
+        assert!(ambiguous_head(b"GET http://a:80/ HTTP/1.1\r\nHost: a\r\n\r\n").is_none());
+        assert!(
+            ambiguous_head(b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 9\r\n\r\nHost: b\r\n")
+                .is_none()
+        );
     }
 
     /// The framings `request_body` reads, and the ones it refuses.
