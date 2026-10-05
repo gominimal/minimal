@@ -33,6 +33,7 @@
 //! spike #485's systemd-resolved finding (spec Open Question 1).
 
 use std::borrow::Cow;
+use std::collections::BTreeSet;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -665,23 +666,39 @@ fn parse_request(head: &[u8]) -> Option<ParsedRequest<'_>> {
 }
 
 /// Why a buffered request head is ambiguous, or `None` when it is not: more
-/// than one `Host` field (RFC 9112 §3.2 requires a `400`), or both
+/// than one `Host` field (RFC 9112 §3.2 requires a `400`), both
 /// `Content-Length` and `Transfer-Encoding` (RFC 9112 §6.1 bars an
-/// intermediary from forwarding it as it is). Header names match
-/// case-insensitively; the request line is not a header and is not consulted,
-/// and bytes past the end-of-head marker are never scanned.
+/// intermediary from forwarding it as it is), or `Content-Length` values that
+/// differ (RFC 9112 §6.3; repeated identical values are one length). Header
+/// names match case-insensitively; the request line is not a header and is not
+/// consulted, and bytes past the end-of-head marker are never scanned. A
+/// `Content-Length` that is not a decimal number is left to [`request_body`],
+/// which refuses it.
 fn ambiguous_head(head: &[u8]) -> Option<&'static str> {
     let lines = head_lines(head.get(..head_end(head)).unwrap_or_default());
-    let names: Vec<&[u8]> = lines
+    let headers: Vec<(&[u8], &[u8])> = lines
         .iter()
         .skip(1)
-        .filter_map(|line| header_parts(line).map(|(name, _)| name))
+        .filter_map(|line| header_parts(line))
         .collect();
-    let count = |want: &[u8]| names.iter().filter(|name| is_header(name, want)).count();
-    if count(b"host") > 1 {
+    let values = |want: &'static [u8]| {
+        headers
+            .iter()
+            .filter(move |(name, _)| is_header(name, want))
+            .map(|(_, value)| *value)
+    };
+    let lengths: BTreeSet<u64> = values(b"content-length")
+        .flat_map(value_tokens)
+        .filter_map(|token| std::str::from_utf8(token).ok()?.parse().ok())
+        .collect();
+    if values(b"host").count() > 1 {
         Some("the request head has more than one Host header")
-    } else if count(b"content-length") > 0 && count(b"transfer-encoding") > 0 {
+    } else if values(b"content-length").next().is_some()
+        && values(b"transfer-encoding").next().is_some()
+    {
         Some("the request head has both Content-Length and Transfer-Encoding")
+    } else if lengths.len() > 1 {
+        Some("the request head has Content-Length values that differ")
     } else {
         None
     }
@@ -3307,6 +3324,53 @@ mod tests {
         let request = format!(
             "POST / HTTP/1.1\r\nHost: box-a.min.internal:{box_a_port}\r\n\
              Content-Length: 4\r\n\r\nping"
+        );
+        client.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "got: {response}");
+        assert!(
+            String::from_utf8_lossy(&box_a_received.lock().unwrap()).contains("Host: box-a"),
+            "the box must receive the request"
+        );
+    }
+
+    /// A head whose `Content-Length` fields differ is refused with `400`
+    /// before any dial (RFC 9112 §6.3), and the refusal names its reason.
+    #[tokio::test]
+    async fn request_with_differing_content_lengths_is_refused_before_dialing() {
+        let (response, logged, dialed) = drive_toward_unanswered_box(|port| {
+            format!(
+                "POST / HTTP/1.1\r\nHost: web.min.internal:{port}\r\n\
+                 Content-Length: 4\r\nContent-Length: 5\r\n\r\nping"
+            )
+        })
+        .await;
+        assert!(
+            response.starts_with("HTTP/1.1 400 Bad Request"),
+            "got: {response}"
+        );
+        assert!(
+            !dialed,
+            "the proxy must not dial the box for an ambiguous head"
+        );
+        assert!(
+            logged.contains("the request head has Content-Length values that differ"),
+            "expected the refusal to be logged with its reason, got: {logged}"
+        );
+    }
+
+    /// Repeated identical `Content-Length` values are one length, not an
+    /// ambiguity (RFC 9112 §6.3): the request still routes to its box.
+    #[tokio::test]
+    async fn request_with_identical_content_lengths_still_routes() {
+        let proxy_addr = spawn_two_box_proxy().await;
+        let (box_a_port, box_a_received) = spawn_recording_backend().await;
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        let request = format!(
+            "POST / HTTP/1.1\r\nHost: box-a.min.internal:{box_a_port}\r\n\
+             Content-Length: 4\r\nContent-Length: 4\r\n\r\nping"
         );
         client.write_all(request.as_bytes()).await.unwrap();
         let mut response = Vec::new();
