@@ -17,7 +17,7 @@
 # point of the barrier.
 #
 # Usage:
-#   sudo scripts/install-host-classifier.sh [--user NAME] [--root DIR]
+#   sudo scripts/install-host-classifier.sh [--user NAME|UID] [--root DIR]
 #         [--answerer-address ADDR] [--answerer-port PORT]
 #         [--no-resolver-carve-out] [--ct-mark-mask 0x30000000]
 #         --cohort-address ADDR --node-plane-address ADDR
@@ -244,8 +244,16 @@ resolve_owner() {
             owner_gid="$(id -g "$user")" || die "no such account: $user"
             ;;
         *)
+            # A numeric uid needs no passwd entry for its uid, but its group
+            # is the account's own: take it from the account when there is
+            # one, and from the caller only when the caller is that uid (an
+            # unprivileged rehearsal under a uid with no passwd entry).
             owner_uid=$user
-            owner_gid="$(id -g)"
+            if ! owner_gid="$(id -g "$user" 2>/dev/null)"; then
+                [ "$user" = "$(id -u)" ] ||
+                    die "no account with uid $user to take a group from: pass --user NAME"
+                owner_gid="$(id -g)"
+            fi
             ;;
         esac
     elif [ -n "${SUDO_UID:-}" ] && [ -n "${SUDO_GID:-}" ]; then
