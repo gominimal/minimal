@@ -5878,6 +5878,13 @@ async fn refused_admission_report_leaves_no_partial_mapping() {
         }
         other => panic!("a report the grant refused must fail the publish: {other:?}"),
     }
+    // The refused report asked the switch nothing (T94's ordering): the bind
+    // waits on the grant, so a refused grant leaves nothing to unbind.
+    assert!(
+        served.lock().expect("served lock").is_empty(),
+        "a publish whose report the grant refused never asks the switch: {:?}",
+        served.lock().expect("served lock")
+    );
 
     // No partial mapping, the listing first: the row the policy surfaces
     // read names nothing the refused publish left behind (NET-047).
@@ -8539,4 +8546,223 @@ async fn respawn_frees_published_ports() {
     );
     handle.stop().await;
     drop(listener);
+}
+
+/// Launches a VM-shaped allow box for the T94 ordering tests: a fake
+/// forwarder answering `status` on the box's switch control socket, and a
+/// fake report door seeded for it.
+struct VmBackedBox {
+    _server: TestServer,
+    handle: crate::session::SessionHandle,
+    sock: std::path::PathBuf,
+    forwarder: tokio::task::JoinHandle<()>,
+    served: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    door: tokio::task::JoinHandle<()>,
+    reports: tokio::sync::mpsc::UnboundedReceiver<minimald_rpc::BoxControlRequest>,
+    replies: tokio::sync::mpsc::UnboundedSender<minimald_rpc::BoxControlReply>,
+}
+
+async fn vm_backed_allow_box(name: &str, octet: u8, status: u16) -> VmBackedBox {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let manager = server.state.sessions_manager().await;
+    manager.land_range_verdict(crate::net::dns::RangeVerdict::Present);
+    let id = finalize_dynamic_ingress_session(
+        &mut client,
+        name,
+        std::net::Ipv4Addr::new(100, 64, 128, octet),
+        std::net::Ipv4Addr::new(127, 0, 64, octet),
+        Some(sessions::DynamicIngress::Allow),
+        Some((3000, 3999)),
+    )
+    .await;
+    let handle = manager
+        .get_session(crate::sessions::SessionKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the allowing box resolves");
+    handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("the allowing box launches its host");
+    let sock = handle
+        .net_switch()
+        .await
+        .unwrap()
+        .lock()
+        .await
+        .control_socket();
+    let (forwarder, served) = fake_forwarder(sock.clone(), status).await;
+    let door_sock = sock.with_file_name("report-door.sock");
+    let (door, reports, replies) = fake_report_door(&door_sock).await;
+    crate::net::listeners::seed_vm_report_door_for_tests(&sock, &door_sock);
+    VmBackedBox {
+        _server: server,
+        handle,
+        sock,
+        forwarder,
+        served,
+        door,
+        reports,
+        replies,
+    }
+}
+
+/// Awaits the report door's next request, or fails the proof.
+async fn next_report(
+    reports: &mut tokio::sync::mpsc::UnboundedReceiver<minimald_rpc::BoxControlRequest>,
+) -> minimald_rpc::BoxControlRequest {
+    tokio::time::timeout(Duration::from_secs(10), reports.recv())
+        .await
+        .expect("the report reaches the VM host daemon's door within the bound")
+        .expect("the report door stand-in lives")
+}
+
+/// T94: a bind the switch fails after the host admitted the port gives the
+/// admission back. The withdrawal follows the failed bind — the door reads
+/// it only once the switch has answered — and the failed bind left nothing
+/// bound, so nothing is unexposed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bind_failure_withdraws_the_admitted_report() {
+    let VmBackedBox {
+        _server,
+        handle,
+        sock,
+        forwarder,
+        served,
+        door,
+        mut reports,
+        replies,
+    } = vm_backed_allow_box("vmbindfail", 23, 500).await;
+
+    let reporting = handle.clone();
+    let expose = tokio::spawn(async move { reporting.expose_dynamic(3000).await });
+    assert!(
+        matches!(
+            next_report(&mut reports).await,
+            minimald_rpc::BoxControlRequest::AdmitPort(_)
+        ),
+        "the publish reports the port before it binds"
+    );
+    replies
+        .send(minimald_rpc::BoxControlReply::PortRecorded {
+            port: 3000,
+            proto: sessions::IpProto::Tcp,
+        })
+        .expect("the report door stand-in lives");
+    let withdrawal = next_report(&mut reports).await;
+    assert_eq!(
+        withdrawal,
+        minimald_rpc::BoxControlRequest::WithdrawPort(minimald_rpc::WithdrawPortRequest {
+            switch_address: std::net::Ipv4Addr::new(100, 64, 128, 23),
+            port: 3000,
+            proto: sessions::IpProto::Tcp,
+            source: minimald_rpc::PortReportSource::Expose,
+        }),
+        "a bind that failed gives the host's admission back"
+    );
+    {
+        // The door holds the withdrawal's reply, so what the switch saw by
+        // now is everything the publish asked of it before withdrawing.
+        let served = served.lock().expect("served lock");
+        assert_eq!(
+            served.len(),
+            1,
+            "the failed bind is the switch's one request: {served:?}"
+        );
+        assert!(
+            served[0].starts_with("POST /services/forwarder/expose "),
+            "the withdrawal follows the failed bind: {served:?}"
+        );
+    }
+    replies
+        .send(minimald_rpc::BoxControlReply::PortRecorded {
+            port: 3000,
+            proto: sessions::IpProto::Tcp,
+        })
+        .expect("the report door stand-in lives");
+    assert!(
+        matches!(
+            expose.await.expect("the expose task should not panic"),
+            Err(crate::net::policy::ExposeFailure::Publish { port: 3000, .. })
+        ),
+        "a failed bind fails the publish"
+    );
+
+    forwarder.abort();
+    door.abort();
+    crate::net::listeners::clear_vm_report_door_for_tests(&sock);
+}
+
+/// T94: a forward that is coming down is unexposed at the switch before the
+/// host's admission is withdrawn — the host's gate applies a runtime port's
+/// retraction only while its row still holds the port. Proved on the stop
+/// path's sweep: while the door holds the withdrawal's reply, the switch has
+/// already seen the unexpose.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_unexposes_before_withdrawing_the_report() {
+    let VmBackedBox {
+        _server,
+        handle,
+        sock,
+        forwarder,
+        served,
+        door,
+        mut reports,
+        replies,
+    } = vm_backed_allow_box("vmstoporder", 24, 200).await;
+
+    let reporting = handle.clone();
+    let expose = tokio::spawn(async move { reporting.expose_dynamic(3000).await });
+    assert!(matches!(
+        next_report(&mut reports).await,
+        minimald_rpc::BoxControlRequest::AdmitPort(_)
+    ));
+    replies
+        .send(minimald_rpc::BoxControlReply::PortRecorded {
+            port: 3000,
+            proto: sessions::IpProto::Tcp,
+        })
+        .expect("the report door stand-in lives");
+    expose
+        .await
+        .expect("the expose task should not panic")
+        .expect("the admitted port publishes");
+
+    let stopping = handle.clone();
+    let stop = tokio::spawn(async move { stopping.stop().await });
+    let withdrawal = next_report(&mut reports).await;
+    assert!(
+        matches!(
+            withdrawal,
+            minimald_rpc::BoxControlRequest::WithdrawPort(minimald_rpc::WithdrawPortRequest {
+                port: 3000,
+                ..
+            })
+        ),
+        "the stop withdraws the host's admission: {withdrawal:?}"
+    );
+    {
+        let served = served.lock().expect("served lock");
+        assert!(
+            served
+                .iter()
+                .any(|line| line.starts_with("POST /services/forwarder/unexpose ")),
+            "the switch's unexpose precedes the report's withdrawal: {served:?}"
+        );
+    }
+    replies
+        .send(minimald_rpc::BoxControlReply::PortRecorded {
+            port: 3000,
+            proto: sessions::IpProto::Tcp,
+        })
+        .expect("the report door stand-in lives");
+    tokio::time::timeout(Duration::from_secs(30), stop)
+        .await
+        .expect("the stop finishes once the withdrawal is answered")
+        .expect("the stop task should not panic");
+
+    forwarder.abort();
+    door.abort();
+    crate::net::listeners::clear_vm_report_door_for_tests(&sock);
 }
