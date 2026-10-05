@@ -1003,6 +1003,53 @@ pub enum AskAdmitOutcome {
         ask_id: AskId,
         /// Which end the ask met.
         reason: AskRefused,
+        /// What cancelled the ask, for a [`AskRefused::Cancelled`] end;
+        /// absent for every other end.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cause: Option<AskCancelCause>,
+    },
+}
+
+/// What cancelled a pending ask (NET-045): the four ends an ask meets with
+/// no answer, so the in-VM daemon and a late client can each say which.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum AskCancelCause {
+    /// The last host client attached to the box detached.
+    LastDetach,
+    /// The box's host row was withdrawn.
+    RowWithdrawn,
+    /// The in-VM daemon closed the asking connection: it withdrew the ask.
+    GuestClosed,
+    /// The VM host daemon is stopping.
+    MinvmdStopping,
+}
+
+impl std::fmt::Display for AskCancelCause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::LastDetach => "the last attached client detached",
+            Self::RowWithdrawn => "the box's host row was withdrawn",
+            Self::GuestClosed => "the guest connection closed",
+            Self::MinvmdStopping => "minvmd is stopping",
+        })
+    }
+}
+
+/// How an already-ended ask ended (NET-045), as the VM host daemon answers
+/// a late recorded answer for it: the client whose dialog outlived the ask
+/// says what actually happened instead of guessing.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "end", rename_all = "snake_case")]
+pub enum AskLateEnd {
+    /// Another attach's yes admitted it.
+    Allowed,
+    /// Another attach answered no (or could not show the prompt).
+    Denied,
+    /// It was cancelled before an answer.
+    Cancelled {
+        /// What cancelled it.
+        cause: AskCancelCause,
     },
 }
 
@@ -1232,6 +1279,21 @@ pub enum ProxyDownCause {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum BoxControlReply {
+    /// The record-ask-answer verb's answer for an ask that already ended
+    /// (NET-045): how it ended, and the port and protocol it was about.
+    /// Nothing is recorded. `already_ended` is required — the marker that
+    /// keeps this document from decoding as any other reply; placed first,
+    /// before every shape whose fields are a subset of its own.
+    AskAlreadyEnded {
+        /// The ask the late answer named.
+        ask_id: AskId,
+        /// The port the ask was about.
+        port: u16,
+        /// The protocol the ask was about.
+        proto: IpProto,
+        /// How the ask ended.
+        already_ended: AskLateEnd,
+    },
     /// The subscribe-asks verb's answer: the row's box id the client is
     /// now attached to. `subscribed` is required — the marker that keeps
     /// this document from decoding as any other reply, a registration's
@@ -3486,13 +3548,52 @@ mod tests {
             (AskRefused::NoRow, r#""reason":"no_row""#),
             (AskRefused::StanceNotAsk, r#""reason":"stance_not_ask""#),
         ] {
-            let refused = BoxControlReply::AskAdmit(AskAdmitOutcome::Refused { ask_id, reason });
+            let cause = (reason == AskRefused::Cancelled).then_some(AskCancelCause::LastDetach);
+            let refused = BoxControlReply::AskAdmit(AskAdmitOutcome::Refused {
+                ask_id,
+                reason,
+                cause,
+            });
             let wire = serde_json_lenient::to_string(&refused).expect("serialize");
             assert!(
                 wire.contains(r#""ask":"refused""#) && wire.contains(spelling),
                 "the refused answer spells its tag and its typed end: {wire}"
             );
+            assert_eq!(
+                wire.contains(r#""cause":"last-detach""#),
+                cause.is_some(),
+                "only a cancellation carries its cause: {wire}"
+            );
             assert_eq!(round_trip(&refused), refused);
+        }
+
+        // A late answer for an ended ask is answered with how it ended, a
+        // shape no other reply decodes as.
+        for (end, spelling) in [
+            (AskLateEnd::Allowed, r#""end":"allowed""#),
+            (AskLateEnd::Denied, r#""end":"denied""#),
+            (
+                AskLateEnd::Cancelled {
+                    cause: AskCancelCause::MinvmdStopping,
+                },
+                r#""cause":"minvmd-stopping""#,
+            ),
+        ] {
+            let late = BoxControlReply::AskAlreadyEnded {
+                ask_id,
+                port: 8080,
+                proto: IpProto::Tcp,
+                already_ended: end,
+            };
+            let wire = serde_json_lenient::to_string(&late).expect("serialize");
+            assert!(
+                wire.contains(spelling),
+                "the late end spells {spelling}: {wire}"
+            );
+            assert_eq!(
+                serde_json_lenient::from_str::<BoxControlReply>(&wire).expect("decodes"),
+                late
+            );
         }
 
         // The older recorded-port reply still decodes as the port record

@@ -1152,6 +1152,9 @@ fn run_foreground() -> Result<()> {
 
     // ── Phase 3: Supervise until VMM child exits ─────────────────────────────
     let status = child.wait().context("waiting for VMM child")?;
+    // The VM is gone, so no answer to a pending ask can still matter: each
+    // is cancelled and audited before the supervisor exits (NET-045).
+    crate::control::stop_pending_asks(&boxes);
     // The one-per-stop line (NET-055): the supervisor observes every stop of
     // its VM — `min stop`, `minvmd stop`, a guest poweroff, a crash — as the
     // VMM child exiting, and it is the line's only witness: the `minvmd stop`

@@ -888,6 +888,154 @@ struct AskBook {
     queues: std::collections::HashMap<[u8; 4], VecDeque<minimald_rpc::AskId>>,
     subscribers: std::collections::HashMap<BoxId, Vec<AskSubscriber>>,
     next_subscriber: u64,
+    /// The most recent ends, oldest first, bounded at
+    /// [`ENDED_ASKS_REMEMBERED`]: what a late answer for an ended ask is
+    /// told instead of a bare refusal. Never consulted to admit anything.
+    ended: VecDeque<EndedAsk>,
+}
+
+/// How many ended asks the book remembers for late answers (NET-045). An
+/// answer that arrives after its ask's end was evicted is refused as an
+/// unknown id, which admits nothing either.
+pub(crate) const ENDED_ASKS_REMEMBERED: usize = 256;
+
+/// One ended ask as the book remembers it for a late answer.
+#[derive(Debug, Clone, Copy)]
+struct EndedAsk {
+    ask_id: minimald_rpc::AskId,
+    port: u16,
+    proto: IpProto,
+    end: minimald_rpc::AskLateEnd,
+}
+
+/// Why a recorded answer was refused (NET-045). Neither records anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AnswerRefusal {
+    /// The book never minted the id, or its end has been forgotten.
+    UnknownId,
+    /// The ask already ended: how, and what it was about.
+    AlreadyEnded {
+        port: u16,
+        proto: IpProto,
+        end: minimald_rpc::AskLateEnd,
+    },
+}
+
+/// How an outcome reads to a late answer: allowed only when admitted,
+/// denied for a no or a no-tty, and every other end as the cancellation it
+/// is — a yes the row could no longer take included, since its row went.
+fn late_end(outcome: &minimald_rpc::AskAdmitOutcome) -> minimald_rpc::AskLateEnd {
+    use minimald_rpc::{AskCancelCause, AskLateEnd, AskRefused};
+    match outcome {
+        minimald_rpc::AskAdmitOutcome::Admitted { .. } => AskLateEnd::Allowed,
+        minimald_rpc::AskAdmitOutcome::Refused {
+            reason: AskRefused::Denied | AskRefused::NoTty,
+            ..
+        } => AskLateEnd::Denied,
+        minimald_rpc::AskAdmitOutcome::Refused { cause, .. } => AskLateEnd::Cancelled {
+            cause: cause.unwrap_or(AskCancelCause::RowWithdrawn),
+        },
+    }
+}
+
+/// A count of live connections of one kind, with an optional cap: the ask
+/// verbs' threads (NET-045) are bounded by it, and a graceful stop waits on
+/// one to reach zero.
+#[derive(Debug, Default)]
+pub(crate) struct ConnectionGauge {
+    count: Mutex<usize>,
+    idle: std::sync::Condvar,
+}
+
+/// One counted connection; the count drops with the guard.
+#[derive(Debug)]
+pub(crate) struct GaugeGuard(Arc<ConnectionGauge>);
+
+impl Drop for GaugeGuard {
+    fn drop(&mut self) {
+        let mut count = self
+            .0
+            .count
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            self.0.idle.notify_all();
+        }
+    }
+}
+
+impl ConnectionGauge {
+    /// Count one more connection, unless `cap` are already counted.
+    pub(crate) fn try_acquire(self: &Arc<Self>, cap: usize) -> Option<GaugeGuard> {
+        let mut count = self
+            .count
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *count >= cap {
+            return None;
+        }
+        *count += 1;
+        Some(GaugeGuard(Arc::clone(self)))
+    }
+
+    /// Wait until nothing is counted, at most `bound`; whether it emptied.
+    pub(crate) fn wait_idle(&self, bound: std::time::Duration) -> bool {
+        let count = self
+            .count
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (count, _) = self
+            .idle
+            .wait_timeout_while(count, bound, |count| *count > 0)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *count == 0
+    }
+}
+
+/// The ask verbs' gauges (NET-045), shared by every clone of a registry:
+/// the guest-door ask connections and the host subscriptions, each capped
+/// by the door, and the asks whose end is not yet audited, which a graceful
+/// stop waits on.
+#[derive(Debug)]
+pub(crate) struct AskGauges {
+    pub(crate) guest_asks: Arc<ConnectionGauge>,
+    pub(crate) subscriptions: Arc<ConnectionGauge>,
+    pub(crate) unaudited: Arc<ConnectionGauge>,
+    guest_ask_cap: std::sync::atomic::AtomicUsize,
+    subscription_cap: std::sync::atomic::AtomicUsize,
+}
+
+impl Default for AskGauges {
+    fn default() -> Self {
+        Self {
+            guest_asks: Arc::default(),
+            subscriptions: Arc::default(),
+            unaudited: Arc::default(),
+            guest_ask_cap: crate::control::MAX_GUEST_ASK_CONNECTIONS.into(),
+            subscription_cap: crate::control::MAX_ASK_SUBSCRIPTIONS.into(),
+        }
+    }
+}
+
+impl AskGauges {
+    /// The guest-door ask connection cap.
+    pub(crate) fn guest_ask_cap(&self) -> usize {
+        self.guest_ask_cap.load(Ordering::Relaxed)
+    }
+
+    /// The host subscription cap.
+    pub(crate) fn subscription_cap(&self) -> usize {
+        self.subscription_cap.load(Ordering::Relaxed)
+    }
+
+    /// Lower both caps, so a test can fill them.
+    #[cfg(test)]
+    pub(crate) fn set_caps(&self, guest_asks: usize, subscriptions: usize) {
+        self.guest_ask_cap.store(guest_asks, Ordering::Relaxed);
+        self.subscription_cap
+            .store(subscriptions, Ordering::Relaxed);
+    }
 }
 
 /// Counts, not contents: the reply and push channels have no useful debug
@@ -961,6 +1109,15 @@ impl AskBook {
             }
         }
         let outcome = outcome(&pending.facts);
+        if self.ended.len() >= ENDED_ASKS_REMEMBERED {
+            self.ended.pop_front();
+        }
+        self.ended.push_back(EndedAsk {
+            ask_id,
+            port: pending.facts.port,
+            proto: pending.facts.proto,
+            end: late_end(&outcome),
+        });
         // The guest may already be gone; its connection's end is its own
         // cancellation, and there is nothing left to tell it.
         let _ = pending.reply.send(outcome);
@@ -990,8 +1147,28 @@ impl AskBook {
         })
     }
 
-    /// End every pending ask the predicate selects as cancelled.
-    fn cancel_where(&mut self, select: impl Fn(&AskFacts) -> bool) -> Vec<AskEnded> {
+    /// How a recorded answer for an ask the book no longer holds is
+    /// refused: with the ask's remembered end, or as an unknown id.
+    fn late_refusal(&self, ask_id: minimald_rpc::AskId) -> AnswerRefusal {
+        self.ended
+            .iter()
+            .rev()
+            .find(|ended| ended.ask_id == ask_id)
+            .map_or(AnswerRefusal::UnknownId, |ended| {
+                AnswerRefusal::AlreadyEnded {
+                    port: ended.port,
+                    proto: ended.proto,
+                    end: ended.end,
+                }
+            })
+    }
+
+    /// End every pending ask the predicate selects as cancelled by `cause`.
+    fn cancel_where(
+        &mut self,
+        select: impl Fn(&AskFacts) -> bool,
+        cause: minimald_rpc::AskCancelCause,
+    ) -> Vec<AskEnded> {
         let ids: Vec<minimald_rpc::AskId> = self
             .pending
             .iter()
@@ -999,16 +1176,20 @@ impl AskBook {
             .map(|(ask_id, _)| *ask_id)
             .collect();
         ids.into_iter()
-            .filter_map(|ask_id| self.end(ask_id, |_| cancelled(ask_id)))
+            .filter_map(|ask_id| self.end(ask_id, |_| cancelled(ask_id, cause)))
             .collect()
     }
 }
 
-/// The cancelled end of `ask_id`.
-fn cancelled(ask_id: minimald_rpc::AskId) -> minimald_rpc::AskAdmitOutcome {
+/// The cancelled end of `ask_id`, by `cause`.
+fn cancelled(
+    ask_id: minimald_rpc::AskId,
+    cause: minimald_rpc::AskCancelCause,
+) -> minimald_rpc::AskAdmitOutcome {
     minimald_rpc::AskAdmitOutcome::Refused {
         ask_id,
         reason: minimald_rpc::AskRefused::Cancelled,
+        cause: Some(cause),
     }
 }
 
@@ -1166,13 +1347,14 @@ impl BoxRegistry {
     ///
     /// # Errors
     ///
-    /// `Err(())` when the book holds no pending ask under `ask_id`: it is
-    /// unknown, cancelled, or already answered. Nothing is recorded.
+    /// [`AnswerRefusal`] when the book holds no pending ask under `ask_id`:
+    /// how it ended, when the book still remembers, or an unknown id.
+    /// Nothing is recorded either way: a late yes never admits.
     pub(crate) fn record_ask_answer(
         &self,
         ask_id: minimald_rpc::AskId,
         answer: minimald_rpc::AskAnswer,
-    ) -> Result<AskEnded, ()> {
+    ) -> Result<AskEnded, AnswerRefusal> {
         let rows = self
             .rows
             .read()
@@ -1181,6 +1363,9 @@ impl BoxRegistry {
             .asks
             .lock()
             .expect("the ask book's lock is never held across a panic");
+        if !book.pending.contains_key(&ask_id) {
+            return Err(book.late_refusal(ask_id));
+        }
         book.end(ask_id, |facts| match answer {
             minimald_rpc::AskAnswer::Yes => match record_ask_yes(&rows, facts) {
                 Ok(()) => minimald_rpc::AskAdmitOutcome::Admitted {
@@ -1188,18 +1373,24 @@ impl BoxRegistry {
                     port: facts.port,
                     proto: facts.proto,
                 },
-                Err(reason) => minimald_rpc::AskAdmitOutcome::Refused { ask_id, reason },
+                Err(reason) => minimald_rpc::AskAdmitOutcome::Refused {
+                    ask_id,
+                    reason,
+                    cause: None,
+                },
             },
             minimald_rpc::AskAnswer::No => minimald_rpc::AskAdmitOutcome::Refused {
                 ask_id,
                 reason: minimald_rpc::AskRefused::Denied,
+                cause: None,
             },
             minimald_rpc::AskAnswer::NoTty => minimald_rpc::AskAdmitOutcome::Refused {
                 ask_id,
                 reason: minimald_rpc::AskRefused::NoTty,
+                cause: None,
             },
         })
-        .ok_or(())
+        .ok_or(AnswerRefusal::UnknownId)
     }
 
     /// Cancel one pending ask (NET-045): the guest withdrew it — its
@@ -1210,7 +1401,9 @@ impl BoxRegistry {
         self.asks
             .lock()
             .expect("the ask book's lock is never held across a panic")
-            .end(ask_id, |_| cancelled(ask_id))
+            .end(ask_id, |_| {
+                cancelled(ask_id, minimald_rpc::AskCancelCause::GuestClosed)
+            })
     }
 
     /// Cancel every pending ask the row at `switch_addr` holds (NET-045):
@@ -1220,7 +1413,10 @@ impl BoxRegistry {
         self.asks
             .lock()
             .expect("the ask book's lock is never held across a panic")
-            .cancel_where(|facts| facts.switch_address == switch_addr)
+            .cancel_where(
+                |facts| facts.switch_address == switch_addr,
+                minimald_rpc::AskCancelCause::RowWithdrawn,
+            )
     }
 
     /// Subscribe an attached host client to the pending asks of the row
@@ -1290,7 +1486,34 @@ impl BoxRegistry {
         if book.has_client(&box_id) {
             return Vec::new();
         }
-        book.cancel_where(|facts| facts.box_id == box_id)
+        book.cancel_where(
+            |facts| facts.box_id == box_id,
+            minimald_rpc::AskCancelCause::LastDetach,
+        )
+    }
+
+    /// Cancel every pending ask for a graceful stop (NET-045): each ends
+    /// through the same path as any cancellation, by
+    /// [`minimald_rpc::AskCancelCause::MinvmdStopping`], so its guest's
+    /// serving thread audits it; then wait, at most `bound`, for every
+    /// ended ask's audit line to be written. Answers the ended asks.
+    pub(crate) fn stop_asks(&self, bound: std::time::Duration) -> Vec<AskEnded> {
+        let ended = self
+            .asks
+            .lock()
+            .expect("the ask book's lock is never held across a panic")
+            .cancel_where(|_| true, minimald_rpc::AskCancelCause::MinvmdStopping);
+        if !self.ask_gauges.unaudited.wait_idle(bound) {
+            tracing::warn!(
+                "some cancelled asks' audit lines were not written before the stop's bound"
+            );
+        }
+        ended
+    }
+
+    /// The ask verbs' connection gauges (NET-045).
+    pub(crate) fn ask_gauges(&self) -> &AskGauges {
+        &self.ask_gauges
     }
 
     /// How many asks the book holds pending: the tests' view that an ask
@@ -1423,6 +1646,8 @@ pub struct BoxRegistry {
     /// because the clients the doors register are the same clients every
     /// clone's offers must reach.
     asks: Arc<Mutex<AskBook>>,
+    /// The ask verbs' connection gauges (NET-045), shared by every clone.
+    ask_gauges: Arc<AskGauges>,
 }
 
 /// A clone shares the live rows, the allocation cursors, and the withdrawal
@@ -1445,6 +1670,7 @@ impl Clone for BoxRegistry {
             loopback_slice: self.loopback_slice,
             attachments: self.attachments.clone(),
             asks: Arc::clone(&self.asks),
+            ask_gauges: Arc::clone(&self.ask_gauges),
         }
     }
 }
@@ -1473,6 +1699,7 @@ impl BoxRegistry {
             loopback_slice,
             attachments: None,
             asks: Arc::new(Mutex::new(AskBook::default())),
+            ask_gauges: Arc::new(AskGauges::default()),
         }
     }
 

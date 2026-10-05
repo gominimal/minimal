@@ -649,42 +649,63 @@ fn serve_connection(
     // own: a door serves its other connections one at a time, and an ask
     // waiting on a human must not hold a report or a registration behind
     // it.
-    match (&request, door) {
+    //
+    // Each kind is capped ([`MAX_GUEST_ASK_CONNECTIONS`],
+    // [`MAX_ASK_SUBSCRIPTIONS`]): past the cap the connection is refused on
+    // this door's own turn, before any thread is spawned, so a guest that
+    // opens asks in a loop cannot grow threads without limit. The first
+    // request line is read under [`REGISTER_READ_TIMEOUT`] before any of
+    // this, so a connection that never sends one costs no thread at all.
+    let gauges = boxes.ask_gauges();
+    let served = match (&request, door) {
         (BoxControlRequest::AdmitAsk(ask), ControlDoor::GuestReports) => {
             let ask = *ask;
-            return spawn_ask_thread(
-                stream,
-                "minvmd-guest-ask",
-                boxes,
-                audit_path,
-                move |s, b, a| {
-                    serve_guest_ask(s, b, a, ask);
-                },
-            );
+            match gauges.guest_asks.try_acquire(gauges.guest_ask_cap()) {
+                Some(slot) => {
+                    return spawn_ask_thread(
+                        stream,
+                        "minvmd-guest-ask",
+                        boxes,
+                        audit_path,
+                        move |s, b, a| {
+                            let _slot = slot;
+                            serve_guest_ask(s, b, a, ask);
+                        },
+                    );
+                }
+                None => refuse_past_ask_cap(&mut stream, "guest ask", gauges.guest_ask_cap()),
+            }
         }
         (BoxControlRequest::SubscribeAsks(subscribe), ControlDoor::Host) => {
             let box_id = subscribe.box_id;
-            return spawn_ask_thread(
-                stream,
-                "minvmd-ask-client",
-                boxes,
-                audit_path,
-                move |s, b, a| {
-                    serve_ask_subscription(s, b, a, box_id);
-                },
-            );
+            match gauges.subscriptions.try_acquire(gauges.subscription_cap()) {
+                Some(slot) => {
+                    return spawn_ask_thread(
+                        stream,
+                        "minvmd-ask-client",
+                        boxes,
+                        audit_path,
+                        move |s, b, a| {
+                            let _slot = slot;
+                            serve_ask_subscription(s, b, a, box_id);
+                        },
+                    );
+                }
+                None => {
+                    refuse_past_ask_cap(&mut stream, "ask subscription", gauges.subscription_cap())
+                }
+            }
         }
-        _ => {}
-    }
-    let served = serve_request(
-        &mut stream,
-        boxes,
-        answerer,
-        proxy_publish,
-        door,
-        audit_path,
-        request,
-    );
+        _ => serve_request(
+            &mut stream,
+            boxes,
+            answerer,
+            proxy_publish,
+            door,
+            audit_path,
+            request,
+        ),
+    };
     // The guest door never closes a connection first (G-N8): on the KVM
     // libkrun shuttle a server-initiated close drops the reply's
     // still-buffered bytes on their way to the guest, and the in-VM daemon
@@ -1459,6 +1480,77 @@ fn watch_peer_close(
     Ok(closed_rx)
 }
 
+/// How many guest-door ask connections are served at once (NET-045): the
+/// per-row queue bound across a generous number of rows. Each holds a
+/// serving thread and a watcher thread for the ask's life.
+pub(crate) const MAX_GUEST_ASK_CONNECTIONS: usize = crate::box_registry::PENDING_ASKS_PER_ROW * 32;
+
+/// How many host-client ask subscriptions are served at once (NET-045):
+/// one per interactive attach, bounded the same way.
+pub(crate) const MAX_ASK_SUBSCRIPTIONS: usize = MAX_GUEST_ASK_CONNECTIONS;
+
+/// When the last connection-cap warn line was written: rate-limited like
+/// the queue-full line.
+static ASK_CAP_WARNED: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
+/// Whether a rate-limited warn line is due, stamping it when it is.
+fn warn_due(last: &Mutex<Option<std::time::Instant>>) -> bool {
+    let mut last = last
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let now = std::time::Instant::now();
+    let due = last.is_none_or(|at| now.duration_since(at) >= QUEUE_FULL_WARN_EVERY);
+    if due {
+        *last = Some(now);
+    }
+    due
+}
+
+/// Refuse an ask verb's connection past its cap, before any thread is
+/// spawned: an error reply naming the cap, and a rate-limited warn line.
+fn refuse_past_ask_cap(stream: &mut UnixStream, kind: &str, cap: usize) -> std::io::Result<()> {
+    if warn_due(&ASK_CAP_WARNED) {
+        tracing::warn!(
+            kind,
+            cap,
+            "refused an ask connection past the VM host daemon's cap"
+        );
+    } else {
+        tracing::debug!(
+            kind,
+            cap,
+            "refused an ask connection past the VM host daemon's cap"
+        );
+    }
+    write_reply(
+        stream,
+        &BoxControlReply::Error {
+            error: format!(
+                "the VM host daemon is already serving {cap} {kind} connections; try again \
+                 once one ends"
+            ),
+        },
+    )
+}
+
+/// How long a graceful stop waits for the cancelled asks' audit lines.
+const STOP_AUDIT_BOUND: Duration = Duration::from_secs(5);
+
+/// Cancel every pending ask on a graceful stop (NET-045): each ends through
+/// the book's one end path, by `minvmd-stopping`, its guest's serving
+/// thread writes its audit line, and this returns once every line is
+/// written (or the bound passed). The audit lines are plain appends, so
+/// written is on disk as far as this process can make it. A crash or a
+/// SIGKILL skips this; the guest's EOF fails each ask closed then.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+pub(crate) fn stop_pending_asks(boxes: &BoxRegistry) {
+    let ended = boxes.stop_asks(STOP_AUDIT_BOUND);
+    tracing::info!(
+        cancelled = ended.len(),
+        "cancelled the pending asks: minvmd is stopping"
+    );
+}
+
 /// When the last queue-full warn line was written: the line is rate-limited
 /// to one per [`QUEUE_FULL_WARN_EVERY`], because a guest asking in a loop
 /// must not flood the daemon's log; the refusals in between are debug
@@ -1484,6 +1576,9 @@ fn serve_guest_ask(
     request: minimald_rpc::AdmitAskRequest,
 ) {
     let (reply, outcome) = std::sync::mpsc::channel();
+    // Held until the ask's end is audited: a graceful stop waits on it, so
+    // every cancellation it causes is on record before the daemon exits.
+    let unaudited = boxes.ask_gauges().unaudited.try_acquire(usize::MAX);
     let recorded =
         match boxes.record_ask(request.switch_address, request.port, request.proto, reply) {
             Ok(recorded) => recorded,
@@ -1500,8 +1595,10 @@ fn serve_guest_ask(
                     &BoxControlReply::AskAdmit(minimald_rpc::AskAdmitOutcome::Refused {
                         ask_id: refusal.ask_id,
                         reason: refusal.reason,
+                        cause: None,
                     }),
                 );
+                drop(unaudited);
                 drain_until_peer_closes(&mut stream);
                 return;
             }
@@ -1552,11 +1649,14 @@ fn serve_guest_ask(
         .unwrap_or(minimald_rpc::AskAdmitOutcome::Refused {
             ask_id,
             reason: minimald_rpc::AskRefused::Cancelled,
+            cause: Some(minimald_rpc::AskCancelCause::MinvmdStopping),
         });
-    audit_ask(
-        audit_path,
-        AskAudit::new(outcome_text(&outcome), ask_id).with_facts(Some(&recorded.facts)),
-    );
+    let mut line = AskAudit::new(outcome_text(&outcome), ask_id).with_facts(Some(&recorded.facts));
+    if let minimald_rpc::AskAdmitOutcome::Refused { cause, .. } = outcome {
+        line.cause = cause;
+    }
+    audit_ask(audit_path, line);
+    drop(unaudited);
     let _ = write_reply(&mut stream, &BoxControlReply::AskAdmit(outcome));
     if closed.recv_timeout(GUEST_REPORT_DRAIN_TIMEOUT).is_err() {
         // A guest that holds its end past the drain bound is ended here,
@@ -1687,18 +1787,34 @@ fn record_ask_answer_and_reply(
                 recorded: true,
             }
         }
-        Err(()) => {
+        // A late answer for an ask that already ended: told how it ended,
+        // and nothing is recorded — a late yes never admits.
+        Err(crate::box_registry::AnswerRefusal::AlreadyEnded { port, proto, end }) => {
+            tracing::info!(
+                %ask_id,
+                answer = %answer_text(request.answer),
+                ended = ?end,
+                "refused a late ask answer: the ask already ended"
+            );
+            let mut line = AskAudit::new("refused_already_ended", ask_id);
+            line.port = Some(port);
+            line.proto = Some(proto);
+            audit_ask(audit_path, line);
+            BoxControlReply::AskAlreadyEnded {
+                ask_id,
+                port,
+                proto,
+                already_ended: end,
+            }
+        }
+        Err(crate::box_registry::AnswerRefusal::UnknownId) => {
             tracing::warn!(
                 %ask_id,
-                "refused an ask answer: no pending ask holds the id (unknown, cancelled or \
-                 already answered)"
+                "refused an ask answer: no pending or recently ended ask holds the id"
             );
             audit_ask(audit_path, AskAudit::new("refused_unknown_id", ask_id));
             BoxControlReply::Error {
-                error: format!(
-                    "no pending ask holds id {ask_id}: it is unknown, cancelled or already \
-                     answered"
-                ),
+                error: format!("no pending or recently ended ask holds id {ask_id}"),
             }
         }
     };
@@ -1726,17 +1842,8 @@ fn log_ask_refusal(
     refusal: &crate::box_registry::AskRecordRefusal,
     request: &minimald_rpc::AdmitAskRequest,
 ) {
-    let warn = refusal.reason != minimald_rpc::AskRefused::QueueFull || {
-        let mut last = QUEUE_FULL_WARNED
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let now = std::time::Instant::now();
-        let due = last.is_none_or(|at| now.duration_since(at) >= QUEUE_FULL_WARN_EVERY);
-        if due {
-            *last = Some(now);
-        }
-        due
-    };
+    let warn =
+        refusal.reason != minimald_rpc::AskRefused::QueueFull || warn_due(&QUEUE_FULL_WARNED);
     let box_name = refusal.facts.as_ref().map(|facts| facts.name.as_str());
     if warn {
         tracing::warn!(
@@ -1826,6 +1933,9 @@ struct AskAudit {
     /// How many attached clients an offer reached.
     #[serde(skip_serializing_if = "Option::is_none")]
     offered_to: Option<usize>,
+    /// What cancelled the ask, on a `cancelled` line.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cause: Option<minimald_rpc::AskCancelCause>,
 }
 
 impl AskAudit {
@@ -1841,6 +1951,7 @@ impl AskAudit {
             port: None,
             proto: None,
             offered_to: None,
+            cause: None,
         }
     }
 
@@ -2009,7 +2120,8 @@ mod tests {
             | BoxControlReply::PendingAskOffer(_)
             | BoxControlReply::PendingAskDismissed { .. }
             | BoxControlReply::AskAnswerRecorded { .. }
-            | BoxControlReply::AskAdmit(_)) => {
+            | BoxControlReply::AskAdmit(_)
+            | BoxControlReply::AskAlreadyEnded { .. }) => {
                 panic!("a box verb is never answered with an ask verb's reply, got {other:?}")
             }
             BoxControlReply::Registered(web) => web,
@@ -2345,7 +2457,8 @@ mod tests {
             | BoxControlReply::PendingAskOffer(_)
             | BoxControlReply::PendingAskDismissed { .. }
             | BoxControlReply::AskAnswerRecorded { .. }
-            | BoxControlReply::AskAdmit(_)) => {
+            | BoxControlReply::AskAdmit(_)
+            | BoxControlReply::AskAlreadyEnded { .. }) => {
                 panic!("a box verb is never answered with an ask verb's reply, got {other:?}")
             }
             BoxControlReply::Addresses(echoed) => {
@@ -2442,7 +2555,8 @@ mod tests {
                 | BoxControlReply::PendingAskOffer(_)
                 | BoxControlReply::PendingAskDismissed { .. }
                 | BoxControlReply::AskAnswerRecorded { .. }
-                | BoxControlReply::AskAdmit(_)) => {
+                | BoxControlReply::AskAdmit(_)
+                | BoxControlReply::AskAlreadyEnded { .. }) => {
                     panic!("a box verb is never answered with an ask verb's reply, got {other:?}")
                 }
                 BoxControlReply::Error { error } => {
@@ -2498,7 +2612,8 @@ mod tests {
             | BoxControlReply::PendingAskOffer(_)
             | BoxControlReply::PendingAskDismissed { .. }
             | BoxControlReply::AskAnswerRecorded { .. }
-            | BoxControlReply::AskAdmit(_)) => {
+            | BoxControlReply::AskAdmit(_)
+            | BoxControlReply::AskAlreadyEnded { .. }) => {
                 panic!("a box verb is never answered with an ask verb's reply, got {other:?}")
             }
             BoxControlReply::Addresses(echoed) => {
@@ -3631,8 +3746,14 @@ mod tests {
         ));
         let replayed = host.answer(offer.ask_id, AskAnswer::Yes);
         assert!(
-            matches!(replayed, BoxControlReply::Error { .. }),
-            "a consumed id is refused: {replayed:?}"
+            matches!(
+                replayed,
+                BoxControlReply::AskAlreadyEnded {
+                    already_ended: minimald_rpc::AskLateEnd::Allowed,
+                    ..
+                }
+            ),
+            "a consumed id is refused with how it ended: {replayed:?}"
         );
 
         // A cancelled id: the guest withdraws its ask, then a yes arrives.
@@ -3650,7 +3771,18 @@ mod tests {
             BoxControlReply::PendingAskDismissed { .. }
         ));
         let late = host.answer(offer.ask_id, AskAnswer::Yes);
-        assert!(matches!(late, BoxControlReply::Error { .. }), "{late:?}");
+        assert!(
+            matches!(
+                late,
+                BoxControlReply::AskAlreadyEnded {
+                    already_ended: minimald_rpc::AskLateEnd::Cancelled {
+                        cause: minimald_rpc::AskCancelCause::GuestClosed
+                    },
+                    ..
+                }
+            ),
+            "{late:?}"
+        );
         assert_eq!(host.runtime_ports("web"), vec![ASK_PORT]);
     }
 
@@ -3677,7 +3809,16 @@ mod tests {
             );
         }
         let late = host.answer(offer.ask_id, AskAnswer::Yes);
-        assert!(matches!(late, BoxControlReply::Error { .. }), "{late:?}");
+        assert!(
+            matches!(
+                late,
+                BoxControlReply::AskAlreadyEnded {
+                    already_ended: minimald_rpc::AskLateEnd::Denied,
+                    ..
+                }
+            ),
+            "the late answer is told the first answer won: {late:?}"
+        );
         assert_eq!(refused(expect_outcome(&mut guest)), AskRefused::Denied);
         assert!(host.runtime_ports("web").is_empty());
     }
@@ -3925,5 +4066,129 @@ mod tests {
             expect_outcome(&mut guest),
             AskAdmitOutcome::Admitted { .. }
         ));
+    }
+
+    /// A late answer for an ask another attach already answered is told
+    /// the real outcome — allowed, denied, or cancelled with its cause —
+    /// and never admits anything: a late yes after a no leaves the row
+    /// without the port.
+    #[test]
+    fn late_answer_is_told_how_the_ask_ended() {
+        let host = AskHost::start();
+        let web = host.register_ask_box("web");
+        let mut first = attach_client(&host, &web);
+        let mut second = attach_client(&host, &web);
+
+        // Denied by the first attach; the second's late yes admits nothing.
+        let mut guest = guest_ask(&host, &web, ASK_PORT);
+        let offer = expect_offer(&mut first);
+        expect_offer(&mut second);
+        host.answer(offer.ask_id, AskAnswer::No);
+        assert_eq!(refused(expect_outcome(&mut guest)), AskRefused::Denied);
+        assert_eq!(
+            host.answer(offer.ask_id, AskAnswer::Yes),
+            BoxControlReply::AskAlreadyEnded {
+                ask_id: offer.ask_id,
+                port: ASK_PORT,
+                proto: sessions::IpProto::Tcp,
+                already_ended: minimald_rpc::AskLateEnd::Denied,
+            }
+        );
+        assert!(
+            host.runtime_ports("web").is_empty(),
+            "a late yes never admits"
+        );
+        first.next();
+        second.next();
+
+        // Allowed by the first attach; the second's late no is told so.
+        let mut guest = guest_ask(&host, &web, ASK_PORT + 1);
+        let offer = expect_offer(&mut first);
+        expect_offer(&mut second);
+        host.answer(offer.ask_id, AskAnswer::Yes);
+        expect_outcome(&mut guest);
+        assert!(matches!(
+            host.answer(offer.ask_id, AskAnswer::No),
+            BoxControlReply::AskAlreadyEnded {
+                already_ended: minimald_rpc::AskLateEnd::Allowed,
+                ..
+            }
+        ));
+        assert_eq!(host.runtime_ports("web"), vec![ASK_PORT + 1]);
+    }
+
+    /// A graceful stop cancels every pending ask through the one end path,
+    /// by `minvmd-stopping`: the guest is answered cancelled, and the audit
+    /// line is written before the stop returns.
+    #[test]
+    fn graceful_stop_cancels_and_audits_pending_asks() {
+        let host = AskHost::start();
+        let web = host.register_ask_box("web");
+        let mut client = attach_client(&host, &web);
+        let mut guest = guest_ask(&host, &web, ASK_PORT);
+        let offer = expect_offer(&mut client);
+
+        stop_pending_asks(&host.boxes);
+        let audit = host.audit();
+        assert!(
+            audit
+                .lines()
+                .any(|line| line.contains(r#""outcome":"cancelled""#)
+                    && line.contains(&offer.ask_id.to_string())
+                    && line.contains(r#""cause":"minvmd-stopping""#)),
+            "the stop's cancellation is audited before the stop returns: {audit}"
+        );
+        assert_eq!(host.boxes.pending_ask_count(), 0);
+        assert_eq!(
+            expect_outcome(&mut guest),
+            AskAdmitOutcome::Refused {
+                ask_id: offer.ask_id,
+                reason: AskRefused::Cancelled,
+                cause: Some(minimald_rpc::AskCancelCause::MinvmdStopping),
+            }
+        );
+    }
+
+    /// Past the cap, a guest-door ask connection and a host subscription
+    /// are each refused on the door's own turn, before any thread is
+    /// spawned; a slot freed by a connection's end admits the next.
+    #[test]
+    fn ask_connections_refused_past_the_cap() {
+        let host = AskHost::start();
+        host.boxes.ask_gauges().set_caps(2, 1);
+        let web = host.register_ask_box("web");
+        let mut client = attach_client(&host, &web);
+        let mut held = vec![
+            guest_ask(&host, &web, ASK_PORT),
+            guest_ask(&host, &web, ASK_PORT + 1),
+        ];
+        expect_offer(&mut client);
+        let until = std::time::Instant::now() + ASK_WAIT;
+        while host.boxes.pending_ask_count() < 2 {
+            assert!(std::time::Instant::now() < until, "the asks never queued");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let mut past = guest_ask(&host, &web, ASK_PORT + 2);
+        let refused_ask = past.next();
+        assert!(
+            matches!(&refused_ask, BoxControlReply::Error { error } if error.contains("2 guest ask")),
+            "the third guest ask is refused at the cap: {refused_ask:?}"
+        );
+        assert_eq!(
+            host.boxes.pending_ask_count(),
+            2,
+            "the refused ask was never recorded"
+        );
+
+        let mut second = Held::open(
+            &host.host,
+            &BoxControlRequest::SubscribeAsks(SubscribeAsksRequest { box_id: web.box_id }),
+        );
+        let refused_sub = second.next();
+        assert!(
+            matches!(&refused_sub, BoxControlReply::Error { error } if error.contains("1 ask subscription")),
+            "the second subscription is refused at the cap: {refused_sub:?}"
+        );
+        held.clear();
     }
 }
