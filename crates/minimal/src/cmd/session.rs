@@ -167,6 +167,16 @@ async fn register_box_with_vm_host(
                  answerer release reply; the registration did not happen"
             )
         }
+        other @ (minimald_rpc::BoxControlReply::AsksSubscribed { .. }
+        | minimald_rpc::BoxControlReply::PendingAskOffer(_)
+        | minimald_rpc::BoxControlReply::PendingAskDismissed { .. }
+        | minimald_rpc::BoxControlReply::AskAnswerRecorded { .. }
+        | minimald_rpc::BoxControlReply::AskAdmit(_)) => {
+            anyhow::bail!(
+                "the VM host daemon answered the box registration with an ask \
+                 verb's reply {other:?}; the registration did not happen"
+            )
+        }
     }
 }
 
@@ -416,6 +426,18 @@ pub(crate) async fn withdraw_box_row(
                     port,
                     "the VM host daemon answered the box row withdrawal with a \
                      port report; the row stays published"
+                );
+            }
+            other @ (minimald_rpc::BoxControlReply::AsksSubscribed { .. }
+            | minimald_rpc::BoxControlReply::PendingAskOffer(_)
+            | minimald_rpc::BoxControlReply::PendingAskDismissed { .. }
+            | minimald_rpc::BoxControlReply::AskAnswerRecorded { .. }
+            | minimald_rpc::BoxControlReply::AskAdmit(_)) => {
+                tracing::warn!(
+                    box = %name,
+                    reply = ?other,
+                    "the VM host daemon answered the box row withdrawal with an \
+                     ask verb's reply; the row stays published"
                 );
             }
         },
