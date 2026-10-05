@@ -110,6 +110,14 @@ pub const CONTROL_SOCK_FILE: &str = "control.sock";
 /// refused *to the reporter* for the publish to unwind.
 pub const GUEST_CONTROL_SOCK_FILE: &str = "guest-control.sock";
 
+/// The env the supervisor hands the VMM child the guest report door's path
+/// under (T94): the child is the process that owns the libkrun context, so
+/// only it can register the door's vsock port — and it registers the port
+/// exactly when the env names a door the supervisor bound, which is how the
+/// door is bound only once the bridge is up. The name lives here, beside
+/// the door it names, because the child only reads it.
+pub const GUEST_REPORT_SOCK_ENV: &str = "MINVMD_GUEST_REPORT_SOCK";
+
 /// The audit log the daemon appends its host-side copy of each recorded
 /// admission to, relative to the provider dir the sockets live in — the
 /// daemon's own audit log, beside the state it keeps for the VM it
@@ -141,16 +149,11 @@ enum ControlDoor {
     /// The host's control socket, in the provider dir beside the ssh
     /// socket: registrations, withdrawals, and both read-only verbs.
     Host,
-    /// The in-VM daemon's control channel: the port reports alone. No
-    /// runtime socket serves it until T94 binds it with the vsock bridge;
-    /// the tests drive it directly.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the guest door is bound by T94 with the vsock bridge"
-        )
-    )]
+    /// The in-VM daemon's control channel: the port reports alone. Bound
+    /// by the supervisor for the vsock bridge at
+    /// [`minimald_rpc::VM_HOST_BOX_REPORT_PORT`] (T94,
+    /// [`spawn_guest_reports_door`]); before the bridge hands the door
+    /// over, no report can reach it, and the tests drive it directly.
     GuestReports,
 }
 
@@ -159,6 +162,13 @@ enum ControlDoor {
 /// must not pin the serving thread — connections are served one at a
 /// time — forever.
 const REGISTER_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long the guest door waits for the in-VM daemon to close its end
+/// after its reply is written. The wait is the G-N8 workaround's other
+/// half, so the bound only ends a client that read its reply and never
+/// closed: a wedged reporter cannot pin the door's serial accept loop the
+/// way an honest one never does.
+const GUEST_REPORT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The largest request line the server will read. A registration carries a
 /// name, a port list, and a policy; anything past this bound is not one.
@@ -431,11 +441,11 @@ pub fn resolve_control_sock() -> std::io::Result<PathBuf> {
 /// long as the daemon lives.
 ///
 /// The in-VM daemon's report channel ([`GUEST_CONTROL_SOCK_FILE`]) is not
-/// bound here: T94 binds the guest door together with the vsock bridge at
-/// [`minimald_rpc::VM_HOST_BOX_REPORT_PORT`] (7352) that is its only peer.
-/// Until then the port-report verbs (`admit_port`, `withdraw_port`) are
-/// served only on [`ControlDoor::GuestReports`], which no runtime socket
-/// carries, so a report reaching the host's socket is refused as the
+/// bound here: the supervisor binds it as the vsock bridge's other half
+/// ([`spawn_guest_reports_door`]), so the door exists exactly when a
+/// running VM is handed it at
+/// [`minimald_rpc::VM_HOST_BOX_REPORT_PORT`] (7352). Until a bridge hands
+/// the door over, a report reaching the host's socket is refused as the
 /// wrong door.
 ///
 /// The bind happens on the calling thread so its failure surfaces to the
@@ -474,6 +484,68 @@ pub fn spawn(
                 &audit_path,
             )
         })
+}
+
+/// Bind the in-VM daemon's report door (T94, NET-138) at
+/// [`GUEST_CONTROL_SOCK_FILE`] beside `control_sock_path` and serve the
+/// port-report verbs on it against `boxes` on a dedicated thread, answering
+/// the door's bound path so the caller hands the VMM child the same socket
+/// it registered the vsock port at [`minimald_rpc::VM_HOST_BOX_REPORT_PORT`]
+/// for — the bridge's two halves, one step.
+///
+/// The door is the port reports' alone: the admit-port and withdraw-port
+/// verbs answer on it and nothing else does, so the grant a row's
+/// registration holds — never the peer, whose uid the socket posture
+/// already gates — decides what a report records. It serves one connection
+/// at a time on its own thread beside the host socket's thread, and never
+/// closes a connection first: after its reply is written it waits for the
+/// reporter's close, because the KVM shuttle drops a server-initiated
+/// close's still-buffered reply bytes on the way to the guest (G-N8).
+///
+/// The bind runs the control socket's own posture — path-length check,
+/// 0700 parent dir, ownership verified, stale socket removed, 0600 on the
+/// socket — and happens on the calling thread, so a bind failure surfaces
+/// to the supervisor's startup handling rather than inside a thread the
+/// supervisor cannot reach. One info line at the bind says the door stands
+/// behind its bridge: the observability half of the report channel.
+pub fn spawn_guest_reports_door(
+    control_sock_path: &Path,
+    boxes: BoxRegistry,
+    answerer: AnswererStatus,
+    proxy_publish: ProxyPublishStatus,
+) -> std::io::Result<PathBuf> {
+    let sock_path = control_sock_path.with_file_name(GUEST_CONTROL_SOCK_FILE);
+    crate::sock::check_uds_path_len(&sock_path)?;
+    crate::sock::prepare_socket_dir(&sock_path)?;
+    if let Some(parent) = sock_path.parent() {
+        crate::sock::restrict_owned_dir(parent)?;
+        crate::sock::verify_provider_dir_ownership(parent)?;
+    }
+    crate::sock::remove_stale_socket(&sock_path)?;
+    let listener = UnixListener::bind(&sock_path)?;
+    crate::sock::enforce_socket_permissions(&sock_path)?;
+    let audit_path = audit_log_path(&sock_path);
+    tracing::info!(
+        sock = %sock_path.display(),
+        vsock_port = minimald_rpc::VM_HOST_BOX_REPORT_PORT,
+        "bound the guest report door; the in-VM daemon's port reports reach the \
+         host-held grant over the vsock bridge"
+    );
+    std::thread::Builder::new()
+        .name("minvmd-guest-control".to_string())
+        .spawn(move || {
+            accept_loop(
+                listener,
+                boxes,
+                answerer,
+                proxy_publish,
+                ControlDoor::GuestReports,
+                &audit_path,
+            )
+        })
+        // The door's bound path is the handle the caller pairs with the
+        // bridge; the thread keeps the socket open for the daemon's life.
+        .map(|_| sock_path)
 }
 
 /// Accept and serve box control requests until the daemon exits. One
@@ -561,7 +633,7 @@ fn serve_connection(
         );
         return Ok(());
     }
-    serve_request(
+    let served = serve_request(
         &mut stream,
         boxes,
         answerer,
@@ -569,7 +641,36 @@ fn serve_connection(
         door,
         audit_path,
         request,
-    )
+    );
+    // The guest door never closes a connection first (G-N8): on the KVM
+    // libkrun shuttle a server-initiated close drops the reply's
+    // still-buffered bytes on their way to the guest, and the in-VM daemon
+    // reads an immediate EOF with nothing in it — the answer a report's
+    // unwind depends on, lost to the close that carried it. So the door
+    // holds the connection open until the reporter, which has its reply,
+    // closes from its side. The host socket's peers are on the same host,
+    // not behind a shuttle, and close as they always did.
+    if door == ControlDoor::GuestReports {
+        drain_until_peer_closes(&mut stream);
+    }
+    served
+}
+
+/// Wait for the peer's close on a guest-door connection whose reply was
+/// already written: read until EOF — the reporter closing its end, which
+/// it does once it has the reply — or until the drain bound ends a client
+/// that never closes, so a wedged reporter cannot pin the door's serial
+/// accept loop. Bytes past the request line, if any, are discarded: the
+/// door's protocol is one line each way.
+fn drain_until_peer_closes(stream: &mut UnixStream) {
+    let _ = stream.set_read_timeout(Some(GUEST_REPORT_DRAIN_TIMEOUT));
+    let mut sink = [0u8; 1024];
+    loop {
+        match std::io::Read::read(stream, &mut sink) {
+            Ok(0) | Err(_) => return,
+            Ok(_) => {}
+        }
+    }
 }
 
 /// Whether `peer_uid` is root connecting to a daemon that is not root's:
@@ -1313,35 +1414,23 @@ mod tests {
         Ok((sock_path, handle, boxes, answerer, proxy_publish))
     }
 
-    /// Serves [`ControlDoor::GuestReports`] on a test-only socket beside
-    /// `sock_path` — the runtime binds no guest door until T94 brings the
-    /// vsock bridge — so the per-door verb enforcement is driven with the
-    /// door value directly, through the same accept loop and audit path the
-    /// daemon's door will use.
+    /// Serves [`ControlDoor::GuestReports`] on the guest door beside
+    /// `sock_path`, through the same production bind the supervisor calls
+    /// behind the vsock bridge — posture, audit path, drain and all — so the
+    /// per-door verb enforcement runs the runtime's own door.
     fn spawn_guest_door(
         sock_path: &std::path::Path,
         boxes: &BoxRegistry,
         answerer: &AnswererStatus,
         proxy_publish: &ProxyPublishStatus,
     ) -> std::io::Result<()> {
-        let guest_sock_path = sock_path.with_file_name(GUEST_CONTROL_SOCK_FILE);
-        let listener = UnixListener::bind(&guest_sock_path)?;
-        let audit_path = audit_log_path(sock_path);
-        let (boxes, answerer, proxy_publish) =
-            (boxes.clone(), answerer.clone(), proxy_publish.clone());
-        std::thread::Builder::new()
-            .name("minvmd-guest-control-test".to_string())
-            .spawn(move || {
-                accept_loop(
-                    listener,
-                    boxes,
-                    answerer,
-                    proxy_publish,
-                    ControlDoor::GuestReports,
-                    &audit_path,
-                )
-            })?;
-        Ok(())
+        spawn_guest_reports_door(
+            sock_path,
+            boxes.clone(),
+            answerer.clone(),
+            proxy_publish.clone(),
+        )
+        .map(|_| ())
     }
 
     /// A client that writes the request and reads the reply line back,
