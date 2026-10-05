@@ -16769,6 +16769,13 @@ proof_listen_published_port_reaches_peer_and_host() {
   local lp_policy="" lp_ans_why="" lp_ans_ls=""
   local lp_stance="allow"            # the target's stance, on every lane
   local LP_SEED_DIR="" LP_PEER_SEED_DIR=""
+  local lp_bridge_switch="" lp_bridge_row=""
+  # Whether a `minvmd status --row` line is the box's row at its switch
+  # address with the in-range listen's port in its runtime set.
+  lp_row_holds() {
+    [[ "$1" == *" switch $lp_bridge_switch "* ]] \
+      && [[ "$1" =~ runtime\ \[([0-9]+,)*${lp_listen_port}(,[0-9]+)*\] ]]
+  }
 
   if [ -z "${MINVMD_GVPROXY_BIN:-}" ] && [ -z "$E2E_NATIVE_SWITCH" ]; then
     echo "listen-published port SKIPPED (no switch: neither MINVMD_GVPROXY_BIN (VM) nor E2E_NATIVE_SWITCH (native) is set — a box has no address to publish at)"
@@ -17169,11 +17176,12 @@ proof_listen_published_port_reaches_peer_and_host() {
   fi
   echo "peer: GET http://$lp_peer_host:$lp_listen_port/ from the peer box -> HTTP 200 carrying $lp_marker — a listen the range allows is published with no expose (NET-016)"
 
-  # ---- the bridge: the VM host daemon admitted the listen (T94) -----------
+  # ---- the bridge: the host-held grant admitted the listen (T94) ---------
   # The peer leg never leaves the VM, so on a VM lane the host half of the
-  # listen is read off the VM host daemon's own record: the in-VM daemon's
-  # report crossed the bridge and the host gate admitted it, as a `listen`
-  # source, at the box's own switch address.
+  # listen is read off the VM host daemon's own row for the box: the in-VM
+  # daemon's report crossed the bridge and the host gate admitted the port
+  # into the row's runtime set, at the box's own switch address. This case
+  # declares no expose, so a runtime port in the row is the listen's report.
   lp_bridge_switch=""
   if [ -n "${E2E_VM:-}" ]; then
     # The box's switch address, in activate's own word: its session-start
@@ -17185,27 +17193,18 @@ proof_listen_published_port_reaches_peer_and_host() {
       cat "$WORK/lp-activate.err" 2>/dev/null || true
       fail
     fi
-    lp_bridge_admit=""
+    lp_bridge_row=""
     for _ in $(seq 1 20); do
-      lp_bridge_admit="$(minvmd_log_lines \
-        "recorded the box's runtime-admitted port in the host-held grant" \
-        | grep -F "\"box\":\"$lp_target_name\"" \
-        | grep -F "\"switch_address\":\"$lp_bridge_switch\"" \
-        | grep -E "\"port\":${lp_listen_port}[,}]" \
-        | grep -F '"source":"listen"' | tail -n1)"
-      [ -n "$lp_bridge_admit" ] && break
+      lp_bridge_row="$(minvmd status --row "$lp_target_name" 2>/dev/null || true)"
+      lp_row_holds "$lp_bridge_row" && break
       sleep 0.25
     done
-    if [ -z "$lp_bridge_admit" ]; then
-      echo "::error::the VM host daemon recorded no listen-sourced admission of port $lp_listen_port for box '$lp_target_name' at $lp_bridge_switch — the report never crossed the bridge to the host gate (T94)"
-      echo "--- minvmd log files ---"
-      find "$XDG_STATE_HOME/minimal/logs" -name 'minvmd.log*' -type f 2>/dev/null || true
-      echo "--- minvmd records naming the box or a runtime port ---"
-      minvmd_log_lines "$lp_target_name" | tail -n 20 || true
-      minvmd_log_lines 'runtime-admitted port' | tail -n 20 || true
+    echo "minvmd status --row $lp_target_name -> '${lp_bridge_row:-<no answer>}'"
+    if ! lp_row_holds "$lp_bridge_row"; then
+      echo "::error::the VM host daemon's row for box '$lp_target_name' at $lp_bridge_switch holds no runtime port $lp_listen_port — the listen's report never crossed the bridge to the host gate (T94)"
       fail
     fi
-    echo "bridge: the VM host daemon admitted the listen as source listen at $lp_bridge_switch:$lp_listen_port"
+    echo "bridge: the host-held grant admitted the listen — the row at $lp_bridge_switch holds runtime port $lp_listen_port"
   fi
 
   # ---- reach: the host probe, at the address the answerer returned ---------
@@ -17284,27 +17283,18 @@ PY
   fi
   echo "peer, after the close: the same GET -> connection refused (curl exit $lp_rc) $(( $(now_ms) - lp_close_start ))ms after the kill — the listen's publication withdrew with its listener (NET-017)"
   if [ -n "$lp_bridge_switch" ]; then
-    lp_bridge_withdraw=""
+    lp_bridge_row=""
     for _ in $(seq 1 20); do
-      lp_bridge_withdraw="$(minvmd_log_lines \
-        "withdrew the box's runtime-admitted port from the host-held grant" \
-        | grep -F "\"box\":\"$lp_target_name\"" \
-        | grep -F "\"switch_address\":\"$lp_bridge_switch\"" \
-        | grep -E "\"port\":${lp_listen_port}[,}]" \
-        | grep -F '"source":"listen"' | tail -n1)"
-      [ -n "$lp_bridge_withdraw" ] && break
+      lp_bridge_row="$(minvmd status --row "$lp_target_name" 2>/dev/null || true)"
+      [ -n "$lp_bridge_row" ] && ! lp_row_holds "$lp_bridge_row" && break
       sleep 0.25
     done
-    if [ -z "$lp_bridge_withdraw" ]; then
-      echo "::error::the VM host daemon recorded no listen-sourced withdrawal of port $lp_listen_port for box '$lp_target_name' after the close — the withdrawal never crossed the bridge (T94)"
-      echo "--- minvmd log files ---"
-      find "$XDG_STATE_HOME/minimal/logs" -name 'minvmd.log*' -type f 2>/dev/null || true
-      echo "--- minvmd records naming the box or a runtime port ---"
-      minvmd_log_lines "$lp_target_name" | tail -n 20 || true
-      minvmd_log_lines 'runtime-admitted port' | tail -n 20 || true
+    echo "minvmd status --row $lp_target_name -> '${lp_bridge_row:-<no answer>}'"
+    if [ -z "$lp_bridge_row" ] || lp_row_holds "$lp_bridge_row"; then
+      echo "::error::the VM host daemon's row for box '$lp_target_name' still holds runtime port $lp_listen_port after the close, or no longer answers — the withdrawal never crossed the bridge (T94)"
       fail
     fi
-    echo "bridge: the VM host daemon withdrew the listen (source listen) at $lp_bridge_switch:$lp_listen_port after the close"
+    echo "bridge: the host-held grant withdrew the listen — the live row at $lp_bridge_switch no longer holds runtime port $lp_listen_port"
   fi
   if [ "$lp_host_reach" != "asserted" ]; then
     echo "host probe, after the close: SKIPPED ($lp_ans_why)"
