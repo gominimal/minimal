@@ -277,6 +277,20 @@ enum MainloopExitReason {
     Shed,
 }
 
+impl MainloopExitReason {
+    /// The exit status the binding reports to its client, which `min session
+    /// attach` exits with. An end the user chose — a detach, or the session
+    /// process exiting — is 0. An end the daemon imposed is not, so a script
+    /// can tell the two apart.
+    fn exit_status(&self) -> u32 {
+        match self {
+            Self::Detach | Self::ProcessExited => 0,
+            Self::HostGone | Self::Superceded | Self::Shutdown => DAEMON_ENDED_EXIT_STATUS,
+            Self::Shed => SHED_EXIT_STATUS,
+        }
+    }
+}
+
 /// What a binding told to end itself renders, and the mainloop exit it ends
 /// in — the one rendering the four [`BindingMsg`] teardown variants share,
 /// written once so the mainloop's own arm and the ask dialog a teardown
@@ -529,6 +543,18 @@ const SHED_NOTICE: &[u8] =
 /// shed it has to, because the output stream was cut mid-flight and no
 /// unwind codes followed it.
 const SHED_EXIT_STATUS: u32 = 255;
+
+/// The exit status of an attach the daemon ended: the session was destroyed
+/// (or otherwise went away), another connection took it over, or the daemon
+/// is shutting down. Non-zero so a script does not read it as a detach, and
+/// not ssh's 255, because the daemon still spoke for itself: these ends send
+/// their own unwind codes or none are owed, so the client's blind unwind (see
+/// [`SHED_EXIT_STATUS`]) stays off.
+const DAEMON_ENDED_EXIT_STATUS: u32 = 254;
+
+/// The line a binding whose host went away leaves on the terminal: the
+/// session is gone, so there is no farewell from the host to render.
+const HOST_GONE_NOTICE: &[u8] = b"\r\nDisconnecting - the session is gone\r\n";
 
 /// Hands a departing binding its teardown message and waits for it to
 /// finish, so its farewell lands before whatever comes next.
@@ -964,24 +990,26 @@ impl Binding {
             control.detached().await;
         }
 
-        let shed = exit_reason == MainloopExitReason::Shed;
-        if shed {
-            // Bounded: the client stopped draining, so this write can park
-            // exactly as the one that got the binding shed. The notice is
-            // lost then, but the close below still goes out. The writer is a
-            // fresh one whenever a write was cut short mid-send — the mainloop
-            // replaces it at every race it drops, because russh's channel
-            // writer otherwise answers this short buffer with the interrupted
-            // write's byte count and tokio's `write_all` panics past its end.
+        let notice = match exit_reason {
+            MainloopExitReason::Shed => Some(SHED_NOTICE),
+            MainloopExitReason::HostGone => Some(HOST_GONE_NOTICE),
+            _ => None,
+        };
+        if let Some(notice) = notice {
+            // Bounded: after a shed the client stopped draining, so this
+            // write can park exactly as the one that got the binding shed.
+            // The notice is lost then, but the close below still goes out.
+            // The writer is a fresh one whenever a write was cut short
+            // mid-send — the mainloop replaces it at every race it drops,
+            // because russh's channel writer otherwise answers this short
+            // buffer with the interrupted write's byte count and tokio's
+            // `write_all` panics past its end.
             let _ =
-                tokio::time::timeout(crate::session::HOST_PROBE_TIMEOUT, w.write_all(SHED_NOTICE))
-                    .await;
+                tokio::time::timeout(crate::session::HOST_PROBE_TIMEOUT, w.write_all(notice)).await;
         }
 
         let _ = ws.eof().await;
-        let _ = ws
-            .exit_status(if shed { SHED_EXIT_STATUS } else { 0 })
-            .await;
+        let _ = ws.exit_status(exit_reason.exit_status()).await;
         let _ = ws.close().await; // needed to release the remote
     }
 
