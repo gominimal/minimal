@@ -244,11 +244,16 @@ pub struct ListenArgs {
     #[arg(long)]
     hostname_proxy_port: Option<u16>,
 
-    /// Port the box-zone answerer must listen on (UDP), when this deployment
-    /// pins one — the port the host's resolver is pointed at to answer
-    /// `*.min.internal`, whose documented default is 7656. Unset (the
-    /// default) gives it the same try-the-default-then-select treatment the
-    /// hostname proxy's flag documents.
+    /// Port the machine's box-zone answerer serves on (UDP), when this
+    /// deployment pins one — the port the host's resolver is pointed at to
+    /// answer `*.min.internal`, whose documented default is 7656. On a
+    /// native host the daemon is first a client of the installed
+    /// `min-answerer` service (its rows publish over the machine-global
+    /// channel and it hosts nothing); the port is the hook port it hosts
+    /// the single-operator interim on while no service serves, and
+    /// unlike the hostname proxy there is no select-when-busy for it: the
+    /// address is the one the host's resolver is routed to, so a held
+    /// hook port is a surfaced error, never a move.
     #[arg(long)]
     zone_answerer_port: Option<u16>,
 

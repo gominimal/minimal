@@ -1,13 +1,14 @@
 use futures::StreamExt as _;
 use minimald_rpc::{
-    AbortSession, AbortSessionResponse, CleanCacheRequest, CleanCacheUpdate, CreateSession,
-    DestroySession, DestroySessionResponse, Errorable, FinalizeSession, FinalizeSessionResponse,
-    GetEffectiveSessionPolicy, GetEffectiveSessionPolicyRequest, GetMeshStatus, GetSessionPolicy,
-    GetSessionPolicyRequest, GetSessionRecord, GetSessionRecordRequest, GetSessionRecordResponse,
-    GetSessionScreen, GetVersion, GetVersionResponse, ListSessions, ListSessionsEntry,
-    ListSessionsResponse, OneshotSshRpc, RPC_SUBSYSTEM_PREFIX, RenameSession,
-    RenameSessionResponse, ResourcePool, SessionDelta, SessionDeltaRequest, SessionDeltaResponse,
-    Shutdown, ShutdownRequest, ShutdownResponse, SubmitVerdict,
+    AbortSession, AbortSessionResponse, BoxControlReply, BoxControlRequest, CleanCacheRequest,
+    CleanCacheUpdate, CreateSession, DestroySession, DestroySessionResponse, Errorable,
+    FinalizeSession, FinalizeSessionResponse, GetEffectiveSessionPolicy,
+    GetEffectiveSessionPolicyRequest, GetMeshStatus, GetSessionPolicy, GetSessionPolicyRequest,
+    GetSessionRecord, GetSessionRecordRequest, GetSessionRecordResponse, GetSessionScreen,
+    GetVersion, GetVersionResponse, ListSessions, ListSessionsEntry, ListSessionsResponse,
+    OneshotSshRpc, RPC_SUBSYSTEM_PREFIX, RenameSession, RenameSessionResponse, ResourcePool,
+    SessionDelta, SessionDeltaRequest, SessionDeltaResponse, Shutdown, ShutdownRequest,
+    ShutdownResponse, SubmitVerdict,
 };
 use russh::{
     Channel as RuChannel, ChannelId,
@@ -692,6 +693,214 @@ async fn settled_proxy_port(state: &ServerStateHandle) -> Option<u16> {
         }
         tokio::time::sleep(POLL).await;
     }
+}
+
+/// The answerer control socket's file name, beside the daemon's identity
+/// dir (its provider instance dir) — the native door the answerer's
+/// handover verbs knock on, the counterpart of the VM host daemon's
+/// `control.sock` (its `minvmd` control module's socket of the same
+/// name): one door per daemon, in a dir only this operator (and root)
+/// can reach.
+pub const ANSWERER_CONTROL_SOCK_FILE: &str = "control.sock";
+
+/// The largest request line the answerer control socket will read: a
+/// request is one small verb, so anything past this bound is not one.
+const ANSWER_CONTROL_MAX_LINE: usize = 64 * 1024;
+
+/// Binds and serves the daemon's answerer control socket (NET-122's
+/// native half of the same door the VM host daemon serves): the socket
+/// answers the answerer's status and handover verbs —
+/// `answerer_status`, `release_answerer`, `release_answerer_cancel` —
+/// from the acquisition's status cell ([`AnswererStatus`]), and nothing
+/// else: this daemon's boxes register over RPC channels, not over this
+/// door, so every box verb is refused as a wrong-door ask.
+///
+/// The socket lives in the daemon's identity dir (its provider instance
+/// dir, the dir its node id is), at [`ANSWERER_CONTROL_SOCK_FILE`], bound
+/// before the answerer's acquisition starts so a control surface is
+/// there whatever the acquisition decides; a daemon with no identity dir
+/// configured (a harness server) serves from its state dir. Bound on the
+/// calling task so a failure to bind surfaces to the caller, and the
+/// accept loop runs detached for the daemon's life.
+///
+/// Access is the file's: owner-only (0600), in a dir only this operator
+/// and root can reach. The peer check is belt to that braces: a request
+/// is served when its peer is this daemon's own uid, or — for the two
+/// handover verbs alone — root, whose install step (the answerer
+/// service's) is the only asker that runs as root.
+pub(crate) async fn spawn_answerer_control(
+    state: &ServerStateHandle,
+    status: crate::net::answerer::AnswererStatus,
+) -> std::io::Result<()> {
+    let dir = match state.daemon_identity_dir().await {
+        Some(dir) => dir,
+        None => state.minimal_state_dir().await,
+    };
+    let sock_path = std::path::PathBuf::from(dir.as_str()).join(ANSWERER_CONTROL_SOCK_FILE);
+    // A socket left by a previous run of this same daemon instance is
+    // stale the moment this one binds; a live one would not be ours to
+    // remove, so only a socket file is.
+    use std::os::unix::fs::FileTypeExt as _;
+
+    match std::fs::symlink_metadata(&sock_path) {
+        Ok(meta) if meta.file_type().is_socket() => {
+            let _ = std::fs::remove_file(&sock_path);
+        }
+        _ => {}
+    }
+    let listener = tokio::net::UnixListener::bind(&sock_path)?;
+    std::fs::set_permissions(
+        &sock_path,
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )?;
+    let shutdown = state.shutdown_token().await;
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => return,
+                accepted = listener.accept() => {
+                    let Ok((stream, _)) = accepted else { return };
+                    let status = status.clone();
+                    tokio::spawn(serve_answerer_control(stream, status));
+                }
+            }
+        }
+    });
+    tracing::info!(
+        component = "zone-answerer",
+        socket = %sock_path.display(),
+        "the answerer control socket is listening; it answers the answerer's status and \
+         handover verbs"
+    );
+    Ok(())
+}
+
+/// Serves one answerer control connection: one request line, one reply
+/// line, the same shape every control socket of this system speaks (a
+/// [`BoxControlRequest`] in, a [`BoxControlReply`] out), with this
+/// daemon's bounds on both.
+async fn serve_answerer_control(
+    mut stream: tokio::net::UnixStream,
+    status: crate::net::answerer::AnswererStatus,
+) {
+    use tokio::io::AsyncWriteExt as _;
+
+    let reply = match (read_control_request(&mut stream).await, stream.peer_cred()) {
+        (Ok(Some(line)), Ok(cred)) => {
+            let request: BoxControlRequest =
+                serde_json_lenient::from_str(&line).unwrap_or(BoxControlRequest::AnswererStatus);
+            // An unparseable line is a status ask, not an error reply: the
+            // status ask is the read this door always answers, so a
+            // probe's garbage gets the status and closes, rather than a
+            // parse-failure no client of this door ever sends.
+            let peer_uid = cred.uid();
+            let own_uid = current_uid();
+            let root_may_ask = peer_uid == 0 && own_uid != 0;
+            match request {
+                BoxControlRequest::AnswererStatus if peer_uid == own_uid || peer_uid == 0 => {
+                    BoxControlReply::Status(status.get())
+                }
+                BoxControlRequest::ReleaseAnswerer if peer_uid == own_uid || root_may_ask => {
+                    let reply = status.release().await;
+                    tracing::info!(
+                        acted = reply.acted,
+                        component = "zone-answerer",
+                        "answer to a release request: {}",
+                        reply.detail
+                    );
+                    BoxControlReply::AnswererRelease {
+                        acted: reply.acted,
+                        detail: reply.detail,
+                    }
+                }
+                BoxControlRequest::ReleaseAnswererCancel if peer_uid == own_uid || root_may_ask => {
+                    let reply = status.release_cancel().await;
+                    tracing::info!(
+                        acted = reply.acted,
+                        component = "zone-answerer",
+                        "answer to a release-cancel request: {}",
+                        reply.detail
+                    );
+                    BoxControlReply::AnswererRelease {
+                        acted: reply.acted,
+                        detail: reply.detail,
+                    }
+                }
+                BoxControlRequest::Register(_)
+                | BoxControlRequest::Withdraw(_)
+                | BoxControlRequest::AdmitPort(_)
+                | BoxControlRequest::WithdrawPort(_)
+                | BoxControlRequest::ReadRow(_) => BoxControlReply::Error {
+                    error: "the native daemon's control socket answers only the answerer \
+                            verbs; boxes register over the daemon's RPC channels"
+                        .to_string(),
+                },
+                // The gate left no verb behind: a status ask from a peer
+                // that is neither this daemon's uid nor root.
+                _ => BoxControlReply::Error {
+                    error: "the answerer control socket answers its own operator and root \
+                            (root for the handover verbs) only"
+                        .to_string(),
+                },
+            }
+        }
+        (Ok(_), _) => BoxControlReply::Error {
+            error: "could not read the request's credentials".to_string(),
+        },
+        (Err(error), _) => BoxControlReply::Error {
+            error: format!("could not read the request line: {error}"),
+        },
+    };
+    let line = match serde_json_lenient::to_string(&reply) {
+        Ok(mut line) => {
+            line.push('\n');
+            line
+        }
+        Err(_) => "{\"error\":\"the reply did not serialize\"}\n".to_string(),
+    };
+    let _ = stream.write_all(line.as_bytes()).await;
+    let _ = stream.flush().await;
+}
+
+/// Reads one request line off a control connection, bounded by
+/// [`ANSWER_CONTROL_MAX_LINE`]: a request is one small verb, so a line
+/// past the bound is refused whole. `Ok(None)` is a connection that said
+/// nothing — a probe's connect-and-close, answered with nothing.
+async fn read_control_request(
+    stream: &mut tokio::net::UnixStream,
+) -> std::io::Result<Option<String>> {
+    use tokio::io::AsyncReadExt as _;
+
+    let mut line = Vec::new();
+    let mut buf = [0u8; 1024];
+    loop {
+        let read = stream.read(&mut buf).await?;
+        if read == 0 {
+            return if line.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(String::from_utf8_lossy(&line).into_owned()))
+            };
+        }
+        if let Some(newline) = buf[..read].iter().position(|byte| *byte == b'\n') {
+            line.extend_from_slice(&buf[..newline]);
+            return Ok(Some(String::from_utf8_lossy(&line).into_owned()));
+        }
+        line.extend_from_slice(&buf[..read]);
+        if line.len() > ANSWER_CONTROL_MAX_LINE {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "the control request exceeded the line bound",
+            ));
+        }
+    }
+}
+
+/// This daemon's own uid — the peer check's own half.
+fn current_uid() -> u32 {
+    // SAFETY: getuid takes no arguments and cannot fault.
+    unsafe { libc::getuid() }
 }
 
 /// `ConfigureLoadout`: composes a created session's loadout from the
