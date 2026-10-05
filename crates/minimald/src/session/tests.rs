@@ -5724,9 +5724,10 @@ async fn vm_backed_expose_reports_admission_to_host() {
     let (door, mut reports, replies) = fake_report_door(&door_sock).await;
     crate::net::listeners::seed_vm_report_door_for_tests(&sock, &door_sock);
 
-    // The report is the caller's gate: the door holds its reply, and the
-    // publish — whose forward the switch has already accepted — is not the
-    // caller's word until the door answers.
+    // The report is the caller's gate and the switch's: the door holds its
+    // reply, and the publish has asked the switch nothing yet — the host's
+    // egress gate admits a bind only for a port the grant holds — nor is it
+    // the caller's word until the door answers.
     let reporting = handle.clone();
     let expose = tokio::spawn(async move { reporting.expose_dynamic(3000).await });
     let request = tokio::time::timeout(Duration::from_secs(5), reports.recv())
@@ -5737,6 +5738,12 @@ async fn vm_backed_expose_reports_admission_to_host() {
         !expose.is_finished(),
         "the publish is reported to the caller only after the VM host daemon \
          answered the port report"
+    );
+    assert!(
+        served.lock().expect("served lock").is_empty(),
+        "the switch is asked to bind only after the VM host daemon admitted \
+         the port: {:?}",
+        served.lock().expect("served lock")
     );
     assert_eq!(
         request,
@@ -5792,9 +5799,9 @@ async fn vm_backed_expose_reports_admission_to_host() {
     crate::net::listeners::clear_vm_report_door_for_tests(&sock);
 }
 
-/// T94, NET-138: a report the VM host daemon's grant refuses unwinds the
-/// publish whole — the forward the switch accepted comes down, the
-/// publication the reservation committed comes out of the set, the live
+/// T94, NET-138: a report the VM host daemon's grant refuses publishes
+/// nothing — the switch is never asked to bind, the reservation the
+/// publish held is given back, the live
 /// listing names nothing, and a caller that asks again is asking for a
 /// port nothing holds, never an `AlreadyPublished` a leaked entry would
 /// answer with. The refusal the caller hears carries the grant's own
@@ -5915,26 +5922,17 @@ async fn refused_admission_report_leaves_no_partial_mapping() {
         .expect("the expose task should not panic")
         .expect("the port the host admitted on the second ask publishes");
 
-    // The switch saw the bind, the unwind of the refused report, and the
-    // second ask's bind — and nothing else: the report never rode it.
+    // The refused report asked the switch nothing; the second ask's bind is
+    // the only switch request — the report never rode it.
     forwarder.abort();
     let served = served.lock().expect("served lock");
     assert_eq!(
         served.len(),
-        3,
-        "the refused publish unbound the forward it bound: {served:?}"
+        1,
+        "the refused publish never asked the switch to bind: {served:?}"
     );
     assert!(
         served[0].starts_with("POST /services/forwarder/expose "),
-        "the first switch request is the forward's bind: {served:?}"
-    );
-    assert!(
-        served[1].starts_with("POST /services/forwarder/unexpose "),
-        "the refused report unwinds by unbinding the forward the switch \
-         accepted: {served:?}"
-    );
-    assert!(
-        served[2].starts_with("POST /services/forwarder/expose "),
         "the second ask binds afresh: {served:?}"
     );
     drop(served);

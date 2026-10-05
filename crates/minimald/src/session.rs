@@ -2678,14 +2678,14 @@ impl Session {
     /// watcher the launch started, whichever got there first. Everything
     /// the box can refuse without asking the switch runs first, so a
     /// refused request is refused with nothing bound and nothing asked
-    /// (NET-047). Only then is the switch asked to bind, and the forwarder
-    /// is recorded only once it accepted. On a VM-backed host the publish
-    /// is still not whole then (T94, NET-138): `source` names the runtime
-    /// surface the report carries — the expose request, an answered ask —
-    /// and the VM host daemon's grant decides the report before the caller
-    /// hears the port is published, so a publish its grant refuses is
-    /// unwound to nothing rather than left as a mapping the host never
-    /// vouched for.
+    /// (NET-047). On a VM-backed host the VM host daemon's grant is asked
+    /// next (T94, NET-138): `source` names the runtime surface the report
+    /// carries — the expose request, an answered ask — and a publish its
+    /// grant refuses asks the switch nothing, because the egress gate in
+    /// front of the switch admits a bind only for a port the grant holds.
+    /// Only then is the switch asked to bind, and the forwarder is recorded
+    /// only once it accepted; a publish that does not stand from there
+    /// withdraws its report again.
     async fn publish_exposed_port(
         &mut self,
         record: &Record,
@@ -2786,6 +2786,41 @@ impl Session {
                 }));
             }
         };
+        // The VM host daemon's grant decides the publish before the switch
+        // is asked to bind it (T94, NET-138): on a VM-backed host the egress
+        // gate in front of the switch admits a forward only for a port the
+        // box's host-side row holds, and the report is what puts a runtime
+        // port in that row — so a bind asked first is refused at the gate
+        // with no reply at all. A report the grant refuses — or a door that
+        // never answers it, fail-closed, because a publish the host never
+        // vouched for is not one to stand against its grant either —
+        // publishes nothing: the reservation releases itself, the switch was
+        // asked nothing, and the caller hears the publish failed, carrying
+        // the reason it failed. A reply lost after the host recorded the port
+        // is withdrawn again by the report itself before it answers,
+        // best-effort. A native host has no report channel and reports
+        // nothing: its publish stands, admitted by the switch alone, exactly
+        // as it always did. Every end below that leaves the port unpublished
+        // withdraws the report again once the forward is down — the gate
+        // applies a runtime port's retraction only while the row holds it.
+        if let Err(report) =
+            crate::net::listeners::report_admitted_port(&control, switch_address, port, source)
+                .await
+        {
+            tracing::warn!(
+                session_id = %record.id,
+                name = ?record.name,
+                port,
+                source = ?source,
+                reason = %report,
+                "the VM host daemon did not admit the port report; the \
+                 publish unwound"
+            );
+            return Err(ExposeFailure::Publish {
+                port,
+                source: report,
+            });
+        }
         let forwarder = match expose_dynamic(
             &control,
             loopback_address,
@@ -2801,7 +2836,13 @@ impl Session {
             // so a publish that failed leaves the port free and the set
             // empty of it: nothing was published, and the watcher's next
             // observation of the port publishes it normally (NET-047).
-            Err(source) => return Err(ExposeFailure::Publish { port, source }),
+            Err(source_error) => {
+                crate::net::listeners::unreport_port(&control, switch_address, port, source).await;
+                return Err(ExposeFailure::Publish {
+                    port,
+                    source: source_error,
+                });
+            }
         };
         // Recorded only now, with the switch's acceptance in hand: a publish
         // that failed leaves nothing in the list (NET-047), so the rows the
@@ -2828,6 +2869,7 @@ impl Session {
         };
         if !self.has_live_host() {
             crate::net::policy::remove_ingress(&control, &[forwarder]).await;
+            crate::net::listeners::unreport_port(&control, switch_address, port, source).await;
             return Err(ExposeFailure::Refused(ExposeRefusal::NotRunning));
         }
         // The bind stood, so the reservation commits as this surface's own
@@ -2842,48 +2884,8 @@ impl Session {
             // box's spawn is gone, the answer a revoked publish shares with
             // the stale-spawn arm below.
             crate::net::policy::remove_ingress(&control, &[forwarder]).await;
+            crate::net::listeners::unreport_port(&control, switch_address, port, source).await;
             return Err(ExposeFailure::Refused(ExposeRefusal::NotAttached));
-        }
-        // The VM host daemon's grant decides the publish before the caller
-        // hears it stood (T94, NET-138): the switch's forward is bound but
-        // the runtime cell does not name it yet, so a report the grant
-        // refuses — or a door that never answers it, fail-closed, because a
-        // publish the host never vouched for is not one to leave standing
-        // against its grant either — unwinds to exactly nothing: the forward
-        // comes down, the publication the reservation committed comes out of
-        // the set, and the caller hears the publish failed, carrying the
-        // reason it failed. A native host has no report channel and reports
-        // nothing: its publish stands, admitted by the switch alone, exactly
-        // as it always did. The order is the guard's: the runtime cell is
-        // recorded only once the host vouched for the port, because it has
-        // no per-port removal — a record already pushed is a port that stays
-        // listed until the spawn ends — and the report is answered before
-        // the caller hears anything, so the caller never names a port the
-        // host refused. A reply lost after the host recorded the port is
-        // withdrawn again by the report itself before it answers, best-effort:
-        // only a withdrawal the door also never answers leaves a row entry
-        // no forward answers, gone with the row at the box's own destroy —
-        // the same stale-entry posture a failed withdrawal already accepts.
-        if let Err(report) =
-            crate::net::listeners::report_admitted_port(&control, switch_address, port, source)
-                .await
-        {
-            self.publications
-                .withdraw(port, crate::net::listeners::PublicationOwner::Expose);
-            crate::net::policy::remove_ingress(&control, &[forwarder]).await;
-            tracing::warn!(
-                session_id = %record.id,
-                name = ?record.name,
-                port,
-                source = ?source,
-                reason = %report,
-                "the VM host daemon did not admit the port report; the \
-                 publish unwound"
-            );
-            return Err(ExposeFailure::Publish {
-                port,
-                source: report,
-            });
         }
         if let Err(stale) = self
             .live_ingress
@@ -2903,18 +2905,7 @@ impl Session {
             // names a forward that is gone, and the withdrawal report clears
             // it — best-effort, like the unexpose beside it, because there
             // is no caller left to propagate a failure to.
-            #[expect(
-                clippy::let_underscore_must_use,
-                reason = "the spawn that would carry this withdrawal's failure has \
-                          already ended, so no caller is left to propagate it to"
-            )]
-            let _ = crate::net::listeners::report_withdrawn_port(
-                &control,
-                switch_address,
-                port,
-                source,
-            )
-            .await;
+            crate::net::listeners::unreport_port(&control, switch_address, port, source).await;
             return Err(ExposeFailure::Refused(ExposeRefusal::NotAttached));
         }
         Ok(mapping)
