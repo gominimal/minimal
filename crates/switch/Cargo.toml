@@ -30,6 +30,14 @@ tokio = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
 
 [dev-dependencies]
+# The crate's own test build turns its Box Egress Proxy feature on: the
+# pool tests behind `bep_host` (NET-132/NET-133) are the crate's own, and
+# `cargo test -p switch` must build them without carrying a `--features`
+# flag everywhere. A dev-dependency only ever shapes this crate's own test
+# and bench targets — never another crate's build — so the in-VM
+# `minimald` build keeps linking the feature off, as the `stack-peer`
+# comment above promises.
+switch = { path = ".", features = ["test-util"] }
 tempfile.workspace = true
 
 [lints]

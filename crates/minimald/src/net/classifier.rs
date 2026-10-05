@@ -15,10 +15,19 @@
 //! privileged step installs refuses every connection it opens except the
 //! one to the resolver Minimal owns for it, at that resolver's own address
 //! and port; every other box is placed under `boxes/allow`, where only the
-//! cohort's identity is carried on its traffic. A leaf directly under
-//! `boxes/` sits outside both subtrees, so the refusing rule's match on the
-//! subtree would silently miss it — [`verdict_of`] and the sandbox layer's
-//! leaf arithmetic are what keep that shape out of the daemon.
+//! cohort's identity is carried on its traffic — nothing is refused on a
+//! box's behalf there, so a declaration that asks it to refuse something
+//! (a `deny_subnets` entry, a narrowing allow list) can never reach the
+//! subtree enforced: a host that decides per box refuses it at create and
+//! at launch, over [`unenforceable_rules`] — the vocabulary's edge, and
+//! the one predicate both paths share — because the box would run placed
+//! and looking decided while its rules went unenforced, and on a host that
+//! cannot decide per box NET-079's exception stands instead: such a box
+//! runs unenforced and is recorded as such, never refused on that ground.
+//! A leaf directly under `boxes/` sits outside both subtrees, so the
+//! refusing rule's match on the subtree would silently miss it —
+//! [`verdict_of`] and the sandbox layer's leaf arithmetic are what keep
+//! that shape out of the daemon.
 //!
 //! Flow termination is the declaration's and the kernel's, never this
 //! module's. A box's declaration is fixed at create, so tightening its
@@ -95,6 +104,165 @@ fn admits_nothing(section: &sessions::EgressPolicy) -> bool {
     section.allow_subnets.as_ref().is_some_and(Vec::is_empty)
         && section.allow_dns_hosts.as_ref().is_some_and(Vec::is_empty)
         && section.allow_protocols.as_ref().is_some_and(Vec::is_empty)
+}
+
+/// One rule of a host-address box's egress declaration that this host's
+/// classifier cannot enforce (NET-079): the field of the declaration that
+/// names it, and — for a `deny_subnets` rule, where one entry *is* the rule
+/// — the entry. Which declarations carry which rules is
+/// [`unenforceable_rules`]'s to say; this type only carries what it named,
+/// so the refusal's words ([`unenforceable_declaration_words`]) and the log
+/// line beside them name the same rules by construction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum UnenforceableRule {
+    /// One `deny_subnets` entry: a range the declaration subtracts from
+    /// whatever its `allow_*` lists admit, while the loaded table's one
+    /// per-box verdict — deny-all, or refuse nothing — subtracts nothing.
+    DenySubnets(String),
+    /// A present `allow_subnets` list: a narrowing of the subnets the box
+    /// may reach, which the allow subtree refuses nothing to enforce on a
+    /// box's behalf.
+    AllowSubnets,
+    /// A present `allow_dns_hosts` list, what [`Self::AllowSubnets`] is for
+    /// names.
+    AllowDnsHosts,
+    /// A present `allow_protocols` list, what [`Self::AllowSubnets`] is for
+    /// protocols.
+    AllowProtocols,
+}
+
+impl UnenforceableRule {
+    /// The rule's own spelling for the refusal's words and the log line
+    /// beside them: the field a person's declaration named, with the entry
+    /// where the rule is one.
+    pub(crate) fn describe(&self) -> String {
+        match self {
+            Self::DenySubnets(entry) => format!("deny_subnets {entry}"),
+            Self::AllowSubnets => "allow_subnets".to_string(),
+            Self::AllowDnsHosts => "allow_dns_hosts".to_string(),
+            Self::AllowProtocols => "allow_protocols".to_string(),
+        }
+    }
+}
+
+/// Each rule of a host-address box's egress declaration that this host's
+/// classifier cannot enforce (NET-079): the loaded table's per-box
+/// vocabulary is the two subtrees — deny-all, and refuse nothing — so every
+/// `deny_subnets` entry (a partial refusal the deny subtree does not spell)
+/// and every present `allow_*` list in a declaration that is not the
+/// deny-all shape (a narrowing the allow subtree has no rule to enforce)
+/// names a rule this host decides nothing for. An absent section and the
+/// deny-all shape name nothing — the first is placed under `allow` exactly
+/// as the allow-all it is, and the second is the one shape the deny
+/// subtree enforces; a `deny_subnets` entry over the deny-all shape
+/// subtracts from an admitted set that is already empty, so it names
+/// nothing there either.
+///
+/// Pure over the declaration, so the create path, which reads the daemon's
+/// one node fact for the host's state, and the launch path, which re-reads
+/// the host, name the same declaration's rules whatever each read said
+/// about the host — [`refuses_unenforceable_declaration`] is the half that
+/// folds the host in.
+pub(crate) fn unenforceable_rules(
+    declaration: Option<&sessions::EgressPolicy>,
+) -> Vec<UnenforceableRule> {
+    let Some(section) = declaration else {
+        return Vec::new();
+    };
+    if admits_nothing(section) {
+        return Vec::new();
+    }
+    let mut rules = Vec::new();
+    rules.extend(
+        section
+            .deny_subnets
+            .iter()
+            .flatten()
+            .map(|entry| UnenforceableRule::DenySubnets(entry.clone())),
+    );
+    if section.allow_subnets.is_some() {
+        rules.push(UnenforceableRule::AllowSubnets);
+    }
+    if section.allow_dns_hosts.is_some() {
+        rules.push(UnenforceableRule::AllowDnsHosts);
+    }
+    if section.allow_protocols.is_some() {
+        rules.push(UnenforceableRule::AllowProtocols);
+    }
+    rules
+}
+
+/// Whether a host that decides per box refuses this host-address box, and
+/// the rules it is refused over (NET-079): the one predicate the create
+/// path and the launch path share — the create reads the daemon's one node
+/// fact for its `can_decide_per_box`, the launch re-reads the host for
+/// its own, and neither spells the refusal of its own — so a declaration
+/// the classifier cannot enforce is refused the same way wherever it meets
+/// a host that decides per box. That is what closes the create-then-install
+/// race (a box created on a host that could not decide, relaunched on one
+/// that can, is refused at launch) and what reaches the boxes a persisted
+/// record can still relaunch.
+///
+/// `None` on a host that cannot decide per box — NET-079's exception stands
+/// there whole: the box is created, runs unenforced and is recorded as
+/// such, never refused on this ground — and `None` for any declaration the
+/// classifier can enforce, whatever the host.
+pub(crate) fn refuses_unenforceable_declaration(
+    network_mode: sessions::NetworkMode,
+    can_decide_per_box: bool,
+    declaration: Option<&sessions::EgressPolicy>,
+) -> Option<Vec<UnenforceableRule>> {
+    if !matches!(network_mode, sessions::NetworkMode::HostNet) || !can_decide_per_box {
+        return None;
+    }
+    let rules = unenforceable_rules(declaration);
+    (!rules.is_empty()).then_some(rules)
+}
+
+/// The refusal's words, spelled once for the two paths that make it: each
+/// unenforced rule by the field that names it, why this host has no rule
+/// for any of them, and — at the end, where a person still reading is
+/// looking — what to do about it: remove the rules, or declare the one
+/// shape this host's classifier enforces — by the flag that writes it,
+/// `--deny-all-egress`, or by the box's `egress` section — or take the
+/// mode that enforces them. A refusal that names what it refused without
+/// saying how to get the box running leaves a person with nothing to
+/// type, and the words are the typed error a client sees, so the create
+/// and the launch say the same thing about the same declaration.
+pub(crate) fn unenforceable_declaration_words(rules: &[UnenforceableRule]) -> String {
+    let named = rules
+        .iter()
+        .map(|rule| rule.describe())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "this host decides a host-address box's egress verdict per box, and \
+         its classifier cannot enforce the rules this box's declaration \
+         names: {named} — the host-address classifier enforces only \
+         deny-all until declared address rules are supported, and the \
+         per-box verdict the loaded table decides is deny-all alone \
+         (every allow_* list present and empty) or nothing, so the box \
+         was refused rather than run with these rules unenforced; remove \
+         these rules, or declare deny-all egress instead — `min session \
+         activate --deny-all-egress`, or the box's `egress` section, all \
+         three allow lists present and empty, and no deny entries — or \
+         run the box with `--network own_ip` \
+         (own-address boxes enforce them)"
+    )
+}
+
+/// The refusal both paths return over these rules (NET-079), typed once:
+/// the create's `InvalidInput` is the launch's too, so the same
+/// declaration's refusal is the same machine-mode failure wherever a
+/// client meets it — at a create, where the RPC's `InvalidInput` arm is
+/// the machine's reading of it, or at a launch, where an `io::Error`'s
+/// kind is the one thing downstream that carries it — and the words both
+/// paths log and print are the one string above.
+pub(crate) fn unenforceable_declaration_refusal(rules: &[UnenforceableRule]) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        unenforceable_declaration_words(rules),
+    )
 }
 
 /// Why a host cannot decide a box's egress verdict per box (NET-079): the
@@ -1775,6 +1943,290 @@ mod tests {
         );
     }
 
+    /// NET-079: on a host that decides per box, the classifier's per-box
+    /// vocabulary is the two subtrees, so every rule of a declaration that
+    /// asks for anything between deny-all and refuse nothing is a rule this
+    /// host has no verdict for — and each is named by the field that
+    /// carries it, `deny_subnets` down to its entry, because the refusal's
+    /// words have to tell a person which parts of what they typed are the
+    /// parts that could not be honoured. The gate that folds the host in
+    /// refuses exactly over these rules.
+    #[test]
+    fn unenforceable_rules_names_deny_subnets_and_partial_allow_lists() {
+        // The CLI's own spelling of a narrowing: `--deny-subnets` subtracts
+        // a range from an allow-all — one entry, one rule.
+        let deny_a_range = sessions::EgressPolicy {
+            deny_subnets: Some(vec!["0.0.0.0/0".to_string()]),
+            ..Default::default()
+        };
+        assert_eq!(
+            unenforceable_rules(Some(&deny_a_range)),
+            vec![UnenforceableRule::DenySubnets("0.0.0.0/0".to_string())],
+            "a denied range is one unenforceable rule, named with its entry"
+        );
+
+        // Every entry is a rule, and every present `allow_*` list is one,
+        // denied ranges first and the lists in the declaration's own field
+        // order — the same order a person typed them in.
+        let narrowing = sessions::EgressPolicy {
+            deny_subnets: Some(vec!["10.1.0.0/16".to_string(), "10.2.0.0/16".to_string()]),
+            allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
+            allow_dns_hosts: Some(vec!["example.com".to_string()]),
+            allow_protocols: Some(vec![sessions::IpProto::Tcp]),
+        };
+        let rules = unenforceable_rules(Some(&narrowing));
+        assert_eq!(
+            rules,
+            vec![
+                UnenforceableRule::DenySubnets("10.1.0.0/16".to_string()),
+                UnenforceableRule::DenySubnets("10.2.0.0/16".to_string()),
+                UnenforceableRule::AllowSubnets,
+                UnenforceableRule::AllowDnsHosts,
+                UnenforceableRule::AllowProtocols,
+            ],
+            "each rule the classifier cannot enforce is named, by field, \
+             entry by entry: {rules:?}"
+        );
+        // A present-but-empty allow list still names its rule when the
+        // declaration is not the deny-all shape: an empty `allow_subnets`
+        // over a denied range admits one range and refuses the rest, and
+        // "refuse the rest" is the rule the table cannot make.
+        let one_range = sessions::EgressPolicy {
+            deny_subnets: Some(vec!["0.0.0.0/1".to_string()]),
+            allow_subnets: Some(vec![]),
+            ..Default::default()
+        };
+        assert_eq!(
+            unenforceable_rules(Some(&one_range)),
+            vec![
+                UnenforceableRule::DenySubnets("0.0.0.0/1".to_string()),
+                UnenforceableRule::AllowSubnets,
+            ],
+            "the narrowing is named whatever it narrows from"
+        );
+        // A present-but-empty allow list names its rule *alone*: with the
+        // other two allow lists absent the declaration is not the deny-all
+        // shape, so the empty list is a narrowing by itself — "refuse
+        // every subnet, allow everything else" — and the classifier has no
+        // verdict for that half of it.
+        let lone_empty_allow_list = sessions::EgressPolicy {
+            allow_subnets: Some(vec![]),
+            ..Default::default()
+        };
+        assert_eq!(
+            unenforceable_rules(Some(&lone_empty_allow_list)),
+            vec![UnenforceableRule::AllowSubnets],
+            "a lone present-but-empty allow list is unenforceable, named \
+             by the field that carries it: it is not the deny-all shape \
+             while the other two allow lists are absent"
+        );
+
+        // The words the two refusal paths say name each rule by the field
+        // the person typed, and say the mode that enforces them — the
+        // own-address box's verdict is decided on the address it holds, so
+        // the message has to point the person at it.
+        let words = unenforceable_declaration_words(&rules);
+        assert!(
+            words.contains("deny_subnets 10.1.0.0/16")
+                && words.contains("deny_subnets 10.2.0.0/16")
+                && words.contains("allow_subnets")
+                && words.contains("allow_dns_hosts")
+                && words.contains("allow_protocols"),
+            "the refusal names every rule: {words}"
+        );
+        assert!(
+            words.contains("--network own_ip") && words.contains("own-address boxes enforce them"),
+            "the refusal says own-address boxes enforce these rules: {words}"
+        );
+        // The words end with what to do: a refusal that names the rules it
+        // refused and stops leaves a person with nothing to type, so the
+        // tail is the remedy — remove these rules, declare the one shape
+        // this host's classifier enforces, by the flag that writes it
+        // (T88's `--deny-all-egress`, pinned by its own test below) or by
+        // the `egress` section, or take the mode that enforces them — and
+        // the why ahead of it is the classifier's own limit, the thing a
+        // person cannot fix from the declaration.
+        assert!(
+            words.contains("remove these rules")
+                && words.contains("declare deny-all egress")
+                && words.contains("`egress` section")
+                && words.contains("all three allow lists present and empty")
+                && words.contains("no deny entries")
+                && words.contains(
+                    "the host-address classifier enforces only deny-all \
+                     until declared address rules are supported"
+                ),
+            "the refusal says what to do about the rules it named: {words}"
+        );
+        assert!(
+            words.ends_with("(own-address boxes enforce them)"),
+            "the words end with the remedy, so what a person reads last is \
+             what they can do: {words}"
+        );
+
+        // The gate folds the host in: a host that decides per box refuses
+        // the same declaration's box over exactly these rules, and the
+        // paths that read the host answer over its two facts alone.
+        assert_eq!(
+            refuses_unenforceable_declaration(
+                sessions::NetworkMode::HostNet,
+                true,
+                Some(&narrowing),
+            ),
+            Some(rules),
+            "a per-box host refuses the narrowing over its rules"
+        );
+        assert_eq!(
+            refuses_unenforceable_declaration(
+                sessions::NetworkMode::HostNet,
+                false,
+                Some(&narrowing),
+            ),
+            None,
+            "a host that cannot decide per box keeps the exception, whatever \
+             the declaration names"
+        );
+        for (mode, why) in [
+            (
+                sessions::NetworkMode::NoNet,
+                "a none box declares no traffic",
+            ),
+            (
+                sessions::NetworkMode::OwnIp,
+                "an own-address box's verdict is its own, on the address it \
+                 holds — the declaration is enforced, not refused",
+            ),
+        ] {
+            assert_eq!(
+                refuses_unenforceable_declaration(mode, true, Some(&narrowing)),
+                None,
+                "{why}"
+            );
+        }
+    }
+
+    /// NET-079: the create and the launch make the one refusal — the same
+    /// typed error over the same rules, not two spellings of one finding —
+    /// so the same declaration's refusal maps to the same machine-mode
+    /// code wherever a client meets it: at a create, whose RPC answer keys
+    /// on the kind, and at a launch, whose `io::Error` carries the kind to
+    /// whatever reads it downstream. An `other` would be an unspecified
+    /// failure — the words identical, the code beneath them not — and a
+    /// declaration refused at a create and refused again at a launch would
+    /// read as two different failures of the same box.
+    #[test]
+    fn unenforceable_declaration_refusal_is_one_typed_error_for_create_and_launch() {
+        let deny_a_range = sessions::EgressPolicy {
+            deny_subnets: Some(vec!["0.0.0.0/0".to_string()]),
+            ..Default::default()
+        };
+        let rules = unenforceable_rules(Some(&deny_a_range));
+        let refusal = unenforceable_declaration_refusal(&rules);
+        assert_eq!(
+            refusal.kind(),
+            std::io::ErrorKind::InvalidInput,
+            "the refusal the create and the launch both return is the \
+             create's own typed error — the kind its RPC arm keys on — so \
+             the launch's refusal is not an unspecified failure but the \
+             same machine-mode code the create's was"
+        );
+        assert_eq!(
+            refusal.to_string(),
+            unenforceable_declaration_words(&rules),
+            "the typed error carries the one words string both paths say"
+        );
+    }
+
+    /// The refusal names the flag that declares the deny-all shape (T88,
+    /// the remedy half of the words): `--deny-all-egress` is the one-
+    /// keystroke form of the section the words have always spelled, so a
+    /// person refused over a rule the classifier cannot enforce is told
+    /// both spellings — the flag to type at the next activate, and the
+    /// section it writes — rather than a remedy the CLI could not reach.
+    /// The flag and the section write the same record, so the words name
+    /// them as the one declaration they are, and the flag sits in the
+    /// remedy — the tail a person still reading is looking at — beside
+    /// the section form, never in place of it.
+    #[test]
+    fn unenforceable_refusal_names_the_deny_all_flag() {
+        let declaration = sessions::EgressPolicy {
+            deny_subnets: Some(vec!["0.0.0.0/0".to_string()]),
+            ..Default::default()
+        };
+        let rules = unenforceable_rules(Some(&declaration));
+        let words = unenforceable_declaration_words(&rules);
+        let (_, remedy) = words
+            .split_once("remove these rules")
+            .expect("the refusal ends with its remedy");
+        assert!(
+            remedy.contains("--deny-all-egress"),
+            "the remedy names the flag that declares deny-all: {words}"
+        );
+        assert!(
+            remedy.contains("`egress` section"),
+            "the flag names the section form beside it, never in place of \
+             it: {words}"
+        );
+        assert!(
+            remedy.contains("--network own_ip"),
+            "the mode remedy stays beside the declaration's: {words}"
+        );
+    }
+
+    /// NET-079: the declaration that admits no destination — spelled the
+    /// one shape that does, every `allow_*` list present and empty — is the
+    /// one the deny subtree enforces, and an absent section is the
+    /// allow-all it is, so neither names a rule the classifier cannot
+    /// enforce: a host that decides per box refuses neither, and a
+    /// `deny_subnets` entry over the deny-all shape subtracts from an
+    /// admitted set that is already empty.
+    #[test]
+    fn unenforceable_rules_empty_for_absent_section_and_deny_all() {
+        let deny_all = sessions::EgressPolicy::deny_all();
+        assert_eq!(
+            unenforceable_rules(Some(&deny_all)),
+            Vec::new(),
+            "the deny-all shape is the deny subtree's own verdict"
+        );
+        assert_eq!(
+            unenforceable_rules(None),
+            Vec::new(),
+            "an absent section is the default's allow-all"
+        );
+        let deny_all_plus_denies = sessions::EgressPolicy {
+            deny_subnets: Some(vec!["0.0.0.0/0".to_string(), "192.168.0.0/16".to_string()]),
+            ..deny_all.clone()
+        };
+        assert_eq!(
+            unenforceable_rules(Some(&deny_all_plus_denies)),
+            Vec::new(),
+            "a denied range over the deny-all shape subtracts from an \
+             admitted set that is already empty"
+        );
+
+        // So a host that decides per box refuses none of these boxes — the
+        // create and the launch answer over the one predicate, and it names
+        // nothing to refuse them over.
+        for (declaration, why) in [
+            (None, "a box with no egress section"),
+            (Some(&deny_all), "a box declared deny-all"),
+            (
+                Some(&deny_all_plus_denies),
+                "a deny-all box with denied ranges",
+            ),
+        ] {
+            assert_eq!(
+                refuses_unenforceable_declaration(
+                    sessions::NetworkMode::HostNet,
+                    true,
+                    declaration
+                ),
+                None,
+                "{why} is enforceable, so a per-box host refuses it over nothing"
+            );
+        }
+    }
+
     /// NET-079: the one carve-out from a deny-all verdict is the address
     /// and port of the resolver Minimal owns for the box — one destination,
     /// not the loopback, and not the host's own resolver at DNS's port.
@@ -1840,6 +2292,32 @@ mod tests {
     /// (loose tracking is the host's, never this table's to tighten), and
     /// the same admission in any other chain would admit replies a subtree
     /// never asked for.
+    /// The install replaces the table rather than adding to it: its batch
+    /// opens by declaring the table and deleting it, inside the one `nft -f`
+    /// transaction that re-declares it. That prelude is why re-running the
+    /// install reloads a table that is installed but not refusing, the
+    /// remedy [`Cause::TableNotEffective`] names; were the load ever made
+    /// add-only, that remedy would silently become a false one, so it is
+    /// pinned on the batch a host actually loads.
+    #[test]
+    fn rendered_ruleset_replaces_the_table_it_loads() {
+        let ruleset = rendered_ruleset();
+        let mut statements = ruleset
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'));
+        assert_eq!(
+            statements.next(),
+            Some("add table inet minimal_class"),
+            "the batch opens by declaring the table: {ruleset}"
+        );
+        assert_eq!(
+            statements.next(),
+            Some("delete table inet minimal_class"),
+            "and deletes it before re-declaring it, in the same transaction: {ruleset}"
+        );
+    }
+
     #[test]
     fn rendered_ruleset_admits_only_reply_direction_in_deny_subtree() {
         let ruleset = rendered_ruleset();

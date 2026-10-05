@@ -15,10 +15,12 @@
 //! The trust boundary is the row table's own (NET-138): nothing inside the
 //! VM can reach this table. The facts an attachment holds are the host's
 //! own — the namespace's name and the two addresses the host's plan
-//! assigned — and the id is minted from them here, so an
-//! address-to-box claim from inside the VM changes nothing: the guest has
-//! no path that writes this table, and the claim it could make is not a
-//! write. The acceptor that reads delivered connections holds a clone it
+//! assigned — beside the box's own id, minted here once per creation from
+//! the host's OS CSPRNG and never from anything the guest could arrange
+//! (BEP-070), so an address-to-box claim from inside the VM changes
+//! nothing: the guest has no path that writes this table or reaches a
+//! mint, and the claim it could make is not a write. The acceptor that
+//! reads delivered connections holds a clone it
 //! looks up through and never writes — the same shape as the read-only row
 //! view the egress gate is handed — so a delivered connection is attributed
 //! only to a live box this table holds an attachment for.
@@ -39,65 +41,34 @@ use std::time::Instant;
 /// boxes by.
 pub use switch::bep_host::BoxId;
 
-/// The box id a delivery carries when nobody named a box: all zero, the
-/// value the delivery path writes until it fills the id from the box's
-/// attachment. The acceptor reads it as **no claim** — an id to skip the
-/// cross-check for, never a mismatch to refuse.
-pub const NO_BOX_ID: BoxId = [0; 16];
-
-/// The FNV-1a offset basis and prime this mint's lanes run on.
-const FNV_OFFSET_BASIS: u32 = 0x811c_9dc5;
-const FNV_PRIME: u32 = 0x0100_0193;
-
-/// Folds `bytes` into `hash`, one FNV-1a round per byte.
-fn fnv1a(mut hash: u32, bytes: &[u8]) -> u32 {
-    for byte in bytes {
-        hash ^= u32::from(*byte);
-        hash = hash.wrapping_mul(FNV_PRIME);
-    }
-    hash
-}
-
-/// Mints the box id one attachment names its box by: 16 bytes derived from
-/// exactly the facts the host itself assigned — the namespace's name and
-/// its two addresses — and from nothing the guest says.
+/// Mints the box id one attachment names its box by (BEP-070): one
+/// UUIDv7 — a millisecond timestamp and 74 random bits — minted fresh at
+/// each creation, with its random bytes from the host's OS CSPRNG and from
+/// nothing the guest could observe, predict or arrange: never a counter,
+/// never a digest of the box's facts, never anything a process inside the
+/// VM could reach. The mint needs no shared table between minters, because
+/// two creations cannot collide.
 ///
-/// The derivation is deterministic on purpose: the same box facts mint the
-/// same id on every path that derives one, so the id the proxy's attachment
-/// carries and any id a later task hands the in-VM daemon over the
-/// registration agree without a shared table between them. It is a stable
-/// derivation, not a secret: the id identifies the box, and a box learns its
-/// own through the host's own registration path, never by guessing one.
+/// Unique per creation is the point: a box recreated with the same name
+/// and the same addresses is a new box, and its id says so — the id the
+/// proxy's attachment carries and the id the registration reply hands back
+/// agree without deriving anything, because both are the one the mint made
+/// for this creation. The id never returns to use — nothing is ever
+/// allocated from it — so a revocation scoped to it stays scoped forever.
 ///
-/// Sixteen lanes, each the whole facts' hash salted by its own index, so
-/// the id's bytes do not repeat one hash's worth across lanes. The first
-/// lane's byte is forced odd, which puts the all-zero [`NO_BOX_ID`] — the
-/// delivery's "no box named" sentinel — outside the mint's reach by
-/// construction, at the cost of one bit of the id's space.
-fn mint_box_id(name: &str, switch_addr: Ipv4Addr, loopback_addr: Ipv4Addr) -> BoxId {
-    let facts = [
-        name.as_bytes(),
-        &switch_addr.octets(),
-        &loopback_addr.octets(),
-    ];
-    let mut id = NO_BOX_ID;
-    for (index, lane) in id.iter_mut().enumerate() {
-        let mut hash = fnv1a(FNV_OFFSET_BASIS, &[index as u8]);
-        for fact in facts {
-            hash = fnv1a(hash, fact);
-        }
-        *lane = if index == 0 {
-            (hash as u8) | 1
-        } else {
-            hash as u8
-        };
-    }
-    id
+/// A minted id never lands on the all-zero value the delivery header
+/// carried before ids were the box's own: UUIDv7's version and variant
+/// bits make the all-zero id impossible by construction, and the acceptor
+/// that reads a delivered header refuses it like any other id the source's
+/// attachment does not hold.
+pub fn mint_box_id() -> BoxId {
+    uuid::Uuid::now_v7().into_bytes()
 }
 
 /// One box's attachment: the facts the proxy attributes a delivered
-/// connection by. The box's identity is its [`BoxId`] — minted from the
-/// host's own facts about it — and beside it the addressing the host
+/// connection by. The box's identity is its [`BoxId`] — minted once, by
+/// the host-side creator that issues the attachment, unique per creation
+/// — and beside it the addressing the host
 /// assigned: the switch address, which is the source address the box's
 /// delivered connections arrive from, and the loopback address the box is
 /// published at. Carried with them, whether the box declared a credentialed
@@ -155,9 +126,10 @@ impl Attachment {
 }
 
 /// A box id rendered for a log line: 32 lowercase hex digits, one fixed
-/// form every diagnostic that names a box id uses, so a tail can compare
-/// two lines for the same box.
-struct BoxIdText<'a>(&'a BoxId);
+/// form every diagnostic that names a box id uses — the same spelling the
+/// wire's own [`minimald_rpc::BoxId`] renders — so a tail can compare two
+/// lines for the same box.
+pub(crate) struct BoxIdText<'a>(pub(crate) &'a BoxId);
 
 impl fmt::Display for BoxIdText<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -189,15 +161,16 @@ impl Attachments {
         Self::default()
     }
 
-    /// Issues one box's attachment and returns it: the box is named by the
-    /// id minted from the host's own facts about it, and attributed by the
-    /// address its delivered connections arrive from. The registration
-    /// that publishes the box's row calls this **before** the row is
-    /// visible, so the proxy holds the attachment ahead of the box's first
-    /// connection: the pool's listeners are partitioned by rows, and a
-    /// delivered connection can only exist once the row made the box a
-    /// share — one pool turn after the registration, an attachment behind
-    /// it.
+    /// Issues one box's attachment and returns it: the box is named by
+    /// `box_id` — the box's own id, minted once for this creation by the
+    /// host-side creator that hands it over ([`mint_box_id`], or the id a
+    /// re-registration presented) — and attributed by the address its
+    /// delivered connections arrive from. The registration that publishes
+    /// the box's row calls this **before** the row is visible, so the
+    /// proxy holds the attachment ahead of the box's first connection:
+    /// the pool's listeners are partitioned by rows, and a delivered
+    /// connection can only exist once the row made the box a share — one
+    /// pool turn after the registration, an attachment behind it.
     ///
     /// Issuing for an address that already holds one replaces it, exactly
     /// as the row's re-registration replaces the row: the attachment's
@@ -218,13 +191,14 @@ impl Attachments {
     pub fn issue(
         &self,
         name: &str,
+        box_id: BoxId,
         switch_addr: Ipv4Addr,
         loopback_addr: Ipv4Addr,
         credentialed_upstream: bool,
     ) -> Arc<Attachment> {
         let attachment = Arc::new(Attachment {
             name: name.to_string(),
-            box_id: mint_box_id(name, switch_addr, loopback_addr),
+            box_id,
             switch_addr,
             loopback_addr,
             credentialed_upstream,
@@ -306,6 +280,23 @@ impl Attachments {
             .cloned()
             .collect()
     }
+
+    /// Whether some live attachment already holds `id`: one half of the
+    /// collision check every registration runs on the id it minted (the
+    /// rows the registry holds are the other, BEP-070), so a registration
+    /// can never share an identity with a live box. The check covers live
+    /// attachments only: a withdrawn attachment leaves this set, and its id
+    /// with it. An id is never reused because no registration can present
+    /// one and the mint never draws the same UUIDv7 twice, not because this
+    /// set remembers it.
+    #[must_use]
+    pub fn holds_id(&self, id: BoxId) -> bool {
+        self.rows
+            .read()
+            .expect("the attachment lock is never held across a panic, so it cannot be poisoned")
+            .values()
+            .any(|attachment| attachment.box_id == id)
+    }
 }
 
 #[cfg(test)]
@@ -317,41 +308,69 @@ mod tests {
 
     use super::*;
 
-    /// The box id is minted from the host's own facts and nothing else: the
-    /// same facts mint the same id — the same box, the same identity, on
-    /// every path that derives one — while any fact that differs names a
-    /// different box, and no mint lands on the all-zero "no box named"
-    /// value the acceptor's cross-check skips.
+    /// A minted box id is unique per creation and unique to the box it
+    /// names: one UUIDv7 — a millisecond timestamp and 74 random bits from
+    /// the host's OS CSPRNG — never a counter over the host's facts,
+    /// never a digest of them, so the same facts on a second mint name a
+    /// second box, and no mint lands on the all-zero "no box named" value
+    /// the delivery header carried before ids were the box's own.
     #[test]
-    fn box_ids_mint_from_the_hosts_own_facts() {
+    fn box_id_is_unique_per_creation() {
         let name = "web";
         let switch = Ipv4Addr::new(100, 64, 0, 9);
         let loopback = Ipv4Addr::LOCALHOST;
 
+        // The id's shape is a UUIDv7: the version nibble at byte 6, the
+        // RFC 4122 variant at byte 8. A digest of the box's facts would
+        // carry neither, and this shape is what puts the all-zero id
+        // outside the mint's reach by construction.
+        let id = mint_box_id();
+        assert_eq!(id[6] & 0xf0, 0x70, "a minted id is a version-7 UUID");
         assert_eq!(
-            mint_box_id(name, switch, loopback),
-            mint_box_id(name, switch, loopback),
-            "the same box facts mint the same id"
+            id[8] & 0xc0,
+            0x80,
+            "a minted id carries the RFC 4122 variant"
         );
         assert_ne!(
-            mint_box_id(name, switch, loopback),
-            mint_box_id("db", switch, loopback),
-            "a different name is a different box"
-        );
-        assert_ne!(
-            mint_box_id(name, switch, loopback),
-            mint_box_id(name, Ipv4Addr::new(100, 64, 0, 10), loopback),
-            "a different switch address is a different box"
-        );
-        assert_ne!(
-            mint_box_id(name, switch, loopback),
-            mint_box_id(name, switch, Ipv4Addr::new(127, 0, 0, 2)),
-            "a different loopback address is a different box"
-        );
-        assert_ne!(
-            mint_box_id(name, switch, loopback),
-            NO_BOX_ID,
+            id, [0u8; 16],
             "the mint names the box, never the no-claim value"
+        );
+
+        // Unique per creation: two mints name two boxes, because each is a
+        // fresh creation — the only way two minted ids could agree is two
+        // mints, which is two boxes.
+        assert_ne!(mint_box_id(), mint_box_id(), "two creations name two boxes");
+
+        // The attachments agree: a box recreated on its own facts — the same
+        // name, the same addresses, its first creation ended and a second
+        // begun, the shape a recreate takes — carries a second mint's id,
+        // so the id names the creation, never the facts. The first
+        // creation's id goes with the first creation: the table holds the
+        // second id alone.
+        let attachments = Attachments::new();
+        let first = attachments.issue(name, mint_box_id(), switch, loopback, false);
+        assert!(
+            attachments.holds_id(first.box_id()),
+            "the table holds the id its own attachment carries"
+        );
+        attachments.withdraw(switch, Instant::now());
+        assert!(
+            !attachments.holds_id(first.box_id()),
+            "the ended box's id went with it: the table no longer holds it"
+        );
+        let second = attachments.issue(name, mint_box_id(), switch, loopback, false);
+        assert_ne!(
+            first.box_id(),
+            second.box_id(),
+            "a box recreated on its own facts carries a new id"
+        );
+        assert!(
+            !attachments.holds_id(first.box_id()) && attachments.holds_id(second.box_id()),
+            "the table holds the recreated box's id, and it alone"
+        );
+        assert!(
+            !attachments.holds_id([0u8; 16]),
+            "no attachment holds the all-zero non-id"
         );
     }
 
@@ -370,6 +389,7 @@ mod tests {
 
         let web = attachments.issue(
             "web",
+            mint_box_id(),
             Ipv4Addr::new(100, 64, 0, 9),
             Ipv4Addr::LOCALHOST,
             false,
@@ -400,6 +420,7 @@ mod tests {
         // upstream, so its attachment carries the lane the first lacks.
         attachments.issue(
             "db",
+            mint_box_id(),
             Ipv4Addr::new(100, 64, 0, 10),
             Ipv4Addr::LOCALHOST,
             true,
@@ -452,6 +473,7 @@ mod tests {
         let attachments = Attachments::new();
         let web = attachments.issue(
             "web",
+            mint_box_id(),
             Ipv4Addr::new(100, 64, 0, 9),
             Ipv4Addr::LOCALHOST,
             true,

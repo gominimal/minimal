@@ -60,6 +60,24 @@ impl From<SessionKeyPredicate> for RecordPredicate {
 /// Transport / internal error when communicating with the sessions actor.
 type SessionsError = std::io::Error;
 
+/// NET-079's observability, for the create path's half of the refusal: how
+/// many creates this daemon has refused because a host-address box's
+/// declaration named rules the classifier cannot enforce while the host
+/// decided per box. Process-global like the fact it reads — the count is
+/// the daemon's, not a session's — and only counted here: a launch
+/// refused on the same ground is that launch's own refusal, logged beside
+/// the box it refused, never a create this counter saw.
+static REFUSED_UNENFORCEABLE_CREATES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Reads how many creates this daemon has refused over an unenforceable
+/// host-address declaration — the counter's surface, for a diagnostics
+/// pass or a test that wants the count itself rather than the log line
+/// each refusal also writes.
+pub(crate) fn refused_unenforceable_creates() -> u64 {
+    REFUSED_UNENFORCEABLE_CREATES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Assemble a [`sessions::Record`] from the out-of-band session
 /// config and the SSH-supplied username, then validate its policy.
 /// Returns `Err(io::InvalidInput)` if the policy is incompatible
@@ -89,10 +107,14 @@ fn build_record(
         box_addresses: config.box_addresses,
         status,
         hooks_enabled: config.hooks_enabled,
+        // Daemon-owned from its first line: a create holds no launch's
+        // outcome to record, and the key a client might assert in `attrs`
+        // is stripped above, so only a launch ever writes this field.
+        host_ip_enforcement: None,
         attrs: config.attrs,
     };
     record
-        .validate_policy()
+        .validate_new_policy()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     Ok(record)
 }
@@ -989,6 +1011,38 @@ impl Manager {
                 std::io::ErrorKind::ConnectionRefused,
                 "in shutdown",
             ));
+        }
+        // NET-079: a host that decides per box refuses a host-address
+        // declaration naming rules its classifier cannot enforce — a denied
+        // range, a narrowing allow list — and refuses it here, before
+        // anything is allocated: no record, no id, no name held, no actor
+        // spawned. The host's state is the daemon's one node fact, read
+        // exactly as the create response reads it — a create is not a place
+        // that decides a box, so it re-probes nothing itself — and the
+        // same `can_decide_per_box` the launch that follows re-reads for
+        // its own gate; a host that cannot decide per box answers `false`
+        // and the create falls through to the exception whole — the box is
+        // created, runs unenforced and is recorded as such, never refused
+        // on this ground. Own-address boxes are untouched here: their
+        // declarations are enforced on the address the box holds, so the
+        // gate is the host-address mode's alone.
+        if let Some(rules) = crate::net::classifier::refuses_unenforceable_declaration(
+            config.network,
+            crate::session_host::host_ip_enforcement_fact().can_decide_per_box(),
+            config.policy.egress.as_ref(),
+        ) {
+            let refusal = crate::net::classifier::unenforceable_declaration_refusal(&rules);
+            REFUSED_UNENFORCEABLE_CREATES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::info!(
+                session_name = ?config.name,
+                network_mode = ?config.network,
+                host_ip_enforcement = %minimald_rpc::HostIpEnforcement::PerBox.machine_str(),
+                refused_unenforceable_creates = refused_unenforceable_creates(),
+                refusal = %refusal,
+                "refused a create whose host-address declaration names rules \
+                 this host's classifier cannot enforce"
+            );
+            return Err(refusal);
         }
         // Allocate the record up front: `store.create` assigns the id and
         // catches a name collision (`AlreadyExists`) before any actor exists.
