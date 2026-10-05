@@ -209,6 +209,7 @@ meet the policy yet.
 | Artifact | How the release run tests it |
 | --- | --- |
 | Linux amd64 `min`, `minimald`, `minvmd`, `gvproxy-min` | `smoke-linux-amd64` runs the session e2e on the host daemon. `smoke-linux-kvm` runs it in a KVM microVM. |
+| `min-answerer` (every platform that ships `min`) | [`scripts/dist-build.sh`](../../scripts/dist-build.sh) runs the link gate ([`scripts/check-answerer-links.sh`](../../scripts/check-answerer-links.sh)) on the binary it built, and the stage refuses to run without the artifact. The session-start advisory verifies it again, unprivileged, before it ever offers to copy it. **Gap:** the frozen release workflow does not yet build or upload it, and the stage now refuses without it, so no release can ship until the workflow change in the min-answerer steps under `release.yml` lands. |
 | amd64 guest kernel, rootfs, and initramfs | `smoke-linux-kvm` boots them. |
 | arm64 guest kernel, rootfs, and initramfs | `smoke-macos` boots them. |
 | macOS arm64 `min`, `minvmd`, `libkrun.1.dylib`, `gvproxy-min` | `smoke-macos` runs the session e2e with the signed files in the installer layout. **Gap:** when the `RUN_MACOS_CI` variable is `false`, this job skips and the run counts the skip as a pass. |
@@ -306,6 +307,68 @@ whose `package.version` is stale or not above the newest `v*` tag.
 - `compute-version-string` reads the version from a built binary. The GitHub
   Release name uses it. On a versioned run, the job checks that it equals the
   release version.
+
+**min-answerer.** The box-zone answerer binary ships in every release that
+ships `min`, because the session-start advisory (NET-122) copies it into a
+root-owned host-service path. The script half of this is done by the scripts
+this repository owns, on any branch that carries this section:
+
+- [`scripts/dist-build.sh`](../../scripts/dist-build.sh) builds `min-answerer`
+  in its own cargo invocation — never beside `-p minvmd` and never through a
+  `--workspace` build, which would unify the KVM backend into a binary a root
+  host service must never carry — and runs the link gate
+  ([`scripts/check-answerer-links.sh`](../../scripts/check-answerer-links.sh))
+  on what it built: every library must resolve from a system directory, with
+  no embedded search path and the interpreter a system loader. The build
+  fails without it.
+- [`scripts/stage-release.sh`](../../scripts/stage-release.sh) requires
+  `bin/min-answerer` beside `bin/min` on every platform the manifest ships
+  `min` for, and refuses to stage without it. The staged copy is only the
+  advisory's copy source: no unit file or launchd plist references it at its
+  user-writable path.
+- [`scripts/package-nfpm.sh`](../../scripts/package-nfpm.sh) and
+  [`packaging/nfpm.yaml`](../../packaging/nfpm.yaml) ship
+  `/usr/bin/min-answerer` in every `.deb`, `.rpm`, and `.apk`, installing no
+  service: the advisory's one privileged command stays the one privileged
+  step.
+- [`scripts/install.sh`](../../scripts/install.sh) installs it beside `min`
+  and replaces it on upgrade, like every other `bin` row.
+
+The workflow half is a change the code owner must apply, because
+[`.github/workflows/`](../../.github/workflows/) is frozen and CODEOWNER-gated;
+the pull request body carries the patch. Until it lands, a release run cannot
+stage — the artifact the manifest now requires is missing — so the patch is the
+needs-human item blocking the first release that carries T71. It mirrors the
+steps the other binaries already have:
+
+- `build-release-linux-{amd64,arm64}`: the shared entrypoint already builds
+  and link-gates `min-answerer`. The rename step adds
+  `mv min-answerer min-answerer-linux-<arch>`, and one `upload-artifact` step
+  uploads it, like the other binaries.
+- `build-release-macos-arm64`: build it in its own invocation
+  (`cargo build --release --locked -p min-answerer`), run
+  `scripts/check-answerer-links.sh target/release/min-answerer` on the built
+  binary, rename it to `min-answerer-macos-arm64`, and sign it with the
+  Developer ID, the hardened runtime, and a timestamp — with an empty
+  entitlements set, unlike `minvmd`: no hypervisor, no
+  `disable-library-validation`, no `allow-dyld-environment-variables`, no JIT,
+  because the answerer needs none of them. Verify with
+  `codesign --verify --strict`, then run the link gate on the signed and
+  renamed artifact again, as the last thing before the upload, so the shipped
+  bytes stay the checked bytes. The pipeline signs but does not yet notarize
+  any binary; the signature is notarization-ready, and `min-answerer` rides
+  along if notarization is added pipeline-wide.
+- The release and stage-installer jobs need no change: they gather artifacts
+  by the platform-suffixed names, so the new names ride into the GitHub
+  Release, the `components` manifest, and the packages, and the manifest's
+  SHA-256 columns are the checksums to verify against.
+
+One residual this section does not close: `answerer_survives_session_stop`,
+the e2e proof that the installed answerer service outlives a stopped
+session, installs a root-run unit, and no macOS lane has the passwordless
+sudo to run it — [`scripts/session-e2e.sh`](../../scripts/session-e2e.sh)
+skips it there. A privileged macOS e2e runner remains the open item for that
+proof.
 
 **release job.** This job downloads all build outputs. It writes the release
 notes with `scripts/next-version.sh --notes` and generates shell completions
@@ -430,14 +493,20 @@ installer, in strict POSIX `sh`. It works in these steps:
 
 The components come from the `COMPONENTS` table in `stage-release.sh`:
 
-- Linux amd64 and arm64: `bin/min`, `bin/mip`, `bin/minimald`, `bin/minvmd`,
-  `bin/gvproxy-min`, a `git-remote-min` symlink, the guest files
-  (`data/vmlinuz`, `data/rootfs.img`, `data/initramfs.cpio`), and the AppArmor
-  profile, tunable, and loader under `data/`.
-- macOS arm64: `bin/min`, `bin/minvmd`, `bin/gvproxy-min`,
-  `lib/libkrun.1.dylib`, the `git-remote-min` symlink, and the same guest
-  files. Only macOS has a `lib/` folder, because the Linux `minvmd` links
-  libkrun statically.
+- Linux amd64 and arm64: `bin/min`, `bin/min-answerer`, `bin/mip`,
+  `bin/minimald`, `bin/minvmd`, `bin/gvproxy-min`, a `git-remote-min` symlink,
+  the guest files (`data/vmlinuz`, `data/rootfs.img`, `data/initramfs.cpio`),
+  and the AppArmor profile, tunable, and loader under `data/`.
+- macOS arm64: `bin/min`, `bin/min-answerer`, `bin/minvmd`,
+  `bin/gvproxy-min`, `lib/libkrun.1.dylib`, the `git-remote-min` symlink, and
+  the same guest files. Only macOS has a `lib/` folder, because the Linux
+  `minvmd` links libkrun statically.
+
+`bin/min-answerer` is the box-zone answerer binary the session-start advisory
+copies into its root-owned service path. The installer puts it beside `min`
+and nothing else references it there: no manifest row writes a unit file or a
+launchd plist, and none names the root-owned service path the advisory's one
+privileged command creates.
 
 The installer also adds shell setup: PATH init files, `min` completions, and
 one marked block in the shell rc file. `--uninstall` removes all of it with no
