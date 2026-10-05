@@ -353,9 +353,28 @@ impl Network for HostIpAddressNetwork {
                 // with its `port` directive (NET-122, design §7.1), and it
                 // stays the answerer's own, not the plan's.
                 if self.verdict == sandbox2::config::Verdict::Deny {
-                    return Ok(NetPlan::host().with_resolver(Resolver::Nameservers(vec![
-                        crate::net::classifier::ANSWERER_ADDRESS,
-                    ])));
+                    // Over a table that decides per box, the carve-out it
+                    // loaded must name the answerer actually serving: a
+                    // stale target, or no answerer at all, refuses the box
+                    // (NET-079), and the resolver is the live bind's own
+                    // address, never a constant.
+                    let live = crate::net::classifier::live_answerer();
+                    if let Some(decision) = self
+                        .decision
+                        .as_ref()
+                        .filter(|decision| decision.can_decide_per_box())
+                        && let Some(refusal) = crate::net::classifier::stale_carve_out_refusal(
+                            decision.carve_out(),
+                            live,
+                        )
+                    {
+                        return Err(NetworkError::new(std::io::Error::other(refusal)));
+                    }
+                    let answerer = match live {
+                        Some(std::net::SocketAddr::V4(bound)) => *bound.ip(),
+                        _ => crate::net::classifier::ANSWERER_ADDRESS,
+                    };
+                    return Ok(NetPlan::host().with_resolver(Resolver::Nameservers(vec![answerer])));
                 }
                 // Native host: the namespace the box shares is the host's own,
                 // so the sandbox layer's plan answers `host.min.internal` from
@@ -845,6 +864,71 @@ mod tests {
             TapMechanism::InNamespace,
         );
         assert_eq!(plan.resolver(), own.resolver());
+    }
+
+    /// NET-079 natively: over a table that decides per box, a deny-all box's
+    /// plan follows the live answerer bind — its resolver is the bind's own
+    /// address while the table's recorded carve-out names that bind, and the
+    /// plan refuses the box as a stale carve-out once it does not. A box that
+    /// is not deny-all is unaffected.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn carve_out_targets_live_answerer_bind_in_the_box_plan() {
+        use crate::net::classifier::{Decision, clear_live_answerer, set_live_answerer};
+
+        let deny_all = Some(sessions::SessionPolicy::new(
+            Some(sessions::EgressPolicy::deny_all()),
+            None,
+        ));
+        let native = Arc::new(Mutex::new(SwitchClient::new(
+            "/usr/bin/gvproxy",
+            "/run/minimal/gvproxy",
+        )));
+        let recorded = std::net::SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 7656);
+        let decision = Decision::decided().with_carve_out(Some(recorded));
+        let plan = |policy| {
+            network_for(
+                NetworkMode::HostNet,
+                &native,
+                "s",
+                policy,
+                None,
+                None,
+                Some(decision.clone()),
+            )
+        };
+
+        set_live_answerer(std::net::SocketAddr::V4(recorded));
+        let live = plan(deny_all.clone())
+            .plan()
+            .await
+            .expect("a carve-out naming the live bind plans the box");
+        assert_eq!(
+            live.resolver(),
+            &Resolver::Nameservers(vec![*recorded.ip()]),
+            "the resolver is the live bind's address"
+        );
+
+        set_live_answerer(std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            7700,
+        ));
+        let stale = plan(deny_all.clone()).plan().await;
+        let refusal = stale.expect_err("a carve-out naming another bind is stale");
+        assert!(
+            refusal.to_string().contains("stale carve-out"),
+            "the plan refuses the box as a stale carve-out: {refusal}"
+        );
+
+        clear_live_answerer();
+        assert!(
+            plan(deny_all).plan().await.is_err(),
+            "no live answerer refuses the deny-all box"
+        );
+        assert!(
+            plan(None).plan().await.is_ok(),
+            "a box that is not deny-all is unaffected"
+        );
     }
 
     /// NET-079: on a native host, a deny-all host-address box resolves through

@@ -100,6 +100,12 @@ readonly TABLE_NAME=minimal_class
 # way, so the two read one fact — and an uninstall and a check read it
 # back by prefix, never by the default value.
 readonly MASK_RECORD_PREFIX=ct-mark-mask-
+# The resolver carve-out the loaded table admits, recorded beside the
+# marker as "$CARVE_OUT_RECORD_PREFIX<address>-<port>" so the daemon can
+# refuse a deny-all box whose carve-out no longer names its live answerer.
+# A table rendered with --no-resolver-carve-out carries none and records
+# none.
+readonly CARVE_OUT_RECORD_PREFIX=carve-out-
 readonly DEFAULT_CT_MARK_MASK=0x30000000
 
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
@@ -749,7 +755,7 @@ if [ "$mode" = uninstall ]; then
     # The mask records go with the marker they were written beside, read
     # back by prefix so whatever mask an install chose comes away with its
     # install, never a record left vouching for a table that is gone.
-    for record in "$tree_root"/"$MASK_RECORD_PREFIX"*; do
+    for record in "$tree_root"/"$MASK_RECORD_PREFIX"* "$tree_root"/"$CARVE_OUT_RECORD_PREFIX"*; do
         [ -d "$record" ] || continue
         rmdir "$record" 2>/dev/null || true
     done
@@ -838,10 +844,10 @@ fi
 # loaded table classifies with reads the step as not installed — so a
 # re-install that cannot remove the records it is about to replace dies
 # before touching the table, exactly as it does for the marker.
-for stale_record in "$tree_root"/"$MASK_RECORD_PREFIX"*; do
+for stale_record in "$tree_root"/"$MASK_RECORD_PREFIX"* "$tree_root"/"$CARVE_OUT_RECORD_PREFIX"*; do
     [ -d "$stale_record" ] || continue
     rmdir "$stale_record" 2>/dev/null ||
-        die "cannot remove the previous ct-mark mask record at $stale_record: a re-install must leave no record beside a table it did not load"
+        die "cannot remove the previous record at $stale_record: a re-install must leave no record beside a table it did not load"
 done
 # Render into a variable first, so nothing that touches a disk can sit between
 # rendering and loading. The captured text is byte for byte what render_ruleset
@@ -864,6 +870,12 @@ note "loaded the classifier table inet $TABLE_NAME: sha256 $ruleset_sha256, over
 # at. The record is written first and the marker last, so the marker is
 # the commit point: it is never there without the mask beside it, and a
 # daemon that reads it also reads the one value the table classifies by.
+if [ -n "$resolver_carve_out" ]; then
+    carve_out_record="$tree_root/$CARVE_OUT_RECORD_PREFIX$answerer_address-$answerer_port"
+    mkdir "$carve_out_record" 2>/dev/null ||
+        [ -d "$carve_out_record" ] ||
+        die "cannot record the table's resolver carve-out at $carve_out_record"
+fi
 mask_record="$tree_root/$MASK_RECORD_PREFIX$mask_hex"
 mkdir "$mask_record" 2>/dev/null ||
     [ -d "$mask_record" ] ||

@@ -63,7 +63,7 @@
 //! boxes run unenforced like any host's and say so per launch, in the
 //! interim's words.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -424,6 +424,11 @@ impl Cause {
 pub struct Decision {
     decided: bool,
     cause: Option<Cause>,
+    /// The resolver carve-out the native table recorded beside its marker
+    /// ([`recorded_carve_out`]), as the decision read it: what a native
+    /// deny-all launch compares with the live answerer bind before it runs
+    /// ([`stale_carve_out_refusal`]). `None` where none is recorded.
+    carve_out: Option<SocketAddrV4>,
 }
 
 impl Decision {
@@ -437,6 +442,7 @@ impl Decision {
         Self {
             decided: true,
             cause: None,
+            carve_out: None,
         }
     }
 
@@ -445,7 +451,20 @@ impl Decision {
         Self {
             decided: false,
             cause: Some(cause),
+            carve_out: None,
         }
+    }
+
+    /// This decision with the carve-out the native table recorded.
+    #[must_use]
+    pub fn with_carve_out(mut self, carve_out: Option<SocketAddrV4>) -> Self {
+        self.carve_out = carve_out;
+        self
+    }
+
+    /// The carve-out the native table recorded, as this decision read it.
+    pub fn carve_out(&self) -> Option<SocketAddrV4> {
+        self.carve_out
     }
 
     /// Whether a host-address box here has a verdict of its own.
@@ -1860,7 +1879,11 @@ pub(crate) fn decide_over(
     // refuse is its own cause, and a probe that could not read the table
     // says so and claims nothing.
     match read() {
-        Reading::Refused(_) => Decision::decided(),
+        // A native table's carve-out is read with the verdict, so the
+        // launch compares the target this table admits with the live
+        // answerer bind; a guest's table carries none.
+        Reading::Refused(_) if guest => Decision::decided(),
+        Reading::Refused(_) => Decision::decided().with_carve_out(recorded_carve_out(root)),
         Reading::NotRefused { .. } => Decision::undecidable(Cause::TableNotEffective),
         Reading::Inconclusive { because } => {
             tracing::info!(
@@ -2129,6 +2152,104 @@ fn recorded_ct_mark_mask(root: &Path) -> Option<u32> {
         mask = Some(bits);
     }
     mask
+}
+
+/// The resolver carve-out the loaded native table admits, as the step
+/// recorded it beside the presence marker: a cgroup named
+/// `carve-out-<address>-<port>` (`CARVE_OUT_RECORD_PREFIX` in
+/// scripts/install-host-classifier.sh). One well-formed record or nothing:
+/// two that disagree name no one target.
+fn recorded_carve_out(root: &Path) -> Option<SocketAddrV4> {
+    let recorded = std::fs::read_dir(root).ok()?;
+    let mut target = None;
+    for entry in recorded.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(value) = name.strip_prefix(CARVE_OUT_RECORD_PREFIX) else {
+            continue;
+        };
+        let (address, port) = value.rsplit_once('-')?;
+        let this = SocketAddrV4::new(address.parse().ok()?, port.parse().ok()?);
+        if target.is_some_and(|other| other != this) {
+            return None;
+        }
+        target = Some(this);
+    }
+    target
+}
+
+/// The prefix of the carve-out record the privileged step writes beside the
+/// presence marker.
+const CARVE_OUT_RECORD_PREFIX: &str = "carve-out-";
+
+/// The address and port the daemon's zone answerer is bound at while it
+/// serves, set where the bind is recorded (`server.rs`, beside
+/// `set_zone_answerer_port`) and cleared when the answerer stops — the live
+/// bind a native table's carve-out must name.
+static LIVE_ANSWERER: std::sync::Mutex<Option<SocketAddr>> = std::sync::Mutex::new(None);
+
+/// Records the address and port the answerer actually bound.
+pub(crate) fn set_live_answerer(bound: SocketAddr) {
+    *LIVE_ANSWERER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(bound);
+}
+
+/// Clears the live bind: the answerer stopped serving, so a carve-out that
+/// named it now names nothing, and deny-all launches read as stale.
+pub(crate) fn clear_live_answerer() {
+    *LIVE_ANSWERER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+}
+
+/// The answerer's live bind, while it serves.
+pub(crate) fn live_answerer() -> Option<SocketAddr> {
+    *LIVE_ANSWERER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Whether a native deny-all launch over a table that decides per box must
+/// be refused because the table's carve-out is stale, and the words that say
+/// so: the recorded target is not the live answerer bind, no answerer is
+/// bound, or the table recorded no carve-out at all. The words name the
+/// cause, both values, and the install that re-renders the carve-out onto
+/// the live bind. `None` when the carve-out names the live answerer.
+pub(crate) fn stale_carve_out_refusal(
+    recorded: Option<SocketAddrV4>,
+    live: Option<SocketAddr>,
+) -> Option<String> {
+    let live_v4 = match live {
+        Some(SocketAddr::V4(bound)) => Some(bound),
+        _ => None,
+    };
+    if recorded.is_some() && recorded == live_v4 {
+        return None;
+    }
+    let recorded_words = recorded.map_or_else(
+        || "no recorded carve-out".to_string(),
+        |target| target.to_string(),
+    );
+    let live_words = live.map_or_else(|| "no live answerer".to_string(), |bound| bound.to_string());
+    let remedy = match live_v4 {
+        Some(bound) => format!(
+            "{} --answerer-address {} --answerer-port {}",
+            sandbox2::classifier::install_hint(),
+            bound.ip(),
+            bound.port()
+        ),
+        None => "start the daemon's zone answerer on an IPv4 loopback address, then re-run \
+                 the classifier install with --answerer-address and --answerer-port set to \
+                 its bind"
+            .to_string(),
+    };
+    Some(format!(
+        "{}: stale carve-out: the table admits {recorded_words} and the zone answerer is \
+         bound at {live_words}, so a deny-all box's lookups would reach nothing; the box \
+         was refused rather than run on a resolver nothing serves ({remedy})",
+        Cause::TableNotEffective.detail()
+    ))
 }
 
 /// The prefix of the ct-mark mask record the privileged step writes beside
@@ -5130,6 +5251,143 @@ mod tests {
              (follow-up gominimal/inbox#897)",
             "the render's one line names the follow-up"
         );
+    }
+
+    /// The native install records the carve-out it loaded beside the marker,
+    /// the decision reads that record with the verdict, and a deny-all
+    /// launch over it runs only while the record names the answerer's live
+    /// bind (NET-079). An install that renders no carve-out records none.
+    #[test]
+    fn carve_out_targets_live_answerer_bind() {
+        let mount = standin_mount();
+        let nft_dir = tempfile::tempdir().expect("a temp dir holding the recording nft");
+        recording_nft(nft_dir.path(), &[]);
+        let installed = run_install_with(
+            &mount,
+            &["--answerer-address", "127.0.0.1", "--answerer-port", "7666"],
+            nft_dir.path(),
+        );
+        assert!(
+            installed.status.success(),
+            "the install runs over the recording nft: {}",
+            String::from_utf8_lossy(&installed.stderr),
+        );
+        let target = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 7666);
+        assert_eq!(
+            recorded_carve_out(&mount.root),
+            Some(target),
+            "the install records the carve-out it loaded beside the marker"
+        );
+        let table = std::fs::read_to_string(&mount.mountinfo).expect("the stand-in mount table");
+        let decision = decide(&mount.root, Some(&table), false, refused_reading);
+        assert!(
+            decision.can_decide_per_box(),
+            "the stand-in install decides"
+        );
+        assert_eq!(
+            decision.carve_out(),
+            Some(target),
+            "the decision reads the record"
+        );
+        assert_eq!(
+            stale_carve_out_refusal(decision.carve_out(), Some(SocketAddr::V4(target))),
+            None,
+            "a carve-out naming the live bind runs the box"
+        );
+
+        // A re-install that renders no carve-out clears the record it
+        // replaces and writes none.
+        let bare = run_install_with(&mount, &["--no-resolver-carve-out"], nft_dir.path());
+        assert!(
+            bare.status.success(),
+            "the re-install runs: {}",
+            String::from_utf8_lossy(&bare.stderr),
+        );
+        assert_eq!(
+            recorded_carve_out(&mount.root),
+            None,
+            "no carve-out, no record"
+        );
+    }
+
+    /// A native deny-all launch is refused when the table's carve-out is not
+    /// the live answerer bind, or when the table recorded none: the words are
+    /// the table-not-effective cause, both values, and the install that
+    /// re-renders onto the live bind.
+    #[test]
+    fn native_deny_all_refused_when_carve_out_target_is_stale() {
+        let recorded = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 7656);
+        let live = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7700);
+        let refusal = stale_carve_out_refusal(Some(recorded), Some(live))
+            .expect("a carve-out naming another port is stale");
+        for needle in [
+            Cause::TableNotEffective.detail(),
+            "stale carve-out",
+            "127.0.0.1:7656",
+            "127.0.0.1:7700",
+            "--answerer-address 127.0.0.1 --answerer-port 7700",
+        ] {
+            assert!(
+                refusal.contains(needle),
+                "the refusal names {needle}: {refusal}"
+            );
+        }
+        let unrecorded = stale_carve_out_refusal(None, Some(live))
+            .expect("a table with no recorded carve-out is stale");
+        assert!(
+            unrecorded.contains("no recorded carve-out") && unrecorded.contains("127.0.0.1:7700"),
+            "the refusal names the missing record and the live bind: {unrecorded}"
+        );
+    }
+
+    /// No live answerer — never bound, or stopped — refuses a native
+    /// deny-all launch whatever the table recorded: its carve-out names
+    /// nothing that serves.
+    #[test]
+    fn native_deny_all_refused_with_no_live_answerer() {
+        let recorded = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 7656);
+        let refusal = stale_carve_out_refusal(Some(recorded), None)
+            .expect("a carve-out with no answerer behind it is stale");
+        for needle in [
+            Cause::TableNotEffective.detail(),
+            "stale carve-out",
+            "127.0.0.1:7656",
+            "no live answerer",
+        ] {
+            assert!(
+                refusal.contains(needle),
+                "the refusal names {needle}: {refusal}"
+            );
+        }
+    }
+
+    /// The live bind is set where the answerer binds and cleared when it
+    /// stops, and a cleared cell makes the same carve-out stale.
+    #[test]
+    #[serial_test::serial]
+    fn release_clears_live_answerer_cell() {
+        let before = live_answerer();
+        let bound = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7656);
+        let recorded = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 7656);
+        set_live_answerer(bound);
+        assert_eq!(live_answerer(), Some(bound));
+        assert_eq!(
+            stale_carve_out_refusal(Some(recorded), live_answerer()),
+            None
+        );
+        clear_live_answerer();
+        assert_eq!(
+            live_answerer(),
+            None,
+            "a stopped answerer leaves no live bind"
+        );
+        assert!(
+            stale_carve_out_refusal(Some(recorded), live_answerer()).is_some(),
+            "a released answerer makes the carve-out stale"
+        );
+        if let Some(previous) = before {
+            set_live_answerer(previous);
+        }
     }
 
     /// The marker's discipline (NET-079), as the guest's own boot keeps it:

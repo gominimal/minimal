@@ -2212,6 +2212,9 @@ pub(crate) async fn drive_answerer_until_serving<T: crate::net::answerer::Zone>(
                                     "box-zone answerer receive loop exited"
                                 );
                             }
+                            // The answerer no longer serves: a carve-out that
+                            // named its bind now names nothing (NET-079).
+                            crate::net::classifier::clear_live_answerer();
                         }));
                         bound = true;
                         if !publish_on_host {
@@ -2372,6 +2375,10 @@ pub(crate) async fn drive_answerer_until_serving<T: crate::net::answerer::Zone>(
     // take a host port of its own (NET-059) — the published one.
     let reached_port = published_port.unwrap_or(bound_port);
     state.set_zone_answerer_port(reached_port).await;
+    // The live bind a native table's resolver carve-out must name (NET-079):
+    // the address and port the socket actually bound, beside the port the
+    // RPC discovery field carries.
+    crate::net::classifier::set_live_answerer(SocketAddr::new(bind_base, bound_port));
     // NET-018's observability line, at the moment its fact can first be
     // true: the answerer's bind is the daemon's half of the native
     // surface, so this — the bind's success — is when a diagnostics
