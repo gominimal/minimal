@@ -3,7 +3,8 @@ id: BOX
 title: Box — one record and one spec for every session and task on a stock install
 owner: mitodrummer
 epic: gominimal/inbox#731
-arch: https://github.com/gominimal/arch/blob/main/architecture.md
+arch: https://github.com/gominimal/arch/blob/2e11b6d2354911f0c14b83dc38dfb29166833577/architecture.md
+arch_sha: "2e11b6d2354911f0c14b83dc38dfb29166833577"
 updated: 2026-09-29
 ---
 
