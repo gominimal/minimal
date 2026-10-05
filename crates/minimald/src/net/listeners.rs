@@ -1804,16 +1804,26 @@ impl WatchState {
 /// of its processes holds it. Both tables are read — a server bound on the
 /// IPv6 any address accepts IPv4 connections, and its row lives in `tcp6` —
 /// and only the rows a publication's forward can deliver to are kept
-/// ([`binds_for_the_lease`]).
+/// ([`binds_for_the_lease`]). A kernel built without IPv6 — the microVM
+/// guest's — has no `tcp6` table at all, so its absence reads as no v6
+/// listeners rather than as a failure.
 ///
 /// # Errors
 ///
-/// Any read failure, so a caller decides what an unreadable table means
-/// rather than silently acting on half of one.
+/// Any other read failure, so a caller decides what an unreadable table
+/// means rather than silently acting on half of one.
 fn listening_ports(leader: u32, lease: Ipv4Addr) -> io::Result<HashSet<u16>> {
-    let entry = Path::new("/proc").join(leader.to_string());
+    listening_ports_in(&Path::new("/proc").join(leader.to_string()), lease)
+}
+
+/// [`listening_ports`] for one `/proc` entry.
+fn listening_ports_in(entry: &Path, lease: Ipv4Addr) -> io::Result<HashSet<u16>> {
     let mut ports = read_listening(&entry.join("net/tcp"), false, lease)?;
-    ports.extend(read_listening(&entry.join("net/tcp6"), true, lease)?);
+    match read_listening(&entry.join("net/tcp6"), true, lease) {
+        Ok(v6) => ports.extend(v6),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
     Ok(ports)
 }
 
@@ -3489,6 +3499,30 @@ mod tests {
         assert!(
             !ports.contains(&reachable_port),
             "a closed listener leaves the leader's table"
+        );
+    }
+
+    /// A kernel without IPv6 has no `tcp6` table: the entry's v4 listeners
+    /// still read, while a missing `tcp` table stays a failure.
+    #[test]
+    fn an_entry_without_a_v6_table_reads_its_v4_listeners() {
+        let entry = tempfile::tempdir().expect("a scratch /proc entry");
+        std::fs::create_dir(entry.path().join("net")).expect("its net directory");
+        assert_eq!(
+            listening_ports_in(entry.path(), LEASE)
+                .expect_err("no tcp table is a failure")
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+        std::fs::write(
+            entry.path().join("net/tcp"),
+            "  sl  local_address  rem_address   st\n\
+             0: 00000000:1F90 00000000:0000 0A 00000000:00000000\n",
+        )
+        .expect("its tcp table");
+        assert_eq!(
+            listening_ports_in(entry.path(), LEASE).expect("no tcp6 table reads as empty"),
+            HashSet::from([8080])
         );
     }
 
