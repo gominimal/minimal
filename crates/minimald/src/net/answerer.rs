@@ -53,7 +53,7 @@ use hickory_proto::rr::rdata::{A, SOA};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 use serde::{Deserialize, Serialize};
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Notify};
 use tokio_util::sync::CancellationToken;
 
 use sessions::core::zone_answer;
@@ -1155,9 +1155,10 @@ fn refuse_command(command: HandoverCommand) {
 
 /// The status a daemon that published its rows reports, by the holder its
 /// hello ack named: the manager-held service, or another daemon hosting
-/// the single-operator interim. The port it carries is the machine's
-/// answerer port this daemon knows — the hook port, where the service the
-/// installer records its `ListenDatagram` at serves in the default world.
+/// the single-operator interim. The port it carries is the bind the
+/// answerer serving while the publish holds — the service's recorded one,
+/// [`recorded_service_bind`], which is not this daemon's hook port when
+/// the machine pins that elsewhere.
 fn registered_status(holder: &str, port: u16) -> minimald_rpc::ZoneAnswererStatus {
     if holder == SERVICE_HOLDER {
         minimald_rpc::ZoneAnswererStatus::ManagerHeld { port }
@@ -1254,9 +1255,29 @@ async fn recheck_live_carve_outs(
         sandbox2::classifier::own_mountinfo().as_deref(),
         false,
     );
-    let refusal = crate::net::classifier::stale_carve_out_refusal(decision.carve_out(), live);
+    recheck_live_carve_outs_against(manager, decision.carve_out(), live, said).await;
+}
+
+/// [`recheck_live_carve_outs`] over a recorded half the caller names — the
+/// split the tests drive, pinning the record a real re-check re-reads so
+/// every arm of the comparison, the matching one included, is reachable
+/// from a test.
+async fn recheck_live_carve_outs_against(
+    manager: &crate::sessions::ManagerHandle,
+    recorded: Option<SocketAddrV4>,
+    live: Option<SocketAddr>,
+    said: &mut Option<String>,
+) {
+    let refusal = crate::net::classifier::stale_carve_out_refusal(recorded, live);
     match refusal {
         Some(why) => {
+            // The same stale state is named once, not once per pass: a
+            // bind change is one event a person reads once, and the
+            // acquisition's polling would otherwise re-log every box on
+            // every wake slice the state outlives.
+            if said.as_deref() == Some(&why) {
+                return;
+            }
             // Name every live deny-all box the change leaves behind: the
             // boxes whose launch placed them in a leaf of their own (the
             // record's `per_box`), over this host's addresses (HostNet),
@@ -1375,7 +1396,13 @@ async fn acquire_at(
         // by its marker: its channel or nothing.
         let installed = paths.marker.exists();
         let channel = &paths.channel;
-        if !installed && !stale_global_once && std::fs::symlink_metadata(channel).is_ok() {
+        // A socket at the channel path with no install marker is not the
+        // installed service's channel — a corpse's leftover or a foreign
+        // program's — and this daemon treats the path as absent: the host
+        // arm below decides the answerer, never a publish into a channel
+        // nobody installed.
+        let stale_global_socket = !installed && std::fs::symlink_metadata(channel).is_ok();
+        if stale_global_socket && !stale_global_once {
             stale_global_once = true;
             tracing::info!(
                 component = COMPONENT,
@@ -1386,11 +1413,22 @@ async fn acquire_at(
             );
         }
         let rows = zone_rows_of(&registry);
-        match connect_and_publish(channel, &node, rows).await {
+        let attempt = if stale_global_socket {
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "no install marker beside the channel path",
+            ))
+        } else {
+            connect_and_publish(channel, &node, rows).await
+        };
+        match attempt {
             Ok(published) => {
                 retry = CHANNEL_RETRY;
                 erroring = false;
-                status.set(registered_status(&published.holder, hook_port));
+                status.set(registered_status(
+                    &published.holder,
+                    recorded_service_bind().port(),
+                ));
                 warn_refused(&node, &published.refused);
                 if !published_once {
                     published_once = true;
@@ -1399,10 +1437,12 @@ async fn acquire_at(
                 // While this daemon publishes, the live bind a deny-all
                 // box's carve-out must name is the manager-held answerer's
                 // recorded one — the bind the publish reached, and the
-                // cell the plan-time check reads. The zone answerer's
-                // port answerer keeps reporting the machine's hook port,
-                // where the installed service records its bind.
-                state.set_zone_answerer_port(hook_port).await;
+                // cell the plan-time check reads. The port the status and
+                // the session replies name is the same recorded one, the
+                // service's own bind: this daemon's hook port can be
+                // pinned elsewhere than where the service serves, and the
+                // answerer actually serving is the service.
+                state.set_zone_answerer_port(recorded_service_bind().port()).await;
                 crate::net::classifier::set_live_answerer(recorded_service_bind());
                 recheck_live_carve_outs(
                     &manager,
@@ -1452,9 +1492,12 @@ async fn acquire_at(
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             // A refused connect names a corpse: a socket file with no
             // listener behind it, the leftover of a service that died
-            // with its sockets unmanaged. The host arm takes the zone
-            // answerer from here; the corpse's socket file is the service
-            // manager's own path to manage, not this daemon's to remove.
+            // with its sockets unmanaged. With no marker this state is
+            // caught before the connect (above); one reaching the connect
+            // is the race between the two reads, and the host arm takes
+            // the zone answerer from here all the same. The corpse's
+            // socket file is the service manager's own path to manage,
+            // not this daemon's to remove.
             Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
                 if !stale_once {
                     stale_once = true;
@@ -1694,10 +1737,14 @@ async fn host_the_interim(
         );
         // The interim serves the daemon's own registry — the same answerer
         // this module always served, stopped by its token when a release
-        // frees the port.
+        // frees the port. Its exit is reported rather than polled, so the
+        // wait below hears a serve loop that ends on its own (its receive
+        // returned an error) as readily as one a release stopped.
         let answerer = ZoneAnswerer::new(Arc::clone(registry), AnswerScope::Native);
         serve_stop = CancellationToken::new();
         let stop = serve_stop.clone();
+        let serve_done = Arc::new(Notify::new());
+        let done = Arc::clone(&serve_done);
         // The socket this pass serves is the one the caller bound (the
         // first pass) or the re-bind opened (every later one); None only
         // between the take and the assignment, never at the take itself.
@@ -1720,6 +1767,9 @@ async fn host_the_interim(
             // The answerer no longer serves: a carve-out that named its
             // bind now names nothing (NET-079).
             crate::net::classifier::clear_live_answerer();
+            // The exit the inner loop answers, whatever arm ended the
+            // serve: a stop's exit is consumed by the arm that stopped it.
+            done.notify_one();
         });
         serve_task = Some(task);
         // The interim's own bind is the live one while it serves.
@@ -1744,6 +1794,39 @@ async fn host_the_interim(
                     }
                     status.set_hosting(false);
                     return;
+                }
+                _ = serve_done.notified() => {
+                    // The serve loop exited on its own: its receive
+                    // returned an error, so the port it held is already
+                    // gone. The cell it cleared is the honest one, the
+                    // re-check names the boxes that clear leaves behind,
+                    // and the interim re-binds the port it lost — the
+                    // same re-bind a cancelled window runs, one pass
+                    // later than a serve that stops answering.
+                    if let Some(task) = serve_task.take() {
+                        let _ = task.await;
+                    }
+                    status.set(minimald_rpc::ZoneAnswererStatus::Starting);
+                    status.set_hosting(false);
+                    recheck_live_carve_outs(manager, None, carve_out_said).await;
+                    match tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, hook_port)).await {
+                        Ok(bound_again) => {
+                            socket = Some(bound_again);
+                            break;
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                component = COMPONENT,
+                                %error,
+                                port = hook_port,
+                                "the interim answerer's serve loop exited and the hook \
+                                 port could not be re-bound; the host arm decides the \
+                                 answerer from here"
+                            );
+                            status.set_hosting(false);
+                            return;
+                        }
+                    }
                 }
                 command = commands.recv() => {
                     let Some(command) = command else { continue };
@@ -1791,7 +1874,7 @@ async fn host_the_interim(
                                     status.set_hosting(false);
                                     status.set(registered_status(
                                         &published.holder,
-                                        hook_port,
+                                        recorded_service_bind().port(),
                                     ));
                                     warn_refused(node, &published.refused);
                                     announce_publish(
@@ -1800,7 +1883,8 @@ async fn host_the_interim(
                                         &paths.channel,
                                         node,
                                     );
-                                    state.set_zone_answerer_port(hook_port).await;
+                                    state.set_zone_answerer_port(recorded_service_bind().port())
+                                        .await;
                                     crate::net::classifier::set_live_answerer(
                                         recorded_service_bind(),
                                     );
@@ -1907,12 +1991,20 @@ async fn release_window(
         // The channel is tried every poll, but only once the service's
         // install marker says the service is there: a channel that answers
         // with no marker is a corpse or a foreign program, not the service
-        // this window waits for.
-        if paths.marker.exists()
-            && let Ok(published) =
-                connect_and_publish(&paths.channel, node, zone_rows_of(registry)).await
-        {
-            return WindowEnd::Switched(published);
+        // this window waits for. The try is bounded by what is left of the
+        // window — the hello and the publish can each take
+        // [`CHANNEL_REPLY_TIMEOUT`], and a window shorter than them must
+        // not overrun on a channel that never answers — and a try that
+        // failed is just the next poll's, not the window's end.
+        if paths.marker.exists() {
+            let attempt = tokio::time::timeout(
+                remaining,
+                connect_and_publish(&paths.channel, node, zone_rows_of(registry)),
+            )
+            .await;
+            if let Ok(Ok(published)) = attempt {
+                return WindowEnd::Switched(published);
+            }
         }
         tokio::select! {
             command = commands.recv() => {
@@ -2670,6 +2762,10 @@ mod tests {
         publishes: Arc<Mutex<Vec<Vec<RegisteredRow>>>>,
         /// Stops the service's accept loop (its connections close with it).
         stop: CancellationToken,
+        /// The connections the service holds — the daemon's publish rides
+        /// one — so a stop can end them: the connection's end is the whole
+        /// withdrawal, the one event a stop must produce for the daemon.
+        connections: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     }
 
     impl FakeServiceHandle {
@@ -2678,9 +2774,15 @@ mod tests {
             self.publishes.lock().unwrap().clone()
         }
 
-        /// Stops standing in for the service.
+        /// Stops standing in for the service: the accept loop ends, and
+        /// every connection it held is dropped — the service's end of the
+        /// channel, which is what a service stopping is to the daemon
+        /// holding a publish there.
         fn stop(&self) {
             self.stop.cancel();
+            for connection in self.connections.lock().unwrap().drain(..) {
+                connection.abort();
+            }
         }
     }
 
@@ -2695,6 +2797,9 @@ mod tests {
         let publishes_loop = Arc::clone(&publishes);
         let stop = CancellationToken::new();
         let stop_task = stop.clone();
+        let connections: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let connections_loop = Arc::clone(&connections);
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -2702,7 +2807,7 @@ mod tests {
                     accepted = listener.accept() => {
                         let Ok((stream, _)) = accepted else { return };
                         let publishes = Arc::clone(&publishes_loop);
-                        tokio::spawn(async move {
+                        let connection = tokio::spawn(async move {
                             let mut stream = stream;
                             let mut saw_hello = false;
                             loop {
@@ -2749,11 +2854,16 @@ mod tests {
                                 .await;
                             }
                         });
+                        connections_loop.lock().unwrap().push(connection);
                     }
                 }
             }
         });
-        FakeServiceHandle { publishes, stop }
+        FakeServiceHandle {
+            publishes,
+            stop,
+            connections,
+        }
     }
 
     /// Asks the control socket at `sock` one `verb` and reads the one reply
@@ -2829,9 +2939,15 @@ mod tests {
             shutdown.clone(),
             buf.clone(),
         );
+        // The status the publish leaves: the manager holds the answerer,
+        // and the port it serves on is the service's own recorded bind —
+        // not this daemon's hook port, which can be pinned elsewhere than
+        // where the service serves.
         await_status_is(
             &status,
-            minimald_rpc::ZoneAnswererStatus::ManagerHeld { port: hook_port },
+            minimald_rpc::ZoneAnswererStatus::ManagerHeld {
+                port: recorded_service_bind().port(),
+            },
             "published into the manager-held answerer",
         )
         .await;
@@ -2906,13 +3022,277 @@ mod tests {
         end(task, &shutdown);
     }
 
+    /// NET-122's withdrawal: the connection's end is the whole publish, so
+    /// the service's end of one — a stop, a restart the manager does not
+    /// hold the socket through — clears the live-answerer cell the publish
+    /// fed (T75's cell, the plan-time check's live half), leaving the
+    /// host to say no answerer serves rather than one that died. The
+    /// channel that no longer answers with the marker still there is the
+    /// surfaced error, never a reason to host.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_withdrawal_clears_the_live_answerer_cell() {
+        let buf = CaptureWriter::default();
+        let server = crate::test_harness::TestServer::new().await;
+        server
+            .state
+            .sessions_manager()
+            .await
+            .hostnames()
+            .write()
+            .expect("the registry lock is held")
+            .register_host_net(SessionId::nil(), "web");
+        let dir = tempfile::tempdir().expect("a tempdir for the channel and the marker");
+        let channel = dir.path().join("answerer.sock");
+        let marker = dir.path().join("dev.minimal.zone-answerer.socket");
+        std::fs::write(&marker, b"[Unit]\n").expect("the install marker is written");
+        let service = fake_manager_held_service(channel.clone());
+
+        let status = AnswererStatus::starting();
+        let shutdown = CancellationToken::new();
+        let hook_port = free_udp_port();
+        let task = drive(
+            server.state.clone(),
+            hook_port,
+            status.clone(),
+            AnswererPaths {
+                channel: channel.clone(),
+                marker,
+                release_window: RELEASE_WINDOW,
+            },
+            shutdown.clone(),
+            buf.clone(),
+        );
+        await_status_is(
+            &status,
+            minimald_rpc::ZoneAnswererStatus::ManagerHeld {
+                port: recorded_service_bind().port(),
+            },
+            "published into the manager-held answerer",
+        )
+        .await;
+        assert_eq!(
+            crate::net::classifier::live_answerer(),
+            Some(recorded_service_bind()),
+            "the cell takes the service's recorded bind while the publish is held"
+        );
+
+        // The withdrawal: the service stops, so its end of the connection
+        // — the publish's whole life — ends with it, and the cell clears.
+        service.stop();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if crate::net::classifier::live_answerer().is_none() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the withdrawal never cleared the live-answerer cell"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // The channel that stopped answering with the marker still there
+        // is the surfaced error: the hook port stays free, never hosted.
+        await_status_is(
+            &status,
+            minimald_rpc::ZoneAnswererStatus::PortHeldNoChannel { port: hook_port },
+            "surfaced the channel that stopped answering",
+        )
+        .await;
+        probe_udp_port(hook_port).expect("the hook port stays free through the withdrawal");
+
+        end(task, &shutdown);
+    }
+
+    /// NET-079's residual, re-checked live: a bind change or clear names
+    /// every live deny-all box whose carve-out the change leaves stale —
+    /// each stale state once, not once per pass — and the return to a
+    /// matching bind is the one info line the recovery owes. Driven over a
+    /// real running box (the fact a launch places per box, a deny-all
+    /// host-address box holding it), against a recorded carve-out the
+    /// caller pins so every arm of the comparison is reached.
+    // The guard is taken before the server is even built and held across
+    // the awaited creates and re-checks on purpose: the fact is
+    // process-global, so under libtest another test's create or launch in
+    // the window would answer over it too.
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "the fact is process-global, so the guard must span the awaited \
+                  creates and re-checks it is set for"
+    )]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_recheck_names_each_stale_carve_out_state_once() {
+        use minimald_rpc::{
+            ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, FinalizeSession,
+            FinalizeSessionRequest,
+        };
+
+        // The fact is process-global: hold the window every fact-writing
+        // test holds, and put it back before the test ends.
+        let _fact_window = crate::session_host::PROBE_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let capture = crate::test_harness::captured_log();
+        crate::session_host::set_host_ip_enforcement_fact(
+            &crate::net::classifier::Decision::decided(),
+        );
+
+        let server = crate::test_harness::TestServer::new().await;
+        let mut client = server.connect().await;
+
+        // A deny-all host-address box: the shape whose carve-out is a
+        // fact the loaded table enforces, created and finalized the way a
+        // box a person attaches is.
+        let mut deny_all = crate::test_harness::create_session_req("carve-out-box", "/uwu");
+        deny_all.config.policy = minimald_rpc::SessionPolicy::new(
+            Some(minimald_rpc::EgressPolicy::deny_all()),
+            None,
+        );
+        let id = client.call::<CreateSession>(&deny_all).await.unwrap().id;
+        crate::test_harness::unwrap_ready(
+            client
+                .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
+                    session_id: id,
+                    contribution: Default::default(),
+                })
+                .await
+                .unwrap(),
+        );
+        client
+            .call::<FinalizeSession>(&FinalizeSessionRequest { session_id: id })
+            .await
+            .unwrap();
+
+        // The attach is the launch: the mock launcher records the fact's
+        // per-box placement, and only a running box has the attrs the
+        // re-check filters on. The shell stays bound so the box stays
+        // running through the re-checks below.
+        let channel = client.open_shell(id).await;
+        let manager = server.state.sessions_manager().await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let listed = manager.list().await.unwrap();
+            if listed.iter().any(|info| {
+                info.name.as_deref() == Some("carve-out-box") && info.attrs.is_some()
+            }) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the launched box never surfaced its attrs: {listed:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // The stale-state line the re-check logs per box, and the
+        // recovery line it logs once — counted over the capture, because
+        // a stale state named once per *state*, not once per pass, is the
+        // contract this pins.
+        let stale_lines = |log: &str| -> usize {
+            log.lines()
+                .filter(|line| {
+                    line.contains("no longer names the answerer actually serving")
+                })
+                .count()
+        };
+        let matched_lines = |log: &str| -> usize {
+            log.lines()
+                .filter(|line| {
+                    line.contains("matches the table's recorded carve-out again")
+                })
+                .count()
+        };
+
+        // The gate itself: with the fact decided, the re-check runs over
+        // the table's own record — re-read from the host's real tree, none
+        // on this host — and the box is named for the state it reads.
+        let mut said = None;
+        recheck_live_carve_outs(
+            &manager,
+            Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7001)),
+            &mut said,
+        )
+        .await;
+        let after_first = stale_lines(&capture.contents());
+        assert_eq!(after_first, 1, "one stale state is one line per box");
+
+        // The same stale state on a later pass says nothing: the box is
+        // named once, not once per pass.
+        recheck_live_carve_outs(
+            &manager,
+            Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7001)),
+            &mut said,
+        )
+        .await;
+        assert_eq!(
+            stale_lines(&capture.contents()),
+            after_first,
+            "the same stale state is never re-logged"
+        );
+
+        // The recorded half is what a test pins: the comparison's every
+        // arm, the matching one included. The bind changes — a new stale
+        // state, named once.
+        let recorded = SocketAddrV4::new(Ipv4Addr::LOCALHOST, ANSWERER_PORT);
+        recheck_live_carve_outs_against(
+            &manager,
+            Some(recorded),
+            Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7002)),
+            &mut said,
+        )
+        .await;
+        let after_change = stale_lines(&capture.contents());
+        assert_eq!(
+            after_change,
+            after_first + 1,
+            "a changed bind is a new stale state, named once"
+        );
+
+        // The bind clears — named once.
+        recheck_live_carve_outs_against(&manager, Some(recorded), None, &mut said).await;
+        let after_clear = stale_lines(&capture.contents());
+        assert_eq!(
+            after_clear,
+            after_change + 1,
+            "a cleared bind is a new stale state, named once"
+        );
+
+        // The bind matches the recorded carve-out again: the one info
+        // line the recovery owes, and the state that follows re-logs
+        // nothing.
+        recheck_live_carve_outs_against(
+            &manager,
+            Some(recorded),
+            Some(SocketAddr::V4(recorded)),
+            &mut said,
+        )
+        .await;
+        let log = capture.contents();
+        assert_eq!(
+            matched_lines(&log),
+            1,
+            "the return to a matching bind is one info line"
+        );
+        assert_eq!(
+            stale_lines(&log),
+            after_clear,
+            "a matching bind logs no stale state"
+        );
+
+        drop(channel);
+        crate::session_host::clear_host_ip_enforcement_fact();
+    }
+
     /// NET-122's host arm and its bound: with no install marker and no
     /// channel, the daemon hosts the interim answerer itself on the hook
     /// port — the single-operator interim — and the zone answers its own
-    /// table over real UDP. But the host arm is the absent-channel arm
-    /// only: a channel that is present and answers no is a surfaced error,
-    /// never a reason to host, and the hook port stays free while the
-    /// daemon retries it.
+    /// table over real UDP. A socket at the channel path is no channel
+    /// without the marker: a corpse's leftover or a foreign program's, it
+    /// is treated as absent — the path is where the *installed service*
+    /// serves, and nobody installed one. But the host arm is the
+    /// absent-channel arm only: an installed service's channel that is
+    /// present and answers no is a surfaced error, never a reason to
+    /// host, and the hook port stays free while the daemon retries it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn native_daemon_hosts_only_when_the_channel_is_absent() {
         // ── no channel at all: host the interim.
@@ -2977,11 +3357,49 @@ mod tests {
 
         end(task, &shutdown);
 
-        // ── a channel that is present and answers no: a surfaced error,
-        // never a reason to host.
+        // ── a socket at the channel path with no marker: absent, the same
+        // host arm — nothing installed answers there, whoever's socket it
+        // is, and the one line says the path was treated as absent.
+        let buf = CaptureWriter::default();
+        let server = crate::test_harness::TestServer::new().await;
+        let unmarked = dir.path().join("unmarked.sock");
+        let _listener = tokio::net::UnixListener::bind(&unmarked)
+            .expect("the unmarked channel's socket file binds");
+        let status = AnswererStatus::starting();
+        let shutdown = CancellationToken::new();
+        let task = drive(
+            server.state.clone(),
+            hook_port,
+            status.clone(),
+            AnswererPaths {
+                channel: unmarked,
+                marker: dir.path().join("unmarked-marker.socket"),
+                release_window: RELEASE_WINDOW,
+            },
+            shutdown.clone(),
+            buf.clone(),
+        );
+        await_status_is(
+            &status,
+            minimald_rpc::ZoneAnswererStatus::Holder { port: hook_port },
+            "hosted the interim over an unmarked channel socket",
+        )
+        .await;
+        let log = buf.contents();
+        assert!(
+            log.contains("treating the path as absent"),
+            "the unmarked socket is named as the absent path it is treated as, got: {log}"
+        );
+
+        end(task, &shutdown);
+
+        // ── an installed service's channel that is present and answers
+        // no: a surfaced error, never a reason to host.
         let buf = CaptureWriter::default();
         let server = crate::test_harness::TestServer::new().await;
         let channel = dir.path().join("refusing.sock");
+        std::fs::write(dir.path().join("refusing-marker.socket"), b"[Unit]\n")
+            .expect("the install marker is written");
         let listener = tokio::net::UnixListener::bind(&channel)
             .expect("the refusing channel's listener binds");
         tokio::spawn(async move {
@@ -3029,8 +3447,10 @@ mod tests {
             .expect("a present channel that answers no is never a reason to host");
         let log = buf.contents();
         assert!(
-            log.contains("present but did not answer"),
-            "the surfaced error names what the channel did, got: {log}"
+            log.contains("the answerer service is installed")
+                && log.contains("did not answer"),
+            "the surfaced error names the installed service whose channel answered \
+             no, got: {log}"
         );
 
         end(task, &shutdown);

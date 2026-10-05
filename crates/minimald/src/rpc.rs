@@ -707,6 +707,12 @@ pub const ANSWERER_CONTROL_SOCK_FILE: &str = "control.sock";
 /// request is one small verb, so anything past this bound is not one.
 const ANSWER_CONTROL_MAX_LINE: usize = 64 * 1024;
 
+/// How long the answerer control socket waits for one request line: the
+/// door answers one ask per connect, so a connection that parks without
+/// asking is released at the bound rather than held for the daemon's
+/// life.
+const CONTROL_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Binds and serves the daemon's answerer control socket (NET-122's
 /// native half of the same door the VM host daemon serves): the socket
 /// answers the answerer's status and handover verbs —
@@ -738,12 +744,24 @@ pub(crate) async fn spawn_answerer_control(
     };
     let sock_path = std::path::PathBuf::from(dir.as_str()).join(ANSWERER_CONTROL_SOCK_FILE);
     // A socket left by a previous run of this same daemon instance is
-    // stale the moment this one binds; a live one would not be ours to
-    // remove, so only a socket file is.
+    // stale the moment this one binds; a live one is another daemon's
+    // door, not this one's to remove, so the bind is refused in its name
+    // rather than taking the file out from under a daemon still serving
+    // it. The probe is the connect the door's own askers make: a corpse
+    // refuses it, a live listener takes it.
     use std::os::unix::fs::FileTypeExt as _;
 
     match std::fs::symlink_metadata(&sock_path) {
         Ok(meta) if meta.file_type().is_socket() => {
+            if tokio::net::UnixStream::connect(&sock_path).await.is_ok() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AddrInUse,
+                    format!(
+                        "another daemon is already serving the answerer control socket at {}",
+                        sock_path.display()
+                    ),
+                ));
+            }
             let _ = std::fs::remove_file(&sock_path);
         }
         _ => {}
@@ -864,9 +882,12 @@ async fn serve_answerer_control(
 }
 
 /// Reads one request line off a control connection, bounded by
-/// [`ANSWER_CONTROL_MAX_LINE`]: a request is one small verb, so a line
-/// past the bound is refused whole. `Ok(None)` is a connection that said
-/// nothing — a probe's connect-and-close, answered with nothing.
+/// [`ANSWER_CONTROL_MAX_LINE`] and by
+/// [`CONTROL_REQUEST_TIMEOUT`]: a request is one small verb one connect
+/// sends whole, so a connection that sends none — or half of one — is
+/// released after the bound instead of being held for the daemon's life.
+/// `Ok(None)` is a connection that said nothing — a probe's
+/// connect-and-close, answered with nothing.
 async fn read_control_request(
     stream: &mut tokio::net::UnixStream,
 ) -> std::io::Result<Option<String>> {
@@ -874,26 +895,35 @@ async fn read_control_request(
 
     let mut line = Vec::new();
     let mut buf = [0u8; 1024];
-    loop {
-        let read = stream.read(&mut buf).await?;
-        if read == 0 {
-            return if line.is_empty() {
-                Ok(None)
-            } else {
-                Ok(Some(String::from_utf8_lossy(&line).into_owned()))
-            };
+    let read = async {
+        loop {
+            let read = stream.read(&mut buf).await?;
+            if read == 0 {
+                return if line.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(String::from_utf8_lossy(&line).into_owned()))
+                };
+            }
+            if let Some(newline) = buf[..read].iter().position(|byte| *byte == b'\n') {
+                line.extend_from_slice(&buf[..newline]);
+                return Ok(Some(String::from_utf8_lossy(&line).into_owned()));
+            }
+            line.extend_from_slice(&buf[..read]);
+            if line.len() > ANSWER_CONTROL_MAX_LINE {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "the control request exceeded the line bound",
+                ));
+            }
         }
-        if let Some(newline) = buf[..read].iter().position(|byte| *byte == b'\n') {
-            line.extend_from_slice(&buf[..newline]);
-            return Ok(Some(String::from_utf8_lossy(&line).into_owned()));
-        }
-        line.extend_from_slice(&buf[..read]);
-        if line.len() > ANSWER_CONTROL_MAX_LINE {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "the control request exceeded the line bound",
-            ));
-        }
+    };
+    match tokio::time::timeout(CONTROL_REQUEST_TIMEOUT, read).await {
+        Ok(result) => result,
+        Err(_elapsed) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "the control request did not arrive in time",
+        )),
     }
 }
 
