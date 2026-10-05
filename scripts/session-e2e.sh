@@ -15755,6 +15755,29 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
     echo "the box outlived its detached client and still serves by name (NET-015)"
 
     mnl session destroy --force "$po_sid" >/dev/null 2>&1 || true
+
+    # After the box ends, its declared port's published address must refuse a
+    # host connect fast: nothing in the box answers, so a forward still bound
+    # there is a bind that outlived its box. Not a hard assertion yet: the
+    # host's egress gate refuses the guest's retraction of a declared port's
+    # forward by design (sessions::core::switch_request, Refusal::Unheld), and
+    # nothing on the host unbinds it at box end, so on main this leg is
+    # expected to find the bind still standing. Reported as a known gap with
+    # a ::warning:: until the host-side unbind lands; flip it to `fail` then.
+    if [ -n "$po_addr" ]; then
+      po_t0=$(now_ms)
+      curl -sS --max-time 8 -o /dev/null "http://$po_addr:$PO_EXT/" \
+        >/dev/null 2>"$WORK/po-after-destroy.err"
+      po_gone_rc=$?
+      po_t1=$(now_ms)
+      echo "after destroy: GET http://$po_addr:$PO_EXT/ -> curl exit $po_gone_rc in $((po_t1 - po_t0))ms ($(head -n1 "$WORK/po-after-destroy.err" 2>/dev/null || true))"
+      if [ "$po_gone_rc" -eq 7 ] && [ $((po_t1 - po_t0)) -lt 4000 ]; then
+        echo "declared port refused fast after its box ended: no bind outlived the box"
+      else
+        echo "::warning::KNOWN GAP (not asserted): the declared port $po_addr:$PO_EXT was not refused fast after its box was destroyed (curl exit $po_gone_rc in $((po_t1 - po_t0))ms) — the declared forward's bind outlived the box"
+      fi
+    fi
+
     rm -rf "$PO_OWNIP_SEED_DIR"; PO_OWNIP_SEED_DIR=""
     po_restore_log
     echo "port-publish half OK (declared port: refused fast before the listen, then its declaration's forward answering by name at once (NET-121); live undeclared listen: refused by name as not-published, left unpublished by the watcher (NET-016); box: outlives its detached client)"
