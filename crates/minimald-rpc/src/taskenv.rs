@@ -110,9 +110,56 @@ impl TaskEnv {
     }
 }
 
+/// The trace variables the daemon puts into a sandboxed process's
+/// environment (TEL-023: on opt-in, only `TRACEPARENT` is forwarded into a
+/// box; never `OTEL_EXPORTER_OTLP_HEADERS`, `BAGGAGE` or any other
+/// `OTEL_*`). `telemetry_on` is the daemon's own export state: with it off
+/// nothing is added, so a box sees exactly what it saw before. A `min` run
+/// in the box adopts this as its parent, so its work joins the caller's
+/// trace.
+pub fn trace_env(telemetry_on: bool, traceparent: Option<String>) -> BTreeMap<String, String> {
+    let mut env = BTreeMap::new();
+    if telemetry_on && let Some(tp) = traceparent {
+        env.insert(crate::trace::TRACEPARENT_ENV.to_string(), tp);
+    }
+    env
+}
+
+/// A `min task run`'s environment overlay plus [`trace_env`]: the task's
+/// own entries (resolved by the client) with the exec span's `TRACEPARENT`
+/// added on opt-in, so a `min` the task runs joins the caller's trace. The
+/// overlay is applied per name, so adding one entry leaves every other name's
+/// resolution (client value, declaration, daemon-side `inherit`) unchanged.
+pub fn with_trace(
+    mut task_env: BTreeMap<String, String>,
+    trace: BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    task_env.extend(trace);
+    task_env
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A task run gets only `TRACEPARENT`, only on opt-in, and keeps its own
+    /// entries; exporter headers and baggage never ride along.
+    #[test]
+    fn a_task_run_gets_traceparent_only_on_opt_in() {
+        let tp = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01".to_string();
+        let mut own = BTreeMap::new();
+        own.insert("ZZ_TASK".to_string(), "v".to_string());
+        let on = with_trace(own.clone(), trace_env(true, Some(tp.clone())));
+        assert_eq!(on.get(crate::trace::TRACEPARENT_ENV), Some(&tp));
+        assert_eq!(on.get("ZZ_TASK").map(String::as_str), Some("v"));
+        assert_eq!(on.len(), 2, "only TRACEPARENT is added: {on:?}");
+        assert!(
+            !on.keys()
+                .any(|k| k.contains("OTEL_EXPORTER_OTLP_HEADERS") || k == "BAGGAGE")
+        );
+        let off = with_trace(own.clone(), trace_env(false, Some(tp)));
+        assert_eq!(off, own, "nothing is added when telemetry is off");
+    }
 
     /// A name survives the prefix round-trip, which is the whole contract:
     /// the client prefixes, the daemon strips, and the task sees the name
@@ -146,6 +193,24 @@ mod tests {
         let out = from_channel_env(&channel);
         assert_eq!(out.len(), 1);
         assert!(out.contains_key("KEPT"));
+    }
+
+    /// `TRACEPARENT` reaches a box only on opt-in, and it is the only
+    /// trace variable that ever does.
+    #[test]
+    fn trace_env_is_traceparent_only_and_only_on_opt_in() {
+        let tp = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01".to_string();
+        assert!(trace_env(false, Some(tp.clone())).is_empty());
+        assert!(trace_env(true, None).is_empty());
+        let on = trace_env(true, Some(tp.clone()));
+        assert_eq!(on.len(), 1);
+        assert_eq!(on.get(crate::trace::TRACEPARENT_ENV), Some(&tp));
+        for k in on.keys() {
+            assert!(
+                !k.starts_with("OTEL_") && k != "BAGGAGE",
+                "{k} must never reach a box"
+            );
+        }
     }
 
     /// A client that sends no task env yields an empty map — the signal

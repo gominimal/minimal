@@ -1406,7 +1406,7 @@ async fn recheck_live_carve_outs(
     // The probe spawns a child under the process-wide probe lock and waits
     // up to its own deadline, so it runs on the blocking pool, as its doc
     // asks of an async caller: this task keeps answering the control socket.
-    let recorded = tokio::task::spawn_blocking(|| {
+    let recorded = crate::traced::spawn_blocking(|| {
         crate::net::classifier::decide_now(
             std::path::Path::new(sandbox2::classifier::TREE_ROOT),
             sandbox2::classifier::own_mountinfo().as_deref(),
@@ -1946,7 +1946,7 @@ async fn host_the_interim(
         let serve_socket = socket
             .take()
             .expect("every pass enters with a bound socket");
-        let task = tokio::spawn(async move {
+        let task = crate::traced::spawn(async move {
             tokio::select! {
                 _ = stop.cancelled() => {}
                 served = serve(serve_socket, answerer) => {
@@ -3026,14 +3026,14 @@ mod tests {
         let connections: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>> =
             Arc::new(Mutex::new(Vec::new()));
         let connections_loop = Arc::clone(&connections);
-        tokio::spawn(async move {
+        crate::traced::spawn(async move {
             loop {
                 tokio::select! {
                     _ = stop_task.cancelled() => return,
                     accepted = listener.accept() => {
                         let Ok((stream, _)) = accepted else { return };
                         let publishes = Arc::clone(&publishes_loop);
-                        let connection = tokio::spawn(async move {
+                        let connection = crate::traced::spawn(async move {
                             let mut stream = stream;
                             let mut saw_hello = false;
                             loop {
@@ -3925,7 +3925,7 @@ mod tests {
             .expect("the install marker is written");
         let listener = tokio::net::UnixListener::bind(&channel)
             .expect("the refusing channel's listener binds");
-        tokio::spawn(async move {
+        crate::traced::spawn(async move {
             loop {
                 let Ok((mut stream, _)) = listener.accept().await else {
                     return;

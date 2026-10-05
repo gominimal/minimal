@@ -126,6 +126,16 @@ pub fn attach_command(
     // always-present `/bin/sh` rather than inherit the user's interactive shell.
     ssh.env("SHELL", "/bin/sh");
     ssh.env("MINIMAL_SESSION_ID", id.to_string());
+    // The CLI's trace context, as the native client sends it on every channel
+    // (`send_trace_context`): without it a `min session exec` / `run` /
+    // `attach` reached the daemon with no parent and its `exec` span began a
+    // trace of its own. With telemetry off the opt-out marker goes instead,
+    // and no `TRACEPARENT`. The daemon reads either from the channel config,
+    // not the session env (neither is in the `AcceptEnv` allowlist and
+    // neither reaches the box).
+    let (trace_var, trace_value) = trace_env();
+    ssh.env(trace_var, trace_value);
+    ssh.args(["-o", &format!("SendEnv={trace_var}")]);
     ssh.args([
         "-o",
         "SendEnv=MINIMAL_SESSION_ID",
@@ -769,6 +779,18 @@ pub fn checked_remote_command(command: &[String]) -> anyhow::Result<Option<Strin
         );
     }
     Ok(wire)
+}
+
+/// The one trace variable the ssh child carries to the daemon: the
+/// process's `TRACEPARENT`, or the opt-out marker when telemetry is off
+/// ([`crate::telemetry_opted_out`]).
+pub(crate) fn trace_env() -> (&'static str, String) {
+    use minimald_rpc::trace::{OTEL_ENV, OTEL_OFF, TRACEPARENT_ENV};
+    if crate::telemetry_opted_out() {
+        (OTEL_ENV, OTEL_OFF.to_owned())
+    } else {
+        (TRACEPARENT_ENV, crate::trace_context().traceparent())
+    }
 }
 
 #[cfg(test)]

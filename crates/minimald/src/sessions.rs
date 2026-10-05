@@ -18,7 +18,7 @@ use std::net::Ipv4Addr;
 use std::sync::Arc;
 #[cfg(target_os = "linux")]
 use std::sync::RwLock;
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, oneshot};
 use tokio_util::sync::CancellationToken;
 
 pub(crate) mod composables;
@@ -196,6 +196,27 @@ enum ManagerMessage {
     Evict(SessionId),
 }
 
+impl ManagerMessage {
+    /// The variant's name, for the manager loop's span.
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::List(..) => "List",
+            Self::GetRecord(..) => "GetRecord",
+            Self::GetSession(..) => "GetSession",
+            Self::GetScreen(..) => "GetScreen",
+            Self::GetComposition(..) => "GetComposition",
+            #[cfg(test)]
+            Self::RunningCount(..) => "RunningCount",
+            Self::CreateSession(..) => "CreateSession",
+            Self::DeleteSession(..) => "DeleteSession",
+            Self::Shutdown(..) => "Shutdown",
+            #[cfg(target_os = "linux")]
+            Self::ResumeActive(..) => "ResumeActive",
+            Self::Evict(..) => "Evict",
+        }
+    }
+}
+
 /// Routes session operations to per-session [`Session`] actors, spawning
 /// them as needed: `CreateSession` allocates a record and spawns the actor
 /// that owns the create flow, `GetSession` brings a known session's actor up
@@ -210,7 +231,7 @@ pub struct Manager {
     /// Shared with every [`ManagerHandle`], so a command the shutdown ends
     /// can tell (see [`ManagerHandle::is_shutting_down`]).
     in_shutdown: CancellationToken,
-    receiver: mpsc::Receiver<ManagerMessage>,
+    receiver: crate::traced::Receiver<ManagerMessage>,
     running: BTreeMap<SessionId, SessionHandle>,
     store: StoreHandle,
 
@@ -286,7 +307,7 @@ impl Manager {
         reap_unresumable_records(&store).await?;
 
         let running = BTreeMap::new();
-        let (sender, receiver) = mpsc::channel(8);
+        let (sender, receiver) = crate::traced::channel(8);
         // Shared so the host-side proxies can resolve `Host:` headers directly;
         // a clone is held by both the actor (which mutates it) and the handle
         // (which hands it to the proxies via `hostnames()`). Whether the
@@ -378,7 +399,7 @@ impl Manager {
                 crate::net::SwitchTransport::HostShuttle { cid, port } => (None, Some((cid, port))),
                 _ => (
                     Some(
-                        tokio::task::spawn_blocking(crate::net::loopback::probe)
+                        crate::traced::spawn_blocking(crate::net::loopback::probe)
                             .await
                             .unwrap_or_else(|join_error| {
                                 tracing::warn!(
@@ -484,7 +505,7 @@ impl Manager {
                 // publish is gone.
                 let book = Arc::clone(&loopback);
                 let registry = Arc::clone(&hostnames);
-                tokio::spawn(async move {
+                crate::traced::spawn(async move {
                     let probe = crate::net::policy::probe_publish_surface(
                         &crate::net::policy::ControlChannel::Vsock { cid, port },
                     )
@@ -579,7 +600,13 @@ impl Manager {
             deny_all_opt_out,
         };
 
-        tokio::spawn(mngr.mainloop());
+        // The manager serves every request for the daemon's life: a root of
+        // its own, so it never pins whatever span its creator ran in. Each
+        // message's span names its sender (see `mainloop`).
+        crate::traced::spawn_detached(
+            tracing::info_span!(parent: None, "sessions.manager"),
+            mngr.mainloop(),
+        );
         Ok(handle)
     }
 }
@@ -945,8 +972,22 @@ impl Manager {
     /// The async task which handles interactions with the
     /// manager.
     async fn mainloop(mut self) {
-        while let Some(msg) = self.receiver.recv().await {
-            self.handle_message(msg).await;
+        while let Some((msg, caller)) = self.receiver.recv().await {
+            // One span per message, opened now and a child of the sender's
+            // ids (see `traced::Receiver::recv`): a message that holds the
+            // loop (an inline await on a busy actor) shows as a long span
+            // here, and every caller queued behind it waits for its end.
+            let span = tracing::info_span!(
+                parent: None,
+                "sessions.manager.message",
+                kind = msg.kind(),
+                queued_behind = self.receiver.len(),
+                trace_id = tracing::field::Empty,
+                span_id = tracing::field::Empty,
+                parent_span_id = tracing::field::Empty,
+            );
+            crate::exec::adopt_trace(&span, caller);
+            tracing::Instrument::instrument(self.handle_message(msg), span).await;
         }
     }
 
@@ -1288,7 +1329,7 @@ impl Manager {
                     // the hang off this loop and onto a task nothing reaps,
                     // leaving the client on an unanswered oneshot.
                     Ok(Some(h)) => {
-                        tokio::spawn(async move {
+                        crate::traced::spawn(async move {
                             r.handle(async move {
                                 Ok(tokio::time::timeout(HOST_PROBE_TIMEOUT, h.get_screen())
                                     .await
@@ -1448,7 +1489,7 @@ impl Manager {
 /// The handle to the session manager.
 #[derive(Debug, Clone)]
 pub struct ManagerHandle {
-    sender: mpsc::Sender<ManagerMessage>,
+    sender: crate::traced::Sender<ManagerMessage>,
     /// The actor's [`Manager::in_shutdown`].
     in_shutdown: CancellationToken,
     /// A clone of the actor's shared PTask hostname registry, handed to the
@@ -1472,7 +1513,7 @@ pub struct ManagerHandle {
 /// why the path back to the manager must be weak.
 #[derive(Debug, Clone)]
 pub struct WeakManagerHandle {
-    sender: mpsc::WeakSender<ManagerMessage>,
+    sender: crate::traced::WeakSender<ManagerMessage>,
     /// Mirrors [`ManagerHandle::in_shutdown`].
     in_shutdown: CancellationToken,
     /// Mirrors [`ManagerHandle::hostnames`]; the registry `Arc` is held so an

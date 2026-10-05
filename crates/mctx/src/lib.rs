@@ -1147,7 +1147,10 @@ impl Context {
                 let rc_clone = rc.clone(); // TODO: This is trash
                 let cache_clone = self.daemon.cache.clone();
                 let semaphore = semaphore.clone();
-                task_set.spawn(async move {
+                // A spawned task starts with no current span: without this every
+                // package fetch (`materialize`) began a trace of its own, cut off
+                // from the activation that needed it.
+                let fetch = async move {
                     let sema = semaphore.acquire().await;
                     let res = rc_clone
                         .materialize(&spec_hash, &cache_clone, &name)
@@ -1166,7 +1169,11 @@ impl Context {
                         });
                     drop(sema);
                     res
-                });
+                };
+                task_set.spawn(tracing::Instrument::instrument(
+                    fetch,
+                    tracing::Span::current(),
+                ));
             }
         }
 

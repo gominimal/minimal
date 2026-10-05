@@ -337,7 +337,10 @@ impl DaemonLogRelease {
         Self(Box::new(release))
     }
 
-    fn run(self) {
+    /// Run the release: the file layer off, the appender flushed and closed.
+    /// Once, at shutdown ([`ServerStateHandle::release_log`]), or by a test of
+    /// the binary's `DaemonLogger` that wants to read what the file holds.
+    pub fn run(self) {
         (self.0)()
     }
 }
@@ -1040,7 +1043,7 @@ impl Server {
                 .await
                 .enqueue_resume_active_sessions()
                 .await;
-            tokio::spawn(async move {
+            crate::traced::spawn(async move {
                 if let Err(error) = resumed.await {
                     tracing::warn!(
                         %error,
@@ -1252,6 +1255,7 @@ async fn build_russh_config(
 /// restart. A finalized (`Active`) session is long-lived and must
 /// survive the connection that created it, so it is left untouched.
 /// Best-effort and never fatal: minimald is pid-1 in the guest.
+#[tracing::instrument(level = "info", name = "sessions.reap_unfinalized", skip_all, fields(count = ids.len()))]
 async fn reap_unfinalized_sessions(state: &ServerStateHandle, ids: Vec<::sessions::SessionId>) {
     if ids.is_empty() {
         return;
@@ -1346,7 +1350,7 @@ async fn start_host_proxies(
     // that port on the host loopback follows the same default-first rule and
     // walks to a host port of its own when the host already holds the
     // default — the bind itself never moves for a publish (NET-059).
-    tokio::spawn(drive_proxy_until_serving(
+    crate::traced::spawn(drive_proxy_until_serving(
         state.clone(),
         HostProxyStartup::Egress {
             bind_base,
@@ -1400,7 +1404,7 @@ async fn start_host_proxies(
         );
     }
     let hook_port = zone_answerer_port.unwrap_or(crate::net::answerer::ANSWERER_PORT);
-    tokio::spawn(crate::net::answerer::acquire(
+    crate::traced::spawn(crate::net::answerer::acquire(
         state.clone(),
         hook_port,
         answerer_status,
@@ -1642,7 +1646,7 @@ impl HostProxyStartup {
             proxied_request_verdict,
         );
         match self {
-            Self::Egress { .. } => tokio::spawn(async move {
+            Self::Egress { .. } => crate::traced::spawn(async move {
                 if let Err(error) = serve(listener, router).await {
                     tracing::error!(%error, "egress proxy accept loop exited");
                 }
@@ -2166,7 +2170,7 @@ pub(crate) async fn drive_proxy_until_serving(
                 // tell. Sent in the background: the report's vsock dial can
                 // take seconds per try, and the drive must record serving
                 // without waiting on it.
-                tokio::spawn(report_proxy_serving(host_port));
+                crate::traced::spawn(report_proxy_serving(host_port));
                 break;
             }
             Some(failure) => {
@@ -2225,7 +2229,7 @@ pub(crate) async fn drive_proxy_until_serving(
                     // ends here and never waits on the report's vsock dial,
                     // which can take seconds per try.
                     proxy.record_unavailable(&state, failure.report).await;
-                    tokio::spawn(report_proxy_port_held(host_port));
+                    crate::traced::spawn(report_proxy_port_held(host_port));
                     return;
                 }
                 // No rung left to walk to, a pinned port, or a transient
@@ -2375,7 +2379,7 @@ pub(crate) async fn drive_answerer_until_serving<T: crate::net::answerer::Zone>(
                         // handle is dropped on purpose — nothing ever aborts
                         // it, because nothing ever rebinds: the walk below
                         // moves the *publication*, never the socket.
-                        drop(tokio::spawn(async move {
+                        drop(crate::traced::spawn(async move {
                             if let Err(error) =
                                 crate::net::answerer::serve(socket, serve_answerer).await
                             {
@@ -2928,7 +2932,7 @@ mod tests {
     ) {
         let sock = dir.path().join("minimald.sock");
         let listener = UnixListener::bind(&sock).unwrap();
-        let run = tokio::spawn(Server::run(config, listener, None));
+        let run = crate::traced::spawn(Server::run(config, listener, None));
         (run, sock)
     }
 
@@ -2954,7 +2958,7 @@ mod tests {
         start_host_proxies(&state, in_microvm, hostname_proxy_port, zone_answerer_port).await;
         let sock = dir.path().join("minimald.sock");
         let listener = UnixListener::bind(&sock).unwrap();
-        let run = tokio::spawn(Server::serve(state.clone(), listener));
+        let run = crate::traced::spawn(Server::serve(state.clone(), listener));
         (state, run, sock)
     }
 
@@ -3202,7 +3206,7 @@ mod tests {
             .unwrap();
         // A compressed schedule: first retry 5 ms after the failure, doubling
         // to a 20 ms cap, so a loop's worth of failures costs milliseconds.
-        let retrier = tokio::spawn(drive_proxy_until_serving(
+        let retrier = crate::traced::spawn(drive_proxy_until_serving(
             state.clone(),
             HostProxyStartup::Egress {
                 bind_base: addr.ip(),
@@ -3288,9 +3292,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     async fn spawn_backend_on(addr: std::net::SocketAddr, body: &'static str) {
         let backend = TcpListener::bind(addr).await.unwrap();
-        tokio::spawn(async move {
+        crate::traced::spawn(async move {
             while let Ok((mut sock, _)) = backend.accept().await {
-                tokio::spawn(async move {
+                crate::traced::spawn(async move {
                     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
                     let mut scratch = [0u8; 1024];
@@ -3398,7 +3402,7 @@ mod tests {
         // host-loopback gate, record the bound port. The compressed backoff
         // keeps a failed attempt cheap should the box be noisy.
         let retry = RetryBackoff::new(Duration::from_millis(10), Duration::from_millis(100));
-        tokio::spawn(drive_proxy_until_serving(
+        crate::traced::spawn(drive_proxy_until_serving(
             state.clone(),
             HostProxyStartup::Egress {
                 bind_base: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
@@ -3440,7 +3444,7 @@ mod tests {
         let state = ServerStateHandle::new(test_config(&dir), None)
             .await
             .unwrap();
-        let drive = tokio::spawn(drive_proxy_until_serving(
+        let drive = crate::traced::spawn(drive_proxy_until_serving(
             state.clone(),
             HostProxyStartup::Egress {
                 bind_base: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
@@ -3658,7 +3662,7 @@ mod tests {
         let state = ServerStateHandle::new(test_config(&dir), None)
             .await
             .unwrap();
-        let drive = tokio::spawn(drive_proxy_until_serving(
+        let drive = crate::traced::spawn(drive_proxy_until_serving(
             state.clone(),
             HostProxyStartup::Egress {
                 bind_base: std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED),
@@ -4018,7 +4022,7 @@ mod tests {
             switch.lock().await.hostname_proxy_unsettled(),
             "an OS-picked port's bind is pending, not absent"
         );
-        let waiter = tokio::spawn({
+        let waiter = crate::traced::spawn({
             let switch = Arc::clone(&switch);
             async move { crate::net::hostname_proxy_serving_port(&switch, Some(BOX_LEASE)).await }
         });
@@ -4093,7 +4097,7 @@ mod tests {
         let state = ServerStateHandle::new(test_config(&dir), None)
             .await
             .unwrap();
-        let retrier = tokio::spawn(drive_proxy_until_serving(
+        let retrier = crate::traced::spawn(drive_proxy_until_serving(
             state.clone(),
             HostProxyStartup::Egress {
                 bind_base: IpAddr::V4(Ipv4Addr::LOCALHOST),
@@ -4166,7 +4170,7 @@ mod tests {
         let state = ServerStateHandle::new(test_config(&dir), None)
             .await
             .unwrap();
-        let retrier = tokio::spawn(drive_proxy_until_serving(
+        let retrier = crate::traced::spawn(drive_proxy_until_serving(
             state.clone(),
             HostProxyStartup::Egress {
                 // `192.0.2.1` is TEST-NET-1: no interface holds it, so every
@@ -4259,7 +4263,7 @@ mod tests {
         let state = ServerStateHandle::new(test_config(&dir), None)
             .await
             .unwrap();
-        let retrier = tokio::spawn(drive_proxy_until_serving(
+        let retrier = crate::traced::spawn(drive_proxy_until_serving(
             state.clone(),
             HostProxyStartup::Egress {
                 bind_base: IpAddr::V4(Ipv4Addr::LOCALHOST),
@@ -4465,7 +4469,7 @@ mod tests {
         let state = ServerStateHandle::new(test_config(&dir), None)
             .await
             .unwrap();
-        let drive = tokio::spawn(drive_proxy_until_serving(
+        let drive = crate::traced::spawn(drive_proxy_until_serving(
             state.clone(),
             HostProxyStartup::Egress {
                 bind_base: IpAddr::V4(Ipv4Addr::LOCALHOST),
@@ -4631,7 +4635,7 @@ mod tests {
         let state = ServerStateHandle::new(test_config(&dir), None)
             .await
             .unwrap();
-        tokio::spawn(drive_proxy_until_serving(
+        crate::traced::spawn(drive_proxy_until_serving(
             state.clone(),
             HostProxyStartup::Egress {
                 bind_base: IpAddr::V4(Ipv4Addr::LOCALHOST),
@@ -4750,9 +4754,9 @@ mod tests {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
         let listener = UnixListener::bind(&path).unwrap();
-        tokio::spawn(async move {
+        crate::traced::spawn(async move {
             while let Ok((mut sock, _)) = listener.accept().await {
-                tokio::spawn(async move {
+                crate::traced::spawn(async move {
                     let mut scratch = [0u8; 1024];
                     let _ = sock.read(&mut scratch).await;
                     let response = format!(
@@ -5420,7 +5424,7 @@ mod tests {
 
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
         let answerer = ZoneAnswerer::new(hostnames, AnswerScope::Native);
-        tokio::spawn(drive_answerer_until_serving(
+        crate::traced::spawn(drive_answerer_until_serving(
             state.clone(),
             answerer,
             addr.ip(),
@@ -5516,7 +5520,7 @@ mod tests {
             .unwrap();
         let hostnames = state.sessions_manager().await.hostnames();
         let answerer = ZoneAnswerer::new(hostnames, AnswerScope::Native);
-        tokio::spawn(drive_answerer_until_serving(
+        crate::traced::spawn(drive_answerer_until_serving(
             state.clone(),
             answerer,
             IpAddr::V4(Ipv4Addr::LOCALHOST),

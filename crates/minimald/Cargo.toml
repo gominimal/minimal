@@ -109,6 +109,12 @@ proptest.workspace = true
 # state; tests that hold or read them (NET-079, `net/classifier.rs`) mark
 # themselves serial so no two of them race one set of listeners.
 serial_test.workspace = true
+# An in-memory span exporter under the harness daemon's subscriber, so a
+# test can see what a request exports (`exec.rs`: an opted-out request
+# exports nothing) without a collector or the process-wide tracer.
+opentelemetry.workspace = true
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
+tracing-opentelemetry.workspace = true
 
 # The guest (initramfs pid-1) boot path is Linux-only.
 [target.'cfg(target_os = "linux")'.dependencies]

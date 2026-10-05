@@ -311,6 +311,43 @@ fn error_chain(err: &dyn std::error::Error) -> String {
     })
 }
 
+/// The `guest.ready` span: the microVM guest's READY beacon, a child of the
+/// `TRACEPARENT` minvmd put on the kernel command line (which the kernel
+/// hands `/init` as its environment) when telemetry is on. Its ids are
+/// recorded for the file log the way every sibling span's are
+/// (`exec::adopt_trace`): the exported span's when the export records it,
+/// otherwise a child of the host's context, otherwise fresh ones.
+fn guest_ready_span() -> tracing::Span {
+    use minimald_rpc::trace::{TRACEPARENT_ENV, TraceContext};
+    let span = tracing::info_span!(
+        "guest.ready",
+        trace_id = tracing::field::Empty,
+        span_id = tracing::field::Empty,
+        parent_span_id = tracing::field::Empty,
+    );
+    let parent = mlog::otel::exporting()
+        .then(|| std::env::var(TRACEPARENT_ENV).ok())
+        .flatten()
+        .and_then(|v| TraceContext::parse_traceparent(&v));
+    let ctx = mlog::otel::align(&span, parent.as_ref().map(TraceContext::parts))
+        .map(|(t, s, f)| TraceContext::from_parts(t, s, f))
+        .unwrap_or_else(|| {
+            parent
+                .as_ref()
+                .map(TraceContext::child)
+                .unwrap_or_else(TraceContext::mint)
+        });
+    span.record("trace_id", tracing::field::display(ctx.trace_id_hex()));
+    span.record("span_id", tracing::field::display(ctx.span_id_hex()));
+    if let Some(parent) = &parent {
+        span.record(
+            "parent_span_id",
+            tracing::field::display(parent.span_id_hex()),
+        );
+    }
+    span
+}
+
 /// Open (creating if absent) a lock file; only its fd matters, for flock.
 fn open_lock_file(path: impl AsRef<std::path::Path>) -> std::io::Result<std::fs::File> {
     std::fs::OpenOptions::new()
@@ -355,7 +392,21 @@ fn main() -> Result<(), MainError> {
         .enable_all()
         .build()
         .unwrap();
-    let result = runtime.block_on(async_main());
+    // The microVM's own egress lives outside the server runtime, so the
+    // final telemetry flush below still has a network; see [`GuestEgress`].
+    let mut egress = GuestEgress::new(is_minimal_microvm());
+    let result = runtime.block_on(async_main(&mut egress));
+
+    // Drop the tasks still running when `async_main` returns (the connection
+    // that sent `Shutdown`, a session reaper) before the final telemetry
+    // flush: their spans end as they are dropped, and must reach the exporter,
+    // or every span they parented is an orphan in its trace (the last stray
+    // `sessions.manager.message` roots: `Shutdown` and the reaper's
+    // `GetRecord`). Bounded, so a stuck task cannot hold the exit.
+    runtime.shutdown_timeout(std::time::Duration::from_secs(2));
+    mlog::otel::shutdown(std::time::Duration::from_secs(5));
+    // Only now, with the flush done (or given up on), take the egress down.
+    egress.tear_down();
 
     // As the microVM's daemon we must not return: exiting init panics the
     // guest kernel and wedges the VM (#730), and when the daemon runs as pid
@@ -474,7 +525,88 @@ fn lock_held(path: &std::path::Path) -> std::io::Result<bool> {
     }
 }
 
-async fn async_main() -> Result<(), MainError> {
+/// The microVM daemon's own egress: the root-netns tap relayed to the host
+/// gvproxy over the vsock shuttle ([`minimald::guest::bring_up_root_egress`]).
+///
+/// `main` owns it, not the server future, and its relay runs on a small
+/// runtime of its own. `main` shuts the server runtime down before the
+/// bounded telemetry flush (so the spans of the tasks it drops end and are
+/// exported), and a relay held by the server future, or running on that
+/// runtime, would be torn down with it: the guest's final flush would then
+/// have no network. [`GuestEgress::tear_down`] runs after the flush.
+struct GuestEgress {
+    /// The relay's runtime: `None` off the microVM, and the build error when
+    /// it could not be built. Either way the relay then runs on the server
+    /// runtime, as it did before it had one of its own.
+    runtime: Option<std::io::Result<tokio::runtime::Runtime>>,
+    /// The relay, once [`GuestEgress::bring_up`] succeeded. Dropping it
+    /// aborts the relay's tasks.
+    relay: Option<minimald::net::switch::SwitchRelay>,
+}
+
+impl GuestEgress {
+    /// Prepares the egress for the microVM's init (`in_microvm`) by building
+    /// the relay's runtime. Brings nothing up yet: `async_main` does, once
+    /// the guest is ready.
+    fn new(in_microvm: bool) -> Self {
+        let runtime = in_microvm.then(|| {
+            Builder::new_multi_thread()
+                .worker_threads(1)
+                .thread_name("minimald-egress")
+                .enable_all()
+                .build()
+        });
+        Self {
+            runtime,
+            relay: None,
+        }
+    }
+
+    /// Brings the egress up and holds it until [`GuestEgress::tear_down`].
+    /// Best effort: if the host gvproxy is absent the daemon serves without
+    /// network, the prior behaviour.
+    async fn bring_up(&mut self) {
+        use minimald::guest::bring_up_root_egress;
+
+        let relay = match &self.runtime {
+            Some(Ok(runtime)) => match runtime
+                .spawn(tracing::Instrument::in_current_span(bring_up_root_egress()))
+                .await
+            {
+                Ok(relay) => relay,
+                Err(join) => Err(std::io::Error::other(join)),
+            },
+            Some(Err(e)) => {
+                tracing::warn!(
+                    error = %e,
+                    "no runtime of its own for the guest root egress; \
+                     the final telemetry flush will go without network"
+                );
+                bring_up_root_egress().await
+            }
+            None => bring_up_root_egress().await,
+        };
+        match relay {
+            Ok(relay) => self.relay = Some(relay),
+            Err(e) => {
+                tracing::warn!(error = %e, "guest root egress unavailable; serving without network");
+            }
+        }
+    }
+
+    /// Takes the egress down: aborts the relay's tasks, then drops its
+    /// runtime without waiting (the relay keeps no state worth draining).
+    /// Call outside any runtime, after the final telemetry flush.
+    fn tear_down(self) {
+        let Self { runtime, relay } = self;
+        drop(relay);
+        if let Some(Ok(runtime)) = runtime {
+            runtime.shutdown_background();
+        }
+    }
+}
+
+async fn async_main(egress: &mut GuestEgress) -> Result<(), MainError> {
     // Use hardcoded configuration if we are the init process (`argv[0] == "/init"`), which
     // would indicate we are operating in a single-purpose micro-vm.
     //
@@ -889,6 +1021,19 @@ async fn async_main() -> Result<(), MainError> {
         return Err(MainError::IO(e, "creating minimal dir"));
     }
 
+    // The telemetry spool follows the state dir now that it is final
+    // (`<state>/telemetry/spool`): the microVM's pid-1 had no home when
+    // telemetry initialised, so its spool was deferred until the state volume
+    // mounted, and a `--minimal-state-dir` daemon keeps it under that dir. A
+    // no-op for the native default, which already is this directory.
+    mlog::otel::relocate_spool(
+        cli.minimal_state_dir()
+            .as_utf8_path()
+            .as_std_path()
+            .join("telemetry")
+            .join("spool"),
+    );
+
     // The log directory is now final under `<state>/logs` — the native
     // daemon's from the start, the microVM's now that the state volume is
     // mounted and state relocated onto it, where `min bug`'s guest collector
@@ -1101,7 +1246,7 @@ async fn async_main() -> Result<(), MainError> {
 
     // Track the host's wall clock, when configured.
     if let Some(port) = cli.listen_args().unwrap().timekeep_listener_port {
-        tokio::spawn(async move {
+        minimald::traced::spawn(async move {
             match guest::run_timekeep_listener(port).await {
                 // `Infallible`: the listener only ever returns by failing.
                 Ok(never) => match never {},
@@ -1179,22 +1324,22 @@ async fn async_main() -> Result<(), MainError> {
 
         tracing::info!("Started listening on vsock:{port_num}");
 
-        if let Err(e) = guest::emit_ready_marker(host_private_key.public_key()).await {
+        // `guest.ready`: the beacon to the host, a child of the host's
+        // `vm.boot` when minvmd passed its `TRACEPARENT` on the boot line
+        // (the guest's only environment; telemetry on only).
+        if let Err(e) = tracing::Instrument::instrument(
+            guest::emit_ready_marker(host_private_key.public_key()),
+            guest_ready_span(),
+        )
+        .await
+        {
             tracing::warn!(error = %e, "initramfs: READY marker failed");
         }
 
         // Bring up the daemon's own egress: a primary tap in the root netns
-        // attached to the host gvproxy over the vsock shuttle. Held for the
-        // server's lifetime (dropping `_egress` tears the relay down). Best
-        // effort — if the host gvproxy is absent the daemon serves without
-        // network, the prior behaviour.
-        let _egress = match guest::bring_up_root_egress().await {
-            Ok(relay) => Some(relay),
-            Err(e) => {
-                tracing::warn!(error = %e, "guest root egress unavailable; serving without network");
-                None
-            }
-        };
+        // attached to the host gvproxy over the vsock shuttle. Held by `main`
+        // past the server's lifetime, through the final telemetry flush.
+        egress.bring_up().await;
 
         Server::run(config, listener, log_release)
             .await
@@ -1361,5 +1506,24 @@ mod tests {
             sock.as_str(),
             "/tmp/minimald-test-state/providers/local-minimald3/ssh.sock"
         );
+    }
+
+    /// Off the microVM there is no relay runtime to build, and tearing the
+    /// egress down is a no-op.
+    #[test]
+    fn a_native_daemon_builds_no_egress_runtime() {
+        let egress = GuestEgress::new(false);
+        assert!(egress.runtime.is_none());
+        assert!(egress.relay.is_none());
+        egress.tear_down();
+    }
+
+    /// The microVM's relay runtime is built up front and taken down outside
+    /// any runtime, as `main` does after its final flush, without blocking.
+    #[test]
+    fn the_microvm_egress_runtime_is_built_up_front_and_torn_down_cleanly() {
+        let egress = GuestEgress::new(true);
+        assert!(matches!(egress.runtime, Some(Ok(_))));
+        egress.tear_down();
     }
 }

@@ -461,7 +461,7 @@ fn build_handle(
         "starting WireGuard mesh peer"
     );
 
-    let pump = tokio::spawn(pump(
+    let pump = crate::traced::spawn(pump(
         socket,
         local_addr,
         peers,

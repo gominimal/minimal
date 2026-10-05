@@ -87,6 +87,156 @@ pub fn captured_log() -> CaptureWriter {
         .clone()
 }
 
+/// One span a [`SpanLog`] saw.
+#[derive(Clone, Debug)]
+pub struct LoggedSpan {
+    pub name: &'static str,
+    /// Every field value, at creation or recorded later (`Span::record`):
+    /// a `&str` as is, anything else in its `Debug` form.
+    pub fields: std::collections::BTreeMap<String, String>,
+    /// The index (in [`SpanLog::spans`]) of the span's `tracing` parent.
+    pub parent: Option<usize>,
+    pub closed: bool,
+}
+
+impl LoggedSpan {
+    /// The value of `field`, if the span has one.
+    pub fn field(&self, field: &str) -> Option<&str> {
+        self.fields.get(field).map(String::as_str)
+    }
+}
+
+/// A `tracing` layer that keeps every span: its name, its fields, its
+/// parent and whether it has closed, so a test can assert how the daemon's
+/// spans nest and which trace ids they carry (`trace_id`, `span_id`,
+/// `parent_span_id`, recorded by `exec::adopt_trace` whether or not export
+/// is on). Install it with `tracing::subscriber::set_default` on a
+/// current-thread runtime: the daemon's tasks then run on the test's thread
+/// and report to it, and no global subscriber is involved. In a test binary
+/// with no global subscriber, a thread-local one can miss callsites another
+/// libtest thread registered first; there, install it process-wide and pick
+/// a test's spans out by trace id (`crates/minimal/tests/otel_cli.rs`).
+#[derive(Clone, Default)]
+pub struct SpanLog(Arc<Mutex<SpanLogInner>>);
+
+#[derive(Default)]
+struct SpanLogInner {
+    spans: Vec<LoggedSpan>,
+    /// The open span each live `tracing` id stands for (ids are reused
+    /// once a span closes).
+    open: std::collections::HashMap<u64, usize>,
+}
+
+impl SpanLog {
+    /// The log, whether or not a panicking test thread poisoned it.
+    fn inner(&self) -> std::sync::MutexGuard<'_, SpanLogInner> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Every span seen so far, in creation order.
+    pub fn spans(&self) -> Vec<LoggedSpan> {
+        self.inner().spans.clone()
+    }
+
+    /// The spans named `name` whose `field` is `value`.
+    pub fn find(&self, name: &str, field: &str, value: &str) -> Vec<LoggedSpan> {
+        self.spans()
+            .into_iter()
+            .filter(|s| s.name == name && s.field(field) == Some(value))
+            .collect()
+    }
+
+    /// The one span named `name` whose `field` is `value`; panics, listing
+    /// every span, unless there is exactly one.
+    #[expect(
+        clippy::unwrap_used,
+        reason = "test scaffolding: the assert above leaves exactly one"
+    )]
+    pub fn one(&self, name: &str, field: &str, value: &str) -> LoggedSpan {
+        let found = self.find(name, field, value);
+        assert_eq!(
+            found.len(),
+            1,
+            "{name}{{{field}={value}}}: {found:?} among {:#?}",
+            self.spans()
+        );
+        found.into_iter().next().unwrap()
+    }
+
+    /// The `tracing` parent of `span`, if it has one.
+    pub fn parent_of(&self, span: &LoggedSpan) -> Option<LoggedSpan> {
+        let spans = self.spans();
+        span.parent.and_then(|i| spans.get(i).cloned())
+    }
+}
+
+/// Collects field values for [`SpanLog`].
+struct FieldVisitor<'a>(&'a mut std::collections::BTreeMap<String, String>);
+
+impl tracing::field::Visit for FieldVisitor<'_> {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        self.0.insert(field.name().to_owned(), value.to_owned());
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.0.insert(field.name().to_owned(), format!("{value:?}"));
+    }
+}
+
+impl<S> tracing_subscriber::Layer<S> for SpanLog
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    fn on_new_span(
+        &self,
+        attrs: &tracing::span::Attributes<'_>,
+        id: &tracing::span::Id,
+        cx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let parent_id = cx
+            .span(id)
+            .and_then(|s| s.parent())
+            .map(|p| p.id().into_u64());
+        let mut fields = std::collections::BTreeMap::new();
+        attrs.record(&mut FieldVisitor(&mut fields));
+        let mut log = self.inner();
+        let parent = parent_id.and_then(|p| log.open.get(&p).copied());
+        log.spans.push(LoggedSpan {
+            name: attrs.metadata().name(),
+            fields,
+            parent,
+            closed: false,
+        });
+        let index = log.spans.len() - 1;
+        log.open.insert(id.into_u64(), index);
+    }
+
+    fn on_record(
+        &self,
+        id: &tracing::span::Id,
+        values: &tracing::span::Record<'_>,
+        _: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let mut log = self.inner();
+        if let Some(i) = log.open.get(&id.into_u64()).copied()
+            && let Some(span) = log.spans.get_mut(i)
+        {
+            values.record(&mut FieldVisitor(&mut span.fields));
+        }
+    }
+
+    fn on_close(&self, id: tracing::span::Id, _: tracing_subscriber::layer::Context<'_, S>) {
+        let mut log = self.inner();
+        if let Some(i) = log.open.remove(&id.into_u64())
+            && let Some(span) = log.spans.get_mut(i)
+        {
+            span.closed = true;
+        }
+    }
+}
+
 /// A minimald instance running against a tempdir, ready to accept
 /// in-memory ssh connections.
 pub struct TestServer {
@@ -179,7 +329,7 @@ impl TestServer {
                 Connection::from_stream(server_side, russh_config, state, true)
                     .await
                     .expect("handshake in test harness");
-            tokio::spawn(session_fut);
+            crate::traced::spawn(session_fut);
         };
 
         let client_config = Arc::new(russh::client::Config::default());
@@ -202,11 +352,11 @@ impl TestServer {
         let listener = UnixListener::bind(sock).unwrap();
         let russh_config = self.russh_config.clone();
         let state = self.state.clone();
-        tokio::spawn(async move {
+        crate::traced::spawn(async move {
             while let Ok((socket, _)) = listener.accept().await {
                 let russh_config = russh_config.clone();
                 let state = state.clone();
-                tokio::spawn(async move {
+                crate::traced::spawn(async move {
                     let (_conn, session_fut) =
                         match Connection::from_stream(socket, russh_config, state, true).await {
                             Ok(conn) => conn,
@@ -325,7 +475,24 @@ impl TestClient {
     /// Panics on any transport or codec failure — appropriate for unit
     /// tests, which want loud failure rather than recovery.
     pub async fn call<R: OneshotSshRpc>(&mut self, req: &R::Request<'_>) -> R::Response {
+        self.call_with_env::<R>(&[], req).await
+    }
+
+    /// [`Self::call`], with `env` set on the channel first (as `min` sets
+    /// `TRACEPARENT`).
+    #[expect(
+        clippy::unwrap_used,
+        reason = "test scaffolding: a transport failure must fail the test loudly, as in `call`"
+    )]
+    pub async fn call_with_env<R: OneshotSshRpc>(
+        &mut self,
+        env: &[(&str, &str)],
+        req: &R::Request<'_>,
+    ) -> R::Response {
         let mut channel = self.handle.channel_open_session().await.unwrap();
+        for (name, value) in env {
+            channel.set_env(true, *name, *value).await.unwrap();
+        }
         channel.request_subsystem(true, R::NAME).await.unwrap();
 
         let body = serde_json_lenient::to_vec(req).expect("request serializes");

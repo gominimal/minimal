@@ -32,7 +32,10 @@ use russh_sftp::server::StatusReply;
 use sessions::SessionId;
 use tokio::fs::{self, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-use tokio::task::spawn;
+
+// Every task this module spawns carries the caller's span (TEL-022): the
+// clippy `disallowed-methods` for the crate names tokio's own spawn.
+use crate::traced::spawn;
 
 use crate::connection::{ConnectionError, ConnectionHandle};
 use crate::server::ServerStateHandle;

@@ -285,7 +285,7 @@ mod tests {
 
             // A child waited on blockingly by pid, as hakoniwa's
             // `Child::wait()` does for the session host.
-            let status = tokio::task::spawn_blocking(|| {
+            let status = crate::traced::spawn_blocking(|| {
                 std::process::Command::new("sh")
                     .args(["-c", "sleep 0.3; exit 5"])
                     .status()

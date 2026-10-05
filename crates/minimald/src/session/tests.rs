@@ -37,7 +37,7 @@ async fn a_probe_of_a_wedged_host_ends_instead_of_stranding_its_task() {
     let probes: Vec<_> = (0..3 * HOST_MAILBOX_CAPACITY)
         .map(|_| {
             let host = host.clone();
-            tokio::spawn(async move { super::probe_host(host.get_attrs()).await })
+            crate::traced::spawn(async move { super::probe_host(host.get_attrs()).await })
         })
         .collect();
 
@@ -83,7 +83,7 @@ async fn stopping_a_wedged_host_detaches_its_loop_instead_of_parking() {
 
     // A loop that accepted the kill but never resolves — models the
     // mainloop parked mid-`step()`.
-    let mut task = tokio::spawn(std::future::pending::<Result<i32, std::io::Error>>());
+    let mut task = crate::traced::spawn(std::future::pending::<Result<i32, std::io::Error>>());
 
     // Far past HOST_PROBE_TIMEOUT: under the paused clock the join bound is
     // the deadline that returns this call. Reaching GIVE_UP would mean the
@@ -2417,7 +2417,7 @@ async fn spawn_run_server(
 ) {
     let sock = dir.path().join("minimald.sock");
     let listener = tokio::net::UnixListener::bind(&sock).unwrap();
-    let run = tokio::spawn(crate::server::Server::run(
+    let run = crate::traced::spawn(crate::server::Server::run(
         crate::server::test_config(dir.path()),
         listener,
         None,
@@ -4826,7 +4826,8 @@ async fn a_handed_box_pending_at_finalize_publishes_the_interim_when_the_verdict
     // inside the registration's bounded wait — the shape a finalize meets
     // when the deferred probe answers while it is asking.
     let mut finalize_client = server.connect().await;
-    let finalize = tokio::spawn(async move { finalize_session(&mut finalize_client, web).await });
+    let finalize =
+        crate::traced::spawn(async move { finalize_session(&mut finalize_client, web).await });
     await_verdict_waiter(&manager).await;
     manager.land_range_verdict(crate::net::dns::RangeVerdict::Absent);
     finalize.await.expect("the finalize's task runs to its end");
@@ -5252,10 +5253,12 @@ async fn a_destroy_queued_behind_a_waiting_finalize_runs_after_the_promotion() {
     .await;
 
     let mut finalize_client = server.connect().await;
-    let finalize = tokio::spawn(async move { finalize_session(&mut finalize_client, id).await });
+    let finalize =
+        crate::traced::spawn(async move { finalize_session(&mut finalize_client, id).await });
     await_verdict_waiter(&manager).await;
     let mut destroy_client = server.connect().await;
-    let destroy = tokio::spawn(async move { destroy_session(&mut destroy_client, id).await });
+    let destroy =
+        crate::traced::spawn(async move { destroy_session(&mut destroy_client, id).await });
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(
         !destroy.is_finished(),
@@ -5533,7 +5536,7 @@ async fn a_handed_reserved_address_waits_for_the_verdict_before_it_publishes() {
         .await;
         let mut finalize_client = server.connect().await;
         let finalize =
-            tokio::spawn(async move { finalize_session(&mut finalize_client, web).await });
+            crate::traced::spawn(async move { finalize_session(&mut finalize_client, web).await });
         await_verdict_waiter(&manager).await;
         manager.land_range_verdict(crate::net::dns::RangeVerdict::Present);
         finalize.await.expect("the finalize's task runs to its end");
@@ -5983,7 +5986,8 @@ async fn register_hostname_promotes_an_interim_to_its_vouched_hand() {
     // The finalize's registration parks on the pending verdict — past its
     // read of the registry, ahead of its publish.
     let mut finalize_client = server.connect().await;
-    let finalize = tokio::spawn(async move { finalize_session(&mut finalize_client, web).await });
+    let finalize =
+        crate::traced::spawn(async move { finalize_session(&mut finalize_client, web).await });
     await_verdict_waiter(&manager).await;
 
     // The registry's write lock, held across both landings in one
@@ -6305,7 +6309,7 @@ pub(crate) async fn scripted_forwarder(
     let listener = tokio::net::UnixListener::bind(&sock).expect("bind the control socket");
     let served = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let recorded = served.clone();
-    let server = tokio::spawn(async move {
+    let server = crate::traced::spawn(async move {
         let mut script: std::collections::VecDeque<u16> = script.into();
         // The last status answers anything past the script, so a stand-in
         // scripted for two requests still answers a third.
@@ -6388,7 +6392,7 @@ async fn gated_forwarder(
     let served = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let recorded = served.clone();
     let (gate_tx, gate_rx) = tokio::sync::watch::channel(0u64);
-    let server = tokio::spawn(async move {
+    let server = crate::traced::spawn(async move {
         let mut script = script;
         // Requests are read and recorded one at a time, in arrival order,
         // and each hold is numbered in that order; the answers are sent from
@@ -6419,7 +6423,7 @@ async fn gated_forwarder(
                 }
             };
             let mut gate_rx = gate_rx.clone();
-            tokio::spawn(async move {
+            crate::traced::spawn(async move {
                 if let Some(before) = hold {
                     // A dropped gate (the test gone) answers rather than
                     // parks the answer forever.
@@ -6853,7 +6857,7 @@ pub(crate) async fn fake_report_door(
     let (requests_tx, requests) = tokio::sync::mpsc::unbounded_channel();
     let (replies, mut replies_rx) =
         tokio::sync::mpsc::unbounded_channel::<minimald_rpc::BoxControlReply>();
-    let door_task = tokio::spawn(async move {
+    let door_task = crate::traced::spawn(async move {
         // One connection at a time, the real door's own posture: the door
         // serves serially and holds each connection open until the
         // reporter, which has its reply, closes from its side.
@@ -6951,7 +6955,7 @@ async fn vm_backed_expose_reports_admission_to_host() {
     // egress gate admits a bind only for a port the grant holds — nor is it
     // the caller's word until the door answers.
     let reporting = handle.clone();
-    let expose = tokio::spawn(async move { reporting.expose_dynamic(3000).await });
+    let expose = crate::traced::spawn(async move { reporting.expose_dynamic(3000).await });
     let request = tokio::time::timeout(Duration::from_secs(5), reports.recv())
         .await
         .expect("an expose decided allow reaches the VM host daemon's report door")
@@ -7068,7 +7072,7 @@ async fn refused_admission_report_leaves_no_partial_mapping() {
     // The grant refuses the report, and the refusal is the caller's answer:
     // the publish failed, carrying the grant's own reason.
     let reporting = handle.clone();
-    let expose = tokio::spawn(async move { reporting.expose_dynamic(3000).await });
+    let expose = crate::traced::spawn(async move { reporting.expose_dynamic(3000).await });
     let request = tokio::time::timeout(Duration::from_secs(5), reports.recv())
         .await
         .expect("the publish reaches the VM host daemon's report door")
@@ -7125,7 +7129,7 @@ async fn refused_admission_report_leaves_no_partial_mapping() {
     // unwound is owed again, so a second ask reaches the door afresh —
     // never the `AlreadyPublished` a leaked reservation would answer with.
     let reporting = handle.clone();
-    let expose = tokio::spawn(async move { reporting.expose_dynamic(3000).await });
+    let expose = crate::traced::spawn(async move { reporting.expose_dynamic(3000).await });
     let request = tokio::time::timeout(Duration::from_secs(5), reports.recv())
         .await
         .expect("the second ask reaches the VM host daemon's report door")
@@ -9457,7 +9461,7 @@ async fn concurrent_expose_and_listen_publish_bind_once() {
     // a port the expose's reservation already holds.
     let exposing = {
         let handle = handle.clone();
-        tokio::spawn(async move { handle.expose_dynamic(a_port).await })
+        crate::traced::spawn(async move { handle.expose_dynamic(a_port).await })
     };
     soon(|| served_naming(&served, loopback, a_port).len() == 1).await;
     let a_listener = std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, a_port))
@@ -9702,7 +9706,7 @@ async fn cancelled_publish_releases_its_reservation() {
     // expose path's own in-flight bind, aborted before it could record.
     let holder = {
         let publications = publications.clone();
-        tokio::spawn(async move {
+        crate::traced::spawn(async move {
             let _reservation = publications
                 .reserve(port, crate::net::listeners::PublicationOwner::Expose)
                 .expect("nothing holds the port yet");
@@ -9827,7 +9831,7 @@ async fn revocation_during_in_flight_bind_leaves_no_forward() {
     // is revoked under it, and the bind then stands.
     let exposing = {
         let handle = handle.clone();
-        tokio::spawn(async move { handle.expose_dynamic(a_port).await })
+        crate::traced::spawn(async move { handle.expose_dynamic(a_port).await })
     };
     soon(|| served_naming(&served, loopback, a_port).len() == 1).await;
     publications.revoke_all();
@@ -10231,7 +10235,7 @@ async fn bind_failure_withdraws_the_admitted_report() {
     } = vm_backed_allow_box("vmbindfail", 23, 500).await;
 
     let reporting = handle.clone();
-    let expose = tokio::spawn(async move { reporting.expose_dynamic(3000).await });
+    let expose = crate::traced::spawn(async move { reporting.expose_dynamic(3000).await });
     assert!(
         matches!(
             next_report(&mut reports).await,
@@ -10308,7 +10312,7 @@ async fn stop_unexposes_before_withdrawing_the_report() {
     } = vm_backed_allow_box("vmstoporder", 24, 200).await;
 
     let reporting = handle.clone();
-    let expose = tokio::spawn(async move { reporting.expose_dynamic(3000).await });
+    let expose = crate::traced::spawn(async move { reporting.expose_dynamic(3000).await });
     assert!(matches!(
         next_report(&mut reports).await,
         minimald_rpc::BoxControlRequest::AdmitPort(_)
@@ -10325,7 +10329,7 @@ async fn stop_unexposes_before_withdrawing_the_report() {
         .expect("the admitted port publishes");
 
     let stopping = handle.clone();
-    let stop = tokio::spawn(async move { stopping.stop().await });
+    let stop = crate::traced::spawn(async move { stopping.stop().await });
     let withdrawal = next_report(&mut reports).await;
     assert!(
         matches!(
