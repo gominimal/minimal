@@ -40,7 +40,7 @@
 use std::io::IsTerminal as _;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
@@ -84,9 +84,12 @@ const LIVE_OUTPUT_HIGH_WATER: usize = 4 * 1024 * 1024;
 // ---------------------------------------------------------------------------
 // Signals
 //
-// The handlers do the only thing that is async-signal-safe and enough:
-// raise a flag. The pump runs without SA_RESTART, so poll(2) returns EINTR
-// and the loop notices the flags on its next turn. No locks, no allocation.
+// The handlers do only what is async-signal-safe: raise a flag, and kick the
+// pump's ctl pipe. The pump runs without SA_RESTART, so a signal that
+// interrupts its own poll(2) surfaces as EINTR; one delivered to any other
+// thread of the process (a multi-threaded CLI has several) surfaces as the
+// kick byte. Either way the pump services the flags on its next turn, which
+// is the same turn. No locks, no allocation.
 // ---------------------------------------------------------------------------
 
 static SIGWINCH_SEEN: AtomicBool = AtomicBool::new(false);
@@ -94,20 +97,45 @@ static SIGINT_SEEN: AtomicBool = AtomicBool::new(false);
 static SIGTERM_SEEN: AtomicBool = AtomicBool::new(false);
 static SIGHUP_SEEN: AtomicBool = AtomicBool::new(false);
 
+/// The relay's ctl-pipe write end, published for the signal handlers as a
+/// raw fd: a signal is out-of-band to poll(2) — the kernel may deliver it to
+/// any thread, and one that lands off the pump never interrupts the pump's
+/// wait — so each handler also writes one byte into the pipe, making the
+/// signal a poll event the pump services at once (the self-pipe trick).
+/// Published only while a relay runs, and cleared before its fd is ever
+/// closed, so a handler can never touch a stale descriptor number.
+static SIGNAL_KICK: AtomicI32 = AtomicI32::new(-1);
+
+/// Best-effort one-byte kick to the pump: a failed write (no relay running)
+/// only means the flags wait for a pump that is gone too.
+fn kick_pump() {
+    let fd = SIGNAL_KICK.load(Ordering::Acquire);
+    if fd >= 0 {
+        let byte = 1u8;
+        // SAFETY: write(2) is async-signal-safe, and the fd is valid for as
+        // long as it is published (see `SIGNAL_KICK`).
+        let _ = unsafe { libc::write(fd, &byte as *const u8 as *const libc::c_void, 1) };
+    }
+}
+
 extern "C" fn on_sigwinch(_: libc::c_int) {
     SIGWINCH_SEEN.store(true, Ordering::Release);
+    kick_pump();
 }
 
 extern "C" fn on_sigint(_: libc::c_int) {
     SIGINT_SEEN.store(true, Ordering::Release);
+    kick_pump();
 }
 
 extern "C" fn on_sigterm(_: libc::c_int) {
     SIGTERM_SEEN.store(true, Ordering::Release);
+    kick_pump();
 }
 
 extern "C" fn on_sighup(_: libc::c_int) {
     SIGHUP_SEEN.store(true, Ordering::Release);
+    kick_pump();
 }
 
 /// The dispositions the relay replaced, put back when the relay exits. A
@@ -150,6 +178,9 @@ fn install_relay_signals() -> Result<(), anyhow::Error> {
 
 /// Put back every disposition [`install_relay_signals`] replaced.
 fn restore_relay_signals() {
+    // Retract the handlers' kick fd before anything can close it, so a late
+    // signal writes nowhere.
+    SIGNAL_KICK.store(-1, Ordering::Release);
     let saved = {
         let mut saved = SAVED_SIGNALS.lock().unwrap();
         std::mem::take(&mut *saved)
@@ -639,6 +670,9 @@ impl Relay {
 
         let (ctl_read, kick) = pipe2(OFlag::O_CLOEXEC | OFlag::O_NONBLOCK)
             .context("opening the relay's control pipe")?;
+        // Publish the kick end for the signal handlers before the pump can
+        // exist: from here on a signal is a poll event, not a lost wakeup.
+        SIGNAL_KICK.store(kick.as_fd().as_raw_fd(), Ordering::Release);
         let inner = Arc::new(RelayInner {
             shared: Shared::default(),
             tty: real,
@@ -906,9 +940,11 @@ fn pump(
             break;
         }
 
-        // 3. Poll. The ctl pipe is what makes commands prompt; signals
-        // arrive as EINTR (no SA_RESTART); ssh's exit arrives as EOF on
-        // the master. Never a timeout: everything that matters wakes it.
+        // 3. Poll. The ctl pipe is what makes commands prompt; a signal that
+        // interrupts the pump surfaces as EINTR (no SA_RESTART), and one
+        // delivered to any other thread as a kick byte in the same pipe;
+        // ssh's exit arrives as EOF on the master. Never a timeout:
+        // everything that matters wakes it.
         let mut fds = Vec::with_capacity(4);
         let input_idx = if input_open && !suspended && pending_in.is_empty() {
             fds.push(PollFd::new(inner.tty.input.as_fd(), PollFlags::POLLIN));
@@ -936,7 +972,10 @@ fn pump(
         } else {
             None
         };
-        let output_idx = if !pending_out.is_empty() {
+        // The real terminal: never a write while a prompt owns it — bytes
+        // read before the suspend stay in `pending_out` (the replay keeps
+        // its order), and the terminal the caller leased stays theirs alone.
+        let output_idx = if !suspended && !pending_out.is_empty() {
             let idx = fds.len();
             fds.push(PollFd::new(inner.tty.output.as_fd(), PollFlags::POLLOUT));
             Some(idx)
@@ -1100,6 +1139,20 @@ fn pump(
     inner.shared.cv.notify_all();
 }
 
+/// The two sizes the resume nudge walks the session's pty through: rows−1,
+/// then back to the current size. A size change is the one repaint trigger
+/// that costs the session nothing — it repaints on its own SIGWINCH — and
+/// ending on the current size is what makes the nudge invisible except as
+/// the repaint itself. A one-row terminal cannot shrink; writing the same
+/// size changes nothing, which is the honest best it offers.
+fn repaint_nudge_sizes(ws: Winsize) -> [Winsize; 2] {
+    let mut smaller = ws;
+    if ws.ws_row >= 2 {
+        smaller.ws_row -= 1;
+    }
+    [smaller, ws]
+}
+
 /// The pump's half of [`RelayHandle::suspend`]: everything the caller needs
 /// true before they touch the terminal.
 fn suspend(
@@ -1146,17 +1199,14 @@ fn resume(
         tracing::warn!("{dropped}{DROP_LINE_SUFFIX}");
     }
 
-    // Nudge the pty size (rows−1, then back) so the session repaints on
-    // its own SIGWINCH: its cursor is somewhere in output the user never
-    // saw. Never a single unwind or reset code — this is the session's
-    // pty, not the user's terminal.
+    // Nudge the pty size so the session repaints on its own SIGWINCH: its
+    // cursor is somewhere in output the user never saw. Never a single
+    // unwind or reset code — this is the session's pty, not the user's
+    // terminal.
     if let Ok(ws) = get_winsize(&inner.tty.input) {
-        if ws.ws_row >= 2 {
-            let mut smaller = ws;
-            smaller.ws_row -= 1;
-            let _ = set_winsize(master, smaller);
+        for nudge in repaint_nudge_sizes(ws) {
+            let _ = set_winsize(master, nudge);
         }
-        let _ = set_winsize(master, ws);
     }
 
     // Reassert the raw set and the current size — the terminal may have
@@ -1174,4 +1224,904 @@ fn resume(
     inner.buffered.store(0, Ordering::Release);
     *dropped = 0;
     inner.dropped.store(0, Ordering::Release);
+}
+
+// ---------------------------------------------------------------------------
+// Driven terminals for the relay's callers' tests
+//
+// The relay's callers — the CLI's attach wait and the TUI's dash attach — own
+// no pty or termios dependency of their own (the CLI's nix features carry no
+// `term`, the TUI has no nix at all), yet their tests must drive the relay
+// end to end over a real terminal and assert its restore discipline in
+// before/after terms. This is that surface: a fresh pty pair to play the
+// terminal with, and an opaque-but-comparable termios snapshot. It is the
+// same machinery the relay itself is built on, so the tests drive exactly
+// what production drives.
+// ---------------------------------------------------------------------------
+
+/// A snapshot of a terminal's termios, opaque but comparable: callers' tests
+/// assert "restored to what it was before the attach" without taking on
+/// nix's `term` types.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TermiosSnapshot(Termios);
+
+/// Capture the current termios of the terminal `fd` is an end of.
+pub fn termios_snapshot(fd: impl AsFd) -> Result<TermiosSnapshot, anyhow::Error> {
+    Ok(TermiosSnapshot(
+        tcgetattr(fd.as_fd()).context("reading the terminal's termios")?,
+    ))
+}
+
+/// A fresh pty pair for driving a relay from the outside: the master end
+/// reads and writes as "the user at the keyboard", the slave end is moved
+/// onto the driven process's fds to play "the real terminal" (and the relay
+/// it spawns takes over from there).
+///
+/// The pair starts in the platform's default cooked termios, like a terminal
+/// a user opens before `min` ever touches it.
+pub struct DrivenPty {
+    master: OwnedFd,
+    slave: OwnedFd,
+    path: std::path::PathBuf,
+}
+
+impl DrivenPty {
+    /// Open the pair.
+    pub fn open() -> Result<Self, anyhow::Error> {
+        let pty = openpty(None, None).context("opening a driven pty pair")?;
+        // nix 0.31's own ptsname wants its `PtyMaster` wrapper while its
+        // openpty hands back plain fds, so ask libc for the slave's name.
+        let path = unsafe {
+            let raw = libc::ptsname(pty.master.as_fd().as_raw_fd());
+            if raw.is_null() {
+                return Err(anyhow::anyhow!(
+                    "naming the driven pty's slave: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            std::ffi::CStr::from_ptr(raw).to_string_lossy().into_owned()
+        };
+        Ok(Self {
+            master: pty.master,
+            slave: pty.slave,
+            path: path.into(),
+        })
+    }
+
+    /// The "user" end: reading here watches what the terminal was shown,
+    /// writing here types.
+    pub fn master(&self) -> BorrowedFd<'_> {
+        self.master.as_fd()
+    }
+
+    /// The "terminal" end: the fd to move onto stdio (or hand to a relay as
+    /// its real terminal, in this crate's own tests).
+    pub fn slave(&self) -> BorrowedFd<'_> {
+        self.slave.as_fd()
+    }
+
+    /// The slave's device path, so a test can tell a process that inherited
+    /// this terminal from one the relay put on its own pty.
+    pub fn slave_path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nix::sys::termios::ControlFlags;
+    use std::os::unix::process::ExitStatusExt as _;
+    use std::time::Duration;
+
+    /// One relay at a time per process: a relay installs process-global
+    /// signal dispositions, and the public-entry test moves stdio's fds.
+    /// Under nextest — the lane this crate's tests run in — every test owns
+    /// its process anyway; this keeps a plain `cargo test` run honest too.
+    static RELAY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    const WINSIZE: Winsize = Winsize {
+        ws_row: 24,
+        ws_col: 80,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+
+    /// `sh -c <script>`: the child standing in for ssh.
+    fn sh(script: impl AsRef<str>) -> Command {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg(script.as_ref());
+        cmd
+    }
+
+    /// A full cooked set — the state a user's terminal is in before `min`
+    /// ever touches it — on the fd named, returned so every restore below is
+    /// measured against it.
+    fn cooked(fd: &OwnedFd) -> Termios {
+        let mut t = tcgetattr(fd).expect("reading the driven pty's termios");
+        t.local_flags |=
+            LocalFlags::ECHO | LocalFlags::ICANON | LocalFlags::ISIG | LocalFlags::IEXTEN;
+        t.input_flags |= InputFlags::IXON | InputFlags::ICRNL;
+        t.output_flags |= OutputFlags::OPOST | OutputFlags::ONLCR;
+        tcsetattr(fd, SetArg::TCSADRAIN, &t).expect("setting the driven pty to a cooked set");
+        t
+    }
+
+    /// One relay over a driven pty: the outer pair's slave plays the real
+    /// terminal (the relay's input and output), the master is where the test
+    /// reads what the terminal was shown and types what the user types, and
+    /// `probe` is a spare handle on the terminal for termios assertions.
+    struct Driven {
+        master: OwnedFd,
+        probe: OwnedFd,
+        relay: Relay,
+        handle: RelayHandle,
+        attach_start: Termios,
+    }
+
+    fn start_driven(cmd: Command) -> Driven {
+        let pty = openpty(None, None).expect("opening the driven pty");
+        let (master, slave) = (pty.master, pty.slave);
+        let probe = slave
+            .try_clone()
+            .expect("duplicating the driven pty's slave");
+        let attach_start = cooked(&probe);
+        set_winsize(&master, WINSIZE).expect("sizing the driven pty");
+        let real = RealTty::from_fds(
+            slave
+                .try_clone()
+                .expect("duplicating the slave as the relay's input"),
+            slave,
+        );
+        let relay = Relay::start(cmd, real).expect("starting the relay");
+        let handle = relay.handle();
+        Driven {
+            master,
+            probe,
+            relay,
+            handle,
+            attach_start,
+        }
+    }
+
+    /// Read from the driven pty's master until `want` bytes arrived, `secs`
+    /// pass, or the pty has nothing more to give. Tolerates EINTR: the
+    /// signal tests raise real signals into this process while it polls.
+    fn read_for(master: &OwnedFd, want: usize, secs: u64) -> Vec<u8> {
+        let mut out = Vec::with_capacity(want);
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        while out.len() < want && Instant::now() < deadline {
+            let mut fds = [PollFd::new(master.as_fd(), PollFlags::POLLIN)];
+            match poll(&mut fds, PollTimeout::from(250u16)) {
+                Ok(_) | Err(nix::errno::Errno::EINTR) => {}
+                Err(e) => panic!("polling the driven pty's master: {e}"),
+            }
+            if !fds[0]
+                .revents()
+                .map(|e| e.intersects(PollFlags::POLLIN))
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let mut scratch = [0u8; 4096];
+            match read(master, &mut scratch) {
+                Ok(n) if n > 0 => out.extend_from_slice(&scratch[..n]),
+                Ok(_) | Err(nix::errno::Errno::EAGAIN) => {}
+                Err(_) => break, // the pty's far end is gone
+            }
+        }
+        out
+    }
+
+    /// Type into the driven pty's master until every byte is in: a pty
+    /// accepts what its reader has drained and blocks the rest, so a
+    /// looping writer loses nothing (this is the relay's own discipline —
+    /// never read more than can be handed off).
+    fn type_bytes(master: &OwnedFd, bytes: &[u8]) {
+        let mut off = 0;
+        while off < bytes.len() {
+            match write(master, &bytes[off..]) {
+                Ok(n) => off += n,
+                Err(nix::errno::Errno::EINTR) => {}
+                Err(e) => panic!("writing to the driven pty's master: {e}"),
+            }
+        }
+    }
+
+    /// Read from the master until `quiet_ms` pass with nothing arriving.
+    fn drain(master: &OwnedFd, quiet_ms: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut quiet = 0u64;
+        while quiet < quiet_ms {
+            let mut fds = [PollFd::new(master.as_fd(), PollFlags::POLLIN)];
+            match poll(&mut fds, PollTimeout::from(50u16)) {
+                Ok(n) if n > 0 => {
+                    let mut scratch = [0u8; 8192];
+                    match read(master, &mut scratch) {
+                        Ok(n) if n > 0 => {
+                            out.extend_from_slice(&scratch[..n]);
+                            quiet = 0;
+                        }
+                        _ => quiet += 50,
+                    }
+                }
+                Ok(_) | Err(nix::errno::Errno::EINTR) => quiet += 50,
+                Err(e) => panic!("polling the driven pty's master: {e}"),
+            }
+        }
+        out
+    }
+
+    /// End an attach: kill the child's group (the only way to end a `cat`),
+    /// keep reading — the pump can only finish once every byte it read from
+    /// the session has reached the terminal — then join for ssh's status.
+    fn finish(d: Driven) -> std::process::ExitStatus {
+        let Driven {
+            master,
+            probe,
+            relay,
+            handle,
+            ..
+        } = d;
+        if let Some(child) = relay.child.as_ref() {
+            let _ = killpg(child.id(), libc::SIGKILL);
+        }
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline {
+            if handle.inner.shared.mutex.lock().unwrap().finished {
+                break;
+            }
+            let _ = drain(&master, 100);
+        }
+        let status = relay
+            .join(Some(deadline))
+            .expect("the relay must finish once the session is dead and the terminal drained");
+        assert_eq!(
+            tcgetattr(&probe).unwrap(),
+            d.attach_start,
+            "the attach-start termios must be back once the relay ends"
+        );
+        status
+    }
+
+    /// The `y\n` payload used by the flood tests: deterministic, position
+    /// homogeneous, and printable in a failure message.
+    fn yes_payload(len: usize) -> Vec<u8> {
+        b"y\n".iter().copied().cycle().take(len).collect()
+    }
+
+    #[test]
+    fn relay_copies_bytes_both_ways_in_order() {
+        let _guard = RELAY_LOCK.lock().unwrap();
+        // Position-coded: every 4-byte group is its own index, so a dropped,
+        // duplicated or reordered chunk cannot compare equal.
+        let payload: Vec<u8> = (0..65536u32).flat_map(|i| i.to_le_bytes()).collect();
+        assert_eq!(payload.len(), 262144);
+
+        let d = start_driven(sh("cat"));
+        // While the relay runs, the real terminal sits in ssh's raw set —
+        // the premise the session-key chord rides on.
+        assert_eq!(
+            tcgetattr(&d.probe).unwrap(),
+            ssh_raw_termios(&d.attach_start),
+            "the real terminal must be in ssh's raw set mid-relay"
+        );
+
+        type_bytes(&d.master, &payload);
+        let echoed = read_for(&d.master, payload.len(), 20);
+        assert_eq!(echoed, payload, "the round trip must be byte-exact");
+
+        let status = finish(d);
+        // `cat` only ends when killed; its death-by-signal is the status a
+        // plain wait would see, which is the mapping under test.
+        assert_eq!(status.signal(), Some(9));
+    }
+
+    #[test]
+    fn client_raw_mode_matches_ssh_raw_set() {
+        let pty = openpty(None, None).expect("opening a driven pty");
+        let base = cooked(&pty.slave);
+        assert!(
+            base.local_flags
+                .contains(LocalFlags::ECHO | LocalFlags::ICANON | LocalFlags::ISIG),
+            "the base must be cooked, or the raw set below proves nothing"
+        );
+
+        let raw = ssh_raw_termios(&base);
+        // ssh's own enter_raw_mode is cfmakeraw; the explicit removals
+        // restate the three flags that carry the chord as data end to end.
+        let mut expect = base.clone();
+        cfmakeraw(&mut expect);
+        expect.input_flags.remove(InputFlags::IXON);
+        expect
+            .local_flags
+            .remove(LocalFlags::ISIG | LocalFlags::IEXTEN);
+        assert_eq!(raw, expect, "the raw set must be exactly ssh's own");
+        assert!(!raw.local_flags.intersects(
+            LocalFlags::ECHO | LocalFlags::ICANON | LocalFlags::ISIG | LocalFlags::IEXTEN
+        ));
+        assert!(!raw.input_flags.intersects(InputFlags::IXON));
+        assert!(!raw.output_flags.intersects(OutputFlags::OPOST));
+        assert!(raw.control_flags.contains(ControlFlags::CS8));
+    }
+
+    #[test]
+    fn winsize_follows_sigwinch() {
+        let _guard = RELAY_LOCK.lock().unwrap();
+        let d = start_driven(sh("while :; do stty size; sleep 0.2; done"));
+
+        // The relay copies the terminal's size to the session's pty at start.
+        let first = read_for(&d.master, 8, 20);
+        let text = String::from_utf8_lossy(&first).to_string();
+        assert!(
+            text.contains("24 80"),
+            "the session must see the starting size; saw {text:?}"
+        );
+
+        // A resize of the real terminal arrives as a SIGWINCH to the client,
+        // which owns the terminal; the relay forwards it to the session's
+        // pty as a TIOCSWINSZ.
+        let grown = Winsize {
+            ws_row: 60,
+            ws_col: 200,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        set_winsize(&d.master, grown).expect("resizing the driven pty");
+        unsafe { libc::raise(libc::SIGWINCH) };
+        let second = read_for(&d.master, 64, 20);
+        let text = String::from_utf8_lossy(&second).to_string();
+        assert!(
+            text.contains("60 200"),
+            "the session must see the resized size; saw {text:?}"
+        );
+
+        let status = finish(d);
+        assert_eq!(
+            status.signal(),
+            Some(9),
+            "the looping child is killed to end the attach"
+        );
+    }
+
+    #[test]
+    fn termios_restored_on_transport_drop() {
+        let _guard = RELAY_LOCK.lock().unwrap();
+        // ssh exit 255 is the transport-drop signature.
+        let d = start_driven(sh("exit 255"));
+        let status = d
+            .relay
+            .join(Some(Instant::now() + Duration::from_secs(10)))
+            .expect("the relay must end with the session");
+        assert_eq!(status.code(), Some(255));
+        assert_eq!(
+            tcgetattr(&d.probe).unwrap(),
+            d.attach_start,
+            "the attach-start termios must be back after the transport dropped"
+        );
+    }
+
+    #[test]
+    fn termios_restored_on_panic() {
+        let _guard = RELAY_LOCK.lock().unwrap();
+        let d = start_driven(sh("sleep 1"));
+
+        // Poison the shared state from a thread that holds the mutex while
+        // panicking: the pump's next turn dies at its first lock, and the
+        // drop guard it holds is what must put the terminal back.
+        let inner = Arc::clone(&d.handle.inner);
+        let poisoner = std::thread::spawn(move || {
+            let _held = inner.shared.mutex.lock().unwrap();
+            panic!("poisoning the relay's shared state");
+        });
+        assert!(
+            poisoner.join().is_err(),
+            "the poisoning thread must panic while holding the mutex"
+        );
+        // Kick the pump out of poll; its turn starts by taking the lock.
+        let _ = write(&d.handle.inner.kick, b"p").ok();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if tcgetattr(&d.probe)
+                .map(|t| t == d.attach_start)
+                .unwrap_or(false)
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the pump's drop guard must restore the terminal after a panic"
+            );
+        }
+
+        // A dead pump and a poisoned mutex: join still reaps the child and
+        // the failure is a report, not a hang.
+        let status = d
+            .relay
+            .join(Some(deadline))
+            .expect("join must survive a panicking pump");
+        assert_eq!(status.code(), Some(0));
+        assert_eq!(
+            tcgetattr(&d.probe).unwrap(),
+            d.attach_start,
+            "the terminal must still be in its attach-start set"
+        );
+    }
+
+    #[test]
+    fn client_signal_restores_termios_and_reaches_ssh() {
+        let _guard = RELAY_LOCK.lock().unwrap();
+        // ssh runs on the relay's pty, outside the terminal's foreground
+        // group — so the client owns the terminal's signals and must forward
+        // them. The child proves receipt by trapping and acting on it.
+        let d = start_driven(sh(concat!(
+            "echo READY; ",
+            "trap 'echo CAUGHT_INT; exit 7' INT; ",
+            "while :; do sleep 0.2; done",
+        )));
+        // Wait for the child to announce itself: raising before the trap is
+        // installed would kill a plain loop child instead of exercising the
+        // forwarding this test is about.
+        let seen = read_for(&d.master, b"READY\n".len(), 20);
+        assert_eq!(
+            seen, b"READY\n",
+            "the session must be running (the relay holds the terminal raw)"
+        );
+        unsafe { libc::raise(libc::SIGINT) };
+
+        let seen = read_for(&d.master, b"CAUGHT_INT\n".len(), 20);
+        assert_eq!(
+            seen, b"CAUGHT_INT\n",
+            "the forwarded SIGINT must reach the session's process group"
+        );
+
+        let status = d
+            .relay
+            .join(Some(Instant::now() + Duration::from_secs(10)))
+            .expect("the relay must end with the session");
+        assert_eq!(
+            status.code(),
+            Some(7),
+            "the session's own exit status must come back through the relay"
+        );
+        assert_eq!(
+            tcgetattr(&d.probe).unwrap(),
+            d.attach_start,
+            "the terminal must be back in its attach-start set after the signal round trip"
+        );
+    }
+
+    #[test]
+    fn ssh_exit_status_maps_unchanged() {
+        let _guard = RELAY_LOCK.lock().unwrap();
+        let a = start_driven(sh("exit 42"));
+        let status = a
+            .relay
+            .join(Some(Instant::now() + Duration::from_secs(10)))
+            .expect("the relay must end with the session");
+        assert_eq!(status.code(), Some(42), "a plain exit code maps unchanged");
+        assert_eq!(tcgetattr(&a.probe).unwrap(), a.attach_start);
+
+        let b = start_driven(sh("kill -9 $$"));
+        let status = b
+            .relay
+            .join(Some(Instant::now() + Duration::from_secs(10)))
+            .expect("the relay must end with the session");
+        assert_eq!(status.code(), None);
+        assert_eq!(
+            status.signal(),
+            Some(9),
+            "death by signal must map as death by signal, never as a code"
+        );
+        assert_eq!(tcgetattr(&b.probe).unwrap(), b.attach_start);
+    }
+
+    #[test]
+    fn suspend_hands_back_attach_start_termios() {
+        let _guard = RELAY_LOCK.lock().unwrap();
+        const SENT: usize = 512 * 1024;
+        // 512KiB of session output, then silence. The test reads nothing
+        // before suspending, so at the suspend the relay is holding most of
+        // that undelivered — and a lease must hold back not just fresh output
+        // but the parked backlog too: while the prompt owns the terminal,
+        // nothing of the session may reach it.
+        let d = start_driven(sh(format!("sleep 0.2; yes | head -c {SENT}; sleep 30")));
+        std::thread::sleep(Duration::from_millis(700));
+
+        let lease = d.handle.suspend().expect("suspending the relay");
+        assert!(d.handle.is_suspended());
+        assert_eq!(
+            tcgetattr(&d.probe).unwrap(),
+            d.attach_start,
+            "the leased terminal must be in its attach-start set"
+        );
+
+        // The kernel may still hold a little of the backlog in the pty's
+        // buffer; drain it and confirm the flow stops. A pump that kept
+        // draining here would empty all 512KiB onto the prompt's terminal.
+        let parked = drain(&d.master, 400);
+        assert!(
+            parked.len() <= 64 * 1024,
+            "nothing of the session may reach the terminal while the lease is up; \
+             got {} bytes",
+            parked.len()
+        );
+        let payload = yes_payload(SENT);
+        assert_eq!(&parked, &payload[..parked.len()]);
+
+        // The leased terminal behaves like the user's terminal: it echoes.
+        type_bytes(&d.master, b"PROMPT> \n");
+        let echo = drain(&d.master, 200);
+        assert!(
+            echo.starts_with(b"PROMPT>"),
+            "the leased terminal must still behave like a terminal; saw {echo:?}"
+        );
+
+        lease.resume();
+        assert!(!d.handle.is_suspended());
+        // The parked backlog replays now, and every byte the session wrote
+        // arrives exactly once, head first.
+        let rest = read_for(&d.master, SENT - parked.len(), 20);
+        assert_eq!(
+            rest.len(),
+            SENT - parked.len(),
+            "the replay must be complete"
+        );
+        assert_eq!(
+            &rest,
+            &payload[parked.len()..],
+            "the replay must be in order"
+        );
+
+        let status = finish(d);
+        assert_eq!(
+            status.code(),
+            None,
+            "the parked child is killed to end the attach"
+        );
+    }
+
+    #[test]
+    fn suspend_keeps_head_and_drops_tail_past_bound() {
+        let _guard = RELAY_LOCK.lock().unwrap();
+        const SENT: usize = 3 * 512 * 1024; // the bound, plus 512KiB of tail
+        // The child produces everything AFTER the suspension is up, so the
+        // relay never has the option of delivering it live.
+        let d = start_driven(sh(format!("sleep 1.0; yes | head -c {SENT}")));
+        let lease = d.handle.suspend().expect("suspending before any output");
+        assert_eq!(
+            d.handle.suspended_output(),
+            (0, 0),
+            "a fresh suspension buffers nothing yet"
+        );
+
+        // All of it arrives — the head fills the bound, the tail is dropped
+        // and counted, and the child never blocks: a suspension applies no
+        // backpressure to the session.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let (buffered, dropped) = d.handle.suspended_output();
+            if buffered as usize == SUSPEND_OUTPUT_BUFFER_BYTES
+                && dropped as usize == SENT - SUSPEND_OUTPUT_BUFFER_BYTES
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the child's output must all arrive; so far {:?}",
+                d.handle.suspended_output()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        lease.resume();
+        let head = yes_payload(SUSPEND_OUTPUT_BUFFER_BYTES);
+        let line = format!(
+            "\r\n{}{DROP_LINE_SUFFIX}\r\n",
+            SENT - SUSPEND_OUTPUT_BUFFER_BYTES
+        );
+        let replayed = read_for(&d.master, head.len() + line.len(), 20);
+        assert_eq!(
+            &replayed[..head.len()],
+            &head[..],
+            "the buffered head must replay byte-exact"
+        );
+        assert_eq!(
+            &replayed[head.len()..],
+            line.as_bytes(),
+            "the one visible line must say exactly what was dropped"
+        );
+        assert_eq!(
+            tcgetattr(&d.probe).unwrap(),
+            ssh_raw_termios(&d.attach_start),
+            "resume must reassert the raw set before replaying"
+        );
+
+        let status = d
+            .relay
+            .join(Some(deadline))
+            .expect("the relay must end with the session");
+        assert_eq!(status.code(), Some(0));
+        assert_eq!(
+            tcgetattr(&d.probe).unwrap(),
+            d.attach_start,
+            "the attach-start termios must be back after the replay"
+        );
+    }
+
+    #[test]
+    fn resume_after_drop_prints_line_and_nudges_winsize() {
+        let _guard = RELAY_LOCK.lock().unwrap();
+        // The nudge itself, pure: rows−1 then back, and a one-row terminal
+        // cannot shrink.
+        let [smaller, back] = repaint_nudge_sizes(WINSIZE);
+        assert_eq!((smaller.ws_row, smaller.ws_col), (23, 80));
+        assert_eq!((back.ws_row, back.ws_col), (24, 80));
+        let one_row = Winsize {
+            ws_row: 1,
+            ..WINSIZE
+        };
+        let [a, b] = repaint_nudge_sizes(one_row);
+        assert_eq!((a.ws_row, b.ws_row), (1, 1), "a one-row pty cannot shrink");
+
+        // End to end: the session must see the nudge as its own SIGWINCH —
+        // the repaint trigger — and end at the current size. Observing that
+        // needs a session that owns the pty as its controlling terminal, so
+        // it leads its own session (setsid) and counts the signals.
+        const SENT: usize = 3 * 512 * 1024;
+        let script = "trap 'W=$((W+1))' WINCH; W=0; \
+                     sleep 1.0; \
+                     yes | head -c 1572864; \
+                     read -r x; \
+                     printf 'WINS=%s SIZE=%s\\n' \"$W\" \"$(stty size)\"";
+        let mut cmd = Command::new("setsid");
+        cmd.arg("-w").arg("sh").arg("-c").arg(script);
+        let d = start_driven(cmd);
+
+        let lease = d.handle.suspend().expect("suspending before any output");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let (buffered, dropped) = d.handle.suspended_output();
+            if buffered as usize + dropped as usize == SENT {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the child's output must all arrive; so far {:?}",
+                d.handle.suspended_output()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        lease.resume();
+        type_bytes(&d.master, b"r\n");
+        let head = yes_payload(SUSPEND_OUTPUT_BUFFER_BYTES);
+        let line = format!(
+            "\r\n{}{DROP_LINE_SUFFIX}\r\n",
+            SENT - SUSPEND_OUTPUT_BUFFER_BYTES
+        );
+        let mut shown = read_for(&d.master, head.len() + line.len(), 20);
+        // Then the child's report arrives once its `read` returns.
+        shown.extend(drain(&d.master, 600));
+        assert_eq!(
+            &shown[..head.len()],
+            &head[..],
+            "the replayed head must be intact"
+        );
+        assert_eq!(&shown[head.len()..head.len() + line.len()], line.as_bytes());
+        let report = String::from_utf8_lossy(&shown[head.len() + line.len()..]).to_string();
+        let winches: u32 = report
+            .split("WINS=")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(0);
+        assert!(
+            (1..=2).contains(&winches),
+            "the nudge must reach the session as its own SIGWINCH; report: {report:?}"
+        );
+        assert!(
+            report.contains("SIZE=24 80"),
+            "the nudge must end at the terminal's current size; report: {report:?}"
+        );
+
+        let status = d
+            .relay
+            .join(Some(Instant::now() + Duration::from_secs(15)))
+            .expect("the relay must end with the session");
+        assert_eq!(status.code(), Some(0));
+    }
+
+    #[test]
+    fn suspend_and_resume_are_idempotent() {
+        let _guard = RELAY_LOCK.lock().unwrap();
+        let d = start_driven(sh("sleep 3"));
+
+        // Suspending twice hands out two leases of the same terminal.
+        let first = d.handle.suspend().expect("first suspend");
+        let _second = d.handle.suspend().expect("suspending a suspended relay");
+        assert!(d.handle.is_suspended());
+        assert_eq!(tcgetattr(&d.probe).unwrap(), d.attach_start);
+
+        // Resuming twice — once through the lease, once through the handle —
+        // leaves one running relay, not an error.
+        first.resume();
+        assert!(!d.handle.is_suspended());
+        d.handle.resume();
+        assert!(!d.handle.is_suspended());
+
+        // A second round, resumed through the handle.
+        let _third = d.handle.suspend().expect("re-suspending");
+        assert!(d.handle.is_suspended());
+        d.handle.resume();
+        assert!(!d.handle.is_suspended());
+
+        // The child exits on its own; the relay must go inert.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if d.handle.inner.shared.mutex.lock().unwrap().finished {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the relay must end with the attach"
+            );
+        }
+
+        // Both calls are well-defined after the end: suspend errors, resume
+        // is a no-op.
+        assert!(
+            d.handle.suspend().is_err(),
+            "suspending a finished attach must error"
+        );
+        d.handle.resume();
+        assert_eq!(d.handle.suspended_output(), (0, 0));
+
+        let status = d
+            .relay
+            .join(Some(deadline))
+            .expect("the relay must end with the attach");
+        assert_eq!(status.code(), Some(0));
+        assert_eq!(
+            tcgetattr(&d.probe).unwrap(),
+            d.attach_start,
+            "the attach-start termios must be back once the relay ends"
+        );
+    }
+
+    #[test]
+    fn chord_bytes_pass_through_unmodified() {
+        let _guard = RELAY_LOCK.lock().unwrap();
+        let d = start_driven(sh("cat"));
+        // The shipped detach chord plus every control byte a cooked line
+        // discipline would have eaten, in one write: with the relay holding
+        // both ends in ssh's raw set they must round-trip as data.
+        let typed: Vec<u8> = [
+            0x1d, b'd', // the detach chord: leader, then its subcommand
+            0x11, 0x13, // XON/XOFF — flow control while IXON is set
+            0x16, 0x03, // LNEXT, and the INTR byte it would shield
+            0x1a, 0x04, // SUSP, and EOF in canonical mode
+            0x00, // NUL
+            b'h', b'i', b'\r', b'\n',
+        ]
+        .to_vec();
+        type_bytes(&d.master, &typed);
+        let back = read_for(&d.master, typed.len(), 20);
+        assert_eq!(
+            back, typed,
+            "the raw set must pass every byte through, exactly once and in order"
+        );
+
+        let status = finish(d);
+        assert_eq!(
+            status.code(),
+            None,
+            "the relayed cat is killed to end the attach"
+        );
+    }
+
+    #[test]
+    fn exec_path_keeps_inherited_stdio() {
+        let _guard = RELAY_LOCK.lock().unwrap();
+        // The interactive relay re-homes the child's stdio onto its own pty:
+        // a relay's child sees a terminal on both ends no matter what this
+        // process's stdio is.
+        let d = start_driven(sh("test -t 0 && test -t 1; exit $?"));
+        let status = d
+            .relay
+            .join(Some(Instant::now() + Duration::from_secs(10)))
+            .expect("the relay must end with the session");
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "the relay's child runs on the pty pair: both ends must be terminals"
+        );
+
+        // The exec path spawns ssh the plain way, so whatever this process's
+        // stdio is the child inherits it unchanged — the child's view must
+        // equal this process's view, here and on any host.
+        let expected =
+            2 * (std::io::stdin().is_terminal() as i32) + (std::io::stdout().is_terminal() as i32);
+        let status = sh(
+            "A=$([ -t 0 ] && echo 1 || echo 0); B=$([ -t 1 ] && echo 1 || echo 0); \
+             exit $((2*A + B))",
+        )
+        .status()
+        .expect("spawning the exec-path child");
+        assert_eq!(
+            status.code(),
+            Some(expected),
+            "the exec path must leave the child's stdio exactly as it inherited it"
+        );
+    }
+
+    /// The public entry, driven with a real hook: the hook suspends the relay
+    /// from its own thread, owns the terminal for its prompt, and hands it
+    /// back — and the attach then runs to the child's exit.
+    #[test]
+    fn run_interactive_attach_runs_a_suspend_hook_to_completion() {
+        use crate::attach::run_interactive_attach;
+
+        let _guard = RELAY_LOCK.lock().unwrap();
+        let pty = openpty(None, None).expect("opening the driven pty");
+        let (master, slave) = (pty.master, pty.slave);
+        let probe = slave
+            .try_clone()
+            .expect("duplicating the driven pty's slave");
+        let attach_start = cooked(&probe);
+        set_winsize(&master, WINSIZE).expect("sizing the driven pty");
+
+        // run_interactive_attach takes the real terminal from this process's
+        // stdio, so play the terminal on fds 0 and 1 for the duration.
+        let saved_in = nix::unistd::dup(std::io::stdin()).expect("saving stdin");
+        let saved_out = nix::unistd::dup(std::io::stdout()).expect("saving stdout");
+        struct RestoreStdio {
+            saved_in: OwnedFd,
+            saved_out: OwnedFd,
+        }
+        impl Drop for RestoreStdio {
+            fn drop(&mut self) {
+                let _ = nix::unistd::dup2_stdin(&self.saved_in);
+                let _ = nix::unistd::dup2_stdout(&self.saved_out);
+            }
+        }
+        let _restore = RestoreStdio {
+            saved_in,
+            saved_out,
+        };
+        nix::unistd::dup2_stdin(&slave).expect("moving the pty onto stdin");
+        nix::unistd::dup2_stdout(&slave).expect("moving the pty onto stdout");
+
+        let resumed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hook_resumed = Arc::clone(&resumed);
+        let hook: SuspendHook = Box::new(move |handle| {
+            let lease = handle.suspend().expect("the hook suspends the relay");
+            // A prompt writes to the terminal it was handed.
+            let _ = write(lease.as_fd(), b"HOOK_PROMPT\n");
+            std::thread::sleep(Duration::from_millis(200));
+            lease.resume();
+            hook_resumed.store(true, Ordering::Release);
+        });
+
+        let status = run_interactive_attach(sh("sleep 1.5"), Some(hook))
+            .expect("the interactive attach runs to the child's exit");
+        assert_eq!(status.code(), Some(0));
+        assert!(
+            resumed.load(Ordering::Acquire),
+            "the hook must have run to its resume"
+        );
+
+        let shown = drain(&master, 300);
+        let text = String::from_utf8_lossy(&shown).to_string();
+        assert!(
+            text.contains("HOOK_PROMPT"),
+            "the prompt's output must land on the real terminal; saw {text:?}"
+        );
+        assert_eq!(
+            tcgetattr(&probe).unwrap(),
+            attach_start,
+            "the attach-start termios must be back after the interactive attach"
+        );
+    }
 }
