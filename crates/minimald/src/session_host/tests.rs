@@ -5801,7 +5801,7 @@ async fn ask_no_or_no_tty_records_nothing() {
         ),
         (
             minimald_rpc::AskRefused::NoTty,
-            crate::net::policy::ExposeRefusal::AskNeedsAnswer,
+            crate::net::policy::ExposeRefusal::DeniedByPolicy,
         ),
     ] {
         let asking = handle.clone();
@@ -5811,6 +5811,7 @@ async fn ask_no_or_no_tty_records_nothing() {
             .send(host_end(minimald_rpc::AskAdmitOutcome::Refused {
                 ask_id: host_ask_id(),
                 reason,
+                cause: None,
             }))
             .expect("the report door stand-in lives");
         let refused = tokio::time::timeout(Duration::from_secs(30), asked)
@@ -5844,4 +5845,225 @@ async fn ask_no_or_no_tty_records_nothing() {
     assert_eq!(records[0]["decided_by"], "attached-human");
     assert_eq!(records[1]["decided_by"], "daemon");
     assert!(records.iter().all(|record| record["outcome"] == "refused"));
+}
+
+/// One VM-backed ask the host ends with `outcome`: the expose's result.
+async fn vm_ask_ended_by_host(
+    outcome: minimald_rpc::AskAdmitOutcome,
+) -> Result<minimald_rpc::LiveMapping, crate::net::policy::ExposeFailure> {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let (_web, handle) = dynamic_ingress_box(
+        &server,
+        &mut client,
+        "web",
+        Some(sessions::DynamicIngress::Ask),
+        Some((3000, 3999)),
+    )
+    .await;
+    handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("the ask box launches its host");
+    let (forwarder, served, _door, mut requests, replies) = vm_backed_ask_box(&handle).await;
+    let asking = handle.clone();
+    let asked = tokio::spawn(async move { asking.expose_dynamic(3000).await });
+    expect_admit_ask(&mut requests).await;
+    replies
+        .send(host_end(outcome))
+        .expect("the report door stand-in lives");
+    let result = tokio::time::timeout(Duration::from_secs(30), asked)
+        .await
+        .expect("the ask is answered")
+        .expect("the spawned request should not panic");
+    forwarder.abort();
+    if result.is_err() {
+        assert!(
+            served.lock().expect("served lock").is_empty(),
+            "a refused ask asks the switch nothing"
+        );
+    }
+    result
+}
+
+fn host_refused(
+    reason: minimald_rpc::AskRefused,
+    cause: Option<minimald_rpc::AskCancelCause>,
+) -> minimald_rpc::AskAdmitOutcome {
+    minimald_rpc::AskAdmitOutcome::Refused {
+        ask_id: host_ask_id(),
+        reason,
+        cause,
+    }
+}
+
+/// NET-045 mapping: no client attached on the host when the ask arrived is
+/// the typed nobody-is-attached refusal — the only host end that uses it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn vm_ask_no_client_is_nobody_attached() {
+    let result = vm_ask_ended_by_host(host_refused(minimald_rpc::AskRefused::NoClient, None)).await;
+    assert!(
+        matches!(
+            result,
+            Err(crate::net::policy::ExposeFailure::Refused(
+                crate::net::policy::ExposeRefusal::AskNeedsAnswer
+            ))
+        ),
+        "{result:?}"
+    );
+}
+
+/// NET-045 mapping: a client that could not show the prompt is the denied
+/// refusal, never the nobody-attached one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn vm_ask_no_tty_is_denied() {
+    let capture = captured_log();
+    let result = vm_ask_ended_by_host(host_refused(minimald_rpc::AskRefused::NoTty, None)).await;
+    assert!(
+        matches!(
+            result,
+            Err(crate::net::policy::ExposeFailure::Refused(
+                crate::net::policy::ExposeRefusal::DeniedByPolicy
+            ))
+        ),
+        "{result:?}"
+    );
+    assert!(
+        capture
+            .contents()
+            .contains("the attached client could not show the prompt; treated as no"),
+        "the no-tty end says why it was treated as no"
+    );
+}
+
+/// NET-045 mapping: a cancellation is a publish failure carrying its cause,
+/// and the last detach adds that nobody is attached any more.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn vm_ask_cancelled_is_a_publish_failure_with_its_cause() {
+    for (cause, says) in [
+        (
+            minimald_rpc::AskCancelCause::LastDetach,
+            "nobody is attached any more",
+        ),
+        (
+            minimald_rpc::AskCancelCause::RowWithdrawn,
+            "row was withdrawn",
+        ),
+        (
+            minimald_rpc::AskCancelCause::GuestClosed,
+            "guest connection closed",
+        ),
+        (
+            minimald_rpc::AskCancelCause::MinvmdStopping,
+            "minvmd is stopping",
+        ),
+    ] {
+        let result = vm_ask_ended_by_host(host_refused(
+            minimald_rpc::AskRefused::Cancelled,
+            Some(cause),
+        ))
+        .await;
+        match result {
+            Err(crate::net::policy::ExposeFailure::Publish { port: 3000, source }) => assert!(
+                source.to_string().contains(says),
+                "{cause:?} says {says}: {source}"
+            ),
+            other => panic!("{cause:?} is a publish failure, got {other:?}"),
+        }
+    }
+}
+
+/// NET-045 mapping: the host's own refusals are publish failures with the
+/// host's reason.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn vm_ask_host_refusals_are_publish_failures() {
+    for (reason, says) in [
+        (minimald_rpc::AskRefused::QueueFull, "queue is full"),
+        (minimald_rpc::AskRefused::OutsideGrant, "outside"),
+        (minimald_rpc::AskRefused::StanceNotAsk, "not ask"),
+        (minimald_rpc::AskRefused::NoRow, "no row"),
+    ] {
+        let result = vm_ask_ended_by_host(host_refused(reason, None)).await;
+        match result {
+            Err(crate::net::policy::ExposeFailure::Publish { port: 3000, source }) => assert!(
+                source.to_string().contains(says),
+                "{reason:?} says {says}: {source}"
+            ),
+            other => panic!("{reason:?} is a publish failure, got {other:?}"),
+        }
+    }
+}
+
+/// NET-045, NET-138: a port published from a host-recorded yes is withdrawn
+/// from the host's row when the box stops — the stop's sweep reports the
+/// withdrawal like any runtime publish's, after the switch's unexpose.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ask_yes_publish_withdraws_on_unexpose() {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let (_web, handle) = dynamic_ingress_box(
+        &server,
+        &mut client,
+        "web",
+        Some(sessions::DynamicIngress::Ask),
+        Some((3000, 3999)),
+    )
+    .await;
+    handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("the ask box launches its host");
+    let (forwarder, served, _door, mut requests, replies) = vm_backed_ask_box(&handle).await;
+    let asking = handle.clone();
+    let asked = tokio::spawn(async move { asking.expose_dynamic(3000).await });
+    expect_admit_ask(&mut requests).await;
+    replies
+        .send(host_end(minimald_rpc::AskAdmitOutcome::Admitted {
+            ask_id: host_ask_id(),
+            port: 3000,
+            proto: sessions::IpProto::Tcp,
+        }))
+        .expect("the report door stand-in lives");
+    tokio::time::timeout(Duration::from_secs(30), asked)
+        .await
+        .expect("the ask is answered")
+        .expect("the spawned request should not panic")
+        .expect("the host's yes publishes");
+
+    let stopping = handle.clone();
+    let stop = tokio::spawn(async move { stopping.stop().await });
+    let withdrawal = tokio::time::timeout(Duration::from_secs(10), requests.recv())
+        .await
+        .expect("the stop reports a withdrawal")
+        .expect("the report door stand-in lives");
+    assert!(
+        matches!(
+            withdrawal,
+            minimald_rpc::BoxControlRequest::WithdrawPort(minimald_rpc::WithdrawPortRequest {
+                switch_address: ASK_SWITCH,
+                port: 3000,
+                ..
+            })
+        ),
+        "the ask-yes port is withdrawn from the host row: {withdrawal:?}"
+    );
+    assert!(
+        served
+            .lock()
+            .expect("served lock")
+            .iter()
+            .any(|line| line.starts_with("POST /services/forwarder/unexpose ")),
+        "the switch's unexpose precedes the withdrawal"
+    );
+    replies
+        .send(minimald_rpc::BoxControlReply::PortRecorded {
+            port: 3000,
+            proto: sessions::IpProto::Tcp,
+        })
+        .expect("the report door stand-in lives");
+    tokio::time::timeout(Duration::from_secs(30), stop)
+        .await
+        .expect("the stop finishes")
+        .expect("the stop task should not panic");
+    forwarder.abort();
 }

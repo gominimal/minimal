@@ -555,18 +555,25 @@ pub(crate) struct AskId(u64);
 /// How a routed ask ended (NET-045): the continuation's input, the same
 /// for an ask this daemon's binding rendered and one the VM host daemon
 /// asked the human attached on the host.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AskEnd {
     /// The attached human answered.
     Answered(session_host::AskAnswer),
-    /// Nobody answered: no binding or no attached host client, a dialog
-    /// that ended without a pick or found no terminal, or an ask cancelled
-    /// before its answer. The ask's own fail-closed end.
+    /// Nobody answered: on a native host no binding, or a dialog that ended
+    /// without a pick; on a VM-backed host no client attached when the ask
+    /// arrived. The typed nobody-is-attached refusal.
     Unanswered,
+    /// The host's attached client could not show the prompt: treated as
+    /// the human's no.
+    HostNoTty,
+    /// The VM host daemon cancelled the ask before an answer, by `cause`.
+    HostCancelled(minimald_rpc::AskCancelCause),
     /// The VM host daemon refused the ask for a reason that is not about
     /// who is attached: its row's ask queue was full, or the row's grant
     /// did not admit the ask.
     HostRefused(minimald_rpc::AskRefused),
+    /// The VM host daemon could not be asked or did not answer the ask.
+    HostUnreachable(String),
 }
 
 /// The binding's answer, or its absence: the native dialog's own ends.
@@ -586,17 +593,35 @@ impl AskEnd {
             minimald_rpc::AskAdmitOutcome::Admitted { .. } => {
                 Self::Answered(session_host::AskAnswer::Allowed)
             }
-            minimald_rpc::AskAdmitOutcome::Refused { reason, .. } => match reason {
+            minimald_rpc::AskAdmitOutcome::Refused { reason, cause, .. } => match reason {
                 AskRefused::Denied => Self::Answered(session_host::AskAnswer::Refused),
-                AskRefused::NoClient | AskRefused::NoTty | AskRefused::Cancelled => {
-                    Self::Unanswered
-                }
+                AskRefused::NoClient => Self::Unanswered,
+                AskRefused::NoTty => Self::HostNoTty,
+                // A cancellation always names its cause; one that does not
+                // is a daemon that predates causes, said as its own stop.
+                AskRefused::Cancelled => Self::HostCancelled(
+                    cause.unwrap_or(minimald_rpc::AskCancelCause::MinvmdStopping),
+                ),
                 AskRefused::QueueFull
                 | AskRefused::NoRow
                 | AskRefused::StanceNotAsk
                 | AskRefused::OutsideGrant => Self::HostRefused(reason),
             },
         }
+    }
+}
+
+/// What the expose's failure says when the attached client could not show
+/// the prompt (NET-045): the human's no, by default.
+const HOST_NO_TTY_REASON: &str = "the attached client could not show the prompt; treated as no";
+
+/// A host cancellation as the expose's failure names it.
+fn host_ask_cancel_text(cause: minimald_rpc::AskCancelCause) -> String {
+    match cause {
+        minimald_rpc::AskCancelCause::LastDetach => {
+            format!("the ask was cancelled: {cause}; nobody is attached any more")
+        }
+        _ => format!("the ask was cancelled: {cause}"),
     }
 }
 
@@ -2552,7 +2577,7 @@ impl Session {
                                     reason = %error,
                                     "the VM host daemon did not answer the ask; it fails closed"
                                 );
-                                AskEnd::Unanswered
+                                AskEnd::HostUnreachable(error.to_string())
                             }
                         };
                     if let Some(handle) = weak.upgrade() {
@@ -2612,7 +2637,7 @@ impl Session {
             return;
         };
         let ask = self.pending_asks.remove(position);
-        let outcome = match answer {
+        let outcome = match &answer {
             // The human said allow: run the publish half. Everything that can
             // still refuse it runs there — a duplicate publish, a missing
             // address pair, a switch that would not bind — so even an
@@ -2669,19 +2694,45 @@ impl Session {
             AskEnd::Unanswered => Err(crate::net::policy::ExposeFailure::Refused(
                 crate::net::policy::ExposeRefusal::AskNeedsAnswer,
             )),
+            // The host's attached client could not show the prompt: the
+            // deny an unanswerable dialog defaults to, said as such.
+            AskEnd::HostNoTty => {
+                tracing::info!(
+                    port = ask.port,
+                    reason = HOST_NO_TTY_REASON,
+                    "the VM host daemon's ask ended without a prompt"
+                );
+                Err(crate::net::policy::ExposeFailure::Refused(
+                    crate::net::policy::ExposeRefusal::DeniedByPolicy,
+                ))
+            }
+            // Cancelled at the host before an answer: nothing was recorded
+            // and nothing is published; the cause says why.
+            AskEnd::HostCancelled(cause) => Err(crate::net::policy::ExposeFailure::Publish {
+                port: ask.port,
+                source: std::io::Error::other(host_ask_cancel_text(*cause)),
+            }),
             // The VM host daemon refused the ask before any human saw it:
             // nothing was recorded at the host and nothing is published.
             AskEnd::HostRefused(reason) => Err(crate::net::policy::ExposeFailure::Publish {
                 port: ask.port,
                 source: std::io::Error::other(format!(
                     "the VM host daemon refused the ask: {}",
-                    host_ask_refusal_text(reason)
+                    host_ask_refusal_text(*reason)
                 )),
+            }),
+            AskEnd::HostUnreachable(error) => Err(crate::net::policy::ExposeFailure::Publish {
+                port: ask.port,
+                source: std::io::Error::other(error.clone()),
             }),
         };
         let decided_by = match answer {
             AskEnd::Answered(_) => crate::audit::DecidedBy::AttachedHuman,
-            AskEnd::Unanswered | AskEnd::HostRefused(_) => crate::audit::DecidedBy::Daemon,
+            AskEnd::Unanswered
+            | AskEnd::HostNoTty
+            | AskEnd::HostCancelled(_)
+            | AskEnd::HostRefused(_)
+            | AskEnd::HostUnreachable(_) => crate::audit::DecidedBy::Daemon,
         };
         self.answer_expose(
             &ask.box_name,
