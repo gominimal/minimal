@@ -2203,9 +2203,11 @@ fn control_args(install: &AnswererInstall, quote: char) -> String {
 /// prefix its user can write, so these are the checks that count, run as
 /// root on the root-owned copy before anything names it. In order:
 ///
-/// 1. `dir` must be a root-owned directory with no group or other write —
-///    otherwise someone else could swap the copy after it is checked — and
-///    the step refuses before it copies anything.
+/// 1. `dir` and every ancestor of it, up to `/`, must be a root-owned,
+///    non-sticky directory with no group or other write. Otherwise someone
+///    else could swap the copy, or rename a directory on its path away,
+///    between the check and the rename. The step names the first offender
+///    and refuses before it copies anything.
 /// 2. `install` copies the source, root's and mode 0755, to an exclusive
 ///    `mktemp` name inside `dir`.
 /// 3. The temp copy is hashed (`shasum -a 256` on macOS, `sha256sum` on
@@ -2223,10 +2225,12 @@ fn control_args(install: &AnswererInstall, quote: char) -> String {
 /// that could end it. The Linux payload is double-quoted whole, so its `$`
 /// is escaped for the outer shell (`\$`) and reaches the inner one as `$`.
 fn verified_copy_steps(install: &AnswererInstall, dir: &str, dest: &str, macos: bool) -> String {
-    let (q, d, group, hash) = if macos {
-        ('"', "$", "wheel", "shasum -a 256")
+    // `dq` is a double quote the inner shell sees: bare in the macOS
+    // payload's single quotes, escaped in the Linux payload's double ones.
+    let (q, d, dq, group, hash) = if macos {
+        ('"', "$", "\"", "wheel", "shasum -a 256")
     } else {
-        ('\'', "\\$", "root", "sha256sum")
+        ('\'', "\\$", "\\\"", "root", "sha256sum")
     };
     let source = &install.source;
     let sha = &install.sha256;
@@ -2245,9 +2249,11 @@ fn verified_copy_steps(install: &AnswererInstall, dir: &str, dest: &str, macos: 
         _ => String::new(),
     };
     format!(
-        " ; find {q}{dir}{q} -maxdepth 0 -type d -user root -not -perm -g+w -not -perm -o+w \
-         | grep -q . || {{ echo {q}minimal: {dir} is not a root-owned directory closed to group \
-         and other writes; the answerer service was not installed{q} >&2 ; exit 1 ; }} \
+        " ; p={q}{dir}{q} ; while : ; do find {dq}{d}p{dq} -maxdepth 0 -type d -user root \
+         -not -perm -g+w -not -perm -o+w -not -perm -1000 | grep -q . || {{ echo {q}minimal:{q} \
+         {dq}{d}p{dq}{q}, on the path to {dir}, is not a root-owned, non-sticky directory closed \
+         to group and other writes; the answerer service was not installed{q} >&2 ; exit 1 ; }} \
+         ; if [ {dq}{d}p{dq} = / ] ; then break ; fi ; p={d}(dirname {dq}{d}p{dq}) ; done \
          ; t={d}(mktemp {q}{dir}/.{ANSWERER_UNIT_LABEL}.XXXXXX{q}) \
          ; install -m 0755 -o root -g {group} {q}{source}{q} {d}t || {copy_failed} \
          ; h={d}({hash} < {d}t || true) ; h={d}{{h%% *}} \
@@ -4601,7 +4607,7 @@ mod tests {
         // carry markdown) writes rather than runs.
         let steps_only = command.replace(&program, "").replace(RANGE_UNIT_PLIST, "");
         let (range_steps, answerer_steps) = steps_only
-            .split_once(" ; find \"")
+            .split_once(" ; p=\"")
             .expect("the answerer service's step follows the range's");
         assert!(
             !range_steps.contains('$') && !steps_only.contains('`'),
@@ -4609,8 +4615,10 @@ mod tests {
              they carry: {range_steps}"
         );
         // The answerer's steps substitute only the verified copy's own
-        // names: its temp file and the hash of it.
+        // names: the path component it walks, its temp file and its hash.
         let copy_names = answerer_steps
+            .replace("$(dirname ", "")
+            .replace("$p", "")
             .replace("$(mktemp ", "")
             .replace("$(shasum ", "")
             .replace("${h%% *}", "")
@@ -6382,127 +6390,216 @@ mod tests {
         }
     }
 
-    /// The privileged step's verified copy (design §7.1): the rendered copy
-    /// fragment, run in a temp dir with `install` and the root-ownership
-    /// `find` stubbed (the only two steps that need root), copies the
-    /// pinned bytes into place — and refuses a source swapped after the
-    /// render, removing its temp copy and naming both hashes.
-    #[test]
-    fn privileged_copy_refuses_a_source_swapped_after_render() {
-        use sha2::Digest as _;
-        let macos = cfg!(target_os = "macos");
-        let root = tempfile::tempdir().expect("a temp dir");
-        let stubs = root.path().join("stubs");
-        let dest_dir = root.path().join("dest");
-        std::fs::create_dir_all(&stubs).unwrap();
-        std::fs::create_dir_all(&dest_dir).unwrap();
-        let stub = |name: &str, body: &str| {
-            use std::os::unix::fs::PermissionsExt as _;
-            let path = stubs.join(name);
-            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        };
-        // `install -m 0755 -o root -g <group> <src> <dst>`: the last two
-        // arguments are the copy; ownership needs root, so it is dropped.
-        stub(
-            "install",
-            "while [ $# -gt 2 ]; do shift; done\ncp \"$1\" \"$2\"",
-        );
-        // The root-ownership check: answer as root's directory would.
-        stub("find", "printf '%s\\n' \"$1\"");
+    /// A temp tree the privileged copy fragment runs in, unprivileged:
+    /// `install` is stubbed to a plain `cp` (ownership needs root), and
+    /// `find` delegates to the real one inside the tree with `-user root`
+    /// mapped to `COPY_ROOT` (this user unless a test says otherwise), and
+    /// answers as root's for the ancestors above the tree.
+    struct CopyHarness {
+        _root: tempfile::TempDir,
+        stubs: std::path::PathBuf,
+        tree: std::path::PathBuf,
+        ancestor: std::path::PathBuf,
+        dest_dir: std::path::PathBuf,
+        dest: std::path::PathBuf,
+        source: std::path::PathBuf,
+        checked: &'static [u8],
+        pinned: String,
+    }
 
-        let source = root.path().join(ANSWERER_PROGRAM_NAME);
-        let checked = b"the bytes the advisory checked\n";
-        std::fs::write(&source, checked).unwrap();
-        let pinned = hex::encode(sha2::Sha256::digest(checked));
-        let dest = dest_dir.join("dev.minimal.zone-answerer");
-        let install = AnswererInstall {
-            source: source.display().to_string(),
-            sha256: pinned.clone(),
-            ..test_install()
-        };
-        let fragment = verified_copy_steps(
-            &install,
-            &dest_dir.display().to_string(),
-            &dest.display().to_string(),
-            macos,
-        );
-        // The fragment as the pasted command's inner shell receives it: the
-        // payload's own quoting, then `sh -c`.
-        let pasted = if macos {
-            format!("sh -c 'set -e{fragment}'")
-        } else {
-            format!("sh -c \"set -e{fragment}\"")
-        };
-        let run = || {
-            std::process::Command::new("/bin/sh")
+    impl CopyHarness {
+        fn new() -> Self {
+            use sha2::Digest as _;
+            use std::os::unix::fs::PermissionsExt as _;
+            let root = tempfile::tempdir().expect("a temp dir");
+            let base = root.path().canonicalize().expect("the temp dir resolves");
+            let stubs = base.join("stubs");
+            let tree = base.join("tree");
+            let ancestor = tree.join("a");
+            let dest_dir = ancestor.join("dest");
+            std::fs::create_dir_all(&stubs).unwrap();
+            std::fs::create_dir_all(&dest_dir).unwrap();
+            for dir in [&tree, &ancestor, &dest_dir] {
+                std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            let stub = |name: &str, body: &str| {
+                let path = stubs.join(name);
+                std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            };
+            // `install -m 0755 -o root -g <group> <src> <dst>`: the last two
+            // arguments are the copy.
+            stub(
+                "install",
+                "while [ $# -gt 2 ]; do shift; done\ncp \"$1\" \"$2\"",
+            );
+            stub(
+                "find",
+                "p=$1; shift\n\
+                 case \"$p\" in \"$COPY_TREE\"|\"$COPY_TREE\"/*) ;; *) printf '%s\\n' \"$p\"; exit 0 ;; esac\n\
+                 owner=${COPY_ROOT:-$(id -un)}\n\
+                 exec /usr/bin/find \"$p\" $(printf '%s ' \"$@\" | sed \"s/-user root/-user $owner/\")",
+            );
+            let source = base.join(ANSWERER_PROGRAM_NAME);
+            let checked: &'static [u8] = b"the bytes the advisory checked\n";
+            std::fs::write(&source, checked).unwrap();
+            let pinned = hex::encode(sha2::Sha256::digest(checked));
+            let dest = dest_dir.join("dev.minimal.zone-answerer");
+            CopyHarness {
+                _root: root,
+                stubs,
+                tree,
+                ancestor,
+                dest_dir,
+                dest,
+                source,
+                checked,
+                pinned,
+            }
+        }
+
+        /// Runs the rendered fragment the way the pasted command's inner
+        /// shell receives it — the payload's own quoting, then `sh -c` —
+        /// with `COPY_ROOT` as the owner the `find` stub calls root.
+        fn run(&self, copy_root: Option<&str>) -> std::process::Output {
+            let macos = cfg!(target_os = "macos");
+            let install = AnswererInstall {
+                source: self.source.display().to_string(),
+                sha256: self.pinned.clone(),
+                ..test_install()
+            };
+            let fragment = verified_copy_steps(
+                &install,
+                &self.dest_dir.display().to_string(),
+                &self.dest.display().to_string(),
+                macos,
+            );
+            let pasted = if macos {
+                format!("sh -c 'set -e{fragment}'")
+            } else {
+                format!("sh -c \"set -e{fragment}\"")
+            };
+            let mut command = std::process::Command::new("/bin/sh");
+            command
                 .args(["-c", &pasted])
                 .env(
                     "PATH",
                     format!(
                         "{}:{}",
-                        stubs.display(),
+                        self.stubs.display(),
                         std::env::var("PATH").unwrap_or_default()
                     ),
                 )
-                .output()
-                .expect("sh runs")
-        };
-        let leftovers = || {
-            std::fs::read_dir(&dest_dir)
+                .env("COPY_TREE", &self.tree)
+                .env_remove("COPY_ROOT");
+            if let Some(owner) = copy_root {
+                command.env("COPY_ROOT", owner);
+            }
+            command.output().expect("sh runs")
+        }
+
+        /// The temp copies left in the destination directory.
+        fn leftovers(&self) -> Vec<String> {
+            std::fs::read_dir(&self.dest_dir)
                 .unwrap()
                 .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
                 .filter(|name| name.starts_with('.'))
-                .collect::<Vec<_>>()
-        };
+                .collect()
+        }
 
-        // The source as checked: copied into place, nothing left over.
-        let output = run();
+        /// Asserts a refusal that names `offender` as the first component
+        /// of the destination's path that fails custody, with nothing
+        /// copied.
+        fn assert_refused_at(&self, output: &std::process::Output, offender: &std::path::Path) {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(!output.status.success(), "refused: {stderr}");
+            assert!(
+                stderr.contains(&format!(
+                    "minimal: {}, on the path to {}, is not a root-owned, non-sticky directory",
+                    offender.display(),
+                    self.dest_dir.display()
+                )),
+                "the refusal names the first offender {}: {stderr}",
+                offender.display()
+            );
+            assert!(!self.dest.exists(), "nothing reaches the destination");
+            assert!(self.leftovers().is_empty(), "{:?}", self.leftovers());
+        }
+    }
+
+    /// The privileged step's verified copy (design §7.1): the rendered copy
+    /// fragment copies the pinned bytes into place, and refuses a source
+    /// swapped after the render, removing its temp copy and naming both
+    /// hashes.
+    #[test]
+    fn privileged_copy_refuses_a_source_swapped_after_render() {
+        use sha2::Digest as _;
+        let harness = CopyHarness::new();
+
+        let output = harness.run(None);
         assert!(
             output.status.success(),
             "the checked bytes install: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        assert_eq!(std::fs::read(&dest).unwrap(), checked);
-        assert!(leftovers().is_empty(), "{:?}", leftovers());
+        assert_eq!(std::fs::read(&harness.dest).unwrap(), harness.checked);
+        assert!(harness.leftovers().is_empty(), "{:?}", harness.leftovers());
 
-        // Swapped after the render: refused, both hashes named, the temp
-        // copy removed, and the installed copy left as it was.
-        std::fs::remove_file(&dest).unwrap();
+        std::fs::remove_file(&harness.dest).unwrap();
         let swapped = b"bytes planted after the advisory checked\n";
-        std::fs::write(&source, swapped).unwrap();
+        std::fs::write(&harness.source, swapped).unwrap();
         let actual = hex::encode(sha2::Sha256::digest(swapped));
-        let output = run();
+        let output = harness.run(None);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(!output.status.success(), "a swapped source is refused");
         assert!(
-            stderr.contains(&pinned) && stderr.contains(&actual),
+            stderr.contains(&harness.pinned) && stderr.contains(&actual),
             "the refusal names both hashes: {stderr}"
         );
-        assert!(!dest.exists(), "nothing reaches the destination");
+        assert!(!harness.dest.exists(), "nothing reaches the destination");
         assert!(
-            leftovers().is_empty(),
+            harness.leftovers().is_empty(),
             "the temp copy is removed: {:?}",
-            leftovers()
+            harness.leftovers()
         );
+    }
 
-        // A destination directory root does not own, or that others can
-        // write, is refused before anything is copied: the real `find`
-        // says so of this user-owned temp dir (a suite run as root owns it,
-        // so the arm is asserted only off root).
+    /// Every ancestor of the destination counts, not only the directory
+    /// itself: one that others can write, or a sticky one, lets a user
+    /// rename the directory away between the check and the rename, so the
+    /// step refuses and names it before anything is copied.
+    #[test]
+    fn privileged_copy_refuses_a_user_writable_ancestor() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let harness = CopyHarness::new();
+        for mode in [0o777, 0o775, 0o757, 0o1755] {
+            std::fs::set_permissions(&harness.ancestor, std::fs::Permissions::from_mode(mode))
+                .unwrap();
+            let output = harness.run(None);
+            harness.assert_refused_at(&output, &harness.ancestor);
+        }
+        std::fs::set_permissions(&harness.ancestor, std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        let output = harness.run(None);
+        assert!(
+            output.status.success(),
+            "the same tree with the ancestor closed installs: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// A destination directory root does not own is refused before
+    /// anything is copied: the real `find` says so of this user-owned temp
+    /// tree, the destination directory the first component it walks. A
+    /// suite run as root owns the tree, so the test asserts only off root.
+    #[test]
+    fn privileged_copy_refuses_a_user_owned_destination() {
         if nix::unistd::geteuid().is_root() {
             return;
         }
-        std::fs::remove_file(stubs.join("find")).unwrap();
-        std::fs::write(&source, checked).unwrap();
-        let output = run();
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(!output.status.success(), "{stderr}");
-        assert!(
-            stderr.contains("is not a root-owned directory"),
-            "the refusal names the directory: {stderr}"
-        );
-        assert!(!dest.exists() && leftovers().is_empty());
+        let harness = CopyHarness::new();
+        let output = harness.run(Some("root"));
+        harness.assert_refused_at(&output, &harness.dest_dir);
     }
 
     /// NET-122's upgrade path the other way: a root-owned copy OLDER than
