@@ -795,6 +795,40 @@ pub(crate) enum AnswererStep {
         /// The protocol version this daemon speaks.
         daemon: u32,
     },
+    /// The step's copy source — this machine's `min-answerer` — passed the
+    /// identity check the advisory runs before offering the privileged step
+    /// ([`answerer_step_with_source`]), and its bytes are pinned: the
+    /// command carries the step, copying exactly those bytes or nothing.
+    /// `service` is the service state the detection read underneath.
+    SourceVerified {
+        /// The service state the checks read: what the host is missing.
+        service: Box<AnswererStep>,
+        /// The verified source and its pin.
+        source: VerifiedSource,
+    },
+    /// The step's copy source failed the identity check the advisory runs
+    /// before offering the privileged step ([`answerer_step_with_source`]):
+    /// on macOS, the Developer ID requirement. The command then carries no
+    /// answerer step at all. `service` is the service state the detection
+    /// read underneath it, so the fact that names what the host is missing
+    /// survives; `reason` names the check that failed.
+    SourceRefused {
+        /// The service state the checks read: what the host is missing
+        /// while the source cannot be copied.
+        service: Box<AnswererStep>,
+        /// The named check that failed on the copy source.
+        reason: String,
+    },
+    /// The step cannot be offered at all, for a named reason no check could
+    /// change: this release ships no `min-answerer`, or this build carries
+    /// no signing identity to verify one by. The step is said to be
+    /// unavailable — never silently dropped — and the command carries none.
+    SourceUnavailable {
+        /// The service state the checks read: what the host is missing.
+        service: Box<AnswererStep>,
+        /// Why the step is unavailable.
+        reason: String,
+    },
     /// The host is not offered the step: a native host, whose in-daemon
     /// answerer stays the interim until the native channel client lands.
     /// Nothing to say and nothing to install, so the advisory's quiet arm
@@ -973,6 +1007,13 @@ pub(crate) struct AnswererInstall {
     /// The `min-answerer` program the step copies — beside this `min`, or
     /// on `PATH`; never a bare name the shell might resolve to anything.
     pub source: String,
+    /// The SHA-256 of the source bytes verified at render time: the
+    /// privileged step refuses a root-owned copy that hashes otherwise.
+    pub sha256: String,
+    /// The designated requirement the privileged step re-verifies its copy
+    /// with on macOS ([`VerifiedSource::requirement`]); `None` renders no
+    /// signature re-check.
+    pub requirement: Option<String>,
     /// The control sockets of the VM host daemons the step asks to release
     /// the hook port: this CLI's own state dir's daemon and its named VMs'.
     /// Empty when none is known — the step then starts the unit directly.
@@ -1025,27 +1066,17 @@ pub(crate) fn answerer_source_in(
 }
 
 /// The answerer program this machine's step copies ([`answerer_source_in`]
-/// over this `min`'s directory and `PATH`). A test build that finds none
-/// renders a fixed stand-in, so the render is asserted wherever the suite
-/// runs; the not-found arm is asserted on the pure half.
+/// over this `min`'s directory and `PATH`); the not-found arm is asserted
+/// on the pure half.
 fn answerer_source() -> Option<String> {
     let exe = std::env::current_exe().ok();
-    let found = answerer_source_in(
+    answerer_source_in(
         exe.as_deref().and_then(std::path::Path::parent),
         std::env::var_os("PATH").as_deref(),
-    );
-    #[cfg(test)]
-    {
-        found.or_else(|| Some(TEST_ANSWERER_SOURCE.to_string()))
-    }
-    #[cfg(not(test))]
-    {
-        found
-    }
+    )
 }
 
-/// The stand-in program path a test build renders when no `min-answerer`
-/// is beside the test binary or on `PATH`.
+/// The stand-in program path the suite's fixed installs carry.
 #[cfg(test)]
 pub(crate) const TEST_ANSWERER_SOURCE: &str = "/opt/minimal-test/bin/min-answerer";
 
@@ -1061,19 +1092,21 @@ pub(crate) fn set_handover_controls(controls: Vec<String>) {
         .unwrap_or_else(std::sync::PoisonError::into_inner) = controls;
 }
 
-/// [`AnswererInstall`] for this machine, as the render and the reader
-/// agree on it — `None` when no `min-answerer` is on this machine to copy.
+/// [`AnswererInstall`] for this machine and the copy source the advisory
+/// verified — `None` when a value it would carry cannot be quoted.
 /// The channel path is the daemon's own resolution —
 /// [`minvmd::net::answerer::resolve_channel_sock`], the machine-global path
 /// every node connects to — so the socket the unit holds and the socket
 /// the daemons connect to are one path by one definition.
-pub(crate) fn answerer_install() -> Option<AnswererInstall> {
+pub(crate) fn answerer_install(verified: &VerifiedSource) -> Option<AnswererInstall> {
     let channel = minvmd::net::answerer::resolve_channel_sock();
     let install = AnswererInstall {
         operator: operator_name(),
         channel_dir: channel.parent().unwrap_or(&channel).display().to_string(),
         channel: channel.display().to_string(),
-        source: answerer_source()?,
+        source: verified.path.clone(),
+        sha256: verified.sha256.clone(),
+        requirement: verified.requirement.clone(),
         controls: HANDOVER_CONTROLS
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1109,6 +1142,217 @@ fn unquotable_value(install: &AnswererInstall) -> Option<&str> {
     .chain(install.controls.iter())
     .map(String::as_str)
     .find(|value| value.chars().any(unsafe_char))
+}
+
+/// The Developer ID team the release signs `min-answerer` with, compiled in
+/// from `MINIMAL_ANSWERER_TEAMID` by the release build of this CLI — the
+/// `<TEAMID>` of [`answerer_requirement`]. A release build without it
+/// carries no signing identity and offers no answerer step on macOS (see
+/// [`macos_answerer_requirement`]); there is no fallback to a bare
+/// `codesign --strict`, which any ad-hoc signature passes.
+#[cfg(all(target_os = "macos", not(any(test, debug_assertions))))]
+const ANSWERER_SIGNING_TEAMID: Option<&str> = option_env!("MINIMAL_ANSWERER_TEAMID");
+
+/// The code-signing identifier the release signs `min-answerer` under
+/// (`codesign --identifier`), compiled in from `MINIMAL_ANSWERER_IDENTIFIER`
+/// beside [`ANSWERER_SIGNING_TEAMID`] and required the same way.
+#[cfg(all(target_os = "macos", not(any(test, debug_assertions))))]
+const ANSWERER_SIGNING_IDENTIFIER: Option<&str> = option_env!("MINIMAL_ANSWERER_IDENTIFIER");
+
+/// The reason the step is unavailable when this machine has no
+/// `min-answerer` to copy: the release this `min` came from shipped none
+/// beside it, and none is on `PATH`.
+const ANSWERER_NOT_SHIPPED: &str = "this release ships no min-answerer";
+
+/// The reason the step is unavailable on a macOS release build that was
+/// compiled without [`ANSWERER_SIGNING_TEAMID`] or
+/// [`ANSWERER_SIGNING_IDENTIFIER`]: there is no requirement to verify the
+/// copy source against, so nothing is offered.
+#[cfg(any(test, all(target_os = "macos", not(debug_assertions))))]
+const ANSWERER_NO_SIGNING_IDENTITY: &str = "this build carries no signing identity";
+
+/// The designated requirement `min-answerer` must satisfy on macOS: signed
+/// by Apple's Developer ID chain (the intermediate's Developer ID marker,
+/// the leaf's Developer ID Application marker), by this team, under this
+/// identifier. `None` when either value holds anything but ASCII letters,
+/// digits, `.`, `-` or `_`: the requirement rides inside the privileged
+/// command's quotes, so a value that could end them is never rendered.
+#[cfg(any(test, all(target_os = "macos", not(debug_assertions))))]
+fn answerer_requirement(teamid: &str, identifier: &str) -> Option<String> {
+    let safe = |value: &str| {
+        !value.is_empty()
+            && value
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+    };
+    (safe(teamid) && safe(identifier)).then(|| {
+        format!(
+            "anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and \
+             certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate \
+             leaf[subject.OU] = \"{teamid}\" and identifier \"{identifier}\""
+        )
+    })
+}
+
+/// The requirement a macOS release build checks the copy source against,
+/// from the signing identity compiled into it — or, when none is, the
+/// named reason the step is unavailable. Pure over the two compiled-in
+/// values, so the no-identity arm is asserted in the suite.
+#[cfg(any(test, all(target_os = "macos", not(debug_assertions))))]
+fn macos_answerer_requirement(
+    teamid: Option<&str>,
+    identifier: Option<&str>,
+) -> Result<String, SourceProblem> {
+    teamid
+        .zip(identifier)
+        .and_then(|(teamid, identifier)| answerer_requirement(teamid, identifier))
+        .ok_or_else(|| SourceProblem::Unavailable(ANSWERER_NO_SIGNING_IDENTITY.to_string()))
+}
+
+/// The copy source the advisory verified, as the step renders it: the path,
+/// the SHA-256 of the bytes the verification read — the pin the privileged
+/// step re-hashes its root-owned copy against — and, on a macOS release
+/// build, the designated requirement the privileged step re-verifies the
+/// copy with ([`answerer_requirement`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct VerifiedSource {
+    /// The `min-answerer` the step copies.
+    pub path: String,
+    /// Lowercase hex SHA-256 of the bytes verified at render time.
+    pub sha256: String,
+    /// The designated requirement the root step re-checks the copy with;
+    /// `None` on Linux, where the hash pin is the identity, and in debug
+    /// and test builds.
+    pub requirement: Option<String>,
+}
+
+/// Why the copy source cannot be offered: refused, with the named check it
+/// failed, or unavailable, with the named reason no check could run. The
+/// identity check's `Ok` is the requirement the root step re-checks the
+/// copy with, where there is one ([`VerifiedSource::requirement`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SourceProblem {
+    /// The source failed the identity check; the reason names it.
+    Refused(String),
+    /// No identity check can run, or there is no source to check; the
+    /// reason names why.
+    Unavailable(String),
+}
+
+/// The bound on the user-side `codesign` run: a verification that wedges
+/// costs the read that ran it a few seconds, never the verb.
+#[cfg(all(target_os = "macos", not(any(test, debug_assertions))))]
+const ANSWERER_IDENTITY_BOUND: Duration = Duration::from_secs(5);
+
+/// The identity check on the copy source, run unprivileged before the step
+/// is offered. It is a pre-check only: the source sits beside `min` in a
+/// prefix its user can write, so the check that counts is the privileged
+/// step's own, on the root-owned copy (design §7.1, post-install custody).
+///
+/// On a macOS release build: `codesign --verify --strict -R` against the
+/// Developer ID requirement this build carries ([`answerer_requirement`]),
+/// or unavailable when it carries none. On Linux the identity is the
+/// SHA-256 pin alone ([`answerer_step_with_source`]); link-cleanliness is
+/// proven at release (`scripts/check-answerer-links.sh`), not here.
+///
+/// Skipped for debug and test builds under the same gate as the
+/// channel-path override (`debug_path_override` in minvmd's answerer
+/// module): a dev tree's binaries carry no Developer ID signature.
+#[cfg(any(test, debug_assertions))]
+async fn answerer_source_identity(_source: String) -> Result<Option<String>, SourceProblem> {
+    Ok(None)
+}
+
+/// The macOS release half of [`answerer_source_identity`].
+#[cfg(all(target_os = "macos", not(any(test, debug_assertions))))]
+async fn answerer_source_identity(source: String) -> Result<Option<String>, SourceProblem> {
+    let requirement =
+        macos_answerer_requirement(ANSWERER_SIGNING_TEAMID, ANSWERER_SIGNING_IDENTIFIER)?;
+    let run = tokio::process::Command::new("codesign")
+        .args(["--verify", "--strict", "-R"])
+        .arg(format!("={requirement}"))
+        .arg(&source)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .output();
+    match tokio::time::timeout(ANSWERER_IDENTITY_BOUND, run).await {
+        Ok(Ok(output)) if output.status.success() => Ok(Some(requirement)),
+        Ok(Ok(output)) => Err(SourceProblem::Refused(format!(
+            "failed its Developer ID check: codesign --verify --strict -R did not accept it ({})",
+            String::from_utf8_lossy(&output.stderr)
+                .lines()
+                .last()
+                .unwrap_or("no reason given")
+                .trim()
+        ))),
+        _ => Err(SourceProblem::Refused(
+            "failed its Developer ID check: codesign did not run, or did not answer within 5 s"
+                .to_string(),
+        )),
+    }
+}
+
+/// The Linux release half of [`answerer_source_identity`]: no signature to
+/// check, so the source is verified by the SHA-256 pin alone.
+#[cfg(all(not(target_os = "macos"), not(any(test, debug_assertions))))]
+async fn answerer_source_identity(_source: String) -> Result<Option<String>, SourceProblem> {
+    Ok(None)
+}
+
+/// The lowercase hex SHA-256 of `path`'s bytes.
+async fn sha256_of(path: &str) -> std::io::Result<String> {
+    use sha2::Digest as _;
+    let bytes = tokio::fs::read(path).await?;
+    Ok(hex::encode(sha2::Sha256::digest(&bytes)))
+}
+
+/// The answerer step with its copy source's verdict folded in — the half of
+/// [`read_answerer_step`] that runs after the service state is read, with
+/// the identity check injected so the suite drives it without a real
+/// `codesign`. Only a step that would carry the copy is touched: a held or
+/// not-offered step comes back as it went in. Otherwise the source is
+/// unavailable (none shipped, or no identity to check it by), refused (it
+/// failed the check), or verified — and only a verified source is pinned:
+/// its bytes are hashed after the check passes, and the privileged step
+/// refuses a copy whose hash differs.
+pub(crate) async fn answerer_step_with_source<F, Fut>(
+    step: AnswererStep,
+    source: Option<String>,
+    identity: F,
+) -> AnswererStep
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = Result<Option<String>, SourceProblem>>,
+{
+    if !step.offered() || step.holds() {
+        return step;
+    }
+    let pinned = match source {
+        None => Err(SourceProblem::Unavailable(ANSWERER_NOT_SHIPPED.to_string())),
+        Some(path) => match identity(path.clone()).await {
+            Ok(requirement) => sha256_of(&path)
+                .await
+                .map(|sha256| VerifiedSource {
+                    path,
+                    sha256,
+                    requirement,
+                })
+                .map_err(|error| {
+                    SourceProblem::Refused(format!("could not be read to pin its SHA-256: {error}"))
+                }),
+            Err(problem) => Err(problem),
+        },
+    };
+    let service = Box::new(step);
+    match pinned {
+        Ok(source) => AnswererStep::SourceVerified { service, source },
+        Err(SourceProblem::Refused(reason)) => AnswererStep::SourceRefused { service, reason },
+        Err(SourceProblem::Unavailable(reason)) => {
+            AnswererStep::SourceUnavailable { service, reason }
+        }
+    }
 }
 
 /// The deadline on the installed copy's one protocol probe: the second
@@ -1173,7 +1417,12 @@ pub(crate) async fn read_answerer_step() -> AnswererStep {
             .map(str::to_string),
         installed_version: installed_protocol_version().await,
     };
-    answerer_step_over(&facts, minvmd::net::answerer::CHANNEL_PROTOCOL_VERSION)
+    let step = answerer_step_over(&facts, minvmd::net::answerer::CHANNEL_PROTOCOL_VERSION);
+    // The copy source's identity, only when the step would carry the copy
+    // (NET-122's privileged step copies this program as root): checked
+    // unprivileged before the step is ever offered, and pinned by hash for
+    // the privileged step to re-check ([`answerer_step_with_source`]).
+    answerer_step_with_source(step, answerer_source(), answerer_source_identity).await
 }
 
 /// `/etc/resolv.conf`: the file every host process's lookup reads (through
@@ -1949,6 +2198,76 @@ fn control_args(install: &AnswererInstall, quote: char) -> String {
         .collect()
 }
 
+/// The privileged step's verified copy of the answerer program (design
+/// §7.1, post-install custody): the user-side checks ran on a source in a
+/// prefix its user can write, so these are the checks that count, run as
+/// root on the root-owned copy before anything names it. In order:
+///
+/// 1. `dir` and every ancestor of it, up to `/`, must be a root-owned,
+///    non-sticky directory with no group or other write. Otherwise someone
+///    else could swap the copy, or rename a directory on its path away,
+///    between the check and the rename. The step names the first offender
+///    and refuses before it copies anything.
+/// 2. `install` copies the source, root's and mode 0755, to an exclusive
+///    `mktemp` name inside `dir`.
+/// 3. The temp copy is hashed (`shasum -a 256` on macOS, `sha256sum` on
+///    Linux) and compared with the SHA-256 the advisory pinned when it
+///    verified the source; a mismatch removes the temp copy and exits
+///    non-zero naming both hashes.
+/// 4. On macOS, when the install carries a requirement, `codesign --verify
+///    --strict -R` re-verifies the temp copy against it.
+/// 5. The copy is renamed into `dest` atomically; the caller writes and
+///    loads the unit or plist only after this, naming only `dest`.
+///
+/// Nothing here touches the running service or the units, so a refusal
+/// leaves the host as it was. Every interpolated path rides in the
+/// payload's inner quote, and [`unquotable_value`] has already refused any
+/// that could end it. The Linux payload is double-quoted whole, so its `$`
+/// is escaped for the outer shell (`\$`) and reaches the inner one as `$`.
+fn verified_copy_steps(install: &AnswererInstall, dir: &str, dest: &str, macos: bool) -> String {
+    // `dq` is a double quote the inner shell sees: bare in the macOS
+    // payload's single quotes, escaped in the Linux payload's double ones.
+    let (q, d, dq, group, hash) = if macos {
+        ('"', "$", "\"", "wheel", "shasum -a 256")
+    } else {
+        ('\'', "\\$", "\\\"", "root", "sha256sum")
+    };
+    let source = &install.source;
+    let sha = &install.sha256;
+    let refuse = |reason: &str| {
+        format!(
+            "{{ rm -f {d}t ; echo {q}minimal: {reason}; the answerer service was not \
+             installed{q} >&2 ; exit 1 ; }}"
+        )
+    };
+    let codesign = match (&install.requirement, macos) {
+        (Some(requirement), true) => format!(
+            " ; codesign --verify --strict -R \"={}\" {d}t || {}",
+            requirement.replace('"', "\\\""),
+            refuse("the copied answerer failed its Developer ID check (codesign -R)")
+        ),
+        _ => String::new(),
+    };
+    format!(
+        " ; [ -d {q}{dir}{q} ] || install -d -m 0755 -o root -g {group} {q}{dir}{q} \
+         || {{ echo {q}minimal: {dir} could not be created root-owned; the answerer service \
+         was not installed{q} >&2 ; exit 1 ; }} \
+         ; p={q}{dir}{q} ; while : ; do find {dq}{d}p{dq} -maxdepth 0 -type d -user root \
+         -not -perm -g+w -not -perm -o+w -not -perm -1000 | grep -q . || {{ echo {q}minimal:{q} \
+         {dq}{d}p{dq}{q}, on the path to {dir}, is not a root-owned, non-sticky directory closed \
+         to group and other writes; the answerer service was not installed{q} >&2 ; exit 1 ; }} \
+         ; if [ {dq}{d}p{dq} = / ] ; then break ; fi ; p={d}(dirname {dq}{d}p{dq}) ; done \
+         ; t={d}(mktemp {q}{dir}/.{ANSWERER_UNIT_LABEL}.XXXXXX{q}) \
+         ; install -m 0755 -o root -g {group} {q}{source}{q} {d}t || {copy_failed} \
+         ; h={d}({hash} < {d}t || true) ; h={d}{{h%% *}} \
+         ; case {d}h in {sha}) ;; *) rm -f {d}t ; echo {q}minimal: the answerer copy hashes{q} \
+         {d}h{q}, not the {sha} the advisory verified: the source changed after it was checked; \
+         the answerer service was not installed{q} >&2 ; exit 1 ;; esac{codesign} \
+         ; mv -f {d}t {q}{dest}{q}",
+        copy_failed = refuse("the answerer program could not be copied"),
+    )
+}
+
 /// The macOS answerer steps of the privileged command (NET-122's host
 /// service), after the range's: boot out a running service, copy
 /// `min-answerer` to the root-owned path and write the plist naming it,
@@ -1959,6 +2278,11 @@ fn control_args(install: &AnswererInstall, quote: char) -> String {
 /// files, asks the daemons to re-bind their interims (`release-cancel`)
 /// and exits non-zero naming the reason, so the host is never left with
 /// nobody answering. With no daemon known, the unit is loaded directly.
+///
+/// The copy comes first, verified as root before anything else runs
+/// ([`verified_copy_steps`]): a copy that fails its hash pin or its
+/// Developer ID re-check never reaches the root-owned path, and the running
+/// service is left as it was.
 #[cfg(any(test, target_os = "macos"))]
 fn macos_answerer_steps(install: &AnswererInstall) -> String {
     let controls = control_args(install, '"');
@@ -1985,21 +2309,20 @@ fn macos_answerer_steps(install: &AnswererInstall) -> String {
         )
     };
     format!(
-        " ; (launchctl bootout system/{ANSWERER_UNIT_LABEL} 2>/dev/null || true) \
+        "{verified_copy} \
+         ; (launchctl bootout system/{ANSWERER_UNIT_LABEL} 2>/dev/null || true) \
          ; mkdir -p \"{channel_dir}\" \
-         ; cp \"{source}\" \"{copy}\" \
          ; cat > {ANSWERER_PLIST_PATH} <<\\{ANSWERER_PLIST_HEREDOC}\n\
 {answerer_plist}\
 {ANSWERER_PLIST_HEREDOC}\n\
-chown root:wheel \"{copy}\" {ANSWERER_PLIST_PATH} \
-         ; chmod 0755 \"{copy}\" ; chmod 0644 {ANSWERER_PLIST_PATH}\
+chown root:wheel {ANSWERER_PLIST_PATH} ; chmod 0644 {ANSWERER_PLIST_PATH}\
 {release} \
          ; rm -f \"{channel}\" \
          ; launchctl bootstrap system {ANSWERER_PLIST_PATH} || {load_failed} \
          ; for poll in {UNIT_UP_POLLS} ; do if [ -S \"{channel}\" ] ; then break ; fi ; sleep 0.25 ; done \
          ; [ -S \"{channel}\" ] || {not_up}",
+        verified_copy = verified_copy_steps(install, RANGE_PROGRAM_DIR, copy, true),
         channel_dir = install.channel_dir,
-        source = install.source,
         answerer_plist = answerer_unit_plist(install),
         load_failed = fail("launchd did not load the answerer service"),
         not_up = fail("the answerer service channel did not come up within 5 s"),
@@ -2132,6 +2455,10 @@ pub(crate) fn linux_command(port: u16, install: Option<&AnswererInstall>) -> Str
 /// interims (`release-cancel`) and exits non-zero naming the reason, so the
 /// host is never left with nobody answering. With no daemon known, the
 /// unit is started directly.
+///
+/// The copy comes first, verified as root before anything else runs
+/// ([`verified_copy_steps`]): a copy that fails its hash pin never reaches
+/// the root-owned path, and the running service is left as it was.
 #[cfg(any(test, not(target_os = "macos")))]
 fn linux_answerer_steps(install: &AnswererInstall) -> String {
     let controls = control_args(install, '\'');
@@ -2160,17 +2487,15 @@ fn linux_answerer_steps(install: &AnswererInstall) -> String {
         )
     };
     format!(
-        " ; mkdir -p {ANSWERER_PROGRAM_DIR} \
+        "{verified_copy} \
          ; (systemctl stop {unit} {ANSWERER_UNIT_LABEL}.service 2>/dev/null || true) \
-         ; cp '{source}' '{copy}' \
          ; cat > {ANSWERER_UNIT_SOCKET_PATH} <<\\{ANSWERER_SOCKET_HEREDOC}\n\
 {answerer_socket}\
 {ANSWERER_SOCKET_HEREDOC}\n\
 cat > {ANSWERER_UNIT_SERVICE_PATH} <<\\{ANSWERER_SERVICE_HEREDOC}\n\
 {answerer_service}\
 {ANSWERER_SERVICE_HEREDOC}\n\
-chown root:root '{copy}' {ANSWERER_UNIT_SOCKET_PATH} {ANSWERER_UNIT_SERVICE_PATH} \
-         ; chmod 0755 '{copy}' \
+chown root:root {ANSWERER_UNIT_SOCKET_PATH} {ANSWERER_UNIT_SERVICE_PATH} \
          ; chmod 0644 {ANSWERER_UNIT_SOCKET_PATH} {ANSWERER_UNIT_SERVICE_PATH} \
          ; systemctl daemon-reload \
          ; systemctl enable {unit}\
@@ -2181,7 +2506,7 @@ chown root:root '{copy}' {ANSWERER_UNIT_SOCKET_PATH} {ANSWERER_UNIT_SERVICE_PATH
          '{channel}' ] ; then break ; fi ; fi ; sleep 0.25 ; done \
          ; systemctl is-active --quiet {unit} || {not_active} \
          ; [ -S '{channel}' ] || {not_up}",
-        source = install.source,
+        verified_copy = verified_copy_steps(install, ANSWERER_PROGRAM_DIR, copy, false),
         answerer_socket = answerer_socket_unit(install),
         answerer_service = answerer_service_unit(install),
         not_active = fail("the answerer service socket unit did not become active within 5 s"),
@@ -2248,6 +2573,12 @@ fn answerer_fact(answerer: &AnswererStep, carried: bool) -> Option<String> {
              this daemon's {daemon}{}",
             remedy("reinstalls it from this machine's own answerer program")
         )),
+        // The refusal itself is said beside this one (see [`advisory_at`]):
+        // what the host is missing is still a fact, and the service state
+        // underneath the refusal is the one the detection read.
+        AnswererStep::SourceVerified { service, .. }
+        | AnswererStep::SourceRefused { service, .. }
+        | AnswererStep::SourceUnavailable { service, .. } => answerer_fact(service, carried),
     }
 }
 
@@ -2425,24 +2756,37 @@ pub(crate) fn advisory_at(
             _ => {}
         }
     }
-    // The step's inputs, when the step is offered and this machine has a
-    // `min-answerer` to copy: the command then carries the step.
-    let install = if answerer.offered() && !answerer.holds() {
-        answerer_install()
-    } else {
-        None
+    // The step's inputs, when the advisory verified and pinned the copy
+    // source: only then does the command carry the step. Every other state
+    // of a step the host still needs is said, never silently dropped.
+    let install = match answerer {
+        AnswererStep::SourceVerified { source, .. } => answerer_install(source),
+        _ => None,
     };
     if answerer.offered() && !answerer.holds() && install.is_none() {
-        facts.push(if answerer_source().is_none() {
-            format!(
-                "the box-zone answerer program {ANSWERER_PROGRAM_NAME} is not beside min or \
-                 on PATH, so the command below cannot install the answerer service"
-            )
-        } else {
-            "a path the answerer service step would carry holds a quote, `$`, a backtick, \
-             a backslash or a line break, which the privileged command cannot quote safely, \
-             so the command below leaves the answerer service out"
-                .to_string()
+        facts.push(match answerer {
+            // The identity check refused the copy source: the reason names
+            // the check that failed.
+            AnswererStep::SourceRefused { reason, .. } => format!(
+                "this machine's box-zone answerer program {ANSWERER_PROGRAM_NAME} failed the \
+                 check the advisory runs before offering to copy it ({reason}), so the command \
+                 below leaves the answerer service out"
+            ),
+            AnswererStep::SourceUnavailable { reason, .. } => format!(
+                "{reason}; the answerer service step is unavailable, so the command below \
+                 leaves it out"
+            ),
+            AnswererStep::SourceVerified { .. } => "a path the answerer service step would \
+                 carry holds a quote, `$`, a backtick, a backslash or a line break, which the \
+                 privileged command cannot quote safely, so the command below leaves the \
+                 answerer service out"
+                .to_string(),
+            // A state no source verdict was folded into: nothing vouches for
+            // the bytes the step would copy, so it is not carried.
+            _ => format!(
+                "this machine's box-zone answerer program {ANSWERER_PROGRAM_NAME} was not \
+                 verified, so the command below leaves the answerer service out"
+            ),
         });
     }
     if let Some(fact) = answerer_fact(answerer, install.is_some()) {
@@ -3197,11 +3541,40 @@ mod tests {
             channel_dir: channel.parent().unwrap_or(&channel).display().to_string(),
             channel: channel.display().to_string(),
             source: TEST_ANSWERER_SOURCE.to_string(),
+            sha256: TEST_ANSWERER_SHA256.to_string(),
+            requirement: None,
             controls: vec![
                 "/state/minimal/providers/local-minvmd0/control.sock".to_string(),
                 "/state/minimal/providers/local-minvmd0/alpha/control.sock".to_string(),
             ],
         }
+    }
+
+    /// The pin [`test_install`] carries: the SHA-256 of the empty input.
+    const TEST_ANSWERER_SHA256: &str =
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+    /// `step` with a verified, pinned copy source folded in — what
+    /// [`read_answerer_step`] returns for a host that still needs the step
+    /// and has a `min-answerer` that passed its identity check.
+    fn verified(step: AnswererStep) -> AnswererStep {
+        AnswererStep::SourceVerified {
+            service: Box::new(step),
+            source: VerifiedSource {
+                path: TEST_ANSWERER_SOURCE.to_string(),
+                sha256: TEST_ANSWERER_SHA256.to_string(),
+                requirement: None,
+            },
+        }
+    }
+
+    /// [`answerer_install`] over the verified source [`verified`] folds in.
+    fn verified_install() -> Option<AnswererInstall> {
+        answerer_install(&VerifiedSource {
+            path: TEST_ANSWERER_SOURCE.to_string(),
+            sha256: TEST_ANSWERER_SHA256.to_string(),
+            requirement: None,
+        })
     }
 
     /// The fragments the advisory must carry on this platform: the exact
@@ -3270,6 +3643,8 @@ mod tests {
             channel_dir: "/run/minimal".to_string(),
             channel: "/run/minimal/answerer.sock".to_string(),
             source: "/home/operator/.local/bin/min-answerer".to_string(),
+            sha256: TEST_ANSWERER_SHA256.to_string(),
+            requirement: None,
             controls: vec!["/home/operator/.minimal/vm/control.sock".to_string()],
         };
         assert_eq!(unquotable_value(&base), None, "plain paths render");
@@ -4229,38 +4604,52 @@ mod tests {
              last command — the payload separates its steps, so the first \
              failure stops the script: {payload}"
         );
-        // The steps outside the two bodies substitute nothing — no `$`, no
-        // backtick — and the bodies themselves are quoted-delimiter
+        // The range's steps outside the two bodies substitute nothing — no
+        // `$`, no backtick — and the bodies themselves are quoted-delimiter
         // (asserted above), so a backtick inside one (the program's comments
         // carry markdown) writes rather than runs.
         let steps_only = command.replace(&program, "").replace(RANGE_UNIT_PLIST, "");
+        let (range_steps, answerer_steps) = steps_only
+            .split_once(" ; [ -d \"")
+            .expect("the answerer service's step follows the range's");
         assert!(
-            !steps_only.contains('$') && !steps_only.contains('`'),
-            "the steps substitute nothing — the bytes they write are the bytes they \
-             carry: {steps_only}"
+            !range_steps.contains('$') && !steps_only.contains('`'),
+            "the range's steps substitute nothing — the bytes they write are the bytes \
+             they carry: {range_steps}"
+        );
+        // The answerer's steps substitute only the verified copy's own
+        // names: the path component it walks, its temp file and its hash.
+        let copy_names = answerer_steps
+            .replace("$(dirname ", "")
+            .replace("$p", "")
+            .replace("$(mktemp ", "")
+            .replace("$(shasum ", "")
+            .replace("${h%% *}", "")
+            .replace("$t", "")
+            .replace("$h", "");
+        assert!(
+            !copy_names.contains('$'),
+            "the answerer's steps substitute nothing but the copy's own names: {answerer_steps}"
         );
         // The range's steps copy nothing in from anywhere, user-writable or
         // not. The answerer service's step after them (NET-122's host
         // service) copies exactly one program — the daemon's own binary,
         // which cannot ride in the command — and only to the root-owned
-        // path its custody checks read back.
-        let (range_steps, answerer_steps) = steps_only
-            .split_once("; mkdir -p \"")
-            .expect("the answerer service's step follows the range's");
+        // path its custody checks read back, through a pinned temp copy.
         assert!(
             !range_steps.contains("cp ") && !range_steps.contains("install "),
             "nothing is copied in for the range, user-writable or not: {range_steps}"
         );
         assert_eq!(
-            answerer_steps.matches("cp ").count(),
+            answerer_steps.matches("install -m ").count(),
             1,
             "the answerer step copies its one program: {answerer_steps}"
         );
         assert!(
             answerer_steps.contains(&format!(
-                "cp \"{}\" \"{MACOS_ANSWERER_PROGRAM_PATH}\"",
+                "install -m 0755 -o root -g wheel \"{}\" $t",
                 install.source
-            )),
+            )) && answerer_steps.contains(&format!("mv -f $t \"{MACOS_ANSWERER_PROGRAM_PATH}\"")),
             "the copy lands at the root-owned path: {answerer_steps}"
         );
         // Root owns both files, at the exact modes the custody checks
@@ -4730,7 +5119,7 @@ mod tests {
             .strip_prefix(resolver_steps)
             .unwrap_or_else(|| panic!("the resolver steps lead unchanged: {command}"));
         assert!(
-            answerer_steps.starts_with(" ; mkdir -p /usr/local/lib/minimal"),
+            answerer_steps.starts_with(" ; [ -d '/usr/local/lib/minimal' ] || install -d"),
             "the answerer service's step follows them: {answerer_steps}"
         );
         assert!(
@@ -5501,16 +5890,20 @@ mod tests {
         // macOS: the copy, root's, and the plist naming it with both
         // sockets launchd holds.
         let mac = macos_command(15353, Some(&install));
-        let copy = format!(
-            "cp \"{}\" \"{MACOS_ANSWERER_PROGRAM_PATH}\"",
-            install.source
-        );
-        let copy_at = mac.find(&copy).expect("the macOS step copies the program");
+        let copy = format!("install -m 0755 -o root -g wheel \"{}\" $t", install.source);
+        let copy_at = mac
+            .find(&copy)
+            .expect("the macOS step copies the program, root's");
         let chown_at = mac
-            .find(&format!(
-                "chown root:wheel \"{MACOS_ANSWERER_PROGRAM_PATH}\" {ANSWERER_PLIST_PATH}"
-            ))
-            .expect("the macOS step makes root the owner of the copy and the plist");
+            .find(&format!("mv -f $t \"{MACOS_ANSWERER_PROGRAM_PATH}\""))
+            .expect("the macOS step renames the verified copy into place");
+        assert!(
+            chown_at
+                < mac
+                    .find(&format!("chown root:wheel {ANSWERER_PLIST_PATH}"))
+                    .unwrap(),
+            "the copy is in place before the plist is written: {mac}"
+        );
         let load_at = mac
             .find(&format!("launchctl bootstrap system {ANSWERER_PLIST_PATH}"))
             .expect("the macOS step loads the service into the system domain");
@@ -5564,13 +5957,20 @@ mod tests {
         // it, run as the operator, the channel's directory the socket
         // unit's RuntimeDirectory.
         let linux = linux_command(15353, Some(&install));
-        let copy = format!("cp '{}' '{LINUX_ANSWERER_PROGRAM_PATH}'", install.source);
+        let copy = format!("install -m 0755 -o root -g root '{}' \\$t", install.source);
         let copy_at = linux
             .find(&copy)
-            .expect("the Linux step copies the program");
+            .expect("the Linux step copies the program, root's");
         let chown_at = linux
-            .find(&format!("chown root:root '{LINUX_ANSWERER_PROGRAM_PATH}'"))
-            .expect("the Linux step makes root the owner of the copy");
+            .find(&format!("mv -f \\$t '{LINUX_ANSWERER_PROGRAM_PATH}'"))
+            .expect("the Linux step renames the verified copy into place");
+        assert!(
+            chown_at
+                < linux
+                    .find(&format!("cat > {ANSWERER_UNIT_SOCKET_PATH}"))
+                    .unwrap(),
+            "the copy is in place before the units are written: {linux}"
+        );
         let enable_at = linux
             .find(&format!("systemctl enable {ANSWERER_UNIT_LABEL}.socket"))
             .expect("the Linux step enables the socket unit");
@@ -5640,7 +6040,7 @@ mod tests {
             false,
             Some(true),
             &range_step_on_this_os(),
-            &AnswererStep::Absent,
+            &verified(AnswererStep::Absent),
             None,
         )
         .expect("a host without the answerer service is advised");
@@ -5650,7 +6050,7 @@ mod tests {
             "{advisory}"
         );
         assert!(
-            advisory.contains(&command(port, answerer_install().as_ref())),
+            advisory.contains(&command(port, verified_install().as_ref())),
             "{advisory}"
         );
         assert!(
@@ -5698,14 +6098,15 @@ mod tests {
             }
         );
         assert!(!behind.holds());
-        let advisory = advise(&behind).expect("a mismatched copy re-surfaces the advisory");
+        let advisory =
+            advise(&verified(behind)).expect("a mismatched copy re-surfaces the advisory");
         assert!(
             advisory.contains(&format!("speaks channel protocol {}", daemon + 1))
                 && advisory.contains(&format!("not this daemon's {daemon}")),
             "the advisory names both versions: {advisory}"
         );
         assert!(
-            advisory.contains(&command(port, answerer_install().as_ref())),
+            advisory.contains(&command(port, verified_install().as_ref())),
             "{advisory}"
         );
 
@@ -5717,7 +6118,8 @@ mod tests {
                 daemon
             }
         );
-        let advisory = advise(&silent).expect("a copy that does not answer re-surfaces it");
+        let advisory =
+            advise(&verified(silent)).expect("a copy that does not answer re-surfaces it");
         assert!(
             advisory.contains(&format!(
                 "does not answer this daemon's channel protocol {daemon}"
@@ -5730,6 +6132,569 @@ mod tests {
         assert!(
             advise(&current).is_none(),
             "a matching copy lets it fall quiet"
+        );
+    }
+
+    /// NET-122's identity check, through the real wiring
+    /// ([`answerer_step_with_source`], the half of [`read_answerer_step`]
+    /// after the service state is read) with the identity checker injected:
+    /// a source that fails it is refused with the reason and never carried;
+    /// a source that passes is pinned, and the rendered command carries the
+    /// SHA-256 of exactly the bytes that were checked. The source sits in a
+    /// prefix its user can write, so this is the pre-check; the privileged
+    /// step's own re-check of the root-owned copy is
+    /// `privileged_copy_refuses_a_source_swapped_after_render`.
+    #[tokio::test]
+    async fn advisory_refuses_an_unsigned_or_link_unclean_source() {
+        use sha2::Digest as _;
+        let port = 15353;
+        let configured = Hook::configured("test", Some(port), "routes the zone");
+        let advise = |step: &AnswererStep| {
+            advisory_at(
+                &configured,
+                port,
+                false,
+                Some(true),
+                &range_step_on_this_os(),
+                step,
+                None,
+            )
+        };
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let source = dir.path().join(ANSWERER_PROGRAM_NAME);
+        let bytes = b"min-answerer fixture bytes\n";
+        std::fs::write(&source, bytes).expect("the fixture source");
+        let source = source.display().to_string();
+        let pinned = hex::encode(sha2::Sha256::digest(bytes));
+
+        // A source that fails its identity check: refused, with the reason.
+        let reason = "failed its Developer ID check: codesign --verify --strict -R did not \
+                      accept it (test-requirement: code failed to satisfy specified code \
+                      requirement(s))";
+        let refused =
+            answerer_step_with_source(AnswererStep::Absent, Some(source.clone()), |_| async {
+                Err(SourceProblem::Refused(reason.to_string()))
+            })
+            .await;
+        assert_eq!(
+            refused,
+            AnswererStep::SourceRefused {
+                service: Box::new(AnswererStep::Absent),
+                reason: reason.to_string(),
+            }
+        );
+        assert!(refused.offered() && !refused.holds());
+        let advisory = advise(&refused).expect("a refused source still advises");
+        assert!(
+            advisory.contains(&format!(
+                "this machine's box-zone answerer program {ANSWERER_PROGRAM_NAME} failed the \
+                 check the advisory runs before offering to copy it ({reason})"
+            )),
+            "the advisory names the reason: {advisory}"
+        );
+        assert!(
+            advisory.contains("not installed as a host service"),
+            "the service state underneath the refusal survives: {advisory}"
+        );
+        assert!(
+            !advisory.contains(ANSWERER_UNIT_LABEL) && !advisory.contains(&pinned),
+            "no copy of the program is carried: {advisory}"
+        );
+        assert!(
+            !advisory.contains("install the box-zone answerer service"),
+            "the lead-in offers no answerer install: {advisory}"
+        );
+        assert!(
+            advisory.contains(&format!("\n  {}", command(port, None))),
+            "the command is the resolver's alone: {advisory}"
+        );
+
+        // A source that passes: verified and pinned to its bytes' SHA-256,
+        // with the requirement the root step re-checks the copy by.
+        let requirement =
+            answerer_requirement("3G47C5HY64", "dev.minimal.min-answerer").expect("safe values");
+        let checked = std::sync::Mutex::new(None);
+        let passed =
+            answerer_step_with_source(AnswererStep::Absent, Some(source.clone()), |path| {
+                *checked.lock().unwrap() = Some(path);
+                let requirement = requirement.clone();
+                async move { Ok(Some(requirement)) }
+            })
+            .await;
+        assert_eq!(
+            checked.lock().unwrap().as_deref(),
+            Some(source.as_str()),
+            "the identity check ran on the source the step copies"
+        );
+        let AnswererStep::SourceVerified {
+            service,
+            source: verified,
+        } = &passed
+        else {
+            panic!("a passing source is verified: {passed:?}");
+        };
+        assert_eq!(**service, AnswererStep::Absent);
+        assert_eq!(
+            verified.sha256, pinned,
+            "the pin is the checked bytes' hash"
+        );
+        assert_eq!(verified.requirement.as_deref(), Some(requirement.as_str()));
+        let advisory = advise(&passed).expect("a verified source advises the step");
+        assert!(
+            advisory.contains(&format!(" in {pinned}) ;;")),
+            "the rendered command carries the pinned hash: {advisory}"
+        );
+        assert!(
+            advisory.contains("install the box-zone answerer service"),
+            "the lead-in offers the answerer install: {advisory}"
+        );
+        #[cfg(target_os = "macos")]
+        assert!(
+            advisory.contains(&format!(
+                "codesign --verify --strict -R \"={}\" $t",
+                requirement.replace('"', "\\\"")
+            )),
+            "the root step re-verifies the copy against the requirement: {advisory}"
+        );
+
+        // The checker this build really runs — the debug-and-test half of
+        // the gate — verifies without a requirement, and the pin still
+        // applies.
+        let real = answerer_step_with_source(
+            AnswererStep::Absent,
+            Some(source.clone()),
+            answerer_source_identity,
+        )
+        .await;
+        assert!(
+            matches!(
+                &real,
+                AnswererStep::SourceVerified { source: VerifiedSource { sha256, requirement: None, .. }, .. }
+                    if *sha256 == pinned
+            ),
+            "{real:?}"
+        );
+
+        // A source that cannot be read is refused, never pinned to nothing.
+        let unreadable = answerer_step_with_source(
+            AnswererStep::Absent,
+            Some(dir.path().join("absent").display().to_string()),
+            answerer_source_identity,
+        )
+        .await;
+        assert!(
+            matches!(&unreadable, AnswererStep::SourceRefused { reason, .. }
+                if reason.starts_with("could not be read to pin its SHA-256")),
+            "{unreadable:?}"
+        );
+
+        // A held or not-offered step is not touched: no source is checked.
+        for step in [AnswererStep::Installed, AnswererStep::NotOffered] {
+            let untouched =
+                answerer_step_with_source(step.clone(), Some(source.clone()), |_| async {
+                    panic!("a step that holds checks no source")
+                })
+                .await;
+            assert_eq!(untouched, step);
+        }
+    }
+
+    /// When the release ships no `min-answerer`, or the build carries no
+    /// signing identity to verify one by, the step is unavailable and the
+    /// advisory says so by name — it never silently drops the step.
+    #[tokio::test]
+    async fn advisory_names_an_unavailable_answerer_step() {
+        let port = 15353;
+        let configured = Hook::configured("test", Some(port), "routes the zone");
+        let advise = |step: &AnswererStep| {
+            advisory_at(
+                &configured,
+                port,
+                false,
+                Some(true),
+                &range_step_on_this_os(),
+                step,
+                None,
+            )
+            .expect("a host still missing the service is advised")
+        };
+
+        let unshipped = answerer_step_with_source(AnswererStep::Absent, None, |_| async {
+            panic!("no source, nothing to check")
+        })
+        .await;
+        assert_eq!(
+            unshipped,
+            AnswererStep::SourceUnavailable {
+                service: Box::new(AnswererStep::Absent),
+                reason: ANSWERER_NOT_SHIPPED.to_string(),
+            }
+        );
+        let advisory = advise(&unshipped);
+        assert!(
+            advisory.contains(
+                "this release ships no min-answerer; the answerer service step is unavailable"
+            ),
+            "{advisory}"
+        );
+        assert!(
+            advisory.contains("not installed as a host service"),
+            "the service state underneath survives: {advisory}"
+        );
+        assert!(
+            advisory.contains(&format!("\n  {}", command(port, None)))
+                && !advisory.contains("install the box-zone answerer service"),
+            "the command carries no answerer step: {advisory}"
+        );
+
+        // A macOS release build with no TEAMID or identifier compiled in.
+        let no_identity = macos_answerer_requirement(None, Some("dev.minimal.min-answerer"))
+            .expect_err("no TEAMID, no requirement");
+        assert_eq!(
+            no_identity,
+            SourceProblem::Unavailable(ANSWERER_NO_SIGNING_IDENTITY.to_string())
+        );
+        assert!(macos_answerer_requirement(Some("3G47C5HY64"), None).is_err());
+        let step = answerer_step_with_source(
+            AnswererStep::Absent,
+            Some(TEST_ANSWERER_SOURCE.to_string()),
+            |_| async { Err(no_identity) },
+        )
+        .await;
+        let advisory = advise(&step);
+        assert!(
+            advisory.contains(
+                "this build carries no signing identity; the answerer service step is \
+                 unavailable"
+            ),
+            "{advisory}"
+        );
+        assert!(
+            !advisory.contains("install the box-zone answerer service"),
+            "never a fallback to a weaker check: {advisory}"
+        );
+
+        // The requirement a build that does carry one checks by.
+        assert_eq!(
+            macos_answerer_requirement(Some("3G47C5HY64"), Some("dev.minimal.min-answerer")),
+            Ok(
+                "anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists \
+                and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate \
+                leaf[subject.OU] = \"3G47C5HY64\" and identifier \"dev.minimal.min-answerer\""
+                    .to_string()
+            )
+        );
+        for (teamid, identifier) in [("3G47\"C5", "id"), ("TEAM", "id' x"), ("", "id")] {
+            assert_eq!(
+                answerer_requirement(teamid, identifier),
+                None,
+                "{teamid:?} / {identifier:?} cannot ride in the command"
+            );
+        }
+    }
+
+    /// A temp tree the privileged copy fragment runs in, unprivileged:
+    /// `install` is stubbed to a plain `cp` (ownership needs root), and
+    /// `find` delegates to the real one inside the tree with `-user root`
+    /// mapped to `COPY_ROOT` (this user unless a test says otherwise), and
+    /// answers as root's for the ancestors above the tree.
+    struct CopyHarness {
+        _root: tempfile::TempDir,
+        stubs: std::path::PathBuf,
+        tree: std::path::PathBuf,
+        ancestor: std::path::PathBuf,
+        dest_dir: std::path::PathBuf,
+        dest: std::path::PathBuf,
+        source: std::path::PathBuf,
+        checked: &'static [u8],
+        pinned: String,
+    }
+
+    impl CopyHarness {
+        fn new() -> Self {
+            use sha2::Digest as _;
+            use std::os::unix::fs::PermissionsExt as _;
+            let root = tempfile::tempdir().expect("a temp dir");
+            let base = root.path().canonicalize().expect("the temp dir resolves");
+            let stubs = base.join("stubs");
+            let tree = base.join("tree");
+            let ancestor = tree.join("a");
+            let dest_dir = ancestor.join("dest");
+            std::fs::create_dir_all(&stubs).unwrap();
+            std::fs::create_dir_all(&dest_dir).unwrap();
+            for dir in [&tree, &ancestor, &dest_dir] {
+                std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            let stub = |name: &str, body: &str| {
+                let path = stubs.join(name);
+                std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            };
+            // `install -m 0755 -o root -g <group> <src> <dst>`: the last two
+            // arguments are the copy.
+            stub(
+                "install",
+                "if [ \"$1\" = -d ]; then while [ $# -gt 1 ]; do shift; done; \
+                 mkdir -m 0755 \"$1\"; exit; fi\n\
+                 while [ $# -gt 2 ]; do shift; done\ncp \"$1\" \"$2\"",
+            );
+            stub(
+                "find",
+                "p=$1; shift\n\
+                 case \"$p\" in \"$COPY_TREE\"|\"$COPY_TREE\"/*) ;; *) printf '%s\\n' \"$p\"; exit 0 ;; esac\n\
+                 owner=${COPY_ROOT:-$(id -un)}\n\
+                 exec /usr/bin/find \"$p\" $(printf '%s ' \"$@\" | sed \"s/-user root/-user $owner/\")",
+            );
+            let source = base.join(ANSWERER_PROGRAM_NAME);
+            let checked: &'static [u8] = b"the bytes the advisory checked\n";
+            std::fs::write(&source, checked).unwrap();
+            let pinned = hex::encode(sha2::Sha256::digest(checked));
+            let dest = dest_dir.join("dev.minimal.zone-answerer");
+            CopyHarness {
+                _root: root,
+                stubs,
+                tree,
+                ancestor,
+                dest_dir,
+                dest,
+                source,
+                checked,
+                pinned,
+            }
+        }
+
+        /// Runs the rendered fragment the way the pasted command's inner
+        /// shell receives it — the payload's own quoting, then `sh -c` —
+        /// with `COPY_ROOT` as the owner the `find` stub calls root.
+        fn run(&self, copy_root: Option<&str>) -> std::process::Output {
+            let macos = cfg!(target_os = "macos");
+            let install = AnswererInstall {
+                source: self.source.display().to_string(),
+                sha256: self.pinned.clone(),
+                ..test_install()
+            };
+            let fragment = verified_copy_steps(
+                &install,
+                &self.dest_dir.display().to_string(),
+                &self.dest.display().to_string(),
+                macos,
+            );
+            let pasted = if macos {
+                format!("sh -c 'set -e{fragment}'")
+            } else {
+                format!("sh -c \"set -e{fragment}\"")
+            };
+            let mut command = std::process::Command::new("/bin/sh");
+            command
+                .args(["-c", &pasted])
+                .env(
+                    "PATH",
+                    format!(
+                        "{}:{}",
+                        self.stubs.display(),
+                        std::env::var("PATH").unwrap_or_default()
+                    ),
+                )
+                .env("COPY_TREE", &self.tree)
+                .env_remove("COPY_ROOT");
+            if let Some(owner) = copy_root {
+                command.env("COPY_ROOT", owner);
+            }
+            command.output().expect("sh runs")
+        }
+
+        /// The temp copies left in the destination directory.
+        fn leftovers(&self) -> Vec<String> {
+            std::fs::read_dir(&self.dest_dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|name| name.starts_with('.'))
+                .collect()
+        }
+
+        /// Asserts a refusal that names `offender` as the first component
+        /// of the destination's path that fails custody, with nothing
+        /// copied.
+        fn assert_refused_at(&self, output: &std::process::Output, offender: &std::path::Path) {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(!output.status.success(), "refused: {stderr}");
+            assert!(
+                stderr.contains(&format!(
+                    "minimal: {}, on the path to {}, is not a root-owned, non-sticky directory",
+                    offender.display(),
+                    self.dest_dir.display()
+                )),
+                "the refusal names the first offender {}: {stderr}",
+                offender.display()
+            );
+            assert!(!self.dest.exists(), "nothing reaches the destination");
+            assert!(self.leftovers().is_empty(), "{:?}", self.leftovers());
+        }
+    }
+
+    /// A stock host has no destination dir until the first install: the
+    /// root step creates it root-owned at 0755 (never the umask's mode)
+    /// before the ancestor walk, which then checks the new dir with the rest.
+    #[test]
+    fn privileged_copy_creates_a_missing_destination() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let harness = CopyHarness::new();
+        std::fs::remove_dir(&harness.dest_dir).unwrap();
+
+        let output = harness.run(None);
+        assert!(
+            output.status.success(),
+            "a missing destination is created and the checked bytes install: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let mode = std::fs::metadata(&harness.dest_dir)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(mode, 0o755, "the destination is created at 0755");
+        assert_eq!(std::fs::read(&harness.dest).unwrap(), harness.checked);
+    }
+
+    /// The privileged step's verified copy (design §7.1): the rendered copy
+    /// fragment copies the pinned bytes into place, and refuses a source
+    /// swapped after the render, removing its temp copy and naming both
+    /// hashes.
+    #[test]
+    fn privileged_copy_refuses_a_source_swapped_after_render() {
+        use sha2::Digest as _;
+        let harness = CopyHarness::new();
+
+        let output = harness.run(None);
+        assert!(
+            output.status.success(),
+            "the checked bytes install: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(std::fs::read(&harness.dest).unwrap(), harness.checked);
+        assert!(harness.leftovers().is_empty(), "{:?}", harness.leftovers());
+
+        std::fs::remove_file(&harness.dest).unwrap();
+        let swapped = b"bytes planted after the advisory checked\n";
+        std::fs::write(&harness.source, swapped).unwrap();
+        let actual = hex::encode(sha2::Sha256::digest(swapped));
+        let output = harness.run(None);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "a swapped source is refused");
+        assert!(
+            stderr.contains(&harness.pinned) && stderr.contains(&actual),
+            "the refusal names both hashes: {stderr}"
+        );
+        assert!(!harness.dest.exists(), "nothing reaches the destination");
+        assert!(
+            harness.leftovers().is_empty(),
+            "the temp copy is removed: {:?}",
+            harness.leftovers()
+        );
+    }
+
+    /// Every ancestor of the destination counts, not only the directory
+    /// itself: one that others can write, or a sticky one, lets a user
+    /// rename the directory away between the check and the rename, so the
+    /// step refuses and names it before anything is copied.
+    #[test]
+    fn privileged_copy_refuses_a_user_writable_ancestor() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let harness = CopyHarness::new();
+        for mode in [0o777, 0o775, 0o757, 0o1755] {
+            std::fs::set_permissions(&harness.ancestor, std::fs::Permissions::from_mode(mode))
+                .unwrap();
+            let output = harness.run(None);
+            harness.assert_refused_at(&output, &harness.ancestor);
+        }
+        std::fs::set_permissions(&harness.ancestor, std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        let output = harness.run(None);
+        assert!(
+            output.status.success(),
+            "the same tree with the ancestor closed installs: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// A destination directory root does not own is refused before
+    /// anything is copied: the real `find` says so of this user-owned temp
+    /// tree, the destination directory the first component it walks. A
+    /// suite run as root owns the tree, so the test asserts only off root.
+    #[test]
+    fn privileged_copy_refuses_a_user_owned_destination() {
+        if nix::unistd::geteuid().is_root() {
+            return;
+        }
+        let harness = CopyHarness::new();
+        let output = harness.run(Some("root"));
+        harness.assert_refused_at(&output, &harness.dest_dir);
+    }
+
+    /// NET-122's upgrade path the other way: a root-owned copy OLDER than
+    /// this daemon — what a release upgrade leaves behind — re-surfaces
+    /// the advisory the way a newer one does, and the command it names
+    /// re-copies the program, so an old root copy never runs silently
+    /// against a new channel.
+    #[test]
+    fn advisory_resurfaces_when_service_binary_is_older() {
+        let daemon = minvmd::net::answerer::CHANNEL_PROTOCOL_VERSION;
+        let port = 15353;
+        let configured = Hook::configured("test", Some(port), "routes the zone");
+
+        let older = answerer_step_over(&root_owned_answerer_facts(Some(daemon - 1)), daemon);
+        assert_eq!(
+            older,
+            AnswererStep::ProtocolMismatch {
+                installed: Some(daemon - 1),
+                daemon
+            }
+        );
+        assert!(!older.holds(), "a behind copy does not hold");
+
+        // Even with the hook routing the zone and everything else held, a
+        // behind copy re-surfaces the advisory: the host service exists,
+        // and it still speaks the box a release upgrade replaced.
+        let advisory = advisory_at(
+            &configured,
+            port,
+            false,
+            Some(true),
+            &range_step_on_this_os(),
+            &verified(older),
+            None,
+        )
+        .expect("a behind copy re-surfaces the advisory even when the hook routes");
+        assert!(
+            advisory.contains(&format!("speaks channel protocol {}", daemon - 1))
+                && advisory.contains(&format!("not this daemon's {daemon}")),
+            "the advisory names both versions: {advisory}"
+        );
+        // And the command it names re-copies the root-owned program.
+        let install = verified_install().expect("the step's inputs");
+        assert!(
+            advisory.contains(&command(port, Some(&install))),
+            "the command carries the answerer step: {advisory}"
+        );
+        #[cfg(target_os = "macos")]
+        let re_copy = [
+            format!("install -m 0755 -o root -g wheel \"{}\" $t", install.source),
+            format!("mv -f $t \"{MACOS_ANSWERER_PROGRAM_PATH}\""),
+        ];
+        #[cfg(not(target_os = "macos"))]
+        let re_copy = [
+            format!("install -m 0755 -o root -g root '{}' \\$t", install.source),
+            format!("mv -f \\$t '{LINUX_ANSWERER_PROGRAM_PATH}'"),
+        ];
+        for step in &re_copy {
+            assert!(
+                advisory.contains(step),
+                "the command re-copies the root-owned program ({step}): {advisory}"
+            );
+        }
+        assert!(
+            advisory.contains(&format!(" in {}) ;;", install.sha256)),
+            "the re-copy is pinned to the verified source's hash: {advisory}"
         );
     }
 
@@ -5775,9 +6740,12 @@ mod tests {
             3,
             "every failed wait asks the daemons to re-bind: {linux}"
         );
+        // Those three, and the verified copy's four refusals (creating the
+        // destination dir, its ancestor walk, the copy, the hash pin), which
+        // run before anything is released and so have nothing to re-bind.
         assert_eq!(
             linux.matches("exit 1").count(),
-            3,
+            7,
             "and fails the command: {linux}"
         );
         assert!(
@@ -5790,8 +6758,9 @@ mod tests {
             .and_then(|rest| rest.strip_suffix('"'))
             .expect("one sudo sh -c, its payload double-quoted whole");
         assert!(
-            !payload.contains('$') && !payload.contains('`'),
-            "nothing inside the double quotes expands in the outer shell: {payload}"
+            !payload.replace("\\$", "").contains('$') && !payload.contains('`'),
+            "nothing inside the double quotes expands in the outer shell — the copy's own \
+             names are escaped for the inner one: {payload}"
         );
 
         let mac = macos_command(15353, Some(&install));
