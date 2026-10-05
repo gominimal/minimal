@@ -4076,6 +4076,10 @@ if [ -n "${MINVMD_GVPROXY_BIN:-}" ] && [ -x "$MINVMD_GVPROXY_BIN" ]; then
   fi_gvproxy="$MINVMD_GVPROXY_BIN"
 elif [ -x "$ROOT/.scratch/gvproxy" ]; then
   fi_gvproxy="$ROOT/.scratch/gvproxy"
+elif [ -x "$WORK/gvproxy-bin/gvproxy-min" ]; then
+  # The native lane's provisioning already staged the same pinned switch
+  # (same lock) at the top of this run — the fetch is once per run.
+  fi_gvproxy="$WORK/gvproxy-bin/gvproxy-min"
 else
   mkdir -p "$WORK/fresh-install"
   if ! "$ROOT/scripts/fetch-gvproxy.sh" "$WORK/fresh-install/gvproxy" \
@@ -7635,6 +7639,10 @@ proof_box_name_resolves_natively_without_proxy() {
       cp "$MINVMD_GVPROXY_BIN" "$bn_bin/gvproxy-min"
     elif [ -x "$ROOT/.scratch/gvproxy" ]; then
       cp "$ROOT/.scratch/gvproxy" "$bn_bin/gvproxy-min"
+    elif [ -x "$WORK/gvproxy-bin/gvproxy-min" ]; then
+      # The native lane's provisioning already staged the same pinned switch
+      # (same lock) at the top of this run — the fetch is once per run.
+      cp "$WORK/gvproxy-bin/gvproxy-min" "$bn_bin/gvproxy-min"
     elif [ -x "$WORK/fresh-install/gvproxy" ]; then
       # An earlier case in this same run already fetched the same pinned
       # switch (the fresh-install proof's fetch, same lock) — the fetch is
