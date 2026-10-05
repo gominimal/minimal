@@ -229,7 +229,16 @@ impl fmt::Display for HookStatus {
             Self::Failed { code: Some(code) } => write!(f, "exited with status {code}"),
             Self::Failed { code: None } => write!(f, "was killed by a signal"),
             Self::TimedOut { after, budgeted } => {
-                write!(f, "timed out after {}s", after.as_secs())?;
+                // Whole seconds read as declared timeouts do; a teardown
+                // budget can leave a fraction, which `as_secs` would
+                // truncate to a misleading "0s".
+                if after.subsec_nanos() == 0 {
+                    write!(f, "timed out after {}s", after.as_secs())?;
+                } else if after.as_secs() == 0 {
+                    write!(f, "timed out after {}ms", after.as_millis())?;
+                } else {
+                    write!(f, "timed out after {:.1}s", after.as_secs_f64())?;
+                }
                 if *budgeted {
                     write!(f, " (teardown budget)")?;
                 }
@@ -1098,6 +1107,22 @@ mod tests {
             }
             .to_string(),
             "timed out after 4s (teardown budget)"
+        );
+        assert_eq!(
+            HookStatus::TimedOut {
+                after: Duration::from_millis(250),
+                budgeted: true,
+            }
+            .to_string(),
+            "timed out after 250ms (teardown budget)"
+        );
+        assert_eq!(
+            HookStatus::TimedOut {
+                after: Duration::from_millis(2500),
+                budgeted: true,
+            }
+            .to_string(),
+            "timed out after 2.5s (teardown budget)"
         );
         assert_eq!(
             HookStatus::NotRun {
