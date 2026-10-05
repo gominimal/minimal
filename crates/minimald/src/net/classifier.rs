@@ -1101,17 +1101,14 @@ pub const GUEST_CT_MARK_MASK: u32 = 0x3000_0000;
 const REHEARSAL_MOUNTINFO_ENV: &str = "MINIMAL_OVERRIDE_CGROUP_MOUNTINFO";
 
 /// What the guest's own boot hands the installer's render: the tree this
-/// daemon mounted, the answerer as this daemon serves it, and NET-078's two
-/// source identities — which on a guest are both the guest's own address,
-/// but the render is told so, never left to assume.
+/// daemon mounted and NET-078's two source identities — which on a guest are
+/// both the guest's own address, but the render is told so, never left to
+/// assume. No answerer: a VM-backed guest renders no resolver carve-out
+/// ([`GUEST_NO_CARVE_OUT_LINE`]).
 pub struct GuestRender<'a> {
     /// The tree root this daemon itself laid out: `sandbox2`'s
     /// `classifier::TREE_ROOT`, under the cgroup2 its boot mounted.
     pub tree_root: &'a Path,
-    /// The one destination a deny-all box may reach, at the port this
-    /// daemon's answerer serves on this guest.
-    pub answerer_address: Ipv4Addr,
-    pub answerer_port: u16,
     /// What the boxes cohort leaves as, and what everything else in the
     /// slice leaves as.
     pub cohort_address: IpAddr,
@@ -1132,6 +1129,14 @@ pub struct GuestRender<'a> {
 /// guest's bound, not the host installer's: a step a person runs under
 /// sudo is theirs to interrupt, while a boot has only this.
 const GUEST_CHILD_DEADLINE: Duration = Duration::from_secs(30);
+
+/// The one line the guest's render logs: a VM-backed host's node DNS layer
+/// applies no per-box name rule to host-address boxes, so the guest's table
+/// admits no resolver for a deny-all box and retargets nothing — its DNS to
+/// the gateway is refused like any other destination until the follow-up
+/// gives it a resolver of its own.
+pub const GUEST_NO_CARVE_OUT_LINE: &str =
+    "deny-all host-address box on VM host: no resolver carve-out (follow-up gominimal/inbox#897)";
 
 /// Feeds one of the guest's own runs the bytes it reads on stdin, then
 /// waits for it, both inside the bound it is given. The feed is part of
@@ -1261,10 +1266,7 @@ pub fn render_guest_ruleset_over(
         .arg("--print-ruleset")
         .arg("--root")
         .arg(params.tree_root)
-        .arg("--answerer-address")
-        .arg(params.answerer_address.to_string())
-        .arg("--answerer-port")
-        .arg(params.answerer_port.to_string())
+        .arg("--no-resolver-carve-out")
         .arg("--cohort-address")
         .arg(params.cohort_address.to_string())
         .arg("--node-plane-address")
@@ -1278,6 +1280,7 @@ pub fn render_guest_ruleset_over(
     if let Some(mountinfo) = params.mountinfo_override {
         installer.env(REHEARSAL_MOUNTINFO_ENV, mountinfo);
     }
+    tracing::info!("{GUEST_NO_CARVE_OUT_LINE}");
     let child = installer
         .spawn()
         .map_err(|cause| format!("spawning {}: {cause}", bash.display()))?;
@@ -2315,10 +2318,11 @@ fn mapped_non_root_id(map: &str) -> Option<u32> {
 /// is delegated to is named through the step's sudo seam whatever uid the
 /// lane runs as — see [`delegated_owner`] — so the lane asserts on root
 /// lanes too, not only where a person's account happens to be the one
-/// that ran sudo.
+/// that ran sudo. `flags` follow `--root`, so a lane can install with the
+/// same parameters another lane rendered with.
 #[cfg(test)]
-fn run_install(mount: &StandinMount, nft_dir: &Path) -> std::process::Output {
-    let mut step = step_command(mount, &[], Some(nft_dir));
+fn run_install_with(mount: &StandinMount, flags: &[&str], nft_dir: &Path) -> std::process::Output {
+    let mut step = step_command(mount, flags, Some(nft_dir));
     let (uid, gid) = delegated_owner();
     step.env("SUDO_UID", uid.to_string())
         .env("SUDO_GID", gid.to_string());
@@ -2405,8 +2409,6 @@ fn guest_params<'a>(
 ) -> GuestRender<'a> {
     GuestRender {
         tree_root: &mount.root,
-        answerer_address: ANSWERER_ADDRESS,
-        answerer_port: crate::net::answerer::ANSWERER_PORT,
         cohort_address: cohort,
         node_plane_address: node_plane,
         ct_mark_mask: GUEST_CT_MARK_MASK,
@@ -4119,8 +4121,20 @@ mod tests {
             "the digest the boot logs covers exactly the bytes piped to the load"
         );
 
-        // The print lane: the same transaction as text.
-        let printed = rendered_ruleset();
+        // The print lane: the same transaction as text, over the guest's
+        // own parameters — a VM-backed guest renders no resolver carve-out.
+        let print_mount = standin_mount();
+        let printed = run_step(
+            &print_mount,
+            &["--print-ruleset", "--no-resolver-carve-out"],
+            None,
+        );
+        assert!(
+            printed.status.success(),
+            "the step's print mode renders the guest's parameters: {}",
+            String::from_utf8_lossy(&printed.stderr),
+        );
+        let printed = String::from_utf8(printed.stdout).expect("the rendered ruleset is text");
         assert_eq!(
             blake3::hash(&guest_piped),
             blake3::hash(printed.as_bytes()),
@@ -4142,7 +4156,7 @@ mod tests {
         // posture lifts is the only privilege it does — so this lane
         // asserts the one text on root lanes too, not only where a
         // person's account happens to be the one that ran sudo.
-        let installed = run_install(&mount, stub.path());
+        let installed = run_install_with(&mount, &["--no-resolver-carve-out"], stub.path());
         assert!(
             installed.status.success(),
             "the install lays out its tree and hands its one transaction to nft: {}{}",
@@ -4856,7 +4870,7 @@ mod tests {
         ] {
             let step = step_command_over(
                 &mount,
-                &["--print-ruleset"],
+                &["--print-ruleset", "--no-resolver-carve-out"],
                 None,
                 &cohort.to_string(),
                 &node_plane.to_string(),
@@ -4920,10 +4934,7 @@ mod tests {
                 "--print-ruleset".to_string(),
                 "--root".to_string(),
                 mount.root.display().to_string(),
-                "--answerer-address".to_string(),
-                ANSWERER_ADDRESS.to_string(),
-                "--answerer-port".to_string(),
-                crate::net::answerer::ANSWERER_PORT.to_string(),
+                "--no-resolver-carve-out".to_string(),
                 "--cohort-address".to_string(),
                 guest_ip.to_string(),
                 "--node-plane-address".to_string(),
@@ -5077,72 +5088,47 @@ mod tests {
         );
     }
 
-    /// NET-079's one carve-out, as the guest's own render spells it: the
-    /// dstnat rule retargets a *deny-subtree* socket's lookups at DNS's port
-    /// onto the answerer's address and port — matched by address and port,
-    /// never loopback-wide :53 and never the node plane's DNS — so a
-    /// deny-all box's resolver is the one destination its connections are
-    /// admitted to and nothing else's lookups are moved. Read off the
-    /// guest's own render, the one its boot loads, over the collapsed pair
-    /// of identities an un-enrolled guest has.
+    /// On a VM-backed host the guest renders no resolver carve-out: its node
+    /// DNS layer applies no per-box name rule to host-address boxes, so the
+    /// table admits no resolver for a deny-all box and retargets nothing.
+    /// The deny chain is the reply admission, the log, and the reject — a
+    /// deny-all box's DNS to the gateway meets the reject like any other
+    /// destination — and no chain moves or matches DNS's port. Read off the
+    /// guest's own render, over the collapsed pair an un-enrolled guest has.
     #[test]
-    fn guest_dstnat_scoped_to_deny_subtree() {
+    fn guest_deny_all_renders_no_resolver_carve_out() {
         let guest_ip = IpAddr::V4(crate::net::SwitchSubnet::default().daemon_ip());
         let ruleset = String::from_utf8(guest_ruleset(guest_ip, guest_ip))
             .expect("the guest's render is text");
-        let dstnat = chain_rules(&ruleset, "dstnat");
-        assert_eq!(
-            dstnat.len(),
-            1,
-            "one retargeting rule, nothing else at dstnat: {dstnat:?}"
-        );
-        let rel = tree_root_name();
-        let deny_subtree = format!(
-            "{}/{}/{}",
-            rel,
-            sandbox2::classifier::BOXES_DIR,
-            sandbox2::config::DENY_DIR
-        );
-        assert_eq!(
-            dstnat[0],
-            format!(
-                "socket cgroupv2 level {} \"{}\" ip daddr {ANSWERER_ADDRESS} udp dport 53 \
-                 dnat ip to {ANSWERER_ADDRESS}:{}",
-                deny_subtree.split('/').count(),
-                deny_subtree,
-                crate::net::answerer::ANSWERER_PORT,
-            ),
-            "the rule matches a deny-subtree socket at the subtree's own level, \
-             sending to the answerer's address on DNS's port, and retargets \
-             exactly that one destination onto the answerer"
-        );
-
-        // Nothing else in the table moves a lookup: no other chain dnat's
-        // anything, and no rule outside dstnat matches DNS's port — so a
-        // lookup from anywhere but the deny subtree, and a lookup on any
-        // other port from inside it, meets the table it always met.
-        for chain in ["output", "deny_out", "classify", "postrouting"] {
-            let rules = chain_rules(&ruleset, chain);
-            assert!(
-                rules.iter().all(|rule| !rule.contains("dnat ")),
-                "the retargeting lives in dstnat alone, not {chain}: {rules:?}"
-            );
-            assert!(
-                rules.iter().all(|rule| !rule.contains("udp dport 53")),
-                "no rule outside dstnat matches DNS's port, so nothing is \
-                 retargeted loopback-wide: {rules:?}"
-            );
-        }
-
-        // And the node plane's DNS is never the destination: the resolver a
-        // guest that decides nothing falls back to is the switch gateway, and
-        // the carve-out never reaches it — the dstnat rule names the
-        // answerer's address, the one address the deny chain admits.
-        let node_dns = crate::net::SwitchSubnet::default().dns_server();
         assert!(
-            !ruleset.contains(&node_dns.to_string()),
-            "the node plane's DNS at {node_dns} is never the carve-out's \
-             destination"
+            chain_rules(&ruleset, "dstnat").is_empty() && !ruleset.contains("chain dstnat"),
+            "the guest's table has no dstnat chain:\n{ruleset}"
+        );
+        let deny_out = chain_rules(&ruleset, "deny_out");
+        let accepts: Vec<&str> = deny_out
+            .iter()
+            .copied()
+            .filter(|rule| rule.ends_with("accept"))
+            .collect();
+        assert_eq!(
+            accepts,
+            ["ct state established,related ct direction reply accept"],
+            "the deny chain admits the reply direction and nothing else: {deny_out:?}"
+        );
+        assert_eq!(
+            deny_out.last().copied(),
+            Some("reject with icmpx admin-prohibited"),
+            "everything else a deny-all box opens is rejected: {deny_out:?}"
+        );
+        assert!(
+            !ruleset.contains("dport 53") && !ruleset.contains("dnat "),
+            "no rule matches or moves DNS's port:\n{ruleset}"
+        );
+        assert_eq!(
+            GUEST_NO_CARVE_OUT_LINE,
+            "deny-all host-address box on VM host: no resolver carve-out \
+             (follow-up gominimal/inbox#897)",
+            "the render's one line names the follow-up"
         );
     }
 
@@ -5652,7 +5638,7 @@ mod tests {
         // a memo another launch could overwrite — so the undecidable
         // reading above is exactly what keeps the plan on the node's DNS
         // layer. Proven in provider.rs's
-        // `guest_deny_all_box_resolves_through_answerer_once_decided`.
+        // `guest_deny_all_renders_no_resolver_carve_out_in_the_box_plan`.
     }
 
     /// The guest's recheck (NET-079): a marker is the boot's claim, and the

@@ -19,7 +19,7 @@
 # Usage:
 #   sudo scripts/install-host-classifier.sh [--user NAME] [--root DIR]
 #         [--answerer-address ADDR] [--answerer-port PORT]
-#         [--ct-mark-mask 0x30000000]
+#         [--no-resolver-carve-out] [--ct-mark-mask 0x30000000]
 #         --cohort-address ADDR --node-plane-address ADDR
 #   sudo scripts/install-host-classifier.sh --pid PID
 #   sudo scripts/install-host-classifier.sh --uninstall
@@ -138,6 +138,13 @@ tree_root=$DEFAULT_TREE_ROOT
 # carve-out is by address and port, never loopback-wide).
 answerer_address=127.0.0.1
 answerer_port=7656
+# --no-resolver-carve-out renders neither the answerer's admission in
+# deny_out nor the dstnat retarget: a VM-backed guest has no resolver a
+# deny-all box may be admitted to (its node DNS layer applies no per-box
+# name rule to host-address boxes), so its DNS is refused like any other
+# destination until gominimal/inbox#897 gives it one.
+resolver_carve_out=1
+answerer_given=
 # The cohort's and the node plane's source identities (NET-078). They are
 # this host's to know, not the script's to guess: each SNAT rule is rendered
 # only when its address was given, and the two go together — half a
@@ -167,6 +174,7 @@ while [ $# -gt 0 ]; do
         --answerer-address)
             [ $# -ge 2 ] || die "--answerer-address needs an address"
             answerer_address=$2
+            answerer_given=1
             shift 2
             ;;
         --answerer-port)
@@ -175,6 +183,7 @@ while [ $# -gt 0 ]; do
                 die "--answerer-port needs a numeric port, got: $2" ;;
             esac
             answerer_port=$2
+            answerer_given=1
             shift 2
             ;;
         --cohort-address)
@@ -192,6 +201,7 @@ while [ $# -gt 0 ]; do
             ct_mark_mask=$2
             shift 2
             ;;
+        --no-resolver-carve-out) resolver_carve_out=; shift ;;
         --uninstall) mode=uninstall; shift ;;
         --check)     mode=check; shift ;;
         --print-ruleset) mode=print_ruleset; shift ;;
@@ -211,6 +221,12 @@ while [ $# -gt 0 ]; do
         *)           die "unknown argument: $1 (see --help)" ;;
     esac
 done
+
+# A render without the carve-out has no answerer to name, so a call that
+# names one asked for two renders at once.
+if [ -z "$resolver_carve_out" ] && [ -n "$answerer_given" ]; then
+    die "--no-resolver-carve-out renders no answerer: drop --answerer-address and --answerer-port"
+fi
 
 # The account the tree is delegated to, and the one whose boxes it is:
 # --user wins, else the account that ran sudo, else there is no default worth
@@ -488,6 +504,17 @@ cgroup_level() {
 # so translating its source would rewrite the reply the conntrack entry
 # already knows.
 render_ruleset() {
+    carve_out_rule=
+    dstnat_chain=
+    if [ -n "$resolver_carve_out" ]; then
+        carve_out_rule="
+        ip daddr $answerer_address udp dport $answerer_port accept"
+        dstnat_chain="
+    chain dstnat {
+        type nat hook output priority dstnat; policy accept;
+        socket cgroupv2 level $(cgroup_level "$deny_path") \"$deny_path\" ip daddr $answerer_address udp dport 53 dnat ip to $answerer_address:$answerer_port
+    }"
+    fi
     cat <<RULES
 add table inet $TABLE_NAME
 delete table inet $TABLE_NAME
@@ -498,15 +525,10 @@ table inet $TABLE_NAME {
         socket cgroupv2 level $(cgroup_level "$deny_path") "$deny_path" jump deny_out
     }
     chain deny_out {
-        ct state established,related ct direction reply accept
-        ip daddr $answerer_address udp dport $answerer_port accept
+        ct state established,related ct direction reply accept$carve_out_rule
         limit rate 1/second burst 4 packets log prefix "minimal-classifier: refused " level warn
         reject with icmpx admin-prohibited
-    }
-    chain dstnat {
-        type nat hook output priority dstnat; policy accept;
-        socket cgroupv2 level $(cgroup_level "$deny_path") "$deny_path" ip daddr $answerer_address udp dport 53 dnat ip to $answerer_address:$answerer_port
-    }
+    }$dstnat_chain
     chain classify {
         type filter hook output priority mangle; policy accept;
         ct state new socket cgroupv2 level $(cgroup_level "$boxes_path") "$boxes_path" ct mark set ct mark and $clear_hex or $cohort_hex

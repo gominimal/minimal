@@ -734,8 +734,6 @@ async fn async_main() -> Result<(), MainError> {
         let identity = std::net::IpAddr::V4(minimald::net::DEFAULT_SUBNET.daemon_ip());
         let render = minimald::net::classifier::GuestRender {
             tree_root,
-            answerer_address: minimald::net::classifier::ANSWERER_ADDRESS,
-            answerer_port: zone_answerer_port.unwrap_or(minimald::net::answerer::ANSWERER_PORT),
             cohort_address: identity,
             node_plane_address: identity,
             ct_mark_mask: minimald::net::classifier::GUEST_CT_MARK_MASK,
