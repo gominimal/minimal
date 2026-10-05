@@ -153,8 +153,9 @@ const PUBLISH_RETRY_CAP: Duration = Duration::from_secs(30);
 /// VM host daemon answers a report from memory, so a report that outlives
 /// this is a host that is not answering. The publish waiting on it holds
 /// the session's actor, so the bound covers the attempts as a whole — the
-/// dials, the reply waits and the backoffs between them — never each
-/// attempt on its own.
+/// dials, the reply waits and the backoffs between them — and each attempt
+/// gets an equal share of it ([`attempt_deadline`]), so a reply that never
+/// arrives still leaves the later attempts their turn.
 const REPORT_DEADLINE: Duration = Duration::from_secs(10);
 
 /// The one deadline every attempt of a *withdrawn*-port report shares: the
@@ -305,6 +306,20 @@ where
     })
 }
 
+/// One attempt's own bound under a report's shared `deadline`: an equal
+/// share of the `total` across its `attempts`, never past the deadline. A
+/// reply that never arrives — a door that holds the connection without
+/// answering — then costs one share, not the whole budget, so the attempts
+/// after it still run.
+fn attempt_deadline(
+    deadline: tokio::time::Instant,
+    total: Duration,
+    attempts: usize,
+) -> tokio::time::Instant {
+    let share = total / u32::try_from(attempts).unwrap_or(u32::MAX).max(1);
+    deadline.min(tokio::time::Instant::now() + share)
+}
+
 /// One report's dial and exchange, timed out as a whole at `deadline`: a
 /// door that accepts and then stalls must not hang the publish or the
 /// teardown waiting on it. The connection closes from this side when the
@@ -382,7 +397,8 @@ pub(crate) async fn report_admitted_port(
     let deadline = tokio::time::Instant::now() + REPORT_DEADLINE;
     let mut unanswered = None;
     for attempt in 1..=REPORT_ATTEMPTS {
-        match report_exchange(&channel, &request, deadline).await {
+        let bound = attempt_deadline(deadline, REPORT_DEADLINE, REPORT_ATTEMPTS);
+        match report_exchange(&channel, &request, bound).await {
             // Answered, so decided: the recorded port is the grant's own
             // word that the publish may stand.
             Ok(minimald_rpc::BoxControlReply::PortRecorded { .. }) => return Ok(()),
@@ -495,7 +511,8 @@ async fn withdraw_report(
     let deadline = tokio::time::Instant::now() + WITHDRAW_REPORT_DEADLINE;
     let mut unanswered = None;
     for attempt in 1..=WITHDRAW_REPORT_ATTEMPTS {
-        match report_exchange(channel, &request, deadline).await {
+        let bound = attempt_deadline(deadline, WITHDRAW_REPORT_DEADLINE, WITHDRAW_REPORT_ATTEMPTS);
+        match report_exchange(channel, &request, bound).await {
             // Answered: the host's withdrawal is never refused, and a row
             // that held nothing the report named is the report's goal
             // state — both replies end it.
@@ -3752,6 +3769,88 @@ mod tests {
     /// before it answers it withdraws the same port at the host — the lost
     /// reply may have followed a recorded port, and the unwound publish must
     /// not leave the host's row naming it.
+    /// A door that reads each admit and then holds the connection open
+    /// without answering — the shape a lost reply takes on the KVM shuttle —
+    /// still sees every attempt: each attempt waits out its own share of the
+    /// report's deadline, not the whole of it.
+    #[tokio::test]
+    async fn held_admit_report_is_retried_within_the_deadline() {
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+        let dir = tempfile::tempdir().unwrap();
+        let control_sock = dir.path().join("control.sock");
+        let door = dir.path().join("report-door.sock");
+        let listener = UnixListener::bind(&door).expect("bind the report door stand-in");
+        let (seen_tx, mut seen) = mpsc::unbounded_channel();
+        let task = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                let (read, mut write) = stream.into_split();
+                let mut reader = tokio::io::BufReader::new(read);
+                let mut line = String::new();
+                if reader.read_line(&mut line).await.is_err() {
+                    continue;
+                }
+                let request =
+                    serde_json_lenient::from_str::<minimald_rpc::BoxControlRequest>(line.trim())
+                        .expect("the report door's request line parses");
+                let admit = matches!(request, minimald_rpc::BoxControlRequest::AdmitPort(_));
+                #[expect(
+                    clippy::let_underscore_must_use,
+                    reason = "the test may drop its receiver once it has its answer"
+                )]
+                let _ = seen_tx.send(request);
+                if admit {
+                    held.push((reader, write));
+                    continue;
+                }
+                let mut reply_line =
+                    serde_json_lenient::to_string(&minimald_rpc::BoxControlReply::PortRecorded {
+                        port: 3000,
+                        proto: IpProto::Tcp,
+                    })
+                    .expect("the reply serialises");
+                reply_line.push('\n');
+                #[expect(
+                    clippy::let_underscore_must_use,
+                    reason = "the client may already have given up on the reply"
+                )]
+                let _ = write.write_all(reply_line.as_bytes()).await;
+            }
+        });
+        seed_vm_report_door_for_tests(&control_sock, &door);
+
+        let started = std::time::Instant::now();
+        let reported = report_admitted_port(
+            &ControlChannel::Unix(control_sock.clone()),
+            Ipv4Addr::new(100, 64, 128, 22),
+            3000,
+            minimald_rpc::PortReportSource::Listen,
+        )
+        .await;
+        let elapsed = started.elapsed();
+        clear_vm_report_door_for_tests(&control_sock);
+        task.abort();
+
+        assert!(
+            reported.is_err(),
+            "an admit the host never answered fails closed"
+        );
+        let mut admits = 0;
+        while let Ok(request) = seen.try_recv() {
+            if matches!(request, minimald_rpc::BoxControlRequest::AdmitPort(_)) {
+                admits += 1;
+            }
+        }
+        assert_eq!(
+            admits, REPORT_ATTEMPTS,
+            "a held reply is retried within the attempts, not spent on the first"
+        );
+        assert!(
+            elapsed < REPORT_DEADLINE + WITHDRAW_REPORT_DEADLINE,
+            "the attempts stay under the report's deadline: {elapsed:?}"
+        );
+    }
+
     #[tokio::test]
     async fn unanswered_admit_report_withdraws_before_failing() {
         let dir = tempfile::tempdir().unwrap();
