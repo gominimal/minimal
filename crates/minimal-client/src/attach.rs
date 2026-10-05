@@ -3,7 +3,8 @@
 //! Shared between the `min session attach` CLI path and the `min dash` TUI
 //! (which suspends itself around the attach). Both run the interactive
 //! attach through the client-owned terminal relay
-//! ([`run_interactive_attach`]); the CLI's exec path `exec()`s the command.
+//! ([`run_interactive_attach`]); the CLI's exec path runs the command
+//! itself, with no pty of its own.
 
 use std::path::Path;
 
@@ -221,8 +222,8 @@ pub fn attach_command(
 /// call after that is a no-op or an error. `None` for callers that just
 /// attach: the CLI and the TUI today.
 ///
-/// The exec path (`wire: Some`) never comes here: it `exec()`s ssh with
-/// the caller's inherited stdio, as it always has.
+/// The exec path (`wire: Some`) never comes here: the caller runs ssh
+/// itself, with no relay and no pty.
 pub fn run_interactive_attach(
     ssh: std::process::Command,
     suspend: Option<tty_relay::SuspendHook>,
@@ -342,8 +343,8 @@ mod tests {
     }
 
     /// The exec path (`wire: Some`) is not the relay's: its command carries
-    /// no stdio of its own, so the caller's `exec()` hands ssh the inherited
-    /// stdin, stdout and stderr, and no `-tt` forces a pty.
+    /// no stdio of its own (ssh inherits whatever the caller does not
+    /// override) and no `-tt` forces a pty.
     #[test]
     fn exec_path_keeps_inherited_stdio() {
         let sock = PathBuf::from("/tmp/x/providers/local-minimald0/ssh.sock");

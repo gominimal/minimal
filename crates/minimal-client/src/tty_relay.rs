@@ -1767,4 +1767,30 @@ mod tests {
         handle.resume();
         assert_eq!(mode(&term.termios()), mode(&start));
     }
+
+    /// The public entry with a real hook: the hook suspends the relay from
+    /// its own thread, writes its prompt on the terminal it was handed, and
+    /// resumes; the attach then runs to the session's exit.
+    #[test]
+    fn run_interactive_attach_runs_a_suspend_hook_to_completion() {
+        let _serial = serial();
+        let term = FakeTerminal::new(24, 80);
+        let start = term.termios();
+        let resumed = Arc::new(AtomicBool::new(false));
+        let hook_resumed = Arc::clone(&resumed);
+        let hook: SuspendHook = Box::new(move |handle| {
+            let lease = handle.suspend().unwrap();
+            write(lease.as_fd(), b"HOOK_PROMPT\r\n").unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+            lease.resume();
+            hook_resumed.store(true, Ordering::Release);
+        });
+        let status =
+            crate::attach::run_interactive_attach_on(session("sleep 1"), term.real(), Some(hook))
+                .unwrap();
+        assert!(status.success());
+        assert!(resumed.load(Ordering::Acquire), "the hook never resumed");
+        term.wait_for_text("HOOK_PROMPT");
+        assert_eq!(mode(&term.termios()), mode(&start));
+    }
 }
