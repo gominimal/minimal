@@ -795,6 +795,22 @@ pub(crate) enum AnswererStep {
         /// The protocol version this daemon speaks.
         daemon: u32,
     },
+    /// The step's copy source — this machine's `min-answerer`, the one
+    /// [`AnswererInstall::source`] would copy — failed the verification
+    /// the advisory runs before offering the privileged step (see
+    /// [`answerer_source_refusal`]): a signature or link check a root
+    /// service must pass. The command below then carries no answerer
+    /// step at all — a copy root would run that fails its own checks is
+    /// never offered. `service` is the service state the detection read
+    /// underneath it, so the fact that names what the host is missing
+    /// survives; `reason` names the check that failed.
+    SourceRefused {
+        /// The service state the checks read: what the host is missing
+        /// while the source cannot be copied.
+        service: Box<AnswererStep>,
+        /// The named check that failed on the copy source.
+        reason: String,
+    },
     /// The host is not offered the step: a native host, whose in-daemon
     /// answerer stays the interim until the native channel client lands.
     /// Nothing to say and nothing to install, so the advisory's quiet arm
@@ -815,6 +831,16 @@ impl AnswererStep {
     /// Whether the advisory offers this host the answerer step at all.
     pub(crate) fn offered(&self) -> bool {
         !matches!(self, AnswererStep::NotOffered)
+    }
+
+    /// The reason the pre-copy verification refused the copy source, when
+    /// it did — the named check that failed ([`AnswererStep::SourceRefused`],
+    /// [`answerer_source_refusal`]).
+    pub(crate) fn source_refusal(&self) -> Option<&str> {
+        match self {
+            AnswererStep::SourceRefused { reason, .. } => Some(reason),
+            _ => None,
+        }
     }
 }
 
@@ -1111,6 +1137,381 @@ fn unquotable_value(install: &AnswererInstall) -> Option<&str> {
     .find(|value| value.chars().any(unsafe_char))
 }
 
+/// The system directories a path the answerer's link check accepts on
+/// Linux: the loader's default dirs, whole path components only — the
+/// same rule the release's link gate (`scripts/check-answerer-links.sh`)
+/// carries, so the advisory's check and the gate cannot disagree about
+/// what "system" means. `/usr/local/lib` and `/usr/lib-x` are not
+/// `/usr/lib`.
+///
+/// The whole check — these tables and the parses below them — is the
+/// release half of the debug-and-test gate (see
+/// [`answerer_source_refusal`]): a dev tree links user-writable libraries
+/// on purpose, so the check runs only where it means something, in
+/// tests (the parses are pure over the tools' outputs) and in release
+/// builds (the runners below gather those outputs).
+#[cfg(any(test, not(debug_assertions)))]
+const LINUX_ANSWERER_SYSTEM_DIRS: &[&str] = &["/lib", "/lib64", "/usr/lib", "/usr/lib64"];
+
+/// The system directories on macOS ([`LINUX_ANSWERER_SYSTEM_DIRS`]'s rule,
+/// the OS's own dirs): `/usr/lib` and `/System`.
+#[cfg(any(test, not(debug_assertions)))]
+const MACOS_ANSWERER_SYSTEM_DIRS: &[&str] = &["/usr/lib", "/System"];
+
+/// One path the answerer's link check inspects: the whole system
+/// directory it provably lives under, or why it does not. Pure over the
+/// path and the accepted directories, so the rule is unit-tested on
+/// every platform the suite runs on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(any(test, not(debug_assertions)))]
+enum AnswererPath {
+    /// The system directory the path lives under — the prefix a whole
+    /// path component: `/usr/local/lib` is not `/usr/lib`.
+    System(&'static str),
+    /// The path carries a `..` component: the loader walks it to wherever
+    /// it lands, so a system-directory prefix proves nothing about where
+    /// it ends up.
+    DotDot,
+    /// The path lives under none of the accepted directories.
+    Outside,
+}
+
+#[cfg(any(test, not(debug_assertions)))]
+fn answerer_path_state(path: &str, dirs: &'static [&'static str]) -> AnswererPath {
+    if path.split('/').any(|component| component == "..") {
+        return AnswererPath::DotDot;
+    }
+    dirs.iter()
+        .find(|dir| {
+            path.strip_prefix(*dir)
+                .is_some_and(|rest| rest.starts_with('/'))
+        })
+        .map_or(AnswererPath::Outside, |dir| AnswererPath::System(dir))
+}
+
+/// The first refusal in a `readelf -l` of the answerer's copy source: the
+/// program interpreter is the first thing root runs, before any library,
+/// and the path is baked into the binary — a loader that is not provably
+/// the system's is user-chosen code running as root before anything else
+/// loads. A statically linked binary has none, and passes. Pure over the
+/// tool's output, so the parse is unit-tested on every platform the suite
+/// runs on.
+#[cfg(any(test, not(debug_assertions)))]
+fn answerer_interpreter_refusal(readelf_l: &str) -> Option<String> {
+    readelf_l
+        .lines()
+        .filter_map(|line| line.split_once("Requesting program interpreter: "))
+        .find_map(|(_, rest)| {
+            let interp = rest.strip_suffix(']').unwrap_or(rest).trim();
+            match answerer_path_state(interp, LINUX_ANSWERER_SYSTEM_DIRS) {
+                AnswererPath::System(_) => None,
+                AnswererPath::DotDot => Some(format!(
+                    "carries a '..' path component in its program interpreter {interp}, which \
+                     the loader walks to wherever it lands"
+                )),
+                AnswererPath::Outside => Some(format!(
+                    "names the program interpreter {interp}, which is not a system loader path, \
+                     and root runs the interpreter before any library"
+                )),
+            }
+        })
+}
+
+/// The first refusal in an `ldd` of the answerer's copy source: every
+/// dependency must resolve inside a system directory or be the kernel's
+/// vDSO, and a dependency that resolves from nowhere is as refused as one
+/// that resolves somewhere user-writable — nothing is "system" until it
+/// is shown to resolve from a system directory. A line the parse does
+/// not recognize is a refusal too: the check fails closed, the way the
+/// gate does. Pure over the tool's combined output.
+#[cfg(any(test, not(debug_assertions)))]
+fn answerer_ldd_refusal(ldd: &str) -> Option<String> {
+    for line in ldd.lines() {
+        if line.trim().is_empty()
+            || line.starts_with("ldd: warning: you do not have execution permission")
+        {
+            // glibc warns about the missing exec bit, then lists the
+            // dependencies as usual: the warning is not one of them.
+            continue;
+        }
+        let mut fields = line.split_whitespace();
+        let first = fields.next()?;
+        if first.starts_with("linux-vdso.so") || first.starts_with("linux-gate.so") {
+            // The kernel's vDSO, not a file the loader resolves.
+            continue;
+        }
+        match (fields.next(), fields.next(), fields.next()) {
+            (Some("=>"), Some("not"), Some("found")) => {
+                return Some(format!(
+                    "names the library {first}, which resolves from nowhere — nothing is a \
+                     system library until it is shown to resolve from a system directory"
+                ));
+            }
+            (Some("=>"), Some(path), _) => {
+                if let Some(refusal) = answerer_dep_refusal(path, LINUX_ANSWERER_SYSTEM_DIRS) {
+                    return Some(refusal);
+                }
+            }
+            (_, _, _) if first.starts_with('/') => {
+                // The interpreter line's own resolution.
+                if let Some(refusal) = answerer_dep_refusal(first, LINUX_ANSWERER_SYSTEM_DIRS) {
+                    return Some(refusal);
+                }
+            }
+            (_, _, _) => {
+                return Some(format!(
+                    "has a dependency line the check does not read: {line}"
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// The refusal for one resolved dependency — the pure half both the
+/// dependency parses share: a library outside the system directories, or
+/// on a `..` path the loader walks somewhere else.
+#[cfg(any(test, not(debug_assertions)))]
+fn answerer_dep_refusal(path: &str, dirs: &'static [&'static str]) -> Option<String> {
+    match answerer_path_state(path, dirs) {
+        AnswererPath::System(_) => None,
+        AnswererPath::DotDot => Some(format!(
+            "resolves {path}, which carries a '..' path component the loader walks to wherever \
+             it lands"
+        )),
+        AnswererPath::Outside => Some(format!(
+            "resolves {path}, from outside the system directories — a root service loading a \
+             library from a user-writable path runs user-chosen code as root"
+        )),
+    }
+}
+
+/// The first refusal in a `readelf -d` of the answerer's copy source: the
+/// binary must carry no RPATH and no RUNPATH entry at all — an embedded
+/// search path decides where root loads libraries from, and every system
+/// library is already on the loader's default path, so there is no
+/// legitimate use for one here. Pure over the tool's output.
+#[cfg(any(test, not(debug_assertions)))]
+fn answerer_rpath_refusal(readelf_d: &str) -> Option<String> {
+    for line in readelf_d.lines() {
+        let mut fields = line.split_whitespace();
+        let _index = fields.next();
+        let tag = match fields.next() {
+            Some(tag @ ("(RPATH)" | "(RUNPATH)")) => tag,
+            _ => continue,
+        };
+        let entry = line
+            .split_once("path: [")
+            .map(|(_, rest)| rest)
+            .unwrap_or_default()
+            .trim_end_matches(']')
+            .trim();
+        return Some(format!(
+            "carries an embedded library search path ({tag} {entry}), which decides where root \
+             loads libraries from"
+        ));
+    }
+    None
+}
+
+/// The first refusal in an `otool -L` of the answerer's copy source: every
+/// install name must live under /usr/lib or /System — a dylib beside the
+/// binary, or an `@rpath` name, is exactly what the release's linkage
+/// rewrite exists to remove (scripts/rewrite-macos-linkage.sh). Pure over
+/// the tool's output.
+#[cfg(any(test, not(debug_assertions)))]
+fn answerer_install_name_refusal(otool_l: &str) -> Option<String> {
+    otool_l
+        .lines()
+        .enumerate()
+        .filter(|(number, line)| {
+            // The first line is the binary's own path; a line ending in
+            // `:` is a slice header of a fat binary.
+            *number > 0 && !line.trim().is_empty() && !line.trim_end().ends_with(':')
+        })
+        .find_map(|(_, line)| {
+            let name = line.trim();
+            // The "(compatibility version …)" suffix rides on the same
+            // line: the install name is everything before it.
+            let path = match name.split_once(" (") {
+                Some((path, _)) => path,
+                None => name,
+            };
+            answerer_dep_refusal(path, MACOS_ANSWERER_SYSTEM_DIRS)
+        })
+}
+
+/// The first refusal in an `otool -l` of the answerer's copy source: no
+/// LC_RPATH load command at all — minvmd's dev-build `@loader_path` rpath
+/// is exactly the shape a root answerer must not ship. Pure over the
+/// tool's output.
+#[cfg(any(test, not(debug_assertions)))]
+fn answerer_lcrpath_refusal(otool_l: &str) -> Option<String> {
+    let mut want = false;
+    for line in otool_l.lines() {
+        let mut fields = line.split_whitespace();
+        match fields.next() {
+            Some("cmd") => want = fields.next() == Some("LC_RPATH"),
+            Some("path") if want => {
+                if let Some(path) = line.split_whitespace().nth(1) {
+                    return Some(format!(
+                        "carries an embedded library search path (LC_RPATH {path}), which \
+                         decides where root loads libraries from"
+                    ));
+                }
+                want = false;
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The bound on each tool the pre-copy verification runs: the second the
+/// protocol probe's own bound carries, so a tool that wedges costs one
+/// second of the read that ran it, never the verb.
+#[cfg(not(any(test, debug_assertions)))]
+const ANSWERER_CHECK_PROBE_BOUND: Duration = Duration::from_secs(1);
+
+/// One bounded, unprivileged run of a verification tool: whether it exited
+/// zero, and its stdout and stderr combined — the way the gate reads
+/// `ldd`'s. The run is this CLI's own uid, with the loader's environment
+/// injections scrubbed (`LD_LIBRARY_PATH`, `LD_PRELOAD`): the service
+/// manager starts the answerer with a clean environment, so a verdict
+/// that depended on them would depend on who ran the check rather than
+/// on what the source resolves. `None` when the tool did not run or did
+/// not answer within [`ANSWERER_CHECK_PROBE_BOUND`] — a failed check,
+/// never a pass.
+#[cfg(not(any(test, debug_assertions)))]
+async fn answerer_tool_words(name: &str, args: &[&str]) -> Option<(bool, String)> {
+    let run = tokio::process::Command::new(name)
+        .args(args)
+        .env_remove("LD_LIBRARY_PATH")
+        .env_remove("LD_PRELOAD")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .output();
+    let output = tokio::time::timeout(ANSWERER_CHECK_PROBE_BOUND, run)
+        .await
+        .ok()?
+        .ok()?;
+    Some((
+        output.status.success(),
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ),
+    ))
+}
+
+/// A verification tool's combined output, requiring it exited zero — for
+/// the tools whose non-zero exit means the input could not be inspected
+/// (every one but `ldd`, whose static case exits 1 and is read for its
+/// words instead: see [`answerer_source_refusal`]).
+#[cfg(not(any(test, debug_assertions)))]
+async fn answerer_tool_read(name: &str, args: &[&str]) -> Result<String, String> {
+    match answerer_tool_words(name, args).await {
+        Some((true, words)) => Ok(words),
+        Some((false, words)) => Err(format!("{name} could not read it: {words}")),
+        None => Err(format!(
+            "{name} did not run, or did not answer within a second"
+        )),
+    }
+}
+
+/// The pre-copy verification of the step's copy source (NET-122: the
+/// privileged step copies this program as root), run unprivileged, in
+/// this CLI's own process, before the step is ever offered: the signature
+/// check — `codesign --verify --strict` — on macOS, where the shipped
+/// source is Developer ID signed, and the link rule on both OSes, the
+/// one the release's gate (`scripts/check-answerer-links.sh`) ships by —
+/// every library the source resolves must live in a system directory,
+/// with no embedded search path and no interpreter outside the system
+/// loaders. `Some(reason)` — the named check that failed — refuses the
+/// step ([`AnswererStep::SourceRefused`]).
+///
+/// glibc `ldd` can execute the target's interpreter, so `ldd` runs here
+/// and nowhere else: never inside the privileged step, which re-checks
+/// the copy it made with the static `readelf`/`otool` checks alone. A
+/// tool that does not run is a failed check — the gate fails closed, and
+/// so does the advisory's half of it.
+///
+/// Skipped for debug and test builds under the same gate as the
+/// channel-path override (`debug_path_override` in minvmd's answerer
+/// module): a dev tree links user-writable libraries on purpose, and the
+/// advisory keeps offering its step rather than refusing every dev build.
+async fn answerer_source_refusal(source: &str) -> Option<String> {
+    answerer_source_refusal_checked(source).await
+}
+
+/// The test and debug half of the gate: nothing is verified, so the
+/// advisory keeps offering the step the dev tree renders (see
+/// [`answerer_source_refusal`]).
+#[cfg(any(test, debug_assertions))]
+async fn answerer_source_refusal_checked(_source: &str) -> Option<String> {
+    None
+}
+
+/// The release half on macOS: the signature check first — the shipped
+/// source is Developer ID signed and notarized (docs/internal/release-pipeline.md),
+/// so a copy Gatekeeper would refuse serves nothing — then the link rule.
+#[cfg(all(not(any(test, debug_assertions)), target_os = "macos"))]
+async fn answerer_source_refusal_checked(source: &str) -> Option<String> {
+    if answerer_tool_words("codesign", &["--verify", "--strict", source])
+        .await
+        .is_none_or(|(passed, _)| !passed)
+    {
+        return Some(
+            "failed its signature check: codesign --verify --strict did not accept it".into(),
+        );
+    }
+    let otool_l = match answerer_tool_read("otool", &["-L", source]).await {
+        Ok(words) => words,
+        Err(why) => return Some(format!("could not be link-checked: {why}")),
+    };
+    if let Some(refusal) = answerer_install_name_refusal(&otool_l) {
+        return Some(refusal);
+    }
+    let otool_l = match answerer_tool_read("otool", &["-l", source]).await {
+        Ok(words) => words,
+        Err(why) => return Some(format!("could not be link-checked: {why}")),
+    };
+    answerer_lcrpath_refusal(&otool_l)
+}
+
+/// The release half on Linux: the interpreter first — root runs it before
+/// any library — then the dependencies, then the embedded search paths.
+#[cfg(all(not(any(test, debug_assertions)), not(target_os = "macos")))]
+async fn answerer_source_refusal_checked(source: &str) -> Option<String> {
+    let readelf_l = match answerer_tool_read("readelf", &["-l", source]).await {
+        Ok(words) => words,
+        Err(why) => return Some(format!("could not be link-checked: {why}")),
+    };
+    if let Some(refusal) = answerer_interpreter_refusal(&readelf_l) {
+        return Some(refusal);
+    }
+    // ldd exits 1 for a binary with no dynamic section as well — that is
+    // the static case this check passes, not an error — so its words are
+    // read first and its exit never fails the check on its own.
+    let ldd = match answerer_tool_words("ldd", &[source]).await {
+        Some((_, words)) => words,
+        None => return Some("could not be link-checked: ldd did not run".into()),
+    };
+    if ldd.contains("not a dynamic executable") || ldd.contains("statically linked") {
+        // The static case: no dynamic dependencies to resolve.
+    } else if let Some(refusal) = answerer_ldd_refusal(&ldd) {
+        return Some(refusal);
+    }
+    let readelf_d = match answerer_tool_read("readelf", &["-d", source]).await {
+        Ok(words) => words,
+        Err(why) => return Some(format!("could not be link-checked: {why}")),
+    };
+    answerer_rpath_refusal(&readelf_d)
+}
+
 /// The deadline on the installed copy's one protocol probe: the second
 /// the detection's other bounded reads carry, so a copy that wedges —
 /// or a program from before the probe, one that starts serving instead
@@ -1173,7 +1574,25 @@ pub(crate) async fn read_answerer_step() -> AnswererStep {
             .map(str::to_string),
         installed_version: installed_protocol_version().await,
     };
-    answerer_step_over(&facts, minvmd::net::answerer::CHANNEL_PROTOCOL_VERSION)
+    let step = answerer_step_over(&facts, minvmd::net::answerer::CHANNEL_PROTOCOL_VERSION);
+    // The copy source's pre-copy verification, only when the step would
+    // carry the copy (NET-122's privileged step copies this program as
+    // root): run unprivileged, in this CLI's own process, before the step
+    // is ever offered, and a source that fails it is refused with the
+    // reason instead of installed ([`answerer_source_refusal`]).
+    if step.offered() && !step.holds() {
+        let reason = match answerer_source() {
+            Some(source) => answerer_source_refusal(&source).await,
+            None => None,
+        };
+        if let Some(reason) = reason {
+            return AnswererStep::SourceRefused {
+                service: Box::new(step),
+                reason,
+            };
+        }
+    }
+    step
 }
 
 /// `/etc/resolv.conf`: the file every host process's lookup reads (through
@@ -1959,6 +2378,12 @@ fn control_args(install: &AnswererInstall, quote: char) -> String {
 /// files, asks the daemons to re-bind their interims (`release-cancel`)
 /// and exits non-zero naming the reason, so the host is never left with
 /// nobody answering. With no daemon known, the unit is loaded directly.
+///
+/// The copy the step makes is re-checked before anything is loaded —
+/// with the static `otool` checks alone, the way the source was verified
+/// before the step was offered: a copy that carries an LC_RPATH load
+/// command or links a library outside /usr/lib and /System is removed and
+/// named, not loaded.
 #[cfg(any(test, target_os = "macos"))]
 fn macos_answerer_steps(install: &AnswererInstall) -> String {
     let controls = control_args(install, '"');
@@ -1992,7 +2417,9 @@ fn macos_answerer_steps(install: &AnswererInstall) -> String {
 {answerer_plist}\
 {ANSWERER_PLIST_HEREDOC}\n\
 chown root:wheel \"{copy}\" {ANSWERER_PLIST_PATH} \
-         ; chmod 0755 \"{copy}\" ; chmod 0644 {ANSWERER_PLIST_PATH}\
+         ; chmod 0755 \"{copy}\" ; chmod 0644 {ANSWERER_PLIST_PATH} \
+         ; if otool -l \"{copy}\" 2>/dev/null | grep -q LC_RPATH ; then {recheck_rpath} ; fi \
+         ; if otool -L \"{copy}\" 2>/dev/null | grep -v : | grep -v -e /usr/lib/ -e /System/ | grep -q . ; then {recheck_dep} ; fi\
 {release} \
          ; rm -f \"{channel}\" \
          ; launchctl bootstrap system {ANSWERER_PLIST_PATH} || {load_failed} \
@@ -2003,6 +2430,16 @@ chown root:wheel \"{copy}\" {ANSWERER_PLIST_PATH} \
         answerer_plist = answerer_unit_plist(install),
         load_failed = fail("launchd did not load the answerer service"),
         not_up = fail("the answerer service channel did not come up within 5 s"),
+        // The re-checks of the root-owned copy the step just made —
+        // NET-122's second half: the privileged step re-verifies its own
+        // copy with the static otool checks alone, the way the source was
+        // verified before the step was offered. The pre-copy verification
+        // is the gate; a re-check that fails names what it found and
+        // undoes the install, so the host is never left with an unchecked
+        // program in the root-owned path.
+        recheck_rpath =
+            fail("the copied answerer carries an LC_RPATH load command, an embedded search path"),
+        recheck_dep = fail("the copied answerer links a library outside /usr/lib and /System"),
     )
 }
 
@@ -2132,6 +2569,13 @@ pub(crate) fn linux_command(port: u16, install: Option<&AnswererInstall>) -> Str
 /// interims (`release-cancel`) and exits non-zero naming the reason, so the
 /// host is never left with nobody answering. With no daemon known, the
 /// unit is started directly.
+///
+/// The copy the step makes is re-checked before anything is enabled —
+/// with the static `readelf` checks alone, the way the source was
+/// verified before the step was offered, never `ldd` (glibc's `ldd` can
+/// execute the target's interpreter, so it never runs as root): a copy
+/// that carries an embedded search path or names an interpreter outside
+/// the system loaders is removed and named, not started.
 #[cfg(any(test, not(target_os = "macos")))]
 fn linux_answerer_steps(install: &AnswererInstall) -> String {
     let controls = control_args(install, '\'');
@@ -2171,6 +2615,8 @@ cat > {ANSWERER_UNIT_SERVICE_PATH} <<\\{ANSWERER_SERVICE_HEREDOC}\n\
 {ANSWERER_SERVICE_HEREDOC}\n\
 chown root:root '{copy}' {ANSWERER_UNIT_SOCKET_PATH} {ANSWERER_UNIT_SERVICE_PATH} \
          ; chmod 0755 '{copy}' \
+         ; if readelf -d '{copy}' 2>/dev/null | grep -q -e RPATH -e RUNPATH ; then {recheck_rpath} ; fi \
+         ; if readelf -l '{copy}' 2>/dev/null | grep interpreter: | grep -q -v -e 'interpreter: /lib' -e 'interpreter: /usr/lib' ; then {recheck_interp} ; fi \
          ; chmod 0644 {ANSWERER_UNIT_SOCKET_PATH} {ANSWERER_UNIT_SERVICE_PATH} \
          ; systemctl daemon-reload \
          ; systemctl enable {unit}\
@@ -2186,6 +2632,19 @@ chown root:root '{copy}' {ANSWERER_UNIT_SOCKET_PATH} {ANSWERER_UNIT_SERVICE_PATH
         answerer_service = answerer_service_unit(install),
         not_active = fail("the answerer service socket unit did not become active within 5 s"),
         not_up = fail("the answerer service channel did not come up within 5 s"),
+        // The re-checks of the root-owned copy the step just made —
+        // NET-122's second half: the privileged step re-verifies its own
+        // copy the way the source was verified before the step was
+        // offered, with the static readelf checks alone, never `ldd`
+        // (glibc's `ldd` can execute the target's interpreter, so it
+        // never runs as root). The pre-copy verification is the gate; a
+        // re-check that fails names what it found and undoes the install,
+        // so the host is never left with an unchecked program in the
+        // root-owned path.
+        recheck_rpath =
+            fail("the copied answerer carries an embedded library search path (RPATH or RUNPATH)"),
+        recheck_interp =
+            fail("the copied answerer names a program interpreter outside the system loaders"),
     )
 }
 
@@ -2248,6 +2707,10 @@ fn answerer_fact(answerer: &AnswererStep, carried: bool) -> Option<String> {
              this daemon's {daemon}{}",
             remedy("reinstalls it from this machine's own answerer program")
         )),
+        // The refusal itself is said beside this one (see [`advisory_at`]):
+        // what the host is missing is still a fact, and the service state
+        // underneath the refusal is the one the detection read.
+        AnswererStep::SourceRefused { service, .. } => answerer_fact(service, carried),
     }
 }
 
@@ -2425,24 +2888,36 @@ pub(crate) fn advisory_at(
             _ => {}
         }
     }
-    // The step's inputs, when the step is offered and this machine has a
-    // `min-answerer` to copy: the command then carries the step.
-    let install = if answerer.offered() && !answerer.holds() {
+    // The step's inputs, when the step is offered, this machine has a
+    // `min-answerer` to copy, and the pre-copy verification did not refuse
+    // it: the command then carries the step. A refused source is never
+    // offered a copy, whatever the reason — the refusal is the fact.
+    let refusal = answerer.source_refusal();
+    let install = if answerer.offered() && !answerer.holds() && refusal.is_none() {
         answerer_install()
     } else {
         None
     };
     if answerer.offered() && !answerer.holds() && install.is_none() {
-        facts.push(if answerer_source().is_none() {
-            format!(
+        facts.push(match refusal {
+            // The pre-copy verification refused the copy source
+            // ([`answerer_source_refusal`]): the reason is the one named
+            // check that failed — the signature or link check the release
+            // ships the program by.
+            Some(reason) => format!(
+                "this machine's box-zone answerer program {ANSWERER_PROGRAM_NAME} failed the \
+                 check the advisory runs before offering to copy it ({reason}), so the command \
+                 below leaves the answerer service out"
+            ),
+            None if answerer_source().is_none() => format!(
                 "the box-zone answerer program {ANSWERER_PROGRAM_NAME} is not beside min or \
                  on PATH, so the command below cannot install the answerer service"
-            )
-        } else {
-            "a path the answerer service step would carry holds a quote, `$`, a backtick, \
-             a backslash or a line break, which the privileged command cannot quote safely, \
-             so the command below leaves the answerer service out"
-                .to_string()
+            ),
+            None => "a path the answerer service step would carry holds a quote, `$`, a \
+                     backtick, a backslash or a line break, which the privileged command \
+                     cannot quote safely, so the command below leaves the answerer service \
+                     out"
+            .to_string(),
         });
     }
     if let Some(fact) = answerer_fact(answerer, install.is_some()) {
@@ -5733,6 +6208,274 @@ mod tests {
         );
     }
 
+    /// NET-122's pre-copy verification: before the step is offered, the
+    /// advisory verifies the copy source — `codesign --verify --strict` on
+    /// macOS, the link rule the release's gate ships by on both OSes —
+    /// and a source that fails it is refused with the reason, never
+    /// installed. The parses are pure over the tools' outputs, so the
+    /// rule is exercised on every platform the suite runs on; the
+    /// signature half is the release runner's, and is asserted here as
+    /// the refusal it renders.
+    #[test]
+    fn advisory_refuses_an_unsigned_or_link_unclean_source() {
+        let port = 15353;
+        let configured = Hook::configured("test", Some(port), "routes the zone");
+        let advise = |step: &AnswererStep| {
+            advisory_at(
+                &configured,
+                port,
+                false,
+                Some(true),
+                &range_step_on_this_os(),
+                step,
+                None,
+            )
+        };
+
+        // The system-directory rule, the gate's own: a whole path
+        // component, and `..` is never system.
+        assert_eq!(
+            answerer_path_state("/lib64/ld-linux-x86-64.so.2", LINUX_ANSWERER_SYSTEM_DIRS),
+            AnswererPath::System("/lib64")
+        );
+        assert_eq!(
+            answerer_path_state("/usr/local/lib/libinject.so", LINUX_ANSWERER_SYSTEM_DIRS),
+            AnswererPath::Outside
+        );
+        assert_eq!(
+            answerer_path_state("/usr/lib/../lib64/libfoo.so", LINUX_ANSWERER_SYSTEM_DIRS),
+            AnswererPath::DotDot
+        );
+        assert_eq!(
+            answerer_path_state("/usr/lib-x/libfoo.so", LINUX_ANSWERER_SYSTEM_DIRS),
+            AnswererPath::Outside
+        );
+        assert_eq!(
+            answerer_path_state("/System/libSystem.B.dylib", MACOS_ANSWERER_SYSTEM_DIRS),
+            AnswererPath::System("/System")
+        );
+        assert_eq!(
+            answerer_path_state("@rpath/libkrun.1.dylib", MACOS_ANSWERER_SYSTEM_DIRS),
+            AnswererPath::Outside
+        );
+
+        // The interpreter readelf -l names: a static release never names
+        // one, a system loader passes, and any other loader is refused —
+        // root runs the interpreter before any library.
+        assert_eq!(answerer_interpreter_refusal(""), None);
+        assert_eq!(
+            answerer_interpreter_refusal(
+                "  INTERP      0x0000000000000318 ...\n      [Requesting program interpreter: \
+                 /lib64/ld-linux-x86-64.so.2]"
+            ),
+            None
+        );
+        for (readelf_l, named) in [
+            (
+                "      [Requesting program interpreter: /home/operator/ld.so]",
+                "/home/operator/ld.so",
+            ),
+            (
+                "      [Requesting program interpreter: /lib64/../opt/ld.so]",
+                "'..'",
+            ),
+        ] {
+            let refusal = answerer_interpreter_refusal(readelf_l).expect("refused");
+            assert!(
+                refusal.contains(named),
+                "the refusal names {named}: {refusal}"
+            );
+        }
+
+        // The dependencies ldd lists: the vDSO and the interpreter's own
+        // resolution pass, and a library outside the system directories,
+        // one that resolves from nowhere, a `..` path, or a line the
+        // check does not read are each refused in their own words.
+        let ldd_clean = "\tlinux-vdso.so.1 (0x00007ffc5a7f9000)\n\tlibcrypto.so.3 => \
+             /lib/x86_64-linux-gnu/libcrypto.so.3 (0x00007f8e12345000)\n\t\
+             /lib64/ld-linux-x86-64.so.2 (0x00007f8e1abcdef0)\n";
+        assert_eq!(answerer_ldd_refusal(ldd_clean), None);
+        assert_eq!(
+            answerer_ldd_refusal(&format!(
+                "ldd: warning: you do not have execution permission for \
+                 /usr/bin/min-answerer\n{ldd_clean}"
+            )),
+            None
+        );
+        for (ldd, named) in [
+            (
+                "\tlibinject.so => /home/operator/lib/libinject.so (0x00007f0000000000)\n",
+                "/home/operator/lib/libinject.so",
+            ),
+            ("\tlibfoo.so.1 => not found\n", "resolves from nowhere"),
+            (
+                "\tlibfoo.so.1 => /usr/lib/../opt/libfoo.so.1 (0x0)\n",
+                "'..'",
+            ),
+            ("\tsomething ldd never says\n", "does not read"),
+        ] {
+            let refusal = answerer_ldd_refusal(ldd).expect("refused");
+            assert!(
+                refusal.contains(named),
+                "the refusal names {named}: {refusal}"
+            );
+        }
+
+        // The embedded search paths readelf -d must not carry at all:
+        // every system library is already on the loader's default path.
+        assert_eq!(
+            answerer_rpath_refusal(
+                " 0x0000000000000001 (NEEDED) Shared library: \
+             [libcrypto.so.3]\n"
+            ),
+            None
+        );
+        for (readelf_d, named) in [
+            (
+                " 0x000000000000000f (RPATH)  Library rpath: [/home/operator/lib]\n",
+                "(RPATH) /home/operator/lib",
+            ),
+            (
+                " 0x000000000000001d (RUNPATH) Library runpath: [/opt/lib]\n",
+                "(RUNPATH) /opt/lib",
+            ),
+        ] {
+            let refusal = answerer_rpath_refusal(readelf_d).expect("refused");
+            assert!(
+                refusal.contains(named),
+                "the refusal names {named}: {refusal}"
+            );
+        }
+
+        // The install names otool -L lists, and the load command it must
+        // not carry: the `@rpath` shape the release's linkage rewrite
+        // exists to remove, and minvmd's dev-build rpath.
+        let otool_l_clean = "/usr/bin/min-answerer:\n\t/usr/lib/libSystem.B.dylib \
+             (compatibility version 1.0.0, current version 1345.100.2)\n";
+        assert_eq!(answerer_install_name_refusal(otool_l_clean), None);
+        let refusal = answerer_install_name_refusal(
+            "/usr/bin/min-answerer:\n\t@rpath/libkrun.1.dylib (compatibility version 1.0.0)\n",
+        )
+        .expect("refused");
+        assert!(
+            refusal.contains("@rpath/libkrun.1.dylib"),
+            "the refusal names the library: {refusal}"
+        );
+        assert_eq!(
+            answerer_lcrpath_refusal(
+                "Load command 5\n          cmd LC_LOAD_DYLINKER\n      cmdsize 56\n         \
+                 name /usr/lib/dyld (offset 12)\n"
+            ),
+            None
+        );
+        let refusal = answerer_lcrpath_refusal(
+            "          cmd LC_RPATH\n      cmdsize 56\n         path /opt/minimal/lib (offset \
+             12)\n",
+        )
+        .expect("refused");
+        assert!(
+            refusal.contains("LC_RPATH /opt/minimal/lib"),
+            "the refusal names the path: {refusal}"
+        );
+
+        // The refusal is the fact: the advisory names the check that
+        // failed, carries no answerer step, and still says what the host
+        // is missing — the service state the detection read underneath.
+        let reason = "failed its signature check: codesign --verify --strict did not accept it";
+        let refused = AnswererStep::SourceRefused {
+            service: Box::new(AnswererStep::Absent),
+            reason: reason.to_string(),
+        };
+        assert!(refused.offered() && !refused.holds());
+        assert_eq!(refused.source_refusal(), Some(reason));
+        let advisory = advise(&refused).expect("a refused source still advises");
+        assert!(
+            advisory.contains(&format!(
+                "this machine's box-zone answerer program {ANSWERER_PROGRAM_NAME} failed the \
+                 check the advisory runs before offering to copy it ({reason})"
+            )),
+            "the advisory names the reason: {advisory}"
+        );
+        assert!(
+            advisory.contains("not installed as a host service"),
+            "the service state underneath the refusal survives: {advisory}"
+        );
+        assert!(
+            !advisory.contains("dev.minimal.zone-answerer"),
+            "no copy of the program is carried: {advisory}"
+        );
+        assert!(
+            advisory.contains("leaves the answerer service out"),
+            "the refusal says the command leaves the step out: {advisory}"
+        );
+        assert!(
+            !advisory.contains("install the box-zone answerer service"),
+            "the lead-in offers no answerer install: {advisory}"
+        );
+        assert!(
+            advisory.contains(&format!("\n  {}", command(port, None))),
+            "the command is the resolver's alone: {advisory}"
+        );
+    }
+
+    /// NET-122's upgrade path the other way: a root-owned copy OLDER than
+    /// this daemon — what a release upgrade leaves behind — re-surfaces
+    /// the advisory the way a newer one does, and the command it names
+    /// re-copies the program, so an old root copy never runs silently
+    /// against a new channel.
+    #[test]
+    fn advisory_resurfaces_when_service_binary_is_older() {
+        let daemon = minvmd::net::answerer::CHANNEL_PROTOCOL_VERSION;
+        let port = 15353;
+        let configured = Hook::configured("test", Some(port), "routes the zone");
+
+        let older = answerer_step_over(&root_owned_answerer_facts(Some(daemon - 1)), daemon);
+        assert_eq!(
+            older,
+            AnswererStep::ProtocolMismatch {
+                installed: Some(daemon - 1),
+                daemon
+            }
+        );
+        assert!(!older.holds(), "a behind copy does not hold");
+
+        // Even with the hook routing the zone and everything else held, a
+        // behind copy re-surfaces the advisory: the host service exists,
+        // and it still speaks the box a release upgrade replaced.
+        let advisory = advisory_at(
+            &configured,
+            port,
+            false,
+            Some(true),
+            &range_step_on_this_os(),
+            &older,
+            None,
+        )
+        .expect("a behind copy re-surfaces the advisory even when the hook routes");
+        assert!(
+            advisory.contains(&format!("speaks channel protocol {}", daemon - 1))
+                && advisory.contains(&format!("not this daemon's {daemon}")),
+            "the advisory names both versions: {advisory}"
+        );
+        // And the command it names re-copies the root-owned program.
+        let install = answerer_install().expect("the step's inputs");
+        assert!(
+            advisory.contains(&command(port, Some(&install))),
+            "the command carries the answerer step: {advisory}"
+        );
+        #[cfg(target_os = "macos")]
+        let re_copy = format!(
+            "cp \"{}\" \"{MACOS_ANSWERER_PROGRAM_PATH}\"",
+            install.source
+        );
+        #[cfg(not(target_os = "macos"))]
+        let re_copy = format!("cp '{}' '{LINUX_ANSWERER_PROGRAM_PATH}'", install.source);
+        assert!(
+            advisory.contains(&re_copy),
+            "the command re-copies the root-owned program: {advisory}"
+        );
+    }
+
     /// The handover's order (NET-122's privileged step): the command
     /// installs the units without starting the port socket, asks each of
     /// this CLI's daemons to release the hook port, and only then starts
@@ -5772,12 +6515,12 @@ mod tests {
         );
         assert_eq!(
             linux.matches(&cancel).count(),
-            3,
-            "every failed wait asks the daemons to re-bind: {linux}"
+            5,
+            "every failed wait and every failed re-check asks the daemons to re-bind: {linux}"
         );
         assert_eq!(
             linux.matches("exit 1").count(),
-            3,
+            5,
             "and fails the command: {linux}"
         );
         assert!(
