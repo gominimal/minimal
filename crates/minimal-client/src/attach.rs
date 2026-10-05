@@ -6,6 +6,7 @@
 
 use std::path::Path;
 
+use crate::tty_relay;
 use anyhow::Context as _;
 
 /// Read and validate the session-key config, returning the resolved
@@ -200,6 +201,42 @@ pub fn attach_command(
     }
 
     Ok(ssh)
+}
+
+/// Run an interactive attach (`wire: None`) through the client-owned
+/// [relay](tty_relay): ssh goes on the slave end of a pty pair, the relay
+/// keeps the real terminal in ssh's own raw set, restores its attach-start
+/// termios on every exit path, and returns ssh's exit status unchanged —
+/// death by a signal included.
+///
+/// `suspend` is the hook a prompt uses to borrow the real terminal
+/// mid-attach (the dynamic-ingress `ask` flow, NET-045): it runs on its
+/// own thread for the duration of the attach with a
+/// [`tty_relay::RelayHandle`], whose `suspend` hands the terminal over
+/// (attach-start termios, session output buffered) and whose `resume`
+/// takes it back. The hook thread is not joined: an attach that ends
+/// while a prompt is up must still exit with ssh's status, and every
+/// handle call after that is a no-op or an error. `None` for callers that
+/// just attach — the CLI and the TUI today.
+///
+/// The exec path (`wire: Some`) never comes here: it `exec()`s ssh with
+/// the caller's inherited stdio, as it always has.
+pub fn run_interactive_attach(
+    ssh: std::process::Command,
+    suspend: Option<tty_relay::SuspendHook>,
+) -> Result<std::process::ExitStatus, anyhow::Error> {
+    let real = tty_relay::RealTty::acquire()
+        .context("the interactive attach needs a terminal, but none could be taken")?;
+    let relay = tty_relay::Relay::start(ssh, real)?;
+    if let Some(hook) = suspend {
+        // The hook outlives nothing: the relay's exit is the attach's
+        // exit, and the handle is inert afterwards by construction.
+        let handle = relay.handle();
+        let _ = std::thread::Builder::new()
+            .name("tty-relay-suspend-hook".into())
+            .spawn(move || hook(&handle));
+    }
+    relay.join(None)
 }
 
 /// The single command string to hand `ssh`, or `None` for the interactive
