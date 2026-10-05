@@ -2992,8 +2992,11 @@ impl Session {
                     .box_addresses
                     .map(|addresses| addresses.switch_address)
             });
-            // The withdrawals run side by side, so the sweep is bounded by
-            // one withdrawal's deadline however many ports it takes down.
+            // The withdrawals run side by side under one shared bound: the
+            // guest report door serves one connection at a time, so a door
+            // that accepts and never answers would otherwise hold each
+            // withdrawal's own deadline in turn. Past the bound the rest are
+            // abandoned, best-effort like every withdrawal here.
             if let Some(switch_address) = switch_address {
                 let withdrawals = forwarders.iter().map(|forwarder| {
                     let control = &control;
@@ -3016,7 +3019,19 @@ impl Session {
                         }
                     }
                 });
-                futures::future::join_all(withdrawals).await;
+                if tokio::time::timeout(
+                    crate::net::listeners::WITHDRAW_REPORT_DEADLINE,
+                    futures::future::join_all(withdrawals),
+                )
+                .await
+                .is_err()
+                {
+                    tracing::warn!(
+                        ports = forwarders.len(),
+                        "the stopped box's port withdrawals did not finish inside \
+                         their shared deadline; the host's row may still name some"
+                    );
+                }
             }
         }
 

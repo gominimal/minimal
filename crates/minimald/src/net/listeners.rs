@@ -161,7 +161,7 @@ const REPORT_DEADLINE: Duration = Duration::from_secs(10);
 /// withdrawal is teardown, so it is given up on sooner than a publish. A
 /// sweep that withdraws several ports runs them side by side, so the sweep
 /// as a whole is bounded by this too.
-const WITHDRAW_REPORT_DEADLINE: Duration = Duration::from_secs(5);
+pub(crate) const WITHDRAW_REPORT_DEADLINE: Duration = Duration::from_secs(5);
 
 /// How many attempts one *admitted*-port report makes when its reply does
 /// not arrive (T94): the host's admit is idempotent per port and protocol —
