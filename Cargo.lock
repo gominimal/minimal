@@ -4084,6 +4084,7 @@ dependencies = [
  "mfile",
  "minimal-client",
  "minimald-rpc",
+ "nix 0.31.3",
  "paths",
  "ratatui",
  "serde",
