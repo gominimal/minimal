@@ -1149,6 +1149,10 @@ pub struct GuestRender<'a> {
 /// sudo is theirs to interrupt, while a boot has only this.
 const GUEST_CHILD_DEADLINE: Duration = Duration::from_secs(30);
 
+/// How long the per-launch recheck gives `nft list` to read the table back
+/// before the table reads as gone.
+const TABLE_LIST_DEADLINE: Duration = Duration::from_secs(5);
+
 /// The one line the guest's render logs: a VM-backed host's node DNS layer
 /// applies no per-box name rule to host-address boxes, so the guest's table
 /// admits no resolver for a deny-all box and retargets nothing — its DNS to
@@ -1559,22 +1563,31 @@ pub(crate) enum Listing {
 pub(crate) fn guest_table_listed(nft: &Path) -> Listing {
     use std::process::{Command, Stdio};
 
-    let listed = Command::new(nft)
+    let spawned = Command::new(nft)
         .env_clear()
         .arg("list")
         .arg("table")
         .arg("inet")
         .arg(TABLE_NAME)
         .stdin(Stdio::null())
-        .output();
-    let listed = match listed {
-        Ok(listed) => listed,
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn();
+    let child = match spawned {
+        Ok(child) => child,
         Err(cause) => {
             return Listing::Gone(format!(
                 "running {} to list the table: {cause}",
                 nft.display()
             ));
         }
+    };
+    // Bounded like every other guest child: this runs before each
+    // host-address launch, and an `nft` wedged on its netlink read must
+    // read as gone, never hold the launch forever.
+    let listed = match wait_for_child_bounded(child, nft, TABLE_LIST_DEADLINE) {
+        Ok(listed) => listed,
+        Err(cause) => return Listing::Gone(cause),
     };
     if !listed.status.success() {
         return Listing::Gone(format!(
@@ -5897,6 +5910,32 @@ mod tests {
         // reading above is exactly what keeps the plan on the node's DNS
         // layer. Proven in provider.rs's
         // `guest_deny_all_renders_no_resolver_carve_out_in_the_box_plan`.
+    }
+
+    /// The per-launch recheck is bounded like every other guest child: an
+    /// `nft` wedged on its read reads the table as gone within the deadline,
+    /// never holds the launch that asked.
+    #[test]
+    fn guest_table_listing_is_bounded_when_nft_wedges() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let stub = tempfile::tempdir().expect("a temp dir holding the wedged nft");
+        let nft = stub.path().join("nft");
+        std::fs::write(&nft, "#!/bin/sh\nexec sleep 60\n").expect("writing the wedged stub");
+        std::fs::set_permissions(&nft, std::fs::Permissions::from_mode(0o755))
+            .expect("the wedged stub is executable");
+
+        let started = std::time::Instant::now();
+        let listing = guest_table_listed(&nft);
+        let took = started.elapsed();
+        assert!(
+            matches!(listing, Listing::Gone(_)),
+            "a wedged nft reads the table as gone: {listing:?}"
+        );
+        assert!(
+            took < TABLE_LIST_DEADLINE + Duration::from_secs(5),
+            "the recheck returned past its deadline: {took:?}"
+        );
     }
 
     /// The guest's recheck (NET-079): a marker is the boot's claim, and the
