@@ -579,7 +579,7 @@ mod tests {
     fn spawn_control_channel_capturing(path: PathBuf, requests: usize) -> mpsc::Receiver<Vec<u8>> {
         let listener = UnixListener::bind(&path).unwrap();
         let (tx, rx) = mpsc::channel(requests);
-        tokio::spawn(async move {
+        crate::traced::spawn(async move {
             for _ in 0..requests {
                 let (mut sock, _) = listener
                     .accept()
@@ -1063,7 +1063,7 @@ mod tests {
         handed: mpsc::Sender<UnixStream>,
     ) -> tokio::task::JoinHandle<()> {
         let listener = UnixListener::bind(&path).unwrap();
-        tokio::spawn(async move {
+        crate::traced::spawn(async move {
             loop {
                 let Ok((mut sock, _)) = listener.accept().await else {
                     return;
@@ -2228,7 +2228,7 @@ mod tests {
         let (accepted_tx, accepted_rx) = mpsc::channel(4);
         let mut accepted_rx = Some(accepted_rx);
         let listener = UnixListener::bind(&path).unwrap();
-        tokio::spawn(async move {
+        crate::traced::spawn(async move {
             loop {
                 let Ok((mut sock, _)) = listener.accept().await else {
                     return;
@@ -2241,7 +2241,7 @@ mod tests {
                     // response; this stand-in *is* the switch side from here
                     // on.
                     if let Some(accepted_rx) = accepted_rx.take() {
-                        tokio::spawn(switch_side(sock, switch_frames.clone(), accepted_rx));
+                        crate::traced::spawn(switch_side(sock, switch_frames.clone(), accepted_rx));
                     }
                     continue;
                 }
@@ -2277,7 +2277,7 @@ mod tests {
                                             .expect("the stand-in's forwards lock")
                                             .insert(local.to_string(), stop_tx);
                                         let accepted_tx = accepted_tx.clone();
-                                        tokio::spawn(async move {
+                                        crate::traced::spawn(async move {
                                             let mut stop_rx = stop_rx;
                                             let stopped: Option<oneshot::Sender<()>> = loop {
                                                 tokio::select! {

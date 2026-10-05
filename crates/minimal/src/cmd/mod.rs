@@ -35,16 +35,153 @@ pub use project::*;
 pub use session::*;
 
 pub async fn run(cli: Cli) -> Result<(), anyhow::Error> {
-    use tracing::Instrument as _;
-    let ctx = minimal_client::trace_context();
     let root = tracing::info_span!(
         "cmd",
-        trace_id = %ctx.trace_id_hex(),
-        span_id = %ctx.span_id_hex(),
+        trace_id = tracing::field::Empty,
+        span_id = tracing::field::Empty,
+        parent_span_id = tracing::field::Empty,
     );
+    // A caller may run `min` inside its own trace (a CI job, a test
+    // harness, or a script in a session, whose daemon put the exec's
+    // `TRACEPARENT` there on opt-in): adopt it as the parent. Adopting is
+    // not exporting. When this process exports, the context goes on to
+    // this command's daemon RPCs; when it does not, the daemon is told
+    // the command opted out and gets no `TRACEPARENT` (below), and the ids
+    // only join this process's own log lines to the caller's trace. A
+    // `min` inside a box is the in-box helper, not this binary: it hands
+    // the box's `TRACEPARENT` to the daemon itself (TEL-025, minimald's
+    // `channel_request_span`).
+    let inbound = inbound_parent(std::env::var(minimald_rpc::trace::TRACEPARENT_ENV).ok());
+    let ctx = root_context(&root, inbound.as_ref());
+    minimal_client::init_trace_context(ctx);
+    // With telemetry off (not opted in, `DO_NOT_TRACK`, `OTEL_SDK_DISABLED`,
+    // or traces off: whatever left no tracer installed) the daemon is told
+    // so on every channel and given no `TRACEPARENT`, so it records nothing
+    // of this command's requests either. The ids above still join this
+    // process's own log lines.
+    minimal_client::set_telemetry_opted_out(!mlog::otel::exporting());
+    let ctx = minimal_client::trace_context();
+    root.record("trace_id", tracing::field::display(ctx.trace_id_hex()));
+    root.record("span_id", tracing::field::display(ctx.span_id_hex()));
+    if let Some(p) = &inbound {
+        root.record("parent_span_id", tracing::field::display(p.span_id_hex()));
+    }
     // Boxed: inlined, this dispatch match's deepest arm overruns rustc's
     // query depth (128) when computing the future's layout.
-    Box::pin(run_command(cli)).instrument(root).await
+    match run_in_root(root, Box::pin(run_command(cli))).await? {
+        None => Ok(()),
+        Some(handoff) => Err(handoff.finish()),
+    }
+}
+
+/// What a command leaves for the process to do after its `cmd` span has
+/// ended: exit with ssh's status, or die of the signal that stopped it.
+///
+/// Neither returns, so neither can run inside the span: the span would never
+/// end, and every span under it (the client's and the daemon's) would parent
+/// to one the collector never sees. A command returns this as its error
+/// ([`session_via_ssh`]); [`run`] takes it back out once the span has ended
+/// and finishes it there. It is the [`crate::task::TaskExit`] pattern: a
+/// status carried on the error path, never printed.
+#[derive(Debug)]
+pub(crate) enum Handoff {
+    /// Exit with this status (`min session exec` / `run` once ssh has exited
+    /// or been taken down, an interactive attach after ssh has exited and the
+    /// terminal has been put back).
+    Exit(i32),
+    /// Die of this signal, as if nothing had caught it (`min net forward`,
+    /// stopped by SIGTERM or SIGHUP once its relays are down).
+    Raise(nix::sys::signal::Signal),
+}
+
+impl std::fmt::Display for Handoff {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Only seen if a hand-off escapes [`run`], which takes every one back.
+        match self {
+            Self::Exit(code) => write!(f, "unfinished hand-off: exit {code}"),
+            Self::Raise(signal) => write!(f, "unfinished hand-off: raise {signal}"),
+        }
+    }
+}
+
+impl std::error::Error for Handoff {}
+
+impl Handoff {
+    /// Flush exported telemetry, then exit or raise. Never returns.
+    ///
+    /// The flush has the bound of the normal exit path
+    /// ([`mlog::otel::CLI_EXIT_FLUSH`]); with telemetry off it returns at
+    /// once, so the hand-off is what it was before. On the exit path the
+    /// `atexit` hook finds the flush done and returns.
+    fn finish(self) -> anyhow::Error {
+        mlog::otel::shutdown(mlog::otel::CLI_EXIT_FLUSH);
+        match self {
+            Self::Exit(code) => std::process::exit(code),
+            Self::Raise(signal) => die_of(signal),
+        }
+    }
+}
+
+/// End the process by `signal` as an uncaught one would: restore its default
+/// action, then raise it, so a parent sees the same wait status (killed by
+/// that signal, no core) as when no handler was installed.
+///
+/// Exits with the shell's `128 + signal` only if the signal does not end the
+/// process: its default action could not be restored, or it does not
+/// terminate.
+fn die_of(signal: nix::sys::signal::Signal) -> ! {
+    use nix::sys::signal::{SigHandler, raise};
+    // SAFETY: SIG_DFL installs no handler, so no code of ours can run in
+    // signal context; the handler it replaces (tokio's) is never needed again
+    // because the process ends here.
+    let restored = unsafe { nix::sys::signal::signal(signal, SigHandler::SigDfl) };
+    // raise() delivers to this thread before it returns, so with the default
+    // action restored a terminating signal never comes back here.
+    #[expect(
+        clippy::let_underscore_must_use,
+        reason = "a failure to restore or raise falls through to the exit below"
+    )]
+    let _ = restored.and_then(|_| raise(signal));
+    std::process::exit(128_i32.saturating_add(signal as i32))
+}
+
+/// Run `command` inside `root`, end `root`, and return the command's
+/// [`Handoff`], if it made one. Any other error is returned as is.
+///
+/// `root` ends when the instrumented future is dropped, at the end of the
+/// `await`, so it has closed (and its exporter has it) by the time a caller
+/// finishes the hand-off.
+async fn run_in_root<F>(root: tracing::Span, command: F) -> Result<Option<Handoff>, anyhow::Error>
+where
+    F: std::future::Future<Output = Result<(), anyhow::Error>>,
+{
+    use tracing::Instrument as _;
+    match command.instrument(root).await {
+        Ok(()) => Ok(None),
+        Err(e) => match e.downcast::<Handoff>() {
+            Ok(handoff) => Ok(Some(handoff)),
+            Err(e) => Err(e),
+        },
+    }
+}
+
+/// The caller's trace context from a `TRACEPARENT` value, read whether or not
+/// this process exports (TEL-021: forwarding is not exporting).
+fn inbound_parent(raw: Option<String>) -> Option<minimald_rpc::trace::TraceContext> {
+    raw.and_then(|v| minimald_rpc::trace::TraceContext::parse_traceparent(&v))
+}
+
+/// The command's root context: the exported span's ids when exporting,
+/// otherwise a child of `inbound` (or a fresh trace when there is none).
+fn root_context(
+    root: &tracing::Span,
+    inbound: Option<&minimald_rpc::trace::TraceContext>,
+) -> minimald_rpc::trace::TraceContext {
+    use minimald_rpc::trace::TraceContext;
+    match mlog::otel::align(root, inbound.map(TraceContext::parts)) {
+        Some((t, s, f)) => TraceContext::from_parts(t, s, f),
+        None => inbound.map_or_else(TraceContext::mint, TraceContext::child),
+    }
 }
 
 pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
@@ -911,5 +1048,190 @@ mod tests {
             "warning: port 18080 is already held by first.min.internal; this session \
              will not forward it (first-come on the shared address)"
         );
+    }
+}
+
+#[cfg(test)]
+mod trace_forward_tests {
+    use super::{inbound_parent, root_context};
+
+    /// With telemetry off (no exporter installed), an inbound `TRACEPARENT`
+    /// still parents the command, so this process's own log lines carry
+    /// the caller's trace id, and nothing is installed to export. The
+    /// daemon is not told the context then: an opted-out command sends the
+    /// opt-out marker instead (`minimal_client::set_telemetry_opted_out`).
+    /// A `min` inside a box joins the outer trace by the in-box helper's
+    /// route instead (TEL-025, minimald's
+    /// `a_min_in_a_box_joins_the_outer_trace_through_the_helper_prefix`).
+    #[test]
+    fn adopts_an_inbound_traceparent_without_exporting() {
+        let tp = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+        let parent = inbound_parent(Some(tp.to_string())).expect("valid traceparent");
+        let root = tracing::info_span!("cmd");
+        let ctx = root_context(&root, Some(&parent));
+        assert!(
+            !mlog::otel::exporting(),
+            "the test must not install an exporter"
+        );
+        assert_eq!(ctx.trace_id_hex(), parent.trace_id_hex());
+        assert_ne!(ctx.span_id_hex(), parent.span_id_hex());
+        assert!(
+            ctx.traceparent()
+                .contains("0af7651916cd43dd8448eb211c80319c")
+        );
+    }
+
+    #[test]
+    fn a_missing_or_malformed_traceparent_starts_a_fresh_trace() {
+        assert!(inbound_parent(None).is_none());
+        assert!(inbound_parent(Some("junk".into())).is_none());
+        let root = tracing::info_span!("cmd");
+        let a = root_context(&root, None);
+        assert_ne!(a.trace_id_hex(), "0af7651916cd43dd8448eb211c80319c");
+    }
+}
+
+#[cfg(test)]
+mod handoff_tests {
+    use super::{Handoff, die_of, run_in_root};
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::layer::{Context, SubscriberExt as _};
+
+    /// Records the name of every span that closes, in the order they close.
+    #[derive(Clone, Default)]
+    struct Closed(Arc<Mutex<Vec<&'static str>>>);
+
+    impl<S> tracing_subscriber::Layer<S> for Closed
+    where
+        S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    {
+        fn on_close(&self, id: tracing::span::Id, ctx: Context<'_, S>) {
+            if let Some(span) = ctx.span(&id) {
+                self.0.lock().unwrap().push(span.name());
+            }
+        }
+    }
+
+    fn closed_names(closed: &Closed) -> Vec<&'static str> {
+        closed.0.lock().unwrap().clone()
+    }
+
+    /// The TEL-031 contract: by the time `run` holds a hand-off (and so before
+    /// it flushes and exits or raises), the `cmd` span and the spans under it
+    /// have closed, which is what puts them in the exporter and the spool.
+    #[tokio::test]
+    async fn the_cmd_span_ends_before_a_handoff_is_finished() {
+        let closed = Closed::default();
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(closed.clone()));
+        let root = tracing::info_span!("cmd");
+        let handoff = run_in_root(root, async {
+            tracing::info_span!("client.rpc").in_scope(|| ());
+            Err(Handoff::Exit(0).into())
+        })
+        .await
+        .unwrap();
+        assert!(matches!(handoff, Some(Handoff::Exit(0))), "{handoff:?}");
+        assert_eq!(closed_names(&closed), ["client.rpc", "cmd"]);
+    }
+
+    /// The attach's exit status comes back unchanged, after the span ends.
+    #[tokio::test]
+    async fn an_exit_handoff_keeps_its_status() {
+        let closed = Closed::default();
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(closed.clone()));
+        let handoff = run_in_root(tracing::info_span!("cmd"), async {
+            Err(Handoff::Exit(130).into())
+        })
+        .await
+        .unwrap();
+        assert!(matches!(handoff, Some(Handoff::Exit(130))), "{handoff:?}");
+        assert_eq!(closed_names(&closed), ["cmd"]);
+    }
+
+    /// A SIGTERM'd `min net forward` hands back the signal after `cmd` ends.
+    #[tokio::test]
+    async fn a_raise_handoff_comes_back_after_the_span_ends() {
+        let closed = Closed::default();
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(closed.clone()));
+        let handoff = run_in_root(tracing::info_span!("cmd"), async {
+            tracing::info_span!("client.rpc").in_scope(|| ());
+            Err(Handoff::Raise(nix::sys::signal::Signal::SIGTERM).into())
+        })
+        .await
+        .unwrap();
+        assert!(
+            matches!(
+                handoff,
+                Some(Handoff::Raise(nix::sys::signal::Signal::SIGTERM))
+            ),
+            "{handoff:?}"
+        );
+        assert_eq!(closed_names(&closed), ["client.rpc", "cmd"]);
+    }
+
+    /// Set in the child [`die_of_ends_the_process_by_the_signal`] spawns, to
+    /// the number of the signal the child dies of.
+    const DIE_OF_CHILD: &str = "MINIMAL_TEST_DIE_OF_CHILD";
+
+    /// `die_of` kills the process by the signal even though a handler for it
+    /// is installed (tokio's, as in the forward), so a parent sees the wait
+    /// status an uncaught SIGTERM or SIGHUP gave it before the handler
+    /// existed. Runs itself in a child process, since passing means the
+    /// process dies.
+    #[test]
+    fn die_of_ends_the_process_by_the_signal() {
+        use nix::sys::signal::Signal;
+        use std::os::unix::process::ExitStatusExt as _;
+        if let Some(raw) = std::env::var_os(DIE_OF_CHILD) {
+            let signal = Signal::try_from(raw.to_str().unwrap().parse::<i32>().unwrap()).unwrap();
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let _handler = rt
+                .block_on(async {
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::from_raw(
+                        signal as i32,
+                    ))
+                })
+                .unwrap();
+            die_of(signal);
+        }
+        for signal in [Signal::SIGTERM, Signal::SIGHUP] {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "cmd::handoff_tests::die_of_ends_the_process_by_the_signal",
+                    "--test-threads=1",
+                ])
+                .env(DIE_OF_CHILD, (signal as i32).to_string())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            assert_eq!(status.signal(), Some(signal as i32), "{signal}: {status:?}");
+            assert!(!status.core_dumped(), "{signal}: {status:?}");
+        }
+    }
+
+    /// A command that returns, or fails, hands nothing off: its error comes
+    /// back as it was, and the span still ends.
+    #[tokio::test]
+    async fn ordinary_outcomes_pass_through() {
+        let closed = Closed::default();
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(closed.clone()));
+        let ok = run_in_root(tracing::info_span!("cmd"), async { Ok(()) }).await;
+        assert!(matches!(ok, Ok(None)));
+        let err = run_in_root(tracing::info_span!("cmd"), async {
+            Err(anyhow::anyhow!("no session found"))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(format!("{err:#}"), "no session found");
+        assert_eq!(closed_names(&closed), ["cmd", "cmd"]);
     }
 }

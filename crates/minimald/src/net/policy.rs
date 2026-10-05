@@ -1763,7 +1763,7 @@ mod tests {
         // must return the full reply from a peer that stays open. If it ever
         // reverts to read-to-EOF, this test hangs (the peer never closes).
         let (client, mut server) = tokio::io::duplex(1024);
-        let server = tokio::spawn(async move {
+        let server = crate::traced::spawn(async move {
             let mut buf = [0u8; 256];
             // Drain the request (headers + empty body arrive together here).
             let _ = server.read(&mut buf).await.unwrap();
@@ -1870,7 +1870,7 @@ mod tests {
             let listener = UnixListener::bind(&path).unwrap();
             let (tx, rx) = mpsc::channel(512);
             let decide = std::sync::Arc::new(decide);
-            let handle = tokio::spawn(async move {
+            let handle = crate::traced::spawn(async move {
                 // Sequential on purpose: the probe is a walk, one request per
                 // address, so one connection served at a time is its shape.
                 loop {

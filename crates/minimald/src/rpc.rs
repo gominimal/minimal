@@ -19,7 +19,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, ReadBuf};
-use tokio::task::spawn;
+
+// Every task this module spawns carries the caller's span (TEL-022): the
+// clippy `disallowed-methods` for the crate names tokio's own spawn.
+use crate::traced::spawn;
 
 use crate::{
     ChannelConfig,
@@ -116,7 +119,7 @@ async fn serve_list_sessions(
 ) -> Result<(), ConnectionError> {
     ListSessions
         .handle_channel(c, async |_req| {
-            let resource_pool = tokio::task::spawn_blocking(detect_resource_pool)
+            let resource_pool = crate::traced::spawn_blocking(detect_resource_pool)
                 .await
                 .map_err(|e| ConnectionError::Internal(e.to_string()))?;
             let mngr = s.sessions_manager().await;
@@ -618,7 +621,7 @@ async fn run_loopback_probe() -> crate::net::loopback::RangeProbe {
     let probe_fn = crate::net::loopback::session_start_probe;
     #[cfg(not(any(test, feature = "test-support")))]
     let probe_fn = crate::net::loopback::probe;
-    tokio::task::spawn_blocking(probe_fn)
+    crate::traced::spawn_blocking(probe_fn)
         .await
         .unwrap_or_else(|join| {
             tracing::warn!(
@@ -801,7 +804,7 @@ pub(crate) async fn spawn_answerer_control(
         std::os::unix::fs::PermissionsExt::from_mode(0o600),
     )?;
     let shutdown = state.shutdown_token().await;
-    tokio::spawn(async move {
+    crate::traced::spawn(async move {
         loop {
             tokio::select! {
                 biased;
@@ -809,7 +812,7 @@ pub(crate) async fn spawn_answerer_control(
                 accepted = listener.accept() => {
                     let Ok((stream, _)) = accepted else { return };
                     let status = status.clone();
-                    tokio::spawn(serve_answerer_control(stream, status));
+                    crate::traced::spawn(serve_answerer_control(stream, status));
                 }
             }
         }
@@ -1213,18 +1216,15 @@ async fn serve_shutdown(s: ServerStateHandle, c: RuChannel<Msg>) -> Result<(), C
             let mngr = s.sessions_manager().await;
             Ok(match mngr.shutdown(req.force).await {
                 Ok(()) => {
-                    // Close the file log first (both the native daemon and the
-                    // microVM): it flushes buffered records, and in the
-                    // microVM its write-open fd under the mountpoint would
-                    // otherwise defeat the clean unmount below. Records still
-                    // reach the console. A no-op for a foreground run.
-                    s.release_log().await;
-                    // R2.1/R2.2: with the sessions drained, quiesce the state
-                    // volume (syncfs + detach) before acknowledging, so a
-                    // caller-driven VMM teardown right after the ack leaves a
-                    // clean ext4 journal. Best-effort with a bounded wait; the
-                    // journal replay backstop covers every failure arm.
-                    quiesce_state_volume_if_mounted(&s).await;
+                    // With the sessions drained, run the clean-stop steps in
+                    // their fixed order (see [`clean_stop_steps`]): every fd
+                    // the daemon holds write-open under the state volume is
+                    // closed before the quiesce, so a caller-driven VMM
+                    // teardown right after the ack leaves a clean ext4
+                    // journal.
+                    for step in clean_stop_steps(s.state_volume_mounted().await) {
+                        run_clean_stop_step(&s, step).await;
+                    }
                     // Manager is down; tell the accept loop to stop and drain
                     // so the process can exit. Firing before the response is
                     // written is safe: the drain waits out the grace period,
@@ -1236,6 +1236,86 @@ async fn serve_shutdown(s: ServerStateHandle, c: RuChannel<Msg>) -> Result<(), C
             })
         })
         .await
+}
+
+/// One step of the clean stop the `Shutdown` handler runs once its sessions
+/// have drained. [`clean_stop_steps`] decides which run and in what order;
+/// [`run_clean_stop_step`] runs one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CleanStopStep {
+    /// Close the file log (both the native daemon and the microVM): it flushes
+    /// buffered records, and in the microVM its write-open fd under the
+    /// mountpoint would otherwise defeat the read-only remount. Records still
+    /// reach the console. A no-op for a foreground run.
+    ReleaseLog,
+    /// Export the telemetry recorded so far, bounded by
+    /// [`CLEAN_STOP_TELEMETRY_FLUSH`]. Before the ack, because `minvmd stop`
+    /// SIGTERMs the VMM as soon as the ack arrives, so the guest's exit-time
+    /// flush in `main` rarely gets to run. Non-terminal: what follows (the
+    /// Shutdown span itself) still goes out with that exit-time flush when it
+    /// does run. Before [`CleanStopStep::ReleaseSpool`], so records the flush
+    /// emits are still spooled.
+    FlushTelemetry,
+    /// Close the telemetry spool's file and stop spooling: the spool lives on
+    /// the state volume (`<state>/telemetry/spool`), and its write-open fd
+    /// would defeat the read-only remount exactly as the file log's would.
+    /// Records after this point are dropped, as a spool with no directory yet
+    /// drops them.
+    ReleaseSpool,
+    /// R2.1/R2.2: quiesce the state volume (syncfs, read-only remount, trim,
+    /// detach). Best-effort with a bounded wait; the journal replay backstop
+    /// covers every failure arm.
+    QuiesceVolume,
+}
+
+/// Bound on the clean stop's telemetry flush. It delays the ack, and with it
+/// every `minvmd stop`, by at most this much when the collector is slow or
+/// down. Short, because every stop pays it while a reachable collector
+/// answers in a few hundred milliseconds; the exit-time flush in `main`
+/// keeps its 5 s bound.
+const CLEAN_STOP_TELEMETRY_FLUSH: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// The clean-stop steps, in order, for a daemon that did (or did not) mount
+/// the state volume itself.
+///
+/// The order is the contract: everything that holds a write-open fd under
+/// the state volume (the file log, the telemetry spool) is released before
+/// the quiesce, or the read-only remount fails and the journal stays dirty.
+/// Only the microVM guest (the daemon that mounted the volume) flushes before
+/// the ack, since only its process is torn down right after it. A daemon that
+/// mounted no volume keeps its spool: nothing is quiesced, and the records up
+/// to its exit still spool.
+fn clean_stop_steps(volume_mounted: bool) -> Vec<CleanStopStep> {
+    let mut steps = vec![CleanStopStep::ReleaseLog];
+    if volume_mounted {
+        steps.push(CleanStopStep::FlushTelemetry);
+        steps.push(CleanStopStep::ReleaseSpool);
+        steps.push(CleanStopStep::QuiesceVolume);
+    }
+    steps
+}
+
+/// Runs one [`CleanStopStep`]. None fails the stop: each is best-effort.
+async fn run_clean_stop_step(s: &ServerStateHandle, step: CleanStopStep) {
+    match step {
+        CleanStopStep::ReleaseLog => s.release_log().await,
+        CleanStopStep::FlushTelemetry => flush_telemetry_for_clean_stop().await,
+        CleanStopStep::ReleaseSpool => mlog::otel::release_spool(),
+        CleanStopStep::QuiesceVolume => quiesce_state_volume_if_mounted(s).await,
+    }
+}
+
+/// Flushes telemetry on the blocking pool, since the flush blocks its thread
+/// for up to [`CLEAN_STOP_TELEMETRY_FLUSH`]. The handler stops waiting shortly
+/// after that bound even if the flush thread is still stuck in the exporter.
+async fn flush_telemetry_for_clean_stop() {
+    let flush = crate::traced::spawn_blocking(|| mlog::otel::flush(CLEAN_STOP_TELEMETRY_FLUSH));
+    let ceiling = CLEAN_STOP_TELEMETRY_FLUSH + std::time::Duration::from_millis(500);
+    match tokio::time::timeout(ceiling, flush).await {
+        Ok(Ok(())) => {}
+        Ok(Err(join)) => tracing::warn!(error = %join, "telemetry flush task panicked"),
+        Err(_) => tracing::warn!("telemetry flush outlived its bound; proceeding"),
+    }
 }
 
 /// Quiesce the guest state volume during shutdown (R2.2). No-op unless the
@@ -1254,10 +1334,10 @@ async fn quiesce_state_volume_if_mounted(s: &ServerStateHandle) {
     if !s.state_volume_mounted().await {
         return;
     }
-    // The file log was already released by the shutdown handler, so its fd no
-    // longer holds the mountpoint busy.
+    // The file log and the telemetry spool were already released by the
+    // shutdown handler, so their fds no longer hold the mountpoint busy.
     let mountpoint = s.minimal_state_dir().await;
-    let quiesce = tokio::task::spawn_blocking(move || {
+    let quiesce = crate::traced::spawn_blocking(move || {
         crate::guest::quiesce_state_volume(mountpoint.as_utf8_path().as_str())
     });
     match tokio::time::timeout(QUIESCE_TIMEOUT, quiesce).await {
@@ -2349,7 +2429,7 @@ async fn unpack_tar_zst_into(target: UnpackTarget, c: &mut RuChannel<Msg>) -> Re
     // gates that wrapper behind `target_env = "gnu"`, but `minimald`
     // is also cross-compiled for static musl (the guest initramfs),
     // where the nix item is configured out.
-    let swap_result = tokio::task::spawn_blocking({
+    let swap_result = crate::traced::spawn_blocking({
         let staging_dir = staging_dir.clone();
         let dir = dir.clone();
         move || {
@@ -2547,29 +2627,21 @@ pub async fn handle_ssh_rpc(
     // malformed values mint fresh — propagation is a diagnostic aid and must
     // never fail a request. Every record the handler emits carries the ids,
     // so one trace_id grep joins the CLI's log with this daemon's.
-    use minimald_rpc::trace::{TRACEPARENT_ENV, TraceContext};
     use tracing::Instrument as _;
-    let client_ctx = config
-        .env_vars
-        .get(TRACEPARENT_ENV)
-        .and_then(|v| TraceContext::parse_traceparent(v));
-    let ctx = client_ctx
-        .as_ref()
-        .map(TraceContext::child)
-        .unwrap_or_else(TraceContext::mint);
     let span = tracing::info_span!(
         "rpc",
         rpc = name,
-        trace_id = %ctx.trace_id_hex(),
-        span_id = %ctx.span_id_hex(),
+        telemetry = tracing::field::Empty,
+        trace_id = tracing::field::Empty,
+        span_id = tracing::field::Empty,
         parent_span_id = tracing::field::Empty,
     );
-    if let Some(client_ctx) = &client_ctx {
-        span.record(
-            "parent_span_id",
-            tracing::field::display(client_ctx.span_id_hex()),
-        );
-    }
+    // With OTel export on, the exported span's ids are the ids; otherwise
+    // adopt-or-mint exactly as before. The shared helper also notes the ids
+    // for the mailbox messages this RPC sends (`traced::caller_context`),
+    // and honours a client's opt-out (`MINIMAL_OTEL=off`): the span and
+    // what it sends are then recorded nowhere.
+    crate::exec::adopt_client_trace(&span, &config);
 
     // Handle the named RPC (fire-and-forget; join handles are discarded).
     // `served` brackets each handler with its dispatch/outcome records —
@@ -6286,6 +6358,25 @@ mod tests {
         );
     }
 
+    /// Every step that releases a write-open fd under the state volume runs
+    /// before the quiesce, or the read-only remount fails and the journal
+    /// stays dirty; the flush runs before the spool's release and the ack.
+    #[test]
+    fn a_clean_stop_releases_its_fds_before_the_quiesce() {
+        use CleanStopStep::{FlushTelemetry, QuiesceVolume, ReleaseLog, ReleaseSpool};
+        assert_eq!(
+            clean_stop_steps(true),
+            [ReleaseLog, FlushTelemetry, ReleaseSpool, QuiesceVolume]
+        );
+    }
+
+    /// With no volume of its own there is nothing to quiesce, so the spool
+    /// stays open for the records still to come.
+    #[test]
+    fn a_clean_stop_without_a_mounted_volume_keeps_its_spool() {
+        assert_eq!(clean_stop_steps(false), [CleanStopStep::ReleaseLog]);
+    }
+
     #[tokio::test]
     async fn shutdown_reports_shutting_down_when_no_sessions_are_live() {
         let server = TestServer::new().await;
@@ -6613,5 +6704,116 @@ mod tests {
             tokio::net::UnixStream::connect(&sock).await.is_ok(),
             "the live door still answers"
         );
+    }
+}
+
+/// The spans an RPC's work runs in (TEL-021, TEL-022): the
+/// `rpc` span adopts the client's `TRACEPARENT`, each mailbox message's
+/// span is a child of its sender's, and a long-lived actor started by a
+/// request does not hold that request's spans open. Export is off here, so
+/// the ids are the ones `exec::adopt_trace` records for the file log.
+#[cfg(test)]
+mod trace_tests {
+    use minimald_rpc::{CreateSession, DestroySession, DestroySessionRequest};
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    use crate::test_harness::{SpanLog, TestServer, create_session_req};
+
+    const TRACE: &str = "0af7651916cd43dd8448eb211c80319c";
+    const PARENT: &str = "b7ad6b7169203331";
+
+    fn env() -> [(&'static str, &'static str); 1] {
+        [(
+            minimald_rpc::trace::TRACEPARENT_ENV,
+            "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+        )]
+    }
+
+    /// TEL-021 (daemon side), TEL-022: the `rpc` span is a child of
+    /// the client's span; the manager message it sends is a child of the
+    /// `rpc` span; the session message the manager sends on is a child of
+    /// the manager's; all in the client's trace.
+    #[tokio::test]
+    async fn a_manager_and_a_session_message_are_children_of_their_senders() {
+        let log = SpanLog::default();
+        let _g = tracing::subscriber::set_default(tracing_subscriber::registry().with(log.clone()));
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let id = client
+            .call_with_env::<CreateSession>(&env(), &create_session_req("s", "/tmp"))
+            .await
+            .unwrap()
+            .id;
+        client
+            .call_with_env::<DestroySession>(&env(), &DestroySessionRequest { id })
+            .await
+            .unwrap();
+
+        let child_of = |child: &crate::test_harness::LoggedSpan,
+                        parent: &crate::test_harness::LoggedSpan| {
+            assert_eq!(child.field("trace_id"), Some(TRACE), "{child:?}");
+            assert_eq!(
+                child.field("parent_span_id"),
+                parent.field("span_id"),
+                "{} is a child of {}: {child:?} {parent:?}",
+                child.name,
+                parent.name
+            );
+        };
+        let create = log.one("rpc", "rpc", "minimald-v1-CreateSession");
+        assert_eq!(create.field("trace_id"), Some(TRACE));
+        assert_eq!(create.field("parent_span_id"), Some(PARENT));
+        child_of(
+            &log.one("sessions.manager.message", "kind", "CreateSession"),
+            &create,
+        );
+        let destroy = log.one("rpc", "rpc", "minimald-v1-DestroySession");
+        let delete = log.one("sessions.manager.message", "kind", "DeleteSession");
+        child_of(&delete, &destroy);
+        child_of(&log.one("session.message", "kind", "Destroy"), &delete);
+    }
+
+    /// TEL-022: the session actor a CreateSession starts runs in
+    /// a root span of its own, so the request's `rpc` and manager-message
+    /// spans close once the RPC has answered while the actor lives on. They
+    /// stayed open for the actor's whole life (a 313 s CreateSession message
+    /// behind a 114 ms RPC).
+    #[tokio::test]
+    async fn a_request_span_closes_when_its_rpc_returns() {
+        let log = SpanLog::default();
+        let _g = tracing::subscriber::set_default(tracing_subscriber::registry().with(log.clone()));
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        client
+            .call_with_env::<CreateSession>(&env(), &create_session_req("s", "/tmp"))
+            .await
+            .unwrap();
+        // The answer can reach the client a moment before the handler's
+        // span is dropped: give it a bounded moment.
+        let closed = || {
+            log.one("rpc", "rpc", "minimald-v1-CreateSession").closed
+                && log
+                    .one("sessions.manager.message", "kind", "CreateSession")
+                    .closed
+        };
+        for _ in 0..100 {
+            if closed() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            closed(),
+            "the request's spans are still open: {:#?}",
+            log.spans()
+        );
+        let actors: Vec<_> = log
+            .spans()
+            .into_iter()
+            .filter(|s| s.name == "session.actor")
+            .collect();
+        assert_eq!(actors.len(), 1, "{actors:?}");
+        assert!(!actors[0].closed, "the actor lives on");
+        assert!(actors[0].parent.is_none(), "the actor's span is a root");
     }
 }

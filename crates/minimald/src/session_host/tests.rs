@@ -167,7 +167,7 @@ fn watch_binding<P: SessionProcess, G: SessionGuard>(
     host: &mut Host<P, G>,
 ) -> mpsc::Receiver<BindingMsg> {
     let (tx, rx) = mpsc::channel(16);
-    host.remote = Some((tx, tokio::spawn(async {}), CancellationToken::new()));
+    host.remote = Some((tx, crate::traced::spawn(async {}), CancellationToken::new()));
     rx
 }
 
@@ -214,7 +214,7 @@ async fn a_shell_exit_reaches_the_binding_with_the_reaped_exit_reason() {
     .expect("failed to build host");
     let mut rx = watch_binding(&mut host);
     let stdin = host.remote_tx.clone();
-    let task = tokio::spawn(host.mainloop());
+    let task = crate::traced::spawn(host.mainloop());
 
     stdin
         .send(stdin_bytes(format!("{MOCK_EXIT_LINE}\n").into_bytes()))
@@ -282,12 +282,12 @@ async fn a_stalled_binding_does_not_wedge_the_host_loop() {
         tx.try_send(BindingMsg::Stdin(Vec::new()))
             .expect("pre-fill stays within the mailbox capacity");
     }
-    host.remote = Some((tx, tokio::spawn(async {}), CancellationToken::new()));
+    host.remote = Some((tx, crate::traced::spawn(async {}), CancellationToken::new()));
     // Short, so the shed this test goes on to rely on comes quickly.
     host.output_stall_timeout = Duration::from_millis(200);
 
     let stdin = host.remote_tx.clone();
-    let task = tokio::spawn(host.mainloop());
+    let task = crate::traced::spawn(host.mainloop());
 
     // Make the shell echo so the host has output for the full binding, and
     // reads it once the stalled binding has been shed.
@@ -424,7 +424,7 @@ impl FloodedAttach {
         .expect("failed to build host");
         host.output_stall_timeout = output_stall_timeout;
         let stdin = host.remote_tx.clone();
-        let task = tokio::spawn(host.mainloop());
+        let task = crate::traced::spawn(host.mainloop());
 
         let (server_side, client_side) = tokio::net::UnixStream::pair().unwrap();
         let key = russh::keys::PrivateKey::random(
@@ -449,7 +449,7 @@ impl FloodedAttach {
             russh::server::run_stream(server_config, server_side, ChannelCatcher(caught_tx)),
             russh::client::connect_stream(client_config, client_side, TrustingClient),
         );
-        tokio::spawn(server.expect("ssh server handshake"));
+        crate::traced::spawn(server.expect("ssh server handshake"));
         let mut client = client.expect("ssh client handshake");
         let auth = client.authenticate_none("test").await.unwrap();
         assert!(auth.success(), "the test server accepts anyone");
@@ -473,7 +473,7 @@ impl FloodedAttach {
         // the host before it has processed the attach are dropped as stale,
         // and so is everything after a shed; neither matters here.
         let line = format!("{}\n", "x".repeat(2000));
-        let feeder = tokio::spawn(async move {
+        let feeder = crate::traced::spawn(async move {
             while stdin
                 .send(StdinMsg::new(
                     1,
@@ -679,7 +679,7 @@ async fn a_shell_exit_hands_the_binding_the_codes_that_leave_mouse_mode() {
     .expect("failed to build host");
     let mut rx = watch_binding(&mut host);
     let stdin = host.remote_tx.clone();
-    let task = tokio::spawn(host.mainloop());
+    let task = crate::traced::spawn(host.mainloop());
 
     // The mock shell echoes every line back, which is how a test drives the
     // host's screen into the state a full-screen app leaves behind: here,
@@ -792,7 +792,7 @@ async fn a_kill_tells_the_binding_nothing() {
     .await
     .expect("failed to build host");
     let mut rx = watch_binding(&mut host);
-    let task = tokio::spawn(host.mainloop());
+    let task = crate::traced::spawn(host.mainloop());
 
     handle
         .kill(false)
@@ -854,7 +854,7 @@ fn reap_lines(capture: &crate::test_harness::CaptureWriter, name: &str) -> Vec<S
 async fn a_requested_kill_logs_its_reap_at_info() {
     let capture = captured_log();
     let (host, handle) = reap_log_host("reap-requested").await;
-    let task = tokio::spawn(host.mainloop());
+    let task = crate::traced::spawn(host.mainloop());
 
     handle
         .kill(false)
@@ -884,7 +884,7 @@ async fn an_unrequested_kill_still_warns_abnormal() {
     let pid = host.container_pid();
     let mut rx = watch_binding(&mut host);
     let stdin = host.remote_tx.clone();
-    let task = tokio::spawn(host.mainloop());
+    let task = crate::traced::spawn(host.mainloop());
 
     // Kill only once the loop is parked in `step`, as it is for a live
     // session: killed before its first `try_wait`, the shell is reaped there
@@ -1310,7 +1310,7 @@ async fn get_attrs_tracks_title_and_io_times() {
     .await
     .expect("failed to build host");
     let stdin = host.remote_tx.clone();
-    tokio::spawn(host.mainloop());
+    crate::traced::spawn(host.mainloop());
 
     // OSC "set window title" (ESC ] 0 ; <title> BEL), sent as one line. The
     // mock echoes the line back (prefixed with `got:`), so the raw escape
@@ -1387,7 +1387,7 @@ async fn kill_tears_down_host_and_reaps_process() {
     )
     .await
     .expect("failed to build host");
-    let task = tokio::spawn(host.mainloop());
+    let task = crate::traced::spawn(host.mainloop());
 
     handle
         .kill(false)
@@ -1494,7 +1494,7 @@ async fn exit_releases_the_network() {
     .await
     .expect("failed to build host");
     let stdin = host.remote_tx.clone();
-    let task = tokio::spawn(host.mainloop());
+    let task = crate::traced::spawn(host.mainloop());
 
     // While the shell is alive the network must stay up.
     assert!(
@@ -1550,7 +1550,7 @@ async fn detach_keystroke_holds_the_session_and_network() {
     .await
     .expect("failed to build host");
     let stdin = host.remote_tx.clone();
-    let task = tokio::spawn(host.mainloop());
+    let task = crate::traced::spawn(host.mainloop());
 
     // The default detach chord is `ctrl-]` (0x1d, the leader) then `d`.
     // Both bytes are consumed by the command-mode state machine rather
@@ -1653,7 +1653,7 @@ async fn stale_binding_generation_input_is_discarded() {
     .await
     .expect("failed to build host");
     let stdin = host.remote_tx.clone();
-    let mut task = tokio::spawn(host.mainloop());
+    let mut task = crate::traced::spawn(host.mainloop());
 
     // The exit sentinel on a stale generation: if this reached the shell
     // the mainloop would reap the process and the task would complete.
@@ -2594,7 +2594,7 @@ async fn the_closure_report_is_removed_only_once_the_boxs_fate_is_known() {
 
     let covered = dir.path().join("a-covered-closure");
     std::fs::write(&covered, "cover cgroup2\n").expect("the cover the closure took");
-    let watching = tokio::spawn(super::report_box_closure(
+    let watching = crate::traced::spawn(super::report_box_closure(
         covered.clone(),
         "a session".to_string(),
         Duration::from_millis(300),
@@ -4303,7 +4303,7 @@ async fn expose_ask_human_deny_refused() {
     .expect("the attached shell should echo within the bound");
 
     // Ask off the test's own task: the reply waits on the human.
-    let asked = tokio::spawn(async move { handle.expose_dynamic(3000).await });
+    let asked = crate::traced::spawn(async move { handle.expose_dynamic(3000).await });
 
     let rendered = answer_ask_on(&mut channel, false).await;
     let rendered = String::from_utf8_lossy(&rendered);
@@ -4428,7 +4428,7 @@ async fn expose_ask_answered_after_the_stall_bound_publishes() {
     host.set_output_stall_timeout(Duration::from_millis(500))
         .await;
 
-    let asked = tokio::spawn(async move { handle.expose_dynamic(3000).await });
+    let asked = crate::traced::spawn(async move { handle.expose_dynamic(3000).await });
 
     // The dialog has to be up before the session starts printing, so the
     // printing lands inside it — where the binding used to stop draining.
@@ -4608,7 +4608,7 @@ async fn expose_ask_shed_mid_dialog_is_the_daemons_refusal() {
         .await;
 
     // Ask off the test's own task: the reply waits on the human.
-    let asked = tokio::spawn(async move { handle.expose_dynamic(3000).await });
+    let asked = crate::traced::spawn(async move { handle.expose_dynamic(3000).await });
 
     // The dialog has to be up before the client stops reading, so the shed
     // lands inside it.
@@ -4771,7 +4771,7 @@ async fn expose_ask_superseded_mid_dialog_is_the_daemons_refusal() {
     .expect("the attached shell should echo within the bound");
 
     // Ask off the test's own task: the reply waits on the human.
-    let asked = tokio::spawn(async move { handle.expose_dynamic(3000).await });
+    let asked = crate::traced::spawn(async move { handle.expose_dynamic(3000).await });
 
     let rendered = await_ask_prompt(&mut channel).await;
     let rendered = String::from_utf8_lossy(&rendered);
@@ -4931,7 +4931,7 @@ async fn expose_ask_client_eof_mid_dialog_is_the_daemons_refusal() {
     .expect("the attached shell should echo within the bound");
 
     // Ask off the test's own task: the reply waits on the human.
-    let asked = tokio::spawn(async move { handle.expose_dynamic(3000).await });
+    let asked = crate::traced::spawn(async move { handle.expose_dynamic(3000).await });
 
     // The dialog has to be up before the client goes away, so the EOF lands
     // inside it.
@@ -5215,7 +5215,7 @@ async fn expose_ask_answers_reach_their_own_ask_on_a_shared_port() {
     // confirmed standing before the second is even sent, so the parked
     // book's order and the binding's dialog order are the same order, and
     // the ids below say whose caller they are.
-    let asked_first = tokio::spawn({
+    let asked_first = crate::traced::spawn({
         let handle = handle.clone();
         async move { handle.expose_dynamic(3000).await }
     });
@@ -5242,7 +5242,7 @@ async fn expose_ask_answers_reach_their_own_ask_on_a_shared_port() {
         "the first dialog's lead-in names the box and the port: {rendered}"
     );
 
-    let asked_second = tokio::spawn({
+    let asked_second = crate::traced::spawn({
         let handle = handle.clone();
         async move { handle.expose_dynamic(3000).await }
     });
@@ -5449,7 +5449,7 @@ async fn expose_ask_prompts_attached_human() {
     .expect("the attached shell should echo within the bound");
 
     // Ask off the test's own task: the reply waits on the human.
-    let asked = tokio::spawn(async move { handle.expose_dynamic(3000).await });
+    let asked = crate::traced::spawn(async move { handle.expose_dynamic(3000).await });
 
     let rendered = answer_ask_on(&mut channel, true).await;
     let rendered = String::from_utf8_lossy(&rendered);
@@ -5580,7 +5580,7 @@ async fn expose_ask_yes_admits_the_port_at_the_box_gate() {
     .expect("the attached shell should echo within the bound");
 
     assert!(!gate.admits_tcp(3000), "nothing is published yet");
-    let asked = tokio::spawn(async move { handle.expose_dynamic(3000).await });
+    let asked = crate::traced::spawn(async move { handle.expose_dynamic(3000).await });
     answer_ask_on(&mut channel, true).await;
     tokio::time::timeout(Duration::from_secs(30), asked)
         .await
@@ -5816,7 +5816,7 @@ async fn expose_unrecordable_allow_is_refused_and_deny_still_refuses() {
         let gate = std::sync::Arc::clone(&gate);
         let ever_admitted = std::sync::Arc::clone(&ever_admitted);
         let sampling = std::sync::Arc::clone(&sampling);
-        tokio::spawn(async move {
+        crate::traced::spawn(async move {
             while sampling.load(std::sync::atomic::Ordering::SeqCst) {
                 if gate.admits_tcp(3000) {
                     ever_admitted.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -5927,7 +5927,7 @@ async fn unaudited_vm_withdrawal(
     std::os::unix::fs::symlink(&planted, state_dir.join("audit")).unwrap();
 
     let exposing = handle.clone();
-    let expose = tokio::spawn(async move { exposing.expose_dynamic(3000).await });
+    let expose = crate::traced::spawn(async move { exposing.expose_dynamic(3000).await });
     let admit = tokio::time::timeout(Duration::from_secs(10), requests.recv())
         .await
         .expect("the publish reaches the VM host daemon's door")
@@ -6064,7 +6064,7 @@ async fn unaudited_allow_keeps_a_forward_the_switch_would_not_unbind() {
     std::os::unix::fs::symlink(&planted, state_dir.join("audit")).unwrap();
 
     let exposing = handle.clone();
-    let expose = tokio::spawn(async move { exposing.expose_dynamic(3000).await });
+    let expose = crate::traced::spawn(async move { exposing.expose_dynamic(3000).await });
     // The publish reports its port first; the door admits it.
     let admit = tokio::time::timeout(Duration::from_secs(10), requests.recv())
         .await
@@ -6186,7 +6186,7 @@ async fn unaudited_allow_whose_spawn_ends_mid_unbind_gives_the_port_back() {
     let forwarder = {
         let served = served.clone();
         let runtime_ingress = runtime_ingress.clone();
-        tokio::spawn(async move {
+        crate::traced::spawn(async move {
             loop {
                 let Ok((mut stream, _)) = listener.accept().await else {
                     return;
@@ -6223,7 +6223,7 @@ async fn unaudited_allow_whose_spawn_ends_mid_unbind_gives_the_port_back() {
     std::os::unix::fs::symlink(&planted, state_dir.join("audit")).unwrap();
 
     let exposing = handle.clone();
-    let expose = tokio::spawn(async move { exposing.expose_dynamic(3000).await });
+    let expose = crate::traced::spawn(async move { exposing.expose_dynamic(3000).await });
     let admit = tokio::time::timeout(Duration::from_secs(10), requests.recv())
         .await
         .expect("the publish reaches the VM host daemon's door")
@@ -6328,7 +6328,7 @@ async fn ask_expose_without_a_binding_answers_no_one() {
     )
     .await
     .expect("failed to build host");
-    let task = tokio::spawn(host.mainloop());
+    let task = crate::traced::spawn(host.mainloop());
 
     let answer = tokio::time::timeout(Duration::from_secs(5), handle.ask_expose(3000))
         .await
@@ -6482,7 +6482,7 @@ async fn guest_ask_prompt_not_rendered_on_vm_host() {
     let mut channel = attach_live_shell(&mut client, web).await;
 
     let asking = handle.clone();
-    let asked = tokio::spawn(async move { asking.expose_dynamic(3000).await });
+    let asked = crate::traced::spawn(async move { asking.expose_dynamic(3000).await });
     expect_admit_ask(&mut requests).await;
 
     // The attached guest shell is shown nothing while the host asks.
@@ -6546,7 +6546,7 @@ async fn native_ask_prompt_still_renders() {
     )
     .await;
     let mut channel = attach_live_shell(&mut client, web).await;
-    let asked = tokio::spawn(async move { handle.expose_dynamic(3000).await });
+    let asked = crate::traced::spawn(async move { handle.expose_dynamic(3000).await });
     let rendered = answer_ask_on(&mut channel, false).await;
     assert!(
         String::from_utf8_lossy(&rendered).contains("web asks to publish port 3000"),
@@ -6602,7 +6602,7 @@ async fn ask_no_or_no_tty_records_nothing() {
         ),
     ] {
         let asking = handle.clone();
-        let asked = tokio::spawn(async move { asking.expose_dynamic(3000).await });
+        let asked = crate::traced::spawn(async move { asking.expose_dynamic(3000).await });
         expect_admit_ask(&mut requests).await;
         replies
             .send(host_end(minimald_rpc::AskAdmitOutcome::Refused {
@@ -6671,7 +6671,7 @@ async fn vm_ask_ended_by_host_audited(
         .expect("the ask box launches its host");
     let (forwarder, served, _door, mut requests, replies) = vm_backed_ask_box(&handle).await;
     let asking = handle.clone();
-    let asked = tokio::spawn(async move { asking.expose_dynamic(3000).await });
+    let asked = crate::traced::spawn(async move { asking.expose_dynamic(3000).await });
     expect_admit_ask(&mut requests).await;
     replies
         .send(host_end(outcome))
@@ -6828,7 +6828,7 @@ async fn ask_yes_publish_withdraws_on_unexpose() {
         .expect("the ask box launches its host");
     let (forwarder, served, _door, mut requests, replies) = vm_backed_ask_box(&handle).await;
     let asking = handle.clone();
-    let asked = tokio::spawn(async move { asking.expose_dynamic(3000).await });
+    let asked = crate::traced::spawn(async move { asking.expose_dynamic(3000).await });
     expect_admit_ask(&mut requests).await;
     replies
         .send(host_end(minimald_rpc::AskAdmitOutcome::Admitted {
@@ -6844,7 +6844,7 @@ async fn ask_yes_publish_withdraws_on_unexpose() {
         .expect("the host's yes publishes");
 
     let stopping = handle.clone();
-    let stop = tokio::spawn(async move { stopping.stop().await });
+    let stop = crate::traced::spawn(async move { stopping.stop().await });
     let withdrawal = tokio::time::timeout(Duration::from_secs(10), requests.recv())
         .await
         .expect("the stop reports a withdrawal")

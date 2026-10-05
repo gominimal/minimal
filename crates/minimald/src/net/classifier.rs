@@ -3501,7 +3501,7 @@ mod tests {
             .await
             .expect("the proxy binds a loopback port");
         let proxy_addr = proxy.local_addr().expect("the proxy's address");
-        tokio::spawn(crate::net::proxy::serve(proxy, router));
+        crate::traced::spawn(crate::net::proxy::serve(proxy, router));
         let answered = crate::net::proxy::proxy_get(
             proxy_addr,
             &format!("denybox.min.internal:{backend_port}"),

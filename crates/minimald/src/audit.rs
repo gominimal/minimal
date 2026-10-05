@@ -637,7 +637,7 @@ mod tests {
         let mut tasks = Vec::new();
         for writer in 0..8u16 {
             let state_dir = state_dir.clone();
-            tasks.push(tokio::spawn(async move {
+            tasks.push(crate::traced::spawn(async move {
                 for n in 0..50u16 {
                     try_append_capped(&state_dir, &record_for(1000 + writer * 100 + n), cap)
                         .await

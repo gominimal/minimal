@@ -54,6 +54,13 @@
 //! `minimal_class` table, is that host's, and a proof that found one would
 //! be a proof run over something it must not replace.
 #![cfg(target_os = "linux")]
+// An integration test has no `crate::traced` to route its spawns through,
+// and nothing it spawns is in a daemon request's trace; the crate's clippy
+// `disallowed-methods` (see clippy.toml) is for the daemon's own sources.
+#![expect(
+    clippy::disallowed_methods,
+    reason = "an integration test cannot reach crate::traced, and traces nothing"
+)]
 
 use std::io::{BufRead as _, Read as _, Write as _};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};

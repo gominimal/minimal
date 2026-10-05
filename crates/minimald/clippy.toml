@@ -1,0 +1,21 @@
+# Clippy configuration for minimald. Clippy reads the nearest clippy.toml
+# above a crate's manifest and no other, so this file restates the
+# workspace's keys (see /clippy.toml) and adds the daemon's own.
+
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-indexing-slicing-in-tests = true
+allow-dbg-in-tests = true
+
+# Every task and blocking-pool call in minimald goes through `crate::traced`,
+# which carries the caller's span into the task; a bare tokio spawn starts
+# with no span and silently cuts its work out of the request's trace
+# (TEL-022). `traced.rs` itself carries the one `expect` per wrapper. The
+# text guard `traced::tests::no_direct_tokio_spawn_blocking` keeps checking
+# the same files from the test lane, where clippy does not run.
+disallowed-methods = [
+    { path = "tokio::spawn", reason = "use crate::traced::spawn (or spawn_detached for a task that outlives its request)" },
+    { path = "tokio::task::spawn", reason = "use crate::traced::spawn (or spawn_detached for a task that outlives its request)" },
+    { path = "tokio::task::spawn_blocking", reason = "use crate::traced::spawn_blocking" },
+]

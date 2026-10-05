@@ -925,6 +925,7 @@ impl Loader for DiskLoader {
         }
     }
 
+    #[tracing::instrument(level = "debug", name = "sessions.store.get", skip_all)]
     fn get(&self, key: &Self::Key) -> Result<Self::Object, std::io::Error> {
         // Refuse a stale key (session deleted, or its short re-allocated to a
         // different session) with `NotFound` rather than reading the wrong
