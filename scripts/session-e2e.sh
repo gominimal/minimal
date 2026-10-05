@@ -16897,13 +16897,15 @@ proof_listen_published_port_reaches_peer_and_host() {
     || { echo "::error::could not stop the in-box listener on port $lp_listen_port"; fail; }
   # The withdrawal is the watcher's own next poll of the box, so the peer's
   # GET polls until the refusal stands — bounded by the same cadence the
-  # publish leg just proved on this box.
+  # publish leg just proved on this box. Until that poll, the standing
+  # publication accepts the connect and resets it against the closed backend
+  # (curl exit 56), so only the refusal (7) ends the poll early.
   lp_refused=""
   for _ in $(seq 1 60); do
     lp_peer_get "$lp_listen_port"
     if [ "$lp_rc" -ne 0 ] || [ "$lp_status" != "200" ]; then
       lp_refused=1
-      break
+      [ "$lp_rc" -eq 7 ] && break
     fi
     sleep 0.25
   done
