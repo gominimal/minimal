@@ -643,46 +643,98 @@ pub(crate) struct AnswererPaths {
 /// install marker — the address and port the loaded table's carve-out names
 /// and the live-answerer cell takes while this daemon publishes, so a
 /// deny-all box's launch check keeps reading the answerer actually serving
-/// (T75's cell, fed here by the publish that reached it). A unit that
-/// cannot be read, or names no IPv4 `ListenDatagram=`, reads as the
-/// install's documented bind, 127.0.0.1 at [`ANSWERER_PORT`].
-fn recorded_service_bind(marker: &std::path::Path) -> SocketAddr {
-    std::fs::read_to_string(marker)
-        .ok()
-        .and_then(|unit| {
-            unit.lines().find_map(|line| {
-                line.trim()
-                    .strip_prefix("ListenDatagram=")
-                    .and_then(|value| value.trim().parse::<SocketAddrV4>().ok())
-            })
+/// (T75's cell, fed here by the publish that reached it). `None` when the
+/// unit cannot be read or names no IPv4 `ListenDatagram=`: there is then
+/// no recorded bind, and none is assumed — the documented default would be
+/// a guess the cell must never hold.
+fn recorded_service_bind(marker: &std::path::Path) -> Option<SocketAddr> {
+    std::fs::read_to_string(marker).ok().and_then(|unit| {
+        unit.lines().find_map(|line| {
+            line.trim()
+                .strip_prefix("ListenDatagram=")
+                .and_then(|value| value.trim().parse::<SocketAddrV4>().ok())
+                .map(SocketAddr::V4)
         })
-        .map_or(
-            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, ANSWERER_PORT)),
-            SocketAddr::V4,
-        )
+    })
+}
+
+/// Takes the installed service's recorded bind as the answerer actually
+/// serving while this daemon publishes: the status, the reported port and
+/// the live-answerer cell all name it. A unit whose bind cannot be read
+/// leaves all three claiming nothing — the status back at `Starting` (the
+/// pre-acquisition state, which names no port), no reported port, and the
+/// cell unset, so T75's plan-time check refuses new native deny-all
+/// launches as stale (fail-closed) — with one warn naming the unit, said
+/// once until a bind is read again.
+async fn adopt_service_bind(
+    state: &crate::server::ServerStateHandle,
+    status: &AnswererStatus,
+    holder: &str,
+    marker: &std::path::Path,
+    unit_warned: &mut bool,
+) -> Option<SocketAddr> {
+    if let Some(bind) = recorded_service_bind(marker) {
+        *unit_warned = false;
+        status.set(registered_status(holder, bind.port()));
+        state.set_zone_answerer_port(bind.port()).await;
+        crate::net::classifier::set_live_answerer(bind);
+        return Some(bind);
+    }
+    if !*unit_warned {
+        *unit_warned = true;
+        tracing::warn!(
+            component = COMPONENT,
+            unit = %marker.display(),
+            "the installed answerer service's unit {} names no readable ListenDatagram= \
+             bind; this daemon publishes to the service but claims no answerer bind, so \
+             the live-answerer cell stays unset and new deny-all boxes are refused as \
+             stale until the unit is reinstalled",
+            marker.display()
+        );
+    }
+    status.set(minimald_rpc::ZoneAnswererStatus::Starting);
+    state.clear_zone_answerer_port().await;
+    crate::net::classifier::clear_live_answerer();
+    None
 }
 
 /// What this daemon knows of the answerers that may hold a stale
-/// carve-out's target: its own interim's bind while it hosts one, and the
-/// installed service's recorded bind while the service is installed. The
+/// carve-out's target, each only while it is live: its own interim's bind
+/// while its socket is open, and the installed service's recorded bind
+/// while the service's channel answers. An address match alone labels
+/// nothing — a port held at a dead answerer's bind is someone else's. The
 /// carve-out re-check classifies a held target against these.
 #[derive(Debug, Clone, Copy, Default)]
 struct HolderFacts {
-    /// The interim's bind, while this daemon hosts it.
+    /// The interim's bind, while this daemon's interim socket is open.
     interim: Option<SocketAddr>,
-    /// The installed service's recorded bind, while it is installed.
+    /// The installed service's recorded bind, while its channel answers.
     service: Option<SocketAddr>,
 }
 
 impl HolderFacts {
-    /// The facts over `paths`' install marker, with the interim's bind.
-    fn of(paths: &AnswererPaths, interim: Option<SocketAddr>) -> Self {
+    /// The facts from this daemon's own state and the service's liveness:
+    /// the interim's bind only while `status` says this daemon hosts it
+    /// (its socket open), and the service's recorded bind only while the
+    /// install marker names one and a connect to the channel succeeds.
+    async fn of(
+        paths: &AnswererPaths,
+        status: &AnswererStatus,
+        interim_bind: Option<SocketAddr>,
+    ) -> Self {
+        let service = match recorded_service_bind(&paths.marker) {
+            Some(bind)
+                if tokio::net::UnixStream::connect(&paths.channel)
+                    .await
+                    .is_ok() =>
+            {
+                Some(bind)
+            }
+            _ => None,
+        };
         Self {
-            interim,
-            service: paths
-                .marker
-                .exists()
-                .then(|| recorded_service_bind(&paths.marker)),
+            interim: interim_bind.filter(|_| status.hosting()),
+            service,
         }
     }
 }
@@ -708,6 +760,10 @@ enum CarveOutHolder {
 /// fails for any other reason (the address is not on this host) has
 /// nothing behind it, so it reads free.
 fn classify_carve_out_target(target: SocketAddrV4, facts: &HolderFacts) -> CarveOutHolder {
+    // std's `UdpSocket::bind` sets neither SO_REUSEADDR nor SO_REUSEPORT
+    // (std sets SO_REUSEADDR only on a Unix `TcpListener`), so a holder
+    // that bound with either reuse flag still refuses this probe with
+    // AddrInUse: a held target can never read as free.
     match std::net::UdpSocket::bind(target) {
         Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
             let target = SocketAddr::V4(target);
@@ -1499,6 +1555,7 @@ async fn acquire_at(
     let mut stale_global_once = false;
     let mut stale_once = false;
     let mut carve_out_said: Option<String> = None;
+    let mut unit_warned = false;
 
     loop {
         if shutdown.is_cancelled() {
@@ -1537,8 +1594,6 @@ async fn acquire_at(
             Ok(published) => {
                 retry = CHANNEL_RETRY;
                 erroring = false;
-                let service_bind = recorded_service_bind(&paths.marker);
-                status.set(registered_status(&published.holder, service_bind.port()));
                 warn_refused(&node, &published.refused);
                 if !published_once {
                     published_once = true;
@@ -1552,14 +1607,22 @@ async fn acquire_at(
                 // service's own bind: this daemon's hook port can be
                 // pinned elsewhere than where the service serves, and the
                 // answerer actually serving is the service.
-                state.set_zone_answerer_port(service_bind.port()).await;
-                crate::net::classifier::set_live_answerer(service_bind);
+                let service_bind = adopt_service_bind(
+                    &state,
+                    &status,
+                    &published.holder,
+                    &paths.marker,
+                    &mut unit_warned,
+                )
+                .await;
+                // The publish just landed over the channel: the service is
+                // live, so its bind (when the unit names one) is its own.
                 recheck_live_carve_outs(
                     &manager,
-                    Some(service_bind),
+                    service_bind,
                     &HolderFacts {
                         interim: None,
-                        service: Some(service_bind),
+                        service: service_bind,
                     },
                     &mut carve_out_said,
                 )
@@ -1582,7 +1645,7 @@ async fn acquire_at(
                     recheck_live_carve_outs(
                         &manager,
                         None,
-                        &HolderFacts::of(&paths, None),
+                        &HolderFacts::of(&paths, &status, None).await,
                         &mut carve_out_said,
                     )
                     .await;
@@ -1899,7 +1962,7 @@ async fn host_the_interim(
         recheck_live_carve_outs(
             manager,
             Some(bound),
-            &HolderFacts::of(paths, Some(bound)),
+            &HolderFacts::of(paths, status, Some(bound)).await,
             carve_out_said,
         )
         .await;
@@ -1934,7 +1997,7 @@ async fn host_the_interim(
                     }
                     status.set(minimald_rpc::ZoneAnswererStatus::Starting);
                     status.set_hosting(false);
-                    let lost = HolderFacts::of(paths, None);
+                    let lost = HolderFacts::of(paths, status, None).await;
                     recheck_live_carve_outs(manager, None, &lost, carve_out_said).await;
                     // A serve that fails at once would otherwise re-bind
                     // in a hot loop: wait a beat first, or stop on shutdown.
@@ -1947,6 +2010,7 @@ async fn host_the_interim(
                     // freed port in: classify the target again, so a
                     // deny-all box whose lookups now reach a foreign
                     // listener is named before the re-bind.
+                    let lost = HolderFacts::of(paths, status, None).await;
                     recheck_live_carve_outs(manager, None, &lost, carve_out_said).await;
                     match tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, hook_port)).await {
                         Ok(bound_again) => {
@@ -2011,11 +2075,6 @@ async fn host_the_interim(
                                     // client.
                                     *erroring = false;
                                     status.set_hosting(false);
-                                    let service_bind = recorded_service_bind(&paths.marker);
-                                    status.set(registered_status(
-                                        &published.holder,
-                                        service_bind.port(),
-                                    ));
                                     warn_refused(node, &published.refused);
                                     announce_publish(
                                         &published.holder,
@@ -2023,14 +2082,20 @@ async fn host_the_interim(
                                         &paths.channel,
                                         node,
                                     );
-                                    state.set_zone_answerer_port(service_bind.port()).await;
-                                    crate::net::classifier::set_live_answerer(service_bind);
+                                    let service_bind = adopt_service_bind(
+                                        state,
+                                        status,
+                                        &published.holder,
+                                        &paths.marker,
+                                        &mut false,
+                                    )
+                                    .await;
                                     recheck_live_carve_outs(
                                         manager,
-                                        Some(service_bind),
+                                        service_bind,
                                         &HolderFacts {
                                             interim: None,
-                                            service: Some(service_bind),
+                                            service: service_bind,
                                         },
                                         carve_out_said,
                                     )
@@ -2051,7 +2116,7 @@ async fn host_the_interim(
                                         recheck_live_carve_outs(
                                             manager,
                                             None,
-                                            &HolderFacts::of(paths, None),
+                                            &HolderFacts::of(paths, status, None).await,
                                             carve_out_said,
                                         )
                                         .await;
@@ -3046,21 +3111,14 @@ mod tests {
         }
     }
 
-    /// NET-122's publish arm: with the answerer service installed and its
-    /// channel answering, the native daemon publishes its zone rows there
-    /// with its node id and hosts nothing — the hook port stays free, the
-    /// status says the manager holds the answerer, the live-answerer cell
-    /// takes the service's recorded bind (the one the loaded table's
-    /// carve-out names, T75's cell fed by the publish that reached it),
-    /// and the one start line names publish-or-host, the hook port and the
-    /// channel path. The held publish also keeps following the table: a
-    /// second registration's row reaches the service without the daemon
-    /// doing anything but diffing its registry.
     /// The re-check's holder classification, each case: a free target, the
     /// interim's held bind, the installed service's held bind, and a held
-    /// target that is neither — a non-Minimal listener.
-    #[test]
-    fn carve_out_target_holder_is_classified() {
+    /// target that is neither — a non-Minimal listener. The labels need
+    /// liveness, not an address match: a foreign holder at the interim's
+    /// bind after the interim died, or at the service's bind while the
+    /// service's channel does not answer, is non-Minimal.
+    #[tokio::test]
+    async fn carve_out_target_holder_is_classified() {
         let free = SocketAddrV4::new(Ipv4Addr::LOCALHOST, free_udp_port());
         assert_eq!(
             classify_carve_out_target(free, &HolderFacts::default()),
@@ -3096,11 +3154,56 @@ mod tests {
             classify_carve_out_target(target, &HolderFacts::default()),
             CarveOutHolder::NonMinimal
         );
+
+        // The facts as the daemon builds them: a unit recording the held
+        // target, a channel path, and this daemon's own interim state.
+        let dir = tempfile::tempdir().expect("a tempdir for the unit and the channel");
+        let paths = AnswererPaths {
+            channel: dir.path().join("answerer.sock"),
+            marker: dir.path().join("dev.minimal.zone-answerer.socket"),
+            release_window: RELEASE_WINDOW,
+        };
+        std::fs::write(
+            &paths.marker,
+            format!("[Socket]\nListenDatagram={target}\n").as_bytes(),
+        )
+        .expect("the unit is written");
+        let status = AnswererStatus::starting();
+
+        // The interim died (this daemon hosts nothing) and a foreign
+        // process holds its bind: non-Minimal, never the interim.
+        let facts = HolderFacts::of(&paths, &status, at).await;
+        assert_eq!(facts.interim, None, "a dead interim is no holder");
+        // The unit records the target but no channel answers: the service
+        // is not live, so the held port is a foreign process's.
+        assert_eq!(
+            facts.service, None,
+            "a service whose channel is dead is no holder"
+        );
+        assert_eq!(
+            classify_carve_out_target(target, &facts),
+            CarveOutHolder::NonMinimal
+        );
+
+        // While this daemon hosts the interim, its bind is the interim's.
+        status.set_hosting(true);
+        assert_eq!(
+            classify_carve_out_target(target, &HolderFacts::of(&paths, &status, at).await),
+            CarveOutHolder::Interim
+        );
+        status.set_hosting(false);
+
+        // While the service's channel answers, its recorded bind is its own.
+        let _channel = tokio::net::UnixListener::bind(&paths.channel).expect("the channel binds");
+        assert_eq!(
+            classify_carve_out_target(target, &HolderFacts::of(&paths, &status, None).await),
+            CarveOutHolder::ManagerHeld
+        );
     }
 
     /// The recorded service bind is the installed unit's own
-    /// `ListenDatagram=`, read — not a constant — and the documented bind
-    /// only when the unit names none.
+    /// `ListenDatagram=`, read — not a constant — and nothing at all when
+    /// the unit names none: no default is assumed.
     #[test]
     fn recorded_service_bind_reads_the_installed_unit() {
         let dir = tempfile::tempdir().expect("a tempdir for the unit");
@@ -3112,13 +3215,94 @@ mod tests {
         .expect("the unit is written");
         assert_eq!(
             recorded_service_bind(&unit),
-            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 17999))
+            Some(SocketAddr::V4(SocketAddrV4::new(
+                Ipv4Addr::LOCALHOST,
+                17999
+            )))
         );
         std::fs::write(&unit, b"[Unit]\n").expect("the unit is rewritten");
-        assert_eq!(
-            recorded_service_bind(&unit),
-            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, ANSWERER_PORT))
+        assert_eq!(recorded_service_bind(&unit), None);
+        std::fs::remove_file(&unit).expect("the unit is removed");
+        assert_eq!(recorded_service_bind(&unit), None);
+    }
+
+    /// A unit whose `ListenDatagram=` cannot be read claims no bind: the
+    /// daemon still publishes, but the status names no port (`Starting`),
+    /// no answerer port is reported, the cell is never set to the
+    /// documented default, and one warn names the unit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unreadable_service_unit_leaves_the_cell_unset() {
+        let buf = CaptureWriter::default();
+        let server = crate::test_harness::TestServer::new().await;
+        server
+            .state
+            .sessions_manager()
+            .await
+            .hostnames()
+            .write()
+            .expect("the registry lock is held")
+            .register_host_net(SessionId::nil(), "web");
+        let dir = tempfile::tempdir().expect("a tempdir for the channel and the marker");
+        let channel = dir.path().join("answerer.sock");
+        let marker = dir.path().join("dev.minimal.zone-answerer.socket");
+        std::fs::write(&marker, b"[Socket]\nListenDatagram=not-an-address\n")
+            .expect("the install marker is written");
+        let service = fake_manager_held_service(channel.clone());
+
+        let status = AnswererStatus::starting();
+        let shutdown = CancellationToken::new();
+        let task = drive(
+            server.state.clone(),
+            free_udp_port(),
+            status.clone(),
+            AnswererPaths {
+                channel,
+                marker: marker.clone(),
+                release_window: RELEASE_WINDOW,
+            },
+            shutdown.clone(),
+            buf.clone(),
         );
+        // The publish lands, and the warn naming the unit follows it.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while service.publishes().is_empty()
+            || !buf
+                .contents()
+                .contains("names no readable ListenDatagram= bind")
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the publish or the unit's warn never came: {}",
+                buf.contents()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let log = buf.contents();
+        assert!(
+            log.contains(&marker.display().to_string()),
+            "the warn names the unit: {log}"
+        );
+        assert_eq!(
+            status.get(),
+            minimald_rpc::ZoneAnswererStatus::Starting,
+            "the status claims no port"
+        );
+        assert_eq!(
+            server.state.zone_answerer_port().await,
+            None,
+            "no answerer port is reported"
+        );
+        assert_ne!(
+            crate::net::classifier::live_answerer(),
+            Some(SocketAddr::V4(SocketAddrV4::new(
+                Ipv4Addr::LOCALHOST,
+                ANSWERER_PORT
+            ))),
+            "the cell never takes the documented default"
+        );
+
+        service.stop();
+        end(task, &shutdown);
     }
 
     /// A unit installed on another port moves the cell: while this daemon
@@ -3186,6 +3370,16 @@ mod tests {
         end(task, &shutdown);
     }
 
+    /// NET-122's publish arm: with the answerer service installed and its
+    /// channel answering, the native daemon publishes its zone rows there
+    /// with its node id and hosts nothing — the hook port stays free, the
+    /// status says the manager holds the answerer, the live-answerer cell
+    /// takes the service's recorded bind (the one the loaded table's
+    /// carve-out names, T75's cell fed by the publish that reached it),
+    /// and the one start line names publish-or-host, the hook port and the
+    /// channel path. The held publish also keeps following the table: a
+    /// second registration's row reaches the service without the daemon
+    /// doing anything but diffing its registry.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn native_daemon_publishes_into_the_held_answerer() {
         let buf = CaptureWriter::default();
@@ -3201,9 +3395,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("a tempdir for the channel and the marker");
         let channel = dir.path().join("answerer.sock");
         let marker = dir.path().join("dev.minimal.zone-answerer.socket");
-        std::fs::write(&marker, b"[Unit]\n").expect("the install marker is written");
+        std::fs::write(&marker, b"[Socket]\nListenDatagram=127.0.0.1:17656\n")
+            .expect("the install marker is written");
         let service = fake_manager_held_service(channel.clone());
-        let recorded = recorded_service_bind(&marker);
+        let recorded = recorded_service_bind(&marker).expect("the unit records a bind");
 
         let status = AnswererStatus::starting();
         let shutdown = CancellationToken::new();
@@ -3325,9 +3520,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("a tempdir for the channel and the marker");
         let channel = dir.path().join("answerer.sock");
         let marker = dir.path().join("dev.minimal.zone-answerer.socket");
-        std::fs::write(&marker, b"[Unit]\n").expect("the install marker is written");
+        std::fs::write(&marker, b"[Socket]\nListenDatagram=127.0.0.1:17656\n")
+            .expect("the install marker is written");
         let service = fake_manager_held_service(channel.clone());
-        let recorded = recorded_service_bind(&marker);
+        let recorded = recorded_service_bind(&marker).expect("the unit records a bind");
 
         let status = AnswererStatus::starting();
         let shutdown = CancellationToken::new();

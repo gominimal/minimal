@@ -760,6 +760,12 @@ impl ServerStateHandle {
         self.0.lock().await.zone_answerer_port = Some(port);
     }
 
+    /// Forgets the answerer's port: nothing this daemon can name answers
+    /// for it now (a publish whose service bind could not be read).
+    pub(crate) async fn clear_zone_answerer_port(&self) {
+        self.0.lock().await.zone_answerer_port = None;
+    }
+
     /// The port the box-zone answerer listens on (UDP), or `None` while it
     /// is still coming up. Filled beside [`Self::hostname_proxy_port`] on
     /// the `ListSessions` and `CreateSession` replies so a client can name
