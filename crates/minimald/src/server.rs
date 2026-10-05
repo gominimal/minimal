@@ -1174,7 +1174,7 @@ async fn reap_unfinalized_sessions(state: &ServerStateHandle, ids: Vec<::session
             continue;
         }
         match mngr.delete_session(id).await {
-            Ok(()) => tracing::info!(
+            Ok(_) => tracing::info!(
                 session_id = %id,
                 ?status,
                 "reaped unfinalized session after its connection closed"

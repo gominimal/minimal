@@ -765,6 +765,13 @@ pub struct ReadRowRequest {
 pub struct BoxRow {
     /// The name the row was registered under.
     pub name: String,
+    /// The box's identity on its host ([`BoxId`]): the row's own
+    /// host-minted id, so a host-side client can subscribe to the row's
+    /// pending asks by an identity no guest-reported string can name
+    /// (NET-045). Required the same way [`RegisteredBox::box_id`] is: a
+    /// row read from a daemon that predates ids fails the whole parse on
+    /// a new client rather than silently naming a box no id names.
+    pub box_id: BoxId,
     /// The box's address on the switch: the row's key.
     pub switch_address: std::net::Ipv4Addr,
     /// The row's derived egress allow-list, as CIDR strings.
@@ -775,6 +782,275 @@ pub struct BoxRow {
     /// The ports the row holds as runtime-admitted — reported by the in-VM
     /// daemon within the grant and not yet withdrawn — in report order.
     pub runtime_ports: Vec<u16>,
+}
+
+/// A pending ask's identity on its host: 16 bytes — one UUIDv4, 32
+/// lowercase hex digits on the wire — minted by the VM host daemon when
+/// the in-VM daemon reports an ask (NET-045), never carried by any
+/// client: the offer hands the id to the attached host client, and the
+/// recorded answer carries it back, so the id names one ask's whole
+/// lifetime — offered, answered, consumed — and no client can name an
+/// ask the host did not mint.
+///
+/// Unique per ask by construction, like [`BoxId`]: the daemon that mints
+/// one draws it from the host's OS CSPRNG, and an answer for an id the
+/// daemon never minted — or minted and already consumed — is refused, so
+/// a recorded yes can be spent by exactly the one admit it answers and
+/// never replayed. The wire form is one hex string, the same spelling a
+/// diagnostic names an ask by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct AskId([u8; 16]);
+
+impl AskId {
+    /// Wraps `bytes` as an ask id — the shape the VM host daemon mints and
+    /// the offer and the recorded answer carry.
+    #[must_use]
+    pub fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+
+    /// The id's own 16 bytes.
+    #[must_use]
+    pub fn to_bytes(self) -> [u8; 16] {
+        self.0
+    }
+}
+
+impl std::fmt::Display for AskId {
+    /// 32 lowercase hex digits — the one fixed form every diagnostic that
+    /// names an ask id uses, so a log line and a socket capture read the
+    /// same spelling.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for byte in self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+impl Serialize for AskId {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&hex::encode(self.0))
+    }
+}
+
+impl<'de> Deserialize<'de> for AskId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text: &str = Deserialize::deserialize(deserializer)?;
+        let bytes = hex::decode(text).map_err(serde::de::Error::custom)?;
+        let bytes: [u8; 16] = match bytes.try_into() {
+            Ok(bytes) => bytes,
+            Err(bytes) => {
+                return Err(serde::de::Error::custom(format!(
+                    "an ask id is 32 hex digits (16 bytes); got {} bytes",
+                    bytes.len()
+                )));
+            }
+        };
+        Ok(Self(bytes))
+    }
+}
+
+/// The answer a host client records for one pending ask over the host
+/// door (NET-045): `yes` from a human who picked Allow, `no` from a human
+/// who picked Deny or ended the dialog without a pick — Ctrl-C, Escape, a
+/// closed input — and `no_tty` when no terminal was there to render the
+/// dialog at all, so the host's audit can tell a human's own *no* from a
+/// render that never reached one.
+///
+/// The daemon never answers on its own behalf: a client that went away
+/// before answering is an un-asked ask the admit path refuses, not an
+/// answer this enum could carry.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AskAnswer {
+    /// The attached human chose Allow: the ask's port is recorded in the
+    /// row, and the waiting admit publishes.
+    Yes,
+    /// The attached human chose Deny, or ended the dialog: the ask is
+    /// cleared and admits nothing.
+    No,
+    /// No terminal was there to render the dialog: nobody answered, and
+    /// the ask is cleared without recording a port.
+    NoTty,
+}
+
+/// The in-VM daemon's report that one of its boxes' exposes was decided
+/// `ask` (NET-045): the row key, the port and the protocol — nothing
+/// else, the same fixed, size-bounded shape [`AdmitPortRequest`] carries,
+/// and for the same reason: the guest can raise a question but never
+/// answer one, and a name or a prompt string it might have sent is not
+/// something a dialog could trust.
+///
+/// The VM host daemon mints the ask's [`AskId`], offers it to every host
+/// client attached to the row, and holds this request's reply until a
+/// recorded answer resolves it — there is no deadline on either side, so
+/// an ask ends only by an answer or a cancellation, never by a timer
+/// expiring a publish the human never saw.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AdmitAskRequest {
+    /// The switch address of the row the ask belongs to — the row's own
+    /// key, the address the registration handed back.
+    pub switch_address: std::net::Ipv4Addr,
+    /// The port the exposure asks to publish.
+    pub port: u16,
+    /// The protocol the port would publish under.
+    pub proto: IpProto,
+}
+
+/// A host client's recorded answer for one pending ask (NET-045): the
+/// offer's [`AskId`] and the answer. Served on the host's control socket
+/// only — the guest door refuses it, because a guest can raise a question
+/// but never answer one — and the first recorded answer wins: every later
+/// one is refused as an answer for an id the daemon already consumed, so
+/// a yes can be spent by exactly the one admit it answered.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RecordAskAnswerRequest {
+    /// The ask the offer named.
+    pub ask_id: AskId,
+    /// The answer the attached human gave, or the render's own no-tty.
+    pub answer: AskAnswer,
+}
+
+/// An attached host client's subscription to one row's pending asks
+/// (NET-045): keyed by the row's [`BoxId`] — the host-minted identity, so
+/// a guest-reported name can never subscribe — and held only while the
+/// connection lives. The daemon answers [`BoxControlReply::AsksSubscribed`],
+/// then pushes one [`BoxControlReply::PendingAskOffer`] line per ask the
+/// row gains and one [`BoxControlReply::PendingAskDismissed`] line per ask
+/// another client answered, until the client closes.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SubscribeAsksRequest {
+    /// The row's box id — the host-minted identity the row read hands the
+    /// client.
+    pub box_id: BoxId,
+}
+
+/// One pending ask as the VM host daemon offers it to an attached client
+/// (NET-045): the ask's id, the row it belongs to, and the port and
+/// protocol the exposure named. The box's name travels here too — from
+/// the host's own row, never from a guest-supplied string, because the
+/// dialog the client renders is built from these fields alone.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PendingAskOffer {
+    /// The ask's host-minted id: what the recorded answer carries back.
+    pub ask_id: AskId,
+    /// The row's box id — the identity the client subscribed by.
+    pub box_id: BoxId,
+    /// The box's name, from the host's own row: the one guest-untouched
+    /// field the dialog's text is built from.
+    pub name: String,
+    /// The port the exposure asks to publish.
+    pub port: u16,
+    /// The protocol the port would publish under.
+    pub proto: IpProto,
+}
+
+/// Why a pending ask will not publish (NET-045): the typed end the ask
+/// met, so the in-VM daemon's refusal says which end it was rather than
+/// parsing a sentence. [`Denied`] alone is the attached human's own no;
+/// every other end is an ask nobody answered, and the guest fails it
+/// closed the way it fails an ask with no client at all.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AskRefused {
+    /// No row is published at the named switch address.
+    NoRow,
+    /// No host client was attached to the row's box when the ask arrived.
+    NoClient,
+    /// The row's pending-ask queue was at its bound when the ask arrived.
+    QueueFull,
+    /// The row's stance is not `ask`.
+    StanceNotAsk,
+    /// The row's grant admits no such port: no range is declared, or the
+    /// port is outside the one that is. Refused at the host before any
+    /// dialog is offered, so a client is never asked to answer for a
+    /// publish the grant would refuse anyway.
+    OutsideGrant,
+    /// The attached human answered no.
+    Denied,
+    /// The dialog could not be rendered: no terminal was there.
+    NoTty,
+    /// The ask was cancelled before an answer: the row was withdrawn, the
+    /// guest's connection ended, the last attached client detached, or
+    /// the daemon stopped.
+    Cancelled,
+}
+
+/// The VM host daemon's answer to the in-VM daemon's ask admit (NET-045):
+/// the outcome of the ask the offered dialog decided, tagged `ask` so the
+/// untagged reply cannot mistake it for any older shape. [`Admitted`]
+/// alone records the port in the row — the one reply a publish may go
+/// ahead on; [`Refused`] names which end the ask met
+/// ([`AskRefused`]), and the guest's publish unwinds with no partial
+/// mapping either way.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "ask", rename_all = "snake_case")]
+pub enum AskAdmitOutcome {
+    /// The attached human answered yes: the port is recorded in the row
+    /// under the ask's id, and this admit — this one — may publish.
+    Admitted {
+        /// The ask that was answered.
+        ask_id: AskId,
+        /// The port the host now holds as runtime-admitted.
+        port: u16,
+        /// The protocol the port was recorded under.
+        proto: IpProto,
+    },
+    /// The ask will not publish: the typed end it met.
+    Refused {
+        /// The ask that met this end.
+        ask_id: AskId,
+        /// Which end the ask met.
+        reason: AskRefused,
+        /// What cancelled the ask, for a [`AskRefused::Cancelled`] end;
+        /// absent for every other end.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cause: Option<AskCancelCause>,
+    },
+}
+
+/// What cancelled a pending ask (NET-045): the four ends an ask meets with
+/// no answer, so the in-VM daemon and a late client can each say which.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum AskCancelCause {
+    /// The last host client attached to the box detached.
+    LastDetach,
+    /// The box's host row was withdrawn.
+    RowWithdrawn,
+    /// The in-VM daemon closed the asking connection: it withdrew the ask.
+    GuestClosed,
+    /// The VM host daemon is stopping.
+    MinvmdStopping,
+}
+
+impl std::fmt::Display for AskCancelCause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::LastDetach => "the last attached client detached",
+            Self::RowWithdrawn => "the box's host row was withdrawn",
+            Self::GuestClosed => "the guest connection closed",
+            Self::MinvmdStopping => "minvmd is stopping",
+        })
+    }
+}
+
+/// How an already-ended ask ended (NET-045), as the VM host daemon answers
+/// a late recorded answer for it: the client whose dialog outlived the ask
+/// says what actually happened instead of guessing.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "end", rename_all = "snake_case")]
+pub enum AskLateEnd {
+    /// Another attach's yes admitted it.
+    Allowed,
+    /// Another attach answered no (or could not show the prompt).
+    Denied,
+    /// It was cancelled before an answer.
+    Cancelled {
+        /// What cancelled it.
+        cause: AskCancelCause,
+    },
 }
 
 /// The host-side port the in-VM daemon's box-port reports cross to: the
@@ -828,6 +1104,24 @@ pub enum BoxControlRequest {
     /// runtime-admitted port: the withdrawal half of the admit report,
     /// accepted whatever the row's cap or rate says.
     WithdrawPort(WithdrawPortRequest),
+    /// The in-VM daemon's report that an expose was decided `ask`
+    /// (NET-045): carried on the daemon's own control channel like the
+    /// port reports, answered when a host client the daemon offered the
+    /// ask to records an answer — with no deadline on the reply, because
+    /// no timer ever answers an ask.
+    AdmitAsk(AdmitAskRequest),
+    /// A host client's recorded answer for one pending ask (NET-045):
+    /// served on the host's control socket only — the guest door refuses
+    /// it, because a guest can raise a question but never answer one —
+    /// and the first answer recorded for an ask is the only one that
+    /// counts.
+    RecordAskAnswer(RecordAskAnswerRequest),
+    /// An attached host client's subscription to one row's pending asks
+    /// (NET-045): keyed by the row's host-minted [`BoxId`] — never a
+    /// guest-reported name — and served on the host's control socket
+    /// only, whose owner-only file mode is its access control. The
+    /// subscription lives exactly as long as the connection it arrived on.
+    SubscribeAsks(SubscribeAsksRequest),
     /// Read one box's row by name — the read-only row verb: the row's
     /// switch address, its derived egress allow-list, and its declared and
     /// runtime-admitted ports, or [`BoxControlReply::NoRow`] when no live
@@ -968,15 +1262,83 @@ pub enum ProxyDownCause {
 ///
 /// The untagged order carries the same rule
 /// [`Registered`](Self::Registered) documents: a variant is tried before
-/// any it is a strict superset of. The three newer shapes are disjoint from
-/// every older one by a required field each carries and no other does —
-/// [`Row`](Self::Row) its `egress_allow_list`, [`NoRow`](Self::NoRow) its
-/// `no_row`, [`PortRecorded`](Self::PortRecorded) its `proto` — so no
-/// document of one can decode as another's, and the order among them is
-/// free.
+/// any it is a strict superset of. The ask shapes are disjoint from every
+/// older one by a required field each carries and no other does —
+/// [`AsksSubscribed`](Self::AsksSubscribed) its `subscribed`,
+/// [`PendingAskOffer`](Self::PendingAskOffer) its `ask_id`,
+/// [`PendingAskDismissed`](Self::PendingAskDismissed) its `dismissed`,
+/// [`AskAnswerRecorded`](Self::AskAnswerRecorded) its `recorded`,
+/// [`AskAdmit`](Self::AskAdmit) its `ask` tag — but two of them also carry
+/// a port and a protocol, so a `PortRecorded` document is a strict subset
+/// of their fields: they are placed before it rather than after, so an
+/// offered ask cannot decode as a recorded port. The older newer shapes
+/// stay disjoint the same way — [`Row`](Self::Row) its
+/// `egress_allow_list`, [`NoRow`](Self::NoRow) its `no_row`,
+/// [`PortRecorded`](Self::PortRecorded) its `proto` — so no document of
+/// one can decode as another's, and the order among them is free.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum BoxControlReply {
+    /// The record-ask-answer verb's answer for an ask that already ended
+    /// (NET-045): how it ended, and the port and protocol it was about.
+    /// Nothing is recorded. `already_ended` is required — the marker that
+    /// keeps this document from decoding as any other reply; placed first,
+    /// before every shape whose fields are a subset of its own.
+    AskAlreadyEnded {
+        /// The ask the late answer named.
+        ask_id: AskId,
+        /// The port the ask was about.
+        port: u16,
+        /// The protocol the ask was about.
+        proto: IpProto,
+        /// How the ask ended.
+        already_ended: AskLateEnd,
+    },
+    /// The subscribe-asks verb's answer: the row's box id the client is
+    /// now attached to. `subscribed` is required — the marker that keeps
+    /// this document from decoding as any other reply, a registration's
+    /// id-carrying answer included.
+    AsksSubscribed {
+        /// The marker: always `true`, carried so the untagged reply
+        /// discriminates this from every other shape.
+        subscribed: bool,
+        /// The row's box id the subscription is attached to.
+        box_id: BoxId,
+    },
+    /// A pending ask, pushed to a subscribed client's connection
+    /// (NET-045): the ask's id, the row, the port and the protocol — the
+    /// host row's own fields, never a guest-supplied string, because the
+    /// dialog the client renders is built from these alone. Carries an
+    /// `ask_id` no other reply shape has, and is placed before
+    /// [`PortRecorded`](Self::PortRecorded), whose port and protocol are
+    /// a subset of its fields.
+    PendingAskOffer(PendingAskOffer),
+    /// A pending ask taken away from a subscribed client: another client
+    /// recorded the first answer, the ask was cancelled, or the client's
+    /// own subscription ended — the dialog it may still be showing is not
+    /// the one that decides. `dismissed` is required — the marker.
+    PendingAskDismissed {
+        /// The ask that is no longer this client's to answer.
+        ask_id: AskId,
+        /// The marker: always `true`, carried so the untagged reply
+        /// discriminates this from every other shape.
+        dismissed: bool,
+    },
+    /// The record-ask-answer verb's answer: the ask the daemon recorded
+    /// the client's answer against — the first answer, because every
+    /// later one is refused as an unknown-or-consumed id and answers
+    /// [`Error`](Self::Error) instead. `recorded` is required — the
+    /// marker.
+    AskAnswerRecorded {
+        /// The ask whose first answer this was.
+        ask_id: AskId,
+        /// The marker: always `true`, carried so the untagged reply
+        /// discriminates this from every other shape.
+        recorded: bool,
+    },
+    /// The ask admit's answer ([`AskAdmitOutcome`]): the ask's end, as a
+    /// `ask`-tagged document no older reply shape can decode as.
+    AskAdmit(AskAdmitOutcome),
     /// The registration succeeded: the allocated addresses and the box id
     /// the published row holds ([`RegisteredBox`]) — the reply the register
     /// verb answers with. The withdrawal never answers this: it has no id
@@ -1355,8 +1717,67 @@ pub struct DestroySessionRequest {
 }
 
 /// The response for a [`DestroySession`] RPC.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct DestroySessionResponse;
+///
+/// Carries the session's failed `on_destroy` hooks, so the client can
+/// report them: a failing destroy hook does not stop the destroy, and
+/// without this the only trace is the daemon log.
+///
+/// This was a unit struct, which encodes as `null`. It still does when
+/// no hook failed, so a client and a daemon either side of the change
+/// keep agreeing on a clean destroy.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(
+    from = "DestroySessionResponseWire",
+    into = "DestroySessionResponseWire"
+)]
+pub struct DestroySessionResponse {
+    /// One line per `on_destroy` hook that did not succeed: where it was
+    /// declared and what happened, followed by its captured output tail
+    /// on the lines after, when there is any.
+    pub hook_failures: Vec<String>,
+}
+
+/// [`DestroySessionResponse`] on the wire: `null` (the old unit shape)
+/// or an object.
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum DestroySessionResponseWire {
+    Unit(()),
+    Fields(DestroySessionResponseFields),
+}
+
+/// `deny_unknown_fields` for the same reason as on
+/// [`FinalizeSessionResponse`]: without it, `{"error": "..."}` parses as
+/// a successful destroy with no failures.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DestroySessionResponseFields {
+    #[serde(default)]
+    hook_failures: Vec<String>,
+}
+
+impl From<DestroySessionResponseWire> for DestroySessionResponse {
+    fn from(wire: DestroySessionResponseWire) -> Self {
+        match wire {
+            DestroySessionResponseWire::Unit(()) => Self::default(),
+            DestroySessionResponseWire::Fields(f) => Self {
+                hook_failures: f.hook_failures,
+            },
+        }
+    }
+}
+
+impl From<DestroySessionResponse> for DestroySessionResponseWire {
+    fn from(resp: DestroySessionResponse) -> Self {
+        if resp.hook_failures.is_empty() {
+            Self::Unit(())
+        } else {
+            Self::Fields(DestroySessionResponseFields {
+                hook_failures: resp.hook_failures,
+            })
+        }
+    }
+}
 
 impl OneshotSshRpc for DestroySession {
     const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "DestroySession");
@@ -2158,6 +2579,35 @@ mod tests {
             "got: {json}"
         );
         assert!(json.contains("\"dynamic_ingress\":null"), "got: {json}");
+    }
+
+    /// A daemon that predates `hook_failures` answers a destroy with the
+    /// old unit shape, `null`; it must still read as a clean success, and
+    /// a clean success must still go out as `null` for an older client.
+    /// An error must not read as a success with no failures.
+    #[test]
+    fn destroy_session_response_decodes_the_old_shape() {
+        let old: Errorable<DestroySessionResponse> =
+            serde_json_lenient::from_str("null").expect("the old shape must decode");
+        assert_eq!(old, Errorable::Ok(DestroySessionResponse::default()));
+        assert_eq!(
+            serde_json_lenient::to_string(&Errorable::Ok(DestroySessionResponse::default()))
+                .unwrap(),
+            "null"
+        );
+
+        let failed = DestroySessionResponse {
+            hook_failures: vec!["user loadout `dev`: exited with status 3".to_string()],
+        };
+        assert_eq!(round_trip(&failed), failed);
+
+        let err: Errorable<DestroySessionResponse> =
+            serde_json_lenient::from_str(r#"{"error":"no such session"}"#)
+                .expect("an error payload must decode");
+        assert!(
+            matches!(err, Errorable::Err { .. }),
+            "an error decoded as success: {err:?}"
+        );
     }
 
     fn round_trip<T>(value: &T) -> T
@@ -2984,6 +3434,271 @@ mod tests {
         );
     }
 
+    /// The ask verbs' offer half (NET-045) round-trips: the guest's ask
+    /// admit carries only the row key, the port and the protocol — no name
+    /// or free text a guest could smuggle a prompt with — the subscription
+    /// keys itself by the row's box id, and the offer the daemon pushes to
+    /// an attached client carries the host row's own fields. Every ask
+    /// reply stays distinct from every older shape in the untagged order —
+    /// an offered ask is never a recorded port, and a registration's
+    /// id-carrying answer is never a subscription's.
+    #[test]
+    fn box_control_pending_ask_offer_round_trip() {
+        let box_id = BoxId::from_bytes([
+            0x01, 0x95, 0x65, 0x5f, 0x7f, 0x1e, 0x7a, 0xbc, 0x9d, 0x1f, 0x2a, 0x3b, 0x4c, 0x5d,
+            0x6e, 0x7f,
+        ]);
+
+        // The guest's ask admit: the row key, the port, the protocol, and
+        // nothing else — the one fixed shape a guest may raise a question
+        // in.
+        let admit_ask = BoxControlRequest::AdmitAsk(AdmitAskRequest {
+            switch_address: std::net::Ipv4Addr::new(100, 64, 127, 255),
+            port: 8080,
+            proto: IpProto::Tcp,
+        });
+        let wire = serde_json_lenient::to_string(&admit_ask).expect("serialize");
+        assert!(
+            wire.contains(r#""verb":"admit_ask""#)
+                && wire.contains(r#""port":8080"#)
+                && wire.contains(r#""proto":"tcp""#),
+            "the tagged line names its verb and the port and protocol it asks for: {wire}"
+        );
+        assert!(
+            !wire.contains("name") && !wire.contains("source") && !wire.contains("answer"),
+            "the ask admit carries no name, no source and no answer — the guest can raise a \
+             question but neither phrase it nor answer it: {wire}"
+        );
+        assert_eq!(round_trip(&admit_ask), admit_ask);
+
+        // The subscription: keyed by the row's box id, never a name.
+        let subscribe = BoxControlRequest::SubscribeAsks(SubscribeAsksRequest { box_id });
+        let wire = serde_json_lenient::to_string(&subscribe).expect("serialize");
+        assert!(
+            wire.contains(r#""verb":"subscribe_asks""#)
+                && wire.contains(r#""box_id":"0195655f7f1e7abc9d1f2a3b4c5d6e7f""#),
+            "the subscription names its verb and the box id it keys by: {wire}"
+        );
+        assert_eq!(round_trip(&subscribe), subscribe);
+
+        // The subscription's answer: subscribed marks the shape, so a
+        // registration's id-carrying answer — a strict superset of the
+        // marker-less fields — still decodes as the registration it is,
+        // from either side of the order.
+        let subscribed = BoxControlReply::AsksSubscribed {
+            subscribed: true,
+            box_id,
+        };
+        assert_eq!(round_trip(&subscribed), subscribed);
+        assert_eq!(
+            serde_json_lenient::from_str::<BoxControlReply>(
+                r#"{"subscribed":true,"box_id":"0195655f7f1e7abc9d1f2a3b4c5d6e7f"}"#
+            )
+            .expect("the subscription's answer decodes"),
+            subscribed
+        );
+        let registered: BoxControlReply = serde_json_lenient::from_str(
+            r#"{"switch_address":"100.64.127.255","loopback_address":"127.0.0.2","box_id":"0195655f7f1e7abc9d1f2a3b4c5d6e7f"}"#,
+        )
+        .expect("a registration reply still decodes");
+        assert!(
+            matches!(registered, BoxControlReply::Registered(_)),
+            "a registration's answer is never a subscription's: {registered:?}"
+        );
+
+        // The offer: the host row's own fields — ask id, box id, name,
+        // port, protocol — and a document of it decodes as nothing else,
+        // the recorded-port reply its fields are a superset of included.
+        let ask_id = AskId::from_bytes([
+            0x9f, 0x1c, 0x2d, 0x3e, 0x4f, 0x5a, 0x6b, 0x7c, 0x8d, 0x9e, 0x0f, 0x1a, 0x2b, 0x3c,
+            0x4d, 0x5e,
+        ]);
+        let offer = BoxControlReply::PendingAskOffer(PendingAskOffer {
+            ask_id,
+            box_id,
+            name: "web".to_string(),
+            port: 8080,
+            proto: IpProto::Tcp,
+        });
+        let wire = serde_json_lenient::to_string(&offer).expect("serialize");
+        for field in [
+            r#""ask_id":"9f1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e""#,
+            r#""box_id":"0195655f7f1e7abc9d1f2a3b4c5d6e7f""#,
+            r#""name":"web""#,
+            r#""port":8080"#,
+            r#""proto":"tcp""#,
+        ] {
+            assert!(wire.contains(field), "the offer spells {field}: {wire}");
+        }
+        assert_eq!(round_trip(&offer), offer);
+        assert_eq!(
+            serde_json_lenient::from_str::<BoxControlReply>(&wire)
+                .expect("an offered ask decodes as its own reply"),
+            offer,
+            "the offer is placed before the recorded-port reply its fields \
+             are a superset of"
+        );
+
+        // The dismissal: the marker keeps it distinct, both directions.
+        let dismissed = BoxControlReply::PendingAskDismissed {
+            ask_id,
+            dismissed: true,
+        };
+        assert_eq!(round_trip(&dismissed), dismissed);
+        assert_eq!(
+            serde_json_lenient::from_str::<BoxControlReply>(
+                r#"{"ask_id":"9f1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e","dismissed":true}"#
+            )
+            .expect("a dismissal decodes"),
+            dismissed
+        );
+    }
+
+    /// The ask verbs' answer half (NET-045) round-trips: the client's
+    /// recorded answer carries the offer's ask id and one of the three
+    /// answers — a human's yes, a human's no, a render that found no
+    /// terminal — and the admit's reply carries the ask's end, as a
+    /// `ask`-tagged document the recorded-port reply cannot be mistaken
+    /// for in either direction.
+    #[test]
+    fn box_control_record_ask_answer_round_trip() {
+        let ask_id = AskId::from_bytes([
+            0x9f, 0x1c, 0x2d, 0x3e, 0x4f, 0x5a, 0x6b, 0x7c, 0x8d, 0x9e, 0x0f, 0x1a, 0x2b, 0x3c,
+            0x4d, 0x5e,
+        ]);
+
+        for (answer, spelling) in [
+            (AskAnswer::Yes, r#""answer":"yes""#),
+            (AskAnswer::No, r#""answer":"no""#),
+            (AskAnswer::NoTty, r#""answer":"no_tty""#),
+        ] {
+            let record =
+                BoxControlRequest::RecordAskAnswer(RecordAskAnswerRequest { ask_id, answer });
+            let wire = serde_json_lenient::to_string(&record).expect("serialize");
+            assert!(
+                wire.contains(r#""verb":"record_ask_answer""#)
+                    && wire.contains(r#""ask_id":"9f1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e""#)
+                    && wire.contains(spelling),
+                "the recorded answer names its verb, its ask and its answer: {wire}"
+            );
+            assert_eq!(round_trip(&record), record);
+        }
+
+        // The record's answer: the first answer is acknowledged, the
+        // marker keeps the shape distinct, and an id the daemon never
+        // minted or already consumed is the error it is instead.
+        let recorded = BoxControlReply::AskAnswerRecorded {
+            ask_id,
+            recorded: true,
+        };
+        assert_eq!(round_trip(&recorded), recorded);
+        assert_eq!(
+            serde_json_lenient::from_str::<BoxControlReply>(
+                r#"{"ask_id":"9f1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e","recorded":true}"#
+            )
+            .expect("a recorded answer's reply decodes"),
+            recorded
+        );
+
+        // The admit's answer: admitted names the port the host now holds
+        // and the ask it was admitted under; refused names the typed end
+        // the ask met. Both are `ask`-tagged documents, and the older
+        // recorded-port reply — a strict subset of admitted's fields —
+        // decodes as the port record it is, not as an ask.
+        let admitted = BoxControlReply::AskAdmit(AskAdmitOutcome::Admitted {
+            ask_id,
+            port: 8080,
+            proto: IpProto::Tcp,
+        });
+        let wire = serde_json_lenient::to_string(&admitted).expect("serialize");
+        assert!(
+            wire.contains(r#""ask":"admitted""#)
+                && wire.contains(r#""ask_id":"9f1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e""#)
+                && wire.contains(r#""port":8080"#),
+            "the admitted answer spells its tag, its ask and its port: {wire}"
+        );
+        assert_eq!(round_trip(&admitted), admitted);
+        assert_eq!(
+            serde_json_lenient::from_str::<BoxControlReply>(&wire)
+                .expect("the admitted answer decodes as its own reply"),
+            admitted,
+            "the admitted answer is placed before the recorded-port reply its \
+             fields are a superset of"
+        );
+
+        for (reason, spelling) in [
+            (AskRefused::Denied, r#""reason":"denied""#),
+            (AskRefused::NoClient, r#""reason":"no_client""#),
+            (AskRefused::QueueFull, r#""reason":"queue_full""#),
+            (AskRefused::OutsideGrant, r#""reason":"outside_grant""#),
+            (AskRefused::NoTty, r#""reason":"no_tty""#),
+            (AskRefused::Cancelled, r#""reason":"cancelled""#),
+            (AskRefused::NoRow, r#""reason":"no_row""#),
+            (AskRefused::StanceNotAsk, r#""reason":"stance_not_ask""#),
+        ] {
+            let cause = (reason == AskRefused::Cancelled).then_some(AskCancelCause::LastDetach);
+            let refused = BoxControlReply::AskAdmit(AskAdmitOutcome::Refused {
+                ask_id,
+                reason,
+                cause,
+            });
+            let wire = serde_json_lenient::to_string(&refused).expect("serialize");
+            assert!(
+                wire.contains(r#""ask":"refused""#) && wire.contains(spelling),
+                "the refused answer spells its tag and its typed end: {wire}"
+            );
+            assert_eq!(
+                wire.contains(r#""cause":"last-detach""#),
+                cause.is_some(),
+                "only a cancellation carries its cause: {wire}"
+            );
+            assert_eq!(round_trip(&refused), refused);
+        }
+
+        // A late answer for an ended ask is answered with how it ended, a
+        // shape no other reply decodes as.
+        for (end, spelling) in [
+            (AskLateEnd::Allowed, r#""end":"allowed""#),
+            (AskLateEnd::Denied, r#""end":"denied""#),
+            (
+                AskLateEnd::Cancelled {
+                    cause: AskCancelCause::MinvmdStopping,
+                },
+                r#""cause":"minvmd-stopping""#,
+            ),
+        ] {
+            let late = BoxControlReply::AskAlreadyEnded {
+                ask_id,
+                port: 8080,
+                proto: IpProto::Tcp,
+                already_ended: end,
+            };
+            let wire = serde_json_lenient::to_string(&late).expect("serialize");
+            assert!(
+                wire.contains(spelling),
+                "the late end spells {spelling}: {wire}"
+            );
+            assert_eq!(
+                serde_json_lenient::from_str::<BoxControlReply>(&wire).expect("decodes"),
+                late
+            );
+        }
+
+        // The older recorded-port reply still decodes as the port record
+        // it is — no ask-shaped variant claims a document with no ask in
+        // it.
+        let decoded: BoxControlReply =
+            serde_json_lenient::from_str(r#"{"port":8080,"proto":"tcp"}"#)
+                .expect("a recorded report's reply still decodes");
+        assert_eq!(
+            decoded,
+            BoxControlReply::PortRecorded {
+                port: 8080,
+                proto: IpProto::Tcp
+            }
+        );
+    }
+
     /// The read-only row verb round-trips under its key, and its two
     /// answers stay two answers: a live row's reply cannot decode as the
     /// no-row marker or as any older reply shape, so a host-side read can
@@ -3002,6 +3717,10 @@ mod tests {
 
         let row = BoxControlReply::Row(BoxRow {
             name: "web".to_string(),
+            box_id: BoxId::from_bytes([
+                0x01, 0x95, 0x65, 0x5f, 0x7f, 0x1e, 0x7a, 0xbc, 0x9d, 0x1f, 0x2a, 0x3b, 0x4c, 0x5d,
+                0x6e, 0x7f,
+            ]),
             switch_address: std::net::Ipv4Addr::new(100, 64, 127, 255),
             egress_allow_list: vec!["10.0.0.0/8".to_string()],
             declared_ports: vec![8080, 9090],
@@ -3010,6 +3729,7 @@ mod tests {
         let wire = serde_json_lenient::to_string(&row).expect("serialize");
         for field in [
             r#""switch_address":"100.64.127.255""#,
+            r#""box_id":"0195655f7f1e7abc9d1f2a3b4c5d6e7f""#,
             r#""egress_allow_list":["10.0.0.0/8"]"#,
             r#""declared_ports":[8080,9090]"#,
             r#""runtime_ports":[3000]"#,

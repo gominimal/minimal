@@ -277,6 +277,20 @@ enum MainloopExitReason {
     Shed,
 }
 
+impl MainloopExitReason {
+    /// The exit status the binding reports to its client, which `min session
+    /// attach` exits with. An end the user chose — a detach, or the session
+    /// process exiting — is 0. An end the daemon imposed is not, so a script
+    /// can tell the two apart.
+    fn exit_status(&self) -> u32 {
+        match self {
+            Self::Detach | Self::ProcessExited => 0,
+            Self::HostGone | Self::Superceded | Self::Shutdown => DAEMON_ENDED_EXIT_STATUS,
+            Self::Shed => SHED_EXIT_STATUS,
+        }
+    }
+}
+
 /// What a binding told to end itself renders, and the mainloop exit it ends
 /// in — the one rendering the four [`BindingMsg`] teardown variants share,
 /// written once so the mainloop's own arm and the ask dialog a teardown
@@ -529,6 +543,18 @@ const SHED_NOTICE: &[u8] =
 /// shed it has to, because the output stream was cut mid-flight and no
 /// unwind codes followed it.
 const SHED_EXIT_STATUS: u32 = 255;
+
+/// The exit status of an attach the daemon ended: the session was destroyed
+/// (or otherwise went away), another connection took it over, or the daemon
+/// is shutting down. Non-zero so a script does not read it as a detach, and
+/// not ssh's 255, because the daemon still spoke for itself: these ends send
+/// their own unwind codes or none are owed, so the client's blind unwind (see
+/// [`SHED_EXIT_STATUS`]) stays off.
+const DAEMON_ENDED_EXIT_STATUS: u32 = 254;
+
+/// The line a binding whose host went away leaves on the terminal: the
+/// session is gone, so there is no farewell from the host to render.
+const HOST_GONE_NOTICE: &[u8] = b"\r\nDisconnecting - the session is gone\r\n";
 
 /// Hands a departing binding its teardown message and waits for it to
 /// finish, so its farewell lands before whatever comes next.
@@ -964,24 +990,26 @@ impl Binding {
             control.detached().await;
         }
 
-        let shed = exit_reason == MainloopExitReason::Shed;
-        if shed {
-            // Bounded: the client stopped draining, so this write can park
-            // exactly as the one that got the binding shed. The notice is
-            // lost then, but the close below still goes out. The writer is a
-            // fresh one whenever a write was cut short mid-send — the mainloop
-            // replaces it at every race it drops, because russh's channel
-            // writer otherwise answers this short buffer with the interrupted
-            // write's byte count and tokio's `write_all` panics past its end.
+        let notice = match exit_reason {
+            MainloopExitReason::Shed => Some(SHED_NOTICE),
+            MainloopExitReason::HostGone => Some(HOST_GONE_NOTICE),
+            _ => None,
+        };
+        if let Some(notice) = notice {
+            // Bounded: after a shed the client stopped draining, so this
+            // write can park exactly as the one that got the binding shed.
+            // The notice is lost then, but the close below still goes out.
+            // The writer is a fresh one whenever a write was cut short
+            // mid-send — the mainloop replaces it at every race it drops,
+            // because russh's channel writer otherwise answers this short
+            // buffer with the interrupted write's byte count and tokio's
+            // `write_all` panics past its end.
             let _ =
-                tokio::time::timeout(crate::session::HOST_PROBE_TIMEOUT, w.write_all(SHED_NOTICE))
-                    .await;
+                tokio::time::timeout(crate::session::HOST_PROBE_TIMEOUT, w.write_all(notice)).await;
         }
 
         let _ = ws.eof().await;
-        let _ = ws
-            .exit_status(if shed { SHED_EXIT_STATUS } else { 0 })
-            .await;
+        let _ = ws.exit_status(exit_reason.exit_status()).await;
         let _ = ws.close().await; // needed to release the remote
     }
 
@@ -4008,6 +4036,13 @@ impl SessionLauncher for SandboxLauncher {
         // leaf is named by. The declaration is fixed at create, so a launch
         // decides it once and a box is never re-verdicted mid-flight.
         let classifier_verdict = crate::net::classifier::verdict_of(policy.egress.as_ref());
+        // Whether the declaration lets a listen publish at all (NET-016):
+        // `allow` with a range. Read now, before the policy moves into the
+        // network plan, for the missing-listen-plan line below.
+        let listens_can_publish = policy.ingress.as_ref().is_some_and(|ingress| {
+            ingress.dynamic_ingress == Some(sessions::DynamicIngress::Allow)
+                && ingress.dynamic_allowed_range.is_some()
+        });
         let network_mode = self.network_mode;
         // The classifier tree this daemon places boxes in, moved out before
         // the rest of `self` is consumed (see the field's doc).
@@ -4576,13 +4611,51 @@ impl SessionLauncher for SandboxLauncher {
         // and stops it with the session — so a box with no lease, no
         // published address or no live gate carries no plan, and its ports
         // stay unpublishable by listening.
-        let lease = plan.tap().map(|tap| tap.address);
+        //
+        // Read here, after `planned.attach` above returned: a successful
+        // attach has already reported this spawn's lease
+        // (`complete_own_ip_attach` reports it before it returns `Ok`), and
+        // every launch — a respawn included — runs this step afresh, so the
+        // lease the plan carries is always this spawn's own.
+        let lease = crate::net::provider::attached_lease(&plan, own_address.as_ref());
         let published = own_address
             .as_ref()
             .and_then(|reporter| reporter.published_address());
         let gate = lease.and_then(crate::net::switch::live_gate);
+        if matches!(network_mode, NetworkMode::OwnIp)
+            && (lease.is_none() || published.is_none() || gate.is_none())
+        {
+            // An own-address box whose listens will never publish: said once
+            // per launch, naming the fact that is missing, so a listen that
+            // never publishes is not silent (NET-016) — a warning where the
+            // declaration allows listens to publish, since one it allows will
+            // not.
+            if listens_can_publish {
+                tracing::warn!(
+                    session = %session_label,
+                    lease = ?lease,
+                    published = ?published,
+                    gate = gate.is_some(),
+                    "the box carries no listen plan; its listens are not published"
+                );
+            } else {
+                tracing::info!(
+                    session = %session_label,
+                    lease = ?lease,
+                    published = ?published,
+                    gate = gate.is_some(),
+                    "the box carries no listen plan; its listens are not published"
+                );
+            }
+        }
         let listen_plan = match (lease, published, gate) {
             (Some(lease), Some(published), Some(gate)) => {
+                tracing::debug!(
+                    session = %session_label,
+                    %lease,
+                    %published,
+                    "built the box's listen plan"
+                );
                 let switch = net_switch.lock().await;
                 let control = match switch.transport() {
                     crate::net::SwitchTransport::LocalSpawn => {
@@ -5346,6 +5419,10 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
                 // `Err` from `step`, but a destroy or a daemon shutdown either
                 // wants no prompt at all or has already sent its own teardown.
                 let mut pending = self.pending_pty_err.take();
+                // Read before `take_if` below can empty `pending`: with no
+                // stashed pty error, the only way `step` errs is
+                // `Message::Kill`, so the end was asked for.
+                let requested = pending.is_none();
 
                 // Notify *before* the reap when the process may still be
                 // running, because `wait` below is unbounded — see
@@ -5368,14 +5445,29 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
                 // hakoniwa's own account is logged from the process handle,
                 // which has no span and so names no session, and the binding's
                 // prompt line never happens with nothing attached.
-                tracing::warn!(
-                    session_id = %self.session_id,
-                    session = %self.session_name,
-                    ?code,
-                    abnormal = exit.as_ref().is_some_and(ExitReason::is_abnormal),
-                    exit_reason = exit.as_ref().map_or("", |r| r.reason.as_str()),
-                    "session process reaped after pty/step error",
-                );
+                //
+                // A requested teardown is logged at info: its SIGKILL reaps
+                // with the same abnormal reason an OOM kill does, and a warn
+                // for every destroy would bury the deaths nobody asked for.
+                if requested {
+                    tracing::info!(
+                        session_id = %self.session_id,
+                        session = %self.session_name,
+                        ?code,
+                        abnormal = exit.as_ref().is_some_and(ExitReason::is_abnormal),
+                        exit_reason = exit.as_ref().map_or("", |r| r.reason.as_str()),
+                        "session process reaped after requested teardown",
+                    );
+                } else {
+                    tracing::warn!(
+                        session_id = %self.session_id,
+                        session = %self.session_name,
+                        ?code,
+                        abnormal = exit.as_ref().is_some_and(ExitReason::is_abnormal),
+                        exit_reason = exit.as_ref().map_or("", |r| r.reason.as_str()),
+                        "session process reaped after pty/step error",
+                    );
+                }
 
                 // Otherwise notify *after* it, which is the whole point: only
                 // the reap can say whether that shell exited or was killed, and

@@ -882,7 +882,10 @@ async fn serve_answerer_control(
                 | BoxControlRequest::Withdraw(_)
                 | BoxControlRequest::AdmitPort(_)
                 | BoxControlRequest::WithdrawPort(_)
-                | BoxControlRequest::ReadRow(_) => BoxControlReply::Error {
+                | BoxControlRequest::ReadRow(_)
+                | BoxControlRequest::AdmitAsk(_)
+                | BoxControlRequest::RecordAskAnswer(_)
+                | BoxControlRequest::SubscribeAsks(_) => BoxControlReply::Error {
                     error: "the native daemon's control socket answers only the answerer \
                             verbs; boxes register over the daemon's RPC channels"
                         .to_string(),
@@ -1143,13 +1146,13 @@ async fn serve_destroy_session(
                 .flatten()
                 .and_then(|record| record.name);
             match mngr.delete_session(req.id).await {
-                Ok(()) => {
+                Ok(hook_failures) => {
                     tracing::info!(
                         session_id = %req.id,
                         session_name = session_name.as_deref().unwrap_or(ANONYMOUS_SESSION),
                         "session destroyed"
                     );
-                    Ok(Errorable::Ok(DestroySessionResponse))
+                    Ok(Errorable::Ok(DestroySessionResponse { hook_failures }))
                 }
                 Err(e) => Ok(Errorable::Err {
                     error: e.to_string(),
@@ -6090,7 +6093,7 @@ mod tests {
         let resp = client
             .call::<DestroySession>(&DestroySessionRequest { id: session_id })
             .await;
-        assert_eq!(resp, Errorable::Ok(DestroySessionResponse));
+        assert_eq!(resp, Errorable::Ok(DestroySessionResponse::default()));
 
         // The record is gone: it no longer resolves by id...
         let get_session = client

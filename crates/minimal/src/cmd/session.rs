@@ -167,6 +167,17 @@ async fn register_box_with_vm_host(
                  answerer release reply; the registration did not happen"
             )
         }
+        other @ (minimald_rpc::BoxControlReply::AsksSubscribed { .. }
+        | minimald_rpc::BoxControlReply::PendingAskOffer(_)
+        | minimald_rpc::BoxControlReply::PendingAskDismissed { .. }
+        | minimald_rpc::BoxControlReply::AskAnswerRecorded { .. }
+        | minimald_rpc::BoxControlReply::AskAdmit(_)
+        | minimald_rpc::BoxControlReply::AskAlreadyEnded { .. }) => {
+            anyhow::bail!(
+                "the VM host daemon answered the box registration with an ask \
+                 verb's reply {other:?}; the registration did not happen"
+            )
+        }
     }
 }
 
@@ -418,6 +429,19 @@ pub(crate) async fn withdraw_box_row(
                      port report; the row stays published"
                 );
             }
+            other @ (minimald_rpc::BoxControlReply::AsksSubscribed { .. }
+            | minimald_rpc::BoxControlReply::PendingAskOffer(_)
+            | minimald_rpc::BoxControlReply::PendingAskDismissed { .. }
+            | minimald_rpc::BoxControlReply::AskAnswerRecorded { .. }
+            | minimald_rpc::BoxControlReply::AskAdmit(_)
+            | minimald_rpc::BoxControlReply::AskAlreadyEnded { .. }) => {
+                tracing::warn!(
+                    box = %name,
+                    reply = ?other,
+                    "the VM host daemon answered the box row withdrawal with an \
+                     ask verb's reply; the row stays published"
+                );
+            }
         },
         Ok(Err(error)) => {
             tracing::warn!(
@@ -591,33 +615,6 @@ pub fn box_registered_start_line(
 /// suppresses it — that path must land in a session, never in a config
 /// prompt. Everything else, including the session id on stdout, is
 /// identical for both callers.
-/// The refusal a VM-backed host gives a box created with a dynamic-ingress
-/// stance that could publish (`allow` or `ask`). The VM host's egress gate
-/// admits a runtime publish only at a port the box's host-side registration
-/// already carries, and that registration carries the create's static
-/// `--ingress` mappings alone, so an in-range publish would be decided allow
-/// and then refused at the host. Until the dynamic range reaches the host
-/// registration (gominimal/minimal#1897) the create says so up front instead
-/// of handing the box a stance it cannot keep. `deny`, an absent stance, and
-/// every native host are unchanged.
-fn refuse_dynamic_ingress_on_vm(
-    kind: paths::ProviderKind,
-    mode: Option<sessions::DynamicIngress>,
-) -> Result<(), anyhow::Error> {
-    if kind == paths::ProviderKind::Minvmd
-        && matches!(
-            mode,
-            Some(sessions::DynamicIngress::Allow | sessions::DynamicIngress::Ask)
-        )
-    {
-        anyhow::bail!(
-            "dynamic ingress allow/ask is not yet supported on VM-backed hosts \
-             (gominimal/minimal#1897)"
-        );
-    }
-    Ok(())
-}
-
 /// Refuses a dynamic ingress declaration on a box that is not `own_ip`:
 /// only an own-IP box has a published address a runtime publish could
 /// apply to, so a stance or range on a `host_ip` or `none` box would be a
@@ -643,10 +640,10 @@ pub(crate) async fn activate_session(
     offer_scaffold: bool,
 ) -> Result<(), anyhow::Error> {
     ensure_daemon(global)?;
-    // Before anything is created: a VM-backed host cannot keep an allow/ask
-    // stance yet, so the activation ends here with the reason.
+    // Before anything is created: a dynamic declaration needs an own-IP
+    // box. Every stance stands on a VM-backed host: an `ask` there is
+    // answered by the human attached on the host (NET-045).
     refuse_dynamic_ingress_off_own_ip(args.network, args.dynamic_ingress, args.dynamic_range)?;
-    refuse_dynamic_ingress_on_vm(daemon_provider_kind(global), args.dynamic_ingress)?;
 
     let effective_path = match (&args.path, &global.repo_dir) {
         (Some(p), _) => std::path::PathBuf::from(p),
@@ -1740,7 +1737,15 @@ pub async fn cmd_attach(global: &GlobalArgs, args: AttachArgs) -> Result<(), any
         "found session"
     );
 
-    session_via_ssh(&sock, id, None, global.config_dir.as_deref()).await
+    let host_asks = host_asks_box(global, name.as_deref());
+    session_via_ssh(
+        &sock,
+        id,
+        None,
+        global.config_dir.as_deref(),
+        host_asks.as_deref(),
+    )
+    .await
 }
 
 /// Resolve a named attach target to its record and the socket the hand-off
@@ -1813,7 +1818,7 @@ pub async fn cmd_exec(global: &GlobalArgs, args: ExecArgs) -> Result<(), anyhow:
         "found session"
     );
 
-    session_via_ssh(&sock, r.id, wire, None).await
+    session_via_ssh(&sock, r.id, wire, None, None).await
 }
 
 /// Runs a task declared by the session's project, in that session.
@@ -1854,9 +1859,11 @@ pub async fn cmd_session_run(
                 task: args.task,
                 owns_box: false,
                 args: vec![],
+                cwd: String::new(),
             }
             .encode(),
         ),
+        None,
         None,
     )
     .await
@@ -1980,11 +1987,18 @@ pub(crate) fn ensure_interactive_attach_tty(stdin_is_tty: bool) -> Result<(), an
 /// keys from `config_dir` so the daemon adopts the user's detach/forward
 /// chord for that channel; the exec path (`wire` set) has no detach
 /// and sends none.
+///
+/// `host_asks_for` names the box whose pending asks the interactive attach
+/// answers on a VM-backed host (NET-045): the attach subscribes on the VM
+/// host daemon's control socket beside `sock` and renders each ask's dialog
+/// while the relay is suspended. `None` on a native host, where the
+/// session's own binding asks, and for every exec channel.
 pub(crate) async fn session_via_ssh(
     sock: &std::path::Path,
     id: sessions::SessionId,
     wire: Option<String>,
     config_dir: Option<&std::path::Path>,
+    host_asks_for: Option<&str>,
 ) -> Result<(), anyhow::Error> {
     // The command itself lives in minimal-client, shared with the dash TUI's
     // suspend-attach-resume flow. The interactive path resolves the
@@ -2000,11 +2014,16 @@ pub(crate) async fn session_via_ssh(
 
     if wire.is_none() {
         let stdin_is_tty = std::io::stdin().is_terminal();
+        let host_asks = host_asks_for
+            .and_then(|name| control_sock_beside(sock).map(|control| (control, name.to_string())));
         // The relay blocks its thread until ssh exits, so it runs off the
         // runtime's workers.
         let code = tokio::task::spawn_blocking(move || {
             interactive_attach(ssh, stdin_is_tty, attach::TerminalUnwind::arm, |ssh| {
-                minimal_client::attach::run_interactive_attach(ssh, None)
+                minimal_client::attach::run_interactive_attach(
+                    ssh,
+                    subscribe_host_asks(host_asks).map(minimal_client::attach::HostAsks::into_hook),
+                )
             })
         })
         .await
@@ -2061,6 +2080,37 @@ pub(crate) async fn session_via_ssh(
     };
     kill_ssh(&mut child).await;
     std::process::exit(128 + signo);
+}
+
+/// Subscribe an interactive attach to its box's pending asks on the VM host
+/// daemon (NET-045), from the control socket and the box's name. A
+/// subscription that cannot be made leaves the attach as it is: the box's
+/// asks are then refused at the host for want of an attached client, and
+/// the reason is said here.
+fn subscribe_host_asks(
+    target: Option<(std::path::PathBuf, String)>,
+) -> Option<minimal_client::attach::HostAsks> {
+    let (control, name) = target?;
+    match minimal_client::attach::HostAsks::subscribe(&control, &name) {
+        Ok(asks) => Some(asks),
+        Err(error) => {
+            tracing::warn!(box = %name, error = %format!("{error:#}"), "could not subscribe to the box's asks");
+            eprintln!(
+                "warning: this attach cannot answer box '{name}' asking to publish a port: \
+                 {error:#}"
+            );
+            None
+        }
+    }
+}
+
+/// The box an interactive attach answers asks for (NET-045): its name, on a
+/// VM-backed host only.
+pub(crate) fn host_asks_box(global: &GlobalArgs, name: Option<&str>) -> Option<String> {
+    (daemon_provider_kind(global) == paths::ProviderKind::Minvmd)
+        .then_some(name)
+        .flatten()
+        .map(str::to_string)
 }
 
 /// Kill the exec path's ssh child and reap it.
@@ -3548,8 +3598,17 @@ pub(crate) async fn destroy_session(
         .await
         .context("DestroySession RPC failed")?;
 
-    if resp.ok().is_some() {
+    if let Some(resp) = resp.ok() {
         println!("Destroyed session {} ({})", id, name.unwrap_or("-"));
+        // A failed `on_destroy` hook does not stop the destroy, so it is a
+        // warning rather than an error: the session is gone either way.
+        for failure in &resp.hook_failures {
+            let (head, output) = failure.split_once('\n').unwrap_or((failure, ""));
+            eprintln!("warning: on_destroy hook {head}; the session was destroyed anyway");
+            if !output.is_empty() {
+                eprintln!("{output}");
+            }
+        }
         // The session is gone; the row its activation bought outlives it on
         // the VM host daemon, and its creator withdraws it here (T66) —
         // presenting the pair the registration handed back. Best-effort: a
@@ -3777,25 +3836,376 @@ mod tests {
             .expect("an own-IP box keeps its dynamic declaration");
     }
 
-    #[test]
-    fn vm_backed_activate_refuses_dynamic_allow_until_host_admission() {
-        use paths::ProviderKind::{Minimald, Minvmd};
-        for mode in [DynamicIngress::Allow, DynamicIngress::Ask] {
-            let error = refuse_dynamic_ingress_on_vm(Minvmd, Some(mode))
-                .expect_err("a VM-backed host must refuse an allow/ask stance");
+    /// A host-side ask stand: the real VM host daemon's control server and
+    /// guest door over a real registry, in a provider dir the CLI resolves
+    /// the control socket in (NET-045).
+    struct AskStand {
+        _dir: tempfile::TempDir,
+        global: GlobalArgs,
+        control: std::path::PathBuf,
+        guest: std::path::PathBuf,
+        registry: minvmd::box_registry::BoxRegistry,
+    }
+
+    impl AskStand {
+        fn start() -> Self {
+            let dir = tempfile::TempDir::new().unwrap();
+            let provider_dir = dir.path().join("providers").join("local-minvmd0");
+            std::fs::create_dir_all(&provider_dir).unwrap();
+            let control = provider_dir.join("control.sock");
+            let registry = minvmd::box_registry::BoxRegistry::new(switch::SwitchSubnet::default());
+            let answerer =
+                minvmd::net::answerer::AnswererStatus::allocating_for_tests("ask-test-node");
+            let _server = minvmd::control::spawn(
+                control.clone(),
+                registry.clone(),
+                answerer.clone(),
+                minvmd::control::ProxyPublishStatus::default(),
+            )
+            .expect("the control server binds its socket");
+            let guest = minvmd::control::spawn_guest_reports_door(
+                &control,
+                registry.clone(),
+                answerer,
+                minvmd::control::ProxyPublishStatus::default(),
+            )
+            .expect("the guest door binds its socket");
+            let global = GlobalArgs {
+                provider: Some(Provider::LocalMinvmd),
+                minimal_dir: Some(dir.path().to_path_buf()),
+                ..Default::default()
+            };
+            Self {
+                _dir: dir,
+                global,
+                control,
+                guest,
+                registry,
+            }
+        }
+
+        /// Register `name` the way the activation does, with `stance` over
+        /// 3000-3999.
+        async fn register(&self, name: &str, stance: DynamicIngress) -> RegisteredWithVmHost {
+            let policy = sessions::SessionPolicy {
+                egress: None,
+                ingress: Some(IngressPolicy {
+                    port_mappings: vec![],
+                    dynamic_allowed_range: Some((3000, 3999)),
+                    dynamic_ingress: Some(stance),
+                }),
+                credentialed_upstream: None,
+            };
+            register_box_for_activation(
+                paths::ProviderKind::Minvmd,
+                self.global.minimal_dir.as_deref(),
+                NetworkMode::OwnIp,
+                name,
+                &policy,
+            )
+            .await
+            .expect("the real control server answers the registration")
+            .expect("an own-address box on a VM-backed host registers")
+        }
+
+        /// The guest's ask for `port`, its reply read on a thread.
+        fn guest_ask(
+            &self,
+            web: &RegisteredWithVmHost,
+            port: u16,
+        ) -> std::sync::mpsc::Receiver<minimald_rpc::BoxControlReply> {
+            use std::io::{BufRead as _, Write as _};
+            let mut stream = std::os::unix::net::UnixStream::connect(&self.guest).unwrap();
+            let mut line = serde_json_lenient::to_string(
+                &minimald_rpc::BoxControlRequest::AdmitAsk(minimald_rpc::AdmitAskRequest {
+                    switch_address: web.addresses.switch_address,
+                    port,
+                    proto: sessions::IpProto::Tcp,
+                }),
+            )
+            .unwrap();
+            line.push('\n');
+            stream.write_all(line.as_bytes()).unwrap();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let mut reader = std::io::BufReader::new(stream);
+                let mut reply = String::new();
+                if reader.read_line(&mut reply).is_ok() && !reply.trim().is_empty() {
+                    let _ = tx.send(serde_json_lenient::from_str(reply.trim()).unwrap());
+                }
+            });
+            rx
+        }
+    }
+
+    /// The relay as the ask loop sees it: every suspend and resume, in
+    /// order, reported on a channel.
+    struct RecordingTerminal(std::sync::mpsc::Sender<&'static str>);
+
+    impl minimal_client::attach::AskTerminal for RecordingTerminal {
+        fn suspend_for_ask(&self) -> Result<(), anyhow::Error> {
+            let _ = self.0.send("suspend");
+            Ok(())
+        }
+
+        fn resume_after_ask(&self) {
+            let _ = self.0.send("resume");
+        }
+
+        fn ask_cancelled(&self) -> bool {
+            false
+        }
+    }
+
+    /// Serve `asks` on a thread with `dialog`, reporting the terminal's
+    /// suspend and resume, and the offer each dialog was built from.
+    fn serve_asks(
+        asks: minimal_client::attach::HostAsks,
+        dialog: fn(&minimald_rpc::PendingAskOffer) -> minimald_rpc::AskAnswer,
+    ) -> (
+        std::sync::mpsc::Receiver<&'static str>,
+        std::sync::mpsc::Receiver<minimald_rpc::PendingAskOffer>,
+    ) {
+        let (events, events_rx) = std::sync::mpsc::channel();
+        let (offers, offers_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            asks.serve(&RecordingTerminal(events), |offer| {
+                let _ = offers.send(offer.clone());
+                dialog(offer)
+            });
+        });
+        (events_rx, offers_rx)
+    }
+
+    const ASK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// An ask create stands on a VM-backed host (NET-045): T94's refusal is
+    /// gone, and the registration hands the host row the ask stance — as it
+    /// does allow and deny — so the host holds the stance the human is
+    /// asked under.
+    #[tokio::test]
+    async fn vm_backed_dynamic_ask_create_accepted() {
+        let stand = AskStand::start();
+        for (name, stance) in [
+            ("asker", DynamicIngress::Ask),
+            ("allower", DynamicIngress::Allow),
+            ("denier", DynamicIngress::Deny),
+        ] {
+            stand.register(name, stance).await;
+            let row = stand
+                .registry
+                .row_by_name(name)
+                .expect("the registration published the row");
             assert_eq!(
-                error.to_string(),
-                "dynamic ingress allow/ask is not yet supported on VM-backed hosts \
-                 (gominimal/minimal#1897)"
+                row.dynamic_ingress(),
+                stance,
+                "{name}'s row holds its stance"
             );
-            refuse_dynamic_ingress_on_vm(Minimald, Some(mode))
-                .expect("a native host keeps every stance");
+            assert_eq!(row.dynamic_range(), Some((3000, 3999)));
         }
-        for kind in [Minvmd, Minimald] {
-            refuse_dynamic_ingress_on_vm(kind, Some(DynamicIngress::Deny))
-                .expect("deny is never refused");
-            refuse_dynamic_ingress_on_vm(kind, None).expect("an absent stance is never refused");
-        }
+        refuse_dynamic_ingress_off_own_ip(
+            crate::cli::CliNetworkMode::OwnIp,
+            Some(DynamicIngress::Ask),
+            Some((3000, 3999)),
+        )
+        .expect("an own-IP ask create is not refused");
+        assert_eq!(
+            minimal_client::attach::VM_HOST_CONTROL_SOCK_FILE,
+            minvmd::control::CONTROL_SOCK_FILE,
+            "the dash finds the control socket the VM host daemon binds"
+        );
+    }
+
+    /// The attached client renders the offer the host pushed — built from
+    /// the host row — suspends the relay for it, records the yes through
+    /// the host door, and resumes; the guest's held ask is admitted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn client_records_ask_yes_through_host_door() {
+        let stand = AskStand::start();
+        let web = stand.register("web", DynamicIngress::Ask).await;
+        let asks = tokio::task::spawn_blocking({
+            let control = stand.control.clone();
+            move || minimal_client::attach::HostAsks::subscribe(&control, "web")
+        })
+        .await
+        .unwrap()
+        .expect("the attach subscribes by the row's box id");
+        let (events, offers) = serve_asks(asks, |_| minimald_rpc::AskAnswer::Yes);
+
+        let reply = stand.guest_ask(&web, 3000);
+        let offer = offers.recv_timeout(ASK_WAIT).expect("the dialog is shown");
+        assert_eq!(offer.name, "web");
+        assert_eq!(Some(offer.box_id), web.box_id);
+        assert_eq!(
+            minimal_client::attach::ask_dialog_lead_in(&offer),
+            "web asks to publish port 3000/tcp."
+        );
+        let minimald_rpc::BoxControlReply::AskAdmit(outcome) =
+            reply.recv_timeout(ASK_WAIT).unwrap()
+        else {
+            panic!("the guest's ask is answered with its end");
+        };
+        assert!(
+            matches!(
+                outcome,
+                minimald_rpc::AskAdmitOutcome::Admitted { port: 3000, .. }
+            ),
+            "the recorded yes admits the ask: {outcome:?}"
+        );
+        assert_eq!(events.recv_timeout(ASK_WAIT).unwrap(), "suspend");
+        assert_eq!(events.recv_timeout(ASK_WAIT).unwrap(), "resume");
+        let row = stand.registry.row_by_name("web").unwrap();
+        assert_eq!(row.runtime_port_numbers(), vec![3000]);
+    }
+
+    /// Two attaches are offered one ask; the first records a no while the
+    /// second's dialog is still up. The second's late yes is told the ask
+    /// was already denied, and admits nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn late_attach_answer_admits_nothing() {
+        let stand = AskStand::start();
+        let web = stand.register("web", DynamicIngress::Ask).await;
+        let subscribe = || {
+            let control = stand.control.clone();
+            tokio::task::spawn_blocking(move || {
+                minimal_client::attach::HostAsks::subscribe(&control, "web")
+            })
+        };
+        let first = subscribe()
+            .await
+            .unwrap()
+            .expect("the first attach subscribes");
+        let second = subscribe()
+            .await
+            .unwrap()
+            .expect("the second attach subscribes");
+        // The second dialog is up before the first answers, and answers
+        // only once the first's no is recorded.
+        let (shown, shown_rx) = std::sync::mpsc::channel::<()>();
+        let (first_done, first_done_rx) = std::sync::mpsc::channel::<()>();
+        let (first_offers, first_offers_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (events, _) = std::sync::mpsc::channel();
+            first.serve(&RecordingTerminal(events), |offer| {
+                let _ = shown_rx.recv();
+                let _ = first_offers.send(offer.clone());
+                minimald_rpc::AskAnswer::No
+            });
+        });
+        let (events, events_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            second.serve(&RecordingTerminal(events), |_| {
+                let _ = shown.send(());
+                let _ = first_done_rx.recv();
+                minimald_rpc::AskAnswer::Yes
+            });
+        });
+        let reply = stand.guest_ask(&web, 3000);
+        first_offers_rx
+            .recv_timeout(ASK_WAIT)
+            .expect("the first dialog is shown");
+        let minimald_rpc::BoxControlReply::AskAdmit(outcome) =
+            reply.recv_timeout(ASK_WAIT).unwrap()
+        else {
+            panic!("the guest's ask is answered with its end");
+        };
+        assert!(matches!(
+            outcome,
+            minimald_rpc::AskAdmitOutcome::Refused {
+                reason: minimald_rpc::AskRefused::Denied,
+                ..
+            }
+        ));
+        first_done.send(()).unwrap();
+        assert_eq!(events_rx.recv_timeout(ASK_WAIT).unwrap(), "suspend");
+        assert_eq!(
+            events_rx.recv_timeout(ASK_WAIT).unwrap(),
+            "resume",
+            "the late dialog resumes the relay"
+        );
+        assert!(
+            stand
+                .registry
+                .row_by_name("web")
+                .unwrap()
+                .runtime_port_numbers()
+                .is_empty(),
+            "the late yes admitted nothing"
+        );
+    }
+
+    /// Ctrl-C at the dialog is a no: the client records no through the host
+    /// door, nothing is admitted, and the relay resumes. Escape and a closed
+    /// input are a no the same way; no terminal at all is recorded as such.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ctrl_c_at_ask_dialog_records_no_and_relay_resumes() {
+        use minimal_client::attach::ask_answer_from;
+        assert_eq!(
+            ask_answer_from(Err(inquire::InquireError::OperationInterrupted)),
+            minimald_rpc::AskAnswer::No
+        );
+        assert_eq!(
+            ask_answer_from(Err(inquire::InquireError::OperationCanceled)),
+            minimald_rpc::AskAnswer::No
+        );
+        assert_eq!(
+            ask_answer_from(Err(inquire::InquireError::IO(std::io::Error::from(
+                std::io::ErrorKind::UnexpectedEof
+            )))),
+            minimald_rpc::AskAnswer::No
+        );
+        assert_eq!(
+            ask_answer_from(Err(inquire::InquireError::NotTTY)),
+            minimald_rpc::AskAnswer::NoTty
+        );
+        assert_eq!(ask_answer_from(Ok(false)), minimald_rpc::AskAnswer::No);
+        assert_eq!(ask_answer_from(Ok(true)), minimald_rpc::AskAnswer::Yes);
+
+        let stand = AskStand::start();
+        let web = stand.register("web", DynamicIngress::Ask).await;
+        let asks = tokio::task::spawn_blocking({
+            let control = stand.control.clone();
+            move || minimal_client::attach::HostAsks::subscribe(&control, "web")
+        })
+        .await
+        .unwrap()
+        .expect("the attach subscribes");
+        let (events, offers) = serve_asks(asks, |_| {
+            ask_answer_from(Err(inquire::InquireError::OperationInterrupted))
+        });
+        let reply = stand.guest_ask(&web, 3000);
+        offers.recv_timeout(ASK_WAIT).expect("the dialog is shown");
+        let minimald_rpc::BoxControlReply::AskAdmit(outcome) =
+            reply.recv_timeout(ASK_WAIT).unwrap()
+        else {
+            panic!("the guest's ask is answered with its end");
+        };
+        assert_eq!(
+            outcome,
+            minimald_rpc::AskAdmitOutcome::Refused {
+                ask_id: match outcome {
+                    minimald_rpc::AskAdmitOutcome::Refused { ask_id, .. }
+                    | minimald_rpc::AskAdmitOutcome::Admitted { ask_id, .. } => ask_id,
+                },
+                reason: minimald_rpc::AskRefused::Denied,
+                cause: None,
+            },
+            "Ctrl-C records a no"
+        );
+        assert_eq!(events.recv_timeout(ASK_WAIT).unwrap(), "suspend");
+        assert_eq!(
+            events.recv_timeout(ASK_WAIT).unwrap(),
+            "resume",
+            "the relay resumes after the dialog"
+        );
+        assert!(
+            stand
+                .registry
+                .row_by_name("web")
+                .unwrap()
+                .runtime_port_numbers()
+                .is_empty()
+        );
     }
 
     #[test]

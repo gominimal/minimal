@@ -904,10 +904,12 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
                 Effect::Attach(key) => match providers.iter().find(|p| p.label == key.provider) {
                     Some(p) => {
                         let sock = p.sock.clone();
+                        let box_name = model.entry(&key).and_then(|entry| entry.name.clone());
                         attach_and_resume(
                             &mut terminal,
                             &sock,
                             key.id,
+                            box_name.as_deref(),
                             opts.config_dir.as_deref(),
                             &mut model,
                         );
@@ -1087,10 +1089,16 @@ async fn exec_effect(
 /// detaches), then resume. The session-key config is resolved from
 /// `config_dir` so the daemon adopts the user's detach/forward chord; a bad
 /// config is reported in the status bar rather than aborting the TUI.
+///
+/// On a VM-backed daemon the attach subscribes to `box_name`'s pending asks
+/// on the VM host daemon and answers them the way `min session attach`
+/// does (NET-045); the dash's list view never subscribes, so only an attach
+/// counts as an attached client.
 fn attach_and_resume(
     terminal: &mut TerminalGuard,
     sock: &std::path::Path,
     id: SessionId,
+    box_name: Option<&str>,
     config_dir: Option<&std::path::Path>,
     model: &mut Model,
 ) {
@@ -1104,7 +1112,13 @@ fn attach_and_resume(
     let result = minimal_client::attach::attach_command(sock, id, None, session_keys.as_ref())
         .and_then(|cmd| {
             attach_through_relay(terminal, cmd, |cmd| {
-                minimal_client::attach::run_interactive_attach(cmd, None)
+                let host_asks = box_name.and_then(|name| {
+                    minimal_client::attach::HostAsks::subscribe_beside(sock, name)
+                });
+                minimal_client::attach::run_interactive_attach(
+                    cmd,
+                    host_asks.map(minimal_client::attach::HostAsks::into_hook),
+                )
             })
         });
     match result {
