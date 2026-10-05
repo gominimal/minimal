@@ -17176,12 +17176,13 @@ proof_listen_published_port_reaches_peer_and_host() {
   # source, at the box's own switch address.
   lp_bridge_switch=""
   if [ -n "${E2E_VM:-}" ]; then
-    lp_bridge_switch="$(minvmd_log_lines \
-      'registered box with the VM host daemon; addresses allocated' \
-      | grep -F "\"box\":\"$lp_target_name\"" | tail -n1 \
-      | sed -n 's/.*"switch_address":"\([0-9.]*\)".*/\1/p')"
+    # The box's switch address, in activate's own word: its session-start
+    # registration line names the address the VM host daemon allocated.
+    lp_bridge_switch="$(grep -F 'BOX REGISTRATION:' "$WORK/lp-activate.err" 2>/dev/null \
+      | tail -n1 | sed -n 's/.*switch address \([0-9.]*\).*/\1/p')"
     if [ -z "$lp_bridge_switch" ]; then
-      echo "::error::the VM host daemon's log carries no registration record naming box '$lp_target_name' and its switch address"
+      echo "::error::activate printed no BOX REGISTRATION line naming the switch address of box '$lp_target_name'"
+      cat "$WORK/lp-activate.err" 2>/dev/null || true
       fail
     fi
     lp_bridge_admit=""
@@ -17197,7 +17198,10 @@ proof_listen_published_port_reaches_peer_and_host() {
     done
     if [ -z "$lp_bridge_admit" ]; then
       echo "::error::the VM host daemon recorded no listen-sourced admission of port $lp_listen_port for box '$lp_target_name' at $lp_bridge_switch — the report never crossed the bridge to the host gate (T94)"
-      echo "--- minvmd runtime-port records ---"
+      echo "--- minvmd log files ---"
+      find "$XDG_STATE_HOME/minimal/logs" -name 'minvmd.log*' -type f 2>/dev/null || true
+      echo "--- minvmd records naming the box or a runtime port ---"
+      minvmd_log_lines "$lp_target_name" | tail -n 20 || true
       minvmd_log_lines 'runtime-admitted port' | tail -n 20 || true
       fail
     fi
@@ -17293,7 +17297,10 @@ PY
     done
     if [ -z "$lp_bridge_withdraw" ]; then
       echo "::error::the VM host daemon recorded no listen-sourced withdrawal of port $lp_listen_port for box '$lp_target_name' after the close — the withdrawal never crossed the bridge (T94)"
-      echo "--- minvmd runtime-port records ---"
+      echo "--- minvmd log files ---"
+      find "$XDG_STATE_HOME/minimal/logs" -name 'minvmd.log*' -type f 2>/dev/null || true
+      echo "--- minvmd records naming the box or a runtime port ---"
+      minvmd_log_lines "$lp_target_name" | tail -n 20 || true
       minvmd_log_lines 'runtime-admitted port' | tail -n 20 || true
       fail
     fi
