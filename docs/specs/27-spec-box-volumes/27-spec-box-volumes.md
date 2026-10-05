@@ -4,7 +4,7 @@ title: Box Volumes — named, persistent, single-writer, locally backed
 owner: mitodrummer
 epic: gominimal/inbox#731
 arch: https://github.com/gominimal/arch/blob/main/architecture.md
-updated: 2026-09-25
+updated: 2026-09-28
 ---
 
 # BVOL — Box Volumes — named, persistent, single-writer, locally backed
