@@ -42,7 +42,7 @@ let source_provenance_gitlab = {
     repo | String | doc "The project (repository) name.",
 }
 in
-# --- security-patch revision ledger (inbox#511) -------------------------
+# --- patch revision ledger (inbox#511) ----------------------------------
 # These contracts fail CLOSED on malformed entries: a blank or misshapen
 # `cve` / `origin` / `sha256` / `upstream_commit` refuses to parse rather
 # than producing an SBOM row that quietly asserts nothing.
@@ -74,23 +74,89 @@ let NonBlankString = std.contract.custom (fun _label value =>
         'Error { message = "expected a non-blank string" }
 )
 in
-let security_patch_entry = {
-    file
-        | NonBlankString
-        | doc "The patch file name as it appears in this spec's build_deps (a Local input).",
-    cve
-        | CveId
-        | doc "The CVE this patch remediates. One entry per CVE, even when one file fixes several — the ledger is what feeds go by.",
-    sha256
-        | Sha256Hex
-        | doc "sha256 of the patch file contents, pinning what was actually applied.",
-    origin
-        | NonBlankString
-        | doc "Where the fix came from: the upstream advisory, MR, or mailing-list URL a reviewer can follow.",
-    upstream_commit
-        | CommitHex
-        | doc "The upstream commit this patch was cherry-picked from (ancestry-verifiable).",
+# The fields a ledger entry carries, by kind. Every entry names its file,
+# digest and origin; a security fix also names its CVE and the upstream
+# commit it was taken from, while a build or vendor patch may lack one.
+let common_fields = [
+    { name = "file", contract = NonBlankString, required = true,
+      doc = "The patch file name as it appears in this spec's build_deps (a Local input)." },
+    { name = "sha256", contract = Sha256Hex, required = true,
+      doc = "sha256 of the patch file contents, pinning what was actually applied." },
+    { name = "origin", contract = NonBlankString, required = true,
+      doc = "Where the patch came from: the upstream advisory, MR, bug or mailing-list URL a reviewer can follow." },
+]
+in
+let upstream_commit_field = fun is_required => {
+    name = "upstream_commit", contract = CommitHex, required = is_required,
+    doc = "The upstream commit this patch was cherry-picked from (ancestry-verifiable).",
 }
+in
+let fields_by_kind = {
+    security = common_fields @ [
+        { name = "cve", contract = CveId, required = true,
+          doc = "The CVE this patch remediates. One entry per CVE, even when one file fixes several — the ledger is what feeds go by." },
+        upstream_commit_field true,
+    ],
+    build = common_fields @ [upstream_commit_field false],
+    vendor = common_fields @ [upstream_commit_field false],
+}
+in
+# Checks every field of an entry now. A record contract checks lazily, so a
+# missing or malformed field would surface for whoever read it first.
+let check_entry = fun label fields value =>
+    let allowed = ["kind"] @ std.array.map (fun f => f.name) fields in
+    let unknown = std.record.fields value |> std.array.filter (fun n => !(std.array.elem n allowed)) in
+    if std.array.length unknown > 0 then
+        'Error { message = "a patches[] entry does not take `%{std.array.first unknown}`" }
+    else
+        fields
+        |> std.array.try_fold_left
+            (fun acc f =>
+                if !(std.record.has_field f.name value) then
+                    if f.required then
+                        'Error { message = "a patches[] entry needs `%{f.name}`" }
+                    else
+                        'Ok acc
+                else
+                    std.contract.check f.contract label value."%{f.name}"
+                    |> match {
+                        'Ok _ => 'Ok acc,
+                        'Error e =>
+                            let why = if std.record.has_field "message" e then ": %{e.message}" else "" in
+                            'Error { message = "`%{f.name}`%{why}" },
+                    })
+            value
+in
+# An entry's shape follows its `kind`.
+let patch_entry = std.contract.custom (fun label value =>
+    if !(std.is_record value) then
+        'Error { message = "a patches[] entry is a record" }
+    else
+        match {
+            { kind = 'security, .. } => check_entry label fields_by_kind.security value,
+            { kind = 'build, .. } => check_entry label fields_by_kind.build value,
+            { kind = 'vendor, .. } => check_entry label fields_by_kind.vendor value,
+            _ => 'Error { message = "a patches[] entry needs a kind of 'security, 'build or 'vendor" },
+        }
+        value
+)
+in
+# Every entry is checked when the ledger is, because a consumer that reads
+# attrs as values sees an array's elements without their contracts.
+let patch_ledger = std.contract.custom (fun label value =>
+    if !(std.is_array value) then
+        'Error { message = "patches must be an array of ledger entries" }
+    else
+        value
+        |> std.array.try_fold_left
+            (fun acc entry =>
+                std.contract.check patch_entry label entry
+                |> match {
+                    'Ok checked => 'Ok (acc @ [checked]),
+                    'Error e => 'Error e,
+                })
+            []
+)
 in
 let PURL = std.contract.custom (fun _label value =>
     if std.typeof value != 'String then
@@ -124,8 +190,8 @@ in
         ),
     },
     revision = {
-        name = "security patch revision",
-        desc = "Counts security patch-sets applied on top of upstream_version. 0 (or absent) = pristine upstream. Owned by pkgmgr — never hand-edited — and resets to 0 on any upstream version bump. Rendered as `-rN` into published version strings (SBOM, OpenVEX, secdb) by the publish-boundary helper.",
+        name = "patch revision",
+        desc = "Counts the patch-sets applied on top of upstream_version that change the artifact. 0 (or absent) = pristine upstream. Owned by pkgmgr — never hand-edited — and resets to 0 on any upstream version bump. Rendered as `-rN` into published version strings (SBOM, OpenVEX, secdb) by the publish-boundary helper.",
         validate = std.contract.custom (fun _label value =>
             if std.typeof value == 'Number && value >= 0 && value == std.number.floor value then
                 'Ok value
@@ -134,9 +200,9 @@ in
         ),
     },
     patches = {
-        name = "security patch ledger",
-        desc = "Typed record of every security patch applied beyond upstream_version: which CVE, from which upstream commit, via which advisory, with the patch file's digest. This ledger — not the patch files — is what qualified_version() and the vulnerability feeds consume, so entries are contract-enforced: a blank cve or origin refuses to parse.",
-        validate = Array security_patch_entry,
+        name = "patch ledger",
+        desc = "Typed record of every patch applied beyond upstream_version, by kind: a security fix names its CVE and upstream commit; a build or vendor patch names its origin. This ledger — not the patch files — is what qualified_version() and the vulnerability feeds consume, so entries are contract-enforced: a missing kind, or a blank cve or origin, refuses to parse.",
+        validate = patch_ledger,
     },
     repology_project = {
         name = "repology project name",
