@@ -155,6 +155,16 @@
 #                                    the VM host daemon answers the zone on
 #                                    the host loopback and the in-VM daemon
 #                                    owns no answerer
+#   native_answerer_survives_session_stop
+#                                    NET-122's host service on a native
+#                                    host (T90): the advisory's command run
+#                                    as root hands node A's interim to the
+#                                    manager-held answerer, A's name keeps
+#                                    answering from it, a second native
+#                                    node publishes there too, and its name
+#                                    still answers after A's session and
+#                                    daemon stop; NOT RUN without root, on
+#                                    macOS, or on a VM lane
 #   local_range_reserved_by_privileged_step
 #                                    NET-123's macOS half: the advisory's one
 #                                    command installs the boot-time range unit;
@@ -335,6 +345,9 @@ E2E_NOT_RUN="" # the cases this lane could not run, named by `not_run`; the lane
 ASR_SEED_DIR="" # seeded by the answerer-service proof below; removed on teardown
 ASR_STATE2_DIR="" # that proof's second node's state base; stopped on teardown
 ASR_REVERT_LINK="" # the link that proof's advisory pointed the host resolver at; reverted on teardown
+NASR_SEED_DIR="" # seeded by the native answerer-service proof below; removed on teardown
+NASR_STATE2_DIR="" # that proof's second native node's state base; stopped on teardown
+NASR_REVERT_LINK="" # the link that proof's advisory pointed the host resolver at; reverted on teardown
 BN_API_SEED_DIR="" # its second box's seed; removed on teardown
 BN_REVERT_LINK="" # the link that proof pointed the host resolver at; reverted on teardown
 PROXY_SEED_DIR="" # seeded by the min.internal proxy proof; removed on teardown
@@ -799,6 +812,16 @@ teardown() {
   if [ -n "$ASR_REVERT_LINK" ]; then
     sudo -n resolvectl revert "$ASR_REVERT_LINK" >/dev/null 2>&1 || true
     sudo -n ip link del "$ASR_REVERT_LINK" >/dev/null 2>&1 || true
+  fi
+  # The native answerer-service proof's second node and resolver link, the
+  # same way.
+  if [ -n "$NASR_STATE2_DIR" ]; then
+    min --minimal-dir "$NASR_STATE2_DIR" stop --force >/dev/null 2>&1 || true
+  fi
+  [ -n "$NASR_SEED_DIR" ] && rm -rf "$NASR_SEED_DIR"
+  if [ -n "$NASR_REVERT_LINK" ]; then
+    sudo -n resolvectl revert "$NASR_REVERT_LINK" >/dev/null 2>&1 || true
+    sudo -n ip link del "$NASR_REVERT_LINK" >/dev/null 2>&1 || true
   fi
   range_teardown_unit
   # Every proof that runs the advisory as root also installs the answerer
@@ -9050,6 +9073,325 @@ for row in json.load(open(sys.argv[1])):
   range_teardown_unit
   rm -rf "$ASR_SEED_DIR"; ASR_SEED_DIR=""
   echo "answerer survives session stop OK (handover, two nodes, restart, sibling stop, later publish — each printed)"
+  echo "::endgroup::"
+}
+
+# ---------------------------------------------------------------------------
+# The box-zone answerer host service on a NATIVE host, end to end (NET-122's
+# host service, T90): native minimald becomes a client of the manager-held
+# answerer the advisory installs, and a stopped native session leaves the
+# host's names answering. Native Linux lanes with passwordless sudo only: a
+# VM lane's service story is answerer_survives_session_stop, macOS runs no
+# native daemon, and a host without root cannot install the unit. Those
+# record the case as NOT RUN, never as passed:
+#
+#   1. Node A (this lane's state dir) starts with no service installed and
+#      hosts the interim on the hook port; its box name answers there.
+#   2. A's session start prints the advisory; its command, run verbatim as
+#      root, asks A's own control socket to release the port, installs the
+#      service and starts it. A becomes a client of the manager-held
+#      answerer, no minimald holds the port, and A's name keeps answering
+#      the same address — now from the service.
+#   3. Node B starts under a second state dir and publishes into the same
+#      service over the machine-global channel, hosting nothing.
+#   4. A's session is destroyed and A's daemon stopped: A's name stops
+#      answering while B's keeps answering from the service.
+#
+# Every host change — the units, the program copy, the channel socket, the
+# resolver link, the second node — is undone here and again by the EXIT
+# trap, so the shared runner is left as found.
+proof_native_answerer_survives_session_stop() {
+  local nasr_case=native_answerer_survives_session_stop
+  if [ -n "$E2E_VM" ]; then
+    not_run "$nasr_case" "VM-backed lane: the native daemon runs in the guest; answerer_survives_session_stop is this lane's case"
+    return 0
+  fi
+  if [ "$(uname -s)" != Linux ]; then
+    not_run "$nasr_case" "no native daemon on $(uname -s)"
+    return 0
+  fi
+  if ! sudo -n true >/dev/null 2>&1; then
+    not_run "$nasr_case" "no passwordless sudo: the advisory's command must run as root"
+    return 0
+  fi
+  local nasr_tool
+  for nasr_tool in systemctl resolvectl ip dig ss; do
+    if ! command -v "$nasr_tool" >/dev/null 2>&1; then
+      not_run "$nasr_case" "this host has no $nasr_tool, which installing and reading the service needs"
+      return 0
+    fi
+  done
+  echo "::group::the native daemon publishes into the manager-held answerer, which survives a session stop (NET-122, T90)"
+
+  local nasr_channel=/run/minimal/answerer.sock
+  local nasr_marker=/etc/systemd/system/dev.minimal.zone-answerer.socket
+  local nasr_base_a="$XDG_STATE_HOME/minimal"
+  local nasr_log_filter="warn,minimald::rpc=info,minimald::net::answerer=info"
+  local nasr_port=""
+
+  # A leftover service from a run killed past its EXIT trap would make A a
+  # client from its first start, so the interim this case hands over could
+  # never exist. Remove it first.
+  if [ -e "$nasr_marker" ] || [ -e "$nasr_channel" ] \
+     || [ -e /usr/local/lib/minimal/dev.minimal.zone-answerer ]; then
+    echo "removing a leftover answerer service from a prior run, so node A starts from the interim"
+    ANSWERER_SERVICE_CHANNEL="$nasr_channel"
+    answerer_service_teardown
+  fi
+
+  NASR_STATE2_DIR="$WORK/nasr-state2"
+  mkdir -p "$NASR_STATE2_DIR"
+  nasr_mnl2() { min --minimal-dir "$NASR_STATE2_DIR" "$@"; }
+
+  # A node's minimald file logs, and the count of its zone-answerer lines
+  # that carry a phrase: read as a count before and after the step that
+  # must add one, because earlier cases left records in the shared log dir.
+  nasr_count() {
+    # $1: the node's state base. $2: the phrase.
+    local f n=0 c
+    while IFS= read -r f; do
+      [ -f "$f" ] || continue
+      c="$(grep -F -- 'zone-answerer' "$f" 2>/dev/null | grep -cF -- "$2" || true)"
+      n=$((n + ${c:-0}))
+    done < <(find "$1/logs" -name 'minimald.log*' -type f 2>/dev/null | sort)
+    echo "$n"
+  }
+  nasr_wait_more() {
+    # $1: state base. $2: phrase. $3: the count before. Polls 30 s.
+    local _i
+    for _i in $(seq 1 60); do
+      [ "$(nasr_count "$1" "$2")" -gt "$3" ] && return 0
+      sleep 0.5
+    done
+    return 1
+  }
+  nasr_dump_log() {
+    local f
+    echo "--- $1: minimald zone-answerer lines (tail) ---"
+    while IFS= read -r f; do
+      [ -f "$f" ] || continue
+      grep -F -- 'zone-answerer' "$f" 2>/dev/null | tail -n8
+    done < <(find "$1/logs" -name 'minimald.log*' -type f 2>/dev/null | sort)
+  }
+  # The first A address the hook port answers for a name, polled for 20 s;
+  # empty when none came.
+  nasr_address() {
+    local _i addr=""
+    for _i in $(seq 1 40); do
+      addr="$(dig +time=1 +tries=1 +noall +answer @127.0.0.1 -p "$nasr_port" "$1" A 2>/dev/null \
+        | awk '$4 == "A" { print $5; exit }' || true)"
+      [ -n "$addr" ] && break
+      sleep 0.5
+    done
+    printf '%s\n' "$addr"
+  }
+  nasr_expect_a() {
+    # $1: name. $2: address. $3: who should be answering, for the line.
+    local addr
+    addr="$(nasr_address "$1")"
+    if [ "$addr" != "$2" ]; then
+      echo "::error::$1 did not answer $2 at 127.0.0.1:$nasr_port within 20 s (got '${addr:-nothing}'); $3 is not answering it"
+      dig +time=1 +tries=1 @127.0.0.1 -p "$nasr_port" "$1" A 2>&1 || true
+      nasr_dump_log "$nasr_base_a"
+      nasr_dump_log "$NASR_STATE2_DIR"
+      fail
+    fi
+    echo "  $1 answers $2 at 127.0.0.1:$nasr_port ($3)"
+  }
+  nasr_expect_nx() {
+    local _i reply=""
+    for _i in $(seq 1 40); do
+      reply="$(dig +time=1 +tries=1 @127.0.0.1 -p "$nasr_port" "$1" A 2>/dev/null || true)"
+      case "$reply" in
+        *"status: NXDOMAIN"*) echo "  $1 answers NXDOMAIN"; return 0 ;;
+      esac
+      sleep 0.5
+    done
+    echo "::error::$1 still answers 20 s after its session was destroyed"
+    printf '%s\n' "$reply"
+    fail
+  }
+  nasr_activate() {
+    # $1: the CLI function. $2: the session name. $3: stderr file. Prints
+    # the session id.
+    local sid
+    if ! sid="$(cd "$NASR_SEED_DIR" && RUST_LOG="$nasr_log_filter" "$1" session activate . \
+        --no-prompt --name "$2" 2>"$3")"; then
+      echo "::error::'min session activate' of $2 failed" >&2
+      echo "--- stderr ---" >&2; cat "$3" >&2 2>/dev/null || true
+      return 1
+    fi
+    printf '%s\n' "$sid" | tail -n1 | tr -d '\r'
+  }
+  nasr_bring_up() {
+    # $1: the CLI function. $2: which node, for the error.
+    local _i
+    for _i in 1 2 3; do
+      if RUST_LOG="$nasr_log_filter" "$1" ls >/dev/null 2>"$WORK/nasr-up.err"; then
+        return 0
+      fi
+      sleep 2
+    done
+    echo "::error::'min ls' could not bring $2 daemon up"
+    cat "$WORK/nasr-up.err" 2>/dev/null || true
+    fail
+  }
+
+  # The advisory's command copies the min-answerer program found beside min
+  # or on PATH; the answerer-service case's helper builds and stages it.
+  asr_answerer_ready
+  NASR_SEED_DIR="$(hook_mktemp /tmp/mnlnasr.XXXXXX)"
+  hook_seed_preamble > "$NASR_SEED_DIR/minimal.toml"
+  mkdir "$NASR_SEED_DIR/.git"
+
+  # ---- 1. node A hosts the interim -----------------------------------------
+  local nasr_hosts_before
+  nasr_hosts_before="$(nasr_count "$nasr_base_a" 'holds the host loopback answerer port itself')"
+  mnl stop --force >/dev/null 2>&1 || true
+  nasr_bring_up mnl "node A's"
+  if ! nasr_wait_more "$nasr_base_a" 'holds the host loopback answerer port itself' "$nasr_hosts_before"; then
+    echo "::error::node A never hosted the interim answerer — is the hook port held by another daemon or a leftover service?"
+    nasr_dump_log "$nasr_base_a"
+    fail
+  fi
+  nasr_port="$(find "$nasr_base_a/logs" -name 'minimald.log*' -type f 2>/dev/null | sort \
+    | while IFS= read -r f; do grep -F -- 'holds the host loopback answerer port itself' "$f" 2>/dev/null; done \
+    | tail -n1 | sed -n 's/.*"port":\([0-9][0-9]*\).*/\1/p')"
+  [ -n "$nasr_port" ] || nasr_port=7656
+  echo "1. node A hosts the interim answerer on 127.0.0.1:$nasr_port"
+
+  local nasr_a_sid nasr_a_err="$WORK/nasr-a-activate.err" nasr_a_ip
+  nasr_a_sid="$(nasr_activate mnl e2e-nasr-a "$nasr_a_err")" || fail
+  nasr_a_ip="$(nasr_address e2e-nasr-a.min.internal)"
+  if [ -z "$nasr_a_ip" ]; then
+    echo "::error::e2e-nasr-a.min.internal does not answer from node A's interim on 127.0.0.1:$nasr_port"
+    nasr_dump_log "$nasr_base_a"
+    fail
+  fi
+  echo "  e2e-nasr-a.min.internal answers $nasr_a_ip from node A's interim"
+
+  # ---- 2. the advisory hands the port to the service -----------------------
+  local nasr_cmd
+  nasr_cmd="$(advisory_command_from "$nasr_a_err" "Configure the host's resolver")"
+  case "$nasr_cmd" in
+    *zone-answerer*) ;;
+    *)
+      echo "::error::node A's native session start printed no advisory carrying the answerer service step"
+      echo "--- activate stderr ---"; cat "$nasr_a_err" 2>/dev/null || true
+      fail
+      ;;
+  esac
+  case "$nasr_cmd" in
+    *" release --control "*"providers/local-minimald0/control.sock"*) ;;
+    *)
+      echo "::error::the advisory's command does not ask node A's native daemon to release the port before it starts the unit"
+      echo "--- command ---"; printf '%s\n' "$nasr_cmd"
+      fail
+      ;;
+  esac
+  # Record every undo BEFORE the run, so a half-failed command still leaves
+  # the teardown its targets.
+  NASR_REVERT_LINK="$(printf '%s\n' "$nasr_cmd" | sed -n 's/.*resolvectl dns \([^ ][^ ]*\) .*/\1/p' | head -n1)"
+  if [ -z "$NASR_REVERT_LINK" ]; then
+    echo "::error::could not find the link in the advisory's command, so it was not run"
+    printf '%s\n' "$nasr_cmd"
+    fail
+  fi
+  ANSWERER_SERVICE_CHANNEL="$(answerer_channel_of "$nasr_cmd")"
+  if [ "$ANSWERER_SERVICE_CHANNEL" != "$nasr_channel" ]; then
+    echo "::error::the advisory's command names channel '$ANSWERER_SERVICE_CHANNEL', not the machine-global $nasr_channel; it was not run"
+    ANSWERER_SERVICE_CHANNEL="$nasr_channel"
+    fail
+  fi
+  local nasr_released_before nasr_service_before
+  nasr_released_before="$(nasr_count "$nasr_base_a" 'released the interim answerer')"
+  nasr_service_before="$(nasr_count "$nasr_base_a" 'the manager-held answerer service')"
+  if ! sh -c "$nasr_cmd" >"$WORK/nasr-cmd.out" 2>"$WORK/nasr-cmd.err"; then
+    echo "::error::the advisory's command did not run"
+    echo "--- command ---"; printf '%s\n' "$nasr_cmd"
+    echo "--- output ---"; cat "$WORK/nasr-cmd.out" "$WORK/nasr-cmd.err" 2>/dev/null || true
+    nasr_dump_log "$nasr_base_a"
+    fail
+  fi
+  echo "2. ran the advisory's command as root (resolver, release, service)"
+  if ! nasr_wait_more "$nasr_base_a" 'released the interim answerer' "$nasr_released_before"; then
+    echo "::error::node A has no record of releasing the interim answerer"
+    nasr_dump_log "$nasr_base_a"
+    fail
+  fi
+  if ! nasr_wait_more "$nasr_base_a" 'the manager-held answerer service' "$nasr_service_before"; then
+    echo "::error::node A never became a client of the manager-held answerer service"
+    nasr_dump_log "$nasr_base_a"
+    fail
+  fi
+  if ! systemctl is-active --quiet dev.minimal.zone-answerer.socket; then
+    echo "::error::the answerer socket unit is not active after the command"
+    systemctl status dev.minimal.zone-answerer.socket 2>&1 | tail -n 15 || true
+    fail
+  fi
+  local nasr_holders
+  nasr_holders="$(sudo -n ss -lunp 2>/dev/null | grep -F -- "127.0.0.1:$nasr_port " || true)"
+  case "$nasr_holders" in
+    *minimald*)
+      echo "::error::a minimald still holds 127.0.0.1:$nasr_port after the handover: $nasr_holders"
+      fail
+      ;;
+    "")
+      echo "::error::nothing holds 127.0.0.1:$nasr_port after the handover"
+      fail
+      ;;
+  esac
+  echo "  the hook port's holder: $nasr_holders"
+  if ! sudo -n test -S "$nasr_channel"; then
+    echo "::error::the machine-global channel socket $nasr_channel is absent after the command"
+    fail
+  fi
+  nasr_expect_a e2e-nasr-a.min.internal "$nasr_a_ip" "the manager-held answerer, node A publishing"
+
+  # ---- 3. node B publishes into the same service ----------------------------
+  local nasr_b_sid nasr_b_ip
+  nasr_bring_up nasr_mnl2 "node B's"
+  nasr_b_sid="$(nasr_activate nasr_mnl2 e2e-nasr-b "$WORK/nasr-b-activate.err")" || fail
+  if ! nasr_wait_more "$NASR_STATE2_DIR" 'the manager-held answerer service' 0; then
+    echo "::error::node B never published into the manager-held answerer service"
+    nasr_dump_log "$NASR_STATE2_DIR"
+    fail
+  fi
+  if [ "$(nasr_count "$NASR_STATE2_DIR" 'holds the host loopback answerer port itself')" != 0 ]; then
+    echo "::error::node B hosted an answerer of its own beside the service"
+    nasr_dump_log "$NASR_STATE2_DIR"
+    fail
+  fi
+  nasr_b_ip="$(nasr_address e2e-nasr-b.min.internal)"
+  if [ -z "$nasr_b_ip" ]; then
+    echo "::error::e2e-nasr-b.min.internal does not answer from the manager-held answerer"
+    nasr_dump_log "$NASR_STATE2_DIR"
+    fail
+  fi
+  echo "3. node B (state dir $NASR_STATE2_DIR) publishes into the service: e2e-nasr-b.min.internal answers $nasr_b_ip"
+
+  # ---- 4. stopping node A leaves B's name answering --------------------------
+  mnl session destroy --force "$nasr_a_sid" >/dev/null 2>&1 || true
+  echo "4. destroyed node A's session"
+  nasr_expect_nx e2e-nasr-a.min.internal
+  nasr_expect_a e2e-nasr-b.min.internal "$nasr_b_ip" "the manager-held answerer, node B publishing"
+  mnl stop --force >/dev/null 2>&1 || true
+  echo "  stopped node A's daemon"
+  nasr_expect_a e2e-nasr-b.min.internal "$nasr_b_ip" "the manager-held answerer, with node A gone"
+
+  # ---- cleanup: the host as found -----------------------------------------
+  nasr_mnl2 session destroy --force "$nasr_b_sid" >/dev/null 2>&1 || true
+  nasr_mnl2 stop --force >/dev/null 2>&1 || true
+  NASR_STATE2_DIR=""
+  answerer_service_teardown
+  sudo -n resolvectl revert "$NASR_REVERT_LINK" >/dev/null 2>&1 || true
+  if sudo -n ip link del "$NASR_REVERT_LINK" >/dev/null 2>&1; then
+    NASR_REVERT_LINK=""
+  else
+    echo "::warning::could not remove the dedicated link $NASR_REVERT_LINK"
+  fi
+  rm -rf "$NASR_SEED_DIR"; NASR_SEED_DIR=""
+  echo "native answerer survives session stop OK (interim, handover, second node, session and daemon stop — each printed)"
   echo "::endgroup::"
 }
 
@@ -19622,6 +19964,7 @@ case "${1:-}" in
     else
       not_run answerer_survives_session_stop "no privileged LaunchDaemon install on this lane"
     fi
+    proof_native_answerer_survives_session_stop
     proof_hostnames_recover_and_two_daemons_route
     proof_min_internal_names_through_proxy
     proof_own_ip_deny_all_box_answers_published_port
@@ -19668,7 +20011,7 @@ case "${1:-}" in
     | native_resolution_from_host_answerer_on_vm_host \
     | local_range_reserved_by_privileged_step \
     | box_name_resolves_natively_without_proxy \
-    | answerer_survives_session_stop \
+    | answerer_survives_session_stop | native_answerer_survives_session_stop \
     | hostnames_recover_and_two_daemons_route \
     | min_internal_names_through_proxy | own_ip_deny_all_box_answers_published_port \
     | port_publishes_on_listen_and_box_outlives_client \
@@ -19699,7 +20042,7 @@ case "${1:-}" in
     echo "         native_resolution_from_host_answerer_on_vm_host"
     echo "         local_range_reserved_by_privileged_step"
     echo "         box_name_resolves_natively_without_proxy"
-    echo "         answerer_survives_session_stop"
+    echo "         answerer_survives_session_stop native_answerer_survives_session_stop"
     echo "         fresh_linux_kvm_activate_local_minvmd fresh_arm64_kvm_activate_local_minvmd"
     echo "         linux_stock_install_runs_vm_boxes"
     echo "         hostnames_recover_and_two_daemons_route"
