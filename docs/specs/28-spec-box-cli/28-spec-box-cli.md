@@ -4,7 +4,7 @@ title: The box grammar — `min box`, the type nouns, and the migration from the
 owner: mitodrummer
 epic: gominimal/inbox#731
 arch: https://github.com/gominimal/arch/blob/main/architecture.md
-updated: 2026-09-25
+updated: 2026-09-29
 ---
 
 # BCLI — The box grammar — `min box`, the type nouns, and the migration from the session verbs
