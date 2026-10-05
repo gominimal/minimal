@@ -1810,7 +1810,7 @@ async fn end_run_box(
         .flatten()
         .and_then(|record| record.name);
     match mngr.delete_session(session_id).await {
-        Ok(()) => tracing::info!(
+        Ok(_) => tracing::info!(
             session_id = %session_id,
             session_name = session_name.as_deref().unwrap_or("<anonymous>"),
             task = %task,

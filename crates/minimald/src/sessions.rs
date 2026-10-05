@@ -178,7 +178,7 @@ enum ManagerMessage {
     #[cfg(test)]
     RunningCount(Responder<usize>),
     CreateSession(Box<CreateSessionMsg>),
-    DeleteSession(SessionId, Responder<()>),
+    DeleteSession(SessionId, Responder<Vec<String>>),
     Shutdown(bool, Responder<Result<(), ()>>),
     /// Fire-and-forget: drop the `running` entry for a session whose actor
     /// terminated on its own (abort, failed verdict resume, create failure).
@@ -1260,7 +1260,7 @@ impl Manager {
                     };
                     match actor {
                         Some(hnd) => {
-                            hnd.destroy().await?;
+                            let hook_failures = hnd.destroy().await?;
                             // Belt-and-braces: a dead actor (self-terminated
                             // but not yet evicted) reads as `Ok` above, and
                             // may have died *without* deleting its record
@@ -1271,10 +1271,13 @@ impl Manager {
                             {
                                 return Err(e);
                             }
+                            Ok(hook_failures)
                         }
-                        None => handle.delete().await?,
+                        None => {
+                            handle.delete().await?;
+                            Ok(Vec::new())
+                        }
                     }
-                    Ok(())
                 })
                 .await
             }
@@ -1405,7 +1408,7 @@ impl SessionControl {
     /// delete itself fails (e.g. the manager is mid-shutdown).
     pub async fn destroy(&self) -> Result<(), SessionsError> {
         match self.manager.upgrade() {
-            Some(mngr) => mngr.delete_session(self.id).await,
+            Some(mngr) => mngr.delete_session(self.id).await.map(drop),
             None => Err(SessionsError::new(
                 std::io::ErrorKind::NotConnected,
                 "sessions manager is gone",
@@ -1662,8 +1665,9 @@ impl ManagerHandle {
     /// Deletes the session with the given ID, cascadingly tearing down its
     /// running host and actor (if any) before removing its on-disk record.
     ///
+    /// On success, returns one line per `on_destroy` hook that failed.
     /// Returns a `NotFound` error if no session with that ID is known.
-    pub async fn delete_session(&self, id: SessionId) -> Result<(), SessionsError> {
+    pub async fn delete_session(&self, id: SessionId) -> Result<Vec<String>, SessionsError> {
         let (send, recv) = Responder::channel();
         // Ignore send errors - the recv will also fail.
         let _ = self
