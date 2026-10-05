@@ -4213,11 +4213,53 @@ mod tests {
             "a transient publish failure must keep the port it bound, got: {logged}"
         );
 
-        // The port it keeps is the one it named: the listener is bound and
-        // serving behind the still-failing publish — exactly the state a VM
-        // daemon is in while its host gvproxy comes up.
+        // The port the listener bound, as the publish warnings name it. The
+        // probe's port is free only until the probe drops: a parallel test
+        // can take it before the bind (an outgoing connection's ephemeral
+        // port, say), and then NET-025 relocates the *bind* — its own tests
+        // cover that — and nothing listens on the probed port. Follow the
+        // listener to where it landed, and hold it to the probed port
+        // whenever the bind did not relocate.
+        let bound_port: u16 = logged
+            .split("guest_port=")
+            .nth(1)
+            .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+            .and_then(|port| port.parse().ok())
+            .unwrap_or_else(|| {
+                panic!("the publish warning must name the bound port, got: {logged}")
+            });
+        if !logged.contains("selecting a free one") {
+            assert_eq!(
+                bound_port, default_port,
+                "a bind that did not relocate must hold the default, got: {logged}"
+            );
+        }
+        // Relocated bind or not, every failed publish proposed the port it
+        // bound: no walk, on either side of the publication.
+        let field = |line: &str, key: &str| -> Option<u16> {
+            line.split(key)
+                .nth(1)?
+                .split(|c: char| !c.is_ascii_digit())
+                .next()?
+                .parse()
+                .ok()
+        };
+        for line in logged
+            .lines()
+            .filter(|line| line.contains("could not publish on the host loopback"))
+        {
+            assert_eq!(
+                (field(line, " host_port="), field(line, " guest_port=")),
+                (Some(bound_port), Some(bound_port)),
+                "each failed publish must propose the bound port, got: {line}"
+            );
+        }
+
+        // The port it keeps is the one it bound: the listener is serving
+        // behind the still-failing publish — exactly the state a VM daemon
+        // is in while its host gvproxy comes up.
         let routed = proxy_get(
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), default_port),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), bound_port),
             "ghost.min.internal",
         )
         .await;
