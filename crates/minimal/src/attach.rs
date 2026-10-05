@@ -12,7 +12,7 @@
 //! owns its own raw-mode handling and fuzzy-filters by default.
 
 use std::fmt;
-use std::io::{IsTerminal as _, Write as _};
+use std::io::{IsTerminal as _, Write};
 
 use anyhow::Context as _;
 use minimald_rpc::ListSessionsEntry;
@@ -107,18 +107,28 @@ pub(crate) fn client_must_unwind(status: &std::process::ExitStatus) -> bool {
 /// mouse moves. Once ssh has exited normally the daemon is known to have
 /// spoken for itself, and the caller [`disarm`](Self::disarm)s: see
 /// [`client_must_unwind`] for why writing anyway is not free.
-pub(crate) struct TerminalUnwind {
+pub(crate) struct TerminalUnwind<W: Write = std::io::Stdout> {
     /// Whether the guard still owes the terminal anything on drop. Starts as
     /// "is there a terminal to write to at all" — a redirected stdout gets
     /// nothing, since the bytes would be data in whatever captured it and a
     /// pipe has no modes to restore — and is cleared by [`Self::disarm`].
     armed: bool,
+    /// The real terminal: stdout in production.
+    out: W,
 }
 
 impl TerminalUnwind {
     pub(crate) fn arm() -> Self {
+        Self::arm_on(std::io::stdout(), std::io::stdout().is_terminal())
+    }
+}
+
+impl<W: Write> TerminalUnwind<W> {
+    /// Arm over `out`, which `is_terminal` says is a terminal (or not).
+    pub(crate) fn arm_on(out: W, is_terminal: bool) -> Self {
         Self {
-            armed: std::io::stdout().is_terminal(),
+            armed: is_terminal,
+            out,
         }
     }
 
@@ -131,16 +141,15 @@ impl TerminalUnwind {
     }
 }
 
-impl Drop for TerminalUnwind {
+impl<W: Write> Drop for TerminalUnwind<W> {
     fn drop(&mut self) {
         if !self.armed {
             return;
         }
         // Best-effort: this runs on the way out of an attach, and a terminal
         // that cannot be written to is already beyond repair.
-        let mut out = std::io::stdout();
-        let _ = out.write_all(&terminal_unwind_bytes());
-        let _ = out.flush();
+        let _ = self.out.write_all(&terminal_unwind_bytes());
+        let _ = self.out.flush();
     }
 }
 

@@ -4076,6 +4076,10 @@ if [ -n "${MINVMD_GVPROXY_BIN:-}" ] && [ -x "$MINVMD_GVPROXY_BIN" ]; then
   fi_gvproxy="$MINVMD_GVPROXY_BIN"
 elif [ -x "$ROOT/.scratch/gvproxy" ]; then
   fi_gvproxy="$ROOT/.scratch/gvproxy"
+elif [ -x "$WORK/gvproxy-bin/gvproxy-min" ]; then
+  # The native lane's provisioning already staged the same pinned switch
+  # (same lock) at the top of this run — the fetch is once per run.
+  fi_gvproxy="$WORK/gvproxy-bin/gvproxy-min"
 else
   mkdir -p "$WORK/fresh-install"
   if ! "$ROOT/scripts/fetch-gvproxy.sh" "$WORK/fresh-install/gvproxy" \
@@ -6115,6 +6119,122 @@ echo "::endgroup::"
 }
 
 # ---------------------------------------------------------------------------
+# Terminal relay proof (every lane). The interactive attach no longer hands
+# the user's terminal to ssh: the client keeps it, in ssh's own raw set, and
+# relays it to ssh through a local pty. Nothing a user does at an attached
+# terminal may notice. Each attach below runs through a REAL pty
+# (scripts/e2e-attach-pty.py), on a session of its own:
+#   1. a resize while attached is what `stty size` reports in the session,
+#      then the detach chord detaches,
+#   2. a re-attach finds the session, a large paste arrives intact and in
+#      order (checksummed on both sides), and the session-exit prompt still
+#      answers ("keep"),
+#   3. killing the ssh transport mid-attach (the `min proxy` ProxyCommand,
+#      as a dropped connection) exits 255 and leaves the terminal's termios
+#      (its `stty -g`) exactly as it was before the attach,
+#   4. the session outlives the drop, and the exit prompt answers "Delete".
+proof_tty_relay() {
+echo "::group::terminal relay (resize, paste, detach + re-attach, transport drop, exit prompt)"
+local relay_sid relay_out relay_paste relay_sum
+# shellcheck disable=SC2086
+relay_sid="$(cd "$PROJECT_DIR" && mnl session activate . --name e2e-relay ${E2E_ACTIVATE_ARGS:-} 2>"$WORK/relay-activate.err")" || {
+  echo "::error::activation for the terminal relay proof failed"
+  echo "--- stderr ---"; cat "$WORK/relay-activate.err" 2>/dev/null || true
+  fail
+}
+relay_sid="$(printf '%s\n' "$relay_sid" | tail -n1 | tr -d '\r')"
+
+# 1. Resize, then the detach chord. The typed line echoes as
+# `RELAY_SIZE[%s]`; only the shell's output carries the size itself.
+# shellcheck disable=SC2016 # `$(stty size)` must run in the SESSION's shell.
+# shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
+relay_out="$(E2E_PTY_COMMANDS='echo RELAY_READY' E2E_PTY_SIZE='24 80' E2E_PTY_RESIZE='41 117' \
+  E2E_PTY_AFTER='printf "RELAY_SIZE[%s]\n" "$(stty size)"' E2E_PTY_DETACH=1 \
+  python3 "$ROOT/scripts/e2e-attach-pty.py" - \
+  min ${E2E_MINIMAL_ARGS:-} session attach "$relay_sid" 2>"$WORK/relay-resize.err")" || {
+  echo "::error::the resize-and-detach attach through the relay failed"
+  echo "--- transcript ---"; printf '%s\n' "$relay_out"
+  echo "--- stderr ---"; cat "$WORK/relay-resize.err" 2>/dev/null || true
+  fail
+}
+if [[ "$relay_out" != *"RELAY_SIZE[41 117]"* ]]; then
+  echo "::error::a resize of the attached terminal did not reach the session's 'stty size'"
+  echo "--- transcript ---"; printf '%s\n' "$relay_out"
+  fail
+fi
+if ! mnl ls --raw 2>/dev/null | grep -Fqx "$relay_sid"; then
+  echo "::error::the session is gone after the detach chord"
+  fail
+fi
+echo "resize reached the session; the detach chord detached"
+
+# 2. Re-attach, paste ~140 KB of numbered lines into `cat`, end it with
+# ctrl-D, and compare checksums. The paste is written while the session's
+# echo is read, as a terminal emulator would.
+relay_paste="$WORK/relay-paste.txt"
+for i in $(seq 1 2000); do
+  printf 'RELAY_PASTE %05d the quick brown fox jumps over the lazy dog %05d\n' "$i" "$i"
+done >"$relay_paste"
+relay_sum="$(cksum <"$relay_paste" | tr -s ' ')"
+# shellcheck disable=SC2016 # `$(cksum ...)` must run in the SESSION's shell.
+# shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
+relay_out="$(E2E_PTY_COMMANDS='cat > /home/relay-paste' E2E_PTY_PASTE_FILE="$relay_paste" \
+  E2E_PTY_AFTER="$(printf '\004')"'printf "PASTE_SUM[%s]\n" "$(cksum < /home/relay-paste | tr -s " ")"
+exit' E2E_PTY_ANSWER=keep \
+  python3 "$ROOT/scripts/e2e-attach-pty.py" - \
+  min ${E2E_MINIMAL_ARGS:-} session attach "$relay_sid" 2>"$WORK/relay-paste.err")" || {
+  echo "::error::the paste attach through the relay failed"
+  echo "--- transcript (tail) ---"; printf '%s\n' "$relay_out" | tail -n 40
+  echo "--- stderr ---"; cat "$WORK/relay-paste.err" 2>/dev/null || true
+  fail
+}
+if [[ "$relay_out" != *"PASTE_SUM[$relay_sum]"* ]]; then
+  echo "::error::a large paste did not arrive intact and in order (want cksum '$relay_sum')"
+  echo "--- transcript (tail) ---"; printf '%s\n' "$relay_out" | tail -n 40
+  fail
+fi
+if ! mnl ls --raw 2>/dev/null | grep -Fqx "$relay_sid"; then
+  echo "::error::the session is gone after answering the exit prompt with 'keep'"
+  fail
+fi
+echo "re-attach found the session; a $(wc -c <"$relay_paste" | tr -d ' ')-byte paste arrived intact; the exit prompt answered"
+
+# 3. Kill the transport mid-attach.
+# shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
+relay_out="$(E2E_PTY_COMMANDS='echo RELAY_BEFORE_DROP' E2E_PTY_KILL_TRANSPORT=1 E2E_PTY_EXPECT_EXIT=255 \
+  python3 "$ROOT/scripts/e2e-attach-pty.py" - \
+  min ${E2E_MINIMAL_ARGS:-} session attach "$relay_sid" 2>"$WORK/relay-drop.err")" || {
+  echo "::error::the transport-drop attach did not exit 255"
+  echo "--- transcript ---"; printf '%s\n' "$relay_out"
+  echo "--- stderr ---"; cat "$WORK/relay-drop.err" 2>/dev/null || true
+  fail
+}
+if [[ "$relay_out" != *OUTER_STTY_UNCHANGED* ]]; then
+  echo "::error::a dropped transport left the terminal's termios changed"
+  echo "--- transcript ---"; printf '%s\n' "$relay_out"
+  fail
+fi
+echo "a dropped transport exited 255 and left the terminal's stty -g unchanged"
+
+# 4. The session outlived the drop; leave it through the exit prompt.
+# shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
+relay_out="$(E2E_PTY_COMMANDS='echo RELAY_AFTER_DROP
+exit' python3 "$ROOT/scripts/e2e-attach-pty.py" - \
+  min ${E2E_MINIMAL_ARGS:-} session attach "$relay_sid" 2>"$WORK/relay-exit.err")" || {
+  echo "::error::the attach after the transport drop failed"
+  echo "--- transcript ---"; printf '%s\n' "$relay_out"
+  echo "--- stderr ---"; cat "$WORK/relay-exit.err" 2>/dev/null || true
+  fail
+}
+if mnl ls --raw 2>/dev/null | grep -Fqx "$relay_sid"; then
+  echo "::error::session $relay_sid still listed after answering 'Delete' at the exit prompt"
+  fail
+fi
+echo "terminal relay OK"
+echo "::endgroup::"
+}
+
+# ---------------------------------------------------------------------------
 # Session-sandbox proof (every lane). Everything above proves the lifecycle;
 # this forks a real sandbox and proves the in-sandbox `min add`. A session is
 # interactive by design, so we drive it like a real user through a REAL pty
@@ -7635,6 +7755,10 @@ proof_box_name_resolves_natively_without_proxy() {
       cp "$MINVMD_GVPROXY_BIN" "$bn_bin/gvproxy-min"
     elif [ -x "$ROOT/.scratch/gvproxy" ]; then
       cp "$ROOT/.scratch/gvproxy" "$bn_bin/gvproxy-min"
+    elif [ -x "$WORK/gvproxy-bin/gvproxy-min" ]; then
+      # The native lane's provisioning already staged the same pinned switch
+      # (same lock) at the top of this run — the fetch is once per run.
+      cp "$WORK/gvproxy-bin/gvproxy-min" "$bn_bin/gvproxy-min"
     elif [ -x "$WORK/fresh-install/gvproxy" ]; then
       # An earlier case in this same run already fetched the same pinned
       # switch (the fresh-install proof's fetch, same lock) — the fetch is
@@ -19467,6 +19591,7 @@ case "${1:-}" in
     proof_task_run
     proof_hooks
     proof_skip_scaffold
+    proof_tty_relay
     proof_sandbox
     proof_restart
     proof_own_ip_box_registers_with_the_vm_host_without_a_provider_flag
@@ -19537,7 +19662,7 @@ case "${1:-}" in
     proof_daemon_fetch_under_deny_all_host_address_box
     ;;
   lifecycle | session_exec | session_rename | session_outbound_request | own_ip | own_ip_egress_declared_and_enforced | task_run | hooks \
-    | skip_scaffold | sandbox | restart | fresh_install_own_ip_ingress_publishes_loopback \
+    | skip_scaffold | tty_relay | sandbox | restart | fresh_install_own_ip_ingress_publishes_loopback \
     | own_ip_box_registers_with_the_vm_host_without_a_provider_flag \
     | network_posture_from_stock_install | native_resolution_without_proxy_env \
     | native_resolution_from_host_answerer_on_vm_host \
@@ -19568,7 +19693,7 @@ case "${1:-}" in
     echo "usage: $0 [case]"
     echo "  no argument: every proof, in the whole-lane order"
     echo "  cases: lifecycle session_exec session_rename session_outbound_request own_ip own_ip_egress_declared_and_enforced task_run hooks"
-    echo "         skip_scaffold sandbox restart fresh_install_own_ip_ingress_publishes_loopback"
+    echo "         skip_scaffold tty_relay sandbox restart fresh_install_own_ip_ingress_publishes_loopback"
     echo "         own_ip_box_registers_with_the_vm_host_without_a_provider_flag"
     echo "         network_posture_from_stock_install native_resolution_without_proxy_env"
     echo "         native_resolution_from_host_answerer_on_vm_host"

@@ -6,6 +6,7 @@
 
 pub mod attach;
 pub mod file_upload;
+pub mod tty_relay;
 
 use std::path::Path;
 use std::sync::Arc;
