@@ -696,6 +696,7 @@ pub(crate) async fn inject(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use tracing::Instrument as _;
 
     const BOX: [u8; 4] = [100, 64, 0, 9];
     const PEER: [u8; 4] = [100, 64, 0, 1];
@@ -769,7 +770,7 @@ pub(crate) mod tests {
                 return;
             };
             let resets = resets.clone();
-            tokio::spawn(async move {
+            let serve = async move {
                 let mut chunk = [0u8; 4096];
                 let mut head = Vec::new();
                 while !head.windows(4).any(|window| window == b"\r\n\r\n") {
@@ -798,7 +799,8 @@ pub(crate) mod tests {
                         }
                     }
                 }
-            });
+            };
+            tokio::spawn(serve.in_current_span());
         }
     }
 
@@ -985,7 +987,7 @@ pub(crate) mod tests {
         let sock = dir.path().join("switch.sock");
         let listener = tokio::net::UnixListener::bind(&sock).expect("binding the stand-in switch");
         let (resets_tx, mut resets_rx) = tokio::sync::mpsc::unbounded_channel();
-        let switch = tokio::spawn(hijacking_switch(listener, resets_tx));
+        let switch = tokio::spawn(hijacking_switch(listener, resets_tx).in_current_span());
         let flows = ForwardedFlows::default();
         let now = Instant::now();
         flows.observe_toward_box(&toward_box(1, 0, TCP_SYN, 0), now);
@@ -1048,7 +1050,7 @@ pub(crate) mod tests {
         flows.observe_from_box(&from_box(501, 5, TCP_ACK, 100), now);
         let taken = flows.take_at(BOX);
         let connect: &'static [u8] = b"POST /connect HTTP/1.1\r\n\r\n";
-        let injecting = tokio::spawn(async move {
+        let inject_fut = async move {
             inject(
                 &sock,
                 connect,
@@ -1057,7 +1059,8 @@ pub(crate) mod tests {
                 Duration::from_secs(2),
             )
             .await
-        });
+        };
+        let injecting = tokio::spawn(inject_fut.in_current_span());
 
         let (mut switch, _) = listener.accept().await.expect("accepting the gate's dial");
         answer_the_probe(&mut switch, connect).await;

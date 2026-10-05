@@ -92,6 +92,42 @@ const BASE_KERNEL_CMDLINE: &str = "console=hvc0 ipv6.disable=1";
 /// architectures libkrun boots.
 const COMMAND_LINE_SIZE: usize = 2048;
 
+/// Bytes libkrun appends to the line minvmd hands `krun_set_kernel` before
+/// the guest kernel sees it, so [`BOOT_LINE_BUDGET`] keeps the whole line
+/// inside [`COMMAND_LINE_SIZE`]. minvmd is not the boot line's only writer.
+///
+/// libkrun v1.19.4 (728df812, `vendor/libkrun/libkrun.lock`) composes the
+/// line as minvmd's string, then `krun_env`, then `tsi_hijack`, then an
+/// epilog, each `insert_str` preceded by one space and checked against
+/// `CMDLINE_MAX_SIZE` by an `unwrap` that panics inside `krun_start_enter`
+/// (`src/vmm/src/builder.rs:584-595` and `:1050-1073`,
+/// `src/kernel/src/cmdline/mod.rs:94-100`: `len + more + space < capacity`).
+/// For the context minvmd builds (no `krun_set_exec`, `_workdir`, `_root`,
+/// `_rlimits` or `_env`; vsock ports and no virtio-net device, so TSI is
+/// implicit; no DHCP) that is:
+///
+/// - `krun_env`, `" {} {} {} {} {}"` of five empty parts
+///   (`src/libkrun/src/lib.rs:2907-2914`): 5 bytes, 6 with its separator;
+/// - `tsi_hijack` (`builder.rs:1053`): 11 bytes;
+/// - the epilog `" -- "` with no args (`lib.rs:2915`, `builder.rs:1073`):
+///   5 bytes;
+///
+/// 22 bytes on aarch64, whose `CMDLINE_MAX_SIZE` is 2048
+/// (`src/arch/src/aarch64/layout.rs:63`). On x86_64 libkrun's capacity is
+/// 64 KiB (`src/arch/src/x86_64/layout.rs:16`), so nothing panics, but it
+/// also inserts one ` virtio_mmio.device=4K@0x........:NN` per device
+/// (`src/vmm/src/device_manager/kvm/mmio.rs:178-181`, up to 36 bytes; this
+/// boot registers balloon, rng, console, root disk, data disk and vsock)
+/// before the epilog, and the guest kernel then truncates at its own
+/// 2048-byte `COMMAND_LINE_SIZE`, which would cut those device tokens:
+/// 22 + 6 × 36 = 238 bytes. 256 covers both, with room for one more device.
+const LIBKRUN_CMDLINE_RESERVE: usize = 256;
+
+/// The most bytes minvmd's own part of the boot line may hold:
+/// [`COMMAND_LINE_SIZE`] less the NUL terminator and less
+/// [`LIBKRUN_CMDLINE_RESERVE`].
+const BOOT_LINE_BUDGET: usize = COMMAND_LINE_SIZE - 1 - LIBKRUN_CMDLINE_RESERVE;
+
 /// Environment variable toggling `direct_io` (bypass the host page cache) on the
 /// data volume (spec R1.9). Accepts `true` / `1` (any other value is false).
 /// Defaults to `false`, correct for guest ext4 (the guest journal and page cache
@@ -293,18 +329,39 @@ impl VmConfig {
         let node_proxy_port = node_proxy_port_from_env()?;
         let publish_generation = publish_generation_from_env()?;
         let egress_deny_all_opt_out = egress_deny_all_opt_out_from_env();
-        let cmdline = kernel_cmdline(
-            rust_log.as_deref(),
-            node_proxy_port,
-            publish_generation,
-            egress_deny_all_opt_out,
+        // The host's telemetry decision crosses the same way, under the
+        // guest's own `MINIMAL_` names and never with an endpoint, headers
+        // or credentials (`telemetry::guest_env`, TEL-033); nothing is
+        // added when telemetry is off on the host. The `TRACEPARENT` this
+        // process inherited from the supervisor makes the guest daemon's boot
+        // spans children of the supervisor's `vm.boot`.
+        let guest_env = crate::telemetry::guest_env(
+            |k| std::env::var(k).ok(),
+            mlog::otel::telemetry_enabled(),
+            std::env::var(minimald_rpc::trace::TRACEPARENT_ENV)
+                .ok()
+                .as_deref(),
+        );
+        let cmdline = with_guest_env(
+            kernel_cmdline(
+                rust_log.as_deref(),
+                node_proxy_port,
+                publish_generation,
+                egress_deny_all_opt_out,
+            ),
+            &guest_env,
         );
         // The boot line at info, not debug: the kernel echoes it back as
         // `Kernel command line: …` only once its console is up, and this is
         // the one line that says what the guest was told to boot with — a
         // missing or mistyped parameter (`ipv6.disable=1` among them) is
         // diagnosable from the host before the guest says anything.
-        tracing::info!(cmdline = %cmdline, "composed the guest boot line");
+        // The telemetry tokens by name only (TEL-040): minvmd's info log is
+        // exported and spooled when telemetry is on.
+        tracing::info!(
+            cmdline = %loggable_boot_line(&cmdline, &guest_env),
+            "composed the guest boot line"
+        );
         ctx.set_kernel(
             &self.kernel_path,
             crate::image::kernel_format(),
@@ -402,6 +459,195 @@ impl VmConfig {
     }
 }
 
+/// One `KEY=VALUE` boot token carrying a host-supplied `value` to the guest,
+/// or why `value` cannot be one. Every such token minvmd puts on the boot
+/// line is built here ([`kernel_cmdline`] for `RUST_LOG`,
+/// `telemetry::guest_env` for the telemetry settings), so the line's grammar
+/// has one writer.
+///
+/// The line has two readers, and a value must be exactly one token to both:
+///
+/// - libkrun's `Cmdline` accepts only `' '..='~'` and `unwrap`s the insert,
+///   so any other char — a UTF-8 multibyte, a C0 control — panics inside
+///   `krun_start_enter` and aborts minvmd (libkrun v1.19.4
+///   `src/kernel/src/cmdline/mod.rs:51-52`, `src/vmm/src/builder.rs:586`);
+/// - the kernel's `next_arg` (`lib/cmdline.c`) splits on `isspace` outside
+///   quotes, toggles quote state on every `"`, and strips a quote pair around
+///   a value, so whitespace splits a value into further tokens and a `"`
+///   merges every later token into this one, or silently unquotes it.
+///
+/// The alphabet is their intersection: printable ASCII `0x21..=0x7E` minus
+/// `"`. A value outside it is refused, never rewritten or quoted (a value
+/// with a byte cut out means something else), and the caller warns and
+/// boots without it. Within the alphabet the value crosses byte for byte.
+#[cfg_attr(
+    all(not(minvmd_libkrun), not(test), not(kani)),
+    expect(
+        dead_code,
+        reason = "used only by the libkrun build; the tests and proofs cover it on every target"
+    )
+)]
+pub(crate) fn boot_token(key: &str, value: &str) -> Result<String, &'static str> {
+    if let Some(fault) = token_fault(value.as_bytes()) {
+        return Err(fault.reason());
+    }
+    // Copied, not formatted: the token is the key, `=` and the value byte
+    // for byte, and a copy is what the tests below can follow.
+    let mut token = String::with_capacity(key.len() + 1 + value.len());
+    token.push_str(key);
+    token.push('=');
+    token.push_str(value);
+    Ok(token)
+}
+
+/// Why a value cannot be a boot token: the class of its first byte outside
+/// the alphabet, or that it has no bytes at all. One variant per class so a
+/// proof can compare verdicts without comparing strings; [`Self::reason`]
+/// is the text a caller logs.
+#[cfg_attr(
+    all(not(minvmd_libkrun), not(test), not(kani)),
+    expect(
+        dead_code,
+        reason = "used only by the libkrun build; the tests and proofs cover it on every target"
+    )
+)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TokenFault {
+    /// No bytes: `key=` would hand the guest an empty variable.
+    Empty,
+    /// A `"`, which the kernel's tokenizer would merge later tokens into.
+    Quote,
+    /// ASCII whitespace, which the kernel would split the value on.
+    Whitespace,
+    /// Any other byte outside printable ASCII, which libkrun refuses.
+    Outside,
+}
+
+impl TokenFault {
+    /// The reason a caller logs; fixed text per class.
+    #[cfg_attr(
+        all(not(minvmd_libkrun), not(test), not(kani)),
+        expect(
+            dead_code,
+            reason = "used only by the libkrun build; the tests and proofs cover it on every target"
+        )
+    )]
+    fn reason(self) -> &'static str {
+        match self {
+            Self::Empty => "value is empty",
+            Self::Quote => {
+                "value contains a double quote, which the kernel would merge later tokens into"
+            }
+            Self::Whitespace => {
+                "value contains whitespace, which the kernel would split into separate boot tokens"
+            }
+            Self::Outside => "value contains a byte outside printable ASCII, which libkrun refuses",
+        }
+    }
+}
+
+/// The recognizer behind [`boot_token`], on bytes alone: `None` when
+/// `value` is non-empty and every byte passes [`boot_byte`], else the class
+/// of the first byte that does not (or [`TokenFault::Empty`]). No string is
+/// built or compared here, so a proof can run it over every byte value in
+/// every position of a short value.
+#[cfg_attr(
+    all(not(minvmd_libkrun), not(test), not(kani)),
+    expect(
+        dead_code,
+        reason = "used only by the libkrun build; the tests and proofs cover it on every target"
+    )
+)]
+fn token_fault(value: &[u8]) -> Option<TokenFault> {
+    if value.is_empty() {
+        return Some(TokenFault::Empty);
+    }
+    match value.iter().find(|b| !boot_byte(**b)) {
+        None => None,
+        Some(b'"') => Some(TokenFault::Quote),
+        Some(b) if b.is_ascii_whitespace() => Some(TokenFault::Whitespace),
+        Some(_) => Some(TokenFault::Outside),
+    }
+}
+
+/// Whether `b` may appear in a boot token: printable ASCII minus `"`; see
+/// [`boot_token`].
+#[cfg_attr(
+    all(not(minvmd_libkrun), not(test), not(kani)),
+    expect(
+        dead_code,
+        reason = "used only by the libkrun build; the tests and proofs cover it on every target"
+    )
+)]
+fn boot_byte(b: u8) -> bool {
+    (0x21..=0x7e).contains(&b) && b != b'"'
+}
+
+/// The bytes a line of `base_len` bytes takes once every token in
+/// `token_lens` follows it, one separating space before each. The one
+/// place the boot line's length is reckoned, so [`append_tokens`] and the
+/// proofs below judge the same sum.
+#[cfg_attr(
+    all(not(minvmd_libkrun), not(test), not(kani)),
+    expect(
+        dead_code,
+        reason = "used only by the libkrun build; the tests and proofs cover it on every target"
+    )
+)]
+fn line_len(base_len: usize, token_lens: impl IntoIterator<Item = usize>) -> usize {
+    token_lens
+        .into_iter()
+        .fold(base_len, |len, token| len + 1 + token)
+}
+
+/// The verdict on a line of `base_len` bytes with tokens of `token_lens`
+/// after it, passed on lengths alone: the length [`line_len`] reckons, as
+/// `Ok` when it is within [`BOOT_LINE_BUDGET`] and as `Err` when it is not.
+/// The one place that decides whether tokens cross, so [`append_tokens`]
+/// and the proofs below pass the same judgement — and the proofs state it
+/// on lengths, never on a string, which keeps them cheap to verify.
+#[cfg_attr(
+    all(not(minvmd_libkrun), not(test), not(kani)),
+    expect(
+        dead_code,
+        reason = "used only by the libkrun build; the tests and proofs cover it on every target"
+    )
+)]
+fn within_budget(
+    base_len: usize,
+    token_lens: impl IntoIterator<Item = usize>,
+) -> Result<usize, usize> {
+    let total = line_len(base_len, token_lens);
+    if total > BOOT_LINE_BUDGET {
+        Err(total)
+    } else {
+        Ok(total)
+    }
+}
+
+/// `base` with every token in `tokens` after it, one space before each, when
+/// that line is within [`BOOT_LINE_BUDGET`]; otherwise the length the line
+/// would have had, and no line. The pure core of [`kernel_cmdline`]'s filter
+/// step and of [`with_guest_env`]: a line comes back whole or not at all,
+/// never cut inside a token. [`within_budget`] decides; this only copies.
+#[cfg_attr(
+    all(not(minvmd_libkrun), not(test), not(kani)),
+    expect(
+        dead_code,
+        reason = "used only by the libkrun build; the tests and proofs cover it on every target"
+    )
+)]
+fn append_tokens(base: &str, tokens: &[String]) -> Result<String, usize> {
+    let total = within_budget(base.len(), tokens.iter().map(String::len))?;
+    let mut line = String::with_capacity(total);
+    line.push_str(base);
+    for t in tokens {
+        line.push(' ');
+        line.push_str(t);
+    }
+    Ok(line)
+}
+
 /// Build the guest kernel command line, forwarding `RUST_LOG` when the host has
 /// one worth forwarding and the node's proxy port when the supervisor handed
 /// it.
@@ -436,18 +682,25 @@ impl VmConfig {
 /// the boot's publish generation (T93), which the guest daemon echoes in its
 /// publish reports, rides beside the port and, like it, is never skipped; the
 /// egress opt-out (NET-077) rides the same way, and is only written when the
-/// operator set it. A
-/// `RUST_LOG` value that cannot survive the boot line is skipped (leaving the
-/// base line plus the port token byte-identical) with a warning, rather than
-/// corrupting the boot: whitespace would be split into separate boot tokens, an
-/// empty value carries nothing, and an over-long one would overrun
-/// [`COMMAND_LINE_SIZE`]. The port is never skipped — the guest binds it as
-/// handed — so its token counts against [`COMMAND_LINE_SIZE`] when the filter's
-/// length is judged. Commas are untouched — `info,russh=debug` is the normal
-/// form.
+/// operator set it. A `RUST_LOG` value that cannot survive the boot line is
+/// skipped (leaving the base line plus the port, generation and opt-out
+/// tokens byte-identical) with a warning, rather than corrupting the boot: a
+/// value outside the boot alphabet is not one token to the kernel or not a
+/// line libkrun accepts ([`boot_token`]), an empty value carries nothing, and
+/// an over-long one would push the line past [`BOOT_LINE_BUDGET`]. The port,
+/// the generation and the opt-out are never skipped — the guest binds the
+/// port as handed — so their tokens count against the budget when the
+/// filter's length is judged. Commas are untouched — `info,russh=debug` is
+/// the normal form.
 // Only `apply` calls this, and `apply` needs libkrun; without it the crate is a
 // runtime-bailing stub, but the tests below still cover this on every target.
-#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+#[cfg_attr(
+    all(not(minvmd_libkrun), not(test)),
+    expect(
+        dead_code,
+        reason = "used only by the libkrun build; the tests cover it on every target"
+    )
+)]
 fn kernel_cmdline(
     rust_log: Option<&str>,
     proxy_port: Option<u16>,
@@ -483,33 +736,45 @@ fn kernel_cmdline(
         return base_with_port;
     };
 
-    // `<base-with-ports> RUST_LOG=<value>`: the three extra bytes are the
-    // separating space, the `=`, and the NUL the kernel's buffer must also
-    // hold.
-    let joined = format!("{base_with_port} {GUEST_LOG_ENV}={value}");
-    let rejection = if value.is_empty() {
-        Some("value is empty")
-    } else if value.contains(char::is_whitespace) {
-        Some("value contains whitespace, which the kernel would split into separate boot tokens")
-    } else if joined.len() + 1 > COMMAND_LINE_SIZE {
-        Some("value would push the boot line past the kernel's COMMAND_LINE_SIZE")
-    } else {
-        None
+    // `<base-with-port> RUST_LOG=<value>`, judged against the budget that
+    // leaves libkrun's suffix and the NUL inside the kernel's buffer.
+    let token = match boot_token(GUEST_LOG_ENV, value) {
+        Ok(token) => token,
+        Err(reason) => return skip_log_filter(base_with_port, value, reason),
     };
-
-    match rejection {
-        Some(reason) => {
-            tracing::warn!(
-                env = GUEST_LOG_ENV,
-                value_len = value.len(),
-                reason,
-                "not forwarding the host log filter to the guest; the guest keeps minimald's \
-                 default filter",
-            );
-            base_with_port
-        }
-        None => Cow::Owned(joined),
+    match append_tokens(&base_with_port, std::slice::from_ref(&token)) {
+        Ok(line) => Cow::Owned(line),
+        Err(_) => skip_log_filter(
+            base_with_port,
+            value,
+            "value would push the boot line past the budget that keeps libkrun's suffix inside \
+             the kernel's COMMAND_LINE_SIZE",
+        ),
     }
+}
+
+/// The boot line without the host's `RUST_LOG`, warning why it was skipped;
+/// see [`kernel_cmdline`].
+#[cfg_attr(
+    all(not(minvmd_libkrun), not(test)),
+    expect(
+        dead_code,
+        reason = "used only by the libkrun build; the tests cover it on every target"
+    )
+)]
+fn skip_log_filter(
+    base_with_port: Cow<'static, str>,
+    value: &str,
+    reason: &'static str,
+) -> Cow<'static, str> {
+    tracing::warn!(
+        env = GUEST_LOG_ENV,
+        value_len = value.len(),
+        reason,
+        "not forwarding the host log filter to the guest; the guest keeps minimald's default \
+         filter",
+    );
+    base_with_port
 }
 
 /// Reads the node's proxy port the supervisor handed the VMM child in its env
@@ -587,6 +852,63 @@ pub(crate) fn egress_deny_all_opt_out_from_env() -> bool {
     )
 }
 
+/// Append `tokens` (`KEY=VALUE` boot tokens from [`crate::telemetry::guest_env`],
+/// each built by [`boot_token`]) to `base`, all of them or none: if they
+/// would push the line past [`BOOT_LINE_BUDGET`], the guest boots with
+/// `base` and a warning, since a half-forwarded telemetry configuration (an
+/// enable without its endpoint) would export somewhere unintended or
+/// nowhere. The cut is at a token boundary, never inside a value.
+#[cfg_attr(
+    all(not(minvmd_libkrun), not(test)),
+    expect(
+        dead_code,
+        reason = "used only by the libkrun build; the tests cover it on every target"
+    )
+)]
+fn with_guest_env(base: Cow<'static, str>, tokens: &[String]) -> Cow<'static, str> {
+    if tokens.is_empty() {
+        return base;
+    }
+    match append_tokens(&base, tokens) {
+        Ok(line) => Cow::Owned(line),
+        Err(total) => {
+            tracing::warn!(
+                tokens = tokens.len(),
+                total,
+                budget = BOOT_LINE_BUDGET,
+                "not forwarding telemetry settings to the guest: the boot line would pass the \
+                 budget that keeps libkrun's suffix inside the kernel's COMMAND_LINE_SIZE",
+            );
+            base
+        }
+    }
+}
+
+/// `cmdline` as minvmd logs it: every word as it is, except a telemetry
+/// token from `tokens` ([`crate::telemetry::guest_env`]), which is logged
+/// as its key alone, `KEY=…`. The kernel's own parameters stay readable,
+/// so a missing or mistyped one is still diagnosable from the host, and no
+/// telemetry value (the filter, `TRACEPARENT`) reaches the log, which is
+/// exported and spooled when telemetry is on (TEL-040). A token the budget
+/// dropped is not in `cmdline` and is not logged at all.
+#[cfg_attr(
+    all(not(minvmd_libkrun), not(test)),
+    expect(
+        dead_code,
+        reason = "used only by the libkrun build; the tests cover it on every target"
+    )
+)]
+fn loggable_boot_line(cmdline: &str, tokens: &[String]) -> String {
+    cmdline
+        .split(' ')
+        .map(|word| match word.split_once('=') {
+            Some((key, _)) if tokens.iter().any(|t| t == word) => format!("{key}=…"),
+            _ => word.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Resolve the data-volume `(direct_io, sync_mode)` from the R1.9 environment
 /// tunables ([`DISK_DIRECT_IO_ENV`], [`DISK_SYNC_ENV`]). Defaults: `direct_io =
 /// false`, `sync_mode = Relaxed`.
@@ -628,6 +950,244 @@ fn resolve_disk_flags() -> (bool, crate::krun::SyncMode) {
     };
 
     (direct_io, sync_mode)
+}
+
+/// The widest line [`kernel_cmdline`] can make before the filter: every
+/// token it adds to the base line present, the port and the publish
+/// generation at their most digits and the egress opt-out set. The proofs
+/// take it as the bound on the base line, and
+/// `widest_base_len_covers_every_base_token` checks it against
+/// `kernel_cmdline` itself, so a token added there has to be added here.
+#[cfg(any(test, kani))]
+fn widest_base_len() -> usize {
+    line_len(
+        BASE_KERNEL_CMDLINE.len(),
+        [
+            HOSTNAME_PROXY_PORT_TOKEN.len() + 1 + "65535".len(),
+            PUBLISH_GENERATION_TOKEN.len() + 1 + "18446744073709551615".len(),
+            EGRESS_DENY_ALL_OPT_OUT_TOKEN.len() + "=1".len(),
+        ],
+    )
+}
+
+#[cfg(kani)]
+mod kani_proofs {
+    //! Bounded proofs over the boot line, all on bytes and lengths, never
+    //! on a `String`. The two alphabet proofs run `boot_byte` over every
+    //! byte and `token_fault` over every byte value in every position of a
+    //! value of up to `N` bytes; the three budget proofs state the budget
+    //! on symbolic `usize`s into `line_len` and `within_budget`. CBMC
+    //! models every byte of a `String`, and a `String` of symbolic chars
+    //! (UTF-8 encoding, `push_str`, `with_capacity`, a memcmp of the result)
+    //! is what took the lane past 300 GB and then past a 64 GB ceiling, so
+    //! the one claim that needs the `String` — that `boot_token` returns
+    //! `key=value` byte for byte with no whitespace and no NUL — is a plain
+    //! test over every one-char value and a set of longer ones
+    //! (`every_accepted_token_is_key_equals_value`), as the bytes of a line
+    //! at the budget are (`a_filter_at_the_budget_crosses_whole_or_not_at_all`,
+    //! `guest_env_tokens_at_the_budget_cross_all_or_none`).
+    use super::{
+        BOOT_LINE_BUDGET, COMMAND_LINE_SIZE, GUEST_LOG_ENV, LIBKRUN_CMDLINE_RESERVE, TokenFault,
+        boot_byte, line_len, token_fault, widest_base_len, within_budget,
+    };
+
+    /// Bytes in a proved value. Three covers the first-offending-byte rule:
+    /// an offender behind up to two legal bytes, behind another offender of
+    /// the same or another class, and ahead of either; every position
+    /// ranges over all 256 byte values. More bytes only multiply the cost.
+    const N: usize = 3;
+
+    /// The alphabet both readers of the boot line agree on, stated here on
+    /// its own so the proofs do not lean on `boot_byte`: printable ASCII
+    /// `0x21..=0x7E` without `"`.
+    fn in_alphabet(b: u8) -> bool {
+        (0x21..=0x7e).contains(&b) && b != b'"'
+    }
+
+    /// `boot_byte` is the alphabet exactly: for every one of the 256 byte
+    /// values it holds iff the byte is printable ASCII `0x21..=0x7E` and not
+    /// `"`. No whitespace byte, no NUL and no byte from `0x80` up passes, so
+    /// a value it admits has nothing the kernel splits on, nothing it quotes
+    /// and nothing libkrun refuses. No loop, so no unwinding bound.
+    #[kani::proof]
+    fn boot_byte_is_printable_ascii_without_a_quote() {
+        let b: u8 = kani::any();
+        assert_eq!(boot_byte(b), in_alphabet(b));
+        if boot_byte(b) {
+            assert!(!b.is_ascii_whitespace(), "whitespace passes");
+            assert_ne!(b, 0, "NUL passes");
+            assert_ne!(b, b'"', "a quote passes");
+            assert!(b.is_ascii_graphic(), "a byte libkrun refuses passes");
+        }
+    }
+
+    // Unwinding for the token proof: the longest loop is `token_fault`'s
+    // `find` over the value's up to `N` bytes (the harness's own `find` is
+    // the same length), and a Rust `for` needs one unwinding more than its
+    // iterations, so `N + 1` (4 at `N = 3`) is the least that verifies; 5
+    // leaves one spare. The attribute takes a literal, so the figure is
+    // written out.
+
+    /// `token_fault` is the whole of `boot_token`'s verdict: for a value of
+    /// any length up to `N`, each byte any of the 256 values, it is `None`
+    /// exactly when the value is non-empty and every byte is in the
+    /// alphabet, and otherwise names the class of the first byte outside
+    /// it — `Empty` for no bytes, else `Quote`, `Whitespace` or `Outside`
+    /// by that byte alone, whatever follows it.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn token_fault_names_the_first_byte_outside_the_alphabet() {
+        let bytes: [u8; N] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= N);
+        let value = &bytes[..len];
+        let first_outside = value.iter().copied().find(|b| !in_alphabet(*b));
+        match token_fault(value) {
+            None => {
+                assert!(!value.is_empty(), "an empty value was accepted");
+                assert!(
+                    first_outside.is_none(),
+                    "a value outside the alphabet was accepted"
+                );
+            }
+            Some(TokenFault::Empty) => assert!(value.is_empty(), "a value with bytes is empty"),
+            Some(fault) => {
+                let b = first_outside.expect("a value inside the alphabet was refused");
+                let want = if b == b'"' {
+                    TokenFault::Quote
+                } else if b.is_ascii_whitespace() {
+                    TokenFault::Whitespace
+                } else {
+                    TokenFault::Outside
+                };
+                assert_eq!(fault, want, "the reason is not the first offending byte's");
+            }
+        }
+    }
+
+    // Unwinding for the three budget proofs: their only loops are
+    // `line_len`'s fold over an array of one or two token lengths, two
+    // iterations at most, so three unwindings — and, in the first, the same
+    // fold over `widest_base_len`'s three token lengths, so four there; a
+    // loop that ran longer would fail the unwinding assertion out loud rather
+    // than unwind without a bound, which is what a harness with no attribute
+    // lets CBMC do.
+
+    /// The budget is the kernel's buffer less the NUL and less libkrun's
+    /// reserve, so a line within it, with libkrun's suffix appended, fits
+    /// `COMMAND_LINE_SIZE`; and for a `RUST_LOG` value of any length `n`
+    /// behind a base line of any length up to the widest the port, the
+    /// generation and the egress opt-out can make (`widest_base_len`), the
+    /// verdict is `Ok` exactly when
+    /// `n <= BOOT_LINE_BUDGET - base - len("RUST_LOG=") - 1`, so a filter
+    /// is forwarded or skipped on its length alone, and a one-byte filter
+    /// always fits: the port, the generation and the opt-out, which are
+    /// never skipped, never fill the budget on their own.
+    #[kani::proof]
+    #[kani::unwind(4)]
+    fn the_budget_leaves_libkrun_its_reserve() {
+        assert_eq!(
+            BOOT_LINE_BUDGET + LIBKRUN_CMDLINE_RESERVE + 1,
+            COMMAND_LINE_SIZE
+        );
+        let base_len: usize = kani::any();
+        kani::assume(base_len <= widest_base_len());
+        let n: usize = kani::any();
+        kani::assume(n <= COMMAND_LINE_SIZE + 16);
+        let room = BOOT_LINE_BUDGET - base_len - GUEST_LOG_ENV.len() - 2;
+        match within_budget(base_len, [GUEST_LOG_ENV.len() + 1 + n]) {
+            Ok(total) => {
+                assert!(n <= room, "a filter past the room was forwarded");
+                assert!(
+                    total + LIBKRUN_CMDLINE_RESERVE + 1 <= COMMAND_LINE_SIZE,
+                    "a line within the budget leaves libkrun no room"
+                );
+            }
+            Err(_) => assert!(n > room, "a filter within the room was skipped"),
+        }
+        assert!(
+            matches!(within_budget(base_len, [GUEST_LOG_ENV.len() + 2]), Ok(_)),
+            "a one-byte filter does not fit behind the port, the generation and the opt-out"
+        );
+    }
+
+    /// A filter token is forwarded or skipped whole, on its length alone:
+    /// for a base line and a token of any lengths up to the kernel's buffer,
+    /// the verdict is `Ok` with the length of base, a space and the whole
+    /// token when that is within the budget, and `Err` with that same
+    /// length when it is not — no third outcome, and never a length that
+    /// counts a part of the token. That the admitted line is base, a space
+    /// and the token byte for byte is a plain test on a base line at the
+    /// boundary, `a_filter_at_the_budget_crosses_whole_or_not_at_all`.
+    #[kani::proof]
+    #[kani::unwind(3)]
+    fn a_filter_at_the_budget_is_forwarded_or_skipped_whole() {
+        let base_len: usize = kani::any();
+        kani::assume(base_len <= COMMAND_LINE_SIZE);
+        let token_len: usize = kani::any();
+        kani::assume(token_len <= COMMAND_LINE_SIZE);
+        let want = base_len + 1 + token_len;
+        assert_eq!(line_len(base_len, [token_len]), want);
+        match within_budget(base_len, [token_len]) {
+            Ok(total) => {
+                assert_eq!(total, want, "a forwarded line is not base, space, token");
+                assert!(total <= BOOT_LINE_BUDGET, "a line over the budget");
+            }
+            Err(total) => {
+                assert_eq!(total, want, "a refusal does not report the line's length");
+                assert!(
+                    total > BOOT_LINE_BUDGET,
+                    "a line within the budget was refused"
+                );
+            }
+        }
+    }
+
+    /// The telemetry tokens cross all or none: for a base line and two
+    /// tokens of any lengths up to the kernel's buffer, the pair gets one
+    /// verdict — `Ok` with the length of base and both tokens, a space
+    /// before each, or `Err` with that same length — never a verdict on one
+    /// of them, so the caller boots on the whole set or on `base` alone.
+    /// The length is the set's, not the order's; and a pair that fits has
+    /// each token fitting on its own, so a refusal of the pair is the pair's
+    /// length and not a token's. That an admitted line holds every token in
+    /// order is a plain test on a base line at the boundary,
+    /// `guest_env_tokens_at_the_budget_cross_all_or_none`.
+    #[kani::proof]
+    #[kani::unwind(3)]
+    fn guest_env_tokens_cross_all_or_none() {
+        let base_len: usize = kani::any();
+        kani::assume(base_len <= COMMAND_LINE_SIZE);
+        let first: usize = kani::any();
+        kani::assume(first <= COMMAND_LINE_SIZE);
+        let second: usize = kani::any();
+        kani::assume(second <= COMMAND_LINE_SIZE);
+        let want = base_len + 1 + first + 1 + second;
+        assert_eq!(line_len(base_len, [first, second]), want);
+        assert_eq!(
+            line_len(base_len, [second, first]),
+            want,
+            "the length depends on the order"
+        );
+        match within_budget(base_len, [first, second]) {
+            Ok(total) => {
+                assert_eq!(total, want, "a forwarded line is not base then every token");
+                assert!(total <= BOOT_LINE_BUDGET, "a line over the budget");
+                assert!(
+                    matches!(within_budget(base_len, [first]), Ok(_))
+                        && matches!(within_budget(base_len, [second]), Ok(_)),
+                    "a pair fits but a token of it does not"
+                );
+            }
+            Err(total) => {
+                assert_eq!(total, want, "a refusal does not report the line's length");
+                assert!(
+                    total > BOOT_LINE_BUDGET,
+                    "a line within the budget was refused"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -714,19 +1274,393 @@ mod tests {
     }
 
     #[test]
-    fn kernel_cmdline_forwards_the_longest_filter_that_fits_the_kernel_buffer() {
-        // `console=hvc0 ipv6.disable=1 RUST_LOG=` is 37 bytes, so a 2010-byte
-        // value yields a 2047-byte line that fills COMMAND_LINE_SIZE exactly
-        // once NUL-terminated.
-        let longest = "d".repeat(2010);
+    fn kernel_cmdline_forwards_the_longest_filter_that_fits_the_budget() {
+        // The budget is the kernel's buffer less the NUL and less what
+        // libkrun appends (F12).
+        assert_eq!(
+            BOOT_LINE_BUDGET + LIBKRUN_CMDLINE_RESERVE + 1,
+            COMMAND_LINE_SIZE
+        );
+        // `console=hvc0 ipv6.disable=1 RUST_LOG=` (37 bytes today, computed
+        // from the constants so the base line may change) precedes the
+        // value, so this value yields a line that fills the budget exactly.
+        let prefix = format!("{BASE_KERNEL_CMDLINE} {GUEST_LOG_ENV}=").len();
+        let longest = "d".repeat(BOOT_LINE_BUDGET - prefix);
         let line = kernel_cmdline(Some(&longest), None, None, false);
-        assert_eq!(line.len(), COMMAND_LINE_SIZE - 1);
+        assert_eq!(line.len(), BOOT_LINE_BUDGET);
         assert!(line.ends_with(&longest));
 
         // One byte more must be skipped, not truncated.
         assert_eq!(
-            kernel_cmdline(Some(&"d".repeat(2011)), None, None, false),
+            kernel_cmdline(
+                Some(&"d".repeat(BOOT_LINE_BUDGET - prefix + 1)),
+                None,
+                None,
+                false
+            ),
             "console=hvc0 ipv6.disable=1"
+        );
+    }
+
+    /// The same two witnesses behind the widest line the port, the
+    /// generation and the egress opt-out can make: the longest filter that
+    /// still crosses fills the budget exactly, and one byte more is skipped
+    /// while the port, the generation and the opt-out still boot.
+    #[test]
+    fn kernel_cmdline_forwards_the_longest_filter_behind_the_widest_port_and_generation() {
+        let base = kernel_cmdline(None, Some(u16::MAX), Some(u64::MAX), true);
+        let prefix = format!("{base} {GUEST_LOG_ENV}=").len();
+        let longest = "d".repeat(BOOT_LINE_BUDGET - prefix);
+        let line = kernel_cmdline(Some(&longest), Some(u16::MAX), Some(u64::MAX), true);
+        assert_eq!(line.len(), BOOT_LINE_BUDGET);
+        assert!(line.starts_with(&*base) && line.ends_with(&longest));
+        assert_eq!(
+            kernel_cmdline(
+                Some(&"d".repeat(BOOT_LINE_BUDGET - prefix + 1)),
+                Some(u16::MAX),
+                Some(u64::MAX),
+                true
+            ),
+            base
+        );
+    }
+
+    /// `widest_base_len`, the bound the budget proofs put on the line before
+    /// the filter, covers every token `kernel_cmdline` adds to the base line:
+    /// with each optional token set at its widest and no filter, the line is
+    /// no longer than the bound. A token added to `kernel_cmdline` and not to
+    /// the bound fails here, rather than leaving the widest real base line
+    /// outside what the proofs assume.
+    #[test]
+    fn widest_base_len_covers_every_base_token() {
+        let widest = kernel_cmdline(None, Some(u16::MAX), Some(u64::MAX), true);
+        assert!(
+            widest.len() <= widest_base_len(),
+            "the widest base line is {} bytes, past widest_base_len() = {}: {widest}",
+            widest.len(),
+            widest_base_len()
+        );
+    }
+
+    /// Scenario 715g (the lab probe): a build without the budget took
+    /// `RUST_LOG` filters of 1600 to 1760 bytes onto the line and libkrun
+    /// panicked inside `krun_start_enter`. With the budget, the ends of that
+    /// range are decided: 1600 bytes cross, with or without the port and the
+    /// generation, and 1760 are skipped; every line handed on leaves libkrun
+    /// its reserve.
+    #[test]
+    fn kernel_cmdline_decides_the_filter_lengths_the_lab_probe_crashed_on() {
+        for (port, generation) in [(None, None), (Some(u16::MAX), Some(u64::MAX))] {
+            let base = kernel_cmdline(None, port, generation, false);
+            let crosses = "d".repeat(1600);
+            let line = kernel_cmdline(Some(&crosses), port, generation, false);
+            assert!(line.ends_with(&crosses), "a 1600-byte filter was skipped");
+            assert!(line.len() + LIBKRUN_CMDLINE_RESERVE < COMMAND_LINE_SIZE);
+            assert_eq!(
+                kernel_cmdline(Some(&"d".repeat(1760)), port, generation, false),
+                base,
+                "a 1760-byte filter crossed"
+            );
+        }
+    }
+
+    /// The pure core behind `kernel_cmdline`'s filter step and
+    /// `with_guest_env`: a line comes back whole or not at all, and a
+    /// refusal reports the length the line would have had, so the warning
+    /// can say by how much it passed the budget.
+    #[test]
+    fn append_tokens_reports_the_length_a_dropped_line_would_have_had() {
+        let tokens = vec!["A=1".to_string(), "B=22".to_string()];
+        assert_eq!(
+            append_tokens("base", &tokens).as_deref(),
+            Ok("base A=1 B=22")
+        );
+        let base = "d".repeat(BOOT_LINE_BUDGET - " A=1 B=22".len());
+        assert_eq!(
+            append_tokens(&base, &tokens).as_deref(),
+            Ok(format!("{base} A=1 B=22").as_str())
+        );
+        assert_eq!(
+            append_tokens(&format!("{base}d"), &tokens),
+            Err(BOOT_LINE_BUDGET + 1)
+        );
+    }
+
+    /// The bytes behind the Kani harness
+    /// `a_filter_at_the_budget_is_forwarded_or_skipped_whole`, which states
+    /// the verdict on lengths alone: with a real base line two bytes short
+    /// of leaving room for the shortest `RUST_LOG` token (1779 bytes at
+    /// today's budget), a token `boot_token` built is appended whole when
+    /// the line is within the budget and not at all when it is not; the
+    /// appended line is `base`, a space and the token, its length the one
+    /// `line_len` reckons, and a refusal reports that same length.
+    #[test]
+    fn a_filter_at_the_budget_crosses_whole_or_not_at_all() {
+        // `base + " RUST_LOG=" + v` fits iff `v.len() <= 2`; values run from
+        // 1 to 8 bytes, so both outcomes are reached.
+        let base = "d".repeat(BOOT_LINE_BUDGET - GUEST_LOG_ENV.len() - 4);
+        for n in 1..=8 {
+            let token = boot_token(GUEST_LOG_ENV, &"v".repeat(n)).unwrap();
+            let want = line_len(base.len(), [token.len()]);
+            match append_tokens(&base, std::slice::from_ref(&token)) {
+                Ok(line) => {
+                    assert!(n <= 2, "a line over the budget crossed ({n})");
+                    assert_eq!(line.len(), want);
+                    assert_eq!(line, format!("{base} {token}"));
+                }
+                Err(total) => {
+                    assert!(n > 2, "a line within the budget was refused ({n})");
+                    assert_eq!(total, want);
+                    assert!(total > BOOT_LINE_BUDGET);
+                }
+            }
+        }
+    }
+
+    /// The bytes behind the Kani harness `guest_env_tokens_cross_all_or_none`:
+    /// with a base line at the boundary and two tokens `boot_token` built,
+    /// the line that comes back is within the budget and holds `base`, then
+    /// every token in order, one space before each; when the line would
+    /// pass the budget nothing comes back but the length it would have had,
+    /// so the caller boots on `base` alone and never on a part of the set.
+    #[test]
+    fn guest_env_tokens_at_the_budget_cross_all_or_none() {
+        let keys = ["MINIMAL_TELEMETRY", "MINIMAL_OTEL_FILTER"];
+        // Both tokens fit iff their values total at most 8 bytes; each runs
+        // from 1 to 8 bytes, so both outcomes are reached.
+        let base = "d".repeat(BOOT_LINE_BUDGET - keys[0].len() - keys[1].len() - 4 - 8);
+        for a in 1..=8 {
+            for b in 1..=8 {
+                let tokens = [
+                    boot_token(keys[0], &"v".repeat(a)).unwrap(),
+                    boot_token(keys[1], &"w".repeat(b)).unwrap(),
+                ];
+                let want = line_len(base.len(), tokens.iter().map(String::len));
+                match append_tokens(&base, &tokens) {
+                    Ok(line) => {
+                        assert!(a + b <= 8, "a line over the budget crossed ({a}, {b})");
+                        assert_eq!(line.len(), want);
+                        assert_eq!(line, format!("{base} {} {}", tokens[0], tokens[1]));
+                    }
+                    Err(total) => {
+                        assert!(a + b > 8, "a line within the budget was refused ({a}, {b})");
+                        assert_eq!(total, want);
+                        assert!(total > BOOT_LINE_BUDGET);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The alphabet of a boot value is the intersection of what libkrun's
+    /// `Cmdline` accepts and what the kernel's tokenizer reads as part of
+    /// one token: printable ASCII `0x21..=0x7E` without `"`. Every other
+    /// char is refused.
+    #[test]
+    fn boot_token_accepts_exactly_the_bytes_both_readers_agree_on() {
+        for c in (0u8..=0xff).map(char::from) {
+            let value = format!("a{c}z");
+            let accepted = boot_token("K", &value).is_ok();
+            let in_alphabet = ('\u{21}'..='\u{7e}').contains(&c) && c != '"';
+            assert_eq!(accepted, in_alphabet, "{c:?} ({:#x})", u32::from(c));
+            if accepted {
+                assert_eq!(boot_token("K", &value).unwrap(), format!("K={value}"));
+            }
+        }
+        boot_token("K", "").unwrap_err();
+        boot_token("K", "\u{1f496}").unwrap_err();
+    }
+
+    /// Every value `boot_token` accepts comes back as `key=value` byte for
+    /// byte — nothing rewritten, quoted or cut — holding no whitespace and
+    /// no NUL, so the kernel reads it as one token and libkrun takes it;
+    /// and every refusal is `token_fault`'s verdict on the value's bytes,
+    /// with the fixed reason for the first offending byte's class. Over
+    /// every one-char value (a char from `0x80` up is two bytes, both
+    /// outside ASCII) and a set of longer values that put an offender
+    /// behind legal bytes and behind another offender. The alphabet itself
+    /// and the first-offending-byte rule are proved on bytes in
+    /// `kani_proofs`; this test is where the `String` is checked, cheap here
+    /// and the lane's memory sink under CBMC.
+    #[test]
+    fn every_accepted_token_is_key_equals_value() {
+        fn check(value: &str) {
+            let fault = token_fault(value.as_bytes());
+            match boot_token(GUEST_LOG_ENV, value) {
+                Ok(token) => {
+                    assert_eq!(fault, None, "{value:?}: accepted with a fault");
+                    assert_eq!(token, format!("{GUEST_LOG_ENV}={value}"), "{value:?}");
+                    assert_eq!(token.len(), GUEST_LOG_ENV.len() + 1 + value.len());
+                    assert!(
+                        token.bytes().all(|b| !b.is_ascii_whitespace() && b != 0),
+                        "{value:?}: whitespace or NUL in a token"
+                    );
+                    assert!(
+                        value.bytes().all(boot_byte),
+                        "{value:?}: a byte outside the alphabet crossed"
+                    );
+                }
+                Err(reason) => {
+                    let fault =
+                        fault.unwrap_or_else(|| panic!("{value:?}: refused without a fault"));
+                    assert_eq!(reason, fault.reason(), "{value:?}");
+                    let want = if value.is_empty() {
+                        TokenFault::Empty
+                    } else {
+                        match value.bytes().find(|b| !boot_byte(*b)) {
+                            Some(b'"') => TokenFault::Quote,
+                            Some(b) if b.is_ascii_whitespace() => TokenFault::Whitespace,
+                            Some(_) => TokenFault::Outside,
+                            None => panic!("{value:?}: refused inside the alphabet"),
+                        }
+                    };
+                    assert_eq!(fault, want, "{value:?}");
+                }
+            }
+        }
+        for c in (0u8..=0xff).map(char::from) {
+            check(&c.to_string());
+        }
+        for value in [
+            "",
+            "debug",
+            "minvmd=trace,hyper=warn",
+            "a\"b",
+            "a b",
+            "ab\u{80}",
+            "a\0",
+            "\"\t",
+            "\t\"",
+            "\u{e9}\"",
+            "\"\u{e9}",
+            "\u{7f}",
+            "\u{1f496}",
+            "ok then",
+            "~!#$%&'()*+,-./:;<=>?@[\\]^_`{|}",
+        ] {
+            check(value);
+        }
+        assert_eq!(TokenFault::Empty.reason(), "value is empty");
+        assert!(
+            TokenFault::Quote
+                .reason()
+                .starts_with("value contains a double quote")
+        );
+        assert!(
+            TokenFault::Whitespace
+                .reason()
+                .starts_with("value contains whitespace")
+        );
+        assert!(
+            TokenFault::Outside
+                .reason()
+                .starts_with("value contains a byte outside printable ASCII")
+        );
+    }
+
+    /// A port of the kernel's `next_arg` (`lib/cmdline.c`): split on
+    /// whitespace outside quotes, toggle quote state on every `"`, strip a
+    /// quote pair around a value. Every token the writer accepts comes back
+    /// from it unchanged, so the guest reads what minvmd logged.
+    #[test]
+    fn the_kernel_tokenizer_returns_every_accepted_token_unchanged() {
+        fn next_arg(line: &str) -> Vec<String> {
+            let mut out = Vec::new();
+            let mut cur = String::new();
+            let mut in_quote = false;
+            for c in line.chars() {
+                if c == '"' {
+                    in_quote = !in_quote;
+                }
+                if c.is_ascii_whitespace() && !in_quote {
+                    if !cur.is_empty() {
+                        out.push(std::mem::take(&mut cur));
+                    }
+                } else {
+                    cur.push(c);
+                }
+            }
+            if !cur.is_empty() {
+                out.push(cur);
+            }
+            out.into_iter()
+                .map(|t| {
+                    let unquoted = t.split_once('=').and_then(|(k, v)| {
+                        let inner = v.strip_prefix('"')?.strip_suffix('"')?;
+                        Some(format!("{k}={inner}"))
+                    });
+                    unquoted.unwrap_or(t)
+                })
+                .collect()
+        }
+
+        let tokens: Vec<String> = [
+            ("RUST_LOG", "info,russh=debug,minimald=debug"),
+            ("MINIMAL_OTEL_FILTER", "warn,minimald[exec{cmd='x'}]=trace"),
+            (
+                "TRACEPARENT",
+                "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+            ),
+            ("K", "a=b=c\\'~!#$%&()*+,-./:;<>?@[]^_`{|}"),
+        ]
+        .into_iter()
+        .map(|(k, v)| boot_token(k, v).unwrap())
+        .collect();
+        let line = with_guest_env(Cow::Borrowed(BASE_KERNEL_CMDLINE), &tokens);
+        let mut expected: Vec<String> =
+            BASE_KERNEL_CMDLINE.split(' ').map(str::to_string).collect();
+        expected.extend(tokens.iter().cloned());
+        assert_eq!(next_arg(&line), expected);
+
+        // What the alphabet keeps out: a quote would merge the tokens after
+        // it into one, and a space would split a value in two.
+        assert_eq!(
+            next_arg("A=x\" B=1 C=2").len(),
+            1,
+            "a quote merges every later token"
+        );
+        assert_eq!(next_arg("A=\"x\""), ["A=x"], "a quote pair is stripped");
+        assert_eq!(next_arg("A=x y").len(), 2, "a space splits the value");
+    }
+
+    /// F11: the boot line has two readers, libkrun's printable-ASCII
+    /// `Cmdline` and the kernel's quote-aware `next_arg`. A value with a byte
+    /// neither accepts as part of one token is skipped, never handed on: a
+    /// non-ASCII char or a C0 control would panic libkrun inside
+    /// `krun_start_enter`, and a `"` would make the kernel merge every later
+    /// token into this one or silently unquote it.
+    #[test]
+    fn kernel_cmdline_skips_a_filter_outside_the_boot_alphabet() {
+        for bad in [
+            "info\"",
+            "\"info\"",
+            "x\u{e0}info",
+            "info\u{a0}debug",
+            "info\u{1b}[0m",
+            "info\u{1}",
+        ] {
+            assert_eq!(
+                kernel_cmdline(Some(bad), None, None, false),
+                BASE_KERNEL_CMDLINE,
+                "{bad:?}"
+            );
+        }
+    }
+
+    /// F12: libkrun appends its own tokens after minvmd's line and panics
+    /// when the result passes its 2048-byte capacity, so a line that fits
+    /// the kernel's buffer on its own is not enough. The 2000-`d` filter
+    /// (a 2037-byte line) is the audit's reproducer.
+    #[test]
+    fn the_boot_line_leaves_room_for_the_suffix_libkrun_appends() {
+        assert_eq!(
+            kernel_cmdline(Some(&"d".repeat(2000)), None, None, false),
+            BASE_KERNEL_CMDLINE
+        );
+        let tokens = vec![format!("MINIMAL_OTEL_FILTER={}", "d".repeat(1990))];
+        assert_eq!(
+            with_guest_env(Cow::Borrowed(BASE_KERNEL_CMDLINE), &tokens),
+            BASE_KERNEL_CMDLINE
         );
     }
 
@@ -818,6 +1752,95 @@ mod tests {
             "console=hvc0 ipv6.disable=1 MINIMALD_HOSTNAME_PROXY_PORT=7654 \
              MINIMALD_PUBLISH_GENERATION=42 MINIMALD_EGRESS_DENY_ALL_OPT_OUT=1 RUST_LOG=debug"
         );
+    }
+
+    #[test]
+    fn guest_env_tokens_follow_the_log_filter() {
+        let tokens = vec![
+            "MINIMAL_TELEMETRY=1".to_string(),
+            "MINIMAL_OTEL_FILTER=info,minimald::net=debug".to_string(),
+        ];
+        // Relative to the base line, which upstream owns (it gained ipv6.disable=1).
+        assert_eq!(
+            with_guest_env(kernel_cmdline(Some("info"), None, None, false), &tokens),
+            format!(
+                "{} MINIMAL_TELEMETRY=1 MINIMAL_OTEL_FILTER=info,minimald::net=debug",
+                kernel_cmdline(Some("info"), None, None, false)
+            )
+        );
+    }
+
+    /// (code review, TEL-040) The logged boot line names each telemetry
+    /// token by its key and shows none of their values; the kernel's own
+    /// parameters are logged as they are.
+    #[test]
+    fn the_logged_boot_line_shows_telemetry_keys_not_values() {
+        let tokens = [
+            "MINIMAL_TELEMETRY=1".to_string(),
+            "MINIMAL_OTEL_FILTER=warn,minimald=debug".to_string(),
+            "MINIMAL_OTEL_TRACES_EXPORTER=none".to_string(),
+            "TRACEPARENT=00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01".to_string(),
+        ];
+        let base = kernel_cmdline(Some("info"), None, None, false);
+        let line = with_guest_env(base.clone(), &tokens);
+        let logged = loggable_boot_line(&line, &tokens);
+        assert!(logged.starts_with(base.as_ref()), "{logged}");
+        for key in [
+            "MINIMAL_TELEMETRY=…",
+            "MINIMAL_OTEL_FILTER=…",
+            "MINIMAL_OTEL_TRACES_EXPORTER=…",
+            "TRACEPARENT=…",
+        ] {
+            assert!(logged.contains(key), "{key} missing from {logged}");
+        }
+        for token in &tokens {
+            assert!(
+                !logged.contains(token.as_str()),
+                "{token} logged in {logged}"
+            );
+        }
+        for value in ["minimald=debug", "0af7651916cd43dd8448eb211c80319c"] {
+            assert!(!logged.contains(value), "{value} logged in {logged}");
+        }
+        // With no tokens the line is logged unchanged.
+        assert_eq!(loggable_boot_line(&base, &[]), base.as_ref());
+    }
+
+    #[test]
+    fn no_guest_env_leaves_the_boot_line_byte_identical() {
+        assert_eq!(
+            with_guest_env(kernel_cmdline(None, None, None, false), &[]),
+            kernel_cmdline(None, None, None, false)
+        );
+    }
+
+    #[test]
+    fn guest_env_that_would_overflow_the_boot_line_is_dropped_whole() {
+        let big = vec![
+            "MINIMAL_TELEMETRY=1".to_string(),
+            format!("MINIMAL_OTEL_FILTER=info,{}=debug", "h".repeat(2100)),
+        ];
+        assert_eq!(
+            with_guest_env(kernel_cmdline(None, None, None, false), &big),
+            kernel_cmdline(None, None, None, false)
+        );
+
+        // At the boundary: tokens that fill the budget exactly cross; one
+        // byte more drops them all, at the token boundary, never mid-value.
+        let base = kernel_cmdline(None, None, None, false);
+        let fill = |len: usize| {
+            vec![
+                "MINIMAL_TELEMETRY=1".to_string(),
+                format!("MINIMAL_OTEL_FILTER={}", "d".repeat(len)),
+            ]
+        };
+        let room =
+            BOOT_LINE_BUDGET - base.len() - " MINIMAL_TELEMETRY=1 MINIMAL_OTEL_FILTER=".len();
+        assert_eq!(
+            with_guest_env(base.clone(), &fill(room)).len(),
+            BOOT_LINE_BUDGET
+        );
+        assert_eq!(with_guest_env(base.clone(), &fill(room + 1)), base);
     }
 
     #[test]

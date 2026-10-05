@@ -76,6 +76,7 @@ use std::time::Duration;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 
 use minimald_rpc::IpProto;
+use tracing::Instrument as _;
 // gvproxy-switch primitives live in the shared `switch` crate. Re-exported so
 // `minvmd::net::{SwitchSubnet, MacAddr, …}` keeps working.
 pub use switch::{DEFAULT_MTU, MacAddr, SwitchSubnet, render_gvproxy_config};
@@ -373,12 +374,23 @@ impl GvproxySupervisor {
         };
         let stopping = Arc::new(AtomicBool::new(false));
         let (exit_tx, exit_rx) = oneshot::channel();
-        let supervisor = tokio::spawn(supervise_switch(child, pid, Arc::clone(&stopping), exit_tx));
-        let datapath_monitor = tokio::spawn(monitor_switch_datapath(
-            switch_socket.clone(),
-            datapath_check_interval,
-            Arc::clone(&stopping),
-        ));
+        // Each in a span of its own that follows from this one (the guard
+        // test in `telemetry` holds that every spawn is instrumented): both
+        // live as long as the switch, and a task that kept this
+        // `net.switch.start` span would keep the supervisor's start phase
+        // open with it (`telemetry::vm_task`).
+        let supervisor = tokio::spawn(
+            supervise_switch(child, pid, Arc::clone(&stopping), exit_tx)
+                .instrument(crate::telemetry::vm_task("net.switch.supervise")),
+        );
+        let datapath_monitor = tokio::spawn(
+            monitor_switch_datapath(
+                switch_socket.clone(),
+                datapath_check_interval,
+                Arc::clone(&stopping),
+            )
+            .instrument(crate::telemetry::vm_task("net.switch.monitor")),
+        );
         let switch = Self {
             pid,
             #[cfg(target_os = "linux")]
@@ -719,6 +731,7 @@ impl HostGvproxy {
     /// Returns the I/O error if the runtime cannot be built, the config cannot
     /// be written, the gate socket cannot be bound, or the gvproxy binary
     /// cannot be launched.
+    #[tracing::instrument(name = "net.switch.start", skip_all)]
     pub fn spawn(
         binary: PathBuf,
         switch_sock: PathBuf,
