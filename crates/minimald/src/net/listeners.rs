@@ -1510,10 +1510,30 @@ impl WatchState {
             // own bind lines already name the port.
             ListenVerdict::Declared => Appearance::Settled,
             ListenVerdict::Deny => {
+                let reason = match self.plan.gate.dynamic_verdict(port) {
+                    sessions::core::egress::DynamicPortVerdict::Deny => {
+                        "the box's dynamic ingress stance is deny".to_string()
+                    }
+                    sessions::core::egress::DynamicPortVerdict::Ask => {
+                        "the box's dynamic ingress stance is ask; a listen cannot answer it"
+                            .to_string()
+                    }
+                    sessions::core::egress::DynamicPortVerdict::NoRange => {
+                        "the box declared no dynamic allowed range".to_string()
+                    }
+                    sessions::core::egress::DynamicPortVerdict::OutOfRange { .. } => {
+                        "the port is outside the box's dynamic allowed range".to_string()
+                    }
+                    // Not reached: an allowed port is a `Publish` verdict.
+                    sessions::core::egress::DynamicPortVerdict::Allow => {
+                        "the stance allows it but the verdict did not".to_string()
+                    }
+                };
                 tracing::info!(
                     session = %self.plan.box_name,
                     port,
                     verdict = "not permitted",
+                    reason = %reason,
                     "left a listening port unpublished"
                 );
                 Appearance::Settled

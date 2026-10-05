@@ -4576,11 +4576,23 @@ impl SessionLauncher for SandboxLauncher {
         // and stops it with the session — so a box with no lease, no
         // published address or no live gate carries no plan, and its ports
         // stay unpublishable by listening.
-        let lease = plan.tap().map(|tap| tap.address);
+        let lease = crate::net::provider::attached_lease(&plan, own_address.as_ref());
         let published = own_address
             .as_ref()
             .and_then(|reporter| reporter.published_address());
         let gate = lease.and_then(crate::net::switch::live_gate);
+        if lease.is_some() && (published.is_none() || gate.is_none()) {
+            // An own-address box whose listens will never publish: said once
+            // per launch, naming the fact that is missing, so a listen that
+            // never publishes is not silent (NET-016).
+            tracing::info!(
+                session = %session_label,
+                lease = ?lease,
+                published = ?published,
+                gate = gate.is_some(),
+                "the box carries no listen plan; its listens are not published"
+            );
+        }
         let listen_plan = match (lease, published, gate) {
             (Some(lease), Some(published), Some(gate)) => {
                 let switch = net_switch.lock().await;

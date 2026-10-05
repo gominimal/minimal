@@ -1661,6 +1661,14 @@ impl SessionGate {
         self.ingress.listen_verdict(proto, port)
     }
 
+    /// What the box's dynamic stance and permit range say about `port`
+    /// (NET-043), for the watcher's line naming why a listen it saw was left
+    /// unpublished: the stance, no range, or out of range.
+    #[must_use]
+    pub(crate) fn dynamic_verdict(&self, port: u16) -> sessions::core::egress::DynamicPortVerdict {
+        self.ingress.dynamic_verdict(port)
+    }
+
     /// Admits one listen-published port (NET-016): the runtime-published
     /// half of the inbound gate's TCP set, so the connections its forwarder
     /// dials through the relay reach the box. The watcher calls this only

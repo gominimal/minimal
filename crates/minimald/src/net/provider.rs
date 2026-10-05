@@ -187,6 +187,18 @@ impl OwnAddressReporter {
         self.runtime_ingress.attached();
     }
 
+    /// The switch lease the attach reported for this box ([`Self::report`]),
+    /// or `None` before an attach reported one. On a VM host the daemon
+    /// builds the box's tap itself after the spawn
+    /// ([`TapMechanism::Privileged`]), so the launch's plan carries no tap to
+    /// read the lease from: this is where the lease is read there.
+    pub(crate) fn lease(&self) -> Option<Ipv4Addr> {
+        self.registry
+            .read()
+            .expect("hostname registry lock poisoned")
+            .own_lease(self.session_id)
+    }
+
     /// The host loopback address this box's declaration publishes on (NET-010):
     /// the address a creator handed the box and its record published — `None`
     /// when nobody handed one, because the daemon has no address of its own to
@@ -212,6 +224,21 @@ impl OwnAddressReporter {
             .expect("hostname registry lock poisoned");
         registry.withdraw_own_name(self.session_id, session_name);
     }
+}
+
+/// The box's switch lease once its launch has attached, for the listen
+/// watcher (NET-016): the tap the plan asked the sandbox to build carries it
+/// where the sandbox builds the tap, and where the daemon builds it itself —
+/// a VM host's privileged tap, whose plan carries no tap at all — the lease
+/// the attach reported is read instead. `None` for a box with neither: no
+/// own address, so nothing a listen could be published for.
+pub(crate) fn attached_lease(
+    plan: &NetPlan,
+    own_address: Option<&OwnAddressReporter>,
+) -> Option<Ipv4Addr> {
+    plan.tap()
+        .map(|tap| tap.address)
+        .or_else(|| own_address.and_then(OwnAddressReporter::lease))
 }
 
 /// The network provider for `mode`. `NoNet` is the sandbox layer's own; `HostNet`
@@ -744,6 +771,35 @@ mod tests {
         // The mechanism decides who makes the tap, not what the PTask gets.
         assert!(privileged.isolates_netns() && rootless.isolates_netns());
         assert_eq!(privileged.resolver(), rootless.resolver());
+    }
+
+    /// T94, NET-016: a VM host's privileged-tap plan carries no tap, so the
+    /// listen watcher's lease comes from the attach's report — without it a
+    /// VM box gets no listen plan, and no listen of its ever publishes.
+    #[test]
+    fn a_privileged_tap_box_reads_its_lease_from_the_attach_report() {
+        let subnet = crate::net::SwitchSubnet::default();
+        let lease = std::net::Ipv4Addr::new(100, 64, 128, 5);
+        let registry = Arc::new(RwLock::new(crate::net::dns::HostnameRegistry::new(
+            "dev", false,
+        )));
+        let reporter = OwnAddressReporter::new(registry, SessionId::nil());
+        let privileged = own_ip_plan(subnet, lease, TapMechanism::Privileged);
+
+        assert_eq!(
+            attached_lease(&privileged, Some(&reporter)),
+            None,
+            "nothing is reported before the attach"
+        );
+        reporter.report("vm-box", lease, BTreeMap::new());
+        assert_eq!(
+            attached_lease(&privileged, Some(&reporter)),
+            Some(lease),
+            "the privileged plan has no tap, so the attach's reported lease is the box's"
+        );
+        let rootless = own_ip_plan(subnet, lease, TapMechanism::InNamespace);
+        assert_eq!(attached_lease(&rootless, None), Some(lease));
+        assert_eq!(attached_lease(&NetPlan::isolated(), None), None);
     }
 
     /// 017-009 and 017-006 for own-IP: the PTask gets its own namespace and
