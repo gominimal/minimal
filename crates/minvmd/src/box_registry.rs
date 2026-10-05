@@ -60,17 +60,19 @@ use crate::bep_attach::BoxId;
 /// runtime-published set answers to this bound, so a report storm cannot
 /// grow a row without limit — the cap is the row-state half of the grant,
 /// beside the stance and range the declaration carries. An admit report a
-/// row at its cap receives is refused, whatever it names — even a port the
-/// row already holds: a full row admits nothing, and a client that retries
-/// a lost reply gets the refusal its report could not have changed.
+/// row at its cap receives is refused when it names a new port; a re-admit
+/// of a port the row already holds is answered as recorded and changes
+/// nothing, so a client that retries a lost reply never draws a refusal for
+/// a port the host holds.
 pub(crate) const RUNTIME_PORT_CAP: usize = 256;
 
 /// The per-row admit rate (NET-138): at most this many admit reports are
 /// recorded per trailing second. The rate bounds the *reports*, not the
 /// ports (the cap bounds the ports): a box that churns its mappings faster
 /// than this is a loop, and a loop must not hold the serving thread. Only
-/// reports that pass every grant check count toward it — a refusal records
-/// nothing and paces nothing — and a withdrawal never counts.
+/// reports that pass every grant check and record a new port count toward
+/// it — a refusal records nothing and paces nothing, a re-admit of a held
+/// port changes nothing and is not counted, and a withdrawal never counts.
 pub(crate) const ROW_ADMIT_RATE_PER_SECOND: usize = 10;
 
 /// The window the admit rate is measured over, matching
@@ -1348,13 +1350,17 @@ impl BoxRegistry {
     ///    host sees the attached human's answer.
     /// 3. **The port is inside the row's allowed range**, inclusively at
     ///    both ends; a row that declared no range permits nothing.
-    /// 4. **The row holds fewer than [`RUNTIME_PORT_CAP`] runtime ports** —
-    ///    the cap applies to duplicates too, so a full row admits nothing.
-    /// 5. **The row is inside its admit rate** — at most
+    /// 4. **A port the row already holds** is answered as recorded, a
+    ///    no-op: the report's goal state already holds, so it spends
+    ///    neither the cap nor the rate. A retry after a lost reply is this
+    ///    case, and it must never be refused for a port the host holds —
+    ///    a refusal is not withdrawn, so the row would keep a port its
+    ///    reporter believes was refused.
+    /// 5. **The row holds fewer than [`RUNTIME_PORT_CAP`] runtime ports.**
+    /// 6. **The row is inside its admit rate** — at most
     ///    [`ROW_ADMIT_RATE_PER_SECOND`] recorded reports per trailing
-    ///    second, counting every report that passes the checks above,
-    ///    duplicates included: the rate bounds the reporting, not the
-    ///    ports.
+    ///    second, counting every report that records a new port: the rate
+    ///    bounds the reporting, not the ports.
     ///
     /// A report that passes records the port idempotently — the port and
     /// protocol pair the report named — and answers the row it recorded
@@ -1424,13 +1430,17 @@ impl BoxRegistry {
                 range,
             });
         }
-        // The row's runtime half: cap, then rate, then the recording — one
-        // lock section, so a report that passes every check is recorded in
-        // the order it arrived.
+        // The row's runtime half: a held port, then cap, then rate, then the
+        // recording — one lock section, so a report that passes every check
+        // is recorded in the order it arrived.
+        let reported = RuntimePort { port, proto };
         let mut runtime = record
             .runtime_ports
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if runtime.ports.contains(&reported) {
+            return Ok(Arc::clone(record));
+        }
         if runtime.ports.len() >= RUNTIME_PORT_CAP {
             return Err(PortReportRefusal::RowCapReached {
                 name,
@@ -1457,10 +1467,7 @@ impl BoxRegistry {
             });
         }
         runtime.admits.push_back(now);
-        let reported = RuntimePort { port, proto };
-        if !runtime.ports.contains(&reported) {
-            runtime.ports.push(reported);
-        }
+        runtime.ports.push(reported);
         Ok(Arc::clone(record))
     }
 
@@ -3167,10 +3174,63 @@ mod tests {
         assert_eq!(refused.name(), "allow-box");
     }
 
+    /// A re-admit of a port the row already holds — the retry after a lost
+    /// reply — is answered as recorded and spends neither the rate nor the
+    /// cap: a row whose window is full still answers it, a full row still
+    /// answers it, and the row's set is unchanged. A withdrawal of a port the
+    /// row does not hold is answered too.
+    #[test]
+    fn readmit_of_a_held_port_is_idempotent_and_consumes_no_budget() {
+        let registry = BoxRegistry::new(SUBNET);
+        let web = registry.register(
+            BoxRegistration::new("web", Ipv4Addr::new(100, 64, 0, 9), Ipv4Addr::LOCALHOST)
+                .with_dynamic_ingress(DynamicIngress::Allow, Some((3000, 3999))),
+        );
+        let at = Instant::now();
+        registry
+            .admit_runtime_port(web.switch_addr(), 3000, IpProto::Tcp, at)
+            .expect("the first admit records");
+        for _ in 0..ROW_ADMIT_RATE_PER_SECOND * 3 {
+            registry
+                .admit_runtime_port(web.switch_addr(), 3000, IpProto::Tcp, at)
+                .expect("a re-admit of a held port is answered as recorded");
+        }
+        assert_eq!(
+            web.runtime_port_numbers(),
+            vec![3000],
+            "the re-admits change nothing"
+        );
+        // The re-admits spent nothing: the rest of the second's rate still
+        // records new ports, and only the report past it is refused.
+        for port in 3001..3000 + ROW_ADMIT_RATE_PER_SECOND as u16 {
+            registry
+                .admit_runtime_port(web.switch_addr(), port, IpProto::Tcp, at)
+                .unwrap_or_else(|refusal| panic!("port {port} records inside the rate: {refusal}"));
+        }
+        assert!(matches!(
+            registry.admit_runtime_port(web.switch_addr(), 3999, IpProto::Tcp, at),
+            Err(PortReportRefusal::RateExceeded { .. })
+        ));
+        // With the window full, a held port is still answered.
+        registry
+            .admit_runtime_port(web.switch_addr(), 3000, IpProto::Tcp, at)
+            .expect("a full window still answers a re-admit of a held port");
+        assert_eq!(web.runtime_port_numbers().len(), ROW_ADMIT_RATE_PER_SECOND);
+
+        // A withdrawal of a port the row does not hold is answered.
+        assert!(
+            registry
+                .withdraw_runtime_port(web.switch_addr(), 3998, IpProto::Tcp)
+                .is_some(),
+            "a withdrawal of an unheld port is the goal state already"
+        );
+        assert_eq!(web.runtime_port_numbers().len(), ROW_ADMIT_RATE_PER_SECOND);
+    }
+
     /// NET-138: the per-row cap and the per-row admit rate bound what the
     /// reports can do to the host's state. A row holding
-    /// [`RUNTIME_PORT_CAP`] ports refuses any report — a duplicate included —
-    /// and a row over [`ROW_ADMIT_RATE_PER_SECOND`] recorded reports in a
+    /// [`RUNTIME_PORT_CAP`] ports refuses a report of a new port, and a row
+    /// over [`ROW_ADMIT_RATE_PER_SECOND`] recorded reports in a
     /// trailing second refuses until the second passes, while a refusal paces
     /// nothing and a withdrawal never counts.
     #[test]
@@ -3219,23 +3279,19 @@ mod tests {
                 cap: RUNTIME_PORT_CAP
             }
         );
-        let refused = registry
+        assert_eq!(
+            refused.to_string(),
+            "box web already holds 256 runtime-admitted ports, its per-row cap; the reported \
+             port 3999 records nothing"
+        );
+        registry
             .admit_runtime_port(
                 web.switch_addr(),
                 3000,
                 IpProto::Tcp,
                 base + Duration::from_secs(301),
             )
-            .expect_err("a full row refuses a duplicate too");
-        assert!(
-            matches!(refused, PortReportRefusal::RowCapReached { .. }),
-            "the cap applies to duplicates: a full row admits nothing, got {refused}"
-        );
-        assert_eq!(
-            refused.to_string(),
-            "box web already holds 256 runtime-admitted ports, its per-row cap; the reported \
-             port 3000 records nothing"
-        );
+            .expect("a full row still answers a re-admit of a port it holds");
 
         // The rate: a fresh row's own trailing second. Ten distinct ports
         // record in one instant; the eleventh is refused, is still refused
