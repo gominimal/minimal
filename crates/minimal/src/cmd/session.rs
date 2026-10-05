@@ -591,28 +591,24 @@ pub fn box_registered_start_line(
 /// suppresses it — that path must land in a session, never in a config
 /// prompt. Everything else, including the session id on stdout, is
 /// identical for both callers.
-/// The refusal a VM-backed host gives a box created with a dynamic-ingress
-/// stance that could publish (`allow` or `ask`). The VM host's egress gate
-/// admits a runtime publish only at a port the box's host-side registration
-/// already carries, and that registration carries the create's static
-/// `--ingress` mappings alone, so an in-range publish would be decided allow
-/// and then refused at the host. Until the dynamic range reaches the host
-/// registration (gominimal/minimal#1897) the create says so up front instead
-/// of handing the box a stance it cannot keep. `deny`, an absent stance, and
-/// every native host are unchanged.
+/// The refusal a VM-backed host still gives a box created with a
+/// dynamic-ingress `ask` stance. An `allow` create now stands there (T94):
+/// the runtime publish it makes is reported over the bridged guest report
+/// door and the VM host daemon's host-held grant decides it, so the stance
+/// is keepable. An `ask` is not yet — the port the attached human answers
+/// yes to is recorded in the host-held row by the client (NET-138), and
+/// until that answered-ask carry reaches the host table (T96) the create
+/// says so up front instead of handing the box a stance whose yes the host
+/// cannot record. `deny`, an absent stance, and every native host are
+/// unchanged.
 fn refuse_dynamic_ingress_on_vm(
     kind: paths::ProviderKind,
     mode: Option<sessions::DynamicIngress>,
 ) -> Result<(), anyhow::Error> {
-    if kind == paths::ProviderKind::Minvmd
-        && matches!(
-            mode,
-            Some(sessions::DynamicIngress::Allow | sessions::DynamicIngress::Ask)
-        )
-    {
+    if kind == paths::ProviderKind::Minvmd && matches!(mode, Some(sessions::DynamicIngress::Ask)) {
         anyhow::bail!(
-            "dynamic ingress allow/ask is not yet supported on VM-backed hosts \
-             (gominimal/minimal#1897)"
+            "dynamic ingress ask is not yet supported on VM-backed hosts \
+             (T96: the answered ask must be recorded in the host-held row)"
         );
     }
     Ok(())
@@ -643,7 +639,7 @@ pub(crate) async fn activate_session(
     offer_scaffold: bool,
 ) -> Result<(), anyhow::Error> {
     ensure_daemon(global)?;
-    // Before anything is created: a VM-backed host cannot keep an allow/ask
+    // Before anything is created: a VM-backed host cannot keep an ask
     // stance yet, so the activation ends here with the reason.
     refuse_dynamic_ingress_off_own_ip(args.network, args.dynamic_ingress, args.dynamic_range)?;
     refuse_dynamic_ingress_on_vm(daemon_provider_kind(global), args.dynamic_ingress)?;
@@ -3678,24 +3674,32 @@ mod tests {
     }
 
     #[test]
-    fn vm_backed_activate_refuses_dynamic_allow_until_host_admission() {
+    fn vm_backed_dynamic_allow_publishes_through_host_admission() {
         use paths::ProviderKind::{Minimald, Minvmd};
-        for mode in [DynamicIngress::Allow, DynamicIngress::Ask] {
-            let error = refuse_dynamic_ingress_on_vm(Minvmd, Some(mode))
-                .expect_err("a VM-backed host must refuse an allow/ask stance");
-            assert_eq!(
-                error.to_string(),
-                "dynamic ingress allow/ask is not yet supported on VM-backed hosts \
-                 (gominimal/minimal#1897)"
-            );
-            refuse_dynamic_ingress_on_vm(Minimald, Some(mode))
-                .expect("a native host keeps every stance");
-        }
+        // The allow create stands on a VM-backed host (T94): the runtime
+        // publish it makes is reported to the VM host daemon over the
+        // bridged guest report door and admitted against the host-held
+        // grant, so the create hands the box the stance.
+        refuse_dynamic_ingress_on_vm(Minvmd, Some(DynamicIngress::Allow))
+            .expect("a VM-backed host keeps an allow stance now that the \
+                     host admits runtime publishes");
         for kind in [Minvmd, Minimald] {
             refuse_dynamic_ingress_on_vm(kind, Some(DynamicIngress::Deny))
                 .expect("deny is never refused");
             refuse_dynamic_ingress_on_vm(kind, None).expect("an absent stance is never refused");
         }
+        // The ask create stays refused on a VM-backed host, its typed
+        // reason naming T96 — the answered ask's port must reach the
+        // host-held row before an ask stance can publish.
+        let error = refuse_dynamic_ingress_on_vm(Minvmd, Some(DynamicIngress::Ask))
+            .expect_err("a VM-backed host must still refuse an ask stance");
+        assert_eq!(
+            error.to_string(),
+            "dynamic ingress ask is not yet supported on VM-backed hosts \
+             (T96: the answered ask must be recorded in the host-held row)"
+        );
+        refuse_dynamic_ingress_on_vm(Minimald, Some(DynamicIngress::Ask))
+            .expect("a native host keeps every stance");
     }
 
     #[test]
