@@ -34,7 +34,7 @@ pub use mfile_search_strategy::MFileSearchStrategy;
 mod project_setup;
 pub use project_setup::ProjectSetup;
 
-pub use env::{Env, PatchHome, interpolate_task_strings};
+pub use env::{Env, PatchHome, WdLayout, interpolate_task_strings};
 use tokio::sync::Semaphore;
 use toml_edit::{Array, DocumentMut, Item, TableLike, Value};
 
@@ -73,11 +73,73 @@ pub trait PackageSelection {
                 .unwrap()
                 .map(|n| match g.by_name(n) {
                     Some(bsr) => Ok(*bsr),
-                    None => Err(Error::Other(anyhow!("No such package: {}", n))),
+                    None => Err(Error::Other(anyhow!(package_not_found_message(g, n)))),
                 })
                 .collect::<Result<_, _>>()
         }
     }
+}
+
+/// Builds the `No such package` error message, suggesting close package
+/// names when any exist.
+fn package_not_found_message(g: &Graph, input: &str) -> String {
+    let suggestions = package_suggestions(g, input);
+    // Show the name the suggestions were computed from, not stray padding.
+    let input = input.trim();
+    if suggestions.is_empty() {
+        format!(
+            "No such package: {} (try 'min package search {}')",
+            input, input
+        )
+    } else {
+        format!(
+            "No such package: {} (did you mean: {}?)",
+            input,
+            suggestions.join(", ")
+        )
+    }
+}
+
+/// Collects up to three package names close to `input`, preferring names
+/// that share a prefix with the input before fuzzier matches.
+fn package_suggestions(g: &Graph, input: &str) -> Vec<String> {
+    use common::fuzzy_search::fuzzy_match;
+
+    let input = input.trim().to_lowercase();
+    // An empty name is a prefix of every package, so it has no close match.
+    if input.is_empty() {
+        return Vec::new();
+    }
+    let mut exact: Vec<&str> = Vec::new();
+    let mut prefix_of_input: Vec<&str> = Vec::new();
+    let mut input_prefix_of: Vec<&str> = Vec::new();
+    let mut fuzzy: Vec<(&str, common::fuzzy_search::SearchMatch)> = Vec::new();
+
+    for name in g.names() {
+        let lower = name.to_lowercase();
+        if lower == input {
+            exact.push(name);
+        } else if input.starts_with(&lower) {
+            prefix_of_input.push(name);
+        } else if lower.starts_with(&input) {
+            input_prefix_of.push(name);
+        } else if let Some(m) = fuzzy_match(&input, name) {
+            fuzzy.push((name, m));
+        }
+    }
+
+    exact.sort_unstable();
+    prefix_of_input.sort_by_key(|n| (n.len(), *n));
+    input_prefix_of.sort_by_key(|n| (n.len(), *n));
+    fuzzy.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+
+    let mut candidates: Vec<String> = Vec::with_capacity(3);
+    candidates.extend(exact.into_iter().map(str::to_string));
+    candidates.extend(prefix_of_input.into_iter().map(str::to_string));
+    candidates.extend(input_prefix_of.into_iter().map(str::to_string));
+    candidates.extend(fuzzy.into_iter().map(|(n, _)| n.to_string()));
+    candidates.truncate(3);
+    candidates
 }
 
 impl PackageSelection for Vec<String> {
@@ -894,6 +956,7 @@ impl Context {
             packages,
             std::sync::Arc::new(sandbox2::HostNet),
             home,
+            WdLayout::BoundDir,
         )
         .await
     }
@@ -907,6 +970,11 @@ impl Context {
     /// `home` is the directory `~/`-rooted patch paths expand against; see
     /// [`PatchHome`] for why every caller states it rather than letting
     /// the conversion read the ambient one.
+    ///
+    /// `wd_layout` chooses how the sandbox's working directory is laid out;
+    /// see [`WdLayout`]. Callers that run a task inside a session pass
+    /// [`WdLayout::Session`] so the task sees `/workbench` and `/home` rather
+    /// than the daemon's internal tree.
     // Left positional: public library API; `make_env` already forwards here, so
     // a struct would only relocate the same argument list.
     #[allow(clippy::too_many_arguments)]
@@ -921,6 +989,7 @@ impl Context {
         packages: S,
         network: std::sync::Arc<dyn sandbox2::Network>,
         home: PatchHome,
+        wd_layout: WdLayout,
     ) -> Result<env::Env<'a>, Error> {
         let mfile = self.minimal_file();
 
@@ -995,6 +1064,7 @@ impl Context {
                 state_base_dir,
                 transitives: transitive_deps,
                 cwd: wd,
+                wd_layout,
                 patches,
                 home,
                 env_vars,
@@ -1886,5 +1956,91 @@ mod tests {
                 },]
             );
         });
+    }
+
+    /// Builds a small graph containing the named packages for the
+    /// package-not-found suggestion tests.
+    fn suggestion_graph(names: &[&str]) -> Graph {
+        let mut opts = decode::LoadOptions::for_test();
+        opts.minimal_lib_path = std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
+            .join("../stdlib/minimal-ncl");
+
+        let specs = names
+            .iter()
+            .map(|n| format!("({{ name = \"{n}\", build_deps = [], cmd = \"\" }} | BuildSpec)"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let layer = decode::Layer::new_for_test_with(
+            format!("let {{BuildSpec, ..}} = import \"minimal.ncl\" in [{specs}]"),
+            &opts,
+        )
+        .unwrap_or_else(|e| {
+            e.report_to_stderr();
+            panic!("spec parsing failed");
+        });
+
+        Graph::new().ingest(layer).unwrap()
+    }
+
+    #[test]
+    fn package_not_found_suggests_prefix_of_input() {
+        let graph = suggestion_graph(&["node", "python"]);
+        let err = vec!["nodejs".to_string()].as_bsrs(&graph).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "No such package: nodejs (did you mean: node?)"
+        );
+    }
+
+    #[test]
+    fn empty_package_name_gets_no_suggestions() {
+        let graph = suggestion_graph(&["node", "python"]);
+        assert!(package_suggestions(&graph, "").is_empty());
+        assert!(package_suggestions(&graph, "  ").is_empty());
+    }
+
+    #[test]
+    fn package_not_found_suggests_fuzzy_match() {
+        let graph = suggestion_graph(&["node", "python"]);
+        let err = vec!["pyhton".to_string()].as_bsrs(&graph).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "No such package: pyhton (did you mean: python?)"
+        );
+    }
+
+    #[test]
+    fn package_not_found_without_candidates_suggests_search() {
+        let graph = suggestion_graph(&["node", "python"]);
+        let err = vec!["zzzz".to_string()].as_bsrs(&graph).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "No such package: zzzz (try 'min package search zzzz')"
+        );
+    }
+
+    #[test]
+    fn package_not_found_suggests_case_insensitive_match() {
+        let graph = suggestion_graph(&["Python"]);
+        let err = vec!["python".to_string()].as_bsrs(&graph).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "No such package: python (did you mean: Python?)"
+        );
+    }
+
+    #[test]
+    fn package_not_found_suggests_exact_name_for_other_case() {
+        let graph = suggestion_graph(&["node", "nodejs", "python"]);
+        for input in ["NODE", "Node", "node "] {
+            let err = vec![input.to_string()].as_bsrs(&graph).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "No such package: {} (did you mean: node, nodejs?)",
+                    input.trim()
+                )
+            );
+        }
     }
 }

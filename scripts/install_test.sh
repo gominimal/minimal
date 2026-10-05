@@ -159,6 +159,8 @@ MOCKEOF
 # Linux amd64 release artifacts, including the VM stack (NET-048).
 printf 'linux-amd64-minimald-body\n'     >"$mock/versions/v1/minimald-linux-amd64"
 write_min_stub "$mock/versions/v1/minimal-linux-amd64"  linux-amd64
+# The answerer NET-122's advisory copies from beside min (NET-122).
+printf 'linux-amd64-answerer-body\n'    >"$mock/versions/v1/min-answerer-linux-amd64"
 printf 'linux-amd64-minvmd-body\n'       >"$mock/versions/v1/minvmd-linux-amd64"
 printf 'linux-amd64-initramfs-body\n'   >"$mock/versions/v1/initramfs-amd64.cpio"
 printf 'linux-amd64-rootfs-body\n'      >"$mock/versions/v1/rootfs-amd64.img"
@@ -170,6 +172,7 @@ printf 'mock-gvproxy-switch-body\n'      >"$mock/versions/v1/gvproxy-min-linux-a
 # Linux arm64 release artifacts, including the VM stack (NET-050).
 printf 'linux-arm64-minimald-body\n'    >"$mock/versions/v1/minimald-linux-arm64"
 write_min_stub "$mock/versions/v1/minimal-linux-arm64" linux-arm64
+printf 'linux-arm64-answerer-body\n'    >"$mock/versions/v1/min-answerer-linux-arm64"
 printf 'linux-arm64-minvmd-body\n'      >"$mock/versions/v1/minvmd-linux-arm64"
 printf 'linux-arm64-initramfs-body\n'    >"$mock/versions/v1/initramfs-arm64.cpio"
 printf 'linux-arm64-rootfs-body\n'       >"$mock/versions/v1/rootfs-arm64.img"
@@ -179,6 +182,7 @@ printf 'mock-gvproxy-switch-arm64-body\n' >"$mock/versions/v1/gvproxy-min-linux-
 # macOS arm64 guest payload (kept distinct from the linux arm64 rootfs so each
 # architecture is exercised with its own artifact and hash).
 write_min_stub "$mock/versions/v1/minimal-darwin-arm64" darwin-arm64
+printf 'darwin-arm64-answerer-body\n'    >"$mock/versions/v1/min-answerer-macos-arm64"
 printf 'darwin-arm64-rootfs-body\n'      >"$mock/versions/v1/rootfs-darwin-arm64.img"
 
 # AppArmor components: noarch text (the loader is a runnable stub here), shipped
@@ -190,6 +194,7 @@ printf '#!/bin/sh\n# mock apparmor loader\n' >"$mock/versions/v1/install-apparmo
 # Hashes for every artifact referenced by the component table below.
 h_minimald="$(hash_file "$mock/versions/v1/minimald-linux-amd64")"
 h_minimal="$(hash_file "$mock/versions/v1/minimal-linux-amd64")"
+h_answerer="$(hash_file "$mock/versions/v1/min-answerer-linux-amd64")"
 h_minvmd="$(hash_file "$mock/versions/v1/minvmd-linux-amd64")"
 h_initramfs="$(hash_file "$mock/versions/v1/initramfs-amd64.cpio")"
 h_rootfs="$(hash_file "$mock/versions/v1/rootfs-amd64.img")"
@@ -198,6 +203,7 @@ h_gvmin="$(hash_file "$mock/versions/v1/gvproxy-min-linux-amd64")"
 
 h_minimald_arm="$(hash_file "$mock/versions/v1/minimald-linux-arm64")"
 h_minimal_arm="$(hash_file "$mock/versions/v1/minimal-linux-arm64")"
+h_answerer_arm="$(hash_file "$mock/versions/v1/min-answerer-linux-arm64")"
 h_minvmd_arm="$(hash_file "$mock/versions/v1/minvmd-linux-arm64")"
 h_initramfs_arm="$(hash_file "$mock/versions/v1/initramfs-arm64.cpio")"
 h_rootfs_arm="$(hash_file "$mock/versions/v1/rootfs-arm64.img")"
@@ -205,6 +211,7 @@ h_vmlinuz_arm="$(hash_file "$mock/versions/v1/vmlinuz-arm64")"
 h_gvmin_arm="$(hash_file "$mock/versions/v1/gvproxy-min-linux-arm64")"
 
 h_dmin="$(hash_file "$mock/versions/v1/minimal-darwin-arm64")"
+h_danswerer="$(hash_file "$mock/versions/v1/min-answerer-macos-arm64")"
 h_drootfs="$(hash_file "$mock/versions/v1/rootfs-darwin-arm64.img")"
 
 h_aaprof="$(hash_file "$mock/versions/v1/minimald.apparmor")"
@@ -224,6 +231,10 @@ write_manifest() {
             minimald linux amd64 v1 "$h_minimald" file bin/minimald versions/v1/minimald-linux-amd64
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
             minimal linux amd64 v1 "$h_minimal" file bin/min versions/v1/minimal-linux-amd64
+        # The answerer installs beside min on every platform min ships for
+        # (NET-122); the installed copy is only the advisory's copy source.
+        printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+            min-answerer linux amd64 v1 "$h_answerer" file bin/min-answerer versions/v1/min-answerer-linux-amd64
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
             gvproxy-min linux amd64 v1 "$h_gvmin" file bin/gvproxy-min versions/v1/gvproxy-min-linux-amd64
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
@@ -240,6 +251,8 @@ write_manifest() {
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
             minimal linux arm64 v1 "$h_minimal_arm" file bin/min versions/v1/minimal-linux-arm64
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+            min-answerer linux arm64 v1 "$h_answerer_arm" file bin/min-answerer versions/v1/min-answerer-linux-arm64
+        printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
             gvproxy-min linux arm64 v1 "$h_gvmin_arm" file bin/gvproxy-min versions/v1/gvproxy-min-linux-arm64
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
             minvmd linux arm64 v1 "$h_minvmd_arm" file bin/minvmd versions/v1/minvmd-linux-arm64
@@ -252,6 +265,8 @@ write_manifest() {
         # macOS arm64: VM host stack is macOS-native, guest payload is arm64.
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
             minimal darwin arm64 v1 "$h_dmin" file bin/min versions/v1/minimal-darwin-arm64
+        printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+            min-answerer darwin arm64 v1 "$h_danswerer" file bin/min-answerer versions/v1/min-answerer-macos-arm64
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
             rootfs darwin arm64 v1 "$h_drootfs" file data/rootfs.img versions/v1/rootfs-darwin-arm64.img
         # AppArmor support files ship to every Linux arch.
@@ -1526,7 +1541,7 @@ case_host_classifier_tree_installed() {
 
     cg="$root/cg"                      # the stand-in cgroup2 mountpoint
     tree="$cg/minimald.slice"          # the tree the script installs
-    me="$(id -un)"
+    me="$(id -u)"
 
     # Stand-in mount tables. Field 4 is the mount's root within the
     # filesystem: "/" in the host's initial cgroup namespace, something else
@@ -1803,6 +1818,23 @@ originates is refused" \
     want_ok "check reports the table's marker" grep -q "classifier-table" "$OUT"
     want_ok "check reports the recorded ct-mark mask" grep -q "ct-mark:  0x30000000" "$OUT"
 
+    # --user takes an account name too, resolved to the same uid and group;
+    # only when the caller's uid has a passwd entry to name it by (a cross
+    # container runs as the host's uid, which has none).
+    if me_name="$(id -un 2>/dev/null)"; then
+        run_hc named_check "$root/mi-on" --check --user "$me_name"
+        check 0 "$rc" "check by account name verifies the same delegation"
+    fi
+
+    # A numeric uid that is neither an account nor the caller has no group
+    # to delegate to: refused, never handed the caller's group.
+    stranger=4000000000
+    if ! id -g "$stranger" >/dev/null 2>&1 && [ "$stranger" != "$(id -u)" ]; then
+        run_hc stranger_check "$root/mi-on" --check --user "$stranger"
+        check 1 "$rc" "check refuses a numeric uid with no account behind it"
+        want_ok "the refusal names the uid" grep -q "no account with uid $stranger" "$OUT"
+    fi
+
     # --- A re-install whose transaction dies leaves no marker: the step
     # removes it before the load and writes it only after, so the daemon
     # reads a host that decides nothing per box rather than a marker that
@@ -2031,6 +2063,75 @@ case_linux_vm_stack() {
 case_linux_amd64_manifest_ships_vm_stack() { case_linux_vm_stack amd64; }
 case_linux_arm64_manifest_ships_vm_stack() { case_linux_vm_stack arm64; }
 
+# --- NET-122: the answerer ships beside min on every platform, as the copy
+# source the session advisory's privileged step copies from. The installer
+# places it with the same rules as the other binaries and writes no unit or
+# plist naming the user-prefix path — the advisory's one privileged command is
+# the only thing that ever installs the answerer service.
+case_answerer_source_installed() {
+    # linux/amd64: beside min, executable, byte-exact, recorded.
+    H_A1="$root/h_ans_amd64"; mkdir -p "$H_A1"
+    run ans_amd64_install "$H_A1"
+    check 0 "$rc" "amd64 install with the answerer row exits 0"
+    want_ok "amd64: the answerer installs beside min" test -f "$H_A1/bin/min-answerer"
+    want_ok "amd64: beside the installed min itself" test -f "$H_A1/bin/min"
+    want_ok "amd64: the answerer is executable like every bin row" test -x "$H_A1/bin/min-answerer"
+    check "$h_answerer" "$(hash_file "$H_A1/bin/min-answerer")" \
+        "amd64: installed answerer matches the manifest hash"
+    want_ok "amd64: the installer printed the answerer status" \
+        grep -qE "^  min-answerer +(installed|current)" "$OUT"
+    _rec="$H_A1/xdg-state/minimal/installed"
+    want_ok "amd64: the answerer is recorded at its user-prefix path" \
+        record_has min-answerer "$H_A1/bin/min-answerer" "$_rec"
+    # The installed copy is only the copy source: no unit or plist was
+    # written, and no record row names a service-manager path or the
+    # root-owned program path.
+    # shellcheck disable=SC2016  # $1 is expanded by the inner sh, not here
+    want_err "no unit or plist file was written" \
+        sh -c 'find "$1" \( -name "*.plist" -o -name "*.service" -o -name "*.socket" \) -print | grep -q .' sh "$H_A1"
+    # shellcheck disable=SC2016  # $2 is awk's second field, not a shell parameter
+    want_ok "no record row names a unit, plist, or root-owned answerer path" \
+        awk '$2 ~ /(systemd|launchd|PrivilegedHelperTools|zone-answerer)/ {bad=1} END{exit bad ? 1 : 0}' "$_rec"
+
+    # An upgrade replaces it like the other binaries: a new release's answerer
+    # bytes alone re-download and land.
+    printf 'linux-amd64-answerer-body-v2\n' >"$mock/versions/v1/min-answerer-linux-amd64-v2"
+    h_answerer2="$(hash_file "$mock/versions/v1/min-answerer-linux-amd64-v2")"
+    awk -v h="$h_answerer2" \
+        '$1=="min-answerer" && $2=="linux" && $3=="amd64" {$5=h; $8="versions/v1/min-answerer-linux-amd64-v2"} {print}' \
+        "$root/good-components" >"$mock/versions/v1/components"
+    reset_dl
+    run ans_amd64_upgrade "$H_A1"
+    check 0 "$rc" "answerer upgrade install exits 0"
+    check 1 "$(downloads)" "a new manifest hash re-downloads the answerer alone"
+    check "$h_answerer2" "$(hash_file "$H_A1/bin/min-answerer")" \
+        "the upgraded answerer replaced the installed copy"
+    cp "$root/good-components" "$mock/versions/v1/components"   # restore
+
+    # linux/arm64: its own row and bytes.
+    PLAT_M=arm64
+    H_A2="$root/h_ans_arm64"; mkdir -p "$H_A2"
+    run ans_arm64_install "$H_A2"
+    check 0 "$rc" "arm64 install with the answerer row exits 0"
+    check "$h_answerer_arm" "$(hash_file "$H_A2/bin/min-answerer")" \
+        "arm64: the answerer installs beside min"
+    PLAT_M=x86_64
+
+    # darwin/arm64: beside min, dequarantined like every other bin row,
+    # recorded at the user prefix.
+    PLAT_S=Darwin; PLAT_M=arm64
+    : >"$root/xattr.calls"
+    H_A3="$root/h_ans_darwin"; mkdir -p "$H_A3"
+    run ans_darwin_install "$H_A3"
+    check 0 "$rc" "darwin install with the answerer row exits 0"
+    want_ok "darwin: the answerer installs beside min" test -f "$H_A3/bin/min-answerer"
+    want_ok "darwin: quarantine stripped from the answerer bin (xattr)" \
+        grep -q "/bin/min-answerer\.tmp" "$root/xattr.calls"
+    want_ok "darwin: the answerer is recorded at its user-prefix path" \
+        record_has min-answerer "$H_A3/bin/min-answerer" "$H_A3/xdg-state/minimal/installed"
+    PLAT_S=Linux; PLAT_M=x86_64
+}
+
 # --- Case dispatch -----------------------------------------------------------
 # Every scenario group above is one named case. No argument runs them all, in
 # the order the linear script used to have; one argument runs exactly that
@@ -2053,6 +2154,7 @@ case_for() {
         gvproxy_rename_migration)           case_gvproxy_rename_migration ;;
         installer_switch_binary_executable) case_installer_switch_binary_executable ;;
         host_classifier_tree_installed)  case_host_classifier_tree_installed ;;
+        answerer_source_installed)      case_answerer_source_installed ;;
         linux_amd64_manifest_ships_vm_stack) case_linux_amd64_manifest_ships_vm_stack ;;
         linux_arm64_manifest_ships_vm_stack) case_linux_arm64_manifest_ships_vm_stack ;;
         *)
@@ -2067,7 +2169,7 @@ case "${1:-}" in
             target_validation prefix_resolution install_record daemon_stop \
             shell_integration darwin_dequarantine uninstall \
             gvproxy_rename_migration installer_switch_binary_executable \
-            host_classifier_tree_installed \
+            host_classifier_tree_installed answerer_source_installed \
             linux_amd64_manifest_ships_vm_stack linux_arm64_manifest_ships_vm_stack; do
             case_for "$_c"
         done

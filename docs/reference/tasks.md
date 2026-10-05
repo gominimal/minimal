@@ -114,6 +114,16 @@ _Optional_
 state_key = "dev" # Cache build artifacts under 'dev'
 ```
 
+`min task run`, and `min run` inside a session, run the task in the session
+layout. The working directory is the project tree at `/workbench`, and `$HOME`
+is the session home at `/home`. There, `state_key` backs only `XDG_CACHE_HOME`
+(`/state/cache`). `XDG_CONFIG_HOME`, `XDG_DATA_HOME` and `XDG_STATE_HOME`
+point into the shared session home: `/home/.config`, `/home/.local/share` and
+`/home/.local/state`. `PATH` adds `/home/.local/bin`. The locale is
+`LANG=C.UTF-8` with no `LC_ALL`, as in the interactive session. `mip run` keeps
+the host working directory, the `/state`-backed `XDG_*` directories and
+`LANG`/`LC_ALL=en_US.utf8`.
+
 
 ### `env_vars` - Environment variables to set {#env_vars}
 
@@ -258,6 +268,11 @@ missing read-only source is an error naming the task and the patch declaration.
 
 Mapped paths must be absolute or start with `~/`, in which case the tilde is expanded to the user's
 home directory.
+
+In a task the daemon runs in the session layout, `~/` expands to the session home. The daemon
+mounts a mapping inside that home or the project tree at the matching path under `/home` or
+`/workbench`. It mounts the mapping on top of the read-write session mounts, so a read-only mapping
+stays read-only. It mounts any other absolute path at that same path.
 
 ### `inherit_cwd` - Use parent working directory instead of repository root
 

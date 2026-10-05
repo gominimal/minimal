@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use anyhow::anyhow;
 use graph::{BuildSpecRef, Transitives};
-use lcache::{EntryMeta, MetaInner, PendingDir};
+use lcache::{CacheErr, EntryMeta, MetaInner, PendingDir};
 
 use crate::{Error, Options, Runnable, SpecBuild};
 
@@ -13,8 +13,9 @@ pub struct PatchedBuildResult {
     pub meta: EntryMeta,
 }
 
-/// Builds a spec, resolving dependencies by name from the most recent cached
-/// build of each dependency rather than by spec hash.
+/// Builds a spec, resolving each dependency to its most recent cached build by
+/// name, falling back to its exact spec-hash entry. Every dependency that has
+/// neither is reported together in one error.
 ///
 /// This breaks the normal caching model but is useful for development workflows
 /// where you want to test a build against locally-modified dependencies.
@@ -45,15 +46,31 @@ impl<'a, SF: crate::SourceFetcher> Runnable for PatchedBuild<'a, SF> {
             .to_owned()
             .collect();
 
+        let mut missing = Vec::new();
         for bsr in build_deps.iter() {
             let dep_build = opts.graph.get(bsr).unwrap();
-            let cache_dir = opts
-                .cache
-                .unsafe_get_build_by_name(&dep_build.name)
-                .map_err(|e| {
-                    Error::Other(anyhow!("resolving dep '{}' by name: {}", dep_build.name, e))
-                })?;
+            let cache_dir = match opts.cache.unsafe_get_build_by_name(&dep_build.name) {
+                Ok(entry) => entry,
+                Err(by_name) => {
+                    warn_unless_not_found(&dep_build.name, "by name", &by_name);
+                    match opts.cache.read_dir(&opts.graph.spec_hash(bsr)) {
+                        Ok(entry) => entry,
+                        Err(by_hash) => {
+                            warn_unless_not_found(&dep_build.name, "by spec hash", &by_hash);
+                            missing.push(dep_build.name.clone());
+                            continue;
+                        }
+                    }
+                }
+            };
             dependencies.insert(cache_dir.path().to_path_buf());
+        }
+
+        if !missing.is_empty() {
+            return Err(Error::Other(anyhow!(
+                "patched-build needs local builds of: {}; build them first",
+                missing.join(", ")
+            )));
         }
 
         let res = SpecBuild {
@@ -79,5 +96,214 @@ impl<'a, SF: crate::SourceFetcher> Runnable for PatchedBuild<'a, SF> {
             outputs: res.outputs,
             build_ms: res.build_ms,
         })
+    }
+}
+
+/// Logs a dependency lookup failure that is not a plain cache miss, so an IO
+/// error or a corrupt cache is not mistaken for an unbuilt dependency.
+fn warn_unless_not_found(name: &str, lookup: &str, err: &CacheErr) {
+    if !matches!(err, CacheErr::NotFound) {
+        tracing::warn!(dep = name, lookup, error = ?err, "patched-build dependency lookup failed");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::SourceFetcher;
+    use decode::Layer;
+    use graph::Graph;
+    use indoc::indoc;
+    use lcache::{Cache, LocalDir};
+    use tempfile::TempDir;
+
+    /// A [`SourceFetcher`] that must never be called: the paths exercised here
+    /// short-circuit before any source is fetched.
+    #[derive(Debug)]
+    struct UnusedFetcher;
+
+    impl SourceFetcher for UnusedFetcher {
+        async fn download_web(
+            &self,
+            _url: &str,
+            _sha256: &str,
+            _op: &ot::OpTracker,
+        ) -> anyhow::Result<std::path::PathBuf> {
+            unreachable!("source fetch must not happen on these build paths")
+        }
+
+        async fn download_gcs(
+            &self,
+            _bucket_id: String,
+            _file: &str,
+            _sha256: &str,
+            _op: &ot::OpTracker,
+        ) -> anyhow::Result<std::path::PathBuf> {
+            unreachable!("source fetch must not happen on these build paths")
+        }
+    }
+
+    fn graph_from(ncl: &str) -> Graph {
+        Graph::new()
+            .ingest(Layer::new_for_test(ncl.to_string()).unwrap())
+            .unwrap()
+    }
+
+    fn patched_build<'a>(
+        spec: &'a BuildSpecRef,
+        fetcher: &'a UnusedFetcher,
+    ) -> PatchedBuild<'a, UnusedFetcher> {
+        PatchedBuild {
+            spec,
+            remote_fetcher: fetcher,
+            stdout_writer: None,
+            stderr_writer: None,
+        }
+    }
+
+    /// Fakes a completed build of `package` whose cache entry is recorded
+    /// under `meta_name` rather than the package's own name, so a by-name
+    /// lookup for `package` misses while its spec-hash entry still exists.
+    fn fake_build(cache: &Cache<LocalDir>, graph: &Graph, package: &str, meta_name: &str) {
+        let hash = graph.spec_hash(graph.by_name(package).expect("package in graph"));
+        let pending = cache.write_dir(&hash).expect("write cache dir");
+        std::fs::write(pending.path().join("marker"), b"x").expect("write build output");
+        pending
+            .finalize(EntryMeta {
+                inner: MetaInner::Spec(meta_name.to_string()),
+                ..Default::default()
+            })
+            .expect("finalize cache entry");
+    }
+
+    /// A top-level pure collection with three runtime dependencies, so
+    /// dependency resolution runs without any sandbox build work.
+    const THREE_DEPS: &str = indoc! {r#"
+        let {BuildSpec, ..} = import "minimal.ncl" in
+        let dep_a = { name = "dep-a", build_deps = [], cmd = "" } | BuildSpec in
+        let dep_b = { name = "dep-b", build_deps = [], cmd = "" } | BuildSpec in
+        let dep_c = { name = "dep-c", build_deps = [], cmd = "" } | BuildSpec in
+        {
+            name = "top",
+            build_deps = [],
+            runtime_deps = [dep_a, dep_b, dep_c],
+            cmd = "",
+        } | BuildSpec
+    "#};
+
+    /// A dependency with no by-name build but a spec-hash entry is still used,
+    /// and every dependency that has no local build at all is reported in one
+    /// error rather than one per attempt.
+    #[test]
+    fn reports_every_missing_dependency_and_uses_spec_hash_fallback() {
+        let tmp = TempDir::new().unwrap();
+        let cache = Cache::at_dir(tmp.path()).unwrap();
+        let dg = graph_from(THREE_DEPS);
+
+        // dep-a resolves by name; dep-b only by spec hash; dep-c is absent.
+        fake_build(&cache, &dg, "dep-a", "dep-a");
+        fake_build(&cache, &dg, "dep-b", "some-other-name");
+
+        let bsr = *dg.by_name("top").unwrap();
+        let fetcher = UnusedFetcher;
+        let mut pb = patched_build(&bsr, &fetcher);
+        let opts = Options {
+            cache: cache.clone(),
+            graph: &dg,
+            exec_base: "/not-exists".into(),
+            ot: None,
+            daemon_id: None,
+        };
+
+        let err = futures::executor::block_on(pb.run(&opts))
+            .err()
+            .expect("PatchedBuild::run should fail when a dependency is missing");
+
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("dep-c"),
+            "the error must name the missing dependency, got: {msg}"
+        );
+        assert!(
+            !msg.contains("dep-a"),
+            "dep-a is cached by name and must not be reported missing, got: {msg}"
+        );
+        assert!(
+            !msg.contains("dep-b"),
+            "dep-b is cached by spec hash and must not be reported missing, got: {msg}"
+        );
+    }
+
+    /// Several missing dependencies are collected into one error rather than
+    /// the first miss aborting the lookup.
+    #[test]
+    fn reports_several_missing_dependencies_in_one_error() {
+        let tmp = TempDir::new().unwrap();
+        let cache = Cache::at_dir(tmp.path()).unwrap();
+        let dg = graph_from(THREE_DEPS);
+
+        // Only dep-a is built; dep-b and dep-c are both absent.
+        fake_build(&cache, &dg, "dep-a", "dep-a");
+
+        let bsr = *dg.by_name("top").unwrap();
+        let fetcher = UnusedFetcher;
+        let mut pb = patched_build(&bsr, &fetcher);
+        let opts = Options {
+            cache: cache.clone(),
+            graph: &dg,
+            exec_base: "/not-exists".into(),
+            ot: None,
+            daemon_id: None,
+        };
+
+        let err = futures::executor::block_on(pb.run(&opts))
+            .err()
+            .expect("PatchedBuild::run should fail when dependencies are missing");
+
+        let msg = format!("{err}");
+        for missing in ["dep-b", "dep-c"] {
+            assert!(
+                msg.contains(missing),
+                "the error must name every missing dependency ({missing}), got: {msg}"
+            );
+        }
+        assert!(
+            !msg.contains("dep-a"),
+            "dep-a is cached by name and must not be reported missing, got: {msg}"
+        );
+        assert!(
+            msg.contains("build them first"),
+            "the error must say how to recover, got: {msg}"
+        );
+    }
+
+    /// When every dependency resolves — some by name, some only by spec hash —
+    /// the build proceeds.
+    #[test]
+    fn resolves_dependencies_by_name_or_spec_hash() {
+        let tmp = TempDir::new().unwrap();
+        let cache = Cache::at_dir(tmp.path()).unwrap();
+        let dg = graph_from(THREE_DEPS);
+
+        fake_build(&cache, &dg, "dep-a", "dep-a");
+        fake_build(&cache, &dg, "dep-b", "some-other-name");
+        fake_build(&cache, &dg, "dep-c", "dep-c");
+
+        let bsr = *dg.by_name("top").unwrap();
+        let fetcher = UnusedFetcher;
+        let mut pb = patched_build(&bsr, &fetcher);
+        let opts = Options {
+            cache: cache.clone(),
+            graph: &dg,
+            exec_base: "/not-exists".into(),
+            ot: None,
+            daemon_id: None,
+        };
+
+        let result =
+            futures::executor::block_on(pb.run(&opts)).expect("all dependencies are resolvable");
+
+        // `top` is a pure collection, so no build work is performed.
+        assert_eq!(result.build_ms, 0);
     }
 }
