@@ -4008,6 +4008,13 @@ impl SessionLauncher for SandboxLauncher {
         // leaf is named by. The declaration is fixed at create, so a launch
         // decides it once and a box is never re-verdicted mid-flight.
         let classifier_verdict = crate::net::classifier::verdict_of(policy.egress.as_ref());
+        // Whether the declaration lets a listen publish at all (NET-016):
+        // `allow` with a range. Read now, before the policy moves into the
+        // network plan, for the missing-listen-plan line below.
+        let listens_can_publish = policy.ingress.as_ref().is_some_and(|ingress| {
+            ingress.dynamic_ingress == Some(sessions::DynamicIngress::Allow)
+                && ingress.dynamic_allowed_range.is_some()
+        });
         let network_mode = self.network_mode;
         // The classifier tree this daemon places boxes in, moved out before
         // the rest of `self` is consumed (see the field's doc).
@@ -4576,13 +4583,51 @@ impl SessionLauncher for SandboxLauncher {
         // and stops it with the session — so a box with no lease, no
         // published address or no live gate carries no plan, and its ports
         // stay unpublishable by listening.
-        let lease = plan.tap().map(|tap| tap.address);
+        //
+        // Read here, after `planned.attach` above returned: a successful
+        // attach has already reported this spawn's lease
+        // (`complete_own_ip_attach` reports it before it returns `Ok`), and
+        // every launch — a respawn included — runs this step afresh, so the
+        // lease the plan carries is always this spawn's own.
+        let lease = crate::net::provider::attached_lease(&plan, own_address.as_ref());
         let published = own_address
             .as_ref()
             .and_then(|reporter| reporter.published_address());
         let gate = lease.and_then(crate::net::switch::live_gate);
+        if matches!(network_mode, NetworkMode::OwnIp)
+            && (lease.is_none() || published.is_none() || gate.is_none())
+        {
+            // An own-address box whose listens will never publish: said once
+            // per launch, naming the fact that is missing, so a listen that
+            // never publishes is not silent (NET-016) — a warning where the
+            // declaration allows listens to publish, since one it allows will
+            // not.
+            if listens_can_publish {
+                tracing::warn!(
+                    session = %session_label,
+                    lease = ?lease,
+                    published = ?published,
+                    gate = gate.is_some(),
+                    "the box carries no listen plan; its listens are not published"
+                );
+            } else {
+                tracing::info!(
+                    session = %session_label,
+                    lease = ?lease,
+                    published = ?published,
+                    gate = gate.is_some(),
+                    "the box carries no listen plan; its listens are not published"
+                );
+            }
+        }
         let listen_plan = match (lease, published, gate) {
             (Some(lease), Some(published), Some(gate)) => {
+                tracing::debug!(
+                    session = %session_label,
+                    %lease,
+                    %published,
+                    "built the box's listen plan"
+                );
                 let switch = net_switch.lock().await;
                 let control = match switch.transport() {
                     crate::net::SwitchTransport::LocalSpawn => {
