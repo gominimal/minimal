@@ -157,6 +157,7 @@ const GUEST_CT_MARK_MASK_ARG: &str = "0x30000000";
 const ERRNO_EHOSTUNREACH: i32 = 113;
 const ERRNO_EACCES: i32 = 13;
 const ERRNO_EPERM: i32 = 1;
+const ERRNO_ECONNREFUSED: i32 = 111;
 
 /// The loopback families the probe reads, as its own record spells them
 /// (`Family::name` in `minimald::net::classifier`).
@@ -1085,11 +1086,13 @@ async fn guest_deny_all_probe_refused() {
 /// A deny-all box's DNS to the gateway is refused like any other destination:
 /// on a VM-backed host the guest renders no resolver carve-out, because the
 /// node's DNS layer applies no per-box name rule to host-address boxes
-/// (follow-up gominimal/inbox#897). Both transports are read: a UDP query to
-/// 53 on the gateway reads the reject's errno back on the connected socket,
-/// and a TCP connect to 53 reads it on the connect — each must be in the
-/// reject set, never an answer or a timeout. The render's own line is on the
-/// guest's console.
+/// (follow-up gominimal/inbox#897). The deny chain ends in `reject with icmpx
+/// admin-prohibited`, so the TCP connect to 53 must read an errno in the
+/// reject set. A UDP send to a refused destination often succeeds locally,
+/// so the UDP leg asserts only that no reply arrives within a bounded wait:
+/// the wait running out, or the reject's errno coming back on the connected
+/// socket (ECONNREFUSED included), passes; an answer fails. The render's own
+/// line is on the guest's console.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 #[ignore = "gated MINVMD_E2E=1; requires libkrun, kernel/rootfs/initramfs images, and the gvproxy switch"]
@@ -1159,19 +1162,31 @@ async fn guest_deny_all_dns_to_gateway_refused() {
         ERRNO_EACCES.to_string(),
         ERRNO_EPERM.to_string(),
     ];
-    for transport in ["udp", "tcp"] {
-        let read = stdout
+    let read = |transport: &str| {
+        stdout
             .lines()
             .find_map(|line| line.strip_prefix(&format!("{transport} ")))
-            .unwrap_or("missing");
-        assert!(
-            reject_set.iter().any(|errno| errno == read),
-            "a deny-all box's {transport} 53 to the gateway {gateway} must be refused \
-             with an errno in EHOSTUNREACH, EACCES and EPERM; read {read}\n\
-             --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}\n--- guest boot log ---\n{}",
-            guest.boot_log(),
-        );
-    }
+            .unwrap_or("missing")
+            .to_string()
+    };
+    // UDP: no reply within the bound. The reject's errno, or ECONNREFUSED,
+    // read back on the connected socket is the same refusal seen sooner.
+    let udp = read("udp");
+    assert!(
+        udp == "timeout" || udp == ERRNO_ECONNREFUSED.to_string() || reject_set.contains(&udp),
+        "a deny-all box's udp 53 to the gateway {gateway} must get no reply; read {udp}\n\
+         --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}\n--- guest boot log ---\n{}",
+        guest.boot_log(),
+    );
+    // TCP: the deny chain rejects, so the connect reads the reject's errno.
+    let tcp = read("tcp");
+    assert!(
+        reject_set.contains(&tcp),
+        "a deny-all box's tcp 53 to the gateway {gateway} must be refused with an errno in \
+         EHOSTUNREACH, EACCES and EPERM (the deny chain rejects); read {tcp}\n\
+         --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}\n--- guest boot log ---\n{}",
+        guest.boot_log(),
+    );
 }
 
 /// A deny-all box answers what reaches it: a connection another box opens to
