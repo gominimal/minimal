@@ -797,6 +797,15 @@ mod tests {
             Some(lease),
             "the privileged plan has no tap, so the attach's reported lease is the box's"
         );
+        // A respawn attaches afresh and reports its own lease, and the
+        // watcher it starts reads that one — never the previous spawn's.
+        let respawned = std::net::Ipv4Addr::new(100, 64, 128, 9);
+        reporter.report("vm-box", respawned, BTreeMap::new());
+        assert_eq!(
+            attached_lease(&privileged, Some(&reporter)),
+            Some(respawned),
+            "a respawned box's watcher reads the lease its own attach reported"
+        );
         let rootless = own_ip_plan(subnet, lease, TapMechanism::InNamespace);
         assert_eq!(attached_lease(&rootless, None), Some(lease));
         assert_eq!(attached_lease(&NetPlan::isolated(), None), None);
