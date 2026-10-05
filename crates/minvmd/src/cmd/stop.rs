@@ -15,6 +15,7 @@ use crate::lifecycle::Lifecycle;
 use crate::state::{State, StateDir};
 
 /// Run the `stop` subcommand.
+#[tracing::instrument(name = "vm.stop", skip_all, fields(vm = %crate::state::vm_name()))]
 pub fn run() -> Result<()> {
     run_with_state_dir(StateDir::default_path(), true)
 }

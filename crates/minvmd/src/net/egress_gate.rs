@@ -157,6 +157,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
+use tracing::Instrument as _;
 
 use sessions::EgressDefaultPhase;
 use sessions::core::egress::{self, DropReason, FrameFamily, FrameSummary, FrameVerdict, Ipv4Cidr};
@@ -983,28 +984,37 @@ impl EgressGate {
         // teardown that retracts it arrive on different connections.
         let forwards = Arc::new(PublishedForwards::new());
         // Subscribed before the accept loop starts, so no row withdrawn
-        // while the gate serves escapes the revoker.
+        // while the gate serves escapes the revoker. The revoker and the
+        // accept loop live as long as the VM, each in a span of its own that
+        // follows from this one: held, the supervisor's start phase would
+        // never export (`telemetry::vm_task`).
         let withdrawn = table.subscribe_row_withdrawals();
-        let revoker = tokio::spawn(revoke_on_row_withdrawal(
-            withdrawn,
-            switch_sock.clone(),
-            Arc::clone(&forwards),
-            replies.clone(),
-        ));
+        let revoker = tokio::spawn(
+            revoke_on_row_withdrawal(
+                withdrawn,
+                switch_sock.clone(),
+                Arc::clone(&forwards),
+                replies.clone(),
+            )
+            .instrument(crate::telemetry::vm_task("net.gate.revoke")),
+        );
         Ok(Self {
             revoker,
-            accept: tokio::spawn(accept_loop(
-                listener,
-                switch_sock,
-                table,
-                pins,
-                replies,
-                baseline,
-                limiter,
-                forwards,
-                HANDSHAKE_TIMEOUT,
-                phase,
-            )),
+            accept: tokio::spawn(
+                accept_loop(
+                    listener,
+                    switch_sock,
+                    table,
+                    pins,
+                    replies,
+                    baseline,
+                    limiter,
+                    forwards,
+                    HANDSHAKE_TIMEOUT,
+                    phase,
+                )
+                .instrument(crate::telemetry::vm_task("net.gate.accept")),
+            ),
         })
     }
 }
@@ -1183,18 +1193,24 @@ async fn accept_loop<A: GuestSource>(
             }
             continue;
         }
-        relays.spawn(serve_connection(
-            guest,
-            switch_sock.clone(),
-            table.clone(),
-            pins.clone(),
-            replies.clone(),
-            baseline.clone(),
-            Arc::clone(&limiter),
-            Arc::clone(&forwards),
-            handshake_timeout,
-            phase,
-        ));
+        // In the accept loop's span, as every minvmd task is: a JoinSet task
+        // starts with no current span, and the relay's records (errors,
+        // refusals, frame drops) would lose the `vm` they belong to.
+        relays.spawn(
+            serve_connection(
+                guest,
+                switch_sock.clone(),
+                table.clone(),
+                pins.clone(),
+                replies.clone(),
+                baseline.clone(),
+                Arc::clone(&limiter),
+                Arc::clone(&forwards),
+                handshake_timeout,
+                phase,
+            )
+            .in_current_span(),
+        );
     }
 }
 
@@ -1382,15 +1398,18 @@ async fn relay_frames(
     limiter: Arc<DropLimiter>,
     forwards: Arc<PublishedForwards>,
 ) {
-    let mut ingress = tokio::spawn(relay_switch_frames_to_guest(
-        switch_rx,
-        guest_tx,
-        table.clone(),
-        pins.clone(),
-        replies.clone(),
-        Arc::clone(&limiter),
-        Arc::clone(&forwards),
-    ));
+    let mut ingress = tokio::spawn(
+        relay_switch_frames_to_guest(
+            switch_rx,
+            guest_tx,
+            table.clone(),
+            pins.clone(),
+            replies.clone(),
+            Arc::clone(&limiter),
+            Arc::clone(&forwards),
+        )
+        .in_current_span(),
+    );
     // Every admitted frame's source, deduplicated: the attribution this relay
     // files at its end. Filled by the egress leg's loop below but owned here,
     // so it outlives whichever leg loses the race and is filed on every exit.
@@ -1723,11 +1742,9 @@ async fn relay_control(
         }
     }
     let answered = Arc::new(OnceLock::new());
-    let mut response = tokio::spawn(copy_switch_to_guest(
-        switch_rx,
-        guest_tx,
-        Arc::clone(&answered),
-    ));
+    let mut response = tokio::spawn(
+        copy_switch_to_guest(switch_rx, guest_tx, Arc::clone(&answered)).in_current_span(),
+    );
     // The legs race, as the frame relay's do: the switch's side can end under
     // an idle guest — the per-connection close a keep-alive control channel
     // makes while the guest waits on the answer — and only the response leg
@@ -2262,13 +2279,16 @@ async fn revoke_on_row_withdrawal(
                 let Some(withdrawal) = next else {
                     break;
                 };
-                revocations.spawn(revoke_box_forwards(
-                    switch_sock.clone(),
-                    Arc::clone(&forwards),
-                    replies.clone(),
-                    withdrawal,
-                    &UNBIND_RETRY_BACKOFF,
-                ));
+                revocations.spawn(
+                    revoke_box_forwards(
+                        switch_sock.clone(),
+                        Arc::clone(&forwards),
+                        replies.clone(),
+                        withdrawal,
+                        &UNBIND_RETRY_BACKOFF,
+                    )
+                    .in_current_span(),
+                );
             }
             Some(done) = revocations.join_next(), if !revocations.is_empty() => {
                 if let Ok(Some(held)) = done {
@@ -5683,6 +5703,7 @@ mod tests {
     use std::net::Ipv4Addr;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
+    use tracing::Instrument as _;
 
     use sessions::EgressPolicy;
     use sessions::core::egress::{DropReason, FrameFamily, FrameVerdict, InboundFlow, Ipv4Cidr};
@@ -8544,7 +8565,7 @@ mod tests {
     ) {
         let listener = UnixListener::bind(path).expect("binding the stand-in switch");
         let (asked, receiver) = tokio::sync::mpsc::unbounded_channel();
-        let server = tokio::spawn(async move {
+        let serve = async move {
             let mut answers = answers.iter().peekable();
             loop {
                 let Ok((mut stream, _)) = listener.accept().await else {
@@ -8563,7 +8584,8 @@ mod tests {
                 );
                 let _answered = stream.write_all(answer.as_bytes()).await;
             }
-        });
+        };
+        let server = tokio::spawn(serve.in_current_span());
         (server, receiver)
     }
 
@@ -11158,18 +11180,21 @@ mod tests {
         let _guard = tracing::subscriber::set_default(subscriber);
 
         let (mut guest, gate_end) = UnixStream::pair().expect("pairing the guest's socket");
-        tokio::spawn(serve_connection(
-            gate_end,
-            switch_sock.clone(),
-            table,
-            dns_pins::DnsPins::new(SUBNET),
-            ReplyTables::new(),
-            NodePlaneBaseline::built_in(SUBNET),
-            Arc::new(DropLimiter::new()),
-            Arc::new(PublishedForwards::new()),
-            bound,
-            UNREGISTERED_SOURCE_PHASE,
-        ));
+        tokio::spawn(
+            serve_connection(
+                gate_end,
+                switch_sock.clone(),
+                table,
+                dns_pins::DnsPins::new(SUBNET),
+                ReplyTables::new(),
+                NodePlaneBaseline::built_in(SUBNET),
+                Arc::new(DropLimiter::new()),
+                Arc::new(PublishedForwards::new()),
+                bound,
+                UNREGISTERED_SOURCE_PHASE,
+            )
+            .in_current_span(),
+        );
         // One control request, spoken whole, answered by nothing: an honest
         // zone-add at an in-plan lease the interim admits.
         let body = br#"{"name":"min.internal.","records":[{"name":"web","ip":"100.64.0.10"}]}"#;
@@ -11244,18 +11269,21 @@ mod tests {
         let _guard = tracing::subscriber::set_default(subscriber);
 
         let (mut guest, gate_end) = UnixStream::pair().expect("pairing the guest's socket");
-        tokio::spawn(serve_connection(
-            gate_end,
-            switch_sock.clone(),
-            table,
-            dns_pins::DnsPins::new(SUBNET),
-            ReplyTables::new(),
-            NodePlaneBaseline::built_in(SUBNET),
-            Arc::new(DropLimiter::new()),
-            Arc::new(PublishedForwards::new()),
-            bound,
-            UNREGISTERED_SOURCE_PHASE,
-        ));
+        tokio::spawn(
+            serve_connection(
+                gate_end,
+                switch_sock.clone(),
+                table,
+                dns_pins::DnsPins::new(SUBNET),
+                ReplyTables::new(),
+                NodePlaneBaseline::built_in(SUBNET),
+                Arc::new(DropLimiter::new()),
+                Arc::new(PublishedForwards::new()),
+                bound,
+                UNREGISTERED_SOURCE_PHASE,
+            )
+            .in_current_span(),
+        );
         // One control request, spoken whole, and then the guest stays on the
         // connection: no close, nothing more to say — the posture it waits
         // an answer in, which is why neither leg can end the exchange. An
@@ -11329,18 +11357,21 @@ mod tests {
         // same way.
         for first_write in [Vec::new(), b"POST /connec".to_vec()] {
             let (mut guest, gate_end) = UnixStream::pair().expect("pairing the guest's socket");
-            tokio::spawn(serve_connection(
-                gate_end,
-                switch_sock.clone(),
-                table.clone(),
-                dns_pins::DnsPins::new(SUBNET),
-                ReplyTables::new(),
-                NodePlaneBaseline::built_in(SUBNET),
-                Arc::new(DropLimiter::new()),
-                Arc::new(PublishedForwards::new()),
-                bound,
-                UNREGISTERED_SOURCE_PHASE,
-            ));
+            tokio::spawn(
+                serve_connection(
+                    gate_end,
+                    switch_sock.clone(),
+                    table.clone(),
+                    dns_pins::DnsPins::new(SUBNET),
+                    ReplyTables::new(),
+                    NodePlaneBaseline::built_in(SUBNET),
+                    Arc::new(DropLimiter::new()),
+                    Arc::new(PublishedForwards::new()),
+                    bound,
+                    UNREGISTERED_SOURCE_PHASE,
+                )
+                .in_current_span(),
+            );
             if !first_write.is_empty() {
                 guest
                     .write_all(&first_write)
@@ -11409,7 +11440,7 @@ mod tests {
     ) {
         let (log, guard) = capture_log();
         let (feed, script) = mpsc::unbounded_channel();
-        let accept = tokio::spawn(accept_loop(
+        let accept_fut = accept_loop(
             ScriptedGuests(script),
             switch_sock.to_path_buf(),
             table.clone(),
@@ -11420,7 +11451,8 @@ mod tests {
             Arc::new(PublishedForwards::new()),
             HANDSHAKE_TIMEOUT,
             UNREGISTERED_SOURCE_PHASE,
-        ));
+        );
+        let accept = tokio::spawn(accept_fut.in_current_span());
         (feed, accept, log, guard)
     }
 
@@ -11662,18 +11694,21 @@ mod tests {
         let (log, _guard) = capture_log();
         let (feed, _accept) = {
             let (feed, script) = mpsc::unbounded_channel();
-            let accept = tokio::spawn(accept_loop(
-                ScriptedGuests(script),
-                switch_sock.clone(),
-                table,
-                dns_pins::DnsPins::new(SUBNET),
-                ReplyTables::new(),
-                NodePlaneBaseline::built_in(SUBNET),
-                Arc::new(DropLimiter::new()),
-                Arc::new(PublishedForwards::new()),
-                bound,
-                UNREGISTERED_SOURCE_PHASE,
-            ));
+            let accept = tokio::spawn(
+                accept_loop(
+                    ScriptedGuests(script),
+                    switch_sock.clone(),
+                    table,
+                    dns_pins::DnsPins::new(SUBNET),
+                    ReplyTables::new(),
+                    NodePlaneBaseline::built_in(SUBNET),
+                    Arc::new(DropLimiter::new()),
+                    Arc::new(PublishedForwards::new()),
+                    bound,
+                    UNREGISTERED_SOURCE_PHASE,
+                )
+                .in_current_span(),
+            );
             (feed, accept)
         };
 

@@ -54,6 +54,8 @@ pub(crate) fn call_oneshot_blocking<R: OneshotSshRpc>(
     connect_timeout: Duration,
     rpc_timeout: Duration,
 ) -> anyhow::Result<R::Response> {
+    // Read before the runtime: its tasks start with no current span.
+    let traceparent = crate::telemetry::traceparent();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -67,9 +69,14 @@ pub(crate) fn call_oneshot_blocking<R: OneshotSshRpc>(
                     uds_path.display()
                 )
             })??;
-        tokio::time::timeout(rpc_timeout, call_oneshot::<R>(&mut handle, request))
-            .await
-            .map_err(|_| anyhow::anyhow!("RPC {} timed out after {rpc_timeout:?}", R::NAME))?
+        tokio::time::timeout(
+            rpc_timeout,
+            call_oneshot::<R>(&mut handle, request, traceparent.as_deref()),
+        )
+        .await
+        // `Elapsed` says only "deadline has elapsed"; the deadline itself is
+        // `rpc_timeout`, so the message names that and not the error.
+        .map_err(|_elapsed| anyhow::anyhow!("RPC {} timed out after {rpc_timeout:?}", R::NAME))?
     })
 }
 
@@ -77,6 +84,7 @@ pub(crate) fn call_oneshot_blocking<R: OneshotSshRpc>(
 /// volume (R2.3). `force: true` because the caller is tearing the VM down
 /// regardless — a refused non-force shutdown would only trade a clean drain
 /// for an unclean SIGTERM.
+#[tracing::instrument(name = "guest.shutdown", skip_all)]
 pub(crate) fn shutdown_guest(
     uds_path: &Path,
     connect_timeout: Duration,
@@ -113,11 +121,24 @@ async fn connect(uds_path: &Path) -> anyhow::Result<russh::client::Handle<AnyHos
 async fn call_oneshot<R: OneshotSshRpc>(
     handle: &mut russh::client::Handle<AnyHostKey>,
     request: R::Request<'_>,
+    traceparent: Option<&str>,
 ) -> anyhow::Result<R::Response> {
     let channel = handle
         .channel_open_session()
         .await
         .with_context(|| format!("open channel for {}", R::NAME))?;
+    // The same `TRACEPARENT` channel env the CLI's RPCs carry, so the guest
+    // daemon's `rpc` span is a child of this call's span. Best effort and
+    // reply-less, as there: a daemon ignores env names it does not know.
+    if let Some(tp) = traceparent {
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "best effort: a telemetry failure is a silent no-op (spec 25 principle 8)"
+        )]
+        let _ = channel
+            .set_env(false, minimald_rpc::trace::TRACEPARENT_ENV, tp)
+            .await;
+    }
     channel
         .request_subsystem(false, R::NAME)
         .await
@@ -170,6 +191,57 @@ mod tests {
         assert!(
             err.to_string().contains("connect to minimald"),
             "got: {err:#}"
+        );
+    }
+
+    /// `guest.shutdown` is open before the guest is dialed: the span is the
+    /// host's and starts on entry, so the guest's `rpc` span for the
+    /// Shutdown it carries starts after it. A guest `rpc` that a trace shows
+    /// starting before its `guest.shutdown` parent does so on the guest's
+    /// clock, which follows the host's only to within the timekeep step
+    /// threshold (spec 25 TEL-034); it is not an ordering slip on this side.
+    #[test]
+    fn guest_shutdown_opens_before_the_guest_is_dialed() {
+        use std::sync::{Arc, Mutex};
+        use std::time::Instant;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        /// The instant the first `guest.shutdown` span was opened.
+        #[derive(Clone, Default)]
+        struct Opened(Arc<Mutex<Option<Instant>>>);
+
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Opened {
+            fn on_new_span(
+                &self,
+                attrs: &tracing::span::Attributes<'_>,
+                _id: &tracing::span::Id,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if attrs.metadata().name() == "guest.shutdown" {
+                    self.0.lock().unwrap().get_or_insert_with(Instant::now);
+                }
+            }
+        }
+
+        let opened = Opened::default();
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(opened.clone()));
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("guest.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        // The stand-in guest notes when it is dialed and hangs up, so the
+        // call fails at the handshake.
+        let dialed = std::thread::spawn(move || {
+            let (_conn, _) = listener.accept().unwrap();
+            Instant::now()
+        });
+        let _failed =
+            shutdown_guest(&sock, Duration::from_secs(5), Duration::from_secs(5)).unwrap_err();
+        let dialed = dialed.join().unwrap();
+        let opened = opened.0.lock().unwrap().expect("guest.shutdown was opened");
+        assert!(
+            opened < dialed,
+            "guest.shutdown must open before the guest is dialed"
         );
     }
 

@@ -89,6 +89,11 @@ russh-sftp.workspace = true
 # real registry (`bep_stub`, NET-132) on the switch crate's channel-wired
 # lane and box-side client — the same `test_util` the pool's own tests use.
 switch = { workspace = true, features = ["test-util"] }
+# The supervisor's span-phase tests (`telemetry`) record what the OTel layer
+# exports in memory, with the same layer `mlog::otel` installs.
+opentelemetry.workspace = true
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
+tracing-opentelemetry.workspace = true
 
 [lints]
 workspace = true

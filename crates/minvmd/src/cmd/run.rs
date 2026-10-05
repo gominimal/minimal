@@ -32,7 +32,15 @@ pub const DEFAULT_DETACH_TIMEOUT_SECS: u64 = 8;
 /// - `timeout_secs`: only meaningful under `--detach`; `None` when the flag was
 ///   omitted. Rejected without `--detach` rather than silently ignored;
 ///   defaults to [`DEFAULT_DETACH_TIMEOUT_SECS`] when detaching.
-pub fn run(detach: bool, timeout_secs: Option<u64>) -> Result<()> {
+/// - `root`: this process's root span ([`crate::telemetry::root_span`]),
+///   entered. A `--detach` caller holds it until it returns; the supervisor
+///   ends it once the VM is ready, so it exports while the VM runs
+///   (`telemetry::SupervisorStart`).
+pub fn run(
+    detach: bool,
+    timeout_secs: Option<u64>,
+    root: tracing::span::EnteredSpan,
+) -> Result<()> {
     // `--timeout` only bounds the detach poll loop; foreground runs supervise
     // the VMM child for its whole life and never consult it. Accepting it in
     // foreground mode would silently ignore it, so reject the combination.
@@ -79,17 +87,18 @@ pub fn run(detach: bool, timeout_secs: Option<u64>) -> Result<()> {
     }
 
     #[cfg(minvmd_libkrun)]
-    return run_supervisor(detach, timeout_secs);
+    return run_supervisor(detach, timeout_secs, root);
 
     #[cfg(not(minvmd_libkrun))]
     {
         let _ = (detach, timeout_secs);
+        drop(root);
         bail!("`minvmd run` requires libkrun (macOS, or Linux with libkrun installed)");
     }
 }
 
 #[cfg(minvmd_libkrun)]
-fn run_supervisor(detach: bool, timeout_secs: u64) -> Result<()> {
+fn run_supervisor(detach: bool, timeout_secs: u64, root: tracing::span::EnteredSpan) -> Result<()> {
     // Adopt any pre-split `providers/local-<N>` dir into the kind-tagged scheme
     // before resolving our own `local-minvmd0` dir, so an upgraded host reuses
     // its existing VM state (data volume, boot log) instead of orphaning it.
@@ -108,9 +117,13 @@ fn run_supervisor(detach: bool, timeout_secs: u64) -> Result<()> {
     crate::sock::check_uds_path_len(&crate::net::resolve_gate_sock()?)?;
 
     if detach {
-        return run_detach(timeout_secs);
+        // The caller's root covers its whole wait: the hand-off ends when this
+        // returns, with the VM serving or the wait failed.
+        let result = run_detach(timeout_secs);
+        drop(root);
+        return result;
     }
-    run_foreground()
+    run_foreground(root)
 }
 
 /// Outcome of one poll of the `--detach` readiness loop, decided from the
@@ -254,6 +267,8 @@ fn run_detach(timeout_secs: u64) -> Result<()> {
     // Forward the state-dir override and VM name so the re-exec'd supervisor
     // resolves the same per-VM state dir this process did.
     crate::state::forward_identity(&mut cmd);
+    // And the trace: the supervisor's spans are children of this `run`.
+    crate::telemetry::forward_trace(&mut cmd);
     // Mark the child as detached so it routes tracing to the daily-rotated
     // log file (`<state>/logs/minvmd.log`) instead of stdout.
     cmd.env(crate::DETACHED_ENV, "1");
@@ -342,8 +357,12 @@ fn run_detach(timeout_secs: u64) -> Result<()> {
 
 /// Foreground supervisor: boot the VM, manage lifecycle state, supervise until
 /// the VMM child exits.
+///
+/// `root` (the process's root span, entered) and the `supervisor.start` span
+/// under it end once the VM is ready; the rest of the VM's life runs under a
+/// `supervisor.serve` root linked to them (`telemetry::SupervisorStart`).
 #[cfg(minvmd_libkrun)]
-fn run_foreground() -> Result<()> {
+fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
     use std::io::Read as _;
     use std::os::unix::net::UnixListener;
     use std::path::PathBuf;
@@ -357,12 +376,14 @@ fn run_foreground() -> Result<()> {
     use crate::net::answerer::DEFAULT_ANSWERER_PORT;
     use crate::state::{StartingGuard, State, StateDir};
 
-    // One span per supervised VM, like minimald's per-connection `conn` span:
-    // every record the supervisor emits carries `vm`, so a detached
+    // One span per supervisor phase, like minimald's per-connection `conn`
+    // span: every record the supervisor emits carries `vm`, so a detached
     // supervisor's lines in the shared log (`<state>/logs/minvmd.log`, common
     // to every VM on the host) stay attributable once a second VM runs —
-    // grep instead of manual fields on each line.
-    let _vm_scope = tracing::info_span!("supervisor", vm = %crate::state::vm_name()).entered();
+    // grep instead of manual fields on each line. This one, `supervisor.start`,
+    // is the parent of the switch start and of `vm.boot` (and so of the guest's
+    // `guest.ready`), and ends with the process root at READY below.
+    let start_phase = crate::telemetry::SupervisorStart::enter(root);
 
     // Fail-fast: resolve paths before touching lifecycle state.
     // (UDS path lengths were already checked in `run_supervisor`.)
@@ -875,11 +896,28 @@ fn run_foreground() -> Result<()> {
             generation = publish_generation,
             "drew the boot's publish generation"
         );
+        // `vm.boot`: from spawning the VMM child to the guest's READY beacon,
+        // one span per boot (a T93 redraw boots again under a fresh one). The
+        // child and, through the boot line, the guest daemon inherit it as
+        // their parent (`telemetry::forward_trace`), so the guest's boot
+        // spans land under it in the same trace.
+        let boot_span = tracing::info_span!(
+            "vm.boot",
+            vm = %crate::state::vm_name(),
+            otel.status_code = tracing::field::Empty,
+        )
+        .entered();
+        // Every return from here to READY (the spawn's `?`, the lifecycle
+        // lock, read and write `?`s, the `bail!` on a lifecycle changed
+        // during spawn, a failed wait) exports `vm.boot` with an error
+        // status (TEL-035), as `minvmd boot` does; reaching READY clears it.
+        let boot_failed = crate::telemetry::ErrorUnlessOk::new(&boot_span);
         let mut cmd = std::process::Command::new(&exe);
         cmd.arg("__krun-vmm");
         // Forward the state-dir override and VM name so the VMM child resolves the
         // same per-VM state dir this supervisor does.
         crate::state::forward_identity(&mut cmd);
+        crate::telemetry::forward_trace(&mut cmd);
         alive_lock.inherit_into(&mut cmd);
         // The guest report door's path travels the same way the marker
         // socket's does: the child is the process that owns the libkrun
@@ -964,6 +1002,8 @@ fn run_foreground() -> Result<()> {
                 // guard drops here → StartingGuard resets state to Stopped (R4.6)
             }
         };
+        boot_failed.ok();
+        drop(boot_span);
 
         // T93: watch what became of the port this start reserved. The guest
         // reports the publish's outcome over the marker channel — served, or
@@ -1089,8 +1129,10 @@ fn run_foreground() -> Result<()> {
     // from a guest too old to echo one — none.
     if let Some((port, generation)) = unconfirmed_port {
         let proxy_publish = proxy_publish.clone();
-        // The watcher keeps the supervisor's span, so its lines carry `vm`.
-        let vm_scope = tracing::Span::current();
+        // The watcher's lines carry `vm` through a span of its own: it may
+        // outlive READY, and keeping the start phase's span would keep that
+        // phase from exporting (`telemetry::vm_task`).
+        let vm_scope = crate::telemetry::vm_task("proxy.publish.watch");
         std::thread::spawn(move || {
             let _vm_scope = vm_scope.entered();
             for event in marker_events {
@@ -1188,6 +1230,12 @@ fn run_foreground() -> Result<()> {
             tracing::warn!(error = %e, "minimald bridge socket path resolution failed");
         }
     }
+
+    // The VM is ready: the start phase and the process root end and are
+    // flushed now, not when the supervisor exits — which is the VM's whole
+    // life later, if ever: a supervisor killed with its VM never exports what
+    // is still open. Supervision runs under its own root.
+    let _serve_phase = start_phase.ready();
 
     // ── Phase 3: Supervise until VMM child exits ─────────────────────────────
     let status = child.wait().context("waiting for VMM child")?;
@@ -2596,7 +2644,7 @@ mod tests {
     #[cfg(not(minvmd_libkrun))]
     #[test]
     fn run_bails_without_libkrun() {
-        let err = run(false, None).unwrap_err();
+        let err = run(false, None, tracing::Span::none().entered()).unwrap_err();
         assert!(
             err.to_string().contains("requires libkrun"),
             "expected libkrun-required message, got: {err}"
@@ -2606,7 +2654,7 @@ mod tests {
     #[cfg(not(minvmd_libkrun))]
     #[test]
     fn run_rejects_timeout_without_detach() {
-        let err = run(false, Some(5)).unwrap_err();
+        let err = run(false, Some(5), tracing::Span::none().entered()).unwrap_err();
         assert!(
             err.to_string()
                 .contains("`--timeout` only applies with `--detach`"),
