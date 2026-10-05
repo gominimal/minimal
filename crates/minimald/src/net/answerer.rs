@@ -1331,12 +1331,20 @@ async fn recheck_live_carve_outs(
     // reads it — the record the step wrote beside its marker, re-read now
     // because the table's target is the one thing that cannot have moved
     // with the bind.
-    let decision = crate::net::classifier::decide_now(
-        std::path::Path::new(sandbox2::classifier::TREE_ROOT),
-        sandbox2::classifier::own_mountinfo().as_deref(),
-        false,
-    );
-    recheck_live_carve_outs_against(manager, decision.carve_out(), live, facts, said).await;
+    // The probe spawns a child under the process-wide probe lock and waits
+    // up to its own deadline, so it runs on the blocking pool, as its doc
+    // asks of an async caller: this task keeps answering the control socket.
+    let recorded = tokio::task::spawn_blocking(|| {
+        crate::net::classifier::decide_now(
+            std::path::Path::new(sandbox2::classifier::TREE_ROOT),
+            sandbox2::classifier::own_mountinfo().as_deref(),
+            false,
+        )
+        .carve_out()
+    })
+    .await
+    .unwrap_or_default();
+    recheck_live_carve_outs_against(manager, recorded, live, facts, said).await;
 }
 
 /// [`recheck_live_carve_outs`] over a recorded half the caller names — the
