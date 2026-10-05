@@ -53,7 +53,7 @@ use hickory_proto::rr::rdata::{A, SOA};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 use serde::{Deserialize, Serialize};
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, oneshot, Notify};
+use tokio::sync::{Notify, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use sessions::core::zone_answer;
@@ -1442,7 +1442,9 @@ async fn acquire_at(
                 // service's own bind: this daemon's hook port can be
                 // pinned elsewhere than where the service serves, and the
                 // answerer actually serving is the service.
-                state.set_zone_answerer_port(recorded_service_bind().port()).await;
+                state
+                    .set_zone_answerer_port(recorded_service_bind().port())
+                    .await;
                 crate::net::classifier::set_live_answerer(recorded_service_bind());
                 recheck_live_carve_outs(
                     &manager,
@@ -3144,10 +3146,8 @@ mod tests {
         // fact the loaded table enforces, created and finalized the way a
         // box a person attaches is.
         let mut deny_all = crate::test_harness::create_session_req("carve-out-box", "/uwu");
-        deny_all.config.policy = minimald_rpc::SessionPolicy::new(
-            Some(minimald_rpc::EgressPolicy::deny_all()),
-            None,
-        );
+        deny_all.config.policy =
+            minimald_rpc::SessionPolicy::new(Some(minimald_rpc::EgressPolicy::deny_all()), None);
         let id = client.call::<CreateSession>(&deny_all).await.unwrap().id;
         crate::test_harness::unwrap_ready(
             client
@@ -3172,9 +3172,10 @@ mod tests {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         loop {
             let listed = manager.list().await.unwrap();
-            if listed.iter().any(|info| {
-                info.name.as_deref() == Some("carve-out-box") && info.attrs.is_some()
-            }) {
+            if listed
+                .iter()
+                .any(|info| info.name.as_deref() == Some("carve-out-box") && info.attrs.is_some())
+            {
                 break;
             }
             assert!(
@@ -3190,16 +3191,12 @@ mod tests {
         // contract this pins.
         let stale_lines = |log: &str| -> usize {
             log.lines()
-                .filter(|line| {
-                    line.contains("no longer names the answerer actually serving")
-                })
+                .filter(|line| line.contains("no longer names the answerer actually serving"))
                 .count()
         };
         let matched_lines = |log: &str| -> usize {
             log.lines()
-                .filter(|line| {
-                    line.contains("matches the table's recorded carve-out again")
-                })
+                .filter(|line| line.contains("matches the table's recorded carve-out again"))
                 .count()
         };
 
@@ -3447,8 +3444,7 @@ mod tests {
             .expect("a present channel that answers no is never a reason to host");
         let log = buf.contents();
         assert!(
-            log.contains("the answerer service is installed")
-                && log.contains("did not answer"),
+            log.contains("the answerer service is installed") && log.contains("did not answer"),
             "the surfaced error names the installed service whose channel answered \
              no, got: {log}"
         );
