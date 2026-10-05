@@ -15,6 +15,163 @@ fn interactive_attach_requires_a_tty_on_stdin() {
     ensure_interactive_attach_tty(true).expect("a real terminal must pass the guard");
 }
 
+/// The #953 refusal still comes first: a non-terminal stdin is turned away
+/// before the unwind guard arms or the relay opens a pty or touches the
+/// terminal.
+#[test]
+fn non_terminal_stdin_still_refused_before_relay() {
+    let armed = std::cell::Cell::new(false);
+    let relayed = std::cell::Cell::new(false);
+    let err = interactive_attach(
+        std::process::Command::new("ssh"),
+        false,
+        || {
+            armed.set(true);
+            attach::TerminalUnwind::arm_on(Vec::new(), true)
+        },
+        |_| {
+            relayed.set(true);
+            unreachable!("the relay must not run over a non-terminal stdin")
+        },
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("not a TTY"), "{err}");
+    assert!(!armed.get(), "the unwind guard armed before the refusal");
+    assert!(!relayed.get(), "the relay ran before the refusal");
+}
+
+/// The termios the relay put back must be in force before the blind unwind
+/// writes a byte, and the unwind goes to the real terminal (what the user
+/// sees), not to the session's pty. Driven over a pty that stands in for
+/// the user's terminal, through the real relay, with a session that ends
+/// the way a dropped transport does (255) so the guard fires.
+#[test]
+fn relay_restores_termios_before_unwind_codes() {
+    use nix::sys::termios::{LocalFlags, Termios, tcgetattr};
+    use std::io::Read as _;
+    use std::os::fd::OwnedFd;
+    use std::sync::{Arc, Mutex};
+
+    fn mode(t: &Termios) -> String {
+        // PENDIN is kernel bookkeeping on macOS, not a mode anyone set; and
+        // only the named control characters count (Linux's kernel keeps
+        // fewer than libc's `NCCS`, so the array's tail is stack garbage).
+        use nix::sys::termios::SpecialCharacterIndices as C;
+        let cc: Vec<u8> = [
+            C::VEOF,
+            C::VEOL,
+            C::VERASE,
+            C::VINTR,
+            C::VKILL,
+            C::VMIN,
+            C::VQUIT,
+            C::VSTART,
+            C::VSTOP,
+            C::VSUSP,
+            C::VTIME,
+        ]
+        .iter()
+        .map(|&i| t.control_chars[i as usize])
+        .collect();
+        format!(
+            "{:?} {:?} {:?} {:?} {cc:?}",
+            t.input_flags,
+            t.output_flags,
+            t.control_flags,
+            t.local_flags - LocalFlags::PENDIN,
+        )
+    }
+
+    /// Writes to the user's terminal, noting the termios it found there
+    /// at the moment of the first write.
+    struct RealTerminal {
+        tty: std::fs::File,
+        termios_at_write: Arc<Mutex<Option<String>>>,
+    }
+    impl std::io::Write for RealTerminal {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let mut seen = self.termios_at_write.lock().unwrap();
+            if seen.is_none() {
+                *seen = Some(mode(&tcgetattr(&self.tty).unwrap()));
+            }
+            self.tty.write(buf)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.tty.flush()
+        }
+    }
+
+    let pty = nix::pty::openpty(None, None).unwrap();
+    let start = mode(&tcgetattr(&pty.slave).unwrap());
+    let mut master = std::fs::File::from(pty.master);
+    let screen = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&screen);
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match master.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => sink.lock().unwrap().extend_from_slice(&buf[..n]),
+                // A signal can interrupt the read on some targets.
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
+    });
+    let dup = |fd: &OwnedFd| fd.try_clone().unwrap();
+    let termios_at_write = Arc::new(Mutex::new(None));
+
+    let mut session = std::process::Command::new("/bin/sh");
+    session
+        .arg("-c")
+        .arg("stty raw -echo -iexten; printf R; exit 255");
+    let code = interactive_attach(
+        session,
+        true,
+        || {
+            attach::TerminalUnwind::arm_on(
+                RealTerminal {
+                    tty: std::fs::File::from(dup(&pty.slave)),
+                    termios_at_write: Arc::clone(&termios_at_write),
+                },
+                true,
+            )
+        },
+        |ssh| {
+            let real = client::tty_relay::RealTty::from_fds(dup(&pty.slave), dup(&pty.slave));
+            client::attach::run_interactive_attach_on(ssh, real, None)
+        },
+    )
+    .unwrap();
+    assert_eq!(code, 255);
+
+    let at_write = termios_at_write
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("a transport drop arms the blind unwind");
+    assert_eq!(
+        at_write, start,
+        "the unwind wrote before the termios was restored"
+    );
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let seen = screen.lock().unwrap().clone();
+        // The session's output, then the unwind's codes, on the user's
+        // terminal.
+        if seen.starts_with(b"R") && seen.ends_with(b"\x1b[?1004l") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < until,
+            "the unwind codes never reached the terminal: {:?}",
+            String::from_utf8_lossy(&seen)
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
 /// The interactive attach no longer `exec()`s ssh — it waits on it so the
 /// terminal can be put back afterwards (#1210) — so the status ssh reports
 /// has to become this process's own, signalled children included.

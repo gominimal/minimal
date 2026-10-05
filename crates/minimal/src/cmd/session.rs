@@ -1993,46 +1993,70 @@ pub(crate) async fn session_via_ssh(
     let mut ssh =
         minimal_client::attach::attach_command(sock, id, wire.as_deref(), session_keys.as_ref())?;
 
-    // `-tt` over a *non-terminal* stdin is a trap: ssh still forces the
-    // remote PTY, yet the interactive shell reading it never sees an EOF from a
-    // redirected local stdin (`< /dev/null`, a pipe), so the command blocks
-    // forever (#953). Fail fast instead of hanging.
     if wire.is_none() {
-        ensure_interactive_attach_tty(std::io::stdin().is_terminal())?;
-
-        // The interactive path waits on ssh rather than `exec()`ing it, so this
-        // process outlives the attach by the moment it takes to put the
-        // terminal back. `minimald` sends unwind codes with every teardown it
-        // initiates, but a transport that drops mid-session sends nothing at
-        // all, and once ssh is gone this is the only process left that can
-        // still reach the tty. So the guard stays armed for the duration and
-        // is stood down only once ssh's exit proves the daemon was alive and
-        // speaking — see `attach::client_must_unwind`. `min dash` already runs
-        // the same command as a child while it is suspended.
-        let mut unwind = attach::TerminalUnwind::arm();
-        let status = match tokio::process::Command::from(ssh).status().await {
-            Ok(status) => status,
-            Err(e) => {
-                // ssh never ran, so nothing of ours reached the terminal and
-                // there is nothing to put back.
-                unwind.disarm();
-                return Err(e).context("failed to run ssh");
-            }
-        };
-        if !attach::client_must_unwind(&status) {
-            unwind.disarm();
-        }
-        let code = exit_code_of(status);
-        drop(unwind);
+        let stdin_is_tty = std::io::stdin().is_terminal();
+        // The relay blocks its thread until ssh exits, so it runs off the
+        // runtime's workers.
+        let code = tokio::task::spawn_blocking(move || {
+            interactive_attach(ssh, stdin_is_tty, attach::TerminalUnwind::arm, |ssh| {
+                minimal_client::attach::run_interactive_attach(ssh, None)
+            })
+        })
+        .await
+        .context("the interactive attach's thread failed")??;
         // Terminate with ssh's own status, exactly as the `exec()` this
         // replaced did: `min` has nothing of its own left to say after an
-        // attach, and the guard above has already run.
+        // attach, and the unwind guard has already run.
         std::process::exit(code);
     }
 
     let err = ssh.exec();
     // exec() only returns on failure
     bail!("failed to exec ssh: {err}");
+}
+
+/// The interactive attach, from the terminal check to ssh's exit code.
+///
+/// `-tt` over a *non-terminal* stdin is a trap: ssh still forces the remote
+/// PTY, yet the interactive shell reading it never sees an EOF from a
+/// redirected local stdin (`< /dev/null`, a pipe), so the command blocks
+/// forever (#953). So the refusal comes first, before the relay opens any
+/// pty or touches the terminal.
+///
+/// Then `relay` runs ssh through the client-owned terminal relay
+/// ([`minimal_client::attach::run_interactive_attach`]), which has put the
+/// terminal's termios back by the time it returns. Only then does the
+/// unwind guard get its say, so its codes reach the real terminal (never
+/// the relay's pty) in the termios the user started with. `minimald` sends
+/// unwind codes with every teardown it initiates, but a transport that
+/// drops mid-session sends nothing at all, and once ssh is gone this is the
+/// only process left that can still reach the tty. So the guard stays
+/// armed for the duration and is stood down only once ssh's exit proves
+/// the daemon was alive and speaking: see `attach::client_must_unwind`.
+pub(crate) fn interactive_attach<W: std::io::Write>(
+    ssh: std::process::Command,
+    stdin_is_tty: bool,
+    arm_unwind: impl FnOnce() -> attach::TerminalUnwind<W>,
+    relay: impl FnOnce(std::process::Command) -> Result<std::process::ExitStatus, anyhow::Error>,
+) -> Result<i32, anyhow::Error> {
+    ensure_interactive_attach_tty(stdin_is_tty)?;
+    let mut unwind = arm_unwind();
+    let status = match relay(ssh) {
+        Ok(status) => status,
+        Err(e) => {
+            // ssh never ran (or the relay never took the terminal), so
+            // nothing of the session reached the terminal and there is
+            // nothing to put back.
+            unwind.disarm();
+            return Err(e).context("failed to run ssh");
+        }
+    };
+    if !attach::client_must_unwind(&status) {
+        unwind.disarm();
+    }
+    let code = exit_code_of(status);
+    drop(unwind);
+    Ok(code)
 }
 
 /// A child's exit status as this process's exit code, following the shell's
