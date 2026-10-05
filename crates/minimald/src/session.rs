@@ -2726,7 +2726,7 @@ impl Session {
                 source: std::io::Error::other(error.clone()),
             }),
         };
-        let decided_by = match answer {
+        let decided_by = match &answer {
             AskEnd::Answered(_) => crate::audit::DecidedBy::AttachedHuman,
             AskEnd::Unanswered
             | AskEnd::HostNoTty
@@ -2734,12 +2734,14 @@ impl Session {
             | AskEnd::HostRefused(_)
             | AskEnd::HostUnreachable(_) => crate::audit::DecidedBy::Daemon,
         };
-        self.answer_expose(
+        let because = matches!(answer, AskEnd::HostNoTty).then_some(HOST_NO_TTY_REASON);
+        self.answer_expose_because(
             &ask.box_name,
             ask.port,
             sessions::DynamicIngress::Ask,
             decided_by,
             outcome,
+            because,
             ask.reply,
         )
         .await;
@@ -2759,6 +2761,30 @@ impl Session {
         decision: sessions::DynamicIngress,
         decided_by: crate::audit::DecidedBy,
         outcome: Result<minimald_rpc::LiveMapping, crate::net::policy::ExposeFailure>,
+        reply: oneshot::Sender<
+            Result<minimald_rpc::LiveMapping, crate::net::policy::ExposeFailure>,
+        >,
+    ) {
+        self.answer_expose_because(box_name, port, decision, decided_by, outcome, None, reply)
+            .await;
+    }
+
+    /// [`Self::answer_expose`], with the audit record's reason said in
+    /// `because`'s words when the refusal's own text would hide why: a
+    /// VM host's no-tty end refuses with the plain deny, and its record
+    /// says the client could not show the prompt.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "answer_expose's arguments plus the one reason override"
+    )]
+    async fn answer_expose_because(
+        &mut self,
+        box_name: &str,
+        port: u16,
+        decision: sessions::DynamicIngress,
+        decided_by: crate::audit::DecidedBy,
+        outcome: Result<minimald_rpc::LiveMapping, crate::net::policy::ExposeFailure>,
+        because: Option<&'static str>,
         reply: oneshot::Sender<
             Result<minimald_rpc::LiveMapping, crate::net::policy::ExposeFailure>,
         >,
@@ -2863,6 +2889,7 @@ impl Session {
                 )
             }
         };
+        let reason = because.map(str::to_string).or(reason);
         crate::audit::append(
             self.minimal_state_dir.as_utf8_path().as_std_path(),
             &crate::audit::DecisionRecord {

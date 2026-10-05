@@ -5849,6 +5849,16 @@ async fn ask_no_or_no_tty_records_nothing() {
 async fn vm_ask_ended_by_host(
     outcome: minimald_rpc::AskAdmitOutcome,
 ) -> Result<minimald_rpc::LiveMapping, crate::net::policy::ExposeFailure> {
+    vm_ask_ended_by_host_audited(outcome).await.0
+}
+
+/// [`vm_ask_ended_by_host`], with the decision records the ask left.
+async fn vm_ask_ended_by_host_audited(
+    outcome: minimald_rpc::AskAdmitOutcome,
+) -> (
+    Result<minimald_rpc::LiveMapping, crate::net::policy::ExposeFailure>,
+    Vec<serde_json_lenient::Value>,
+) {
     let server = TestServer::new().await;
     let mut client = server.connect().await;
     let (_web, handle) = dynamic_ingress_box(
@@ -5881,7 +5891,8 @@ async fn vm_ask_ended_by_host(
             "a refused ask asks the switch nothing"
         );
     }
-    result
+    let records = audit_records(&server.state.minimal_state_dir().await).await;
+    (result, records)
 }
 
 fn host_refused(
@@ -5916,7 +5927,8 @@ async fn vm_ask_no_client_is_nobody_attached() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn vm_ask_no_tty_is_denied() {
     let capture = captured_log();
-    let result = vm_ask_ended_by_host(host_refused(minimald_rpc::AskRefused::NoTty, None)).await;
+    let (result, records) =
+        vm_ask_ended_by_host_audited(host_refused(minimald_rpc::AskRefused::NoTty, None)).await;
     assert!(
         matches!(
             result,
@@ -5931,6 +5943,13 @@ async fn vm_ask_no_tty_is_denied() {
             .contents()
             .contains("the attached client could not show the prompt; treated as no"),
         "the no-tty end says why it was treated as no"
+    );
+    assert_eq!(records.len(), 1, "one ask is one decision: {records:?}");
+    assert_eq!(records[0]["outcome"], "refused");
+    assert_eq!(records[0]["decided_by"], "daemon");
+    assert_eq!(
+        records[0]["reason"], "the attached client could not show the prompt; treated as no",
+        "the audit says the client could not show the prompt, not a plain deny"
     );
 }
 
