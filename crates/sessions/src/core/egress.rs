@@ -27,11 +27,25 @@
 //!   around the rules.
 //! * **IPv4 is decided by the box's rules** — `allow_protocols`, then
 //!   `deny_subnets`, then `allow_subnets` (a `None` dimension allows all, a
-//!   `Some([])` one allows nothing) — with one carve-out: a UDP datagram to
-//!   the resolver Minimal owns for the box, at that resolver's address and
+//!   `Some([])` one allows nothing) — with two carve-outs and one drop
+//!   ahead of them, each granted by its own author: a UDP datagram to the
+//!   resolver Minimal owns for the box, at that resolver's address and
 //!   port, is admitted under any declaration including deny-all (NET-079,
 //!   NET-134), because a box that cannot resolve cannot use an allow list
-//!   of names either.
+//!   of names either; the Box Egress Proxy's **listener** — TCP to the
+//!   listener's own port — is admitted for a box that declared a
+//!   credentialed upstream (NET-134), because the proxy is that lane's
+//!   infrastructure — the one destination a box reaches by declaring the
+//!   upstream, never by allowing its address; and every other frame to the
+//!   proxy's address is dropped ahead of the rules, for a laned box and a
+//!   lane-less one alike — a lane-less box's own listener triple included,
+//!   by the one lane predicate [`proxy_lane_admits`] both legs of a
+//!   frame's path out of a VM share, under the same rule the host-side
+//!   gate refuses the address with — the address is the machine's
+//!   infrastructure, no egress rule of the box's opens it, and the
+//!   listener's refusal a lane-less box is owed belongs to the box's own
+//!   path, which a native host runs with no gate beside this relay to
+//!   make it, so this leg makes it.
 //!
 //! The rules are compiled once per box at attach
 //! ([`EgressRules::from_policy`]); the per-frame work is [`summarize`] plus
@@ -76,10 +90,238 @@ const ETHERTYPE_ARP: u16 = 0x0806;
 const ETHERTYPE_IPV4: u16 = 0x0800;
 /// `EtherType` for IPv6.
 const ETHERTYPE_IPV6: u16 = 0x86DD;
-/// IPv4 protocol number for UDP.
-const IPPROTO_UDP: u8 = 17;
+/// The reply-flow record's first protocol — UDP, the one the resolver
+/// carve-out reads, beside the TCP of [`IPPROTO_TCP`], for the gates'
+/// record and reply arms: a gate that ends a retraction's records reads
+/// it here, so its purge keys by the number the recording keyed.
+pub const IPPROTO_UDP: u8 = 17;
 /// The port DNS is served on: the resolver carve-out's port (NET-079).
 const DNS_PORT: u16 = 53;
+
+/// The port the Box Egress Proxy's listener answers on — the listener a
+/// box's credentialed lane reaches (NET-134). The number is
+/// `switch::bep_host::PROXY_PORT`'s, spelled here because the two crates
+/// cannot share one constant: the switch crate holds the listener itself
+/// and depends on nothing in-tree, while this crate — the relay leg's
+/// rules — is linked into every daemon without it. minvmd, the one crate
+/// that sees both spellings, asserts they are one number where the gate
+/// reads them; the lane's e2e case is the drift check on the wire: a leg
+/// that disagrees with the listener drops the credentialed box's connect
+/// before it completes, so the lane and the listener can never silently
+/// part.
+pub const PROXY_LISTENER_PORT: u16 = 8118;
+
+/// The protocol the Box Egress Proxy's listener speaks: NET-134 admits the
+/// proxy's **listener** — TCP at [`PROXY_LISTENER_PORT`] — for a box that
+/// declared a credentialed upstream and nothing else at its address, so a
+/// UDP datagram to the address, a TCP frame to another port, and a
+/// lane-less box's own listener triple are all dropped ahead of the
+/// rules, by the one lane predicate both legs of the frame's path share
+/// ([`proxy_lane_admits`]).
+pub const PROXY_LISTENER_PROTOCOL: u8 = 6;
+
+/// The Box Egress Proxy's listener on the switch this box attaches to —
+/// the destination a credentialed lane's frames are admitted to, and the
+/// only one (NET-134): the listener, never the address, because what a
+/// lane buys is the listener its credentials are redeemed through, not a
+/// host address. Every other frame to the proxy's address — another port
+/// over TCP, any other protocol, and the listener's own triple from a box
+/// that declared no lane — is dropped ahead of the rules, and the address
+/// is carried for a lane-less box exactly as for a laned one, because the
+/// drop at it is the relay's own: a native host runs no minvmd gate beside
+/// the relay to make the refusal, so the relay makes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProxyListener {
+    /// The proxy's address on the switch.
+    pub addr: [u8; 4],
+    /// The port the listener answers on ([`PROXY_LISTENER_PORT`]).
+    pub port: u16,
+    /// The protocol the listener speaks ([`PROXY_LISTENER_PROTOCOL`]):
+    /// TCP, the protocol of the proxy's acceptor.
+    pub proto: u8,
+}
+
+impl ProxyListener {
+    /// The listener at `addr`: the one fixed listener every switch's Box
+    /// Egress Proxy answers on — TCP at [`PROXY_LISTENER_PORT`] over
+    /// [`PROXY_LISTENER_PROTOCOL`] — assembled one way, so the (address,
+    /// port, protocol) triple [`proxy_lane_admits`] matches against is the
+    /// same listener on the relay leg and on the VM host's gate.
+    #[must_use]
+    pub fn at(addr: [u8; 4]) -> Self {
+        Self {
+            addr,
+            port: PROXY_LISTENER_PORT,
+            proto: PROXY_LISTENER_PROTOCOL,
+        }
+    }
+}
+
+/// The switch's own addresses for one box's verdict (NET-062's sub-clause,
+/// design §5.3's infrastructure deny set as the frame side holds it): the
+/// four addresses of the switch this box attaches to that are the machine's
+/// control surface rather than destinations a box's `egress.allow_subnets`
+/// could ever admit — the gateway (where the resolver answers and gvproxy's
+/// API listens), the host alias (the deprecated host-reach literal, NET-004),
+/// the node address (the daemon's own address on the switch), and the Box
+/// Egress Proxy's peer address — handed by the caller, which is the one
+/// place that knows the switch's subnet, the way the resolver and the
+/// proxy's address are handed.
+///
+/// The set subtracts those addresses from whatever the box's CIDR
+/// dimensions admit, with these port-scoped openings, and no others:
+///
+/// * **The resolver's port on the gateway** (NET-079): TCP or UDP to
+///   [`DNS_PORT`] falls through to the box's own rules, which still decide
+///   it — the UDP carve-out ahead of the set's arm already admits the query
+///   under any declaration, and a TCP query keeps the verdict its rules
+///   would give it anywhere else, so the opening adds a ceiling over the
+///   gateway without moving any floor. Every other port, and any protocol
+///   with no port to name one by, points at the switch itself and is the
+///   set's drop.
+/// * **The proxy's peer address on a credentialed lane** (NET-134): the
+///   [`ProxyListener`] arms ahead of the set's own already decide that
+///   address — the
+///   listener's whole triple for a box that declared the lane, and
+///   nothing else — so the set names the address only to hold it for a
+///   rule set compiled without a listener at all, where no lane exists to
+///   open it and the address is the set's drop like any other.
+/// * **Configured host exposures over the host alias**, reached as local
+///   reach under the box's rules (design §7.1): box→host reach over the
+///   alias is default-deny except the exposures the host configured. The
+///   exposure ports fall through to the box's own rules, which decide
+///   reach within an exposure but never open the alias by themselves;
+///   every other port at the alias is the set's drop. With no exposure
+///   configured the alias has no opening at all, at any port.
+/// * **Interim: the hostname proxy's port on the node address**, TCP
+///   only, falling through to the box's own rules. The opening exists only
+///   while the interim `:7654` Host-header proxy is served there (design
+///   §7.1), and it retires with that proxy. It grants nothing beyond the
+///   caller's own direct reach: the proxy checks every request against the
+///   caller's rules (NET-070/071 parity). The accepted exposure is the
+///   proxy's request parser, reachable by any box whose rules admit the
+///   node address, bounded by its HTTP/1.1-only parsing (design §5.7).
+///   With no proxy port compiled in there is no opening.
+///
+/// Every other port at the node address is the set's drop: the daemon's
+/// own plane is not a destination a box's declaration could admit.
+///
+/// Attached by [`EgressRules::with_switch_own_addresses`] and absent from
+/// [`EgressRules::new`], so a rule set compiled without it — the VM host's
+/// gate rows among them — decides exactly as it did, and the Kani oracle's
+/// shape over `new` and the proxy builders still holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SwitchOwnAddresses {
+    /// The gateway address — the resolver this box's carve-out is keyed to,
+    /// handed again because the caller, not the rules, is what knows the
+    /// switch's own layout.
+    gateway: [u8; 4],
+    /// The host alias: the deprecated host-reach literal (NET-004),
+    /// default-deny: reached only at the exposures the host configures,
+    /// as local reach under the box's rules there.
+    host_alias: [u8; 4],
+    /// The node address — the daemon's own address on the switch: the
+    /// machine's plane, opened only at the interim hostname proxy's port.
+    node: [u8; 4],
+    /// The Box Egress Proxy's peer address (NET-134): the one member the
+    /// listener arms decide when the rules carry a listener, and the set's
+    /// own drop when they do not.
+    bep_peer: [u8; 4],
+    /// The ports the host configured as its exposures over the host alias:
+    /// the alias's only openings. Empty — the shape every compile builds
+    /// today — leaves the alias with no opening, dropped at every port.
+    host_exposure_ports: Vec<u16>,
+    /// Interim: the port the hostname proxy listens on at the node address,
+    /// the node's one opening (TCP only) while that proxy is served.
+    /// `None` leaves the node address with no opening.
+    hostname_proxy_port: Option<u16>,
+}
+
+impl SwitchOwnAddresses {
+    /// The four addresses of the switch this box attaches to, with no host
+    /// exposure configured: the host alias has no opening, and every frame
+    /// to it is the set's drop.
+    #[must_use]
+    pub fn new(gateway: [u8; 4], host_alias: [u8; 4], node: [u8; 4], bep_peer: [u8; 4]) -> Self {
+        Self {
+            gateway,
+            host_alias,
+            node,
+            bep_peer,
+            host_exposure_ports: Vec::new(),
+            hostname_proxy_port: None,
+        }
+    }
+
+    /// The configured host exposures over the host alias (NET-062's third
+    /// opening): the ports the host itself exposes, at which the alias is
+    /// reached as local reach under the box's rules. The alias is
+    /// default-deny (design §7.1): every port outside this list is the
+    /// set's drop, and an empty list leaves the alias with no opening.
+    #[must_use]
+    pub fn with_host_exposure_ports(mut self, ports: impl Into<Vec<u16>>) -> Self {
+        self.host_exposure_ports = ports.into();
+        self
+    }
+
+    /// Interim: the hostname proxy's listen port on the node address, the
+    /// node's one opening — TCP to exactly this port falls through to the
+    /// box's own rules, and every other frame to the node address is still
+    /// the set's drop. It exists only while the interim `:7654` Host-header
+    /// proxy is served (design §7.1) and retires with it; see
+    /// [`SwitchOwnAddresses`] for the exposure it accepts.
+    #[must_use]
+    pub fn with_hostname_proxy_port(mut self, port: u16) -> Self {
+        self.hostname_proxy_port = Some(port);
+        self
+    }
+
+    /// Why the switch's own addresses drop this frame, when they do: the
+    /// infrastructure deny set's own drop (design §5.3), ahead of the
+    /// box's rules and naming the address the frame reached for — the
+    /// gateway outside the resolver's port, the node address outside the
+    /// interim hostname proxy's port, the proxy's peer when no listener was compiled to open it,
+    /// and the host alias outside the exposures the host configured.
+    /// `None` when the frame sits at one of the openings, whose frames
+    /// fall through to the box's own rules to decide.
+    fn drop_reason(
+        &self,
+        dst_port: u16,
+        dst: [u8; 4],
+        proto: u8,
+        listener: Option<ProxyListener>,
+    ) -> Option<DropReason> {
+        let reason = DropReason::InfrastructureDestination { dst, proto };
+        if dst == self.gateway {
+            // The resolver's port, over the two protocols a query travels
+            // (a UDP query, or TCP when the answer truncates) — and nothing
+            // else: a protocol with no port to name one by points at the
+            // switch itself, and a frame with no readable port fails the
+            // opening closed, the way it fails the carve-out ahead of this
+            // arm in the verdict.
+            let resolver_query =
+                (proto == IPPROTO_TCP || proto == IPPROTO_UDP) && dst_port == DNS_PORT;
+            (!resolver_query).then_some(reason)
+        } else if dst == self.node {
+            // Interim: the hostname proxy's port over TCP, the proxy's own
+            // protocol, is the node's one opening while that proxy is served.
+            let hostname_proxy = proto == IPPROTO_TCP && self.hostname_proxy_port == Some(dst_port);
+            (!hostname_proxy).then_some(reason)
+        } else if dst == self.bep_peer
+            && listener.is_none_or(|listener| listener.addr != self.bep_peer)
+        {
+            // The peer's opening is the lane's, decided by the listener arms
+            // ahead of this one for every rule set that carries a listener;
+            // the set holds the address for a compile that carries none,
+            // where no lane exists to open it.
+            Some(reason)
+        } else if dst == self.host_alias && !self.host_exposure_ports.contains(&dst_port) {
+            Some(reason)
+        } else {
+            None
+        }
+    }
+}
 
 /// How long an address a DNS reply admitted stays admitted, from the
 /// instant of the reply the box's own lookup received. The two admission
@@ -447,15 +689,67 @@ pub struct EgressRules {
     /// gateway), which the carve-out admits at [`DNS_PORT`] under any
     /// declaration.
     resolver: [u8; 4],
+    /// The Box Egress Proxy's listener on the switch this box attaches to
+    /// (NET-134): the address it names is the machine's infrastructure,
+    /// carried for a lane-less box exactly as for a laned one — the drop
+    /// at it is the relay's own, not the host-side gate's alone, because a
+    /// native host runs no gate beside the relay — and the listener it
+    /// names is the one destination admitted beside the rules, whatever
+    /// they say about it, the way the resolver carve-out is: the proxy is
+    /// that lane's infrastructure and the credentials it redeems are the
+    /// lane's own, so no egress rule of the box's decides them. The
+    /// admission is the listener's, never the address's (design §5.3's
+    /// port-scoped opening): [`ProxyListener`] carries the address, the
+    /// port and the protocol together, and the whole address is decided
+    /// by the one lane predicate both legs of a frame's path share
+    /// ([`proxy_lane_admits`]) — a frame that is not the listener's own
+    /// triple from a box that declared the lane is dropped ahead of the
+    /// rules below. `None`, the shape [`EgressRules::new`] and
+    /// [`EgressRules::from_policy`] build, is a compile that knows no
+    /// proxy on the switch: no address is dropped and no listener
+    /// admitted.
+    ///
+    /// The declaration that opens the listener is
+    /// [`Self::credentialed_upstream`]'s; the address is the relay's own
+    /// knowledge of its switch, resolved from the switch subnet at compile
+    /// time the way the resolver above is.
+    proxy: Option<ProxyListener>,
+    /// Whether this box declared a credentialed upstream
+    /// ([`crate::CredentialedUpstream`], NET-134) — the box's own
+    /// declaration, and the one thing that opens the listener the rules
+    /// carry beside them. A lane is never an egress dimension: nothing a
+    /// box says inside the VM grants one, and nothing an egress rule says
+    /// stands in for one, so the frame to the listener a lane-less box
+    /// sends is not the rules' to admit either — the listener's refusal
+    /// belongs to the box's own path, and a native host runs no minvmd
+    /// gate and no shipped acceptor beside the relay to make it, so the
+    /// relay makes it: the frame is the address's own drop below.
+    credentialed_upstream: bool,
     /// The box's lease on the switch — the one source address its frames
     /// may carry, which the verdict rejects any other of (NET-084). Known
     /// when the box is attached, the same moment the policy is compiled.
     lease: [u8; 4],
+    /// The switch's own addresses, NET-062's sub-clause subtracts from
+    /// whatever the CIDR dimensions admit ([`SwitchOwnAddresses`]): the
+    /// gateway, the host alias (default-deny outside the host's configured
+    /// exposures), the node address, and the Box Egress Proxy's peer —
+    /// handed by the caller, the one place that knows the switch's subnet.
+    /// `None`, the shape [`EgressRules::new`] and
+    /// [`EgressRules::from_policy`] build, is a compile that subtracts
+    /// nothing: the VM host's gate rows are compiled this way and decide
+    /// by their own copies, and the Kani oracle holds that shape.
+    switch_own: Option<SwitchOwnAddresses>,
 }
 
 impl EgressRules {
     /// Assembles a rule set from its dimensions. The shape the Kani proof
     /// and [`EgressRules::from_policy`] share.
+    ///
+    /// Never a lane and never a proxy: a rule set built here knows no Box
+    /// Egress Proxy on the switch, so no address is dropped and no listener
+    /// admitted — the proof's oracle holds that shape, and the compile
+    /// attaches the proxy through [`Self::with_box_egress_proxy`] or
+    /// [`Self::with_credentialed_upstream`].
     #[must_use]
     pub fn new(
         allow_protocols: Option<Vec<u8>>,
@@ -469,7 +763,10 @@ impl EgressRules {
             allow_subnets,
             deny_subnets,
             resolver,
+            proxy: None,
+            credentialed_upstream: false,
             lease,
+            switch_own: None,
         }
     }
 
@@ -510,6 +807,78 @@ impl EgressRules {
     #[must_use]
     pub fn resolver(&self) -> [u8; 4] {
         self.resolver
+    }
+
+    /// Marks this rule set's switch as one carrying a node-local Box
+    /// Egress Proxy (NET-134): `proxy` is its address on the switch this
+    /// box attaches to, an infrastructure address the relay knows by its
+    /// own subnet — so the address is attached for a lane-less box exactly
+    /// as for a laned one, and every frame to it the box's lane did not
+    /// admit is the relay's named drop, ahead of the box's rules, whatever
+    /// they would say about the address: another port over TCP, any other
+    /// protocol, and the listener's own triple from a box that declared no
+    /// lane. The drop is the relay's own rather than the host-side gate's
+    /// alone because a native host runs no gate beside it, and the
+    /// refusal a lane-less box is owed at the listener belongs to the
+    /// box's own path, not to the proxy's acceptor.
+    ///
+    /// The listener is one fixed listener — TCP at [`PROXY_LISTENER_PORT`],
+    /// [`PROXY_LISTENER_PROTOCOL`] — so the compile hands the address alone
+    /// and the port and protocol travel with it from here: the triple the
+    /// verdict matches against is the whole listener, never the bare
+    /// address.
+    #[must_use]
+    pub fn with_box_egress_proxy(mut self, proxy: [u8; 4]) -> Self {
+        self.proxy = Some(ProxyListener::at(proxy));
+        self
+    }
+
+    /// Marks this rule set's box as one that declared a credentialed
+    /// upstream (NET-134), beside the [`Self::with_box_egress_proxy`]
+    /// address the switch carries: a frame to that listener is admitted
+    /// beside the rules — whatever they say about the address — because
+    /// the proxy is that lane's infrastructure, the one destination a box
+    /// reaches by declaring the upstream rather than by allowing its
+    /// address, and the one frame at the address the declaration ever
+    /// admits.
+    ///
+    /// The caller is the compile of a whole session policy, the only place
+    /// that holds both halves — the declaration ([`crate::CredentialedUpstream`],
+    /// carried on the [`crate::SessionPolicy`]) and the switch subnet its
+    /// address is drawn from — so the address arrives already resolved and
+    /// the verdict reads one field.
+    #[must_use]
+    pub fn with_credentialed_upstream(mut self, proxy: [u8; 4]) -> Self {
+        self.proxy = Some(ProxyListener::at(proxy));
+        self.credentialed_upstream = true;
+        self
+    }
+
+    /// Marks this rule set's switch with its own addresses (NET-062's
+    /// sub-clause): the gateway, the host alias, the node address, and the
+    /// Box Egress Proxy's peer address, all handed by the caller — the
+    /// compile, the one place that knows the switch's subnet — and
+    /// subtracted from whatever the box's `allow_subnets` would admit at
+    /// them, as design §5.3's infrastructure deny set names, except at the
+    /// three port-scoped openings the sub-clause lists (see
+    /// [`SwitchOwnAddresses`]): the resolver's port on the gateway, the
+    /// proxy's listener for a box on a credentialed lane, and the host's
+    /// configured exposures over the alias, reached as local reach under
+    /// the box's own rules. The alias is default-deny: with no exposure
+    /// configured it has no opening. While the interim hostname proxy is
+    /// served, its TCP port on the node address is a fourth, interim
+    /// opening ([`SwitchOwnAddresses::with_hostname_proxy_port`]).
+    ///
+    /// The relay leg of a frame's path out of a VM is the leg a native
+    /// host runs alone, so the set is the relay's own here: no box
+    /// declaration, no allow list, and no DNS pin can turn one of the
+    /// switch's own addresses back into a destination. The VM host's gate
+    /// keeps its own copy and is not edited; a rule set compiled without
+    /// this call — the gate's rows among them — subtracts nothing.
+    #[must_use]
+    pub fn with_switch_own_addresses(mut self, own: SwitchOwnAddresses) -> Self {
+        self.switch_own = Some(own);
+        self
     }
 
     /// The compiled `allow_subnets`, `None` when the dimension allows all —
@@ -590,9 +959,38 @@ pub enum DropReason {
         /// The frame's IPv4 protocol number.
         proto: u8,
     },
+    /// The destination is the Box Egress Proxy's address and the box's lane
+    /// did not admit the frame — another port, another protocol, or the
+    /// listener's own triple from a box that declared no upstream: the
+    /// address is the machine's infrastructure and no egress rule of the
+    /// box's opens it (NET-134), so the frame is the relay's own drop —
+    /// ahead of the rules, for a laned box and a lane-less one alike —
+    /// under the same rule string the host-side gate refuses the address
+    /// with.
+    UncredentialedProxyDestination {
+        /// The frame's IPv4 destination address: the proxy's.
+        dst: [u8; 4],
+        /// The frame's IPv4 protocol number.
+        proto: u8,
+    },
     /// The destination is not in `allow_subnets`.
     UndeclaredSubnet {
         /// The frame's IPv4 destination address.
+        dst: [u8; 4],
+        /// The frame's IPv4 protocol number.
+        proto: u8,
+    },
+    /// The destination is one of the switch's own addresses the rules
+    /// carry (NET-062's sub-clause, design §5.3's infrastructure deny
+    /// set): the machine's control surface — the gateway outside the
+    /// resolver's port, the node address outside the interim hostname
+    /// proxy's port, the proxy's peer when no
+    /// listener opened it, the host alias outside the exposures the host
+    /// configured — dropped ahead of the box's rules, whatever its
+    /// `allow_subnets` would admit at the address, under the rule string
+    /// the host-side gate refuses the same set with.
+    InfrastructureDestination {
+        /// The frame's IPv4 destination address: the switch's own.
         dst: [u8; 4],
         /// The frame's IPv4 protocol number.
         proto: u8,
@@ -611,7 +1009,11 @@ impl DropReason {
             Self::Truncated => "egress-truncated-ipv4",
             Self::UndeclaredProtocol { .. } => "egress-undeclared-protocol",
             Self::DeniedSubnet { .. } => "egress-denied-subnet",
+            Self::UncredentialedProxyDestination { .. } => {
+                "egress-uncredentialed-proxy-destination"
+            }
             Self::UndeclaredSubnet { .. } => "egress-undeclared-subnet",
+            Self::InfrastructureDestination { .. } => "egress-infrastructure-destination",
         }
     }
 
@@ -624,7 +1026,10 @@ impl DropReason {
             | Self::UndeclaredFamily(_)
             | Self::Truncated
             | Self::UndeclaredProtocol { .. } => None,
-            Self::DeniedSubnet { dst, .. } | Self::UndeclaredSubnet { dst, .. } => Some(*dst),
+            Self::DeniedSubnet { dst, .. }
+            | Self::UncredentialedProxyDestination { dst, .. }
+            | Self::UndeclaredSubnet { dst, .. }
+            | Self::InfrastructureDestination { dst, .. } => Some(*dst),
         }
     }
 
@@ -634,7 +1039,9 @@ impl DropReason {
         match self {
             Self::UndeclaredProtocol { proto }
             | Self::DeniedSubnet { proto, .. }
-            | Self::UndeclaredSubnet { proto, .. } => Some(*proto),
+            | Self::UncredentialedProxyDestination { proto, .. }
+            | Self::UndeclaredSubnet { proto, .. }
+            | Self::InfrastructureDestination { proto, .. } => Some(*proto),
             Self::ForeignSource { .. }
             | Self::Ipv6
             | Self::UndeclaredFamily(_)
@@ -658,6 +1065,25 @@ pub fn foreign_source(summary: &FrameSummary, lease: [u8; 4]) -> Option<DropReas
     (src != lease).then_some(DropReason::ForeignSource { src, lease })
 }
 
+/// NET-134's one lane predicate, shared by the two gates a frame's path to
+/// the Box Egress Proxy can be refused at — the relay leg every daemon runs
+/// ([`verdict`], whose `verdict_ipv4` calls this) and the VM host's gate
+/// (`minvmd`'s `egress-uncredentialed-proxy-destination` arm), so the two
+/// admit the same frame or refuse it together by construction and can
+/// never drift. The listener is admitted only for a box that declared a
+/// credentialed upstream (`declared`), and only as the whole (address,
+/// port, protocol) triple the listener is — never the address alone
+/// (design §5.3's port-scoped opening): a frame to the address at any
+/// other port, over any other protocol, or from a box that declared no
+/// lane, is every other leg's refusal.
+#[must_use]
+pub fn proxy_lane_admits(declared: bool, listener: ProxyListener, summary: &FrameSummary) -> bool {
+    declared
+        && summary.dst == Some(listener.addr)
+        && summary.proto == Some(listener.proto)
+        && summary.dst_port == listener.port
+}
+
 /// The admit-or-drop decision for one frame summary against one box's rules
 /// — the pure function NET-062, NET-063, NET-064, and NET-084 all reduce
 /// to, and the one the Kani harness exhausts.
@@ -666,8 +1092,17 @@ pub fn foreign_source(summary: &FrameSummary, lease: [u8; 4]) -> Option<DropReas
 /// first, so a frame from a foreign source is rejected whatever family or
 /// destination it carries (NET-084); the resolver carve-out then comes
 /// before the rules, so a box that denies the resolver's own subnet still
-/// resolves (NET-079); `deny_subnets` then carves out of what the allows
-/// admit; and a drop never depends on the rule lists being sorted.
+/// resolves (NET-079); the credentialed lane's proxy listener comes with it,
+/// before every rule, so a box that declared the upstream reaches the
+/// listener whatever its rules say (NET-134); the proxy's address is then
+/// dropped at every frame the lane did not admit, ahead of the rules,
+/// laned or not, so no open dimension ever opens it and a lane-less box
+/// reaches no listener either; the switch's own addresses are then
+/// subtracted from what the dimensions below admit, outside the
+/// port-scoped openings that fall through to them (NET-062's sub-clause);
+/// `deny_subnets` then carves
+/// out of what the allows admit; and a drop never depends on the rule
+/// lists being sorted.
 #[must_use]
 pub fn verdict(summary: &FrameSummary, rules: &EgressRules) -> FrameVerdict {
     if let Some(reason) = foreign_source(summary, rules.lease) {
@@ -684,8 +1119,9 @@ pub fn verdict(summary: &FrameSummary, rules: &EgressRules) -> FrameVerdict {
     }
 }
 
-/// The IPv4 half of the verdict: the carve-out, then the three declared
-/// dimensions. `summary`'s address and protocol are read only after the
+/// The IPv4 half of the verdict: the two carve-outs, the switch's own
+/// addresses outside their openings, then the three declared dimensions.
+/// `summary`'s address and protocol are read only after the
 /// [`FrameFamily::Truncated`] case has been ruled out, so both are `Some`
 /// here.
 fn verdict_ipv4(summary: &FrameSummary, rules: &EgressRules) -> FrameVerdict {
@@ -696,10 +1132,70 @@ fn verdict_ipv4(summary: &FrameSummary, rules: &EgressRules) -> FrameVerdict {
         return FrameVerdict::Drop(DropReason::Truncated);
     };
     // NET-079 / NET-134: the resolver Minimal owns for the box is the one
-    // carve-out from a deny-all verdict — at its address and port, whatever
-    // the rules say, because no box can be denied its own resolution.
+    // carve-out the system itself grants — at its address and port, whatever
+    // the rules say, because no box can be denied its own resolution. The
+    // proxy's listener below is the one a box's own declaration grants.
     if proto == IPPROTO_UDP && dst == rules.resolver && summary.dst_port == DNS_PORT {
         return FrameVerdict::Admit;
+    }
+    // NET-134: the Box Egress Proxy's listener for a box that declared a
+    // credentialed upstream — the lane's infrastructure, admitted beside
+    // the rules and by the whole (address, port, protocol) triple the
+    // listener is, through the one lane predicate (`proxy_lane_admits`)
+    // the host-side gate decides the same destination by, so the two legs
+    // of a frame's path out of a VM never disagree about the one
+    // destination neither decides by the box's rules. The triple, never
+    // the address alone, is the contract (NET-062's port-scoped opening):
+    // a frame to the proxy's address at any other port, or over any other
+    // protocol, is not the listener and is the drop below's. A
+    // declaration the box never made admits nothing either — the
+    // listener's own triple included, which is the drop below's too.
+    if let Some(listener) = rules.proxy
+        && proxy_lane_admits(rules.credentialed_upstream, listener, summary)
+    {
+        return FrameVerdict::Admit;
+    }
+    // NET-134: and the proxy's address is infrastructure on this leg too —
+    // the machine's, not the box's, so no egress rule of the box's opens
+    // it, and the whole address is the lane's: decided by the same
+    // predicate the admit above reads and the host-side gate holds, and
+    // dropped ahead of the rules for every frame the lane did not admit —
+    // another port over TCP, any other protocol, and the listener's own
+    // triple from a box that declared no lane — under the same rule string
+    // the host-side gate refuses the address with, so an allow-all box's
+    // open dimensions buy nothing at the address and the two legs of a
+    // frame's path agree completely: the listener opens for a box that
+    // declared the lane alone, and nothing else at the address opens at
+    // all. The refusal a lane-less box is owed at the listener belongs to
+    // the box's own path, not to the proxy's acceptor: a native host runs
+    // no minvmd gate beside the relay to make it, so this leg makes it —
+    // and on a VM host this leg drops first, so the gate never sees the
+    // frame and the refusal is counted once, by whichever leg refused it.
+    if let Some(listener) = rules.proxy
+        && dst == listener.addr
+    {
+        return FrameVerdict::Drop(DropReason::UncredentialedProxyDestination { dst, proto });
+    }
+    // NET-062's sub-clause: the switch's own addresses the caller handed —
+    // the infrastructure deny set, design §5.3 — subtracted from whatever
+    // the dimensions below would admit, decided ahead of them so that no
+    // open `allow_subnets` and no DNS pin turns the machine's control
+    // surface back into a destination. The openings fall through to
+    // those same dimensions: the resolver's port on the gateway (the UDP
+    // carve-out above has already admitted the query under any
+    // declaration, and a TCP query keeps the verdict its rules give it),
+    // the proxy's listener for a box on a credentialed lane (the arms
+    // above, which every rule set carrying a listener has already decided
+    // the peer address by), and the host alias at the exposures the host
+    // configured, reached as local reach under the box's rules — the alias
+    // is default-deny, so with none configured it drops at every port —
+    // and, interim, the hostname proxy's TCP port on the node address. A
+    // drop here is a drop, never a reset: the verdict answers the relay,
+    // which writes nothing back toward the box.
+    if let Some(own) = &rules.switch_own
+        && let Some(reason) = own.drop_reason(summary.dst_port, dst, proto, rules.proxy)
+    {
+        return FrameVerdict::Drop(reason);
     }
     if let Some(allow) = &rules.allow_protocols
         && !allow.contains(&proto)
@@ -1656,6 +2152,20 @@ mod tests {
     /// address the frames below may carry (NET-084).
     const LEASE: [u8; 4] = [100, 64, 0, 9];
 
+    /// The host alias on the switch these tests' resolver and lease are
+    /// drawn from: broadcast - 1 of the default /16, the deprecated
+    /// host-reach literal (NET-004), the address the switch's `nat` table
+    /// maps to the host's loopback.
+    const HOST_ALIAS: [u8; 4] = [100, 64, 255, 254];
+
+    /// The node address on the same switch: broadcast - 2, the daemon's own
+    /// address in the switch subnet.
+    const NODE: [u8; 4] = [100, 64, 255, 253];
+
+    /// The Box Egress Proxy's peer address on the same switch: broadcast -
+    /// 3, where a credentialed lane's listener answers (NET-134).
+    const BEP_PEER: [u8; 4] = [100, 64, 255, 252];
+
     /// IPv4 protocol number for TCP, for the frames below.
     const IPPROTO_TCP: u8 = 6;
 
@@ -1668,6 +2178,30 @@ mod tests {
             RESOLVER,
             LEASE,
         )
+    }
+
+    /// The switch's own addresses of the default /16, with no host exposure
+    /// configured — the shape every compile builds today.
+    fn own_addresses() -> SwitchOwnAddresses {
+        SwitchOwnAddresses::new(RESOLVER, HOST_ALIAS, NODE, BEP_PEER)
+    }
+
+    /// A rule set whose `allow_subnets` cover the whole switch subnet, with
+    /// the switch's own addresses attached: every dimension the rules hold
+    /// admits every one of the addresses the set names, so any drop at one
+    /// of them is the subtraction's alone.
+    fn covering_with(own: SwitchOwnAddresses) -> EgressRules {
+        EgressRules::new(
+            None,
+            Some(vec![Ipv4Cidr {
+                addr: [100, 64, 0, 0],
+                prefix: 16,
+            }]),
+            None,
+            RESOLVER,
+            LEASE,
+        )
+        .with_switch_own_addresses(own)
     }
 
     /// An Ethernet II frame carrying `ethertype` and `payload`.
@@ -1951,6 +2485,455 @@ mod tests {
         );
     }
 
+    /// NET-134: the Box Egress Proxy's **listener** is a declared lane's
+    /// infrastructure — the one destination admitted beside the rules,
+    /// granted by the box's own declaration where the resolver carve-out is
+    /// granted by the system, and admitted as the whole (address, port,
+    /// protocol) triple the listener is, never the address alone: a TCP
+    /// frame to the listener's own port passes a deny-all. The address is
+    /// infrastructure on this leg too, so every frame to it the lane did
+    /// not admit is the relay's own named drop, ahead of the rules and
+    /// under the same rule string the host-side gate refuses the address
+    /// with, for a laned box and a lane-less one alike — an allow-all box's
+    /// open dimensions buy nothing at the address, and a lane-less box's
+    /// own listener triple is the drop's too: the lane alone opens the
+    /// listener, and the refusal a lane-less box is owed there belongs to
+    /// the box's own path, which a native host runs with no gate beside
+    /// the relay to make it, so the relay makes it. Without any proxy
+    /// compiled in, the rules alone decide, as they always did.
+    #[test]
+    fn proxy_lane_admits_only_the_listener() {
+        // The Box Egress Proxy's address on the switch these tests' resolver
+        // and lease are drawn from (broadcast - 3 of the default /16).
+        const PROXY: [u8; 4] = [100, 64, 255, 252];
+        let laned = deny_all().with_credentialed_upstream(PROXY);
+        assert!(
+            admits(&ipv4_frame(IPPROTO_TCP, PROXY, PROXY_LISTENER_PORT), &laned),
+            "TCP to the proxy's listener is admitted beside the deny-all"
+        );
+        // The lane is the listener's, never the address's: TCP to another
+        // port at the same address and any other protocol at the listener's
+        // port are both the address's own drop below, ahead of the deny
+        // rules — the address is infrastructure whatever the box declared.
+        assert!(
+            !admits(&ipv4_frame(IPPROTO_TCP, PROXY, 443), &laned),
+            "the lane holds the listener's port only, not the address"
+        );
+        assert!(
+            !admits(&ipv4_frame(IPPROTO_TCP, PROXY, 8080), &laned),
+            "nor any other port at the proxy's address"
+        );
+        assert!(
+            !admits(&ipv4_frame(IPPROTO_UDP, PROXY, PROXY_LISTENER_PORT), &laned),
+            "and not for any protocol but the listener's"
+        );
+        assert!(
+            !admits(&ipv4_frame(IPPROTO_UDP, PROXY, 53), &laned),
+            "a datagram to the proxy's address is any other destination"
+        );
+        assert!(
+            admits(&ipv4_frame(IPPROTO_UDP, RESOLVER, DNS_PORT), &laned),
+            "the resolver carve-out is untouched beside the lane"
+        );
+        // Anti-spoof ordering (NET-084 before NET-134): the lane arm reads
+        // a frame the lease check has already cleared, so a frame to the
+        // listener wearing a foreign source is dropped before the lane is
+        // ever consulted — the lane is this box's, not the address's.
+        assert!(
+            !admits(
+                &ipv4_frame_from([203, 0, 113, 7], IPPROTO_TCP, PROXY, PROXY_LISTENER_PORT),
+                &laned
+            ),
+            "a foreign source to the listener is the lease check's drop, never the lane's admit"
+        );
+        // And nowhere else: the lane buys the one listener, not the rules.
+        assert!(
+            !admits(&ipv4_frame(IPPROTO_TCP, [203, 0, 113, 7], 443), &laned),
+            "an outside destination stays denied"
+        );
+        assert!(
+            !admits(&ipv4_frame(IPPROTO_TCP, [100, 64, 255, 254], 8118), &laned),
+            "the host alias on the same switch is not the lane's address"
+        );
+        // The drop is the address's own, ahead of the rules and named the
+        // way the host-side gate names it — a deny-all box's frame to
+        // another port at the address is this drop, not the deny's.
+        let other_port = ipv4_frame(IPPROTO_TCP, PROXY, 443);
+        assert_eq!(
+            verdict(&summarize(&other_port), &laned),
+            FrameVerdict::Drop(DropReason::UncredentialedProxyDestination {
+                dst: PROXY,
+                proto: IPPROTO_TCP,
+            }),
+            "the proxy's address is dropped ahead of the deny rules, named the gate's way"
+        );
+        // And that is what holds an allow-all box at the address, laned or
+        // lane-less: the open dimensions never open it, on either leg, so
+        // a node-local proxy on a host with no gate beside the relay is
+        // no more reachable through an absent egress section than a
+        // VM-backed one's is.
+        let allow_all_laned =
+            EgressRules::from_policy(None, RESOLVER, LEASE).with_credentialed_upstream(PROXY);
+        let allow_all_unlaned =
+            EgressRules::from_policy(None, RESOLVER, LEASE).with_box_egress_proxy(PROXY);
+        for (label, rules) in [
+            ("an allow-all box that declared the lane", &allow_all_laned),
+            ("an allow-all box that declared no lane", &allow_all_unlaned),
+        ] {
+            let tcp_other_port = ipv4_frame(IPPROTO_TCP, PROXY, 443);
+            assert_eq!(
+                verdict(&summarize(&tcp_other_port), rules),
+                FrameVerdict::Drop(DropReason::UncredentialedProxyDestination {
+                    dst: PROXY,
+                    proto: IPPROTO_TCP,
+                }),
+                "{label}: TCP to another port at the proxy's address is the address's drop, not the rules'"
+            );
+            // A steered QUIC probe — UDP to 443 at the proxy's address — is
+            // the same drop. The eventual ICMP reject for steered UDP/443
+            // belongs to the proxy re-plan, not to this rule: the drop
+            // stays silent, and the re-plan decides the wire behaviour.
+            let steered_quic = ipv4_frame(IPPROTO_UDP, PROXY, 443);
+            assert_eq!(
+                verdict(&summarize(&steered_quic), rules),
+                FrameVerdict::Drop(DropReason::UncredentialedProxyDestination {
+                    dst: PROXY,
+                    proto: IPPROTO_UDP,
+                }),
+                "{label}: a UDP datagram to the proxy's address is the address's drop too"
+            );
+        }
+        // A lane-less box's own listener triple is the address's drop too:
+        // the lane is the one thing that opens the listener, so the rules
+        // never see the frame at all — an allow-all box's open dimensions
+        // buy nothing at it on a native host, where no gate stands beside
+        // the relay to make the refusal, as much as on a VM-backed one.
+        let listener_triple = ipv4_frame(IPPROTO_TCP, PROXY, PROXY_LISTENER_PORT);
+        let refused = FrameVerdict::Drop(DropReason::UncredentialedProxyDestination {
+            dst: PROXY,
+            proto: IPPROTO_TCP,
+        });
+        assert_eq!(
+            verdict(&summarize(&listener_triple), &allow_all_unlaned),
+            refused,
+            "a lane-less box's listener triple is the address's drop, not the rules'"
+        );
+        assert_eq!(
+            verdict(
+                &summarize(&listener_triple),
+                &deny_all().with_box_egress_proxy(PROXY)
+            ),
+            refused,
+            "a deny-all box that declared no lane still reaches no listener"
+        );
+        // No proxy compiled in at all: the rules alone decide, and under
+        // deny-all they drop the proxy's address the way they drop any
+        // other.
+        assert!(
+            !admits(&listener_triple, &deny_all()),
+            "the declaration is the one thing that opens the listener"
+        );
+    }
+
+    /// NET-062's sub-clause, the shared frame verdict's own leg: the
+    /// switch's own addresses the caller hands — the gateway, the host
+    /// alias, the node address, and the Box Egress Proxy's peer — are
+    /// subtracted from whatever the box's `egress.allow_subnets` admits,
+    /// as the infrastructure deny set design §5.3 names, so a box whose
+    /// list covers the whole switch subnet still cannot open a flow to
+    /// them outside the openings the next test pins. The drop is a drop,
+    /// never a reset: the verdict answers the relay, which writes nothing
+    /// back toward the box, so the flow times out rather than being told
+    /// no — the relay leg's own proof of that silence is minimald's. The
+    /// drop is the set's own, ahead of the rules and naming the address
+    /// the frame reached for, under the rule string the host-side gate
+    /// refuses the same set with.
+    #[test]
+    fn switch_addresses_egress_dropped_not_reset() {
+        // A box whose `allow_subnets` cover the whole switch subnet, and
+        // the same switch's addresses attached: every dimension the rules
+        // hold would admit every one of the addresses below, so the drop
+        // proves the subtraction alone. The allow-all default beside it
+        // proves the same for the undeclared spelling.
+        let covering = covering_with(own_addresses());
+        let allow_all = EgressRules::from_policy(None, RESOLVER, LEASE)
+            .with_switch_own_addresses(own_addresses());
+        for (label, rules) in [
+            ("a covering allow list", &covering),
+            ("the allow-all default", &allow_all),
+        ] {
+            // The gateway: the address the resolver answers at and gvproxy's
+            // API listens on, outside the resolver's port the one test pins.
+            let api = ipv4_frame(IPPROTO_TCP, RESOLVER, 443);
+            assert_eq!(
+                verdict(&summarize(&api), rules),
+                FrameVerdict::Drop(DropReason::InfrastructureDestination {
+                    dst: RESOLVER,
+                    proto: IPPROTO_TCP,
+                }),
+                "{label}: TCP to the gateway is the set's drop, whatever the rules admit"
+            );
+            let api_udp = ipv4_frame(IPPROTO_UDP, RESOLVER, 80);
+            assert_eq!(
+                verdict(&summarize(&api_udp), rules),
+                FrameVerdict::Drop(DropReason::InfrastructureDestination {
+                    dst: RESOLVER,
+                    proto: IPPROTO_UDP,
+                }),
+                "{label}: and so is UDP to another port there"
+            );
+            // A protocol with no port to name an opening by points at the
+            // switch itself, whatever its L4 bytes say.
+            let icmp = ipv4_frame(1, RESOLVER, 0);
+            assert_eq!(
+                verdict(&summarize(&icmp), rules),
+                FrameVerdict::Drop(DropReason::InfrastructureDestination {
+                    dst: RESOLVER,
+                    proto: 1,
+                }),
+                "{label}: ICMP at the gateway is the set's drop with the rest"
+            );
+            // The node address: the daemon's own address on the switch, at a
+            // port outside the interim hostname proxy's opening (pinned by
+            // the next test but one).
+            let node_ssh = ipv4_frame(IPPROTO_TCP, NODE, 22);
+            assert_eq!(
+                verdict(&summarize(&node_ssh), rules),
+                FrameVerdict::Drop(DropReason::InfrastructureDestination {
+                    dst: NODE,
+                    proto: IPPROTO_TCP,
+                }),
+                "{label}: the node address is not a destination, at any port"
+            );
+            // The BEP peer, for a rule set that never compiled a listener:
+            // no lane exists to open it, so the address is the set's own
+            // member — the shape the relay leg runs when the switch the box
+            // attaches to carries no proxy.
+            let peer = ipv4_frame(IPPROTO_TCP, BEP_PEER, PROXY_LISTENER_PORT);
+            assert_eq!(
+                verdict(&summarize(&peer), rules),
+                FrameVerdict::Drop(DropReason::InfrastructureDestination {
+                    dst: BEP_PEER,
+                    proto: IPPROTO_TCP,
+                }),
+                "{label}: the proxy's peer without a listener is the set's drop too"
+            );
+        }
+        // The reason names what the rate-limited warn line reads: the
+        // rule names the infrastructure deny set, the destination the
+        // switch's own address the frame reached for, the protocol the
+        // frame's own — so a box that cannot reach its gateway on a port
+        // it expected reads why in a bundle.
+        let reason = DropReason::InfrastructureDestination {
+            dst: RESOLVER,
+            proto: IPPROTO_TCP,
+        };
+        assert_eq!(reason.rule(), "egress-infrastructure-destination");
+        assert_eq!(reason.destination(), Some(RESOLVER));
+        assert_eq!(reason.protocol(), Some(IPPROTO_TCP));
+        // A destination the switch does not hold is none of the set's: the
+        // covering rules decide it, as they always did.
+        let sibling = ipv4_frame(IPPROTO_TCP, [100, 64, 0, 10], 80);
+        assert!(
+            admits(&sibling, &covering),
+            "a sibling box's lease is not one of the switch's own addresses"
+        );
+    }
+
+    /// Each of NET-062's three port-scoped openings admits exactly its
+    /// port, and falls through to the box's own rules — so the opening adds
+    /// a ceiling over the switch's own addresses without moving any floor:
+    /// the resolver's port on the gateway answers under any declaration,
+    /// and a TCP query keeps the verdict its rules give it anywhere else;
+    /// the proxy's listener opens for a box on a credentialed lane and
+    /// nothing else at that address opens at all; and the host alias is
+    /// default-deny (design §7.1): reached as local reach under the box's
+    /// egress rules at exactly the exposures the host configured, and at
+    /// no port while none are.
+    #[test]
+    fn switch_address_openings_admit_only_their_ports() {
+        let deny_all_set = deny_all().with_switch_own_addresses(own_addresses());
+        let allow_all = EgressRules::from_policy(None, RESOLVER, LEASE)
+            .with_switch_own_addresses(own_addresses());
+        let covering = covering_with(own_addresses());
+
+        // Opening one: the resolver's port on the gateway. The UDP carve-out
+        // ahead of the set admits the query under any declaration, and a TCP
+        // query — the fallback a truncated answer sends — falls through to
+        // the rules behind the set, which still decide it.
+        assert!(
+            admits(&ipv4_frame(IPPROTO_UDP, RESOLVER, DNS_PORT), &deny_all_set),
+            "the resolver's UDP port answers a deny-all box, as it always did"
+        );
+        assert!(
+            admits(&ipv4_frame(IPPROTO_TCP, RESOLVER, DNS_PORT), &allow_all),
+            "a TCP query the rules admit is admitted through the opening"
+        );
+        assert!(
+            !admits(&ipv4_frame(IPPROTO_TCP, RESOLVER, DNS_PORT), &deny_all_set),
+            "the opening does not move the rules' floor: a deny-all box's \
+             TCP query keeps the refusal its rules give it"
+        );
+        // And exactly that port: the neighbouring port over either
+        // protocol is the set's drop under rules that admit the subnet.
+        for proto in [IPPROTO_TCP, IPPROTO_UDP] {
+            let neighbouring = ipv4_frame(proto, RESOLVER, 54);
+            assert_eq!(
+                verdict(&summarize(&neighbouring), &covering),
+                FrameVerdict::Drop(DropReason::InfrastructureDestination {
+                    dst: RESOLVER,
+                    proto,
+                }),
+                "the resolver's opening is port {DNS_PORT}'s alone, not {proto}'s"
+            );
+        }
+
+        // Opening two: the proxy's address for a box on a credentialed
+        // lane. The listener arms ahead of the set decide the whole
+        // address once a listener is compiled — the lane's own triple
+        // admitted beside a deny-all, and every other frame at the address
+        // the proxy arm's own drop, never the set's.
+        let laned = deny_all()
+            .with_credentialed_upstream(BEP_PEER)
+            .with_switch_own_addresses(own_addresses());
+        assert!(
+            admits(
+                &ipv4_frame(IPPROTO_TCP, BEP_PEER, PROXY_LISTENER_PORT),
+                &laned
+            ),
+            "the credentialed lane's listener opens beside a deny-all, set attached"
+        );
+        let other_port = ipv4_frame(IPPROTO_TCP, BEP_PEER, 443);
+        assert_eq!(
+            verdict(&summarize(&other_port), &laned),
+            FrameVerdict::Drop(DropReason::UncredentialedProxyDestination {
+                dst: BEP_PEER,
+                proto: IPPROTO_TCP,
+            }),
+            "another port at the peer is the proxy arm's drop, not the set's: \
+             the lane is the address's whole opening"
+        );
+        // The same for a box whose rules admit everything: the listener arms
+        // run ahead of the own-address check in the verdict, so a
+        // non-listener port at the peer drops there, whatever the rules say.
+        let laned_allow_all = EgressRules::from_policy(None, RESOLVER, LEASE)
+            .with_credentialed_upstream(BEP_PEER)
+            .with_switch_own_addresses(own_addresses());
+        assert_eq!(
+            verdict(&summarize(&other_port), &laned_allow_all),
+            FrameVerdict::Drop(DropReason::UncredentialedProxyDestination {
+                dst: BEP_PEER,
+                proto: IPPROTO_TCP,
+            }),
+            "an allow-all box on a credentialed lane cannot reach the peer off the listener"
+        );
+        // Opening three: the host alias, default-deny except the host's
+        // configured exposures (design §7.1). Nothing configured — the
+        // shape every compile builds today — leaves the alias with no
+        // opening: even an allow-all box's frame to it is the set's drop.
+        assert_eq!(
+            verdict(
+                &summarize(&ipv4_frame(IPPROTO_TCP, HOST_ALIAS, 80)),
+                &allow_all
+            ),
+            FrameVerdict::Drop(DropReason::InfrastructureDestination {
+                dst: HOST_ALIAS,
+                proto: IPPROTO_TCP,
+            }),
+            "with no exposure configured the alias has no opening, even for an allow-all box"
+        );
+        // A configured exposure is the alias's only opening: the exposure
+        // ports fall through to the box's rules, which decide reach within
+        // the exposure, and every other port at the alias is the set's drop.
+        let exposed = own_addresses().with_host_exposure_ports([18081u16]);
+        let allow_all_exposed = EgressRules::from_policy(None, RESOLVER, LEASE)
+            .with_switch_own_addresses(exposed.clone());
+        assert!(
+            admits(
+                &ipv4_frame(IPPROTO_TCP, HOST_ALIAS, 18081),
+                &allow_all_exposed
+            ),
+            "an allow-all box reaches the configured exposure under its own rules"
+        );
+        assert_eq!(
+            verdict(
+                &summarize(&ipv4_frame(IPPROTO_TCP, HOST_ALIAS, 80)),
+                &allow_all_exposed
+            ),
+            FrameVerdict::Drop(DropReason::InfrastructureDestination {
+                dst: HOST_ALIAS,
+                proto: IPPROTO_TCP,
+            }),
+            "and every other alias port is still the set's drop"
+        );
+        let deny_all_exposed = deny_all().with_switch_own_addresses(exposed);
+        assert!(
+            !admits(
+                &ipv4_frame(IPPROTO_TCP, HOST_ALIAS, 18081),
+                &deny_all_exposed
+            ),
+            "but adds no floor: the deny-all box's rules still refuse the exposure"
+        );
+    }
+
+    /// Interim: the hostname proxy's port on the node address is the node's
+    /// one opening while the `:7654` Host-header proxy is served (design
+    /// §7.1). TCP to exactly that port falls through to the box's own rules
+    /// — an allow-all box reaches it, a deny-all box is refused by its own
+    /// rules — and every other port, UDP to the same port, and the same
+    /// port on a set compiled with no proxy port are the set's drop.
+    #[test]
+    fn switch_address_hostname_proxy_opening_is_interim() {
+        const HOSTNAME_PROXY_PORT: u16 = 7654;
+        let with_proxy = own_addresses().with_hostname_proxy_port(HOSTNAME_PROXY_PORT);
+        let allow_all = EgressRules::from_policy(None, RESOLVER, LEASE)
+            .with_switch_own_addresses(with_proxy.clone());
+        let deny_all_set = deny_all().with_switch_own_addresses(with_proxy);
+        let node_drop =
+            |proto| FrameVerdict::Drop(DropReason::InfrastructureDestination { dst: NODE, proto });
+
+        assert!(
+            admits(
+                &ipv4_frame(IPPROTO_TCP, NODE, HOSTNAME_PROXY_PORT),
+                &allow_all
+            ),
+            "an allow-all box reaches the hostname proxy's port on the node"
+        );
+        assert_eq!(
+            verdict(&summarize(&ipv4_frame(IPPROTO_TCP, NODE, 7655)), &allow_all),
+            node_drop(IPPROTO_TCP),
+            "and nothing else at the node address"
+        );
+        assert_eq!(
+            verdict(
+                &summarize(&ipv4_frame(IPPROTO_UDP, NODE, HOSTNAME_PROXY_PORT)),
+                &allow_all
+            ),
+            node_drop(IPPROTO_UDP),
+            "the opening is TCP only: UDP to the proxy's port is the set's drop"
+        );
+        assert_eq!(
+            verdict(
+                &summarize(&ipv4_frame(IPPROTO_TCP, NODE, HOSTNAME_PROXY_PORT)),
+                &deny_all_set
+            ),
+            FrameVerdict::Drop(DropReason::UndeclaredProtocol { proto: IPPROTO_TCP }),
+            "a deny-all box is refused at the proxy's port by its own rules, not the set"
+        );
+
+        // No proxy port compiled in: the node address has no opening.
+        let no_proxy = EgressRules::from_policy(None, RESOLVER, LEASE)
+            .with_switch_own_addresses(own_addresses());
+        assert_eq!(
+            verdict(
+                &summarize(&ipv4_frame(IPPROTO_TCP, NODE, HOSTNAME_PROXY_PORT)),
+                &no_proxy
+            ),
+            node_drop(IPPROTO_TCP),
+            "with no proxy port the node address drops at the proxy's port too"
+        );
+    }
+
     /// NET-064: UDP is dropped when only TCP is allowed — and TCP to a
     /// declared subnet still completes (NET-063).
     #[test]
@@ -2163,10 +3146,6 @@ mod tests {
         let short_ip = eth_frame(ETHERTYPE_IPV4, &[0u8; 10]);
         assert_eq!(summarize(&short_ip).family, FrameFamily::Truncated);
     }
-
-    /// The default switch's host alias, the helper's address the
-    /// infrastructure deny set holds beside the resolver.
-    const HOST_ALIAS: [u8; 4] = [100, 64, 255, 254];
 
     /// Compiles a CIDR list, the way [`EgressRules::from_policy`] does, for
     /// the intersection tests below.
@@ -2973,10 +3952,17 @@ mod kani_proofs {
     /// silently become unreachable (the rcache harness pattern). The frame
     /// half is restated over the same summary and rules — the lease first
     /// (NET-084: the source is the lease), then the resolver carve-out
-    /// (NET-079), then the three declared dimensions conjunctively — so a
-    /// verdict that checks in a different order, or that reads `None` as
-    /// deny-all, fails here. The listen half (NET-016) is restated over the
-    /// same ingress rules, below.
+    /// (NET-079), then the credentialed lane's proxy listener (NET-134),
+    /// then the proxy address's own drop, then the three declared
+    /// dimensions conjunctively — so a verdict that checks in a different
+    /// order, or that reads `None` as deny-all, fails here. The lane's
+    /// half is the whole (address, port, protocol) triple the rules carry,
+    /// never the address alone, so a verdict that admits the proxy's
+    /// address at any port or protocol fails here; and the drop's half
+    /// holds for a lane-less box on a switch that carries the proxy as
+    /// much as for a laned one, so a verdict that lets an open dimension
+    /// reach the address fails here too. The listen half (NET-016) is
+    /// restated over the same ingress rules, below.
     ///
     /// The unwind bound is 6, with one loop to spare over the longest
     /// this proof unwinds: comparing `[u8; 4]` addresses lowers to
@@ -2997,9 +3983,14 @@ mod kani_proofs {
         //
         // Symbolic: the fragment offset, the source, the protocol, the
         // destination and the L4 destination port — every value the
-        // decision reads — and the lease, beside the rules, that the source
+        // decision reads — the lease, beside the rules, that the source
         // is checked against (NET-084's property is over every frame and
-        // every lease).
+        // every lease), and the Box Egress Proxy the rules may carry,
+        // with the lane beside it, so the proof's oracle holds over a
+        // lane-declaring box, a lane-less box whose switch carries the
+        // proxy, and a switch that carries none (NET-134: the first
+        // alone admits the listener, and the second drops every other
+        // frame to the address).
         //
         // Pinned to constants: the EtherType (IPv4, the one family the
         // rules decide; the families decided without rules each have their
@@ -3044,7 +4035,26 @@ mod kani_proofs {
 
         let resolver: [u8; 4] = kani::any();
         let lease: [u8; 4] = kani::any();
+        // The proxy, spelled the way the compile produces it: a symbolic
+        // address a boolean chooses to attach, and a second boolean that
+        // chooses whether the box declared the lane — so the proof covers a
+        // lane-declaring box, a lane-less box whose switch carries the
+        // proxy, and a switch that carries none (NET-134). The port and
+        // protocol the setters fill are the listener's fixed ones, so the
+        // oracle below reads them off the rules the same way the verdict
+        // does — over a fully symbolic frame, which is where the triple,
+        // not the address, is what the proof pins.
+        let proxy_addr: [u8; 4] = kani::any();
+        let proxied = kani::any::<bool>();
+        let laned = kani::any::<bool>();
         let rules = EgressRules::new(two_protocols(), two_cidrs(), two_cidrs(), resolver, lease);
+        let rules = match proxied {
+            false => rules,
+            true => match laned {
+                true => rules.with_credentialed_upstream(proxy_addr),
+                false => rules.with_box_egress_proxy(proxy_addr),
+            },
+        };
 
         let admitted = matches!(verdict(&summary, &rules), FrameVerdict::Admit);
 
@@ -3054,6 +4064,20 @@ mod kani_proofs {
                 let resolver = proto == IPPROTO_UDP
                     && dst == rules.resolver()
                     && summary.destination_port() == DNS_PORT;
+                let lane = rules.credentialed_upstream
+                    && rules.proxy.is_some_and(|listener| {
+                        proto == listener.proto
+                            && dst == listener.addr
+                            && summary.destination_port() == listener.port
+                    });
+                // NET-134's other arm: every frame to the proxy's address
+                // the lane did not admit, dropped ahead of the rules — the
+                // listener's own triple from a box that declared no lane
+                // included, by the one predicate both legs share: the
+                // listener opens for a laned box alone, and nothing else at
+                // the address opens at all, so no open dimension ever
+                // reaches it.
+                let at_the_address = rules.proxy.is_some_and(|listener| dst == listener.addr);
                 let protocols = rules
                     .allow_protocols
                     .as_ref()
@@ -3066,7 +4090,7 @@ mod kani_proofs {
                     .allow_subnets
                     .as_ref()
                     .is_none_or(|list| list.iter().any(|cidr| cidr.contains(dst)));
-                lease && (resolver || (protocols && !denied && allowed))
+                lease && (resolver || lane || (!at_the_address && protocols && !denied && allowed))
             }
             // No readable IPv4 header is never a declared frame.
             _ => false,

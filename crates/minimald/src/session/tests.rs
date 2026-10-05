@@ -1446,6 +1446,53 @@ async fn ensure_host_launches_an_unattached_host_and_then_reuses_it() {
     );
 }
 
+/// NET-079's "recorded as such" is not best-effort: a host-address box
+/// whose launch cannot write its outcome onto the session record does not
+/// run as though it had one. The launch kills the box it minted and fails
+/// with `LaunchRecordUnwritable`, the session holds no host, and the record
+/// keeps no outcome — so no read surface ever answers for a box that ran
+/// without one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_launch_whose_record_cannot_be_written_kills_its_box() {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let session_id = create_configured_session(&mut client, "unrecorded-launch", "/tmp").await;
+    let torn_down = crate::session::launch_record_seam::fail_writes_for(session_id);
+
+    let manager = server.state.sessions_manager().await;
+    let handle = manager
+        .get_session(crate::sessions::SessionKeyPredicate::Id(session_id))
+        .await
+        .unwrap()
+        .expect("session should resolve");
+
+    match handle.ensure_host("tester".to_string()).await {
+        Err(crate::session::AttachError::LaunchRecordUnwritable(_)) => {}
+        Err(other) => panic!("the launch failed for another reason: {other}"),
+        Ok(_) => panic!("a launch whose outcome could not be recorded handed its box back"),
+    }
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !torn_down.load(std::sync::atomic::Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the launch kills the box it could not record, tearing its network down");
+    assert!(
+        handle.get_attrs().await.is_none(),
+        "the session holds no host after a launch it could not record"
+    );
+    let record = client
+        .call::<GetSessionRecord>(&GetSessionRecordRequest::Id(session_id))
+        .await
+        .record
+        .expect("the session's record is readable");
+    assert_eq!(
+        record.host_ip_enforcement, None,
+        "a launch that could not record its outcome left none on the record"
+    );
+}
+
 // ---- lifecycle hooks -------------------------------------------------
 //
 // Hooks run inside the session, which under test means the host-side
@@ -2741,6 +2788,7 @@ fn own_ip_session_req(name: &str) -> minimald_rpc::CreateSessionRequest {
                     }],
                     ..Default::default()
                 }),
+                credentialed_upstream: None,
             },
             box_addresses: None,
             hooks_enabled: true,
@@ -4957,6 +5005,71 @@ pub(crate) async fn finalize_dynamic_ingress_session(
     id
 }
 
+/// The box an expose reply's honesty is decided against: an own-address box
+/// that declares one published port *and* allows dynamic ingress over a range
+/// containing it, with the hand a publish needs — so one box's flow reaches
+/// both halves of the reply's predicate (NET-047): the declared port, which
+/// the gate admitted when the box attached, and a runtime-only port inside
+/// the range, which is still waiting for it. [`dynamic_ingress_session_req`]
+/// clears the declared mappings because its tests decide only runtime ones;
+/// this keeps one, which is the point.
+fn declared_and_dynamic_ingress_session_req(
+    name: &str,
+    switch: std::net::Ipv4Addr,
+    loopback: std::net::Ipv4Addr,
+) -> minimald_rpc::CreateSessionRequest {
+    let mut request = own_ip_session_req(name);
+    let ingress = request
+        .config
+        .policy
+        .ingress
+        .as_mut()
+        .expect("own_ip_session_req always declares an ingress policy");
+    ingress.port_mappings = vec![sessions::PortMapping {
+        external_port: 3000,
+        internal_port: 3000,
+        proto: sessions::IpProto::Tcp,
+    }];
+    ingress.dynamic_ingress = Some(sessions::DynamicIngress::Allow);
+    ingress.dynamic_allowed_range = Some((3000, 3999));
+    request.config.box_addresses = Some(sessions::BoxAddresses {
+        switch_address: switch,
+        loopback_address: loopback,
+    });
+    request
+}
+
+/// Drives Create → ConfigureLoadout → FinalizeSession for a
+/// [`declared_and_dynamic_ingress_session_req`] box and returns its id.
+/// `pub(crate)`: the env channel's tests drive a real session's publish to
+/// read the reply the box's own `min net expose` gets.
+pub(crate) async fn finalize_declared_dynamic_ingress_session(
+    client: &mut TestClient,
+    name: &str,
+    switch: std::net::Ipv4Addr,
+    loopback: std::net::Ipv4Addr,
+) -> SessionId {
+    use minimald_rpc::{ConfigureLoadout, ConfigureLoadoutRequest, CreateSession};
+    let id = client
+        .call::<CreateSession>(&declared_and_dynamic_ingress_session_req(
+            name, switch, loopback,
+        ))
+        .await
+        .unwrap()
+        .id;
+    crate::test_harness::unwrap_ready(
+        client
+            .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
+                session_id: id,
+                contribution: Default::default(),
+            })
+            .await
+            .unwrap(),
+    );
+    finalize_session(client, id).await;
+    id
+}
+
 /// Reads one control request off `stream` — its head through the blank line,
 /// then exactly its `Content-Length` of body — mirroring the keep-alive
 /// framing [`crate::net::policy`] writes, so the stand-in forwarder below
@@ -5006,10 +5119,27 @@ async fn read_control_request(stream: &mut tokio::net::UnixStream) -> Option<Str
 /// and records every request it served as `"<request line>\n<body>"`. The
 /// harness never spawns a real forwarder, so binding here is what puts a
 /// control channel behind the publish verbs — a 500 answers the way the real
-/// forwarder answers a bind it cannot make.
+/// forwarder answers a bind it cannot make. `pub(crate)`: the env channel's
+/// tests drive a real session's publish through the same stand-in.
 pub(crate) async fn fake_forwarder(
     sock: std::path::PathBuf,
     status: u16,
+) -> (
+    tokio::task::JoinHandle<()>,
+    std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+) {
+    scripted_forwarder(sock, vec![status]).await
+}
+
+/// A stand-in for the host gvproxy that answers each request with the next
+/// status of `script`, keeping the last for any request past them — so a test
+/// can have the switch accept one bind and refuse the next, the way the real
+/// forwarder answers a duplicate of a bind another forward already holds.
+/// Everything else is [`fake_forwarder`]'s contract: one request per
+/// connection, each recorded as `"<request line>\n<body>"`.
+async fn scripted_forwarder(
+    sock: std::path::PathBuf,
+    script: Vec<u16>,
 ) -> (
     tokio::task::JoinHandle<()>,
     std::sync::Arc<std::sync::Mutex<Vec<String>>>,
@@ -5022,6 +5152,10 @@ pub(crate) async fn fake_forwarder(
     let served = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let recorded = served.clone();
     let server = tokio::spawn(async move {
+        let mut script: std::collections::VecDeque<u16> = script.into();
+        // The last status answers anything past the script, so a stand-in
+        // scripted for two requests still answers a third.
+        let last = *script.back().unwrap_or(&500);
         // Sequential on purpose: the publish verbs open a fresh connection
         // per request, so one connection served at a time is their shape.
         loop {
@@ -5032,6 +5166,7 @@ pub(crate) async fn fake_forwarder(
                 continue;
             };
             recorded.lock().expect("served lock").push(request);
+            let status = script.pop_front().unwrap_or(last);
             let reason = if (200..300).contains(&status) {
                 "OK"
             } else {
@@ -5053,6 +5188,193 @@ pub(crate) async fn fake_forwarder(
     (server, served)
 }
 
+/// What the gated stand-in below answers one request with.
+#[derive(Clone)]
+enum GateAnswer {
+    /// Answer the request with this status, the way [`scripted_forwarder`]
+    /// answers its script's.
+    With(u16),
+    /// Record the request but hold the answer — the connection stays open,
+    /// the client stays awaiting its bind — until the test's gate counter
+    /// passes the held answers the stand-in has already resolved, then
+    /// answer with this status. A bind the stand-in holds is a bind the
+    /// reserving surface is in flight across: the window in which the
+    /// other surface must lose to the reservation, never to the switch.
+    Held(u16),
+}
+
+/// [`scripted_forwarder`], with [`GateAnswer::Held`] answers a test times
+/// itself: the stand-in serves one request per connection, recording each,
+/// and a held answer is not sent until the test advances the returned gate
+/// past the held answers it has already resolved — first held answer waits
+/// for the counter to pass 0, the second for it to pass 1, and so on, so
+/// sequential phases each open and close one in-flight bind of their own.
+/// Returns the server, the record of every request it served, and the
+/// gate a test advances to resolve the holds.
+///
+/// The script is keyed by port: a request is answered by the first entry
+/// left for the port its `local` names, and a request for any other port is
+/// answered 200 without touching the script. The watcher reads the host's
+/// whole socket table, so a wildcard listener another test holds inside the
+/// box's range is published too; keyed, its request can never take the
+/// answer — or the hold — a phase scripted for its own port.
+async fn gated_forwarder(
+    sock: std::path::PathBuf,
+    script: Vec<(u16, GateAnswer)>,
+) -> (
+    tokio::task::JoinHandle<()>,
+    std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    tokio::sync::watch::Sender<u64>,
+) {
+    use tokio::io::AsyncWriteExt;
+    if let Some(parent) = sock.parent() {
+        std::fs::create_dir_all(parent).expect("create the switch state dir");
+    }
+    let listener = tokio::net::UnixListener::bind(&sock).expect("bind the control socket");
+    let served = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = served.clone();
+    let (gate_tx, gate_rx) = tokio::sync::watch::channel(0u64);
+    let server = tokio::spawn(async move {
+        let mut script = script;
+        // Requests are read and recorded one at a time, in arrival order,
+        // and each hold is numbered in that order; the answers are sent from
+        // a task per connection, so a held bind never parks a request for
+        // any other port behind it — the watcher's publish of a listener
+        // another test holds is answered while a phase's hold is open.
+        let mut held: u64 = 0;
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Some(request) = read_control_request(&mut stream).await else {
+                continue;
+            };
+            let port = request_port(&request);
+            recorded.lock().expect("served lock").push(request);
+            let scripted = script
+                .iter()
+                .position(|(scripted, _)| Some(*scripted) == port)
+                .map(|at| script.remove(at).1);
+            let (status, hold) = match scripted.unwrap_or(GateAnswer::With(200)) {
+                GateAnswer::With(status) => (status, None),
+                GateAnswer::Held(status) => {
+                    // This is held request number `held + 1`: it waits for
+                    // the gate to pass the `held` resolved before it.
+                    held += 1;
+                    (status, Some(held - 1))
+                }
+            };
+            let mut gate_rx = gate_rx.clone();
+            tokio::spawn(async move {
+                if let Some(before) = hold {
+                    // A dropped gate (the test gone) answers rather than
+                    // parks the answer forever.
+                    while *gate_rx.borrow() <= before {
+                        if gate_rx.changed().await.is_err() {
+                            break;
+                        }
+                    }
+                }
+                let reason = if (200..300).contains(&status) {
+                    "OK"
+                } else {
+                    "Internal Server Error"
+                };
+                #[expect(
+                    clippy::let_underscore_must_use,
+                    reason = "the answer's fate is not what the stand-in records; the request is"
+                )]
+                let _ = stream
+                    .write_all(
+                        format!("HTTP/1.1 {status} {reason}\r\nContent-Length: 0\r\n\r\n")
+                            .as_bytes(),
+                    )
+                    .await;
+            });
+        }
+    });
+    (server, served, gate_tx)
+}
+
+/// The port a control request's `local` names, if it names one.
+fn request_port(request: &str) -> Option<u16> {
+    let (_, rest) = request.split_once("\"local\":\"")?;
+    let (local, _) = rest.split_once('"')?;
+    local.rsplit_once(':')?.1.parse().ok()
+}
+
+/// NET-043: the session-create info line names the dynamic ingress stance
+/// and the range the record holds, resolved the way the box runs them —
+/// an absent stance reads as the deny the policy module evaluates it as,
+/// not as a missing fact — so a diagnostics bundle's daemon-log tail shows
+/// which setting a box was created with, beside the egress facts that were
+/// already on the line. Both halves of the declaration are named: the mode
+/// the box's creator chose for it, and the range that bounds the dynamic
+/// requests the mode admits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_logs_dynamic_ingress() {
+    let capture = crate::test_harness::captured_log();
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+
+    use minimald_rpc::{CreateSession, CreateSessionRequest};
+    // The allowing box over a range, and a bare box that declared nothing —
+    // the two halves a bundle has to tell apart, by the lines they left.
+    client
+        .call::<CreateSession>(&dynamic_ingress_session_req(
+            "dyn-allow-logged",
+            std::net::Ipv4Addr::new(100, 64, 128, 31),
+            std::net::Ipv4Addr::new(127, 0, 64, 31),
+            Some(sessions::DynamicIngress::Allow),
+            Some((3000, 3999)),
+        ))
+        .await
+        .unwrap();
+    client
+        .call::<CreateSession>(&CreateSessionRequest {
+            config: minimald_rpc::SessionConfig {
+                name: Some("dyn-bare-logged".to_string()),
+                project_path: paths::HostAbsPath::try_new("/uwu").unwrap(),
+                network: sessions::NetworkMode::OwnIp,
+                policy: sessions::SessionPolicy::default(),
+                box_addresses: None,
+                hooks_enabled: true,
+                attrs: Default::default(),
+            },
+            must_match_version: None,
+        })
+        .await
+        .unwrap();
+
+    let logged = capture.contents();
+    for (name, facts) in [
+        (
+            "dyn-allow-logged",
+            [
+                "dynamic_ingress=allow",
+                "dynamic_allowed_range=Some((3000, 3999))",
+            ],
+        ),
+        (
+            "dyn-bare-logged",
+            ["dynamic_ingress=deny", "dynamic_allowed_range=None"],
+        ),
+    ] {
+        let start_line = logged
+            .lines()
+            .find(|line| line.contains("session starts") && line.contains(name))
+            .unwrap_or_else(|| {
+                panic!("the session start must be logged for {name}, got: {logged}")
+            });
+        for fact in facts {
+            assert!(
+                start_line.contains(fact),
+                "the start line must name {fact}, got: {start_line}"
+            );
+        }
+    }
+}
+
 /// NET-043: a port-publish request from inside a box is decided against the
 /// box's own `dynamic_ingress` setting, on the local daemon — the un-enrolled
 /// host's shape, where the same daemon that owns the switch answers the box
@@ -5066,6 +5388,10 @@ pub(crate) async fn fake_forwarder(
 async fn expose_unenrolled_local_rpc_evaluates_dynamic_ingress() {
     let server = TestServer::new().await;
     let mut client = server.connect().await;
+    // The hand vouched for, so the registry publishes it: the publish below
+    // binds at the address the box's name answers at, deterministically.
+    let manager = server.state.sessions_manager().await;
+    manager.land_range_verdict(crate::net::dns::RangeVerdict::Present);
     let web = finalize_dynamic_ingress_session(
         &mut client,
         "web",
@@ -5084,7 +5410,6 @@ async fn expose_unenrolled_local_rpc_evaluates_dynamic_ingress() {
         None,
     )
     .await;
-    let manager = server.state.sessions_manager().await;
     let web_handle = manager
         .get_session(crate::sessions::SessionKeyPredicate::Id(web))
         .await
@@ -5095,6 +5420,11 @@ async fn expose_unenrolled_local_rpc_evaluates_dynamic_ingress() {
         .await
         .unwrap()
         .expect("the unenrolled box resolves");
+    // A publish needs a box standing behind it, so the allowing box runs one.
+    web_handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("the allowing box launches its host");
     let sock = web_handle
         .net_switch()
         .await
@@ -5162,21 +5492,31 @@ async fn expose_allow_publishes_and_lists() {
     let capture = crate::test_harness::captured_log();
     let server = TestServer::new().await;
     let mut client = server.connect().await;
+    // The hand vouched for, so the registry publishes it and the publish
+    // binds at the address the box's name answers at.
+    let manager = server.state.sessions_manager().await;
+    manager.land_range_verdict(crate::net::dns::RangeVerdict::Present);
     let web = finalize_dynamic_ingress_session(
         &mut client,
-        "web",
+        // This test's own box name: under the shared capture every test's
+        // lines ride one buffer, so each assertion finds its line by the
+        // box it names.
+        "listweb",
         std::net::Ipv4Addr::new(100, 64, 128, 21),
         std::net::Ipv4Addr::new(127, 0, 64, 21),
         Some(sessions::DynamicIngress::Allow),
         Some((3000, 3999)),
     )
     .await;
-    let manager = server.state.sessions_manager().await;
     let handle = manager
         .get_session(crate::sessions::SessionKeyPredicate::Id(web))
         .await
         .unwrap()
         .expect("the allowing box resolves");
+    handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("the allowing box launches its host");
     let sock = handle
         .net_switch()
         .await
@@ -5194,6 +5534,7 @@ async fn expose_allow_publishes_and_lists() {
         local: "127.0.64.21:3000".to_string(),
         internal_port: 3000,
         proto: sessions::IpProto::Tcp,
+        pending: Some(false),
     };
     assert_eq!(
         mapping, expected,
@@ -5204,7 +5545,10 @@ async fn expose_allow_publishes_and_lists() {
     // double-bind the same address, so it is refused as the duplicate it is.
     match handle.expose_dynamic(3000).await {
         Err(crate::net::policy::ExposeFailure::Refused(
-            crate::net::policy::ExposeRefusal::AlreadyPublished(3000),
+            crate::net::policy::ExposeRefusal::AlreadyPublished {
+                port: 3000,
+                owner: crate::net::listeners::PublicationOwner::Expose,
+            },
         )) => {}
         other => panic!("a second request for a live port is a duplicate: {other:?}"),
     }
@@ -5216,15 +5560,21 @@ async fn expose_allow_publishes_and_lists() {
     );
 
     // The publish is listed where `min session policy` reads it, by name and
-    // by id alike.
+    // by id alike — and it reads as what it is: pending, because the box's
+    // relay gate admits the ports the *declaration* named, and this port
+    // was published at runtime, outside it.
+    let listed = minimald_rpc::LiveMapping {
+        pending: Some(true),
+        ..mapping.clone()
+    };
     let by_name: minimald_rpc::Errorable<Vec<minimald_rpc::LiveMapping>> = client
         .call::<minimald_rpc::GetLiveIngress>(&minimald_rpc::GetLiveIngressRequest::Name(
-            "web".to_string(),
+            "listweb".to_string(),
         ))
         .await;
     assert_eq!(
         by_name,
-        minimald_rpc::Errorable::Ok(vec![mapping.clone()]),
+        minimald_rpc::Errorable::Ok(vec![listed.clone()]),
         "the live mapping is listed beside the declaration, by name"
     );
     let by_id: minimald_rpc::Errorable<Vec<minimald_rpc::LiveMapping>> = client
@@ -5232,21 +5582,25 @@ async fn expose_allow_publishes_and_lists() {
         .await;
     assert_eq!(
         by_id,
-        minimald_rpc::Errorable::Ok(vec![mapping]),
+        minimald_rpc::Errorable::Ok(vec![listed]),
         "the live mapping is listed beside the declaration, by id"
     );
 
     // The one line the request leaves in the log, with the box, the port, the
-    // decision the box's setting made, and the outcome.
+    // decision the box's setting made, and the outcome — found by this
+    // test's own box name, the shared capture holding every test's lines.
     let logged = capture.contents();
     let line = logged
         .lines()
-        .find(|line| line.contains("dynamic ingress expose") && line.contains("name=web"))
+        .find(|line| {
+            line.contains("dynamic ingress expose")
+                && line.contains("name=listweb")
+                && line.contains("outcome=\"published\"")
+        })
         .unwrap_or_else(|| panic!("the publish must be logged, got: {logged}"));
     assert!(
         line.contains("port=3000")
             && line.contains("decision=allow")
-            && line.contains("outcome=\"published\"")
             && line.contains("local=127.0.64.21:3000"),
         "the publish line names the box, the port, the decision and the \
          outcome: {line}"
@@ -5325,6 +5679,10 @@ async fn expose_self_allocated_box_publishes_at_its_registered_address() {
         .await
         .unwrap()
         .expect("the allowing box resolves");
+    handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("the allowing box launches its host");
     let sock = handle
         .net_switch()
         .await
@@ -5345,6 +5703,7 @@ async fn expose_self_allocated_box_publishes_at_its_registered_address() {
             local: format!("{published}:3000"),
             internal_port: 3000,
             proto: sessions::IpProto::Tcp,
+            pending: Some(false),
         },
         "the mapping names the box's registered address at its own port number"
     );
@@ -5380,9 +5739,14 @@ async fn expose_self_allocated_box_publishes_at_its_registered_address() {
             "selfweb".to_string(),
         ))
         .await;
+    // The row reads as what it is: pending, the gate not having admitted a
+    // runtime-published port yet.
     assert_eq!(
         live,
-        minimald_rpc::Errorable::Ok(vec![mapping]),
+        minimald_rpc::Errorable::Ok(vec![minimald_rpc::LiveMapping {
+            pending: Some(true),
+            ..mapping
+        }]),
         "the live mapping is listed beside the declaration"
     );
 }
@@ -5412,6 +5776,13 @@ async fn expose_self_allocated_box_without_a_registered_address_is_refused() {
         .await
         .unwrap()
         .expect("the allowing box resolves");
+    // The two refusals below are about the address pair, not about the box
+    // running: a live host, so the not-running refusal is not the one they
+    // exercise.
+    handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("the allowing box launches its host");
     let sock = handle
         .net_switch()
         .await
@@ -5473,9 +5844,12 @@ async fn expose_deny_typed_error() {
     let capture = crate::test_harness::captured_log();
     let server = TestServer::new().await;
     let mut client = server.connect().await;
+    // This test's own box names: under the shared capture every test's lines
+    // ride one buffer, so each assertion finds its lines by the box they
+    // name.
     let closed = finalize_dynamic_ingress_session(
         &mut client,
-        "closed",
+        "denyclosed",
         std::net::Ipv4Addr::new(100, 64, 128, 31),
         std::net::Ipv4Addr::new(127, 0, 64, 31),
         Some(sessions::DynamicIngress::Deny),
@@ -5484,7 +5858,7 @@ async fn expose_deny_typed_error() {
     .await;
     let bare = finalize_dynamic_ingress_session(
         &mut client,
-        "bare",
+        "denybare",
         std::net::Ipv4Addr::new(100, 64, 128, 32),
         std::net::Ipv4Addr::new(127, 0, 64, 32),
         None,
@@ -5538,7 +5912,7 @@ async fn expose_deny_typed_error() {
     );
     let live: minimald_rpc::Errorable<Vec<minimald_rpc::LiveMapping>> = client
         .call::<minimald_rpc::GetLiveIngress>(&minimald_rpc::GetLiveIngressRequest::Name(
-            "bare".to_string(),
+            "denybare".to_string(),
         ))
         .await;
     assert_eq!(
@@ -5548,25 +5922,27 @@ async fn expose_deny_typed_error() {
     );
 
     // Both refusals say their line, each naming the box, the port, the
-    // decision the box's setting made, and the reason.
+    // decision the box's setting made, and the reason — counted and taken
+    // per box name, the shared capture holding every test's refused lines.
     let logged = capture.contents();
-    let refused: Vec<_> = logged
-        .lines()
-        .filter(|line| {
-            line.contains("dynamic ingress expose") && line.contains("outcome=\"refused\"")
-        })
-        .collect();
-    assert_eq!(
-        refused.len(),
-        2,
-        "one refused line per request, got: {logged}"
-    );
-    for line in &refused {
+    for name in ["denyclosed", "denybare"] {
+        let refused: Vec<&str> = logged
+            .lines()
+            .filter(|line| {
+                line.contains("dynamic ingress expose") && line.contains(&format!("name={name}"))
+            })
+            .collect();
+        assert_eq!(
+            refused.len(),
+            1,
+            "one refused line per request for {name}, got: {logged}"
+        );
         assert!(
-            line.contains("port=3000")
-                && line.contains("decision=deny")
-                && line.contains("reason=dynamic ingress is denied for this box"),
-            "the refusal names the port, the decision and the reason: {line}"
+            refused[0].contains("port=3000")
+                && refused[0].contains("decision=deny")
+                && refused[0].contains("reason=dynamic ingress is denied for this box"),
+            "the refusal names the port, the decision and the reason: {}",
+            refused[0]
         );
     }
 }
@@ -5598,6 +5974,12 @@ async fn expose_rejected_leaves_no_partial_mapping() {
         .await
         .unwrap()
         .expect("the allowing box resolves");
+    // The in-range request below reaches the switch, so a box must be
+    // standing behind it.
+    handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("the allowing box launches its host");
     let sock = handle
         .net_switch()
         .await
@@ -5683,4 +6065,2125 @@ async fn expose_rejected_leaves_no_partial_mapping() {
         failed_line.contains("returned HTTP 500"),
         "the failed publish names the switch's refusal: {failed_line}"
     );
+}
+
+/// NET-044 on the shared-address interim: under an absent range verdict every
+/// box publishes at `127.0.0.1`, so a runtime expose of a port another box
+/// already holds there cannot be made — the switch refuses the duplicate
+/// bind — and the refusal is the typed publish failure naming the port,
+/// never a fallback to another address and never a success for a forward
+/// nobody owns. The colliding box keeps no forward and lists no mapping, and
+/// the box that holds the address keeps its publish.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expose_colliding_on_shared_address_is_a_bind_error() {
+    let capture = crate::test_harness::captured_log();
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    // An absent range: the interim both boxes publish at, so one address's
+    // port carries one forward at most.
+    let manager = server.state.sessions_manager().await;
+    manager.land_range_verdict(crate::net::dns::RangeVerdict::Absent);
+    let web = finalize_dynamic_ingress_session(
+        &mut client,
+        // This test's own box names: under the shared capture every test's
+        // lines ride one buffer, so the assertion below finds the failed
+        // publish by the box it names.
+        "clashweb",
+        std::net::Ipv4Addr::new(100, 64, 128, 31),
+        std::net::Ipv4Addr::new(127, 0, 64, 31),
+        Some(sessions::DynamicIngress::Allow),
+        Some((3000, 3999)),
+    )
+    .await;
+    let db = finalize_dynamic_ingress_session(
+        &mut client,
+        "clashdb",
+        std::net::Ipv4Addr::new(100, 64, 128, 32),
+        std::net::Ipv4Addr::new(127, 0, 64, 32),
+        Some(sessions::DynamicIngress::Allow),
+        Some((3000, 3999)),
+    )
+    .await;
+    let web_handle = manager
+        .get_session(crate::sessions::SessionKeyPredicate::Id(web))
+        .await
+        .unwrap()
+        .expect("the first box resolves");
+    let db_handle = manager
+        .get_session(crate::sessions::SessionKeyPredicate::Id(db))
+        .await
+        .unwrap()
+        .expect("the second box resolves");
+    // Both boxes run: a publish needs a box standing behind it, and the
+    // collision below is one two live boxes make, not a box that cannot
+    // publish at all.
+    web_handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("the first box launches its host");
+    db_handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("the second box launches its host");
+    let sock = web_handle
+        .net_switch()
+        .await
+        .unwrap()
+        .lock()
+        .await
+        .control_socket();
+    // The switch accepts the first box's bind of the shared address's port
+    // and refuses the second box's bind of the same one — a 500, the way the
+    // real forwarder answers a bind it cannot make because another forward
+    // already holds the address.
+    let (forwarder, served) = scripted_forwarder(sock, vec![200, 500]).await;
+
+    let held = web_handle
+        .expose_dynamic(3000)
+        .await
+        .expect("the first box's publish holds the shared address's port");
+    assert_eq!(
+        held.local, "127.0.0.1:3000",
+        "under an absent range both boxes publish at the interim"
+    );
+
+    // The second box exposes the port the first holds: one address:port
+    // carries one forward, so this bind cannot be made, and the failure is
+    // the typed publish failure naming the port.
+    match db_handle.expose_dynamic(3000).await {
+        Err(crate::net::policy::ExposeFailure::Publish { port: 3000, source }) => {
+            assert!(
+                source.to_string().contains("returned HTTP 500"),
+                "the bind failure names the switch's refusal: {source}"
+            );
+        }
+        other => panic!("a bind on an address another box holds is the publish failure: {other:?}"),
+    }
+    forwarder.abort();
+
+    // The refused bind asked for exactly what it meant to bind — the shared
+    // address, delivered to the second box's own switch address — and asked
+    // nothing else: no retry at a fallback address.
+    let served = served.lock().expect("served lock").clone();
+    assert_eq!(
+        served.len(),
+        2,
+        "one request per publish, and no third for a fallback: {served:?}"
+    );
+    let (line, body) = served[1]
+        .split_once('\n')
+        .expect("the served request carries its request line and body");
+    assert!(
+        line.starts_with("POST /services/forwarder/expose "),
+        "the colliding publish rides the forwarder's expose verb: {served:?}"
+    );
+    let colliding = crate::net::policy::expose_request(
+        &sessions::PortMapping {
+            external_port: 3000,
+            internal_port: 3000,
+            proto: sessions::IpProto::Tcp,
+        },
+        std::net::Ipv4Addr::LOCALHOST,
+        std::net::Ipv4Addr::new(100, 64, 128, 32),
+    );
+    assert_eq!(
+        body,
+        String::from_utf8(serde_json_lenient::to_vec(&colliding).unwrap()).unwrap(),
+        "the refused bind is the request at the shared address, never a \
+         fallback one"
+    );
+
+    // No forward and no listed mapping for the colliding box; the box that
+    // holds the address keeps its publish.
+    let db_live: minimald_rpc::Errorable<Vec<minimald_rpc::LiveMapping>> = client
+        .call::<minimald_rpc::GetLiveIngress>(&minimald_rpc::GetLiveIngressRequest::Id(db))
+        .await;
+    assert_eq!(
+        db_live,
+        minimald_rpc::Errorable::Ok(vec![]),
+        "the colliding box lists no mapping: its bind was never made"
+    );
+    let web_live: minimald_rpc::Errorable<Vec<minimald_rpc::LiveMapping>> = client
+        .call::<minimald_rpc::GetLiveIngress>(&minimald_rpc::GetLiveIngressRequest::Id(web))
+        .await;
+    assert_eq!(
+        web_live,
+        minimald_rpc::Errorable::Ok(vec![minimald_rpc::LiveMapping {
+            local: "127.0.0.1:3000".to_string(),
+            internal_port: 3000,
+            proto: sessions::IpProto::Tcp,
+            // The box declared no port mappings, so its relay gate admits
+            // nothing: the runtime publish reads pending.
+            pending: Some(true),
+        }]),
+        "the first box's publish is untouched by the collision"
+    );
+
+    // The one line the failed publish owes the log: the box, the port, the
+    // decision its setting made, and the switch's refusal.
+    let logged = capture.contents();
+    let line = logged
+        .lines()
+        .find(|line| line.contains("dynamic ingress expose") && line.contains("name=clashdb"))
+        .unwrap_or_else(|| panic!("the failed publish must be logged, got: {logged}"));
+    assert!(
+        line.contains("port=3000")
+            && line.contains("decision=allow")
+            && line.contains("outcome=\"publish failed\"")
+            && line.contains("returned HTTP 500"),
+        "the failed publish names the box, the port, the decision and the \
+         switch's refusal: {line}"
+    );
+}
+
+/// NET-044's address, on a hand the loopback verdict has not vouched for:
+/// the runtime publish binds at the hostname registry's published own
+/// address — the one source the declared path reads too, through
+/// `OwnAddressReporter::published_address` — and never at the raw handed
+/// loopback address. The hand names an address the publish surface cannot
+/// bind under an absent range, so the finalize published the box at the
+/// `127.0.0.1` interim (NET-123 §7.1), which is where its declared ports
+/// bind and its name answers: the runtime publish rides the same address a
+/// connection actually reaches, while the hand's `switch_address` stays
+/// what the forward delivers to.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expose_publishes_at_the_registered_address() {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    // An absent range: the hand is unvouched, so the finalize publishes the
+    // interim — the hand stands only in the record.
+    let manager = server.state.sessions_manager().await;
+    manager.land_range_verdict(crate::net::dns::RangeVerdict::Absent);
+    let web = finalize_dynamic_ingress_session(
+        &mut client,
+        "web",
+        std::net::Ipv4Addr::new(100, 64, 128, 9),
+        std::net::Ipv4Addr::new(127, 0, 64, 9),
+        Some(sessions::DynamicIngress::Allow),
+        Some((3000, 3999)),
+    )
+    .await;
+    assert_eq!(
+        manager
+            .hostnames()
+            .read()
+            .expect("registry lock")
+            .published_own_address(web),
+        Some(std::net::Ipv4Addr::LOCALHOST),
+        "under an absent range the hand is unvouched, so the finalize \
+         publishes the interim — the address the registry holds"
+    );
+    let handle = manager
+        .get_session(crate::sessions::SessionKeyPredicate::Id(web))
+        .await
+        .unwrap()
+        .expect("the allowing box resolves");
+    handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("the allowing box launches its host");
+    let sock = handle
+        .net_switch()
+        .await
+        .unwrap()
+        .lock()
+        .await
+        .control_socket();
+    let (forwarder, served) = fake_forwarder(sock, 200).await;
+
+    let mapping = handle
+        .expose_dynamic(3000)
+        .await
+        .expect("the allowed port publishes at the registered address");
+    forwarder.abort();
+    assert_eq!(
+        mapping.local, "127.0.0.1:3000",
+        "the mapping names the registered address — the interim the box \
+         publishes at — never the raw handed loopback address"
+    );
+
+    // The request the switch is asked: bound at the registered address,
+    // delivered to the hand's switch address.
+    let served = served.lock().expect("served lock").clone();
+    assert_eq!(served.len(), 1, "one mapping is one request: {served:?}");
+    let (line, body) = served[0]
+        .split_once('\n')
+        .expect("the served request carries its request line and body");
+    assert!(
+        line.starts_with("POST /services/forwarder/expose "),
+        "the publish rides the forwarder's expose verb: {served:?}"
+    );
+    let declared = crate::net::policy::expose_request(
+        &sessions::PortMapping {
+            external_port: 3000,
+            internal_port: 3000,
+            proto: sessions::IpProto::Tcp,
+        },
+        std::net::Ipv4Addr::LOCALHOST,
+        std::net::Ipv4Addr::new(100, 64, 128, 9),
+    );
+    assert_eq!(
+        body,
+        String::from_utf8(serde_json_lenient::to_vec(&declared).unwrap()).unwrap(),
+        "the publish binds where the declared ports bind — the registry's \
+         published address — and delivers to the hand's switch address"
+    );
+
+    // The mapping is listed where `min session policy` reads it, naming that
+    // address.
+    let live: minimald_rpc::Errorable<Vec<minimald_rpc::LiveMapping>> = client
+        .call::<minimald_rpc::GetLiveIngress>(&minimald_rpc::GetLiveIngressRequest::Name(
+            "web".to_string(),
+        ))
+        .await;
+    assert_eq!(
+        live,
+        minimald_rpc::Errorable::Ok(vec![minimald_rpc::LiveMapping {
+            local: "127.0.0.1:3000".to_string(),
+            internal_port: 3000,
+            proto: sessions::IpProto::Tcp,
+            // The box declared no port mappings, so its relay gate admits
+            // nothing: the runtime publish reads pending.
+            pending: Some(true),
+        }]),
+        "the live mapping names the registered address the publish bound at"
+    );
+}
+
+/// The stopped-box half of the publish: Stop keeps the record `active`, its
+/// grant and its publish row (NET-013), so the session still resolves — but
+/// the actor its record resurrects holds no host, and a publish needs a box
+/// standing behind it. The request is refused with the not-running typed
+/// error, the switch is asked nothing, no mapping is listed, and the one
+/// line the request owes the log says what happened to it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expose_on_stopped_box_refused() {
+    let capture = crate::test_harness::captured_log();
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let manager = server.state.sessions_manager().await;
+    manager.land_range_verdict(crate::net::dns::RangeVerdict::Present);
+    let web = finalize_dynamic_ingress_session(
+        &mut client,
+        // This test's own box name: under the shared capture every test's
+        // lines ride one buffer, so the assertion below finds the refusal
+        // by the box it names.
+        "stopweb",
+        std::net::Ipv4Addr::new(100, 64, 128, 9),
+        std::net::Ipv4Addr::new(127, 0, 64, 9),
+        Some(sessions::DynamicIngress::Allow),
+        Some((3000, 3999)),
+    )
+    .await;
+    let handle = manager
+        .get_session(crate::sessions::SessionKeyPredicate::Id(web))
+        .await
+        .unwrap()
+        .expect("the box resolves while it runs");
+    handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("the box launches its host");
+    let sock = handle
+        .net_switch()
+        .await
+        .unwrap()
+        .lock()
+        .await
+        .control_socket();
+    let (forwarder, served) = fake_forwarder(sock, 200).await;
+
+    // Stop the box, then reach the fresh actor its still-active record
+    // resurrects — the shape a `min net expose` finds after a Stop.
+    handle.stop().await;
+    manager.evict(web).await;
+    let stopped = manager
+        .get_session(crate::sessions::SessionKeyPredicate::Id(web))
+        .await
+        .unwrap()
+        .expect("a stopped box's record still resolves, still active");
+    match stopped.expose_dynamic(3000).await {
+        Err(crate::net::policy::ExposeFailure::Refused(
+            crate::net::policy::ExposeRefusal::NotRunning,
+        )) => {}
+        other => panic!("an expose on a stopped box is refused as not running: {other:?}"),
+    }
+    forwarder.abort();
+    assert!(
+        served.lock().expect("served lock").is_empty(),
+        "a stopped box asks the switch nothing: no forward is bound for a \
+         box that is not running"
+    );
+    let live: minimald_rpc::Errorable<Vec<minimald_rpc::LiveMapping>> = client
+        .call::<minimald_rpc::GetLiveIngress>(&minimald_rpc::GetLiveIngressRequest::Id(web))
+        .await;
+    assert_eq!(
+        live,
+        minimald_rpc::Errorable::Ok(vec![]),
+        "a stopped box lists no mapping"
+    );
+
+    // The one line the request owes the log: the box, the port, the decision
+    // its setting made, and the refusal that answered it — found by this
+    // test's own box name, the shared capture holding every test's lines.
+    let logged = capture.contents();
+    let line = logged
+        .lines()
+        .find(|line| line.contains("dynamic ingress expose") && line.contains("name=stopweb"))
+        .unwrap_or_else(|| panic!("the refused request must be logged, got: {logged}"));
+    assert!(
+        line.contains("port=3000")
+            && line.contains("decision=allow")
+            && line.contains("outcome=\"refused\"")
+            && line.contains("reason=this box is not running; start the box and try again"),
+        "the refusal names the box, the port, the decision and the reason: {line}"
+    );
+}
+
+/// The no-published-address refusal is its own typed error, never a policy
+/// deny: a box whose `dynamic_ingress` allows but whose publish the
+/// registry no longer holds is refused for the capability gap it is (NET-010
+/// — the daemon has no default address to stand in with), and the log says
+/// both facts: the decision was allow, and the refusal was the missing
+/// publish, so a diagnostics bundle cannot misread it as the box denying.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expose_without_published_address_is_not_a_policy_deny() {
+    let capture = crate::test_harness::captured_log();
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let web = finalize_self_allocated_dynamic_ingress_session(
+        &mut client,
+        // This test's own box name: under the shared capture every test's
+        // lines ride one buffer, so the assertion below finds the refusal
+        // by the box it names.
+        "nopubweb",
+        Some(sessions::DynamicIngress::Allow),
+        Some((3000, 3999)),
+    )
+    .await;
+    let manager = server.state.sessions_manager().await;
+    let registry = manager.hostnames();
+    let handle = manager
+        .get_session(crate::sessions::SessionKeyPredicate::Id(web))
+        .await
+        .unwrap()
+        .expect("the allowing box resolves");
+    handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("the box launches its host");
+    let sock = handle
+        .net_switch()
+        .await
+        .unwrap()
+        .lock()
+        .await
+        .control_socket();
+    let (forwarder, served) = fake_forwarder(sock, 200).await;
+
+    // The lease reported, the publish withdrawn: the box has somewhere to
+    // deliver to and nowhere to bind at.
+    registry.write().expect("registry lock").report_own_address(
+        web,
+        "nopubweb",
+        std::net::Ipv4Addr::new(100, 64, 128, 42),
+        std::collections::BTreeMap::new(),
+    );
+    registry
+        .write()
+        .expect("registry lock")
+        .unpublish_own_address(web);
+    match handle.expose_dynamic(3000).await {
+        Err(crate::net::policy::ExposeFailure::Refused(
+            crate::net::policy::ExposeRefusal::NoPublishedAddress,
+        )) => {}
+        Err(crate::net::policy::ExposeFailure::Refused(
+            crate::net::policy::ExposeRefusal::DeniedByPolicy,
+        )) => panic!(
+            "a missing publish is a capability gap, not the box denying: \
+             the refusal must not read as a policy deny"
+        ),
+        other => panic!("a box with no published address is refused as such: {other:?}"),
+    }
+    forwarder.abort();
+    assert!(
+        served.lock().expect("served lock").is_empty(),
+        "a refused request asks the switch nothing"
+    );
+
+    // The log's answer is not a misreading waiting to happen: the decision
+    // was allow, and the refusal names the missing publish — found by this
+    // test's own box name, the shared capture holding every test's lines.
+    let logged = capture.contents();
+    let line = logged
+        .lines()
+        .find(|line| line.contains("dynamic ingress expose") && line.contains("name=nopubweb"))
+        .unwrap_or_else(|| panic!("the refused request must be logged, got: {logged}"));
+    assert!(
+        line.contains("port=3000")
+            && line.contains("decision=allow")
+            && line.contains("outcome=\"refused\"")
+            && line
+                .contains("reason=this box has no published address on file to expose a port at"),
+        "the line says the decision was allow and the refusal was the missing \
+         publish: {line}"
+    );
+}
+
+/// NET-044's observability, for the outcomes the actor sees: every expose
+/// request leaves exactly one line, naming the box, the port, the decision
+/// its setting made, and the outcome — the publish that succeeded, the
+/// policy refusal, the duplicate refusal, and the publish that failed. The
+/// paths no actor ever sees leave their one line in the env channel instead,
+/// pinned beside the channel that owns them (the channel test in `env`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expose_logs_every_path() {
+    let capture = crate::test_harness::captured_log();
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let manager = server.state.sessions_manager().await;
+    manager.land_range_verdict(crate::net::dns::RangeVerdict::Present);
+
+    // A box that publishes, and then refuses its own duplicate. The three
+    // boxes are this test's own names: under the shared capture every
+    // test's lines ride one buffer, so each request's line below is found
+    // and counted by the box it names.
+    let web = finalize_dynamic_ingress_session(
+        &mut client,
+        "pathweb",
+        std::net::Ipv4Addr::new(100, 64, 128, 25),
+        std::net::Ipv4Addr::new(127, 0, 64, 25),
+        Some(sessions::DynamicIngress::Allow),
+        Some((3000, 3999)),
+    )
+    .await;
+    let web_handle = manager
+        .get_session(crate::sessions::SessionKeyPredicate::Id(web))
+        .await
+        .unwrap()
+        .expect("the allowing box resolves");
+    web_handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("the allowing box launches its host");
+    let (web_forwarder, web_served) = fake_forwarder(
+        web_handle
+            .net_switch()
+            .await
+            .unwrap()
+            .lock()
+            .await
+            .control_socket(),
+        200,
+    )
+    .await;
+    web_handle
+        .expose_dynamic(3000)
+        .await
+        .expect("the allowed port publishes");
+    match web_handle.expose_dynamic(3000).await {
+        Err(crate::net::policy::ExposeFailure::Refused(
+            crate::net::policy::ExposeRefusal::AlreadyPublished {
+                port: 3000,
+                owner: crate::net::listeners::PublicationOwner::Expose,
+            },
+        )) => {}
+        other => panic!("the second request for a live port is a duplicate: {other:?}"),
+    }
+
+    // A box that declared nothing: the deny-all default refuses it.
+    let closed = finalize_dynamic_ingress_session(
+        &mut client,
+        "pathclosed",
+        std::net::Ipv4Addr::new(100, 64, 128, 26),
+        std::net::Ipv4Addr::new(127, 0, 64, 26),
+        None,
+        None,
+    )
+    .await;
+    let closed_handle = manager
+        .get_session(crate::sessions::SessionKeyPredicate::Id(closed))
+        .await
+        .unwrap()
+        .expect("the unenrolled box resolves");
+    match closed_handle.expose_dynamic(3000).await {
+        Err(crate::net::policy::ExposeFailure::Refused(
+            crate::net::policy::ExposeRefusal::DeniedByPolicy,
+        )) => {}
+        other => panic!("the deny-all default refuses the request: {other:?}"),
+    }
+    // No switch stand-in was bound for this box, so the typed refusal is
+    // also the proof the switch was never asked: a request that reached one
+    // would fail with a connection error, not answer as a policy denial.
+
+    // A box whose switch refuses the bind: the publish that failed. The
+    // daemon's switch control socket is one shared path, so the 500 stand-in
+    // takes it over from the 200 one that served the publish above.
+    let broken = finalize_dynamic_ingress_session(
+        &mut client,
+        "pathbroken",
+        std::net::Ipv4Addr::new(100, 64, 128, 27),
+        std::net::Ipv4Addr::new(127, 0, 64, 27),
+        Some(sessions::DynamicIngress::Allow),
+        Some((3000, 3999)),
+    )
+    .await;
+    let broken_handle = manager
+        .get_session(crate::sessions::SessionKeyPredicate::Id(broken))
+        .await
+        .unwrap()
+        .expect("the broken box resolves");
+    broken_handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("the broken box launches its host");
+    web_forwarder.abort();
+    let broken_sock = broken_handle
+        .net_switch()
+        .await
+        .unwrap()
+        .lock()
+        .await
+        .control_socket();
+    std::fs::remove_file(&broken_sock).ok();
+    let (broken_forwarder, broken_served) = fake_forwarder(broken_sock, 500).await;
+    match broken_handle.expose_dynamic(3000).await {
+        Err(crate::net::policy::ExposeFailure::Publish { port: 3000, .. }) => {}
+        other => panic!("a bind the switch refuses fails the publish: {other:?}"),
+    }
+    broken_forwarder.abort();
+    assert_eq!(
+        web_served.lock().expect("served lock").len(),
+        1,
+        "one mapping is one request"
+    );
+    assert_eq!(
+        broken_served.lock().expect("served lock").len(),
+        1,
+        "the failed publish asked the switch once"
+    );
+
+    // One line per request — four requests, four lines among this test's
+    // own boxes, no strays from any test sharing the process-wide capture —
+    // each naming the box, the port, the decision, and the outcome.
+    let logged = capture.contents();
+    let lines_for = |name: &str| -> Vec<&str> {
+        logged
+            .lines()
+            .filter(|line| {
+                line.contains("dynamic ingress expose") && line.contains(&format!("name={name}"))
+            })
+            .collect()
+    };
+    assert_eq!(
+        lines_for("pathweb").len(),
+        2,
+        "one line per request at the publishing box, got: {logged}"
+    );
+    assert_eq!(
+        lines_for("pathclosed").len(),
+        1,
+        "the unenrolled box's refusal says its one line, got: {logged}"
+    );
+    assert_eq!(
+        lines_for("pathbroken").len(),
+        1,
+        "the broken box's failed publish says its one line, got: {logged}"
+    );
+    let line_for = |name: &str, outcome: &str| {
+        logged
+            .lines()
+            .find(|line| {
+                line.contains("dynamic ingress expose")
+                    && line.contains(&format!("name={name}"))
+                    && line.contains(&format!("outcome=\"{outcome}\""))
+            })
+            .unwrap_or_else(|| panic!("a line per outcome, got: {logged}"))
+    };
+    let published = line_for("pathweb", "published");
+    assert!(
+        published.contains("port=3000")
+            && published.contains("decision=allow")
+            && published.contains("local=127.0.64.25:3000"),
+        "the publish line names the box, the port, the decision and the \
+         address it bound: {published}"
+    );
+    let duplicate = line_for("pathweb", "refused");
+    assert!(
+        duplicate.contains("port=3000")
+            && duplicate.contains("decision=allow")
+            && duplicate.contains("reason=port 3000 is published already by this box"),
+        "the duplicate refusal names the port and the reason: {duplicate}"
+    );
+    let denied = line_for("pathclosed", "refused");
+    assert!(
+        denied.contains("port=3000")
+            && denied.contains("decision=deny")
+            && denied.contains("reason=dynamic ingress is denied for this box"),
+        "the policy refusal names the decision and the reason: {denied}"
+    );
+    let failed = line_for("pathbroken", "publish failed");
+    assert!(
+        failed.contains("port=3000")
+            && failed.contains("decision=allow")
+            && failed.contains("returned HTTP 500"),
+        "the failed publish names the switch's refusal: {failed}"
+    );
+}
+
+/// The ingress policy a seeded listen plan's gate is built over: the same
+/// shape the box's record carries — allow, over `range`, declaring nothing
+/// — so the watcher's verdicts are the box's own.
+fn listen_policy_over(range: (u16, u16)) -> sessions::SessionPolicy {
+    sessions::SessionPolicy::new(
+        None,
+        Some(sessions::IngressPolicy {
+            port_mappings: vec![],
+            dynamic_allowed_range: Some(range),
+            dynamic_ingress: Some(sessions::DynamicIngress::Allow),
+        }),
+    )
+}
+
+/// A listening socket on the any address — the bind a publication's forward
+/// can deliver to, so a box's watcher sees the port as the box's own
+/// listener.
+fn listening_socket() -> std::net::TcpListener {
+    std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, 0))
+        .expect("bind a listening socket")
+}
+
+/// The port `listener` holds.
+fn port_of(listener: &std::net::TcpListener) -> u16 {
+    listener
+        .local_addr()
+        .expect("a bound listener names its address")
+        .port()
+}
+
+/// Awaits `what` until it holds, or fails the proof: the box's watcher polls
+/// on its own cadence, so a fact it owes arrives on a later poll, never on
+/// the one the caller just missed.
+async fn soon(mut what: impl FnMut() -> bool) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !what() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the box did not reach the awaited state in the bound"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// The control requests the fake forwarder served that name `published:port`
+/// as their bind — the expose and unexpose verbs of one publication, from
+/// whichever of the box's two runtime surfaces sent them.
+fn served_naming(
+    served: &std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    published: std::net::Ipv4Addr,
+    port: u16,
+) -> Vec<String> {
+    served
+        .lock()
+        .expect("served lock")
+        .iter()
+        .filter(|record| record.contains(&format!("\"local\":\"{published}:{port}\"")))
+        .cloned()
+        .collect()
+}
+
+/// The box whose two runtime publishing surfaces are one publication set's
+/// two halves (NET-044, NET-047): an own-address box that allows dynamic
+/// ingress over `range`, launched with the listen plan a test seeds into its
+/// mock launch — the lease, published address and control channel its
+/// record and switch already name, and a gate over the policy the record
+/// carries — so the host its launch builds starts the box's listen watcher
+/// the way a real launch's host does. The switch's control socket is one
+/// shared path, so the fake forwarder bound here before the launch serves
+/// every control request either surface sends. Returns the box's handle,
+/// the seeded gate (the watcher's verdicts and admissions run through it),
+/// and the forwarder's record of every request it served.
+///
+/// One box per call: the forwarder this binds takes the control socket over,
+/// so a test that needs a second box builds it itself.
+async fn box_with_listen_plan(
+    client: &mut TestClient,
+    manager: &crate::sessions::ManagerHandle,
+    name: &str,
+    switch: std::net::Ipv4Addr,
+    loopback: std::net::Ipv4Addr,
+    range: (u16, u16),
+) -> (
+    crate::session::SessionHandle,
+    std::sync::Arc<crate::net::switch::SessionGate>,
+    std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+) {
+    let (handle, gate, served, _gate, _id) =
+        box_with_scripted_plan(client, manager, name, switch, loopback, range, Vec::new()).await;
+    (handle, gate, served)
+}
+
+/// [`box_with_listen_plan`], over a gated stand-in: the forwarder bound
+/// before the launch answers each request with the next answer `script`
+/// holds for its port — held answers wait on the gate a test advances, so a
+/// test can hold one surface's bind in flight while the other races it for
+/// the port — and the box's session id comes back with it, so a test can reach the
+/// publication set its launch is running on through the seam.
+async fn box_with_scripted_plan(
+    client: &mut TestClient,
+    manager: &crate::sessions::ManagerHandle,
+    name: &str,
+    switch: std::net::Ipv4Addr,
+    loopback: std::net::Ipv4Addr,
+    range: (u16, u16),
+    script: Vec<(u16, GateAnswer)>,
+) -> (
+    crate::session::SessionHandle,
+    std::sync::Arc<crate::net::switch::SessionGate>,
+    std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    tokio::sync::watch::Sender<u64>,
+    sessions::SessionId,
+) {
+    // The hand vouched for, so the registry publishes the loopback hand's
+    // address: both surfaces' forwards bind at the address the box's name
+    // answers at, exactly as they do for a production box.
+    manager.land_range_verdict(crate::net::dns::RangeVerdict::Present);
+    let id = finalize_dynamic_ingress_session(
+        client,
+        name,
+        switch,
+        loopback,
+        Some(sessions::DynamicIngress::Allow),
+        Some(range),
+    )
+    .await;
+    let handle = manager
+        .get_session(crate::sessions::SessionKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the box resolves");
+    // Bound before the launch, so the watcher's first publish reaches a
+    // forwarder instead of a refused connection and a backoff.
+    let sock = handle
+        .net_switch()
+        .await
+        .unwrap()
+        .lock()
+        .await
+        .control_socket();
+    let (_forwarder, served, gate_sender) = gated_forwarder(sock.clone(), script).await;
+    // The plan a real launch gathers itself, seeded into this one: the facts
+    // a box's host builds its watcher from, riding the mock's `Launched` the
+    // way a real launch's plan rides its own.
+    let gate = std::sync::Arc::new(crate::net::switch::SessionGate::for_session(
+        name.to_string(),
+        switch,
+        &listen_policy_over(range),
+        crate::net::SwitchSubnet::default(),
+        None,
+    ));
+    crate::session::listen_plan_seam::seed(
+        id,
+        crate::session::listen_plan_seam::Seeded {
+            lease: switch,
+            published: loopback,
+            control: crate::net::policy::ControlChannel::Unix(sock),
+            gate: std::sync::Arc::clone(&gate),
+        },
+    );
+    handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("the box launches its host");
+    (handle, gate, served, gate_sender, id)
+}
+
+/// NET-047, the port one surface already holds: whichever of the box's two
+/// runtime surfaces reaches a port first, the port is bound once. A port the
+/// listen watcher published, asked for by `min net expose`, is answered with
+/// the typed already-published refusal — the switch asked nothing — and a
+/// port `min net expose` published is skipped silently by the watcher: one
+/// settlement line, never a bind, never a retry under backoff. Each surface
+/// withdraws only its own: the watcher unpublishes its port when the
+/// listener closes, and the expose's port comes down only with the box's
+/// teardown, never with the other surface's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn listen_publish_and_runtime_expose_never_double_bind() {
+    let capture = crate::test_harness::captured_log();
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let manager = server.state.sessions_manager().await;
+
+    // Two ports the box's range covers: one its process listens on before
+    // the host builds, one free until the runtime expose asks for it.
+    let listen_port_socket = listening_socket();
+    let listen_port = port_of(&listen_port_socket);
+    let exposed_port = port_of(&listening_socket());
+    let range = (listen_port.min(exposed_port), listen_port.max(exposed_port));
+    let switch = std::net::Ipv4Addr::new(100, 64, 128, 71);
+    let loopback = std::net::Ipv4Addr::new(127, 0, 64, 71);
+    let (handle, gate, served) =
+        box_with_listen_plan(&mut client, &manager, "ownboth", switch, loopback, range).await;
+
+    // The watcher publishes the port the box listens on — the publication is
+    // written into the box's shared set before the gate admits it, so waiting
+    // on the admission is waiting on the record the refusal below reads.
+    soon(|| gate.admits_tcp(listen_port)).await;
+    assert_eq!(
+        served_naming(&served, loopback, listen_port).len(),
+        1,
+        "the listening port is published once: {:?}",
+        served.lock().expect("served lock")
+    );
+
+    // The runtime expose asks for the port the watcher holds: the typed
+    // duplicate refusal, with nothing bound for it and nothing asked of the
+    // switch — the one request so far is the watcher's own publish.
+    match handle.expose_dynamic(listen_port).await {
+        Err(crate::net::policy::ExposeFailure::Refused(
+            crate::net::policy::ExposeRefusal::AlreadyPublished {
+                port: asked,
+                owner: crate::net::listeners::PublicationOwner::Listen,
+            },
+        )) => assert_eq!(asked, listen_port),
+        other => panic!("a port the watcher published is a typed duplicate: {other:?}"),
+    }
+    assert_eq!(
+        served_naming(&served, loopback, listen_port).len(),
+        1,
+        "the refused request asks the switch nothing: {:?}",
+        served.lock().expect("served lock")
+    );
+
+    // The runtime expose publishes the free port, and then the box's own
+    // process listens on the same number: the watcher sees a listener on a
+    // port the expose surface already holds, and settles on skipping it.
+    let mapping = handle
+        .expose_dynamic(exposed_port)
+        .await
+        .expect("the free port publishes");
+    assert_eq!(
+        mapping,
+        minimald_rpc::LiveMapping {
+            local: format!("{loopback}:{exposed_port}"),
+            internal_port: exposed_port,
+            proto: sessions::IpProto::Tcp,
+            pending: Some(false),
+        },
+        "the expose binds where the box's watcher binds, at its own port number"
+    );
+    assert_eq!(
+        handle.live_ingress().await.expect("the actor answers"),
+        vec![mapping],
+        "the runtime publish is listed as the box's live ingress"
+    );
+    let second_listener =
+        std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, exposed_port))
+            .expect("the box's process listens on the exposed port");
+    soon(|| {
+        let logged = capture.contents();
+        logged.lines().any(|line| {
+            line.contains("left a listening port the runtime expose already published")
+                && line.contains("session=ownboth")
+                && line.contains(&format!("port={exposed_port}"))
+        })
+    })
+    .await;
+
+    // Several poll intervals past the skip: the settlement is one line —
+    // never retried under backoff — and one request, the expose's own; the
+    // watcher asked the switch nothing for the port it does not own.
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    assert_eq!(
+        served_naming(&served, loopback, exposed_port).len(),
+        1,
+        "the expose's publication is the only forward the port ever got: {:?}",
+        served.lock().expect("served lock")
+    );
+    let logged = capture.contents();
+    assert_eq!(
+        logged
+            .lines()
+            .filter(|line| {
+                line.contains("left a listening port the runtime expose already published")
+                    && line.contains("session=ownboth")
+            })
+            .count(),
+        1,
+        "the skip is one line, not one per poll: {logged}"
+    );
+
+    // The listening process closes its port: the watcher withdraws its own
+    // publication — the request the expose's refusal never made — and the
+    // shared set gives the port back.
+    drop(listen_port_socket);
+    soon(|| served_naming(&served, loopback, listen_port).len() == 2).await;
+    let listen_records = served_naming(&served, loopback, listen_port);
+    assert!(
+        listen_records[1].starts_with("POST /services/forwarder/unexpose "),
+        "the watcher's own withdrawal unpublishes its port: {listen_records:?}"
+    );
+
+    // The listener on the expose's port closes too — and nothing happens: the
+    // publication is the expose surface's, held until the box does, and the
+    // watcher never withdraws the other surface's.
+    drop(second_listener);
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    assert_eq!(
+        served_naming(&served, loopback, exposed_port).len(),
+        1,
+        "no surface withdraws a publication it does not own: {:?}",
+        served.lock().expect("served lock")
+    );
+
+    // The box stops: each publication comes down with whoever published it.
+    // The watcher's is down already; the expose's is unbound by the box's own
+    // teardown sweep, not by anything the watcher did.
+    handle.stop().await;
+    assert_eq!(
+        served_naming(&served, loopback, listen_port).len(),
+        2,
+        "the watcher's publication came down when its listener closed, and \
+         nothing else ever named the port: {:?}",
+        served.lock().expect("served lock")
+    );
+    let exposed_records = served_naming(&served, loopback, exposed_port);
+    assert_eq!(
+        exposed_records.len(),
+        2,
+        "the expose's publication comes down once, with the box: {exposed_records:?}"
+    );
+    assert!(
+        exposed_records[1].starts_with("POST /services/forwarder/unexpose "),
+        "the publisher's own withdrawal is the one that came down: {exposed_records:?}"
+    );
+
+    // The daemon log's tail reads whose publication every port is: the
+    // watcher's publish, the expose's publish, the typed refusal the expose
+    // answered with, and the skip the watcher settled on — each naming its
+    // owner.
+    let logged = capture.contents();
+    let publish_line = logged
+        .lines()
+        .find(|line| {
+            line.contains("session=ownboth")
+                && line.contains("published a listening port on the box's address")
+                && line.contains(&format!("port={listen_port}"))
+        })
+        .unwrap_or_else(|| panic!("the watcher's publish is one line, got: {logged}"));
+    assert!(
+        publish_line.contains("owner=listen"),
+        "the publication line names the surface that owns it: {publish_line}"
+    );
+    let skip_line = logged
+        .lines()
+        .find(|line| {
+            line.contains("session=ownboth")
+                && line.contains("left a listening port the runtime expose already published")
+        })
+        .unwrap_or_else(|| panic!("the skip is one line, got: {logged}"));
+    assert!(
+        skip_line.contains("owner=expose") && skip_line.contains(&format!("port={exposed_port}")),
+        "the skip line names the expose surface's publication and the port it \
+         holds: {skip_line}"
+    );
+    let refusal_line = logged
+        .lines()
+        .find(|line| {
+            line.contains("name=ownboth")
+                && line.contains("dynamic ingress expose")
+                && line.contains("outcome=\"refused\"")
+                && line.contains(&format!("port={listen_port}"))
+        })
+        .unwrap_or_else(|| panic!("the duplicate refusal is one line, got: {logged}"));
+    assert!(
+        refusal_line.contains("owner=listen")
+            && refusal_line.contains(&format!(
+                "reason=port {listen_port} is published already by this box (listen)"
+            )),
+        "the refusal names the owner that holds the port and the reason it \
+         gave: {refusal_line}"
+    );
+    let expose_line = logged
+        .lines()
+        .find(|line| {
+            line.contains("name=ownboth")
+                && line.contains("dynamic ingress expose")
+                && line.contains("outcome=\"published\"")
+                && line.contains(&format!("port={exposed_port}"))
+        })
+        .unwrap_or_else(|| panic!("the expose's publish is one line, got: {logged}"));
+    assert!(
+        expose_line.contains("owner=expose"),
+        "the expose's publication line names its owner: {expose_line}"
+    );
+}
+
+/// NET-047's refusal half, alone: a port the box's listen watcher published,
+/// asked for by the box's own `min net expose`, is refused as the typed
+/// duplicate it is — the switch is asked nothing, the refusal is one line
+/// naming the owner that holds the port, and the publication stands until
+/// the box stops, when its publisher takes it down.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expose_on_listen_published_port_is_already_published() {
+    let capture = crate::test_harness::captured_log();
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let manager = server.state.sessions_manager().await;
+
+    // One port, listened on before the box's host builds: the watcher owns
+    // it from its first poll.
+    let listener = listening_socket();
+    let port = port_of(&listener);
+    let switch = std::net::Ipv4Addr::new(100, 64, 128, 72);
+    let loopback = std::net::Ipv4Addr::new(127, 0, 64, 72);
+    let (handle, gate, served) = box_with_listen_plan(
+        &mut client,
+        &manager,
+        "ownlisten",
+        switch,
+        loopback,
+        (port, port),
+    )
+    .await;
+
+    // The watcher publishes the port; the refusal reads the shared set the
+    // publication wrote, so wait on the admission that follows it.
+    soon(|| gate.admits_tcp(port)).await;
+    match handle.expose_dynamic(port).await {
+        Err(crate::net::policy::ExposeFailure::Refused(
+            crate::net::policy::ExposeRefusal::AlreadyPublished {
+                port: asked,
+                owner: crate::net::listeners::PublicationOwner::Listen,
+            },
+        )) => assert_eq!(asked, port),
+        other => panic!("the runtime expose is refused as the duplicate it is: {other:?}"),
+    }
+
+    // One request, the watcher's publish: the refused request bound nothing,
+    // and the box lists no live ingress for the port.
+    let requests = served_naming(&served, loopback, port);
+    assert_eq!(requests.len(), 1, "the port was bound once: {requests:?}");
+    assert!(
+        requests[0].starts_with("POST /services/forwarder/expose "),
+        "the one bind is the watcher's publish: {requests:?}"
+    );
+    assert_eq!(
+        handle.live_ingress().await.expect("the actor answers"),
+        Vec::new(),
+        "the refused request published nothing the box lists"
+    );
+
+    // The refusal is one line naming the port, the owner that holds it, and
+    // the reason the surface gave.
+    let logged = capture.contents();
+    let refusal = logged
+        .lines()
+        .find(|line| {
+            line.contains("dynamic ingress expose")
+                && line.contains("name=ownlisten")
+                && line.contains("outcome=\"refused\"")
+        })
+        .unwrap_or_else(|| panic!("the refusal is one line, got: {logged}"));
+    assert!(
+        refusal.contains(&format!("port={port}"))
+            && refusal.contains("owner=listen")
+            && refusal.contains(&format!(
+                "reason=port {port} is published already by this box (listen)"
+            )),
+        "the refusal names the port, the owner holding it, and the reason: {refusal}"
+    );
+
+    // The publication stands — still one request — and comes down once, with
+    // the box: the publisher's own withdrawal, the session's sweep holding
+    // nothing of it.
+    handle.stop().await;
+    let requests = served_naming(&served, loopback, port);
+    assert_eq!(
+        requests.len(),
+        2,
+        "the watcher's publication comes down once, with the box: {requests:?}"
+    );
+    assert!(
+        requests[1].starts_with("POST /services/forwarder/unexpose "),
+        "the withdrawal is the publisher's own: {requests:?}"
+    );
+    drop(listener);
+}
+
+/// NET-047's other order: a port the box's runtime expose published, then
+/// listened on by the box's own process, is skipped by the watcher — never
+/// bound, never retried under backoff, never withdrawn — and its publication
+/// comes down only with the box, the expose surface's own teardown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn listen_watcher_skips_an_expose_owned_port() {
+    let capture = crate::test_harness::captured_log();
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let manager = server.state.sessions_manager().await;
+
+    // One port, free until the box's expose asks for it.
+    let port = port_of(&listening_socket());
+    let switch = std::net::Ipv4Addr::new(100, 64, 128, 73);
+    let loopback = std::net::Ipv4Addr::new(127, 0, 64, 73);
+    let (handle, _gate, served) = box_with_listen_plan(
+        &mut client,
+        &manager,
+        "ownexpose",
+        switch,
+        loopback,
+        (port, port),
+    )
+    .await;
+
+    // The runtime expose publishes the port, and only then does the box's
+    // own process listen on it: whatever the watcher sees from here on, the
+    // port is the expose surface's.
+    handle
+        .expose_dynamic(port)
+        .await
+        .expect("the free port publishes");
+    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, port))
+        .expect("the box's process listens on the exposed port");
+
+    // The watcher settles the appearance: one skip line, no bind, no backoff
+    // retry — and the only request the port ever got is the expose's own.
+    soon(|| {
+        let logged = capture.contents();
+        logged.lines().any(|line| {
+            line.contains("left a listening port the runtime expose already published")
+                && line.contains("session=ownexpose")
+                && line.contains(&format!("port={port}"))
+        })
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    let requests = served_naming(&served, loopback, port);
+    assert_eq!(
+        requests.len(),
+        1,
+        "the expose's publish is the only bind the port got: {requests:?}"
+    );
+    assert!(
+        requests[0].starts_with("POST /services/forwarder/expose "),
+        "the one bind is the expose surface's: {requests:?}"
+    );
+    let logged = capture.contents();
+    assert_eq!(
+        logged
+            .lines()
+            .filter(|line| {
+                line.contains("left a listening port the runtime expose already published")
+                    && line.contains("session=ownexpose")
+            })
+            .count(),
+        1,
+        "the skip is said once, never retried under backoff: {logged}"
+    );
+
+    // The listener closes and nothing comes down: the publication is the
+    // expose surface's, held until the box stops, because the publisher is
+    // the one who withdraws.
+    drop(listener);
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    assert_eq!(
+        served_naming(&served, loopback, port).len(),
+        1,
+        "no surface withdraws a publication it does not own: {:?}",
+        served.lock().expect("served lock")
+    );
+
+    // The box stops and the expose's publication comes down with it — the
+    // session's own teardown sweep, the publisher's withdrawal.
+    handle.stop().await;
+    let requests = served_naming(&served, loopback, port);
+    assert_eq!(
+        requests.len(),
+        2,
+        "the publication comes down once, with the box: {requests:?}"
+    );
+    assert!(
+        requests[1].starts_with("POST /services/forwarder/unexpose "),
+        "the withdrawal is the publisher's own: {requests:?}"
+    );
+}
+
+/// The plan's one handoff: a launch carries its box's listen plan inside its
+/// own `Launched` — the host that launch builds is the only thing that can
+/// read it — so a launch whose box's facts gathered one starts the box's
+/// watcher, and a launch that gathered none starts nothing: no plan ever
+/// reaches a spawn that did not gather it, and the seeded box's two surfaces
+/// read the one set the plan carried.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn listen_plan_travels_in_launched() {
+    let capture = crate::test_harness::captured_log();
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let manager = server.state.sessions_manager().await;
+
+    // The seeded box's own port, listened on before its host builds, and a
+    // second port the bare box's range covers but the seeded box's does not.
+    let seeded_socket = listening_socket();
+    let seeded_port = port_of(&seeded_socket);
+    let bare_socket = listening_socket();
+    let bare_port = port_of(&bare_socket);
+    let seeded_switch = std::net::Ipv4Addr::new(100, 64, 128, 74);
+    let seeded_loopback = std::net::Ipv4Addr::new(127, 0, 64, 74);
+    let (seeded, gate, served) = box_with_listen_plan(
+        &mut client,
+        &manager,
+        "ownseed",
+        seeded_switch,
+        seeded_loopback,
+        (seeded_port, seeded_port),
+    )
+    .await;
+
+    // A second box, launched with no plan seeded: its launch's `Launched`
+    // carries none, so no watcher starts for it — and nothing of another
+    // box's can reach it, the way the plan's travels never did.
+    let bare_id = finalize_dynamic_ingress_session(
+        &mut client,
+        "ownbare",
+        std::net::Ipv4Addr::new(100, 64, 128, 75),
+        std::net::Ipv4Addr::new(127, 0, 64, 75),
+        Some(sessions::DynamicIngress::Allow),
+        Some((seeded_port.min(bare_port), seeded_port.max(bare_port))),
+    )
+    .await;
+    let bare = manager
+        .get_session(crate::sessions::SessionKeyPredicate::Id(bare_id))
+        .await
+        .unwrap()
+        .expect("the bare box resolves");
+    bare.ensure_host("tester".to_string())
+        .await
+        .expect("the bare box launches its host");
+
+    // The seeded plan traveled: the host its launch built runs a watcher
+    // that publishes the box's own port at the plan's own addresses.
+    soon(|| gate.admits_tcp(seeded_port)).await;
+    let seeded_records = served_naming(&served, seeded_loopback, seeded_port);
+    assert_eq!(
+        seeded_records.len(),
+        1,
+        "the seeded plan's watcher publishes its box's port: {seeded_records:?}"
+    );
+    assert!(
+        seeded_records[0].contains(&format!("\"remote\":\"{seeded_switch}:{seeded_port}\"")),
+        "the publication delivers to the plan's lease: {seeded_records:?}"
+    );
+
+    // The set traveled with the plan: the actor's runtime expose reads the
+    // same one the watcher wrote, and answers the typed duplicate.
+    match seeded.expose_dynamic(seeded_port).await {
+        Err(crate::net::policy::ExposeFailure::Refused(
+            crate::net::policy::ExposeRefusal::AlreadyPublished {
+                port: asked,
+                owner: crate::net::listeners::PublicationOwner::Listen,
+            },
+        )) => assert_eq!(asked, seeded_port),
+        other => panic!("the seeded box's two surfaces read one set: {other:?}"),
+    }
+
+    // The bare box's launch carried no plan, so no watcher ran for it: its
+    // own listening port was published by nothing — and the seeded box's
+    // watcher, which can see the port too, leaves it alone as outside its
+    // box's range. Several poll intervals pass with no request from either.
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    let served_records = served.lock().expect("served lock").clone();
+    assert!(
+        served_records
+            .iter()
+            .all(|record| !record.contains("127.0.64.75")),
+        "no surface published anything at the bare box's address: {served_records:?}"
+    );
+    assert!(
+        served_naming(&served, seeded_loopback, bare_port).is_empty(),
+        "the seeded box's watcher leaves a port outside its range alone: {served_records:?}"
+    );
+    // No watcher ever ran for the launch that carried no plan — not even one
+    // that could not resolve its leader: the bare box's name is on no
+    // watcher line at all, of the phrases a watcher says on any path it has.
+    let logged = capture.contents();
+    let watcher_phrases = [
+        "published a listening port",
+        "left a listening port",
+        "withdrew a listening port",
+        "resolving the box's leader",
+        "publishing a listening port on the switch failed",
+        "unpublishing a listening port on the switch failed",
+    ];
+    let bare_watcher_lines = logged
+        .lines()
+        .filter(|line| line.contains("session=ownbare"))
+        .filter(|line| watcher_phrases.iter().any(|phrase| line.contains(phrase)))
+        .count();
+    assert_eq!(
+        bare_watcher_lines, 0,
+        "no watcher ever ran for the launch that carried no plan: {logged}"
+    );
+    seeded.stop().await;
+    bare.stop().await;
+    drop(seeded_socket);
+    drop(bare_socket);
+}
+
+/// NET-047's race, both orders, closed by the reservation: the box's two
+/// runtime surfaces reach one port together and the port is bound once, by
+/// whichever surface's reservation won. The loser is answered before it
+/// asks the switch anything — the expose with the typed already-published
+/// refusal naming the owner that holds the port, the watcher with the
+/// settle-and-skip that names it — never a switch error, never a retry
+/// under backoff. A winner whose bind the switch refuses releases its
+/// reservation, so the other surface's next observation publishes the port
+/// normally; and none of it lets a listener the box's ingress does not
+/// permit ride on any publication (NET-016): the watcher leaves such a
+/// port unpublished, and nothing asks the switch for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_expose_and_listen_publish_bind_once() {
+    let capture = crate::test_harness::captured_log();
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let manager = server.state.sessions_manager().await;
+
+    // Four ports, drawn and sorted so the smallest sits outside the range
+    // the other three make: the box's own process holds that one from
+    // before the launch, and the box's ingress does not permit it — the
+    // port no surface may publish. The three in range stay free until each
+    // phase binds its own listener on them.
+    let mut probes: Vec<std::net::TcpListener> = (0..4).map(|_| listening_socket()).collect();
+    probes.sort_by_key(port_of);
+    let denied_socket = probes.remove(0);
+    let denied_port = port_of(&denied_socket);
+    let a_port = port_of(&probes[0]);
+    let b_port = port_of(&probes[1]);
+    let c_port = port_of(&probes[2]);
+    let range = (a_port, c_port);
+    drop(probes);
+    let switch = std::net::Ipv4Addr::new(100, 64, 128, 81);
+    let loopback = std::net::Ipv4Addr::new(127, 0, 64, 81);
+    // The stand-in's answers, keyed by port, in the order each port's
+    // requests are sent: the expose's bind on `a` and the watcher's bind on `b` are
+    // held — each a reservation's in-flight window, wide enough to observe
+    // the other surface losing inside it — and the expose's bind on `c` is
+    // refused, the watcher's publish of `c` accepted.
+    let (handle, gate, served, gate_sender, _id) = box_with_scripted_plan(
+        &mut client,
+        &manager,
+        "ownrace",
+        switch,
+        loopback,
+        range,
+        vec![
+            (a_port, GateAnswer::Held(200)), // 1: the expose's bind on `a`
+            (b_port, GateAnswer::Held(200)), // 2: the watcher's bind on `b`
+            (c_port, GateAnswer::With(500)), // 3: the expose's bind on `c`, refused
+            (c_port, GateAnswer::With(200)), // 4: the watcher's publish of `c`
+        ],
+    )
+    .await;
+
+    // The port the box's ingress does not permit is listened on from before
+    // the launch: the watcher denies it — one line, no bind, and no request
+    // ever names it, whichever of the box's publications stands.
+    soon(|| {
+        capture.contents().lines().any(|line| {
+            line.contains("session=ownrace")
+                && line.contains("left a listening port unpublished")
+                && line.contains(&format!("port={denied_port}"))
+        })
+    })
+    .await;
+    assert!(
+        served_naming(&served, loopback, denied_port).is_empty(),
+        "no surface asks the switch for a port the box's ingress does not \
+         permit: {:?}",
+        served.lock().expect("served lock")
+    );
+
+    // Either order, one port each. The expose surface first: it reserves
+    // `a` and binds — held at the stand-in — before the box's process ever
+    // listens on the port, so the watcher reading that listener arrives at
+    // a port the expose's reservation already holds.
+    let exposing = {
+        let handle = handle.clone();
+        tokio::spawn(async move { handle.expose_dynamic(a_port).await })
+    };
+    soon(|| served_naming(&served, loopback, a_port).len() == 1).await;
+    let a_listener = std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, a_port))
+        .expect("the box's process listens on the expose's port");
+    // The watcher loses to the pending reservation, never to the switch:
+    // the contention is said once while the bind is in flight, and the
+    // port is never asked of the switch at all.
+    soon(|| {
+        capture.contents().lines().any(|line| {
+            line.contains("session=ownrace")
+                && line.contains("left a listening port the runtime expose is publishing")
+                && line.contains(&format!("port={a_port}"))
+        })
+    })
+    .await;
+    assert_eq!(
+        served_naming(&served, loopback, a_port).len(),
+        1,
+        "the expose's held bind is the only request the port has: {:?}",
+        served.lock().expect("served lock")
+    );
+    // The bind resolves, the reservation commits, and the watcher's next
+    // observation settles on the skip: the publication that stands is the
+    // expose's own, never the watcher's, and the skip admits nothing.
+    gate_sender
+        .send(1)
+        .expect("the gate opens for the held bind");
+    let mapping = exposing
+        .await
+        .expect("the exposing task ends")
+        .expect("the held bind stood, so the expose publishes its port");
+    assert_eq!(
+        mapping.local,
+        format!("{loopback}:{a_port}"),
+        "the expose binds at its own address at its own port number"
+    );
+    soon(|| {
+        capture.contents().lines().any(|line| {
+            line.contains("session=ownrace")
+                && line.contains("left a listening port the runtime expose already published")
+                && line.contains(&format!("port={a_port}"))
+        })
+    })
+    .await;
+    assert_eq!(
+        served_naming(&served, loopback, a_port).len(),
+        1,
+        "the watcher never asks the switch for a port the expose's \
+         reservation won: {:?}",
+        served.lock().expect("served lock")
+    );
+    assert!(
+        !gate.admits_tcp(a_port),
+        "the skip admits nothing for the port: the expose's publication is \
+         served by its own forward, never by an admission the watcher made"
+    );
+    let logged = capture.contents();
+    assert_eq!(
+        logged
+            .lines()
+            .filter(|line| {
+                line.contains("session=ownrace")
+                    && line.contains("left a listening port the runtime expose is publishing")
+                    && line.contains(&format!("port={a_port}"))
+            })
+            .count(),
+        1,
+        "the contention is said once while the bind is in flight, never \
+         once per poll: {logged}"
+    );
+    assert!(
+        !logged.lines().any(|line| {
+            line.contains("session=ownrace")
+                && line.contains("publishing a listening port on the switch failed")
+                && line.contains(&format!("port={a_port}"))
+        }),
+        "the loser is answered by the reservation, never by a switch error: {logged}"
+    );
+    assert!(
+        !logged.lines().any(|line| {
+            line.contains("session=ownrace")
+                && line.contains("published a listening port on the box's address")
+                && line.contains(&format!("port={a_port}"))
+        }),
+        "the watcher never publishes the port the expose's reservation won: {logged}"
+    );
+
+    // The other order: the watcher first. The box's process listens on `b`,
+    // the watcher reserves it and binds — held at the stand-in — and the
+    // expose asked for the port inside that window is refused by the
+    // reservation, naming the owner whose bind is still in flight.
+    let b_listener = std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, b_port))
+        .expect("the box's process listens on its own port");
+    soon(|| served_naming(&served, loopback, b_port).len() == 1).await;
+    match handle.expose_dynamic(b_port).await {
+        Err(crate::net::policy::ExposeFailure::Refused(
+            crate::net::policy::ExposeRefusal::AlreadyPublished {
+                port: asked,
+                owner: crate::net::listeners::PublicationOwner::Listen,
+            },
+        )) => assert_eq!(asked, b_port),
+        other => panic!(
+            "the expose loses to the watcher's pending reservation, not to the \
+             switch: {other:?}"
+        ),
+    }
+    gate_sender
+        .send(2)
+        .expect("the gate opens for the held bind");
+    soon(|| gate.admits_tcp(b_port)).await;
+    assert_eq!(
+        served_naming(&served, loopback, b_port).len(),
+        1,
+        "the watcher's held bind is the only request the port has: {:?}",
+        served.lock().expect("served lock")
+    );
+    let logged = capture.contents();
+    let b_refusal = logged
+        .lines()
+        .find(|line| {
+            line.contains("dynamic ingress expose")
+                && line.contains("name=ownrace")
+                && line.contains("outcome=\"refused\"")
+                && line.contains(&format!("port={b_port}"))
+        })
+        .unwrap_or_else(|| panic!("the refusal is one line: {logged}"));
+    assert!(
+        b_refusal.contains("owner=listen")
+            && b_refusal.contains(&format!(
+                "reason=port {b_port} is published already by this box (listen)"
+            )),
+        "the refusal names the owner holding the port and the reason it \
+         gave: {b_refusal}"
+    );
+    // The watcher admits before it says so, so the line is awaited too.
+    soon(|| {
+        capture.contents().lines().any(|line| {
+            line.contains("session=ownrace")
+                && line.contains("published a listening port on the box's address")
+                && line.contains("owner=listen")
+                && line.contains(&format!("port={b_port}"))
+        })
+    })
+    .await;
+
+    // A winner's bind can fail: the switch refuses the expose's bind on
+    // `c`, the failure releases the reservation it held, and the box's
+    // process listening on the port afterwards is published by the watcher
+    // — the loser's port ends up published, by its own publisher.
+    match handle.expose_dynamic(c_port).await {
+        Err(crate::net::policy::ExposeFailure::Publish { port, .. }) => assert_eq!(port, c_port),
+        other => panic!("the refused bind is a publish failure: {other:?}"),
+    }
+    let logged = capture.contents();
+    let c_failure = logged
+        .lines()
+        .find(|line| {
+            line.contains("dynamic ingress expose")
+                && line.contains("name=ownrace")
+                && line.contains("outcome=\"publish failed\"")
+                && line.contains(&format!("port={c_port}"))
+        })
+        .unwrap_or_else(|| panic!("the failed bind is one line: {logged}"));
+    assert!(
+        c_failure.contains("owner=expose"),
+        "the publish-failure line names the surface that held the \
+         reservation: {c_failure}"
+    );
+    let c_listener = std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, c_port))
+        .expect("the box's process listens on the port the expose failed to bind");
+    soon(|| gate.admits_tcp(c_port)).await;
+    let c_records = served_naming(&served, loopback, c_port);
+    assert_eq!(
+        c_records.len(),
+        2,
+        "the failed bind and the watcher's publish of the freed port: {c_records:?}"
+    );
+    assert!(
+        c_records[1].starts_with("POST /services/forwarder/expose "),
+        "the watcher's publish is the bind that stood: {c_records:?}"
+    );
+    // The watcher's next observation publishes the port the failed bind
+    // released; it admits before it says so, so the line is awaited.
+    soon(|| {
+        capture.contents().lines().any(|line| {
+            line.contains("session=ownrace")
+                && line.contains("published a listening port on the box's address")
+                && line.contains(&format!("port={c_port}"))
+        })
+    })
+    .await;
+    assert!(
+        served_naming(&served, loopback, denied_port).is_empty(),
+        "the unpermitted listener never rode on any of it: {:?}",
+        served.lock().expect("served lock")
+    );
+
+    handle.stop().await;
+    drop(a_listener);
+    drop(b_listener);
+    drop(c_listener);
+    drop(denied_socket);
+}
+
+/// A reservation is released by its cancellation: a publish dropped
+/// mid-bind — the future that held it aborted — gives the port back, so
+/// the watcher that lost to the pending reservation publishes the port on
+/// its next observation. The actor's own turn is not abortable from its
+/// handles (a dropped reply future abandons the answer, not the work), so
+/// the reservation a cancelled publish drops is driven here through the
+/// seam the launch hands its publication set back on: the same set the
+/// box's two surfaces read, holding the same guard the expose path's
+/// publish holds across its bind, dropped the same way a cancelled bind's
+/// future drops it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_publish_releases_its_reservation() {
+    let capture = crate::test_harness::captured_log();
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let manager = server.state.sessions_manager().await;
+
+    // One port the box's range covers, with nothing listening on it yet.
+    let port = port_of(&listening_socket());
+    let switch = std::net::Ipv4Addr::new(100, 64, 128, 82);
+    let loopback = std::net::Ipv4Addr::new(127, 0, 64, 82);
+    let (handle, gate, served, _gate_sender, id) = box_with_scripted_plan(
+        &mut client,
+        &manager,
+        "owncancel",
+        switch,
+        loopback,
+        (port, port),
+        Vec::new(),
+    )
+    .await;
+    let publications = crate::session::listen_plan_seam::publications_of(id)
+        .expect("the launch handed its publication set back");
+
+    // The publish a cancellation drops: a reservation on the box's real
+    // set, held across a bind that never resolves — the shape of the
+    // expose path's own in-flight bind, aborted before it could record.
+    let holder = {
+        let publications = publications.clone();
+        tokio::spawn(async move {
+            let _reservation = publications
+                .reserve(port, crate::net::listeners::PublicationOwner::Expose)
+                .expect("nothing holds the port yet");
+            std::future::pending::<()>().await
+        })
+    };
+
+    // The box's process starts listening: the watcher loses to the pending
+    // reservation — nothing is asked of the switch, and the contention is
+    // said once — for as long as the reservation stands.
+    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, port))
+        .expect("the box's process listens on the port");
+    soon(|| {
+        capture.contents().lines().any(|line| {
+            line.contains("session=owncancel")
+                && line.contains("left a listening port the runtime expose is publishing")
+                && line.contains(&format!("port={port}"))
+        })
+    })
+    .await;
+    assert!(
+        served_naming(&served, loopback, port).is_empty(),
+        "the watcher asks the switch nothing for a port a pending \
+         reservation holds: {:?}",
+        served.lock().expect("served lock")
+    );
+    assert!(
+        !gate.admits_tcp(port),
+        "a pending reservation is not a mapping: nothing is admitted for it"
+    );
+
+    // The publish is cancelled: the task holding the reservation is
+    // aborted mid-bind, the guard drops, and the port is free again — the
+    // watcher's next observation publishes it normally.
+    holder.abort();
+    soon(|| gate.admits_tcp(port)).await;
+    let records = served_naming(&served, loopback, port);
+    assert_eq!(
+        records.len(),
+        1,
+        "the port is published once, by the watcher the reservation held \
+         off: {records:?}"
+    );
+    assert!(
+        records[0].starts_with("POST /services/forwarder/expose "),
+        "the one request is the watcher's publish: {records:?}"
+    );
+    // The watcher's next observation publishes the freed port; it admits
+    // before it says so, so the line is awaited.
+    soon(|| {
+        capture.contents().lines().any(|line| {
+            line.contains("session=owncancel")
+                && line.contains("published a listening port on the box's address")
+                && line.contains(&format!("port={port}"))
+        })
+    })
+    .await;
+    let logged = capture.contents();
+    assert!(
+        !logged.lines().any(|line| {
+            line.contains("session=owncancel")
+                && line.contains("publishing a listening port on the switch failed")
+        }),
+        "the contention was never a switch error, and the publish that \
+         followed never failed: {logged}"
+    );
+    assert_eq!(
+        logged
+            .lines()
+            .filter(|line| {
+                line.contains("session=owncancel")
+                    && line.contains("left a listening port the runtime expose is publishing")
+            })
+            .count(),
+        1,
+        "the contention is said once, then settled by the publish: {logged}"
+    );
+    handle.stop().await;
+    drop(listener);
+}
+
+/// Ingress revocation unbinds (design §7.1), including a bind it could not
+/// see: a revocation that clears the box's publication set while a surface's
+/// bind is in flight leaves that surface holding a forward nobody else
+/// names. The surface that bound it unbinds it itself, so no forward
+/// outlives the revocation. The expose answers with the typed not-attached
+/// refusal; the watcher admits nothing and settles, never retrying the
+/// revoked port.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revocation_during_in_flight_bind_leaves_no_forward() {
+    let capture = crate::test_harness::captured_log();
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let manager = server.state.sessions_manager().await;
+
+    // Two ports in the box's range, with nothing listening on either yet.
+    let mut probes: Vec<std::net::TcpListener> = (0..2).map(|_| listening_socket()).collect();
+    probes.sort_by_key(port_of);
+    let a_port = port_of(&probes[0]);
+    let b_port = port_of(&probes[1]);
+    drop(probes);
+    let switch = std::net::Ipv4Addr::new(100, 64, 128, 83);
+    let loopback = std::net::Ipv4Addr::new(127, 0, 64, 83);
+    let (handle, gate, served, gate_sender, id) = box_with_scripted_plan(
+        &mut client,
+        &manager,
+        "ownrevoke",
+        switch,
+        loopback,
+        (a_port, b_port),
+        vec![
+            (a_port, GateAnswer::Held(200)), // 1: the expose's bind on `a`
+            (b_port, GateAnswer::Held(200)), // 2: the watcher's bind on `b`
+        ],
+    )
+    .await;
+    let publications = crate::session::listen_plan_seam::publications_of(id)
+        .expect("the launch handed its publication set back");
+
+    // The expose surface: its bind on `a` is held at the stand-in, the set
+    // is revoked under it, and the bind then stands.
+    let exposing = {
+        let handle = handle.clone();
+        tokio::spawn(async move { handle.expose_dynamic(a_port).await })
+    };
+    soon(|| served_naming(&served, loopback, a_port).len() == 1).await;
+    publications.revoke_all();
+    gate_sender
+        .send(1)
+        .expect("the gate opens for the held bind");
+    match exposing.await.expect("the exposing task ends") {
+        Err(crate::net::policy::ExposeFailure::Refused(
+            crate::net::policy::ExposeRefusal::NotAttached,
+        )) => {}
+        other => panic!("a publish revoked mid-bind is refused as not attached: {other:?}"),
+    }
+    let a_records = served_naming(&served, loopback, a_port);
+    assert_eq!(
+        a_records.len(),
+        2,
+        "the bind and the expose's own unbind of it: {a_records:?}"
+    );
+    assert!(
+        a_records[0].starts_with("POST /services/forwarder/expose ")
+            && a_records[1].starts_with("POST /services/forwarder/unexpose "),
+        "the forward the revocation never saw is unbound by its binder: {a_records:?}"
+    );
+    assert!(
+        publications.held_by(a_port).is_none(),
+        "the revoked publish writes nothing back into the set"
+    );
+    assert!(
+        !gate.admits_tcp(a_port),
+        "nothing is admitted for a publish revoked mid-bind"
+    );
+
+    // The watcher: the box's process listens on `b`, the watcher's bind is
+    // held at the stand-in, the set is revoked under it, and the bind then
+    // stands.
+    let b_listener = std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, b_port))
+        .expect("the box's process listens on its own port");
+    soon(|| served_naming(&served, loopback, b_port).len() == 1).await;
+    publications.revoke_all();
+    gate_sender
+        .send(2)
+        .expect("the gate opens for the held bind");
+    soon(|| served_naming(&served, loopback, b_port).len() == 2).await;
+    // Several poll intervals with the listener still standing: the watcher
+    // settled the revoked port, so it neither admits nor binds it again.
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    let b_records = served_naming(&served, loopback, b_port);
+    assert_eq!(
+        b_records.len(),
+        2,
+        "the bind and the watcher's own unbind of it, never a retry: {b_records:?}"
+    );
+    assert!(
+        b_records[0].starts_with("POST /services/forwarder/expose ")
+            && b_records[1].starts_with("POST /services/forwarder/unexpose "),
+        "the forward the revocation never saw is unbound by its binder: {b_records:?}"
+    );
+    assert!(
+        !gate.admits_tcp(b_port),
+        "the watcher admits nothing for a publish revoked mid-bind"
+    );
+    assert!(
+        publications.held_by(b_port).is_none(),
+        "the revoked publish writes nothing back into the set"
+    );
+    let logged = capture.contents();
+    assert!(
+        !logged.lines().any(|line| {
+            line.contains("session=ownrevoke")
+                && line.contains("published a listening port on the box's address")
+                && line.contains(&format!("port={b_port}"))
+        }),
+        "the watcher never reports a revoked publish as published: {logged}"
+    );
+    // The line follows the unbind's answer, so it is awaited.
+    soon(|| {
+        capture.contents().lines().any(|line| {
+            line.contains("session=ownrevoke")
+                && line.contains("unbound a listening port whose publication was revoked mid-bind")
+                && line.contains(&format!("port={b_port}"))
+        })
+    })
+    .await;
+
+    handle.stop().await;
+    drop(b_listener);
+}
+
+/// The box's stop is a revocation, not a publisher's withdrawal: it unbinds
+/// every runtime publication the box holds — the watcher's and the
+/// expose's alike, whichever owner holds each port — and the publication
+/// set the launch ran on names nothing after it. Neither ownership rule
+/// could take both down (the watcher never withdraws the expose's; the
+/// session's own sweep never sees the watcher's), so the revocation is the
+/// one path that owns both, and it answers to neither.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revocation_withdraws_regardless_of_owner() {
+    let _capture = crate::test_harness::captured_log();
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let manager = server.state.sessions_manager().await;
+
+    // Two ports the box's range covers: one its process listens on from
+    // before the launch — the watcher publishes it — and one only the
+    // runtime expose asks for.
+    let listen_socket = listening_socket();
+    let listen_port = port_of(&listen_socket);
+    let exposed_port = port_of(&listening_socket());
+    let range = (listen_port.min(exposed_port), listen_port.max(exposed_port));
+    let switch = std::net::Ipv4Addr::new(100, 64, 128, 83);
+    let loopback = std::net::Ipv4Addr::new(127, 0, 64, 83);
+    let (handle, gate, served, _gate_sender, id) = box_with_scripted_plan(
+        &mut client,
+        &manager,
+        "ownrevoke",
+        switch,
+        loopback,
+        range,
+        Vec::new(),
+    )
+    .await;
+
+    // Both owners' publications stand: the watcher's on the port the box's
+    // process listens on, the expose's on the port its user asked for.
+    soon(|| gate.admits_tcp(listen_port)).await;
+    handle
+        .expose_dynamic(exposed_port)
+        .await
+        .expect("the free port publishes");
+
+    // The box stops, and the stop is a revocation: both publications come
+    // down, each exactly once — the watcher's by its own withdrawal, the
+    // expose's by the session's sweep — and the set the launch ran on
+    // names neither port afterwards, whoever owned them.
+    handle.stop().await;
+    let listen_records = served_naming(&served, loopback, listen_port);
+    assert_eq!(
+        listen_records.len(),
+        2,
+        "the watcher's publication came down with the box: {listen_records:?}"
+    );
+    assert!(
+        listen_records[1].starts_with("POST /services/forwarder/unexpose "),
+        "the withdrawal took the watcher's own publication down: {listen_records:?}"
+    );
+    let exposed_records = served_naming(&served, loopback, exposed_port);
+    assert_eq!(
+        exposed_records.len(),
+        2,
+        "the expose's publication came down with the box: {exposed_records:?}"
+    );
+    assert!(
+        exposed_records[1].starts_with("POST /services/forwarder/unexpose "),
+        "the session's sweep took the expose's own publication down: {exposed_records:?}"
+    );
+    assert!(
+        !gate.admits_tcp(listen_port),
+        "the gate refuses the revoked port: no new connection rides on it"
+    );
+    let publications = crate::session::listen_plan_seam::publications_of(id)
+        .expect("the launch handed its publication set back");
+    assert_eq!(
+        publications.held_by(listen_port),
+        None,
+        "the revocation cleared the watcher's entry without an owner check"
+    );
+    assert_eq!(
+        publications.held_by(exposed_port),
+        None,
+        "the revocation cleared the expose's entry without an owner check"
+    );
+    drop(listen_socket);
+}
+
+/// A respawn frees the ports its predecessor published: the publication
+/// set belongs to one launch, so the ports a dead spawn published never
+/// answer for its successor — the same port is exposable again after the
+/// respawn, and listen-publishable: the respawned box's watcher publishes
+/// it once the box's process binds it, and the expose asking then is the
+/// duplicate the fresh set says it is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn respawn_frees_published_ports() {
+    let _capture = crate::test_harness::captured_log();
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let manager = server.state.sessions_manager().await;
+
+    // One port the box's range covers, with nothing listening on it.
+    let port = port_of(&listening_socket());
+    let switch = std::net::Ipv4Addr::new(100, 64, 128, 84);
+    let loopback = std::net::Ipv4Addr::new(127, 0, 64, 84);
+    let (handle, gate, served, _gate_sender, id) = box_with_scripted_plan(
+        &mut client,
+        &manager,
+        "ownrespawn",
+        switch,
+        loopback,
+        (port, port),
+        Vec::new(),
+    )
+    .await;
+
+    // The first launch publishes the port at runtime, and its set holds it.
+    handle
+        .expose_dynamic(port)
+        .await
+        .expect("the first box publishes the port");
+    assert_eq!(
+        served_naming(&served, loopback, port).len(),
+        1,
+        "the first publish is one bind: {:?}",
+        served.lock().expect("served lock")
+    );
+
+    // The launch's spawn ends — its host is killed — and the box's next
+    // launch respawns it: the plan the next launch carries is seeded again,
+    // the way a real launch gathers its own facts for every launch it runs.
+    let host = handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("the box's host resolves");
+    host.kill(false).await.expect("the box's spawn ends");
+    soon(|| !host.is_alive()).await;
+    let sock = handle
+        .net_switch()
+        .await
+        .unwrap()
+        .lock()
+        .await
+        .control_socket();
+    crate::session::listen_plan_seam::seed(
+        id,
+        crate::session::listen_plan_seam::Seeded {
+            lease: switch,
+            published: loopback,
+            control: crate::net::policy::ControlChannel::Unix(sock),
+            gate: std::sync::Arc::clone(&gate),
+        },
+    );
+    handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("the box respawns its host");
+
+    // The respawn's expose of the same port publishes again: the launch
+    // that runs a box starts from an empty set, so the port the dead spawn
+    // published answers free for its successor.
+    handle
+        .expose_dynamic(port)
+        .await
+        .expect("the respawned box publishes the port the dead spawn held");
+    assert_eq!(
+        served_naming(&served, loopback, port).len(),
+        2,
+        "the second publish is one more bind: {:?}",
+        served.lock().expect("served lock")
+    );
+
+    // The second spawn ends and respawns once more, and this time the box's
+    // own process binds the port: the respawn's watcher publishes it — the
+    // port is listen-publishable again, owned by the listen surface now —
+    // and the expose asking after it is the typed duplicate the fresh set
+    // says it is.
+    let host = handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("the box's host resolves again");
+    host.kill(false).await.expect("the second spawn ends");
+    soon(|| !host.is_alive()).await;
+    let sock = handle
+        .net_switch()
+        .await
+        .unwrap()
+        .lock()
+        .await
+        .control_socket();
+    crate::session::listen_plan_seam::seed(
+        id,
+        crate::session::listen_plan_seam::Seeded {
+            lease: switch,
+            published: loopback,
+            control: crate::net::policy::ControlChannel::Unix(sock),
+            gate: std::sync::Arc::clone(&gate),
+        },
+    );
+    handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("the box respawns its host again");
+    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, port))
+        .expect("the respawned box's process listens on the port");
+    soon(|| gate.admits_tcp(port)).await;
+    match handle.expose_dynamic(port).await {
+        Err(crate::net::policy::ExposeFailure::Refused(
+            crate::net::policy::ExposeRefusal::AlreadyPublished {
+                port: asked,
+                owner: crate::net::listeners::PublicationOwner::Listen,
+            },
+        )) => assert_eq!(asked, port),
+        other => panic!("the respawn's watcher owns the port it published: {other:?}"),
+    }
+    assert_eq!(
+        served_naming(&served, loopback, port).len(),
+        3,
+        "the watcher's publish is the only new bind of the third launch: {:?}",
+        served.lock().expect("served lock")
+    );
+    handle.stop().await;
+    drop(listener);
 }

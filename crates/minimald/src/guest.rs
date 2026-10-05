@@ -30,6 +30,13 @@ use tokio_vsock::{VMADDR_CID_HOST, VsockAddr, VsockStream};
 /// booted. The host listens here for the one-shot `READY` marker.
 const BOOT_MARKER_PORT: u32 = 7350;
 
+/// The VM-wide PTY pool the guest init raises `kernel.pty.max` to. Each box's
+/// devpts is capped at [`sandbox2::config::BOX_PTY_MAX`] by its own remount,
+/// but every instance still draws from the one kernel-wide counter, so the
+/// pool must be large enough for several boxes at their cap plus the session
+/// host's own shells. 65536 is a working value.
+const GUEST_PTY_MAX: u32 = 65536;
+
 // ── The node port the boot line hands the daemon ────────────────────────
 
 /// Boot token the VM host puts on the kernel command line to hand the guest
@@ -57,6 +64,31 @@ pub const HANDED_PROXY_PORT_TOKEN: &str = "MINIMALD_HOSTNAME_PROXY_PORT";
 /// ([`HandedPortError`]), never a fallback.
 pub fn handed_proxy_port() -> Result<Option<u16>, HandedPortError> {
     handed_port(HANDED_PROXY_PORT_TOKEN)
+}
+
+/// Boot token the VM host puts beside [`HANDED_PROXY_PORT_TOKEN`] to hand the
+/// guest daemon its boot's publish generation (T93): a value the host draws
+/// fresh for every boot and the daemon echoes in every publish report, so
+/// the host tells this boot's report from a killed boot's even when both
+/// were handed the same port. Mirrors the token `minvmd`'s `vm.rs` writes —
+/// keep the two in step.
+pub const HANDED_PUBLISH_GENERATION_TOKEN: &str = "MINIMALD_PUBLISH_GENERATION";
+
+/// The publish generation the VM host handed this boot, if it handed one: an
+/// older minvmd hands none, and a value that does not parse is treated the
+/// same way — the report then goes out without one, which the host reads as
+/// an older guest's, never as another boot's.
+pub fn handed_publish_generation() -> Option<u64> {
+    parse_publish_generation(
+        std::env::var(HANDED_PUBLISH_GENERATION_TOKEN)
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Decodes a handed publish generation from its raw boot-token value.
+fn parse_publish_generation(raw: Option<&str>) -> Option<u64> {
+    raw?.trim().parse::<u64>().ok()
 }
 
 /// A boot token the host put a port on that does not carry one (NET-025):
@@ -351,6 +383,20 @@ pub fn enter_rootfs(device: &str) -> std::io::Result<()> {
         if let Err(e) = std::os::unix::fs::symlink("pts/ptmx", &ptmx) {
             tracing::warn!(error = %e, "linking /dev/ptmx -> pts/ptmx; interactive PTY sessions may fail");
         }
+    }
+
+    // Raise the VM-wide PTY pool so several boxes at their per-instance cap
+    // still fit. Each box's devpts is remounted with `max=<BOX_PTY_MAX>` in
+    // its pre-exec step, but the guest's own devpts (mounted above) and every
+    // box draw from the one kernel-wide counter bounded by `kernel.pty.max`
+    // minus `kernel.pty.reserve`; the kernel default (4096) leaves room for
+    // only a few boxes at their cap. Best-effort: a guest that cannot raise
+    // it still boots, just with the smaller shared pool.
+    if let Err(e) = std::fs::write(
+        format!("{NEWROOT}/proc/sys/kernel/pty/max"),
+        format!("{GUEST_PTY_MAX}\n"),
+    ) {
+        tracing::warn!(error = %e, "raising kernel.pty.max; several boxes at their PTY cap may exhaust the shared pool");
     }
 
     // NET-079: cgroup2, mounted with `nsdelegate` so the cgroup namespace a
@@ -1531,6 +1577,15 @@ fn mount_if_absent(target: &str, source: &str, fstype: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The publish generation the host handed is echoed as handed; none
+    /// handed, or one that does not parse, is a report without one (T93).
+    #[test]
+    fn the_publish_generation_is_read_off_the_boot_line() {
+        assert_eq!(parse_publish_generation(Some("42")), Some(42));
+        assert_eq!(parse_publish_generation(None), None);
+        assert_eq!(parse_publish_generation(Some("not-a-generation")), None);
+    }
 
     /// The handed port is read off the environment the kernel passes
     /// through from the boot token: a present token parses, an absent one

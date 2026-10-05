@@ -25,6 +25,29 @@ pub const BOX_UID: u32 = 1000;
 /// synthesized `group` entry is held to it by the same test.
 pub const BOX_GID: u32 = 1000;
 
+/// The most PTYs one box may hold at once. PTYs are a machine-wide pool: a
+/// devpts instance mounted without a per-instance `max=` draws from the one
+/// kernel-wide counter (`kernel.pty.max` minus `kernel.pty.reserve`), so a
+/// single box that opens PTYs until the kernel refuses starves every other
+/// box and the session host's own shells. The launch path remounts the box's
+/// `/dev/pts` with `max=<BOX_PTY_MAX>` (see `exec_box_program`), so each box
+/// is bounded by its own instance rather than the shared pool. 1024 is a
+/// working value: it leaves room for the PTYs a real session needs while
+/// keeping one box from exhausting the host. Only the guest VM raises
+/// `kernel.pty.max`; on a native Linux host the shared pool stays at the
+/// kernel default (4096 minus the 1024 reserve), so a few boxes at this cap
+/// can still exhaust it.
+pub const BOX_PTY_MAX: u32 = 1024;
+
+/// The data string the launch path remounts the box's `/dev/pts` with. A
+/// devpts remount resets every option it is not given to the kernel default
+/// (`ptmxmode=0000`, `mode=0600`), so the string restates the options the
+/// box's devpts was mounted with (`ptmxmode=0666,mode=620`, hakoniwa's devfs
+/// setup) and adds the per-instance `max=`. Without `ptmxmode=0666` the
+/// box's `/dev/ptmx` (a link to `pts/ptmx`) becomes unopenable for the box's
+/// unprivileged user, and no program in the box can open a PTY.
+pub const BOX_DEVPTS_REMOUNT_DATA: &std::ffi::CStr = c"ptmxmode=0666,mode=620,max=1024";
+
 /// A capability no box may hold: its kernel number (these are ABI, assigned
 /// once and never reused) and its name, for the launch log line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,14 +181,27 @@ pub enum WdSetup {
     /// The layout used for a minimal session.
     ///
     /// The homedir is at /home, and the working directory is at /workbench (unless overridden).
+    /// `fs_mappings` are bind-mounted on top of those two mounts, so a
+    /// read-only mapping inside the home stays read-only.
     Session {
         home: PathBuf,
         working: PathBuf,
         working_name_override: Option<String>,
+        fs_mappings: Vec<common::FsMapping>,
     },
 }
 
 impl WdSetup {
+    /// The file mappings bind-mounted into the sandbox: those of a
+    /// [`Self::BoundDir`] or [`Self::Session`] layout, none for
+    /// [`Self::Isolated`].
+    pub(crate) fn fs_mappings(&self) -> &[common::FsMapping] {
+        match self {
+            Self::BoundDir { fs_mappings, .. } | Self::Session { fs_mappings, .. } => fs_mappings,
+            Self::Isolated { .. } => &[],
+        }
+    }
+
     /// Returns the path within the sandbox of the cwd. The returned path
     /// is always relative.
     ///
@@ -511,6 +547,13 @@ impl Config {
     #[must_use]
     pub fn command_env(&self) -> BTreeMap<String, String> {
         let mut env = BTreeMap::new();
+        // The layout default `PATH`; a composed `PATH` expands `$PATH`/`${PATH}`
+        // against it.
+        let default_path = if let WdSetup::Session { .. } = &self.wd {
+            "/usr/bin:/bin:/usr/sbin:/sbin:/home/.local/bin" // adds /home/.local/bin
+        } else {
+            "/usr/bin:/bin:/usr/sbin:/sbin"
+        };
         let mut set = |k: &str, v: &str| {
             env.insert(k.to_string(), v.to_string());
         };
@@ -520,7 +563,7 @@ impl Config {
             set("XDG_STATE_HOME", "/home/.local/state");
             set("XDG_CONFIG_HOME", "/home/.config");
             set("XDG_DATA_HOME", "/home/.local/share");
-            set("PATH", "/usr/bin:/bin:/usr/sbin:/sbin:/home/.local/bin"); // adds /home/.local/bin
+            set("PATH", default_path);
             // A styled default shell prompt for interactive sessions. Set as a
             // plain default here (not forced) so a user's composition var can
             // override it: the composed `env_vars` are applied further down and
@@ -543,7 +586,7 @@ impl Config {
             set("XDG_STATE_HOME", "/state/state");
             set("XDG_CONFIG_HOME", "/state/home");
             set("XDG_DATA_HOME", "/state/data");
-            set("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
+            set("PATH", default_path);
         }
         set("XDG_CACHE_HOME", "/state/cache");
         set("XDG_RUNTIME_DIR", "/run");
@@ -582,7 +625,16 @@ impl Config {
             }
         }
 
-        self.env_vars.iter().for_each(|(var, val)| set(var, val));
+        // A composed `PATH` may extend the layout default by referring to it
+        // as `$PATH` or `${PATH}`; expand that reference so the default
+        // directories are not lost. Every other variable stays literal.
+        self.env_vars.iter().for_each(|(var, val)| {
+            if var == "PATH" {
+                set(var, &expand_path_reference(val, default_path));
+            } else {
+                set(var, val);
+            }
+        });
         env
     }
 
@@ -643,11 +695,26 @@ impl Config {
         self
     }
     /// Configures the sandbox following the layout for a session.
-    pub fn with_session_dirs(mut self, home: PathBuf, working: PathBuf) -> Self {
+    pub fn with_session_dirs(self, home: PathBuf, working: PathBuf) -> Self {
+        self.with_session_dirs_mapped(home, working, Vec::new())
+    }
+    /// Configures the sandbox following the layout for a session, with
+    /// `fs_mappings` bind-mounted over the session's home and working
+    /// directory. Each mapping's [`path_in_sandbox`] is where it lands, so a
+    /// mapping meant to sit inside the home names its `/home/...` path.
+    ///
+    /// [`path_in_sandbox`]: common::FsMapping::path_in_sandbox
+    pub fn with_session_dirs_mapped(
+        mut self,
+        home: PathBuf,
+        working: PathBuf,
+        fs_mappings: Vec<common::FsMapping>,
+    ) -> Self {
         self.wd = WdSetup::Session {
             home,
             working,
             working_name_override: None,
+            fs_mappings,
         };
         self
     }
@@ -868,50 +935,48 @@ impl Config {
         };
 
         // Validate FS mappings, creating any non-existent files as we go.
-        if let WdSetup::BoundDir { fs_mappings, .. } = &self.wd {
-            for m in fs_mappings {
-                match fs::metadata(&m.host_path) {
-                    Ok(stat) => {
-                        if stat.is_dir() && m.is_file {
-                            return Err(Error::IO(
-                                "stat fs mapping",
-                                m.host_path.clone().into(),
-                                std::io::Error::new(
-                                    std::io::ErrorKind::AlreadyExists,
-                                    "directory mapped as a file",
-                                ),
-                            ));
-                        }
+        for m in self.wd.fs_mappings() {
+            match fs::metadata(&m.host_path) {
+                Ok(stat) => {
+                    if stat.is_dir() && m.is_file {
+                        return Err(Error::IO(
+                            "stat fs mapping",
+                            m.host_path.clone().into(),
+                            std::io::Error::new(
+                                std::io::ErrorKind::AlreadyExists,
+                                "directory mapped as a file",
+                            ),
+                        ));
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        if !m.create_if_missing {
-                            return Err(Error::IO("fs mapping", m.host_path.clone().into(), e));
-                        }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    if !m.create_if_missing {
+                        return Err(Error::IO("fs mapping", m.host_path.clone().into(), e));
+                    }
 
-                        // Missing and needs to be created.
-                        if m.is_file {
-                            fs::write(
-                                &m.host_path,
-                                if m.host_path.ends_with(".json") {
-                                    "{}"
-                                } else {
-                                    ""
-                                },
-                            )
-                            .map_err(|e| {
-                                Error::IO("create mapped file", m.host_path.clone().into(), e)
-                            })?;
-                        } else {
-                            fs::create_dir_all(&m.host_path).map_err(|e| {
-                                Error::IO("create mapped dir", m.host_path.clone().into(), e)
-                            })?;
-                        }
+                    // Missing and needs to be created.
+                    if m.is_file {
+                        fs::write(
+                            &m.host_path,
+                            if m.host_path.ends_with(".json") {
+                                "{}"
+                            } else {
+                                ""
+                            },
+                        )
+                        .map_err(|e| {
+                            Error::IO("create mapped file", m.host_path.clone().into(), e)
+                        })?;
+                    } else {
+                        fs::create_dir_all(&m.host_path).map_err(|e| {
+                            Error::IO("create mapped dir", m.host_path.clone().into(), e)
+                        })?;
                     }
-                    Err(e) => {
-                        return Err(Error::IO("stat fs mapping", m.host_path.clone().into(), e));
-                    }
-                };
-            }
+                }
+                Err(e) => {
+                    return Err(Error::IO("stat fs mapping", m.host_path.clone().into(), e));
+                }
+            };
         }
 
         // Make synthetic configuration. The resolver is the plan's to say, and
@@ -928,6 +993,31 @@ impl Config {
 
         Sandbox::new(build_base_dir, self, channel)
     }
+}
+
+/// Replaces each `${PATH}` and `$PATH` reference in `value` with `default`.
+/// A `$PATH` followed by a character that continues a variable name (such as
+/// `$PATH_SUFFIX`) is a different variable and stays literal.
+fn expand_path_reference(value: &str, default: &str) -> String {
+    let expanded = value.replace("${PATH}", default);
+    let mut expanded_path = String::with_capacity(expanded.len());
+    let mut remaining = expanded.as_str();
+    while let Some(index) = remaining.find("$PATH") {
+        expanded_path.push_str(&remaining[..index]);
+        let after_reference = &remaining[index + "$PATH".len()..];
+        let continues_variable = after_reference
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_');
+        if continues_variable {
+            expanded_path.push_str("$PATH");
+        } else {
+            expanded_path.push_str(default);
+        }
+        remaining = after_reference;
+    }
+    expanded_path.push_str(remaining);
+    expanded_path
 }
 
 /// Fits a box name into `budget` bytes. A name that fits is kept as is; a
@@ -958,6 +1048,24 @@ fn fit_box_name(name: &str, budget: usize) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_devpts_remount_keeps_the_box_ptmx_open_and_caps_at_box_pty_max() {
+        let data = BOX_DEVPTS_REMOUNT_DATA.to_str().expect("ASCII options");
+        let opts: Vec<&str> = data.split(',').collect();
+        assert!(
+            opts.contains(&"ptmxmode=0666"),
+            "a remount without ptmxmode resets it to 0000 and the box cannot open /dev/ptmx"
+        );
+        assert!(
+            opts.contains(&"mode=620"),
+            "the box's slave mode survives the remount"
+        );
+        assert!(
+            opts.contains(&format!("max={BOX_PTY_MAX}").as_str()),
+            "the remount caps the instance at BOX_PTY_MAX"
+        );
+    }
 
     #[test]
     fn a_box_name_within_budget_is_kept() {
@@ -1002,6 +1110,7 @@ mod tests {
             home: PathBuf::from("/tmp/home"),
             working: PathBuf::from("/tmp/working"),
             working_name_override: None,
+            fs_mappings: Vec::new(),
         };
         config.username = Some("dev".to_string());
         config
@@ -1036,6 +1145,80 @@ mod tests {
 
         assert_eq!(env.get("LANG").map(String::as_str), Some("en_GB.UTF-8"));
         assert_eq!(env.get("EDITOR").map(String::as_str), Some("hx"));
+    }
+
+    /// A composed `PATH` that refers to `$PATH` (or `${PATH}`) extends the
+    /// layout default instead of replacing it verbatim; a `PATH` without a
+    /// reference, and any other variable, stay literal.
+    #[test]
+    fn a_composed_path_expands_its_self_reference() {
+        let mut config = session_config();
+        config
+            .env_vars
+            .insert("PATH".to_string(), "/opt/bin:$PATH".to_string());
+        config
+            .env_vars
+            .insert("EDITOR".to_string(), "hx:$PATH".to_string());
+
+        let env = config.command_env();
+
+        assert_eq!(
+            env.get("PATH").map(String::as_str),
+            Some("/opt/bin:/usr/bin:/bin:/usr/sbin:/sbin:/home/.local/bin"),
+        );
+        // A non-PATH variable containing `$PATH` stays literal.
+        assert_eq!(env.get("EDITOR").map(String::as_str), Some("hx:$PATH"));
+
+        let mut braced = session_config();
+        braced
+            .env_vars
+            .insert("PATH".to_string(), "/opt/bin:${PATH}".to_string());
+        assert_eq!(
+            braced.command_env().get("PATH").map(String::as_str),
+            Some("/opt/bin:/usr/bin:/bin:/usr/sbin:/sbin:/home/.local/bin"),
+        );
+
+        let mut literal = session_config();
+        literal
+            .env_vars
+            .insert("PATH".to_string(), "/opt/bin".to_string());
+        assert_eq!(
+            literal.command_env().get("PATH").map(String::as_str),
+            Some("/opt/bin"),
+        );
+    }
+
+    /// A non-session sandbox expands a composed `PATH` against its own layout
+    /// default, which has no `/home/.local/bin`.
+    #[test]
+    fn a_build_sandbox_expands_a_composed_path_against_its_default() {
+        let mut config = Config::new("test");
+        config
+            .env_vars
+            .insert("PATH".to_string(), "/opt/bin:$PATH".to_string());
+
+        assert_eq!(
+            config.command_env().get("PATH").map(String::as_str),
+            Some("/opt/bin:/usr/bin:/bin:/usr/sbin:/sbin"),
+        );
+    }
+
+    /// A `$PATH` reference is expanded only when the following character cannot
+    /// continue a variable name, so a longer reference such as `$PATH_SUFFIX`
+    /// stays literal instead of being corrupted into the default path.
+    #[test]
+    fn a_composed_path_keeps_longer_variable_references_literal() {
+        let mut config = session_config();
+        config
+            .env_vars
+            .insert("PATH".to_string(), "/opt/bin:$PATH_SUFFIX".to_string());
+
+        let env = config.command_env();
+
+        assert_eq!(
+            env.get("PATH").map(String::as_str),
+            Some("/opt/bin:$PATH_SUFFIX"),
+        );
     }
 
     /// A build sandbox keeps the layout it always had — the extraction of this

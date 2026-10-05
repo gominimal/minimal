@@ -1462,6 +1462,7 @@ async fn netns_ownip_ptask_to_ptask() {
             dynamic_ingress: None,
         }),
         egress: None,
+        credentialed_upstream: None,
     };
     let mut b = Ptask::provision("peer-b", lease_b, subnet, &sock, &b_policy).await;
 
@@ -1552,6 +1553,7 @@ async fn netns_ingress_static_port_mapping_exposes_then_unexposes() {
             dynamic_ingress: None,
         }),
         egress: None,
+        credentialed_upstream: None,
     };
     let mut ptask = Ptask::provision("ingress", lease, subnet, &sock, &gate_policy).await;
 
@@ -1702,7 +1704,7 @@ impl Ptask {
             sudo_ok("configure PTask tap", &strs);
         }
 
-        let gate = SessionGate::for_session(lease.ip.to_string(), lease.ip, policy, subnet);
+        let gate = SessionGate::for_session(lease.ip.to_string(), lease.ip, policy, subnet, None);
         let relay = attach_to_switch(
             fd,
             api_sock,

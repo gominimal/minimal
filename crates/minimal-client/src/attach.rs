@@ -234,6 +234,41 @@ pub fn remote_command(command: &[String]) -> Option<String> {
     }
 }
 
+/// The largest encoded exec command `min session exec` will hand to ssh.
+///
+/// Linux caps a single argument at `MAX_ARG_STRLEN` (128 KiB), so a command
+/// that large already fails with `E2BIG` on the box; larger still, the exec
+/// request exceeds the SSH transport's packet limit and tears the connection
+/// down instead of erroring, leaving the client with ssh's rc 255 — the same
+/// status a command's own `exit 255` produces. Refusing here, before ssh is
+/// contacted, keeps the failure a clear client-side error.
+///
+/// The limit applies to the whole encoded wire for both forms on purpose. A
+/// multi-word argv is stricter than it needs to be for `E2BIG` alone, since
+/// each word is its own `execve` argument, but the whole wire still rides in
+/// one SSH exec request and must fit the transport's packet limit. Do not
+/// relax this into a per-word check without also bounding the packet.
+pub const MAX_EXEC_COMMAND_BYTES: usize = 128 * 1024;
+
+/// Encode a command for the wire, refusing one that exceeds
+/// [`MAX_EXEC_COMMAND_BYTES`].
+///
+/// Returns the encoded command when it fits, or an error naming the size and
+/// pointing large data at stdin or a file under `/workbench`.
+pub fn checked_remote_command(command: &[String]) -> anyhow::Result<Option<String>> {
+    let wire = remote_command(command);
+    if let Some(wire) = wire.as_deref()
+        && wire.len() >= MAX_EXEC_COMMAND_BYTES
+    {
+        anyhow::bail!(
+            "the command is {} bytes once encoded; min session exec needs it under {} KiB once encoded; pass large data on stdin or in a file under /workbench",
+            wire.len(),
+            MAX_EXEC_COMMAND_BYTES / 1024,
+        );
+    }
+    Ok(wire)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -341,6 +376,33 @@ mod tests {
                 "min --version".to_string()
             ))
         );
+    }
+
+    /// A command just under the limit encodes and passes the guard; one byte
+    /// over is refused with the size in the message, before any ssh command is
+    /// built.
+    #[test]
+    fn checked_remote_command_refuses_an_oversized_command() {
+        // A lone argument encodes as `min://shell <cmd>`; size the payload so
+        // the wire lands exactly on the boundary.
+        let prefix_len = "min://shell ".len();
+        let under = "x".repeat(MAX_EXEC_COMMAND_BYTES - prefix_len - 1);
+        let wire = checked_remote_command(&[under]).unwrap().unwrap();
+        assert_eq!(wire.len(), MAX_EXEC_COMMAND_BYTES - 1);
+
+        // The per-argument limit includes the terminating NUL, so a wire of
+        // exactly the limit still fails with E2BIG once ssh execs it. Refuse
+        // the boundary too, not just lengths above it.
+        let at_limit = "x".repeat(MAX_EXEC_COMMAND_BYTES - prefix_len);
+        let boundary_wire = remote_command(std::slice::from_ref(&at_limit)).unwrap();
+        assert_eq!(boundary_wire.len(), MAX_EXEC_COMMAND_BYTES);
+        assert!(checked_remote_command(&[at_limit]).is_err());
+
+        let over = "x".repeat(MAX_EXEC_COMMAND_BYTES - prefix_len + 1);
+        let err = checked_remote_command(&[over]).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("needs it under 128 KiB once encoded"));
+        assert!(msg.contains(&format!("{} bytes", MAX_EXEC_COMMAND_BYTES + 1)));
     }
 
     /// The interactive attach path negotiates the session-key config: each

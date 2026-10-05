@@ -475,6 +475,7 @@ fn twin_entry(
         project_path: path.map(|p| paths::HostAbsPath::try_new(p).unwrap()),
         status,
         git: None,
+        host_ip_enforcement: None,
         attrs: None,
     }
 }
@@ -767,6 +768,15 @@ fn sanitize_name_component_trims_and_falls_back() {
     assert_eq!(sanitize_name_component("café"), "caf");
     assert_eq!(sanitize_name_component("...."), "session");
     assert_eq!(sanitize_name_component("a\tb"), "ab");
+    // `_` and `.` map to `-`, so the minted name stays a single DNS label.
+    assert_eq!(sanitize_name_component("my_app.dev"), "my-app-dev");
+    assert_eq!(sanitize_name_component("mnlh.Ab12_"), "mnlh-ab12");
+    // An over-long basename is capped and re-trimmed.
+    assert_eq!(sanitize_name_component(&"a".repeat(100)).len(), 48);
+    assert_eq!(
+        sanitize_name_component(&format!("{}-tail", "b".repeat(47))),
+        "b".repeat(47)
+    );
 }
 
 /// The minted suffix is exactly four lowercase hex digits.
@@ -1769,6 +1779,140 @@ fn legacy_network_spellings_parse_with_hint() {
     );
 }
 
+/// `--deny-all-egress` conflicts with every egress rule flag at parse
+/// (NET-075's CLI half): a deny-all declaration admits no exceptions, so
+/// combining it with any `--allow-*`/`--deny-*` rule is refused before the
+/// activation runs, naming both flags — and the refusal is the parser's
+/// conflict, not a later validation, so nothing is half-declared. The one
+/// egress-shaped flag it must combine with is `--credentialed-upstream`
+/// (NET-134): the proxy listener is infrastructure, the machine-internal
+/// analogue of the fabric pin's infrastructure set, so a deny-all box may
+/// still declare the lane — the proxy's own checks govern what the lane
+/// grants, and this flag's conflict is with rules, never with
+/// infrastructure.
+#[test]
+fn deny_all_egress_conflicts_with_every_egress_flag() {
+    use clap::Parser as _;
+
+    for (rule, value) in [
+        ("--allow-subnets", "10.0.0.0/8"),
+        ("--allow-dns-hosts", "github.com"),
+        ("--allow-protocols", "tcp"),
+        ("--deny-subnets", "0.0.0.0/0"),
+    ] {
+        let err = Cli::try_parse_from([
+            "min",
+            "session",
+            "activate",
+            "--deny-all-egress",
+            rule,
+            value,
+        ])
+        .map(|_| ())
+        .expect_err("--deny-all-egress must conflict with every egress rule flag");
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::ArgumentConflict,
+            "the combination must be refused as a parse conflict, not a later \
+             validation: {err}"
+        );
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("--deny-all-egress"),
+            "the refusal must name the deny-all flag: {rendered}"
+        );
+        assert!(
+            rendered.contains(rule),
+            "the refusal must name the rule flag it conflicts with: {rendered}"
+        );
+    }
+
+    // The flag on its own parses, and it carries one meaning wherever the
+    // egress flags appear: a boolean declaration with no value to validate.
+    let args = Cli::try_parse_from(["min", "session", "activate", "--deny-all-egress"])
+        .expect("--deny-all-egress alone must parse");
+    match args.command {
+        Some(Command::Session(SessionArgs {
+            command: SessionCommand::Activate(a),
+        })) => assert!(a.deny_all_egress, "the flag must land on the args"),
+        _ => panic!("expected an activate command"),
+    }
+
+    // The proxy lane is not a rule (NET-134): the two combine.
+    Cli::try_parse_from([
+        "min",
+        "session",
+        "activate",
+        "--deny-all-egress",
+        "--credentialed-upstream",
+    ])
+    .expect("--deny-all-egress must combine with --credentialed-upstream");
+}
+
+/// The dynamic ingress flags parse at the flag (NET-043): a mode with a
+/// range lands as both, a mode alone lands with no range, an unknown mode
+/// is refused by the mode's parser, and a privileged range is refused by
+/// the range's parser in the launch check's own words.
+#[test]
+fn dynamic_ingress_flags_parse() {
+    use clap::Parser as _;
+
+    let activate = |argv: &[&str]| -> ActivateArgs {
+        let args = Cli::try_parse_from(argv)
+            .unwrap_or_else(|error| panic!("{argv:?} must parse: {error}"));
+        match args.command {
+            Some(Command::Session(SessionArgs {
+                command: SessionCommand::Activate(a),
+            })) => a,
+            _ => panic!("expected an activate command"),
+        }
+    };
+
+    let a = activate(&[
+        "min",
+        "session",
+        "activate",
+        "--dynamic-ingress",
+        "allow",
+        "--dynamic-range",
+        "8000-8443",
+    ]);
+    assert_eq!(a.dynamic_ingress, Some(sessions::DynamicIngress::Allow));
+    assert_eq!(a.dynamic_range, Some((8000, 8443)));
+
+    let a = activate(&["min", "session", "activate", "--dynamic-ingress", "ask"]);
+    assert_eq!(a.dynamic_ingress, Some(sessions::DynamicIngress::Ask));
+    assert_eq!(a.dynamic_range, None, "a mode alone carries no range");
+
+    let Err(err) =
+        Cli::try_parse_from(["min", "session", "activate", "--dynamic-ingress", "maybe"])
+    else {
+        panic!("an unknown dynamic ingress mode must not parse");
+    };
+    let rendered = err.to_string();
+    assert!(
+        rendered.contains("unknown mode 'maybe'"),
+        "the refusal must name the mode, got: {rendered}"
+    );
+
+    let Err(err) = Cli::try_parse_from([
+        "min",
+        "session",
+        "activate",
+        "--dynamic-ingress",
+        "allow",
+        "--dynamic-range",
+        "80-90",
+    ]) else {
+        panic!("a privileged dynamic range must not parse");
+    };
+    let rendered = err.to_string();
+    assert!(
+        rendered.contains(&sessions::PolicyError::PrivilegedDynamicRange { lo: 80 }.to_string()),
+        "the refusal must use the launch check's words, got: {rendered}"
+    );
+}
+
 /// The CLI reference documents the network flags on `session activate`
 /// (NET-036), read from the real file so a docs edit cannot silently drop
 /// either row.
@@ -1789,6 +1933,8 @@ fn cli_reference_documents_network_flags() {
     for row in [
         "--network <none|host_ip|own_ip>",
         "--ingress <EXT:INT[/PROTO]>",
+        "--dynamic-ingress <allow|ask|deny>",
+        "--dynamic-range <LO-HI>",
     ] {
         assert!(
             section.contains(row),
@@ -2037,8 +2183,8 @@ async fn ls_shows_vm_per_box() {
             json: false,
         },
         &single[0].resp,
-        surfaces[1],
-        answerers[1],
+        surfaces[1].clone(),
+        answerers[1].clone(),
     )
     .expect("format_ls on the same listing");
     assert_eq!(

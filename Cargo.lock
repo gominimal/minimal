@@ -3849,6 +3849,7 @@ dependencies = [
  "checkouts",
  "codespan-reporting",
  "common",
+ "decode",
  "futures",
  "google-cloud-auth",
  "google-cloud-storage",
@@ -3980,6 +3981,17 @@ checksum = "f7c44f8e672c00fe5308fa235f821cb4198414e1c77935c1ab6948d3fd78550e"
 dependencies = [
  "mime",
  "unicase",
+]
+
+[[package]]
+name = "min-answerer"
+version = "0.7.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "minvmd",
+ "tracing-subscriber",
+ "version",
 ]
 
 [[package]]
@@ -4211,6 +4223,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "uuid",
  "version",
 ]
 
@@ -7155,6 +7168,7 @@ name = "switch"
 version = "0.0.1"
 dependencies = [
  "smoltcp",
+ "switch",
  "tempfile",
  "tokio",
  "tracing",

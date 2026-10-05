@@ -507,7 +507,7 @@ where
                 status = "403 Forbidden",
                 "network policy violation"
             );
-            return write_status(&mut client, "403 Forbidden").await;
+            return write_refusal_status(&mut client, "403 Forbidden", reason).await;
         }
     };
 
@@ -1337,6 +1337,26 @@ async fn write_status<C: AsyncWrite + Unpin>(client: &mut C, status: &str) -> io
     client.write_all(response.as_bytes()).await
 }
 
+/// Writes the refusal's own answer: the status line, then a plain-text body
+/// carrying the reason — the same wording the refusal's warn line records —
+/// so a refused client reads *why* off the wire instead of inferring it from
+/// the status. A port the box never published answers `403` with "the box
+/// has not published this port", a different refusal from the declared
+/// port's instant connection-refused while nothing listens on it yet
+/// (NET-014: an answer, never a hang; NET-016: the refusal is "not
+/// permitted", not "nothing listening").
+async fn write_refusal_status<C: AsyncWrite + Unpin>(
+    client: &mut C,
+    status: &str,
+    reason: &str,
+) -> io::Result<()> {
+    let response = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reason}",
+        reason.len(),
+    );
+    client.write_all(response.as_bytes()).await
+}
+
 /// Emits the refusal warn line (NET-001): every request the proxy refuses is
 /// logged with the Host asked for — when the head carried one, which the
 /// timeout and unparseable-head refusals cannot have — the reason, and the
@@ -1591,8 +1611,9 @@ mod tests {
     /// A lease route carries only the ports the box's ingress declaration
     /// publishes (NET-001): a request naming any other port — an unrelated one
     /// or the internal port number behind the map — is refused with
-    /// `403 Forbidden` and a warn line naming the host, the session, the port
-    /// and the reason, instead of dialing a port the box's ingress gate would
+    /// `403 Forbidden`, the body saying the port is not published, and a warn
+    /// line naming the host, the session, the port and the reason, instead of
+    /// dialing a port the box's ingress gate would
     /// drop (a dropped SYN is a silent connect hang, not a refusal).
     #[tokio::test]
     async fn proxy_refuses_an_unpublished_port_and_logs_why() {
@@ -1630,6 +1651,10 @@ mod tests {
         assert!(
             refused.contains("403 Forbidden"),
             "expected the unpublished port to be refused, got: {refused}"
+        );
+        assert!(
+            refused.contains("the box has not published this port"),
+            "expected the refusal's body to say the port is not published, got: {refused}"
         );
 
         drop(_guard);
@@ -3246,6 +3271,7 @@ mod tests {
                 dynamic_allowed_range: None,
                 dynamic_ingress: None,
             }),
+            credentialed_upstream: None,
         };
 
         // The registry, as the session actor and the attach path fill it: the
@@ -3273,6 +3299,7 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             &policy,
             SwitchSubnet::default(),
+            None,
         );
         assert!(
             gate.admits_direct_tcp(backend_port),
@@ -3364,7 +3391,7 @@ mod tests {
                 egress_allowing_the_target(),
             ),
         ] {
-            reg.register_caller(id, name, &policy, subnet);
+            reg.register_caller(id, name, &policy, subnet, None);
             reg.report_own_address(id, name, lease, BTreeMap::new());
         }
         let router = Router::new(Arc::new(reg), proxied_request_verdict);
@@ -3584,6 +3611,7 @@ mod tests {
                         dynamic_ingress: None,
                     }
                 }),
+                credentialed_upstream: None,
             };
             // The registry, as the session actor and the attach path fill it
             // for each mode. Loopback stands in for the target's lease.
@@ -3637,8 +3665,10 @@ mod tests {
                     &SessionPolicy {
                         egress: Some(stance_egress(stance)),
                         ingress: None,
+                        credentialed_upstream: None,
                     },
                     subnet,
+                    None,
                 );
                 reg.report_own_address(client, "client", CALLER_LEASE, BTreeMap::new());
                 reg.caller_at(CALLER_LEASE)
@@ -3717,6 +3747,7 @@ mod tests {
                         target_lease,
                         &target_policy,
                         subnet,
+                        None,
                     );
                     prop_assert!(
                         gate.admits_direct_tcp(internal),
@@ -3746,6 +3777,7 @@ mod tests {
         let policy = SessionPolicy {
             egress: None,
             ingress: None,
+            credentialed_upstream: None,
         };
         // The direct half: the relay's own gate for that declaration refuses
         // every new inbound connection — the own-IP default-block posture.
@@ -3754,6 +3786,7 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             &policy,
             SwitchSubnet::default(),
+            None,
         );
         assert!(
             !gate.admits_direct_tcp(18080),
@@ -3772,6 +3805,7 @@ mod tests {
                 "client",
                 &egress_allowing_the_target(),
                 SwitchSubnet::default(),
+                None,
             );
             reg.report_own_address(client, "client", CALLER_LEASE, BTreeMap::new());
             let caller = reg
@@ -4675,6 +4709,7 @@ mod tests {
                 ..EgressPolicy::default()
             }),
             ingress: None,
+            credentialed_upstream: None,
         }
     }
 
@@ -4687,6 +4722,7 @@ mod tests {
                 ..EgressPolicy::default()
             }),
             ingress: None,
+            credentialed_upstream: None,
         }
     }
 }
