@@ -4091,7 +4091,7 @@ mod tests {
             });
         });
         let reply = stand.guest_ask(&web, 3000);
-        first_offers
+        first_offers_rx
             .recv_timeout(ASK_WAIT)
             .expect("the first dialog is shown");
         let minimald_rpc::BoxControlReply::AskAdmit(outcome) =
