@@ -56,6 +56,21 @@
 //! lists nowhere — `min session policy` and the publication lines name a
 //! port only once its reservation is recorded.
 //!
+//! On a VM-backed host neither surface's publish is whole until the VM
+//! host daemon has admitted it (T94, NET-138): the reservation committed
+//! and the switch's forward bound, the publish reports the port over the
+//! guest report door — the channel [`box_report_channel`] derives off the
+//! same control channel the forwarder verbs ride — and the grant the box's
+//! host-side registration holds decides it. A report the grant refuses
+//! unwinds the publish whole: the forward comes down, the publication comes
+//! out of the set, nothing admits at the gate, and the port is owed again
+//! on the backoff a refused publish earns — never left as a mapping the
+//! host never vouched for. The withdrawal reports its twin: a publication
+//! that comes down takes the host's row entry with it, best-effort the way
+//! the unexpose beside it is. A native host has no report channel, and its
+//! publishes stand exactly as they always did, admitted by the switch
+//! alone.
+//!
 //! The plan a launch gathers rides [`crate::session_host::Launched`] to the
 //! host that runs its box — no process-global table between them — so a
 //! plan is the launch's own from the moment it is built, and a launch that
@@ -98,6 +113,8 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::Ipv4Addr;
 use std::path::Path;
+#[cfg(test)]
+use std::sync::LazyLock;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -129,6 +146,292 @@ const WITHDRAW_PASSES: usize = 3;
 /// a refusal that persists is *waited for* — one attempt every half minute,
 /// never one per poll — while never being given up on.
 const PUBLISH_RETRY_CAP: Duration = Duration::from_secs(30);
+
+/// How long one port report waits for its reply line: the VM host daemon
+/// answers a report from memory, so a report that outlives this is a host
+/// that is not answering, and the bound ends the publish waiting on it
+/// rather than parking it behind a door that may never answer.
+const REPORT_REPLY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How many attempts one *admitted*-port report makes when its reply does
+/// not arrive (T94): the host's admit is idempotent per port and protocol —
+/// a reply lost on the shuttle costs nothing but a rate-window entry — so a
+/// lost answer is retried, never re-decided, and the attempts bound how long
+/// a publish whose reply keeps getting lost holds the caller. A report the
+/// host *refused* is answered, not retried: the refusal is the grant's own
+/// decision, and the next attempt would draw the same one.
+const REPORT_ATTEMPTS: usize = 5;
+
+/// The backoff between one report's attempts: the length the marker
+/// channel's retries take — the other control path from inside a microVM
+/// to the VM host daemon — long enough for a shuttle that dropped one reply
+/// to hand back the next, short enough that a publish is not parked behind
+/// it.
+const REPORT_BACKOFF: Duration = Duration::from_millis(100);
+
+/// How many attempts one *withdrawn*-port report makes when its reply does
+/// not arrive: the withdrawal is teardown — the forward is already down, the
+/// gate already refuses the port — so it is tried, waited for, and given up
+/// on faster than a publish would be; a withdrawal the host never recorded
+/// leaves a stale row entry behind, never a live forward.
+const WITHDRAW_REPORT_ATTEMPTS: usize = 3;
+
+/// Where a runtime port report goes when the daemon runs inside a VM (T94,
+/// NET-138): the VM host daemon's report door, over the same host CID the
+/// switch's control channel rides — the two vsock paths reach one host, so
+/// they share one CID, at ports of their own. A native host's control
+/// channel is a local UDS and no VM host daemon sits behind it, so its
+/// report channel is `None` and a runtime publish there stands exactly as
+/// it always did: admitted by the switch alone, reported to nobody.
+#[derive(Debug, Clone)]
+enum BoxReportChannel {
+    /// The VM host daemon's report door at
+    /// [`minimald_rpc::VM_HOST_BOX_REPORT_PORT`], over the shuttle at the
+    /// host CID the switch's control channel carries.
+    Vsock { cid: u32 },
+    /// A UDS report door — the tests' stand-in for the VM host daemon's
+    /// door, seeded per switch control socket by
+    /// [`seed_vm_report_door_for_tests`].
+    #[cfg(test)]
+    Unix(std::path::PathBuf),
+}
+
+/// The tests' stand-in report doors, keyed by the switch control socket
+/// their session's reports ride: the harness runs on a native-shaped
+/// `ControlChannel::Unix`, which carries no report channel of its own, so a
+/// test that owes a report door seeds one for its switch's control socket
+/// and every report that session makes derives to the seeded door —
+/// consulted on every call, never taken once, so the watcher's repeated
+/// polls reach the stand-in exactly the expose path's own reports do.
+#[cfg(test)]
+static VM_REPORT_SEAM: LazyLock<Mutex<HashMap<std::path::PathBuf, std::path::PathBuf>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Seed a stand-in report door for the session whose switch control socket
+/// is `control_socket` (tests only, T94): the door at `door` answers every
+/// port report that session makes, speaking the VM host daemon's own wire —
+/// one JSON request line in, one JSON reply line back.
+#[cfg(test)]
+pub(crate) fn seed_vm_report_door_for_tests(
+    control_socket: &Path,
+    door: impl Into<std::path::PathBuf>,
+) {
+    VM_REPORT_SEAM
+        .lock()
+        .expect("the vm report seam lock poisoned")
+        .insert(control_socket.to_path_buf(), door.into());
+}
+
+/// Clear the stand-in report door seeded for `control_socket`, so a session
+/// a test has finished with reports nowhere again (tests only).
+#[cfg(test)]
+pub(crate) fn clear_vm_report_door_for_tests(control_socket: &Path) {
+    VM_REPORT_SEAM
+        .lock()
+        .expect("the vm report seam lock poisoned")
+        .remove(control_socket);
+}
+
+/// The report channel a runtime port report rides for the switch at
+/// `control` (T94): the VM host daemon's door over the shuttle a VM host's
+/// control channel carries, or `None` on a native host, whose runtime
+/// publishes were admitted by the switch alone before this channel existed
+/// and still are. Derived per call, so the watcher's every poll and the
+/// expose path's every publish resolve the channel the same way.
+fn box_report_channel(control: &ControlChannel) -> Option<BoxReportChannel> {
+    // The tests' stand-in first: a native-shaped control channel with a
+    // seeded door is a test driving the report channel, and its door
+    // answers reports the way the VM host daemon's own does.
+    #[cfg(test)]
+    if let ControlChannel::Unix(sock) = control {
+        let seam = VM_REPORT_SEAM
+            .lock()
+            .expect("the vm report seam lock poisoned");
+        if let Some(door) = seam.get(sock) {
+            return Some(BoxReportChannel::Unix(door.clone()));
+        }
+    }
+    match control {
+        ControlChannel::Vsock { cid, .. } => Some(BoxReportChannel::Vsock { cid: *cid }),
+        ControlChannel::Unix(_) => None,
+    }
+}
+
+/// One report exchange over the VM host daemon's report door: one JSON
+/// request line in, one JSON reply line back — the door's own protocol, the
+/// same one `minvmd status`'s row read rides on the host's socket.
+///
+/// The write is not followed by a shutdown (G-N8): on the KVM libkrun
+/// `add_vsock_port2(listen=false)` shuttle a close started from either end
+/// drops that end's still-buffered bytes as it propagates, so this side
+/// sends its line and waits for the reply instead of half-closing after the
+/// write — the door holds its end open until *this* side closes, which the
+/// drop at the exchange's end is, after the reply is read.
+async fn report_round<S>(
+    stream: S,
+    request: &minimald_rpc::BoxControlRequest,
+) -> io::Result<minimald_rpc::BoxControlReply>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+    let mut line = serde_json_lenient::to_string(request)
+        .map_err(|error| io::Error::other(format!("the port report did not serialize: {error}")))?;
+    line.push('\n');
+    let mut stream = stream;
+    stream.write_all(line.as_bytes()).await?;
+    let mut reply = String::new();
+    tokio::io::BufReader::new(&mut stream)
+        .read_line(&mut reply)
+        .await?;
+    if reply.trim().is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "the VM host daemon closed the report door without answering",
+        ));
+    }
+    serde_json_lenient::from_str(reply.trim()).map_err(|error| {
+        io::Error::other(format!("the port report's reply did not parse: {error}"))
+    })
+}
+
+/// One report's dial and exchange, timed out as a whole: a door that
+/// accepts and then stalls must not hang the publish or the teardown
+/// waiting on it. The connection closes from this side when the round
+/// returns — the client-side close G-N8's workaround owns.
+async fn report_exchange(
+    channel: &BoxReportChannel,
+    request: &minimald_rpc::BoxControlRequest,
+) -> io::Result<minimald_rpc::BoxControlReply> {
+    tokio::time::timeout(REPORT_REPLY_TIMEOUT, async {
+        match channel {
+            BoxReportChannel::Vsock { cid } => {
+                let stream = tokio_vsock::VsockStream::connect(tokio_vsock::VsockAddr::new(
+                    *cid,
+                    minimald_rpc::VM_HOST_BOX_REPORT_PORT,
+                ))
+                .await?;
+                report_round(stream, request).await
+            }
+            #[cfg(test)]
+            BoxReportChannel::Unix(door) => {
+                let stream = tokio::net::UnixStream::connect(door).await?;
+                report_round(stream, request).await
+            }
+        }
+    })
+    .await
+    .map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("the port report's reply did not arrive in {REPORT_REPLY_TIMEOUT:?}"),
+        )
+    })?
+}
+
+/// Report one runtime-published port as admitted to the VM host daemon
+/// (T94, NET-138): the publish's host-side half — the grant the box's
+/// registration holds decides the report, and a report it refuses comes
+/// back as [`io::Error`] carrying the grant's own reason, so the publish
+/// that asked it unwinds on the refusal that refused it, with nothing left
+/// standing at either end.
+///
+/// A reply that never arrives is retried within [`REPORT_ATTEMPTS`]: the
+/// host's admit is idempotent, so a lost reply costs a rate-window entry
+/// and nothing else. A transport failure that outlives the attempts is the
+/// report's own refusal shape — the publish unwinds on it the same way,
+/// fail-closed, because a publish the host never vouched for is not one to
+/// leave standing against the host's grant either. A native host reports
+/// nowhere and publishes as it always did: [`Ok`] without a round trip.
+pub(crate) async fn report_admitted_port(
+    control: &ControlChannel,
+    switch_address: Ipv4Addr,
+    port: u16,
+    source: minimald_rpc::PortReportSource,
+) -> io::Result<()> {
+    let Some(channel) = box_report_channel(control) else {
+        // A native host has no VM host daemon to report to; the publish
+        // stands admitted by the switch alone, as it always has.
+        return Ok(());
+    };
+    let request = minimald_rpc::BoxControlRequest::AdmitPort(minimald_rpc::AdmitPortRequest {
+        switch_address,
+        port,
+        proto: IpProto::Tcp,
+        source,
+    });
+    let mut unanswered = None;
+    for attempt in 1..=REPORT_ATTEMPTS {
+        match report_exchange(&channel, &request).await {
+            // Answered, so decided: the recorded port is the grant's own
+            // word that the publish may stand.
+            Ok(minimald_rpc::BoxControlReply::PortRecorded { .. }) => return Ok(()),
+            Ok(minimald_rpc::BoxControlReply::Error { error }) => {
+                // The grant's refusal, not a transport failure to retry —
+                // the next attempt would draw the same refusal, and the
+                // rate window does not need it asked for again.
+                return Err(io::Error::other(format!(
+                    "the VM host daemon refused the port report: {error}"
+                )));
+            }
+            Ok(other) => {
+                return Err(io::Error::other(format!(
+                    "the VM host daemon answered the port report with another verb's \
+                     reply: {other:?}"
+                )));
+            }
+            // No reply: a lost answer, retried — the host's admit is
+            // idempotent, so this attempt cost nothing the next cannot pay.
+            Err(error) => unanswered = Some(error),
+        }
+        if attempt < REPORT_ATTEMPTS {
+            tokio::time::sleep(REPORT_BACKOFF).await;
+        }
+    }
+    Err(unanswered.expect("the loop ran at least once without deciding"))
+}
+
+/// Report one runtime-published port as withdrawn to the VM host daemon
+/// (T94): the teardown half of the report channel, answering whether the
+/// host's row heard it. The withdrawal itself never fails the caller that
+/// owes it — the forward it reports about is already down and the gate
+/// already refuses the port; what the report carries is the *host's* row,
+/// whose runtime set must stop naming a port nothing publishes any more.
+/// Never refused by the host, so a reply that arrives ends the report
+/// whichever way it is shaped; a reply that never arrives is retried fewer
+/// times than a publish's, and the [`Err`] a test or a caller reads names
+/// what the host's row still holds.
+pub(crate) async fn report_withdrawn_port(
+    control: &ControlChannel,
+    switch_address: Ipv4Addr,
+    port: u16,
+    source: minimald_rpc::PortReportSource,
+) -> io::Result<()> {
+    let Some(channel) = box_report_channel(control) else {
+        return Ok(());
+    };
+    let request =
+        minimald_rpc::BoxControlRequest::WithdrawPort(minimald_rpc::WithdrawPortRequest {
+            switch_address,
+            port,
+            proto: IpProto::Tcp,
+            source,
+        });
+    let mut unanswered = None;
+    for attempt in 1..=WITHDRAW_REPORT_ATTEMPTS {
+        match report_exchange(&channel, &request).await {
+            // Answered: the host's withdrawal is never refused, and a row
+            // that held nothing the report named is the report's goal
+            // state — both replies end it.
+            Ok(_) => return Ok(()),
+            Err(error) => unanswered = Some(error),
+        }
+        if attempt < WITHDRAW_REPORT_ATTEMPTS {
+            tokio::time::sleep(REPORT_BACKOFF).await;
+        }
+    }
+    Err(unanswered.expect("the loop ran at least once without deciding"))
+}
 
 /// Everything a box's listener watcher needs, gathered by the launch that
 /// attached the box: its name (each publication's line names the box), its
@@ -1015,8 +1318,66 @@ impl WatchState {
                                     // saw: this watcher unbinds it, admits
                                     // nothing, and settles — a revoked
                                     // port is not retried.
-                                    self.unbind_revoked(port, &mapping).await;
+                                    self.unbind_bound_forward(
+                                        port,
+                                        &mapping,
+                                        "unbound a listening port whose publication was \
+                                         revoked mid-bind",
+                                        "unbinding a listening port revoked mid-bind failed",
+                                    )
+                                    .await;
                                     return Appearance::Settled;
+                                }
+                                // The host-held grant's own say before the
+                                // port admits anywhere (T94): on a VM host
+                                // the row the box's registration holds is
+                                // the grant the report is checked against,
+                                // and a report it refuses unwinds this
+                                // publish whole — the forward the switch is
+                                // holding comes down, the publication just
+                                // committed comes out of the set, nothing
+                                // admits at the gate, and the port is owed
+                                // again on the backoff a refused publish
+                                // earns. A native host reports nowhere and
+                                // publishes as it always did.
+                                if let Err(error) = report_admitted_port(
+                                    &self.plan.control,
+                                    self.plan.lease,
+                                    port,
+                                    minimald_rpc::PortReportSource::Listen,
+                                )
+                                .await
+                                {
+                                    if refusals == 0 {
+                                        // One line per streak, naming the
+                                        // refusal's reason: the retries the
+                                        // backoff makes are the same
+                                        // refusal, waited out.
+                                        tracing::warn!(
+                                            session = %self.plan.box_name,
+                                            host = %self.plan.published,
+                                            port,
+                                            verdict = "permitted",
+                                            owner = %PublicationOwner::Listen.as_str(),
+                                            retry_in = ?retry_after(refusals + 1),
+                                            error = %error,
+                                            "the VM host daemon did not admit the \
+                                             listening port's report; the publish unwound"
+                                        );
+                                    }
+                                    self.plan
+                                        .publications
+                                        .withdraw(port, PublicationOwner::Listen);
+                                    self.unbind_bound_forward(
+                                        port,
+                                        &mapping,
+                                        "unbound a listening port whose report the \
+                                         host-held grant refused",
+                                        "unbinding a listening port whose report the \
+                                         host-held grant refused failed",
+                                    )
+                                    .await;
+                                    return Appearance::Owing;
                                 }
                                 self.plan.gate.admit_published(port);
                                 self.forwards.insert(port, mapping);
@@ -1079,20 +1440,26 @@ impl WatchState {
         }
     }
 
-    /// Unbinds the forward a publish bound under a reservation a revocation
-    /// cleared while the bind was in flight. The revocation never saw this
-    /// forward, so this watcher, the one that holds it, takes it down; the
-    /// gate never admitted the port, so there is nothing to withdraw there.
-    /// A failed unexpose is said and left: the revocation's own pass has
-    /// already run, so there is no later pass to hand it to.
-    async fn unbind_revoked(&mut self, port: u16, mapping: &ExposedMapping) {
+    /// Unbinds a forward this watcher bound and now owes the removal of:
+    /// one a revocation cleared mid-bind, which the revocation's own pass
+    /// never saw, or one whose port report the host-held grant refused
+    /// (T94), whose publish unwinds whole. The gate never admitted either
+    /// port, so there is nothing to withdraw there, and a failed unexpose
+    /// is said and left: no later pass is handed either one.
+    async fn unbind_bound_forward(
+        &mut self,
+        port: u16,
+        mapping: &ExposedMapping,
+        undone: &'static str,
+        failed: &'static str,
+    ) {
         match unexpose_mapping(&self.plan.control, mapping).await {
             Ok(()) => tracing::info!(
                 session = %self.plan.box_name,
                 host = %self.plan.published,
                 port,
                 owner = %PublicationOwner::Listen.as_str(),
-                "unbound a listening port whose publication was revoked mid-bind"
+                "{undone}"
             ),
             Err(e) => tracing::warn!(
                 session = %self.plan.box_name,
@@ -1100,7 +1467,7 @@ impl WatchState {
                 port,
                 owner = %PublicationOwner::Listen.as_str(),
                 error = %e,
-                "unbinding a listening port revoked mid-bind failed"
+                "{failed}"
             ),
         }
     }
@@ -1147,6 +1514,33 @@ impl WatchState {
                 self.plan
                     .publications
                     .withdraw(port, PublicationOwner::Listen);
+                // The host-held grant's row comes down with it (T94): the
+                // runtime port this publication recorded at the VM host
+                // daemon stops being named by a row whose port nothing
+                // publishes any more. Best-effort, like the unexpose
+                // beside it — the forward is already down and the gate
+                // already refuses the port, so a report the door would not
+                // answer leaves a stale row entry, cleared with the row at
+                // the box's destroy, and is said once here: a native host
+                // reports nowhere and withdraws as it always did.
+                if let Err(error) = report_withdrawn_port(
+                    &self.plan.control,
+                    self.plan.lease,
+                    port,
+                    minimald_rpc::PortReportSource::Listen,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        session = %self.plan.box_name,
+                        host = %self.plan.published,
+                        port,
+                        owner = %PublicationOwner::Listen.as_str(),
+                        error = %error,
+                        "reporting the listening port's withdrawal to the VM host daemon \
+                         failed; the host's row still names it"
+                    );
+                }
                 // The withdrawal came down, so the streak of its failures —
                 // if it had one — is over and a later failure is its own.
                 self.reported_withdrawal_failures.remove(&port);

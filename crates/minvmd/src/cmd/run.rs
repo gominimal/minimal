@@ -584,12 +584,7 @@ fn run_foreground() -> Result<()> {
     // boot a registration could still activate against.
     let guest_report_door = crate::control::resolve_control_sock()
         .and_then(|sock_path| {
-            guest_report_door_env(
-                &sock_path,
-                &boxes,
-                &answerer_status,
-                &proxy_publish,
-            )
+            guest_report_door_env(&sock_path, &boxes, &answerer_status, &proxy_publish)
         })
         .ok();
 
@@ -3579,8 +3574,7 @@ mod tests {
         )
         .expect("seeding the blocking file");
         assert!(
-            super::guest_report_door_env(&blocked_sock, &boxes, &answerer, &proxy_publish)
-                .is_err(),
+            super::guest_report_door_env(&blocked_sock, &boxes, &answerer, &proxy_publish).is_err(),
             "a guest-door path held by a non-socket file refuses the bind, and \
              the env the child would register it from"
         );

@@ -2350,7 +2350,14 @@ impl Session {
                 // `allow`, so an `Ok` here is one; every other refusal was
                 // made with the switch asked nothing (NET-047).
                 let outcome = match decided {
-                    Ok(_) => self.publish_exposed_port(&record, port).await,
+                    Ok(_) => {
+                        self.publish_exposed_port(
+                            &record,
+                            port,
+                            minimald_rpc::PortReportSource::Expose,
+                        )
+                        .await
+                    }
                     Err(refusal) => Err(ExposeFailure::Refused(refusal)),
                 };
                 self.answer_expose(
@@ -2470,7 +2477,12 @@ impl Session {
             // allowed ask can end refused, with the switch asked only now
             // (NET-047).
             Some(session_host::AskAnswer::Allowed) => {
-                self.publish_exposed_port(&ask.record, ask.port).await
+                self.publish_exposed_port(
+                    &ask.record,
+                    ask.port,
+                    minimald_rpc::PortReportSource::Ask,
+                )
+                .await
             }
             // The human said deny — or keyed a cancel (Ctrl-C, `q`, Escape),
             // which means the same thing: the box's own deny answer, now in
@@ -2667,11 +2679,18 @@ impl Session {
     /// the box can refuse without asking the switch runs first, so a
     /// refused request is refused with nothing bound and nothing asked
     /// (NET-047). Only then is the switch asked to bind, and the forwarder
-    /// is recorded only once it accepted.
+    /// is recorded only once it accepted. On a VM-backed host the publish
+    /// is still not whole then (T94, NET-138): `source` names the runtime
+    /// surface the report carries — the expose request, an answered ask —
+    /// and the VM host daemon's grant decides the report before the caller
+    /// hears the port is published, so a publish its grant refuses is
+    /// unwound to nothing rather than left as a mapping the host never
+    /// vouched for.
     async fn publish_exposed_port(
         &mut self,
         record: &Record,
         port: u16,
+        source: minimald_rpc::PortReportSource,
     ) -> Result<minimald_rpc::LiveMapping, crate::net::policy::ExposeFailure> {
         use crate::net::policy::{ExposeFailure, ExposeRefusal, expose_dynamic};
 
@@ -2825,6 +2844,46 @@ impl Session {
             crate::net::policy::remove_ingress(&control, &[forwarder]).await;
             return Err(ExposeFailure::Refused(ExposeRefusal::NotAttached));
         }
+        // The VM host daemon's grant decides the publish before the caller
+        // hears it stood (T94, NET-138): the switch's forward is bound but
+        // the runtime cell does not name it yet, so a report the grant
+        // refuses — or a door that never answers it, fail-closed, because a
+        // publish the host never vouched for is not one to leave standing
+        // against its grant either — unwinds to exactly nothing: the forward
+        // comes down, the publication the reservation committed comes out of
+        // the set, and the caller hears the publish failed, carrying the
+        // reason it failed. A native host has no report channel and reports
+        // nothing: its publish stands, admitted by the switch alone, exactly
+        // as it always did. The order is the guard's: the runtime cell is
+        // recorded only once the host vouched for the port, because it has
+        // no per-port removal — a record already pushed is a port that stays
+        // listed until the spawn ends — and the report is answered before
+        // the caller hears anything, so the caller never names a port the
+        // host refused. The one window the fail-closed answer cannot close:
+        // a reply lost after the host recorded the port leaves a row entry
+        // no forward answers, gone with the row at the box's own destroy —
+        // the same stale-entry posture a failed withdrawal already accepts.
+        if let Err(report) =
+            crate::net::listeners::report_admitted_port(&control, switch_address, port, source)
+                .await
+        {
+            self.publications
+                .withdraw(port, crate::net::listeners::PublicationOwner::Expose);
+            crate::net::policy::remove_ingress(&control, &[forwarder]).await;
+            tracing::warn!(
+                session_id = %record.id,
+                name = ?record.name,
+                port,
+                source = ?source,
+                reason = %report,
+                "the VM host daemon did not admit the port report; the \
+                 publish unwound"
+            );
+            return Err(ExposeFailure::Publish {
+                port,
+                source: report,
+            });
+        }
         if let Err(stale) = self
             .live_ingress
             .record(crate::net::provider::LiveIngressForward {
@@ -2838,6 +2897,18 @@ impl Session {
             self.publications
                 .withdraw(port, crate::net::listeners::PublicationOwner::Expose);
             crate::net::policy::remove_ingress(&control, &[stale.forwarder]).await;
+            // The host admitted this port a moment ago, so the box's spawn
+            // ending takes the admission with it: the row the report put in
+            // names a forward that is gone, and the withdrawal report clears
+            // it — best-effort, like the unexpose beside it, because there
+            // is no caller left to propagate a failure to.
+            let _ = crate::net::listeners::report_withdrawn_port(
+                &control,
+                switch_address,
+                port,
+                source,
+            )
+            .await;
             return Err(ExposeFailure::Refused(ExposeRefusal::NotAttached));
         }
         Ok(mapping)
@@ -2898,6 +2969,41 @@ impl Session {
         if !forwarders.is_empty() {
             let control = self.switch_control().await;
             crate::net::policy::remove_ingress(&control, &forwarders).await;
+            // The VM host daemon's row entries go with the forwards (T94,
+            // NET-138): each port this box admitted against the host-held
+            // grant is withdrawn once its forward is down — best-effort like
+            // the unexpose beside it, because a report that fails leaves a
+            // stale row entry, never a live forward, and the box's own
+            // destroy clears the row whole. The revocation takes both runtime
+            // surfaces' publishes down in one sweep and the runtime cell does
+            // not keep which surface published what, so every withdrawal
+            // rides the expose label: a withdrawal is never refused, and the
+            // host removes the port whatever the label says — it is the
+            // log's word, not the row's key.
+            let switch_address = self.record.record().await.ok().and_then(|record| {
+                record
+                    .box_addresses
+                    .map(|addresses| addresses.switch_address)
+            });
+            if let Some(switch_address) = switch_address {
+                for forwarder in &forwarders {
+                    if let Err(error) = crate::net::listeners::report_withdrawn_port(
+                        &control,
+                        switch_address,
+                        forwarder.internal_port(),
+                        minimald_rpc::PortReportSource::Expose,
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            port = forwarder.internal_port(),
+                            reason = %error,
+                            "reporting a stopped box's port withdrawal to the \
+                             VM host daemon failed; the host's row still names it"
+                        );
+                    }
+                }
+            }
         }
 
         // Runtime port-publish asks still waiting on a human (NET-045) fail

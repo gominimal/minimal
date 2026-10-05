@@ -133,8 +133,8 @@ fn run_vmm() -> Result<()> {
     // supervisor with no door (a bind failure, or a supervisor that binds
     // no box table) hands no env, and the guest's runtime publishes then
     // fail their reports instead of being recorded.
-    if let Some(guest_report_sock) = std::env::var_os(crate::control::GUEST_REPORT_SOCK_ENV)
-        .filter(|path| !path.is_empty())
+    if let Some(guest_report_sock) =
+        std::env::var_os(crate::control::GUEST_REPORT_SOCK_ENV).filter(|path| !path.is_empty())
     {
         ctx.add_vsock_port(minimald_rpc::VM_HOST_BOX_REPORT_PORT, &guest_report_sock)
             .context("registering the guest report door's vsock port")?;
