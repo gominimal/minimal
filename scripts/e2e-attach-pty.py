@@ -250,19 +250,35 @@ def write_while_reading(data):
     """Write `data` to the terminal in chunks, reading the session's output
     whenever it is ready, so neither side ever blocks on the other."""
     view = memoryview(data)
+    # Nonblocking for the paste: a blocking write to a pty master can wait
+    # for room past what select() promised, and then nothing reads the
+    # session's output, which waits on this very read.
+    os.set_blocking(fd, False)
+    try:
+        write_nonblocking(view)
+    finally:
+        os.set_blocking(fd, True)
+
+
+def write_nonblocking(view):
     while view and time.monotonic() < DEADLINE:
         readable, writable, _ = select.select([fd], [fd], [], 1.0)
         if readable:
             try:
                 chunk = os.read(fd, 65536)
+            except BlockingIOError:
+                chunk = b""
             except OSError:
                 return
-            if not chunk:
-                return
+            else:
+                if not chunk:
+                    return
             buf.extend(chunk)
         if writable:
             try:
                 view = view[os.write(fd, view[:4096]):]
+            except BlockingIOError:
+                pass
             except OSError:
                 return  # the attach is gone; the main loop sees the EOF
 

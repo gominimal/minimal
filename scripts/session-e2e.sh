@@ -6164,7 +6164,7 @@ if ! mnl ls --raw 2>/dev/null | grep -Fqx "$relay_sid"; then
 fi
 echo "resize reached the session; the detach chord detached"
 
-# 2. Re-attach, paste ~100 KiB of numbered lines into `cat`, end it with
+# 2. Re-attach, paste ~140 KB of numbered lines into `cat`, end it with
 # ctrl-D, and compare checksums. The paste is written while the session's
 # echo is read, as a terminal emulator would.
 relay_paste="$WORK/relay-paste.txt"
