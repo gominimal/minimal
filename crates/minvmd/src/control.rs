@@ -1551,6 +1551,110 @@ pub(crate) fn stop_pending_asks(boxes: &BoxRegistry) {
     );
 }
 
+/// The write end of the stop-signal pipe, or -1 before one is installed:
+/// the signal handler's only state, so the handler does nothing but one
+/// async-signal-safe `write`.
+static STOP_SIGNAL_PIPE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+extern "C" fn on_stop_signal(signum: libc::c_int) {
+    let fd = STOP_SIGNAL_PIPE.load(std::sync::atomic::Ordering::Relaxed);
+    if fd >= 0 {
+        let byte = u8::try_from(signum).unwrap_or(u8::MAX);
+        // SAFETY: write(2) is async-signal-safe; the byte outlives the call.
+        // A full pipe drops the byte, and one byte is already waiting then.
+        let _ = unsafe { libc::write(fd, std::ptr::from_ref(&byte).cast(), 1) };
+    }
+}
+
+/// Make SIGTERM and SIGINT a graceful stop for the pending asks (NET-045):
+/// service managers stop the supervisor with SIGTERM (`systemctl stop`,
+/// `launchctl bootout`, logout and shutdown), and a foreground run is
+/// stopped with SIGINT. The handler only wakes a watcher thread, which
+/// runs [`stop_pending_asks`] (bounded at [`STOP_AUDIT_BOUND`]) and then
+/// hands the signal to `then`. The supervisor passes [`die_by_signal`], so
+/// after the asks are audited the process ends exactly as it did before
+/// the handler existed. Only a crash and SIGKILL stay outside this path.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+pub(crate) fn watch_stop_signals(
+    boxes: BoxRegistry,
+    then: impl FnOnce(libc::c_int) + Send + 'static,
+) -> std::io::Result<()> {
+    let mut fds = [0 as libc::c_int; 2];
+    // SAFETY: `fds` is a valid two-element buffer for pipe(2) to fill.
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: pipe(2) just returned both descriptors; nothing else owns them.
+    let (read_end, write_end) = unsafe {
+        use std::os::fd::FromRawFd;
+        (
+            std::os::fd::OwnedFd::from_raw_fd(fds[0]),
+            std::os::fd::OwnedFd::from_raw_fd(fds[1]),
+        )
+    };
+    // SAFETY: fcntl(2) on descriptors this function owns. Close-on-exec
+    // keeps the pipe out of the VMM child; a non-blocking write end keeps
+    // the handler from ever blocking. The read end blocks: the watcher
+    // thread waits on it.
+    let set = unsafe {
+        libc::fcntl(read_end.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) == 0
+            && libc::fcntl(write_end.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) == 0
+            && libc::fcntl(write_end.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) == 0
+    };
+    if !set {
+        return Err(std::io::Error::last_os_error());
+    }
+    STOP_SIGNAL_PIPE.store(
+        std::os::fd::IntoRawFd::into_raw_fd(write_end),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    for signum in [libc::SIGTERM, libc::SIGINT] {
+        // SAFETY: a zeroed sigaction is a valid starting value; the handler
+        // is an `extern "C" fn(c_int)` doing only an async-signal-safe write,
+        // and SA_RESTART keeps the supervisor's own waits uninterrupted.
+        let installed = unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = on_stop_signal as extern "C" fn(libc::c_int) as usize;
+            action.sa_flags = libc::SA_RESTART;
+            libc::sigemptyset(&raw mut action.sa_mask);
+            libc::sigaction(signum, &raw const action, std::ptr::null_mut())
+        };
+        if installed != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    std::thread::Builder::new()
+        .name("minvmd-stop-signal".into())
+        .spawn(move || {
+            let mut pipe = std::fs::File::from(read_end);
+            let mut byte = [0u8; 1];
+            let signum = loop {
+                match pipe.read(&mut byte) {
+                    Ok(1) => break libc::c_int::from(byte[0]),
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    // The write end is never closed while the process lives.
+                    _ => return,
+                }
+            };
+            tracing::info!(signal = signum, "stop signal received");
+            stop_pending_asks(&boxes);
+            then(signum);
+        })?;
+    Ok(())
+}
+
+/// End the process by `signum` with its default disposition, as it ended
+/// before the stop-signal handler was installed.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+pub(crate) fn die_by_signal(signum: libc::c_int) {
+    // SAFETY: restoring the default disposition and signalling this process
+    // touch no memory; the default action of SIGTERM and SIGINT ends it.
+    unsafe {
+        libc::signal(signum, libc::SIG_DFL);
+        libc::kill(libc::getpid(), signum);
+    }
+}
+
 /// When the last queue-full warn line was written: the line is rate-limited
 /// to one per [`QUEUE_FULL_WARN_EVERY`], because a guest asking in a loop
 /// must not flood the daemon's log; the refusals in between are debug
@@ -4136,6 +4240,53 @@ mod tests {
                     && line.contains(&offer.ask_id.to_string())
                     && line.contains(r#""cause":"minvmd-stopping""#)),
             "the stop's cancellation is audited before the stop returns: {audit}"
+        );
+        assert_eq!(host.boxes.pending_ask_count(), 0);
+        assert_eq!(
+            expect_outcome(&mut guest),
+            AskAdmitOutcome::Refused {
+                ask_id: offer.ask_id,
+                reason: AskRefused::Cancelled,
+                cause: Some(minimald_rpc::AskCancelCause::MinvmdStopping),
+            }
+        );
+    }
+
+    /// A SIGTERM to the supervisor — a service manager's stop — is the same
+    /// graceful stop: the pending ask is cancelled by `minvmd-stopping` and
+    /// audited before the signal is handed on. The hand-on here reports the
+    /// signal instead of ending the test process.
+    #[test]
+    fn stop_signal_cancels_and_audits_pending_asks() {
+        let host = AskHost::start();
+        let web = host.register_ask_box("web");
+        let mut client = attach_client(&host, &web);
+        let mut guest = guest_ask(&host, &web, ASK_PORT);
+        let offer = expect_offer(&mut client);
+
+        let (handed_on, handed_on_rx) = std::sync::mpsc::channel();
+        watch_stop_signals(host.boxes.clone(), move |signum| {
+            let _ = handed_on.send(signum);
+        })
+        .expect("the stop-signal handler installs");
+        // SAFETY: kill(2) on this process; the handler just installed takes
+        // SIGTERM, so the test process is not ended by it.
+        assert_eq!(unsafe { libc::kill(libc::getpid(), libc::SIGTERM) }, 0);
+
+        assert_eq!(
+            handed_on_rx
+                .recv_timeout(ASK_WAIT)
+                .expect("the signal is handed on"),
+            libc::SIGTERM
+        );
+        let audit = host.audit();
+        assert!(
+            audit
+                .lines()
+                .any(|line| line.contains(r#""outcome":"cancelled""#)
+                    && line.contains(&offer.ask_id.to_string())
+                    && line.contains(r#""cause":"minvmd-stopping""#)),
+            "the SIGTERM's cancellation is audited before the signal is handed on: {audit}"
         );
         assert_eq!(host.boxes.pending_ask_count(), 0);
         assert_eq!(

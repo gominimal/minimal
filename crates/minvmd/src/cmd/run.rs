@@ -525,6 +525,14 @@ fn run_foreground() -> Result<()> {
     // addresses each relay carried at the relay's end, and this drainer thread
     // applies the reports for the life of the process (NET-133).
     boxes.spawn_withdrawal_drainer();
+    // SIGTERM (a service manager's stop) and SIGINT cancel and audit every
+    // pending ask before the process ends by the signal as it always did
+    // (NET-045). A handler that cannot be installed leaves the default.
+    if let Err(error) =
+        crate::control::watch_stop_signals(boxes.clone(), crate::control::die_by_signal)
+    {
+        tracing::warn!(%error, "could not install the stop-signal handler");
+    }
 
     // The answerer's state — the host fact the CLI surfaces at session
     // start and on `min ls` — created here so both halves that move it can
