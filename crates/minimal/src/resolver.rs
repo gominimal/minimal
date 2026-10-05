@@ -2249,7 +2249,10 @@ fn verified_copy_steps(install: &AnswererInstall, dir: &str, dest: &str, macos: 
         _ => String::new(),
     };
     format!(
-        " ; p={q}{dir}{q} ; while : ; do find {dq}{d}p{dq} -maxdepth 0 -type d -user root \
+        " ; [ -d {q}{dir}{q} ] || install -d -m 0755 -o root -g {group} {q}{dir}{q} \
+         || {{ echo {q}minimal: {dir} could not be created root-owned; the answerer service \
+         was not installed{q} >&2 ; exit 1 ; }} \
+         ; p={q}{dir}{q} ; while : ; do find {dq}{d}p{dq} -maxdepth 0 -type d -user root \
          -not -perm -g+w -not -perm -o+w -not -perm -1000 | grep -q . || {{ echo {q}minimal:{q} \
          {dq}{d}p{dq}{q}, on the path to {dir}, is not a root-owned, non-sticky directory closed \
          to group and other writes; the answerer service was not installed{q} >&2 ; exit 1 ; }} \
@@ -2484,7 +2487,7 @@ fn linux_answerer_steps(install: &AnswererInstall) -> String {
         )
     };
     format!(
-        " ; mkdir -p {ANSWERER_PROGRAM_DIR}{verified_copy} \
+        "{verified_copy} \
          ; (systemctl stop {unit} {ANSWERER_UNIT_LABEL}.service 2>/dev/null || true) \
          ; cat > {ANSWERER_UNIT_SOCKET_PATH} <<\\{ANSWERER_SOCKET_HEREDOC}\n\
 {answerer_socket}\
@@ -4607,7 +4610,7 @@ mod tests {
         // carry markdown) writes rather than runs.
         let steps_only = command.replace(&program, "").replace(RANGE_UNIT_PLIST, "");
         let (range_steps, answerer_steps) = steps_only
-            .split_once(" ; p=\"")
+            .split_once(" ; [ -d \"")
             .expect("the answerer service's step follows the range's");
         assert!(
             !range_steps.contains('$') && !steps_only.contains('`'),
@@ -5116,7 +5119,7 @@ mod tests {
             .strip_prefix(resolver_steps)
             .unwrap_or_else(|| panic!("the resolver steps lead unchanged: {command}"));
         assert!(
-            answerer_steps.starts_with(" ; mkdir -p /usr/local/lib/minimal"),
+            answerer_steps.starts_with(" ; [ -d '/usr/local/lib/minimal' ] || install -d"),
             "the answerer service's step follows them: {answerer_steps}"
         );
         assert!(
@@ -6431,7 +6434,9 @@ mod tests {
             // arguments are the copy.
             stub(
                 "install",
-                "while [ $# -gt 2 ]; do shift; done\ncp \"$1\" \"$2\"",
+                "if [ \"$1\" = -d ]; then while [ $# -gt 1 ]; do shift; done; \
+                 mkdir -m 0755 \"$1\"; exit; fi\n\
+                 while [ $# -gt 2 ]; do shift; done\ncp \"$1\" \"$2\"",
             );
             stub(
                 "find",
@@ -6525,6 +6530,30 @@ mod tests {
             assert!(!self.dest.exists(), "nothing reaches the destination");
             assert!(self.leftovers().is_empty(), "{:?}", self.leftovers());
         }
+    }
+
+    /// A stock host has no destination dir until the first install: the
+    /// root step creates it root-owned at 0755 (never the umask's mode)
+    /// before the ancestor walk, which then checks the new dir with the rest.
+    #[test]
+    fn privileged_copy_creates_a_missing_destination() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let harness = CopyHarness::new();
+        std::fs::remove_dir(&harness.dest_dir).unwrap();
+
+        let output = harness.run(None);
+        assert!(
+            output.status.success(),
+            "a missing destination is created and the checked bytes install: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let mode = std::fs::metadata(&harness.dest_dir)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(mode, 0o755, "the destination is created at 0755");
+        assert_eq!(std::fs::read(&harness.dest).unwrap(), harness.checked);
     }
 
     /// The privileged step's verified copy (design §7.1): the rendered copy
@@ -6711,12 +6740,12 @@ mod tests {
             3,
             "every failed wait asks the daemons to re-bind: {linux}"
         );
-        // Those three, and the verified copy's three refusals (destination
-        // dir, copy, hash pin), which run before anything is released and
-        // so have nothing to re-bind.
+        // Those three, and the verified copy's four refusals (creating the
+        // destination dir, its ancestor walk, the copy, the hash pin), which
+        // run before anything is released and so have nothing to re-bind.
         assert_eq!(
             linux.matches("exit 1").count(),
-            6,
+            7,
             "and fails the command: {linux}"
         );
         assert!(
