@@ -16941,9 +16941,11 @@ proof_listen_published_port_reaches_peer_and_host() {
 # owes. On the native lane the case runs whole:
 #
 #   * an allow box — `min net expose 3000` publishes, the reply names the
-#     address the box's forward bound, the daemon's expose record (NET-040's
-#     observability record, one per mapping) records the same address, and the
-#     host's own probe at that address meets the contract NET-047 pins for a
+#     address the box's forward bound, the publish's own record (the one
+#     info line NET-044's observability owes every decided request; the
+#     NET-040 attach record names only a create's declared mappings, and
+#     this box declares none) records the same address, and the host's own
+#     probe at that address meets the contract NET-047 pins for a
 #     runtime-only port: the publish is BOUND on the host, but the box's
 #     relay gate has not admitted it — the gate's set is the declared ports
 #     plus the listen watcher's publishes (switch.rs `admits_tcp`), and an
@@ -17021,21 +17023,38 @@ proof_expose_from_inside_box() {
     return 0
   fi
 
-  # The expose record this case reads (NET-040) rides the daemon's log at
-  # info under a module the lane's `warn` filter drops, so the daemon restarts
-  # under the pin the port-publish half uses and the lane's filter goes back
-  # afterwards. The audit log needs no pin: it is a file the daemon appends
-  # whatever the filter. This is a native lane by the split above, so its log
-  # is this host's (hook_log_readable).
+  # The record the runtime publish owes (NET-044's observability: one info
+  # line per request, the session actor's `answer_expose` line) rides the
+  # daemon's log at info under a module the lane's `warn` filter drops, so
+  # the daemon restarts under a pin that carries it and the lane's filter
+  # goes back to afterwards. The NET-040 attach record is NOT this case's:
+  # it names only the mappings a create declared, and every box here declares
+  # none — so the publish's own line is the one record on the host that
+  # names the address it bound. The audit log needs no pin: it is a file the
+  # daemon appends whatever the filter. This is a native lane by the split
+  # above, so its log is this host's (hook_log_readable).
   mnl stop >/dev/null 2>&1 || true # a standalone run has no daemon yet
   eib_saved_rust_log="${RUST_LOG:-}"
-  export RUST_LOG="warn,minimald::net::gvproxy_network=info"
+  export RUST_LOG="warn,minimald::session=info"
   eib_restore_log() {
     if [ -n "$eib_saved_rust_log" ]; then export RUST_LOG="$eib_saved_rust_log"; else unset RUST_LOG; fi
   }
   eib_daemon_log() {
     find "$XDG_STATE_HOME/minimal/logs" -name 'minimald.log.*' -type f 2>/dev/null \
       | sort | tail -n1
+  }
+  # The publish's own record (the one info line a decided request owes,
+  # `answer_expose`'s): the one line on the host naming the address the
+  # forward bound. Each field is matched on its own — the file sink's key
+  # order is the subscriber's, not the record's — and the port, a JSON
+  # number, is matched with the delimiter that ends it, so a longer number
+  # sharing the prefix cannot. $1 = the log file, $2 = the box name, $3 =
+  # the port; prints the newest published record, nothing when none names
+  # the box.
+  eib_publish_record() {
+    grep -h -- 'dynamic ingress expose' "$1" 2>/dev/null \
+      | grep -F -- "\"name\":\"$2\"" | grep -E -- "\"port\":$3[,}]" \
+      | grep -F -- '"outcome":"published"' | tail -n1
   }
 
   # The audit record a decision owes (NET-046): argv-driven like the mnx
@@ -17168,32 +17187,32 @@ PY
   echo "the allow stance published: $eib_out (NET-043)"
   eib_addr="$(printf '%s\n' "$eib_out" | sed -n "s/^published port $eib_port at \(.*\):$eib_port.*/\1/p")"
 
-  # The address the daemon recorded for the publish (NET-040): the expose
-  # record is the one place on the host that names it, and the reply the box
-  # read must name the same address — the box's own word and the daemon's
-  # record agree, or one of them is wrong.
+  # The address the daemon recorded for the publish: the publish's own
+  # record (the one info line the request owed) is the one place on the host
+  # that names it, and the reply the box read must name the same address —
+  # the box's own word and the daemon's record agree, or one of them is
+  # wrong.
   eib_log="$(eib_daemon_log)"
   eib_rec=""
   for _ in $(seq 1 10); do
-    eib_rec="$(grep -h -- 'exposed ingress port on the host loopback' "$eib_log" 2>/dev/null \
-      | grep -F -- "\"session\":\"$eib_allow_name\"" | tail -n1)"
+    eib_rec="$(eib_publish_record "$eib_log" "$eib_allow_name" "$eib_port")"
     [ -n "$eib_rec" ] && break
     sleep 0.25
   done
   if [ -z "$eib_rec" ]; then
-    echo "::error::no expose record in the daemon log names the allow box — the publish has no recorded address (NET-040)"
+    echo "::error::no publish record in the daemon log names the allow box — the publish has no recorded address (NET-044)"
     echo "--- daemon log (tail) ---"; tail -20 "$eib_log" 2>/dev/null || true
     eib_restore_log
     fail
   fi
-  eib_rec_addr="$(published_loopback_host "$eib_log" "$eib_allow_name")"
+  eib_rec_addr="$(printf '%s\n' "$eib_rec" | sed -n 's/.*"local":"\([0-9][0-9.]*:[0-9]*\)".*/\1/p')"
   echo "daemon log: $eib_rec"
-  if [ -n "$eib_addr" ] && [ "$eib_addr" != "$eib_rec_addr" ]; then
-    echo "::error::the reply named $eib_addr but the daemon recorded ${eib_rec_addr:-no address} — the box was told a different address than the one its forward bound"
+  if [ -n "$eib_addr" ] && [ "$eib_addr:$eib_port" != "$eib_rec_addr" ]; then
+    echo "::error::the reply named $eib_addr:$eib_port but the daemon recorded ${eib_rec_addr:-no address} — the box was told a different address than the one its forward bound"
     eib_restore_log
     fail
   fi
-  echo "recorded address: the daemon's expose record and the reply agree on ${eib_rec_addr:-$eib_addr} (NET-040)"
+  echo "recorded address: the daemon's publish record and the reply agree on $eib_rec_addr (NET-044)"
 
   # The listener inside the box, started after the publish the way the mnx
   # case starts its own: its own direct answer proves the port answers
@@ -17464,13 +17483,12 @@ exit' E2E_PTY_ASK=deny E2E_PTY_ANSWER=keep \
       fail
       ;;
   esac
-  if grep -h -- 'exposed ingress port on the host loopback' "$eib_log" 2>/dev/null \
-     | grep -qF -- "\"session\":\"$eib_no_name\""; then
-    echo "::error::the daemon's log carries an expose record for the answered-no ask box — nothing was bound, so nothing may be recorded (NET-040)"
+  if [ -n "$(eib_publish_record "$eib_log" "$eib_no_name" "$eib_port")" ]; then
+    echo "::error::the daemon's log carries a publish record for the answered-no ask box — nothing was bound, so nothing may be recorded (NET-044)"
     eib_restore_log
     fail
   fi
-  echo "records nothing: no live row, no expose record — the deny stood (NET-044, NET-045)"
+  echo "records nothing: no live row, no publish record — the deny stood (NET-044, NET-045)"
   if ! eib_audit_assert "$eib_no_name" "$eib_port" ask attached-human refused \
       "dynamic ingress is denied for this box" \
       >"$WORK/eib-no-audit.out" 2>"$WORK/eib-no-audit.err"; then
