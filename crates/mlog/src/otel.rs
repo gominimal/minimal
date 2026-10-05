@@ -2158,8 +2158,8 @@ mod tests {
 
     /// Both kinds of endpoint get a client in an environment with CA roots
     /// (an `https` one through the platform verifier, as before). The no-roots
-    /// case needs a process that finds no CA roots on disk, so it is not a
-    /// unit test here.
+    /// case needs a process that finds no CA roots on disk, so it is the
+    /// integration test `tests/otel_without_ca_roots.rs`.
     #[test]
     fn http_and_https_endpoints_get_a_client() {
         if reqwest::blocking::Client::builder().build().is_err() {
