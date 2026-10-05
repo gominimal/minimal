@@ -496,8 +496,14 @@ chmod 700 "$XDG_RUNTIME_DIR"
 # that variable means "a VM-style switch on the default 100.64/16 is wired",
 # and the proofs gated on it hardcode that subnet's reserved addresses,
 # while a native minimald runs a per-daemon /24 (minimald server.rs,
-# switch_subnet_for). Only proof_own_ip and
-# proof_own_ip_egress_declared_and_enforced accept this signal. Nor is
+# switch_subnet_for). The own-IP proofs and the runtime-publish proofs
+# accept this signal: proof_own_ip,
+# proof_own_ip_egress_declared_and_enforced,
+# proof_min_net_expose_publishes_lists_and_refuses,
+# proof_listen_published_port_reaches_peer_and_host and
+# proof_expose_from_inside_box — the latter three taking the switch's own
+# address from the daemon's expose record or its answer, never from the
+# 100.64/16 constants a VM switch guarantees. Nor is
 # MINIMAL_BIN exported: every MINIMAL_BIN in this file is call-local by
 # design (the browser-path proof reads the lane's own prefix), so mnl
 # hands the staged dir to the autospawned daemon per call instead. VM
@@ -16036,8 +16042,8 @@ proof_min_net_expose_publishes_lists_and_refuses() {
   local mnx_marker="MNX_EXPOSE_OK"
   local MNX_SEED_DIR="" MNX_DENY_SEED_DIR=""
 
-  if [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
-    echo "min net expose SKIPPED (no MINVMD_GVPROXY_BIN: this target has no switch, so a box has no address to publish at)"
+  if [ -z "${MINVMD_GVPROXY_BIN:-}" ] && [ -z "$E2E_NATIVE_SWITCH" ]; then
+    echo "min net expose SKIPPED (no switch: neither MINVMD_GVPROXY_BIN (VM) nor E2E_NATIVE_SWITCH (native) is set — a box has no address to publish at)"
     echo "::endgroup::"
     return 0
   fi
@@ -16407,8 +16413,8 @@ proof_listen_published_port_reaches_peer_and_host() {
   local lp_stance="allow"            # the target's stance; deny on a VM lane (T84)
   local LP_SEED_DIR="" LP_PEER_SEED_DIR=""
 
-  if [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
-    echo "listen-published port SKIPPED (no MINVMD_GVPROXY_BIN: this target has no switch, so a box has no address to publish at)"
+  if [ -z "${MINVMD_GVPROXY_BIN:-}" ] && [ -z "$E2E_NATIVE_SWITCH" ]; then
+    echo "listen-published port SKIPPED (no switch: neither MINVMD_GVPROXY_BIN (VM) nor E2E_NATIVE_SWITCH (native) is set — a box has no address to publish at)"
     echo "::endgroup::"
     return 0
   fi
