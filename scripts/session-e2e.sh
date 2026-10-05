@@ -17157,6 +17157,14 @@ proof_listen_published_port_reaches_peer_and_host() {
     echo "::error::the peer never reached the in-range listen — the watcher did not publish what the stance allows (NET-016)"
     echo "  last attempt: curl exit ${lp_rc:-<none>}, status ${lp_status:-<none>}, body '${lp_body:-<none>}'"
     cat "$WORK/lp-peer.err" 2>/dev/null || true
+    if [ -n "${E2E_VM:-}" ]; then
+      # The guest daemon logs to the VM console, and the diagnostics keep only
+      # its tail: pull the listen path's own records out of the whole console.
+      echo "--- guest listen path (boot console, filtered) ---"
+      grep -aE 'listen plan|listen watcher|leader|listening sockets|listen verdict|admitting a listen|listening port|socket table' \
+        "${MINVMD_BOOT_LOG:-$XDG_STATE_HOME/minimal/providers/local-minvmd0/boot.log}" 2>/dev/null | tail -60 \
+        || echo "(no listen-path records in the boot console)"
+    fi
     fail
   fi
   echo "peer: GET http://$lp_peer_host:$lp_listen_port/ from the peer box -> HTTP 200 carrying $lp_marker — a listen the range allows is published with no expose (NET-016)"
