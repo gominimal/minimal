@@ -219,8 +219,8 @@ pub fn attach_command(
 /// (attach-start termios, session output buffered) and whose `resume`
 /// takes it back. The hook thread is not joined: an attach that ends
 /// while a prompt is up still exits with ssh's status, and every handle
-/// call after that is a no-op or an error. `None` for callers that just
-/// attach: the CLI and the TUI today.
+/// call after that is a no-op or an error. The VM-backed attach hands
+/// [`HostAsks::into_hook`]; `None` for callers that just attach.
 ///
 /// The exec path (`wire: Some`) never comes here: the caller runs ssh
 /// itself, with no relay and no pty.
@@ -252,6 +252,290 @@ pub fn run_interactive_attach_on(
         }
     }
     relay.join(None)
+}
+
+// ---------------------------------------------------------------------------
+// Host-side asks (NET-045)
+// ---------------------------------------------------------------------------
+
+/// The VM host daemon's control socket's file name beside its ssh socket:
+/// `minvmd::control::CONTROL_SOCK_FILE`, spelled here because this crate
+/// does not depend on the VM host daemon; the CLI's tests pin the two equal.
+pub const VM_HOST_CONTROL_SOCK_FILE: &str = "control.sock";
+
+/// How long one exchange with the VM host daemon's control socket may take:
+/// the row read, the subscription's acknowledgement, and a recorded answer.
+/// The subscription itself is held for the whole attach, with no bound.
+const HOST_ASK_CONTROL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// An interactive attach's subscription to its box's pending asks on a
+/// VM-backed host (NET-045): the VM host daemon offers each ask the in-VM
+/// daemon raises to every interactive attach subscribed to the box's row,
+/// and this side renders the dialog on the real terminal and records the
+/// human's answer through the host door. Only an interactive relay attach
+/// subscribes: an exec channel, a task and `min dash`'s list view never do,
+/// so none of them counts as attached.
+///
+/// Opened before the attach starts, so the subscription is in place by the
+/// time the human could expose a port; served for the attach's duration
+/// by the relay's suspend hook ([`Self::into_hook`]).
+pub struct HostAsks {
+    control_sock: std::path::PathBuf,
+    subscription: std::io::BufReader<std::os::unix::net::UnixStream>,
+}
+
+/// The terminal side of the ask dialog: the relay's suspend and resume, as
+/// a trait so the serving loop is testable without a pty.
+pub trait AskTerminal {
+    /// Hand the real terminal to the dialog: the relay stops forwarding and
+    /// puts the attach-start termios back. Errors once the attach ended.
+    fn suspend_for_ask(&self) -> Result<(), anyhow::Error>;
+    /// Take the terminal back and resume relaying.
+    fn resume_after_ask(&self);
+    /// Whether the session ended while the dialog held the terminal: a
+    /// cancelled dialog records nothing.
+    fn ask_cancelled(&self) -> bool;
+}
+
+impl AskTerminal for tty_relay::RelayHandle {
+    fn suspend_for_ask(&self) -> Result<(), anyhow::Error> {
+        // The lease is not held: the handle's resume ends the suspension.
+        self.suspend().map(drop)
+    }
+
+    fn resume_after_ask(&self) {
+        self.resume();
+    }
+
+    fn ask_cancelled(&self) -> bool {
+        self.is_cancelled()
+    }
+}
+
+/// One request line to the VM host daemon's control socket, one reply line
+/// back, both bounded by [`HOST_ASK_CONTROL_TIMEOUT`]; the connection is
+/// handed back for a caller that keeps it.
+fn host_control(
+    control_sock: &Path,
+    request: &minimald_rpc::BoxControlRequest,
+) -> Result<
+    (
+        minimald_rpc::BoxControlReply,
+        std::io::BufReader<std::os::unix::net::UnixStream>,
+    ),
+    anyhow::Error,
+> {
+    use std::io::{BufRead as _, Write as _};
+    let mut stream = std::os::unix::net::UnixStream::connect(control_sock).with_context(|| {
+        format!(
+            "connecting to the VM host daemon's control socket at {}",
+            control_sock.display()
+        )
+    })?;
+    stream.set_read_timeout(Some(HOST_ASK_CONTROL_TIMEOUT))?;
+    stream.set_write_timeout(Some(HOST_ASK_CONTROL_TIMEOUT))?;
+    let mut line = serde_json_lenient::to_string(request).context("serializing the request")?;
+    line.push('\n');
+    stream.write_all(line.as_bytes())?;
+    let mut reader = std::io::BufReader::new(stream);
+    let mut reply = String::new();
+    reader.read_line(&mut reply)?;
+    if reply.trim().is_empty() {
+        anyhow::bail!("the VM host daemon closed its control socket without answering");
+    }
+    let reply = serde_json_lenient::from_str(reply.trim())
+        .with_context(|| format!("the VM host daemon's reply did not parse: {reply}"))?;
+    Ok((reply, reader))
+}
+
+impl HostAsks {
+    /// Subscribe to the pending asks of the box whose row is named
+    /// `box_name` on the VM host daemon at `control_sock`: the row read
+    /// answers the row's host-minted box id, and the subscription is keyed
+    /// by that id, never by a name a guest could report.
+    ///
+    /// # Errors
+    ///
+    /// The socket did not answer, no live row carries the name, or the
+    /// daemon refused the subscription.
+    pub fn subscribe(control_sock: &Path, box_name: &str) -> Result<Self, anyhow::Error> {
+        let (row, _) = host_control(
+            control_sock,
+            &minimald_rpc::BoxControlRequest::ReadRow(minimald_rpc::ReadRowRequest {
+                name: box_name.to_string(),
+            }),
+        )?;
+        let box_id = match row {
+            minimald_rpc::BoxControlReply::Row(row) => row.box_id,
+            minimald_rpc::BoxControlReply::NoRow { .. } => {
+                anyhow::bail!("the VM host daemon holds no row for box {box_name:?}")
+            }
+            other => anyhow::bail!("the VM host daemon answered the row read with {other:?}"),
+        };
+        let (ack, subscription) = host_control(
+            control_sock,
+            &minimald_rpc::BoxControlRequest::SubscribeAsks(minimald_rpc::SubscribeAsksRequest {
+                box_id,
+            }),
+        )?;
+        match ack {
+            minimald_rpc::BoxControlReply::AsksSubscribed { .. } => {}
+            minimald_rpc::BoxControlReply::Error { error } => {
+                anyhow::bail!("the VM host daemon refused the ask subscription: {error}")
+            }
+            other => anyhow::bail!("the VM host daemon answered the subscription with {other:?}"),
+        }
+        // Held for the attach's whole life: offers arrive whenever the box
+        // asks, so the read has no bound.
+        subscription.get_ref().set_read_timeout(None)?;
+        tracing::info!(box = %box_name, "subscribed to the box's pending asks on the VM host");
+        Ok(Self {
+            control_sock: control_sock.to_path_buf(),
+            subscription,
+        })
+    }
+
+    /// [`Self::subscribe`] on the VM host daemon's control socket beside
+    /// the daemon's ssh socket `ssh_sock`, for a caller that does not know
+    /// whether the daemon is VM-backed: anything but a subscription — no
+    /// such socket, a native daemon's socket that serves no rows, no row
+    /// for the box — is `None`, said at debug.
+    pub fn subscribe_beside(ssh_sock: &Path, box_name: &str) -> Option<Self> {
+        let control_sock = ssh_sock.parent()?.join(VM_HOST_CONTROL_SOCK_FILE);
+        if !control_sock.exists() {
+            return None;
+        }
+        Self::subscribe(&control_sock, box_name)
+            .inspect_err(|error| {
+                tracing::debug!(box = %box_name, error = %format!("{error:#}"), "no host-side ask subscription");
+            })
+            .ok()
+    }
+
+    /// The relay's suspend hook: serve the subscription for the attach's
+    /// duration, rendering each offer with [`render_ask_dialog`].
+    pub fn into_hook(self) -> tty_relay::SuspendHook {
+        Box::new(move |handle| self.serve(handle, render_ask_dialog))
+    }
+
+    /// Serve offers until the subscription ends: for each, suspend the
+    /// relay, render the dialog with `dialog`, record its answer through
+    /// the host door, and resume. An offer the daemon already dismissed is
+    /// skipped; an attach that ended under the dialog records nothing.
+    pub fn serve<T: AskTerminal>(
+        mut self,
+        terminal: &T,
+        mut dialog: impl FnMut(&minimald_rpc::PendingAskOffer) -> minimald_rpc::AskAnswer,
+    ) {
+        use std::io::BufRead as _;
+        loop {
+            let mut line = String::new();
+            match self.subscription.read_line(&mut line) {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {}
+            }
+            let offer = match serde_json_lenient::from_str(line.trim()) {
+                Ok(minimald_rpc::BoxControlReply::PendingAskOffer(offer)) => offer,
+                Ok(_) | Err(_) => continue,
+            };
+            if self.dismissed_already(offer.ask_id) {
+                continue;
+            }
+            if terminal.suspend_for_ask().is_err() {
+                return;
+            }
+            tracing::info!(
+                ask_id = %offer.ask_id,
+                box = %offer.name,
+                port = offer.port,
+                "showing the host-side ask dialog"
+            );
+            let answer = dialog(&offer);
+            if terminal.ask_cancelled() {
+                return;
+            }
+            tracing::info!(ask_id = %offer.ask_id, answer = ?answer, "the ask dialog was answered");
+            if let Err(error) = self.record(offer.ask_id, answer) {
+                tracing::warn!(ask_id = %offer.ask_id, %error, "the ask answer was not recorded");
+                eprintln!("The answer was not recorded: {error:#}");
+            }
+            terminal.resume_after_ask();
+        }
+    }
+
+    /// Whether a dismissal for `ask_id` is already buffered behind its
+    /// offer: another attach answered first, so there is no dialog to show.
+    fn dismissed_already(&self, ask_id: minimald_rpc::AskId) -> bool {
+        String::from_utf8_lossy(self.subscription.buffer())
+            .lines()
+            .filter_map(|line| serde_json_lenient::from_str(line.trim()).ok())
+            .any(|reply| {
+                matches!(
+                    reply,
+                    minimald_rpc::BoxControlReply::PendingAskDismissed { ask_id: id, .. }
+                        if id == ask_id
+                )
+            })
+    }
+
+    /// Record `answer` for `ask_id` through the host door.
+    fn record(
+        &self,
+        ask_id: minimald_rpc::AskId,
+        answer: minimald_rpc::AskAnswer,
+    ) -> Result<(), anyhow::Error> {
+        let (reply, _) = host_control(
+            &self.control_sock,
+            &minimald_rpc::BoxControlRequest::RecordAskAnswer(
+                minimald_rpc::RecordAskAnswerRequest { ask_id, answer },
+            ),
+        )?;
+        match reply {
+            minimald_rpc::BoxControlReply::AskAnswerRecorded { .. } => Ok(()),
+            minimald_rpc::BoxControlReply::Error { error } => {
+                anyhow::bail!(
+                    "the VM host daemon refused it ({error}); another attach may have answered first"
+                )
+            }
+            other => anyhow::bail!("the VM host daemon answered with {other:?}"),
+        }
+    }
+}
+
+/// The dialog's question, built from the offer's host-row fields alone: the
+/// box's name as the host row holds it, the protocol and the port. Control
+/// characters are dropped so nothing in a name can drive the terminal.
+#[must_use]
+pub fn ask_dialog_text(offer: &minimald_rpc::PendingAskOffer) -> String {
+    let name: String = offer.name.chars().filter(|c| !c.is_control()).collect();
+    format!(
+        "Box '{name}' asks to publish {} port {} to the host. Allow?",
+        offer.proto, offer.port
+    )
+}
+
+/// The dialog's end as the answer recorded for it: a yes only for an
+/// explicit yes; a no for a no, Ctrl-C, Escape and a closed or failed
+/// input; and no-tty when there was no terminal to render on.
+#[must_use]
+pub fn ask_answer_from(result: Result<bool, inquire::InquireError>) -> minimald_rpc::AskAnswer {
+    match result {
+        Ok(true) => minimald_rpc::AskAnswer::Yes,
+        Err(inquire::InquireError::NotTTY) => minimald_rpc::AskAnswer::NoTty,
+        Ok(false) | Err(_) => minimald_rpc::AskAnswer::No,
+    }
+}
+
+/// Render the ask dialog with `inquire` on the real terminal, in the
+/// attach-start termios the suspended relay put back, defaulting to no.
+#[must_use]
+pub fn render_ask_dialog(offer: &minimald_rpc::PendingAskOffer) -> minimald_rpc::AskAnswer {
+    ask_answer_from(
+        inquire::Confirm::new(&ask_dialog_text(offer))
+            .with_default(false)
+            .with_help_message("y allows the publish; n, Esc or Ctrl-C refuses it")
+            .prompt(),
+    )
 }
 
 /// The single command string to hand `ssh`, or `None` for the interactive

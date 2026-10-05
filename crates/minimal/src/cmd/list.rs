@@ -38,7 +38,15 @@ pub(crate) async fn cmd_bare(global: &GlobalArgs) -> Result<(), anyhow::Error> {
                 session_name = ?entry.name,
                 "found session"
             );
-            session_via_ssh(&sock, entry.id, None, global.config_dir.as_deref()).await
+            let host_asks = super::session::host_asks_box(global, entry.name.as_deref());
+            session_via_ssh(
+                &sock,
+                entry.id,
+                None,
+                global.config_dir.as_deref(),
+                host_asks.as_deref(),
+            )
+            .await
         }
         // Two ways to land on create-and-attach: no sessions exist at all
         // (first run), or the ambiguity picker's `+ Create a new session`

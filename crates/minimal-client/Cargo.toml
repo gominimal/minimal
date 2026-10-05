@@ -13,6 +13,9 @@ async-compression.workspace = true
 async-tar.workspace = true
 constcat.workspace = true
 indicatif.workspace = true
+# `inquire` renders the host-side ask dialog (NET-045) on the real terminal
+# while the relay is suspended, the same prompt library the CLI uses.
+inquire.workspace = true
 # `libc` is only for the winsize ioctls (TIOCGWINSZ/TIOCSWINSZ) in
 # `tty_relay`: nix has no winsize helpers, and minimald's pty module set
 # the same precedent.
