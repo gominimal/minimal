@@ -171,7 +171,8 @@ async fn register_box_with_vm_host(
         | minimald_rpc::BoxControlReply::PendingAskOffer(_)
         | minimald_rpc::BoxControlReply::PendingAskDismissed { .. }
         | minimald_rpc::BoxControlReply::AskAnswerRecorded { .. }
-        | minimald_rpc::BoxControlReply::AskAdmit(_)) => {
+        | minimald_rpc::BoxControlReply::AskAdmit(_)
+        | minimald_rpc::BoxControlReply::AskAlreadyEnded { .. }) => {
             anyhow::bail!(
                 "the VM host daemon answered the box registration with an ask \
                  verb's reply {other:?}; the registration did not happen"
@@ -432,7 +433,8 @@ pub(crate) async fn withdraw_box_row(
             | minimald_rpc::BoxControlReply::PendingAskOffer(_)
             | minimald_rpc::BoxControlReply::PendingAskDismissed { .. }
             | minimald_rpc::BoxControlReply::AskAnswerRecorded { .. }
-            | minimald_rpc::BoxControlReply::AskAdmit(_)) => {
+            | minimald_rpc::BoxControlReply::AskAdmit(_)
+            | minimald_rpc::BoxControlReply::AskAlreadyEnded { .. }) => {
                 tracing::warn!(
                     box = %name,
                     reply = ?other,
@@ -4046,6 +4048,82 @@ mod tests {
         assert_eq!(row.runtime_port_numbers(), vec![3000]);
     }
 
+    /// Two attaches are offered one ask; the first records a no while the
+    /// second's dialog is still up. The second's late yes is told the ask
+    /// was already denied, and admits nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn late_attach_answer_admits_nothing() {
+        let stand = AskStand::start();
+        let web = stand.register("web", DynamicIngress::Ask).await;
+        let subscribe = || {
+            let control = stand.control.clone();
+            tokio::task::spawn_blocking(move || {
+                minimal_client::attach::HostAsks::subscribe(&control, "web")
+            })
+        };
+        let first = subscribe()
+            .await
+            .unwrap()
+            .expect("the first attach subscribes");
+        let second = subscribe()
+            .await
+            .unwrap()
+            .expect("the second attach subscribes");
+        // The second dialog is up before the first answers, and answers
+        // only once the first's no is recorded.
+        let (shown, shown_rx) = std::sync::mpsc::channel::<()>();
+        let (first_done, first_done_rx) = std::sync::mpsc::channel::<()>();
+        let (first_offers, first_offers_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (events, _) = std::sync::mpsc::channel();
+            first.serve(&RecordingTerminal(events), |offer| {
+                let _ = shown_rx.recv();
+                let _ = first_offers.send(offer.clone());
+                minimald_rpc::AskAnswer::No
+            });
+        });
+        let (events, events_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            second.serve(&RecordingTerminal(events), |_| {
+                let _ = shown.send(());
+                let _ = first_done_rx.recv();
+                minimald_rpc::AskAnswer::Yes
+            });
+        });
+        let reply = stand.guest_ask(&web, 3000);
+        first_offers
+            .recv_timeout(ASK_WAIT)
+            .expect("the first dialog is shown");
+        let minimald_rpc::BoxControlReply::AskAdmit(outcome) =
+            reply.recv_timeout(ASK_WAIT).unwrap()
+        else {
+            panic!("the guest's ask is answered with its end");
+        };
+        assert!(matches!(
+            outcome,
+            minimald_rpc::AskAdmitOutcome::Refused {
+                reason: minimald_rpc::AskRefused::Denied,
+                ..
+            }
+        ));
+        first_done.send(()).unwrap();
+        assert_eq!(events_rx.recv_timeout(ASK_WAIT).unwrap(), "suspend");
+        assert_eq!(
+            events_rx.recv_timeout(ASK_WAIT).unwrap(),
+            "resume",
+            "the late dialog resumes the relay"
+        );
+        assert!(
+            stand
+                .registry
+                .row_by_name("web")
+                .unwrap()
+                .runtime_port_numbers()
+                .is_empty(),
+            "the late yes admitted nothing"
+        );
+    }
+
     /// Ctrl-C at the dialog is a no: the client records no through the host
     /// door, nothing is admitted, and the relay resumes. Escape and a closed
     /// input are a no the same way; no terminal at all is recorded as such.
@@ -4100,6 +4178,7 @@ mod tests {
                     | minimald_rpc::AskAdmitOutcome::Admitted { ask_id, .. } => ask_id,
                 },
                 reason: minimald_rpc::AskRefused::Denied,
+                cause: None,
             },
             "Ctrl-C records a no"
         );

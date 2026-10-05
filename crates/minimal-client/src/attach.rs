@@ -455,9 +455,18 @@ impl HostAsks {
                 return;
             }
             tracing::info!(ask_id = %offer.ask_id, answer = ?answer, "the ask dialog was answered");
-            if let Err(error) = self.record(offer.ask_id, answer) {
-                tracing::warn!(ask_id = %offer.ask_id, %error, "the ask answer was not recorded");
-                eprintln!("The answer was not recorded: {error:#}");
+            match self.record(offer.ask_id, answer) {
+                Ok(None) => {}
+                // Another attach ended the ask first: say how it really
+                // ended, not what this dialog chose.
+                Ok(Some(late)) => {
+                    tracing::info!(ask_id = %offer.ask_id, %late, "the ask had already ended");
+                    eprintln!("{late}");
+                }
+                Err(error) => {
+                    tracing::warn!(ask_id = %offer.ask_id, %error, "the ask answer was not recorded");
+                    eprintln!("The answer was not recorded: {error:#}");
+                }
             }
             terminal.resume_after_ask();
         }
@@ -478,12 +487,14 @@ impl HostAsks {
             })
     }
 
-    /// Record `answer` for `ask_id` through the host door.
+    /// Record `answer` for `ask_id` through the host door. `Ok(Some)` is
+    /// the line saying how the ask had already ended when the answer came
+    /// late; nothing was recorded then.
     fn record(
         &self,
         ask_id: minimald_rpc::AskId,
         answer: minimald_rpc::AskAnswer,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<Option<String>, anyhow::Error> {
         let (reply, _) = host_control(
             &self.control_sock,
             &minimald_rpc::BoxControlRequest::RecordAskAnswer(
@@ -491,13 +502,38 @@ impl HostAsks {
             ),
         )?;
         match reply {
-            minimald_rpc::BoxControlReply::AskAnswerRecorded { .. } => Ok(()),
+            minimald_rpc::BoxControlReply::AskAnswerRecorded { .. } => Ok(None),
+            minimald_rpc::BoxControlReply::AskAlreadyEnded {
+                port,
+                proto,
+                already_ended,
+                ..
+            } => Ok(Some(late_answer_line(port, proto, already_ended))),
             minimald_rpc::BoxControlReply::Error { error } => {
-                anyhow::bail!(
-                    "the VM host daemon refused it ({error}); another attach may have answered first"
-                )
+                anyhow::bail!("the VM host daemon refused it: {error}")
             }
             other => anyhow::bail!("the VM host daemon answered with {other:?}"),
+        }
+    }
+}
+
+/// The one line a late answer prints: how the ask it answered had already
+/// ended, as the VM host daemon recorded it.
+#[must_use]
+pub fn late_answer_line(
+    port: u16,
+    proto: sessions::IpProto,
+    end: minimald_rpc::AskLateEnd,
+) -> String {
+    match end {
+        minimald_rpc::AskLateEnd::Allowed => {
+            format!("ask {port}/{proto} was already allowed by another attach")
+        }
+        minimald_rpc::AskLateEnd::Denied => {
+            format!("ask {port}/{proto} was already denied by another attach")
+        }
+        minimald_rpc::AskLateEnd::Cancelled { cause } => {
+            format!("ask {port}/{proto} was cancelled ({cause})")
         }
     }
 }
@@ -620,6 +656,31 @@ pub fn checked_remote_command(command: &[String]) -> anyhow::Result<Option<Strin
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    /// A late answer prints exactly how the ask had already ended.
+    #[test]
+    fn late_answer_line_names_the_real_end() {
+        use minimald_rpc::{AskCancelCause, AskLateEnd};
+        let tcp = sessions::IpProto::Tcp;
+        assert_eq!(
+            late_answer_line(3000, tcp, AskLateEnd::Allowed),
+            "ask 3000/tcp was already allowed by another attach"
+        );
+        assert_eq!(
+            late_answer_line(3000, tcp, AskLateEnd::Denied),
+            "ask 3000/tcp was already denied by another attach"
+        );
+        assert_eq!(
+            late_answer_line(
+                3000,
+                tcp,
+                AskLateEnd::Cancelled {
+                    cause: AskCancelCause::GuestClosed
+                }
+            ),
+            "ask 3000/tcp was cancelled (the guest connection closed)"
+        );
+    }
 
     #[test]
     fn attach_command_targets_the_provider_alias() {
