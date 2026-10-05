@@ -165,7 +165,9 @@ impl Exec for TaskExec {
 /// rollout ends at stays proven while the default is only announced
 /// (NET-076) — and `deny_all_opt_out` is the daemon's opt-out (NET-077),
 /// read through the session handle so a task resolves its egress exactly as
-/// the launcher did.
+/// the launcher did. It carries no classifier decision either (NET-079):
+/// a task places no leaf in the cohort's subtrees, so no per-box verdict
+/// is its plan's to follow.
 ///
 /// A gate is attached only where that egress has rules to enforce: the
 /// deny-all section the in-force default resolves an absent declaration to,
@@ -209,6 +211,11 @@ pub(crate) fn task_network(
         // the reserve, so the two allocators cannot meet; the daemon-side
         // refusals (`IpAllocator::hand`) stay the guard against a pair that
         // disagrees about the split.
+        None,
+        // Deliberately no classifier decision (NET-079): a task places no
+        // leaf in the cohort's subtrees, so there is no per-box verdict for
+        // a task's plan to follow — the session's own launch carries the
+        // decision its reader read, and this one has none to carry.
         None,
     )
 }
