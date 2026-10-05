@@ -17169,6 +17169,41 @@ proof_listen_published_port_reaches_peer_and_host() {
   fi
   echo "peer: GET http://$lp_peer_host:$lp_listen_port/ from the peer box -> HTTP 200 carrying $lp_marker — a listen the range allows is published with no expose (NET-016)"
 
+  # ---- the bridge: the VM host daemon admitted the listen (T94) -----------
+  # The peer leg never leaves the VM, so on a VM lane the host half of the
+  # listen is read off the VM host daemon's own record: the in-VM daemon's
+  # report crossed the bridge and the host gate admitted it, as a `listen`
+  # source, at the box's own switch address.
+  lp_bridge_switch=""
+  if [ -n "${E2E_VM:-}" ]; then
+    lp_bridge_switch="$(minvmd_log_lines \
+      'registered box with the VM host daemon; addresses allocated' \
+      | grep -F "\"box\":\"$lp_target_name\"" | tail -n1 \
+      | sed -n 's/.*"switch_address":"\([0-9.]*\)".*/\1/p')"
+    if [ -z "$lp_bridge_switch" ]; then
+      echo "::error::the VM host daemon's log carries no registration record naming box '$lp_target_name' and its switch address"
+      fail
+    fi
+    lp_bridge_admit=""
+    for _ in $(seq 1 20); do
+      lp_bridge_admit="$(minvmd_log_lines \
+        "recorded the box's runtime-admitted port in the host-held grant" \
+        | grep -F "\"box\":\"$lp_target_name\"" \
+        | grep -F "\"switch_address\":\"$lp_bridge_switch\"" \
+        | grep -E "\"port\":${lp_listen_port}[,}]" \
+        | grep -F '"source":"listen"' | tail -n1)"
+      [ -n "$lp_bridge_admit" ] && break
+      sleep 0.25
+    done
+    if [ -z "$lp_bridge_admit" ]; then
+      echo "::error::the VM host daemon recorded no listen-sourced admission of port $lp_listen_port for box '$lp_target_name' at $lp_bridge_switch — the report never crossed the bridge to the host gate (T94)"
+      echo "--- minvmd runtime-port records ---"
+      minvmd_log_lines 'runtime-admitted port' | tail -n 20 || true
+      fail
+    fi
+    echo "bridge: the VM host daemon admitted the listen as source listen at $lp_bridge_switch:$lp_listen_port"
+  fi
+
   # ---- reach: the host probe, at the address the answerer returned ---------
   if [ "$lp_host_reach" != "asserted" ]; then
     echo "host, in range: SKIPPED ($lp_ans_why)"
@@ -17244,6 +17279,26 @@ PY
     fail
   fi
   echo "peer, after the close: the same GET -> connection refused (curl exit $lp_rc) $(( $(now_ms) - lp_close_start ))ms after the kill — the listen's publication withdrew with its listener (NET-017)"
+  if [ -n "$lp_bridge_switch" ]; then
+    lp_bridge_withdraw=""
+    for _ in $(seq 1 20); do
+      lp_bridge_withdraw="$(minvmd_log_lines \
+        "withdrew the box's runtime-admitted port from the host-held grant" \
+        | grep -F "\"box\":\"$lp_target_name\"" \
+        | grep -F "\"switch_address\":\"$lp_bridge_switch\"" \
+        | grep -E "\"port\":${lp_listen_port}[,}]" \
+        | grep -F '"source":"listen"' | tail -n1)"
+      [ -n "$lp_bridge_withdraw" ] && break
+      sleep 0.25
+    done
+    if [ -z "$lp_bridge_withdraw" ]; then
+      echo "::error::the VM host daemon recorded no listen-sourced withdrawal of port $lp_listen_port for box '$lp_target_name' after the close — the withdrawal never crossed the bridge (T94)"
+      echo "--- minvmd runtime-port records ---"
+      minvmd_log_lines 'runtime-admitted port' | tail -n 20 || true
+      fail
+    fi
+    echo "bridge: the VM host daemon withdrew the listen (source listen) at $lp_bridge_switch:$lp_listen_port after the close"
+  fi
   if [ "$lp_host_reach" != "asserted" ]; then
     echo "host probe, after the close: SKIPPED ($lp_ans_why)"
   else
