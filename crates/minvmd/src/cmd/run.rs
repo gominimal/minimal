@@ -2142,12 +2142,6 @@ fn draw_publish_generation() -> u64 {
 /// failure is warned and answered as the caller's `None`: the boot loop
 /// then hands the child no env at all, so no boot bridges a door it did
 /// not bind, and no bound door stands behind a bridge that never comes up.
-#[expect(
-    clippy::allow_attributes,
-    reason = "the door binds on the libkrun build alone, so the other targets' \
-              unused-function mark is allowed — not expected: an expectation would \
-              be unfulfilled on the one build that reaches the door"
-)]
 #[cfg_attr(
     not(minvmd_libkrun),
     allow(
