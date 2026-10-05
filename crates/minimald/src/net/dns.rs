@@ -466,6 +466,10 @@ struct CallerFacts {
     /// The switch the box's relay is attached to, whose resolver its egress
     /// carve-out is keyed to (NET-079).
     subnet: SwitchSubnet,
+    /// The hostname proxy's port that switch's boxes are compiled with — the
+    /// node address's interim opening — so the caller check compiles the
+    /// same rules the relay does (NET-071).
+    hostname_proxy_port: Option<u16>,
 }
 
 /// What the box zone holds for a name, as the answerer answers from it. The
@@ -758,6 +762,7 @@ impl HostnameRegistry {
         session_name: &str,
         policy: &SessionPolicy,
         subnet: SwitchSubnet,
+        hostname_proxy_port: Option<u16>,
     ) {
         self.callers.insert(
             session_id,
@@ -765,6 +770,7 @@ impl HostnameRegistry {
                 name: session_name.to_string(),
                 policy: policy.clone(),
                 subnet,
+                hostname_proxy_port,
             },
         );
     }
@@ -787,7 +793,12 @@ impl HostnameRegistry {
         Some(Caller {
             lease,
             name: facts.name.clone(),
-            egress: super::switch::compiled_egress(Some(&facts.policy), facts.subnet, lease),
+            egress: super::switch::compiled_egress(
+                Some(&facts.policy),
+                facts.subnet,
+                lease,
+                facts.hostname_proxy_port,
+            ),
         })
     }
 

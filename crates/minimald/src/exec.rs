@@ -165,7 +165,9 @@ impl Exec for TaskExec {
 /// rollout ends at stays proven while the default is only announced
 /// (NET-076) — and `deny_all_opt_out` is the daemon's opt-out (NET-077),
 /// read through the session handle so a task resolves its egress exactly as
-/// the launcher did.
+/// the launcher did. It carries no classifier decision either (NET-079):
+/// a task places no leaf in the cohort's subtrees, so no per-box verdict
+/// is its plan's to follow.
 ///
 /// A gate is attached only where that egress has rules to enforce: the
 /// deny-all section the in-force default resolves an absent declaration to,
@@ -209,6 +211,11 @@ pub(crate) fn task_network(
         // the reserve, so the two allocators cannot meet; the daemon-side
         // refusals (`IpAllocator::hand`) stay the guard against a pair that
         // disagrees about the split.
+        None,
+        // Deliberately no classifier decision (NET-079): a task places no
+        // leaf in the cohort's subtrees, so there is no per-box verdict for
+        // a task's plan to follow — the session's own launch carries the
+        // decision its reader read, and this one has none to carry.
         None,
     )
 }
@@ -357,7 +364,10 @@ async fn task_producer(
         // directory the interactive session sees at `/home`. The daemon's own
         // ambient home is `/` inside the guest, and expanding against that
         // dropped package-declared files onto the read-only rootfs (#1204).
-        let session_home = session.paths().await?.home;
+        // The task then runs in the session layout (home at `/home`, tree at
+        // `/workbench`), and a patch that expanded into either directory is
+        // mounted at the matching path there, keeping its declared mode.
+        let session_paths = session.paths().await?;
         let mut env = ctx
             .make_env_with_network(
                 &exec.task,
@@ -368,7 +378,11 @@ async fn task_producer(
                 Some(&task.vars),
                 task.packages.clone(),
                 network,
-                mctx::PatchHome::Session(session_home),
+                mctx::PatchHome::Session(session_paths.home.clone()),
+                mctx::WdLayout::Session {
+                    home: session_paths.home.as_utf8_path().to_path_buf().into(),
+                    working: session_paths.working.as_utf8_path().to_path_buf().into(),
+                },
             )
             .await
             .map_err(|e| io::Error::other(e.to_string()))?;
@@ -1151,31 +1165,52 @@ where
                         // A child that stops reading stdin parks this
                         // write; race it against client loss so the
                         // disconnect still reaches the kill path below.
+                        //
+                        // `write_all` is not cancel-safe: if the
+                        // client-loss branch wins the select, dropping
+                        // the write future mid-flight loses the bytes it
+                        // had already accepted. Pin the write and loop
+                        // the select until it completes, so a dropped
+                        // client-loss sender only disables that branch
+                        // and never discards stdin data.
                         if let Some(cs) = child_stdin.as_mut() {
-                            tokio::select! {
-                                res = cs.write_all(&stdin_buf[..n]) => {
-                                    if let Err(err) = res {
-                                        tracing::warn!(
-                                            %channel_id, error = %err,
-                                            "exec: failed to write stdin to child; closing child stdin",
-                                        );
-                                        child_stdin = None;
+                            let write_failed = {
+                                let write = cs.write_all(&stdin_buf[..n]);
+                                tokio::pin!(write);
+                                let mut write_failed = false;
+                                loop {
+                                    tokio::select! {
+                                        res = &mut write => {
+                                            if let Err(err) = res {
+                                                tracing::warn!(
+                                                    %channel_id, error = %err,
+                                                    "exec: failed to write stdin to child; closing child stdin",
+                                                );
+                                                write_failed = true;
+                                            }
+                                            break;
+                                        }
+                                        res = client_lost.wait_for(|lost| *lost), if client_watch_open => {
+                                            if res.is_err() {
+                                                // Sender dropped without signalling:
+                                                // stop polling this branch so a
+                                                // dropped sender cannot spin the loop.
+                                                client_watch_open = false;
+                                            } else {
+                                                tracing::warn!(
+                                                    %channel_id,
+                                                    "exec: ssh client disconnected; killing child",
+                                                );
+                                                ssh_write_failed = true;
+                                                break;
+                                            }
+                                        }
                                     }
                                 }
-                                res = client_lost.wait_for(|lost| *lost), if client_watch_open => {
-                                    if res.is_err() {
-                                        // Sender dropped without signalling:
-                                        // stop polling this branch so a
-                                        // dropped sender cannot spin the loop.
-                                        client_watch_open = false;
-                                    } else {
-                                        tracing::warn!(
-                                            %channel_id,
-                                            "exec: ssh client disconnected; killing child",
-                                        );
-                                        ssh_write_failed = true;
-                                    }
-                                }
+                                write_failed
+                            };
+                            if write_failed {
+                                child_stdin = None;
                             }
                         }
                     }
@@ -2377,6 +2412,9 @@ mod tests {
             box_addresses: None,
             status: sessions::SessionStatus::Active,
             hooks_enabled: true,
+            // No launch ever minted these records, so none has recorded its
+            // outcome on one.
+            host_ip_enforcement: None,
             attrs: Default::default(),
         }
     }

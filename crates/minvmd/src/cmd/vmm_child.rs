@@ -16,6 +16,10 @@
 //! 5. Registers the marker socket for `VSOCK_MARKER_PORT` (guest→host): the
 //!    guest workload connects to that vsock port and writes `READY\n`, which
 //!    libkrun bridges to the host UNIX socket where the parent listens.
+//!    When the parent also bound the guest report door (T94), its path
+//!    arrives as `MINVMD_GUEST_REPORT_SOCK` and is registered for
+//!    `VM_HOST_BOX_REPORT_PORT` the same way, so the in-VM daemon's port
+//!    reports reach the VM host daemon's host-held grant.
 //! 6. On macOS, registers the timekeep socket for `VSOCK_TIMEKEEP_PORT`
 //!    (host→guest) and starts the thread that sends the host wall clock to the
 //!    guest, so a host suspend does not leave the guest clock frozen
@@ -121,6 +125,20 @@ fn run_vmm() -> Result<()> {
     // which libkrun bridges to the parent.
     ctx.add_vsock_port(VSOCK_MARKER_PORT, &marker_sock)
         .context("registering READY-marker vsock port")?;
+
+    // The guest report door's vsock port (T94, NET-138): the parent binds
+    // the door and hands its path here, and this registration is what
+    // bridges the in-VM daemon's port reports to it — so it is made only
+    // when the parent bound a door, which is what the env names. A
+    // supervisor with no door (a bind failure, or a supervisor that binds
+    // no box table) hands no env, and the guest's runtime publishes then
+    // fail their reports instead of being recorded.
+    if let Some(guest_report_sock) =
+        std::env::var_os(crate::control::GUEST_REPORT_SOCK_ENV).filter(|path| !path.is_empty())
+    {
+        ctx.add_vsock_port(minimald_rpc::VM_HOST_BOX_REPORT_PORT, &guest_report_sock)
+            .context("registering the guest report door's vsock port")?;
+    }
 
     // Host wall-clock updates (host→guest, `crate::timekeep`), macOS only.
     //

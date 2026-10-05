@@ -52,6 +52,8 @@ use sessions::core::hooks::{HookResult, PolicyHooks, Unapproved};
 use sessions::core::policy::{HooksPolicy, PatchesPolicy, VarsPolicy};
 use tempfile::TempDir;
 
+mod common;
+
 /// Hostnames the box declares in `egress.allow_dns_hosts` only (no subnets, no
 /// protocols beyond TCP). Every operation's reach must be earned by DNS-pinned
 /// admission. The list is shared with the `minimald` unit fixture so the two
@@ -148,6 +150,9 @@ fn e2e_enabled() -> bool {
 /// A booted minimald guest VM, stopped on drop.
 struct Guest {
     sock_path: PathBuf,
+    /// The VM host daemon's box control socket, where the box is registered
+    /// before its session is created, as `min session activate` does.
+    control_sock: PathBuf,
     boot_log_path: PathBuf,
     boot_log_offset: usize,
     _state: TempDir,
@@ -217,6 +222,7 @@ impl Guest {
         let state = short_state_dir();
         let provider_dir = state.path().join("minimal/providers/local-minvmd0");
         let sock_path = provider_dir.join("ssh.sock");
+        let control_sock = provider_dir.join(minvmd::control::CONTROL_SOCK_FILE);
         let boot_log_path = std::env::var_os(MINVMD_BOOT_LOG_ENV)
             .filter(|v| !v.is_empty())
             .map(PathBuf::from)
@@ -230,6 +236,7 @@ impl Guest {
         );
         let guest = Guest {
             sock_path,
+            control_sock,
             boot_log_path,
             boot_log_offset: 0,
             _state: state,
@@ -356,7 +363,7 @@ async fn hostname_allowlist_toolchain_completes() {
 
     let mut session_id = None;
     for attempt in 1..=6 {
-        match create_toolchain_session(&guest.sock_path).await {
+        match create_toolchain_session(&guest.sock_path, &guest.control_sock).await {
             Ok(id) => {
                 session_id = Some(id);
                 break;
@@ -468,7 +475,10 @@ packages = [
 /// Open a russh client over the bridge UDS, authenticate, create a session,
 /// upload a `minimal.toml` with the toolchain packages, compose the loadout, and
 /// finalize it. Returns the session id.
-async fn create_toolchain_session(sock_path: &Path) -> Result<sessions::SessionId, String> {
+async fn create_toolchain_session(
+    sock_path: &Path,
+    control_sock: &Path,
+) -> Result<sessions::SessionId, String> {
     use minimald_rpc::{CreateSession, CreateSessionRequest, OneshotSshRpc};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -491,26 +501,28 @@ async fn create_toolchain_session(sock_path: &Path) -> Result<sessions::SessionI
         .map(|d| d.as_nanos())
         .unwrap_or(0);
 
+    let name = format!("hostname-allowlist-{uniq:x}");
+    let egress = sessions::EgressPolicy {
+        allow_protocols: Some(vec![sessions::IpProto::Tcp]),
+        allow_subnets: Some(Vec::new()),
+        allow_dns_hosts: Some(TOOLCHAIN_HOSTS.iter().map(|h| (*h).to_string()).collect()),
+        deny_subnets: None,
+    };
+    // The box's row, filed with the VM host the way `min session activate`
+    // files it: a box with no row is an unregistered source the gate drops
+    // unconditionally (NET-085), its resolver queries included.
+    let addresses = common::register_box(control_sock, &name, Some(egress.clone()))?;
+
     let req = CreateSessionRequest {
         config: minimald_rpc::SessionConfig {
-            name: Some(format!("hostname-allowlist-{uniq:x}")),
+            name: Some(name),
             project_path: paths::HostAbsPath::try_new("/tmp")
                 .map_err(|e| format!("project_path: {e}"))?,
             network: sessions::NetworkMode::OwnIp,
-            policy: sessions::SessionPolicy::new(
-                Some(sessions::EgressPolicy {
-                    allow_protocols: Some(vec![sessions::IpProto::Tcp]),
-                    allow_subnets: Some(Vec::new()),
-                    allow_dns_hosts: Some(
-                        TOOLCHAIN_HOSTS.iter().map(|h| (*h).to_string()).collect(),
-                    ),
-                    deny_subnets: None,
-                }),
-                None,
-            ),
-            // No registration happened on this path: the box attaches as an
-            // unregistered one always has, drawing its own switch lease.
-            box_addresses: None,
+            policy: sessions::SessionPolicy::new(Some(egress), None),
+            // The addresses the registration handed back, so the in-VM
+            // daemon attaches the box at its row's lease.
+            box_addresses: Some(addresses),
             hooks_enabled: true,
             attrs: Default::default(),
         },
