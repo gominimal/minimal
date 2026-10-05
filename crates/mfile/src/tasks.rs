@@ -142,22 +142,37 @@ impl Default for TaskAction {
     }
 }
 
-impl TaskAction {
-    /// The `[tasks.<name>]` keys that each select an action. A task sets
-    /// exactly one; serde takes one as [Task::action] and leaves any other in
-    /// [Task::extra].
-    pub const KEYS: [&'static str; 4] = ["exec", "bash", "cmdcmd", "echo"];
+/// One list of action keys, each paired with the `TaskAction` variant it
+/// selects, generating both [TaskAction::KEYS] and [TaskAction::key]. The
+/// `key` match is exhaustive, so a `TaskAction` variant missing from this
+/// list fails to compile — the list cannot go stale and silently stop a
+/// second action key from being refused.
+macro_rules! action_keys {
+    ($($variant:ident => $key:literal),* $(,)?) => {
+        impl TaskAction {
+            /// The `[tasks.<name>]` keys that each select an action. A task
+            /// sets exactly one; serde takes one as [Task::action] and
+            /// leaves any other in [Task::extra].
+            pub const KEYS: &[&'static str] = &[$($key),*];
 
-    /// The `[tasks.<name>]` key this action was set with.
-    pub fn key(&self) -> &'static str {
-        match self {
-            TaskAction::Exec(_) => "exec",
-            TaskAction::Bash(_) => "bash",
-            TaskAction::CmdCmd(_) => "cmdcmd",
-            TaskAction::Echo(_) => "echo",
+            /// The `[tasks.<name>]` key this action was set with.
+            pub fn key(&self) -> &'static str {
+                match self {
+                    $(TaskAction::$variant(..) => $key,)*
+                }
+            }
         }
-    }
+    };
+}
 
+action_keys! {
+    Exec => "exec",
+    Bash => "bash",
+    CmdCmd => "cmdcmd",
+    Echo => "echo",
+}
+
+impl TaskAction {
     /// Constructs a [TaskAction] that represents the execve of the given string.
     pub fn exec_from_str(s: &str) -> Self {
         Self::Exec(StrOrList::Single(s.to_string()))
