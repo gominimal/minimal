@@ -844,6 +844,7 @@ pub(crate) struct AskFacts {
 /// recorded answer or a cancellation resolves it with is sent here, once,
 /// by whichever end arrives first. No timer ever touches it: the ask ends
 /// by an answer or a cancellation, and nothing else.
+#[derive(Debug)]
 struct PendingAsk {
     facts: AskFacts,
     /// The sending end of the guest's outcome channel, taken by whichever
@@ -854,6 +855,7 @@ struct PendingAsk {
 /// One attached host client's subscription (NET-045): the push channel its
 /// writer thread reads — one offered ask or dismissal per push — keyed by
 /// an id so the client's own detach removes exactly its own entry.
+#[derive(Debug)]
 struct AskSubscriber {
     id: u64,
     pushes: std::sync::mpsc::Sender<minimald_rpc::BoxControlReply>,
@@ -954,18 +956,6 @@ pub(crate) struct AskCancelled {
 }
 
 impl BoxRegistry {
-    /// Whether a live row holds `id` (NET-045): the ask subscription's
-    /// validation. A subscription is to a *row's* box id — an id an
-    /// attachment still holds but no row does names a box this table no
-    /// longer serves, and there is nothing to subscribe to.
-    pub(crate) fn holds_row_with_box_id(&self, id: BoxId) -> bool {
-        let rows = self
-            .rows
-            .read()
-            .expect("the row lock is never held across a panic, so it cannot be poisoned");
-        rows.values().any(|record| record.box_id == id)
-    }
-
     /// Record the in-VM daemon's ask (NET-045): mint the ask's id, park it
     /// in the row's queue, and — when it is the row's offered dialog —
     /// offer it to every host client attached to the row's box id. The
@@ -1060,7 +1050,7 @@ impl BoxRegistry {
                 reason: minimald_rpc::AskRefused::QueueFull,
             });
         }
-        let is_front = queue.front() == Some(&ask_id);
+        let is_front = queue.is_empty();
         queue.push_back(ask_id);
         book.pending.insert(
             ask_id,
@@ -1122,6 +1112,15 @@ impl BoxRegistry {
             return Err(ask_id);
         };
         let facts = pending.facts;
+        // Whether the answered ask was the row's offered dialog — the
+        // queue's front — before it is taken out: only the front's end
+        // frees the row to offer the ask behind it, so an answer for an
+        // ask that waited mid-queue never re-offers the dialog the row
+        // already holds open.
+        let was_front = book
+            .rows
+            .get(&facts.switch_address.octets())
+            .is_some_and(|queue| queue.front() == Some(&ask_id));
         if let Some(queue) = book.rows.get_mut(&facts.switch_address.octets()) {
             queue.retain(|queued| *queued != ask_id);
         }
@@ -1150,7 +1149,9 @@ impl BoxRegistry {
             let _ = reply.send(outcome);
         }
         let dismissed = Self::dismiss_ask(&mut book, &facts.box_id, ask_id);
-        let offered_next = Self::offer_next(&mut book, &facts.switch_address);
+        let offered_next = was_front
+            .then(|| Self::offer_next(&mut book, &facts.switch_address))
+            .flatten();
         Ok(AskAnswered {
             ask_id,
             facts,
@@ -1175,6 +1176,13 @@ impl BoxRegistry {
             .expect("the ask book's lock is never held across a panic");
         let pending = book.pending.remove(&ask_id)?;
         let facts = pending.facts;
+        // The front's end alone frees the row to offer the ask behind it,
+        // as in the answered path: a mid-queue ask's cancellation never
+        // re-offers the dialog the row already holds open.
+        let was_front = book
+            .rows
+            .get(&facts.switch_address.octets())
+            .is_some_and(|queue| queue.front() == Some(&ask_id));
         if let Some(queue) = book.rows.get_mut(&facts.switch_address.octets()) {
             queue.retain(|queued| *queued != ask_id);
         }
@@ -1186,7 +1194,9 @@ impl BoxRegistry {
             let _ = reply.send(outcome);
         }
         let dismissed = Self::dismiss_ask(&mut book, &facts.box_id, ask_id);
-        let offered_next = Self::offer_next(&mut book, &facts.switch_address);
+        let offered_next = was_front
+            .then(|| Self::offer_next(&mut book, &facts.switch_address))
+            .flatten();
         Some(AskCancelled {
             facts,
             outcome,
@@ -1294,14 +1304,15 @@ impl BoxRegistry {
         clients.retain(|client| client.id != subscriber);
         if clients.is_empty() {
             book.subscribers.remove(&box_id);
-            return self.cancel_asks_for_box_locked(&mut book, box_id);
+            return Self::cancel_asks_for_box_locked(&mut book, box_id);
         }
         Vec::new()
     }
 
-    /// [`Self::cancel_asks_for_box`] under a book the caller already holds:
-    /// the last-detach path runs inside the unsubscribe that found it.
-    fn cancel_asks_for_box_locked(&self, book: &mut AskBook, box_id: BoxId) -> Vec<AskCancelled> {
+    /// Cancel every pending ask a box's last attached client left behind
+    /// (NET-045) — the last-detach path, under the book the unsubscribe
+    /// that found it already holds.
+    fn cancel_asks_for_box_locked(book: &mut AskBook, box_id: BoxId) -> Vec<AskCancelled> {
         let cancelled_ids: Vec<minimald_rpc::AskId> = book
             .pending
             .iter()
@@ -1338,7 +1349,7 @@ impl BoxRegistry {
     /// ask behind it is offered now — to every client attached to its
     /// box, and audited as offered where the door reads this result.
     fn offer_next(book: &mut AskBook, switch_addr: &Ipv4Addr) -> Option<AskOffered> {
-        let ask_id = book.rows.get(switch_addr.octets())?.front().copied()?;
+        let ask_id = book.rows.get(&switch_addr.octets())?.front().copied()?;
         Some(Self::offer_ask(book, ask_id))
     }
 
@@ -4125,5 +4136,441 @@ mod tests {
             "a re-registration starts the runtime set empty — the newest declaration never \
              inherits the row it replaced's runtime facts"
         );
+    }
+
+    /// One ask-stance row, the shape every registry-level ask test starts
+    /// from: the stance the guest's asks are decided by, the range they
+    /// are held within, and the host-minted identity offers key by.
+    fn ask_row(registry: &BoxRegistry, name: &str, switch_addr: Ipv4Addr) -> Arc<BoxRecord> {
+        registry.register(
+            BoxRegistration::new(name, switch_addr, Ipv4Addr::LOCALHOST)
+                .with_dynamic_ingress(DynamicIngress::Ask, Some((3000, 3999))),
+        )
+    }
+
+    /// No attached client, no ask (NET-045): an ask nobody attached can
+    /// answer must not park an exposure behind a dialog that will never be
+    /// seen, so the host refuses it at once — the native path's fail-closed
+    /// refusal, this side of the bridge — and the refusal holds nothing:
+    /// the id it minted answers nothing, and the row's queue keeps its
+    /// whole bound free.
+    #[test]
+    fn pending_ask_without_attached_client_refused() {
+        use minimald_rpc::{AskAnswer, AskRefused};
+        let registry = BoxRegistry::new(SUBNET);
+        let web = ask_row(&registry, "web", Ipv4Addr::new(100, 64, 0, 9));
+
+        let (reply, outcome) = std::sync::mpsc::channel();
+        let refusal = registry
+            .record_ask(web.switch_addr(), 3123, IpProto::Tcp, reply)
+            .expect_err("an ask with no attached client is refused at once");
+        assert_eq!(
+            refusal.reason,
+            AskRefused::NoClient,
+            "the refusal names its end"
+        );
+        assert_eq!(
+            refusal.facts.as_ref().map(|facts| facts.name.as_str()),
+            Some("web"),
+            "the refusal carries the row's own facts, where a row exists to source them"
+        );
+        assert!(
+            outcome.try_recv().is_err(),
+            "no outcome resolves an ask that was never held"
+        );
+
+        // The refusal held nothing: the id it minted answers nothing, and
+        // the row's queue is empty — the bound's whole width is still free.
+        assert_eq!(
+            registry
+                .record_ask_answer(refusal.ask_id, AskAnswer::Yes)
+                .err(),
+            Some(refusal.ask_id),
+            "the refused ask is not held, so its id answers nothing"
+        );
+        let (pushes, _inbox) = std::sync::mpsc::channel();
+        let (subscriber, standing) = registry
+            .subscribe_asks(web.box_id(), pushes)
+            .expect("the row's box id is live");
+        assert!(
+            standing.is_none(),
+            "nothing is offered, because nothing was recorded"
+        );
+        for port in 3000..3000 + PENDING_ASKS_PER_ROW as u16 {
+            let (reply, _outcome) = std::sync::mpsc::channel();
+            registry
+                .record_ask(web.switch_addr(), port, IpProto::Tcp, reply)
+                .unwrap_or_else(|_| panic!("the refused ask held nothing: the whole queue bound is still free at port {port}"));
+        }
+        registry.unsubscribe_asks(web.box_id(), subscriber);
+    }
+
+    /// The first recorded answer wins (NET-045): the ask is consumed by the
+    /// answer, so a second answer for the same id — whichever way it leans
+    /// — is refused as an id the host does not hold, and a yes spent once
+    /// can never be replayed to admit a port again. An id this host never
+    /// minted is refused the same way, recording nothing.
+    #[test]
+    fn record_for_unknown_or_consumed_ask_id_refused() {
+        use minimald_rpc::{AskAdmitOutcome, AskAnswer};
+        let registry = BoxRegistry::new(SUBNET);
+        let web = ask_row(&registry, "web", Ipv4Addr::new(100, 64, 0, 9));
+        let (pushes, _inbox) = std::sync::mpsc::channel();
+        let (subscriber, standing) = registry
+            .subscribe_asks(web.box_id(), pushes)
+            .expect("the row's box id is live");
+        assert!(standing.is_none(), "nothing is pending yet");
+
+        // An id this host never minted answers nothing.
+        let stranger = minimald_rpc::AskId::from_bytes([3u8; 16]);
+        assert_eq!(
+            registry.record_ask_answer(stranger, AskAnswer::Yes).err(),
+            Some(stranger),
+            "an answer for an unknown id is refused, recording nothing"
+        );
+        assert!(
+            web.runtime_port_numbers().is_empty(),
+            "the stranger's yes recorded no port"
+        );
+
+        // One real ask, answered once.
+        let (reply, outcome) = std::sync::mpsc::channel();
+        let recorded = registry
+            .record_ask(web.switch_addr(), 3123, IpProto::Tcp, reply)
+            .expect("the ask is recorded with a client attached");
+        assert_eq!(
+            recorded.offered_to,
+            Some(1),
+            "the ask is the row's offered dialog, reaching its one client"
+        );
+        let answered = registry
+            .record_ask_answer(recorded.ask_id, AskAnswer::Yes)
+            .expect("the first answer wins");
+        assert_eq!(
+            answered.outcome,
+            AskAdmitOutcome::Admitted {
+                ask_id: recorded.ask_id,
+                port: 3123,
+                proto: IpProto::Tcp
+            },
+            "the yes records the port and admits the exposure"
+        );
+        assert_eq!(
+            web.runtime_port_numbers(),
+            [3123],
+            "the one yes records the port once"
+        );
+
+        // The consumed id answers nothing, whichever way the second answer
+        // leans: a replayed yes records nothing further, and a late no
+        // cannot undo the first answer.
+        assert_eq!(
+            registry
+                .record_ask_answer(recorded.ask_id, AskAnswer::Yes)
+                .err(),
+            Some(recorded.ask_id),
+            "the id was consumed by its first answer"
+        );
+        assert_eq!(
+            registry
+                .record_ask_answer(recorded.ask_id, AskAnswer::No)
+                .err(),
+            Some(recorded.ask_id),
+            "a late no cannot undo the first answer either"
+        );
+        assert_eq!(
+            web.runtime_port_numbers(),
+            [3123],
+            "the replayed answers recorded nothing"
+        );
+
+        // The exposure's held reply was answered exactly once.
+        assert_eq!(
+            outcome.try_recv(),
+            Ok(AskAdmitOutcome::Admitted {
+                ask_id: recorded.ask_id,
+                port: 3123,
+                proto: IpProto::Tcp
+            }),
+            "the outcome resolves the exposure's held reply"
+        );
+        assert!(
+            outcome.try_recv().is_err(),
+            "the outcome is sent once, never twice"
+        );
+        registry.unsubscribe_asks(web.box_id(), subscriber);
+    }
+
+    /// The offer reaches every attached client, and the first answer wins
+    /// (NET-045): two clients both render the dialog, whichever answers
+    /// first consumes the ask — its recorded answer decides the exposure —
+    /// and every other dialog is dismissed, the other answer finding
+    /// nothing to answer for.
+    #[test]
+    fn ask_offered_to_all_clients_first_answer_wins() {
+        use minimald_rpc::{AskAdmitOutcome, AskAnswer, BoxControlReply};
+        let registry = BoxRegistry::new(SUBNET);
+        let web = ask_row(&registry, "web", Ipv4Addr::new(100, 64, 0, 9));
+        let (first_pushes, first_inbox) = std::sync::mpsc::channel();
+        let (second_pushes, second_inbox) = std::sync::mpsc::channel();
+        let (first, standing) = registry
+            .subscribe_asks(web.box_id(), first_pushes)
+            .expect("the row's box id is live");
+        assert!(standing.is_none());
+        let (second, standing) = registry
+            .subscribe_asks(web.box_id(), second_pushes)
+            .expect("the row's box id is live");
+        assert!(
+            standing.is_none(),
+            "nothing is pending for the second client either"
+        );
+
+        let (reply, outcome) = std::sync::mpsc::channel();
+        let recorded = registry
+            .record_ask(web.switch_addr(), 3123, IpProto::Tcp, reply)
+            .expect("the ask is recorded");
+        assert_eq!(
+            recorded.offered_to,
+            Some(2),
+            "the offer reaches every attached client"
+        );
+
+        // Both clients hold the offer, built from the host row's own facts.
+        for (label, inbox) in [("the first", &first_inbox), ("the second", &second_inbox)] {
+            match inbox
+                .recv_timeout(Duration::from_secs(1))
+                .expect("the offer is pushed")
+            {
+                BoxControlReply::PendingAskOffer(offer) => {
+                    assert_eq!(
+                        offer.ask_id, recorded.ask_id,
+                        "{label} client is offered the ask"
+                    );
+                    assert_eq!(offer.name, "web", "the offer names the host row's box");
+                    assert_eq!(offer.port, 3123, "the offer names the asked port");
+                }
+                other => panic!("{label} client is offered the ask, got {other:?}"),
+            }
+        }
+
+        // The first answer wins, and the other dialog still holding the
+        // offer is dismissed.
+        let answered = registry
+            .record_ask_answer(recorded.ask_id, AskAnswer::Yes)
+            .expect("the first recorded answer wins");
+        assert_eq!(
+            answered.dismissed, 2,
+            "every dialog still holding the offer is dismissed — the answering client's own \
+             takes its rendering down too"
+        );
+        assert_eq!(
+            answered.outcome,
+            AskAdmitOutcome::Admitted {
+                ask_id: recorded.ask_id,
+                port: 3123,
+                proto: IpProto::Tcp
+            },
+            "the first answer decides the exposure"
+        );
+        assert_eq!(
+            outcome.recv_timeout(Duration::from_secs(1)),
+            Ok(AskAdmitOutcome::Admitted {
+                ask_id: recorded.ask_id,
+                port: 3123,
+                proto: IpProto::Tcp
+            }),
+            "the exposure's held reply is answered with the first answer's outcome"
+        );
+
+        // The second client's dialog was dismissed, and its own answer
+        // finds nothing to answer for — whichever way it leans.
+        match second_inbox
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the dismissal is pushed")
+        {
+            BoxControlReply::PendingAskDismissed {
+                ask_id,
+                dismissed: true,
+            } if ask_id == recorded.ask_id => {}
+            other => panic!("the answered ask is dismissed from the second client, got {other:?}"),
+        }
+        assert_eq!(
+            registry
+                .record_ask_answer(recorded.ask_id, AskAnswer::No)
+                .err(),
+            Some(recorded.ask_id),
+            "the second answer finds the ask consumed"
+        );
+        assert_eq!(
+            web.runtime_port_numbers(),
+            [3123],
+            "the first answer's yes is the port the row holds, once"
+        );
+        registry.unsubscribe_asks(web.box_id(), first);
+        registry.unsubscribe_asks(web.box_id(), second);
+    }
+
+    /// An offer reaches only the clients attached to the asked row's own
+    /// box id (NET-045): a client attached under another box's identity —
+    /// the exec channel's shape, a daemon-side attach that subscribes to
+    /// nothing — is never offered another row's ask, and the exec box's
+    /// own row asks nothing, because its declaration carries no ask grant.
+    /// The offer is keyed by the host-minted identity alone, never by "any
+    /// attached client" and never by a guest-reported name.
+    #[test]
+    fn exec_channel_never_offered_an_ask() {
+        use minimald_rpc::AskRefused;
+        let registry = BoxRegistry::new(SUBNET);
+        let web = ask_row(&registry, "web", Ipv4Addr::new(100, 64, 0, 9));
+        // The exec channel's box: no dynamic-ingress grant at all — the
+        // deny default — because a task's exec traffic is not a publish.
+        let exec = registry.register(BoxRegistration::new(
+            "exec",
+            Ipv4Addr::new(100, 64, 0, 10),
+            Ipv4Addr::LOCALHOST,
+        ));
+
+        // The exec-shaped client attaches under its own box's identity.
+        let (pushes, inbox) = std::sync::mpsc::channel();
+        let (subscriber, standing) = registry
+            .subscribe_asks(exec.box_id(), pushes)
+            .expect("the exec box's id is live");
+        assert!(standing.is_none(), "nothing is pending");
+
+        // The web row's ask is refused: its own row has no attached client,
+        // and the exec-attached client is not the web row's.
+        let (reply, outcome) = std::sync::mpsc::channel();
+        let refusal = registry
+            .record_ask(web.switch_addr(), 3123, IpProto::Tcp, reply)
+            .expect_err("the ask reaches no client attached to its own row");
+        assert_eq!(
+            refusal.reason,
+            AskRefused::NoClient,
+            "the exec-attached client is never another row's answerer"
+        );
+        assert!(
+            inbox.try_recv().is_err(),
+            "no offer ever reaches a client attached under another box's identity"
+        );
+        assert!(
+            outcome.try_recv().is_err(),
+            "no outcome resolves the refused ask"
+        );
+
+        // And the exec box's own row asks nothing: no stance, no ask.
+        let (reply, _outcome) = std::sync::mpsc::channel();
+        let refusal = registry
+            .record_ask(exec.switch_addr(), 3000, IpProto::Tcp, reply)
+            .expect_err("a row without an ask stance asks nothing");
+        assert_eq!(refusal.reason, AskRefused::StanceNotAsk);
+        registry.unsubscribe_asks(exec.box_id(), subscriber);
+    }
+
+    /// No timer ever resolves an ask (NET-045): a pending ask waits past
+    /// every poll and every plausible deadline and is still held — the
+    /// proof is that an answer afterwards still resolves it — and a
+    /// cancellation ends one without recording anything.
+    #[test]
+    fn pending_ask_has_no_timeout() {
+        use minimald_rpc::{AskAdmitOutcome, AskAnswer, AskRefused, BoxControlReply};
+        let registry = BoxRegistry::new(SUBNET);
+        let web = ask_row(&registry, "web", Ipv4Addr::new(100, 64, 0, 9));
+        let (pushes, inbox) = std::sync::mpsc::channel();
+        let (subscriber, standing) = registry
+            .subscribe_asks(web.box_id(), pushes)
+            .expect("the row's box id is live");
+        assert!(standing.is_none(), "nothing is pending yet");
+
+        let (reply, outcome) = std::sync::mpsc::channel();
+        let recorded = registry
+            .record_ask(web.switch_addr(), 3210, IpProto::Tcp, reply)
+            .expect("the ask is recorded");
+        match inbox
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the offer is pushed")
+        {
+            BoxControlReply::PendingAskOffer(offer) => {
+                assert_eq!(
+                    offer.ask_id, recorded.ask_id,
+                    "the offered ask is the recorded one"
+                )
+            }
+            other => panic!("the offer is pushed to the attached client, got {other:?}"),
+        }
+
+        // A wait past every poll the doors run: nothing consumes the ask,
+        // because nothing ever will — the outcome channel is empty, nothing
+        // is recorded, and the ask is still held, answerable.
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(
+            outcome.try_recv().is_err(),
+            "no timer answered the ask while it waited"
+        );
+        assert!(
+            web.runtime_port_numbers().is_empty(),
+            "nothing is recorded while the ask waits"
+        );
+        let answered = registry
+            .record_ask_answer(recorded.ask_id, AskAnswer::Yes)
+            .expect("the ask is still held, so the answer still resolves it");
+        assert_eq!(
+            answered.outcome,
+            AskAdmitOutcome::Admitted {
+                ask_id: recorded.ask_id,
+                port: 3210,
+                proto: IpProto::Tcp
+            },
+            "the late answer decides the ask exactly as a prompt one does"
+        );
+        assert_eq!(
+            outcome.recv_timeout(Duration::from_secs(1)),
+            Ok(AskAdmitOutcome::Admitted {
+                ask_id: recorded.ask_id,
+                port: 3210,
+                proto: IpProto::Tcp
+            }),
+            "the answer resolves the exposure's held reply"
+        );
+        assert_eq!(
+            web.runtime_port_numbers(),
+            [3210],
+            "the yes records its port once the answer finally arrives"
+        );
+
+        // And a cancellation ends an ask without recording anything: the
+        // guest's own withdrawal path, answered with the cancelled refusal.
+        let (reply, outcome) = std::sync::mpsc::channel();
+        let recorded = registry
+            .record_ask(web.switch_addr(), 3211, IpProto::Tcp, reply)
+            .expect("the second ask is recorded");
+        assert!(
+            inbox.recv_timeout(Duration::from_secs(1)).is_ok(),
+            "the second ask is offered too"
+        );
+        let cancelled = registry
+            .cancel_ask(recorded.ask_id)
+            .expect("the cancellation ends the ask");
+        assert_eq!(
+            cancelled.outcome,
+            AskAdmitOutcome::Refused {
+                ask_id: recorded.ask_id,
+                reason: AskRefused::Cancelled
+            },
+            "the cancellation is the ask's own typed end"
+        );
+        assert_eq!(
+            outcome.recv_timeout(Duration::from_secs(1)),
+            Ok(AskAdmitOutcome::Refused {
+                ask_id: recorded.ask_id,
+                reason: AskRefused::Cancelled
+            }),
+            "the cancellation answers the exposure's held reply"
+        );
+        assert_eq!(
+            web.runtime_port_numbers(),
+            [3210],
+            "the cancelled ask recorded nothing"
+        );
+        registry.unsubscribe_asks(web.box_id(), subscriber);
     }
 }

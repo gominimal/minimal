@@ -48,6 +48,25 @@
 //! host-side copy to the daemon's own audit log
 //! (`audit/box-admissions.log`, in the same state dir the sockets live in).
 //!
+//! The ask verbs are the same rule one more time (NET-045): the guest
+//! raises a question and never answers one. The guest door takes the ask
+//! admit alone — the in-VM daemon's report that one of its exposes was
+//! decided `ask` — and its reply is *held*: the host mints the ask's id,
+//! offers the ask to every host client attached to the row, and the
+//! admit's reply is written only when an attached client records an
+//! answer or the ask is cancelled. No timer ever resolves it, so the
+//! connection serves on its own thread, off the door's serial loop. The
+//! host door takes the other two: `subscribe_asks`, an attached client's
+//! push subscription to one row's pending asks keyed by the row's box id
+//! — the host-minted identity, never a guest-reported name — and
+//! `record_ask_answer`, the client's answer for one ask the offer named.
+//! A recorded answer that arrives on the guest door is refused like any
+//! verb on the wrong door, and every ask outcome — offered, answered,
+//! cancelled, refused — answers one log line and one audit line of its
+//! own in the same owner-only host audit, carrying the box's id, the
+//! port, the protocol and the ask's id and nothing the guest could have
+//! written.
+//!
 //! The socket lives beside the daemon's ssh socket in the provider-instance
 //! dir and is created with the same 0700-dir / 0600-socket posture the
 //! bridge socket gets ([`crate::sock`]): only the same user may reach the
@@ -85,15 +104,18 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use minimald_rpc::{
-    AdmitPortRequest, BoxAddresses, BoxControlReply, BoxControlRequest, BoxRow, IpProto,
-    PortReportSource, ProxyDownCause, ReadRowRequest, RegisterBoxRequest, RegisteredBox,
-    WithdrawBoxRequest, WithdrawPortRequest, ZoneAnswererStatus,
+    AdmitAskRequest, AdmitPortRequest, AskAdmitOutcome, AskAnswer, AskRefused, BoxAddresses,
+    BoxControlReply, BoxControlRequest, BoxRow, IpProto, PortReportSource, ProxyDownCause,
+    ReadRowRequest, RecordAskAnswerRequest, RegisterBoxRequest, RegisteredBox,
+    SubscribeAsksRequest, WithdrawBoxRequest, WithdrawPortRequest, ZoneAnswererStatus,
 };
 
-use crate::box_registry::{BoxRegistry, ClientBoxSpec};
+use crate::box_registry::{
+    AskAnswered, AskCancelled, AskFacts, AskOffered, BoxRegistry, ClientBoxSpec,
+};
 use crate::net::answerer::AnswererStatus;
 
 /// The control socket's file name inside the provider-instance dir, beside
@@ -633,7 +655,7 @@ fn serve_connection(
         );
         return Ok(());
     }
-    let served = serve_request(
+    let handed_off = serve_request(
         &mut stream,
         boxes,
         answerer,
@@ -641,7 +663,7 @@ fn serve_connection(
         door,
         audit_path,
         request,
-    );
+    )?;
     // The guest door never closes a connection first (G-N8): on the KVM
     // libkrun shuttle a server-initiated close drops the reply's
     // still-buffered bytes on their way to the guest, and the in-VM daemon
@@ -649,11 +671,14 @@ fn serve_connection(
     // unwind depends on, lost to the close that carried it. So the door
     // holds the connection open until the reporter, which has its reply,
     // closes from its side. The host socket's peers are on the same host,
-    // not behind a shuttle, and close as they always did.
-    if door == ControlDoor::GuestReports {
+    // not behind a shuttle, and close as they always did. A connection
+    // handed to its own thread — an ask admit, whose reply a human may not
+    // answer for minutes — owns its own drain on that thread; the ask's own
+    // lifetime bounds the wait, never the door's serial loop.
+    if door == ControlDoor::GuestReports && !handed_off {
         drain_until_peer_closes(&mut stream);
     }
-    served
+    Ok(())
 }
 
 /// Wait for the peer's close on a guest-door connection whose reply was
@@ -713,9 +738,20 @@ fn root_may_ask(request: &BoxControlRequest) -> bool {
 /// withdrawals and both reads answer only on the host's socket, whose
 /// owner-only file mode is the row read's gate, and the port reports
 /// answer only on the in-VM daemon's channel, where the grant the row's
-/// registration holds decides. A verb on the wrong door is refused with
-/// its reason — never parsed into the other door's posture, because the
-/// peer a door serves is exactly what the verb decides what it may do.
+/// registration holds decides. The ask verbs split across the two by the
+/// same rule (NET-045): the ask admit answers only on the guest's
+/// channel — the guest raises the question — while the answer and the
+/// subscription answer only on the host's socket — a guest can raise a
+/// question but never answer one. A verb on the wrong door is refused
+/// with its reason — never parsed into the other door's posture, because
+/// the peer a door serves is exactly what the verb decides what it may
+/// do.
+///
+/// Answers whether the connection was handed to its own thread
+/// ([`Ok(true)`]): an ask admit parks its reply until a human answers —
+/// no timer ever resolves it — and a subscription is a push stream for its
+/// client's whole attach, so both own their connection on a thread of
+/// their own rather than wedging the door's serial loop behind them.
 fn serve_request(
     stream: &mut UnixStream,
     boxes: &BoxRegistry,
@@ -724,13 +760,13 @@ fn serve_request(
     door: ControlDoor,
     audit_path: &Path,
     request: BoxControlRequest,
-) -> std::io::Result<()> {
+) -> std::io::Result<bool> {
     match (request, door) {
         (BoxControlRequest::Register(request), ControlDoor::Host) => {
-            register_and_reply(stream, boxes, answerer, request)
+            register_and_reply(stream, boxes, answerer, request).map(|()| false)
         }
         (BoxControlRequest::Withdraw(request), ControlDoor::Host) => {
-            withdraw_and_reply(stream, boxes, answerer, request)
+            withdraw_and_reply(stream, boxes, answerer, audit_path, request).map(|()| false)
         }
         (BoxControlRequest::AnswererStatus, ControlDoor::Host) => {
             // The read-only status answers the host facts the CLI's
@@ -742,16 +778,78 @@ fn serve_request(
                 Some(status) => BoxControlReply::Status(status),
                 None => BoxControlReply::Status(answerer.get()),
             };
-            write_reply(stream, &reply)
+            write_reply(stream, &reply).map(|()| false)
         }
         (BoxControlRequest::ReadRow(request), ControlDoor::Host) => {
-            read_row_and_reply(stream, boxes, request)
+            read_row_and_reply(stream, boxes, request).map(|()| false)
         }
         (BoxControlRequest::AdmitPort(request), ControlDoor::GuestReports) => {
-            admit_report_and_reply(stream, boxes, audit_path, request)
+            admit_report_and_reply(stream, boxes, audit_path, request).map(|()| false)
         }
         (BoxControlRequest::WithdrawPort(request), ControlDoor::GuestReports) => {
-            withdraw_report_and_reply(stream, boxes, request)
+            withdraw_report_and_reply(stream, boxes, request).map(|()| false)
+        }
+        (BoxControlRequest::AdmitAsk(request), ControlDoor::GuestReports) => {
+            // The ask's reply is held until an attached client answers or
+            // the ask is cancelled — no timer ever resolves it — so the
+            // admit owns its connection on a thread of its own, and the
+            // door keeps serving the reports and the other rows' asks
+            // behind it.
+            let stream = stream.try_clone()?;
+            let boxes = boxes.clone();
+            let audit_path = audit_path.to_path_buf();
+            let handle = std::thread::Builder::new()
+                .name("minvmd-ask-admit".to_string())
+                .spawn(move || {
+                    if let Err(error) = ask_admit_and_reply(stream, &boxes, &audit_path, request)
+                    {
+                        tracing::debug!(error = %error, "an ask admit's reply could not be written");
+                    }
+                });
+            if let Err(error) = handle {
+                // The thread could not start, so nothing else will answer
+                // this connection: say so rather than leaving the guest
+                // parked on a reply no one holds. The ask was never
+                // recorded, so nothing else needs unwinding.
+                tracing::warn!(error = %error, "the ask admit's serving thread could not start");
+                return Err(error);
+            }
+            Ok(true)
+        }
+        (BoxControlRequest::RecordAskAnswer(request), ControlDoor::Host) => {
+            record_ask_answer_and_reply(stream, boxes, audit_path, request).map(|()| false)
+        }
+        (BoxControlRequest::SubscribeAsks(request), ControlDoor::Host) => {
+            // A subscription is a push stream for as long as the client
+            // stays attached: it owns its connection on a thread of its
+            // own, so one subscribed client never wedges the host socket
+            // behind it.
+            let stream = stream.try_clone()?;
+            let boxes = boxes.clone();
+            let audit_path = audit_path.to_path_buf();
+            let handle = std::thread::Builder::new()
+                .name("minvmd-asks-subscribe".to_string())
+                .spawn(move || {
+                    if let Err(error) =
+                        subscribe_asks_and_reply(stream, &boxes, &audit_path, request)
+                    {
+                        tracing::debug!(
+                            error = %error,
+                            "an ask subscription's pushes could not be written"
+                        );
+                    }
+                });
+            if let Err(error) = handle {
+                // A spawn that cannot start leaves the client parked on a
+                // connection nothing will answer, so the failure is the
+                // reply's own end: the caller closes the connection.
+                tracing::warn!(
+                    error = %error,
+                    "the ask subscription's serving thread could not start"
+                );
+                return Err(error);
+            }
+            Ok(true)
         }
         (BoxControlRequest::ReleaseAnswerer, ControlDoor::Host) => {
             let reply = answerer.release();
@@ -767,6 +865,7 @@ fn serve_request(
                     detail: reply.detail,
                 },
             )
+            .map(|()| false)
         }
         (BoxControlRequest::ReleaseAnswererCancel, ControlDoor::Host) => {
             let reply = answerer.release_cancel();
@@ -782,6 +881,7 @@ fn serve_request(
                     detail: reply.detail,
                 },
             )
+            .map(|()| false)
         }
         // The verb does not answer on this door: a registration or a read
         // that arrives on the in-VM daemon's channel, or a port report
@@ -789,7 +889,7 @@ fn serve_request(
         // that serves it — one warn line per refusal, because a verb on
         // the wrong door is a client built against another posture, not a
         // frame to drop silently.
-        (request, door) => refused_wrong_door(stream, &request, door),
+        (request, door) => refused_wrong_door(stream, &request, door).map(|()| false),
     }
 }
 
@@ -836,6 +936,9 @@ fn request_verb(request: &BoxControlRequest) -> &'static str {
         BoxControlRequest::AnswererStatus => "answerer_status",
         BoxControlRequest::AdmitPort(_) => "admit_port",
         BoxControlRequest::WithdrawPort(_) => "withdraw_port",
+        BoxControlRequest::AdmitAsk(_) => "admit_ask",
+        BoxControlRequest::RecordAskAnswer(_) => "record_ask_answer",
+        BoxControlRequest::SubscribeAsks(_) => "subscribe_asks",
         BoxControlRequest::ReadRow(_) => "read_row",
         BoxControlRequest::ReleaseAnswerer => "release_answerer",
         BoxControlRequest::ReleaseAnswererCancel => "release_answerer_cancel",
@@ -1059,10 +1162,16 @@ fn register_and_reply(
 /// the registration's; a withdrawal that finds no row is the goal state
 /// already holding (already withdrawn, or the daemon restarted since) and
 /// is a debug line, not an error.
+///
+/// The row's pending asks end with the row (NET-045): there is no grant
+/// left to admit a port under, so each one is cancelled — its held reply
+/// answered [`AskRefused::Cancelled`], its dialogs dismissed — and each
+/// cancellation answers one log line and one audit line of its own.
 fn withdraw_and_reply(
     stream: &mut UnixStream,
     boxes: &BoxRegistry,
     answerer: &AnswererStatus,
+    audit_path: &Path,
     request: WithdrawBoxRequest,
 ) -> std::io::Result<()> {
     let reply = match boxes.withdraw_client_box(
@@ -1074,6 +1183,10 @@ fn withdraw_and_reply(
             // The box is gone, so its published address returns to the
             // machine's range — the answerer's release is idempotent.
             answerer.release_address(&request.name);
+            // The row's asks end here, whatever they were waiting for: a
+            // publish with no row to admit it under is refused, not
+            // parked behind a dialog for a box that no longer exists.
+            cancel_row_asks(boxes, audit_path, request.switch_address);
             if withdrawn.is_some() {
                 tracing::info!(
                     box = %request.name,
@@ -1246,6 +1359,624 @@ fn read_row_and_reply(
         },
     };
     write_reply(stream, &reply)
+}
+
+/// How long the ask admit's held reply waits between looks for the guest's
+/// own withdrawal (NET-045): the poll only notices the guest's connection
+/// ending — its exposure unwinding — and never ends the ask itself; no
+/// timer ever resolves an ask. Short so a withdrawal is seen promptly, long
+/// enough that an ask nobody is looking at costs one read a second.
+const ASK_WITHDRAWAL_POLL: Duration = Duration::from_millis(200);
+
+/// How long an ask subscription waits between looks for its client's
+/// close (NET-045): the detach is what the client's own EOF says, so the
+/// poll is the attach's own lifetime bound, never an ask's.
+const ASK_SUBSCRIBE_POLL: Duration = Duration::from_millis(200);
+
+/// What the ask's exposure was decided to, as the recorded answer's info
+/// line names it: `admitted` for the yes the row took, and the typed
+/// refusal for every other end — the no a `Denied` outcome and the no-tty
+/// a `NoTty` one say the answer they came from, and a yes the row could
+/// no longer take says why it still admitted nothing.
+fn ask_decided_text(outcome: &AskAdmitOutcome) -> &'static str {
+    match outcome {
+        AskAdmitOutcome::Admitted { .. } => "admitted",
+        AskAdmitOutcome::Refused { reason, .. } => ask_refusal_text(*reason),
+    }
+}
+
+/// The ask answer as the one info line the observability contract names it
+/// by: "yes" or "no" — and `no_tty`, the render that never reached a
+/// terminal, so the line says what happened rather than a debug spelling.
+fn ask_answer_text(answer: AskAnswer) -> &'static str {
+    match answer {
+        AskAnswer::Yes => "yes",
+        AskAnswer::No => "no",
+        AskAnswer::NoTty => "no_tty",
+    }
+}
+
+/// The typed refusal as a log line and an audit line name it: the one
+/// spelling the wire's own `reason` carries.
+fn ask_refusal_text(reason: AskRefused) -> &'static str {
+    match reason {
+        AskRefused::NoRow => "no_row",
+        AskRefused::NoClient => "no_client",
+        AskRefused::QueueFull => "queue_full",
+        AskRefused::StanceNotAsk => "stance_not_ask",
+        AskRefused::OutsideGrant => "outside_grant",
+        AskRefused::Denied => "denied",
+        AskRefused::NoTty => "no_tty",
+        AskRefused::Cancelled => "cancelled",
+    }
+}
+
+/// The ask id as an audit line carries it: the one fixed spelling the
+/// [`minimald_rpc::AskId`] wire form and every diagnostic share, so a
+/// socket capture and an audit tail read the same name for one ask.
+fn ask_id_text(ask_id: minimald_rpc::AskId) -> String {
+    ask_id.to_string()
+}
+
+/// One ask outcome's host-side audit line (NET-045, NET-046): the record
+/// of what became of a pending ask — offered, answered, cancelled, or
+/// refused — appended to the same owner-only host audit the port reports
+/// copy into, so one file holds the host's whole record of what its table
+/// admitted and why. Every field is host-sourced: the box's facts from the
+/// row the registration published, the id the host minted, the count of
+/// clients an offer reached — and nothing a guest could have written,
+/// because the guest's ask carried only its row key, a port and a
+/// protocol, and a name or a prompt string it might have sent is not
+/// something a dialog could trust.
+#[derive(serde::Serialize)]
+struct AskOutcomeAudit {
+    /// When the outcome was recorded: Unix seconds.
+    ts: u64,
+    /// Which ask outcome this line records: `offered`, the answer's own
+    /// `yes` / `no` / `no_tty`, `cancelled`, or `refused` with the typed
+    /// reason in [`Self::reason`].
+    outcome: &'static str,
+    /// The ask's host-minted id — the one name its whole lifetime carries.
+    ask_id: String,
+    /// The box's name, from the host's own row.
+    #[serde(rename = "box", skip_serializing_if = "Option::is_none")]
+    box_name: Option<String>,
+    /// The row's box id — the host-minted identity the offer keys its
+    /// subscription by.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    box_id: Option<String>,
+    /// The row's switch address — the ask's own row key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    switch_address: Option<Ipv4Addr>,
+    /// The port the ask asked to publish.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    port: Option<u16>,
+    /// The protocol the port would publish under.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    proto: Option<IpProto>,
+    /// How many attached clients the offer reached — the `offered` line's
+    /// own fact.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    offered_to: Option<usize>,
+    /// The typed refusal, on a `refused` line.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'static str>,
+}
+
+impl AskOutcomeAudit {
+    /// An outcome the ask's own host-sourced facts name (NET-045): every
+    /// line but a refusal for an id the host never held carries the row's
+    /// facts, copied at the outcome, never re-read from a row that may
+    /// since have gone.
+    fn facts(outcome: &'static str, ask_id: minimald_rpc::AskId, facts: &AskFacts) -> Self {
+        Self {
+            ts: unix_now_secs(),
+            outcome,
+            ask_id: ask_id_text(ask_id),
+            box_name: Some(facts.name.clone()),
+            box_id: Some(crate::bep_attach::BoxIdText(&facts.box_id).to_string()),
+            switch_address: Some(facts.switch_address),
+            port: Some(facts.port),
+            proto: Some(facts.proto),
+            offered_to: None,
+            reason: None,
+        }
+    }
+
+    /// An offer's own line: the outcome and the client count it reached.
+    fn offered(ask_id: minimald_rpc::AskId, offered: &AskOffered) -> Self {
+        Self::facts("offered", ask_id, &offered.facts).with_offered_to(offered.offered_to)
+    }
+
+    /// A recorded answer's own line: the answer a host client gave, with
+    /// the typed refusal in [`Self::reason`] when the answer's outcome was
+    /// one — a no and a no-tty name the refusal they came from, and a yes
+    /// the row could no longer take names why it still admitted nothing.
+    fn answered(answered: &AskAnswered) -> Self {
+        let mut line = Self::facts(
+            ask_answer_text(answered.answer),
+            answered.ask_id,
+            &answered.facts,
+        );
+        if let AskAdmitOutcome::Refused { reason, .. } = answered.outcome {
+            line.reason = Some(ask_refusal_text(reason));
+        }
+        line
+    }
+
+    /// A cancellation's own line.
+    fn cancelled(ask_id: minimald_rpc::AskId, cancelled: &AskCancelled) -> Self {
+        Self::facts("cancelled", ask_id, &cancelled.facts)
+    }
+
+    /// A recorded answer the host refused to take: the id is the only fact
+    /// this outcome has — the ask it names is not held, so no row's facts
+    /// may be attached to it.
+    fn unknown_id(ask_id: minimald_rpc::AskId) -> Self {
+        Self {
+            ts: unix_now_secs(),
+            outcome: "refused",
+            ask_id: ask_id_text(ask_id),
+            box_name: None,
+            box_id: None,
+            switch_address: None,
+            port: None,
+            proto: None,
+            offered_to: None,
+            reason: Some("unknown_ask_id"),
+        }
+    }
+
+    /// The offered line's client count.
+    fn with_offered_to(mut self, offered_to: usize) -> Self {
+        self.offered_to = Some(offered_to);
+        self
+    }
+}
+
+/// Append one ask outcome's audit line to the owner-only host audit.
+/// Best-effort for the same reason the port report's copy is: the outcome
+/// itself already happened — the answer is recorded, the ask is cleared —
+/// so a copy that cannot be written is a warn line, never a roll-back of
+/// what the host already decided.
+fn append_ask_audit(path: &Path, line: AskOutcomeAudit) {
+    let Ok(json) = serde_json_lenient::to_string(&line) else {
+        tracing::warn!("an ask outcome's audit line did not serialize");
+        return;
+    };
+    // The same owner-only append the port report's copy takes: created
+    // 0600 when absent, appended one line at a time, best-effort — the
+    // outcome it names already happened.
+    let written = (|| -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(path)?;
+        writeln!(file, "{json}")
+    })();
+    if let Err(error) = written {
+        tracing::warn!(
+            %error,
+            path = %path.display(),
+            "the ask outcome could not be copied to the host-side audit log"
+        );
+    }
+}
+
+/// One ask's offer, said the way every offer is said (NET-045): an info
+/// line naming the ask by its id, the row it belongs to, the port and the
+/// protocol it asks to publish, and how many attached clients the offer
+/// reached — the diagnostic a bundle's VM host daemon log is read for.
+fn log_ask_offered(offered: &AskOffered) {
+    tracing::info!(
+        ask_id = %offered.ask_id,
+        box = %offered.facts.name,
+        switch_address = %offered.facts.switch_address,
+        port = offered.facts.port,
+        proto = %offered.facts.proto,
+        offered_to = offered.offered_to,
+        "offered a pending ask to the row's attached clients"
+    );
+}
+
+/// One ask's cancellation, said the way every cancellation is said
+/// (NET-045): the ask is cleared, the dialogs still offering it are
+/// dismissed, and the guest's held reply is answered with the refusal —
+/// the line that explains an exposure that ended without an answer.
+fn log_ask_cancelled(cancelled: &AskCancelled) {
+    tracing::info!(
+        box = %cancelled.facts.name,
+        switch_address = %cancelled.facts.switch_address,
+        port = cancelled.facts.port,
+        proto = %cancelled.facts.proto,
+        dismissed = cancelled.dismissed,
+        "cancelled a pending ask; the guest's held reply is refused"
+    );
+}
+
+/// End every ask a row still holds (NET-045) — the row's withdrawal's own
+/// cancellation path — logging and auditing each: with no row there is no
+/// grant to admit the ask's port under, so the exposure waiting on it is
+/// answered [`AskRefused::Cancelled`] rather than parked behind a dialog
+/// for a box that no longer exists.
+fn cancel_row_asks(boxes: &BoxRegistry, audit_path: &Path, switch_addr: Ipv4Addr) {
+    for cancelled in boxes.cancel_asks_for_row(switch_addr) {
+        log_ask_cancelled(&cancelled);
+        // The cancelled ask's own id, to name the audit line by: the
+        // outcome the guest is answered with carries it.
+        let ask_id = match cancelled.outcome {
+            AskAdmitOutcome::Refused { ask_id, .. } | AskAdmitOutcome::Admitted { ask_id, .. } => {
+                ask_id
+            }
+        };
+        append_ask_audit(audit_path, AskOutcomeAudit::cancelled(ask_id, &cancelled));
+    }
+}
+
+/// The queue-full warning's own bound: one warn line per row per trailing
+/// minute, so a guest that asks in a loop cannot grow the log the way it
+/// cannot grow the queue. A bounded map keyed by the row, pruned as it
+/// ages, because a row that stops asking owes the log nothing.
+fn warn_queue_full_rate_limited(switch_addr: Ipv4Addr, port: u16, proto: IpProto) {
+    use std::sync::OnceLock;
+    static WARNED: OnceLock<Mutex<std::collections::HashMap<[u8; 4], Instant>>> = OnceLock::new();
+    const QUEUE_FULL_WARN_INTERVAL: Duration = Duration::from_secs(60);
+    let warned = WARNED.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    let mut warned = warned
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let now = Instant::now();
+    warned.retain(|_, warned_at| now.duration_since(*warned_at) < QUEUE_FULL_WARN_INTERVAL);
+    let key = switch_addr.octets();
+    if warned.contains_key(&key) {
+        tracing::debug!(
+            switch_address = %switch_addr,
+            port,
+            proto = %proto,
+            "refused an ask past the row's pending-ask queue bound"
+        );
+        return;
+    }
+    warned.insert(key, now);
+    tracing::warn!(
+        switch_address = %switch_addr,
+        port,
+        proto = %proto,
+        "refused an ask past the row's pending-ask queue bound; the row's offered \
+         dialog must be answered before any exposure behind it is asked for"
+    );
+}
+
+/// Serve the in-VM daemon's ask admit (NET-045) — on its own thread,
+/// because the admit's reply is *held*: the host records the ask pending,
+/// mints its id, offers it to every host client attached to the row, and
+/// the reply is written only when one of them records an answer or the ask
+/// is cancelled. No timer ever resolves it.
+///
+/// The host decides before the ask is asked, the same order the native
+/// path decides in: no row ([`AskRefused::NoRow`]), a stance that is not
+/// `ask` ([`AskRefused::StanceNotAsk`]), a port outside the grant's range
+/// ([`AskRefused::OutsideGrant`]), no attached client to answer
+/// ([`AskRefused::NoClient`]) and a row queue at its bound
+/// ([`AskRefused::QueueFull`], its warn line rate-limited per row) are all
+/// refused at once, each answering its log line and its audit line; only a
+/// recorded ask is offered.
+///
+/// While the ask waits, this thread also watches for the guest's own
+/// withdrawal — its connection ending, the exposure unwinding — and ends
+/// the ask as a cancellation when it sees it, so an ask no one is waiting
+/// on any more cannot stay parked behind a dialog either.
+fn ask_admit_and_reply(
+    mut stream: UnixStream,
+    boxes: &BoxRegistry,
+    audit_path: &Path,
+    request: AdmitAskRequest,
+) -> std::io::Result<()> {
+    let (reply, outcome) = std::sync::mpsc::channel::<AskAdmitOutcome>();
+    let recorded = boxes.record_ask(request.switch_address, request.port, request.proto, reply);
+    let ask_id = match recorded {
+        Ok(recorded) => {
+            // The one line that names the pending ask: its id, its row,
+            // its port and protocol, and — when it is the row's offered
+            // dialog at once — how many clients the offer reached. A
+            // queued ask is named when the offer reaches it.
+            match &recorded.offered_to {
+                Some(_) => {
+                    let offered = AskOffered {
+                        ask_id: recorded.ask_id,
+                        facts: recorded.facts.clone(),
+                        offered_to: recorded.offered_to.unwrap_or_default(),
+                    };
+                    log_ask_offered(&offered);
+                    append_ask_audit(
+                        audit_path,
+                        AskOutcomeAudit::offered(recorded.ask_id, &offered),
+                    );
+                }
+                None => tracing::info!(
+                    ask_id = %recorded.ask_id,
+                    box = %recorded.facts.name,
+                    switch_address = %recorded.facts.switch_address,
+                    port = recorded.facts.port,
+                    proto = %recorded.facts.proto,
+                    "queued a pending ask behind the row's offered dialog"
+                ),
+            }
+            recorded.ask_id
+        }
+        Err(refusal) => {
+            // Every refusal answers its warn line — the queue bound's own
+            // rate-limited — and its audit line, and the admit is answered
+            // at once: the guest's publish unwinds on the check that
+            // refused it.
+            match refusal.reason {
+                AskRefused::QueueFull => {
+                    warn_queue_full_rate_limited(
+                        request.switch_address,
+                        request.port,
+                        request.proto,
+                    );
+                }
+                reason => tracing::warn!(
+                    ask_id = %refusal.ask_id,
+                    switch_address = %request.switch_address,
+                    port = request.port,
+                    proto = %request.proto,
+                    reason = ask_refusal_text(reason),
+                    "refused the in-VM daemon's ask admit"
+                ),
+            }
+            if let Some(facts) = &refusal.facts {
+                let mut line = AskOutcomeAudit::facts("refused", refusal.ask_id, facts);
+                line.reason = Some(ask_refusal_text(refusal.reason));
+                append_ask_audit(audit_path, line);
+            }
+            write_reply(
+                &mut stream,
+                &BoxControlReply::AskAdmit(AskAdmitOutcome::Refused {
+                    ask_id: refusal.ask_id,
+                    reason: refusal.reason,
+                }),
+            )?;
+            drain_until_peer_closes(&mut stream);
+            return Ok(());
+        }
+    };
+    // The ask is pending: serve its wait. The poll below looks for the
+    // guest's own withdrawal only — no timer ever ends the ask; the answer
+    // arrives through the outcome channel whenever a client records it.
+    stream.set_read_timeout(Some(ASK_WITHDRAWAL_POLL))?;
+    let mut sink = [0u8; 1024];
+    let mut withdrew = false;
+    let outcome = loop {
+        match outcome.recv_timeout(ASK_WITHDRAWAL_POLL) {
+            Ok(outcome) => break Some(outcome),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break None,
+        }
+        let read = stream.read(&mut sink);
+        let guest_gone = matches!(read, Ok(0))
+            || matches!(
+                &read,
+                Err(error)
+                    if error.kind() != std::io::ErrorKind::WouldBlock
+                        && error.kind() != std::io::ErrorKind::TimedOut
+            );
+        if guest_gone && !withdrew {
+            // The guest's own withdrawal: its exposure went away, so the
+            // ask it asked for is cleared — the held reply the
+            // cancellation resolves it with is the outcome the loop's next
+            // turn takes, and the guest's own connection is gone to take
+            // the line it would have written.
+            withdrew = true;
+            if let Some(cancelled) = boxes.cancel_ask(ask_id) {
+                log_ask_cancelled(&cancelled);
+                append_ask_audit(audit_path, AskOutcomeAudit::cancelled(ask_id, &cancelled));
+                // The ask behind the cancelled one, offered now that the
+                // row's dialog freed — logged and audited the way every
+                // offer is, here on the thread that freed it.
+                if let Some(offered_next) = &cancelled.offered_next {
+                    log_ask_offered(offered_next);
+                    append_ask_audit(
+                        audit_path,
+                        AskOutcomeAudit::offered(offered_next.ask_id, offered_next),
+                    );
+                }
+            }
+        }
+    };
+    // The ask is ended: an answer's outcome was audited where the answer
+    // was recorded, and a cancellation this thread observed was audited
+    // above, so the outcome is written and nothing else. A dropped outcome
+    // — the book gone with it, only at the daemon's own end — fails closed
+    // as a cancellation rather than hanging a connection on it.
+    let outcome = outcome.unwrap_or(AskAdmitOutcome::Refused {
+        ask_id,
+        reason: AskRefused::Cancelled,
+    });
+    write_reply(&mut stream, &BoxControlReply::AskAdmit(outcome))?;
+    drain_until_peer_closes(&mut stream);
+    Ok(())
+}
+
+/// Serve a host client's recorded answer for one pending ask (NET-045) on
+/// the host's control socket — the one door an answer is taken on, because
+/// a guest can raise a question but never answer one. The first answer
+/// recorded for an ask is the only one it takes: the guest-side consume
+/// happens in the registry, before the outcome is decided, so a second
+/// answer — whatever it says — finds no pending ask and is refused here as
+/// an id the host does not hold.
+///
+/// One info line per recorded answer names the ask and the answer, the
+/// observability contract's own line; a refusal of an unknown or consumed
+/// id answers its warn line, and both outcomes write their audit line.
+/// The row's next queued ask, when the answered one was its offered
+/// dialog, is offered on the spot and logged and audited the way every
+/// offer is.
+fn record_ask_answer_and_reply(
+    stream: &mut UnixStream,
+    boxes: &BoxRegistry,
+    audit_path: &Path,
+    request: RecordAskAnswerRequest,
+) -> std::io::Result<()> {
+    let reply = match boxes.record_ask_answer(request.ask_id, request.answer) {
+        Ok(answered) => {
+            // The one info line per recorded answer (NET-045): the ask it
+            // answers, the answer itself, and what the exposure was decided
+            // to — the line the observability contract names, with the
+            // dismissals it ended every other dialog by.
+            tracing::info!(
+                ask_id = %answered.ask_id,
+                box = %answered.facts.name,
+                port = answered.facts.port,
+                proto = %answered.facts.proto,
+                answer = ask_answer_text(answered.answer),
+                decided = ask_decided_text(&answered.outcome),
+                dismissed = answered.dismissed,
+                "recorded an attached client's answer for a pending ask"
+            );
+            append_ask_audit(audit_path, AskOutcomeAudit::answered(&answered));
+            if let Some(offered_next) = &answered.offered_next {
+                log_ask_offered(offered_next);
+                append_ask_audit(
+                    audit_path,
+                    AskOutcomeAudit::offered(offered_next.ask_id, offered_next),
+                );
+            }
+            BoxControlReply::AskAnswerRecorded {
+                ask_id: answered.ask_id,
+                recorded: true,
+            }
+        }
+        Err(ask_id) => {
+            // An id the host does not hold: never minted, already answered,
+            // or already cancelled — a second answer for one ask is this
+            // same refusal, because the first answer consumed it.
+            tracing::warn!(
+                ask_id = %ask_id,
+                answer = ask_answer_text(request.answer),
+                "refused a recorded answer for an ask the host does not hold: \
+                 unknown, cancelled, or already answered"
+            );
+            append_ask_audit(audit_path, AskOutcomeAudit::unknown_id(ask_id));
+            BoxControlReply::Error {
+                error: format!(
+                    "no pending ask is held for the ask id {}: its first answer was \
+                     already recorded or it was cancelled",
+                    ask_id
+                ),
+            }
+        }
+    };
+    write_reply(stream, &reply)
+}
+
+/// Serve an attached host client's subscription to one row's pending asks
+/// (NET-045) — on its own thread, because the subscription is a push
+/// stream: this writes the row's offered asks and the dismissals of the
+/// asks other clients answered, one line each, until the client closes its
+/// end, which is the detach that ends exactly this subscription.
+///
+/// The subscription is keyed by the row's [`BoxId`] — the host-minted
+/// identity the row read hands the client — never a guest-reported name;
+/// the row's standing offered ask is pushed to a client that attached
+/// mid-ask, so a dialog is never missed for arriving late, and the last
+/// client's detach cancels the row's asks: an ask no one can answer must
+/// not park an exposure behind a dialog that will never be seen.
+fn subscribe_asks_and_reply(
+    mut stream: UnixStream,
+    boxes: &BoxRegistry,
+    audit_path: &Path,
+    request: SubscribeAsksRequest,
+) -> std::io::Result<()> {
+    let box_id = request.box_id.to_bytes();
+    let (pushes, inbox) = std::sync::mpsc::channel::<BoxControlReply>();
+    let Ok((subscriber, standing)) = boxes.subscribe_asks(box_id, pushes) else {
+        // No live row holds the box id: nothing to subscribe to, no dialog
+        // would ever arrive, and the refusal says so rather than parking a
+        // client on a stream that will never carry one.
+        tracing::debug!(
+            box_id = %request.box_id,
+            "refused an ask subscription for a box id no live row holds"
+        );
+        return write_reply(
+            &mut stream,
+            &BoxControlReply::Error {
+                error: format!(
+                    "no live box row holds the box id {}; there are no pending asks \
+                     to subscribe to",
+                    request.box_id
+                ),
+            },
+        );
+    };
+    write_reply(
+        &mut stream,
+        &BoxControlReply::AsksSubscribed {
+            subscribed: true,
+            box_id: request.box_id,
+        },
+    )?;
+    // The standing offered ask, if the row holds one: the dialog a client
+    // attaching mid-ask would otherwise never see. Pushed to this client
+    // alone, and logged and audited the way every offer is.
+    if let Some(offered) = standing {
+        log_ask_offered(&offered);
+        append_ask_audit(
+            audit_path,
+            AskOutcomeAudit::offered(offered.ask_id, &offered),
+        );
+    }
+    // The subscription's own serving loop: every push the registry offers
+    // or dismisses is written as it arrives, and the client's own close is
+    // the detach that ends it. The read poll is the attach's bound, never
+    // an ask's: an ask stays pending across every turn of it.
+    stream.set_read_timeout(Some(ASK_SUBSCRIBE_POLL))?;
+    let mut sink = [0u8; 1024];
+    'attached: loop {
+        match inbox.try_recv() {
+            Ok(push) => {
+                if write_reply(&mut stream, &push).is_err() {
+                    // The client is gone; its detach is below.
+                    break 'attached;
+                }
+                continue;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => break 'attached,
+        }
+        match stream.read(&mut sink) {
+            // The client closed its end: the detach. A subscriber sends
+            // nothing past its subscription, so any byte is ignored and
+            // the close alone ends the loop.
+            Ok(0) => break 'attached,
+            Ok(_) => {}
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(_) => break 'attached,
+        }
+    }
+    // The detach, and its consequence: exactly this client's subscription
+    // ends, and when it was the row's last attached client, the row's
+    // asks are cancelled — an ask nobody attached can answer admits
+    // nothing, and the guest is told so rather than left parked.
+    for cancelled in boxes.unsubscribe_asks(box_id, subscriber) {
+        log_ask_cancelled(&cancelled);
+        let ask_id = match cancelled.outcome {
+            AskAdmitOutcome::Refused { ask_id, .. } | AskAdmitOutcome::Admitted { ask_id, .. } => {
+                ask_id
+            }
+        };
+        append_ask_audit(audit_path, AskOutcomeAudit::cancelled(ask_id, &cancelled));
+    }
+    Ok(())
 }
 
 /// The reporting source as a log line names it: the one spelling the
@@ -1504,6 +2235,36 @@ mod tests {
             }
             BoxControlReply::AnswererRelease { detail, .. } => {
                 panic!("a box verb is never answered with a release reply, got {detail}")
+            }
+            BoxControlReply::AsksSubscribed { box_id, .. } => {
+                panic!(
+                    "a registration is answered with the registered box, got an ask \
+                     subscription for {box_id}"
+                )
+            }
+            BoxControlReply::PendingAskOffer(offer) => {
+                panic!(
+                    "a registration is answered with the registered box, got a pending \
+                     ask offer for {offer:?}"
+                )
+            }
+            BoxControlReply::PendingAskDismissed { ask_id, .. } => {
+                panic!(
+                    "a registration is answered with the registered box, got an ask \
+                     dismissal for {ask_id}"
+                )
+            }
+            BoxControlReply::AskAnswerRecorded { ask_id, .. } => {
+                panic!(
+                    "a registration is answered with the registered box, got an ask \
+                     answer record for {ask_id}"
+                )
+            }
+            BoxControlReply::AskAdmit(outcome) => {
+                panic!(
+                    "a registration is answered with the registered box, got an ask \
+                     admit outcome {outcome:?}"
+                )
             }
         }
     }
@@ -1831,6 +2592,31 @@ mod tests {
             BoxControlReply::AnswererRelease { detail, .. } => {
                 panic!("a box verb is never answered with a release reply, got {detail}")
             }
+            BoxControlReply::AsksSubscribed { box_id, .. } => {
+                panic!(
+                    "a box verb is never answered with a release reply, got an ask subscription for {box_id}"
+                )
+            }
+            BoxControlReply::PendingAskOffer(offer) => {
+                panic!(
+                    "a box verb is never answered with a release reply, got a pending ask offer for {offer:?}"
+                )
+            }
+            BoxControlReply::PendingAskDismissed { ask_id, .. } => {
+                panic!(
+                    "a box verb is never answered with a release reply, got an ask dismissal for {ask_id}"
+                )
+            }
+            BoxControlReply::AskAnswerRecorded { ask_id, .. } => {
+                panic!(
+                    "a box verb is never answered with a release reply, got an ask answer record for {ask_id}"
+                )
+            }
+            BoxControlReply::AskAdmit(outcome) => {
+                panic!(
+                    "a box verb is never answered with a release reply, got an ask admit outcome {outcome:?}"
+                )
+            }
         }
         assert!(
             registry
@@ -1920,6 +2706,31 @@ mod tests {
                 BoxControlReply::AnswererRelease { detail, .. } => {
                     panic!("a box verb is never answered with a release reply, got {detail}")
                 }
+                BoxControlReply::AsksSubscribed { box_id, .. } => {
+                    panic!(
+                        "a box verb is never answered with a release reply, got an ask subscription for {box_id}"
+                    )
+                }
+                BoxControlReply::PendingAskOffer(offer) => {
+                    panic!(
+                        "a box verb is never answered with a release reply, got a pending ask offer for {offer:?}"
+                    )
+                }
+                BoxControlReply::PendingAskDismissed { ask_id, .. } => {
+                    panic!(
+                        "a box verb is never answered with a release reply, got an ask dismissal for {ask_id}"
+                    )
+                }
+                BoxControlReply::AskAnswerRecorded { ask_id, .. } => {
+                    panic!(
+                        "a box verb is never answered with a release reply, got an ask answer record for {ask_id}"
+                    )
+                }
+                BoxControlReply::AskAdmit(outcome) => {
+                    panic!(
+                        "a box verb is never answered with a release reply, got an ask admit outcome {outcome:?}"
+                    )
+                }
             }
         }
         assert!(
@@ -1969,6 +2780,31 @@ mod tests {
             }
             BoxControlReply::AnswererRelease { detail, .. } => {
                 panic!("a box verb is never answered with a release reply, got {detail}")
+            }
+            BoxControlReply::AsksSubscribed { box_id, .. } => {
+                panic!(
+                    "a box verb is never answered with a release reply, got an ask subscription for {box_id}"
+                )
+            }
+            BoxControlReply::PendingAskOffer(offer) => {
+                panic!(
+                    "a box verb is never answered with a release reply, got a pending ask offer for {offer:?}"
+                )
+            }
+            BoxControlReply::PendingAskDismissed { ask_id, .. } => {
+                panic!(
+                    "a box verb is never answered with a release reply, got an ask dismissal for {ask_id}"
+                )
+            }
+            BoxControlReply::AskAnswerRecorded { ask_id, .. } => {
+                panic!(
+                    "a box verb is never answered with a release reply, got an ask answer record for {ask_id}"
+                )
+            }
+            BoxControlReply::AskAdmit(outcome) => {
+                panic!(
+                    "a box verb is never answered with a release reply, got an ask admit outcome {outcome:?}"
+                )
             }
         }
 
@@ -2743,6 +3579,827 @@ mod tests {
                 no_row: true
             },
             "a name no live box holds answers no row"
+        );
+    }
+
+    /// One ask-stance registration, the shape every ask test starts from:
+    /// the box the dialogs are offered about, carrying the grant an ask
+    /// needs — the `ask` stance and a range it admits runtime ports in.
+    fn ask_box(name: &str) -> RegisterBoxRequest {
+        RegisterBoxRequest {
+            name: name.to_string(),
+            ingress_ports: vec![8080],
+            egress: None,
+            credentialed_upstream: None,
+            dynamic_ingress: Some(sessions::DynamicIngress::Ask),
+            dynamic_allowed_range: Some((3000, 3999)),
+        }
+    }
+
+    /// An attached host client's ask subscription, as the tests drive one:
+    /// the subscribe verb holds its connection for the pushes, so the
+    /// client owns the raw stream the way the CLI's relay does, reading
+    /// the subscription's reply and then one pushed line at a time.
+    /// Dropping the client is the detach: the daemon sees the stream's
+    /// close and ends exactly this subscription.
+    struct AttachedClient {
+        stream: BufReader<TestStream>,
+    }
+
+    impl AttachedClient {
+        /// Subscribe to the row's pending asks over the host door, keyed
+        /// by the row's host-minted box id, and wait for the
+        /// subscription's own reply.
+        fn subscribe(sock_path: &std::path::Path, box_id: minimald_rpc::BoxId) -> Self {
+            let mut stream = TestStream::connect(sock_path).expect("the host door accepts");
+            let request = BoxControlRequest::SubscribeAsks(SubscribeAsksRequest { box_id });
+            let mut line =
+                serde_json_lenient::to_string(&request).expect("the subscribe request serializes");
+            line.push('\n');
+            stream
+                .write_all(line.as_bytes())
+                .expect("the subscription is written");
+            let mut client = Self {
+                stream: BufReader::new(stream),
+            };
+            let reply = client.next_push();
+            assert_eq!(
+                reply,
+                BoxControlReply::AsksSubscribed {
+                    subscribed: true,
+                    box_id
+                },
+                "the subscription is answered with the box id it subscribed by"
+            );
+            client
+        }
+
+        /// The next line the daemon pushed, as a typed reply. Blocks the
+        /// way the CLI's relay blocks: a push arrives when the host has
+        /// one, and a test that expects none reads nothing.
+        fn next_push(&mut self) -> BoxControlReply {
+            let mut line = String::new();
+            self.stream
+                .read_line(&mut line)
+                .expect("the pushed line is read");
+            serde_json_lenient::from_str(line.trim()).expect("the pushed line parses")
+        }
+
+        /// The next push, as the offer the client renders its dialog from:
+        /// anything else is a panic, so a test reading a dismissal uses
+        /// [`Self::next_push`] instead.
+        fn next_offer(&mut self) -> minimald_rpc::PendingAskOffer {
+            match self.next_push() {
+                BoxControlReply::PendingAskOffer(offer) => offer,
+                other => {
+                    panic!("the row's offered ask is pushed to the attached client, got {other:?}")
+                }
+            }
+        }
+    }
+
+    /// The in-VM daemon's ask admit over the guest door, on the thread the
+    /// held reply needs: the admit parks until an answer or a cancellation
+    /// ends the ask, so the test drives it exactly as the guest does — one
+    /// connection, held open, answered whenever the ask ends.
+    fn admit_ask(
+        guest_sock_path: &std::path::Path,
+        request: AdmitAskRequest,
+    ) -> JoinHandle<BoxControlReply> {
+        let guest_sock_path = guest_sock_path.to_path_buf();
+        std::thread::Builder::new()
+            .name("test-ask-admit".to_string())
+            .spawn(move || {
+                control(&guest_sock_path, &BoxControlRequest::AdmitAsk(request))
+                    .expect("the ask admit is answered")
+            })
+            .expect("the admit's thread spawns")
+    }
+
+    /// A host client's recorded answer for one pending ask, over the host
+    /// door — the one door an answer is taken on.
+    fn answer_ask(
+        sock_path: &std::path::Path,
+        ask_id: minimald_rpc::AskId,
+        answer: AskAnswer,
+    ) -> std::io::Result<BoxControlReply> {
+        control(
+            sock_path,
+            &BoxControlRequest::RecordAskAnswer(RecordAskAnswerRequest { ask_id, answer }),
+        )
+    }
+
+    /// The row a live box's name answers, for the ask tests' row
+    /// assertions.
+    fn read_row(sock_path: &std::path::Path, name: &str) -> BoxRow {
+        let read = control(
+            sock_path,
+            &BoxControlRequest::ReadRow(ReadRowRequest {
+                name: name.to_string(),
+            }),
+        )
+        .expect("the row read is answered");
+        let BoxControlReply::Row(row) = read else {
+            panic!("a live box's name answers its row, got {read:?}")
+        };
+        row
+    }
+
+    /// NET-045's whole path over the two doors: the guest raises the ask
+    /// and its reply is held, the offer reaches a client attached on the
+    /// host — carrying the host row's own facts — the answer recorded
+    /// through the host door decides the held reply, and a yes alone puts
+    /// the port in the row the gate reads. One info line per offer and one
+    /// per recorded answer, and one audit line per outcome.
+    #[test]
+    fn ask_yes_recorded_by_client_admits() {
+        let capture = server_capture();
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (sock_path, _server, _registry, _answerer, _proxy_publish) =
+            spawn_server(dir.path()).expect("server binds");
+        let guest_sock_path = sock_path.with_file_name(GUEST_CONTROL_SOCK_FILE);
+        let web =
+            handed(register(&sock_path, &ask_box("web")).expect("the registration is answered"));
+
+        // The attached host client, subscribed by the row's host-minted
+        // box id — the identity the registration handed back, never a
+        // guest-reported name.
+        let mut client = AttachedClient::subscribe(&sock_path, web.box_id);
+
+        // The in-VM daemon's admit, held on its own connection until an
+        // answer ends the ask — exactly as the guest's exposure waits.
+        let admit = admit_ask(
+            &guest_sock_path,
+            AdmitAskRequest {
+                switch_address: web.switch_address,
+                port: 3123,
+                proto: sessions::IpProto::Tcp,
+            },
+        );
+
+        // The offer the attached client reads: the ask's id and the host
+        // row's own facts.
+        let offer = client.next_offer();
+        assert_eq!(offer.port, 3123, "the offer names the asked port");
+        assert_eq!(offer.proto, sessions::IpProto::Tcp);
+        assert_eq!(
+            offer.box_id, web.box_id,
+            "the offer carries the row's host-minted box id"
+        );
+
+        // The answer, recorded through the host door: the first answer
+        // wins, and the reply says it was taken.
+        let recorded =
+            answer_ask(&sock_path, offer.ask_id, AskAnswer::Yes).expect("the answer is answered");
+        assert_eq!(
+            recorded,
+            BoxControlReply::AskAnswerRecorded {
+                ask_id: offer.ask_id,
+                recorded: true
+            },
+            "the recorded answer is answered with the ask it answered"
+        );
+
+        // The admit's held reply, answered with the one outcome a publish
+        // may go ahead on.
+        let admitted = admit.join().expect("the admit thread ends");
+        assert_eq!(
+            admitted,
+            BoxControlReply::AskAdmit(AskAdmitOutcome::Admitted {
+                ask_id: offer.ask_id,
+                port: 3123,
+                proto: sessions::IpProto::Tcp,
+            }),
+            "a yes recorded by the attached client admits the ask's port"
+        );
+
+        // The row the gate reads holds the port as runtime-admitted, and
+        // nothing else: one ask, one answer, one port.
+        let row = read_row(&sock_path, "web");
+        assert_eq!(
+            row.runtime_ports,
+            vec![3123],
+            "the row the gate reads holds the asked port: {row:?}"
+        );
+
+        // The dismissal: every dialog still holding the offer is told the
+        // ask ended — here the answering client's own, the push the CLI
+        // answers by taking its rendering down.
+        let dismissed = client.next_push();
+        assert_eq!(
+            dismissed,
+            BoxControlReply::PendingAskDismissed {
+                ask_id: offer.ask_id,
+                dismissed: true
+            },
+            "the answered ask is dismissed from every dialog still holding it"
+        );
+
+        // One info line per offer and one per recorded answer — the
+        // observability contract's own lines.
+        let log = capture.contents();
+        assert!(
+            log.contains("offered a pending ask to the row's attached clients")
+                && log.contains(&format!("ask_id={}", offer.ask_id))
+                && log.contains("box=web")
+                && log.contains("port=3123")
+                && log.contains("offered_to=1"),
+            "the offer's info line names the ask, the box, the port and the clients it reached: {log}"
+        );
+        assert!(
+            log.contains("recorded an attached client's answer for a pending ask")
+                && log.contains("answer=\"yes\"")
+                && log.contains("decided=\"admitted\""),
+            "the recorded answer's info line names the ask and what it decided: {log}"
+        );
+        drop(client);
+    }
+
+    /// No attached client, no ask (NET-045): an ask nobody attached can
+    /// answer must not park the exposure behind a dialog that will never
+    /// be seen, so the host refuses it at once with the fail-closed end —
+    /// the same refusal the native path gives a host with no one to ask —
+    /// answering one warn line, one audit line, and recording nothing.
+    #[test]
+    fn ask_admit_without_client_record_refused() {
+        let capture = server_capture();
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (sock_path, _server, _registry, _answerer, _proxy_publish) =
+            spawn_server(dir.path()).expect("server binds");
+        let guest_sock_path = sock_path.with_file_name(GUEST_CONTROL_SOCK_FILE);
+        let web =
+            handed(register(&sock_path, &ask_box("web")).expect("the registration is answered"));
+
+        let refused = control(
+            &guest_sock_path,
+            &BoxControlRequest::AdmitAsk(AdmitAskRequest {
+                switch_address: web.switch_address,
+                port: 3123,
+                proto: sessions::IpProto::Tcp,
+            }),
+        )
+        .expect("the admit is refused at once, not held");
+        let BoxControlReply::AskAdmit(AskAdmitOutcome::Refused { ask_id, reason }) = refused else {
+            panic!("an ask with no attached client is refused, got {refused:?}")
+        };
+        assert_eq!(reason, AskRefused::NoClient, "the refusal names its end");
+        assert_ne!(
+            ask_id,
+            minimald_rpc::AskId::from_bytes([0u8; 16]),
+            "the refusal names the ask it refused by an id the host minted"
+        );
+
+        // Nothing is recorded anywhere: the row holds no runtime port.
+        let row = read_row(&sock_path, "web");
+        assert!(
+            row.runtime_ports.is_empty(),
+            "a refused ask records no port: {row:?}"
+        );
+
+        // One warn line naming the refusal and its typed reason.
+        let log = capture.contents();
+        assert!(
+            log.contains("refused the in-VM daemon's ask admit")
+                && log.contains("reason=\"no_client\""),
+            "the refusal's warn line names the typed end it met: {log}"
+        );
+
+        // One audit line: outcome refused, the typed reason, the row's own
+        // facts — and the ask's id, the one name its whole lifetime
+        // carries.
+        let audit = std::fs::read_to_string(dir.path().join(AUDIT_LOG_RELATIVE_PATH))
+            .expect("the audit copy exists");
+        assert!(
+            audit.contains(r#""outcome":"refused""#)
+                && audit.contains(r#""reason":"no_client""#)
+                && audit.contains(r#""box":"web""#)
+                && audit.contains(r#""port":3123"#)
+                && audit.contains(r#""proto":"tcp""#)
+                && audit.contains(&format!(r#""ask_id":"{ask_id}""#)),
+            "the refusal's audit line carries the host's facts and the typed reason: {audit}"
+        );
+    }
+
+    /// A recorded answer is the host door's verb alone (NET-045): the
+    /// guest raises questions and never answers one, so the guest door
+    /// refuses a recorded answer the way it refuses any verb on the wrong
+    /// door, without touching the ask book or writing an audit line.
+    #[test]
+    fn record_ask_answer_refused_on_guest_door() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (sock_path, _server, _registry, _answerer, _proxy_publish) =
+            spawn_server(dir.path()).expect("server binds");
+        let guest_sock_path = sock_path.with_file_name(GUEST_CONTROL_SOCK_FILE);
+        handed(register(&sock_path, &ask_box("web")).expect("the registration is answered"));
+
+        let refused = control(
+            &guest_sock_path,
+            &BoxControlRequest::RecordAskAnswer(RecordAskAnswerRequest {
+                ask_id: minimald_rpc::AskId::from_bytes([1u8; 16]),
+                answer: AskAnswer::Yes,
+            }),
+        )
+        .expect("the wrong-door refusal is answered");
+        let BoxControlReply::Error { error } = refused else {
+            panic!("a recorded answer on the guest door is refused, got {refused:?}")
+        };
+        assert!(
+            error.contains("record_ask_answer") && error.contains("the host's control socket"),
+            "the refusal names the verb and the door that serves it: {error}"
+        );
+        assert!(
+            !dir.path().join(AUDIT_LOG_RELATIVE_PATH).exists(),
+            "a wrong-door refusal answers no audit line"
+        );
+    }
+
+    /// The row's pending-ask queue is bounded (NET-045): a guest that asks
+    /// in a loop cannot grow a row's ask state without limit, so the asks
+    /// past the bound are refused at once with their typed end — and the
+    /// bound's own warn line is rate-limited per row, so the refusals
+    /// cannot grow the log the way they cannot grow the queue. The bound's
+    /// worth of asks stay held behind the row's one offered dialog, ended
+    /// by the last detach, never by a timer.
+    #[test]
+    fn pending_ask_queue_bound_refuses_past_it() {
+        let capture = server_capture();
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (sock_path, _server, _registry, _answerer, _proxy_publish) =
+            spawn_server(dir.path()).expect("server binds");
+        let guest_sock_path = sock_path.with_file_name(GUEST_CONTROL_SOCK_FILE);
+        let web =
+            handed(register(&sock_path, &ask_box("web")).expect("the registration is answered"));
+        let mut client = AttachedClient::subscribe(&sock_path, web.box_id);
+
+        // Ten exposures ask at once, as overlapping publishes would: one
+        // connection each, its reply held until its ask ends.
+        let (replies, replies_rx) = std::sync::mpsc::channel::<BoxControlReply>();
+        for port in 3000..3010 {
+            let guest_sock_path = guest_sock_path.clone();
+            let replies = replies.clone();
+            std::thread::Builder::new()
+                .name("test-ask-admit".to_string())
+                .spawn(move || {
+                    let reply = control(
+                        &guest_sock_path,
+                        &BoxControlRequest::AdmitAsk(AdmitAskRequest {
+                            switch_address: web.switch_address,
+                            port,
+                            proto: sessions::IpProto::Tcp,
+                        }),
+                    )
+                    .expect("the ask admit is answered");
+                    replies.send(reply).expect("the test is still reading");
+                })
+                .expect("the admit's thread spawns");
+        }
+        drop(replies);
+
+        // The bound's two refusals arrive while the row's held asks wait
+        // behind the offered dialog: no answer is coming, so these are the
+        // only replies that can arrive before the detach below.
+        let mut queue_full = 0;
+        while queue_full < 10 - crate::box_registry::PENDING_ASKS_PER_ROW {
+            match replies_rx.recv().expect("every admit is answered") {
+                BoxControlReply::AskAdmit(AskAdmitOutcome::Refused {
+                    reason: AskRefused::QueueFull,
+                    ..
+                }) => queue_full += 1,
+                other => {
+                    panic!("the asks past the row's queue bound are refused at once, got {other:?}")
+                }
+            }
+        }
+
+        // One dialog is offered — the row's front — and the rest queue
+        // behind it, none of them offered yet.
+        let offer = client.next_offer();
+        assert_eq!(
+            offer.box_id, web.box_id,
+            "the offered dialog carries the row's own identity"
+        );
+
+        // The last attached client's detach cancels everything the row
+        // still holds: the held replies end cancelled, none by a timer.
+        drop(client);
+        let mut cancelled = 0;
+        for reply in replies_rx {
+            match reply {
+                BoxControlReply::AskAdmit(AskAdmitOutcome::Refused {
+                    reason: AskRefused::Cancelled,
+                    ..
+                }) => cancelled += 1,
+                other => panic!("a detached row's held asks end cancelled, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            cancelled,
+            crate::box_registry::PENDING_ASKS_PER_ROW,
+            "the row's queue held exactly its bound of pending asks, all cancelled at the detach"
+        );
+
+        // The bound's own warn line is rate-limited per row: two refusals
+        // in one window answer one warn — the phrase the warn alone
+        // carries, so the rate-limited debug repeats cannot count.
+        let log = capture.contents();
+        assert_eq!(
+            log.matches("the row's offered dialog must be answered")
+                .count(),
+            1,
+            "the queue-full warn line is rate-limited to one per row: {log}"
+        );
+    }
+
+    /// An ask ends by a cancellation when the row goes (NET-045): the
+    /// row's withdrawal takes its asks with it — there is no grant to
+    /// admit under any more — and the last attached client's detach does
+    /// the same, because an ask nobody attached can answer must not park
+    /// an exposure behind a dialog that will never be seen. Both ends
+    /// answer the held reply with the cancelled refusal, never a timer,
+    /// and both write their audit line.
+    #[test]
+    fn ask_cancelled_on_withdraw_or_detach() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (sock_path, _server, _registry, _answerer, _proxy_publish) =
+            spawn_server(dir.path()).expect("server binds");
+        let guest_sock_path = sock_path.with_file_name(GUEST_CONTROL_SOCK_FILE);
+        let web =
+            handed(register(&sock_path, &ask_box("web")).expect("the registration is answered"));
+
+        // The row's withdrawal ends its ask.
+        let mut client = AttachedClient::subscribe(&sock_path, web.box_id);
+        let admit = admit_ask(
+            &guest_sock_path,
+            AdmitAskRequest {
+                switch_address: web.switch_address,
+                port: 3123,
+                proto: sessions::IpProto::Tcp,
+            },
+        );
+        let offer = client.next_offer();
+        let withdrawn = control(
+            &sock_path,
+            &BoxControlRequest::Withdraw(WithdrawBoxRequest {
+                name: "web".to_string(),
+                switch_address: web.switch_address,
+                loopback_address: web.loopback_address,
+            }),
+        )
+        .expect("the withdrawal is answered");
+        assert!(
+            matches!(withdrawn, BoxControlReply::Addresses(_)),
+            "the withdrawal echoes the pair, got {withdrawn:?}"
+        );
+        assert_eq!(
+            admit.join().expect("the admit thread ends"),
+            BoxControlReply::AskAdmit(AskAdmitOutcome::Refused {
+                ask_id: offer.ask_id,
+                reason: AskRefused::Cancelled,
+            }),
+            "the withdrawn row's ask ends cancelled, admitting nothing"
+        );
+        assert_eq!(
+            client.next_push(),
+            BoxControlReply::PendingAskDismissed {
+                ask_id: offer.ask_id,
+                dismissed: true
+            },
+            "the withdrawn row's dialog is dismissed from the attached client"
+        );
+        let read = control(
+            &sock_path,
+            &BoxControlRequest::ReadRow(ReadRowRequest {
+                name: "web".to_string(),
+            }),
+        )
+        .expect("the read is answered");
+        assert_eq!(
+            read,
+            BoxControlReply::NoRow {
+                name: "web".to_string(),
+                no_row: true
+            },
+            "the withdrawn row is gone, not archived"
+        );
+        drop(client);
+
+        // The last attached client's detach ends the ask the same way: a
+        // second row, a second ask, and the detach alone.
+        let web =
+            handed(register(&sock_path, &ask_box("web")).expect("the re-registration is answered"));
+        let mut client = AttachedClient::subscribe(&sock_path, web.box_id);
+        let admit = admit_ask(
+            &guest_sock_path,
+            AdmitAskRequest {
+                switch_address: web.switch_address,
+                port: 3124,
+                proto: sessions::IpProto::Tcp,
+            },
+        );
+        let _offer = client.next_offer();
+        drop(client);
+        assert!(
+            matches!(
+                admit.join().expect("the admit thread ends"),
+                BoxControlReply::AskAdmit(AskAdmitOutcome::Refused {
+                    reason: AskRefused::Cancelled,
+                    ..
+                })
+            ),
+            "the last detach cancels the ask nobody attached can answer"
+        );
+        let row = read_row(&sock_path, "web");
+        assert!(
+            row.runtime_ports.is_empty(),
+            "a cancelled ask records no port: {row:?}"
+        );
+
+        // Both cancellations answer their audit line, in the same
+        // owner-only host audit the port reports copy into.
+        let audit = std::fs::read_to_string(dir.path().join(AUDIT_LOG_RELATIVE_PATH))
+            .expect("the audit copy exists");
+        assert_eq!(
+            audit.matches(r#""outcome":"cancelled""#).count(),
+            2,
+            "each cancelled ask answers one audit line: {audit}"
+        );
+    }
+
+    /// The dialog's text is built from the host row alone (NET-045): the
+    /// offer carries the box's name and identity from the host's own row
+    /// — never a guest-supplied string, because the guest's ask carries
+    /// only its row key, a port and a protocol — and the ask's id is the
+    /// one name the recorded answer may spend.
+    #[test]
+    fn ask_dialog_text_built_from_host_row_only() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (sock_path, _server, _registry, _answerer, _proxy_publish) =
+            spawn_server(dir.path()).expect("server binds");
+        let guest_sock_path = sock_path.with_file_name(GUEST_CONTROL_SOCK_FILE);
+        let web =
+            handed(register(&sock_path, &ask_box("web")).expect("the registration is answered"));
+
+        let mut client = AttachedClient::subscribe(&sock_path, web.box_id);
+        let admit = admit_ask(
+            &guest_sock_path,
+            AdmitAskRequest {
+                switch_address: web.switch_address,
+                port: 3123,
+                proto: sessions::IpProto::Udp,
+            },
+        );
+        let offer = client.next_offer();
+        assert_eq!(
+            offer.name, "web",
+            "the offer names the box from the host's own row"
+        );
+        assert_eq!(
+            offer.box_id, web.box_id,
+            "the offer carries the row's host-minted box id, never a guest-reported name"
+        );
+        assert_eq!(offer.port, 3123, "the offer names the asked port");
+        assert_eq!(
+            offer.proto,
+            sessions::IpProto::Udp,
+            "the offer names the asked protocol"
+        );
+        assert_ne!(
+            offer.ask_id,
+            minimald_rpc::AskId::from_bytes([0u8; 16]),
+            "the ask is named by an id the host minted, never the all-zero non-id"
+        );
+
+        // The id the offer named is the one the recorded answer spends: a
+        // yes recorded against any other id is refused, so an offer's id
+        // cannot be replayed to admit another ask's port.
+        let stranger = answer_ask(
+            &sock_path,
+            minimald_rpc::AskId::from_bytes([7u8; 16]),
+            AskAnswer::Yes,
+        )
+        .expect("the answer is answered");
+        assert!(
+            matches!(stranger, BoxControlReply::Error { .. }),
+            "an answer for an id no offer named records nothing, got {stranger:?}"
+        );
+        let recorded =
+            answer_ask(&sock_path, offer.ask_id, AskAnswer::Yes).expect("the answer is answered");
+        assert_eq!(
+            recorded,
+            BoxControlReply::AskAnswerRecorded {
+                ask_id: offer.ask_id,
+                recorded: true
+            },
+            "the answer for the offer's own id is the one it takes"
+        );
+        assert_eq!(
+            admit.join().expect("the admit thread ends"),
+            BoxControlReply::AskAdmit(AskAdmitOutcome::Admitted {
+                ask_id: offer.ask_id,
+                port: 3123,
+                proto: sessions::IpProto::Udp,
+            }),
+            "the one yes the ask took admits the one port it asked for"
+        );
+        let row = read_row(&sock_path, "web");
+        assert_eq!(
+            row.runtime_ports,
+            vec![3123],
+            "the stranger's yes recorded nothing; the offer's yes recorded its port: {row:?}"
+        );
+        drop(client);
+    }
+
+    /// Every ask outcome answers one audit line in the owner-only host
+    /// audit (NET-045, NET-046): offered, the answer's own yes and no,
+    /// the cancellation, and each record-time refusal — every line
+    /// carrying the ask's id, the box's name and id, the row key, the
+    /// port and the protocol, and nothing a guest could have written,
+    /// because the ask's request never carried anything else to write.
+    #[test]
+    fn ask_outcomes_written_to_host_audit() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (sock_path, _server, _registry, _answerer, _proxy_publish) =
+            spawn_server(dir.path()).expect("server binds");
+        let guest_sock_path = sock_path.with_file_name(GUEST_CONTROL_SOCK_FILE);
+        let web =
+            handed(register(&sock_path, &ask_box("web")).expect("the registration is answered"));
+
+        // A refused ask — no client attached — answers its audit line.
+        control(
+            &guest_sock_path,
+            &BoxControlRequest::AdmitAsk(AdmitAskRequest {
+                switch_address: web.switch_address,
+                port: 3123,
+                proto: sessions::IpProto::Tcp,
+            }),
+        )
+        .expect("the ask with no client is refused at once");
+
+        // An offered ask answered yes.
+        let mut client = AttachedClient::subscribe(&sock_path, web.box_id);
+        let admitted = admit_ask(
+            &guest_sock_path,
+            AdmitAskRequest {
+                switch_address: web.switch_address,
+                port: 3123,
+                proto: sessions::IpProto::Tcp,
+            },
+        );
+        let yes_offer = client.next_offer();
+        answer_ask(&sock_path, yes_offer.ask_id, AskAnswer::Yes).expect("the answer is answered");
+        assert!(
+            matches!(
+                admitted.join().expect("the admit thread ends"),
+                BoxControlReply::AskAdmit(AskAdmitOutcome::Admitted { .. })
+            ),
+            "the recorded yes admits the ask"
+        );
+        assert_eq!(
+            client.next_push(),
+            BoxControlReply::PendingAskDismissed {
+                ask_id: yes_offer.ask_id,
+                dismissed: true
+            },
+            "the answered ask is dismissed from the dialogs still holding it"
+        );
+
+        // An offered ask answered no: the attached human's own refusal.
+        let denied = admit_ask(
+            &guest_sock_path,
+            AdmitAskRequest {
+                switch_address: web.switch_address,
+                port: 3124,
+                proto: sessions::IpProto::Tcp,
+            },
+        );
+        let no_offer = client.next_offer();
+        answer_ask(&sock_path, no_offer.ask_id, AskAnswer::No).expect("the answer is answered");
+        assert!(
+            matches!(
+                denied.join().expect("the admit thread ends"),
+                BoxControlReply::AskAdmit(AskAdmitOutcome::Refused {
+                    reason: AskRefused::Denied,
+                    ..
+                })
+            ),
+            "the recorded no refuses the ask"
+        );
+        assert_eq!(
+            client.next_push(),
+            BoxControlReply::PendingAskDismissed {
+                ask_id: no_offer.ask_id,
+                dismissed: true
+            },
+            "the answered ask is dismissed from the dialogs still holding it"
+        );
+
+        // An offered ask cancelled by the row's withdrawal.
+        let cancelled = admit_ask(
+            &guest_sock_path,
+            AdmitAskRequest {
+                switch_address: web.switch_address,
+                port: 3125,
+                proto: sessions::IpProto::Tcp,
+            },
+        );
+        let _cancelled_offer = client.next_offer();
+        control(
+            &sock_path,
+            &BoxControlRequest::Withdraw(WithdrawBoxRequest {
+                name: "web".to_string(),
+                switch_address: web.switch_address,
+                loopback_address: web.loopback_address,
+            }),
+        )
+        .expect("the withdrawal is answered");
+        assert!(
+            matches!(
+                cancelled.join().expect("the admit thread ends"),
+                BoxControlReply::AskAdmit(AskAdmitOutcome::Refused {
+                    reason: AskRefused::Cancelled,
+                    ..
+                })
+            ),
+            "the withdrawal cancels the ask"
+        );
+        drop(client);
+
+        // Seven outcomes, one audit line each: one refusal at record, two
+        // offers that reached a client, one more offered and cancelled,
+        // a yes and a no.
+        let audit = std::fs::read_to_string(dir.path().join(AUDIT_LOG_RELATIVE_PATH))
+            .expect("the audit copy exists");
+        let lines: Vec<&str> = audit.lines().collect();
+        assert_eq!(lines.len(), 7, "one audit line per ask outcome: {audit}");
+        // Every line carries the host's facts alone, and no key a guest
+        // could have written: the ask's request never carried a name or a
+        // prompt to write, and the line set says so.
+        const HOST_FACTS: [&str; 10] = [
+            "ts",
+            "outcome",
+            "ask_id",
+            "box",
+            "box_id",
+            "switch_address",
+            "port",
+            "proto",
+            "offered_to",
+            "reason",
+        ];
+        for line in &lines {
+            let parsed: serde_json_lenient::Value =
+                serde_json_lenient::from_str(line).expect("each audit line is one JSON object");
+            let serde_json_lenient::Value::Object(fields) = &parsed else {
+                panic!("each audit line is one JSON object, got {parsed:?}")
+            };
+            for key in fields.keys() {
+                assert!(
+                    HOST_FACTS.contains(&key.as_str()),
+                    "the audit line's keys are the host's facts alone, got {key}: {line}"
+                );
+            }
+            assert!(
+                line.contains(r#""box":"web""#)
+                    && line.contains(&format!(r#""box_id":"{}""#, web.box_id))
+                    && line.contains(&format!(r#""switch_address":"{}""#, web.switch_address)),
+                "every outcome's line carries the host row's own facts: {line}"
+            );
+        }
+        // Each outcome is present, with its own spelling.
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains(r#""outcome":"refused""#)
+                    && line.contains(r#""reason":"no_client""#)),
+            "the record-time refusal answers its line: {audit}"
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.contains(r#""outcome":"offered""#))
+                .count(),
+            3,
+            "each offer answers its line: {audit}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains(r#""outcome":"yes""#) && !line.contains(r#""reason""#)),
+            "the yes answers its line, admitted: {audit}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains(r#""outcome":"no""#)
+                    && line.contains(r#""reason":"denied""#)),
+            "the no answers its line with the human's own refusal: {audit}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains(r#""outcome":"cancelled""#)),
+            "the cancellation answers its line: {audit}"
         );
     }
 }
