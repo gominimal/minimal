@@ -372,7 +372,8 @@ Forwards a port from a session's box to the laptop: binds
 SSH channel to `127.0.0.1:<PORT>` inside the box, so a service running in
 the session answers on the laptop with nothing else installed or configured
 on the remote side. `min net forward web 8080:3000` puts the box's port 3000
-on `localhost:8080`.
+on `localhost:8080`. A `<LOCAL>` of `0` binds a free port the OS picks, and
+the forward prints the port it bound. `<PORT>` must be 1-65535.
 
 Each accepted connection gets its own SSH channel, and the daemon dials
 `127.0.0.1:<PORT>` on the box's side of the session: inside the box's own

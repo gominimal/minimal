@@ -47,10 +47,16 @@ pub async fn cmd_net_forward(
     let record = resolve_session_version_gated(&mut client, &args.session).await?;
 
     // Loopback only: the forward publishes a box's service to the laptop
-    // running the command, not to the network the laptop sits on.
+    // running the command, not to the network the laptop sits on. A local
+    // port of 0 asks the OS to pick a free port; the bound port is read back
+    // so the announcements name the port that is actually listening.
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", local_port))
         .await
         .with_context(|| format!("forward: cannot listen on localhost:{local_port}"))?;
+    let local_port = listener
+        .local_addr()
+        .context("forward: cannot read the bound local port")?
+        .port();
 
     // The scoped half of the pair: every direct-tcpip channel opened on this
     // connection is dialed from the session's box. Shared behind a mutex
