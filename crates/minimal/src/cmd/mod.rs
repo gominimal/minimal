@@ -3,8 +3,8 @@
 use anyhow::{Context as _, bail};
 use std::io::IsTerminal as _;
 use std::io::Write as _;
-use std::os::unix::process::CommandExt as _;
 use std::path::PathBuf;
+use tokio::io::AsyncReadExt as _;
 use tokio::io::AsyncWriteExt as _;
 
 // The version gate lives in `minimal-client`, next to the transport it guards,
