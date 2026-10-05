@@ -239,8 +239,15 @@ fi
 # guessing — delegating to root would hand every box a way to write the tree.
 resolve_owner() {
     if [ -n "$user" ]; then
-        owner_uid="$(id -u "$user")" || die "no such account: $user"
-        owner_gid="$(id -g "$user")" || die "no such account: $user"
+        case "$user" in ''|*[!0-9]*)
+            owner_uid="$(id -u "$user")" || die "no such account: $user"
+            owner_gid="$(id -g "$user")" || die "no such account: $user"
+            ;;
+        *)
+            owner_uid=$user
+            owner_gid="$(id -g)"
+            ;;
+        esac
     elif [ -n "${SUDO_UID:-}" ] && [ -n "${SUDO_GID:-}" ]; then
         owner_uid=$SUDO_UID
         owner_gid=$SUDO_GID

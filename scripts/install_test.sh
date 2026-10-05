@@ -1541,7 +1541,7 @@ case_host_classifier_tree_installed() {
 
     cg="$root/cg"                      # the stand-in cgroup2 mountpoint
     tree="$cg/minimald.slice"          # the tree the script installs
-    me="$(id -un)"
+    me="$(id -u)"
 
     # Stand-in mount tables. Field 4 is the mount's root within the
     # filesystem: "/" in the host's initial cgroup namespace, something else
