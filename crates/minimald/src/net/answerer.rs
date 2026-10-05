@@ -638,14 +638,89 @@ pub(crate) struct AnswererPaths {
     release_window: Duration,
 }
 
-/// The bind the manager-held answerer is recorded at: the socket unit's
-/// own `ListenDatagram` (127.0.0.1 at [`ANSWERER_PORT`]), the address and
-/// port the loaded table's carve-out names and the live-answerer cell takes
-/// while this daemon publishes — the one bind the installer records, so a
+/// The bind the manager-held answerer is recorded at: the installed socket
+/// unit's own `ListenDatagram=`, read from the unit file that is also the
+/// install marker — the address and port the loaded table's carve-out names
+/// and the live-answerer cell takes while this daemon publishes, so a
 /// deny-all box's launch check keeps reading the answerer actually serving
-/// (T75's cell, fed here by the publish that reached it).
-fn recorded_service_bind() -> SocketAddr {
-    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, ANSWERER_PORT))
+/// (T75's cell, fed here by the publish that reached it). A unit that
+/// cannot be read, or names no IPv4 `ListenDatagram=`, reads as the
+/// install's documented bind, 127.0.0.1 at [`ANSWERER_PORT`].
+fn recorded_service_bind(marker: &std::path::Path) -> SocketAddr {
+    std::fs::read_to_string(marker)
+        .ok()
+        .and_then(|unit| {
+            unit.lines().find_map(|line| {
+                line.trim()
+                    .strip_prefix("ListenDatagram=")
+                    .and_then(|value| value.trim().parse::<SocketAddrV4>().ok())
+            })
+        })
+        .map_or(
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, ANSWERER_PORT)),
+            SocketAddr::V4,
+        )
+}
+
+/// What this daemon knows of the answerers that may hold a stale
+/// carve-out's target: its own interim's bind while it hosts one, and the
+/// installed service's recorded bind while the service is installed. The
+/// carve-out re-check classifies a held target against these.
+#[derive(Debug, Clone, Copy, Default)]
+struct HolderFacts {
+    /// The interim's bind, while this daemon hosts it.
+    interim: Option<SocketAddr>,
+    /// The installed service's recorded bind, while it is installed.
+    service: Option<SocketAddr>,
+}
+
+impl HolderFacts {
+    /// The facts over `paths`' install marker, with the interim's bind.
+    fn of(paths: &AnswererPaths, interim: Option<SocketAddr>) -> Self {
+        Self {
+            interim,
+            service: paths
+                .marker
+                .exists()
+                .then(|| recorded_service_bind(&paths.marker)),
+        }
+    }
+}
+
+/// Who holds a stale carve-out's target, as the re-check classifies it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CarveOutHolder {
+    /// The installed service's recorded bind, held.
+    ManagerHeld,
+    /// This daemon's own interim's bind, held.
+    Interim,
+    /// Nothing holds the target.
+    Free,
+    /// Something holds the target that is neither answerer Minimal knows:
+    /// a deny-all box's lookups reach a listener Minimal does not own.
+    NonMinimal,
+}
+
+/// Probes `target` and classifies its holder against `facts`: a bind that
+/// succeeds is a free target (the probe socket is dropped at once); a
+/// target held at the interim's or the service's bind is that answerer's;
+/// a held target that is neither is a non-Minimal listener. A bind that
+/// fails for any other reason (the address is not on this host) has
+/// nothing behind it, so it reads free.
+fn classify_carve_out_target(target: SocketAddrV4, facts: &HolderFacts) -> CarveOutHolder {
+    match std::net::UdpSocket::bind(target) {
+        Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
+            let target = SocketAddr::V4(target);
+            if facts.interim == Some(target) {
+                CarveOutHolder::Interim
+            } else if facts.service == Some(target) {
+                CarveOutHolder::ManagerHeld
+            } else {
+                CarveOutHolder::NonMinimal
+            }
+        }
+        Ok(_) | Err(_) => CarveOutHolder::Free,
+    }
 }
 
 // ── the channel's wire ──────────────────────────────────────────────────────
@@ -1243,6 +1318,7 @@ fn surface_error(status: &AnswererStatus, port: u16, erroring: &mut bool, why: &
 async fn recheck_live_carve_outs(
     manager: &crate::sessions::ManagerHandle,
     live: Option<SocketAddr>,
+    facts: &HolderFacts,
     said: &mut Option<String>,
 ) {
     // Only a host that decides a host-address box's verdict per box has
@@ -1260,7 +1336,7 @@ async fn recheck_live_carve_outs(
         sandbox2::classifier::own_mountinfo().as_deref(),
         false,
     );
-    recheck_live_carve_outs_against(manager, decision.carve_out(), live, said).await;
+    recheck_live_carve_outs_against(manager, decision.carve_out(), live, facts, said).await;
 }
 
 /// [`recheck_live_carve_outs`] over a recorded half the caller names — the
@@ -1271,16 +1347,23 @@ async fn recheck_live_carve_outs_against(
     manager: &crate::sessions::ManagerHandle,
     recorded: Option<SocketAddrV4>,
     live: Option<SocketAddr>,
+    facts: &HolderFacts,
     said: &mut Option<String>,
 ) {
     let refusal = crate::net::classifier::stale_carve_out_refusal(recorded, live);
     match refusal {
         Some(why) => {
+            // Who holds the target the stale carve-out still names: the
+            // probe says whether a box's lookups reach an answerer Minimal
+            // knows, nothing, or a listener Minimal does not own.
+            let holder = recorded.map(|target| (target, classify_carve_out_target(target, facts)));
+            let key = format!("{why} [holder: {:?}]", holder.map(|(_, class)| class));
             // The same stale state is named once, not once per pass: a
             // bind change is one event a person reads once, and the
             // acquisition's polling would otherwise re-log every box on
-            // every wake slice the state outlives.
-            if said.as_deref() == Some(&why) {
+            // every wake slice the state outlives. A holder that changed
+            // is a new state.
+            if said.as_deref() == Some(&key) {
                 return;
             }
             // Name every live deny-all box the change leaves behind: the
@@ -1317,9 +1400,25 @@ async fn recheck_live_carve_outs_against(
                 {
                     continue;
                 }
+                let name = info.name.clone().unwrap_or_else(|| info.id.to_string());
+                if let Some((target, CarveOutHolder::NonMinimal)) = holder {
+                    tracing::error!(
+                        component = COMPONENT,
+                        session = %name,
+                        target = %target,
+                        holder = "non-Minimal",
+                        live_bind = ?live,
+                        refusal = %why,
+                        "box {name}'s resolver carve-out reaches a non-Minimal listener at \
+                         {target}; stop the box with `min session destroy {name}` until the \
+                         table is reinstalled at the live answerer"
+                    );
+                    continue;
+                }
                 tracing::error!(
                     component = COMPONENT,
-                    session = %info.name.clone().unwrap_or_else(|| info.id.to_string()),
+                    session = %name,
+                    holder = ?holder.map(|(_, class)| class),
                     live_bind = ?live,
                     refusal = %why,
                     "a live deny-all box's resolver carve-out no longer names the answerer \
@@ -1327,7 +1426,7 @@ async fn recheck_live_carve_outs_against(
                      is reinstalled at the live one"
                 );
             }
-            *said = Some(why);
+            *said = Some(key);
         }
         None => {
             if said.is_some() {
@@ -1430,10 +1529,8 @@ async fn acquire_at(
             Ok(published) => {
                 retry = CHANNEL_RETRY;
                 erroring = false;
-                status.set(registered_status(
-                    &published.holder,
-                    recorded_service_bind().port(),
-                ));
+                let service_bind = recorded_service_bind(&paths.marker);
+                status.set(registered_status(&published.holder, service_bind.port()));
                 warn_refused(&node, &published.refused);
                 if !published_once {
                     published_once = true;
@@ -1447,13 +1544,15 @@ async fn acquire_at(
                 // service's own bind: this daemon's hook port can be
                 // pinned elsewhere than where the service serves, and the
                 // answerer actually serving is the service.
-                state
-                    .set_zone_answerer_port(recorded_service_bind().port())
-                    .await;
-                crate::net::classifier::set_live_answerer(recorded_service_bind());
+                state.set_zone_answerer_port(service_bind.port()).await;
+                crate::net::classifier::set_live_answerer(service_bind);
                 recheck_live_carve_outs(
                     &manager,
-                    Some(recorded_service_bind()),
+                    Some(service_bind),
+                    &HolderFacts {
+                        interim: None,
+                        service: Some(service_bind),
+                    },
                     &mut carve_out_said,
                 )
                 .await;
@@ -1472,7 +1571,13 @@ async fn acquire_at(
                     // The connection's end is the whole withdrawal: the
                     // cell this publish fed clears with it.
                     crate::net::classifier::clear_live_answerer();
-                    recheck_live_carve_outs(&manager, None, &mut carve_out_said).await;
+                    recheck_live_carve_outs(
+                        &manager,
+                        None,
+                        &HolderFacts::of(&paths, None),
+                        &mut carve_out_said,
+                    )
+                    .await;
                 }
                 continue;
             }
@@ -1783,7 +1888,13 @@ async fn host_the_interim(
         let bound = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), hook_port);
         state.set_zone_answerer_port(hook_port).await;
         crate::net::classifier::set_live_answerer(bound);
-        recheck_live_carve_outs(manager, Some(bound), carve_out_said).await;
+        recheck_live_carve_outs(
+            manager,
+            Some(bound),
+            &HolderFacts::of(paths, Some(bound)),
+            carve_out_said,
+        )
+        .await;
         crate::rpc::log_live_name_surface(state, hook_port).await;
         if let Some(reply_to) = rebound.take() {
             let _ = reply_to.send(ReleaseReply::acted(format!(
@@ -1815,7 +1926,8 @@ async fn host_the_interim(
                     }
                     status.set(minimald_rpc::ZoneAnswererStatus::Starting);
                     status.set_hosting(false);
-                    recheck_live_carve_outs(manager, None, carve_out_said).await;
+                    let lost = HolderFacts::of(paths, None);
+                    recheck_live_carve_outs(manager, None, &lost, carve_out_said).await;
                     // A serve that fails at once would otherwise re-bind
                     // in a hot loop: wait a beat first, or stop on shutdown.
                     tokio::select! {
@@ -1823,6 +1935,11 @@ async fn host_the_interim(
                         _ = shutdown.cancelled() => return,
                         _ = tokio::time::sleep(REBIND_BACKOFF) => {}
                     }
+                    // The backoff is a window another process can take the
+                    // freed port in: classify the target again, so a
+                    // deny-all box whose lookups now reach a foreign
+                    // listener is named before the re-bind.
+                    recheck_live_carve_outs(manager, None, &lost, carve_out_said).await;
                     match tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, hook_port)).await {
                         Ok(bound_again) => {
                             socket = Some(bound_again);
@@ -1886,9 +2003,10 @@ async fn host_the_interim(
                                     // client.
                                     *erroring = false;
                                     status.set_hosting(false);
+                                    let service_bind = recorded_service_bind(&paths.marker);
                                     status.set(registered_status(
                                         &published.holder,
-                                        recorded_service_bind().port(),
+                                        service_bind.port(),
                                     ));
                                     warn_refused(node, &published.refused);
                                     announce_publish(
@@ -1897,14 +2015,15 @@ async fn host_the_interim(
                                         &paths.channel,
                                         node,
                                     );
-                                    state.set_zone_answerer_port(recorded_service_bind().port())
-                                        .await;
-                                    crate::net::classifier::set_live_answerer(
-                                        recorded_service_bind(),
-                                    );
+                                    state.set_zone_answerer_port(service_bind.port()).await;
+                                    crate::net::classifier::set_live_answerer(service_bind);
                                     recheck_live_carve_outs(
                                         manager,
-                                        Some(recorded_service_bind()),
+                                        Some(service_bind),
+                                        &HolderFacts {
+                                            interim: None,
+                                            service: Some(service_bind),
+                                        },
                                         carve_out_said,
                                     )
                                     .await;
@@ -1921,8 +2040,13 @@ async fn host_the_interim(
                                     .await
                                     {
                                         crate::net::classifier::clear_live_answerer();
-                                        recheck_live_carve_outs(manager, None, carve_out_said)
-                                            .await;
+                                        recheck_live_carve_outs(
+                                            manager,
+                                            None,
+                                            &HolderFacts::of(paths, None),
+                                            carve_out_said,
+                                        )
+                                        .await;
                                     }
                                     return;
                                 }
@@ -2924,6 +3048,136 @@ mod tests {
     /// channel path. The held publish also keeps following the table: a
     /// second registration's row reaches the service without the daemon
     /// doing anything but diffing its registry.
+    /// The re-check's holder classification, each case: a free target, the
+    /// interim's held bind, the installed service's held bind, and a held
+    /// target that is neither — a non-Minimal listener.
+    #[test]
+    fn carve_out_target_holder_is_classified() {
+        let free = SocketAddrV4::new(Ipv4Addr::LOCALHOST, free_udp_port());
+        assert_eq!(
+            classify_carve_out_target(free, &HolderFacts::default()),
+            CarveOutHolder::Free
+        );
+
+        let held = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("a holder binds");
+        let Ok(SocketAddr::V4(target)) = held.local_addr() else {
+            panic!("the holder is IPv4");
+        };
+        let at = Some(SocketAddr::V4(target));
+        assert_eq!(
+            classify_carve_out_target(
+                target,
+                &HolderFacts {
+                    interim: at,
+                    service: None
+                }
+            ),
+            CarveOutHolder::Interim
+        );
+        assert_eq!(
+            classify_carve_out_target(
+                target,
+                &HolderFacts {
+                    interim: None,
+                    service: at
+                }
+            ),
+            CarveOutHolder::ManagerHeld
+        );
+        assert_eq!(
+            classify_carve_out_target(target, &HolderFacts::default()),
+            CarveOutHolder::NonMinimal
+        );
+    }
+
+    /// The recorded service bind is the installed unit's own
+    /// `ListenDatagram=`, read — not a constant — and the documented bind
+    /// only when the unit names none.
+    #[test]
+    fn recorded_service_bind_reads_the_installed_unit() {
+        let dir = tempfile::tempdir().expect("a tempdir for the unit");
+        let unit = dir.path().join("dev.minimal.zone-answerer.socket");
+        std::fs::write(
+            &unit,
+            b"[Socket]\nListenDatagram=127.0.0.1:17999\nListenStream=/run/minimal/answerer.sock\n",
+        )
+        .expect("the unit is written");
+        assert_eq!(
+            recorded_service_bind(&unit),
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 17999))
+        );
+        std::fs::write(&unit, b"[Unit]\n").expect("the unit is rewritten");
+        assert_eq!(
+            recorded_service_bind(&unit),
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, ANSWERER_PORT))
+        );
+    }
+
+    /// A unit installed on another port moves the cell: while this daemon
+    /// publishes, the status, the reported port and the live-answerer cell
+    /// all take the service's recorded bind, never the daemon's own
+    /// (pinned) hook port.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_unit_on_another_port_moves_the_cell() {
+        let buf = CaptureWriter::default();
+        let server = crate::test_harness::TestServer::new().await;
+        let dir = tempfile::tempdir().expect("a tempdir for the channel and the marker");
+        let channel = dir.path().join("answerer.sock");
+        let marker = dir.path().join("dev.minimal.zone-answerer.socket");
+        std::fs::write(&marker, b"[Socket]\nListenDatagram=127.0.0.1:17999\n")
+            .expect("the install marker is written");
+        let service = fake_manager_held_service(channel.clone());
+
+        let status = AnswererStatus::starting();
+        let shutdown = CancellationToken::new();
+        let hook_port = free_udp_port();
+        assert_ne!(
+            hook_port, 17999,
+            "the pinned hook port differs from the unit's"
+        );
+        let task = drive(
+            server.state.clone(),
+            hook_port,
+            status.clone(),
+            AnswererPaths {
+                channel,
+                marker,
+                release_window: RELEASE_WINDOW,
+            },
+            shutdown.clone(),
+            buf,
+        );
+        await_status_is(
+            &status,
+            minimald_rpc::ZoneAnswererStatus::ManagerHeld { port: 17999 },
+            "published into the manager-held answerer",
+        )
+        .await;
+        // The port and the cell are written just after the status: poll.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while server.state.zone_answerer_port().await != Some(17999)
+            || crate::net::classifier::live_answerer().is_none()
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the reported port never took the service's recorded one: {:?}",
+                server.state.zone_answerer_port().await
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            crate::net::classifier::live_answerer(),
+            Some(SocketAddr::V4(SocketAddrV4::new(
+                Ipv4Addr::LOCALHOST,
+                17999
+            ))),
+            "the cell takes the unit's recorded bind"
+        );
+
+        service.stop();
+        end(task, &shutdown);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn native_daemon_publishes_into_the_held_answerer() {
         let buf = CaptureWriter::default();
@@ -2941,6 +3195,7 @@ mod tests {
         let marker = dir.path().join("dev.minimal.zone-answerer.socket");
         std::fs::write(&marker, b"[Unit]\n").expect("the install marker is written");
         let service = fake_manager_held_service(channel.clone());
+        let recorded = recorded_service_bind(&marker);
 
         let status = AnswererStatus::starting();
         let shutdown = CancellationToken::new();
@@ -2964,7 +3219,7 @@ mod tests {
         await_status_is(
             &status,
             minimald_rpc::ZoneAnswererStatus::ManagerHeld {
-                port: recorded_service_bind().port(),
+                port: recorded.port(),
             },
             "published into the manager-held answerer",
         )
@@ -2989,7 +3244,7 @@ mod tests {
         // plan-time check reads the answerer actually serving (T75).
         assert_eq!(
             crate::net::classifier::live_answerer(),
-            Some(recorded_service_bind()),
+            Some(recorded),
             "the cell takes the service's recorded bind while the publish is held"
         );
 
@@ -3064,6 +3319,7 @@ mod tests {
         let marker = dir.path().join("dev.minimal.zone-answerer.socket");
         std::fs::write(&marker, b"[Unit]\n").expect("the install marker is written");
         let service = fake_manager_held_service(channel.clone());
+        let recorded = recorded_service_bind(&marker);
 
         let status = AnswererStatus::starting();
         let shutdown = CancellationToken::new();
@@ -3083,14 +3339,14 @@ mod tests {
         await_status_is(
             &status,
             minimald_rpc::ZoneAnswererStatus::ManagerHeld {
-                port: recorded_service_bind().port(),
+                port: recorded.port(),
             },
             "published into the manager-held answerer",
         )
         .await;
         assert_eq!(
             crate::net::classifier::live_answerer(),
-            Some(recorded_service_bind()),
+            Some(recorded),
             "the cell takes the service's recorded bind while the publish is held"
         );
 
@@ -3220,9 +3476,11 @@ mod tests {
         // the table's own record — re-read from the host's real tree, none
         // on this host — and the box is named for the state it reads.
         let mut said = None;
+        let facts = HolderFacts::default();
         recheck_live_carve_outs(
             &manager,
             Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7001)),
+            &facts,
             &mut said,
         )
         .await;
@@ -3234,6 +3492,7 @@ mod tests {
         recheck_live_carve_outs(
             &manager,
             Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7001)),
+            &facts,
             &mut said,
         )
         .await;
@@ -3246,11 +3505,14 @@ mod tests {
         // The recorded half is what a test pins: the comparison's every
         // arm, the matching one included. The bind changes — a new stale
         // state, named once.
-        let recorded = SocketAddrV4::new(Ipv4Addr::LOCALHOST, ANSWERER_PORT);
+        // A free target, so the probe classifies it free whatever this
+        // host runs at the answerer's documented port.
+        let recorded = SocketAddrV4::new(Ipv4Addr::LOCALHOST, free_udp_port());
         recheck_live_carve_outs_against(
             &manager,
             Some(recorded),
             Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7002)),
+            &facts,
             &mut said,
         )
         .await;
@@ -3262,7 +3524,7 @@ mod tests {
         );
 
         // The bind clears — named once.
-        recheck_live_carve_outs_against(&manager, Some(recorded), None, &mut said).await;
+        recheck_live_carve_outs_against(&manager, Some(recorded), None, &facts, &mut said).await;
         let after_clear = stale_lines(&capture.contents());
         assert_eq!(
             after_clear,
@@ -3277,6 +3539,7 @@ mod tests {
             &manager,
             Some(recorded),
             Some(SocketAddr::V4(recorded)),
+            &facts,
             &mut said,
         )
         .await;
@@ -3291,6 +3554,35 @@ mod tests {
             after_clear,
             "a matching bind logs no stale state"
         );
+
+        // A foreign process takes a target no Minimal answerer holds: the
+        // box is named at ERROR as reaching a non-Minimal listener, with
+        // the command that stops it.
+        let foreign =
+            std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("a foreign listener binds");
+        let Ok(SocketAddr::V4(foreign_at)) = foreign.local_addr() else {
+            panic!("the foreign listener is IPv4");
+        };
+        recheck_live_carve_outs_against(&manager, Some(foreign_at), None, &facts, &mut said).await;
+        let log = capture.contents();
+        let foreign_line = log
+            .lines()
+            .find(|line| {
+                line.contains(&format!(
+                    "box carve-out-box's resolver carve-out reaches a non-Minimal listener at \
+                     {foreign_at}"
+                ))
+            })
+            .unwrap_or_else(|| panic!("the box is named at the foreign listener, got: {log}"));
+        assert!(
+            foreign_line.contains("ERROR"),
+            "a non-Minimal listener is an error: {foreign_line}"
+        );
+        assert!(
+            foreign_line.contains("min session destroy carve-out-box"),
+            "the line names the command that stops the box: {foreign_line}"
+        );
+        drop(foreign);
 
         drop(channel);
         crate::session_host::clear_host_ip_enforcement_fact();
