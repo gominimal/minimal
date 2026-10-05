@@ -980,11 +980,12 @@ fn pump(
         // 3. The session ended while a prompt held the terminal. What the
         // suspension buffered carries the daemon's unwind codes and
         // farewell, and dropping them would strand the terminal in whatever
-        // mode the session left it: cancel the dialog, put the attach-start
-        // termios back, and queue the buffered head for the terminal, then
-        // leave the way a normal exit does (drain, then stop).
+        // mode the session left it: cancel the dialog, reassert the raw
+        // set, queue the buffered head, then leave the way a normal exit
+        // does (drain in raw, then the guard restores the attach-start
+        // termios, then the caller's unwind decides).
         if s.saw_eof && s.suspended {
-            cancel_suspend(&inner, &attach_start, &mut s);
+            cancel_suspend(&inner, &raw, &mut s);
             continue;
         }
         // The session is gone and everything read from it has reached the
@@ -1190,11 +1191,12 @@ fn suspend(inner: &RelayInner, attach_start: &Termios, s: &mut PumpState) {
     }
 }
 
-/// ssh exited during a suspend: end the dialog as cancelled, restore the
-/// attach-start termios (the prompt may have changed it), and queue the
-/// bounded head the suspension kept (and the drop line, when the bound
-/// cut it) behind whatever predates the prompt, for the exit's drain.
-fn cancel_suspend(inner: &RelayInner, attach_start: &Termios, s: &mut PumpState) {
+/// ssh exited during a suspend: end the dialog as cancelled, reassert the
+/// raw set, and queue the bounded head the suspension kept (and the drop
+/// line, when the bound cut it) behind whatever predates the prompt. The
+/// pump then drains it all in raw, as on a normal exit, and the guard puts
+/// the attach-start termios back after the last byte.
+fn cancel_suspend(inner: &RelayInner, raw: &Termios, s: &mut PumpState) {
     s.suspended = false;
     {
         let mut st = inner.lock();
@@ -1202,13 +1204,11 @@ fn cancel_suspend(inner: &RelayInner, attach_start: &Termios, s: &mut PumpState)
         st.cancelled = true;
     }
     inner.cv.notify_all();
-    match tcsetattr(&inner.tty.input, SetArg::TCSADRAIN, attach_start) {
+    match tcsetattr(&inner.tty.input, SetArg::TCSADRAIN, raw) {
         Err(e) => {
-            tracing::warn!("tty relay: could not restore termios after the session ended: {e}")
+            tracing::warn!("tty relay: could not reassert raw mode for the final replay: {e}")
         }
-        Ok(()) => {
-            inner.restored.store(true, Ordering::Release);
-        }
+        Ok(()) => inner.restored.store(false, Ordering::Release),
     }
     let buffered = s.suspend_buf.len();
     s.pending_out.append(&mut s.suspend_buf);
@@ -1218,7 +1218,7 @@ fn cancel_suspend(inner: &RelayInner, attach_start: &Termios, s: &mut PumpState)
         tracing::warn!("{}{DROP_LINE_SUFFIX}", s.dropped);
     }
     tracing::debug!(
-        "tty relay: ssh exited while suspended; dialog cancelled, termios restored, \
+        "tty relay: ssh exited while suspended; dialog cancelled, raw reasserted, \
          replaying {buffered} buffered bytes ({} dropped past the bound)",
         s.dropped
     );
@@ -1851,8 +1851,10 @@ mod tests {
 
     /// ssh dies while a prompt holds the terminal, with the session's
     /// alt-screen output (and its way out) still in the suspend buffer. The
-    /// dialog ends cancelled, the termios is back, and the buffered bytes,
-    /// the alt-screen exit among them, reach the real terminal.
+    /// dialog ends cancelled, the buffered bytes (the alt-screen exit among
+    /// them) reach the real terminal written in the raw set, as on a normal
+    /// exit, so a bare `\n` arrives untranslated, and the termios is back
+    /// afterwards.
     #[test]
     fn ssh_exit_while_suspended_leaves_terminal_restored() {
         let _serial = serial();
@@ -1861,7 +1863,7 @@ mod tests {
         let relay = Relay::start(
             session(
                 r"head -c 1 >/dev/null; printf G; sleep 1; \
-                  printf '\033[?1049hALT_SCREEN\033[?1049l'; exec sleep 30",
+                  printf '\033[?1049hALT\nSCREEN\033[?1049l'; exec sleep 30",
             ),
             term.real(),
         )
@@ -1871,7 +1873,9 @@ mod tests {
         term.wait_for_text("G");
         let handle = relay.handle();
         let lease = handle.suspend().unwrap();
-        let alt = b"\x1b[?1049hALT_SCREEN\x1b[?1049l";
+        // The bare `\n` must reach the terminal as is: OPOST is off in the
+        // raw set, so a cooked replay would have made it `\r\n`.
+        let alt = b"\x1b[?1049hALT\nSCREEN\x1b[?1049l";
         let until = Instant::now() + WAIT;
         while handle.suspended_output().0 < alt.len() as u64 {
             assert!(
