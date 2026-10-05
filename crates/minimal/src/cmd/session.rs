@@ -1729,6 +1729,9 @@ pub(crate) async fn resolve_attach_target_version_gated(
 /// The session is resolved using the provided predicate, and the connection
 /// is provided by shelling out to `ssh`.
 pub async fn cmd_exec(global: &GlobalArgs, args: ExecArgs) -> Result<(), anyhow::Error> {
+    // Pure client-side validation: refuse an oversized command before
+    // autospawning a daemon or looking up the session.
+    let wire = minimal_client::attach::checked_remote_command(&args.command)?;
     ensure_daemon(global)?;
 
     let sock = client::resolve_socket_path(global.minimal_dir.as_deref(), global.use_minvmd())
@@ -1748,13 +1751,7 @@ pub async fn cmd_exec(global: &GlobalArgs, args: ExecArgs) -> Result<(), anyhow:
         "found session"
     );
 
-    session_via_ssh(
-        &sock,
-        r.id,
-        minimal_client::attach::remote_command(&args.command),
-        None,
-    )
-    .await
+    session_via_ssh(&sock, r.id, wire, None).await
 }
 
 /// Runs a task declared by the session's project, in that session.
