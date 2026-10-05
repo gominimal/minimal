@@ -209,7 +209,7 @@ meet the policy yet.
 | Artifact | How the release run tests it |
 | --- | --- |
 | Linux amd64 `min`, `minimald`, `minvmd`, `gvproxy-min` | `smoke-linux-amd64` runs the session e2e on the host daemon. `smoke-linux-kvm` runs it in a KVM microVM. |
-| `min-answerer` (every platform that ships `min`) | [`scripts/dist-build.sh`](../../scripts/dist-build.sh) runs the link gate ([`scripts/check-answerer-links.sh`](../../scripts/check-answerer-links.sh)) on the binary it built, and the stage refuses to run without the artifact. The session-start advisory verifies it again, unprivileged, before it ever offers to copy it. **Gap:** the frozen release workflow does not yet build or upload it, and the stage now refuses without it, so no release can ship until the workflow change in the min-answerer steps under `release.yml` lands. |
+| `min-answerer` (every platform that has `min`) | [`scripts/dist-build.sh`](../../scripts/dist-build.sh) runs the link gate ([`scripts/check-answerer-links.sh`](../../scripts/check-answerer-links.sh)) on the binary it built. **Gap:** the frozen release workflow does not build, sign, notarize, or upload it yet. Until a code owner applies the workflow patch, the stage treats the artifact as optional and a release goes out without it (gominimal/inbox#899). |
 | amd64 guest kernel, rootfs, and initramfs | `smoke-linux-kvm` boots them. |
 | arm64 guest kernel, rootfs, and initramfs | `smoke-macos` boots them. |
 | macOS arm64 `min`, `minvmd`, `libkrun.1.dylib`, `gvproxy-min` | `smoke-macos` runs the session e2e with the signed files in the installer layout. **Gap:** when the `RUN_MACOS_CI` variable is `false`, this job skips and the run counts the skip as a pass. |
@@ -308,67 +308,118 @@ whose `package.version` is stale or not above the newest `v*` tag.
   Release name uses it. On a versioned run, the job checks that it equals the
   release version.
 
-**min-answerer.** The box-zone answerer binary ships in every release that
-ships `min`, because the session-start advisory (NET-122) copies it into a
-root-owned host-service path. The script half of this is done by the scripts
-this repository owns, on any branch that carries this section:
+**min-answerer.** Every release that publishes `min` must also publish the
+box-zone answerer binary. The session-start advisory (NET-122) copies it
+into a root-owned host-service path. The scripts in this repository do their
+half of the work:
 
 - [`scripts/dist-build.sh`](../../scripts/dist-build.sh) builds `min-answerer`
-  in its own cargo invocation — never beside `-p minvmd` and never through a
-  `--workspace` build, which would unify the KVM backend into a binary a root
-  host service must never carry — and runs the link gate
+  in its own cargo invocation. A build beside `-p minvmd` or a `--workspace`
+  build unifies the KVM backend into the binary, and a root host service must
+  never contain it. The script then runs the link gate
   ([`scripts/check-answerer-links.sh`](../../scripts/check-answerer-links.sh))
-  on what it built: every library must resolve from a system directory, with
-  no embedded search path and the interpreter a system loader. The build
-  fails without it.
-- [`scripts/stage-release.sh`](../../scripts/stage-release.sh) requires
-  `bin/min-answerer` beside `bin/min` on every platform the manifest ships
-  `min` for, and refuses to stage without it. The staged copy is only the
-  advisory's copy source: no unit file or launchd plist references it at its
-  user-writable path.
+  on the binary. Every library must resolve from a system directory. The
+  binary must have no embedded search path, and its interpreter must be a
+  system loader. If the gate fails, the build fails.
+- [`scripts/stage-release.sh`](../../scripts/stage-release.sh) stages
+  `bin/min-answerer` beside `bin/min` on every platform that has `min`. The
+  staged copy is only the source that the advisory copies. No unit file and
+  no `launchd` property list refers to it at its user-writable path.
 - [`scripts/package-nfpm.sh`](../../scripts/package-nfpm.sh) and
-  [`packaging/nfpm.yaml`](../../packaging/nfpm.yaml) ship
-  `/usr/bin/min-answerer` in every `.deb`, `.rpm`, and `.apk`, installing no
-  service: the advisory's one privileged command stays the one privileged
-  step.
+  [`packaging/nfpm.yaml`](../../packaging/nfpm.yaml) put
+  `/usr/bin/min-answerer` in every `.deb`, `.rpm`, and `.apk`. The packages
+  do not install a service. The advisory's privileged command is the only
+  privileged step.
 - [`scripts/install.sh`](../../scripts/install.sh) installs it beside `min`
   and replaces it on upgrade, like every other `bin` row.
 
-The workflow half is a change the code owner must apply, because
-[`.github/workflows/`](../../.github/workflows/) is frozen and CODEOWNER-gated;
-the pull request body carries the patch. Until it lands, a release run cannot
-stage — the artifact the manifest now requires is missing — so the patch is the
-needs-human item blocking the first release that carries T71. It mirrors the
-steps the other binaries already have:
+*Optional until the workflow builds it.* Because the release workflow does
+not build or upload `min-answerer` yet, `stage-release.sh` and `package-nfpm.sh`
+accept a missing `min-answerer` artifact with a warning that names the
+omitted row. They stage or package all other artifacts. A release staged
+without it gives no `min-answerer` to the host. The advisory then shows the
+state `this release ships no min-answerer; the answerer service step is
+unavailable` and does not offer the step. This state is temporary.
+gominimal/inbox#899 tracks the removal of both optional lists after the
+workflow uploads the artifact on every platform.
 
-- `build-release-linux-{amd64,arm64}`: the shared entrypoint already builds
-  and link-gates `min-answerer`. The rename step adds
-  `mv min-answerer min-answerer-linux-<arch>`, and one `upload-artifact` step
-  uploads it, like the other binaries.
-- `build-release-macos-arm64`: build it in its own invocation
-  (`cargo build --release --locked -p min-answerer`), run
-  `scripts/check-answerer-links.sh target/release/min-answerer` on the built
-  binary, rename it to `min-answerer-macos-arm64`, and sign it with the
-  Developer ID, the hardened runtime, and a timestamp — with an empty
-  entitlements set, unlike `minvmd`: no hypervisor, no
-  `disable-library-validation`, no `allow-dyld-environment-variables`, no JIT,
-  because the answerer needs none of them. Verify with
-  `codesign --verify --strict`, then run the link gate on the signed and
-  renamed artifact again, as the last thing before the upload, so the shipped
-  bytes stay the checked bytes. The pipeline signs but does not yet notarize
-  any binary; the signature is notarization-ready, and `min-answerer` rides
-  along if notarization is added pipeline-wide.
-- The release and stage-installer jobs need no change: they gather artifacts
-  by the platform-suffixed names, so the new names ride into the GitHub
-  Release, the `components` manifest, and the packages, and the manifest's
-  SHA-256 columns are the checksums to verify against.
+*Identity model.* Each check runs where it has meaning:
 
-One residual this section does not close: `answerer_survives_session_stop`,
-the e2e proof that the installed answerer service outlives a stopped
-session, installs a root-run unit, and no macOS lane has the passwordless
-sudo to run it — [`scripts/session-e2e.sh`](../../scripts/session-e2e.sh)
-skips it there. A privileged macOS e2e runner remains the open item for that
-proof.
+- **The release proves link-cleanliness.** The link gate runs on the binary
+  that `dist-build.sh` built. The workflow patch runs it again on every signed
+  and renamed artifact, as the last check before upload. The uploaded bytes
+  are then the bytes that the gate checked. The user's machine does not run
+  the gate.
+- **The user side checks identity.** The source is beside `min` in a prefix
+  that its user can write, so each user-side check is only a pre-check. On
+  macOS, the advisory runs `codesign --verify --strict -R` with the Developer
+  ID designated requirement. The requirement names Apple's Developer ID chain,
+  the team in `subject.OU`, and the signing identifier.
+- The release build of `min` gets the team ID and the identifier at compile
+  time, from `MINIMAL_ANSWERER_TEAMID` and `MINIMAL_ANSWERER_IDENTIFIER`.
+  Without them, a release `min` does not offer the step, and it gives the
+  reason `this build carries no signing identity`. It never falls back to
+  `codesign --strict` alone, because any ad-hoc signature passes that check.
+  Debug and test builds skip the check.
+- On both operating systems, the advisory then pins the SHA-256 of the bytes
+  that it checked.
+- **The privileged step checks the root-owned copy again** (design §7.1,
+  post-install custody). The rendered root command stops if the destination
+  directory is not owned by root or if group or others can write to it. It
+  runs `install` to an exclusive `mktemp` name in that directory and hashes
+  the copy. If the hash is different, it removes the copy and exits with both
+  hashes in the message. On macOS it runs the `codesign -R` check on the copy
+  again. Then it renames the copy into place. Only after that does it write
+  the unit or property list that names the copy.
+
+The workflow half is a change that a code owner must apply, because
+[`.github/workflows/`](../../.github/workflows/) is frozen and CODEOWNER-gated.
+The body of the pull request that added this section contains the change as
+a unified diff to `release.yml`. That patch is the needs-human item that
+blocks the first release that offers the answerer service step. It follows
+the steps that the other binaries have:
+
+- `build-release-linux-{amd64,arm64}`: the shared entry point builds and
+  link-gates `min-answerer` already. The rename step adds
+  `mv min-answerer min-answerer-linux-<arch>`. A new step runs the link gate
+  on the renamed file, and one `upload-artifact` step uploads it.
+- `build-release-macos-arm64`: the job's `env` gets
+  `MINIMAL_ANSWERER_TEAMID` and `MINIMAL_ANSWERER_IDENTIFIER`, so the `min`
+  that it builds has the signing identity. The job builds `min-answerer` in
+  its own invocation, link-gates it, and renames it to
+  `min-answerer-macos-arm64`.
+- The job signs it with the Developer ID, the hardened runtime, a timestamp,
+  and `--identifier "$MINIMAL_ANSWERER_IDENTIFIER"`. The signature has no
+  entitlements, unlike the `minvmd` signature. There is no hypervisor
+  entitlement, no `disable-library-validation`, no
+  `allow-dyld-environment-variables`, and no JIT. The job then checks the
+  signature with the designated requirement that `min` uses.
+- **Notarization**, new to the pipeline: the macOS job puts the signed
+  `min-answerer` in a zip file and submits it with
+  `xcrun notarytool submit --wait`. The step fails if the status is not
+  `Accepted`. The keychain profile is in the signing keychain, under the name
+  in the `NOTARY_KEYCHAIN_PROFILE` repository variable. A code owner must
+  create it. A bare binary cannot hold a stapled ticket, so Gatekeeper gets
+  the ticket online.
+- After notarization, the link gate runs again on the signed artifact, and
+  the job uploads it.
+- The release job and the stage-installer job stay the same. They collect
+  artifacts by the platform-suffixed names, so the new names go into the
+  GitHub Release, the `components` manifest, and the packages. The SHA-256
+  columns of the manifest are the checksums.
+
+This section does not close these residuals:
+
+- A shell-installer install on Linux, into the user's prefix, has no
+  signature. The privileged step accepts the copy only up to the hash pin.
+  That limit is inside the single-operator premise of design §7.1.
+- A `.deb` or `.rpm` install copies from the root-owned `/usr/bin`. That
+  closes the residual on packaged hosts.
+- `answerer_survives_session_stop` is the e2e proof that the installed
+  answerer service continues after a session stops. It installs a root-run
+  unit, and no macOS lane can run `sudo` without a password.
+  [`scripts/session-e2e.sh`](../../scripts/session-e2e.sh) skips it there. A
+  privileged macOS e2e runner is still necessary for that proof.
 
 **release job.** This job downloads all build outputs. It writes the release
 notes with `scripts/next-version.sh --notes` and generates shell completions
@@ -502,11 +553,11 @@ The components come from the `COMPONENTS` table in `stage-release.sh`:
   the same guest files. Only macOS has a `lib/` folder, because the Linux
   `minvmd` links libkrun statically.
 
-`bin/min-answerer` is the box-zone answerer binary the session-start advisory
-copies into its root-owned service path. The installer puts it beside `min`
-and nothing else references it there: no manifest row writes a unit file or a
-launchd plist, and none names the root-owned service path the advisory's one
-privileged command creates.
+`bin/min-answerer` is the box-zone answerer binary that the session-start
+advisory copies into its root-owned service path. The installer puts it
+beside `min`, and nothing else refers to it there. Manifest rows write no
+unit file and no `launchd` property list. None of them names the root-owned
+service path that the advisory's privileged command creates.
 
 The installer also adds shell setup: PATH init files, `min` completions, and
 one marked block in the shell rc file. `--uninstall` removes all of it with no
