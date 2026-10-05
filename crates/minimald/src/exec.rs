@@ -113,6 +113,39 @@ pub struct TaskExec {
     /// daemon's own environment — the very indirection #585 removes. A
     /// dropped name has to be named.
     pub drop_env: BTreeSet<String>,
+    /// The client's invocation directory relative to the uploaded tree,
+    /// already refused by [`minimald_rpc::exec::ExecRequest::parse`] if it
+    /// is absolute or holds a `..`. A task that declares `inherit_cwd`
+    /// starts there (see [`task_start_dir`]); empty means the root.
+    pub cwd: String,
+}
+
+/// Where a task starts inside its session-layout sandbox, when not at the
+/// default `/workbench`.
+///
+/// `Ok(Some(dir))` is `/workbench/<cwd>` for a task that declares
+/// `inherit_cwd` when `<cwd>` is a directory of the uploaded tree at
+/// `working`. `Ok(None)` keeps the default: the task does not inherit, or
+/// the client ran from the root. `Err(notice)` also keeps the default, with
+/// the one-line notice to show on the task's stderr: the directory is not in
+/// the uploaded tree (an upload that was skipped, or a path the upload
+/// excluded).
+fn task_start_dir(
+    inherit_cwd: bool,
+    cwd: &str,
+    working: &std::path::Path,
+) -> Result<Option<String>, String> {
+    if !inherit_cwd || cwd.is_empty() {
+        return Ok(None);
+    }
+    if working.join(cwd).is_dir() {
+        Ok(Some(format!("/{}/{cwd}", sandbox2::SESSION_DEFAULT_WD)))
+    } else {
+        Err(format!(
+            "minimal: {cwd} is not in the uploaded tree; running the task at /{}\n",
+            sandbox2::SESSION_DEFAULT_WD
+        ))
+    }
 }
 
 impl Exec for TaskExec {
@@ -368,6 +401,16 @@ async fn task_producer(
         // `/workbench`), and a patch that expanded into either directory is
         // mounted at the matching path there, keeping its declared mode.
         let session_paths = session.paths().await?;
+        // `inherit_cwd`: start where the client was invoked, inside the
+        // uploaded tree, or fall back to the root with a notice.
+        let (start_dir, mut start_notice) = match task_start_dir(
+            task.inherit_cwd,
+            &exec.cwd,
+            session_paths.working.as_utf8_path().as_std_path(),
+        ) {
+            Ok(dir) => (dir, None),
+            Err(notice) => (None, Some(notice)),
+        };
         let mut env = ctx
             .make_env_with_network(
                 &exec.task,
@@ -409,6 +452,9 @@ async fn task_producer(
                 let mut cmd = env
                     .command(&container, &inv.executable, inv.args.iter())
                     .map_err(|e| io::Error::other(format!("building command failed: {}", e)))?;
+                if let Some(dir) = &start_dir {
+                    cmd.current_dir(dir);
+                }
                 cmd.stdin(hakoniwa::Stdio::piped())
                     .stdout(hakoniwa::Stdio::piped())
                     .stderr(hakoniwa::Stdio::piped());
@@ -417,7 +463,10 @@ async fn task_producer(
                     .map_err(|e| io::Error::other(format!("command launch failed: {}", e)))?;
                 let spawned = sandbox2::Spawned::from_child(&mut child);
                 let guard = attach_or_reap(planned, spawned, &mut child).await?;
-                Ok(TaskProcess::Sandbox(HakoniwaProcess::new(child, guard)))
+                let mut process = HakoniwaProcess::new(child, guard);
+                // The fallback notice leads the first invocation's stderr.
+                process.stderr_notice = start_notice.take();
+                Ok(TaskProcess::Sandbox(process))
             }
             .await;
             if let Err(send_err) = proc_tx.send(result).await {
@@ -471,6 +520,9 @@ pub struct HakoniwaProcess {
     /// The network wiring this task's namespace got, released at the end of
     /// [`wait`](Process::wait).
     net: NetRelease,
+    /// A line the daemon shows ahead of the child's own stderr, such as the
+    /// `inherit_cwd` fallback notice (see [`task_start_dir`]).
+    stderr_notice: Option<String>,
 }
 
 /// The release of a task's network, owed once its process is gone.
@@ -545,6 +597,7 @@ impl HakoniwaProcess {
             pid: child.id() as libc::pid_t,
             state: WaitState::Spawned(Box::new(child)),
             net: NetRelease::new(net_guard),
+            stderr_notice: None,
         }
     }
 }
@@ -635,6 +688,8 @@ impl Process for TaskProcess {
         match self {
             TaskProcess::Sandbox(p) => {
                 let (i, o, e) = p.take_stdio()?;
+                let notice = p.stderr_notice.take().unwrap_or_default();
+                let e = std::io::Cursor::new(notice.into_bytes()).chain(e);
                 Some((Box::pin(i), Box::pin(o), Box::pin(e)))
             }
             TaskProcess::Echo(p) => p.take_stdio(),
@@ -1633,6 +1688,7 @@ pub(crate) async fn handle_exec(
             task,
             owns_box,
             args,
+            cwd,
         } => {
             let task = task.trim().to_string();
             if task.is_empty() {
@@ -1662,6 +1718,7 @@ pub(crate) async fn handle_exec(
                         task: task.clone(),
                         env: task_env,
                         drop_env,
+                        cwd,
                     },
                 };
                 let exit_status = exec_task.run(channel).await;
@@ -2397,6 +2454,30 @@ mod tests {
     /// bridge without modelling a disconnect.
     fn client_lost() -> tokio::sync::watch::Receiver<bool> {
         tokio::sync::watch::channel(false).1
+    }
+
+    /// `inherit_cwd` on the daemon side: a task that declares it starts at
+    /// `/workbench/<cwd>` when that directory is in the uploaded tree, and
+    /// falls back to `/workbench` with a stderr notice when it is not. A task
+    /// without `inherit_cwd`, or a run from the root, keeps `/workbench`.
+    #[test]
+    fn task_start_dir_honours_inherit_cwd() {
+        use super::task_start_dir;
+
+        let tree = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tree.path().join("sub/inner")).unwrap();
+
+        assert_eq!(
+            task_start_dir(true, "sub/inner", tree.path()),
+            Ok(Some("/workbench/sub/inner".to_string()))
+        );
+        assert_eq!(task_start_dir(false, "sub/inner", tree.path()), Ok(None));
+        assert_eq!(task_start_dir(true, "", tree.path()), Ok(None));
+
+        let notice = task_start_dir(true, "sub/gone", tree.path()).unwrap_err();
+        assert!(notice.contains("sub/gone"), "{notice}");
+        assert!(notice.contains("/workbench"), "{notice}");
+        assert_eq!(notice.lines().count(), 1, "one line: {notice:?}");
     }
 
     /// A session record carrying `mode`, with everything else at its default.
@@ -3652,6 +3733,7 @@ mod tests {
                         task: "echo_ok".to_string(),
                         owns_box: false,
                         args: vec![],
+                        cwd: String::new(),
                     }
                     .encode(),
                     &[],
@@ -3684,6 +3766,7 @@ mod tests {
                     task: "greet".to_string(),
                     owns_box: false,
                     args,
+                    cwd: String::new(),
                 }
                 .encode()
             };
@@ -3759,6 +3842,7 @@ mod tests {
                         task: "echo_ok".to_string(),
                         owns_box: true,
                         args: vec![],
+                        cwd: String::new(),
                     }
                     .encode(),
                     &[],
@@ -3820,6 +3904,7 @@ mod tests {
                         task: "echo_ok".to_string(),
                         owns_box: false,
                         args: vec![],
+                        cwd: String::new(),
                     }
                     .encode(),
                     &[],
@@ -3862,6 +3947,7 @@ mod tests {
                         task: "some_task".to_string(),
                         owns_box: false,
                         args: vec![],
+                        cwd: String::new(),
                     }
                     .encode(),
                     &[],
@@ -3882,6 +3968,7 @@ mod tests {
                         task: String::new(),
                         owns_box: false,
                         args: vec![],
+                        cwd: String::new(),
                     }
                     .encode(),
                     &[],

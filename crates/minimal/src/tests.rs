@@ -1144,6 +1144,7 @@ fn session_run_encodes_a_task_form_not_a_command() {
         task: "check".to_string(),
         owns_box: false,
         args: vec![],
+        cwd: String::new(),
     };
     let wire = request.encode();
     assert_eq!(
@@ -1152,6 +1153,7 @@ fn session_run_encodes_a_task_form_not_a_command() {
             task: "check".to_string(),
             owns_box: false,
             args: vec![],
+            cwd: String::new(),
         })
     );
 }
