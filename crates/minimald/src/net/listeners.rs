@@ -1440,6 +1440,9 @@ impl WatchState {
                                     // nothing, and settles — a revoked
                                     // port is not retried.
                                     self.unbind_revoked(port, &mapping).await;
+                                    // Unbind first, then withdraw the report:
+                                    // the host's gate retracts a runtime port
+                                    // only while the row still holds it.
                                     unreport_port(
                                         &self.plan.control,
                                         self.plan.lease,

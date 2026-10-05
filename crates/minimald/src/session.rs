@@ -2868,6 +2868,10 @@ impl Session {
             pending: Some(false),
         };
         if !self.has_live_host() {
+            // Unexpose first, then withdraw the report: the host's gate
+            // applies a runtime port's retraction only while the box's row
+            // still holds the port, so a withdrawal that ran first would leave
+            // the forward bound and unretractable.
             crate::net::policy::remove_ingress(&control, &[forwarder]).await;
             crate::net::listeners::unreport_port(&control, switch_address, port, source).await;
             return Err(ExposeFailure::Refused(ExposeRefusal::NotRunning));
@@ -2883,6 +2887,10 @@ impl Session {
             // the one it holds (design §7.1), and the caller hears the
             // box's spawn is gone, the answer a revoked publish shares with
             // the stale-spawn arm below.
+            // Unexpose first, then withdraw the report: the host's gate
+            // applies a runtime port's retraction only while the box's row
+            // still holds the port, so a withdrawal that ran first would leave
+            // the forward bound and unretractable.
             crate::net::policy::remove_ingress(&control, &[forwarder]).await;
             crate::net::listeners::unreport_port(&control, switch_address, port, source).await;
             return Err(ExposeFailure::Refused(ExposeRefusal::NotAttached));
@@ -2900,6 +2908,8 @@ impl Session {
             self.publications
                 .withdraw(port, crate::net::listeners::PublicationOwner::Expose);
             crate::net::policy::remove_ingress(&control, &[stale.forwarder]).await;
+            // The withdrawal follows the unexpose for the same reason as above:
+            // the gate retracts a runtime port only while the row holds it.
             // The host admitted this port a moment ago, so the box's spawn
             // ending takes the admission with it: the row the report put in
             // names a forward that is gone, and the withdrawal report clears
