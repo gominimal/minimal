@@ -5,7 +5,7 @@ owner: mitodrummer
 epic: gominimal/inbox#731
 arch: https://github.com/gominimal/arch/blob/2e11b6d2354911f0c14b83dc38dfb29166833577/architecture.md
 arch_sha: "2e11b6d2354911f0c14b83dc38dfb29166833577"
-updated: 2026-09-29
+updated: 2026-10-05
 ---
 
 # BCLI — The box grammar — `min box`, the type nouns, and the migration from the session verbs
@@ -35,7 +35,7 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
 
 ### Verbs over the box record and spec
 
-- **BCLI-001** WHEN `min box list` or `min ls` runs THE SYSTEM SHALL print id, name, type, state, provider and host per box, scoped to the current project unless `--all` is given, and carry `"schema": "min/v1/box"` under `-o json`.
+- **BCLI-001** WHEN `min box list` or `min ls` runs THE SYSTEM SHALL print id, name, type, state, provider and host for each box BOX-158 lists, scoped to the current project unless `--all` is given, and carry `"schema": "min/v1/box"` under `-o json`.
   <!-- was BOX-006 -->
   tier:     T0
   verify:   cargo nextest run -p minimal box_list_prints_columns_and_schema
@@ -48,7 +48,7 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
     tier:   T0
     verify: cargo nextest run -p minimal ambiguous_name_across_hosts_exit2_lists_candidates
 
-- **BCLI-003** WHEN `min box show <box>` runs THE SYSTEM SHALL render the box's state as BOX-011 defines it and its identity as BOX-140 reports it.
+- **BCLI-003** WHEN `min box show <box>` runs THE SYSTEM SHALL render the record BOX-159 returns, with the box's state as BOX-011 defines it and its identity as BOX-140 reports it.
   <!-- split from BOX-011: the rendering half; the state model stays in BOX. The identity clause is BOX-140's rendering half, moved here in cycle 4 -->
   tier:     T0
   verify:   cargo nextest run -p minimal box_show_renders_state_and_identity
@@ -153,7 +153,7 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
   tier:     T0
   verify:   cargo nextest run -p minimal type_show_matches_shipped_table_with_sources
 
-- **BCLI-021** WHEN `min box spec <entry>` runs THE SYSTEM SHALL render the expanded spec in the format `-o toml|json|yaml` names, with secrets as references only.
+- **BCLI-021** WHEN `min box spec <entry>` runs THE SYSTEM SHALL render the expanded spec in the format `-o toml|json|yaml` names, with secrets as references only, naming beside each value the layer and type BOX-161 reports for it.
   <!-- was BOX-066, without its validation sub-bullet, which stays in BOX -->
   tier:     T0
   verify:   cargo nextest run -p minimal box_spec_renders_formats_secrets_as_refs
