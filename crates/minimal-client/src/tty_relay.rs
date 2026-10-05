@@ -394,6 +394,9 @@ enum Ctl {
 struct SharedState {
     command: Option<Ctl>,
     suspended: bool,
+    /// ssh exited while a suspend was up: the prompt's dialog is over,
+    /// cancelled, and the terminal is the relay's again for the exit.
+    cancelled: bool,
     /// The pump is done; every handle call is a no-op or an error now.
     finished: bool,
 }
@@ -535,6 +538,13 @@ impl RelayHandle {
     pub fn is_suspended(&self) -> bool {
         self.inner.lock().suspended
     }
+
+    /// Whether the session ended while a suspend was up, cancelling the
+    /// prompt's dialog: a cancelled prompt records nothing, and the relay
+    /// has already taken the terminal back for the attach's exit.
+    pub fn is_cancelled(&self) -> bool {
+        self.inner.lock().cancelled
+    }
 }
 
 /// The real terminal, handed back by [`RelayHandle::suspend`].
@@ -551,6 +561,12 @@ impl TtyLease {
     /// would have used, in its attach-start termios.
     pub fn as_fd(&self) -> BorrowedFd<'_> {
         self.inner.tty.input.as_fd()
+    }
+
+    /// Whether the session ended under this lease, cancelling the dialog
+    /// (see [`RelayHandle::is_cancelled`]).
+    pub fn is_cancelled(&self) -> bool {
+        self.inner.lock().cancelled
     }
 
     /// Hand the terminal back to the relay (same as [`RelayHandle::resume`]).
@@ -961,17 +977,19 @@ fn pump(
             break;
         }
 
-        // 3. The session is gone and everything read from it has reached
-        // the terminal. A suspend up at that point keeps the terminal with
-        // the prompt: the attach ends with ssh's status, and what the
-        // suspension buffered has no session left to belong to.
-        if s.saw_eof && (s.suspended || s.pending_out.is_empty()) {
-            if s.suspended {
-                tracing::debug!(
-                    "tty relay: ssh exited while suspended; {} buffered bytes discarded",
-                    s.suspend_buf.len()
-                );
-            }
+        // 3. The session ended while a prompt held the terminal. What the
+        // suspension buffered carries the daemon's unwind codes and
+        // farewell, and dropping them would strand the terminal in whatever
+        // mode the session left it: cancel the dialog, put the attach-start
+        // termios back, and queue the buffered head for the terminal, then
+        // leave the way a normal exit does (drain, then stop).
+        if s.saw_eof && s.suspended {
+            cancel_suspend(&inner, &attach_start, &mut s);
+            continue;
+        }
+        // The session is gone and everything read from it has reached the
+        // terminal.
+        if s.saw_eof && s.pending_out.is_empty() {
             break;
         }
 
@@ -1170,6 +1188,43 @@ fn suspend(inner: &RelayInner, attach_start: &Termios, s: &mut PumpState) {
             );
         }
     }
+}
+
+/// ssh exited during a suspend: end the dialog as cancelled, restore the
+/// attach-start termios (the prompt may have changed it), and queue the
+/// bounded head the suspension kept (and the drop line, when the bound
+/// cut it) behind whatever predates the prompt, for the exit's drain.
+fn cancel_suspend(inner: &RelayInner, attach_start: &Termios, s: &mut PumpState) {
+    s.suspended = false;
+    {
+        let mut st = inner.lock();
+        st.suspended = false;
+        st.cancelled = true;
+    }
+    inner.cv.notify_all();
+    match tcsetattr(&inner.tty.input, SetArg::TCSADRAIN, attach_start) {
+        Err(e) => {
+            tracing::warn!("tty relay: could not restore termios after the session ended: {e}")
+        }
+        Ok(()) => {
+            inner.restored.store(true, Ordering::Release);
+        }
+    }
+    let buffered = s.suspend_buf.len();
+    s.pending_out.append(&mut s.suspend_buf);
+    if s.dropped > 0 {
+        let line = format!("\r\n{}{DROP_LINE_SUFFIX}\r\n", s.dropped);
+        s.pending_out.extend_from_slice(line.as_bytes());
+        tracing::warn!("{}{DROP_LINE_SUFFIX}", s.dropped);
+    }
+    tracing::debug!(
+        "tty relay: ssh exited while suspended; dialog cancelled, termios restored, \
+         replaying {buffered} buffered bytes ({} dropped past the bound)",
+        s.dropped
+    );
+    s.dropped = 0;
+    inner.buffered.store(0, Ordering::Release);
+    inner.dropped.store(0, Ordering::Release);
 }
 
 /// The pump's half of [`RelayHandle::resume`]: queue the head, own up to
@@ -1792,5 +1847,58 @@ mod tests {
         assert!(resumed.load(Ordering::Acquire), "the hook never resumed");
         term.wait_for_text("HOOK_PROMPT");
         assert_eq!(mode(&term.termios()), mode(&start));
+    }
+
+    /// ssh dies while a prompt holds the terminal, with the session's
+    /// alt-screen output (and its way out) still in the suspend buffer. The
+    /// dialog ends cancelled, the termios is back, and the buffered bytes,
+    /// the alt-screen exit among them, reach the real terminal.
+    #[test]
+    fn ssh_exit_while_suspended_leaves_terminal_restored() {
+        let _serial = serial();
+        let term = FakeTerminal::new(24, 80);
+        let start = term.termios();
+        let relay = Relay::start(
+            session(
+                r"head -c 1 >/dev/null; printf G; sleep 1; \
+                  printf '\033[?1049hALT_SCREEN\033[?1049l'; exec sleep 30",
+            ),
+            term.real(),
+        )
+        .unwrap();
+        term.wait_for_text("R");
+        term.type_bytes(b"g");
+        term.wait_for_text("G");
+        let handle = relay.handle();
+        let lease = handle.suspend().unwrap();
+        let alt = b"\x1b[?1049hALT_SCREEN\x1b[?1049l";
+        let until = Instant::now() + WAIT;
+        while handle.suspended_output().0 < alt.len() as u64 {
+            assert!(
+                Instant::now() < until,
+                "the alt-screen output never buffered"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            term.screen(),
+            b"RG",
+            "nothing reaches the terminal while suspended"
+        );
+
+        // Kill ssh (the session's leader is now `sleep`) mid-suspend.
+        let pid = libc::pid_t::try_from(relay.child.as_ref().unwrap().id()).unwrap();
+        // SAFETY: kill(2) has no memory-safety preconditions.
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+        let status = relay.join(deadline()).unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+
+        assert!(handle.is_cancelled() && lease.is_cancelled());
+        assert!(!handle.is_suspended());
+        assert_eq!(mode(&term.termios()), mode(&start));
+        let screen = term.wait_for("the buffered alt-screen output", |s| contains(s, alt));
+        assert!(screen.starts_with(b"RG"));
+        // Resuming a cancelled lease is a no-op.
+        lease.resume();
     }
 }
