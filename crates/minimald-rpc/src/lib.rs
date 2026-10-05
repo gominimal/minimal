@@ -1355,8 +1355,67 @@ pub struct DestroySessionRequest {
 }
 
 /// The response for a [`DestroySession`] RPC.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct DestroySessionResponse;
+///
+/// Carries the session's failed `on_destroy` hooks, so the client can
+/// report them: a failing destroy hook does not stop the destroy, and
+/// without this the only trace is the daemon log.
+///
+/// This was a unit struct, which encodes as `null`. It still does when
+/// no hook failed, so a client and a daemon either side of the change
+/// keep agreeing on a clean destroy.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(
+    from = "DestroySessionResponseWire",
+    into = "DestroySessionResponseWire"
+)]
+pub struct DestroySessionResponse {
+    /// One line per `on_destroy` hook that did not succeed: where it was
+    /// declared and what happened, followed by its captured output tail
+    /// on the lines after, when there is any.
+    pub hook_failures: Vec<String>,
+}
+
+/// [`DestroySessionResponse`] on the wire: `null` (the old unit shape)
+/// or an object.
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum DestroySessionResponseWire {
+    Unit(()),
+    Fields(DestroySessionResponseFields),
+}
+
+/// `deny_unknown_fields` for the same reason as on
+/// [`FinalizeSessionResponse`]: without it, `{"error": "..."}` parses as
+/// a successful destroy with no failures.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DestroySessionResponseFields {
+    #[serde(default)]
+    hook_failures: Vec<String>,
+}
+
+impl From<DestroySessionResponseWire> for DestroySessionResponse {
+    fn from(wire: DestroySessionResponseWire) -> Self {
+        match wire {
+            DestroySessionResponseWire::Unit(()) => Self::default(),
+            DestroySessionResponseWire::Fields(f) => Self {
+                hook_failures: f.hook_failures,
+            },
+        }
+    }
+}
+
+impl From<DestroySessionResponse> for DestroySessionResponseWire {
+    fn from(resp: DestroySessionResponse) -> Self {
+        if resp.hook_failures.is_empty() {
+            Self::Unit(())
+        } else {
+            Self::Fields(DestroySessionResponseFields {
+                hook_failures: resp.hook_failures,
+            })
+        }
+    }
+}
 
 impl OneshotSshRpc for DestroySession {
     const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "DestroySession");
@@ -2158,6 +2217,35 @@ mod tests {
             "got: {json}"
         );
         assert!(json.contains("\"dynamic_ingress\":null"), "got: {json}");
+    }
+
+    /// A daemon that predates `hook_failures` answers a destroy with the
+    /// old unit shape, `null`; it must still read as a clean success, and
+    /// a clean success must still go out as `null` for an older client.
+    /// An error must not read as a success with no failures.
+    #[test]
+    fn destroy_session_response_decodes_the_old_shape() {
+        let old: Errorable<DestroySessionResponse> =
+            serde_json_lenient::from_str("null").expect("the old shape must decode");
+        assert_eq!(old, Errorable::Ok(DestroySessionResponse::default()));
+        assert_eq!(
+            serde_json_lenient::to_string(&Errorable::Ok(DestroySessionResponse::default()))
+                .unwrap(),
+            "null"
+        );
+
+        let failed = DestroySessionResponse {
+            hook_failures: vec!["user loadout `dev`: exited with status 3".to_string()],
+        };
+        assert_eq!(round_trip(&failed), failed);
+
+        let err: Errorable<DestroySessionResponse> =
+            serde_json_lenient::from_str(r#"{"error":"no such session"}"#)
+                .expect("an error payload must decode");
+        assert!(
+            matches!(err, Errorable::Err { .. }),
+            "an error decoded as success: {err:?}"
+        );
     }
 
     fn round_trip<T>(value: &T) -> T
