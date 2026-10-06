@@ -429,6 +429,18 @@ fn state_dirs_from_env_vars(env_vars: &BTreeMap<String, String>) -> BTreeSet<Str
         .collect()
 }
 
+/// Looks up a session package by name in `graph`.
+///
+/// The one lookup both [`Env::build`] (at launch) and session activation's
+/// finalize check use, so a name activation accepts is one the launch
+/// resolves, and both report an unknown name in the same words.
+pub(crate) fn session_package(graph: &Graph, name: &str) -> std::io::Result<BuildSpecRef> {
+    graph
+        .by_name(name)
+        .copied()
+        .ok_or_else(|| std::io::Error::other(format!("no such package: {name}")))
+}
+
 impl Env {
     /// Build a runtime environment. Resolves and locally builds the
     /// requested packages (plus `bash`/`socat` for the `min`
@@ -440,12 +452,7 @@ impl Env {
         graph.top_levels = args
             .packages
             .iter()
-            .map(|n| {
-                graph
-                    .by_name(n)
-                    .copied()
-                    .ok_or_else(|| std::io::Error::other(format!("no such package: {n}")))
-            })
+            .map(|n| session_package(&graph, n))
             .collect::<Result<_, _>>()?;
         for helper_dep in ["bash", "socat"] {
             if let Some(bsr) = graph.by_name(helper_dep).copied()
