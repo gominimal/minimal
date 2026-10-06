@@ -179,8 +179,15 @@ expect_answer host.min.internal "NOERROR 127.0.0.1"
 expect_answer nobody.min.internal "NXDOMAIN"
 got="$(query example.com)"
 [ "${got%% *}" = REFUSED ] || fail "an out-of-zone name answered '$got', expected REFUSED"
-aliases="$(ifconfig lo0 | grep -c -- 'inet 127\.0\.64\.')"
-[ "$aliases" = 254 ] || fail "lo0 carries $aliases of 254 range aliases"
+# The range job adds its aliases one ifconfig call at a time after load,
+# so the count climbs for a while.
+aliases=0
+for _ in $(seq 1 120); do
+  aliases="$(ifconfig lo0 | grep -c -- 'inet 127\.0\.64\.' || true)"
+  [ "$aliases" = 254 ] && break
+  sleep 0.5
+done
+[ "$aliases" = 254 ] || fail "lo0 carries $aliases of 254 range aliases after 60 s"
 dscacheutil -q host -a name host.min.internal | grep -q 'ip_address: 127.0.0.1' \
   || fail "the system resolver does not answer host.min.internal"
 echo "::endgroup::"
