@@ -7983,6 +7983,105 @@ mod tests {
         );
     }
 
+    /// A publish the switch answers as gvproxy does — `200 OK` with a
+    /// `Date` header and an empty body, the client closing first, then the
+    /// switch — keeps its ledger note: the box's end unbinds the forward
+    /// and resets the connection it carries.
+    #[tokio::test]
+    async fn a_publish_the_switch_accepts_is_unbound_and_reset_at_box_end() {
+        let registry = BoxRegistry::new(SUBNET);
+        let handle = registry.clone();
+        registry.register(
+            BoxRegistration::new("web", Ipv4Addr::from(LEASE), Ipv4Addr::LOCALHOST)
+                .with_admitted_ports([8080]),
+        );
+        let publish = expose_request("127.0.0.1:8080", "100.64.0.9:18080", "tcp");
+        let mut h = gate_over_control(registry, publish).await;
+
+        let accepted = b"HTTP/1.1 200 OK\r\nDate: Tue, 06 Oct 2026 04:50:01 GMT\r\n\
+                         Content-Length: 0\r\n\r\n";
+        h.switch
+            .write_all(accepted)
+            .await
+            .expect("answering the expose");
+        let mut seen = vec![0u8; accepted.len()];
+        read_within(&mut h.guest, &mut seen).await;
+        assert_eq!(seen, accepted, "the answer reaches the guest verbatim");
+        // The daemon's client reads `Content-Length` bytes and drops its
+        // stream; gvproxy closes once the gate half-closes its side.
+        h.guest.shutdown().await.expect("closing the guest's side");
+        let mut rest = Vec::new();
+        tokio::time::timeout(DEADLINE, h.switch.read_to_end(&mut rest))
+            .await
+            .expect("the gate half-closes the switch's side")
+            .expect("reading the switch's side to its end");
+        h.switch
+            .shutdown()
+            .await
+            .expect("closing the switch's side");
+
+        // One connection through the forward.
+        let (mut guest, mut switch) = connect_over(&h).await;
+        let forwarder = SUBNET.gateway();
+        let dial = dns_pins::tests::tcp_frame(
+            forwarder,
+            40000,
+            Ipv4Addr::from(LEASE),
+            18080,
+            sessions::core::egress::TCP_SYN,
+        );
+        send_frame(&mut switch, &dial).await;
+        assert_eq!(expect_frame(&mut guest).await, dial);
+        let answer = dns_pins::tests::tcp_frame(
+            Ipv4Addr::from(LEASE),
+            18080,
+            forwarder,
+            40000,
+            sessions::core::egress::TCP_SYN | sessions::core::egress::TCP_ACK,
+        );
+        send_frame(&mut guest, &answer).await;
+        assert_eq!(expect_frame(&mut switch).await, answer);
+
+        // The box ends: the gate unbinds the forward it applied.
+        assert!(handle.withdraw(Ipv4Addr::from(LEASE)).is_some());
+        let (mut unbind, _) = tokio::time::timeout(DEADLINE, h.switch_listener.accept())
+            .await
+            .expect("the gate dials the switch to unbind the accepted publish")
+            .expect("accepting the gate's unbind");
+        let request = read_forwarder_request(&mut unbind).await;
+        assert!(
+            request.ends_with(r#"{"local":"127.0.0.1:8080","protocol":"tcp"}"#),
+            "the unexpose names the accepted publish's listener, got: {request}"
+        );
+        unbind
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .expect("answering the unexpose");
+
+        // Then the reset of the connection the forward carried.
+        let (mut resets, _) = tokio::time::timeout(DEADLINE, h.switch_listener.accept())
+            .await
+            .expect("the gate dials the switch to write the resets")
+            .expect("accepting the gate's reset connection");
+        let mut written = Vec::new();
+        tokio::time::timeout(DEADLINE, resets.read_to_end(&mut written))
+            .await
+            .expect("the gate closes its reset connection")
+            .expect("reading the resets");
+        let frames = written
+            .strip_prefix(CONNECT_REQUEST)
+            .expect("the reset connection is upgraded to a frame stream first");
+        let len = usize::from(u16::from_le_bytes([frames[0], frames[1]]));
+        let reset = super::forward_revoke::parse_tcp_segment(&frames[2..2 + len])
+            .expect("the first frame is a TCP segment");
+        assert_eq!(reset.flags, sessions::core::egress::TCP_RST);
+        assert_eq!(
+            (reset.src, reset.src_port, reset.dst, reset.dst_port),
+            (LEASE, 18080, forwarder.octets(), 40000),
+            "the reset runs from the box's port to the forwarder's"
+        );
+    }
+
     /// Reads one forwarder request off `stream` up to the end of its JSON
     /// body, for the tests that stand in for the switch's control surface.
     async fn read_forwarder_request(stream: &mut UnixStream) -> String {
