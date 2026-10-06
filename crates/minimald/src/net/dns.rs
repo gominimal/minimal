@@ -1324,7 +1324,32 @@ impl HostnameRegistry {
             );
             route = self.by_host.get(&Hostname(two_label)).cloned();
         }
-        route
+        // NET-128, mirrored from the zone (`zone_answer`): a box stopped on
+        // the node's shared address keeps its name held, but nothing may be
+        // forwarded there — the node's own listener at that port would answer
+        // for the dead box.
+        route.filter(|route| !self.stopped_on_shared_address(route))
+    }
+
+    /// Whether `route`'s box is stopped while publishing on the node's shared
+    /// address (NET-128). Its name stays held, but neither the zone nor the
+    /// host-side proxy may point a client at the node for it.
+    fn stopped_on_shared_address(&self, route: &Route) -> bool {
+        let Some(id) = self
+            .by_session
+            .get(route.session())
+            .map(|registration| registration.id)
+        else {
+            return false;
+        };
+        if !self.stopped.contains(&id) {
+            return false;
+        }
+        let address = self
+            .own_published
+            .get(&id)
+            .map_or_else(|| route.address(), |own| own.address);
+        address == self.node
     }
 
     /// The two-label name a deprecated three-label one maps to, when `host` is
@@ -2823,6 +2848,18 @@ mod tests {
                 address: Some(Ipv4Addr::new(127, 0, 64, 9)),
             },
             "a stopped box on its own address keeps answering A"
+        );
+
+        // The host-side proxy applies the same gate: nothing is forwarded to
+        // the node for the stopped shared-address box, while the box on its
+        // own address still routes.
+        assert!(
+            reg.resolve("shared.min.internal").is_none(),
+            "the proxy must not forward a stopped shared-address box to the node"
+        );
+        assert!(
+            reg.resolve("own.min.internal").is_some(),
+            "a stopped box on its own address keeps its route"
         );
 
         // The same view in the zone table the state dump carries: name order

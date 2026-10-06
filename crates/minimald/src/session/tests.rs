@@ -3389,6 +3389,16 @@ async fn stopped_shared_address_box_is_nodata_through_actor() {
         },
         "a stopped shared-address box answers NODATA, not NXDOMAIN"
     );
+    // The host-side proxy keeps the same gate: the route is held, but nothing
+    // is forwarded to the node's own listener for the stopped box.
+    assert_eq!(
+        registry
+            .read()
+            .expect("registry lock")
+            .resolve("sharedbox.min.internal"),
+        None,
+        "the proxy must not forward a stopped shared-address box to the node"
+    );
 }
 
 /// NET-010's durability half (design §7.1): the hand is the record's row,
