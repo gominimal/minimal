@@ -18258,9 +18258,11 @@ proof_expose_from_inside_box() {
     rm -rf "$EIB_ALLOW_SEED_DIR" "$EIB_DENY_SEED_DIR"
 
     # ---- two named VMs: the expose half of T61 ------------------------------
-    # Alpha's switch publishes at the same host 127.0.0.1 as the default VM,
-    # whose allow and ask-yes boxes still hold their ports there, so this leg
-    # asks for its own port in the declared range.
+    # Alpha's switch publishes at the same host 127.0.0.1 as the default VM.
+    # That VM's boxes are destroyed above and their forwards come down with
+    # them, but the release is best-effort — a bind left behind would still
+    # hold the shared address and fail this leg's publish — so the leg asks
+    # for its own port in the declared range.
     local eib_two_port=$((eib_port + 2))
     # A box on the NON-DEFAULT VM publishes there. `min --vm alpha session
     # activate` creates the box on alpha (autospawning and booting it), the
