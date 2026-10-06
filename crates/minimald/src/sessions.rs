@@ -1661,6 +1661,11 @@ impl ManagerHandle {
     #[cfg(target_os = "linux")]
     pub async fn resume_active_sessions(&self) -> Result<usize, SessionsError> {
         let (send, recv) = Responder::channel();
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "a closed manager is the one way the send can fail, and the recv \
+                      below reports it — the send's own receipt has nothing to add"
+        )]
         let _ = self.sender.send(ManagerMessage::ResumeActive(send)).await;
         recv.await.expect("corresponding sessions manager is dead")
     }
