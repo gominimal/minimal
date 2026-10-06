@@ -937,6 +937,14 @@ impl Listener for tokio_vsock::VsockListener {
 /// so an unbounded wait could hang the process; this bounds it.
 const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// How long a freshly accepted connection may spend exchanging SSH id lines
+/// before it is dropped. The id-line exchange is the only pre-auth step that
+/// `russh::server::run_stream` awaits, so a client that connects and never
+/// speaks would otherwise hold its task and socket forever. Later stalls in
+/// KEX or auth run in russh's spawned session task, off the accept loop, and
+/// are governed by keepalive rather than by this deadline.
+const HANDSHAKE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Monotonic id carried by each accepted connection's span, so a
 /// connection's accept, channel bindings, and close correlate across the log.
 static CONN_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1021,25 +1029,44 @@ impl Server {
             let conn = CONN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let span = tracing::info_span!("conn", conn, transport = L::TRANSPORT);
             span.in_scope(|| tracing::info!(?peer, "accepted connection"));
-            let from_stream =
-                Connection::from_stream(stream, russh_config.clone(), state.clone(), L::IS_LOCAL);
-            let (conn_hnd, session_fut) = match from_stream.instrument(span.clone()).await {
-                Ok(conn) => conn,
-                Err(e) => {
-                    // A handshake failure must not take the daemon down — in
-                    // the guest minimald is pid-1. Drop this connection and
-                    // keep accepting.
-                    span.in_scope(
-                        || tracing::warn!(error = %e, "SSH handshake failed; dropping connection"),
-                    );
-                    continue;
-                }
-            };
-            // Log session errors instead of silently dropping the spawned
-            // future, so a failed handshake is visible on any transport.
-            let reap_state = state.clone();
+            // The handshake runs in the spawned task, not here: awaiting it in
+            // the loop would serialize accepts behind each client's id line,
+            // so one slow or silent client could stall the whole daemon.
+            let russh_config = russh_config.clone();
+            let state = state.clone();
+            let handshake_span = span.clone();
             session_set.spawn(
                 async move {
+                    let from_stream =
+                        Connection::from_stream(stream, russh_config, state.clone(), L::IS_LOCAL);
+                    let (conn_hnd, session_fut) =
+                        match tokio::time::timeout(HANDSHAKE_DEADLINE, from_stream)
+                            .instrument(handshake_span.clone())
+                            .await
+                        {
+                            Ok(Ok(conn)) => conn,
+                            Ok(Err(e)) => {
+                                // A handshake failure must not take the daemon
+                                // down — in the guest minimald is pid-1. Drop
+                                // this connection and keep accepting.
+                                handshake_span.in_scope(|| {
+                                    tracing::warn!(
+                                        error = %e,
+                                        "SSH handshake failed; dropping connection"
+                                    )
+                                });
+                                return;
+                            }
+                            Err(_) => {
+                                handshake_span.in_scope(|| {
+                                    tracing::warn!("SSH handshake timed out; dropping connection")
+                                });
+                                return;
+                            }
+                        };
+                    // Log session errors instead of silently dropping the
+                    // spawned future, so a failed handshake is visible on any
+                    // transport.
                     match session_fut.await {
                         Ok(()) => tracing::info!("connection closed"),
                         Err(e) => {
@@ -1066,8 +1093,7 @@ impl Server {
                     // mid-activation (Ctrl-C at the gating prompt, a crash, a
                     // network blip) would otherwise strand a `Pending` /
                     // `Materializing` session that holds its name hostage.
-                    reap_unfinalized_sessions(&reap_state, conn_hnd.take_created_sessions().await)
-                        .await;
+                    reap_unfinalized_sessions(&state, conn_hnd.take_created_sessions().await).await;
                 }
                 .instrument(span),
             );
@@ -2649,7 +2675,7 @@ pub(crate) fn test_config(dir: &std::path::Path) -> Config {
 mod tests {
     use std::time::Duration;
 
-    use minimald_rpc::{Shutdown, ShutdownRequest, ShutdownResponse};
+    use minimald_rpc::{GetVersion, Shutdown, ShutdownRequest, ShutdownResponse};
     use tempfile::TempDir;
 
     use super::*;
@@ -2806,6 +2832,69 @@ mod tests {
             .expect("run must return after the grace period aborts lingering connections");
         assert!(res.unwrap().is_ok(), "run should return Ok after shutdown");
         drop(client);
+    }
+
+    /// A connection that connects and never sends its SSH id line must not
+    /// stall the accept loop: a second connection completes a full handshake
+    /// and a `GetVersion` RPC while the silent one is still open.
+    #[tokio::test]
+    async fn silent_client_does_not_stall_the_accept_loop() {
+        let dir = TempDir::new().unwrap();
+        let (run, sock) = spawn_server(&dir);
+
+        // Open a connection and send nothing: it holds the socket without
+        // ever completing the handshake.
+        let silent = tokio::net::UnixStream::connect(&sock).await.unwrap();
+
+        // A second connection must handshake and serve an RPC promptly. The
+        // bound covers the connect too: a stalled accept loop shows up there.
+        let (mut client, resp) = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut client = connect_uds(&sock).await;
+            let resp = client.call::<GetVersion>(&()).await;
+            (client, resp)
+        })
+        .await
+        .expect("a second connection must complete a handshake and RPC within 2s");
+        assert!(!resp.version.is_empty(), "GetVersion must return a version");
+
+        // Close the silent connection so shutdown does not wait out its grace.
+        drop(silent);
+
+        let _ = client
+            .call::<Shutdown>(&ShutdownRequest { force: false })
+            .await;
+        let _ = tokio::time::timeout(Duration::from_secs(5), run).await;
+    }
+
+    /// A connection that never sends its id line is dropped once the
+    /// handshake deadline elapses, rather than holding its task and socket
+    /// forever.
+    #[tokio::test(start_paused = true)]
+    async fn silent_client_is_dropped_after_the_handshake_deadline() {
+        use tokio::io::AsyncReadExt as _;
+
+        let dir = TempDir::new().unwrap();
+        let (run, sock) = spawn_server(&dir);
+
+        let mut silent = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        // The paused clock auto-advances while the runtime is idle, so this
+        // read resolves once the server's handshake deadline drops the
+        // connection and closes the socket.
+        let mut buf = [0u8; 1];
+        let closed = tokio::time::timeout(HANDSHAKE_DEADLINE + Duration::from_secs(5), async {
+            loop {
+                match silent.read(&mut buf).await {
+                    Ok(0) => break true,
+                    Ok(_) => {}
+                    Err(_) => break true,
+                }
+            }
+        })
+        .await
+        .expect("the silent connection must be closed after the handshake deadline");
+        assert!(closed, "the server must close the silent connection");
+
+        let _ = tokio::time::timeout(Duration::from_secs(5), run).await;
     }
 
     /// A session left unfinalized when its creating connection closes —
