@@ -2489,6 +2489,12 @@ pub(crate) mod tests {
             .expect("an HTTPS query to the resolver is intercepted");
         let message = Message::from_vec(&reply).expect("the synthesized reply parses");
         assert_eq!(message.metadata.id, id, "the reply echoes the query's id");
+        assert_eq!(message.metadata.message_type, MessageType::Response);
+        assert_eq!(
+            message.metadata.response_code,
+            ResponseCode::NoError,
+            "NODATA is NOERROR, not NXDOMAIN"
+        );
         assert!(message.answers.is_empty());
         assert_eq!(
             message.queries.first().unwrap().query_type(),
@@ -2553,6 +2559,12 @@ pub(crate) mod tests {
                     .unwrap_or_else(|| panic!("a {rtype:?} query for {name} is intercepted"));
                 let message = Message::from_vec(&reply).expect("the synthesized reply parses");
                 assert_eq!(message.metadata.id, id, "the reply echoes the query's id");
+                assert_eq!(message.metadata.message_type, MessageType::Response);
+                assert_eq!(
+                    message.metadata.response_code,
+                    ResponseCode::NoError,
+                    "NODATA is NOERROR, not NXDOMAIN"
+                );
                 assert!(message.answers.is_empty(), "NODATA answers nothing");
                 assert_eq!(
                     message.queries.first().unwrap().query_type(),
