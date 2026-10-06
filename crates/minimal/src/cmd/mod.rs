@@ -349,15 +349,20 @@ pub(crate) fn is_id_prefix(s: &str) -> bool {
     (4..=32).contains(&digits) && s.chars().all(|c| c == '-' || c.is_ascii_hexdigit())
 }
 
-/// Match `session` against the listed sessions: an exact name first, then a
-/// unique id prefix (compared without dashes, ignoring case). `None` when
-/// nothing matches or `session` is not prefix-shaped; an error naming the
-/// candidates when the prefix matches more than one session.
+/// Match `session` against the listed sessions: a name first (compared
+/// case-insensitively, matching how names are made unique), then a unique id
+/// prefix (compared without dashes, ignoring case). `None` when nothing
+/// matches or `session` is not prefix-shaped; an error naming the candidates
+/// when the prefix matches more than one session.
 pub(crate) fn match_id_prefix(
     entries: &[minimald_rpc::ListSessionsEntry],
     session: &str,
 ) -> Result<Option<sessions::SessionId>, anyhow::Error> {
-    if let Some(entry) = entries.iter().find(|e| e.name.as_deref() == Some(session)) {
+    if let Some(entry) = entries.iter().find(|e| {
+        e.name
+            .as_deref()
+            .is_some_and(|n| n.eq_ignore_ascii_case(session))
+    }) {
         return Ok(Some(entry.id));
     }
     if !is_id_prefix(session) {

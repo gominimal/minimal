@@ -891,7 +891,12 @@ impl Loader for DiskLoader {
         }))
     }
     fn find_by_name<S: AsRef<str>>(&self, name: S) -> Result<Option<Self::Key>, std::io::Error> {
-        match self.index.find_by_name(name) {
+        let name = name.as_ref();
+        let uuid = self
+            .index
+            .find_by_name(name)
+            .or_else(|| self.index.find_by_name_folded(name));
+        match uuid {
             Some(uuid) => self.find_by_id(uuid),
             None => Ok(None),
         }
@@ -1271,6 +1276,28 @@ mod tests {
             loader.create(record).err().map(|e| e.kind()),
             Some(ErrorKind::AlreadyExists)
         );
+    }
+
+    #[test]
+    fn find_by_name_resolves_case_insensitively() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        let mut record = sample_record();
+        record.name = Some("My-Session".to_string());
+        let key = loader.create(record).unwrap();
+
+        // The exact name resolves, and so does any casing of it: names are
+        // unique under ASCII case folding, so the fallback is unambiguous.
+        assert_eq!(
+            loader.find_by_name("My-Session").unwrap(),
+            Some(key.clone())
+        );
+        assert_eq!(
+            loader.find_by_name("my-session").unwrap(),
+            Some(key.clone())
+        );
+        assert_eq!(loader.find_by_name("MY-SESSION").unwrap(), Some(key));
     }
 
     #[test]
@@ -2319,10 +2346,11 @@ mod tests {
 
         let loader = DiskLoader::new(root.clone()).unwrap();
         // The live session still resolves; the case-colliding orphan is not
-        // indexed.
-        assert_eq!(loader.find_by_id(&a_id).unwrap(), Some(a_key));
+        // indexed. Its name resolves to the live session under the
+        // case-insensitive lookup, not to the orphan.
+        assert_eq!(loader.find_by_id(&a_id).unwrap(), Some(a_key.clone()));
         assert_eq!(loader.find_by_id(&orphan_record.id).unwrap(), None);
-        assert_eq!(loader.find_by_name("MY-SESSION").unwrap(), None);
+        assert_eq!(loader.find_by_name("MY-SESSION").unwrap(), Some(a_key));
         // The orphan dir is left on disk for manual triage.
         assert!(
             session_dir_path(&root, orphan_short).exists(),

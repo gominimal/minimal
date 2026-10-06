@@ -3171,3 +3171,25 @@ fn an_exact_name_wins_over_an_id_prefix() {
         Some(entries[2].id)
     );
 }
+
+/// A name resolves in any casing, matching how names are made unique: a
+/// session named `Case-R` is found by `case-r` (and vice versa), so the
+/// casing a name was refused in at activate time still resolves it.
+#[test]
+fn a_name_resolves_case_insensitively() {
+    use sessions::SessionStatus::Active;
+    let entries = vec![twin_entry(
+        "ffffffff-0a99-78b1-9165-0809440f0052",
+        Some("Case-R"),
+        None,
+        Active,
+    )];
+    assert_eq!(
+        match_id_prefix(&entries, "case-r").unwrap(),
+        Some(entries[0].id)
+    );
+    assert_eq!(
+        match_id_prefix(&entries, "CASE-R").unwrap(),
+        Some(entries[0].id)
+    );
+}
