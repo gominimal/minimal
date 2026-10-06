@@ -786,7 +786,8 @@ const RESERVED_SESSION_NAMES: [&str; 3] = ["host", "local", "localhost"];
 /// `activate --name`, `save` for `rename`) share one gate. The name must
 /// also be a single DNS label (ASCII letters, digits and `-`, 1 to 63
 /// octets, no `-` at either end) because the daemon renders it into
-/// `<name>.min.internal`.
+/// `<name>.min.internal`. A name that parses as a session UUID is refused,
+/// because the CLI resolves a UUID before a name.
 fn validate_session_name(name: &str) -> Result<(), std::io::Error> {
     let invalid = |msg: &str| {
         std::io::Error::new(
@@ -808,6 +809,11 @@ fn validate_session_name(name: &str) -> Result<(), std::io::Error> {
         .find(|reserved| name.eq_ignore_ascii_case(reserved))
     {
         return Err(invalid(&format!("`{reserved}` is reserved")));
+    }
+    // Lookups try a UUID before a name, so a UUID-shaped name would be
+    // shadowed by (or shadow) the session that id belongs to.
+    if SessionId::parse_str(name).is_ok() {
+        return Err(invalid("must not be a session id"));
     }
     // Session names are rendered into `<name>.min.internal` box names, so a
     // name must be a single DNS label: ASCII letters, digits and `-`, 1 to 63
@@ -1312,6 +1318,34 @@ mod tests {
                 "expected `{bad:?}` to be rejected",
             );
         }
+    }
+
+    #[test]
+    fn create_and_rename_refuse_a_uuid_shaped_name() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+        let uuid = "019f5d0f-0a99-78b1-9165-0809440f0052";
+
+        for name in [uuid, "019f5d0f0a9978b191650809440f0052"] {
+            let mut record = sample_record();
+            record.name = Some(name.to_string());
+            let err = loader.create(record).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput, "create `{name}`");
+            assert!(
+                err.to_string().contains("must not be a session id"),
+                "{err}"
+            );
+        }
+        assert!(loader.keys().next().is_none());
+
+        let key = loader.create(sample_record()).unwrap();
+        let err = loader.rename(&key, uuid.to_string()).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("must not be a session id"),
+            "{err}"
+        );
+        assert_eq!(loader.find_by_name("my-session").unwrap(), Some(key));
     }
 
     #[test]
