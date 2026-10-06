@@ -2536,6 +2536,28 @@ pub(crate) fn command(port: u16, install: Option<&AnswererInstall>) -> String {
     linux_command(port, install)
 }
 
+/// The command [`command`] renders for this host with the answerer step
+/// carried, from the same reads a session start's advisory makes — so a
+/// test can run the exact privileged command without starting a daemon.
+/// An error when the step cannot be carried (no `minzoned` beside this
+/// `min` or on `PATH`, or a path the command cannot quote): a test must
+/// not pass on a command without the service in it. Debug builds only,
+/// where the identity check offers every source (see
+/// [`answerer_source_identity`]).
+#[cfg(debug_assertions)]
+pub(crate) async fn answerer_command_for_this_host() -> anyhow::Result<String> {
+    let step = read_answerer_step().await;
+    let install = match &step {
+        AnswererStep::SourceVerified { source, .. } => answerer_install(source),
+        _ => None,
+    }
+    .ok_or_else(|| anyhow::anyhow!("the answerer service step cannot be carried: {step:?}"))?;
+    Ok(command(
+        minvmd::net::answerer::DEFAULT_ANSWERER_PORT,
+        Some(&install),
+    ))
+}
+
 /// The answerer service's own state as an advisory fact, beside the
 /// range's. Every state but the first two is a fact the user has no other
 /// way to see; `carried` is whether the command below carries the service

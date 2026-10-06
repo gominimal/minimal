@@ -103,6 +103,14 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
         // logging may need stdout too.
         Some(Command::Version) => cmd_version(&cli.global_args, &mut std::io::stdout()).await,
         Some(Command::Spin(args)) => cmd_spin(&cli.global_args, args).await,
+        #[cfg(debug_assertions)]
+        Some(Command::DebugAnswererCommand) => {
+            println!(
+                "{}",
+                crate::resolver::answerer_command_for_this_host().await?
+            );
+            Ok(())
+        }
         Some(Command::Init(args)) => cmd_init(&cli.global_args, args)
             .await
             .map_err(|e| anyhow::anyhow!("{e}")),
