@@ -18,8 +18,8 @@ pub mod taskenv;
 pub mod trace;
 
 pub use sessions::{
-    BoxAddresses, DynamicIngress, EffectiveEgress, EffectiveSessionPolicy, EgressPolicy,
-    IngressPolicy, IpProto, NetworkMode, PortMapping, SessionPolicy,
+    BoxAddresses, CredentialedUpstream, DynamicIngress, EffectiveEgress, EffectiveSessionPolicy,
+    EgressPolicy, IngressPolicy, IpProto, NetworkMode, PortMapping, SessionPolicy,
 };
 
 pub const RPC_SUBSYSTEM_PREFIX: &str = "minimald-v1-";
@@ -168,6 +168,20 @@ pub struct RunningSessionAttrs {
     pub visual_bell: Option<Bell>,
 }
 
+/// The per-box egress enforcement state a host-address session's verdict
+/// runs under (NET-079), spelled `per_box` when the session's own launch
+/// placed its box in a classifier leaf of the host's cgroup tree and `none`
+/// when it did not and the box runs with the host's address and no verdict
+/// of its own.
+///
+/// The type is defined in the sessions crate — beside the
+/// [`Record`](sessions::Record) field that carries a box's own launch
+/// outcome, a session-plane type this crate already depends on — and
+/// re-exported here so the paths this crate's clients spell stay what they
+/// were: the listing's [`ListSessionsEntry::host_ip_enforcement`] answers in
+/// it, and the stringly surfaces carry its machine spelling.
+pub use sessions::HostIpEnforcement;
+
 /// An entry in the ListSessions response.
 ///
 /// `project_path` and `status` mirror the fields of the same name on the
@@ -199,6 +213,24 @@ pub struct ListSessionsEntry {
     #[serde(default)]
     pub git: Option<Box<GitInfo>>,
     pub attrs: Option<RunningSessionAttrs>,
+    /// The per-box egress enforcement the session's box actually runs under
+    /// (NET-079): [`HostIpEnforcement::PerBox`] when the box's own launch
+    /// placed it in a classifier leaf of the host's tree,
+    /// [`HostIpEnforcement::None`] when it did not and the box runs with the
+    /// host's address and no verdict of its own. The box's own launch record,
+    /// lowered to `none` by the daemon's one classifier fact when the host
+    /// can no longer decide per box and never raised above it — so a box
+    /// launched unenforced stays `none` for its life, whatever a later launch
+    /// of another box decided — and the fact alone only while the session's
+    /// box has not launched yet, the same state the create response answers
+    /// over. `None` for a session that is not host-address (its verdict is
+    /// decided on address leases, never on the host's cgroup tree), for a
+    /// host-address box the classifier refused, whose launch said the
+    /// refusal, and when the record could not be read back — defaulted so an
+    /// entry from an older daemon still decodes, with the same silence the
+    /// other surfaces read as "not a host-address session".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_ip_enforcement: Option<HostIpEnforcement>,
 }
 
 /// The git state of a session's project path, probed by the client on the
@@ -424,7 +456,15 @@ pub struct SessionConfig {
     /// so a client that predates the field gets hooks, not silence.
     #[serde(default = "default_hooks_enabled")]
     pub hooks_enabled: bool,
-    /// Free-form attributes (typed by the caller).
+    /// Free-form attributes (typed by the caller), persisted onto the
+    /// session's record. The daemon writes none of its own: NET-079's
+    /// per-box enforcement is a daemon-owned launch record, carried on the
+    /// session record's own `host_ip_enforcement` field — written only by
+    /// the box's launch, never by a create — and displayed as that record
+    /// lowered by the host's current fact, so it is never a client attr.
+    /// A client supplying the daemon's own `host_ip_enforcement` key has it
+    /// stripped unconditionally, whatever the session's network mode — the
+    /// state is the host's verdict, never a caller's assertion.
     #[serde(default)]
     pub attrs: std::collections::BTreeMap<String, String>,
 }
@@ -434,6 +474,105 @@ pub struct SessionConfig {
 /// `#[serde(default)]`.
 fn default_hooks_enabled() -> bool {
     true
+}
+
+/// A box's identity on its host: 16 bytes — one UUIDv7, 32 lowercase hex
+/// digits on the wire — minted once per box by the host-side creator
+/// outside the VM, with its random fields from the host's OS CSPRNG
+/// (BEP-070): never a counter, never a digest of the box's facts, never
+/// anything a process inside the VM could predict or arrange. The
+/// registration that publishes the box's row mints it — a client never
+/// presents one — the row and the proxy's attachment hold it, and the
+/// reply hands it back so the client records the id its box was created
+/// as.
+///
+/// Unique per creation by construction: a box recreated with the same
+/// name and the same addresses is a new box, and its id says so. Ids are
+/// never reused — no registration can present one, and the host refuses a
+/// mint that collides with a record it holds — so a revocation scoped to
+/// an id stays scoped forever. The all-zero id is not
+/// a mint's output and never names a box: the delivery header carried it
+/// for "no box named" before ids were the box's own, and the acceptor
+/// that reads a delivered header refuses it like any other id the
+/// source's attachment does not hold.
+///
+/// On the wire it is one hex string, the same 32 lowercase digits a
+/// diagnostic names a box id by — so a log line, a transcript and a
+/// socket capture all read the same spelling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct BoxId([u8; 16]);
+
+impl BoxId {
+    /// Wraps `bytes` as a box id — the shape [`RegisteredBox::box_id`]
+    /// carries and a delivery header fills from the box's attachment.
+    #[must_use]
+    pub fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+
+    /// The id's own 16 bytes.
+    #[must_use]
+    pub fn to_bytes(self) -> [u8; 16] {
+        self.0
+    }
+}
+
+impl std::fmt::Display for BoxId {
+    /// 32 lowercase hex digits — the one fixed form every diagnostic that
+    /// names a box id uses, so a tail can compare two lines for the same
+    /// box.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for byte in self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+impl Serialize for BoxId {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&hex::encode(self.0))
+    }
+}
+
+impl<'de> Deserialize<'de> for BoxId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text: &str = Deserialize::deserialize(deserializer)?;
+        let bytes = hex::decode(text).map_err(serde::de::Error::custom)?;
+        let bytes: [u8; 16] = match bytes.try_into() {
+            Ok(bytes) => bytes,
+            Err(bytes) => {
+                return Err(serde::de::Error::custom(format!(
+                    "a box id is 32 hex digits (16 bytes); got {} bytes",
+                    bytes.len()
+                )));
+            }
+        };
+        Ok(Self(bytes))
+    }
+}
+
+/// What a successful registration hands back: the allocated addresses —
+/// the pair [`BoxAddresses`] has always carried — and the box id the
+/// published row now holds ([`BoxId`]): the one the host minted for this
+/// creation. A registration carries no id; this reply is where the client
+/// learns its box's.
+///
+/// The id travels beside the addresses because both belong to the same
+/// fact — this is the box the host just published — so the client records
+/// the id it is handed, and the client's record, the sealed member's
+/// claims and the proxy's attachment name the box by the same id. A
+/// re-registration is a new creation and is handed a new id.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RegisteredBox {
+    /// The box's address on the switch ([`BoxAddresses::switch_address`]).
+    pub switch_address: std::net::Ipv4Addr,
+    /// The box's published loopback address
+    /// ([`BoxAddresses::loopback_address`]).
+    pub loopback_address: std::net::Ipv4Addr,
+    /// The box id the published row holds: the box's own UUIDv7, handed
+    /// back to the registering client.
+    pub box_id: BoxId,
 }
 
 /// The wire types of the VM host daemon's box control socket (T66): the
@@ -452,6 +591,11 @@ fn default_hooks_enabled() -> bool {
 /// These types live here rather than in `minvmd` because both ends depend
 /// on this crate — the activating client and the host daemon — and the
 /// protocol must not drift between them.
+///
+/// A box's identity is its [`BoxId`]: minted once per box by the host-side
+/// creator outside the VM — never carried on the registration the client
+/// sends — and handed back on the reply, so the client, the published row
+/// and the proxy's attachment all name the box by one id.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RegisterBoxRequest {
     /// The box's name — the session name the following create request
@@ -469,6 +613,30 @@ pub struct RegisterBoxRequest {
     /// carries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub egress: Option<EgressPolicy>,
+    /// The box's declaration of a credentialed upstream (NET-134), carried
+    /// from the session's policy: `Some` marks the Box Egress Proxy's
+    /// listener as the box's infrastructure — the one destination its
+    /// egress rules never decide — and `None`, the default, is no lane: the
+    /// row the host publishes refuses the box's frames to the proxy's
+    /// address under the box-to-host default-deny. The minimum of the proxy
+    /// document's field schema; a client that predates the field declares
+    /// nothing, exactly as one that never asked for a lane does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credentialed_upstream: Option<CredentialedUpstream>,
+    /// The box's dynamic-ingress stance (NET-045), from the same create
+    /// inputs the session record holds: the stance half of the grant the
+    /// host-side row holds a runtime port report against — a report under
+    /// `allow` records in range, one under `ask` records what the attached
+    /// human answered yes to, and `deny`, the stance an absent declaration
+    /// carries, admits nothing. The host decides; the guest only reports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dynamic_ingress: Option<DynamicIngress>,
+    /// The range the stance admits runtime ports in, inclusive at both
+    /// ends — the grant's range half. `None` permits nothing even under an
+    /// `allow` stance, the same meaning the create request's absent range
+    /// carries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dynamic_allowed_range: Option<(u16, u16)>,
 }
 
 /// The withdrawal a destroyed session's client sends for the row its
@@ -501,8 +669,406 @@ pub struct WithdrawBoxRequest {
     pub loopback_address: std::net::Ipv4Addr,
 }
 
+/// What side of the in-VM daemon reported a runtime-admitted port (NET-045,
+/// NET-138): the fixed fact the host's log line and audit copy name, so a
+/// tail can tell an expose decision from an answered ask from a listen
+/// without parsing the daemon's own logs.
+///
+/// Reported, never trusted: the host records the port only inside the grant
+/// the host-side registration holds ([`RegisterBoxRequest`]), whatever this
+/// says — the source is a label on the report, not a permission.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PortReportSource {
+    /// An `expose` decided allow under a `dynamic_ingress = allow` stance.
+    Expose,
+    /// The attached human answered yes to an ask (NET-045).
+    Ask,
+    /// A listen-publish the box's own watcher made (the permitted-listener
+    /// half of the dynamic stance).
+    Listen,
+}
+
+/// The in-VM daemon's report that one of its boxes published a port at
+/// runtime (NET-138): the fixed, size-bounded message — the row key, the
+/// port, the protocol, and the reporting source, nothing else — the guest
+/// sends the VM host daemon before the publish is reported to the caller.
+///
+/// The row key is the box's **switch address**, the address the host-side
+/// registration handed back: it is the one fact the guest cannot invent a
+/// row with, because no row exists at an address the host did not allocate,
+/// so a report keyed anywhere else is refused as no row's. The port is
+/// checked against the grant the row holds — the box's
+/// `dynamic_ingress` stance and its allowed range, both carried at
+/// registration — and a refusal answers [`BoxControlReply::Error`] naming
+/// why, so the guest's publish unwinds with no partial mapping.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AdmitPortRequest {
+    /// The switch address of the row the port belongs to — the row's own
+    /// key, the address the registration handed back.
+    pub switch_address: std::net::Ipv4Addr,
+    /// The runtime-published port the box is admitting.
+    pub port: u16,
+    /// The protocol the port was published under.
+    pub proto: IpProto,
+    /// Which side of the in-VM daemon reported it
+    /// ([`PortReportSource`]): the label the host's log and audit lines
+    /// carry.
+    pub source: PortReportSource,
+}
+
+/// The in-VM daemon's report that one of its boxes stopped publishing a
+/// runtime-admitted port: the withdrawal half of [`AdmitPortRequest`], the
+/// same row key and port, sent when the mapping closes — an unexpose, a
+/// listener's end, or the box's own stop.
+///
+/// A withdrawal is never refused by the cap or the rate the admit path
+/// answers to: removing a fact the row holds is always the row's goal
+/// state, so the host answers [`BoxControlReply::PortRecorded`] whether the
+/// port was held or not.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WithdrawPortRequest {
+    /// The switch address of the row the port belongs to.
+    pub switch_address: std::net::Ipv4Addr,
+    /// The runtime-published port the box withdrew.
+    pub port: u16,
+    /// The protocol the port was published under.
+    pub proto: IpProto,
+    /// Which side of the in-VM daemon reported it
+    /// ([`PortReportSource`]).
+    pub source: PortReportSource,
+}
+
+/// The read-only row verb's key: the box's name, the identity a row is
+/// registered under ([`RegisterBoxRequest::name`]). Liveness is the table's
+/// own fact — a name that no live box holds answers
+/// [`BoxControlReply::NoRow`], never a destroyed box's last row, because a
+/// withdrawn row is gone, not archived.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReadRowRequest {
+    /// The name the row was registered under.
+    pub name: String,
+}
+
+/// The read-only row verb's answer for a live box: the row's switch address
+/// — the key its reports carry — beside the facts the host holds about it:
+/// the egress allow-list derived from its declared rules, and its declared
+/// and runtime-admitted ports, so a host-side read can see both halves of
+/// what the gate admits for the box.
+///
+/// The allow-list is the row's compiled egress subnets as CIDR strings —
+/// `0.0.0.0/0` for the absent-policy allow-all, empty for a row that
+/// declared a policy no subnet passes — because the read is a person's
+/// surface: the strings are the policy as it was declared, not the
+/// compiled form only the gate reads.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BoxRow {
+    /// The name the row was registered under.
+    pub name: String,
+    /// The box's identity on its host ([`BoxId`]): the row's own
+    /// host-minted id, so a host-side client can subscribe to the row's
+    /// pending asks by an identity no guest-reported string can name
+    /// (NET-045). Required the same way [`RegisteredBox::box_id`] is: a
+    /// row read from a daemon that predates ids fails the whole parse on
+    /// a new client rather than silently naming a box no id names.
+    pub box_id: BoxId,
+    /// The box's address on the switch: the row's key.
+    pub switch_address: std::net::Ipv4Addr,
+    /// The row's derived egress allow-list, as CIDR strings.
+    pub egress_allow_list: Vec<String>,
+    /// The external ports the box's ingress declaration admitted, in the
+    /// order the registration carried them.
+    pub declared_ports: Vec<u16>,
+    /// The ports the row holds as runtime-admitted — reported by the in-VM
+    /// daemon within the grant and not yet withdrawn — in report order.
+    pub runtime_ports: Vec<u16>,
+}
+
+/// A pending ask's identity on its host: 16 bytes — one UUIDv4, 32
+/// lowercase hex digits on the wire — minted by the VM host daemon when
+/// the in-VM daemon reports an ask (NET-045), never carried by any
+/// client: the offer hands the id to the attached host client, and the
+/// recorded answer carries it back, so the id names one ask's whole
+/// lifetime — offered, answered, consumed — and no client can name an
+/// ask the host did not mint.
+///
+/// Unique per ask by construction, like [`BoxId`]: the daemon that mints
+/// one draws it from the host's OS CSPRNG, and an answer for an id the
+/// daemon never minted — or minted and already consumed — is refused, so
+/// a recorded yes can be spent by exactly the one admit it answers and
+/// never replayed. The wire form is one hex string, the same spelling a
+/// diagnostic names an ask by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct AskId([u8; 16]);
+
+impl AskId {
+    /// Wraps `bytes` as an ask id — the shape the VM host daemon mints and
+    /// the offer and the recorded answer carry.
+    #[must_use]
+    pub fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+
+    /// The id's own 16 bytes.
+    #[must_use]
+    pub fn to_bytes(self) -> [u8; 16] {
+        self.0
+    }
+}
+
+impl std::fmt::Display for AskId {
+    /// 32 lowercase hex digits — the one fixed form every diagnostic that
+    /// names an ask id uses, so a log line and a socket capture read the
+    /// same spelling.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for byte in self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+impl Serialize for AskId {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&hex::encode(self.0))
+    }
+}
+
+impl<'de> Deserialize<'de> for AskId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text: &str = Deserialize::deserialize(deserializer)?;
+        let bytes = hex::decode(text).map_err(serde::de::Error::custom)?;
+        let bytes: [u8; 16] = match bytes.try_into() {
+            Ok(bytes) => bytes,
+            Err(bytes) => {
+                return Err(serde::de::Error::custom(format!(
+                    "an ask id is 32 hex digits (16 bytes); got {} bytes",
+                    bytes.len()
+                )));
+            }
+        };
+        Ok(Self(bytes))
+    }
+}
+
+/// The answer a host client records for one pending ask over the host
+/// door (NET-045): `yes` from a human who picked Allow, `no` from a human
+/// who picked Deny or ended the dialog without a pick — Ctrl-C, Escape, a
+/// closed input — and `no_tty` when no terminal was there to render the
+/// dialog at all, so the host's audit can tell a human's own *no* from a
+/// render that never reached one.
+///
+/// The daemon never answers on its own behalf: a client that went away
+/// before answering is an un-asked ask the admit path refuses, not an
+/// answer this enum could carry.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AskAnswer {
+    /// The attached human chose Allow: the ask's port is recorded in the
+    /// row, and the waiting admit publishes.
+    Yes,
+    /// The attached human chose Deny, or ended the dialog: the ask is
+    /// cleared and admits nothing.
+    No,
+    /// No terminal was there to render the dialog: nobody answered, and
+    /// the ask is cleared without recording a port.
+    NoTty,
+}
+
+/// The in-VM daemon's report that one of its boxes' exposes was decided
+/// `ask` (NET-045): the row key, the port and the protocol — nothing
+/// else, the same fixed, size-bounded shape [`AdmitPortRequest`] carries,
+/// and for the same reason: the guest can raise a question but never
+/// answer one, and a name or a prompt string it might have sent is not
+/// something a dialog could trust.
+///
+/// The VM host daemon mints the ask's [`AskId`], offers it to every host
+/// client attached to the row, and holds this request's reply until a
+/// recorded answer resolves it — there is no deadline on either side, so
+/// an ask ends only by an answer or a cancellation, never by a timer
+/// expiring a publish the human never saw.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AdmitAskRequest {
+    /// The switch address of the row the ask belongs to — the row's own
+    /// key, the address the registration handed back.
+    pub switch_address: std::net::Ipv4Addr,
+    /// The port the exposure asks to publish.
+    pub port: u16,
+    /// The protocol the port would publish under.
+    pub proto: IpProto,
+}
+
+/// A host client's recorded answer for one pending ask (NET-045): the
+/// offer's [`AskId`] and the answer. Served on the host's control socket
+/// only — the guest door refuses it, because a guest can raise a question
+/// but never answer one — and the first recorded answer wins: every later
+/// one is refused as an answer for an id the daemon already consumed, so
+/// a yes can be spent by exactly the one admit it answered.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RecordAskAnswerRequest {
+    /// The ask the offer named.
+    pub ask_id: AskId,
+    /// The answer the attached human gave, or the render's own no-tty.
+    pub answer: AskAnswer,
+}
+
+/// An attached host client's subscription to one row's pending asks
+/// (NET-045): keyed by the row's [`BoxId`] — the host-minted identity, so
+/// a guest-reported name can never subscribe — and held only while the
+/// connection lives. The daemon answers [`BoxControlReply::AsksSubscribed`],
+/// then pushes one [`BoxControlReply::PendingAskOffer`] line per ask the
+/// row gains and one [`BoxControlReply::PendingAskDismissed`] line per ask
+/// another client answered, until the client closes.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SubscribeAsksRequest {
+    /// The row's box id — the host-minted identity the row read hands the
+    /// client.
+    pub box_id: BoxId,
+}
+
+/// One pending ask as the VM host daemon offers it to an attached client
+/// (NET-045): the ask's id, the row it belongs to, and the port and
+/// protocol the exposure named. The box's name travels here too — from
+/// the host's own row, never from a guest-supplied string, because the
+/// dialog the client renders is built from these fields alone.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PendingAskOffer {
+    /// The ask's host-minted id: what the recorded answer carries back.
+    pub ask_id: AskId,
+    /// The row's box id — the identity the client subscribed by.
+    pub box_id: BoxId,
+    /// The box's name, from the host's own row: the one guest-untouched
+    /// field the dialog's text is built from.
+    pub name: String,
+    /// The port the exposure asks to publish.
+    pub port: u16,
+    /// The protocol the port would publish under.
+    pub proto: IpProto,
+}
+
+/// Why a pending ask will not publish (NET-045): the typed end the ask
+/// met, so the in-VM daemon's refusal says which end it was rather than
+/// parsing a sentence. [`Denied`] alone is the attached human's own no;
+/// every other end is an ask nobody answered, and the guest fails it
+/// closed the way it fails an ask with no client at all.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AskRefused {
+    /// No row is published at the named switch address.
+    NoRow,
+    /// No host client was attached to the row's box when the ask arrived.
+    NoClient,
+    /// The row's pending-ask queue was at its bound when the ask arrived.
+    QueueFull,
+    /// The row's stance is not `ask`.
+    StanceNotAsk,
+    /// The row's grant admits no such port: no range is declared, or the
+    /// port is outside the one that is. Refused at the host before any
+    /// dialog is offered, so a client is never asked to answer for a
+    /// publish the grant would refuse anyway.
+    OutsideGrant,
+    /// The attached human answered no.
+    Denied,
+    /// The dialog could not be rendered: no terminal was there.
+    NoTty,
+    /// The ask was cancelled before an answer: the row was withdrawn, the
+    /// guest's connection ended, the last attached client detached, or
+    /// the daemon stopped.
+    Cancelled,
+}
+
+/// The VM host daemon's answer to the in-VM daemon's ask admit (NET-045):
+/// the outcome of the ask the offered dialog decided, tagged `ask` so the
+/// untagged reply cannot mistake it for any older shape. [`Admitted`]
+/// alone records the port in the row — the one reply a publish may go
+/// ahead on; [`Refused`] names which end the ask met
+/// ([`AskRefused`]), and the guest's publish unwinds with no partial
+/// mapping either way.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "ask", rename_all = "snake_case")]
+pub enum AskAdmitOutcome {
+    /// The attached human answered yes: the port is recorded in the row
+    /// under the ask's id, and this admit — this one — may publish.
+    Admitted {
+        /// The ask that was answered.
+        ask_id: AskId,
+        /// The port the host now holds as runtime-admitted.
+        port: u16,
+        /// The protocol the port was recorded under.
+        proto: IpProto,
+    },
+    /// The ask will not publish: the typed end it met.
+    Refused {
+        /// The ask that met this end.
+        ask_id: AskId,
+        /// Which end the ask met.
+        reason: AskRefused,
+        /// What cancelled the ask, for a [`AskRefused::Cancelled`] end;
+        /// absent for every other end.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cause: Option<AskCancelCause>,
+    },
+}
+
+/// What cancelled a pending ask (NET-045): the four ends an ask meets with
+/// no answer, so the in-VM daemon and a late client can each say which.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum AskCancelCause {
+    /// The last host client attached to the box detached.
+    LastDetach,
+    /// The box's host row was withdrawn.
+    RowWithdrawn,
+    /// The in-VM daemon closed the asking connection: it withdrew the ask.
+    GuestClosed,
+    /// The VM host daemon is stopping.
+    MinvmdStopping,
+}
+
+impl std::fmt::Display for AskCancelCause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::LastDetach => "the last attached client detached",
+            Self::RowWithdrawn => "the box's host row was withdrawn",
+            Self::GuestClosed => "the guest connection closed",
+            Self::MinvmdStopping => "minvmd is stopping",
+        })
+    }
+}
+
+/// How an already-ended ask ended (NET-045), as the VM host daemon answers
+/// a late recorded answer for it: the client whose dialog outlived the ask
+/// says what actually happened instead of guessing.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "end", rename_all = "snake_case")]
+pub enum AskLateEnd {
+    /// Another attach's yes admitted it.
+    Allowed,
+    /// Another attach answered no (or could not show the prompt).
+    Denied,
+    /// It was cancelled before an answer.
+    Cancelled {
+        /// What cancelled it.
+        cause: AskCancelCause,
+    },
+}
+
+/// The host-side port the in-VM daemon's box-port reports cross to: the
+/// vsock port the guest dials `VMADDR_CID_HOST` on to report a runtime
+/// admission or withdrawal into the host-held grant, pinned here because
+/// both ends — the in-VM daemon that dials it and the VM host daemon that
+/// bridges it to its guest control channel — depend on this crate, so the
+/// report channel cannot drift between them. Beside the boot-marker port
+/// (`minimald`'s `VM_HOST_MARKER_PORT`, 7350), one port per purpose: the
+/// marker is one-way and fire-and-forget, this one answers, because a report
+/// the grant refused must be refused *to the reporter* for the publish to
+/// unwind (NET-138). Not 7351: the timekeep bridge owns that number, in the
+/// opposite direction — the host dials *into* the guest on it — and one
+/// number serving two purposes is two channels one misroute away.
+pub const VM_HOST_BOX_REPORT_PORT: u32 = 7352;
+
 /// The one request line the control socket takes: which verb the client
-/// wants, `register` or `withdraw`, tagged in the line itself.
+/// wants, tagged in the line itself.
 ///
 /// The tag is the version corner, and it leans the safe way. A daemon that
 /// predates a verb cannot parse the tagged line and refuses it — and an old
@@ -524,6 +1090,160 @@ pub enum BoxControlRequest {
     /// Withdraw the row a registration filled: the destroyed or failed
     /// session's creator presenting the pair the registration handed back.
     Withdraw(WithdrawBoxRequest),
+    /// Read the machine's zone-answerer status (see [`ZoneAnswererStatus`])
+    /// — the read-only verb: no row is touched, no state changes, the reply
+    /// is the status the answerer's acquisition last left.
+    AnswererStatus,
+    /// The in-VM daemon's report that one of its boxes published a port at
+    /// runtime (NET-138), carried on the daemon's own control channel: the
+    /// host records it in the row only within the grant the host-side
+    /// registration holds, and answers the refusal so the guest's publish
+    /// unwinds.
+    AdmitPort(AdmitPortRequest),
+    /// The in-VM daemon's report that one of its boxes stopped publishing a
+    /// runtime-admitted port: the withdrawal half of the admit report,
+    /// accepted whatever the row's cap or rate says.
+    WithdrawPort(WithdrawPortRequest),
+    /// The in-VM daemon's report that an expose was decided `ask`
+    /// (NET-045): carried on the daemon's own control channel like the
+    /// port reports, answered when a host client the daemon offered the
+    /// ask to records an answer — with no deadline on the reply, because
+    /// no timer ever answers an ask.
+    AdmitAsk(AdmitAskRequest),
+    /// A host client's recorded answer for one pending ask (NET-045):
+    /// served on the host's control socket only — the guest door refuses
+    /// it, because a guest can raise a question but never answer one —
+    /// and the first answer recorded for an ask is the only one that
+    /// counts.
+    RecordAskAnswer(RecordAskAnswerRequest),
+    /// An attached host client's subscription to one row's pending asks
+    /// (NET-045): keyed by the row's host-minted [`BoxId`] — never a
+    /// guest-reported name — and served on the host's control socket
+    /// only, whose owner-only file mode is its access control. The
+    /// subscription lives exactly as long as the connection it arrived on.
+    SubscribeAsks(SubscribeAsksRequest),
+    /// Read one box's row by name — the read-only row verb: the row's
+    /// switch address, its derived egress allow-list, and its declared and
+    /// runtime-admitted ports, or [`BoxControlReply::NoRow`] when no live
+    /// box holds the name. Served on the host's control socket only, whose
+    /// owner-only file mode is its access control.
+    ReadRow(ReadRowRequest),
+    /// Release the interim answerer (NET-122's handover to the host
+    /// service): the daemon stops the answerer it hosts and frees the hook
+    /// port, then waits a bounded window for the service's channel and
+    /// publishes its rows there, re-binding the interim if the channel
+    /// never comes. Answered with [`BoxControlReply::AnswererRelease`] once
+    /// the port is free; a daemon that hosts no interim answers a no-op.
+    /// Accepted from the operator's uid and from root only.
+    ReleaseAnswerer,
+    /// Cancel a release: the daemon re-binds its interim answerer at once.
+    /// A daemon with no release pending answers a no-op.
+    ReleaseAnswererCancel,
+}
+
+/// The VM host daemon's answerer status: the state of the machine's
+/// box-zone answerer as this daemon sees it (NET-138's single-operator
+/// interim), read over the control socket by the verbs that surface it —
+/// the session start and `min ls`.
+///
+/// The zone is answered by whichever VM host daemon bound the machine's
+/// answerer port — the holder — and every other VM host daemon on the
+/// machine registers its table's rows with the holder over the answerer
+/// channel, so one answerer serves every VM's names. The status says which
+/// of the states this daemon is in, so the client can say where to look and
+/// who holds the port; whether the answerer is *live* at that port is the
+/// client's own A query for `host.min.internal` to prove (the row the
+/// answerer itself holds), not a fact this status could vouch for.
+///
+/// The CLI reads this over the control socket and never through the in-VM
+/// daemon, because it is a host fact: a guest relaying a host fact is
+/// forgeable from inside the escape boundary, and the answerer's port is
+/// held on the host's loopback, where only the host's own client can read
+/// it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ZoneAnswererStatus {
+    /// The answerer's acquisition has not finished its first pass: the
+    /// daemon has not yet said which state it is in.
+    Starting,
+    /// This VM host daemon holds the machine's answerer port on the host
+    /// loopback and answers the zone from its own host-authored table.
+    Holder {
+        /// The port the answerer listens on.
+        port: u16,
+    },
+    /// Another VM host daemon on this machine holds the answerer port; this
+    /// daemon's table rows answer through it over the answerer channel.
+    Registered {
+        /// The machine's answerer port the holder serves.
+        port: u16,
+    },
+    /// The installed answerer host service holds the answerer port (NET-122's
+    /// host service): the service manager holds its sockets and this
+    /// daemon's table rows answer through it over the machine-global answerer
+    /// channel. The zone is manager-held, so it answers whether or not any
+    /// session holds it.
+    ManagerHeld {
+        /// The machine's answerer port the service serves.
+        port: u16,
+    },
+    /// The answerer port is held by a process with no channel — a native
+    /// minimald, or a foreign process — so this VM's names are not answered
+    /// on the host and the hostname proxy remains the only surface.
+    PortHeldNoChannel {
+        /// The machine's answerer port, held by a process with no channel.
+        port: u16,
+    },
+    /// The hostname proxy this VM host daemon reserved for its VM is not
+    /// serving, and this is the host-side cause (T93): the port the
+    /// supervisor drew or was pinned and what kept it from publishing. It
+    /// rides the answerer's read because that read is already the one
+    /// host-side fact the CLI asks this daemon for — the proxy's publish
+    /// outcome is a host fact the same way the answerer's state is, never
+    /// something the guest could vouch for, and it is the CLI's only way to
+    /// say *why* the proxy is down rather than that it merely is.
+    ProxyNotServing {
+        /// The port the supervisor reserved and the guest could not publish.
+        port: u16,
+        /// What kept the proxy from serving on that port.
+        cause: ProxyDownCause,
+    },
+}
+
+/// Why a VM host daemon says its VM's hostname proxy is not serving (T93):
+/// the terminal publish outcomes the supervisor itself reached — the port
+/// it reserved is held by another process on the host, or the draws to find
+/// a free one ran out — or that its publish is unconfirmed, the one
+/// non-terminal state: the VM is up, the publish is not one the host saw. A
+/// host that merely has no switch to publish through says nothing here: that
+/// boot's proxy never attempted a publish, and its story stays the daemon
+/// log's, not a cause this status could name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProxyDownCause {
+    /// Another process on the host holds the published port — for a port
+    /// the operator pinned this fails the start outright; for a drawn one
+    /// it is what every redraw skipped.
+    PortHeld,
+    /// The drawn port's publish tries ran out: every port the reservation
+    /// drew was already taken when the guest tried to publish it.
+    RedrawsRanOut,
+    /// The VM came up but the guest never reported the publish, and the
+    /// supervisor could not attribute the port to this VM's own forwarder:
+    /// nothing answers on it, or its holder is one the host does not let
+    /// this user see. Not a failure — the VM stays up — but not a publish
+    /// the host can vouch for either, so the surfaces say "unconfirmed"
+    /// rather than "serving" until the guest's late report clears it.
+    PublishUnconfirmed,
+    /// The VM came up with its publish unconfirmed, and the guest's late
+    /// report then said the port is held: the VM stays up with no hostname
+    /// proxy — not a start failure, so it never reads like one. Names the
+    /// holder as the host saw it when the report landed (`pid <pid>
+    /// (<exe>)`), or `None` when the host would not name it.
+    PortHeldAfterStart {
+        /// Who holds the port, when the host let the supervisor see it.
+        holder: Option<String>,
+    },
 }
 
 /// The addresses a successful registration hands back
@@ -532,20 +1252,152 @@ pub enum BoxControlRequest {
 /// host switch serves — the same pair the create request carries so the
 /// in-VM daemon attaches with it.
 ///
-/// The one reply line the control socket answers either verb with: the
-/// handed addresses, or the reason the verb did not happen. A registration
-/// hands the allocated pair back; a withdrawal echoes the pair it withdrew
-/// by, so the client can check the daemon meant the row it asked about.
-/// Untagged so the reply stays one flat JSON object either way.
+/// The one reply line the control socket answers any verb with: the handed
+/// addresses, or the reason the verb did not happen. A registration hands
+/// the allocated pair and the box id the row holds back
+/// ([`RegisteredBox`]); a withdrawal echoes the pair it withdrew by, so
+/// the client can check the daemon meant the row it asked about; the status
+/// verb answers the answerer's state. Untagged so the reply stays one flat
+/// JSON object either way.
+///
+/// The untagged order carries the same rule
+/// [`Registered`](Self::Registered) documents: a variant is tried before
+/// any it is a strict superset of. The ask shapes are disjoint from every
+/// older one by a required field each carries and no other does —
+/// [`AsksSubscribed`](Self::AsksSubscribed) its `subscribed`,
+/// [`PendingAskOffer`](Self::PendingAskOffer) its `ask_id`,
+/// [`PendingAskDismissed`](Self::PendingAskDismissed) its `dismissed`,
+/// [`AskAnswerRecorded`](Self::AskAnswerRecorded) its `recorded`,
+/// [`AskAdmit`](Self::AskAdmit) its `ask` tag — but two of them also carry
+/// a port and a protocol, so a `PortRecorded` document is a strict subset
+/// of their fields: they are placed before it rather than after, so an
+/// offered ask cannot decode as a recorded port. The older newer shapes
+/// stay disjoint the same way — [`Row`](Self::Row) its
+/// `egress_allow_list`, [`NoRow`](Self::NoRow) its `no_row`,
+/// [`PortRecorded`](Self::PortRecorded) its `proto` — so no document of
+/// one can decode as another's, and the order among them is free.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum BoxControlReply {
-    /// The verb succeeded: a registration's allocated addresses, or a
-    /// withdrawal's echo of the pair the row went by.
+    /// The record-ask-answer verb's answer for an ask that already ended
+    /// (NET-045): how it ended, and the port and protocol it was about.
+    /// Nothing is recorded. `already_ended` is required — the marker that
+    /// keeps this document from decoding as any other reply; placed first,
+    /// before every shape whose fields are a subset of its own.
+    AskAlreadyEnded {
+        /// The ask the late answer named.
+        ask_id: AskId,
+        /// The port the ask was about.
+        port: u16,
+        /// The protocol the ask was about.
+        proto: IpProto,
+        /// How the ask ended.
+        already_ended: AskLateEnd,
+    },
+    /// The subscribe-asks verb's answer: the row's box id the client is
+    /// now attached to. `subscribed` is required — the marker that keeps
+    /// this document from decoding as any other reply, a registration's
+    /// id-carrying answer included.
+    AsksSubscribed {
+        /// The marker: always `true`, carried so the untagged reply
+        /// discriminates this from every other shape.
+        subscribed: bool,
+        /// The row's box id the subscription is attached to.
+        box_id: BoxId,
+    },
+    /// A pending ask, pushed to a subscribed client's connection
+    /// (NET-045): the ask's id, the row, the port and the protocol — the
+    /// host row's own fields, never a guest-supplied string, because the
+    /// dialog the client renders is built from these alone. Carries an
+    /// `ask_id` no other reply shape has, and is placed before
+    /// [`PortRecorded`](Self::PortRecorded), whose port and protocol are
+    /// a subset of its fields.
+    PendingAskOffer(PendingAskOffer),
+    /// A pending ask taken away from a subscribed client: another client
+    /// recorded the first answer, the ask was cancelled, or the client's
+    /// own subscription ended — the dialog it may still be showing is not
+    /// the one that decides. `dismissed` is required — the marker.
+    PendingAskDismissed {
+        /// The ask that is no longer this client's to answer.
+        ask_id: AskId,
+        /// The marker: always `true`, carried so the untagged reply
+        /// discriminates this from every other shape.
+        dismissed: bool,
+    },
+    /// The record-ask-answer verb's answer: the ask the daemon recorded
+    /// the client's answer against — the first answer, because every
+    /// later one is refused as an unknown-or-consumed id and answers
+    /// [`Error`](Self::Error) instead. `recorded` is required — the
+    /// marker.
+    AskAnswerRecorded {
+        /// The ask whose first answer this was.
+        ask_id: AskId,
+        /// The marker: always `true`, carried so the untagged reply
+        /// discriminates this from every other shape.
+        recorded: bool,
+    },
+    /// The ask admit's answer ([`AskAdmitOutcome`]): the ask's end, as a
+    /// `ask`-tagged document no older reply shape can decode as.
+    AskAdmit(AskAdmitOutcome),
+    /// The registration succeeded: the allocated addresses and the box id
+    /// the published row holds ([`RegisteredBox`]) — the reply the register
+    /// verb answers with. The withdrawal never answers this: it has no id
+    /// to hand back, and the addresses echo it has always answered with
+    /// stays its answer ([`Addresses`](Self::Addresses)).
+    ///
+    /// First in the order on purpose. The reply is untagged and serde
+    /// ignores a document's unknown fields, so a variant whose fields are
+    /// a strict superset of another's must be tried before it: an
+    /// id-carrying reply parsed as `Addresses` would silently drop the
+    /// id, and the client would record no id for a box the host named. A
+    /// reply that carries no `box_id` — from a daemon that predates ids —
+    /// fails this variant and parses as `Addresses`: the registration
+    /// succeeded, and the client simply records no id for the box.
+    Registered(RegisteredBox),
+    /// The verb succeeded: a withdrawal's echo of the pair the row went by,
+    /// and a registration's answer on a daemon that predates box ids.
     Addresses(BoxAddresses),
     /// The verb failed: `error` is a sentence naming why, for the client to
     /// warn with.
     Error { error: String },
+    /// The answerer-status read succeeded: the state of the machine's
+    /// zone answerer as the daemon holds it ([`ZoneAnswererStatus`]).
+    Status(ZoneAnswererStatus),
+    /// The read-only row verb's answer for a live box: the row's switch
+    /// address, its derived egress allow-list, and its declared and
+    /// runtime-admitted ports ([`BoxRow`]).
+    Row(BoxRow),
+    /// The read-only row verb's answer for a name no live box holds: the
+    /// name back, with `no_row` marking the shape, so a reader cannot
+    /// mistake "the row is gone" for a parse failure. `no_row` is required
+    /// — the marker that keeps this document from decoding as any other
+    /// reply.
+    NoRow {
+        /// The name that was asked about.
+        name: String,
+        /// The marker: always `true`, carried so the untagged reply
+        /// discriminates this from a live row's answer.
+        no_row: bool,
+    },
+    /// A port report was recorded: the port and protocol the host now holds
+    /// — the one reply both report verbs answer with, the withdrawal
+    /// included, because a withdrawal's goal state holds even when the
+    /// port was never admitted.
+    PortRecorded {
+        /// The port the report named.
+        port: u16,
+        /// The protocol the report named.
+        proto: IpProto,
+    },
+    /// A release or release-cancel was answered: `acted` says whether the
+    /// daemon did anything (false: it hosted no interim, or had no release
+    /// pending), and `detail` is the sentence it logged.
+    AnswererRelease {
+        /// Whether the request changed anything.
+        acted: bool,
+        /// What the daemon did, as its log line said it.
+        detail: String,
+    },
 }
 
 /// The request for a [`CreateSession`] RPC.
@@ -652,6 +1504,55 @@ pub struct CreateSessionResponse {
     /// is where the user is about to rely on the names the surface answers.
     #[serde(default)]
     pub answerer_bound: bool,
+    /// The classifier advisory this host's verdict owes the session start
+    /// (NET-079): `Some` only when both halves it is about are true — the
+    /// daemon is not running inside a microVM, whose causes name its
+    /// image's builder rather than anything the person starting a session
+    /// could run, and the session is a host-address box, whose verdict is
+    /// the one the host's cgroup tree decides — and that host cannot
+    /// decide it per box, naming the cause in
+    /// words, the state that leaves the box in — unenforced, except that
+    /// a deny-all declaration is refused at placement while the probe
+    /// that would decide it cannot be read — and the exact command that
+    /// installs the
+    /// classifier's privileged step only when that step is the cause that
+    /// is missing, because a host that cannot confine a box is not
+    /// cleared by installing anything. Spelled by the daemon, which is
+    /// the one that read the host; printed by the client verbatim, and
+    /// never a prompt — running the command (and any privilege prompt it
+    /// carries) is the person's act, never the session start's: the start
+    /// still hands the box the host's address and runs it unenforced, and
+    /// only a deny-all declaration is refused later, at placement, while
+    /// the probe that would decide it cannot be read.
+    ///
+    /// `None` from a host that decides per box: silence is that host's
+    /// state, and a client reading `None` prints exactly what it printed
+    /// before this field. `None` from a daemon that predates it reads the
+    /// same way — nothing said, so nothing to print.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classifier_advisory: Option<String>,
+    /// The per-box egress enforcement this host's verdict gives a
+    /// host-address session (NET-079): `per_box` when this host can decide
+    /// a box's verdict on a classifier leaf of its own, `none` when it
+    /// cannot and the box runs with the host's address and no verdict of
+    /// its own. Spelled in the machine spelling the daemon's log line and
+    /// the other replies use, so a script reads the state as data and not
+    /// by parsing the prose around it. `None` for a session that is not
+    /// host-address: an own-address or none box's verdict is decided on
+    /// address leases, never on the host's cgroup tree.
+    ///
+    /// The same derivation the listing and the policy read answer through,
+    /// with the same refusal gate: the session this create is minting has
+    /// no launch record yet, so the daemon's one classifier fact is the
+    /// best either half of it knows, and the box the gate refuses — a
+    /// deny-all host-address box the host cannot enforce, the one its own
+    /// launch would refuse — carries no enforcement value anywhere.
+    /// Never recorded at create: only a launch writes the box's own
+    /// outcome. `None` from a daemon that
+    /// predates the field is that daemon's silence, never a decided
+    /// `per_box`: a client that reads nothing here claims nothing from it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_ip_enforcement: Option<String>,
 }
 
 impl OneshotSshRpc for CreateSession {
@@ -816,8 +1717,67 @@ pub struct DestroySessionRequest {
 }
 
 /// The response for a [`DestroySession`] RPC.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct DestroySessionResponse;
+///
+/// Carries the session's failed `on_destroy` hooks, so the client can
+/// report them: a failing destroy hook does not stop the destroy, and
+/// without this the only trace is the daemon log.
+///
+/// This was a unit struct, which encodes as `null`. It still does when
+/// no hook failed, so a client and a daemon either side of the change
+/// keep agreeing on a clean destroy.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(
+    from = "DestroySessionResponseWire",
+    into = "DestroySessionResponseWire"
+)]
+pub struct DestroySessionResponse {
+    /// One line per `on_destroy` hook that did not succeed: where it was
+    /// declared and what happened, followed by its captured output tail
+    /// on the lines after, when there is any.
+    pub hook_failures: Vec<String>,
+}
+
+/// [`DestroySessionResponse`] on the wire: `null` (the old unit shape)
+/// or an object.
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum DestroySessionResponseWire {
+    Unit(()),
+    Fields(DestroySessionResponseFields),
+}
+
+/// `deny_unknown_fields` for the same reason as on
+/// [`FinalizeSessionResponse`]: without it, `{"error": "..."}` parses as
+/// a successful destroy with no failures.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DestroySessionResponseFields {
+    #[serde(default)]
+    hook_failures: Vec<String>,
+}
+
+impl From<DestroySessionResponseWire> for DestroySessionResponse {
+    fn from(wire: DestroySessionResponseWire) -> Self {
+        match wire {
+            DestroySessionResponseWire::Unit(()) => Self::default(),
+            DestroySessionResponseWire::Fields(f) => Self {
+                hook_failures: f.hook_failures,
+            },
+        }
+    }
+}
+
+impl From<DestroySessionResponse> for DestroySessionResponseWire {
+    fn from(resp: DestroySessionResponse) -> Self {
+        if resp.hook_failures.is_empty() {
+            Self::Unit(())
+        } else {
+            Self::Fields(DestroySessionResponseFields {
+                hook_failures: resp.hook_failures,
+            })
+        }
+    }
+}
 
 impl OneshotSshRpc for DestroySession {
     const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "DestroySession");
@@ -1007,6 +1967,145 @@ impl OneshotSshRpc for GetEffectiveSessionPolicy {
     const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "GetEffectiveSessionPolicy");
     type Request<'a> = GetEffectiveSessionPolicyRequest;
     type Response = Errorable<EffectiveSessionPolicy>;
+}
+
+/// One live dynamic-ingress mapping (NET-044): a port a process inside the box
+/// published at runtime with the box's own `min net expose`, held from the
+/// publish until the box stops.
+///
+/// Not a [`PortMapping`]: a declaration names what a box *may* publish, and
+/// this is what it *did* — the mapping's `local` is a full `host:port` on the
+/// box's own published address (NET-010), not an external port number to bind
+/// wherever the publish surface happens to stand, so the row a client renders
+/// can name the address a connection actually reaches.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LiveMapping {
+    /// The host-side `host:port` the forward is published on, spelled as the
+    /// switch bound it.
+    pub local: String,
+    /// The port inside the box the forward delivers to.
+    pub internal_port: u16,
+    /// The transport the forward carries.
+    pub proto: IpProto,
+    /// Whether the box's own relay gate has admitted the port yet. A runtime
+    /// publish binds on the host at once, but the frame only reaches the box
+    /// through the relay gate its attach installed — and that gate admits the
+    /// ports the *declaration* named, so a port published at runtime is
+    /// refused at the relay until the gate's admitted set grows to include
+    /// runtime-published ports. A mapping that reads `pending` is bound, and
+    /// a connection to its `local` is answered by the relay, not by the box.
+    ///
+    /// Filled by the daemon at read time (the serving handler compares the
+    /// mapping against the gate's compile set), never stored with the
+    /// forwarder — the state is a fact about the box, not about the bind.
+    ///
+    /// An `Option`, defaulted on the wire, so a reply from a daemon older
+    /// than the field — one that carries no `pending` key — still decodes,
+    /// as `None`: the row's state reads as *unknown*, and never as the
+    /// reachable reading a missing key must not default itself into. Both
+    /// renderings `min session policy` writes spell that (`unknown` in the
+    /// text row, `null` in the JSON document); a daemon that does carry the
+    /// field answers `Some(true)` or `Some(false)`, and only those.
+    #[serde(default)]
+    pub pending: Option<bool>,
+}
+
+impl LiveMapping {
+    /// The `host:port` pair a client renders, split — `None` when `local` is
+    /// not a `host:port` pair with a numeric port, a shape the daemon never
+    /// publishes.
+    #[must_use]
+    pub fn host_port(&self) -> Option<(&str, u16)> {
+        let (host, port) = self.local.rsplit_once(':')?;
+        Some((host, port.parse().ok()?))
+    }
+}
+
+/// An RPC to read the live dynamic-ingress mappings a session's box published
+/// at runtime (NET-044) — the rows `min session policy` lists beside the
+/// declaration, which is what makes a publish visible rather than only
+/// permitted.
+///
+/// A separate response rather than a field on [`EffectiveSessionPolicy`], for
+/// the same reason the effective halves are separate from the strict
+/// [`SessionPolicy`] at all: the declaration is a fact about the launch, and
+/// these are facts about the running box. They are also the live actor's own
+/// state — a box that is not running holds none — so this resolves the session
+/// where [`GetSessionPolicy`] and [`GetEffectiveSessionPolicy`] read the
+/// record.
+pub struct GetLiveIngress;
+
+/// Request for the [`GetLiveIngress`] RPC: the same lookup as
+/// [`GetSessionPolicyRequest`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GetLiveIngressRequest {
+    Name(String),
+    Id(SessionId),
+}
+
+impl OneshotSshRpc for GetLiveIngress {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "GetLiveIngress");
+    type Request<'a> = GetLiveIngressRequest;
+    type Response = Errorable<Vec<LiveMapping>>;
+}
+
+/// An RPC to read the runtime facts about a session a policy render wants
+/// beside its rules (NET-079): the per-box egress enforcement the session's
+/// box actually runs under — the same state [`ListSessionsEntry::host_ip_enforcement`]
+/// and the create response answer over, served the same way.
+///
+/// A separate reply rather than a field on [`EffectiveSessionPolicy`] because
+/// that policy struct is `deny_unknown_fields`: a strict struct an older `min`
+/// has no field for rejects a new key rather than ignoring it, so a fact that
+/// did not exist when that client was built must ride its own reply, the same
+/// shape live ingress takes ([`GetLiveIngress`]) — an older client that cannot
+/// ask for it never sees it, and a newer one degrades to silence rather than
+/// failing to read the rules at all. The facts are the daemon's to answer,
+/// because the enforcement is decided on the host's cgroup tree and recorded
+/// by the daemon at the box's own launch: no client can read either.
+pub struct GetSessionRuntimeFacts;
+
+/// Request for the [`GetSessionRuntimeFacts`] RPC: the same lookup as
+/// [`GetEffectiveSessionPolicyRequest`], over the same record.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GetSessionRuntimeFactsRequest {
+    Name(String),
+    Id(SessionId),
+}
+
+/// The runtime facts [`GetSessionRuntimeFacts`] answers with.
+///
+/// Not `deny_unknown_fields`: runtime facts grow, and a client built before
+/// a later fact must still read the ones it knows, so an unknown key is
+/// ignored. What keeps the untagged [`Errorable`] honest instead is the
+/// required `id`: serde reads a missing `Option` as `None`, so an
+/// all-optional struct would parse *any* object, the daemon's
+/// `{"error": "..."}` included, as a facts reply with nothing to report. A
+/// field the error object never carries makes that reply fail the `Ok(S)`
+/// arm and fall through to `Err`, without refusing a key it does not know.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionRuntimeFacts {
+    /// The session these facts are about: the record the daemon read them
+    /// from. Required, so the daemon's error reply never decodes as facts.
+    pub id: SessionId,
+    /// The per-box egress enforcement the session's box actually runs under
+    /// (NET-079): the box's own launch record —
+    /// [`Record::host_ip_enforcement`](sessions::Record) — lowered to `none`
+    /// when the host can no longer decide per box and never raised above it,
+    /// and the host's own state only while the session's box has not
+    /// launched. `None` for a session that is not host-address, for a
+    /// host-address box the classifier refused, and when the record could not
+    /// be read back — the same states
+    /// [`ListSessionsEntry::host_ip_enforcement`] names.
+    pub host_ip_enforcement: Option<HostIpEnforcement>,
+}
+
+impl OneshotSshRpc for GetSessionRuntimeFacts {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "GetSessionRuntimeFacts");
+    type Request<'a> = GetSessionRuntimeFactsRequest;
+    type Response = Errorable<SessionRuntimeFacts>;
 }
 
 /// An RPC to list the lifecycle hooks composed into a session, and where
@@ -1470,6 +2569,7 @@ mod tests {
         let policy = SessionPolicy {
             egress: None,
             ingress: Some(IngressPolicy::default()),
+            credentialed_upstream: None,
         };
         let json = serde_json_lenient::to_string(&policy).unwrap();
         assert!(json.contains("\"egress\":null"), "got: {json}");
@@ -1479,6 +2579,35 @@ mod tests {
             "got: {json}"
         );
         assert!(json.contains("\"dynamic_ingress\":null"), "got: {json}");
+    }
+
+    /// A daemon that predates `hook_failures` answers a destroy with the
+    /// old unit shape, `null`; it must still read as a clean success, and
+    /// a clean success must still go out as `null` for an older client.
+    /// An error must not read as a success with no failures.
+    #[test]
+    fn destroy_session_response_decodes_the_old_shape() {
+        let old: Errorable<DestroySessionResponse> =
+            serde_json_lenient::from_str("null").expect("the old shape must decode");
+        assert_eq!(old, Errorable::Ok(DestroySessionResponse::default()));
+        assert_eq!(
+            serde_json_lenient::to_string(&Errorable::Ok(DestroySessionResponse::default()))
+                .unwrap(),
+            "null"
+        );
+
+        let failed = DestroySessionResponse {
+            hook_failures: vec!["user loadout `dev`: exited with status 3".to_string()],
+        };
+        assert_eq!(round_trip(&failed), failed);
+
+        let err: Errorable<DestroySessionResponse> =
+            serde_json_lenient::from_str(r#"{"error":"no such session"}"#)
+                .expect("an error payload must decode");
+        assert!(
+            matches!(err, Errorable::Err { .. }),
+            "an error decoded as success: {err:?}"
+        );
     }
 
     fn round_trip<T>(value: &T) -> T
@@ -1513,9 +2642,83 @@ mod tests {
             decoded,
             Errorable::Ok(SessionPolicy {
                 egress: None,
-                ingress: None
+                ingress: None,
+                credentialed_upstream: None
             })
         );
+    }
+
+    /// The live-ingress response (NET-044) round-trips, and — because it rides
+    /// an untagged `Errorable` — the daemon's `{"error":"..."}` reply for an
+    /// unknown session must still decode as `Err` rather than as an empty
+    /// mapping list, which would read as "the box published nothing" for a box
+    /// that does not exist.
+    #[test]
+    fn live_ingress_response_round_trips_and_decodes_daemon_error() {
+        let live = vec![
+            LiveMapping {
+                local: "127.0.64.2:3000".to_string(),
+                internal_port: 3000,
+                proto: IpProto::Tcp,
+                // A runtime publish the relay gate has not admitted yet:
+                // bound on the host, but the box's own gate still refuses it.
+                pending: Some(true),
+            },
+            LiveMapping {
+                local: "127.0.64.2:5353".to_string(),
+                internal_port: 5353,
+                proto: IpProto::Udp,
+                pending: Some(false),
+            },
+        ];
+        assert_eq!(
+            round_trip(&Errorable::Ok(live.clone())),
+            Errorable::Ok(live.clone())
+        );
+
+        // The reachability half rides the wire by name: a pending publish
+        // says so in the JSON any client of the RPC reads.
+        let json = serde_json_lenient::to_string(&live[0]).unwrap();
+        assert!(
+            json.contains("\"pending\":true"),
+            "the mapping's pending state is part of its wire shape: {json}"
+        );
+
+        // A reply from a daemon older than the field carries no `pending`
+        // key: it decodes as `None` — unknown, the renderings' own spelling
+        // — never as the reachable reading a missing key could default
+        // itself into.
+        let mut pre_field: serde_json_lenient::Value = serde_json_lenient::from_str(&json).unwrap();
+        pre_field
+            .as_object_mut()
+            .expect("a mapping encodes as an object")
+            .remove("pending");
+        let decoded: LiveMapping =
+            serde_json_lenient::from_str(&serde_json_lenient::to_string(&pre_field).unwrap())
+                .unwrap();
+        assert_eq!(
+            decoded.pending, None,
+            "a pre-field reply decodes as unknown, not as not-pending: {json}"
+        );
+
+        let decoded: Errorable<Vec<LiveMapping>> =
+            serde_json_lenient::from_str(r#"{"error":"no session found"}"#).expect("deserialize");
+        assert_eq!(
+            decoded,
+            Errorable::Err {
+                error: "no session found".to_string()
+            },
+            "a daemon error must not decode as an empty mapping list"
+        );
+
+        // The split a renderer reads: `local` is a `host:port` pair.
+        let mapping = LiveMapping {
+            local: "127.0.64.2:3000".to_string(),
+            internal_port: 3000,
+            proto: IpProto::Tcp,
+            pending: Some(false),
+        };
+        assert_eq!(mapping.host_port(), Some(("127.0.64.2", 3000)));
     }
 
     /// `SessionDelta` distinguishes proven-clean VCS state, the
@@ -1656,6 +2859,11 @@ mod tests {
             // line `min session activate` prints from it (NET-018) must not
             // be able to silently drop off.
             answerer_bound: true,
+            // And the classifier state (NET-079): the advisory a start
+            // prints and the enforcement a host-address box runs under
+            // must not be able to silently drop off either.
+            classifier_advisory: None,
+            host_ip_enforcement: None,
         };
         let json = serde_json_lenient::to_string(&resp).expect("serializes");
         assert!(
@@ -1681,6 +2889,8 @@ mod tests {
             zone_answerer_port: None,
             interim_loopback: false,
             answerer_bound: false,
+            classifier_advisory: None,
+            host_ip_enforcement: None,
         };
         let json = serde_json_lenient::to_string(&opted_out).expect("serializes");
         assert!(
@@ -1699,6 +2909,210 @@ mod tests {
             ..opted_out
         };
         assert_eq!(round_trip(&opted_in), opted_in);
+    }
+
+    /// The classifier state a host that cannot decide per box puts on its
+    /// create replies (NET-079), pinned on the wire: the unenforced state
+    /// as `host_ip_enforcement: none` in the machine spelling — `per_box` on
+    /// a host that decides, so the two hosts stay distinguishable to
+    /// whatever reads the field — the cause in words inside the advisory,
+    /// and the install command only for the cause it clears. A daemon
+    /// that predates both fields decodes with neither: silence, never a
+    /// decided `per_box`.
+    #[test]
+    fn create_response_carries_the_classifier_state() {
+        // The host whose step is missing: the advisory names the cause in
+        // words, names the state it leaves the box in, and carries the
+        // exact command that installs the privileged step.
+        let step_missing = CreateSessionResponse {
+            id: SessionId::parse_str("00000000-0000-0000-0000-000000000001").unwrap(),
+            daemon_version: Some("0.6.0".into()),
+            hostname_routing_unavailable: None,
+            hostname_proxy_port: None,
+            zone_answerer_port: None,
+            interim_loopback: false,
+            deny_all_opt_out: None,
+            answerer_bound: false,
+            classifier_advisory: Some(
+                "note: this host cannot decide a host-address box's egress \
+                 verdict per box: the classifier's privileged step is not \
+                 installed on this host. While it cannot, its host-address \
+                 boxes run unenforced — whatever the boxes' declarations \
+                 say. Install the classifier's privileged step with:\n  \
+                 run: curl -fsSLO https://raw.githubusercontent.com/gominimal/\
+                 minimal/main/scripts/install-host-classifier.sh && sudo bash \
+                 ./install-host-classifier.sh --user <the account this \
+                 daemon runs as> --cohort-address <cohort address> \
+                 --node-plane-address <node-plane address>"
+                    .to_string(),
+            ),
+            host_ip_enforcement: Some("none".into()),
+        };
+        let json = serde_json_lenient::to_string(&step_missing).expect("serializes");
+        assert!(
+            json.contains(r#""host_ip_enforcement":"none""#),
+            "the unenforced state must ride the wire in the machine spelling, got: {json}",
+        );
+        assert!(
+            json.contains("the classifier's privileged step is not installed"),
+            "the advisory names its cause in words, got: {json}",
+        );
+        assert!(
+            json.contains("sudo bash ./install-host-classifier.sh"),
+            "the step's cause names the exact command that installs it, got: {json}",
+        );
+        assert_eq!(round_trip(&step_missing), step_missing);
+
+        // The host that cannot confine a box: the same state, named without
+        // a command — installing the step over such a tree would leave the
+        // cause standing, so the advisory must not name one.
+        let cannot_confine = CreateSessionResponse {
+            classifier_advisory: Some(
+                "note: this host cannot decide a host-address box's egress \
+                 verdict per box: no cgroup2 mount with nsdelegate covers \
+                 the classifier tree, so a box could migrate out of its \
+                 leaf. While it cannot, its host-address boxes run \
+                 unenforced — whatever the boxes' declarations say."
+                    .to_string(),
+            ),
+            host_ip_enforcement: Some("none".into()),
+            ..step_missing
+        };
+        let json = serde_json_lenient::to_string(&cannot_confine).expect("serializes");
+        assert!(
+            !json.contains("install-host-classifier"),
+            "a cause no command clears names no command, got: {json}",
+        );
+        assert_eq!(round_trip(&cannot_confine), cannot_confine);
+
+        // The decided host: nothing to say, so nothing on the wire — a
+        // client of either build reads the reply it always read.
+        let decided = CreateSessionResponse {
+            classifier_advisory: None,
+            host_ip_enforcement: Some("per_box".into()),
+            ..cannot_confine
+        };
+        let json = serde_json_lenient::to_string(&decided).expect("serializes");
+        assert!(
+            json.contains(r#""host_ip_enforcement":"per_box""#),
+            "a host that decides per box says so in the machine spelling, got: {json}",
+        );
+        assert!(
+            !json.contains("classifier_advisory"),
+            "a decided host carries no advisory, got: {json}",
+        );
+        assert_eq!(round_trip(&decided), decided);
+
+        // A daemon that predates both fields: the reply it always sent
+        // decodes with neither, and absence must not read as a decided
+        // `per_box` — an older daemon's silence is not evidence of
+        // anything, and a client that reads nothing claims nothing.
+        let pre_field: Errorable<CreateSessionResponse> = serde_json_lenient::from_str(
+            r#"{"id":"00000000-0000-0000-0000-000000000001","daemon_version":"0.5.0"}"#,
+        )
+        .expect("a pre-field CreateSession reply must still decode");
+        match pre_field {
+            Errorable::Ok(c) => {
+                assert!(c.classifier_advisory.is_none());
+                assert_eq!(c.host_ip_enforcement, None);
+            }
+            Errorable::Err { error } => panic!("expected Ok, got {error}"),
+        }
+    }
+
+    /// NET-079's enforcement state never rides the strict policy reply: an
+    /// older `min` built against the two-field [`EffectiveSessionPolicy`] —
+    /// `deny_unknown_fields`, the strictness that keeps an all-optional
+    /// struct from swallowing the daemon's `{"error":...}` replies under
+    /// the untagged [`Errorable`] — rejects a key it has no field for, so a
+    /// policy reply that grew the state would make every old client fail
+    /// `min session policy` outright. Pinned here as the contract that keeps
+    /// that from regressing: the reply this build serves decodes in the old
+    /// client's own strict shape, and the state answers over
+    /// [`GetSessionRuntimeFacts`] instead — a reply an old client simply
+    /// never asks for, and this build's own answer to it stays anchored the
+    /// same way the policy's `egress` is.
+    #[test]
+    fn effective_policy_reply_decodes_in_the_old_clients_strict_shape() {
+        // The reply this build serves: two fields, no enforcement key.
+        let reply = Errorable::Ok(EffectiveSessionPolicy {
+            egress: EffectiveEgress::DenyAll,
+            ingress: None,
+        });
+        let json = serde_json_lenient::to_string(&reply).expect("the policy reply serializes");
+        assert!(
+            !json.contains("host_ip_enforcement"),
+            "the strict policy reply must carry no enforcement key, got: {json}",
+        );
+
+        // The old client: the strict two-field shape it was built against,
+        // spelled as its own derive would spell it. It decodes the reply
+        // above because the reply never grew a field — and it refuses a
+        // reply that did, which is exactly why the state must ride its own
+        // RPC rather than a new field here.
+        #[derive(serde::Deserialize, Debug, PartialEq)]
+        #[serde(deny_unknown_fields)]
+        struct OldClientPolicy {
+            egress: EffectiveEgress,
+            ingress: Option<IngressPolicy>,
+        }
+        let decoded: Errorable<OldClientPolicy> = serde_json_lenient::from_str(&json)
+            .expect("the reply this build serves decodes in the old client's shape");
+        assert_eq!(
+            decoded,
+            Errorable::Ok(OldClientPolicy {
+                egress: EffectiveEgress::DenyAll,
+                ingress: None,
+            })
+        );
+        assert!(
+            serde_json_lenient::from_str::<Errorable<OldClientPolicy>>(
+                r#"{"egress":"deny_all","ingress":null,"host_ip_enforcement":"none"}"#
+            )
+            .is_err(),
+            "the old client refuses a policy reply that grew the key — the \
+             reason the state answers over its own runtime-facts reply",
+        );
+
+        // The runtime-facts reply keeps the property the strict shapes
+        // exist for without being strict: its required `id` is a field the
+        // daemon's `{"error":...}` never carries, so an error answer falls
+        // through the untagged decode to `Err` rather than decoding as a
+        // facts object with nothing to report — while a facts reply that
+        // grew a key this client has no field for still decodes, because
+        // runtime facts grow and an older client keeps the ones it knows.
+        let facts = SessionRuntimeFacts {
+            id: SessionId::nil(),
+            host_ip_enforcement: Some(HostIpEnforcement::None),
+        };
+        assert_eq!(round_trip(&facts), facts);
+        match serde_json_lenient::from_str::<Errorable<SessionRuntimeFacts>>(
+            r#"{"error":"no session found"}"#,
+        )
+        .expect("an error reply is one of the untagged arms")
+        {
+            Errorable::Err { error } => assert_eq!(error, "no session found"),
+            Errorable::Ok(facts) => {
+                panic!("an error reply must not decode as facts, got {facts:?}")
+            }
+        }
+        match serde_json_lenient::from_str::<Errorable<SessionRuntimeFacts>>(
+            r#"{"id":"00000000-0000-0000-0000-000000000000","host_ip_enforcement":"per_box","a_later_fact":true}"#,
+        )
+        .expect("a facts reply with a key this client does not know still decodes")
+        {
+            Errorable::Ok(decoded) => assert_eq!(
+                decoded,
+                SessionRuntimeFacts {
+                    id: SessionId::nil(),
+                    host_ip_enforcement: Some(HostIpEnforcement::PerBox),
+                },
+                "the facts this client knows decode beside a key it does not"
+            ),
+            Errorable::Err { error } => {
+                panic!("a facts reply must not decode as an error, got {error}")
+            }
+        }
     }
 
     /// A daemon that predates `hostname_routing_unavailable` must still decode,
@@ -1942,5 +3356,427 @@ mod tests {
             }))
         );
         assert_eq!(round_trip(&with), with);
+    }
+
+    /// The port-report verbs (NET-138) round-trip as the fixed, size-bounded
+    /// messages they are: the tagged line names its verb, the request carries
+    /// the row key, the port, the protocol and the reporting source, and the
+    /// one reply both verbs answer with cannot be mistaken for any other
+    /// reply shape — the discrimination the untagged reply depends on, since
+    /// a report the grant refused is answered as `Error` and a publish that
+    /// unwinds must be able to tell which it got.
+    #[test]
+    fn box_control_admit_and_withdraw_round_trip() {
+        let admit = BoxControlRequest::AdmitPort(AdmitPortRequest {
+            switch_address: std::net::Ipv4Addr::new(100, 64, 127, 255),
+            port: 8080,
+            proto: IpProto::Tcp,
+            source: PortReportSource::Ask,
+        });
+        let wire = serde_json_lenient::to_string(&admit).expect("serialize");
+        assert!(
+            wire.contains(r#""verb":"admit_port""#),
+            "the tagged line names its verb: {wire}"
+        );
+        assert_eq!(round_trip(&admit), admit);
+
+        let withdraw = BoxControlRequest::WithdrawPort(WithdrawPortRequest {
+            switch_address: std::net::Ipv4Addr::new(100, 64, 127, 255),
+            port: 8080,
+            proto: IpProto::Udp,
+            source: PortReportSource::Listen,
+        });
+        let wire = serde_json_lenient::to_string(&withdraw).expect("serialize");
+        assert!(
+            wire.contains(r#""verb":"withdraw_port""#),
+            "the tagged line names its verb: {wire}"
+        );
+        assert_eq!(round_trip(&withdraw), withdraw);
+        assert!(
+            wire.contains(r#""source":"listen""#) && wire.contains(r#""proto":"udp""#),
+            "the source and the protocol cross in their wire spellings: {wire}"
+        );
+
+        // The reply a recorded report answers with round-trips, and a
+        // document of no other variant's shape decodes as it — the
+        // untagged discrimination, checked from the other side.
+        let recorded = BoxControlReply::PortRecorded {
+            port: 8080,
+            proto: IpProto::Tcp,
+        };
+        assert_eq!(round_trip(&recorded), recorded);
+        let decoded: BoxControlReply =
+            serde_json_lenient::from_str(r#"{"port":8080,"proto":"tcp"}"#)
+                .expect("a recorded report's reply decodes");
+        assert_eq!(decoded, recorded);
+
+        // The refusal a grant-refused report answers with still decodes as
+        // the error it is — the shape the guest unwinds its publish by.
+        let refused: BoxControlReply = serde_json_lenient::from_str(
+            r#"{"error":"the reported port is outside the box's allowed range"}"#,
+        )
+        .expect("a refusal decodes");
+        assert_eq!(
+            refused,
+            BoxControlReply::Error {
+                error: "the reported port is outside the box's allowed range".to_string()
+            }
+        );
+
+        // The report port is the wire contract between the two ends that
+        // depend on this crate — the in-VM daemon that dials it and the VM
+        // host daemon that bridges it — pinned beside the guest's boot
+        // marker, one port per purpose, and clear of the timekeep bridge's
+        // own number, which runs the opposite direction.
+        assert_eq!(
+            VM_HOST_BOX_REPORT_PORT, 7352,
+            "the report port is wire contract; changing it breaks both ends"
+        );
+    }
+
+    /// The ask verbs' offer half (NET-045) round-trips: the guest's ask
+    /// admit carries only the row key, the port and the protocol — no name
+    /// or free text a guest could smuggle a prompt with — the subscription
+    /// keys itself by the row's box id, and the offer the daemon pushes to
+    /// an attached client carries the host row's own fields. Every ask
+    /// reply stays distinct from every older shape in the untagged order —
+    /// an offered ask is never a recorded port, and a registration's
+    /// id-carrying answer is never a subscription's.
+    #[test]
+    fn box_control_pending_ask_offer_round_trip() {
+        let box_id = BoxId::from_bytes([
+            0x01, 0x95, 0x65, 0x5f, 0x7f, 0x1e, 0x7a, 0xbc, 0x9d, 0x1f, 0x2a, 0x3b, 0x4c, 0x5d,
+            0x6e, 0x7f,
+        ]);
+
+        // The guest's ask admit: the row key, the port, the protocol, and
+        // nothing else — the one fixed shape a guest may raise a question
+        // in.
+        let admit_ask = BoxControlRequest::AdmitAsk(AdmitAskRequest {
+            switch_address: std::net::Ipv4Addr::new(100, 64, 127, 255),
+            port: 8080,
+            proto: IpProto::Tcp,
+        });
+        let wire = serde_json_lenient::to_string(&admit_ask).expect("serialize");
+        assert!(
+            wire.contains(r#""verb":"admit_ask""#)
+                && wire.contains(r#""port":8080"#)
+                && wire.contains(r#""proto":"tcp""#),
+            "the tagged line names its verb and the port and protocol it asks for: {wire}"
+        );
+        assert!(
+            !wire.contains("name") && !wire.contains("source") && !wire.contains("answer"),
+            "the ask admit carries no name, no source and no answer — the guest can raise a \
+             question but neither phrase it nor answer it: {wire}"
+        );
+        assert_eq!(round_trip(&admit_ask), admit_ask);
+
+        // The subscription: keyed by the row's box id, never a name.
+        let subscribe = BoxControlRequest::SubscribeAsks(SubscribeAsksRequest { box_id });
+        let wire = serde_json_lenient::to_string(&subscribe).expect("serialize");
+        assert!(
+            wire.contains(r#""verb":"subscribe_asks""#)
+                && wire.contains(r#""box_id":"0195655f7f1e7abc9d1f2a3b4c5d6e7f""#),
+            "the subscription names its verb and the box id it keys by: {wire}"
+        );
+        assert_eq!(round_trip(&subscribe), subscribe);
+
+        // The subscription's answer: subscribed marks the shape, so a
+        // registration's id-carrying answer — a strict superset of the
+        // marker-less fields — still decodes as the registration it is,
+        // from either side of the order.
+        let subscribed = BoxControlReply::AsksSubscribed {
+            subscribed: true,
+            box_id,
+        };
+        assert_eq!(round_trip(&subscribed), subscribed);
+        assert_eq!(
+            serde_json_lenient::from_str::<BoxControlReply>(
+                r#"{"subscribed":true,"box_id":"0195655f7f1e7abc9d1f2a3b4c5d6e7f"}"#
+            )
+            .expect("the subscription's answer decodes"),
+            subscribed
+        );
+        let registered: BoxControlReply = serde_json_lenient::from_str(
+            r#"{"switch_address":"100.64.127.255","loopback_address":"127.0.0.2","box_id":"0195655f7f1e7abc9d1f2a3b4c5d6e7f"}"#,
+        )
+        .expect("a registration reply still decodes");
+        assert!(
+            matches!(registered, BoxControlReply::Registered(_)),
+            "a registration's answer is never a subscription's: {registered:?}"
+        );
+
+        // The offer: the host row's own fields — ask id, box id, name,
+        // port, protocol — and a document of it decodes as nothing else,
+        // the recorded-port reply its fields are a superset of included.
+        let ask_id = AskId::from_bytes([
+            0x9f, 0x1c, 0x2d, 0x3e, 0x4f, 0x5a, 0x6b, 0x7c, 0x8d, 0x9e, 0x0f, 0x1a, 0x2b, 0x3c,
+            0x4d, 0x5e,
+        ]);
+        let offer = BoxControlReply::PendingAskOffer(PendingAskOffer {
+            ask_id,
+            box_id,
+            name: "web".to_string(),
+            port: 8080,
+            proto: IpProto::Tcp,
+        });
+        let wire = serde_json_lenient::to_string(&offer).expect("serialize");
+        for field in [
+            r#""ask_id":"9f1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e""#,
+            r#""box_id":"0195655f7f1e7abc9d1f2a3b4c5d6e7f""#,
+            r#""name":"web""#,
+            r#""port":8080"#,
+            r#""proto":"tcp""#,
+        ] {
+            assert!(wire.contains(field), "the offer spells {field}: {wire}");
+        }
+        assert_eq!(round_trip(&offer), offer);
+        assert_eq!(
+            serde_json_lenient::from_str::<BoxControlReply>(&wire)
+                .expect("an offered ask decodes as its own reply"),
+            offer,
+            "the offer is placed before the recorded-port reply its fields \
+             are a superset of"
+        );
+
+        // The dismissal: the marker keeps it distinct, both directions.
+        let dismissed = BoxControlReply::PendingAskDismissed {
+            ask_id,
+            dismissed: true,
+        };
+        assert_eq!(round_trip(&dismissed), dismissed);
+        assert_eq!(
+            serde_json_lenient::from_str::<BoxControlReply>(
+                r#"{"ask_id":"9f1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e","dismissed":true}"#
+            )
+            .expect("a dismissal decodes"),
+            dismissed
+        );
+    }
+
+    /// The ask verbs' answer half (NET-045) round-trips: the client's
+    /// recorded answer carries the offer's ask id and one of the three
+    /// answers — a human's yes, a human's no, a render that found no
+    /// terminal — and the admit's reply carries the ask's end, as a
+    /// `ask`-tagged document the recorded-port reply cannot be mistaken
+    /// for in either direction.
+    #[test]
+    fn box_control_record_ask_answer_round_trip() {
+        let ask_id = AskId::from_bytes([
+            0x9f, 0x1c, 0x2d, 0x3e, 0x4f, 0x5a, 0x6b, 0x7c, 0x8d, 0x9e, 0x0f, 0x1a, 0x2b, 0x3c,
+            0x4d, 0x5e,
+        ]);
+
+        for (answer, spelling) in [
+            (AskAnswer::Yes, r#""answer":"yes""#),
+            (AskAnswer::No, r#""answer":"no""#),
+            (AskAnswer::NoTty, r#""answer":"no_tty""#),
+        ] {
+            let record =
+                BoxControlRequest::RecordAskAnswer(RecordAskAnswerRequest { ask_id, answer });
+            let wire = serde_json_lenient::to_string(&record).expect("serialize");
+            assert!(
+                wire.contains(r#""verb":"record_ask_answer""#)
+                    && wire.contains(r#""ask_id":"9f1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e""#)
+                    && wire.contains(spelling),
+                "the recorded answer names its verb, its ask and its answer: {wire}"
+            );
+            assert_eq!(round_trip(&record), record);
+        }
+
+        // The record's answer: the first answer is acknowledged, the
+        // marker keeps the shape distinct, and an id the daemon never
+        // minted or already consumed is the error it is instead.
+        let recorded = BoxControlReply::AskAnswerRecorded {
+            ask_id,
+            recorded: true,
+        };
+        assert_eq!(round_trip(&recorded), recorded);
+        assert_eq!(
+            serde_json_lenient::from_str::<BoxControlReply>(
+                r#"{"ask_id":"9f1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e","recorded":true}"#
+            )
+            .expect("a recorded answer's reply decodes"),
+            recorded
+        );
+
+        // The admit's answer: admitted names the port the host now holds
+        // and the ask it was admitted under; refused names the typed end
+        // the ask met. Both are `ask`-tagged documents, and the older
+        // recorded-port reply — a strict subset of admitted's fields —
+        // decodes as the port record it is, not as an ask.
+        let admitted = BoxControlReply::AskAdmit(AskAdmitOutcome::Admitted {
+            ask_id,
+            port: 8080,
+            proto: IpProto::Tcp,
+        });
+        let wire = serde_json_lenient::to_string(&admitted).expect("serialize");
+        assert!(
+            wire.contains(r#""ask":"admitted""#)
+                && wire.contains(r#""ask_id":"9f1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e""#)
+                && wire.contains(r#""port":8080"#),
+            "the admitted answer spells its tag, its ask and its port: {wire}"
+        );
+        assert_eq!(round_trip(&admitted), admitted);
+        assert_eq!(
+            serde_json_lenient::from_str::<BoxControlReply>(&wire)
+                .expect("the admitted answer decodes as its own reply"),
+            admitted,
+            "the admitted answer is placed before the recorded-port reply its \
+             fields are a superset of"
+        );
+
+        for (reason, spelling) in [
+            (AskRefused::Denied, r#""reason":"denied""#),
+            (AskRefused::NoClient, r#""reason":"no_client""#),
+            (AskRefused::QueueFull, r#""reason":"queue_full""#),
+            (AskRefused::OutsideGrant, r#""reason":"outside_grant""#),
+            (AskRefused::NoTty, r#""reason":"no_tty""#),
+            (AskRefused::Cancelled, r#""reason":"cancelled""#),
+            (AskRefused::NoRow, r#""reason":"no_row""#),
+            (AskRefused::StanceNotAsk, r#""reason":"stance_not_ask""#),
+        ] {
+            let cause = (reason == AskRefused::Cancelled).then_some(AskCancelCause::LastDetach);
+            let refused = BoxControlReply::AskAdmit(AskAdmitOutcome::Refused {
+                ask_id,
+                reason,
+                cause,
+            });
+            let wire = serde_json_lenient::to_string(&refused).expect("serialize");
+            assert!(
+                wire.contains(r#""ask":"refused""#) && wire.contains(spelling),
+                "the refused answer spells its tag and its typed end: {wire}"
+            );
+            assert_eq!(
+                wire.contains(r#""cause":"last-detach""#),
+                cause.is_some(),
+                "only a cancellation carries its cause: {wire}"
+            );
+            assert_eq!(round_trip(&refused), refused);
+        }
+
+        // A late answer for an ended ask is answered with how it ended, a
+        // shape no other reply decodes as.
+        for (end, spelling) in [
+            (AskLateEnd::Allowed, r#""end":"allowed""#),
+            (AskLateEnd::Denied, r#""end":"denied""#),
+            (
+                AskLateEnd::Cancelled {
+                    cause: AskCancelCause::MinvmdStopping,
+                },
+                r#""cause":"minvmd-stopping""#,
+            ),
+        ] {
+            let late = BoxControlReply::AskAlreadyEnded {
+                ask_id,
+                port: 8080,
+                proto: IpProto::Tcp,
+                already_ended: end,
+            };
+            let wire = serde_json_lenient::to_string(&late).expect("serialize");
+            assert!(
+                wire.contains(spelling),
+                "the late end spells {spelling}: {wire}"
+            );
+            assert_eq!(
+                serde_json_lenient::from_str::<BoxControlReply>(&wire).expect("decodes"),
+                late
+            );
+        }
+
+        // The older recorded-port reply still decodes as the port record
+        // it is — no ask-shaped variant claims a document with no ask in
+        // it.
+        let decoded: BoxControlReply =
+            serde_json_lenient::from_str(r#"{"port":8080,"proto":"tcp"}"#)
+                .expect("a recorded report's reply still decodes");
+        assert_eq!(
+            decoded,
+            BoxControlReply::PortRecorded {
+                port: 8080,
+                proto: IpProto::Tcp
+            }
+        );
+    }
+
+    /// The read-only row verb round-trips under its key, and its two
+    /// answers stay two answers: a live row's reply cannot decode as the
+    /// no-row marker or as any older reply shape, so a host-side read can
+    /// say "destroyed" without an error standing in for the fact.
+    #[test]
+    fn box_control_read_row_round_trip() {
+        let read = BoxControlRequest::ReadRow(ReadRowRequest {
+            name: "web".to_string(),
+        });
+        let wire = serde_json_lenient::to_string(&read).expect("serialize");
+        assert!(
+            wire.contains(r#""verb":"read_row""#) && wire.contains(r#""name":"web""#),
+            "the tagged line names its verb and its key: {wire}"
+        );
+        assert_eq!(round_trip(&read), read);
+
+        let row = BoxControlReply::Row(BoxRow {
+            name: "web".to_string(),
+            box_id: BoxId::from_bytes([
+                0x01, 0x95, 0x65, 0x5f, 0x7f, 0x1e, 0x7a, 0xbc, 0x9d, 0x1f, 0x2a, 0x3b, 0x4c, 0x5d,
+                0x6e, 0x7f,
+            ]),
+            switch_address: std::net::Ipv4Addr::new(100, 64, 127, 255),
+            egress_allow_list: vec!["10.0.0.0/8".to_string()],
+            declared_ports: vec![8080, 9090],
+            runtime_ports: vec![3000],
+        });
+        let wire = serde_json_lenient::to_string(&row).expect("serialize");
+        for field in [
+            r#""switch_address":"100.64.127.255""#,
+            r#""box_id":"0195655f7f1e7abc9d1f2a3b4c5d6e7f""#,
+            r#""egress_allow_list":["10.0.0.0/8"]"#,
+            r#""declared_ports":[8080,9090]"#,
+            r#""runtime_ports":[3000]"#,
+        ] {
+            assert!(
+                wire.contains(field),
+                "the row answer spells {field}: {wire}"
+            );
+        }
+        assert_eq!(round_trip(&row), row);
+        assert_eq!(
+            serde_json_lenient::from_str::<BoxControlReply>(&wire)
+                .expect("decodes as its own reply"),
+            row
+        );
+
+        // No live box: the marker answer, discriminated from the row by the
+        // `no_row` field and from every older shape by the same.
+        let no_row = BoxControlReply::NoRow {
+            name: "web".to_string(),
+            no_row: true,
+        };
+        assert_eq!(round_trip(&no_row), no_row);
+        assert_eq!(
+            serde_json_lenient::from_str::<BoxControlReply>(r#"{"name":"web","no_row":true}"#)
+                .expect("the no-row answer decodes"),
+            no_row
+        );
+        assert_ne!(
+            serde_json_lenient::from_str::<BoxControlReply>(r#"{"name":"web","no_row":true}"#)
+                .expect("the no-row answer decodes"),
+            row,
+            "a no-row answer is never a live row's answer"
+        );
+
+        // The older replies still decode after the new variants joined the
+        // untagged order: a registration's answer keeps its id, and an
+        // error stays an error.
+        let registered: BoxControlReply = serde_json_lenient::from_str(
+            r#"{"switch_address":"100.64.127.255","loopback_address":"127.0.0.2","box_id":"0195655f7f1e7abc9d1f2a3b4c5d6e7f"}"#,
+        )
+        .expect("a registration reply still decodes");
+        assert!(matches!(registered, BoxControlReply::Registered(_)));
+        let error: BoxControlReply = serde_json_lenient::from_str(
+            r#"{"error":"the row's creator did not present its pair"}"#,
+        )
+        .expect("an error reply still decodes");
+        assert!(matches!(error, BoxControlReply::Error { .. }));
     }
 }

@@ -503,6 +503,91 @@ impl sandbox2::Channel for EnvChannel<'_> {
     }
 }
 
+/// How the sandbox's working directory is laid out.
+///
+/// The default mirrors host paths one-for-one ([`WdSetup::BoundDir`]): the
+/// working directory is the host directory named by [`EnvArgs::cwd`], and
+/// `~/`-rooted patch paths expand against [`EnvArgs::home`]. A session
+/// instead owns its layout outright ([`WdSetup::Session`]): the working
+/// directory is mounted at `/workbench` and the home at `/home`, so a task
+/// run by the daemon sees the same paths the interactive session does rather
+/// than the daemon's internal tree.
+///
+/// [`WdSetup`]: sandbox2::config::WdSetup
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum WdLayout {
+    /// Mirror host paths one-for-one; the working directory is [`EnvArgs::cwd`].
+    #[default]
+    BoundDir,
+    /// Use the session layout: `working` at `/workbench`, `home` at `/home`.
+    Session {
+        /// The host directory mounted at `/home`.
+        home: PathBuf,
+        /// The host directory mounted at `/workbench`.
+        working: PathBuf,
+    },
+}
+
+/// Applies the working-directory layout to a fresh sandbox config.
+///
+/// [`WdLayout::BoundDir`] mirrors host paths one-for-one: the working
+/// directory is `cwd` and `home` (when present) is the `$HOME` the sandbox
+/// reports. [`WdLayout::Session`] owns its layout outright, mounting `home`
+/// at `/home` and `working` at `/workbench`. The `fs_mappings` apply under
+/// both layouts with their declared modes; under the session layout a mapping
+/// whose host path lies inside `home` or `working` is retargeted to the same
+/// place under `/home` or `/workbench` (see [`session_mapping`]).
+fn apply_wd_layout(
+    config: sandbox2::config::Config,
+    layout: &WdLayout,
+    cwd: &Path,
+    home: Option<&Path>,
+    fs_mappings: Vec<common::FsMapping>,
+) -> sandbox2::config::Config {
+    match layout {
+        WdLayout::BoundDir => config
+            .with_wd(cwd.to_path_buf(), false, fs_mappings)
+            .with_home(home.map(Path::to_path_buf)),
+        WdLayout::Session { home, working } => {
+            let fs_mappings = fs_mappings
+                .into_iter()
+                .map(|m| session_mapping(m, home, working))
+                .collect();
+            config.with_session_dirs_mapped(home.clone(), working.clone(), fs_mappings)
+        }
+    }
+}
+
+/// Retargets one file mapping for the session layout.
+///
+/// The session home is mounted at `/home` and the working directory at
+/// `/workbench`, so a mapping whose host path is inside either one lands at
+/// the matching path under that mount; the more specific of the two wins
+/// when one directory is nested in the other. Any other mapping keeps the
+/// sandbox path it already had.
+fn session_mapping(mut m: common::FsMapping, home: &Path, working: &Path) -> common::FsMapping {
+    if m.sandbox_path.is_some() {
+        return m;
+    }
+    let mut bases = [
+        (home, sandbox2::SESSION_HOME),
+        (working, sandbox2::SESSION_DEFAULT_WD),
+    ];
+    bases.sort_by_key(|(base, _)| std::cmp::Reverse(base.as_os_str().len()));
+    let host = Path::new(&m.host_path);
+    if let Some((rel, mount)) = bases
+        .iter()
+        .find_map(|(base, mount)| Some((host.strip_prefix(base).ok()?, *mount)))
+    {
+        m.sandbox_path = Some(if rel.as_os_str().is_empty() {
+            format!("/{mount}")
+        } else {
+            format!("/{mount}/{}", rel.display())
+        });
+    }
+    m
+}
+
 /// The arguments used to construct a runtime environment.
 pub struct EnvArgs<'a> {
     /// A symbolic name for the environment. For tasks, this is the task name.
@@ -514,6 +599,8 @@ pub struct EnvArgs<'a> {
     pub state_base_dir: PathBuf,
     /// The working directory to map.
     pub cwd: PathBuf,
+    /// How the working directory is laid out; see [`WdLayout`].
+    pub wd_layout: WdLayout,
     /// Any additional pinhole bind mounts / file mappings.
     pub patches: Option<&'a EnvPatches>,
     /// The home directory `~/`-rooted patch paths expand against, and that
@@ -793,9 +880,14 @@ impl<'a> Env<'a> {
                 declarations
             });
 
-        let mut config = sandbox2::config::Config::new(args.name)
-            .with_wd(args.cwd.clone(), false, fs_mappings)
-            .with_home(home.clone())
+        let mut config = apply_wd_layout(
+            sandbox2::config::Config::new(args.name),
+            &args.wd_layout,
+            &args.cwd,
+            home.as_deref(),
+            fs_mappings,
+        );
+        config = config
             .with_rootfs(
                 args.transitives
                     .keys()
@@ -1084,6 +1176,89 @@ mod tests {
         );
     }
 
+    /// The working-directory layout choice is what routes a task into the
+    /// session layout (`/workbench` + `/home`) instead of the bound-dir
+    /// layout that mirrors the daemon's internal tree path. `apply_wd_layout`
+    /// is the single branch both callers go through, so asserting its two
+    /// outcomes pins the fix without needing a full sandbox launch.
+    #[test]
+    fn wd_layout_selects_session_or_bound_dir() {
+        let session = apply_wd_layout(
+            sandbox2::config::Config::new("task"),
+            &WdLayout::Session {
+                home: PathBuf::from("/var/lib/minimal/sessions/s1/home"),
+                working: PathBuf::from("/var/lib/minimal/sessions/s1/tree"),
+            },
+            Path::new("/var/lib/minimal/sessions/s1/tree"),
+            None,
+            vec![],
+        );
+        assert_eq!(session.command_cwd().unwrap(), "/workbench");
+        assert_eq!(session.sandbox_home(), "/home");
+
+        let bound = apply_wd_layout(
+            sandbox2::config::Config::new("task"),
+            &WdLayout::BoundDir,
+            Path::new("/var/lib/minimal/sessions/s1/tree"),
+            Some(Path::new("/home/dev")),
+            vec![],
+        );
+        assert_eq!(
+            bound.command_cwd().unwrap(),
+            "/var/lib/minimal/sessions/s1/tree"
+        );
+        assert_eq!(bound.sandbox_home(), "/home/dev");
+    }
+
+    /// A task's `patch` table still applies under the session layout: every
+    /// mapping reaches sandbox2 with its declared mode, a mapping inside the
+    /// session home or tree is retargeted under `/home` or `/workbench`, and
+    /// any other absolute path (a host socket) keeps its own path.
+    #[test]
+    fn session_layout_keeps_and_retargets_fs_mappings() {
+        let mapping = |host_path: &str, read_only: bool, is_file: bool| common::FsMapping {
+            host_path: host_path.to_string(),
+            sandbox_path: None,
+            read_only,
+            is_file,
+            create_if_missing: !read_only,
+        };
+        let home = "/var/lib/minimal/sessions/s1/home";
+        let working = "/var/lib/minimal/sessions/s1/tree";
+        let config = apply_wd_layout(
+            sandbox2::config::Config::new("task"),
+            &WdLayout::Session {
+                home: PathBuf::from(home),
+                working: PathBuf::from(working),
+            },
+            Path::new(working),
+            None,
+            vec![
+                mapping(&format!("{home}/.config/railway"), true, false),
+                mapping(&format!("{home}/.claude.json"), false, true),
+                mapping(&format!("{working}/target"), false, false),
+                mapping("/var/run/docker.sock", false, true),
+            ],
+        );
+        let sandbox2::config::WdSetup::Session { fs_mappings, .. } = &config.wd else {
+            panic!("expected the session layout, got {:?}", config.wd);
+        };
+        let placed: Vec<(String, bool)> = fs_mappings
+            .iter()
+            .map(|m| (m.path_in_sandbox(), m.read_only))
+            .collect();
+        assert_eq!(
+            placed,
+            vec![
+                ("/home/.config/railway".to_string(), true),
+                ("/home/.claude.json".to_string(), false),
+                ("/workbench/target".to_string(), false),
+                ("/var/run/docker.sock".to_string(), false),
+            ]
+        );
+        assert_eq!(fs_mappings[0].host_path, format!("{home}/.config/railway"));
+    }
+
     /// A missing read-only patch source surfaces as `"fs mapping"` and must
     /// name the declaration and its owner; a creation failure keeps the
     /// existing wording. The task's own `patch` table is attributed to the
@@ -1223,6 +1398,33 @@ mod tests {
             cmd, "curl -s -o /dev/null -w \"%{http_code}\" https://example.com",
             "the `%{{\"%\"}}{{...}}` escape should resolve to a literal `%{{http_code}}`"
         );
+    }
+
+    /// A repo-wide `[params]` entry resolves in a task command: its default
+    /// applies when the task is invoked without arguments, and `--<name>`
+    /// overrides it.
+    #[test]
+    fn interpolate_resolves_hydrated_repo_param() {
+        let mf: mfile::File = toml::from_str(indoc::indoc! {
+            r#"
+            [params]
+            greeting = { type = "string", default = "hi" }
+
+            [tasks.useparam]
+            exec = "echo %{greeting}"
+            "#
+        })
+        .unwrap();
+        let task = mf.task("useparam").unwrap();
+
+        for (argv, want) in [("", "echo hi"), ("--greeting bye", "echo bye")] {
+            let parsed = task.args.parse(argv).unwrap();
+            let resolved = interpolate_task_strings(&task, Some(&parsed)).unwrap();
+            let mfile::TaskAction::Exec(mfile::StrOrList::Single(cmd)) = resolved.action else {
+                panic!("expected a single exec string");
+            };
+            assert_eq!(cmd, want, "argv `{argv}`");
+        }
     }
 
     /// Helper: build a Context and Graph from the fakerepo test data,

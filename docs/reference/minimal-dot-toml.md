@@ -96,9 +96,10 @@ runtime_packages = ["<additional runtime package>"] # optional
 The `[stack]` section configures the [stack](../concepts/stacks.md) to use for building code, if any.
 See [stack specs](./stack-specs.md) for how stacks themselves are defined.
 
-`use` is an accepted alias for the canonical `name` key; both parse. `[harness]`
-is accepted as a deprecated alias for `[stack]`, pending removal after
-July 2026; prefer `[stack]` in new configs.
+`use` is an accepted alias for the canonical `name` key, and both parse.
+`[harness]`, the name of this section before v0.5.0, is no longer accepted:
+a file that still uses it warns that the key is unknown, so rename the
+section to `[stack]`.
 
 The environment variables and packages configured on a stack are inherited on all tasks in this repository.
 
@@ -311,6 +312,18 @@ mip materialize virtio-kernel -o ./Image
 Declares named parameters available to tasks across the repository, using the
 same `{type, help, default}` shape as per-task [`args`](./tasks.md). Every
 `[params]` entry must declare a `default`.
+
+Each parameter acts as a defaulted arg on every task: a command reads it as
+`%{name}`, and `--name <value>` overrides it for one run. A task that
+declares an arg of the same name uses its own arg instead.
+
+```toml
+[params]
+greeting = { type = "string", default = "hi" }
+
+[tasks.hello]
+bash = "echo %{greeting}"  # `hi`, or `bye` with `--greeting bye`
+```
 
 ### `[cache]` - Artifact cache behavior {#cache}
 

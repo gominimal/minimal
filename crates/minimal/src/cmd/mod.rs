@@ -3,8 +3,8 @@
 use anyhow::{Context as _, bail};
 use std::io::IsTerminal as _;
 use std::io::Write as _;
-use std::os::unix::process::CommandExt as _;
 use std::path::PathBuf;
+use tokio::io::AsyncReadExt as _;
 use tokio::io::AsyncWriteExt as _;
 
 // The version gate lives in `minimal-client`, next to the transport it guards,
@@ -25,8 +25,8 @@ mod session;
 
 // The Ctrl-C cleanup (`arm_activation_interrupt`) withdraws the row the
 // activation registered with the VM host daemon; the withdrawal lives with
-// the session commands.
-use session::{vm_host_control_sock, withdraw_box_row};
+// the session commands, as does the provider-kind rule its gate keys on.
+use session::{daemon_provider_kind, vm_host_control_sock, withdraw_box_row};
 
 pub use admin::*;
 pub use list::*;
@@ -98,7 +98,10 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
         Some(Command::Login(args)) => {
             cmd_login(&cli.global_args, args, &mut std::io::stdout().lock()).await
         }
-        Some(Command::Version) => cmd_version(&cli.global_args).await,
+        // Unlocked handle: `Stdout` takes its lock per write, so the lock is
+        // not held across the daemon handshake, where a spawned task's
+        // logging may need stdout too.
+        Some(Command::Version) => cmd_version(&cli.global_args, &mut std::io::stdout()).await,
         Some(Command::Spin(args)) => cmd_spin(&cli.global_args, args).await,
         Some(Command::Init(args)) => cmd_init(&cli.global_args, args)
             .await
@@ -124,9 +127,15 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
 /// existing session built from the same directory.
 pub(crate) const AUTOGEN_NAME_RETRIES: u32 = 8;
 
-/// Reduce a directory basename to the characters a session name should carry —
-/// ASCII alphanumerics plus `-`, `_`, `.`, lowercased — dropping everything
-/// else (spaces, unicode) so the minted handle is typable and clears
+/// Longest component [`sanitize_name_component`] returns, so a minted
+/// `task-<component>-<hex>` (the longest wrapper) stays inside the 63-octet
+/// DNS label `validate_session_name` requires.
+const NAME_COMPONENT_MAX: usize = 48;
+
+/// Reduce a directory basename to the characters a session name may carry —
+/// ASCII alphanumerics, lowercased, with `-`, `_` and `.` each mapped to `-` —
+/// dropping everything else (spaces, unicode) and capping the length, so the
+/// minted handle is typable and is a single DNS label that clears
 /// `validate_session_name`. Falls back to `session` when nothing survives.
 pub(crate) fn sanitize_name_component(basename: &str) -> String {
     let filtered: String = basename
@@ -135,13 +144,14 @@ pub(crate) fn sanitize_name_component(basename: &str) -> String {
             if c.is_ascii_alphanumeric() {
                 Some(c.to_ascii_lowercase())
             } else if matches!(c, '-' | '_' | '.') {
-                Some(c)
+                Some('-')
             } else {
                 None
             }
         })
+        .take(NAME_COMPONENT_MAX)
         .collect();
-    let trimmed = filtered.trim_matches(|c| matches!(c, '-' | '_' | '.'));
+    let trimmed = filtered.trim_matches('-');
     if trimmed.is_empty() {
         "session".to_string()
     } else {
@@ -218,7 +228,8 @@ pub(crate) async fn connect_daemon_unchecked(
 }
 
 /// A session reference parsed from a CLI string: either a UUID or a name.
-/// Used to build the typed request enums both `GetSessionRecord` and
+/// A name lookup that misses falls back to a unique id prefix in
+/// [`get_session_record`]. Used to build the typed request enums both `GetSessionRecord` and
 /// `GetSessionPolicy` expect.
 pub(crate) enum SessionLookup {
     Id(sessions::SessionId),
@@ -263,11 +274,13 @@ impl From<SessionLookup> for minimald_rpc::GetSessionHooksRequest {
     }
 }
 
-/// Resolve a session by UUID or name, returning its record.
+/// Resolve a session by UUID, unique id prefix, or session name, returning
+/// its record.
 ///
 /// Used by commands that need the full record before proceeding (destroy,
 /// rename). If the string parses as a UUID, the session
-/// is looked up by ID; otherwise by name. Bails if no session matches.
+/// is looked up by ID; otherwise by name, then by unique id prefix (see
+/// [`get_session_record`]). Bails if no session matches.
 pub(crate) async fn resolve_session(
     client: &mut client::Client,
     session: &str,
@@ -296,17 +309,95 @@ pub(crate) async fn resolve_session_version_gated(
 }
 
 /// The `GetSessionRecord` round trip both resolvers share.
+///
+/// A name lookup that finds no record falls back to matching `session` as an
+/// id prefix (see [`match_id_prefix`]), so the short id `min ls` prints
+/// resolves. An exact name always wins, because the name is asked first. A
+/// prefix that matches several sessions is an error naming them; one that
+/// matches none returns the empty reply, for the caller's "no session found".
 pub(crate) async fn get_session_record(
     client: &mut client::Client,
     session: &str,
 ) -> Result<minimald_rpc::GetSessionRecordResponse, anyhow::Error> {
-    use minimald_rpc::{GetSessionRecord, GetSessionRecordRequest};
-    let lookup: GetSessionRecordRequest = SessionLookup::parse(session).into();
-    client
-        .oneshot_rpc::<GetSessionRecord>(lookup)
+    use minimald_rpc::{GetSessionRecord, GetSessionRecordRequest, ListSessions};
+    let lookup = SessionLookup::parse(session);
+    let by_name = matches!(lookup, SessionLookup::Name(_));
+    let resp = client
+        .oneshot_rpc::<GetSessionRecord>(GetSessionRecordRequest::from(lookup))
         .await
-        .context("GetSessionRecord RPC failed")
+        .context("GetSessionRecord RPC failed")?;
+    if resp.record.is_some() || !by_name || !is_id_prefix(session) {
+        return Ok(resp);
+    }
+    let listing = client
+        .oneshot_rpc::<ListSessions>(())
+        .await
+        .context("ListSessions RPC failed")?;
+    match match_id_prefix(&listing.sessions, session)? {
+        Some(id) => client
+            .oneshot_rpc::<GetSessionRecord>(GetSessionRecordRequest::Id(id))
+            .await
+            .context("GetSessionRecord RPC failed"),
+        None => Ok(resp),
+    }
 }
+
+/// Whether `s` is shaped like a session id prefix: 4 to 32 hex digits, with
+/// dashes allowed between them.
+pub(crate) fn is_id_prefix(s: &str) -> bool {
+    let digits = s.chars().filter(|c| *c != '-').count();
+    (4..=32).contains(&digits) && s.chars().all(|c| c == '-' || c.is_ascii_hexdigit())
+}
+
+/// Match `session` against the listed sessions: an exact name first, then a
+/// unique id prefix (compared without dashes, ignoring case). `None` when
+/// nothing matches or `session` is not prefix-shaped; an error naming the
+/// candidates when the prefix matches more than one session.
+pub(crate) fn match_id_prefix(
+    entries: &[minimald_rpc::ListSessionsEntry],
+    session: &str,
+) -> Result<Option<sessions::SessionId>, anyhow::Error> {
+    if let Some(entry) = entries.iter().find(|e| e.name.as_deref() == Some(session)) {
+        return Ok(Some(entry.id));
+    }
+    if !is_id_prefix(session) {
+        return Ok(None);
+    }
+    let prefix = session.replace('-', "").to_ascii_lowercase();
+    let matches: Vec<sessions::SessionId> = entries
+        .iter()
+        .map(|e| e.id)
+        .filter(|id| id.as_ref().simple().to_string().starts_with(&prefix))
+        .collect();
+    match matches.as_slice() {
+        [] => Ok(None),
+        [id] => Ok(Some(*id)),
+        several => {
+            let candidates: Vec<String> = several
+                .iter()
+                .map(|id| format!("{}…", &id.as_ref().simple().to_string()[..8]))
+                .collect();
+            Err(AmbiguousIdPrefix(format!(
+                "'{session}' matches sessions {}; use more characters",
+                candidates.join(", ")
+            ))
+            .into())
+        }
+    }
+}
+
+/// An id prefix that matches more than one session; the message names them.
+/// Typed so a caller can tell it from a failed RPC.
+#[derive(Debug)]
+pub(crate) struct AmbiguousIdPrefix(String);
+
+impl std::fmt::Display for AmbiguousIdPrefix {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for AmbiguousIdPrefix {}
 
 /// Unwrap a looked-up record, naming what was asked for when nothing matched.
 pub(crate) fn named_record(
@@ -669,8 +760,14 @@ pub(crate) fn arm_activation_interrupt(
 ) -> ActivationInterrupt {
     let sock = client::resolve_socket_path(global.minimal_dir.as_deref(), global.use_minvmd());
     // Resolved here, not inside the task: the withdrawal's socket is the
-    // same provider dir's, and the borrow must not cross the spawn.
-    let control_sock = vm_host_control_sock(global);
+    // same provider dir's, and the borrow must not cross the spawn. Keyed
+    // on the provider kind — the rule the socket resolution itself and the
+    // fabric display turn on — not on `use_minvmd()`, which is true only
+    // under an explicit `--provider local-minvmd`: on macOS every invocation
+    // is minvmd-backed with no flag at all, and a Ctrl-C that keyed on the
+    // flag would leave exactly that host's box row published.
+    let control_sock =
+        vm_host_control_sock(daemon_provider_kind(global), global.minimal_dir.as_deref());
     let task = tokio::spawn(async move {
         // Only the first Ctrl-C is intercepted; a second falls through to
         // the default disposition so a wedged cleanup can still be killed.

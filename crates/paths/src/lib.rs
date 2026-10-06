@@ -191,6 +191,31 @@ pub fn provider_instance_name(kind: ProviderKind, instance: u32) -> String {
     format!("local-{}{instance}", kind.tag())
 }
 
+/// The SSH host alias a client connects with for a provider directory. This
+/// is the single source of the `known_hosts` host identity — the daemon
+/// records the guest key under it and the ssh readers derive it from the
+/// socket's parent directory, so the two can never disagree.
+///
+/// A provider-instance dir (`providers/<name>`) maps to its basename, so the
+/// default VM keeps `local-minvmd0`. A named VM's dir nests one level deeper
+/// (`providers/local-minvmd0/<vm>`) and maps to `<vm>.local-minvmd0`: ssh
+/// matches the host argument against the user's `~/.ssh/config` `Host`
+/// blocks, and a bare user-chosen VM name (`dev`, `work`) could pick up a
+/// block meant for a real machine. VM names never contain `.`, so the
+/// namespaced form cannot clash with another VM's alias.
+#[must_use]
+pub fn ssh_host_alias(provider_dir: &Path) -> Option<String> {
+    let name = provider_dir.file_name()?.to_str()?;
+    match provider_dir
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|n| n.to_str())
+    {
+        Some(parent) if parent != "providers" => Some(format!("{name}.{parent}")),
+        _ => Some(name.to_owned()),
+    }
+}
+
 /// `<state_dir>/providers/local-<kind><instance>` — the directory holding the
 /// sockets, locks, and state files a client needs to reach one local daemon
 /// instance.
@@ -1954,6 +1979,22 @@ mod tests {
             provider_instance_dir(&state, ProviderKind::Minvmd, 0).as_str(),
             "/state/minimal/providers/local-minvmd0",
         );
+    }
+
+    /// The SSH host alias is the provider-instance name for the default VM
+    /// and the VM name namespaced under it for a named VM, so a VM name can
+    /// never match a user's own `~/.ssh/config` `Host` block.
+    #[test]
+    fn ssh_host_alias_namespaces_named_vms() {
+        assert_eq!(
+            ssh_host_alias(Path::new("/state/minimal/providers/local-minvmd0")).as_deref(),
+            Some("local-minvmd0"),
+        );
+        assert_eq!(
+            ssh_host_alias(Path::new("/state/minimal/providers/local-minvmd0/alpha")).as_deref(),
+            Some("alpha.local-minvmd0"),
+        );
+        assert_eq!(ssh_host_alias(Path::new("/")), None);
     }
 
     /// A named VM's provider dir nests under a per-name subdirectory

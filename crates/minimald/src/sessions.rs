@@ -19,10 +19,13 @@ use std::sync::Arc;
 #[cfg(target_os = "linux")]
 use std::sync::RwLock;
 use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
 
 pub(crate) mod composables;
 #[cfg(test)]
-use composables::{ProjectResolution, build_composables, run_composer};
+use composables::{
+    ProjectResolution, build_composables, resolve_project_ctx_and_graph, run_compose, run_composer,
+};
 
 /// A short summary of the metadata of a session.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,6 +61,24 @@ impl From<SessionKeyPredicate> for RecordPredicate {
 /// Transport / internal error when communicating with the sessions actor.
 type SessionsError = std::io::Error;
 
+/// NET-079's observability, for the create path's half of the refusal: how
+/// many creates this daemon has refused because a host-address box's
+/// declaration named rules the classifier cannot enforce while the host
+/// decided per box. Process-global like the fact it reads — the count is
+/// the daemon's, not a session's — and only counted here: a launch
+/// refused on the same ground is that launch's own refusal, logged beside
+/// the box it refused, never a create this counter saw.
+static REFUSED_UNENFORCEABLE_CREATES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Reads how many creates this daemon has refused over an unenforceable
+/// host-address declaration — the counter's surface, for a diagnostics
+/// pass or a test that wants the count itself rather than the log line
+/// each refusal also writes.
+pub(crate) fn refused_unenforceable_creates() -> u64 {
+    REFUSED_UNENFORCEABLE_CREATES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Assemble a [`sessions::Record`] from the out-of-band session
 /// config and the SSH-supplied username, then validate its policy.
 /// Returns `Err(io::InvalidInput)` if the policy is incompatible
@@ -87,10 +108,14 @@ fn build_record(
         box_addresses: config.box_addresses,
         status,
         hooks_enabled: config.hooks_enabled,
+        // Daemon-owned from its first line: a create holds no launch's
+        // outcome to record, and the key a client might assert in `attrs`
+        // is stripped above, so only a launch ever writes this field.
+        host_ip_enforcement: None,
         attrs: config.attrs,
     };
     record
-        .validate_policy()
+        .validate_new_policy()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     Ok(record)
 }
@@ -154,7 +179,7 @@ enum ManagerMessage {
     #[cfg(test)]
     RunningCount(Responder<usize>),
     CreateSession(Box<CreateSessionMsg>),
-    DeleteSession(SessionId, Responder<()>),
+    DeleteSession(SessionId, Responder<Vec<String>>),
     Shutdown(bool, Responder<Result<(), ()>>),
     /// Fire-and-forget: drop the `running` entry for a session whose actor
     /// terminated on its own (abort, failed verdict resume, create failure).
@@ -173,7 +198,10 @@ enum ManagerMessage {
 /// Follows the actor pattern.
 #[derive(Debug)]
 pub struct Manager {
-    in_shutdown: bool,
+    /// Cancelled once a shutdown proceeds, before any session is stopped.
+    /// Shared with every [`ManagerHandle`], so a command the shutdown ends
+    /// can tell (see [`ManagerHandle::is_shutting_down`]).
+    in_shutdown: CancellationToken,
     receiver: mpsc::Receiver<ManagerMessage>,
     running: BTreeMap<SessionId, SessionHandle>,
     store: StoreHandle,
@@ -514,8 +542,10 @@ impl Manager {
             }
             (hostnames, loopback)
         };
+        let in_shutdown = CancellationToken::new();
         let handle = ManagerHandle {
             sender,
+            in_shutdown: in_shutdown.clone(),
             #[cfg(target_os = "linux")]
             hostnames: Arc::clone(&hostnames),
             #[cfg(all(test, target_os = "linux"))]
@@ -525,7 +555,7 @@ impl Manager {
         // so its binding can request destruction (see `weak_self`).
         let weak_self = handle.downgrade();
         let mngr = Self {
-            in_shutdown: false,
+            in_shutdown,
             receiver,
             running,
             store,
@@ -926,7 +956,7 @@ impl Manager {
         &mut self,
         pred: SessionKeyPredicate,
     ) -> Result<Option<SessionHandle>, SessionsError> {
-        if self.in_shutdown {
+        if self.in_shutdown.is_cancelled() {
             return Err(SessionsError::new(
                 std::io::ErrorKind::ConnectionRefused,
                 "in shutdown",
@@ -982,11 +1012,43 @@ impl Manager {
         config: minimald_rpc::SessionConfig,
         username: Option<String>,
     ) -> Result<SessionId, SessionsError> {
-        if self.in_shutdown {
+        if self.in_shutdown.is_cancelled() {
             return Err(SessionsError::new(
                 std::io::ErrorKind::ConnectionRefused,
                 "in shutdown",
             ));
+        }
+        // NET-079: a host that decides per box refuses a host-address
+        // declaration naming rules its classifier cannot enforce — a denied
+        // range, a narrowing allow list — and refuses it here, before
+        // anything is allocated: no record, no id, no name held, no actor
+        // spawned. The host's state is the daemon's one node fact, read
+        // exactly as the create response reads it — a create is not a place
+        // that decides a box, so it re-probes nothing itself — and the
+        // same `can_decide_per_box` the launch that follows re-reads for
+        // its own gate; a host that cannot decide per box answers `false`
+        // and the create falls through to the exception whole — the box is
+        // created, runs unenforced and is recorded as such, never refused
+        // on this ground. Own-address boxes are untouched here: their
+        // declarations are enforced on the address the box holds, so the
+        // gate is the host-address mode's alone.
+        if let Some(rules) = crate::net::classifier::refuses_unenforceable_declaration(
+            config.network,
+            crate::session_host::host_ip_enforcement_fact().can_decide_per_box(),
+            config.policy.egress.as_ref(),
+        ) {
+            let refusal = crate::net::classifier::unenforceable_declaration_refusal(&rules);
+            REFUSED_UNENFORCEABLE_CREATES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::info!(
+                session_name = ?config.name,
+                network_mode = ?config.network,
+                host_ip_enforcement = %minimald_rpc::HostIpEnforcement::PerBox.machine_str(),
+                refused_unenforceable_creates = refused_unenforceable_creates(),
+                refusal = %refusal,
+                "refused a create whose host-address declaration names rules \
+                 this host's classifier cannot enforce"
+            );
+            return Err(refusal);
         }
         // Allocate the record up front: `store.create` assigns the id and
         // catches a name collision (`AlreadyExists`) before any actor exists.
@@ -1154,7 +1216,7 @@ impl Manager {
             // any), then removes its on-disk record.
             ManagerMessage::DeleteSession(id, r) => {
                 r.handle(async {
-                    if self.in_shutdown {
+                    if self.in_shutdown.is_cancelled() {
                         return Err(SessionsError::new(
                             std::io::ErrorKind::ConnectionRefused,
                             "in shutdown",
@@ -1204,7 +1266,7 @@ impl Manager {
                     };
                     match actor {
                         Some(hnd) => {
-                            hnd.destroy().await?;
+                            let hook_failures = hnd.destroy().await?;
                             // Belt-and-braces: a dead actor (self-terminated
                             // but not yet evicted) reads as `Ok` above, and
                             // may have died *without* deleting its record
@@ -1215,10 +1277,13 @@ impl Manager {
                             {
                                 return Err(e);
                             }
+                            Ok(hook_failures)
                         }
-                        None => handle.delete().await?,
+                        None => {
+                            handle.delete().await?;
+                            Ok(Vec::new())
+                        }
                     }
-                    Ok(())
                 })
                 .await
             }
@@ -1238,7 +1303,7 @@ impl Manager {
                         }
                     }
 
-                    self.in_shutdown = true;
+                    self.in_shutdown.cancel();
                     // Stop live sessions. Each actor kills its host and
                     // withdraws its own PTask hostname (R3.5) on the way
                     // down; records — and, with them, the loopback grants
@@ -1279,6 +1344,8 @@ impl Manager {
 #[derive(Debug, Clone)]
 pub struct ManagerHandle {
     sender: mpsc::Sender<ManagerMessage>,
+    /// The actor's [`Manager::in_shutdown`].
+    in_shutdown: CancellationToken,
     /// A clone of the actor's shared PTask hostname registry, handed to the
     /// host-side proxies so they resolve `Host:` headers without a round-trip
     /// through the actor mainloop.
@@ -1301,6 +1368,8 @@ pub struct ManagerHandle {
 #[derive(Debug, Clone)]
 pub struct WeakManagerHandle {
     sender: mpsc::WeakSender<ManagerMessage>,
+    /// Mirrors [`ManagerHandle::in_shutdown`].
+    in_shutdown: CancellationToken,
     /// Mirrors [`ManagerHandle::hostnames`]; the registry `Arc` is held so an
     /// [`upgrade`](Self::upgrade) can reconstruct a full handle. This does not
     /// keep the actor alive (only live senders do).
@@ -1319,6 +1388,7 @@ impl WeakManagerHandle {
     pub fn upgrade(&self) -> Option<ManagerHandle> {
         Some(ManagerHandle {
             sender: self.sender.upgrade()?,
+            in_shutdown: self.in_shutdown.clone(),
             #[cfg(target_os = "linux")]
             hostnames: Arc::clone(&self.hostnames),
             #[cfg(all(test, target_os = "linux"))]
@@ -1349,7 +1419,7 @@ impl SessionControl {
     /// delete itself fails (e.g. the manager is mid-shutdown).
     pub async fn destroy(&self) -> Result<(), SessionsError> {
         match self.manager.upgrade() {
-            Some(mngr) => mngr.delete_session(self.id).await,
+            Some(mngr) => mngr.delete_session(self.id).await.map(drop),
             None => Err(SessionsError::new(
                 std::io::ErrorKind::NotConnected,
                 "sessions manager is gone",
@@ -1382,11 +1452,19 @@ impl SessionControl {
 }
 
 impl ManagerHandle {
+    /// Whether a shutdown is under way: set before the shutdown stops any
+    /// session, so a command it ends can still see why when it returns.
+    #[must_use]
+    pub fn is_shutting_down(&self) -> bool {
+        self.in_shutdown.is_cancelled()
+    }
+
     /// Returns a non-owning handle to this manager.
     #[must_use]
     pub fn downgrade(&self) -> WeakManagerHandle {
         WeakManagerHandle {
             sender: self.sender.downgrade(),
+            in_shutdown: self.in_shutdown.clone(),
             #[cfg(target_os = "linux")]
             hostnames: Arc::clone(&self.hostnames),
             #[cfg(all(test, target_os = "linux"))]
@@ -1606,8 +1684,9 @@ impl ManagerHandle {
     /// Deletes the session with the given ID, cascadingly tearing down its
     /// running host and actor (if any) before removing its on-disk record.
     ///
+    /// On success, returns one line per `on_destroy` hook that failed.
     /// Returns a `NotFound` error if no session with that ID is known.
-    pub async fn delete_session(&self, id: SessionId) -> Result<(), SessionsError> {
+    pub async fn delete_session(&self, id: SessionId) -> Result<Vec<String>, SessionsError> {
         let (send, recv) = Responder::channel();
         // Ignore send errors - the recv will also fail.
         let _ = self
@@ -1643,6 +1722,7 @@ impl ManagerHandle {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::session::PACKAGE_CHECK_DEADLINE;
     use paths::HostAbsPath;
     use sessions::daemon::composer::ComposeOutcome;
     use sessions::wire::request::{ContributionVerdict, SessionStep, WireContribution};
@@ -2469,11 +2549,10 @@ pub(crate) mod tests {
     /// nowhere (yet), and the session persists `Active` on the
     /// empty-contribution fast path.
     ///
-    /// The graph-resolution outcome isn't observed by the test —
-    /// depending on how `Graph::new_from_chain` handles a bare
-    /// `minimal.toml` in a scratch dir, it may return an empty
-    /// graph or an error. Either branch must leave `CreateSession`
-    /// returning `Ready`; that's the invariant guarded here.
+    /// The bare `minimal.toml` fixture must resolve to a graph:
+    /// a graph-resolution error now fails `configure_loadout`, so
+    /// `CreateSession` returning `Ready` here also proves the
+    /// fixture's graph resolves.
     /// Guards against a regression where the mfile parse or graph
     /// pipeline breaks creation for real projects. Once composition
     /// consumes the parsed mfile + graph, this test evolves.
@@ -2641,6 +2720,143 @@ pub(crate) mod tests {
         assert!(mngr.needed_packages().await.unwrap().is_empty());
     }
 
+    /// Creates a session over a workspace declaring local package `pkg` in
+    /// its `[session]` block plus `extra` as further session packages,
+    /// configures it with `contribution`, and finalizes it with the package
+    /// check on, bounded by `deadline`. Returns the manager, the id, and
+    /// the finalize's outcome.
+    async fn finalize_with_package_check(
+        extra: &[&str],
+        contribution: WireContribution,
+        deadline: std::time::Duration,
+    ) -> (
+        TempDir,
+        TempDir,
+        ManagerHandle,
+        SessionId,
+        Result<Vec<minimald_rpc::RanHook>, std::io::Error>,
+    ) {
+        let (state, cache, mngr) = manager().await;
+        let id = mngr.create_session(sample_config(), None).await.unwrap();
+        seed_workspace_package(&mngr, id, "pkg-ok").await;
+        let packages: Vec<String> = std::iter::once("pkg-ok")
+            .chain(extra.iter().copied())
+            .map(|p| format!("\"{p}\""))
+            .collect();
+        seed_workspace_mfile(
+            &mngr,
+            id,
+            &format!("[session]\npackages = [{}]\n", packages.join(", ")),
+        )
+        .await;
+        let handle = session(&mngr, id).await;
+        let response = handle
+            .configure_loadout(contribution)
+            .await
+            .expect("packages gate nothing at compose");
+        assert!(response.is_none(), "nothing in the composition is gated");
+        handle.check_packages_at_finalize(deadline).await;
+        let outcome = handle.finalize().await;
+        (state, cache, mngr, id, outcome)
+    }
+
+    async fn status_of(mngr: &ManagerHandle, id: SessionId) -> sessions::SessionStatus {
+        mngr.get_record(SessionKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .expect("the record should survive the finalize")
+            .status
+    }
+
+    /// A `[session]` package the graph does not declare is refused at
+    /// finalize, naming the package and the project that declared it, and
+    /// the record is not promoted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finalize_refuses_an_unknown_session_package() {
+        let (_state, _cache, mngr, id, outcome) = finalize_with_package_check(
+            &["no-such-pkg-zz"],
+            WireContribution::default(),
+            PACKAGE_CHECK_DEADLINE,
+        )
+        .await;
+        let err = outcome.expect_err("an unknown package must not activate");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no such package: no-such-pkg-zz") && msg.contains("project"),
+            "the error should name the package and its declarer, got {msg:?}"
+        );
+        assert!(
+            !msg.contains("pkg-ok"),
+            "a package that resolves is not reported, got {msg:?}"
+        );
+        assert_ne!(status_of(&mngr, id).await, sessions::SessionStatus::Active);
+    }
+
+    /// The same refusal for a package that arrives through a loadout: the
+    /// project resolves, the loadout's package does not.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finalize_refuses_an_unknown_loadout_package() {
+        use sessions::wire::primitives::{WirePackageRef, WireSource};
+
+        let mut contribution = WireContribution::default();
+        contribution.requested_packages.push(WirePackageRef {
+            name: "no-such-pkg-qq".into(),
+            source: WireSource::UserLoadout {
+                name: "editor".into(),
+            },
+        });
+        let (_state, _cache, mngr, id, outcome) =
+            finalize_with_package_check(&[], contribution, PACKAGE_CHECK_DEADLINE).await;
+        let err = outcome.expect_err("an unknown loadout package must not activate");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no such package: no-such-pkg-qq") && msg.contains("loadout `editor`"),
+            "the error should name the package and its loadout, got {msg:?}"
+        );
+        assert_ne!(status_of(&mngr, id).await, sessions::SessionStatus::Active);
+    }
+
+    /// A composition whose every package resolves still finalizes to
+    /// `Active` with the check on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finalize_with_resolvable_packages_still_activates() {
+        let (_state, _cache, mngr, id, outcome) =
+            finalize_with_package_check(&[], WireContribution::default(), PACKAGE_CHECK_DEADLINE)
+                .await;
+        outcome.expect("a session whose packages resolve should finalize");
+        assert_eq!(status_of(&mngr, id).await, sessions::SessionStatus::Active);
+    }
+
+    /// A check that cannot resolve the graph within its deadline steps
+    /// aside instead of failing the finalize: the session activates with
+    /// its unknown name unresolved, which the launch reports at first
+    /// exec, exactly as before the check existed. This is the daemon-side
+    /// bound on the work the check adds to the `FinalizeSession`
+    /// round-trip — a cold-cache upstream clone can outlast the client's
+    /// own deadline, and a client that expires does not cancel the
+    /// daemon-side finalize, so the check must not hold the record's
+    /// promotion hostage to work the client has stopped waiting for.
+    ///
+    /// A zero deadline pins the expiry path without a slow graph to wait
+    /// out: the check body gets its single poll before the deadline fires
+    /// (tokio polls the future before the delay), and cannot complete
+    /// within it, since its graph evaluation round-trips the blocking
+    /// pool. The composition names an unknown package so a check that
+    /// ignored its deadline would refuse instead of activate.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finalize_with_an_expired_package_check_still_activates() {
+        let (_state, _cache, mngr, id, outcome) = finalize_with_package_check(
+            &["no-such-pkg-exp"],
+            WireContribution::default(),
+            std::time::Duration::ZERO,
+        )
+        .await;
+        outcome.expect("an expired check steps aside; the session still activates");
+        assert_eq!(status_of(&mngr, id).await, sessions::SessionStatus::Active);
+    }
+
     /// The held [`Composition`] actually carries the project
     /// composable's packages — not just an entry-shaped placeholder.
     /// Guards against a `run_composer` refactor that would produce
@@ -2722,16 +2938,14 @@ pub(crate) mod tests {
         assert!(packages.is_empty(), "NoMFile → no PackageComposables");
     }
 
-    /// [`build_composables`] with an [`ProjectResolution::MFileOnly`]
-    /// carrying a `[session]` block produces a [`ProjectComposable`];
-    /// package composables stay empty because the graph is absent.
-    /// The MFileOnly path exercises the "graph resolve failed but
-    /// project still declares packages" branch — project packages
-    /// don't get their own PackageComposables, they just wait for
-    /// the composer to see them via the ProjectComposable's
-    /// contribution.
+    /// [`build_composables`] on a resolved project stamps every
+    /// project-contributed package with `Source::Project` naming the
+    /// *declared* project path, not the per-session workspace the
+    /// mfile was read out of. The hooks policy matches projects by
+    /// this path and every error message quotes it, so a per-session
+    /// value would be unmatchable and unrecognizable.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn build_composables_mfile_only_yields_project_composable_and_no_packages() {
+    async fn build_composables_project_provenance_names_declared_path() {
         use std::io::Write;
 
         let project = TempDir::new().unwrap();
@@ -2740,8 +2954,6 @@ pub(crate) mod tests {
         writeln!(f, "[session]\npackages = [\"cargo\"]").unwrap();
         drop(f);
 
-        // Build a `Context` directly (no graph); the manager sets
-        // the same shape internally on the MFileOnly branch.
         let cache = TempDir::new().unwrap();
         let state = TempDir::new().unwrap();
         let mctx_config = mctx::ConfigBuilder::new()
@@ -2751,37 +2963,26 @@ pub(crate) mod tests {
             .build()
             .unwrap();
         let daemon = std::sync::Arc::new(mctx::DaemonContext::init(mctx_config).unwrap());
-        let mfile = mctx::MFileSearchStrategy::Override(project.path().to_path_buf())
-            .find_mfile()
-            .unwrap();
-        let ctx = mctx::Context::from_daemon(daemon, mfile);
 
         let path = DaemonAbsPath::try_new(project.path().to_str().unwrap()).unwrap();
-        let (project_composable, packages) = build_composables(
+        let resolution = resolve_project_ctx_and_graph(&daemon, &path)
+            .expect("a stdlib-only mfile resolves offline");
+        assert!(
+            matches!(resolution, ProjectResolution::Full(..)),
+            "an mfile on disk with a resolvable graph → Full",
+        );
+        let (project_composable, _packages) = build_composables(
             &path,
             &declared_path(),
-            &ProjectResolution::MFileOnly(ctx),
+            &resolution,
             &WireContribution::default(),
             true,
         )
         .unwrap();
-        assert!(
-            project_composable.is_some(),
-            "MFileOnly with [session] block → ProjectComposable present",
-        );
-        assert!(
-            packages.is_empty(),
-            "MFileOnly → no PackageComposables (no graph to walk)",
-        );
 
-        // Provenance names the project as the *user* knows it, not the
-        // per-session workspace the mfile was read out of. The hooks
-        // policy matches projects by this path and every error message
-        // quotes it, so a per-session value would be unmatchable and
-        // unrecognizable — see `build_composables`.
         use sessions::core::compose::Composable as _;
         let contribution = project_composable
-            .unwrap()
+            .expect("[session] block → ProjectComposable present")
             .contribute(&|_| Err(std::env::VarError::NotPresent))
             .expect("the fixture's [session] block contributes cleanly");
         let sources: Vec<_> = contribution
@@ -2800,6 +3001,58 @@ pub(crate) mod tests {
                 "provenance should name the declared project path, not the workspace",
             );
         }
+    }
+
+    /// A project whose `minimal.toml` demands a newer standard
+    /// library than the daemon ships fails graph resolution, and
+    /// [`run_compose`] surfaces that as an `InvalidInput` error
+    /// rather than silently dropping every package contribution.
+    /// Regression guard for the `MFileOnly` fallback, which let
+    /// `min session activate` succeed (exit 0) while the session
+    /// came up missing all package material.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_compose_returns_invalid_input_when_graph_resolution_fails() {
+        use std::io::Write;
+
+        let project = TempDir::new().unwrap();
+        let mfile_path = project.path().join(mfile::MFILE_NAME);
+        let mut f = std::fs::File::create(&mfile_path).unwrap();
+        writeln!(
+            f,
+            "[stdlib]\nminimum_version = \"999.0.0\"\n\n[session]\npackages = [\"cargo\"]"
+        )
+        .unwrap();
+        drop(f);
+
+        let cache = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        let mctx_config = mctx::ConfigBuilder::new()
+            .with_cache_dir(cache.path())
+            .with_state_dir(state.path())
+            .with_daemon_id("test".to_string())
+            .build()
+            .unwrap();
+        let daemon = std::sync::Arc::new(mctx::DaemonContext::init(mctx_config).unwrap());
+
+        let path = DaemonAbsPath::try_new(project.path().to_str().unwrap()).unwrap();
+        let err = run_compose(
+            &daemon,
+            &path,
+            &declared_path(),
+            WireContribution::default(),
+            true,
+        )
+        .expect_err("an outdated stdlib must fail the compose, not degrade");
+        assert_eq!(
+            err.kind(),
+            ErrorKind::InvalidInput,
+            "graph-resolution failure should surface as InvalidInput, got {err:?}",
+        );
+        assert!(
+            err.to_string()
+                .contains("newer version of the standard library needed"),
+            "the error should carry the graph's own diagnostic, got {err}",
+        );
     }
 
     /// [`run_composer`] with an empty client contribution and no

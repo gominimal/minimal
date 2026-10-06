@@ -17,6 +17,7 @@
 //! to the SSH channel stream — nothing is buffered in memory beyond
 //! the encoder's internal buffer.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
 
@@ -532,13 +533,20 @@ async fn add_dir_entries<W: AsyncWrite + Unpin + Send + Sync>(
     root: &Path,
     prefix: &str,
 ) -> Result<(), anyhow::Error> {
-    add_dir_entries_inner(tar, root, prefix).await
+    // Maps `(dev, ino)` of a file whose link count is above 1 to the
+    // archive path of the first name written. A later name for the same
+    // inode is archived as an `EntryType::Link` entry pointing at that
+    // first path instead of a second full copy, so hard links survive
+    // the upload as links rather than independent files.
+    let mut hardlinks: HashMap<(u64, u64), String> = HashMap::new();
+    add_dir_entries_inner(tar, root, prefix, &mut hardlinks).await
 }
 
 fn add_dir_entries_inner<'a, W: AsyncWrite + Unpin + Send + Sync + 'a>(
     tar: &'a mut Builder<W>,
     root: &'a Path,
     prefix: &'a str,
+    hardlinks: &'a mut HashMap<(u64, u64), String>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), anyhow::Error>> + Send + 'a>> {
     Box::pin(async move {
         let mut entries = match fs::read_dir(root).await {
@@ -612,7 +620,7 @@ fn add_dir_entries_inner<'a, W: AsyncWrite + Unpin + Send + Sync + 'a>(
                     .await
                     .with_context(|| format!("adding directory {archive_path}"))?;
 
-                add_dir_entries_inner(tar, &entry_path, &archive_path).await?;
+                add_dir_entries_inner(tar, &entry_path, &archive_path, hardlinks).await?;
             } else if file_type.is_symlink() {
                 let target = fs::read_link(&entry_path)
                     .await
@@ -662,21 +670,77 @@ fn add_dir_entries_inner<'a, W: AsyncWrite + Unpin + Send + Sync + 'a>(
                     .ok()
                     .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                     .map_or(0, |d| d.as_secs());
-                let mut header = async_tar::Header::new_gnu();
-                header.set_size(metadata.len());
-                header.set_mode(mode);
-                header.set_mtime(mtime);
-                header.set_entry_type(async_tar::EntryType::Regular);
-                header.set_cksum();
-                tar.append_data(&mut header, &archive_path, &mut file)
-                    .await
-                    .with_context(|| format!("adding file {archive_path}"))?;
+
+                // A file with more than one link is a hard link: archive
+                // the first name as a regular entry and every later name
+                // as an `EntryType::Link` pointing at the first, so the
+                // session sees one inode with a link count of N rather
+                // than N independent copies.
+                let (dev, ino, nlink) = {
+                    use std::os::unix::fs::MetadataExt as _;
+                    (metadata.dev(), metadata.ino(), metadata.nlink())
+                };
+                // Emit a link entry when this is a later name for an
+                // inode we already archived under a path that fits the
+                // header's link-name field. Otherwise fall through to a
+                // regular entry: the upload must never fail because of a
+                // link.
+                if let Some(target) = hard_link_target(hardlinks, (dev, ino), nlink, &archive_path)
+                {
+                    let mut header = async_tar::Header::new_gnu();
+                    header.set_size(0);
+                    header.set_mode(mode);
+                    header.set_mtime(mtime);
+                    header.set_entry_type(async_tar::EntryType::Link);
+                    header
+                        .set_link_name(&target)
+                        .with_context(|| format!("setting hard link target {target}"))?;
+                    header.set_cksum();
+                    tar.append_data(&mut header, &archive_path, &[][..])
+                        .await
+                        .with_context(|| format!("adding hard link {archive_path}"))?;
+                } else {
+                    let mut header = async_tar::Header::new_gnu();
+                    header.set_size(metadata.len());
+                    header.set_mode(mode);
+                    header.set_mtime(mtime);
+                    header.set_entry_type(async_tar::EntryType::Regular);
+                    header.set_cksum();
+                    tar.append_data(&mut header, &archive_path, &mut file)
+                        .await
+                        .with_context(|| format!("adding file {archive_path}"))?;
+                }
             }
             // Skip sockets, FIFOs, block/char devices, etc.
         }
 
         Ok(())
     })
+}
+
+/// The earlier archived name a later name of a hard-linked inode links to,
+/// or `None` to archive this name as a regular entry.
+///
+/// A name is linked only when an earlier name for its inode was archived
+/// under a path that fits the tar header's link-name field. Every regular
+/// entry for a multi-link inode becomes the target for the names after it,
+/// so a first path too long to link to is replaced by the next one written.
+fn hard_link_target(
+    hardlinks: &mut HashMap<(u64, u64), String>,
+    key: (u64, u64),
+    nlink: u64,
+    archive_path: &str,
+) -> Option<String> {
+    if nlink <= 1 {
+        return None;
+    }
+    if let Some(target) = hardlinks.get(&key)
+        && async_tar::Header::new_gnu().set_link_name(target).is_ok()
+    {
+        return Some(target.clone());
+    }
+    hardlinks.insert(key, archive_path.to_owned());
+    None
 }
 
 #[cfg(test)]
@@ -1019,6 +1083,171 @@ mod tests {
             !paths.iter().any(|p| p.contains("node_modules/")),
             "node_modules/ should be excluded"
         );
+    }
+
+    /// Unpacks a tar+zstd stream into a tempdir and returns the
+    /// `(dev, ino, nlink)` triple for each regular file, keyed by its
+    /// archive-relative path. Used to assert hard-link preservation:
+    /// two names for one host inode must arrive as one inode with a
+    /// link count of 2, not two independent copies.
+    async fn unpack_and_stat(
+        archive_bytes: &[u8],
+    ) -> std::collections::HashMap<String, (u64, u64, u64)> {
+        use std::os::unix::fs::MetadataExt as _;
+        let decoder = async_compression::tokio::bufread::ZstdDecoder::new(archive_bytes);
+        let out = tempfile::TempDir::new().unwrap();
+        async_tar::Archive::new(decoder)
+            .unpack(out.path().to_path_buf())
+            .await
+            .unwrap();
+
+        let mut stats = std::collections::HashMap::new();
+        fn walk(
+            dir: &std::path::Path,
+            base: &std::path::Path,
+            stats: &mut std::collections::HashMap<String, (u64, u64, u64)>,
+        ) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                let rel = path
+                    .strip_prefix(base)
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string();
+                let ftype = entry.file_type().unwrap();
+                if ftype.is_file() {
+                    let meta = std::fs::metadata(&path).unwrap();
+                    stats.insert(rel, (meta.dev(), meta.ino(), meta.nlink()));
+                } else if ftype.is_dir() {
+                    walk(&path, base, stats);
+                }
+            }
+        }
+        walk(out.path(), out.path(), &mut stats);
+        stats
+    }
+
+    /// A hard-linked pair must survive the upload as a link: the two
+    /// names share one inode on the host, and after the round-trip they
+    /// must still share one inode with a link count of 2 — not arrive
+    /// as two independent copies.
+    #[tokio::test]
+    async fn stream_preserves_hard_links() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "shared contents").unwrap();
+        std::fs::create_dir_all(dir.path().join("sub")).unwrap();
+        std::fs::hard_link(dir.path().join("a.txt"), dir.path().join("sub/b.txt")).unwrap();
+
+        let mut buf = Vec::new();
+        stream_tar_zstd(dir.path(), &mut buf).await.unwrap();
+
+        let stats = unpack_and_stat(&buf).await;
+        let a = stats.get("a.txt").expect("a.txt missing");
+        let b = stats.get("sub/b.txt").expect("sub/b.txt missing");
+        assert_eq!(
+            (a.0, a.1),
+            (b.0, b.1),
+            "hard-linked names must share one inode after the round-trip"
+        );
+        assert_eq!(a.2, 2, "the shared inode must have a link count of 2");
+        assert_eq!(b.2, 2, "the shared inode must have a link count of 2");
+    }
+
+    /// A file with a single link is archived as a regular entry, not a
+    /// link entry — the hard-link path must not change the common case.
+    #[tokio::test]
+    async fn stream_archives_single_link_files_as_regular() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("solo.txt"), "solo").unwrap();
+
+        let mut buf = Vec::new();
+        stream_tar_zstd(dir.path(), &mut buf).await.unwrap();
+
+        let stats = unpack_and_stat(&buf).await;
+        let solo = stats.get("solo.txt").expect("solo.txt missing");
+        assert_eq!(solo.2, 1, "a single-link file must unpack with nlink 1");
+    }
+
+    /// A hard link whose first name lives inside an excluded directory
+    /// is still archived as a regular entry: the excluded name is never
+    /// walked, so the surviving name is the first one seen and must
+    /// carry the file body rather than a dangling link.
+    #[tokio::test]
+    async fn stream_archives_hard_link_into_excluded_dir_as_regular() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("target")).unwrap();
+        std::fs::write(dir.path().join("target/hidden.txt"), "body").unwrap();
+        std::fs::hard_link(
+            dir.path().join("target/hidden.txt"),
+            dir.path().join("visible.txt"),
+        )
+        .unwrap();
+
+        let mut buf = Vec::new();
+        stream_tar_zstd(dir.path(), &mut buf).await.unwrap();
+
+        let stats = unpack_and_stat(&buf).await;
+        assert!(
+            !stats.keys().any(|p| p.contains("target/")),
+            "target/ must be excluded"
+        );
+        let visible = stats.get("visible.txt").expect("visible.txt missing");
+        assert_eq!(
+            visible.2, 1,
+            "the surviving name must be a regular entry with its body"
+        );
+    }
+
+    /// When the first name for a hard-linked inode is too long to fit
+    /// the tar header's link-name field, the upload must fall back to a
+    /// regular entry for the later name rather than failing. Both names are
+    /// too long, so whichever the walk reads first, the second cannot link
+    /// to it and the fallback runs.
+    #[tokio::test]
+    async fn stream_falls_back_to_regular_entry_when_link_name_too_long() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // 120 chars: comfortably over the 100-byte link-name field.
+        let first = "x".repeat(120);
+        let second = "y".repeat(120);
+        std::fs::write(dir.path().join(&first), "body").unwrap();
+        std::fs::hard_link(dir.path().join(&first), dir.path().join(&second)).unwrap();
+
+        let mut buf = Vec::new();
+        stream_tar_zstd(dir.path(), &mut buf).await.unwrap();
+
+        let stats = unpack_and_stat(&buf).await;
+        for name in [&first, &second] {
+            let (_, _, nlink) = stats
+                .get(name.as_str())
+                .unwrap_or_else(|| panic!("{name} must be archived"));
+            assert_eq!(
+                *nlink, 1,
+                "{name} must be a regular entry of its own, not a link"
+            );
+        }
+    }
+
+    /// The link-target bookkeeping in a fixed order: a first name too long
+    /// to link to is replaced by the next regular entry, so a third name
+    /// links to the second instead of being copied again. A single-link file
+    /// is never recorded.
+    #[test]
+    fn hard_link_target_replaces_an_unusable_first_name() {
+        let key = (1, 42);
+        let long_name = "x".repeat(120);
+        let mut hardlinks = HashMap::new();
+
+        assert_eq!(hard_link_target(&mut hardlinks, key, 3, &long_name), None);
+        assert_eq!(hard_link_target(&mut hardlinks, key, 3, "a.txt"), None);
+        assert_eq!(
+            hard_link_target(&mut hardlinks, key, 3, "b.txt"),
+            Some("a.txt".to_string())
+        );
+
+        let mut single = HashMap::new();
+        assert_eq!(hard_link_target(&mut single, (1, 7), 1, "c.txt"), None);
+        assert!(single.is_empty());
     }
 
     #[test]

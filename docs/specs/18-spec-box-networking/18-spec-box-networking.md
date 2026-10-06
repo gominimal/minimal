@@ -610,7 +610,7 @@ included, with every refusal logged (NET-001 to NET-004).
   - WHEN the VM boots THE SYSTEM SHALL assign the hostname-proxy port in the host-side helper, hand it to the in-VM daemon before it listens, and bind the daemon's hostname proxy to that port and no other.
     tier:   T0
     verify: cargo nextest run -p minvmd node_port_assigned_on_host_and_handed_to_daemon
-    <!-- S10a/AC1; prose 51; event-driven; NET-025's free-port selection stays the native daemon's; on a VM-backed host the selection moves to the helper so the node's row is host-authored, and the helper publishes its node's rows into the host's one answerer over its authenticated channel (design §7.1: one always-on answerer per host, its listener socket held by the service manager, never a session-daemon child; co-resident nodes write into one answerer, never two); NET-124 to NET-128 hold in that answerer wherever it is hosted; until the host answerer service exists, the helper that binds the hook port hosts the answerer as a recorded single-operator interim (the port held by a session process, not the manager), a second helper writes into it over the same channel instead of binding, and the interim is surfaced at session start; NET-026's discovery is unchanged, `min` still reads the port in use from the daemon -->
+    <!-- S10a/AC1; prose 51; event-driven; NET-025's free-port selection stays the native daemon's; on a VM-backed host the selection moves to the helper so the node's row is host-authored, and the helper publishes its node's rows into the host's one answerer over its authenticated channel (design §7.1: one always-on answerer per host, its listener socket held by the service manager, never a session-daemon child; co-resident nodes write into one answerer, never two); NET-124 to NET-128 hold in that answerer wherever it is hosted; until the host answerer service exists (NET-122's privileged step installs it), the helper that binds the hook port hosts the answerer as a recorded single-operator interim (the port held by a session process, not the manager), a second helper writes into it over the same channel instead of binding, and the interim is surfaced at session start; NET-026's discovery is unchanged, `min` still reads the port in use from the daemon -->
   - IF the in-VM daemon reports an address, a name, a port or a rule for any row THEN THE SYSTEM SHALL keep it out of the table.
     tier:   T0
     verify: cargo nextest run -p minvmd host_table_never_sourced_from_guest
@@ -756,6 +756,10 @@ included, with every refusal logged (NET-001 to NET-004).
   tier:     T0
   verify:   cargo nextest run -p minimal session_start_advises_resolver_command_without_prompt
   <!-- S1b-1; design §7.1 (host-OS resolution per OS); state+event; `/etc/resolver/min.internal` with its `port` directive on macOS, the systemd-resolved routing-domain link on Linux; NET-009's WHERE presupposes it and the Box Egress Proxy document's default `dns` steering needs it -->
+  - WHERE the host is hooked THE SYSTEM SHALL install, by the privileged step, the box-zone answerer as a host service whose listener and channel sockets the service manager holds, running as the operator, from a root-owned non-user-writable program.
+    tier:   T0
+    verify: cargo nextest run -p minimal advisory_installs_manager_held_answerer
+    <!-- design §7.1 (one always-on answerer per host, its sockets held by the service manager, the answerer running as the operator and never root); state-driven; a launchd plist with socket activation on macOS, a systemd system socket and service pair on Linux, never a user-session unit; the step copies the answerer program to a root-owned path and the unit names that copy, never a user-writable binary; the copy carries the channel protocol version, and the hook probe re-surfaces the advisory when it differs from the daemon's, so an upgrade re-runs the step -->
 
 - **NET-123** WHEN a session starts THE SYSTEM SHALL verify by a bind probe that the reserved local range is present before publishing.
   tier:     T0
@@ -765,6 +769,10 @@ included, with every refusal logged (NET-001 to NET-004).
     tier:   T0
     verify: cargo nextest run -p minimald absent_range_publishes_interim_and_readvises
     <!-- design §7.1; unwanted; the interim is a per-host state that the privileged step supersedes -->
+  - WHERE the host is macOS THE SYSTEM SHALL name, in NET-122's advisory command, a privileged step that installs a boot-time service, from root-owned non-user-writable paths and reading no configuration, which applies exactly the reserved local range to the host loopback at install and at every boot.
+    tier:   T0
+    verify: cargo nextest run -p minimal advisory_command_reserves_the_range_on_macos
+    <!-- design §7.1 (the privileged step, one command with one privilege elevation shared with the answerer unit); state+event; Linux takes no range step — the whole 127/8 binds on `lo` — and its command keeps the routing-domain link's routable-scope address, without which resolved never consults the routing domain -->
 
 - **NET-124** WHEN a lookup asks for a record type other than A for a name a box or node holds in the box zone THE SYSTEM SHALL answer NODATA.
   tier:     T0
