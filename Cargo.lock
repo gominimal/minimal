@@ -3849,6 +3849,7 @@ dependencies = [
  "checkouts",
  "codespan-reporting",
  "common",
+ "decode",
  "futures",
  "google-cloud-auth",
  "google-cloud-storage",
@@ -3983,6 +3984,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "min-answerer"
+version = "0.7.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "minvmd",
+ "tracing-subscriber",
+ "version",
+]
+
+[[package]]
 name = "minimal"
 version = "0.7.0"
 dependencies = [
@@ -3996,6 +4008,7 @@ dependencies = [
  "diagnostics",
  "dirs",
  "hex",
+ "hickory-proto",
  "inquire",
  "mctx",
  "mfile",
@@ -4035,7 +4048,10 @@ dependencies = [
  "async-tar",
  "constcat",
  "indicatif",
+ "inquire",
+ "libc",
  "minimald-rpc",
+ "nix 0.31.3",
  "ot",
  "paths",
  "russh",
@@ -4069,6 +4085,7 @@ dependencies = [
  "mfile",
  "minimal-client",
  "minimald-rpc",
+ "nix 0.31.3",
  "paths",
  "ratatui",
  "serde",
@@ -4106,6 +4123,7 @@ dependencies = [
  "futures",
  "graph",
  "hakoniwa",
+ "hex",
  "hickory-proto",
  "indoc",
  "lcache",
@@ -4126,7 +4144,9 @@ dependencies = [
  "sandbox2",
  "serde",
  "serde_json_lenient",
+ "serial_test",
  "sessions",
+ "sha2 0.11.0",
  "size",
  "stdlib",
  "switch",
@@ -4210,6 +4230,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "uuid",
  "version",
 ]
 
@@ -6406,8 +6427,10 @@ dependencies = [
  "common",
  "globset",
  "hakoniwa",
+ "hex",
  "libc",
  "nix 0.31.3",
+ "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
@@ -7152,6 +7175,7 @@ name = "switch"
 version = "0.0.1"
 dependencies = [
  "smoltcp",
+ "switch",
  "tempfile",
  "tokio",
  "tracing",

@@ -833,6 +833,7 @@ pub(crate) mod tests {
                 deny_subnets: None,
             }),
             ingress: None,
+            credentialed_upstream: None,
         }
     }
 
@@ -858,6 +859,7 @@ pub(crate) mod tests {
                 deny_subnets: None,
             }),
             ingress: None,
+            credentialed_upstream: None,
         }
     }
 
@@ -875,6 +877,7 @@ pub(crate) mod tests {
                 deny_subnets: None,
             }),
             ingress: None,
+            credentialed_upstream: None,
         }
     }
 
@@ -891,6 +894,7 @@ pub(crate) mod tests {
                 deny_subnets: Some(vec!["10.9.9.0/24".to_string()]),
             }),
             ingress: None,
+            credentialed_upstream: None,
         }
     }
 
@@ -1026,6 +1030,7 @@ pub(crate) mod tests {
                 deny_subnets: None,
             }),
             ingress: None,
+            credentialed_upstream: None,
         };
         let gate = gate_for(&two_names);
         let now = Instant::now();
@@ -1686,6 +1691,7 @@ pub(crate) mod tests {
                 tcp_flags: 0,
                 seq: 0,
                 ack: 0,
+                payload_len: 0,
             },
             PINNED.octets(),
         );
@@ -1816,6 +1822,7 @@ pub(crate) mod tests {
                 tcp_flags: ACK,
                 seq: 0,
                 ack: 0,
+                payload_len: 0,
             },
             PINNED.octets(),
         );
@@ -2526,6 +2533,7 @@ pub(crate) mod tests {
                 deny_subnets: None,
             }),
             ingress: None,
+            credentialed_upstream: None,
         };
         let mut harness = spawn_test_relay(&policy);
 

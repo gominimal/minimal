@@ -216,6 +216,7 @@ mod tests {
             project_path: None,
             status: Default::default(),
             git: None,
+            host_ip_enforcement: None,
             attrs: None,
         }
     }

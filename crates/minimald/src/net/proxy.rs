@@ -33,6 +33,7 @@
 //! spike #485's systemd-resolved finding (spec Open Question 1).
 
 use std::borrow::Cow;
+use std::collections::BTreeSet;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -429,6 +430,28 @@ where
         return Ok(());
     }
 
+    // An absolute-form `https://` target asks the proxy to reach the origin
+    // over TLS, but the upstream leg is a plain TCP connection: forwarding it
+    // would send the request in plaintext to a port expecting TLS. Refused;
+    // a client tunnels TLS through the proxy with `CONNECT` instead.
+    if is_https_absolute_form(&head) {
+        log_refusal(
+            None,
+            "absolute-form https:// target; use CONNECT to tunnel TLS",
+            "400 Bad Request",
+        );
+        return write_status(&mut client, "400 Bad Request").await;
+    }
+
+    // A head the proxy and the box could read two ways is refused before any
+    // route lookup or upstream dial: two `Host` fields could route by one and
+    // be served by the other (RFC 9112 §3.2), and `Content-Length` beside
+    // `Transfer-Encoding` could end the body in two places (RFC 9112 §6.1).
+    if let Some(reason) = ambiguous_head(&head) {
+        log_refusal(None, reason, "400 Bad Request");
+        return write_status(&mut client, "400 Bad Request").await;
+    }
+
     let Some(request) = parse_request(&head) else {
         log_refusal(None, "unparseable request head", "400 Bad Request");
         return write_status(&mut client, "400 Bad Request").await;
@@ -494,7 +517,7 @@ where
                 status = "403 Forbidden",
                 "network policy violation"
             );
-            return write_status(&mut client, "403 Forbidden").await;
+            return write_refusal_status(&mut client, "403 Forbidden", reason).await;
         }
     };
 
@@ -543,7 +566,10 @@ where
         // original request, then relay the exchange. An h2c upgrade offer is
         // stripped first, so the request is routed as the HTTP/1.1 request it
         // is and the upstream cannot answer a protocol switch the proxy cannot
-        // splice (NET-135).
+        // splice (NET-135). An absolute-form request target is then rewritten
+        // to origin-form, with `Host:` set to its authority (RFC 9112 §3.2.2):
+        // the upstream is an origin server, and many reject the absolute URI
+        // verbatim.
         //
         // The proxy routes one request per client connection: a keep-alive
         // connection spliced as raw bytes would carry every later request to
@@ -569,7 +595,8 @@ where
                 return write_status(&mut client, "400 Bad Request").await;
             }
             let stripped = strip_h2c_upgrade(&head);
-            let lines = head_lines(stripped.get(..head_end(&stripped)).unwrap_or_default());
+            let rewritten = rewrite_absolute_form(&stripped);
+            let lines = head_lines(rewritten.get(..head_end(&rewritten)).unwrap_or_default());
             let is_upgrade = carries_upgrade(&lines);
             let Some(body) = request_body(&lines) else {
                 log_refusal(
@@ -580,9 +607,9 @@ where
                 return write_status(&mut client, "400 Bad Request").await;
             };
             let head = if is_upgrade {
-                stripped.into_owned()
+                rewritten.into_owned()
             } else {
-                set_connection_close(&stripped).into_owned()
+                set_connection_close(&rewritten).into_owned()
             };
             let (head, buffered) = head.split_at(head_end(&head));
             upstream.write_all(head).await?;
@@ -595,10 +622,16 @@ where
 
 /// Parses the authority to route to out of a buffered HTTP request head. A
 /// `CONNECT` request carries the authority in its request line; any other method
-/// carries it in the `Host:` header (matched case-insensitively). Returns `None`
-/// for a head with no usable authority.
+/// carries it in an absolute-form target's URI authority when it has one, and
+/// otherwise in the `Host:` header (matched case-insensitively). Returns `None`
+/// for a head with no usable authority. Only the head is decoded as text: body
+/// bytes the head read buffered after the end-of-head marker can be anything.
 fn parse_request(head: &[u8]) -> Option<ParsedRequest<'_>> {
-    let text = std::str::from_utf8(head).ok()?;
+    let head_end = head
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map_or(head.len(), |at| at + 4);
+    let text = std::str::from_utf8(head.get(..head_end)?).ok()?;
     let mut lines = text.split("\r\n");
     let request_line = lines.next()?;
     let mut parts = request_line.split(' ');
@@ -612,16 +645,63 @@ fn parse_request(head: &[u8]) -> Option<ParsedRequest<'_>> {
         });
     }
 
-    let authority = lines.find_map(|line| {
-        let (name, value) = line.split_once(':')?;
-        name.trim()
-            .eq_ignore_ascii_case("host")
-            .then(|| value.trim())
-    })?;
+    // Absolute-form request target (RFC 9112 §3.2.2): the request line
+    // carries a full URI (`GET http://host:port/path HTTP/1.1`). The URI
+    // authority takes precedence over any `Host:` header (RFC 9112 §3.2.3).
+    let path = parts.next()?;
+    let authority = if let Some((auth, _)) = split_absolute_form(path) {
+        auth
+    } else {
+        lines.find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case("host")
+                .then(|| value.trim())
+        })?
+    };
     Some(ParsedRequest {
         kind: RequestKind::Forward,
         authority,
     })
+}
+
+/// Why a buffered request head is ambiguous, or `None` when it is not: more
+/// than one `Host` field (RFC 9112 §3.2 requires a `400`), both
+/// `Content-Length` and `Transfer-Encoding` (RFC 9112 §6.1 bars an
+/// intermediary from forwarding it as it is), or `Content-Length` values that
+/// differ (RFC 9112 §6.3; repeated identical values are one length). Header
+/// names match case-insensitively; the request line is not a header and is not
+/// consulted, and bytes past the end-of-head marker are never scanned. A
+/// `Content-Length` that is not a decimal number is left to [`request_body`],
+/// which refuses it.
+fn ambiguous_head(head: &[u8]) -> Option<&'static str> {
+    let lines = head_lines(head.get(..head_end(head)).unwrap_or_default());
+    let headers: Vec<(&[u8], &[u8])> = lines
+        .iter()
+        .skip(1)
+        .filter_map(|line| header_parts(line))
+        .collect();
+    let values = |want: &'static [u8]| {
+        headers
+            .iter()
+            .filter(move |(name, _)| is_header(name, want))
+            .map(|(_, value)| *value)
+    };
+    let lengths: BTreeSet<u64> = values(b"content-length")
+        .flat_map(value_tokens)
+        .filter_map(|token| std::str::from_utf8(token).ok()?.parse().ok())
+        .collect();
+    if values(b"host").count() > 1 {
+        Some("the request head has more than one Host header")
+    } else if values(b"content-length").next().is_some()
+        && values(b"transfer-encoding").next().is_some()
+    {
+        Some("the request head has both Content-Length and Transfer-Encoding")
+    } else if lengths.len() > 1 {
+        Some("the request head has Content-Length values that differ")
+    } else {
+        None
+    }
 }
 
 /// Whether the buffered head opens with the HTTP/2 prior-knowledge preface's
@@ -700,6 +780,101 @@ fn strip_h2c_upgrade(head: &[u8]) -> Cow<'_, [u8]> {
             }
             out.extend(rewritten_header(line, name, &kept));
             continue;
+        }
+        out.extend_from_slice(line);
+    }
+    out.extend_from_slice(rest);
+    Cow::Owned(out)
+}
+
+/// Whether the request line carries an absolute-form `https://` target, which
+/// the proxy refuses: its upstream leg is plain TCP, never TLS. The scheme
+/// matches case-insensitively (RFC 3986 §3.1).
+fn is_https_absolute_form(head: &[u8]) -> bool {
+    const SCHEME: &str = "https://";
+    head.split(|&b| b == b'\n')
+        .next()
+        .and_then(|line| std::str::from_utf8(line).ok())
+        .and_then(|line| line.split(' ').nth(1))
+        .and_then(|target| target.get(..SCHEME.len()))
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(SCHEME))
+}
+
+/// Splits an absolute-form request target (`http://authority/path?query`)
+/// into its authority and the rest, or `None` for any other form. Only the
+/// `http` scheme is split: an `https://` target is refused before routing
+/// ([`is_https_absolute_form`]). The scheme matches case-insensitively
+/// (RFC 3986 §3.1). The authority ends at the first
+/// `/`, `?`, or `#` (RFC 3986 §3.2) and is returned as `host[:port]`, without
+/// any `userinfo@`; the rest keeps the path and query, minus any fragment,
+/// which is never sent.
+fn split_absolute_form(target: &str) -> Option<(&str, &str)> {
+    const SCHEME: &str = "http://";
+    let rest = target
+        .get(..SCHEME.len())
+        .filter(|prefix| prefix.eq_ignore_ascii_case(SCHEME))
+        .and_then(|_| target.get(SCHEME.len()..))?;
+    let rest = rest.split_once('#').map_or(rest, |(before, _)| before);
+    let authority_end = rest.find(['/', '?']).unwrap_or(rest.len());
+    let (authority, rest) = rest.split_at(authority_end);
+    let authority = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    Some((authority, rest))
+}
+
+/// Rewrites an absolute-form request line to origin-form (RFC 9112 §3.2.2):
+/// `GET http://host:port/path?query HTTP/1.1` becomes `GET /path?query HTTP/1.1`.
+/// The scheme and authority are dropped from the line; the path (and any query)
+/// is kept, so the upstream origin server receives the form it expects. The
+/// received `Host:` header is replaced by one carrying the target's authority,
+/// added when the request had none (RFC 9112 §3.2.2), so the upstream sees the
+/// host the request was routed to. Every other header and any buffered body
+/// bytes pass through verbatim; the connection's persistence is the forward
+/// path's to set, not the rewrite's. A head with any other target is returned
+/// as is.
+fn rewrite_absolute_form(head: &[u8]) -> Cow<'_, [u8]> {
+    let head_end = head
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map_or(head.len(), |at| at + 4);
+    let (headers, rest) = head.split_at(head_end);
+
+    let Some(request_line_end) = headers.iter().position(|&b| b == b'\n') else {
+        return Cow::Borrowed(head);
+    };
+    let request_line = &headers[..request_line_end + 1];
+
+    // `METHOD SP http://authority/path?query SP HTTP/1.1`
+    let Some(text) = std::str::from_utf8(request_line).ok() else {
+        return Cow::Borrowed(head);
+    };
+    let mut parts = text.splitn(3, ' ');
+    let (Some(method), Some(target), Some(version)) = (parts.next(), parts.next(), parts.next())
+    else {
+        return Cow::Borrowed(head);
+    };
+
+    let Some((authority, origin_target)) = split_absolute_form(target) else {
+        return Cow::Borrowed(head);
+    };
+
+    let mut out = Vec::with_capacity(head.len());
+    out.extend_from_slice(method.as_bytes());
+    out.push(b' ');
+    // An empty path is sent as `/` (RFC 9112 §3.2.1), ahead of any query.
+    if !origin_target.starts_with('/') {
+        out.push(b'/');
+    }
+    out.extend_from_slice(origin_target.as_bytes());
+    out.push(b' ');
+    out.extend_from_slice(version.as_bytes());
+    out.extend_from_slice(b"Host: ");
+    out.extend_from_slice(authority.as_bytes());
+    out.extend_from_slice(b"\r\n");
+    for line in head_lines(&headers[request_line_end + 1..]) {
+        if header_parts(line).is_some_and(|(name, _)| is_header(name, b"host")) {
+            continue; // Replaced by the target's authority above.
         }
         out.extend_from_slice(line);
     }
@@ -1211,6 +1386,26 @@ async fn write_status<C: AsyncWrite + Unpin>(client: &mut C, status: &str) -> io
     client.write_all(response.as_bytes()).await
 }
 
+/// Writes the refusal's own answer: the status line, then a plain-text body
+/// carrying the reason — the same wording the refusal's warn line records —
+/// so a refused client reads *why* off the wire instead of inferring it from
+/// the status. A port the box never published answers `403` with "the box
+/// has not published this port", a different refusal from the declared
+/// port's instant connection-refused while nothing listens on it yet
+/// (NET-014: an answer, never a hang; NET-016: the refusal is "not
+/// permitted", not "nothing listening").
+async fn write_refusal_status<C: AsyncWrite + Unpin>(
+    client: &mut C,
+    status: &str,
+    reason: &str,
+) -> io::Result<()> {
+    let response = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reason}",
+        reason.len(),
+    );
+    client.write_all(response.as_bytes()).await
+}
+
 /// Emits the refusal warn line (NET-001): every request the proxy refuses is
 /// logged with the Host asked for — when the head carried one, which the
 /// timeout and unparseable-head refusals cannot have — the reason, and the
@@ -1465,8 +1660,9 @@ mod tests {
     /// A lease route carries only the ports the box's ingress declaration
     /// publishes (NET-001): a request naming any other port — an unrelated one
     /// or the internal port number behind the map — is refused with
-    /// `403 Forbidden` and a warn line naming the host, the session, the port
-    /// and the reason, instead of dialing a port the box's ingress gate would
+    /// `403 Forbidden`, the body saying the port is not published, and a warn
+    /// line naming the host, the session, the port and the reason, instead of
+    /// dialing a port the box's ingress gate would
     /// drop (a dropped SYN is a silent connect hang, not a refusal).
     #[tokio::test]
     async fn proxy_refuses_an_unpublished_port_and_logs_why() {
@@ -1504,6 +1700,10 @@ mod tests {
         assert!(
             refused.contains("403 Forbidden"),
             "expected the unpublished port to be refused, got: {refused}"
+        );
+        assert!(
+            refused.contains("the box has not published this port"),
+            "expected the refusal's body to say the port is not published, got: {refused}"
         );
 
         drop(_guard);
@@ -1624,8 +1824,29 @@ mod tests {
             "expected a bad-request refusal, got: {bad}"
         );
 
+        // An absolute-form https:// target, which plain TCP cannot carry: a
+        // bad-request refusal, never a plaintext forward.
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        client
+            .write_all(b"GET https://web.min.internal/ HTTP/1.1\r\nHost: web.min.internal\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        let https = String::from_utf8_lossy(&response).into_owned();
+        assert!(
+            https.contains("400 Bad Request"),
+            "expected an https absolute-form refusal, got: {https}"
+        );
+
         drop(_guard);
         let logged = buf.contents();
+
+        // The https absolute-form refusal carries its reason.
+        assert!(
+            logged.contains("absolute-form https:// target"),
+            "expected the https refusal reason, got: {logged}"
+        );
 
         // The no-route refusal names the host asked for and the reason.
         assert!(
@@ -1963,6 +2184,107 @@ mod tests {
         value
     }
 
+    /// An absolute-form target's authority ends at its first `/` or `?`, and
+    /// the rewrite keeps path and query, drops any fragment, and supplies the
+    /// `/` an empty path needs, so a query-only target stays origin-form.
+    #[test]
+    fn absolute_form_targets_split_and_rewrite_to_origin_form() {
+        let parsed =
+            parse_request(b"GET http://web.min.internal?next=/a HTTP/1.1\r\nHost: x\r\n\r\n")
+                .unwrap();
+        assert_eq!(parsed.authority, "web.min.internal");
+        // The scheme matches case-insensitively, and userinfo is not routed on.
+        let parsed =
+            parse_request(b"GET HTTP://u:p@web.min.internal:81/p HTTP/1.1\r\n\r\n").unwrap();
+        assert_eq!(parsed.authority, "web.min.internal:81");
+
+        let rewrite =
+            |head: &[u8]| String::from_utf8(rewrite_absolute_form(head).into_owned()).unwrap();
+        assert_eq!(
+            rewrite(
+                b"GET http://web.min.internal:8080/p?q=1#frag HTTP/1.1\r\nA: 1\r\nhost: x\r\n\r\nbody"
+            ),
+            "GET /p?q=1 HTTP/1.1\r\nHost: web.min.internal:8080\r\nA: 1\r\n\r\nbody"
+        );
+        assert_eq!(
+            rewrite(b"GET http://web.min.internal?next=/a HTTP/1.1\r\n\r\n"),
+            "GET /?next=/a HTTP/1.1\r\nHost: web.min.internal\r\n\r\n"
+        );
+        assert_eq!(
+            rewrite(b"GET Http://web.min.internal HTTP/1.0\r\n\r\n"),
+            "GET / HTTP/1.0\r\nHost: web.min.internal\r\n\r\n"
+        );
+        assert_eq!(
+            rewrite(b"GET /already HTTP/1.1\r\n\r\n"),
+            "GET /already HTTP/1.1\r\n\r\n"
+        );
+        // The rewrite never touches `Connection` or `Upgrade`: whether the
+        // connection closes is the forward path's to set, after the rewrite.
+        assert_eq!(
+            rewrite(
+                b"GET http://web.min.internal/ws HTTP/1.1\r\n\
+                  Connection: Upgrade\r\nUpgrade: websocket\r\n\r\n"
+            ),
+            "GET /ws HTTP/1.1\r\nHost: web.min.internal\r\n\
+             Connection: Upgrade\r\nUpgrade: websocket\r\n\r\n"
+        );
+        assert_eq!(
+            rewrite(
+                b"GET http://web.min.internal/ws HTTP/1.1\r\n\
+                  Upgrade: websocket\r\nconnection: keep-alive , UPGRADE\r\n\r\n"
+            ),
+            "GET /ws HTTP/1.1\r\nHost: web.min.internal\r\n\
+             Upgrade: websocket\r\nconnection: keep-alive , UPGRADE\r\n\r\n"
+        );
+        assert_eq!(
+            rewrite(
+                b"GET http://web.min.internal/ws HTTP/1.1\r\n\
+                  Upgrade: websocket\r\nConnection: keep-alive\r\n\r\n"
+            ),
+            "GET /ws HTTP/1.1\r\nHost: web.min.internal\r\n\
+             Upgrade: websocket\r\nConnection: keep-alive\r\n\r\n"
+        );
+        assert_eq!(
+            rewrite(b"GET http://web.min.internal/ws HTTP/1.1\r\nUpgrade: websocket\r\n\r\n"),
+            "GET /ws HTTP/1.1\r\nHost: web.min.internal\r\nUpgrade: websocket\r\n\r\n"
+        );
+    }
+
+    /// Body bytes the head read buffered past the end-of-head marker are not
+    /// decoded as text: a non-UTF-8 body still parses, and the rewrite
+    /// forwards it byte for byte.
+    #[test]
+    fn absolute_form_with_non_utf8_buffered_body_parses_and_rewrites() {
+        let head: &[u8] = b"POST http://web.min.internal/u HTTP/1.1\r\n\
+              Content-Length: 3\r\n\r\n\xff\xfe\x00";
+        let parsed = parse_request(head).expect("a non-UTF-8 body must not fail the parse");
+        assert!(matches!(parsed.kind, RequestKind::Forward));
+        assert_eq!(parsed.authority, "web.min.internal");
+        let expected: &[u8] = b"POST /u HTTP/1.1\r\nHost: web.min.internal\r\n\
+              Content-Length: 3\r\n\r\n\xff\xfe\x00";
+        assert_eq!(rewrite_absolute_form(head).as_ref(), expected);
+    }
+
+    /// An absolute-form `https://` target is refused, whatever the scheme's
+    /// case: the upstream leg is plain TCP. `http://` and `CONNECT` are not.
+    #[test]
+    fn https_absolute_form_is_detected_for_refusal() {
+        assert!(is_https_absolute_form(
+            b"GET https://web.min.internal/ HTTP/1.1\r\n\r\n"
+        ));
+        assert!(is_https_absolute_form(
+            b"GET HTTPS://web.min.internal/ HTTP/1.1\r\n\r\n"
+        ));
+        assert!(!is_https_absolute_form(
+            b"GET http://web.min.internal/ HTTP/1.1\r\n\r\n"
+        ));
+        assert!(!is_https_absolute_form(
+            b"CONNECT web.min.internal:443 HTTP/1.1\r\n\r\n"
+        ));
+        assert!(!is_https_absolute_form(b"GET / HTTP/1.1\r\n\r\n"));
+        assert!(split_absolute_form("https://web.min.internal/").is_none());
+    }
+
     /// `CONNECT` carries the authority in its request line; a plain method
     /// carries it in the `Host:` header. Both parse to the same authority.
     #[test]
@@ -2019,13 +2341,14 @@ mod tests {
 
     /// A forward request from an `HTTP_PROXY`-configured client carries an
     /// absolute-form request target (`GET http://web.min.internal/path HTTP/1.1`).
-    /// The proxy routes it by `Host:` header and replays the buffered head
-    /// verbatim, so the upstream receives the absolute-form request line
-    /// unchanged — RFC 9112 requires an origin server to accept it. Complements
+    /// The proxy routes it by the URI authority and rewrites the request line
+    /// to origin-form (`GET /path HTTP/1.1`) before forwarding, because the
+    /// upstream is an origin server and many reject the absolute URI verbatim
+    /// (RFC 9112 §3.2.2). Complements
     /// `host_header_routes_through_proxy_then_not_found_after_deregister`, which
     /// only exercises an origin-form (`GET /`) target.
     #[tokio::test]
-    async fn forward_proxy_replays_absolute_form_target_to_upstream() {
+    async fn forward_proxy_rewrites_absolute_form_target_to_origin_form() {
         // A backend that records the request head it received, then answers 200.
         let backend = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let backend_port = backend.local_addr().unwrap().port();
@@ -2066,11 +2389,78 @@ mod tests {
             String::from_utf8_lossy(&response)
         );
 
-        // The upstream saw the absolute-form request line replayed verbatim.
+        // The upstream saw the request line rewritten to origin-form.
         let upstream_head = String::from_utf8(received.lock().unwrap().clone()).unwrap();
         assert!(
-            upstream_head.starts_with(&request_line),
-            "expected absolute-form target replayed to upstream, got: {upstream_head}"
+            upstream_head.starts_with("GET /path HTTP/1.1"),
+            "expected absolute-form target rewritten to origin-form, got: {upstream_head}"
+        );
+    }
+
+    /// An absolute-form request whose URI authority differs from the `Host:`
+    /// header routes by the URI authority (RFC 9112 §3.2.3). The `Host:`
+    /// header is ignored for routing and replaced in the forwarded head by the
+    /// URI authority, and the upstream receives the origin-form request line.
+    #[tokio::test]
+    async fn absolute_form_uri_authority_overrides_host_header() {
+        let backend = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let backend_port = backend.local_addr().unwrap().port();
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let received_bg = Arc::clone(&received);
+        tokio::spawn(async move {
+            let (mut sock, _) = backend.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let n = sock.read(&mut buf).await.unwrap();
+            received_bg.lock().unwrap().extend_from_slice(&buf[..n]);
+            let _ = sock
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await;
+        });
+
+        let mut reg = HostnameRegistry::new("dev", false);
+        // Register the host that appears in the URI authority, not the one in
+        // the `Host:` header.
+        reg.register_host_net(SessionId::nil(), "real");
+        let router = Router::new(Arc::new(reg), proxied_request_verdict);
+
+        let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        tokio::spawn(serve(proxy, router));
+
+        // URI authority is `real.min.internal`, `Host:` header is a different
+        // host that is not registered — the request must route by the URI.
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        client
+            .write_all(
+                format!(
+                    "GET http://real.min.internal:{backend_port}/data HTTP/1.1\r\n\
+                     Host: other.min.internal:{backend_port}\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&response).contains("200 OK"),
+            "expected the absolute-form request to route by URI authority, got: {}",
+            String::from_utf8_lossy(&response)
+        );
+
+        // The upstream received the origin-form request line.
+        let upstream_head = String::from_utf8(received.lock().unwrap().clone()).unwrap();
+        assert!(
+            upstream_head.starts_with("GET /data HTTP/1.1"),
+            "expected origin-form target, got: {upstream_head}"
+        );
+        assert!(
+            upstream_head.contains(&format!("\r\nHost: real.min.internal:{backend_port}\r\n")),
+            "expected Host: replaced by the URI authority, got: {upstream_head}"
+        );
+        assert!(
+            !upstream_head.contains("other.min.internal"),
+            "expected the received Host: dropped, got: {upstream_head}"
         );
     }
 
@@ -2843,6 +3233,175 @@ mod tests {
         assert!(box_a_received.lock().unwrap().is_empty());
     }
 
+    /// Drives one request head through the proxy toward a `web` box whose
+    /// port is a listener nothing answers on, returning the response, the
+    /// log lines, and whether the proxy dialed the box at all.
+    async fn drive_toward_unanswered_box(head: impl Fn(u16) -> String) -> (String, String, bool) {
+        let upstream = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = upstream.local_addr().unwrap().port();
+        let mut reg = HostnameRegistry::new(DEFAULT_HOST_ID, false);
+        reg.register_host_net(SessionId::nil(), "web");
+        let router = Router::new(Arc::new(reg), proxied_request_verdict);
+
+        let (buf, guard) = capture_logs();
+        let (mut client, proxy_side) = tokio::io::duplex(1024);
+        client.write_all(head(port).as_bytes()).await.unwrap();
+        handle_connection_io(proxy_side, None, &router)
+            .await
+            .unwrap();
+        drop(guard);
+
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        let dialed = tokio::time::timeout(Duration::from_millis(200), upstream.accept())
+            .await
+            .is_ok();
+        (
+            String::from_utf8_lossy(&response).into_owned(),
+            buf.contents(),
+            dialed,
+        )
+    }
+
+    /// A head with two `Host` fields is refused with `400` before any route
+    /// lookup or dial (RFC 9112 §3.2), and the refusal names its reason.
+    #[tokio::test]
+    async fn request_with_two_host_headers_is_refused_before_dialing() {
+        let (response, logged, dialed) = drive_toward_unanswered_box(|port| {
+            format!(
+                "GET / HTTP/1.1\r\nHost: web.min.internal:{port}\r\n\
+                 host: other.min.internal:{port}\r\n\r\n"
+            )
+        })
+        .await;
+        assert!(
+            response.starts_with("HTTP/1.1 400 Bad Request"),
+            "got: {response}"
+        );
+        assert!(
+            !dialed,
+            "the proxy must not dial the box for an ambiguous head"
+        );
+        assert!(
+            logged.contains("the request head has more than one Host header"),
+            "expected the refusal to be logged with its reason, got: {logged}"
+        );
+    }
+
+    /// A head carrying both `Content-Length` and `Transfer-Encoding` is
+    /// refused with `400` before any dial, never forwarded as it is
+    /// (RFC 9112 §6.1).
+    #[tokio::test]
+    async fn request_with_length_and_transfer_encoding_is_refused_before_dialing() {
+        let (response, logged, dialed) = drive_toward_unanswered_box(|port| {
+            format!(
+                "POST / HTTP/1.1\r\nHost: web.min.internal:{port}\r\n\
+                 Content-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"
+            )
+        })
+        .await;
+        assert!(
+            response.starts_with("HTTP/1.1 400 Bad Request"),
+            "got: {response}"
+        );
+        assert!(
+            !dialed,
+            "the proxy must not dial the box for an ambiguous head"
+        );
+        assert!(
+            logged.contains("the request head has both Content-Length and Transfer-Encoding"),
+            "expected the refusal to be logged with its reason, got: {logged}"
+        );
+    }
+
+    /// A head with one `Host` and one framing header is not ambiguous, and
+    /// still routes to its box.
+    #[tokio::test]
+    async fn request_with_one_host_and_one_framing_header_still_routes() {
+        let proxy_addr = spawn_two_box_proxy().await;
+        let (box_a_port, box_a_received) = spawn_recording_backend().await;
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        let request = format!(
+            "POST / HTTP/1.1\r\nHost: box-a.min.internal:{box_a_port}\r\n\
+             Content-Length: 4\r\n\r\nping"
+        );
+        client.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "got: {response}");
+        assert!(
+            String::from_utf8_lossy(&box_a_received.lock().unwrap()).contains("Host: box-a"),
+            "the box must receive the request"
+        );
+    }
+
+    /// A head whose `Content-Length` fields differ is refused with `400`
+    /// before any dial (RFC 9112 §6.3), and the refusal names its reason.
+    #[tokio::test]
+    async fn request_with_differing_content_lengths_is_refused_before_dialing() {
+        let (response, logged, dialed) = drive_toward_unanswered_box(|port| {
+            format!(
+                "POST / HTTP/1.1\r\nHost: web.min.internal:{port}\r\n\
+                 Content-Length: 4\r\nContent-Length: 5\r\n\r\nping"
+            )
+        })
+        .await;
+        assert!(
+            response.starts_with("HTTP/1.1 400 Bad Request"),
+            "got: {response}"
+        );
+        assert!(
+            !dialed,
+            "the proxy must not dial the box for an ambiguous head"
+        );
+        assert!(
+            logged.contains("the request head has Content-Length values that differ"),
+            "expected the refusal to be logged with its reason, got: {logged}"
+        );
+    }
+
+    /// Repeated identical `Content-Length` values are one length, not an
+    /// ambiguity (RFC 9112 §6.3): the request still routes to its box.
+    #[tokio::test]
+    async fn request_with_identical_content_lengths_still_routes() {
+        let proxy_addr = spawn_two_box_proxy().await;
+        let (box_a_port, box_a_received) = spawn_recording_backend().await;
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        let request = format!(
+            "POST / HTTP/1.1\r\nHost: box-a.min.internal:{box_a_port}\r\n\
+             Content-Length: 4\r\nContent-Length: 4\r\n\r\nping"
+        );
+        client.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "got: {response}");
+        assert!(
+            String::from_utf8_lossy(&box_a_received.lock().unwrap()).contains("Host: box-a"),
+            "the box must receive the request"
+        );
+    }
+
+    /// Which heads `ambiguous_head` flags: header names match
+    /// case-insensitively, and the request line and body are not headers.
+    #[test]
+    fn ambiguous_head_flags_duplicate_host_and_dual_framing() {
+        assert!(ambiguous_head(b"GET / HTTP/1.1\r\nHost: a\r\nHOST: b\r\n\r\n").is_some());
+        assert!(
+            ambiguous_head(
+                b"POST / HTTP/1.1\r\nHost: a\r\ncontent-length: 1\r\n\
+                  transfer-encoding: chunked\r\n\r\n"
+            )
+            .is_some()
+        );
+        assert!(ambiguous_head(b"GET http://a:80/ HTTP/1.1\r\nHost: a\r\n\r\n").is_none());
+        assert!(
+            ambiguous_head(b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 9\r\n\r\nHost: b\r\n")
+                .is_none()
+        );
+    }
+
     /// The framings `request_body` reads, and the ones it refuses.
     #[test]
     fn request_body_framing() {
@@ -2930,6 +3489,7 @@ mod tests {
                 dynamic_allowed_range: None,
                 dynamic_ingress: None,
             }),
+            credentialed_upstream: None,
         };
 
         // The registry, as the session actor and the attach path fill it: the
@@ -2957,6 +3517,7 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             &policy,
             SwitchSubnet::default(),
+            None,
         );
         assert!(
             gate.admits_direct_tcp(backend_port),
@@ -3048,7 +3609,7 @@ mod tests {
                 egress_allowing_the_target(),
             ),
         ] {
-            reg.register_caller(id, name, &policy, subnet);
+            reg.register_caller(id, name, &policy, subnet, None);
             reg.report_own_address(id, name, lease, BTreeMap::new());
         }
         let router = Router::new(Arc::new(reg), proxied_request_verdict);
@@ -3268,6 +3829,7 @@ mod tests {
                         dynamic_ingress: None,
                     }
                 }),
+                credentialed_upstream: None,
             };
             // The registry, as the session actor and the attach path fill it
             // for each mode. Loopback stands in for the target's lease.
@@ -3321,8 +3883,10 @@ mod tests {
                     &SessionPolicy {
                         egress: Some(stance_egress(stance)),
                         ingress: None,
+                        credentialed_upstream: None,
                     },
                     subnet,
+                    None,
                 );
                 reg.report_own_address(client, "client", CALLER_LEASE, BTreeMap::new());
                 reg.caller_at(CALLER_LEASE)
@@ -3401,6 +3965,7 @@ mod tests {
                         target_lease,
                         &target_policy,
                         subnet,
+                        None,
                     );
                     prop_assert!(
                         gate.admits_direct_tcp(internal),
@@ -3430,6 +3995,7 @@ mod tests {
         let policy = SessionPolicy {
             egress: None,
             ingress: None,
+            credentialed_upstream: None,
         };
         // The direct half: the relay's own gate for that declaration refuses
         // every new inbound connection — the own-IP default-block posture.
@@ -3438,6 +4004,7 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             &policy,
             SwitchSubnet::default(),
+            None,
         );
         assert!(
             !gate.admits_direct_tcp(18080),
@@ -3456,6 +4023,7 @@ mod tests {
                 "client",
                 &egress_allowing_the_target(),
                 SwitchSubnet::default(),
+                None,
             );
             reg.report_own_address(client, "client", CALLER_LEASE, BTreeMap::new());
             let caller = reg
@@ -4359,6 +4927,7 @@ mod tests {
                 ..EgressPolicy::default()
             }),
             ingress: None,
+            credentialed_upstream: None,
         }
     }
 
@@ -4371,6 +4940,7 @@ mod tests {
                 ..EgressPolicy::default()
             }),
             ingress: None,
+            credentialed_upstream: None,
         }
     }
 }

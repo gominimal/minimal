@@ -55,8 +55,12 @@ min_search() {
 
 min_patched_pkg() {
     local pkg="$1"
-    if [[ -z "$pkg" || -z "$pkg" ]]; then
-        echo "Usage: min_patched_pkg <package-name>" >&2
+    if [[ "$pkg" == "-h" || "$pkg" == "--help" ]]; then
+        echo "Usage: min package patched-build <package-name>" >&2
+        return 0
+    fi
+    if [[ -z "$pkg" || "$pkg" == -* ]]; then
+        echo "Usage: min package patched-build <package-name>" >&2
         return 1
     fi
 

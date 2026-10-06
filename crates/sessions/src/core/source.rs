@@ -25,8 +25,9 @@ pub enum Source {
     /// The user's own [`Loadout`](crate::core::loadout::Loadout). Bypasses
     /// `allow`/`deny` checks (only `ignore` still applies).
     UserLoadout { name: String },
-    /// A project's `minimal.toml`, identified by the path of the
-    /// config file.
+    /// A project's `minimal.toml`, identified by the project root
+    /// directory on the client host (not the config file's path).
+    /// Repo-relative patch sources resolve against this directory.
     Project { path: HostPath },
     /// A specific package's declaration, identified by package name.
     Package { name: String },

@@ -79,9 +79,35 @@ pub enum SocketSeal {
     /// keeps its inet sockets; `AF_PACKET` is admitted here and refused by
     /// the missing `CAP_NET_RAW` no box holds, as NET-083 binds.
     ConfinedFamilies,
-    /// Admits `AF_UNIX` alone and refuses every other family — the `none`
-    /// plan's promise of no reach outside the sandbox at all.
+    /// Admits the families the box's own network namespace confines — unix,
+    /// inet, inet6, netlink — so the box can use its own loopback, and
+    /// refuses every other family with `EAFNOSUPPORT`, the
+    /// namespace-bypass families (`AF_VSOCK`) included.  The `none` plan's
+    /// seal: the namespace already holds only `lo`, so admitting inet
+    /// blocks nothing the namespace does not already block.  It applies
+    /// only inside that namespace; see [`SocketSeal::in_netns`].
     Full,
+    /// Admits `AF_UNIX` alone and refuses every other family.  No plan
+    /// carries it: it is what [`SocketSeal::Full`] falls back to wherever
+    /// the box is not in a fresh network namespace of its own, so a `none`
+    /// box whose namespace was never entered keeps no reach outside it.
+    UnixOnly,
+}
+
+impl SocketSeal {
+    /// The seal a box actually runs under, given whether it sits in a fresh
+    /// network namespace of its own.  [`SocketSeal::Full`] admits inet and
+    /// netlink only because that namespace confines them; on any path where
+    /// the box is not in one (a fallback, an error, a future mode) the same
+    /// families would reach the host's network, so it fails closed to
+    /// [`SocketSeal::UnixOnly`].  Every other seal is returned unchanged.
+    #[must_use]
+    pub fn in_netns(self, fresh_netns: bool) -> Self {
+        match self {
+            Self::Full if !fresh_netns => Self::UnixOnly,
+            seal => seal,
+        }
+    }
 }
 
 impl std::fmt::Display for SocketSeal {
@@ -89,6 +115,7 @@ impl std::fmt::Display for SocketSeal {
         match self {
             Self::ConfinedFamilies => write!(f, "confined-families"),
             Self::Full => write!(f, "full"),
+            Self::UnixOnly => write!(f, "unix-only"),
         }
     }
 }
@@ -166,10 +193,12 @@ impl NetPlan {
     }
 
     /// A none box: an unshared network namespace that will never get a tap,
-    /// with every socket family but `AF_UNIX` refused on top (`AF_VSOCK`
-    /// reaches the host regardless of the namespace). Unlike
+    /// with every socket family but the ones its own namespace confines
+    /// (`AF_UNIX`, `AF_INET`, `AF_INET6`, `AF_NETLINK`) refused on top
+    /// (`AF_VSOCK` reaches the host regardless of the namespace). Unlike
     /// [`NetPlan::isolated`], which an own-address box also starts from when
-    /// its tap is moved in after spawn, this plan is the promise of no reach.
+    /// its tap is moved in after spawn, this plan is the promise of no reach
+    /// outside the box — its own loopback stays usable.
     #[must_use]
     pub fn none() -> Self {
         Self {
@@ -400,8 +429,9 @@ impl Network for HostNet {
     }
 }
 
-/// A fresh, empty network namespace: only a down `lo`, so every egress attempt
-/// fails (UC1). No post-spawn wiring.
+/// A fresh, empty network namespace: only `lo`, which the box's pre-exec
+/// closure brings up, so every egress attempt past loopback fails (UC1). No
+/// post-spawn wiring.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NoNet;
 

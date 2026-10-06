@@ -23,7 +23,7 @@ use russh::{
 use sessions::SessionId;
 use tempfile::TempDir;
 use tokio::net::unix::pipe;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -113,6 +113,39 @@ pub struct TaskExec {
     /// daemon's own environment — the very indirection #585 removes. A
     /// dropped name has to be named.
     pub drop_env: BTreeSet<String>,
+    /// The client's invocation directory relative to the uploaded tree,
+    /// already refused by [`minimald_rpc::exec::ExecRequest::parse`] if it
+    /// is absolute or holds a `..`. A task that declares `inherit_cwd`
+    /// starts there (see [`task_start_dir`]); empty means the root.
+    pub cwd: String,
+}
+
+/// Where a task starts inside its session-layout sandbox, when not at the
+/// default `/workbench`.
+///
+/// `Ok(Some(dir))` is `/workbench/<cwd>` for a task that declares
+/// `inherit_cwd` when `<cwd>` is a directory of the uploaded tree at
+/// `working`. `Ok(None)` keeps the default: the task does not inherit, or
+/// the client ran from the root. `Err(notice)` also keeps the default, with
+/// the one-line notice to show on the task's stderr: the directory is not in
+/// the uploaded tree (an upload that was skipped, or a path the upload
+/// excluded).
+fn task_start_dir(
+    inherit_cwd: bool,
+    cwd: &str,
+    working: &std::path::Path,
+) -> Result<Option<String>, String> {
+    if !inherit_cwd || cwd.is_empty() {
+        return Ok(None);
+    }
+    if working.join(cwd).is_dir() {
+        Ok(Some(format!("/{}/{cwd}", sandbox2::SESSION_DEFAULT_WD)))
+    } else {
+        Err(format!(
+            "minimal: {cwd} is not in the uploaded tree; running the task at /{}\n",
+            sandbox2::SESSION_DEFAULT_WD
+        ))
+    }
 }
 
 impl Exec for TaskExec {
@@ -165,7 +198,9 @@ impl Exec for TaskExec {
 /// rollout ends at stays proven while the default is only announced
 /// (NET-076) — and `deny_all_opt_out` is the daemon's opt-out (NET-077),
 /// read through the session handle so a task resolves its egress exactly as
-/// the launcher did.
+/// the launcher did. It carries no classifier decision either (NET-079):
+/// a task places no leaf in the cohort's subtrees, so no per-box verdict
+/// is its plan's to follow.
 ///
 /// A gate is attached only where that egress has rules to enforce: the
 /// deny-all section the in-force default resolves an absent declaration to,
@@ -209,6 +244,11 @@ pub(crate) fn task_network(
         // the reserve, so the two allocators cannot meet; the daemon-side
         // refusals (`IpAllocator::hand`) stay the guard against a pair that
         // disagrees about the split.
+        None,
+        // Deliberately no classifier decision (NET-079): a task places no
+        // leaf in the cohort's subtrees, so there is no per-box verdict for
+        // a task's plan to follow — the session's own launch carries the
+        // decision its reader read, and this one has none to carry.
         None,
     )
 }
@@ -357,7 +397,20 @@ async fn task_producer(
         // directory the interactive session sees at `/home`. The daemon's own
         // ambient home is `/` inside the guest, and expanding against that
         // dropped package-declared files onto the read-only rootfs (#1204).
-        let session_home = session.paths().await?.home;
+        // The task then runs in the session layout (home at `/home`, tree at
+        // `/workbench`), and a patch that expanded into either directory is
+        // mounted at the matching path there, keeping its declared mode.
+        let session_paths = session.paths().await?;
+        // `inherit_cwd`: start where the client was invoked, inside the
+        // uploaded tree, or fall back to the root with a notice.
+        let (start_dir, mut start_notice) = match task_start_dir(
+            task.inherit_cwd,
+            &exec.cwd,
+            session_paths.working.as_utf8_path().as_std_path(),
+        ) {
+            Ok(dir) => (dir, None),
+            Err(notice) => (None, Some(notice)),
+        };
         let mut env = ctx
             .make_env_with_network(
                 &exec.task,
@@ -368,7 +421,11 @@ async fn task_producer(
                 Some(&task.vars),
                 task.packages.clone(),
                 network,
-                mctx::PatchHome::Session(session_home),
+                mctx::PatchHome::Session(session_paths.home.clone()),
+                mctx::WdLayout::Session {
+                    home: session_paths.home.as_utf8_path().to_path_buf().into(),
+                    working: session_paths.working.as_utf8_path().to_path_buf().into(),
+                },
             )
             .await
             .map_err(|e| io::Error::other(e.to_string()))?;
@@ -395,6 +452,9 @@ async fn task_producer(
                 let mut cmd = env
                     .command(&container, &inv.executable, inv.args.iter())
                     .map_err(|e| io::Error::other(format!("building command failed: {}", e)))?;
+                if let Some(dir) = &start_dir {
+                    cmd.current_dir(dir);
+                }
                 cmd.stdin(hakoniwa::Stdio::piped())
                     .stdout(hakoniwa::Stdio::piped())
                     .stderr(hakoniwa::Stdio::piped());
@@ -403,7 +463,10 @@ async fn task_producer(
                     .map_err(|e| io::Error::other(format!("command launch failed: {}", e)))?;
                 let spawned = sandbox2::Spawned::from_child(&mut child);
                 let guard = attach_or_reap(planned, spawned, &mut child).await?;
-                Ok(TaskProcess::Sandbox(HakoniwaProcess::new(child, guard)))
+                let mut process = HakoniwaProcess::new(child, guard);
+                // The fallback notice leads the first invocation's stderr.
+                process.stderr_notice = start_notice.take();
+                Ok(TaskProcess::Sandbox(process))
             }
             .await;
             if let Err(send_err) = proc_tx.send(result).await {
@@ -457,6 +520,9 @@ pub struct HakoniwaProcess {
     /// The network wiring this task's namespace got, released at the end of
     /// [`wait`](Process::wait).
     net: NetRelease,
+    /// A line the daemon shows ahead of the child's own stderr, such as the
+    /// `inherit_cwd` fallback notice (see [`task_start_dir`]).
+    stderr_notice: Option<String>,
 }
 
 /// The release of a task's network, owed once its process is gone.
@@ -531,6 +597,7 @@ impl HakoniwaProcess {
             pid: child.id() as libc::pid_t,
             state: WaitState::Spawned(Box::new(child)),
             net: NetRelease::new(net_guard),
+            stderr_notice: None,
         }
     }
 }
@@ -621,6 +688,8 @@ impl Process for TaskProcess {
         match self {
             TaskProcess::Sandbox(p) => {
                 let (i, o, e) = p.take_stdio()?;
+                let notice = p.stderr_notice.take().unwrap_or_default();
+                let e = std::io::Cursor::new(notice.into_bytes()).chain(e);
                 Some((Box::pin(i), Box::pin(o), Box::pin(e)))
             }
             TaskProcess::Echo(p) => p.take_stdio(),
@@ -877,24 +946,121 @@ impl<S: Exec> ExecTask<S> {
     /// the channel is closed once this returns — the point at which a box
     /// created for the run can end (NET-131).
     pub async fn run(self, channel: Channel<Msg>) -> u32 {
-        let (mut rs, ws) = channel.split();
+        let (rs, ws) = channel.split();
         // SSH_EXTENDED_DATA_STDERR (RFC 4254 §5.2) — selects the stderr
         // stream on the same channel as a separate extended-data type.
         let mut w = ws.make_writer();
         let mut e = ws.make_writer_ext(Some(1));
-        let mut r = rs.make_reader();
+
+        // Drive `rs.wait()` directly rather than `rs.make_reader()` so we
+        // see `ChannelMsg::Close` and `None` (sender dropped) — the signals
+        // that the SSH client is gone. `make_reader()` reduces the read half
+        // to a bare `AsyncRead`, which only surfaces `ChannelMsg::Data` and
+        // `ChannelMsg::Eof`; a lost client then looks like a normal stdin
+        // EOF, and a silent child (sleep, quiet build) keeps running
+        // indefinitely (gominimal/inbox#813).
+        // An in-memory pipe: unlike pipe(2) it cannot fail (no fds to run
+        // out of), and dropping the pump's half still gives the bridge EOF.
+        let (stdin_tx, mut stdin_rx) = tokio::io::duplex(64 * 1024);
+        let (client_lost_tx, client_lost_rx) = watch::channel(false);
+
+        let msgs = Box::pin(stream::unfold(rs, |mut rs| async move {
+            rs.wait().await.map(|msg| (msg, rs))
+        }));
+        let pump = spawn(pump_channel_input(msgs, stdin_tx, client_lost_tx));
 
         let stream = self.exec.exec(self.session.clone());
-        let exit_status = bridge(self.channel_id, stream, &mut r, &mut w, &mut e).await;
+        let mngr = self.serv.sessions_manager().await;
+        let exit_status = bridge_noting_shutdown(
+            self.channel_id,
+            stream,
+            &mut stdin_rx,
+            &mut w,
+            &mut e,
+            client_lost_rx,
+            || mngr.is_shutting_down(),
+        )
+        .await;
 
+        pump.abort();
         let _ = w.flush().await;
         let _ = e.flush().await;
 
-        drop(r);
+        drop(stdin_rx);
         let _ = ws.eof().await;
         let _ = ws.exit_status(exit_status).await; // otherwise considered -1
         let _ = ws.close().await; // needed to release the remote
         exit_status
+    }
+}
+
+/// The line an exec the daemon's shutdown ended leaves on stderr, so the
+/// client is told why its command stopped rather than handed a bare 137.
+const SHUTDOWN_NOTICE: &[u8] = b"minimald is shutting down; the command was stopped\n";
+
+/// Runs [`bridge`] and, when the daemon's shutdown is what ended it, writes
+/// [`SHUTDOWN_NOTICE`] to `e` before returning the exit status.
+///
+/// `shutting_down` is asked once the bridge returns. It reads the sessions
+/// manager's shutdown state, which is set before the manager stops any box,
+/// rather than the server's shutdown token, which is cancelled only after the
+/// manager is done and so after the command is already gone.
+async fn bridge_noting_shutdown<S, P, R, W, E>(
+    channel_id: impl Display + Clone,
+    stream: S,
+    r: &mut R,
+    w: &mut W,
+    e: &mut E,
+    client_lost: watch::Receiver<bool>,
+    shutting_down: impl FnOnce() -> bool,
+) -> u32
+where
+    P: Process,
+    S: Stream<Item = io::Result<P>> + Unpin,
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+    E: AsyncWrite + Unpin,
+{
+    let exit_status = bridge(channel_id, stream, r, w, e, client_lost).await;
+    if shutting_down() {
+        let _ = e.write_all(SHUTDOWN_NOTICE).await;
+    }
+    exit_status
+}
+
+/// Forwards the SSH channel's read half into the exec's stdin pipe and
+/// reports when the client is gone.
+///
+/// `Data` is written to `stdin`. `Eof` closes `stdin` (the child sees
+/// EOF) but keeps watching the channel: `min task run` from a terminal
+/// half-closes stdin straight away, so a disconnect almost always
+/// arrives *after* EOF and must still be seen. `Close`, or the end of
+/// `msgs` (the channel's sender dropped with the connection), sets
+/// `client_lost` to `true` and returns.
+async fn pump_channel_input<M, W>(mut msgs: M, stdin: W, client_lost: watch::Sender<bool>)
+where
+    M: Stream<Item = russh::ChannelMsg> + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut stdin = Some(stdin);
+    loop {
+        match msgs.next().await {
+            Some(russh::ChannelMsg::Data { data }) => {
+                // A failed write means the pipe's read end is gone; drop
+                // the data but keep watching for a disconnect.
+                if let Some(w) = stdin.as_mut()
+                    && w.write_all(&data).await.is_err()
+                {
+                    stdin = None;
+                }
+            }
+            Some(russh::ChannelMsg::Eof) => stdin = None,
+            Some(russh::ChannelMsg::Close) | None => {
+                let _ = client_lost.send(true);
+                return;
+            }
+            Some(_) => {}
+        }
     }
 }
 
@@ -905,6 +1071,11 @@ impl<S: Exec> ExecTask<S> {
 /// the whole sequence; only child stdio is re-grabbed per step. If the
 /// SSH client sends stdin EOF mid-sequence, subsequent children get
 /// immediate EOF on their stdin without us having to keep reading.
+///
+/// `client_lost` is a watch receiver set to `true` when the SSH client
+/// disconnects (channel close or sender drop). The bridge kills the
+/// current child and stops the sequence when it fires, whatever exit
+/// code that child reports.
 ///
 /// On any non-zero exit the sequence stops and that code is returned —
 /// matching `set -e` shell semantics for chained task invocations. If
@@ -920,6 +1091,7 @@ async fn bridge<S, P, R, W, E>(
     r: &mut R,
     w: &mut W,
     e: &mut E,
+    mut client_lost: watch::Receiver<bool>,
 ) -> u32
 where
     P: Process,
@@ -946,8 +1118,20 @@ where
                 break;
             }
         };
-        last_exit = bridge_one(channel_id.clone(), process, r, w, e, &mut stdin_open).await;
-        if last_exit != 0 {
+        last_exit = bridge_one(
+            channel_id.clone(),
+            process,
+            r,
+            w,
+            e,
+            &mut stdin_open,
+            &mut client_lost,
+        )
+        .await;
+        // `changed()` fires once per transition, so a later step would
+        // never see a disconnect an earlier step already consumed: a child
+        // that exits 0 just as the client goes must still end the sequence.
+        if last_exit != 0 || *client_lost.borrow() {
             break;
         }
     }
@@ -971,8 +1155,8 @@ where
 /// unaffected.
 ///
 /// So the loop ends on the *first* of: both output streams at EOF, the
-/// child exiting, or an SSH-channel write failing. On child exit we
-/// then, in order:
+/// child exiting, the SSH client disconnecting, or an SSH-channel write
+/// failing. On child exit we then, in order:
 ///
 /// 1. **Drain what is already buffered** ([`drain_ready`]): everything
 ///    the child wrote before exiting is sitting in the pipe and still
@@ -997,9 +1181,10 @@ where
 /// the SSH writes live in branch *handlers*, which run after the
 /// `select!` has already resolved.
 ///
-/// On an SSH-channel write failure we stop and `start_kill` the child:
-/// with no one reading its output the pipe buffer would fill, the child
-/// would block on write, and `wait` would never resolve.
+/// On an SSH-channel write failure or client disconnect we stop and
+/// `start_kill` the child: with no one reading its output the pipe
+/// buffer would fill, the child would block on write, and `wait` would
+/// never resolve.
 ///
 /// `stdin_open` is threaded by `&mut` so once the SSH client closes
 /// stdin (EOF or read error), every subsequent child in the sequence
@@ -1011,6 +1196,7 @@ async fn bridge_one<P, R, W, E>(
     w: &mut W,
     e: &mut E,
     stdin_open: &mut bool,
+    client_lost: &mut watch::Receiver<bool>,
 ) -> u32
 where
     P: Process,
@@ -1039,6 +1225,9 @@ where
     // signal, since anything still holding the pipes open past this
     // point is a grandchild we do not wait for.
     let mut child_exit: Option<io::Result<Option<i32>>> = None;
+    // Cleared once the client-loss sender is dropped without signalling:
+    // `changed()` would then resolve `Err` on every poll and spin the loop.
+    let mut client_watch_open = true;
 
     while (stdout_open || stderr_open) && !ssh_write_failed && child_exit.is_none() {
         tokio::select! {
@@ -1064,14 +1253,56 @@ where
                         child_stdin = None;
                     }
                     Ok(n) => {
-                        if let Some(cs) = child_stdin.as_mut()
-                            && let Err(err) = cs.write_all(&stdin_buf[..n]).await
-                        {
-                            tracing::warn!(
-                                %channel_id, error = %err,
-                                "exec: failed to write stdin to child; closing child stdin",
-                            );
-                            child_stdin = None;
+                        // A child that stops reading stdin parks this
+                        // write; race it against client loss so the
+                        // disconnect still reaches the kill path below.
+                        //
+                        // `write_all` is not cancel-safe: if the
+                        // client-loss branch wins the select, dropping
+                        // the write future mid-flight loses the bytes it
+                        // had already accepted. Pin the write and loop
+                        // the select until it completes, so a dropped
+                        // client-loss sender only disables that branch
+                        // and never discards stdin data.
+                        if let Some(cs) = child_stdin.as_mut() {
+                            let write_failed = {
+                                let write = cs.write_all(&stdin_buf[..n]);
+                                tokio::pin!(write);
+                                let mut write_failed = false;
+                                loop {
+                                    tokio::select! {
+                                        res = &mut write => {
+                                            if let Err(err) = res {
+                                                tracing::warn!(
+                                                    %channel_id, error = %err,
+                                                    "exec: failed to write stdin to child; closing child stdin",
+                                                );
+                                                write_failed = true;
+                                            }
+                                            break;
+                                        }
+                                        res = client_lost.wait_for(|lost| *lost), if client_watch_open => {
+                                            if res.is_err() {
+                                                // Sender dropped without signalling:
+                                                // stop polling this branch so a
+                                                // dropped sender cannot spin the loop.
+                                                client_watch_open = false;
+                                            } else {
+                                                tracing::warn!(
+                                                    %channel_id,
+                                                    "exec: ssh client disconnected; killing child",
+                                                );
+                                                ssh_write_failed = true;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                                write_failed
+                            };
+                            if write_failed {
+                                child_stdin = None;
+                            }
                         }
                     }
                 }
@@ -1124,6 +1355,21 @@ where
             // `drain_ready` covers. Nothing here touches `process`, so
             // the `&mut process` this future holds is uncontended.
             status = process.wait() => child_exit = Some(status),
+
+            // The SSH client disconnected (channel close or sender
+            // drop). Kill the child and stop — same path as a failed
+            // SSH write (gominimal/inbox#813).
+            res = client_lost.changed(), if client_watch_open => {
+                if res.is_err() {
+                    client_watch_open = false;
+                } else if *client_lost.borrow() {
+                    tracing::warn!(
+                        %channel_id,
+                        "exec: ssh client disconnected; killing child",
+                    );
+                    ssh_write_failed = true;
+                }
+            }
         }
     }
 
@@ -1178,7 +1424,27 @@ where
 
     let status = match child_exit {
         Some(status) => status,
-        None => process.wait().await,
+        // Already killed, or no disconnect signal left to watch.
+        None if ssh_write_failed || !client_watch_open => process.wait().await,
+        // The loop also ends when the child closes stdout and stderr but
+        // keeps running; a disconnect from then on must still kill it.
+        None => {
+            tokio::select! {
+                status = process.wait() => status,
+                // Reduced to a bool in the branch: the `watch::Ref` it
+                // yields is not `Send` and must not live across the wait.
+                lost = async { client_lost.wait_for(|lost| *lost).await.is_ok() } => {
+                    if lost {
+                        tracing::warn!(
+                            %channel_id,
+                            "exec: ssh client disconnected; killing child",
+                        );
+                        let _ = process.start_kill();
+                    }
+                    process.wait().await
+                }
+            }
+        }
     };
     match status {
         Ok(code) => code.unwrap_or(1) as u32,
@@ -1458,6 +1724,7 @@ pub(crate) async fn handle_exec(
             task,
             owns_box,
             args,
+            cwd,
         } => {
             let task = task.trim().to_string();
             if task.is_empty() {
@@ -1487,6 +1754,7 @@ pub(crate) async fn handle_exec(
                         task: task.clone(),
                         env: task_env,
                         drop_env,
+                        cwd,
                     },
                 };
                 let exit_status = exec_task.run(channel).await;
@@ -1635,7 +1903,7 @@ async fn end_run_box(
         .flatten()
         .and_then(|record| record.name);
     match mngr.delete_session(session_id).await {
-        Ok(()) => tracing::info!(
+        Ok(_) => tracing::info!(
             session_id = %session_id,
             session_name = session_name.as_deref().unwrap_or("<anonymous>"),
             task = %task,
@@ -2215,8 +2483,38 @@ pub(crate) mod testing {
 mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
 
-    use super::bridge;
     use super::testing::{MockEndpoints, build_mock, build_mock_seq};
+    use super::{bridge, bridge_noting_shutdown};
+
+    /// A never-firing client-loss signal for tests that exercise the
+    /// bridge without modelling a disconnect.
+    fn client_lost() -> tokio::sync::watch::Receiver<bool> {
+        tokio::sync::watch::channel(false).1
+    }
+
+    /// `inherit_cwd` on the daemon side: a task that declares it starts at
+    /// `/workbench/<cwd>` when that directory is in the uploaded tree, and
+    /// falls back to `/workbench` with a stderr notice when it is not. A task
+    /// without `inherit_cwd`, or a run from the root, keeps `/workbench`.
+    #[test]
+    fn task_start_dir_honours_inherit_cwd() {
+        use super::task_start_dir;
+
+        let tree = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tree.path().join("sub/inner")).unwrap();
+
+        assert_eq!(
+            task_start_dir(true, "sub/inner", tree.path()),
+            Ok(Some("/workbench/sub/inner".to_string()))
+        );
+        assert_eq!(task_start_dir(false, "sub/inner", tree.path()), Ok(None));
+        assert_eq!(task_start_dir(true, "", tree.path()), Ok(None));
+
+        let notice = task_start_dir(true, "sub/gone", tree.path()).unwrap_err();
+        assert!(notice.contains("sub/gone"), "{notice}");
+        assert!(notice.contains("/workbench"), "{notice}");
+        assert_eq!(notice.lines().count(), 1, "one line: {notice:?}");
+    }
 
     /// A session record carrying `mode`, with everything else at its default.
     #[cfg(target_os = "linux")]
@@ -2231,6 +2529,9 @@ mod tests {
             box_addresses: None,
             status: sessions::SessionStatus::Active,
             hooks_enabled: true,
+            // No launch ever minted these records, so none has recorded its
+            // outcome on one.
+            host_ip_enforcement: None,
             attrs: Default::default(),
         }
     }
@@ -2569,6 +2870,7 @@ mod tests {
                 &mut bridge_stdin,
                 &mut bridge_stdout,
                 &mut bridge_stderr,
+                client_lost(),
             )
             .await
         });
@@ -2599,6 +2901,67 @@ mod tests {
         assert_eq!(err, b"err!");
 
         assert!(!ctrl.was_killed());
+    }
+
+    /// An exec the daemon's shutdown ends tells the client why on stderr,
+    /// after whatever the command itself wrote there, and still reports the
+    /// command's own status. One that ends outside a shutdown gets no notice.
+    #[tokio::test]
+    async fn an_exec_ended_by_shutdown_writes_the_notice_to_stderr() {
+        for shutting_down in [true, false] {
+            let (
+                process,
+                MockEndpoints {
+                    stdin_reader: _stdin_reader,
+                    stdout_writer,
+                    mut stderr_writer,
+                    ctrl,
+                },
+            ) = build_mock();
+
+            let (closed_stdin_w, mut bridge_stdin) = duplex(64);
+            drop(closed_stdin_w);
+            let (mut bridge_stdout, _client_stdout) = duplex(64 * 1024);
+            let (mut bridge_stderr, mut client_stderr) = duplex(64 * 1024);
+
+            let bridge_task = tokio::spawn(async move {
+                let exit = bridge_noting_shutdown(
+                    "test",
+                    process,
+                    &mut bridge_stdin,
+                    &mut bridge_stdout,
+                    &mut bridge_stderr,
+                    client_lost(),
+                    || shutting_down,
+                )
+                .await;
+                (exit, bridge_stderr)
+            });
+
+            stderr_writer.write_all(b"err!").await.unwrap();
+            drop(stderr_writer);
+            drop(stdout_writer);
+            // What a box killed by the shutdown reports: 128 + SIGKILL.
+            ctrl.signal_exit(137).await;
+
+            let (exit, bridge_stderr) = bridge_task.await.unwrap();
+            assert_eq!(exit, 137, "the command's own status passes through");
+            drop(bridge_stderr);
+
+            let mut err = Vec::new();
+            client_stderr.read_to_end(&mut err).await.unwrap();
+            let expected: &[u8] = if shutting_down {
+                b"err!minimald is shutting down; the command was stopped\n"
+            } else {
+                b"err!"
+            };
+            assert_eq!(
+                err,
+                expected,
+                "shutting down: {shutting_down}; stderr was {:?}",
+                String::from_utf8_lossy(&err),
+            );
+        }
     }
 
     /// When the SSH-channel write side fails, the bridge must call
@@ -2639,6 +3002,7 @@ mod tests {
                 &mut bridge_stdin,
                 &mut bridge_stdout,
                 &mut bridge_stderr,
+                client_lost(),
             )
             .await
         });
@@ -2693,6 +3057,7 @@ mod tests {
                 &mut bridge_stdin,
                 &mut bridge_stdout,
                 &mut bridge_stderr,
+                client_lost(),
             )
             .await
         });
@@ -2716,6 +3081,304 @@ mod tests {
             !second.ctrl.was_killed(),
             "nothing beyond the exec's own command was spawned, let alone killed"
         );
+    }
+
+    /// gominimal/inbox#813: a lost client on the *read* side — the SSH
+    /// channel closes or its sender drops while the child is silent —
+    /// must still kill the child. `make_reader()` used to reduce the
+    /// read half to a bare `AsyncRead`, which only surfaces `Data` and
+    /// `Eof`; a lost client then looked like stdin EOF and a silent
+    /// child (sleep, quiet build) kept running indefinitely. The
+    /// client-loss watch signal must end the bridge and kill the child
+    /// even though the child never writes a byte.
+    #[tokio::test]
+    async fn bridge_kills_silent_child_when_client_disconnects() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let (
+            process,
+            MockEndpoints {
+                stdin_reader: _stdin_reader,
+                // Held, never written: a silent child keeps its stdio
+                // open. Dropping them would let output EOF end the loop
+                // before the client-loss branch wins the `select!`.
+                stdout_writer: _stdout_writer,
+                stderr_writer: _stderr_writer,
+                ctrl,
+            },
+        ) = build_mock();
+        // A silent child: nothing on stdout or stderr, and it never
+        // exits on its own.
+
+        // SSH stdin closed: bridge sees EOF immediately.
+        let (closed_stdin_w, mut bridge_stdin) = duplex(64);
+        drop(closed_stdin_w);
+        let (_unused_stdout_peer, mut bridge_stdout) = duplex(64 * 1024);
+        let (_unused_stderr_peer, mut bridge_stderr) = duplex(64 * 1024);
+
+        // The client-loss signal fires: the SSH channel closed.
+        let (client_lost_tx, client_lost_rx) = tokio::sync::watch::channel(false);
+
+        let bridge_task = tokio::spawn(async move {
+            bridge(
+                "test",
+                process,
+                &mut bridge_stdin,
+                &mut bridge_stdout,
+                &mut bridge_stderr,
+                client_lost_rx,
+            )
+            .await
+        });
+
+        client_lost_tx.send(true).unwrap();
+
+        let exit = timeout(Duration::from_secs(10), bridge_task)
+            .await
+            .expect("a lost client must kill a silent child promptly, not hang the bridge")
+            .unwrap();
+        // A killed mock waits back Ok(None), which the bridge maps to 1.
+        assert_eq!(exit, 1);
+        assert!(
+            ctrl.was_killed(),
+            "a silent child must be killed when its client disconnects"
+        );
+    }
+
+    /// gominimal/inbox#813: stdin EOF alone — the client closing its
+    /// input but keeping the channel open — must NOT kill a silent
+    /// child. EOF is a normal close, not a disconnect; the child keeps
+    /// running and the bridge returns the child's own exit code.
+    #[tokio::test]
+    async fn bridge_does_not_kill_silent_child_on_stdin_eof() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let (
+            process,
+            MockEndpoints {
+                stdin_reader: _stdin_reader,
+                stdout_writer,
+                stderr_writer,
+                ctrl,
+            },
+        ) = build_mock();
+        // A silent child: nothing on stdout or stderr.
+        drop(stdout_writer);
+        drop(stderr_writer);
+
+        // SSH stdin closed: bridge sees EOF immediately.
+        let (closed_stdin_w, mut bridge_stdin) = duplex(64);
+        drop(closed_stdin_w);
+        let (_unused_stdout_peer, mut bridge_stdout) = duplex(64 * 1024);
+        let (_unused_stderr_peer, mut bridge_stderr) = duplex(64 * 1024);
+
+        // The client-loss signal never fires: the channel stays open.
+        let (_client_lost_tx, client_lost_rx) = tokio::sync::watch::channel(false);
+
+        let bridge_task = tokio::spawn(async move {
+            bridge(
+                "test",
+                process,
+                &mut bridge_stdin,
+                &mut bridge_stdout,
+                &mut bridge_stderr,
+                client_lost_rx,
+            )
+            .await
+        });
+
+        // The child exits cleanly on its own; the bridge must return its
+        // code without killing it.
+        ctrl.signal_exit(7).await;
+
+        let exit = timeout(Duration::from_secs(10), bridge_task)
+            .await
+            .expect("stdin EOF alone must not hang the bridge")
+            .unwrap();
+        assert_eq!(exit, 7);
+        assert!(
+            !ctrl.was_killed(),
+            "stdin EOF is a normal close, not a disconnect; the child must not be killed"
+        );
+    }
+
+    /// A child that never reads stdin leaves the bridge parked writing
+    /// into a full stdin pipe. A disconnect arriving then must still
+    /// kill the child rather than wait on a write that never completes.
+    #[tokio::test]
+    async fn bridge_kills_child_blocked_on_stdin_when_client_disconnects() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let (
+            process,
+            MockEndpoints {
+                // Held but never read: the child's stdin pipe fills.
+                stdin_reader: _stdin_reader,
+                stdout_writer: _stdout_writer,
+                stderr_writer: _stderr_writer,
+                ctrl,
+            },
+        ) = build_mock();
+
+        let (mut client_stdin, mut bridge_stdin) = duplex(64 * 1024);
+        let (_unused_stdout_peer, mut bridge_stdout) = duplex(64 * 1024);
+        let (_unused_stderr_peer, mut bridge_stderr) = duplex(64 * 1024);
+        let (client_lost_tx, client_lost_rx) = tokio::sync::watch::channel(false);
+
+        // Far more than the child's stdin pipe holds; this writer blocks
+        // once both pipes are full, which is the point.
+        let feeder = tokio::spawn(async move {
+            let _ = client_stdin.write_all(&vec![b'x'; 512 * 1024]).await;
+        });
+
+        let bridge_task = tokio::spawn(async move {
+            bridge(
+                "test",
+                process,
+                &mut bridge_stdin,
+                &mut bridge_stdout,
+                &mut bridge_stderr,
+                client_lost_rx,
+            )
+            .await
+        });
+
+        // Let the bridge fill the child's stdin pipe and park on it.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!bridge_task.is_finished());
+
+        client_lost_tx.send(true).unwrap();
+
+        let exit = timeout(Duration::from_secs(10), bridge_task)
+            .await
+            .expect("a lost client must interrupt a blocked stdin write")
+            .unwrap();
+        assert_eq!(exit, 1);
+        assert!(ctrl.was_killed());
+        feeder.abort();
+    }
+
+    /// A child that closes stdout and stderr but keeps running ends the
+    /// I/O loop with the child still alive. A disconnect arriving while
+    /// the bridge waits on it must still kill the child; if it did not,
+    /// this test times out, since nothing else ever ends the child.
+    #[tokio::test]
+    async fn bridge_kills_child_with_closed_output_when_client_disconnects() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let (
+            process,
+            MockEndpoints {
+                stdin_reader: _stdin_reader,
+                stdout_writer,
+                stderr_writer,
+                ctrl,
+            },
+        ) = build_mock();
+        // Output closed, but the child never exits on its own.
+        drop(stdout_writer);
+        drop(stderr_writer);
+
+        let (closed_stdin_w, mut bridge_stdin) = duplex(64);
+        drop(closed_stdin_w);
+        let (_unused_stdout_peer, mut bridge_stdout) = duplex(64 * 1024);
+        let (_unused_stderr_peer, mut bridge_stderr) = duplex(64 * 1024);
+        let (client_lost_tx, client_lost_rx) = tokio::sync::watch::channel(false);
+
+        let bridge_task = tokio::spawn(async move {
+            bridge(
+                "test",
+                process,
+                &mut bridge_stdin,
+                &mut bridge_stdout,
+                &mut bridge_stderr,
+                client_lost_rx,
+            )
+            .await
+        });
+
+        // Let the loop see both EOFs and park on the final wait.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!bridge_task.is_finished());
+
+        client_lost_tx.send(true).unwrap();
+
+        let exit = timeout(Duration::from_secs(10), bridge_task)
+            .await
+            .expect("a lost client must kill a child whose output is already closed")
+            .unwrap();
+        assert_eq!(exit, 1);
+        assert!(ctrl.was_killed());
+    }
+
+    /// `min task run` from a terminal half-closes stdin before anything
+    /// else, so a disconnect arrives *after* EOF. The pump must close the
+    /// child's stdin on EOF yet keep watching, and still signal client
+    /// loss when the channel then closes.
+    #[tokio::test]
+    async fn pump_signals_client_loss_after_stdin_eof() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let (msg_tx, msg_rx) = tokio::sync::mpsc::unbounded_channel();
+        let msgs = Box::pin(futures::stream::unfold(msg_rx, |mut rx| async move {
+            rx.recv().await.map(|m| (m, rx))
+        }));
+        let (stdin_w, mut stdin_r) = duplex(64);
+        let (lost_tx, mut lost_rx) = tokio::sync::watch::channel(false);
+        let pump = tokio::spawn(super::pump_channel_input(msgs, stdin_w, lost_tx));
+
+        msg_tx
+            .send(russh::ChannelMsg::Data {
+                data: b"hi".as_slice().into(),
+            })
+            .unwrap();
+        msg_tx.send(russh::ChannelMsg::Eof).unwrap();
+
+        let mut got = Vec::new();
+        timeout(Duration::from_secs(10), stdin_r.read_to_end(&mut got))
+            .await
+            .expect("stdin EOF must close the child's stdin")
+            .unwrap();
+        assert_eq!(got, b"hi");
+        assert!(!*lost_rx.borrow(), "stdin EOF is not a disconnect");
+        assert!(!pump.is_finished(), "the pump must outlive stdin EOF");
+
+        msg_tx.send(russh::ChannelMsg::Close).unwrap();
+        timeout(Duration::from_secs(10), lost_rx.changed())
+            .await
+            .expect("a close after EOF must still signal client loss")
+            .unwrap();
+        assert!(*lost_rx.borrow());
+        pump.await.unwrap();
+    }
+
+    /// The channel's sender dropping (the connection died without a
+    /// `Close`) ends the message stream; that is a disconnect too.
+    #[tokio::test]
+    async fn pump_signals_client_loss_when_channel_sender_drops() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let (msg_tx, msg_rx) = tokio::sync::mpsc::unbounded_channel::<russh::ChannelMsg>();
+        let msgs = Box::pin(futures::stream::unfold(msg_rx, |mut rx| async move {
+            rx.recv().await.map(|m| (m, rx))
+        }));
+        let (stdin_w, _stdin_r) = duplex(64);
+        let (lost_tx, mut lost_rx) = tokio::sync::watch::channel(false);
+        let pump = tokio::spawn(super::pump_channel_input(msgs, stdin_w, lost_tx));
+
+        drop(msg_tx);
+        timeout(Duration::from_secs(10), lost_rx.changed())
+            .await
+            .expect("a dropped channel must signal client loss")
+            .unwrap();
+        assert!(*lost_rx.borrow());
+        pump.await.unwrap();
     }
 
     /// A grandchild that inherited the child's stdout keeps the pipe
@@ -2757,6 +3420,7 @@ mod tests {
                 &mut bridge_stdin,
                 &mut bridge_stdout,
                 &mut bridge_stderr,
+                client_lost(),
             )
             .await
         });
@@ -2823,6 +3487,7 @@ mod tests {
                 &mut bridge_stdin,
                 &mut bridge_stdout,
                 &mut bridge_stderr,
+                client_lost(),
             )
             .await
         });
@@ -2840,6 +3505,64 @@ mod tests {
         // The second process was never spawned, so its kill flag should
         // still be unset.
         assert!(!second.ctrl.was_killed());
+    }
+
+    /// A disconnect consumed by the first step must still stop the
+    /// sequence when that child reports exit 0 (it exited just before
+    /// the kill landed, or ignores kill like `EchoProcess`). The watch
+    /// transition is already spent, so a second, silent child would
+    /// never see it: the bridge must not start it. If it did, this test
+    /// times out, since nothing ever ends the second child.
+    #[tokio::test]
+    async fn bridge_stops_sequence_on_client_loss_after_zero_exit() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let (iter, mut endpoints) = build_mock_seq(2);
+        // Silent and never exiting: stdio held open, ctrl never signalled.
+        let second = endpoints.pop().unwrap();
+        let MockEndpoints {
+            stdin_reader: _stdin_reader,
+            stdout_writer: first_stdout,
+            stderr_writer: first_stderr,
+            ctrl: first_ctrl,
+        } = endpoints.pop().unwrap();
+        drop(first_stdout);
+        drop(first_stderr);
+        first_ctrl.signal_exit(0).await;
+
+        let (closed_stdin_w, mut bridge_stdin) = duplex(64);
+        drop(closed_stdin_w);
+        let (_unused_stdout_peer, mut bridge_stdout) = duplex(64 * 1024);
+        let (_unused_stderr_peer, mut bridge_stderr) = duplex(64 * 1024);
+
+        // The client is gone and the transition is already observed, as
+        // the first step's `changed()` branch would have left it.
+        let (client_lost_tx, mut client_lost_rx) = tokio::sync::watch::channel(false);
+        client_lost_tx.send(true).unwrap();
+        client_lost_rx.borrow_and_update();
+
+        let bridge_task = tokio::spawn(async move {
+            bridge(
+                "test",
+                iter,
+                &mut bridge_stdin,
+                &mut bridge_stdout,
+                &mut bridge_stderr,
+                client_lost_rx,
+            )
+            .await
+        });
+
+        timeout(Duration::from_secs(10), bridge_task)
+            .await
+            .expect("a lost client must end the sequence, not start the next child")
+            .unwrap();
+        assert!(
+            !second.ctrl.was_killed(),
+            "the second child must never be started"
+        );
+        drop(client_lost_tx);
     }
 
     /// A two-process sequence where both children exit cleanly: the
@@ -2875,6 +3598,7 @@ mod tests {
                 &mut bridge_stdin,
                 &mut bridge_stdout,
                 &mut bridge_stderr,
+                client_lost(),
             )
             .await
         });
@@ -2921,6 +3645,7 @@ mod tests {
                 &mut bridge_stdin,
                 &mut bridge_stdout,
                 &mut bridge_stderr,
+                client_lost(),
             )
             .await
         });
@@ -3105,6 +3830,7 @@ mod tests {
                         task: "echo_ok".to_string(),
                         owns_box: false,
                         args: vec![],
+                        cwd: String::new(),
                     }
                     .encode(),
                     &[],
@@ -3137,6 +3863,7 @@ mod tests {
                     task: "greet".to_string(),
                     owns_box: false,
                     args,
+                    cwd: String::new(),
                 }
                 .encode()
             };
@@ -3212,6 +3939,7 @@ mod tests {
                         task: "echo_ok".to_string(),
                         owns_box: true,
                         args: vec![],
+                        cwd: String::new(),
                     }
                     .encode(),
                     &[],
@@ -3273,6 +4001,7 @@ mod tests {
                         task: "echo_ok".to_string(),
                         owns_box: false,
                         args: vec![],
+                        cwd: String::new(),
                     }
                     .encode(),
                     &[],
@@ -3315,6 +4044,7 @@ mod tests {
                         task: "some_task".to_string(),
                         owns_box: false,
                         args: vec![],
+                        cwd: String::new(),
                     }
                     .encode(),
                     &[],
@@ -3335,6 +4065,7 @@ mod tests {
                         task: String::new(),
                         owns_box: false,
                         args: vec![],
+                        cwd: String::new(),
                     }
                     .encode(),
                     &[],

@@ -14,6 +14,7 @@
     reason = "test support: a harness that cannot be provisioned fails the test by panicking"
 )]
 
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
@@ -193,4 +194,50 @@ fn fetch_cached(workspace: &Path, lock: &GvproxyLock) -> PathBuf {
     tmp.persist(&dest)
         .unwrap_or_else(|e| panic!("moving the fetched gvproxy to {}: {e}", dest.display()));
     dest
+}
+
+/// Registers one box with the VM host daemon over its control socket: one
+/// request line in, one reply line out, the exchange `min session activate`
+/// makes before it creates the session. Returns the addresses the host's
+/// table allocated for the row.
+pub fn register_box(
+    control_sock: &Path,
+    name: &str,
+    egress: Option<sessions::EgressPolicy>,
+) -> Result<minimald_rpc::BoxAddresses, String> {
+    let request = minimald_rpc::BoxControlRequest::Register(minimald_rpc::RegisterBoxRequest {
+        name: name.to_string(),
+        ingress_ports: Vec::new(),
+        egress,
+        credentialed_upstream: None,
+        dynamic_ingress: None,
+        dynamic_allowed_range: None,
+    });
+    let mut line = serde_json_lenient::to_string(&request)
+        .map_err(|e| format!("serialize the box registration: {e}"))?;
+    line.push('\n');
+    let mut stream = std::os::unix::net::UnixStream::connect(control_sock)
+        .map_err(|e| format!("connect to the control socket: {e}"))?;
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(30)))
+        .map_err(|e| format!("set the control socket's read timeout: {e}"))?;
+    stream
+        .write_all(line.as_bytes())
+        .map_err(|e| format!("write the box registration: {e}"))?;
+    let mut reply = String::new();
+    BufReader::new(stream)
+        .read_line(&mut reply)
+        .map_err(|e| format!("read the box registration's reply: {e}"))?;
+    match serde_json_lenient::from_str(reply.trim())
+        .map_err(|e| format!("parse the box registration's reply {reply:?}: {e}"))?
+    {
+        minimald_rpc::BoxControlReply::Registered(registered) => Ok(minimald_rpc::BoxAddresses {
+            switch_address: registered.switch_address,
+            loopback_address: registered.loopback_address,
+        }),
+        minimald_rpc::BoxControlReply::Addresses(addresses) => Ok(addresses),
+        other => Err(format!(
+            "the VM host refused the box registration: {other:?}"
+        )),
+    }
 }

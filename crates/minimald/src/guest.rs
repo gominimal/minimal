@@ -10,9 +10,11 @@
 //!   for an initramfs root), `/proc`, and `/sys`;
 //! * entering the generic upstream rootfs — mount the ext4 root block device
 //!   and `chroot` into it so the userland (`/bin/sh`, libs) resolves;
-//! * the node ports the VM host hands the boot line — read into the daemon's
-//!   listener config, so it binds them as handed (NET-025); a token present
-//!   but unusable is a surfaced boot failure, not a fallback.
+//! * the node port the VM host hands the boot line — read into the daemon's
+//!   listener config, so it binds it as handed (NET-025); a token present
+//!   but unusable is a surfaced boot failure, not a fallback. The one port
+//!   is the hostname proxy's: the box zone is the VM host daemon's to answer
+//!   (NET-138), so no answerer port is ever handed to a guest.
 //!
 //! Per the spec we keep this minimal and "run as pid-1, revisit if zombie
 //! reaping bites".
@@ -28,7 +30,14 @@ use tokio_vsock::{VMADDR_CID_HOST, VsockAddr, VsockStream};
 /// booted. The host listens here for the one-shot `READY` marker.
 const BOOT_MARKER_PORT: u32 = 7350;
 
-// ── The node ports the boot line hands the daemon ───────────────────────
+/// The VM-wide PTY pool the guest init raises `kernel.pty.max` to. Each box's
+/// devpts is capped at [`sandbox2::config::BOX_PTY_MAX`] by its own remount,
+/// but every instance still draws from the one kernel-wide counter, so the
+/// pool must be large enough for several boxes at their cap plus the session
+/// host's own shells. 65536 is a working value.
+const GUEST_PTY_MAX: u32 = 65536;
+
+// ── The node port the boot line hands the daemon ────────────────────────
 
 /// Boot token the VM host puts on the kernel command line to hand the guest
 /// daemon its hostname-proxy port (NET-025): the kernel starts `/init` with
@@ -37,16 +46,16 @@ const BOOT_MARKER_PORT: u32 = 7350;
 /// `vm.rs` writes — keep the two in step.
 pub const HANDED_PROXY_PORT_TOKEN: &str = "MINIMALD_HOSTNAME_PROXY_PORT";
 
-/// Boot token the VM host hands the guest daemon its zone-answerer port on
-/// (NET-025); see [`HANDED_PROXY_PORT_TOKEN`] for how the tokens travel.
-pub const HANDED_ANSWERER_PORT_TOKEN: &str = "MINIMALD_ZONE_ANSWERER_PORT";
-
 /// The hostname-proxy port the VM host handed this daemon on the boot line,
 /// if it handed one. The daemon binds it as handed and never selects
 /// another: the host's box table already names exactly this port (NET-138),
 /// so a daemon-chosen replacement would publish a listener the host's gate
 /// refuses to carry (NET-081) — and strand every client pointed at the
 /// handed one.
+///
+/// This is the only port the boot line hands: a VM-hosted daemon starts no
+/// zone answerer (NET-138 — the VM host daemon's host answerer serves the
+/// zone), so no answerer token exists for a host to put on the line.
 ///
 /// `Ok(None)` when the boot carries no token — an older minvmd, a native
 /// run, or a host that handed `0` as its "pick one yourself" — leaving the
@@ -57,11 +66,29 @@ pub fn handed_proxy_port() -> Result<Option<u16>, HandedPortError> {
     handed_port(HANDED_PROXY_PORT_TOKEN)
 }
 
-/// The zone-answerer port the VM host handed this daemon on the boot line,
-/// if it handed one; see [`handed_proxy_port`] for the handoff and its
-/// binding rule.
-pub fn handed_answerer_port() -> Result<Option<u16>, HandedPortError> {
-    handed_port(HANDED_ANSWERER_PORT_TOKEN)
+/// Boot token the VM host puts beside [`HANDED_PROXY_PORT_TOKEN`] to hand the
+/// guest daemon its boot's publish generation (T93): a value the host draws
+/// fresh for every boot and the daemon echoes in every publish report, so
+/// the host tells this boot's report from a killed boot's even when both
+/// were handed the same port. Mirrors the token `minvmd`'s `vm.rs` writes —
+/// keep the two in step.
+pub const HANDED_PUBLISH_GENERATION_TOKEN: &str = "MINIMALD_PUBLISH_GENERATION";
+
+/// The publish generation the VM host handed this boot, if it handed one: an
+/// older minvmd hands none, and a value that does not parse is treated the
+/// same way — the report then goes out without one, which the host reads as
+/// an older guest's, never as another boot's.
+pub fn handed_publish_generation() -> Option<u64> {
+    parse_publish_generation(
+        std::env::var(HANDED_PUBLISH_GENERATION_TOKEN)
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Decodes a handed publish generation from its raw boot-token value.
+fn parse_publish_generation(raw: Option<&str>) -> Option<u64> {
+    raw?.trim().parse::<u64>().ok()
 }
 
 /// A boot token the host put a port on that does not carry one (NET-025):
@@ -106,22 +133,19 @@ fn handed_port(token: &'static str) -> Result<Option<u16>, HandedPortError> {
     }
 }
 
-/// Probes that the handed node ports can actually be bound, in the microVM's
-/// bind base (`0.0.0.0`, what the daemon's own listeners use) — binding each
-/// handed one, the proxy over TCP and the answerer over UDP, and dropping
-/// the probe bindings at once. Called on the pid-1 boot path before the
-/// daemon starts, so a handed port that cannot bind — held by something
-/// already in the guest, or reserved by the kernel — fails the boot here,
-/// with the error surfaced to the host, rather than after READY, when the
-/// host already believes the VM healthy and no log line would reach it.
+/// Probes that the handed node port can actually be bound, in the microVM's
+/// bind base (`0.0.0.0`, what the daemon's own listeners use) — binding it
+/// over TCP and dropping the probe binding at once. Called on the pid-1 boot
+/// path before the daemon starts, so a handed port that cannot bind — held
+/// by something already in the guest, or reserved by the kernel — fails the
+/// boot here, with the error surfaced to the host, rather than after READY,
+/// when the host already believes the VM healthy and no log line would
+/// reach it.
 ///
 /// No guest process exists before READY — this runs on the boot path — so
-/// the probe window is the daemon's own: nothing competes for the ports
-/// between this probe and the listeners' bind.
-pub fn probe_handed_node_ports(
-    proxy_port: Option<u16>,
-    answerer_port: Option<u16>,
-) -> std::io::Result<()> {
+/// the probe window is the daemon's own: nothing competes for the port
+/// between this probe and the listener's bind.
+pub fn probe_handed_node_port(proxy_port: Option<u16>) -> std::io::Result<()> {
     let bind = |label: &str, transport: &str, port: u16| {
         format!("binding the handed {label} port {port} ({transport}) in the guest")
     };
@@ -134,18 +158,6 @@ pub fn probe_handed_node_ports(
             std::io::Error::new(
                 e.kind(),
                 format!("{}: {e}", bind("hostname-proxy", "tcp", port)),
-            )
-        })?;
-    }
-    if let Some(port) = answerer_port {
-        std::net::UdpSocket::bind(std::net::SocketAddr::from((
-            std::net::Ipv4Addr::UNSPECIFIED,
-            port,
-        )))
-        .map_err(|e| {
-            std::io::Error::new(
-                e.kind(),
-                format!("{}: {e}", bind("zone-answerer", "udp", port)),
             )
         })?;
     }
@@ -366,6 +378,20 @@ pub fn enter_rootfs(device: &str) -> std::io::Result<()> {
         if let Err(e) = std::os::unix::fs::symlink("pts/ptmx", &ptmx) {
             tracing::warn!(error = %e, "linking /dev/ptmx -> pts/ptmx; interactive PTY sessions may fail");
         }
+    }
+
+    // Raise the VM-wide PTY pool so several boxes at their per-instance cap
+    // still fit. Each box's devpts is remounted with `max=<BOX_PTY_MAX>` in
+    // its pre-exec step, but the guest's own devpts (mounted above) and every
+    // box draw from the one kernel-wide counter bounded by `kernel.pty.max`
+    // minus `kernel.pty.reserve`; the kernel default (4096) leaves room for
+    // only a few boxes at their cap. Best-effort: a guest that cannot raise
+    // it still boots, just with the smaller shared pool.
+    if let Err(e) = std::fs::write(
+        format!("{NEWROOT}/proc/sys/kernel/pty/max"),
+        format!("{GUEST_PTY_MAX}\n"),
+    ) {
+        tracing::warn!(error = %e, "raising kernel.pty.max; several boxes at their PTY cap may exhaust the shared pool");
     }
 
     // NET-079: cgroup2, mounted with `nsdelegate` so the cgroup namespace a
@@ -893,10 +919,12 @@ const FITRIM: u32 =
 /// journal commits, so trimming straight after a sweep otherwise reports far
 /// less than the sweep released.
 ///
-/// Safe to run on a live filesystem — `FITRIM` is the online-discard ioctl —
-/// but it takes ext4's block-group locks as it walks, so callers schedule it
-/// against idle time rather than contending with a build. The daemon's caller
-/// is the `maintenance` actor, which runs it behind the cache clean.
+/// Safe to run on a live filesystem — `FITRIM` is the online-discard ioctl.
+/// It takes ext4's block-group locks as it walks, but ext4 skips every group
+/// it has already trimmed and freed nothing in since, so a trim with nothing
+/// new to discard is cheap even alongside a build. The daemon's caller is the
+/// `maintenance` actor, which runs it behind every cache clean and also alone
+/// every `TRIM_INTERVAL`, whatever the guest is doing.
 ///
 /// Blocking, and unbounded: the walk is proportional to the filesystem, not to
 /// what the clean freed. Callers on an async runtime owe it a blocking thread.
@@ -1087,6 +1115,55 @@ fn set_nofile_limit(soft: libc::rlim_t, hard: libc::rlim_t) -> std::io::Result<(
         .ok_or_else(std::io::Error::last_os_error)
 }
 
+/// The VM-wide kernel settings the microVM's init writes at boot, as paths
+/// under `/proc/sys` and the values written to them.
+///
+/// Every box maps onto the daemon's one kernel uid, so these are shared by all
+/// the sessions on the VM, and the kernel defaults are sized for one user:
+///
+/// * inotify. Every watcher in every box (dev servers, `tsc --watch`, language
+///   servers) charges the same per-uid counters, which default to 128
+///   instances and a watch count scaled to 1% of guest RAM (~31k on a 4 GiB
+///   guest). One session's watchers would exhaust them for every other
+///   session. 8192 instances and 524288 watches are the common dev-machine
+///   values. They are ceilings, not reservations: a watch costs about 1 KiB of
+///   kernel memory on 64-bit only while it exists, charged to the memory cgroup
+///   of the box holding it, so the full 524288 (~512 MiB) is reached only by
+///   boxes that actually watch that many files.
+/// * the kernel log. With `dmesg_restrict` at 0 any box can read the VM's
+///   kernel log, which names other boxes' processes (OOM-kill records among
+///   them). At 1, reading it needs `CAP_SYSLOG`, which no box holds.
+pub const MICROVM_SYSCTLS: &[(&str, &str)] = &[
+    ("fs/inotify/max_user_instances", "8192"),
+    ("fs/inotify/max_user_watches", "524288"),
+    ("kernel/dmesg_restrict", "1"),
+];
+
+/// Writes [`MICROVM_SYSCTLS`] through `/proc/sys`. Best effort: a setting the
+/// kernel refuses is logged and the rest are still applied, since the kernel
+/// default is the prior behaviour, not a reason to refuse to boot.
+pub fn apply_microvm_sysctls() {
+    for (path, error) in write_sysctls(std::path::Path::new("/proc/sys"), MICROVM_SYSCTLS) {
+        tracing::warn!(sysctl = path, error = %error, "could not apply a VM-wide kernel setting");
+    }
+}
+
+/// Writes each `(path, value)` under `root`, continuing past failures, and
+/// returns the ones that failed.
+fn write_sysctls(
+    root: &std::path::Path,
+    settings: &[(&'static str, &str)],
+) -> Vec<(&'static str, std::io::Error)> {
+    settings
+        .iter()
+        .filter_map(|&(path, value)| {
+            std::fs::write(root.join(path), value)
+                .err()
+                .map(|e| (path, e))
+        })
+        .collect()
+}
+
 const NANOS_IN_SECOND: u64 = 1_000_000_000;
 
 /// How far the guest's `CLOCK_REALTIME` may sit from the host's before we step
@@ -1270,7 +1347,6 @@ pub async fn run_timekeep_listener(port: u32) -> std::io::Result<std::convert::I
 /// the caller continues without egress.
 pub async fn bring_up_root_egress() -> std::io::Result<crate::net::switch::SwitchRelay> {
     use crate::net::{DEFAULT_SUBNET, VSOCK_GVPROXY_SHUTTLE_PORT, VSOCK_HOST_CID, switch};
-    use std::net::Ipv4Addr;
 
     const TAP: &str = "eth0";
     let ip = DEFAULT_SUBNET.daemon_ip();
@@ -1286,7 +1362,7 @@ pub async fn bring_up_root_egress() -> std::io::Result<crate::net::switch::Switc
     // ships no `ip`/iproute2 binary, so shelling out is not an option.
     configure_interface_v4(TAP, ip, DEFAULT_SUBNET.prefix(), Some(gateway))?;
     // Bring loopback up too (no address/route needed).
-    configure_interface_v4("lo", Ipv4Addr::LOCALHOST, 8, None)?;
+    bring_up_loopback()?;
 
     // Point the resolver at the switch's DNS server (gvproxy, at the gateway).
     // The rootfs is mounted read-only, so write to the writable /run tmpfs and
@@ -1334,6 +1410,19 @@ fn install_resolv_conf(nameserver: std::net::Ipv4Addr) -> std::io::Result<()> {
         return Err(std::io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// Brings the guest's `lo` up: the interface every loopback address the guest
+/// serves on lives on, and the one its kernel leaves down until something
+/// does this — the microVM's pid-1 has no service manager to bring it up for
+/// it, so until this runs a bind on `127.0.0.1` fails with `EADDRNOTAVAIL` on
+/// a guest whose local table does not carry the address while `lo` is down,
+/// and no connect to it has a route. No address and no route of its own: `lo`
+/// carries `127.0.0.1` the moment it comes up, and the flags ioctl this is
+/// made of is idempotent, so the egress step's own `lo` half and this one
+/// agree however often the boot runs them.
+pub fn bring_up_loopback() -> std::io::Result<()> {
+    configure_interface_v4("lo", std::net::Ipv4Addr::LOCALHOST, 8, None)
 }
 
 /// Assigns `ip`/`prefix` to `ifname`, brings it up, and (when `gateway` is set)
@@ -1545,8 +1634,17 @@ fn mount_if_absent(target: &str, source: &str, fstype: &str) {
 mod tests {
     use super::*;
 
-    /// The handed ports are read off the environment the kernel passes
-    /// through from the boot tokens: a present token parses, an absent one
+    /// The publish generation the host handed is echoed as handed; none
+    /// handed, or one that does not parse, is a report without one (T93).
+    #[test]
+    fn the_publish_generation_is_read_off_the_boot_line() {
+        assert_eq!(parse_publish_generation(Some("42")), Some(42));
+        assert_eq!(parse_publish_generation(None), None);
+        assert_eq!(parse_publish_generation(Some("not-a-generation")), None);
+    }
+
+    /// The handed port is read off the environment the kernel passes
+    /// through from the boot token: a present token parses, an absent one
     /// counts as not handed, `0` is the host's own "pick one yourself", and
     /// a present-but-unusable one is a surfaced boot error naming the token
     /// and the value it carried — a broken handoff is not papered over with
@@ -1555,13 +1653,9 @@ mod tests {
     // SAFETY: env mutation here races only other reads of the same variables,
     // and nextest runs every test in its own process.
     #[test]
-    fn handed_ports_are_read_off_the_boot_line() {
-        unsafe {
-            std::env::set_var(HANDED_PROXY_PORT_TOKEN, "7654");
-            std::env::set_var(HANDED_ANSWERER_PORT_TOKEN, "7656");
-        }
+    fn handed_port_is_read_off_the_boot_line() {
+        unsafe { std::env::set_var(HANDED_PROXY_PORT_TOKEN, "7654") };
         assert_eq!(handed_proxy_port().unwrap(), Some(7654));
-        assert_eq!(handed_answerer_port().unwrap(), Some(7656));
 
         // A present token that carries no port is the surfaced error, not a
         // quiet absence: the boot names the token and the value it carried.
@@ -1576,24 +1670,20 @@ mod tests {
         assert_eq!(handed_proxy_port().unwrap(), None);
 
         // No token at all: the pre-handoff default-then-select behaviour.
-        unsafe {
-            std::env::remove_var(HANDED_PROXY_PORT_TOKEN);
-            std::env::remove_var(HANDED_ANSWERER_PORT_TOKEN);
-        }
+        unsafe { std::env::remove_var(HANDED_PROXY_PORT_TOKEN) };
         assert_eq!(handed_proxy_port().unwrap(), None);
-        assert_eq!(handed_answerer_port().unwrap(), None);
     }
 
-    /// The eager bind the pid-1 boot owes its handed ports: each handed one
-    /// binds in the microVM's bind base — the proxy over TCP, the answerer
-    /// over UDP — and nothing left bound when the probe returns. An absent
-    /// port is probed by nothing, and a held port fails with the port and
-    /// its transport named: the boot-fatal case
-    /// `vm_hosted_daemon_binds_handed_port` drives end to end.
+    /// The eager bind the pid-1 boot owes its handed port: it binds in the
+    /// microVM's bind base — the proxy over TCP — and nothing is left bound
+    /// when the probe returns. An absent port is probed by nothing, and a
+    /// held port fails with the port and its transport named: the
+    /// boot-fatal case `vm_hosted_daemon_binds_handed_port` drives end to
+    /// end.
     #[test]
-    fn the_handed_node_ports_bind_for_the_probe_and_free_again() {
-        // Two ports nothing else holds, probed both at once: the proxy's TCP
-        // bind and the answerer's UDP bind succeed and are dropped.
+    fn the_handed_node_port_binds_for_the_probe_and_frees_again() {
+        // A port nothing else holds: the proxy's TCP bind succeeds and is
+        // dropped.
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let held = listener.local_addr().unwrap().port();
         let free_tcp = loop {
@@ -1603,30 +1693,22 @@ mod tests {
                 break port;
             }
         };
-        let free_udp = loop {
-            let probe = std::net::UdpSocket::bind(("127.0.0.1", 0)).unwrap();
-            let port = probe.local_addr().unwrap().port();
-            if port != held && port != free_tcp {
-                break port;
-            }
-        };
-        probe_handed_node_ports(Some(free_tcp), Some(free_udp))
-            .expect("two free ports bind for the probe and free again");
-        // The probe's bindings were dropped: the ports bind again at once.
+        probe_handed_node_port(Some(free_tcp))
+            .expect("a free port binds for the probe and frees again");
+        // The probe's binding was dropped: the port binds again at once.
         assert!(std::net::TcpListener::bind(("127.0.0.1", free_tcp)).is_ok());
-        assert!(std::net::UdpSocket::bind(("127.0.0.1", free_udp)).is_ok());
 
         // A handed port something already holds fails the probe, with the
         // port and its transport in the reason.
-        let error = probe_handed_node_ports(Some(held), None)
-            .expect_err("a held port cannot bind for the probe");
+        let error =
+            probe_handed_node_port(Some(held)).expect_err("a held port cannot bind for the probe");
         assert!(
             error.to_string().contains(&held.to_string()),
             "the failure names the port it could not bind, got: {error}"
         );
 
         // Nothing handed is nothing bound: the no-token boot probes nothing.
-        probe_handed_node_ports(None, None).expect("no handed port binds nothing");
+        probe_handed_node_port(None).expect("no handed port binds nothing");
     }
 
     /// Only the microVM's init is the microVM daemon: both halves of
@@ -1881,5 +1963,52 @@ mod tests {
             before.rlim_max,
             "an unreachable request must still leave us at the hard limit",
         );
+    }
+
+    /// The boot settings raise the shared inotify ceilings to the dev-machine
+    /// values and restrict the kernel log, all as paths relative to
+    /// `/proc/sys` (an absolute one would make `join` drop the root).
+    #[test]
+    fn the_boot_sysctls_widen_inotify_and_restrict_the_kernel_log() {
+        let settings: std::collections::HashMap<_, _> = MICROVM_SYSCTLS.iter().copied().collect();
+        assert_eq!(
+            settings.len(),
+            MICROVM_SYSCTLS.len(),
+            "no setting is listed twice"
+        );
+        assert_eq!(settings["fs/inotify/max_user_instances"], "8192");
+        assert_eq!(settings["fs/inotify/max_user_watches"], "524288");
+        assert_eq!(settings["kernel/dmesg_restrict"], "1");
+        assert!(
+            MICROVM_SYSCTLS
+                .iter()
+                .all(|(path, _)| !path.starts_with('/')),
+            "every path must be relative to /proc/sys",
+        );
+    }
+
+    /// Each setting is written to its file under the root, and one the kernel
+    /// refuses (here, a missing file) is reported without stopping the rest.
+    #[test]
+    fn sysctls_are_written_under_the_root_past_a_failure() {
+        let root = tempfile::tempdir().unwrap();
+        for dir in ["fs/inotify", "kernel"] {
+            std::fs::create_dir_all(root.path().join(dir)).unwrap();
+        }
+        let settings = [
+            ("fs/inotify/max_user_watches", "524288"),
+            ("vm/missing", "1"),
+            ("kernel/dmesg_restrict", "1"),
+        ];
+
+        let failed = write_sysctls(root.path(), &settings);
+
+        assert_eq!(
+            failed.iter().map(|(path, _)| *path).collect::<Vec<_>>(),
+            ["vm/missing"],
+        );
+        let read = |path: &str| std::fs::read_to_string(root.path().join(path)).unwrap();
+        assert_eq!(read("fs/inotify/max_user_watches"), "524288");
+        assert_eq!(read("kernel/dmesg_restrict"), "1");
     }
 }

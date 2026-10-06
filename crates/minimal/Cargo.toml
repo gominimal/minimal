@@ -47,6 +47,12 @@ chrono.workspace = true
 diagnostics.workspace = true
 dirs.workspace = true
 hex.workspace = true
+# The CLI's own answerer-liveness query on a VM-backed host (NET-138): one A
+# query for the host's row at the reported port, in the same wire codec the
+# VM host daemon's answerer answers with, so the two agree by construction.
+# Workspace-declared with `std` only — no runtime feature, the codec is
+# enough; the datagram is this crate's own UdpSocket.
+hickory-proto.workspace = true
 nix.workspace = true
 mctx.workspace = true
 mfile.workspace = true
@@ -94,7 +100,11 @@ ot.workspace = true
 inquire.workspace = true
 
 [dev-dependencies]
+# `term` for the pty that stands in for the user's terminal in the attach
+# tests.
+nix = { workspace = true, features = ["term"] }
 minimald = { path = "../minimald", features = ["test-support"] }
+minvmd = { path = "../minvmd", default-features = false, features = ["test-support"] }
 # `test-util` (not in tokio's `full`) for `#[tokio::test(start_paused = true)]`:
 # lets the client's handshake-deadline test elapse in virtual time.
 tokio = { workspace = true, features = ["test-util"] }
