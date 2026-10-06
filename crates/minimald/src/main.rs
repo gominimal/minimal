@@ -405,6 +405,16 @@ fn main() -> Result<(), MainError> {
     // `GetRecord`). Bounded, so a stuck task cannot hold the exit.
     runtime.shutdown_timeout(std::time::Duration::from_secs(2));
     mlog::otel::shutdown(std::time::Duration::from_secs(5));
+    // The guest's forwarded records (TEL-034): give the sender a moment to
+    // write the spans that just ended to the host before the VM goes down.
+    #[cfg(target_os = "linux")]
+    if is_minimal_microvm()
+        && !minimald::telemetry_forward::drain(std::time::Duration::from_millis(500))
+    {
+        tracing::warn!(
+            "telemetry forward: records still queued at shutdown; the host spool keeps what arrived"
+        );
+    }
     // Only now, with the flush done (or given up on), take the egress down.
     egress.tear_down();
 
@@ -686,6 +696,13 @@ async fn async_main(egress: &mut GuestEgress) -> Result<(), MainError> {
         LogMode::Console
     };
     let logger = DaemonLogger::install(log_mode)?;
+    // The guest's telemetry sender (TEL-034): started once telemetry is
+    // initialised (in the logger), a no-op unless the boot line named a
+    // forward destination.
+    #[cfg(target_os = "linux")]
+    if is_minimal_microvm() {
+        minimald::telemetry_forward::start();
+    }
 
     let listen_args = cli.listen_args().unwrap();
 

@@ -45,6 +45,12 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::Layer as _;
 use tracing_subscriber::filter::Filtered;
 
+mod forward;
+pub use forward::{
+    Destination as ForwardDestination, FORWARD_ENV, MAX_FRAME_BYTES as FORWARD_MAX_FRAME_BYTES,
+    Signal, classify_line, dropped as forward_dropped, queued as forward_queued,
+    take_receiver as take_forward_receiver,
+};
 mod spool;
 pub use spool::is_spool_file;
 mod switches;
@@ -140,6 +146,149 @@ pub fn relocate_spool(dir: std::path::PathBuf) {
     {
         tracing::info!(dir = %dir.display(), "telemetry spool relocated");
     }
+}
+
+/// Append one OTLP-JSON line to this process's spool for another process's
+/// records: a line carries its own resource, so a guest daemon's records
+/// forwarded to the VM host (TEL-034) sit in the host's `minvmd-<pid>-*.jsonl`
+/// beside the host's own, and `min bug` carries them. The caller writes the
+/// line (`minvmd` re-serializes what it parsed and stamped), never passes
+/// through text it did not check. A no-op when telemetry or the spool is
+/// off. A trailing newline is dropped; the spool adds one.
+///
+/// Foreign lines have no spool budget of their own: they share this
+/// process's spool, its 50 MiB size bound and its pruning order (expired
+/// files first, then the oldest), with the host's own records. What bounds
+/// them is the caller's: `minvmd` charges each VM, across reconnects, the
+/// larger of a line's frame and the stamped line it writes here, at most
+/// 64 KiB a second after a 4 MiB burst
+/// (`minvmd::guest_telemetry::GUEST_BYTES_PER_SEC` and `GUEST_BURST_BYTES`).
+/// So one VM that floods writes a spool's worth in no less than
+/// (50 - 4) MiB / 64 KiB/s = 736 s. The budget is per VM and this spool is
+/// shared: N VMs flooding at once take (50 - 4N) x 16 / N seconds, 336 s
+/// for two.
+pub fn spool_foreign_line(line: &str) {
+    if let Some(Some(f)) = SPOOL.get() {
+        f.append(line.trim_end_matches(['\n', '\r']));
+    }
+}
+
+/// What [`forward_request`] did with a request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Forwarded {
+    /// The signal's export is off in this process: nothing was sent.
+    Off,
+    /// A request carrying this many records' lines went out.
+    Sent(usize),
+}
+
+/// A forward destination for one signal, built once per process: the
+/// host's endpoint, the client with its header rule, and the plain headers
+/// the OTLP exporter itself would add for a plain endpoint.
+struct ForwardTarget {
+    url: Url,
+    client: ExportClient,
+    plain: Vec<(HeaderName, HeaderValue)>,
+}
+
+/// [`forward_target`]'s answer, kept per signal for the process's life.
+type ForwardTargetResult = Result<Option<std::sync::Arc<ForwardTarget>>, String>;
+
+/// The target for `signal`, from this process's switches: `Ok(None)` when
+/// the signal's export is off (no endpoint, `none`, or the header rule
+/// refused it), `Err` when the endpoint value or the client was refused.
+fn forward_target(signal: Signal) -> ForwardTargetResult {
+    static TARGETS: OnceLock<
+        std::sync::Mutex<std::collections::HashMap<Signal, ForwardTargetResult>>,
+    > = OnceLock::new();
+    let targets = TARGETS.get_or_init(Default::default);
+    let mut targets = targets
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    targets
+        .entry(signal)
+        .or_insert_with(|| {
+            let d = read_switches().decide();
+            let sd = match signal {
+                Signal::Traces => d.traces,
+                Signal::Logs => d.logs,
+            };
+            let name = signal.switch_name();
+            let Some(url) = export_url(sd.export, name) else {
+                return Ok(None);
+            };
+            let url = url?;
+            let prefixed = sd.export.prefixed();
+            let client = ExportClient::new(&url, name, prefixed, env_nonempty)?;
+            let plain = if prefixed {
+                Vec::new()
+            } else {
+                // As the exporter reads them: the signal's own headers after
+                // the base ones, so a name in both takes the signal's value.
+                let mut h = env_nonempty("OTEL_EXPORTER_OTLP_HEADERS")
+                    .map(|v| parse_headers(&v))
+                    .unwrap_or_default();
+                h.extend(
+                    env_nonempty(&format!("OTEL_EXPORTER_OTLP_{name}_HEADERS"))
+                        .map(|v| parse_headers(&v))
+                        .unwrap_or_default(),
+                );
+                h
+            };
+            Ok(Some(std::sync::Arc::new(ForwardTarget {
+                url,
+                client,
+                plain,
+            })))
+        })
+        .clone()
+}
+
+/// Send `body`, one OTLP/JSON request for `signal` that carries `records`
+/// lines of another process's records (a guest daemon's, TEL-034), to this
+/// process's endpoint for `signal`, under this process's switches and
+/// header rule: the request goes where this process's own records of that
+/// signal go, with the headers that endpoint gets, and nowhere when that
+/// export is off. The caller serializes `body` from what it parsed and
+/// checked (`minvmd` builds it from the parsed, stamped requests), so the
+/// collector reads the bytes this host's parser read; a body without the
+/// request shape for `signal`, and an empty one, is not sent. Blocking (at
+/// most [`EXPORT_TIMEOUT`]); not for an async context.
+pub fn forward_request(signal: Signal, body: String, records: usize) -> Result<Forwarded, String> {
+    let Some(target) = forward_target(signal)? else {
+        return Ok(Forwarded::Off);
+    };
+    if records == 0 {
+        return Ok(Forwarded::Sent(0));
+    }
+    if forward::classify_line(&body) != Some(signal) {
+        return Err(format!("not one {} request", signal.key()));
+    }
+    let n = records;
+    let mut headers = reqwest::header::HeaderMap::new();
+    for (k, v) in &target.plain {
+        headers.insert(k.clone(), v.clone());
+    }
+    target.client.rewrite(&mut headers);
+    headers.insert(
+        reqwest::header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    let response = target
+        .client
+        .inner
+        .post(target.url.clone())
+        .headers(headers)
+        .body(body)
+        .send()
+        // reqwest's error text names the request URL, userinfo included; the
+        // endpoint is only ever shown as its origin (TEL-040).
+        .map_err(|e| error_chain(&e.without_url()))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("the collector answered HTTP {status}"));
+    }
+    Ok(Forwarded::Sent(n))
 }
 
 /// Close this process's spool file and stop spooling: later records are
@@ -844,6 +993,31 @@ pub fn init(service_name: &str) {
     };
     let want_traces = want("TRACES", d.traces.export);
     let want_logs = want("LOGS", d.logs.export);
+    // The forward path (the microVM guest, TEL-034): `MINIMAL_OTEL_FORWARD`
+    // names where the records go instead of an OTLP endpoint, so no exporter
+    // is built beside it and any endpoint is ignored. A value that is not a
+    // destination is one warning and no forwarding. Only with the opt-in and
+    // no veto, like everything else; a signal switched off stays off.
+    let forward = match env_nonempty(forward::FORWARD_ENV) {
+        Some(v) if switches.enabled() => {
+            let dest = forward::Destination::parse(&v);
+            if dest.is_none() {
+                log.warnings.push(format!(
+                    "telemetry: {} is not a destination (vsock:<port>); nothing is forwarded",
+                    forward::FORWARD_ENV
+                ));
+            }
+            dest
+        }
+        _ => None,
+    };
+    let (want_traces, want_logs) = if forward.is_some() {
+        (None, None)
+    } else {
+        (want_traces, want_logs)
+    };
+    let forward_traces = forward.is_some() && !switches.traces.off;
+    let forward_logs = forward.is_some() && !switches.logs.off;
     // The spool directory, from the environment. The microVM's `/init` (the
     // daemon as pid 1) has none yet: no home, and its state volume mounts
     // later. Its spool is deferred, and minimald relocates it onto the volume
@@ -862,7 +1036,14 @@ pub fn init(service_name: &str) {
         .flatten();
     let spool_traces = spool_file.is_some() && d.traces.spool;
     let spool_logs = spool_file.is_some() && d.logs.spool;
-    if want_traces.is_none() && want_logs.is_none() && !spool_traces && !spool_logs {
+    if want_traces.is_none()
+        && want_logs.is_none()
+        && !spool_traces
+        && !spool_logs
+        && !forward_traces
+        && !forward_logs
+    {
+        forward::mark_absent();
         #[expect(
             clippy::let_underscore_must_use,
             reason = "a second init keeps the first value, which is the intent"
@@ -963,18 +1144,24 @@ pub fn init(service_name: &str) {
     let _ = SPOOL.set(spool_file.clone());
     let span_spool = spool_file.clone().filter(|_| spool_traces);
     let log_spool = spool_file.clone().filter(|_| spool_logs);
+    let queue = (forward_traces || forward_logs).then(forward::install);
+    if queue.is_none() {
+        forward::mark_absent();
+    }
+    // Where a signal goes, for the summary line: its endpoint's origin, the
+    // forward destination, or off.
+    let destination =
+        |exporter: bool, url: Option<&Url>, forwarded: bool| match (forwarded, forward) {
+            (true, Some(d)) => d.to_string(),
+            _ => exporter
+                .then_some(url)
+                .flatten()
+                .map_or_else(|| "off".to_owned(), endpoint_origin),
+        };
     log.summary = Some(format!(
         "telemetry on: traces -> {}, logs -> {}, spool -> {}",
-        built
-            .0
-            .as_ref()
-            .and(traces_url.as_ref())
-            .map_or_else(|| "off".to_owned(), endpoint_origin),
-        built
-            .1
-            .as_ref()
-            .and(logs_url.as_ref())
-            .map_or_else(|| "off".to_owned(), endpoint_origin),
+        destination(built.0.is_some(), traces_url.as_ref(), forward_traces),
+        destination(built.1.is_some(), logs_url.as_ref(), forward_logs),
         match spool_file.as_ref().and_then(|f| f.dir()) {
             Some(d) => d.display().to_string(),
             None if spool_file.is_some() => "deferred until the state dir is known".to_string(),
@@ -989,23 +1176,30 @@ pub fn init(service_name: &str) {
     // One resource for both providers: its `service.instance.id` is drawn
     // once, so a backend can join a process's traces and logs.
     let resource = resource(service_name);
-    let tracer_provider = (built.0.is_some() || span_spool.is_some()).then(|| {
-        let mut b = SdkTracerProvider::builder().with_resource(resource.clone());
-        if let Some(exporter) = built.0 {
-            b = b.with_batch_exporter(exporter);
-        }
-        if let Some(f) = span_spool {
-            b = b.with_span_processor(spool::SpoolSpans::new(f));
-        }
-        b.build()
-    });
-    let logger_provider = (built.1.is_some() || log_spool.is_some()).then(|| {
+    let tracer_provider =
+        (built.0.is_some() || span_spool.is_some() || forward_traces).then(|| {
+            let mut b = SdkTracerProvider::builder().with_resource(resource.clone());
+            if let Some(exporter) = built.0 {
+                b = b.with_batch_exporter(exporter);
+            }
+            if let Some(f) = span_spool {
+                b = b.with_span_processor(spool::SpoolSpans::new(f));
+            }
+            if forward_traces && let Some(q) = &queue {
+                b = b.with_span_processor(forward::ForwardSpans::new(q.clone()));
+            }
+            b.build()
+        });
+    let logger_provider = (built.1.is_some() || log_spool.is_some() || forward_logs).then(|| {
         let mut b = SdkLoggerProvider::builder().with_resource(resource);
         if let Some(exporter) = built.1 {
             b = b.with_batch_exporter(exporter);
         }
         if let Some(f) = log_spool {
             b = b.with_log_processor(spool::SpoolLogs::new(f));
+        }
+        if forward_logs && let Some(q) = &queue {
+            b = b.with_log_processor(forward::ForwardLogs::new(q.clone()));
         }
         b.build()
     });
@@ -2680,5 +2874,336 @@ mod tests {
                 super::signal_url("LOGS")
             );
         }
+    }
+
+    /// Run this test binary's `child` helper with only the given telemetry
+    /// variables, a spool directory, and `flag` set, and return its stdout.
+    fn in_child(child: &str, flag: &str, env: &[(&str, &str)]) -> (String, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut c = std::process::Command::new(std::env::current_exe().unwrap());
+        c.args(["--exact", child, "--nocapture", "--test-threads=1"]);
+        for (k, _) in std::env::vars() {
+            if k.starts_with("OTEL_") || k.starts_with("MINIMAL_") || k == "DO_NOT_TRACK" {
+                c.env_remove(k);
+            }
+        }
+        c.env(flag, "1")
+            .env("MINIMAL_OTEL_SPOOL_DIR", tmp.path().join("spool"));
+        for (k, v) in env {
+            c.env(k, v);
+        }
+        let out = c.output().unwrap();
+        assert!(
+            out.status.success(),
+            "child failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (String::from_utf8(out.stdout).unwrap(), tmp)
+    }
+
+    /// TEL-034: with `MINIMAL_OTEL_FORWARD` set, `init` installs the
+    /// providers with the forward processors and no OTLP exporter (an
+    /// endpoint beside it is ignored), the summary names the destination,
+    /// and each finished span and emitted event reaches the queue as the
+    /// spool's line. A signal switched off is not forwarded; without the
+    /// opt-in nothing is.
+    #[test]
+    fn a_forward_destination_queues_every_record_and_builds_no_exporter() {
+        let (out, _t) = in_child(
+            "otel::tests::forward_child",
+            "MLOG_FORWARD_CHILD",
+            &[
+                ("MINIMAL_TELEMETRY", "1"),
+                ("MINIMAL_OTEL_FORWARD", "vsock:7353"),
+                ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:9"),
+            ],
+        );
+        assert!(out.contains("EXPORTING true"), "{out}");
+        assert!(
+            out.contains(
+                "SUMMARY telemetry on: traces -> vsock:7353, logs -> vsock:7353, spool -> "
+            ),
+            "{out}"
+        );
+        assert!(out.contains("LINE {\"resourceSpans\":["), "{out}");
+        assert!(out.contains("LINE {\"resourceLogs\":["), "{out}");
+        assert!(out.contains("\"name\":\"forward-e2e\""), "{out}");
+
+        let (out, _t) = in_child(
+            "otel::tests::forward_child",
+            "MLOG_FORWARD_CHILD",
+            &[
+                ("MINIMAL_TELEMETRY", "1"),
+                ("MINIMAL_OTEL_FORWARD", "vsock:7353"),
+                ("MINIMAL_OTEL_TRACES_EXPORTER", "none"),
+            ],
+        );
+        assert!(!out.contains("resourceSpans"), "{out}");
+        assert!(out.contains("LINE {\"resourceLogs\":["), "{out}");
+
+        let (out, _t) = in_child(
+            "otel::tests::forward_child",
+            "MLOG_FORWARD_CHILD",
+            &[("MINIMAL_OTEL_FORWARD", "vsock:7353")],
+        );
+        assert!(out.contains("RECEIVER none"), "{out}");
+
+        let (out, _t) = in_child(
+            "otel::tests::forward_child",
+            "MLOG_FORWARD_CHILD",
+            &[
+                ("MINIMAL_TELEMETRY", "1"),
+                ("MINIMAL_OTEL_FORWARD", "udp:1"),
+            ],
+        );
+        assert!(out.contains("RECEIVER none"), "{out}");
+        assert!(
+            out.contains("WARNING telemetry: MINIMAL_OTEL_FORWARD is not a destination"),
+            "{out}"
+        );
+    }
+
+    /// Helper for `a_forward_destination_queues_every_record_and_builds_no_exporter`
+    /// (acts only in the child): records a span and an event, then prints
+    /// what the queue holds.
+    #[test]
+    fn forward_child() {
+        if std::env::var_os("MLOG_FORWARD_CHILD").is_none() {
+            return;
+        }
+        super::init("test");
+        println!("EXPORTING {}", super::exporting());
+        if let Some(log) = super::INIT_LOG.get() {
+            for w in &log.warnings {
+                println!("WARNING {w}");
+            }
+            if let Some(s) = &log.summary {
+                println!("SUMMARY {s}");
+            }
+        }
+        let Some(rx) = super::take_forward_receiver() else {
+            println!("RECEIVER none");
+            return;
+        };
+        let subscriber = tracing_subscriber::registry()
+            .with(super::span_layer())
+            .with(super::log_layer());
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info_span!("forward-e2e").in_scope(|| tracing::info!("forwarded-event"));
+        });
+        while let Ok(line) = rx.recv_timeout(std::time::Duration::from_millis(200)) {
+            println!("LINE {line}");
+        }
+    }
+
+    /// One HTTP request a sink accepted: the request line, the headers
+    /// (lower-cased names) and the body.
+    struct Received {
+        request_line: String,
+        headers: Vec<(String, String)>,
+        body: String,
+    }
+
+    /// A one-request HTTP sink on the loopback: answers `200` with an empty
+    /// body and hands back what it got.
+    fn http_sink() -> (u16, std::sync::mpsc::Receiver<Received>) {
+        use std::io::{BufRead as _, Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let Ok((stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut reader = std::io::BufReader::new(stream);
+            let mut request_line = String::new();
+            reader.read_line(&mut request_line).unwrap();
+            let mut headers = Vec::new();
+            let mut length = 0usize;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let line = line.trim_end().to_owned();
+                if line.is_empty() {
+                    break;
+                }
+                let (k, v) = line.split_once(':').unwrap();
+                let (k, v) = (k.trim().to_ascii_lowercase(), v.trim().to_owned());
+                if k == "content-length" {
+                    length = v.parse().unwrap();
+                }
+                headers.push((k, v));
+            }
+            let mut body = vec![0u8; length];
+            reader.read_exact(&mut body).unwrap();
+            let mut stream = reader.into_inner();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                .unwrap();
+            // The test is gone when this fails; nothing to do.
+            if tx
+                .send(Received {
+                    request_line: request_line.trim_end().to_owned(),
+                    headers,
+                    body: String::from_utf8(body).unwrap(),
+                })
+                .is_err()
+            {
+                eprintln!("http_sink: the test is gone");
+            }
+        });
+        (port, rx)
+    }
+
+    /// TEL-034: `forward_request` sends a request of foreign records to this
+    /// process's endpoint for the signal as OTLP/JSON, with the headers
+    /// that endpoint gets under the header rule: the plain ones
+    /// for a plain endpoint, the `MINIMAL_` ones for a `MINIMAL_` endpoint,
+    /// and nothing at all when the signal's export is off or refused.
+    #[test]
+    fn forwarded_lines_go_where_this_process_exports_with_its_headers() {
+        let lines = "{\"resourceSpans\":[{\"a\":1},{\"b\":2}]}";
+        let header = |r: &Received, name: &str| -> Option<String> {
+            r.headers
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.clone())
+        };
+
+        // A plain endpoint: the plain headers travel.
+        let (port, rx) = http_sink();
+        let (out, _t) = in_child(
+            "otel::tests::forward_lines_child",
+            "MLOG_FORWARD_LINES_CHILD",
+            &[
+                ("MINIMAL_TELEMETRY", "1"),
+                (
+                    "OTEL_EXPORTER_OTLP_ENDPOINT",
+                    &format!("http://127.0.0.1:{port}"),
+                ),
+                ("OTEL_EXPORTER_OTLP_HEADERS", "x-plain=1"),
+                ("OTEL_EXPORTER_OTLP_TRACES_HEADERS", "x-plain-traces=t"),
+                ("MINIMAL_OTEL_EXPORTER_OTLP_HEADERS", "x-ours=2"),
+                ("MLOG_FORWARD_LINES", lines),
+            ],
+        );
+        assert!(out.contains("RESULT Ok(Sent(2))"), "{out}");
+        let got = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert_eq!(got.request_line, "POST /v1/traces HTTP/1.1");
+        assert_eq!(
+            header(&got, "content-type").as_deref(),
+            Some("application/json")
+        );
+        assert_eq!(header(&got, "x-plain").as_deref(), Some("1"));
+        assert_eq!(header(&got, "x-plain-traces").as_deref(), Some("t"));
+        assert_eq!(header(&got, "x-ours"), None);
+        assert_eq!(got.body, "{\"resourceSpans\":[{\"a\":1},{\"b\":2}]}");
+
+        // A `MINIMAL_` endpoint: its own headers, never the plain ones.
+        let (port, rx) = http_sink();
+        let (out, _t) = in_child(
+            "otel::tests::forward_lines_child",
+            "MLOG_FORWARD_LINES_CHILD",
+            &[
+                ("MINIMAL_TELEMETRY", "1"),
+                (
+                    "MINIMAL_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+                    &format!("http://127.0.0.1:{port}/ours/v1/traces"),
+                ),
+                ("OTEL_EXPORTER_OTLP_HEADERS", "x-plain=1"),
+                ("MINIMAL_OTEL_EXPORTER_OTLP_HEADERS", "x-ours=2"),
+                ("MLOG_FORWARD_LINES", lines),
+            ],
+        );
+        assert!(out.contains("RESULT Ok(Sent(2))"), "{out}");
+        let got = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert_eq!(got.request_line, "POST /ours/v1/traces HTTP/1.1");
+        assert_eq!(header(&got, "x-ours").as_deref(), Some("2"));
+        assert_eq!(header(&got, "x-plain"), None);
+
+        // Refused by the header rule, off, and no endpoint: nothing is sent.
+        for env in [
+            vec![
+                ("MINIMAL_TELEMETRY", "1"),
+                ("MINIMAL_OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:9"),
+                ("OTEL_EXPORTER_OTLP_HEADERS", "x-plain=1"),
+            ],
+            vec![("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:9")],
+            vec![("MINIMAL_TELEMETRY", "1")],
+            vec![
+                ("MINIMAL_TELEMETRY", "1"),
+                ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:9"),
+                ("MINIMAL_OTEL_TRACES_EXPORTER", "none"),
+            ],
+        ] {
+            let mut env = env;
+            env.push(("MLOG_FORWARD_LINES", lines));
+            let (out, _t) = in_child(
+                "otel::tests::forward_lines_child",
+                "MLOG_FORWARD_LINES_CHILD",
+                &env,
+            );
+            assert!(out.contains("RESULT Ok(Off)"), "{env:?}: {out}");
+        }
+
+        // A body that is not a request for the signal is not sent.
+        let (out, _t) = in_child(
+            "otel::tests::forward_lines_child",
+            "MLOG_FORWARD_LINES_CHILD",
+            &[
+                ("MINIMAL_TELEMETRY", "1"),
+                ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:9"),
+                ("MLOG_FORWARD_LINES", "{\"resourceLogs\":[{\"l\":1}]}"),
+            ],
+        );
+        assert!(
+            out.contains("RESULT Err(\"not one resourceSpans request\")"),
+            "{out}"
+        );
+
+        // A collector that is not there: the error, and no panic. The
+        // endpoint carries a secret in its path (a tenant token) and in its
+        // userinfo, and the error carries neither: reqwest's error text names
+        // the request URL, path included (TEL-040).
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+            // Dropped here: the port refuses connections.
+        };
+        let (out, _t) = in_child(
+            "otel::tests::forward_lines_child",
+            "MLOG_FORWARD_LINES_CHILD",
+            &[
+                ("MINIMAL_TELEMETRY", "1"),
+                (
+                    "OTEL_EXPORTER_OTLP_ENDPOINT",
+                    &format!("http://user:s3cr3t-pw@127.0.0.1:{port}/ingest/s3cr3t-tenant"),
+                ),
+                ("MLOG_FORWARD_LINES", lines),
+            ],
+        );
+        assert!(out.contains("RESULT Err("), "{out}");
+        // The send was tried (a refused connection), so the check below is
+        // not vacuous.
+        assert!(out.to_lowercase().contains("connect"), "{out}");
+        assert!(
+            !out.contains("s3cr3t"),
+            "a forward error carries the endpoint's secrets: {out}"
+        );
+    }
+
+    /// Helper for `forwarded_lines_go_where_this_process_exports_with_its_headers`
+    /// (acts only in the child): forwards the request `MLOG_FORWARD_LINES`
+    /// carries as traces of two records, and prints the outcome.
+    #[test]
+    fn forward_lines_child() {
+        if std::env::var_os("MLOG_FORWARD_LINES_CHILD").is_none() {
+            return;
+        }
+        let body = std::env::var("MLOG_FORWARD_LINES").unwrap();
+        println!(
+            "RESULT {:?}",
+            super::forward_request(super::Signal::Traces, body, 2)
+        );
     }
 }

@@ -1,9 +1,11 @@
 //! `minvmd stop` subcommand (R4.4, R2.3).
 //!
 //! Reads `vmm_pid` from `minvmd.toml`, asks the in-VM minimald to shut down
-//! (drain sessions + quiesce the data volume) over the bridge UDS, then sends
-//! `SIGTERM` to the VMM child, waits up to 5 s, escalates to `SIGKILL` on
-//! timeout, then resets `minvmd.toml` to `Stopped`.
+//! (drain sessions + quiesce the data volume) over the bridge UDS, lets an
+//! acknowledging guest power the VM off by itself for up to
+//! `GUEST_POWEROFF_GRACE` (its exit path carries its last telemetry), then
+//! sends `SIGTERM` to the VMM child if it is still there, waits up to 5 s,
+//! escalates to `SIGKILL` on timeout, then resets `minvmd.toml` to `Stopped`.
 //!
 //! The command is idempotent: if the daemon is already stopped (or has never
 //! been provisioned), it returns successfully with no action. Stale active
@@ -57,10 +59,8 @@ fn run_with_state_dir(dir: std::path::PathBuf, quiesce_guest: bool) -> Result<()
     // Releasing the lock during the wait allows concurrent `status` reads.
     match vmm_pid {
         Some(pid) => {
-            if quiesce_guest {
-                shutdown_guest_best_effort();
-            }
-            signal_and_wait(pid)?
+            let acked = quiesce_guest && shutdown_guest_best_effort();
+            stop_vmm(pid, acked, GUEST_POWEROFF_GRACE)?
         }
         None => {
             tracing::warn!("daemon is active but vmm_pid is absent; cleaning up state");
@@ -86,8 +86,8 @@ fn run_with_state_dir(dir: std::path::PathBuf, quiesce_guest: bool) -> Result<()
 /// and quiesce the data volume before the VMM is signalled, so a clean stop
 /// leaves a clean ext4 journal. Best-effort: on any failure — guest already
 /// gone, bridge down, timeout — SIGTERM proceeds and the journal replay
-/// backstop bounds the damage.
-fn shutdown_guest_best_effort() {
+/// backstop bounds the damage. Returns whether the guest acknowledged.
+fn shutdown_guest_best_effort() -> bool {
     // Two deadlines, because they bound different things. The connect
     // deadline is short: libkrun accepts the bridge UDS connect even when the
     // guest is wedged, so a completed SSH handshake is the only proof of a
@@ -105,10 +105,80 @@ fn shutdown_guest_best_effort() {
         .and_then(|uds| {
             crate::rpc_client::shutdown_guest(&uds, GUEST_CONNECT_TIMEOUT, GUEST_SHUTDOWN_TIMEOUT)
         }) {
-        Ok(resp) => tracing::info!(?resp, "guest acknowledged Shutdown RPC"),
-        Err(e) => {
-            tracing::warn!(error = %e, "guest Shutdown RPC failed; proceeding with SIGTERM")
+        Ok(resp) => {
+            tracing::info!(?resp, "guest acknowledged Shutdown RPC");
+            true
         }
+        Err(e) => {
+            tracing::warn!(error = %e, "guest Shutdown RPC failed; proceeding with SIGTERM");
+            false
+        }
+    }
+}
+
+/// How long `stop` lets an acknowledged guest power the VM off by itself
+/// before it SIGTERMs the VMM (TEL-034, guest-vsock.md). The ack is not the
+/// guest's last word: its `rpc` span for the Shutdown (the guest's one child
+/// of `guest.shutdown`) ends only once the ack is written, and the guest's
+/// exit path (`minimald` `main`: drain, telemetry shutdown, the vsock
+/// sender's drain, then `reboot(2)`) is what carries that span and the
+/// handler's last records to the host. A SIGTERM at the ack races that path
+/// and, on a loaded host, wins (lab 715k on debian-12). The guest powering
+/// off is what makes the VMM exit, as on a `min stop`; a guest that does not
+/// within this bound gets the SIGTERM as before. Typical exit paths take a
+/// few hundred milliseconds, so a healthy stop pays that, not the bound.
+const GUEST_POWEROFF_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Take the VMM child `pid` down. When the guest acknowledged the Shutdown
+/// RPC (`acked`), first wait up to `grace` for the VM to exit by itself, so
+/// the guest's exit-time telemetry flush completes before the VMM goes;
+/// then (or at once, without an ack) [`signal_and_wait`].
+fn stop_vmm(pid: u32, acked: bool, grace: std::time::Duration) -> Result<()> {
+    let pid_t = checked_pid(pid)?;
+    if acked {
+        if wait_for_exit(pid_t, grace) {
+            tracing::debug!(pid, "the guest powered the VM off after its ack");
+            return Ok(());
+        }
+        tracing::info!(
+            pid,
+            grace_ms = u64::try_from(grace.as_millis()).unwrap_or(u64::MAX),
+            "the guest acknowledged Shutdown but did not power off within the grace; \
+             signalling the VMM (its last telemetry may not reach the host)"
+        );
+    }
+    signal_and_wait(pid)
+}
+
+fn checked_pid(pid: u32) -> Result<libc::pid_t> {
+    match libc::pid_t::try_from(pid) {
+        Ok(p) if p > 0 => Ok(p),
+        _ => Err(anyhow::anyhow!("invalid vmm_pid {pid} in state")),
+    }
+}
+
+/// Whether `pid` exists. Errors other than ESRCH count as alive (best effort,
+/// as the SIGTERM wait has always treated them).
+fn pid_alive(pid: libc::pid_t) -> bool {
+    // SAFETY: kill(pid, 0) checks for process existence without delivering a
+    // signal; `pid` is positive (see `checked_pid`).
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+/// Poll `pid` every 50 ms for up to `timeout`; whether it is gone.
+fn wait_for_exit(pid: libc::pid_t, timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if !pid_alive(pid) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
 }
 
@@ -116,11 +186,7 @@ fn shutdown_guest_best_effort() {
 fn signal_and_wait(pid: u32) -> Result<()> {
     use std::time::{Duration, Instant};
 
-    let pid_t = libc::pid_t::try_from(pid)
-        .map_err(|_| anyhow::anyhow!("invalid vmm_pid {pid} in state"))?;
-    if pid_t <= 0 {
-        return Err(anyhow::anyhow!("invalid vmm_pid {pid} in state"));
-    }
+    let pid_t = checked_pid(pid)?;
 
     // SAFETY: kill(pid, SIGTERM) delivers SIGTERM to the named process. The pid
     // was stored in minvmd.toml by the `run` supervisor that created the VMM
@@ -259,6 +325,56 @@ mod tests {
         .unwrap();
         let _lock = sd.try_acquire_alive_lock().unwrap().expect("acquire");
         assert!(run_with_state_dir(tmp.path().to_path_buf(), false).is_err());
+    }
+
+    /// A stand-in VMM: `sh -c <script>`, reaped on its own thread (as the
+    /// supervisor reaps the real one), so its pid disappears when it exits.
+    /// The join handle answers how it ended.
+    fn stand_in_vmm(script: &str) -> (u32, std::thread::JoinHandle<std::process::ExitStatus>) {
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", script])
+            .spawn()
+            .expect("spawn stand-in VMM");
+        let pid = child.id();
+        (pid, std::thread::spawn(move || child.wait().expect("wait")))
+    }
+
+    /// TEL-034 ordering: after an acknowledged Shutdown, the VMM is not
+    /// signalled while the guest is still on its exit path (flushing its
+    /// last telemetry); it is let exit by itself.
+    #[test]
+    fn an_acked_stop_lets_the_guest_power_off_before_any_signal() {
+        use std::os::unix::process::ExitStatusExt as _;
+        // Exits by itself 300 ms after the "ack", as a guest whose exit-time
+        // flush takes that long.
+        let (pid, ended) = stand_in_vmm("sleep 0.3; exit 7");
+        stop_vmm(pid, true, std::time::Duration::from_secs(3)).unwrap();
+        let status = ended.join().unwrap();
+        assert_eq!(status.signal(), None, "the VMM was signalled: {status:?}");
+        assert_eq!(status.code(), Some(7));
+    }
+
+    /// A guest that acks but never powers off still gets the SIGTERM, once
+    /// the grace is out.
+    #[test]
+    fn an_acked_stop_signals_a_vm_that_outlives_the_grace() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let (pid, ended) = stand_in_vmm("exec sleep 30");
+        let started = std::time::Instant::now();
+        stop_vmm(pid, true, std::time::Duration::from_millis(200)).unwrap();
+        assert!(started.elapsed() >= std::time::Duration::from_millis(200));
+        assert_eq!(ended.join().unwrap().signal(), Some(libc::SIGTERM));
+    }
+
+    /// Without an ack there is no exit path to wait for: SIGTERM at once.
+    #[test]
+    fn an_unacked_stop_signals_at_once() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let (pid, ended) = stand_in_vmm("exec sleep 30");
+        let started = std::time::Instant::now();
+        stop_vmm(pid, false, std::time::Duration::from_secs(30)).unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(ended.join().unwrap().signal(), Some(libc::SIGTERM));
     }
 
     #[test]

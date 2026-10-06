@@ -14,14 +14,14 @@
 //! empty environment; the kernel command line is the only way in (see
 //! `vm::kernel_cmdline`). [`guest_env`] hands it the host's telemetry
 //! decision (`mlog::otel::guest_exports`), not the variables it was decided
-//! from: the opt-in, the spool and filter settings, the per-signal
-//! off-switch under the `MINIMAL_` names the guest reads first and
-//! `TRACEPARENT`. Never a bare `OTEL_*` name, never headers and never an
-//! endpoint (TEL-033): the boot line is world-readable in the guest as
-//! `/proc/cmdline`, and minvmd logs it. With no endpoint, the guest exports
-//! nothing: every signal is `none` there and its records stay in its own
-//! spool. They reach the host's collector only over the VM's vsock channel
-//! (TEL-034), never over the guest's own network.
+//! from: the opt-in, the spool and filter settings and the per-signal
+//! off-switch under the `MINIMAL_` names the guest reads first, never a bare
+//! `OTEL_*` name, never headers, and never an endpoint: the guest's records
+//! come back to this host over the VM's vsock port
+//! (`MINIMAL_OTEL_FORWARD`, [`crate::guest_telemetry`]) and go out from
+//! here under the host's switches (TEL-034), so nothing that names a
+//! collector or a credential ever reaches the boot line, which is
+//! world-readable in the guest as `/proc/cmdline` and logged by minvmd.
 //!
 //! Everything here is a no-op when telemetry is off (`mlog::otel`'s opt-in):
 //! no ids are adopted, nothing is forwarded, the guest boot line is unchanged.
@@ -221,25 +221,14 @@ pub fn forward_trace(cmd: &mut std::process::Command) {
     }
 }
 
-/// The `KEY=VALUE` boot tokens that carry telemetry into the guest, read
-/// through `get` (the process environment in production). Empty unless
-/// telemetry is enabled on the host: a host with it off boots the guest
-/// exactly as before.
-///
-/// What crosses is the host's decision (`mlog::otel::guest_exports`, the
-/// same `Switches::decide` the host exports by), under the names the guest
-/// reads first, so the guest cannot decide differently over what reached
-/// it (audit F6): `MINIMAL_TELEMETRY=1`; `MINIMAL_OTEL_SPOOL=0` when the
-/// spool is off; `MINIMAL_OTEL_FILTER` as given; then
-/// `MINIMAL_OTEL_<signal>_EXPORTER=none` for each signal. No endpoint,
-/// headers or resource attributes ever cross (TEL-033), so the guest
-/// exports nothing and keeps its records in its own spool; no bare
-/// `OTEL_*` name crosses either, so nothing ambient can turn it back on.
-/// Any value is refused, with a warning naming the variable, when it
-/// cannot be one boot token (`vm::boot_token`: a byte outside printable
-/// ASCII without `"`). `TRACEPARENT` is added last when it is a well-formed
-/// W3C version-00 value, so the guest daemon's own startup can join the
-/// trace that booted it; anything else is dropped.
+/// The telemetry settings the guest boot line carries, as `KEY=VALUE`
+/// tokens, from the host's decision over its own environment (`get`):
+/// nothing with telemetry off (`enabled`); else the opt-in, the spool
+/// off-switch, the export filter, each signal's `none` switch, the forward
+/// destination when the supervisor bound the door (`forward`, the vsock
+/// port) and a well-formed `TRACEPARENT`. No endpoint, headers or resource
+/// attributes ever cross (TEL-033): the guest's records come back over the
+/// forward port and go out from this host (TEL-034).
 #[cfg_attr(
     all(not(minvmd_libkrun), not(test)),
     expect(
@@ -250,6 +239,7 @@ pub fn forward_trace(cmd: &mut std::process::Command) {
 pub(crate) fn guest_env(
     get: impl Fn(&str) -> Option<String>,
     enabled: bool,
+    forward: Option<u32>,
     traceparent: Option<&str>,
 ) -> Vec<String> {
     if !enabled {
@@ -263,9 +253,13 @@ pub(crate) fn guest_env(
     if let Some(filter) = get("MINIMAL_OTEL_FILTER").filter(|v| !v.is_empty()) {
         push_token(&mut out, "MINIMAL_OTEL_FILTER", &filter);
     }
-    // TEL-033: no endpoint crosses, so the guest exports no signal.
-    for signal in ["TRACES", "LOGS"] {
-        out.push(format!("MINIMAL_OTEL_{signal}_EXPORTER=none"));
+    for (signal, s) in [("TRACES", decided.traces), ("LOGS", decided.logs)] {
+        if s.off {
+            out.push(format!("MINIMAL_OTEL_{signal}_EXPORTER=none"));
+        }
+    }
+    if let Some(port) = forward {
+        out.push(format!("{}=vsock:{port}", mlog::otel::FORWARD_ENV));
     }
     match traceparent.map(|tp| (tp, TraceContext::parse_traceparent(tp))) {
         // A parsed traceparent is lower-case hex and dashes, always a token.
@@ -353,7 +347,7 @@ mod tests {
             ("MINIMAL_TELEMETRY", "1"),
             ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://10.77.0.1:4318"),
         ]);
-        assert!(guest_env(&get, false, Some("00-aa-bb-01")).is_empty());
+        assert!(guest_env(&get, false, Some(7353), Some("00-aa-bb-01")).is_empty());
     }
 
     #[test]
@@ -368,13 +362,13 @@ mod tests {
             guest_env(
                 &get,
                 true,
+                Some(7353),
                 Some("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01")
             ),
             vec![
                 "MINIMAL_TELEMETRY=1",
                 "MINIMAL_OTEL_SPOOL=0",
-                "MINIMAL_OTEL_TRACES_EXPORTER=none",
-                "MINIMAL_OTEL_LOGS_EXPORTER=none",
+                "MINIMAL_OTEL_FORWARD=vsock:7353",
                 "TRACEPARENT=00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
             ]
         );
@@ -391,22 +385,13 @@ mod tests {
             ),
             ("OTEL_RESOURCE_ATTRIBUTES", "team=x"),
         ]);
-        let out = guest_env(&get, true, None);
-        assert_eq!(
-            out,
-            vec![
-                "MINIMAL_TELEMETRY=1",
-                "MINIMAL_OTEL_TRACES_EXPORTER=none",
-                "MINIMAL_OTEL_LOGS_EXPORTER=none",
-            ]
-        );
+        let out = guest_env(&get, true, None, None);
+        assert_eq!(out, vec!["MINIMAL_TELEMETRY=1"]);
     }
 
     /// TEL-033: no endpoint ever crosses, whatever the host has set and
-    /// under either name, so the guest exports nothing: every signal is
-    /// `none` there. An endpoint on the boot line would be readable by
-    /// everything in the guest as `/proc/cmdline` and would send the guest's
-    /// records over the guest's own network.
+    /// under either name: the guest's records come back over the forward
+    /// port, and the host sends them where its own go.
     #[test]
     fn an_endpoint_never_crosses_to_the_guest() {
         let get = env(&[
@@ -424,21 +409,31 @@ mod tests {
                 "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
                 "https://user:pw@collector.example:4318/v1/logs",
             ),
-            ("MINIMAL_OTEL_TRACES_EXPORTER", "otlp"),
         ]);
-        let out = guest_env(&get, true, None);
+        let out = guest_env(&get, true, Some(7353), None);
         assert_eq!(
             out,
-            vec![
-                "MINIMAL_TELEMETRY=1",
-                "MINIMAL_OTEL_TRACES_EXPORTER=none",
-                "MINIMAL_OTEL_LOGS_EXPORTER=none",
-            ]
+            vec!["MINIMAL_TELEMETRY=1", "MINIMAL_OTEL_FORWARD=vsock:7353"]
         );
         assert!(
             out.iter()
                 .all(|t| !t.contains("ENDPOINT") && !t.contains("4318")),
             "{out:?}"
+        );
+    }
+
+    /// Without a bound door there is no forward token: the guest spools
+    /// alone, and nothing else changes.
+    #[test]
+    fn the_forward_port_crosses_only_when_the_door_is_bound() {
+        let get = env(&[("MINIMAL_TELEMETRY", "1")]);
+        assert_eq!(
+            guest_env(&get, true, None, None),
+            vec!["MINIMAL_TELEMETRY=1"]
+        );
+        assert_eq!(
+            guest_env(&get, true, Some(7353), None),
+            vec!["MINIMAL_TELEMETRY=1", "MINIMAL_OTEL_FORWARD=vsock:7353"]
         );
     }
 
@@ -451,14 +446,15 @@ mod tests {
         let get = env(&[
             ("MINIMAL_TELEMETRY", "1"),
             ("MINIMAL_OTEL_FILTER", "x\u{e0}info"),
+            ("MINIMAL_OTEL_LOGS_EXPORTER", "none"),
         ]);
-        let (out, log) = warnings(|| guest_env(&get, true, None));
+        let (out, log) = warnings(|| guest_env(&get, true, Some(7353), None));
         assert_eq!(
             out,
             vec![
                 "MINIMAL_TELEMETRY=1",
-                "MINIMAL_OTEL_TRACES_EXPORTER=none",
                 "MINIMAL_OTEL_LOGS_EXPORTER=none",
+                "MINIMAL_OTEL_FORWARD=vsock:7353",
             ]
         );
         assert!(
@@ -468,6 +464,36 @@ mod tests {
         assert!(
             !log.contains("info"),
             "a refused value itself is not logged: {log}"
+        );
+    }
+
+    /// F6: an exporter the host reads as `none` is `none` in the guest, and
+    /// one the host reads as `otlp` forwards from the guest too, even when
+    /// an ambient `OTEL_TRACES_EXPORTER=none` would have said otherwise.
+    #[test]
+    fn the_host_exporter_switch_is_what_the_guest_gets() {
+        let get = env(&[
+            ("MINIMAL_TELEMETRY", "1"),
+            ("MINIMAL_OTEL_TRACES_EXPORTER", "none"),
+            ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://10.77.0.1:4318"),
+        ]);
+        assert_eq!(
+            guest_env(&get, true, Some(7353), None),
+            vec![
+                "MINIMAL_TELEMETRY=1",
+                "MINIMAL_OTEL_TRACES_EXPORTER=none",
+                "MINIMAL_OTEL_FORWARD=vsock:7353",
+            ]
+        );
+        let get = env(&[
+            ("MINIMAL_TELEMETRY", "1"),
+            ("MINIMAL_OTEL_TRACES_EXPORTER", "otlp"),
+            ("OTEL_TRACES_EXPORTER", "none"),
+            ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://10.77.0.1:4318"),
+        ]);
+        assert_eq!(
+            guest_env(&get, true, Some(7353), None),
+            vec!["MINIMAL_TELEMETRY=1", "MINIMAL_OTEL_FORWARD=vsock:7353"]
         );
     }
 
@@ -492,6 +518,7 @@ mod tests {
         let out = guest_env(
             &get,
             true,
+            Some(7353),
             Some("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"),
         );
         assert_eq!(
@@ -500,8 +527,7 @@ mod tests {
                 "MINIMAL_TELEMETRY=1",
                 "MINIMAL_OTEL_SPOOL=0",
                 "MINIMAL_OTEL_FILTER=warn",
-                "MINIMAL_OTEL_TRACES_EXPORTER=none",
-                "MINIMAL_OTEL_LOGS_EXPORTER=none",
+                "MINIMAL_OTEL_FORWARD=vsock:7353",
                 "TRACEPARENT=00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
             ]
         );
@@ -517,11 +543,9 @@ mod tests {
         let get = env(&[("MINIMAL_TELEMETRY", "1")]);
         let good = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
         assert_eq!(
-            guest_env(&get, true, Some(good)),
+            guest_env(&get, true, None, Some(good)),
             vec![
                 "MINIMAL_TELEMETRY=1".to_string(),
-                "MINIMAL_OTEL_TRACES_EXPORTER=none".to_string(),
-                "MINIMAL_OTEL_LOGS_EXPORTER=none".to_string(),
                 format!("TRACEPARENT={good}")
             ]
         );
@@ -537,12 +561,8 @@ mod tests {
             "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-zz",
         ] {
             assert_eq!(
-                guest_env(&get, true, Some(bad)),
-                vec![
-                    "MINIMAL_TELEMETRY=1",
-                    "MINIMAL_OTEL_TRACES_EXPORTER=none",
-                    "MINIMAL_OTEL_LOGS_EXPORTER=none",
-                ],
+                guest_env(&get, true, None, Some(bad)),
+                vec!["MINIMAL_TELEMETRY=1"],
                 "{bad}"
             );
         }

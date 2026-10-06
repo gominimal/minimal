@@ -1225,7 +1225,7 @@ fn check_peer_credentials(stream: &UnixStream) -> std::io::Result<()> {
 
 /// Admit `peer_uid` only when it is the daemon's own effective uid; the
 /// decision half of the connection's peer check, apart from the socket.
-fn check_peer_uid(peer_uid: u32) -> std::io::Result<()> {
+pub(crate) fn check_peer_uid(peer_uid: u32) -> std::io::Result<()> {
     // SAFETY: geteuid has no preconditions and cannot fail.
     let my_uid = unsafe { libc::geteuid() };
     if peer_uid == my_uid {
@@ -1259,7 +1259,7 @@ fn check_peer_uid(peer_uid: u32) -> std::io::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn peer_uid(stream: &UnixStream) -> std::io::Result<u32> {
+pub(crate) fn peer_uid(stream: &UnixStream) -> std::io::Result<u32> {
     let mut cred = libc::ucred {
         pid: 0,
         uid: 0,
@@ -1284,7 +1284,7 @@ fn peer_uid(stream: &UnixStream) -> std::io::Result<u32> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn peer_uid(stream: &UnixStream) -> std::io::Result<u32> {
+pub(crate) fn peer_uid(stream: &UnixStream) -> std::io::Result<u32> {
     let mut euid: libc::uid_t = 0;
     let mut egid: libc::gid_t = 0;
     // SAFETY: getpeereid reads the peer's effective uid and gid from the
