@@ -21,7 +21,7 @@
 //! replies under the same rules, so the decision is exact at the relay for
 //! the path the box actually rides.
 //!
-//! Four jobs, one per requirement:
+//! Its jobs, each tied to a requirement:
 //!
 //! * **Pinning** (NET-066) — every DNS reply from the box's own resolver
 //!   (the switch gateway, NET-079's carve-out address) that answers a query
@@ -83,7 +83,13 @@
 //!   the relay itself and never written on to the switch, so the box's
 //!   non-A lookups for its own zone cannot leak to the host's upstream
 //!   resolvers; A queries for zone names still forward, because resolution
-//!   is the one path no box can be denied (NET-079).
+//!   is the one path no box can be denied (NET-079). The switch's resolver
+//!   answers a zone A itself only when the name is strictly below the apex
+//!   and its zone suffix is the exact lowercase `min.internal` (a
+//!   case-sensitive suffix match), and sends the apex or `x.MIN.INTERNAL`
+//!   upstream; any such zone name, of any type, is answered NXDOMAIN here
+//!   instead. Every question in a query is read, not only the first, since
+//!   the switch's resolver walks them all.
 //!
 //! What the gate deliberately is not: a DNS server. Only the resolver
 //! Minimal owns for the box is watched, only standard queries to it are
@@ -211,7 +217,7 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use hickory_proto::op::{Message, MessageType, Metadata, ResponseCode};
+use hickory_proto::op::{Message, MessageType, Metadata, Query, ResponseCode};
 use hickory_proto::rr::{Name, RData, RecordType};
 
 use super::policy::PolicyWarnLimiter;
@@ -408,6 +414,14 @@ fn answered_on_the_switch(name: &Name) -> bool {
         .is_ok_and(|zone| zone.zone_of_case(name) && name.num_labels() > zone.num_labels())
 }
 
+/// Whether `question` names the box zone (NET-072) in any case, the apex
+/// included: the gate's own, wider match, read beside
+/// [`answered_on_the_switch`] to find the zone names the switch's resolver
+/// would send on to the host's resolvers.
+fn in_zone(question: &Query) -> bool {
+    super::dns::is_zone_name(&normalized(&question.name().to_lowercase().to_string()))
+}
+
 impl DnsGate {
     /// Builds one box's gate at attach: the names its policy declared
     /// (normalized), the compiled egress rules the intersection reads, the
@@ -475,16 +489,17 @@ impl DnsGate {
     /// the box sent to `dst` is a query to this box's resolver that the
     /// relay answers itself, and if so the reply to write back toward the
     /// box instead of forwarding the query — `None` means "not mine;
-    /// forward".
+    /// forward". Every rule reads every question, not only the first, so a
+    /// name in front cannot carry a second one out.
     ///
-    /// A deny-all box's query is answered REFUSED, whatever its record type,
-    /// when any name it asks is not one the switch answers itself
-    /// ([`answered_on_the_switch`]; NET-141): every question is read, not
-    /// only the first, so a zone name in front cannot carry a second name
-    /// out. A deny-all box's zone query is answered NODATA unless every
-    /// question in it is an A. For every other box, an AAAA, HTTPS or SVCB
-    /// query, or a non-A query for a zone name, is answered NODATA (NET-136,
-    /// NET-006).
+    /// In order: a deny-all box's query is answered REFUSED, whatever its
+    /// record type, when any name it asks is not one the switch answers
+    /// itself ([`answered_on_the_switch`]; NET-141). Any box's query naming
+    /// the zone in a form the switch would send upstream — the apex, or a
+    /// zone suffix not in exact lowercase — is answered NXDOMAIN (NET-006).
+    /// Then a query is answered NODATA when any question is an AAAA, HTTPS
+    /// or SVCB (NET-136), or a zone name of any type but A (NET-006), since
+    /// the switch answers only a zone A itself.
     ///
     /// `None` is also the answer for anything that does not parse as a
     /// standard query: forwarding stays the default on every failure, so a
@@ -521,6 +536,9 @@ impl DnsGate {
         let question = query.queries.first().cloned()?;
         let rtype = question.query_type();
         let name = normalized(&question.name().to_lowercase().to_string());
+        // Every question is read, not only the first: the switch's resolver
+        // walks them all, so a name behind the first would otherwise ride a
+        // query the first one let through.
         if self.deny_all
             && query
                 .queries
@@ -531,22 +549,29 @@ impl DnsGate {
             // one ever sees the name.
             return self.answer(query, ResponseCode::Refused, &name, rtype);
         }
-        // Every name a deny-all box has left is in the zone, and its query
-        // is forwarded only when every question is an A: the zone's resolver
-        // answers A locally and sends any other type on to the host's
-        // resolvers. For every other box, NODATA (NET-136, NET-006) for an
-        // AAAA, HTTPS or SVCB query, or a non-A query for a zone name.
-        let nodata = if self.deny_all {
-            query
-                .queries
-                .iter()
-                .any(|q| q.query_type() != RecordType::A)
-        } else {
+        if query
+            .queries
+            .iter()
+            .any(|q| in_zone(q) && !answered_on_the_switch(q.name()))
+        {
+            // NXDOMAIN (NET-006): a zone name the switch's resolver would send
+            // on to the host's resolvers — the apex, or a zone suffix not in
+            // exact lowercase — is answered here, so no zone name is ever
+            // answered from off the machine.
+            return self.answer(query, ResponseCode::NXDomain, &name, rtype);
+        }
+        // NODATA (NET-136, NET-006): an AAAA, HTTPS or SVCB question, or a
+        // zone name's question of any type but A — the switch's resolver
+        // answers a zone A itself and sends every other type on to the
+        // host's resolvers. Every name a deny-all box has left here is in
+        // the zone, so its query is forwarded only when every question is A.
+        let nodata = query.queries.iter().any(|q| {
+            let rtype = q.query_type();
             matches!(
                 rtype,
                 RecordType::AAAA | RecordType::HTTPS | RecordType::SVCB
-            ) || (rtype != RecordType::A && super::dns::is_zone_name(&name))
-        };
+            ) || (rtype != RecordType::A && in_zone(q))
+        });
         if !nodata {
             return None;
         }
@@ -3054,6 +3079,137 @@ pub(crate) mod tests {
             .is_none(),
             "a non-A query for a non-zone name is forwarded"
         );
+    }
+
+    /// A query of `questions` built with `Name::from_ascii`, which keeps the
+    /// case as given (`dns_query` goes through IDNA, which lowercases).
+    fn multi_query(questions: &[(&str, RecordType)]) -> Message {
+        let mut query = Message::query();
+        for (name, rtype) in questions {
+            query.add_query(Query::query(Name::from_ascii(name).unwrap(), *rtype));
+        }
+        query
+    }
+
+    /// The gate's reply to `query`, or `None` when it forwards it; a reply
+    /// is asserted to echo the id and every question and to answer nothing.
+    fn rcode_of(gate: &DnsGate, query: &Message) -> Option<ResponseCode> {
+        let reply =
+            gate.intercept_query(&SocketAddrV4::new(RESOLVER, 53), &query.to_vec().unwrap())?;
+        let reply = Message::from_vec(&reply).expect("the gate's reply parses");
+        assert_eq!(reply.metadata.message_type, MessageType::Response);
+        assert_eq!(reply.metadata.id, query.metadata.id, "the id is echoed");
+        assert_eq!(reply.queries, query.queries, "every question is echoed");
+        assert!(reply.answers.is_empty(), "the gate's reply answers nothing");
+        Some(reply.metadata.response_code)
+    }
+
+    /// The allow-list box and the allow-all box: the boxes the zone and
+    /// NET-136 rules decide, as opposed to the deny-all box's refusal.
+    fn forwarding_gates() -> [DnsGate; 2] {
+        [
+            test_gate(),
+            gate_for(&sessions::SessionPolicy {
+                egress: None,
+                ingress: None,
+                credentialed_upstream: None,
+            }),
+        ]
+    }
+
+    /// NET-006 and NET-136 read every question, not only the first: the
+    /// switch's resolver walks them all, so a zone name or an AAAA behind an
+    /// ordinary A would otherwise ride the forwarded query upstream.
+    #[test]
+    fn every_question_is_read_for_nodata() {
+        for gate in forwarding_gates() {
+            for questions in [
+                [
+                    ("example.com.", RecordType::A),
+                    ("x.min.internal.", RecordType::TXT),
+                ],
+                [
+                    ("github.com.", RecordType::A),
+                    ("github.com.", RecordType::AAAA),
+                ],
+                [
+                    ("github.com.", RecordType::A),
+                    ("github.com.", RecordType::HTTPS),
+                ],
+            ] {
+                assert_eq!(
+                    rcode_of(&gate, &multi_query(&questions)),
+                    Some(ResponseCode::NoError),
+                    "{questions:?} is NODATA"
+                );
+            }
+            // Every question an A, the zone's in the switch's own form:
+            // forwarded, so resolution works.
+            assert_eq!(
+                rcode_of(
+                    &gate,
+                    &multi_query(&[
+                        ("github.com.", RecordType::A),
+                        ("x.min.internal.", RecordType::A),
+                    ])
+                ),
+                None,
+            );
+        }
+    }
+
+    /// NET-006: a zone name the switch's resolver would send upstream — the
+    /// apex, or a zone suffix not in exact lowercase, which its
+    /// case-sensitive suffix match misses — is answered NXDOMAIN at the
+    /// relay, in any record type and in any question; the case of the labels
+    /// below the zone does not matter to that match, so those still forward.
+    #[test]
+    fn zone_names_the_switch_would_forward_are_nxdomain() {
+        for gate in forwarding_gates() {
+            for name in [
+                "x.MIN.INTERNAL.",
+                "x.Min.Internal.",
+                "x.min.INTERNAL.",
+                "min.internal.",
+                "MIN.INTERNAL.",
+            ] {
+                for rtype in [RecordType::A, RecordType::TXT, RecordType::AAAA] {
+                    assert_eq!(
+                        rcode_of(&gate, &multi_query(&[(name, rtype)])),
+                        Some(ResponseCode::NXDomain),
+                        "{name} {rtype:?} is NXDOMAIN"
+                    );
+                }
+            }
+            // Behind an ordinary first question, too.
+            assert_eq!(
+                rcode_of(
+                    &gate,
+                    &multi_query(&[
+                        ("github.com.", RecordType::A),
+                        ("x.MIN.INTERNAL.", RecordType::A),
+                    ])
+                ),
+                Some(ResponseCode::NXDomain),
+            );
+            for name in ["X.min.internal.", "host.min.internal."] {
+                assert_eq!(
+                    rcode_of(&gate, &multi_query(&[(name, RecordType::A)])),
+                    None,
+                    "{name} is answered on the switch, so forwarded"
+                );
+            }
+        }
+
+        // The deny-all box keeps its own, stronger answer for the same names.
+        let gate = gate_for(&deny_all_egress());
+        for name in ["x.MIN.INTERNAL.", "min.internal."] {
+            assert_eq!(
+                rcode_of(&gate, &multi_query(&[(name, RecordType::A)])),
+                Some(ResponseCode::Refused),
+                "{name} stays REFUSED for a deny-all box"
+            );
+        }
     }
 
     /// An undeclared `allow_dns_hosts` pins nothing — the deny-all-by-subnet
