@@ -154,7 +154,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -1565,7 +1565,9 @@ async fn relay_control(
     // ([`PUBLISH_LEDGER_FULL_RULE`]): a forward the ledger cannot hold
     // could never be unbound at its box's end, so it is never bound. A
     // write that fails takes its note back out: a forward the gate could
-    // not deliver published nothing.
+    // not deliver published nothing. So does a publish the switch answers
+    // with a status outside 2xx: it bound nothing, and a note nothing
+    // releases would count against the bound for the gate's lifetime.
     let noted = match (verb, forward_listener(verb, &request)) {
         (ControlVerb::Expose, Some(listener)) => {
             match (published_inside(&request), published_protocol(&request)) {
@@ -1574,6 +1576,7 @@ async fn relay_control(
                     decision.request.switch_addr(),
                     inside,
                     proto,
+                    decision.applied,
                 ) {
                     Ok(noted) => noted.then_some(listener),
                     Err(full) => {
@@ -1646,7 +1649,12 @@ async fn relay_control(
             replies.end_port_at(addr, proto, inside);
         }
     }
-    let mut response = tokio::spawn(copy_switch_to_guest(switch_rx, guest_tx));
+    let answered = Arc::new(OnceLock::new());
+    let mut response = tokio::spawn(copy_switch_to_guest(
+        switch_rx,
+        guest_tx,
+        Arc::clone(&answered),
+    ));
     // The legs race, as the frame relay's do: the switch's side can end under
     // an idle guest — the per-connection close a keep-alive control channel
     // makes while the guest waits on the answer — and only the response leg
@@ -1674,21 +1682,22 @@ async fn relay_control(
                     tracing::warn!(%error, "egress gate control response leg ended");
                 }
             }
-            return;
+            None
         }
-        end = control_request_probe(&mut guest, drain_timeout) => end,
+        end = control_request_probe(&mut guest, drain_timeout) => Some(end),
     };
     match end {
+        None => {}
         // A guest that closed, and one that spoke its request and then said
         // nothing for the whole bound — its silence is its normal posture
         // while it waits on the answer — both leave the request leg done.
         // The answer is owed either way: the switch's side is half-closed, so
         // gvproxy sees the request's end and answers it, and the drain that
         // delivers it is bounded.
-        ControlEnd::GuestClosed | ControlEnd::GuestSilent => {
+        Some(ControlEnd::GuestClosed | ControlEnd::GuestSilent) => {
             finish_control(&mut response, &mut switch, drain_timeout).await;
         }
-        ControlEnd::SpokePastRequest => {
+        Some(ControlEnd::SpokePastRequest) => {
             // Refused, at the frame drops' cadence: a guest can attempt this
             // on a fresh connection as cheaply as it can send a frame, and
             // the refusal must not become the flood.
@@ -1706,6 +1715,24 @@ async fn relay_control(
             // than aborting the response leg and dropping an answer
             // mid-flight.
             finish_control(&mut response, &mut switch, drain_timeout).await;
+        }
+    }
+    // A publish the switch refused bound nothing: its note comes back out,
+    // with any records it opened. A publish left unanswered keeps its note,
+    // since the switch may have bound it, and the box's end unbinds it; an
+    // unexpose of a forward that is not bound counts as done there.
+    if let (Some(listener), Some(&status)) = (noted, answered.get())
+        && !(200..300).contains(&status)
+        && let Some((addr, inside, proto)) = forwards.note_retracted(listener)
+    {
+        tracing::info!(
+            status,
+            switch_addr = %Ipv4Addr::from(addr),
+            local = %forward_revoke::listener_local(listener.0, listener.1),
+            "the switch refused a publish; the egress gate's ledger released its note"
+        );
+        if !forwards.still_published(addr, inside, proto) {
+            replies.end_port_at(addr, proto, inside);
         }
     }
 }
@@ -1876,12 +1903,19 @@ struct ControlDecision {
 /// ports a control connection noted. The lock is held only across a lookup
 /// or an update, never across an await.
 ///
-/// The table is bounded at [`PUBLISHED_FORWARDS_TRACKED`]. At the bound a
-/// new publish is refused ([`PUBLISH_LEDGER_FULL_RULE`]) rather than an old
-/// attribution evicted: an evicted entry would be a forward still bound on
-/// the host that its box's end could no longer name, so it would never be
-/// unbound. A box's runtime ports can reach the bound (a wide dynamic range
-/// and a busy box), so the refusal is real, typed and logged.
+/// The row-held publishes are bounded at [`PUBLISHED_FORWARDS_TRACKED`]. At
+/// the bound a new one is refused ([`PUBLISH_LEDGER_FULL_RULE`]) rather than
+/// an old attribution evicted: an evicted entry would be a forward still
+/// bound on the host that its box's end could no longer name, so it would
+/// never be unbound. A box's runtime ports can reach the bound (a wide
+/// dynamic range and a busy box), so the refusal is real, typed and logged.
+///
+/// The interim's publishes ([`Applied::Interim`]) are counted apart, against
+/// [`INTERIM_PUBLISHES_TRACKED`], and at that bound the oldest of them is
+/// evicted. No row's withdrawal ever names their address, so the host never
+/// unbinds them at a box's end and refusing to evict one protects nothing;
+/// counted with the row-held ones, enough of them would refuse every box's
+/// publish until the gate restarts.
 #[derive(Debug, Default)]
 struct PublishedForwards {
     applied: Mutex<Vec<AppliedPublish>>,
@@ -1900,12 +1934,17 @@ struct PublishedForwards {
 type Listener = ([u8; 4], u16);
 
 /// One applied publish in the ledger: its listener, the address it was
-/// applied at, the inside port its forward dials and the protocol it named.
-type AppliedPublish = (Listener, [u8; 4], u16, u8);
+/// applied at, the inside port its forward dials, the protocol it named, and
+/// whether a row or the interim applied it.
+type AppliedPublish = (Listener, [u8; 4], u16, u8, Applied);
 
-/// How many applied publishes' attributions the ledger keeps. A publish past
-/// the bound is refused ([`LedgerFull`]).
+/// How many row-held publishes' attributions the ledger keeps. A row-held
+/// publish past the bound is refused ([`LedgerFull`]).
 const PUBLISHED_FORWARDS_TRACKED: usize = 1024;
+
+/// How many of the interim's publishes' attributions the ledger keeps, apart
+/// from the row-held ones. Past the bound the oldest interim one is evicted.
+const INTERIM_PUBLISHES_TRACKED: usize = 1024;
 
 /// A publish refused because the ledger holds [`PUBLISHED_FORWARDS_TRACKED`]
 /// forwards already: the gate could not unbind one more at its box's end.
@@ -1949,8 +1988,8 @@ impl PublishedForwards {
     fn published_at(&self, addr: [u8; 4]) -> Vec<(Listener, u16, u8)> {
         self.lock()
             .iter()
-            .filter(|(_, at, _, _)| *at == addr)
-            .map(|(listener, _, inside, proto)| (*listener, *inside, *proto))
+            .filter(|(_, at, _, _, _)| *at == addr)
+            .map(|(listener, _, inside, proto, _)| (*listener, *inside, *proto))
             .collect()
     }
 
@@ -1960,7 +1999,7 @@ impl PublishedForwards {
         let mut applied = self.lock();
         let Some(at) = applied
             .iter()
-            .position(|(held, at, _, _)| *held == listener && *at == addr)
+            .position(|(held, at, _, _, _)| *held == listener && *at == addr)
         else {
             return false;
         };
@@ -1969,31 +2008,49 @@ impl PublishedForwards {
     }
 
     /// Notes a publish the gate is about to apply: the address its listener
-    /// is applied at, the inside port its forward dials and the protocol it
-    /// publishes. The listener is keyed first — gvproxy binds one forwarder
-    /// per loopback listener, so a second publish for a held listener never
-    /// becomes live — and `Ok(false)` says the listener was already held, so
-    /// nothing new was noted.
+    /// is applied at, the inside port its forward dials, the protocol it
+    /// publishes and what applied it. The listener is keyed first — gvproxy
+    /// binds one forwarder per loopback listener, so a second publish for a
+    /// held listener never becomes live — and `Ok(false)` says the listener
+    /// was already held, so nothing new was noted.
+    ///
+    /// An interim publish at [`INTERIM_PUBLISHES_TRACKED`] evicts the oldest
+    /// interim attribution, and never counts against the row-held bound.
     ///
     /// # Errors
     ///
-    /// [`LedgerFull`] at [`PUBLISHED_FORWARDS_TRACKED`]: the publish is
-    /// refused, never an older attribution evicted.
+    /// [`LedgerFull`] for a row-held publish at
+    /// [`PUBLISHED_FORWARDS_TRACKED`]: the publish is refused, never an older
+    /// row-held attribution evicted.
     fn note_published(
         &self,
         listener: Listener,
         addr: [u8; 4],
         inside: u16,
         proto: u8,
+        by: Applied,
     ) -> Result<bool, LedgerFull> {
         let mut applied = self.lock();
-        if applied.iter().any(|(held, _, _, _)| *held == listener) {
+        if applied.iter().any(|(held, _, _, _, _)| *held == listener) {
             return Ok(false);
         }
-        if applied.len() >= PUBLISHED_FORWARDS_TRACKED {
-            return Err(LedgerFull);
+        let held_by = applied.iter().filter(|entry| entry.4 == by).count();
+        match by {
+            Applied::Row if held_by >= PUBLISHED_FORWARDS_TRACKED => return Err(LedgerFull),
+            Applied::Interim if held_by >= INTERIM_PUBLISHES_TRACKED => {
+                if let Some(oldest) = applied.iter().position(|entry| entry.4 == Applied::Interim) {
+                    let ((ip, port), at, _, _, _) = applied.remove(oldest);
+                    tracing::warn!(
+                        listener = %std::net::SocketAddrV4::new(ip.into(), port),
+                        addr = %Ipv4Addr::from(at),
+                        "the egress gate's ledger evicted its oldest interim publish at its bound; \
+                         a guest retraction of that forward is now unattributed",
+                    );
+                }
+            }
+            Applied::Row | Applied::Interim => {}
         }
-        applied.push((listener, addr, inside, proto));
+        applied.push((listener, addr, inside, proto, by));
         Ok(true)
     }
 
@@ -2010,9 +2067,9 @@ impl PublishedForwards {
         let mut applied = self.lock();
         applied
             .iter()
-            .position(|(held, _, _, _)| *held == listener)
+            .position(|(held, _, _, _, _)| *held == listener)
             .map(|at| {
-                let (_, addr, inside, proto) = applied.remove(at);
+                let (_, addr, inside, proto, _) = applied.remove(at);
                 (addr, inside, proto)
             })
     }
@@ -2022,8 +2079,8 @@ impl PublishedForwards {
     fn address_of(&self, listener: Listener) -> Option<[u8; 4]> {
         self.lock()
             .iter()
-            .find(|(held, _, _, _)| *held == listener)
-            .map(|(_, addr, _, _)| *addr)
+            .find(|(held, _, _, _, _)| *held == listener)
+            .map(|(_, addr, _, _, _)| *addr)
     }
 
     /// The protocol the applied publish of `listener` was published in,
@@ -2031,8 +2088,8 @@ impl PublishedForwards {
     fn protocol_of(&self, listener: Listener) -> Option<u8> {
         self.lock()
             .iter()
-            .find(|(held, _, _, _)| *held == listener)
-            .map(|(_, _, _, proto)| *proto)
+            .find(|(held, _, _, _, _)| *held == listener)
+            .map(|(_, _, _, proto, _)| *proto)
     }
 
     /// Whether an applied publish's forward dials `addr` at `port`: the
@@ -2047,7 +2104,7 @@ impl PublishedForwards {
     fn inside_published(&self, addr: [u8; 4], port: u16) -> bool {
         self.lock()
             .iter()
-            .any(|(_, at, inside, _)| *at == addr && *inside == port)
+            .any(|(_, at, inside, _, _)| *at == addr && *inside == port)
     }
 
     /// Whether an applied publish still dials `addr` at `inside` in
@@ -2057,7 +2114,7 @@ impl PublishedForwards {
     fn still_published(&self, addr: [u8; 4], inside: u16, proto: u8) -> bool {
         self.lock()
             .iter()
-            .any(|(_, at, port, p)| *at == addr && *port == inside && *p == proto)
+            .any(|(_, at, port, p, _)| *at == addr && *port == inside && *p == proto)
     }
 
     /// Notes a rowless address an applied switch request named as the
@@ -2100,7 +2157,7 @@ impl PublishedForwards {
             .lock()
             .expect("the vouched set's lock is held only across a lookup or an update")
             .contains(&addr);
-        vouched || self.lock().iter().any(|(_, at, _, _)| *at == addr)
+        vouched || self.lock().iter().any(|(_, at, _, _, _)| *at == addr)
     }
 
     fn lock(&self) -> MutexGuard<'_, Vec<AppliedPublish>> {
@@ -2947,15 +3004,48 @@ fn is_client_protocol(protocol: &str) -> bool {
 }
 
 /// switch → guest on a control connection, untouched: the gate applies no
-/// policy and parses nothing on this leg — bytes flow as they came. A frame
+/// policy on this leg — bytes flow as they came. It reads one thing on the
+/// way through, the answer's status code, into `status`: a publish the
+/// switch refused takes its ledger note back ([`relay_control`]). A frame
 /// connection does not use it: its ingress is [`relay_switch_frames_to_guest`],
 /// which reads the DNS replies through, and everything else about the two
 /// legs is the same — nothing is decided, nothing is held back.
 async fn copy_switch_to_guest(
     mut switch: OwnedReadHalf,
     mut guest: OwnedWriteHalf,
+    status: Arc<OnceLock<u16>>,
 ) -> io::Result<()> {
-    tokio::io::copy(&mut switch, &mut guest).await.map(|_| ())
+    let mut head = Vec::new();
+    let mut chunk = [0u8; CONTROL_READ];
+    loop {
+        let n = switch.read(&mut chunk).await?;
+        if n == 0 {
+            return Ok(());
+        }
+        let read = chunk.get(..n).unwrap_or_default();
+        if status.get().is_none() && head.len() < MAX_STATUS_LINE {
+            head.extend_from_slice(read);
+            if let Some(code) = status_code(&head) {
+                let _set = status.set(code);
+            }
+        }
+        guest.write_all(read).await?;
+    }
+}
+
+/// How much of the switch's answer the control relay reads for its status
+/// line ([`copy_switch_to_guest`]).
+const MAX_STATUS_LINE: usize = 256;
+
+/// The status code of an HTTP answer's head, once its status line is whole.
+fn status_code(head: &[u8]) -> Option<u16> {
+    let end = head.iter().position(|&byte| byte == b'\n')?;
+    std::str::from_utf8(head.get(..end)?)
+        .ok()?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
 }
 
 /// switch → guest on an upgraded connection, framed and observed. Ingress is
@@ -6959,6 +7049,7 @@ mod tests {
                 LEASE,
                 18080,
                 super::egress::IPPROTO_TCP,
+                sessions::core::switch_request::Applied::Row,
             )
             .expect("an empty ledger has room for one publish");
         assert!(
@@ -7101,6 +7192,7 @@ mod tests {
                 node_addr,
                 7654,
                 super::egress::IPPROTO_TCP,
+                sessions::core::switch_request::Applied::Row,
             )
             .expect("an empty ledger has room for one publish");
         assert!(
@@ -7262,6 +7354,7 @@ mod tests {
                 LEASE,
                 18080,
                 super::egress::IPPROTO_TCP,
+                sessions::core::switch_request::Applied::Row,
             )
             .expect("an empty ledger has room for one publish");
         assert!(
@@ -7833,6 +7926,63 @@ mod tests {
         }
     }
 
+    /// A publish the switch answers with an error bound nothing, so its
+    /// ledger note comes back out. Kept, it would count against the bound
+    /// for the gate's lifetime, and the box's end would try to unbind a
+    /// forward that was never bound, holding the address while it did.
+    #[tokio::test]
+    async fn a_publish_the_switch_refuses_leaves_no_ledger_entry() {
+        let registry = BoxRegistry::new(SUBNET);
+        let handle = registry.clone();
+        registry.register(
+            BoxRegistration::new("web", Ipv4Addr::from(LEASE), Ipv4Addr::LOCALHOST)
+                .with_admitted_ports([8080]),
+        );
+        let publish = expose_request("127.0.0.1:8080", "100.64.0.9:18080", "tcp");
+        let mut h = gate_over_control(registry, publish).await;
+
+        let body = "listen tcp 127.0.0.1:8080: bind: address already in use";
+        let refused = format!(
+            "HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\n\
+             Content-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        h.switch
+            .write_all(refused.as_bytes())
+            .await
+            .expect("answering the expose with an error");
+        let mut seen = vec![0u8; refused.len()];
+        read_within(&mut h.guest, &mut seen).await;
+        assert_eq!(
+            seen,
+            refused.as_bytes(),
+            "the refusal reaches the guest verbatim"
+        );
+        h.guest.shutdown().await.expect("closing the guest's side");
+        h.switch
+            .shutdown()
+            .await
+            .expect("closing the switch's side");
+        wait_for_log(&h.log, "the egress gate's ledger released its note").await;
+
+        // The box ends. The ledger holds nothing at its address, so the
+        // revocation unbinds nothing and the hold ends without a dial.
+        assert!(handle.withdraw(Ipv4Addr::from(LEASE)).is_some());
+        tokio::time::timeout(DEADLINE, async {
+            while h.table.revocation_pending(LEASE) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the hold ends with nothing to unbind");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), h.switch_listener.accept())
+                .await
+                .is_err(),
+            "the gate dialed the switch to unbind a forward that was never bound"
+        );
+    }
+
     /// Reads one forwarder request off `stream` up to the end of its JSON
     /// body, for the tests that stand in for the switch's control surface.
     async fn read_forwarder_request(stream: &mut UnixStream) -> String {
@@ -7980,7 +8130,8 @@ mod tests {
                 ([127, 0, 0, 1], 8080),
                 LEASE,
                 18080,
-                super::egress::IPPROTO_TCP
+                super::egress::IPPROTO_TCP,
+                sessions::core::switch_request::Applied::Row
             ),
             Ok(true)
         );
@@ -12677,11 +12828,23 @@ mod tests {
 
         let ledger = super::PublishedForwards::new();
         assert_eq!(
-            ledger.note_published(a, [100, 64, 0, 9], 18080, super::egress::IPPROTO_TCP),
+            ledger.note_published(
+                a,
+                [100, 64, 0, 9],
+                18080,
+                super::egress::IPPROTO_TCP,
+                sessions::core::switch_request::Applied::Row
+            ),
             Ok(true)
         );
         assert_eq!(
-            ledger.note_published(b, [100, 64, 0, 10], 18081, super::egress::IPPROTO_UDP),
+            ledger.note_published(
+                b,
+                [100, 64, 0, 10],
+                18081,
+                super::egress::IPPROTO_UDP,
+                sessions::core::switch_request::Applied::Row
+            ),
             Ok(true)
         );
         assert_eq!(ledger.address_of(a), Some([100, 64, 0, 9]));
@@ -12742,13 +12905,25 @@ mod tests {
         };
         for n in 0..super::PUBLISHED_FORWARDS_TRACKED {
             assert_eq!(
-                ledger.note_published(listener(n), addr, 18080, tcp),
+                ledger.note_published(
+                    listener(n),
+                    addr,
+                    18080,
+                    tcp,
+                    sessions::core::switch_request::Applied::Row
+                ),
                 Ok(true)
             );
         }
         let past = listener(super::PUBLISHED_FORWARDS_TRACKED);
         assert_eq!(
-            ledger.note_published(past, addr, 18080, tcp),
+            ledger.note_published(
+                past,
+                addr,
+                18080,
+                tcp,
+                sessions::core::switch_request::Applied::Row
+            ),
             Err(super::LedgerFull),
             "the publish past the bound is refused"
         );
@@ -12762,12 +12937,84 @@ mod tests {
             super::PUBLISHED_FORWARDS_TRACKED
         );
         assert_eq!(
-            ledger.note_published(listener(0), addr, 18080, tcp),
+            ledger.note_published(
+                listener(0),
+                addr,
+                18080,
+                tcp,
+                sessions::core::switch_request::Applied::Row
+            ),
             Ok(false),
             "a held listener is answered as held, not refused"
         );
         assert!(ledger.note_retracted(listener(0)).is_some());
-        assert_eq!(ledger.note_published(past, addr, 18080, tcp), Ok(true));
+        assert_eq!(
+            ledger.note_published(
+                past,
+                addr,
+                18080,
+                tcp,
+                sessions::core::switch_request::Applied::Row
+            ),
+            Ok(true)
+        );
+    }
+
+    /// The interim's publishes are counted apart from the row-held ones. No
+    /// row's withdrawal names their address, so nothing but a guest
+    /// retraction releases them; counted with the row-held ones they would
+    /// fill the bound and refuse every box's publish. At their own bound the
+    /// oldest interim one is evicted, and a row-held publish still lands. A
+    /// full row-held side refuses only row-held publishes.
+    #[test]
+    fn interim_publishes_never_block_a_row_held_publish() {
+        use sessions::core::switch_request::Applied;
+        let tcp = super::egress::IPPROTO_TCP;
+        let rowless = [100, 64, 0, 20];
+        let row_addr = [100, 64, 0, 9];
+        let listener = |base: u16, n: usize| -> super::Listener {
+            let n = u16::try_from(n).expect("the bound fits a port range");
+            ([127, 0, 0, 1], base + n)
+        };
+        let ledger = super::PublishedForwards::new();
+        for n in 0..=super::INTERIM_PUBLISHES_TRACKED {
+            assert_eq!(
+                ledger.note_published(listener(10000, n), rowless, 18080, tcp, Applied::Interim),
+                Ok(true),
+                "an interim publish is never refused"
+            );
+        }
+        assert_eq!(
+            ledger.address_of(listener(10000, 0)),
+            None,
+            "the oldest interim publish was evicted at the interim bound"
+        );
+        assert_eq!(
+            ledger.published_at(rowless).len(),
+            super::INTERIM_PUBLISHES_TRACKED
+        );
+        for n in 0..super::PUBLISHED_FORWARDS_TRACKED {
+            assert_eq!(
+                ledger.note_published(listener(20000, n), row_addr, 18080, tcp, Applied::Row),
+                Ok(true),
+                "the interim publishes take none of the row-held bound"
+            );
+        }
+        assert_eq!(
+            ledger.note_published(([127, 0, 64, 9], 8080), row_addr, 18080, tcp, Applied::Row),
+            Err(super::LedgerFull),
+            "the row-held bound still refuses"
+        );
+        assert_eq!(
+            ledger.address_of(listener(20000, 0)),
+            Some(row_addr),
+            "no row-held publish was evicted"
+        );
+        assert_eq!(
+            ledger.note_published(listener(40000, 0), rowless, 18080, tcp, Applied::Interim),
+            Ok(true),
+            "a full row-held side does not refuse an interim publish"
+        );
     }
 
     #[test]
@@ -12779,11 +13026,23 @@ mod tests {
         let addr = [100, 64, 0, 9];
         let ledger = super::PublishedForwards::new();
         assert_eq!(
-            ledger.note_published(([127, 0, 0, 1], 8080), addr, 18080, tcp),
+            ledger.note_published(
+                ([127, 0, 0, 1], 8080),
+                addr,
+                18080,
+                tcp,
+                sessions::core::switch_request::Applied::Row
+            ),
             Ok(true)
         );
         assert_eq!(
-            ledger.note_published(([127, 0, 0, 1], 8081), addr, 18080, tcp),
+            ledger.note_published(
+                ([127, 0, 0, 1], 8081),
+                addr,
+                18080,
+                tcp,
+                sessions::core::switch_request::Applied::Row
+            ),
             Ok(true)
         );
         assert_eq!(
@@ -12792,6 +13051,7 @@ mod tests {
                 addr,
                 18080,
                 super::egress::IPPROTO_UDP,
+                sessions::core::switch_request::Applied::Row
             ),
             Ok(true)
         );
