@@ -7382,20 +7382,33 @@ async fn listen_publish_and_runtime_expose_never_double_bind() {
     );
     // Both surfaces' publications are listed (NET-044), each once, by the
     // surface that owns it: the runtime expose's row, and the watcher's row
-    // for the in-range listen its box's `allow` stance published.
+    // for the in-range listen its box's `allow` stance published. The range
+    // spans two ephemeral ports, so other tests' listeners can land in it
+    // and be listed too: the listen rows are read for this test's ports.
+    let rows = handle.live_ingress().await.expect("the actor answers");
     assert_eq!(
-        handle.live_ingress().await.expect("the actor answers"),
-        crate::session::LiveIngressRows {
-            exposed: vec![mapping],
-            listened: vec![minimald_rpc::LiveMapping {
-                local: format!("{loopback}:{listen_port}"),
-                internal_port: listen_port,
-                proto: sessions::IpProto::Tcp,
-                pending: Some(false),
-            }],
-        },
-        "the runtime publish and the listen publication are both listed as the \
-         box's live ingress"
+        rows.exposed,
+        vec![mapping],
+        "the runtime publish is listed as the box's live ingress: {rows:?}"
+    );
+    assert_eq!(
+        rows.listened
+            .iter()
+            .filter(|row| row.internal_port == listen_port)
+            .collect::<Vec<_>>(),
+        vec![&minimald_rpc::LiveMapping {
+            local: format!("{loopback}:{listen_port}"),
+            internal_port: listen_port,
+            proto: sessions::IpProto::Tcp,
+            pending: Some(false),
+        }],
+        "the listen publication is listed once as the box's live ingress: {rows:?}"
+    );
+    assert!(
+        rows.listened
+            .iter()
+            .all(|row| row.internal_port != exposed_port),
+        "the exposed port is never also a listen row: {rows:?}"
     );
     let second_listener =
         std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, exposed_port))
@@ -7446,7 +7459,12 @@ async fn listen_publish_and_runtime_expose_never_double_bind() {
     // The listen's row goes with its publication, and the expose's stays:
     // the set gives the port back once the unexpose stood, so the row is
     // awaited, not assumed.
-    let rows = listed_once(&handle, |rows| rows.listened.is_empty()).await;
+    let rows = listed_once(&handle, |rows| {
+        rows.listened
+            .iter()
+            .all(|row| row.internal_port != listen_port)
+    })
+    .await;
     assert_eq!(
         rows.exposed
             .iter()
