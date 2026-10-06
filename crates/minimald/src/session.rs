@@ -1283,9 +1283,14 @@ impl Session {
                 }
                 if let Some(address) = published {
                     // One warn line per port another box at the same address
-                    // also publishes (NET-129): intrinsic to the shared-address
-                    // mode, reported — the session-start report — and never
-                    // translated.
+                    // already holds (NET-129): intrinsic to the shared-address
+                    // mode, reported — here at finalize and at every later
+                    // session start, since each re-registers — and never
+                    // translated. First-come: the registry records the
+                    // collisions on this box, the one that yields, so its
+                    // attach skips those forwards instead of failing on a bind
+                    // the forwarder refuses. The box activates and stays
+                    // usable; its other forwards bind as usual.
                     reg.publish_own_address(record.id, &name, address, declared.clone());
                 }
                 // A box whose grant was withheld registers no name: the
