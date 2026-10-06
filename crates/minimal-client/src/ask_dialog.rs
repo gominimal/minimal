@@ -14,7 +14,9 @@
 //! [`run_selector`] over a [`DialogIo`]: the real one ([`TtyDialogIo`]) puts
 //! the terminal in raw mode and restores it when dropped, so the termios the
 //! relay handed over is back on every exit path (an answer, a dismissal, an
-//! error, an unwind).
+//! error, an unwind). Its reader joins an escape sequence split across
+//! reads, so an arrow key arrives whole even when the terminal delivers its
+//! bytes one at a time, and a lone Escape is still read as a deny.
 
 use std::io::{IsTerminal as _, Write as _};
 use std::os::fd::{AsFd, OwnedFd};
@@ -34,6 +36,20 @@ pub const ASK_DIALOG_PROMPT: &str = "Allow the publish to the host?";
 /// The line under the choices.
 const ASK_DIALOG_HELP: &str = "[Enter picks; Esc or Ctrl-C denies]";
 
+/// How long the reader waits for the rest of a split escape sequence. A
+/// raw-mode read returns as soon as any byte is queued (`cfmakeraw` clears
+/// `ICANON`), so an arrow key's `\x1b[B` can arrive as a lone ESC and then
+/// its tail — and the lone ESC is what a denied Escape press looks like.
+/// Terminals send one keypress as one burst, so a real Escape press has
+/// nothing behind it: this window is what tells the two apart. Terminal
+/// programs make the same wait for the same reason (vim's `ttimeoutlen`).
+const ESCAPE_BURST_WINDOW_MS: u16 = 100;
+/// The most bytes the reader will join into one event while it waits out an
+/// escape sequence's tail. A sequence a human's keypress produced is a
+/// handful of bytes; one still growing past this is not a key, and the wait
+/// stops rather than follow it.
+const ESCAPE_BURST_WINDOW_BYTES: usize = 64;
+
 /// How a dialog ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AskDialogEnd {
@@ -49,7 +65,9 @@ pub enum AskDialogEnd {
 /// One thing the dialog waits for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DialogEvent {
-    /// Bytes typed at the terminal, as one read returned them.
+    /// Bytes typed at the terminal: one read's burst, with the tail of an
+    /// escape sequence the read split it from joined on when it arrived
+    /// inside [`ESCAPE_BURST_WINDOW_MS`].
     Keys(Vec<u8>),
     /// The host dismissed the ask, or the subscription carrying it ended.
     Dismissed,
@@ -120,8 +138,10 @@ pub struct AskSelector {
 impl AskSelector {
     /// Feed the bytes of one terminal read. `Some` is the answer the keys
     /// end the dialog with: a yes only for Enter on Allow; a no for Enter
-    /// on Deny, Ctrl-C, Ctrl-D and a lone Escape. An arrow key moves the
-    /// highlight; anything else is ignored.
+    /// on Deny, Ctrl-C, Ctrl-D and an Escape that stands alone — the reader
+    /// joins a sequence split across reads, so an ESC reaching here alone is
+    /// a pressed Escape and not an arrow key's first byte. An arrow key
+    /// moves the highlight; anything else is ignored.
     #[must_use]
     pub fn feed(&mut self, keys: &[u8]) -> Option<minimald_rpc::AskAnswer> {
         match keys {
@@ -277,6 +297,86 @@ impl<'w, 'a> TtyDialogIo<'w, 'a> {
         };
         Some((input, output))
     }
+
+    /// Wait out [`ESCAPE_BURST_WINDOW_MS`] for the tail of an escape
+    /// sequence a read split. `true` when the terminal has bytes by the
+    /// window's end. A dismissal that lands inside the window is left
+    /// queued: the keys were read first, and an answer they hold is still
+    /// recorded — the same order as the unsplit case.
+    fn wait_out_escape_burst(&mut self) -> bool {
+        let mut fds = [PollFd::new(self.input.as_fd(), PollFlags::POLLIN)];
+        // `u16` converts into the poll timeout as milliseconds, which is
+        // what the constant's name carries.
+        match poll(&mut fds, ESCAPE_BURST_WINDOW_MS) {
+            Ok(_) | Err(nix::Error::EINTR) => {}
+            // The window is a grace period, not a promise: a failed poll
+            // leaves the bytes read as the event.
+            Err(_) => return false,
+        }
+        fds[0]
+            .revents()
+            .is_some_and(|r| r.intersects(PollFlags::POLLIN))
+    }
+
+    /// Finish a read that ended inside an escape sequence: wait the burst
+    /// window for the rest of the key, and return the joined bytes when it
+    /// arrives. A tail that never comes leaves the bytes read as the event,
+    /// which the selector reads — a lone ESC among them as a deny.
+    fn finish_escape_head(&mut self, mut keys: Vec<u8>) -> std::io::Result<DialogEvent> {
+        // A key a human pressed is a handful of bytes; anything still
+        // growing past this is not one, and the wait stops rather than
+        // follow it.
+        while keys.len() < ESCAPE_BURST_WINDOW_BYTES && self.wait_out_escape_burst() {
+            let mut tail = [0u8; 64];
+            match nix::unistd::read(&self.input, &mut tail) {
+                // More of the key: join it, and wait again when it is
+                // itself still missing a final byte.
+                Ok(m) if m > 0 => {
+                    keys.extend(keep(&tail, m));
+                    if !ends_in_escape_sequence(&keys) {
+                        return Ok(DialogEvent::Keys(keys));
+                    }
+                }
+                // A closed input has nothing behind what was read.
+                Ok(_) | Err(nix::Error::EIO) => break,
+                // The window closed, a signal landed, or a spurious wake:
+                // the bytes already read are the honest event.
+                Err(nix::Error::EINTR | nix::Error::EAGAIN) => break,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(DialogEvent::Keys(keys))
+    }
+}
+
+/// The first `n` bytes of `buf`, as a Vec: the part of a raw-mode read the
+/// terminal actually filled. The panic-free form of `&buf[..n]`.
+fn keep(buf: &[u8], n: usize) -> Vec<u8> {
+    buf.iter().take(n).copied().collect()
+}
+
+/// Whether a read ended inside an escape sequence: it holds an ESC whose
+/// final byte has not arrived. Arrow keys go out as one burst but are not
+/// always delivered as one read, so this is where a split key is caught and
+/// rejoined — and where a lone ESC is held back long enough to tell it from
+/// the same first byte of an arrow key.
+fn ends_in_escape_sequence(keys: &[u8]) -> bool {
+    // The ESC that matters is the last one: a key before it is already
+    // complete.
+    let Some(esc) = keys.iter().rposition(|&byte| byte == 0x1b) else {
+        return false;
+    };
+    let mut after = keys.iter().skip(esc + 1);
+    match after.next() {
+        // A lone ESC: the sequence's head, waiting for the rest.
+        None => true,
+        // CSI or SS3: collecting while every byte after the introducer is a
+        // parameter or intermediate one (0x20..=0x3f). The final byte
+        // (0x40..=0x7e) is what ends the sequence.
+        Some(b'[' | b'O') => after.all(|byte| matches!(byte, 0x20..=0x3f)),
+        // Any other ESC is complete the moment it is read.
+        Some(_) => false,
+    }
 }
 
 impl Drop for TtyDialogIo<'_, '_> {
@@ -315,7 +415,13 @@ impl DialogIo for TtyDialogIo<'_, '_> {
                 let mut buf = [0u8; 64];
                 match nix::unistd::read(&self.input, &mut buf) {
                     Ok(0) => return Ok(DialogEvent::InputClosed),
-                    Ok(n) => return Ok(DialogEvent::Keys(buf[..n].to_vec())),
+                    Ok(n) => {
+                        let keys = keep(&buf, n);
+                        if ends_in_escape_sequence(&keys) {
+                            return self.finish_escape_head(keys);
+                        }
+                        return Ok(DialogEvent::Keys(keys));
+                    }
                     Err(nix::Error::EINTR | nix::Error::EAGAIN) => continue,
                     // A pty whose other end closed reads EIO.
                     Err(nix::Error::EIO) => return Ok(DialogEvent::InputClosed),
@@ -430,6 +536,31 @@ mod tests {
         assert_eq!(answer(b"\x1b"), Some(AskAnswer::No), "Escape denies");
         assert_eq!(answer(b"\x1b[B"), None, "a move alone answers nothing");
         assert_eq!(answer(b"yx"), None, "other keys are ignored");
+    }
+
+    /// A read ends inside an escape sequence when the tail a split delivery
+    /// withheld has not arrived, and only then. Complete keys and lone
+    /// non-ESC tails never wait.
+    #[test]
+    fn reads_ending_inside_an_escape_sequence() {
+        let ends = |keys: &[u8]| ends_in_escape_sequence(keys);
+        assert!(ends(b"\x1b"), "a lone ESC waits for a tail");
+        assert!(ends(b"\x1b["), "CSI waits for its final byte");
+        assert!(ends(b"\x1bO"), "SS3 waits for its final byte");
+        assert!(ends(b"\x1b[1;"), "parameters wait for the final byte");
+        assert!(ends(b"a\x1b"), "only the last ESC matters");
+        assert!(!ends(b"\x1b[B"), "a complete arrow key waits for nothing");
+        assert!(!ends(b"\x1bOB"), "a complete SS3 key waits for nothing");
+        assert!(!ends(b""), "an empty read waits for nothing");
+        assert!(!ends(b"a"), "a plain key waits for nothing");
+        assert!(
+            ends(b"\x1b\x1b"),
+            "the last ESC is a head, and waits for its tail"
+        );
+        assert!(
+            !ends(b"\x1b\x1b[B"),
+            "an earlier ESC does not hold a complete key open"
+        );
     }
 
     #[test]
@@ -627,6 +758,54 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(50));
         let end = pty.dialog(id, subscription).unwrap();
         assert_eq!(end, AskDialogEnd::Answered(AskAnswer::Yes));
+    }
+
+    /// A raw-mode read returns as soon as any byte is queued, so an arrow
+    /// key can arrive as a lone ESC and then its tail. The tail is joined
+    /// within the burst window: the arrow moves the highlight instead of
+    /// being read as a denied Escape.
+    #[test]
+    fn tty_arrow_key_split_across_reads_still_moves() {
+        let pty = std::sync::Arc::new(Pty::new());
+        let (_host, subscription) = std::os::unix::net::UnixStream::pair().unwrap();
+        let typist = {
+            let sh = std::sync::Arc::clone(&pty);
+            std::thread::spawn(move || {
+                sh.type_bytes(b"\x1b");
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                sh.type_bytes(b"[B\r");
+            })
+        };
+        let end = pty.dialog(ask_id(), subscription).unwrap();
+        assert_eq!(
+            end,
+            AskDialogEnd::Answered(AskAnswer::Yes),
+            "the split arrow reached Allow and Enter answered"
+        );
+        drop(typist.join());
+    }
+
+    /// A lone ESC with nothing behind it is a denied Escape, not an arrow
+    /// key's head: the window closes, and the deny stands. The dialog must
+    /// take the window rather than answer on the byte alone, so this also
+    /// bounds the wait — the answer comes back within a few windows.
+    #[test]
+    fn tty_lone_escape_denies_after_the_burst_window() {
+        let pty = Pty::new();
+        let (_host, subscription) = std::os::unix::net::UnixStream::pair().unwrap();
+        pty.type_bytes(b"\x1b");
+        let start = std::time::Instant::now();
+        let end = pty.dialog(ask_id(), subscription).unwrap();
+        let took = start.elapsed();
+        assert_eq!(end, AskDialogEnd::Answered(AskAnswer::No));
+        assert!(
+            took >= std::time::Duration::from_millis(u64::from(ESCAPE_BURST_WINDOW_MS)),
+            "the window was waited out before the deny: {took:?}"
+        );
+        assert!(
+            took < std::time::Duration::from_millis(10 * u64::from(ESCAPE_BURST_WINDOW_MS)),
+            "the deny did not wait a second window: {took:?}"
+        );
     }
 
     /// A dismissal for another ask does not take this dialog down; it is
