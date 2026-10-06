@@ -1007,10 +1007,22 @@ fn run_foreground() -> Result<()> {
                 // process, so the refused port, freed meanwhile, would read
                 // as another VM's reservation and be skipped.
                 drop(node_port);
+                // The child is already stopped, so either redraw step that
+                // fails ends this boot on the spot: the fresh image goes
+                // with it (R2.5), like every other failed-boot arm — a
+                // blank stranded here would be read as prior state by the
+                // next boot, wedging it behind the pre-existing-image
+                // message. A pre-existing image is never touched.
                 node_port = assign_node_proxy_port(&ports_dir)
+                    .inspect_err(|_| {
+                        crate::cmd::discard_fresh_volume_image(&volume_path, volume_preexisted);
+                    })
                     .context("redrawing the node's proxy port after a refused publish")?;
                 boxes
                     .try_register_node_namespace(node_port.port)
+                    .inspect_err(|_| {
+                        crate::cmd::discard_fresh_volume_image(&volume_path, volume_preexisted);
+                    })
                     .context("publishing the node namespace's row after a redraw")?;
                 continue;
             }
