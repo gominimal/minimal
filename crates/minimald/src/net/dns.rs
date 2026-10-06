@@ -59,6 +59,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
+use hickory_proto::rr::Name;
 use serde::Serialize;
 use sessions::core::egress::EgressRules;
 #[cfg(target_os = "linux")]
@@ -73,15 +74,18 @@ use super::SwitchSubnet;
 pub const HOSTNAME_SUFFIX: &str = "min.internal";
 
 /// Whether `name` is a box-zone name — the zone apex itself or any name under
-/// it (NET-072). `name` is an already-normalized qname: lowercased, no root
-/// dot, exactly what [`super::dns_gate`]'s gate asks about. Mirrors the
-/// answerer's zone-suffix match so both layers cannot drift.
+/// it (NET-072). `name` is an already-normalized qname in presentation form:
+/// lowercased, no root dot, exactly what [`super::dns_gate`]'s gate asks
+/// about. The match is by labels, not by string suffix: a single label
+/// holding an escaped dot, `evil\.min` under `internal`, renders as
+/// `evil\.min.internal` but sits under `internal`, not under the zone. A
+/// name that does not parse is not the zone.
 #[must_use]
 pub fn is_zone_name(name: &str) -> bool {
-    name == HOSTNAME_SUFFIX
-        || name
-            .strip_suffix(HOSTNAME_SUFFIX)
-            .is_some_and(|stem| stem.ends_with('.'))
+    match (Name::from_ascii(name), Name::from_ascii(HOSTNAME_SUFFIX)) {
+        (Ok(name), Ok(zone)) => zone.zone_of(&name),
+        _ => false,
+    }
 }
 
 /// Default `<host-id>` of the deprecated three-label zone: a stable short name
@@ -2453,6 +2457,13 @@ mod tests {
         assert!(!is_zone_name("webmin.internal"));
         assert!(!is_zone_name("example.com"));
         assert!(!is_zone_name(""), "no name is no zone");
+        // One label holding an escaped dot sits under `internal`, not under
+        // the zone, though its presentation form ends in `.min.internal`.
+        assert!(!is_zone_name("evil\\.min.internal"));
+        assert!(
+            is_zone_name("a\\.b.min.internal"),
+            "the escape is below the zone"
+        );
     }
 
     /// Proof artifact 1 (registry/proxy contract): registering a `HostNet`
