@@ -2527,7 +2527,7 @@ pub(crate) mod tests {
         );
     }
 
-    /// NET-006: a non-A query (TXT, MX, CNAME, SRV, NS) for a box-zone
+    /// NET-006: a non-A query (TXT, MX, CNAME, SRV, NS, AAAA, ANY) for a box-zone
     /// (`*.min.internal`) name is answered NODATA by the relay itself and
     /// never reaches the host's upstream resolvers, while an A query for the
     /// same zone name is forwarded so resolution works, and a non-A query
@@ -2542,6 +2542,8 @@ pub(crate) mod tests {
             RecordType::CNAME,
             RecordType::SRV,
             RecordType::NS,
+            RecordType::AAAA,
+            RecordType::ANY,
         ] {
             for name in ["x.min.internal.", "host.min.internal."] {
                 let query = dns_query(name, rtype);
