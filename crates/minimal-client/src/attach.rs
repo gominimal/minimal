@@ -8,6 +8,7 @@
 
 use std::path::Path;
 
+use crate::HANDSHAKE_TIMEOUT;
 use crate::tty_relay;
 use anyhow::Context as _;
 
@@ -136,6 +137,10 @@ pub fn attach_command(
         &strict,
         "-o",
         &known_hosts_file,
+        // Bound the connect and the initial protocol handshake/key exchange so
+        // a bridge that accepts but never serves fails instead of hanging ssh.
+        "-o",
+        &format!("ConnectTimeout={}", HANDSHAKE_TIMEOUT.as_secs()),
     ]);
     // Negotiate the session-key config per channel: send each resolved key
     // as an env var the daemon reads back (alongside MINIMAL_SESSION_ID) and
@@ -181,6 +186,19 @@ pub fn attach_command(
     // forever (#953). Callers must guarantee a terminal on stdin.
     if wire.is_none() {
         ssh.arg("-tt");
+    }
+
+    // A non-interactive exec channel must not hang forever on a peer that
+    // accepted the connection but stopped answering after the handshake:
+    // keepalives end it with exit 255 within about a minute. The interactive
+    // path is left without them so a laptop sleep does not kill the attach.
+    if wire.is_some() {
+        ssh.args([
+            "-o",
+            "ServerAliveInterval=15",
+            "-o",
+            "ServerAliveCountMax=4",
+        ]);
     }
 
     // The SSH host identity must match the known_hosts entry the daemon wrote,
@@ -716,6 +734,49 @@ mod tests {
         for stdio in ["stdin", "stdout", "stderr"] {
             assert!(!debug.contains(stdio), "{stdio} overridden: {debug}");
         }
+    }
+
+    /// Every attach bounds its connect and handshake with the shared deadline;
+    /// only the non-interactive exec path adds keepalives, so a peer that
+    /// stops answering ends the exec instead of hanging it.
+    #[test]
+    fn attach_command_bounds_the_handshake() {
+        let sock = PathBuf::from("/tmp/x/providers/local-minimald0/ssh.sock");
+        let interactive = attach_command(&sock, sessions::SessionId::nil(), None, None).unwrap();
+        let exec = attach_command(&sock, sessions::SessionId::nil(), Some("wire"), None).unwrap();
+
+        let args = |cmd: &std::process::Command| -> Vec<String> {
+            cmd.get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        };
+
+        let connect_timeout = format!("ConnectTimeout={}", HANDSHAKE_TIMEOUT.as_secs());
+        for cmd in [&interactive, &exec] {
+            let args = args(cmd);
+            assert!(
+                args.iter().any(|a| a == &connect_timeout),
+                "missing {connect_timeout} in {args:?}",
+            );
+        }
+
+        let interactive_args = args(&interactive);
+        assert!(
+            !interactive_args
+                .iter()
+                .any(|a| a.starts_with("ServerAlive")),
+            "interactive attach must not carry keepalives: {interactive_args:?}",
+        );
+
+        let exec_args = args(&exec);
+        assert!(
+            exec_args.iter().any(|a| a == "ServerAliveInterval=15"),
+            "missing ServerAliveInterval in {exec_args:?}",
+        );
+        assert!(
+            exec_args.iter().any(|a| a == "ServerAliveCountMax=4"),
+            "missing ServerAliveCountMax in {exec_args:?}",
+        );
     }
 
     /// A named VM's socket nests under a per-name subdirectory, so the ssh
