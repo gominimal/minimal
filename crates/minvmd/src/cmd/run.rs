@@ -1009,9 +1009,13 @@ fn run_foreground() -> Result<()> {
                 drop(node_port);
                 node_port = assign_node_proxy_port(&ports_dir)
                     .context("redrawing the node's proxy port after a refused publish")?;
-                boxes
-                    .try_register_node_namespace(node_port.port)
-                    .context("publishing the node namespace's row after a redraw")?;
+                // A row the redraw cannot publish fails the start, which
+                // discards a fresh volume image like every other failed boot.
+                if let Err(error) = boxes.try_register_node_namespace(node_port.port) {
+                    crate::cmd::discard_fresh_volume_image(&volume_path, volume_preexisted);
+                    return Err(error)
+                        .context("publishing the node namespace's row after a redraw");
+                }
                 continue;
             }
             crate::control::PublishDecision::FailStart {

@@ -2208,6 +2208,22 @@ impl BoxRegistry {
         if self.loopback_slice.is_none() {
             return Err(AllocationError::UnplannedSubnet(self.subnet));
         }
+        // A withdrawn box's revocation may still hold the published address
+        // the answerer handed back: the answerer releases a box's address at
+        // its withdrawal, and the next box can draw it at once. The wait is
+        // bounded, and normally the revocation is long done. It runs before a
+        // switch address is spent: the cursor never hands one out twice, so a
+        // registration refused here must not have drawn one. The switch
+        // address drawn next is fresh, and `try_register` still checks both.
+        if let Some(addr) = self.wait_for_revocations(&[loopback_addr.octets()], REVOCATION_WAIT) {
+            tracing::warn!(
+                box = %spec.name,
+                %addr,
+                wait = ?REVOCATION_WAIT,
+                "a withdrawn box's revocation still holds an address this registration needs"
+            );
+            return Err(AllocationError::RevocationPending { addr });
+        }
         let (hand_out_first, hand_out_last) = hand_out_run(self.subnet);
         let switch_addr = take_next(&self.next_switch_addr, hand_out_first, hand_out_last)
             .ok_or(AllocationError::SwitchExhausted)?;
@@ -2227,21 +2243,6 @@ impl BoxRegistry {
             registration = registration.with_dynamic_ingress(stance, spec.dynamic_allowed_range);
         }
         registration.box_id = Some(id);
-        // A withdrawn box's revocation may still hold the published address
-        // the answerer handed back: the answerer releases a box's address at
-        // its withdrawal, and the next box can draw it at once. The wait is
-        // bounded, and normally the revocation is long done.
-        if let Some(addr) = self.wait_for_revocations(
-            &revocation_addrs(switch_addr, loopback_addr),
-            REVOCATION_WAIT,
-        ) {
-            tracing::warn!(
-                box = %registration.name,
-                %addr,
-                wait = ?REVOCATION_WAIT,
-                "a withdrawn box's revocation still holds an address this registration needs"
-            );
-        }
         self.try_register(registration)
     }
 
@@ -3722,6 +3723,47 @@ mod tests {
         assert_eq!(again.loopback_addr(), web.loopback_addr());
         assert!(started.elapsed() >= Duration::from_millis(100));
         assert!(started.elapsed() < REVOCATION_WAIT);
+    }
+
+    /// A client registration refused because a revocation still holds its
+    /// published address spends no switch address: the cursor never hands
+    /// one out twice, so a retry loop against a held address would
+    /// otherwise use up the plan.
+    #[test]
+    fn a_registration_refused_for_a_held_address_spends_no_switch_address() {
+        let registry = BoxRegistry::new(SUBNET);
+        let mut withdrawn = registry.table().subscribe_row_withdrawals();
+        let spec = |name: &str| ClientBoxSpec {
+            name: name.to_string(),
+            ingress_ports: vec![8080],
+            egress: None,
+            credentialed_upstream: None,
+            dynamic_ingress: None,
+            dynamic_allowed_range: None,
+        };
+        let web = registry
+            .register_client_box(spec("web"))
+            .expect("the plan has an address for the box");
+        assert!(registry.withdraw(web.switch_addr()).is_some());
+        let withdrawal = withdrawn.try_recv().expect("the subscriber is told");
+
+        assert_eq!(
+            registry
+                .register_client_box_at(spec("db"), web.loopback_addr())
+                .map(|row| row.name().to_string()),
+            Err(AllocationError::RevocationPending {
+                addr: web.loopback_addr()
+            }),
+        );
+        drop(withdrawal);
+        let next = registry
+            .register_client_box(spec("next"))
+            .expect("the plan has an address for the next box");
+        assert_eq!(
+            next.switch_addr(),
+            Ipv4Addr::from(u32::from(web.switch_addr()) + 1),
+            "the refused registration drew no switch address"
+        );
     }
 
     /// With nothing subscribed to withdrawals, nothing would ever release a
