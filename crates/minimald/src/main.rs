@@ -744,6 +744,10 @@ async fn async_main() -> Result<(), MainError> {
         let identity = std::net::IpAddr::V4(minimald::net::DEFAULT_SUBNET.daemon_ip());
         let render = minimald::net::classifier::GuestRender {
             tree_root,
+            // The resolver every host-address box on the guest is pointed
+            // at, deny-all ones included: the node's DNS layer at the switch
+            // gateway, which the deny subtree's carve-out admits (NET-003).
+            gateway_resolver: minimald::net::DEFAULT_SUBNET.dns_server(),
             cohort_address: identity,
             node_plane_address: identity,
             ct_mark_mask: minimald::net::classifier::GUEST_CT_MARK_MASK,
