@@ -205,10 +205,10 @@ artifacts_root="$workdir/artifacts"
 
 # Artifacts whose absence warns and packages without them instead of failing.
 # TEMPORARY (gominimal/inbox#899), the same rule as stage-release.sh's
-# OPTIONAL_COMPONENTS: the frozen release.yml does not build minzoned yet,
-# so a versioned release must still package. A package built without it drops
-# the config's marked minzoned block (see packaging/nfpm.yaml). Empty this
-# list once release.yml uploads the artifact.
+# OPTIONAL_COMPONENTS: release.yml now uploads minzoned on every platform, but
+# this list stays until stage-release.sh's does, so a versioned release without
+# the artifact still packages. A package built without it drops the config's
+# marked minzoned block (see packaging/nfpm.yaml). Empty both lists together.
 OPTIONAL_ARTIFACTS=(minzoned)
 
 # is_optional <staged-name> — whether a missing artifact only warns.

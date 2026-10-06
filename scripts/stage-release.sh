@@ -296,12 +296,11 @@ COMPONENTS=(
 )
 
 # Components whose missing artifact warns and is omitted instead of failing
-# the stage. TEMPORARY (gominimal/inbox#899): .github/workflows/release.yml does
-# not build, sign or upload minzoned yet, and that workflow is frozen, so
-# the patch that adds it waits on a code owner. Until it lands, a release ships
-# no minzoned and the session advisory names that state ("this release
-# ships no minzoned; the answerer service step is unavailable") instead of
-# offering the step. Once release.yml uploads the artifact on every platform,
+# the stage. TEMPORARY (gominimal/inbox#899): .github/workflows/release.yml now
+# builds, signs and uploads minzoned on every platform, but a release cut before
+# that change ships no minzoned, and the session advisory names that state
+# ("this release ships no minzoned; the answerer service step is unavailable")
+# instead of offering the step. Once releases with the artifact are the norm,
 # empty this list so a missing answerer fails the stage like any other binary.
 OPTIONAL_COMPONENTS=(minzoned)
 
