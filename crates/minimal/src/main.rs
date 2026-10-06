@@ -257,9 +257,9 @@ fn stdout_is_data_contract(command: &Option<minimal::Command>) -> bool {
     )
 }
 
-/// The console log layer. `plain` (no `RUST_LOG` in effect) drops the
-/// timestamp and target, so a warning reads as one message line; otherwise the
-/// full tracing format is kept for debugging.
+/// The console log layer. `plain` (no `RUST_LOG` in effect) renders through
+/// [`PlainFormat`]: `warning:`/`error:` lines matching the rest of the CLI;
+/// otherwise the full tracing format is kept for debugging.
 fn console_layer<S, W>(writer: W, ansi: bool, plain: bool) -> Box<dyn Layer<S> + Send + Sync>
 where
     S: tracing::Subscriber + for<'a> LookupSpan<'a>,
@@ -275,7 +275,8 @@ where
 
 /// The plain console format: `warning: <message>` for WARN, `error: <message>`
 /// for ERROR, and the bare message for INFO and below. A message that already
-/// starts with `help:` is written as a help line with no level prefix.
+/// starts with `help:` is written as a help line with no level prefix. Span
+/// context is omitted on purpose: these lines are for a person, not debugging.
 struct PlainFormat;
 
 impl<S, N> FormatEvent<S, N> for PlainFormat
