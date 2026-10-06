@@ -449,11 +449,11 @@ included, with every refusal logged (NET-001 to NET-004).
   verify:   cargo nextest run -p minimald dns_pinned_admission_window
   <!-- S8b/AC1; prose 42; event-driven -->
 
-- **NET-141** WHEN a box queries a name that its `egress.allow_dns_hosts` does not match, as NET-066 matches names, and that is not in the box zone (NET-072, including `host.min.internal`), THE SYSTEM SHALL answer REFUSED and forward the query to no resolver beyond the one Minimal owns for the box.
+- **NET-141** WHEN the resolver Minimal owns for a box receives a query for a name that its `egress.allow_dns_hosts` does not match, as NET-066 matches names, and that is not in the box zone (NET-072, including `host.min.internal`), THE SYSTEM SHALL answer REFUSED and forward the query to no resolver beyond it.
   tier:     T1
   verify:   cargo nextest run -p minimald unmatched_name_refused_without_upstream_forward
   property: for every name, every allow-pattern set, and every zone, the resolver forwards the query beyond the one Minimal owns for the box only if the name matches a pattern, and it never forwards a name that matches none and is not in the zone
-  <!-- design §5.3 ("Non-matching names are refused"); event-driven; the complement of NET-066, decided by the same matcher, so admission and refusal never disagree on a name: case-insensitive, a trailing dot ignored, the same wildcard rule. "Beyond the one Minimal owns" covers every onward hop: the gateway resolver, the host's resolvers, and the Egress Gateway when enrolled. The refusal is REFUSED (rcode 5), answered at once: never NXDOMAIN, which asserts the name does not exist and is negatively cached for the whole name (negative answers are governed by NET-125 and NET-128), and never a timeout. The refusal comes before any onward query, because a forwarded query carries data out in the queried name even when the connection that follows is dropped (NET-062). Names steered to the Box Egress Proxy need no exemption: the credentialed set stays inside the allow list, so they always match. Scope: the requirement binds queries that reach the resolver Minimal owns for the box. Inside a VM-backed host every box's lookups go there (NET-003). A native host-address box shares the host's network namespace, so if its egress rules allow the host's own resolver it can query that resolver directly, and no Minimal resolver sees the query; that is the reduced tier the design concedes for host-address boxes, and closing it needs a native routing rule this spec does not yet state. Besides the T1 property, the session e2e proves that no onward query is made for a non-matching name. -->
+  <!-- design §5.3 ("Non-matching names are refused"); event-driven; the complement of NET-066, decided by the same matcher, so admission and refusal never disagree on a name: case-insensitive, a trailing dot ignored, the same wildcard rule. "Beyond the one Minimal owns" covers every onward hop: the gateway resolver, the host's resolvers, and the Egress Gateway when enrolled. The refusal is REFUSED (rcode 5), answered at once: never NXDOMAIN, which asserts the name does not exist and is negatively cached for the whole name (negative answers are governed by NET-125 and NET-128), and never a timeout. The refusal comes before any onward query, because a forwarded query carries data out in the queried name even when the connection that follows is dropped (NET-062). Names steered to the Box Egress Proxy need no exemption: the credentialed set stays inside the allow list, so they always match. Scope: the requirement binds queries that reach the resolver Minimal owns for the box. For an own-address box, on a native host and inside a VM-backed host alike, that is the relay's DNS gate: the box's `resolv.conf` names the switch gateway, every one of its frames passes the relay (NET-081), and the gate intercepts every standard query to that resolver before it reaches the switch, which is where the refusal is made. For a host-address box inside a VM-backed host it is the node's DNS layer once NET-003's sub-bullet holds; until that routing lands, a host-address box's queries go to the switch gateway without passing a per-box gate, and NET-141 binds nothing for it. A native host-address box shares the host's network namespace, so if its egress rules allow the host's own resolver it can query that resolver directly, and no Minimal resolver sees the query; that is the reduced tier the design concedes for host-address boxes, and closing it needs a native routing rule this spec does not yet state. Besides the T1 property, the session e2e proves that no onward query is made for a non-matching name. -->
 
 - **NET-067** IF an allowed name resolves into the box's `egress.deny_subnets` or the infrastructure deny set THEN THE SYSTEM SHALL refuse the connection.
   tier:     T2
@@ -1176,9 +1176,13 @@ daemon does, and the attribute that makes that gap visible to policy is EHE's.
   covered by: NET-066, NET-067
 - **Invariant:** THE SYSTEM SHALL carry no name that a box's allow list does
   not match, outside the box zone, beyond the resolver Minimal owns for the
-  box.
+  box, for every query that reaches that resolver.
   enforced by: the refusal at that resolver, before any onward query
   covered by: NET-141
+  <!-- residual: a native host-address box shares the host's network
+  namespace, so if its egress rules allow the host's own resolver it can query
+  that resolver directly and no Minimal resolver sees the query; this is the
+  reduced tier the design concedes for host-address boxes (NET-141's scope) -->
 - **Invariant:** THE SYSTEM SHALL publish a dynamically requested port only
   under a recorded allow decision.
   enforced by: the local daemon evaluates the same request shape as the
