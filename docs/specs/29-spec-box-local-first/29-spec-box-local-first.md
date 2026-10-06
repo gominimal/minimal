@@ -316,10 +316,10 @@ After this ships, a developer on a stock install with no identity plane runs ses
   verify:   cargo nextest run -p mfile expansion_order_and_merge_rules
   property: For every set of layers, expansion equals the fold of the merge rule over the layers in the stated order.
 
-- **BOX-065** THE SYSTEM SHALL produce an expanded spec whose serialization is byte-identical across two runs over one file and one set of command-line overrides.
+- **BOX-065** THE SYSTEM SHALL produce an expanded spec whose serialization is byte-identical across two runs over one file, one set of command-line overrides and one client `[secret-store-rules]` set.
   tier:     T1
   verify:   cargo nextest run -p mfile expansion_is_byte_identical_across_runs
-  property: For every minimal.toml and every set of command-line overrides, expanding twice yields identical bytes.
+  property: For every minimal.toml, every set of command-line overrides and every client `[secret-store-rules]` set, expanding twice yields identical bytes.
 
 - **BOX-066** IF an expanded spec carries an invalid key or value THEN THE SYSTEM SHALL fail with exit 3 naming the key and the layer it came from.
   tier:     T0
@@ -435,7 +435,7 @@ Moved to the sibling spec `docs/specs/28-spec-box-cli` (BCLI) when the grammar w
   - WHERE an exec is detached THE SYSTEM SHALL close its stdin at creation, return its exec id, capture its output for reading by that id, and retain its exit code for a wait on that id.
     tier:   T0
     verify: cargo nextest run -p minimald exec_detach_closes_stdin_captures_logs_and_wait_returns_code
-  - WHERE an exec carries its own timeout and that timeout expires while the exec runs THE SYSTEM SHALL end the exec as BOX-150 ends one, SIGTERM to its process group, a wait, then SIGKILL, record its `exec_exited` event with reason `timeout`, and leave the box running.
+  - WHERE an exec carries its own timeout and that timeout expires while the exec runs THE SYSTEM SHALL end the exec as BOX-151 ends one, SIGTERM to its process group, a wait, then SIGKILL, record its `exec_exited` event with reason `timeout`, and leave the box running.
     tier:   T0
     verify: cargo nextest run -p minimald exec_own_timeout_ends_exec_reason_timeout_box_keeps_running
 
@@ -473,10 +473,10 @@ Moved to the sibling spec `docs/specs/28-spec-box-cli` (BCLI) when the grammar w
   tier:     T0
   verify:   cargo nextest run -p minimald store_secret_passed_through_unenrolled
 
-- **BOX-142** THE SYSTEM SHALL produce identical spec bytes and projection digest for one `minimal.toml` and one set of command-line overrides whether the host facts are un-enrolled or enrolled.
+- **BOX-142** THE SYSTEM SHALL produce identical spec bytes and projection digest for one `minimal.toml`, one set of command-line overrides and one client `[secret-store-rules]` set whether the host facts are un-enrolled or enrolled.
   tier:     T1
   verify:   cargo nextest run -p mfile enrolled_and_unenrolled_expansion_identical
-  property: For every minimal.toml and every set of command-line overrides, expansion under un-enrolled and enrolled host facts yields identical spec bytes and projection digest.
+  property: For every minimal.toml, every set of command-line overrides and every client `[secret-store-rules]` set, expansion under un-enrolled and enrolled host facts yields identical spec bytes and projection digest.
 
 - **BOX-143** THE SYSTEM SHALL key every record, event and audit entry on `box_id`, resolve a CLI name lookup to the current alias's `box_id`, and keep every id-addressed reference resolving across a rename.
   tier:     T1
