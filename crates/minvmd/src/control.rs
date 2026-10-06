@@ -648,9 +648,13 @@ fn serve_connection(
     // the subscription lives (NET-045), so each runs on a thread of its
     // own: a door serves its other connections one at a time, and an ask
     // waiting on a human must not hold a report or a registration behind
-    // it.
+    // it. A registration is the one other verb that outlives its turn:
+    // filling the row can wait out a withdrawn box's revocation
+    // ([`REVOCATION_WAIT`]) before the row is refused or filled, and that
+    // wait must not hold a withdrawal, a report or another registration
+    // behind it — so it runs on a thread of its own too.
     //
-    // Each kind is capped ([`MAX_GUEST_ASK_CONNECTIONS`],
+    // Each ask kind is capped ([`MAX_GUEST_ASK_CONNECTIONS`],
     // [`MAX_ASK_SUBSCRIPTIONS`]): past the cap the connection is refused on
     // this door's own turn, before any thread is spawned, so a guest that
     // opens asks in a loop cannot grow threads without limit. The first
@@ -662,9 +666,10 @@ fn serve_connection(
             let ask = *ask;
             match gauges.guest_asks.try_acquire(gauges.guest_ask_cap()) {
                 Some(slot) => {
-                    return spawn_ask_thread(
+                    return spawn_serving_thread(
                         stream,
                         "minvmd-guest-ask",
+                        "guest ask",
                         boxes,
                         audit_path,
                         move |s, b, a| {
@@ -680,9 +685,10 @@ fn serve_connection(
             let box_id = subscribe.box_id;
             match gauges.subscriptions.try_acquire(gauges.subscription_cap()) {
                 Some(slot) => {
-                    return spawn_ask_thread(
+                    return spawn_serving_thread(
                         stream,
                         "minvmd-ask-client",
+                        "ask subscription",
                         boxes,
                         audit_path,
                         move |s, b, a| {
@@ -695,6 +701,22 @@ fn serve_connection(
                     refuse_past_ask_cap(&mut stream, "ask subscription", gauges.subscription_cap())
                 }
             }
+        }
+        // The registration verb on the host's door: moved off the accept
+        // loop because its wait (above) is the door's only long turn.
+        (BoxControlRequest::Register(request), ControlDoor::Host) => {
+            let request = request.clone();
+            let answerer = answerer.clone();
+            return spawn_serving_thread(
+                stream,
+                "minvmd-box-register",
+                "box registration",
+                boxes,
+                audit_path,
+                move |mut stream, boxes, _audit_path| {
+                    let _ = register_and_reply(&mut stream, boxes, &answerer, request);
+                },
+            );
         }
         _ => serve_request(
             &mut stream,
@@ -1420,13 +1442,18 @@ fn append_audit_line(path: &Path, line: &impl serde::Serialize) {
     }
 }
 
-/// Run one ask verb's connection on a thread of its own (NET-045): the ask
-/// or the subscription holds the connection open, so it must not hold the
-/// door's serial accept loop with it. A thread that cannot be spawned is
-/// answered on the spot with the reason, and the connection closes.
-fn spawn_ask_thread(
+/// Run one connection on a thread of its own, off the door's serial accept
+/// loop (NET-045): an ask or a subscription holds its connection open for
+/// as long as the ask lives, and a registration can wait out a withdrawn
+/// box's revocation
+/// ([`crate::box_registry::REVOCATION_WAIT`]) before its row is refused
+/// or filled — none of them may hold the door's other connections behind
+/// them. A thread that cannot be spawned is answered on the spot with the
+/// reason, and the connection closes.
+fn spawn_serving_thread(
     mut stream: UnixStream,
     name: &str,
+    what: &str,
     boxes: &BoxRegistry,
     audit_path: &Path,
     serve: impl FnOnce(UnixStream, &BoxRegistry, &Path) + Send + 'static,
@@ -1440,11 +1467,13 @@ fn spawn_ask_thread(
     {
         Ok(_) => Ok(()),
         Err(error) => {
-            tracing::warn!(%error, thread = %name, "could not start an ask verb's thread");
+            tracing::warn!(%error, thread = name, "could not start a control connection's thread");
             write_reply(
                 &mut stream,
                 &BoxControlReply::Error {
-                    error: format!("the VM host daemon could not serve the ask verb: {error}"),
+                    error: format!(
+                        "the VM host daemon could not serve the {what} on its thread: {error}"
+                    ),
                 },
             )
         }
@@ -2802,6 +2831,93 @@ mod tests {
             !logged.contains("egress-unknown-source"),
             "the withdrawn address is in-plan, so its drop is the \
              unregistered rule's, got: {logged}"
+        );
+    }
+
+    /// A registration that waits out a withdrawn box's revocation
+    /// ([`crate::box_registry::REVOCATION_WAIT`]) holds only its own
+    /// connection: the verb runs on a thread of its own, so the door
+    /// serves another registration while the first is still waiting on
+    /// the address the revocation holds — the serial accept loop never
+    /// carried that wait.
+    #[test]
+    fn a_registration_waiting_out_a_revocation_does_not_hold_the_door() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (sock_path, _server, registry, _answerer, _proxy_publish) =
+            spawn_server(dir.path()).expect("server binds");
+        // The withdrawal's subscriber: the copy it holds is what keeps the
+        // withdrawn box's addresses held, so a registration at the same
+        // published address waits on it.
+        let mut withdrawn = registry.table().subscribe_row_withdrawals();
+        let spec = |name: &str| RegisterBoxRequest {
+            name: name.to_string(),
+            ingress_ports: vec![8080],
+            egress: None,
+            credentialed_upstream: None,
+            dynamic_ingress: None,
+            dynamic_allowed_range: None,
+        };
+        let web = handed(register(&sock_path, &spec("web")).expect("the registration is answered"));
+        let echoed = control(
+            &sock_path,
+            &BoxControlRequest::Withdraw(WithdrawBoxRequest {
+                name: "web".to_string(),
+                switch_address: web.switch_address,
+                loopback_address: web.loopback_address,
+            }),
+        )
+        .expect("the withdrawal is answered");
+        assert!(
+            matches!(echoed, BoxControlReply::Addresses(pair)
+                if pair.switch_address == web.switch_address
+                    && pair.loopback_address == web.loopback_address),
+            "the withdrawal echoes the pair it went by, got {echoed:?}"
+        );
+        let held = withdrawn
+            .try_recv()
+            .expect("the subscriber is told the withdrawal");
+
+        // The waiting registration: the answerer hands a released box its
+        // own address back inside the quarantine, so this registration
+        // names the held address and waits on the subscriber's copy — for
+        // as long as the test holds it.
+        let waiting = {
+            let sock_path = sock_path.clone();
+            let request = spec("web");
+            std::thread::spawn(move || register(&sock_path, &request))
+        };
+        // Give the waiting registration its turn at the door, then ask the
+        // door for another box: it must be served while the first is still
+        // waiting, not behind it.
+        std::thread::sleep(Duration::from_millis(100));
+        let served_at = std::time::Instant::now();
+        let other = handed(
+            register(&sock_path, &spec("other"))
+                .expect("another registration is served while the first waits"),
+        );
+        assert!(
+            served_at.elapsed() < Duration::from_secs(2),
+            "the door served another registration in {:?}, behind the wait",
+            served_at.elapsed()
+        );
+        assert_ne!(
+            other.loopback_address, web.loopback_address,
+            "the other box draws its own address, not the held one"
+        );
+
+        // The waiting registration cannot finish before the hold it waits
+        // on ends; it ends here, and the same box's published address is
+        // its own again.
+        drop(held);
+        let again = handed(
+            waiting
+                .join()
+                .expect("the waiting registration's thread")
+                .expect("the waiting registration is answered"),
+        );
+        assert_eq!(
+            again.loopback_address, web.loopback_address,
+            "the waiting registration waited for the released address, its own again"
         );
     }
 
