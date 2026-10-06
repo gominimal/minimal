@@ -1722,6 +1722,7 @@ impl ManagerHandle {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::session::PACKAGE_CHECK_DEADLINE;
     use paths::HostAbsPath;
     use sessions::daemon::composer::ComposeOutcome;
     use sessions::wire::request::{ContributionVerdict, SessionStep, WireContribution};
@@ -2717,6 +2718,143 @@ pub(crate) mod tests {
         let _pending = mngr.create_session(sample_config(), None).await.unwrap();
 
         assert!(mngr.needed_packages().await.unwrap().is_empty());
+    }
+
+    /// Creates a session over a workspace declaring local package `pkg` in
+    /// its `[session]` block plus `extra` as further session packages,
+    /// configures it with `contribution`, and finalizes it with the package
+    /// check on, bounded by `deadline`. Returns the manager, the id, and
+    /// the finalize's outcome.
+    async fn finalize_with_package_check(
+        extra: &[&str],
+        contribution: WireContribution,
+        deadline: std::time::Duration,
+    ) -> (
+        TempDir,
+        TempDir,
+        ManagerHandle,
+        SessionId,
+        Result<Vec<minimald_rpc::RanHook>, std::io::Error>,
+    ) {
+        let (state, cache, mngr) = manager().await;
+        let id = mngr.create_session(sample_config(), None).await.unwrap();
+        seed_workspace_package(&mngr, id, "pkg-ok").await;
+        let packages: Vec<String> = std::iter::once("pkg-ok")
+            .chain(extra.iter().copied())
+            .map(|p| format!("\"{p}\""))
+            .collect();
+        seed_workspace_mfile(
+            &mngr,
+            id,
+            &format!("[session]\npackages = [{}]\n", packages.join(", ")),
+        )
+        .await;
+        let handle = session(&mngr, id).await;
+        let response = handle
+            .configure_loadout(contribution)
+            .await
+            .expect("packages gate nothing at compose");
+        assert!(response.is_none(), "nothing in the composition is gated");
+        handle.check_packages_at_finalize(deadline).await;
+        let outcome = handle.finalize().await;
+        (state, cache, mngr, id, outcome)
+    }
+
+    async fn status_of(mngr: &ManagerHandle, id: SessionId) -> sessions::SessionStatus {
+        mngr.get_record(SessionKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .expect("the record should survive the finalize")
+            .status
+    }
+
+    /// A `[session]` package the graph does not declare is refused at
+    /// finalize, naming the package and the project that declared it, and
+    /// the record is not promoted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finalize_refuses_an_unknown_session_package() {
+        let (_state, _cache, mngr, id, outcome) = finalize_with_package_check(
+            &["no-such-pkg-zz"],
+            WireContribution::default(),
+            PACKAGE_CHECK_DEADLINE,
+        )
+        .await;
+        let err = outcome.expect_err("an unknown package must not activate");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no such package: no-such-pkg-zz") && msg.contains("project"),
+            "the error should name the package and its declarer, got {msg:?}"
+        );
+        assert!(
+            !msg.contains("pkg-ok"),
+            "a package that resolves is not reported, got {msg:?}"
+        );
+        assert_ne!(status_of(&mngr, id).await, sessions::SessionStatus::Active);
+    }
+
+    /// The same refusal for a package that arrives through a loadout: the
+    /// project resolves, the loadout's package does not.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finalize_refuses_an_unknown_loadout_package() {
+        use sessions::wire::primitives::{WirePackageRef, WireSource};
+
+        let mut contribution = WireContribution::default();
+        contribution.requested_packages.push(WirePackageRef {
+            name: "no-such-pkg-qq".into(),
+            source: WireSource::UserLoadout {
+                name: "editor".into(),
+            },
+        });
+        let (_state, _cache, mngr, id, outcome) =
+            finalize_with_package_check(&[], contribution, PACKAGE_CHECK_DEADLINE).await;
+        let err = outcome.expect_err("an unknown loadout package must not activate");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no such package: no-such-pkg-qq") && msg.contains("loadout `editor`"),
+            "the error should name the package and its loadout, got {msg:?}"
+        );
+        assert_ne!(status_of(&mngr, id).await, sessions::SessionStatus::Active);
+    }
+
+    /// A composition whose every package resolves still finalizes to
+    /// `Active` with the check on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finalize_with_resolvable_packages_still_activates() {
+        let (_state, _cache, mngr, id, outcome) =
+            finalize_with_package_check(&[], WireContribution::default(), PACKAGE_CHECK_DEADLINE)
+                .await;
+        outcome.expect("a session whose packages resolve should finalize");
+        assert_eq!(status_of(&mngr, id).await, sessions::SessionStatus::Active);
+    }
+
+    /// A check that cannot resolve the graph within its deadline steps
+    /// aside instead of failing the finalize: the session activates with
+    /// its unknown name unresolved, which the launch reports at first
+    /// exec, exactly as before the check existed. This is the daemon-side
+    /// bound on the work the check adds to the `FinalizeSession`
+    /// round-trip — a cold-cache upstream clone can outlast the client's
+    /// own deadline, and a client that expires does not cancel the
+    /// daemon-side finalize, so the check must not hold the record's
+    /// promotion hostage to work the client has stopped waiting for.
+    ///
+    /// A zero deadline pins the expiry path without a slow graph to wait
+    /// out: the check body gets its single poll before the deadline fires
+    /// (tokio polls the future before the delay), and cannot complete
+    /// within it, since its graph evaluation round-trips the blocking
+    /// pool. The composition names an unknown package so a check that
+    /// ignored its deadline would refuse instead of activate.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finalize_with_an_expired_package_check_still_activates() {
+        let (_state, _cache, mngr, id, outcome) = finalize_with_package_check(
+            &["no-such-pkg-exp"],
+            WireContribution::default(),
+            std::time::Duration::ZERO,
+        )
+        .await;
+        outcome.expect("an expired check steps aside; the session still activates");
+        assert_eq!(status_of(&mngr, id).await, sessions::SessionStatus::Active);
     }
 
     /// The held [`Composition`] actually carries the project
