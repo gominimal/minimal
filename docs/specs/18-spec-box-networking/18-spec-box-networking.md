@@ -5,7 +5,7 @@ owner: norrietaylor
 epic: gominimal/inbox#646
 arch: https://github.com/gominimal/arch/blob/5c1201517ba07347344fb9725efb06ee39d5c03e/specs/networking/deployment-and-egress-gateway.md
 arch_sha: "5c1201517ba07347344fb9725efb06ee39d5c03e"
-updated: 2026-09-25
+updated: 2026-10-06
 ---
 
 # NET — Box networking on the local host: preview by name and bounded egress
@@ -448,6 +448,11 @@ included, with every refusal logged (NET-001 to NET-004).
   tier:     T0
   verify:   cargo nextest run -p minimald dns_pinned_admission_window
   <!-- S8b/AC1; prose 42; event-driven -->
+
+- **NET-141** WHEN a box queries a name that its `egress.allow_dns_hosts` does not match and that is not in the box zone THE SYSTEM SHALL refuse the query without forwarding it upstream.
+  tier:     T0
+  verify:   cargo nextest run -p minimald unmatched_name_refused_without_upstream_forward
+  <!-- design §5.3 ("Non-matching names are refused"); event-driven; the complement of NET-066; holds on both resolver paths, the node's DNS layer inside a VM-backed host and the host side natively; box-zone names stay exempt (NET-072); the refusal comes before any upstream query, because a forwarded query carries data out in the queried name even when the connection that follows is dropped (NET-062); the proof asserts that no upstream query is made, not only that the client fails -->
 
 - **NET-067** IF an allowed name resolves into the box's `egress.deny_subnets` or the infrastructure deny set THEN THE SYSTEM SHALL refuse the connection.
   tier:     T2
