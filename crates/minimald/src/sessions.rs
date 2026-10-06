@@ -1002,7 +1002,7 @@ impl Manager {
     /// logged and skipped, so one bad record costs only its own name.
     #[cfg(target_os = "linux")]
     async fn resume_active_sessions(&mut self) -> Result<usize, SessionsError> {
-        if self.in_shutdown {
+        if self.in_shutdown.is_cancelled() {
             return Ok(0);
         }
         let mut resumed = 0;
