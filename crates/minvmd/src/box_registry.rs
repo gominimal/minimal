@@ -46,8 +46,8 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
-use std::time::Instant;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock};
+use std::time::{Duration, Instant};
 
 use sessions::core::egress::EgressRules;
 use sessions::core::zone_answer;
@@ -91,9 +91,144 @@ const ALLOW_ALL_SUBNET: &str = "0.0.0.0/0";
 type WithdrawalReport = Vec<[u8; 4]>;
 
 /// The subscribers to row withdrawals: one sender per subscriber, each told
-/// the switch address of every row the registry removes. Shared by the
+/// of every row the registry removes ([`RowWithdrawal`]). Shared by the
 /// registry and every [`BoxTable`] it hands out.
-type RowWithdrawals = Arc<Mutex<Vec<tokio::sync::mpsc::UnboundedSender<[u8; 4]>>>>;
+type RowWithdrawals = Arc<Mutex<Vec<tokio::sync::mpsc::UnboundedSender<RowWithdrawal>>>>;
+
+/// How long a client-driven registration waits for a withdrawn box's
+/// revocation to release the addresses it asks for, before it is refused
+/// with [`AllocationError::RevocationPending`]. A revocation that goes well
+/// holds an address for one unexpose per forward, which takes milliseconds.
+/// The bound is for a switch that is slow to answer, and it keeps the serial
+/// control door from waiting on a switch that never answers.
+pub const REVOCATION_WAIT: Duration = Duration::from_secs(5);
+
+/// The addresses a withdrawn box's revocation still holds against reuse
+/// (design §7.1): the switch address its forwards dial and the published
+/// loopback address they listen on. Each is held from the row's withdrawal
+/// until every subscriber is done with it. No row is registered at a held
+/// address ([`BoxRegistry::try_register`]), so the forwards a revocation
+/// unbinds, and the connections it ends, are always the withdrawn box's. A
+/// new box at the same address can neither receive the old box's forwarded
+/// connections nor have its own forwards unbound by the old box's end.
+///
+/// The holds are counted, because two of them may name one address.
+#[derive(Debug, Default)]
+struct Revoking {
+    held: Mutex<BTreeMap<[u8; 4], usize>>,
+    /// Signalled whenever a hold is released, for the registrations that
+    /// wait on one ([`Revoking::wait_released`]).
+    released: Condvar,
+}
+
+impl Revoking {
+    fn lock(&self) -> MutexGuard<'_, BTreeMap<[u8; 4], usize>> {
+        self.held
+            .lock()
+            .expect("the revocation holds' lock is held only across a map update")
+    }
+
+    /// The first of `addrs` a revocation still holds, when one does.
+    fn first_held(&self, addrs: &[[u8; 4]]) -> Option<[u8; 4]> {
+        let held = self.lock();
+        addrs.iter().find(|addr| held.contains_key(*addr)).copied()
+    }
+
+    fn hold(&self, addrs: &[[u8; 4]]) {
+        let mut held = self.lock();
+        for addr in addrs {
+            *held.entry(*addr).or_default() += 1;
+        }
+    }
+
+    fn release(&self, addrs: &[[u8; 4]]) {
+        let mut held = self.lock();
+        for addr in addrs {
+            if let Some(count) = held.get_mut(addr) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    held.remove(addr);
+                }
+            }
+        }
+        drop(held);
+        self.released.notify_all();
+    }
+
+    /// Waits up to `bound` for every one of `addrs` to be released. Returns
+    /// the first address still held at the bound, or `None` once none is.
+    fn wait_released(&self, addrs: &[[u8; 4]], bound: Duration) -> Option<[u8; 4]> {
+        let deadline = Instant::now() + bound;
+        let mut held = self.lock();
+        loop {
+            let still = addrs
+                .iter()
+                .find(|addr| held.contains_key(*addr))
+                .copied()?;
+            let now = Instant::now();
+            if now >= deadline {
+                return Some(still);
+            }
+            held = self
+                .released
+                .wait_timeout(held, deadline - now)
+                .expect("the revocation holds' lock is held only across a map update")
+                .0;
+        }
+    }
+}
+
+/// The addresses a row's revocation holds: its switch address, and its
+/// published loopback address when that is one of the reserved range's
+/// per-box addresses. The shared `127.0.0.1` is never held: every
+/// host-address namespace publishes there, so it is no one box's to hold.
+fn revocation_addrs(switch_addr: Ipv4Addr, loopback_addr: Ipv4Addr) -> Vec<[u8; 4]> {
+    let mut addrs = vec![switch_addr.octets()];
+    if in_reserved_local_range(loopback_addr) {
+        addrs.push(loopback_addr.octets());
+    }
+    addrs
+}
+
+/// One withdrawn row, as a row-withdrawal subscriber receives it
+/// ([`BoxTable::subscribe_row_withdrawals`]). It holds the row's addresses
+/// against reuse for as long as any subscriber keeps a copy: a registration
+/// at one of them is refused until every copy is dropped. The egress gate
+/// keeps its copy until it has unbound the box's forwards, so no new box is
+/// registered at an address an old box's forward still dials or listens on.
+#[derive(Debug, Clone)]
+pub struct RowWithdrawal {
+    switch_addr: Ipv4Addr,
+    hold: Arc<RevocationHold>,
+}
+
+impl RowWithdrawal {
+    /// The withdrawn row's switch address: the address its forwards dial.
+    #[must_use]
+    pub fn switch_addr(&self) -> Ipv4Addr {
+        self.switch_addr
+    }
+
+    /// The addresses this withdrawal holds against reuse.
+    #[must_use]
+    pub fn held_addrs(&self) -> &[[u8; 4]] {
+        &self.hold.addrs
+    }
+}
+
+/// The hold a [`RowWithdrawal`]'s copies share, released when the last copy
+/// drops.
+#[derive(Debug)]
+struct RevocationHold {
+    addrs: Vec<[u8; 4]>,
+    revoking: Arc<Revoking>,
+}
+
+impl Drop for RevocationHold {
+    fn drop(&mut self) {
+        self.revoking.release(&self.addrs);
+    }
+}
 
 /// The guest node namespace's name in the table: the in-VM daemon, whose own
 /// root-netns tap [`BoxRegistry::register_node_namespace`] publishes.
@@ -187,7 +322,7 @@ pub struct BoxRecord {
 /// ordering across concurrent reports. The set is compared through one
 /// lock at a time, each side's taken and released before the other's: a
 /// row compared with itself — and the table's live rows are the
-/// registrations' own Arcs, so [`BoxRegistry::register`]'s caller holds
+/// registrations' own Arcs, so [`BoxRegistry::try_register`]'s caller holds
 /// the very record the table resolves — must never take its own lock
 /// twice, which a std mutex refuses. The rate window the half also holds
 /// is the limiter's bookkeeping, never the row's identity, so it is not
@@ -625,7 +760,7 @@ pub enum AllocationError {
     LoopbackExhausted,
     /// The address plan does not serve this registry's subnet, so no box
     /// address can be allocated against it. An explicit registration
-    /// ([`BoxRegistry::register`]) still works: it brings its own
+    /// ([`BoxRegistry::try_register`]) still works: it brings its own
     /// addresses.
     #[error("the address plan does not serve subnet {0}; no box address can be allocated")]
     UnplannedSubnet(SwitchSubnet),
@@ -640,6 +775,19 @@ pub enum AllocationError {
     CollidingBoxId {
         /// The id a live row or attachment already holds.
         id: BoxId,
+    },
+    /// The address is still held by a withdrawn box's revocation: the host
+    /// has not finished unbinding the forwards that box published there
+    /// (design §7.1). A row at the address now would receive the old box's
+    /// forwarded connections, or have its own forwards unbound at the old
+    /// box's end, so the registration is refused instead.
+    #[error(
+        "address {addr} is still held by a withdrawn box whose forwards the host has not \
+         finished unbinding"
+    )]
+    RevocationPending {
+        /// The held address: a switch address or a published loopback one.
+        addr: Ipv4Addr,
     },
 }
 
@@ -1626,6 +1774,9 @@ pub struct BoxRegistry {
     /// told the switch address of every row removed, whichever path removed
     /// it. The egress gate subscribes, to unbind a withdrawn box's forwards.
     row_withdrawals: RowWithdrawals,
+    /// The addresses withdrawn boxes' revocations still hold against reuse
+    /// ([`Revoking`]), shared by every clone and every [`BoxTable`].
+    revoking: Arc<Revoking>,
     /// The next switch address the client-driven allocation hands out,
     /// shared by every clone of this registry. Draws from the hand-out run
     /// — the plan run's upper half, above the daemon's self-allocation
@@ -1674,6 +1825,7 @@ impl Clone for BoxRegistry {
             withdrawal_reports: self.withdrawal_reports.clone(),
             withdrawal_reports_rx: Mutex::new(None),
             row_withdrawals: Arc::clone(&self.row_withdrawals),
+            revoking: Arc::clone(&self.revoking),
             next_switch_addr: Arc::clone(&self.next_switch_addr),
             #[cfg(test)]
             next_loopback_addr: Arc::clone(&self.next_loopback_addr),
@@ -1702,6 +1854,7 @@ impl BoxRegistry {
             withdrawal_reports: reports,
             withdrawal_reports_rx: Mutex::new(Some(reports_rx)),
             row_withdrawals: Arc::new(Mutex::new(Vec::new())),
+            revoking: Arc::new(Revoking::default()),
             next_switch_addr: Arc::new(AtomicU32::new(hand_out_run(subnet).0)),
             #[cfg(test)]
             next_loopback_addr: Arc::new(AtomicU32::new(
@@ -1759,11 +1912,24 @@ impl BoxRegistry {
     /// admission is decided against them, on the host, by the gate's DNS
     /// admission table ([`crate::net::dns_pins`]).
     ///
+    /// # Errors
+    ///
+    /// [`AllocationError::RevocationPending`] when the registration's switch
+    /// address, or its per-box published loopback address, is still held by
+    /// a withdrawn box's revocation ([`RowWithdrawal`], design §7.1). The
+    /// check and the insert happen under one write of the row lock, and a
+    /// withdrawal takes its hold under the same lock, so no row can land at
+    /// an address between its withdrawal and the end of its revocation. A
+    /// refused registration leaves nothing behind: no row and no attachment.
+    ///
     /// # Panics
     ///
     /// Never: the row lock is only ever held across this map update, never
     /// across a panic.
-    pub fn register(&self, registration: BoxRegistration) -> Arc<BoxRecord> {
+    pub fn try_register(
+        &self,
+        registration: BoxRegistration,
+    ) -> Result<Arc<BoxRecord>, AllocationError> {
         // The name-based admission lives beside the frame rules, not in
         // them: whether a row's undeclared destinations are the DNS
         // admission table's to decide is the declaration's own fact, read
@@ -1845,6 +2011,33 @@ impl BoxRegistry {
         // address `RegisteredBoxes` excludes) and no attachment either —
         // the plan keeps that address outside the run every client box is
         // handed from, so excluding it names exactly the node row.
+        //
+        // Both happen under the row lock, after the revocation check: a
+        // withdrawal takes its hold under the same lock, so an address is
+        // either still a live row's or held until its revocation ends.
+        #[expect(
+            clippy::unwrap_in_result,
+            reason = "the expect is the lock's poison guard, not this function's error \
+                      handling: the row lock is never held across a panic, so it cannot be \
+                      poisoned"
+        )]
+        let mut rows = self
+            .rows
+            .write()
+            .expect("the row lock is never held across a panic, so it cannot be poisoned");
+        if let Some(held) = self
+            .revoking
+            .first_held(&revocation_addrs(record.switch_addr, record.loopback_addr))
+        {
+            drop(rows);
+            let addr = Ipv4Addr::from(held);
+            tracing::warn!(
+                box = %record.name(),
+                %addr,
+                "refused a box registration at an address a withdrawn box's revocation still holds"
+            );
+            return Err(AllocationError::RevocationPending { addr });
+        }
         if let Some(attachments) = &self.attachments
             && record.switch_addr != self.subnet.daemon_ip()
         {
@@ -1856,10 +2049,8 @@ impl BoxRegistry {
                 record.declares_credentialed_upstream(),
             );
         }
-        self.rows
-            .write()
-            .expect("the row lock is never held across a panic, so it cannot be poisoned")
-            .insert(record.switch_addr.octets(), Arc::clone(&record));
+        rows.insert(record.switch_addr.octets(), Arc::clone(&record));
+        drop(rows);
         // The newest declaration is a namespace that is running: whatever
         // stopped mark the address carried is stale now, and the change is
         // a ping every subscriber re-derives from.
@@ -1868,7 +2059,24 @@ impl BoxRegistry {
             .expect("the stopped set's lock is never held across a panic, so it cannot be poisoned")
             .remove(&record.switch_addr.octets());
         self.ping();
-        record
+        Ok(record)
+    }
+
+    /// [`Self::try_register`] for a test that never registers at a held
+    /// address.
+    #[cfg(test)]
+    pub fn register(&self, registration: BoxRegistration) -> Arc<BoxRecord> {
+        self.try_register(registration)
+            .expect("a test registration never lands at an address a revocation holds")
+    }
+
+    /// Waits up to `bound` for a withdrawn box's revocation to release
+    /// `addrs` ([`RowWithdrawal`]). Returns the first address still held at
+    /// the bound, or `None` once none is.
+    fn wait_for_revocations(&self, addrs: &[[u8; 4]], bound: Duration) -> Option<Ipv4Addr> {
+        self.revoking
+            .wait_released(addrs, bound)
+            .map(Ipv4Addr::from)
     }
 
     /// Withdraws the row published for `switch_addr`, returning it when one
@@ -1888,12 +2096,18 @@ impl BoxRegistry {
         // relay's report — so the withdrawal's own line measures itself
         // against this instant (NET-133's bound).
         self.retire_proxy_attachment(switch_addr, Instant::now());
-        let removed = self
+        let mut rows = self
             .rows
             .write()
-            .expect("the row lock is never held across a panic, so it cannot be poisoned")
-            .remove(&switch_addr.octets());
-        self.retired(&removed);
+            .expect("the row lock is never held across a panic, so it cannot be poisoned");
+        let removed = rows.remove(&switch_addr.octets());
+        // The hold is taken under the same lock the row leaves under, so no
+        // registration can land at the address in between.
+        let withdrawal = removed
+            .as_deref()
+            .and_then(|record| self.begin_revocation(record));
+        drop(rows);
+        self.retired(&removed, withdrawal);
         removed
     }
 
@@ -1918,7 +2132,7 @@ impl BoxRegistry {
     /// Registers a client box: allocates its switch address from the plan's
     /// lease run and its published loopback address from the slice this
     /// subnet's switch serves at, then fills the row from `spec` — the same
-    /// compile [`Self::register`] does, addressed at the allocation — and
+    /// compile [`Self::try_register`] does, addressed at the allocation — and
     /// returns the row, whose addresses are the ones to hand back over the
     /// control socket.
     ///
@@ -2013,7 +2227,22 @@ impl BoxRegistry {
             registration = registration.with_dynamic_ingress(stance, spec.dynamic_allowed_range);
         }
         registration.box_id = Some(id);
-        Ok(self.register(registration))
+        // A withdrawn box's revocation may still hold the published address
+        // the answerer handed back: the answerer releases a box's address at
+        // its withdrawal, and the next box can draw it at once. The wait is
+        // bounded, and normally the revocation is long done.
+        if let Some(addr) = self.wait_for_revocations(
+            &revocation_addrs(switch_addr, loopback_addr),
+            REVOCATION_WAIT,
+        ) {
+            tracing::warn!(
+                box = %registration.name,
+                %addr,
+                wait = ?REVOCATION_WAIT,
+                "a withdrawn box's revocation still holds an address this registration needs"
+            );
+        }
+        self.try_register(registration)
     }
 
     /// [`Self::register_client_box_at`] with the published loopback address
@@ -2124,22 +2353,53 @@ impl BoxRegistry {
         // together — so the order never inverts.
         self.retire_proxy_attachment(switch_addr, Instant::now());
         let removed = rows.remove(&switch_addr.octets());
+        let withdrawal = removed
+            .as_deref()
+            .and_then(|record| self.begin_revocation(record));
         drop(rows);
-        self.retired(&removed);
+        self.retired(&removed, withdrawal);
         Ok(removed)
+    }
+
+    /// Holds a removed row's addresses against reuse until its revocation
+    /// ends ([`RowWithdrawal`]). Called under the row lock that removed it.
+    /// `None`, and no hold, when nothing subscribes to withdrawals: then
+    /// nothing will unbind the row's forwards, and nothing would release
+    /// the hold either.
+    fn begin_revocation(&self, record: &BoxRecord) -> Option<RowWithdrawal> {
+        let subscribed = !self
+            .row_withdrawals
+            .lock()
+            .expect("the withdrawal subscribers' lock is held only across pushes and sends")
+            .is_empty();
+        if !subscribed {
+            return None;
+        }
+        let addrs = revocation_addrs(record.switch_addr, record.loopback_addr);
+        self.revoking.hold(&addrs);
+        Some(RowWithdrawal {
+            switch_addr: record.switch_addr,
+            hold: Arc::new(RevocationHold {
+                addrs,
+                revoking: Arc::clone(&self.revoking),
+            }),
+        })
     }
 
     /// Retires a removed row's side facts: its pending asks are cancelled
     /// (NET-045), its stopped mark is stale with the row gone, the
-    /// row-withdrawal subscribers are told its address (design §7.1: the
-    /// gate unbinds the box's forwards), and the change is a ping like any
-    /// other.
-    fn retired(&self, removed: &Option<Arc<BoxRecord>>) {
+    /// row-withdrawal subscribers are each handed a copy of `withdrawal`
+    /// (design §7.1: the gate unbinds the box's forwards, holding the row's
+    /// addresses until it has), and the change is a ping like any other. A
+    /// subscriber that is gone drops its copy, so it holds nothing.
+    fn retired(&self, removed: &Option<Arc<BoxRecord>>, withdrawal: Option<RowWithdrawal>) {
         if let Some(record) = removed {
-            self.row_withdrawals
-                .lock()
-                .expect("the withdrawal subscribers' lock is held only across pushes and sends")
-                .retain(|subscriber| subscriber.send(record.switch_addr.octets()).is_ok());
+            if let Some(withdrawal) = withdrawal {
+                self.row_withdrawals
+                    .lock()
+                    .expect("the withdrawal subscribers' lock is held only across pushes and sends")
+                    .retain(|subscriber| subscriber.send(withdrawal.clone()).is_ok());
+            }
             // The row's pending asks go with it (NET-045): with no grant
             // left to publish under, each ends cancelled, and its guest's
             // serving thread audits the cancellation it receives.
@@ -2490,11 +2750,33 @@ impl BoxRegistry {
     /// gate existed — its own package fetches above all, which is the
     /// VM-side shape of NET-080. NET-130 tightens this row to the categories
     /// design §5.1 enumerates.
-    pub fn register_node_namespace(&self, proxy_port: u16) -> Arc<BoxRecord> {
-        self.register(
-            BoxRegistration::new(NODE_NAMESPACE, self.subnet.daemon_ip(), Ipv4Addr::LOCALHOST)
+    ///
+    /// # Errors
+    ///
+    /// [`AllocationError::RevocationPending`] when the node's previous row
+    /// was withdrawn and its revocation still holds the node's address past
+    /// [`REVOCATION_WAIT`] ([`Self::try_register`]).
+    pub fn try_register_node_namespace(
+        &self,
+        proxy_port: u16,
+    ) -> Result<Arc<BoxRecord>, AllocationError> {
+        let daemon_ip = self.subnet.daemon_ip();
+        let _still_held = self.wait_for_revocations(
+            &revocation_addrs(daemon_ip, Ipv4Addr::LOCALHOST),
+            REVOCATION_WAIT,
+        );
+        self.try_register(
+            BoxRegistration::new(NODE_NAMESPACE, daemon_ip, Ipv4Addr::LOCALHOST)
                 .with_admitted_ports([proxy_port]),
         )
+    }
+
+    /// [`Self::try_register_node_namespace`] for a test whose node address
+    /// no revocation holds.
+    #[cfg(test)]
+    pub fn register_node_namespace(&self, proxy_port: u16) -> Arc<BoxRecord> {
+        self.try_register_node_namespace(proxy_port)
+            .expect("a test's node address is never held by a revocation")
     }
 
     /// Takes the receiving end of the gate's withdrawal reports, once: every
@@ -2571,6 +2853,7 @@ impl BoxRegistry {
             subnet: self.subnet,
             withdrawal_reports: self.withdrawal_reports.clone(),
             row_withdrawals: Arc::clone(&self.row_withdrawals),
+            revoking: Arc::clone(&self.revoking),
         }
     }
 }
@@ -2642,6 +2925,7 @@ pub struct BoxTable {
     subnet: SwitchSubnet,
     withdrawal_reports: std::sync::mpsc::Sender<WithdrawalReport>,
     row_withdrawals: RowWithdrawals,
+    revoking: Arc<Revoking>,
 }
 
 impl BoxTable {
@@ -2655,14 +2939,27 @@ impl BoxTable {
     /// withdrawn box's forwards and terminates their connections (design
     /// §7.1, host-side ingress revocation). A subscriber that drops its
     /// receiver is pruned on the next withdrawal.
+    ///
+    /// Each [`RowWithdrawal`] holds the row's addresses against reuse until
+    /// the subscriber drops it, so a subscriber keeps it exactly as long as
+    /// the work it does for the row's end.
     #[must_use]
-    pub fn subscribe_row_withdrawals(&self) -> tokio::sync::mpsc::UnboundedReceiver<[u8; 4]> {
+    pub fn subscribe_row_withdrawals(&self) -> tokio::sync::mpsc::UnboundedReceiver<RowWithdrawal> {
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
         self.row_withdrawals
             .lock()
             .expect("the withdrawal subscribers' lock is held only across pushes and sends")
             .push(sender);
         receiver
+    }
+
+    /// Whether a withdrawn box's revocation still holds `addr` against
+    /// reuse ([`RowWithdrawal`]): the gate refuses a publish there until
+    /// the revocation ends, so that it never unbinds a forward that a later
+    /// publish at the same address bound.
+    #[must_use]
+    pub fn revocation_pending(&self, addr: [u8; 4]) -> bool {
+        self.revoking.first_held(&[addr]).is_some()
     }
 
     /// The published namespace holding the switch address `src`, when one
@@ -3292,11 +3589,156 @@ mod tests {
                 .is_some()
         );
 
-        assert_eq!(withdrawn.try_recv(), Ok(web.switch_addr().octets()));
-        assert_eq!(withdrawn.try_recv(), Ok(db.switch_addr().octets()));
+        assert_eq!(
+            withdrawn.try_recv().map(|w| w.switch_addr()),
+            Ok(web.switch_addr())
+        );
+        assert_eq!(
+            withdrawn.try_recv().map(|w| w.switch_addr()),
+            Ok(db.switch_addr())
+        );
         assert!(
             withdrawn.try_recv().is_err(),
             "a withdrawal that removed nothing told the subscriber nothing"
+        );
+    }
+
+    /// The registration half of design §7.1's revocation, for a new row
+    /// that arrives before the old box's revocation has run. While a
+    /// subscriber holds a withdrawal, neither the row's switch address nor
+    /// its per-box published address can be registered again, by any door.
+    /// A row there now would receive the old box's forwarded connections,
+    /// or have its own forwards unbound at the old box's end. Once the
+    /// subscriber drops the withdrawal (its revocation is done), both are
+    /// free.
+    #[test]
+    fn a_withdrawn_rows_addresses_stay_unregistrable_until_its_revocation_ends() {
+        let registry = BoxRegistry::new(SUBNET);
+        let mut withdrawn = registry.table().subscribe_row_withdrawals();
+        let web = registry
+            .register_client_box(ClientBoxSpec {
+                name: "web".to_string(),
+                ingress_ports: vec![8080],
+                egress: None,
+                credentialed_upstream: None,
+                dynamic_ingress: None,
+                dynamic_allowed_range: None,
+            })
+            .expect("the plan has an address for the box");
+        assert!(registry.withdraw(web.switch_addr()).is_some());
+        let withdrawal = withdrawn.try_recv().expect("the subscriber is told");
+        assert_eq!(
+            withdrawal.held_addrs(),
+            [web.switch_addr().octets(), web.loopback_addr().octets()],
+            "the switch address and the per-box published address are both held"
+        );
+
+        // The same switch address, under another published address.
+        let other_switch = Ipv4Addr::from(u32::from(web.switch_addr()) + 7);
+        assert_eq!(
+            registry
+                .try_register(BoxRegistration::new(
+                    "again",
+                    web.switch_addr(),
+                    Ipv4Addr::LOCALHOST
+                ))
+                .map(|row| row.name().to_string()),
+            Err(AllocationError::RevocationPending {
+                addr: web.switch_addr()
+            }),
+        );
+        // The same published address, at another switch address.
+        assert_eq!(
+            registry
+                .try_register(BoxRegistration::new(
+                    "again",
+                    other_switch,
+                    web.loopback_addr()
+                ))
+                .map(|row| row.name().to_string()),
+            Err(AllocationError::RevocationPending {
+                addr: web.loopback_addr()
+            }),
+        );
+        assert!(
+            registry
+                .table()
+                .by_source(web.switch_addr().octets())
+                .is_none()
+                && registry.table().by_source(other_switch.octets()).is_none(),
+            "a refused registration leaves no row behind"
+        );
+        assert!(
+            registry
+                .table()
+                .revocation_pending(web.switch_addr().octets())
+        );
+
+        drop(withdrawal);
+        assert!(
+            !registry
+                .table()
+                .revocation_pending(web.switch_addr().octets())
+        );
+        registry
+            .try_register(BoxRegistration::new(
+                "again",
+                web.switch_addr(),
+                web.loopback_addr(),
+            ))
+            .expect("the revocation is done, so the addresses are free");
+    }
+
+    /// The client door waits, bounded, for a revocation to release the
+    /// published address the answerer handed back, rather than refusing a
+    /// box created just after another one ended.
+    #[test]
+    fn a_client_registration_waits_for_the_revocation_holding_its_address() {
+        let registry = BoxRegistry::new(SUBNET);
+        let mut withdrawn = registry.table().subscribe_row_withdrawals();
+        let spec = |name: &str| ClientBoxSpec {
+            name: name.to_string(),
+            ingress_ports: vec![8080],
+            egress: None,
+            credentialed_upstream: None,
+            dynamic_ingress: None,
+            dynamic_allowed_range: None,
+        };
+        let web = registry
+            .register_client_box(spec("web"))
+            .expect("the plan has an address for the box");
+        assert!(registry.withdraw(web.switch_addr()).is_some());
+        let withdrawal = withdrawn.try_recv().expect("the subscriber is told");
+
+        let started = Instant::now();
+        let revoker = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            drop(withdrawal);
+        });
+        let again = registry
+            .register_client_box_at(spec("web"), web.loopback_addr())
+            .expect("the registration waited for the revocation to end");
+        revoker.join().expect("the revoker thread");
+        assert_eq!(again.loopback_addr(), web.loopback_addr());
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        assert!(started.elapsed() < REVOCATION_WAIT);
+    }
+
+    /// With nothing subscribed to withdrawals, nothing would ever release a
+    /// hold, so a withdrawal takes none.
+    #[test]
+    fn a_withdrawal_with_no_subscriber_holds_nothing() {
+        let registry = BoxRegistry::new(SUBNET);
+        let row = registry.register(BoxRegistration::new(
+            "web",
+            Ipv4Addr::from(SUBNET.first_ptask() + 1),
+            Ipv4Addr::LOCALHOST,
+        ));
+        assert!(registry.withdraw(row.switch_addr()).is_some());
+        assert!(
+            !registry
+                .table()
+                .revocation_pending(row.switch_addr().octets())
         );
     }
 

@@ -170,7 +170,7 @@ use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::task::{JoinHandle, JoinSet};
 
-use crate::box_registry::{BoxRecord, BoxTable};
+use crate::box_registry::{BoxRecord, BoxTable, RowWithdrawal};
 
 use super::baseline::{NodeBaselinePhase, NodePlaneBaseline};
 use super::dns_pins;
@@ -579,6 +579,18 @@ const UNKNOWN_PUBLISH_ADDRESS_RULE: &str = "egress-unknown-publish-address";
 /// over which of the host's ports forward into the VM, and over which names
 /// resolve where, stops at what the host published.
 const UNDECLARED_PUBLISH_RECORD_RULE: &str = "egress-undeclared-publish-record";
+
+/// The rule name for a publish refused because a withdrawn box's revocation
+/// still holds the address it names (design §7.1): the gate is unbinding
+/// that box's forwards, and a forward published there now would be taken
+/// for the old box's and unbound with them.
+const REVOKING_ADDRESS_RULE: &str = "egress-publish-at-revoking-address";
+
+/// The rule name for a publish refused because the gate's publish ledger is
+/// at its bound ([`PUBLISHED_FORWARDS_TRACKED`]): a forward the ledger
+/// cannot hold could never be unbound at its box's end, so it is never
+/// bound.
+const PUBLISH_LEDGER_FULL_RULE: &str = "egress-publish-ledger-full";
 
 /// The rule name for a retraction the decision is applied by nothing at: a
 /// listener no applied publish names — keyed at the unspecified address the
@@ -1537,6 +1549,51 @@ async fn relay_control(
             return;
         }
     };
+    // A publish's two ends go to the ledger before the request is written
+    // on: the listener it is applied at, for a later retraction's
+    // attribution and for its unbind at the box's end, and the inside port
+    // its forward dials — the port the box's declaration listens on and
+    // every client's dial toward the box arrives at — for the reply-flow
+    // recording's bound ([`PublishedForwards::inside_published`], NET-040's
+    // answer half). The protocol is noted with them: the records the inside
+    // port earns are keyed by it, so a later retraction ends them under the
+    // protocol they were opened at, whatever its own body spells. A body
+    // whose remote does not parse is left unnoted, which records nothing
+    // for it: fail closed, the same posture an unapplied publish has.
+    //
+    // Noting first is what lets a full ledger refuse the publish
+    // ([`PUBLISH_LEDGER_FULL_RULE`]): a forward the ledger cannot hold
+    // could never be unbound at its box's end, so it is never bound. A
+    // write that fails takes its note back out: a forward the gate could
+    // not deliver published nothing.
+    let noted = match (verb, forward_listener(verb, &request)) {
+        (ControlVerb::Expose, Some(listener)) => {
+            match (published_inside(&request), published_protocol(&request)) {
+                (Some(inside), Some(proto)) => match forwards.note_published(
+                    listener,
+                    decision.request.switch_addr(),
+                    inside,
+                    proto,
+                ) {
+                    Ok(noted) => noted.then_some(listener),
+                    Err(full) => {
+                        refuse_request(
+                            &limiter,
+                            &RefusedRequest {
+                                rule: PUBLISH_LEDGER_FULL_RULE,
+                                addr: Some(decision.request.switch_addr()),
+                                what: Some(format!("port {}", listener.1)),
+                                reason: full.to_string(),
+                            },
+                        );
+                        return;
+                    }
+                },
+                _ => None,
+            }
+        }
+        _ => None,
+    };
     // Admitted: the head and body are forwarded together, in one write, so
     // the request gvproxy sees is exactly the request the guest sent and
     // exactly the request the table admitted.
@@ -1544,6 +1601,9 @@ async fn relay_control(
     spoken.extend_from_slice(&request);
     if let Err(error) = switch.write_all(&spoken).await {
         tracing::warn!(%error, "egress gate could not forward an admitted control request");
+        if let Some(listener) = noted {
+            let _unpublished = forwards.note_retracted(listener);
+        }
         return;
     }
     if decision.applied == Applied::Interim {
@@ -1555,61 +1615,36 @@ async fn relay_control(
         // live-lease drop line reads ([`PublishedForwards::lease_live_at`]).
         forwards.note_vouched(decision.request.switch_addr());
     }
-    // The applied request is filed with the publish ledger: a forwarder's
-    // listener and the address its publish was applied at are what a later
-    // retraction of it is keyed by, and an applied retraction's listener
-    // leaves the ledger with it — the publication is gone. The note is taken
-    // after the write: a forward the gate could not deliver published
-    // nothing, and attributes nothing. A retraction's note is read back, not
-    // dropped: the attribution it carried names the box whose records the
-    // publication earned, which end with the publication (below).
-    match (verb, forward_listener(verb, &request)) {
-        (ControlVerb::Expose, Some(listener)) => {
-            // The publish's own two ends go to the ledger together: the
-            // listener it was applied at, for a later retraction's
-            // attribution, and the inside port its forward dials — the port
-            // the box's declaration listens on and every client's dial
-            // toward the box arrives at — for the reply-flow recording's
-            // bound ([`PublishedForwards::inside_published`], NET-040's
-            // answer half). The body is one the decision already admitted,
-            // so the remote it read parses here too; a body that somehow did
-            // not is left unnoted, which records nothing for it — fail
-            // closed, the same posture an unapplied publish has. The
-            // protocol is noted with them: the records the inside port earns
-            // are keyed by it, so a later retraction ends them under the
-            // protocol they were opened at, whatever its own body spells.
-            if let Some(inside) = published_inside(&request)
-                && let Some(proto) = published_protocol(&request)
-            {
-                forwards.note_published(listener, decision.request.switch_addr(), inside, proto);
-            }
+    // An applied retraction's listener leaves the publish ledger with it —
+    // the publication is gone. The note is taken after the write: a
+    // retraction the gate could not deliver withdrew nothing. Its note is
+    // read back, not dropped: the attribution it carried names the box
+    // whose records the publication earned, which end with the publication
+    // (below).
+    if let (ControlVerb::Unexpose, Some(listener)) = (verb, forward_listener(verb, &request)) {
+        // The retraction takes the publication's records with it: the
+        // records a publish's inside port earned are admissions *of*
+        // that publish, so they end in the same step the ledger drops
+        // the publish's attribution — the next frame the box sends back
+        // on one of them is decided by the rules, not by the record a
+        // publication that no longer stands opened. The records at the
+        // box's other published ports stay standing: a retraction ends
+        // a publication, never the box. The attribution and the protocol
+        // both come from the ledger, which noted them at the publish the
+        // records were opened under — never from the retraction's own
+        // spelling, which could name a protocol the publish did not —
+        // and which held them for exactly this: a retraction
+        // the ledger could not attribute was already refused, and a
+        // row the retraction ends nothing of simply has no entry to
+        // end. Two listeners can dial one inside port, and the records
+        // are keyed by protocol and inside port, not by listener: while
+        // another applied publish still dials the same port in the same
+        // protocol, the records are that publication's too, so they stay.
+        if let Some((addr, inside, proto)) = forwards.note_retracted(listener)
+            && !forwards.still_published(addr, inside, proto)
+        {
+            replies.end_port_at(addr, proto, inside);
         }
-        (ControlVerb::Unexpose, Some(listener)) => {
-            // The retraction takes the publication's records with it: the
-            // records a publish's inside port earned are admissions *of*
-            // that publish, so they end in the same step the ledger drops
-            // the publish's attribution — the next frame the box sends back
-            // on one of them is decided by the rules, not by the record a
-            // publication that no longer stands opened. The records at the
-            // box's other published ports stay standing: a retraction ends
-            // a publication, never the box. The attribution and the protocol
-            // both come from the ledger, which noted them at the publish the
-            // records were opened under — never from the retraction's own
-            // spelling, which could name a protocol the publish did not —
-            // and which held them for exactly this: a retraction
-            // the ledger could not attribute was already refused, and a
-            // row the retraction ends nothing of simply has no entry to
-            // end. Two listeners can dial one inside port, and the records
-            // are keyed by protocol and inside port, not by listener: while
-            // another applied publish still dials the same port in the same
-            // protocol, the records are that publication's too, so they stay.
-            if let Some((addr, inside, proto)) = forwards.note_retracted(listener)
-                && !forwards.still_published(addr, inside, proto)
-            {
-                replies.end_port_at(addr, proto, inside);
-            }
-        }
-        _ => {}
     }
     let mut response = tokio::spawn(copy_switch_to_guest(switch_rx, guest_tx));
     // The legs race, as the frame relay's do: the switch's side can end under
@@ -1841,12 +1876,12 @@ struct ControlDecision {
 /// ports a control connection noted. The lock is held only across a lookup
 /// or an update, never across an await.
 ///
-/// The table is bounded like the limiter's window table
-/// ([`DROP_WARN_MAX_TRACKED_PAIRS`]): the honest guest's forwards are a
-/// handful per box, and a guest that fills the bound is not rewarded — the
-/// oldest attribution is evicted, which can only turn a later retraction of
-/// that listener into a refusal and a dial at its inside port into one no
-/// record opens.
+/// The table is bounded at [`PUBLISHED_FORWARDS_TRACKED`]. At the bound a
+/// new publish is refused ([`PUBLISH_LEDGER_FULL_RULE`]) rather than an old
+/// attribution evicted: an evicted entry would be a forward still bound on
+/// the host that its box's end could no longer name, so it would never be
+/// unbound. A box's runtime ports can reach the bound (a wide dynamic range
+/// and a busy box), so the refusal is real, typed and logged.
 #[derive(Debug, Default)]
 struct PublishedForwards {
     applied: Mutex<Vec<AppliedPublish>>,
@@ -1868,8 +1903,31 @@ type Listener = ([u8; 4], u16);
 /// applied at, the inside port its forward dials and the protocol it named.
 type AppliedPublish = (Listener, [u8; 4], u16, u8);
 
-/// How many applied publishes' attributions the ledger keeps.
+/// How many applied publishes' attributions the ledger keeps. A publish past
+/// the bound is refused ([`LedgerFull`]).
 const PUBLISHED_FORWARDS_TRACKED: usize = 1024;
+
+/// A publish refused because the ledger holds [`PUBLISHED_FORWARDS_TRACKED`]
+/// forwards already: the gate could not unbind one more at its box's end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "the egress gate's publish ledger holds {PUBLISHED_FORWARDS_TRACKED} forwards, its bound; \
+     a forward the ledger cannot hold could never be unbound at its box's end"
+)]
+struct LedgerFull;
+
+/// The waits between a withdrawn box's unbind attempts, one per retry: a
+/// forward whose unexpose failed is retried after each, and the bound on
+/// the retries is this list's length. Past the last, the forwards still
+/// bound are left bound and said so, and their addresses stay held against
+/// reuse for the gate's lifetime.
+static UNBIND_RETRY_BACKOFF: [Duration; 5] = [
+    Duration::from_millis(250),
+    Duration::from_millis(500),
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+];
 
 /// How many vouched rowless leases the ledger keeps.
 const LEASES_VOUCHED_TRACKED: usize = 1024;
@@ -1884,31 +1942,59 @@ impl PublishedForwards {
         }
     }
 
-    /// Takes every applied publish at the box address `addr` out of the
-    /// ledger, and hands them back for the box's end to unbind
-    /// ([`revoke_box_forwards`]). From here a retraction of one of them is
-    /// unattributed and refused: the host has already withdrawn it.
-    fn take_published_at(&self, addr: [u8; 4]) -> Vec<AppliedPublish> {
-        let mut applied = self.lock();
-        let (taken, kept) = applied.drain(..).partition(|(_, at, _, _)| *at == addr);
-        *applied = kept;
-        taken
+    /// Every applied publish at the box address `addr`: what the box's end
+    /// unbinds ([`revoke_box_forwards`]). Each stays in the ledger until its
+    /// unbind succeeds, so a forward whose unexpose failed is still the
+    /// gate's to retry, and still attributed.
+    fn published_at(&self, addr: [u8; 4]) -> Vec<(Listener, u16, u8)> {
+        self.lock()
+            .iter()
+            .filter(|(_, at, _, _)| *at == addr)
+            .map(|(listener, _, inside, proto)| (*listener, *inside, *proto))
+            .collect()
     }
 
-    /// Notes an applied publish: the address its listener was applied at,
-    /// the inside port its forward dials and the protocol it published. The listener is keyed first —
-    /// gvproxy binds one forwarder per loopback listener, so a second publish
-    /// for a held listener never becomes live — and the ledger is bounded
-    /// oldest-first, so the honest handful never reaches the bound.
-    fn note_published(&self, listener: Listener, addr: [u8; 4], inside: u16, proto: u8) {
+    /// Drops the attribution of `listener` when it is still the one applied
+    /// at `addr`: the box's end unbound it. Returns whether it was.
+    fn note_unbound_at(&self, listener: Listener, addr: [u8; 4]) -> bool {
+        let mut applied = self.lock();
+        let Some(at) = applied
+            .iter()
+            .position(|(held, at, _, _)| *held == listener && *at == addr)
+        else {
+            return false;
+        };
+        applied.remove(at);
+        true
+    }
+
+    /// Notes a publish the gate is about to apply: the address its listener
+    /// is applied at, the inside port its forward dials and the protocol it
+    /// publishes. The listener is keyed first — gvproxy binds one forwarder
+    /// per loopback listener, so a second publish for a held listener never
+    /// becomes live — and `Ok(false)` says the listener was already held, so
+    /// nothing new was noted.
+    ///
+    /// # Errors
+    ///
+    /// [`LedgerFull`] at [`PUBLISHED_FORWARDS_TRACKED`]: the publish is
+    /// refused, never an older attribution evicted.
+    fn note_published(
+        &self,
+        listener: Listener,
+        addr: [u8; 4],
+        inside: u16,
+        proto: u8,
+    ) -> Result<bool, LedgerFull> {
         let mut applied = self.lock();
         if applied.iter().any(|(held, _, _, _)| *held == listener) {
-            return;
+            return Ok(false);
         }
         if applied.len() >= PUBLISHED_FORWARDS_TRACKED {
-            applied.remove(0);
+            return Err(LedgerFull);
         }
         applied.push((listener, addr, inside, proto));
+        Ok(true)
     }
 
     /// Drops the attribution an applied retraction's listener carried, and
@@ -2027,97 +2113,193 @@ impl PublishedForwards {
 /// The gate's half of host-side ingress revocation (design §7.1, NET-121,
 /// NET-017): for every row the registry withdraws, whichever path withdrew
 /// it, the box has ended, so its forwards are unbound and their connections
-/// terminated ([`revoke_box_forwards`]). One withdrawal at a time, each
-/// switch exchange bounded, so a stalled switch delays the next box's
-/// revocation by the bound and never blocks it for good. The loop ends when
-/// the registry is gone.
+/// terminated ([`revoke_box_forwards`]). Each withdrawal is revoked on a
+/// task of its own, so one box's retries never delay another's. A
+/// revocation that gives up hands its withdrawal back, and the loop keeps it
+/// for the gate's lifetime: the addresses it holds stay unregistrable while
+/// a forward is still bound there. The loop ends when the registry is gone.
 async fn revoke_on_row_withdrawal(
-    mut withdrawn: tokio::sync::mpsc::UnboundedReceiver<[u8; 4]>,
+    mut withdrawn: tokio::sync::mpsc::UnboundedReceiver<RowWithdrawal>,
     switch_sock: PathBuf,
     forwards: Arc<PublishedForwards>,
     replies: ReplyTables,
 ) {
-    while let Some(addr) = withdrawn.recv().await {
-        revoke_box_forwards(&switch_sock, &forwards, &replies, addr).await;
+    let mut revocations = JoinSet::new();
+    let mut stranded: Vec<RowWithdrawal> = Vec::new();
+    loop {
+        tokio::select! {
+            next = withdrawn.recv() => {
+                let Some(withdrawal) = next else {
+                    break;
+                };
+                revocations.spawn(revoke_box_forwards(
+                    switch_sock.clone(),
+                    Arc::clone(&forwards),
+                    replies.clone(),
+                    withdrawal,
+                    &UNBIND_RETRY_BACKOFF,
+                ));
+            }
+            Some(done) = revocations.join_next(), if !revocations.is_empty() => {
+                if let Ok(Some(held)) = done {
+                    stranded.push(held);
+                }
+            }
+        }
+    }
+    while let Some(done) = revocations.join_next().await {
+        if let Ok(Some(held)) = done {
+            stranded.push(held);
+        }
     }
 }
 
-/// Unbinds every forward the gate applied at the withdrawn box address
-/// `addr`, then terminates the connections they still carry.
+/// Unbinds every forward the gate applied at the withdrawn box's switch
+/// address, then terminates the connections they still carry. Returns the
+/// withdrawal when it gave up with a forward still bound, so the caller can
+/// keep holding its addresses; `None` once every forward is unbound.
 ///
 /// A declared port's forward is the host's to hold until the box stops:
 /// the gate refuses any withdrawal of it the guest asks for (NET-081's
 /// withdrawal rule), so the host unbinds it here, at box end. A runtime
 /// publish the guest did not retract before the box ended comes down the
-/// same way. Each unexpose ends the reply-flow records its publication
+/// same way. Each unbind ends the reply-flow records its publication
 /// opened, as an applied retraction does in [`relay_control`].
+///
+/// An unexpose that fails leaves its forward in the ledger, and the next
+/// pass retries it after the next wait in `backoff`. A switch that answers
+/// it was not bound counts as unbound: the goal state holds. The
+/// withdrawal, and with it the hold on the box's addresses, is kept until
+/// every forward is unbound ([`RowWithdrawal`]), so no new box is
+/// registered at an address an old forward still serves.
 ///
 /// The order is the one the in-guest revocation keeps, turned around for
 /// the host's side of it: the listeners close first, so no new connection
 /// arrives after the snapshot of the connections to end. Then each tracked
 /// connection gets a reset from the box's address, written into the switch
-/// over a frame connection of the gate's own. The switch closes its side of
-/// the connection, and the host-side client sees it close rather than wait
-/// out a TCP timeout against a box that is gone.
+/// over a frame connection of the gate's own ([`terminate_flows`]).
 ///
 /// Every step logs one line, so a bundle's daemon log tail shows each
 /// forward's unbind beside its bind.
 async fn revoke_box_forwards(
+    switch_sock: PathBuf,
+    forwards: Arc<PublishedForwards>,
+    replies: ReplyTables,
+    withdrawal: RowWithdrawal,
+    backoff: &'static [Duration],
+) -> Option<RowWithdrawal> {
+    let switch_addr = withdrawal.switch_addr();
+    let addr = switch_addr.octets();
+    let mut retries = backoff.iter();
+    let mut attempt = 1usize;
+    loop {
+        unbind_pass(&switch_sock, &forwards, &replies, addr, attempt).await;
+        let flows = forwards.flows.take_at(addr);
+        let still_bound = forwards.published_at(addr);
+        if still_bound.is_empty() {
+            // Every forward is unbound: the addresses are free for a new box
+            // before the resets go out, which reuse no longer depends on.
+            drop(withdrawal);
+            terminate_flows(&switch_sock, switch_addr, &flows).await;
+            return None;
+        }
+        terminate_flows(&switch_sock, switch_addr, &flows).await;
+        let Some(wait) = retries.next() else {
+            for (listener, _, _) in &still_bound {
+                tracing::error!(
+                    %switch_addr,
+                    local = %forward_revoke::listener_local(listener.0, listener.1),
+                    attempts = attempt,
+                    "gave up unbinding the box's forwarder at its row's withdrawal; it stays \
+                     bound, and its addresses stay held against reuse"
+                );
+            }
+            return Some(withdrawal);
+        };
+        tokio::time::sleep(*wait).await;
+        attempt += 1;
+    }
+}
+
+/// One pass over the forwards the ledger still holds at `addr`: an unexpose
+/// each, and the ledger entry and the reply-flow records dropped for each
+/// that is no longer bound. A failure is logged and left for the next pass.
+async fn unbind_pass(
     switch_sock: &std::path::Path,
     forwards: &PublishedForwards,
     replies: &ReplyTables,
     addr: [u8; 4],
+    attempt: usize,
 ) {
     let switch_addr = Ipv4Addr::from(addr);
-    for ((listener_addr, listener_port), _, inside, proto) in forwards.take_published_at(addr) {
-        let local = forward_revoke::listener_local(listener_addr, listener_port);
-        let Some(protocol) = forward_revoke::protocol_name(proto) else {
-            continue;
+    for (listener, inside, proto) in forwards.published_at(addr) {
+        let local = forward_revoke::listener_local(listener.0, listener.1);
+        let outcome = match forward_revoke::protocol_name(proto) {
+            Some(protocol) => {
+                forward_revoke::unexpose(
+                    switch_sock,
+                    &local,
+                    protocol,
+                    forward_revoke::REVOKE_TIMEOUT,
+                )
+                .await
+            }
+            // A protocol the switch has no spelling for was never bound.
+            None => Ok(forward_revoke::Unexposed::NotBound),
         };
-        match forward_revoke::unexpose(
-            switch_sock,
-            &local,
-            protocol,
-            forward_revoke::REVOKE_TIMEOUT,
-        )
-        .await
-        {
-            Ok(()) => tracing::info!(
-                %switch_addr,
-                %local,
-                protocol,
-                reason = "box ended",
-                "unbound the box's forwarder at its row's withdrawal"
-            ),
+        match outcome {
+            Ok(unexposed) => {
+                if forwards.note_unbound_at(listener, addr)
+                    && !forwards.still_published(addr, inside, proto)
+                {
+                    replies.end_port_at(addr, proto, inside);
+                }
+                tracing::info!(
+                    %switch_addr,
+                    %local,
+                    proto,
+                    attempt,
+                    already_unbound = unexposed == forward_revoke::Unexposed::NotBound,
+                    reason = "box ended",
+                    "unbound the box's forwarder at its row's withdrawal"
+                );
+            }
             Err(error) => tracing::warn!(
                 %switch_addr,
                 %local,
-                protocol,
+                proto,
+                attempt,
                 %error,
-                "unbinding the box's forwarder at its row's withdrawal failed"
+                "unbinding the box's forwarder at its row's withdrawal failed; it stays in \
+                 the ledger for a retry"
             ),
         }
-        replies.end_port_at(addr, proto, inside);
     }
-    let flows = forwards.flows.take_at(addr);
+}
+
+/// Resets `flows`, the connections the withdrawn box's forwards carried,
+/// at the switch ([`forward_revoke::inject`]), and logs the outcome.
+async fn terminate_flows(
+    switch_sock: &std::path::Path,
+    switch_addr: Ipv4Addr,
+    flows: &[(forward_revoke::FlowKey, forward_revoke::FlowTail)],
+) {
     if flows.is_empty() {
         return;
     }
-    let resets: Vec<Vec<u8>> = flows
-        .iter()
-        .flat_map(|(key, tail)| forward_revoke::reset_frames(key, tail))
-        .collect();
     match forward_revoke::inject(
         switch_sock,
         CONNECT_REQUEST,
-        &resets,
+        flows,
         forward_revoke::REVOKE_TIMEOUT,
+        forward_revoke::CHALLENGE_WINDOW,
     )
     .await
     {
-        Ok(()) => tracing::info!(
+        Ok(challenges_answered) => tracing::info!(
             %switch_addr,
             terminated = flows.len(),
+            challenges_answered,
             reason = "box ended",
             "terminated the connections the box's forwarders carried"
         ),
@@ -2188,6 +2370,21 @@ fn decide_control_request(
         ControlVerb::Unexpose => summarize_unexpose(body, forwards)?,
         ControlVerb::DnsAdd => summarize_dns_add(body, &mut dictionary)?,
     };
+    // A publish at an address a withdrawn box's revocation still holds is
+    // refused before it is decided: the revocation unbinds every forward
+    // the ledger holds at that address, so a forward bound there now would
+    // be unbound with the old box's. A retraction is still decided: it
+    // takes a forward away, never adds one.
+    if !matches!(verb, ControlVerb::Unexpose) && table.revocation_pending(request.switch_addr()) {
+        return Err(RefusedRequest {
+            rule: REVOKING_ADDRESS_RULE,
+            addr: Some(request.switch_addr()),
+            what: None,
+            reason: "a withdrawn box's revocation still holds this address; the host is \
+                     unbinding that box's forwards"
+                .to_string(),
+        });
+    }
     let applied = switch_request::applied(&request, &switch_table, phase.into_sessions_phase());
     match applied {
         Ok(applied) => Ok(ControlDecision {
@@ -2332,7 +2529,10 @@ fn warn_interim_publish(limiter: &DropLimiter, decision: &ControlDecision) -> bo
                 rule_matched = UNREGISTERED_PUBLISH_RULE,
                 "applied a switch request at an in-plan address no published \
                  namespace holds; the row that bounds it is T66 (#1711), the \
-                 creator-side registration that supplies it",
+                 creator-side registration that supplies it. No row's withdrawal \
+                 names this address, so a forward published here is never unbound \
+                 by the host at its box's end: it stays bound until the switch \
+                 restarts (a known leak of the interim)",
             );
             true
         }
@@ -6753,12 +6953,14 @@ mod tests {
         // listener the switch binds and the inside port its forward dials —
         // the port the recording is bounded by, pinned from the outside.
         let forwards = PublishedForwards::new();
-        forwards.note_published(
-            ([127, 0, 0, 1], 8080),
-            LEASE,
-            18080,
-            super::egress::IPPROTO_TCP,
-        );
+        forwards
+            .note_published(
+                ([127, 0, 0, 1], 8080),
+                LEASE,
+                18080,
+                super::egress::IPPROTO_TCP,
+            )
+            .expect("an empty ledger has room for one publish");
         assert!(
             forwards.inside_published(LEASE, 18080),
             "the mapping's inside port is the port the recording is bounded by"
@@ -6893,12 +7095,14 @@ mod tests {
         // The publish's note for the proxy port, taken as the applied
         // publish takes it.
         let forwards = PublishedForwards::new();
-        forwards.note_published(
-            ([127, 0, 0, 1], 7654),
-            node_addr,
-            7654,
-            super::egress::IPPROTO_TCP,
-        );
+        forwards
+            .note_published(
+                ([127, 0, 0, 1], 7654),
+                node_addr,
+                7654,
+                super::egress::IPPROTO_TCP,
+            )
+            .expect("an empty ledger has room for one publish");
         assert!(
             forwards.inside_published(node_addr, 7654),
             "the proxy port is the port the node's recording is bounded by"
@@ -7052,12 +7256,14 @@ mod tests {
                 }),
         );
         let forwards = PublishedForwards::new();
-        forwards.note_published(
-            ([127, 0, 0, 1], 8080),
-            LEASE,
-            18080,
-            super::egress::IPPROTO_TCP,
-        );
+        forwards
+            .note_published(
+                ([127, 0, 0, 1], 8080),
+                LEASE,
+                18080,
+                super::egress::IPPROTO_TCP,
+            )
+            .expect("an empty ledger has room for one publish");
         assert!(
             forwards.inside_published(LEASE, 18080),
             "the mapping's inside port is the port the recording is bounded by"
@@ -7625,6 +7831,271 @@ mod tests {
             Ok(Err(error)) => panic!("reading the switch end failed: {error}"),
             Err(_) => panic!("the gate neither refused nor forwarded the late retraction"),
         }
+    }
+
+    /// Reads one forwarder request off `stream` up to the end of its JSON
+    /// body, for the tests that stand in for the switch's control surface.
+    async fn read_forwarder_request(stream: &mut UnixStream) -> String {
+        let mut request = Vec::new();
+        let mut chunk = [0u8; 512];
+        while !String::from_utf8_lossy(&request).ends_with('}') {
+            let n = tokio::time::timeout(DEADLINE, stream.read(&mut chunk))
+                .await
+                .expect("the request arrives within the deadline")
+                .expect("reading the request");
+            assert!(n > 0, "the peer closed before its request was whole");
+            request.extend_from_slice(&chunk[..n]);
+        }
+        String::from_utf8_lossy(&request).into_owned()
+    }
+
+    /// B1, design §7.1 under address reuse, at the gate: while a withdrawn
+    /// box's unbind is still in flight, its address is held. A new row at
+    /// that address is refused, so it cannot receive the old box's
+    /// forwarded connections. A publish there, as a new box at the same
+    /// address would make it, is refused before the switch sees it, so the
+    /// old box's revocation never unbinds the new box's forward. Once the
+    /// old forward is unbound the address is free again.
+    #[tokio::test]
+    async fn a_withdrawn_address_is_held_until_its_forwards_are_unbound() {
+        let registry = BoxRegistry::new(SUBNET);
+        let handle = registry.clone();
+        let declare = || {
+            BoxRegistration::new("web", Ipv4Addr::from(LEASE), Ipv4Addr::LOCALHOST)
+                .with_admitted_ports([8080])
+        };
+        registry.register(declare());
+        let publish = expose_request("127.0.0.1:8080", "100.64.0.9:18080", "tcp");
+        let h = gate_over_control(registry, publish).await;
+
+        assert!(handle.withdraw(Ipv4Addr::from(LEASE)).is_some());
+        // The unbind is dialed and left unanswered: the revocation is in
+        // flight.
+        let (mut unbind, _) = tokio::time::timeout(DEADLINE, h.switch_listener.accept())
+            .await
+            .expect("the gate dials the switch to unbind the forward")
+            .expect("accepting the gate's unbind");
+        let asked = read_forwarder_request(&mut unbind).await;
+        assert!(
+            asked.ends_with(r#"{"local":"127.0.0.1:8080","protocol":"tcp"}"#),
+            "the unbind names the old box's listener, got: {asked}"
+        );
+
+        // A new row registered before the revocation ran: refused.
+        assert_eq!(
+            handle
+                .try_register(declare())
+                .map(|row| row.name().to_string()),
+            Err(crate::box_registry::AllocationError::RevocationPending {
+                addr: Ipv4Addr::from(LEASE)
+            }),
+        );
+        // A new box publishing at the address before the revocation ran:
+        // refused, never written on.
+        let (mut guest, mut switch) = connect_control(&h).await;
+        guest
+            .write_all(&expose_request("127.0.0.1:8081", "100.64.0.9:18081", "tcp"))
+            .await
+            .expect("writing the racing publish");
+        let mut probe = [0u8; 1];
+        match tokio::time::timeout(DEADLINE, switch.read(&mut probe)).await {
+            Ok(Ok(0)) => {}
+            Ok(Ok(n)) => {
+                panic!("{n} byte(s) of a publish at a revoking address reached the switch")
+            }
+            Ok(Err(error)) => panic!("reading the switch end failed: {error}"),
+            Err(_) => panic!("the gate neither refused nor forwarded the racing publish"),
+        }
+        wait_for_log(&h.log, super::REVOKING_ADDRESS_RULE).await;
+
+        // The old forward is unbound: the hold ends, and the address takes a
+        // row again.
+        unbind
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .expect("answering the unbind");
+        tokio::time::timeout(DEADLINE, async {
+            while h.table.revocation_pending(LEASE) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the hold ends once the forward is unbound");
+        handle
+            .try_register(declare())
+            .expect("the address is free once the old box's forwards are unbound");
+    }
+
+    /// Stands in for the switch's forwarder surface at `path`: answers each
+    /// unexpose with the next of `answers` (status line and body), the last
+    /// one repeated, and hands each request to the returned receiver.
+    fn forwarder_answering(
+        path: &std::path::Path,
+        answers: &'static [(&'static str, &'static str)],
+    ) -> (
+        tokio::task::JoinHandle<()>,
+        tokio::sync::mpsc::UnboundedReceiver<String>,
+    ) {
+        let listener = UnixListener::bind(path).expect("binding the stand-in switch");
+        let (asked, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            let mut answers = answers.iter().peekable();
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let request = read_forwarder_request(&mut stream).await;
+                let _sent = asked.send(request);
+                let (status, body) = if answers.len() > 1 {
+                    *answers.next().expect("a scripted answer")
+                } else {
+                    **answers.peek().expect("the last answer repeats")
+                };
+                let answer = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                let _answered = stream.write_all(answer.as_bytes()).await;
+            }
+        });
+        (server, receiver)
+    }
+
+    /// A ledger with one declared forward applied at `LEASE`, and the
+    /// withdrawal of that box's row as the gate would receive it.
+    fn withdrawn_with_one_forward() -> (
+        BoxRegistry,
+        Arc<PublishedForwards>,
+        crate::box_registry::RowWithdrawal,
+    ) {
+        let registry = BoxRegistry::new(SUBNET);
+        let mut withdrawn = registry.table().subscribe_row_withdrawals();
+        registry.register(
+            BoxRegistration::new("web", Ipv4Addr::from(LEASE), Ipv4Addr::LOCALHOST)
+                .with_admitted_ports([8080]),
+        );
+        let forwards = Arc::new(PublishedForwards::new());
+        assert_eq!(
+            forwards.note_published(
+                ([127, 0, 0, 1], 8080),
+                LEASE,
+                18080,
+                super::egress::IPPROTO_TCP
+            ),
+            Ok(true)
+        );
+        assert!(registry.withdraw(Ipv4Addr::from(LEASE)).is_some());
+        let withdrawal = withdrawn.try_recv().expect("the withdrawal is delivered");
+        (registry, forwards, withdrawal)
+    }
+
+    static TWO_QUICK_RETRIES: [Duration; 2] =
+        [Duration::from_millis(10), Duration::from_millis(10)];
+
+    /// B2: an unexpose that fails is not the end of the forward. Its ledger
+    /// entry stays, the box's address stays held, and the unbind is retried
+    /// after the backoff. Once a retry succeeds, the entry leaves the ledger
+    /// and the hold ends.
+    #[tokio::test]
+    async fn a_failed_unbind_is_retried_and_holds_the_address_until_it_succeeds() {
+        let dir = tempfile::TempDir::new().expect("a tempdir");
+        let sock = dir.path().join("switch.sock");
+        static ANSWERS: [(&str, &str); 2] =
+            [("500 Internal Server Error", "transient"), ("200 OK", "")];
+        let (server, mut asked) = forwarder_answering(&sock, &ANSWERS);
+        let (registry, forwards, withdrawal) = withdrawn_with_one_forward();
+        assert!(registry.table().revocation_pending(LEASE));
+
+        let kept = super::revoke_box_forwards(
+            sock,
+            Arc::clone(&forwards),
+            ReplyTables::new(),
+            withdrawal,
+            &TWO_QUICK_RETRIES,
+        )
+        .await;
+        server.abort();
+
+        assert!(kept.is_none(), "the retry unbound the forward");
+        let mut tries = 0;
+        while let Ok(request) = asked.try_recv() {
+            assert!(request.ends_with(r#"{"local":"127.0.0.1:8080","protocol":"tcp"}"#));
+            tries += 1;
+        }
+        assert_eq!(tries, 2, "one failed unexpose, then one retry");
+        assert!(forwards.published_at(LEASE).is_empty());
+        assert!(!registry.table().revocation_pending(LEASE));
+    }
+
+    /// B2's bound: a switch that keeps refusing gets the first try plus one
+    /// retry per backoff step, and no more. The forward stays in the ledger,
+    /// and the withdrawal comes back to the caller, which keeps it, so the
+    /// address stays held while the forward is still bound.
+    #[tokio::test]
+    async fn an_unbind_that_keeps_failing_gives_up_and_keeps_the_address_held() {
+        let dir = tempfile::TempDir::new().expect("a tempdir");
+        let sock = dir.path().join("switch.sock");
+        static ANSWERS: [(&str, &str); 1] = [("500 Internal Server Error", "stuck")];
+        let (server, mut asked) = forwarder_answering(&sock, &ANSWERS);
+        let (registry, forwards, withdrawal) = withdrawn_with_one_forward();
+
+        let kept = super::revoke_box_forwards(
+            sock,
+            Arc::clone(&forwards),
+            ReplyTables::new(),
+            withdrawal,
+            &TWO_QUICK_RETRIES,
+        )
+        .await;
+        server.abort();
+
+        let mut tries = 0;
+        while asked.try_recv().is_ok() {
+            tries += 1;
+        }
+        assert_eq!(tries, 3, "the first try and one retry per backoff step");
+        assert_eq!(
+            forwards.published_at(LEASE).len(),
+            1,
+            "still bound, still the gate's"
+        );
+        assert!(kept.is_some(), "the withdrawal is handed back to keep");
+        assert!(registry.table().revocation_pending(LEASE));
+        drop(kept);
+        assert!(!registry.table().revocation_pending(LEASE));
+    }
+
+    /// gvproxy answers an unexpose of a listener it holds no forward at with
+    /// a 500 saying so. The goal state holds, so the box's end counts it as
+    /// unbound instead of retrying: an earlier try whose answer was lost
+    /// must not hold the address for good.
+    #[tokio::test]
+    async fn an_unbind_the_switch_says_was_not_bound_counts_as_done() {
+        let dir = tempfile::TempDir::new().expect("a tempdir");
+        let sock = dir.path().join("switch.sock");
+        static ANSWERS: [(&str, &str); 1] = [("500 Internal Server Error", "proxy not found\n")];
+        let (server, mut asked) = forwarder_answering(&sock, &ANSWERS);
+        let (registry, forwards, withdrawal) = withdrawn_with_one_forward();
+
+        let kept = super::revoke_box_forwards(
+            sock,
+            Arc::clone(&forwards),
+            ReplyTables::new(),
+            withdrawal,
+            &TWO_QUICK_RETRIES,
+        )
+        .await;
+        server.abort();
+
+        assert!(kept.is_none());
+        let _asked_once = asked.try_recv().expect("the one unexpose was asked");
+        assert_eq!(
+            asked.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty),
+            "no retry for a forward already gone"
+        );
+        assert!(forwards.published_at(LEASE).is_empty());
+        assert!(!registry.table().revocation_pending(LEASE));
     }
 
     /// The SYN-only rule on the forwarder path: a record is opened only by
@@ -12205,8 +12676,14 @@ mod tests {
         );
 
         let ledger = super::PublishedForwards::new();
-        ledger.note_published(a, [100, 64, 0, 9], 18080, super::egress::IPPROTO_TCP);
-        ledger.note_published(b, [100, 64, 0, 10], 18081, super::egress::IPPROTO_UDP);
+        assert_eq!(
+            ledger.note_published(a, [100, 64, 0, 9], 18080, super::egress::IPPROTO_TCP),
+            Ok(true)
+        );
+        assert_eq!(
+            ledger.note_published(b, [100, 64, 0, 10], 18081, super::egress::IPPROTO_UDP),
+            Ok(true)
+        );
         assert_eq!(ledger.address_of(a), Some([100, 64, 0, 9]));
         assert_eq!(
             ledger.address_of(b),
@@ -12249,6 +12726,50 @@ mod tests {
         );
     }
 
+    /// At its bound the ledger refuses the next publish with a typed error
+    /// instead of evicting the oldest one: an evicted entry would be a
+    /// forward still bound that its box's end could no longer unbind. A
+    /// listener already held is still answered as held, and a slot freed by
+    /// a retraction takes a publish again.
+    #[test]
+    fn the_ledger_refuses_a_publish_at_its_bound_and_evicts_nothing() {
+        let tcp = super::egress::IPPROTO_TCP;
+        let addr = [100, 64, 0, 9];
+        let ledger = super::PublishedForwards::new();
+        let listener = |n: usize| -> super::Listener {
+            let n = u16::try_from(n).expect("the bound fits a port range");
+            ([127, 0, 64, 9], 10000 + n)
+        };
+        for n in 0..super::PUBLISHED_FORWARDS_TRACKED {
+            assert_eq!(
+                ledger.note_published(listener(n), addr, 18080, tcp),
+                Ok(true)
+            );
+        }
+        let past = listener(super::PUBLISHED_FORWARDS_TRACKED);
+        assert_eq!(
+            ledger.note_published(past, addr, 18080, tcp),
+            Err(super::LedgerFull),
+            "the publish past the bound is refused"
+        );
+        assert_eq!(
+            ledger.address_of(listener(0)),
+            Some(addr),
+            "the oldest forward is still attributed, so its box's end can still unbind it"
+        );
+        assert_eq!(
+            ledger.published_at(addr).len(),
+            super::PUBLISHED_FORWARDS_TRACKED
+        );
+        assert_eq!(
+            ledger.note_published(listener(0), addr, 18080, tcp),
+            Ok(false),
+            "a held listener is answered as held, not refused"
+        );
+        assert!(ledger.note_retracted(listener(0)).is_some());
+        assert_eq!(ledger.note_published(past, addr, 18080, tcp), Ok(true));
+    }
+
     #[test]
     fn retraction_keeps_records_a_sibling_publish_still_dials() {
         // Two listeners dial one inside port: retracting one leaves the
@@ -12257,13 +12778,22 @@ mod tests {
         let tcp = super::egress::IPPROTO_TCP;
         let addr = [100, 64, 0, 9];
         let ledger = super::PublishedForwards::new();
-        ledger.note_published(([127, 0, 0, 1], 8080), addr, 18080, tcp);
-        ledger.note_published(([127, 0, 0, 1], 8081), addr, 18080, tcp);
-        ledger.note_published(
-            ([127, 0, 0, 1], 8082),
-            addr,
-            18080,
-            super::egress::IPPROTO_UDP,
+        assert_eq!(
+            ledger.note_published(([127, 0, 0, 1], 8080), addr, 18080, tcp),
+            Ok(true)
+        );
+        assert_eq!(
+            ledger.note_published(([127, 0, 0, 1], 8081), addr, 18080, tcp),
+            Ok(true)
+        );
+        assert_eq!(
+            ledger.note_published(
+                ([127, 0, 0, 1], 8082),
+                addr,
+                18080,
+                super::egress::IPPROTO_UDP,
+            ),
+            Ok(true)
         );
 
         assert_eq!(

@@ -19,12 +19,20 @@
 //!    timeouts against a box that is gone. The gate writes a reset to the
 //!    switch for each connection it tracked ([`ForwardedFlows`],
 //!    [`reset_frames`], [`inject`]). The reset comes from the box's address,
-//!    at the sequence number the switch expects next.
+//!    at the sequence number the switch expects next. A reset at any other
+//!    in-window number draws a challenge ACK (RFC 5961) carrying the exact
+//!    number, and the gate answers that with one more reset, once per
+//!    connection.
+//!
+//! The long-term home for the second step is the switch itself: gvproxy's
+//! forwarder should close the connections it accepted on a listener when
+//! that listener is unexposed. That is an upstream change. Until it lands,
+//! the gate's reset injection stands in for it.
 //!
 //! This module holds the pieces that do not read the gate's ledger: the
 //! per-connection tracking, the reset frames, and the two switch exchanges.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::net::Ipv4Addr;
 use std::path::Path;
@@ -55,6 +63,16 @@ const FORWARDED_FLOWS_TRACKED: usize = 4096;
 /// The cap on bytes read from one switch answer to an unexpose. gvproxy's
 /// answers are a status line and a short body.
 const MAX_ANSWER: usize = 64 * 1024;
+
+/// How long the gate listens on its reset connection for a challenge ACK
+/// (RFC 5961) after writing the resets. gVisor's stack answers an in-window
+/// reset at the wrong sequence number at once, so a short window is enough.
+pub(crate) const CHALLENGE_WINDOW: Duration = Duration::from_millis(500);
+
+/// The body gvproxy answers an unexpose with when no forward is bound at the
+/// listener (`PortsForwarder::Unexpose`, as an HTTP 500): the goal state
+/// already holds.
+const NOT_BOUND_BODY: &str = "proxy not found";
 
 /// One forwarded TCP connection, keyed from the box's side: the box's
 /// address and port, then the peer's address and port. The peer is the
@@ -239,6 +257,35 @@ pub(crate) fn reset_frames(key: &FlowKey, tail: &FlowTail) -> Vec<Vec<u8>> {
         .collect()
 }
 
+/// The reset that answers a challenge ACK, when `frame` is one: a bare ACK
+/// from the switch's stack toward the box, on one of `flows`, that `answered`
+/// has not answered yet. gVisor follows RFC 5961: a reset inside the receive
+/// window but not at the exact next sequence number draws an ACK whose
+/// acknowledgement number is that exact number. A reset at it closes the
+/// connection. One answer per connection, so a peer that keeps acknowledging
+/// cannot turn the gate into a reset loop.
+pub(crate) fn challenge_reset(
+    frame: &[u8],
+    flows: &[(FlowKey, FlowTail)],
+    answered: &mut BTreeSet<FlowKey>,
+) -> Option<Vec<u8>> {
+    let segment = parse_tcp_segment(frame)?;
+    if segment.flags & TCP_ACK == 0 || segment.flags & (TCP_RST | TCP_SYN) != 0 {
+        return None;
+    }
+    let key = (segment.dst, segment.dst_port, segment.src, segment.src_port);
+    let (_, tail) = flows.iter().find(|(tracked, _)| *tracked == key)?;
+    if !answered.insert(key) {
+        return None;
+    }
+    let tail = FlowTail {
+        box_mac: segment.dst_mac,
+        peer_mac: segment.src_mac,
+        ..*tail
+    };
+    Some(rst_frame(&key, &tail, segment.ack))
+}
+
 /// One reset segment, as a whole Ethernet frame with both checksums.
 fn rst_frame(key: &FlowKey, tail: &FlowTail, seq: u32) -> Vec<u8> {
     let (box_addr, box_port, peer_addr, peer_port) = *key;
@@ -333,21 +380,34 @@ struct UnexposeBody<'a> {
     protocol: &'a str,
 }
 
+/// What an unexpose the switch accepted came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Unexposed {
+    /// The switch closed the listener.
+    Unbound,
+    /// The switch held no forward at the listener: it was already unbound,
+    /// by an earlier try whose answer was lost or by the guest's own
+    /// retraction. The goal state holds, so a retry counts this as done.
+    NotBound,
+}
+
 /// Asks the switch at `switch_sock` to unexpose the forward bound at
 /// `local`, bounded by `bound`. The exchange is the one the daemon's own
 /// client makes: an HTTP/1.1 keep-alive request framed by `Content-Length`,
-/// answered by a status line. A 2xx status is success.
+/// answered by a status line. A 2xx status is [`Unexposed::Unbound`].
+/// gvproxy's 500 whose body says no proxy is bound there is
+/// [`Unexposed::NotBound`].
 ///
 /// # Errors
 ///
-/// The connect, write or read error, a timeout past `bound`, or a status
-/// outside 2xx.
+/// The connect, write or read error, a timeout past `bound`, or any other
+/// status outside 2xx.
 pub(crate) async fn unexpose(
     switch_sock: &Path,
     local: &str,
     protocol: &str,
     bound: Duration,
-) -> io::Result<()> {
+) -> io::Result<Unexposed> {
     let body =
         serde_json_lenient::to_vec(&UnexposeBody { local, protocol }).map_err(io::Error::other)?;
     let mut request = format!(
@@ -357,10 +417,10 @@ pub(crate) async fn unexpose(
     )
     .into_bytes();
     request.extend_from_slice(&body);
-    let status = tokio::time::timeout(bound, async {
+    let (status, body) = tokio::time::timeout(bound, async {
         let mut switch = UnixStream::connect(switch_sock).await?;
         switch.write_all(&request).await?;
-        read_status(&mut switch).await
+        read_answer(&mut switch).await
     })
     .await
     .map_err(|_elapsed| {
@@ -369,21 +429,28 @@ pub(crate) async fn unexpose(
             format!("the switch did not answer an unexpose within {bound:?}"),
         )
     })??;
+    let body = String::from_utf8_lossy(&body);
     if (200..300).contains(&status) {
-        Ok(())
+        Ok(Unexposed::Unbound)
+    } else if status == 500 && body.trim() == NOT_BOUND_BODY {
+        Ok(Unexposed::NotBound)
     } else {
         Err(io::Error::other(format!(
-            "the switch answered the unexpose with HTTP {status}"
+            "the switch answered the unexpose with HTTP {status}: {:?}",
+            body.trim()
         )))
     }
 }
 
-/// Reads an HTTP answer's head and returns its status code. The body is not
-/// needed and is left unread.
-async fn read_status(switch: &mut UnixStream) -> io::Result<u16> {
+/// Reads an HTTP answer and returns its status code and its body, as much
+/// of the body as its `Content-Length` names, within [`MAX_ANSWER`].
+async fn read_answer(switch: &mut UnixStream) -> io::Result<(u16, Vec<u8>)> {
     let mut answer = Vec::with_capacity(256);
     let mut chunk = [0u8; 512];
-    while !answer.windows(4).any(|window| window == b"\r\n\r\n") {
+    let head_end = loop {
+        if let Some(at) = answer.windows(4).position(|window| window == b"\r\n\r\n") {
+            break Some(at + 4);
+        }
         if answer.len() >= MAX_ANSWER {
             return Err(io::Error::other(
                 "the switch's answer exceeded the size cap before its head ended",
@@ -391,15 +458,15 @@ async fn read_status(switch: &mut UnixStream) -> io::Result<u16> {
         }
         let n = switch.read(&mut chunk).await?;
         if n == 0 {
-            break;
+            break None;
         }
         answer.extend_from_slice(chunk.get(..n).unwrap_or_default());
-    }
+    };
     let line = answer
         .split(|&byte| byte == b'\r' || byte == b'\n')
         .next()
         .unwrap_or_default();
-    std::str::from_utf8(line)
+    let status = std::str::from_utf8(line)
         .ok()
         .and_then(|line| line.split_whitespace().nth(1))
         .and_then(|code| code.parse::<u16>().ok())
@@ -408,33 +475,111 @@ async fn read_status(switch: &mut UnixStream) -> io::Result<u16> {
                 "malformed switch status line: {:?}",
                 String::from_utf8_lossy(line)
             ))
-        })
+        })?;
+    let Some(head_end) = head_end else {
+        return Ok((status, Vec::new()));
+    };
+    let length = content_length(answer.get(..head_end).unwrap_or_default())
+        .unwrap_or(0)
+        .min(MAX_ANSWER);
+    let body_end = head_end + length;
+    while answer.len() < body_end {
+        let n = switch.read(&mut chunk).await?;
+        if n == 0 {
+            break;
+        }
+        answer.extend_from_slice(chunk.get(..n).unwrap_or_default());
+    }
+    let body = answer
+        .get(head_end..body_end.min(answer.len()))
+        .unwrap_or_default()
+        .to_vec();
+    Ok((status, body))
 }
 
-/// Writes `frames` into the switch at `switch_sock` over a frame connection
-/// of its own, bounded by `bound`: the `connect_request` upgrade, then each
-/// frame behind its little-endian length, then the gate's side closed.
-/// The switch hijacks the connection and answers nothing.
-///
-/// # Errors
-///
-/// The connect or write error, or a timeout past `bound`.
-pub(crate) async fn inject(
-    switch_sock: &Path,
-    connect_request: &[u8],
-    frames: &[Vec<u8>],
-    bound: Duration,
-) -> io::Result<()> {
-    let mut stream = connect_request.to_vec();
+/// The `Content-Length` an HTTP head declares, when it declares one.
+fn content_length(head: &[u8]) -> Option<usize> {
+    std::str::from_utf8(head).ok()?.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.trim()
+            .eq_ignore_ascii_case("content-length")
+            .then(|| value.trim().parse().ok())
+            .flatten()
+    })
+}
+
+/// Appends each of `frames` to `stream` behind its little-endian length.
+fn frame_onto(stream: &mut Vec<u8>, frames: &[Vec<u8>]) -> io::Result<()> {
     for frame in frames {
         let len = u16::try_from(frame.len()).map_err(io::Error::other)?;
         stream.extend_from_slice(&len.to_le_bytes());
         stream.extend_from_slice(frame);
     }
+    Ok(())
+}
+
+/// Takes one whole length-framed frame off the front of `buf`, when `buf`
+/// holds one.
+fn take_frame(buf: &mut Vec<u8>) -> Option<Vec<u8>> {
+    let len = usize::from(u16::from_le_bytes([*buf.first()?, *buf.get(1)?]));
+    let frame = buf.get(2..2 + len)?.to_vec();
+    buf.drain(..2 + len);
+    Some(frame)
+}
+
+/// Ends the tracked connections `flows` at the switch at `switch_sock`,
+/// over a frame connection of the gate's own, bounded by `bound`. It writes
+/// the `connect_request` upgrade, then each connection's resets
+/// ([`reset_frames`]), each frame behind its little-endian length. Then it
+/// listens for `challenge_window` and answers each challenge ACK with one
+/// reset at the number the ACK carries ([`challenge_reset`]), at most once
+/// per connection. The switch learns the box's hardware address from the
+/// resets, so it sends the challenge ACKs back over this connection. The
+/// gate then closes its side. Returns how many challenge ACKs it answered.
+///
+/// # Errors
+///
+/// The connect, read or write error, or a timeout past `bound`.
+pub(crate) async fn inject(
+    switch_sock: &Path,
+    connect_request: &[u8],
+    flows: &[(FlowKey, FlowTail)],
+    bound: Duration,
+    challenge_window: Duration,
+) -> io::Result<usize> {
+    let resets: Vec<Vec<u8>> = flows
+        .iter()
+        .flat_map(|(key, tail)| reset_frames(key, tail))
+        .collect();
+    let mut stream = connect_request.to_vec();
+    frame_onto(&mut stream, &resets)?;
     tokio::time::timeout(bound, async {
         let mut switch = UnixStream::connect(switch_sock).await?;
         switch.write_all(&stream).await?;
-        switch.shutdown().await
+        let mut answered = BTreeSet::new();
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 2048];
+        let window_end = tokio::time::Instant::now() + challenge_window;
+        while answered.len() < flows.len() {
+            let Ok(read) = tokio::time::timeout_at(window_end, switch.read(&mut chunk)).await
+            else {
+                break;
+            };
+            let n = read?;
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(chunk.get(..n).unwrap_or_default());
+            while let Some(frame) = take_frame(&mut buf) {
+                if let Some(reset) = challenge_reset(&frame, flows, &mut answered) {
+                    let mut framed = Vec::new();
+                    frame_onto(&mut framed, &[reset])?;
+                    switch.write_all(&framed).await?;
+                }
+            }
+        }
+        switch.shutdown().await?;
+        Ok(answered.len())
     })
     .await
     .map_err(|_elapsed| {
@@ -621,6 +766,114 @@ mod tests {
         assert!(
             taken.iter().all(|((_, _, _, port), _)| *port != 1000),
             "the connection seen longest ago was the one evicted"
+        );
+    }
+
+    /// The frames in `bytes`, each behind its little-endian length.
+    fn frames_in(mut bytes: Vec<u8>) -> Vec<Vec<u8>> {
+        let mut frames = Vec::new();
+        while let Some(frame) = take_frame(&mut bytes) {
+            frames.push(frame);
+        }
+        assert!(bytes.is_empty(), "a partial frame was left over");
+        frames
+    }
+
+    /// C1, RFC 5961 at the switch's stack: a reset at an in-window number
+    /// other than the exact next one draws a challenge ACK whose
+    /// acknowledgement number is the exact one. The gate answers it with one
+    /// reset at that number, from the box toward the switch's stack. It
+    /// answers at most once per connection, and never answers an ACK on a
+    /// connection it is not ending.
+    #[tokio::test]
+    async fn a_challenge_ack_is_answered_once_with_a_reset_at_its_number() {
+        let dir = tempfile::TempDir::new().expect("a tempdir");
+        let sock = dir.path().join("switch.sock");
+        let listener = tokio::net::UnixListener::bind(&sock).expect("binding the stand-in switch");
+        let flows = ForwardedFlows::default();
+        let now = Instant::now();
+        flows.observe_toward_box(&toward_box(1, 0, TCP_SYN, 0), now);
+        flows.observe_from_box(&from_box(500, 2, TCP_SYN | TCP_ACK, 0), now);
+        flows.observe_toward_box(&toward_box(2, 501, TCP_ACK, 3), now);
+        flows.observe_from_box(&from_box(501, 5, TCP_ACK, 100), now);
+        let taken = flows.take_at(BOX);
+        let connect: &'static [u8] = b"POST /connect HTTP/1.1\r\n\r\n";
+        let injecting = tokio::spawn(async move {
+            inject(
+                &sock,
+                connect,
+                &taken,
+                Duration::from_secs(5),
+                Duration::from_secs(2),
+            )
+            .await
+        });
+
+        let (mut switch, _) = listener.accept().await.expect("accepting the gate's dial");
+        let mut head = vec![0u8; connect.len()];
+        switch
+            .read_exact(&mut head)
+            .await
+            .expect("reading the upgrade");
+        assert_eq!(head, connect);
+        // The two first resets: past the box's last segment, and at the
+        // switch's last acknowledgement.
+        let mut first = vec![0u8; 2 * (2 + ETH_HDR + 40)];
+        switch
+            .read_exact(&mut first)
+            .await
+            .expect("reading the first resets");
+        let seqs: Vec<u32> = frames_in(first)
+            .iter()
+            .map(|frame| parse_tcp_segment(frame).expect("a reset parses").seq)
+            .collect();
+        assert_eq!(seqs, [601, 501]);
+
+        // An ACK on a connection the gate is not ending, then two challenge
+        // ACKs on the one it is, carrying the exact number 777.
+        let stranger = segment(
+            (PEER_MAC, PEER, 40001),
+            (BOX_MAC, BOX, 8080),
+            (2, 900, TCP_ACK),
+            0,
+        );
+        let challenge = segment(
+            (PEER_MAC, PEER, 40000),
+            (BOX_MAC, BOX, 8080),
+            (2, 777, TCP_ACK),
+            0,
+        );
+        let mut written = Vec::new();
+        frame_onto(&mut written, &[stranger, challenge.clone(), challenge])
+            .expect("framing the ACKs");
+        switch.write_all(&written).await.expect("writing the ACKs");
+
+        let mut rest = Vec::new();
+        switch
+            .read_to_end(&mut rest)
+            .await
+            .expect("reading to the gate's close");
+        let answers = frames_in(rest);
+        assert_eq!(
+            answers.len(),
+            1,
+            "one answer, to the tracked connection only"
+        );
+        let answer = parse_tcp_segment(answers.first().expect("one answer")).expect("it parses");
+        assert_eq!(answer.flags, TCP_RST);
+        assert_eq!(
+            answer.seq, 777,
+            "the reset is at the number the challenge ACK carries"
+        );
+        assert_eq!((answer.src, answer.src_port), (BOX, 8080));
+        assert_eq!((answer.dst, answer.dst_port), (PEER, 40000));
+        assert_eq!(
+            injecting
+                .await
+                .expect("the inject task")
+                .expect("the inject"),
+            1,
+            "one challenge answered"
         );
     }
 
