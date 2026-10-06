@@ -914,7 +914,11 @@ mkdir "$tree_root/$TABLE_MARKER" 2>/dev/null ||
 
 note "installed the classifier tree at $tree_root"
 note "  $DAEMON_LEAF/            the daemon itself, entered at startup or placed with --pid"
-note "  $BOXES_DIR/$DENY_DIR/    the boxes that admit no destination, resolved through the answerer"
+if [ -n "$gateway_resolver" ]; then
+    note "  $BOXES_DIR/$DENY_DIR/    the boxes that admit no destination, resolved through the node's DNS layer at $gateway_resolver:53"
+else
+    note "  $BOXES_DIR/$DENY_DIR/    the boxes that admit no destination, resolved through the answerer"
+fi
 note "  $BOXES_DIR/$ALLOW_DIR/   every other box"
 note "delegated to $owner_uid:$owner_gid per the v2 contract: each directory plus its cgroup.procs, cgroup.threads and cgroup.subtree_control"
 if [ -n "$gateway_resolver" ]; then
