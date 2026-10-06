@@ -15900,6 +15900,7 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
   PO_OUTLIVE_CLIENT_NAME="e2e-port-out-client" # the detach half's outside client, on a VM lane
   PO_EXT=18096                         # the declared — published — port
   PO_UNDECLARED=18097                  # a listen no declaration names
+  PO_HOLD=18099                        # a second declared port, whose connection is held across the destroy
   PO_DETACH_PORT=18098                 # the detach box's server, on the shared loopback
   PO_MARKER="PO_PUBLISH_OK"            # what the port half's box answers with
   PO_OUTLIVE_MARKER="PO_OUTLIVE_OK"    # what the detach box answers with
@@ -15942,6 +15943,10 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
       echo "::error::127.0.0.1:$PO_EXT already answers on this host; the port-publish half needs it free"
       fail
     fi
+    if curl -sS --max-time 2 -o /dev/null "http://127.0.0.1:$PO_HOLD/" 2>/dev/null; then
+      echo "::error::127.0.0.1:$PO_HOLD already answers on this host; the port-publish half needs it free"
+      fail
+    fi
 
     # The watcher's records and the expose record both live at info under
     # modules the lane's `warn` filter drops, so a readable-log lane restarts
@@ -15965,8 +15970,8 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
     mkdir "$PO_OWNIP_SEED_DIR/.git"
     po_sid="$(cd "$PO_OWNIP_SEED_DIR" && mnl session activate . --no-prompt \
       --name "$PO_BOX_NAME" --network own_ip \
-      --ingress "$PO_EXT:$PO_EXT" 2>"$WORK/po-activate.err")" || {
-      echo "::error::'min session activate --network own_ip --ingress $PO_EXT:$PO_EXT' failed"
+      --ingress "$PO_EXT:$PO_EXT" --ingress "$PO_HOLD:$PO_HOLD" 2>"$WORK/po-activate.err")" || {
+      echo "::error::'min session activate --network own_ip --ingress $PO_EXT:$PO_EXT --ingress $PO_HOLD:$PO_HOLD' failed"
       echo "--- stderr ---"; cat "$WORK/po-activate.err" 2>/dev/null || true
       fail
     }
@@ -16310,7 +16315,57 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
     fi
     echo "the box outlived its detached client and still serves by name (NET-015)"
 
+    # Ingress revocation also terminates the connections a forward already
+    # carries (design §7.1), so one is held open across the destroy: the
+    # second declared port's in-box server accepts, marks the accept, and
+    # then says nothing, so the host's connection stays established until
+    # something ends it.
+    po_hold_pid=""
+    if [ -n "$po_addr" ]; then
+      mnl session exec "$po_sid" \
+        "nohup /usr/bin/socat TCP-LISTEN:$PO_HOLD,reuseaddr,fork SYSTEM:\"touch /home/po-held; sleep 600\" >/dev/null 2>&1 &" \
+        >/dev/null 2>>"$WORK/po-responder.err" \
+        || { echo "::error::could not start the in-box holder on the second declared port"; cat "$WORK/po-responder.err" 2>/dev/null || true; fail; }
+      # Up when a direct connect inside the box is accepted and held: curl
+      # times out (exit 28) instead of being refused (exit 7).
+      po_hold_listening=""
+      for _ in $(seq 1 40); do
+        if mnl session exec "$po_sid" \
+          "curl -sS --max-time 1 -o /dev/null http://127.0.0.1:$PO_HOLD/; test \$? -eq 28" \
+          >/dev/null 2>&1; then
+          po_hold_listening=1
+          break
+        fi
+        sleep 0.25
+      done
+      if [ -z "$po_hold_listening" ]; then
+        echo "::error::the in-box holder on the second declared port never accepted a direct connect"
+        echo "--- socat exec stderr ---"; cat "$WORK/po-responder.err" 2>/dev/null || true
+        fail
+      fi
+      mnl session exec "$po_sid" 'rm -f /home/po-held' >/dev/null 2>&1 || true
+      curl -sS --max-time 120 -o /dev/null "http://$po_addr:$PO_HOLD/" \
+        >/dev/null 2>"$WORK/po-held.err" &
+      po_hold_pid=$!
+      po_held=""
+      for _ in $(seq 1 40); do
+        if mnl session exec "$po_sid" 'test -e /home/po-held' >/dev/null 2>&1; then
+          po_held=1
+          break
+        fi
+        sleep 0.25
+      done
+      if [ -z "$po_held" ] || ! kill -0 "$po_hold_pid" 2>/dev/null; then
+        kill "$po_hold_pid" 2>/dev/null || true
+        wait "$po_hold_pid" 2>/dev/null || true
+        echo "::error::the host's connection to the second declared port $po_addr:$PO_HOLD was not held open by the box before the destroy (reached the box: ${po_held:-no}; $(head -n1 "$WORK/po-held.err" 2>/dev/null || true))"
+        fail
+      fi
+      echo "held: a host connection to $po_addr:$PO_HOLD is established through its declared forward, and the box holds it open"
+    fi
+
     mnl session destroy --force "$po_sid" >/dev/null 2>&1 || true
+    po_destroyed_ms=$(now_ms)
 
     # After the box ends, its declared port's published address must refuse a
     # host connect fast: nothing in the box answers, so a forward still bound
@@ -16341,6 +16396,33 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
         echo "::error::the declared port $po_addr:$PO_EXT was not refused fast after its box was destroyed (curl exit $po_gone_rc in ${po_gone_ms}ms), so the declared forward's bind outlived the box (design §7.1, NET-121)"
         fail
       fi
+    fi
+
+    # The held connection must end within the bound once the box is gone:
+    # closed or reset by the host's revocation, never left to wait out its
+    # TCP timeouts against a box that no longer exists (design §7.1). curl
+    # reports the end as 52 (closed, empty reply) or 56 (reset); 28 would be
+    # its own 120s timeout, far past the bound.
+    if [ -n "$po_hold_pid" ]; then
+      while kill -0 "$po_hold_pid" 2>/dev/null \
+        && [ $(($(now_ms) - po_destroyed_ms)) -lt 15000 ]; do
+        sleep 0.25
+      done
+      po_hold_ms=$(($(now_ms) - po_destroyed_ms))
+      if kill -0 "$po_hold_pid" 2>/dev/null; then
+        kill "$po_hold_pid" 2>/dev/null || true
+        wait "$po_hold_pid" 2>/dev/null || true
+        echo "::error::the connection held through the declared forward $po_addr:$PO_HOLD was still open ${po_hold_ms}ms after its box was destroyed, so revocation did not terminate it (design §7.1)"
+        fail
+      fi
+      po_hold_rc=0
+      wait "$po_hold_pid" || po_hold_rc=$?
+      echo "after destroy: the held connection to $po_addr:$PO_HOLD ended with curl exit $po_hold_rc, ${po_hold_ms}ms after the destroy returned ($(head -n1 "$WORK/po-held.err" 2>/dev/null || true))"
+      if [ "$po_hold_rc" -eq 0 ] || [ "$po_hold_rc" -eq 28 ]; then
+        echo "::error::the held connection to $po_addr:$PO_HOLD did not end closed or reset (curl exit $po_hold_rc) after its box was destroyed (design §7.1)"
+        fail
+      fi
+      echo "the connection the declared forward carried was closed when its box ended: revocation terminated it"
     fi
 
     rm -rf "$PO_OWNIP_SEED_DIR"; PO_OWNIP_SEED_DIR=""
