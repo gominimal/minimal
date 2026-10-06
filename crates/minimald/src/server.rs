@@ -937,10 +937,12 @@ impl Listener for tokio_vsock::VsockListener {
 /// so an unbounded wait could hang the process; this bounds it.
 const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// How long a freshly accepted connection may spend in the pre-auth SSH
-/// handshake before it is dropped. The handshake reads the client's id line,
-/// so a client that connects and never speaks would otherwise hold its task
-/// and socket forever; keepalives govern established connections instead.
+/// How long a freshly accepted connection may spend exchanging SSH id lines
+/// before it is dropped. The id-line exchange is the only pre-auth step that
+/// `russh::server::run_stream` awaits, so a client that connects and never
+/// speaks would otherwise hold its task and socket forever. Later stalls in
+/// KEX or auth run in russh's spawned session task, off the accept loop, and
+/// are governed by keepalive rather than by this deadline.
 const HANDSHAKE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Monotonic id carried by each accepted connection's span, so a
@@ -2843,14 +2845,20 @@ mod tests {
         // Open a connection and send nothing: it holds the socket without
         // ever completing the handshake.
         let silent = tokio::net::UnixStream::connect(&sock).await.unwrap();
-        let _ = silent;
 
-        // A second connection must handshake and serve an RPC promptly.
-        let mut client = connect_uds(&sock).await;
-        let resp = tokio::time::timeout(Duration::from_secs(2), client.call::<GetVersion>(&()))
-            .await
-            .expect("a second connection must complete a handshake and RPC within 2s");
+        // A second connection must handshake and serve an RPC promptly. The
+        // bound covers the connect too: a stalled accept loop shows up there.
+        let (mut client, resp) = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut client = connect_uds(&sock).await;
+            let resp = client.call::<GetVersion>(&()).await;
+            (client, resp)
+        })
+        .await
+        .expect("a second connection must complete a handshake and RPC within 2s");
         assert!(!resp.version.is_empty(), "GetVersion must return a version");
+
+        // Close the silent connection so shutdown does not wait out its grace.
+        drop(silent);
 
         let _ = client
             .call::<Shutdown>(&ShutdownRequest { force: false })
