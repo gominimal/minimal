@@ -5731,6 +5731,125 @@ async fn expose_unrecordable_allow_is_refused_and_deny_still_refuses() {
     );
 }
 
+/// Drives one VM-backed publish under `mode` whose allow cannot be audited
+/// and returns the withdrawal the VM host daemon's door read. The door holds
+/// the withdrawal's reply while the switch's requests are checked, so the
+/// unexpose is proved to come first, the order every unwind holds.
+async fn unaudited_vm_withdrawal(
+    mode: sessions::DynamicIngress,
+) -> minimald_rpc::BoxControlRequest {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let (_web, handle) =
+        dynamic_ingress_box(&server, &mut client, "web", Some(mode), Some((3000, 3999))).await;
+    handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("the box launches its host");
+    let sock = handle
+        .net_switch()
+        .await
+        .unwrap()
+        .lock()
+        .await
+        .control_socket();
+    let (forwarder, served, door, mut requests, replies) = vm_backed_ask_box(&handle).await;
+
+    let state_dir = server.state.minimal_state_dir().await;
+    let state_dir = state_dir.as_utf8_path().as_std_path();
+    let planted = state_dir.join("planted");
+    std::fs::create_dir_all(&planted).unwrap();
+    std::os::unix::fs::symlink(&planted, state_dir.join("audit")).unwrap();
+
+    let exposing = handle.clone();
+    let expose = tokio::spawn(async move { exposing.expose_dynamic(3000).await });
+    let admit = tokio::time::timeout(Duration::from_secs(10), requests.recv())
+        .await
+        .expect("the publish reaches the VM host daemon's door")
+        .expect("the report door stand-in lives");
+    let admitted = if mode == sessions::DynamicIngress::Ask {
+        assert!(
+            matches!(admit, minimald_rpc::BoxControlRequest::AdmitAsk(_)),
+            "an ask is raised with the host first: {admit:?}"
+        );
+        host_end(minimald_rpc::AskAdmitOutcome::Admitted {
+            ask_id: host_ask_id(),
+            port: 3000,
+            proto: sessions::IpProto::Tcp,
+        })
+    } else {
+        assert!(
+            matches!(admit, minimald_rpc::BoxControlRequest::AdmitPort(_)),
+            "an allow reports the port before it binds: {admit:?}"
+        );
+        minimald_rpc::BoxControlReply::PortRecorded {
+            port: 3000,
+            proto: sessions::IpProto::Tcp,
+        }
+    };
+    replies
+        .send(admitted)
+        .expect("the report door stand-in lives");
+    let withdrawal = tokio::time::timeout(Duration::from_secs(10), requests.recv())
+        .await
+        .expect("the unaudited publish withdraws its row entry")
+        .expect("the report door stand-in lives");
+    {
+        let served = served.lock().expect("served lock");
+        assert!(
+            served
+                .iter()
+                .any(|line| line.starts_with("POST /services/forwarder/unexpose ")),
+            "the forward is unbound before the row entry is withdrawn: {served:?}"
+        );
+    }
+    replies
+        .send(minimald_rpc::BoxControlReply::PortRecorded {
+            port: 3000,
+            proto: sessions::IpProto::Tcp,
+        })
+        .expect("the report door stand-in lives");
+    assert!(
+        matches!(
+            expose.await.expect("the expose task should not panic"),
+            Err(crate::net::policy::ExposeFailure::Publish { port: 3000, .. })
+        ),
+        "an allow that cannot be audited is refused"
+    );
+    forwarder.abort();
+    door.abort();
+    crate::net::listeners::clear_vm_report_door_for_tests(&sock);
+    withdrawal
+}
+
+/// NET-046's fail-closed withdrawal on a VM-backed host gives the VM host
+/// daemon's row entry back under the surface the publish used: the box's
+/// own expose for an `allow`, the answered ask for an `ask` (NET-045).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unaudited_allow_withdraws_the_vm_row_under_its_source() {
+    for (mode, source) in [
+        (
+            sessions::DynamicIngress::Allow,
+            minimald_rpc::PortReportSource::Expose,
+        ),
+        (
+            sessions::DynamicIngress::Ask,
+            minimald_rpc::PortReportSource::Ask,
+        ),
+    ] {
+        assert_eq!(
+            unaudited_vm_withdrawal(mode).await,
+            minimald_rpc::BoxControlRequest::WithdrawPort(minimald_rpc::WithdrawPortRequest {
+                switch_address: ASK_SWITCH,
+                port: 3000,
+                proto: sessions::IpProto::Tcp,
+                source,
+            }),
+            "the {mode} publish's row entry is withdrawn under its own source"
+        );
+    }
+}
+
 /// The host-level half of NET-045's no-client case: an ask reaching a host
 /// nobody is bound to answers no-one rather than parking — the dialog has no
 /// terminal to render on — which is the fail-closed answer the session turns
