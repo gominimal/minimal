@@ -17096,9 +17096,9 @@ proof_listen_published_port_reaches_peer_and_host() {
     echo "::endgroup::"
     return 0
   fi
-  if [ ! -c /dev/net/tun ]; then
+  if [ -z "${E2E_VM:-}" ] && [ ! -c /dev/net/tun ]; then
     not_run listen_published_port_reaches_peer_and_host \
-      "no /dev/net/tun on this host: an own-IP box cannot open its in-namespace tap, so the listen through the VM bridge is proven on the KVM lane only — https://github.com/gominimal/inbox/issues/925"
+      "no /dev/net/tun on this host: a native own-IP box cannot open its in-namespace tap; a VM lane opens it inside the guest and runs this case"
     echo "::endgroup::"
     return 0
   fi

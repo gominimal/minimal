@@ -695,7 +695,7 @@ e2e: _kvm artifacts gvproxy initramfs minimal-cli answerer-build minvmd-build
 e2e-native:
     cargo build -p minimald --bin minimald -p minimal --bin min --locked
     @just _userns-check
-    ./scripts/session-e2e.sh
+    env -u E2E_VM ./scripts/session-e2e.sh
 
 # Boots switchless like CI's step — MINVMD_GVPROXY_BIN deliberately not set.
 #
