@@ -148,17 +148,17 @@ minvmd-build: libkrun-static
 # across the packages one build selects, and minvmd's default `libkrun`
 # feature would stamp libkrun's load command into this root-run program.
 #
-# Build the box-zone answerer service program, without libkrun.
-answerer-build:
-    cargo build -p min-answerer --locked
+# Build minzoned, the box-name service program, without libkrun.
+zoned-build:
+    cargo build -p minzoned --locked
 
 # The root-installed answerer copy must resolve no library from a
 # user-writable dir (a dylib reached through an rpath there is a root
 # escalation): otool -L on macOS, ldd on Linux, system paths only.
 #
-# Check that min-answerer links only system libraries.
-answerer-link-check: answerer-build
-    scripts/check-answerer-links.sh target/debug/min-answerer
+# Check that minzoned links only system libraries.
+zoned-link-check: zoned-build
+    scripts/check-zoned-links.sh target/debug/minzoned
 
 # Build the `min` CLI.
 minimal-cli:
@@ -467,12 +467,12 @@ hooks:
 #
 # The local PR gate set, cheapest first.
 [linux]
-ci: fmt-check check-version clippy clippy-strict deny test doctest test-ignored answerer-link-check
+ci: fmt-check check-version clippy clippy-strict deny test doctest test-ignored zoned-link-check
     @echo "ci: local PR gates green"
 
 # The local PR gate set, cheapest first (`just test-cross` covers the Linux-only crates).
 [macos]
-ci: fmt-check check-version clippy clippy-strict deny test doctest answerer-link-check
+ci: fmt-check check-version clippy clippy-strict deny test doctest zoned-link-check
     @echo "ci: local PR gates green"
 
 # Run the curl|sh installer's tests under every POSIX sh. CI: ci-shell-installer.yml.
@@ -685,7 +685,7 @@ test-root-integration: _nextest gvproxy
 # minvmd-build is LAST so its macOS codesign is the final touch on the binary.
 #
 # The unified session e2e against the VM-backed daemon. CI: the session e2e steps.
-e2e: _kvm artifacts gvproxy initramfs minimal-cli answerer-build minvmd-build
+e2e: _kvm artifacts gvproxy initramfs minimal-cli zoned-build minvmd-build
     {{e2e-env}} MINVMD_GVPROXY_BIN="{{gvproxy}}" ./scripts/session-e2e.sh
 
 # CI: ci-linux-native.yml `native-daemon-e2e`.
@@ -695,7 +695,7 @@ e2e: _kvm artifacts gvproxy initramfs minimal-cli answerer-build minvmd-build
 e2e-native:
     cargo build -p minimald --bin minimald -p minimal --bin min --locked
     @just _userns-check
-    ./scripts/session-e2e.sh
+    env -u E2E_VM ./scripts/session-e2e.sh
 
 # Boots switchless like CI's step — MINVMD_GVPROXY_BIN deliberately not set.
 #

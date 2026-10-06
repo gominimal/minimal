@@ -168,8 +168,23 @@ const COMMAND_RESERVES_THE_RANGE: bool = false;
 /// command that installs them, and the custody checks over them all name
 /// this one label beside [`RANGE_UNIT_LABEL`]'s step — one definition, so
 /// the service the command installs, the step the advisory re-surfaces
-/// until it holds, and the unit the bundle records cannot drift apart.
-pub(crate) const ANSWERER_UNIT_LABEL: &str = "dev.minimal.zone-answerer";
+/// until it holds, and the unit the bundle records cannot drift apart:
+/// [`ANSWERER_LAUNCHD_LABEL`] on macOS, [`ANSWERER_SYSTEMD_UNIT`] elsewhere.
+#[cfg(target_os = "macos")]
+pub(crate) const ANSWERER_UNIT_LABEL: &str = ANSWERER_LAUNCHD_LABEL;
+#[cfg(not(target_os = "macos"))]
+pub(crate) const ANSWERER_UNIT_LABEL: &str = ANSWERER_SYSTEMD_UNIT;
+
+/// launchd's job label for the answerer service (see
+/// [`ANSWERER_UNIT_LABEL`]); the plist file is named after it.
+#[cfg(any(test, target_os = "macos"))]
+const ANSWERER_LAUNCHD_LABEL: &str = "dev.gominimal.zone";
+
+/// systemd's unit name stem for the answerer service (see
+/// [`ANSWERER_UNIT_LABEL`]): `minzoned.socket` and `minzoned.service`,
+/// named after the program they run.
+#[cfg(any(test, not(target_os = "macos")))]
+const ANSWERER_SYSTEMD_UNIT: &str = "minzoned";
 
 /// The root-owned path the answerer program is copied to — never a
 /// user-writable binary: `/Library/PrivilegedHelperTools` beside the range
@@ -177,20 +192,19 @@ pub(crate) const ANSWERER_UNIT_LABEL: &str = "dev.minimal.zone-answerer";
 /// the copy the service runs nor read what the step wrote before the
 /// ownership converged ([`answerer_step_over`] walks every component).
 #[cfg(any(test, target_os = "macos"))]
-const MACOS_ANSWERER_PROGRAM_PATH: &str =
-    "/Library/PrivilegedHelperTools/dev.minimal.zone-answerer";
+const MACOS_ANSWERER_PROGRAM_PATH: &str = "/Library/PrivilegedHelperTools/minzoned";
 
 /// The plist the answerer step installs: the file launchd scans at boot,
 /// which is what makes the service hold the sockets at every one.
 #[cfg(any(test, target_os = "macos"))]
-const ANSWERER_PLIST_PATH: &str = "/Library/LaunchDaemons/dev.minimal.zone-answerer.plist";
+const ANSWERER_PLIST_PATH: &str = "/Library/LaunchDaemons/dev.gominimal.zone.plist";
 
 /// The root-owned path the answerer program is copied to on Linux — never
 /// a user-writable binary, the same rule as [`MACOS_ANSWERER_PROGRAM_PATH`]'s
 /// macOS arm: `/usr/local/lib/minimal` is root's alone, and the walk over
 /// it is what custody means here.
 #[cfg(any(test, not(target_os = "macos")))]
-const LINUX_ANSWERER_PROGRAM_PATH: &str = "/usr/local/lib/minimal/dev.minimal.zone-answerer";
+const LINUX_ANSWERER_PROGRAM_PATH: &str = "/usr/local/lib/minimal/minzoned";
 
 /// The root-owned program copy this host's step installs and its checks
 /// read back: [`MACOS_ANSWERER_PROGRAM_PATH`] on macOS,
@@ -212,13 +226,13 @@ const ANSWERER_PROGRAM_DIR: &str = "/usr/local/lib/minimal";
 /// stream channel at the channel's path — and hands them to the service
 /// at socket activation.
 #[cfg(any(test, not(target_os = "macos")))]
-const ANSWERER_UNIT_SOCKET_PATH: &str = "/etc/systemd/system/dev.minimal.zone-answerer.socket";
+const ANSWERER_UNIT_SOCKET_PATH: &str = "/etc/systemd/system/minzoned.socket";
 
 /// The systemd service unit the answerer step installs: the unit that
 /// runs the root-owned program copy as the operator and receives the
 /// sockets the socket unit holds.
 #[cfg(any(test, not(target_os = "macos")))]
-const ANSWERER_UNIT_SERVICE_PATH: &str = "/etc/systemd/system/dev.minimal.zone-answerer.service";
+const ANSWERER_UNIT_SERVICE_PATH: &str = "/etc/systemd/system/minzoned.service";
 
 /// The unit files the step installs — launchd's one plist on macOS,
 /// systemd's socket+service pair on Linux — in the order the custody
@@ -229,8 +243,8 @@ const ANSWERER_UNIT_PATHS: &[&str] = &[ANSWERER_PLIST_PATH];
 const ANSWERER_UNIT_PATHS: &[&str] = &[ANSWERER_UNIT_SOCKET_PATH, ANSWERER_UNIT_SERVICE_PATH];
 
 /// The launchd unit the answerer step installs, as the command writes
-/// it: label [`ANSWERER_UNIT_LABEL`], `ProgramArguments` the root-owned
-/// `min-answerer` copy and nothing else, `UserName` the operator
+/// it: label [`ANSWERER_LAUNCHD_LABEL`], `ProgramArguments` the root-owned
+/// `minzoned` copy and nothing else, `UserName` the operator
 /// the service manager runs it as — never root: the channel's uid gate
 /// serves the uid the unit names, so a root-run service is one no daemon
 /// of this operator could ever publish to — and the two sockets launchd
@@ -258,7 +272,7 @@ const ANSWERER_PLIST_TEMPLATE: &str = "\
 <plist version=\"1.0\">
 <dict>
 \t<key>Label</key>
-\t<string>dev.minimal.zone-answerer</string>
+\t<string>dev.gominimal.zone</string>
 \t<key>ProgramArguments</key>
 \t<array>
 \t\t<string>__PROGRAM__</string>
@@ -321,14 +335,14 @@ Description=The Minimal box-zone answerer sockets
 ListenDatagram=127.0.0.1:7656
 ListenStream=__CHANNEL__
 SocketMode=0666
-__RUNTIME_DIRECTORY__Service=dev.minimal.zone-answerer.service
+__RUNTIME_DIRECTORY__Service=minzoned.service
 
 [Install]
 WantedBy=sockets.target
 ";
 
 /// The systemd service unit the answerer step installs, as the command
-/// writes it: the root-owned `min-answerer` copy, run as the operator — `User=` is the uid the channel's
+/// writes it: the root-owned `minzoned` copy, run as the operator — `User=` is the uid the channel's
 /// gate serves, the one whose daemons may publish — and restarted when
 /// it dies, because the sockets it serves belong to the socket unit, not
 /// the process: a service that comes back serves from the same
@@ -795,7 +809,7 @@ pub(crate) enum AnswererStep {
         /// The protocol version this daemon speaks.
         daemon: u32,
     },
-    /// The step's copy source — this machine's `min-answerer` — passed the
+    /// The step's copy source — this machine's `minzoned` — passed the
     /// identity check the advisory runs before offering the privileged step
     /// ([`answerer_step_with_source`]), and its bytes are pinned: the
     /// command carries the step, copying exactly those bytes or nothing.
@@ -820,7 +834,7 @@ pub(crate) enum AnswererStep {
         reason: String,
     },
     /// The step cannot be offered at all, for a named reason no check could
-    /// change: this release ships no `min-answerer`, or this build carries
+    /// change: this release ships no `minzoned`, or this build carries
     /// no signing identity to verify one by. The step is said to be
     /// unavailable — never silently dropped — and the command carries none.
     SourceUnavailable {
@@ -984,7 +998,7 @@ pub(crate) fn answerer_step_over(facts: &AnswererFacts, daemon: u32) -> Answerer
 /// The inputs the answerer install renders from that only the running
 /// machine knows, gathered once per render: the operator the unit runs
 /// the service as, the machine-global channel the unit holds, the
-/// `min-answerer` program on this machine the step copies, and the control
+/// `minzoned` program on this machine the step copies, and the control
 /// sockets of the VM host daemons the step asks to release the hook port.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AnswererInstall {
@@ -994,7 +1008,7 @@ pub(crate) struct AnswererInstall {
     pub channel: String,
     /// The channel socket's directory.
     pub channel_dir: String,
-    /// The `min-answerer` program the step copies — beside this `min`, or
+    /// The `minzoned` program the step copies — beside this `min`, or
     /// on `PATH`; never a bare name the shell might resolve to anything.
     pub source: String,
     /// The SHA-256 of the source bytes verified at render time: the
@@ -1011,9 +1025,9 @@ pub(crate) struct AnswererInstall {
     pub controls: Vec<String>,
 }
 
-/// The program the answerer step copies: `min-answerer`, the dedicated
+/// The program the answerer step copies: `minzoned`, the dedicated
 /// answerer binary — never `minvmd`, and never a bare name.
-pub(crate) const ANSWERER_PROGRAM_NAME: &str = "min-answerer";
+pub(crate) const ANSWERER_PROGRAM_NAME: &str = "minzoned";
 
 /// The operator the answerer unit runs the service as: the user this CLI
 /// runs as, read the way launchd and every login shell record it
@@ -1037,7 +1051,7 @@ fn operator_name() -> String {
 /// Where the answerer program is on this machine, pure over where to look:
 /// beside the running `min` first (a release ships the two together; a dev
 /// build puts them in one target dir), then each directory of `path`. Only
-/// `min-answerer` is ever named — never `minvmd`, whatever sits beside it —
+/// `minzoned` is ever named — never `minvmd`, whatever sits beside it —
 /// and `None` when no such file exists, so the advisory names no program
 /// it cannot find.
 pub(crate) fn answerer_source_in(
@@ -1069,7 +1083,7 @@ fn answerer_source() -> Option<String> {
 
 /// The stand-in program path the suite's fixed installs carry.
 #[cfg(test)]
-pub(crate) const TEST_ANSWERER_SOURCE: &str = "/opt/minimal-test/bin/min-answerer";
+pub(crate) const TEST_ANSWERER_SOURCE: &str = "/opt/minimal-test/bin/minzoned";
 
 /// The control sockets the answerer step asks to release the hook port,
 /// set by the session start that renders the advisory (its own state dir's
@@ -1137,25 +1151,25 @@ fn unquotable_value(install: &AnswererInstall) -> Option<&str> {
     .find(|value| value.chars().any(unsafe_char))
 }
 
-/// The Developer ID team the release signs `min-answerer` with, compiled in
-/// from `MINIMAL_ANSWERER_TEAMID` by the release build of this CLI — the
+/// The Developer ID team the release signs `minzoned` with, compiled in
+/// from `MINIMAL_ZONED_TEAMID` by the release build of this CLI — the
 /// `<TEAMID>` of [`answerer_requirement`]. A release build without it
 /// carries no signing identity and offers no answerer step on macOS (see
 /// [`macos_answerer_requirement`]); there is no fallback to a bare
 /// `codesign --strict`, which any ad-hoc signature passes.
 #[cfg(all(target_os = "macos", not(any(test, debug_assertions))))]
-const ANSWERER_SIGNING_TEAMID: Option<&str> = option_env!("MINIMAL_ANSWERER_TEAMID");
+const ANSWERER_SIGNING_TEAMID: Option<&str> = option_env!("MINIMAL_ZONED_TEAMID");
 
-/// The code-signing identifier the release signs `min-answerer` under
-/// (`codesign --identifier`), compiled in from `MINIMAL_ANSWERER_IDENTIFIER`
+/// The code-signing identifier the release signs `minzoned` under
+/// (`codesign --identifier`), compiled in from `MINIMAL_ZONED_IDENTIFIER`
 /// beside [`ANSWERER_SIGNING_TEAMID`] and required the same way.
 #[cfg(all(target_os = "macos", not(any(test, debug_assertions))))]
-const ANSWERER_SIGNING_IDENTIFIER: Option<&str> = option_env!("MINIMAL_ANSWERER_IDENTIFIER");
+const ANSWERER_SIGNING_IDENTIFIER: Option<&str> = option_env!("MINIMAL_ZONED_IDENTIFIER");
 
 /// The reason the step is unavailable when this machine has no
-/// `min-answerer` to copy: the release this `min` came from shipped none
+/// `minzoned` to copy: the release this `min` came from shipped none
 /// beside it, and none is on `PATH`.
-const ANSWERER_NOT_SHIPPED: &str = "this release ships no min-answerer";
+const ANSWERER_NOT_SHIPPED: &str = "this release ships no minzoned";
 
 /// The reason the step is unavailable on a macOS release build that was
 /// compiled without [`ANSWERER_SIGNING_TEAMID`] or
@@ -1164,7 +1178,7 @@ const ANSWERER_NOT_SHIPPED: &str = "this release ships no min-answerer";
 #[cfg(any(test, all(target_os = "macos", not(debug_assertions))))]
 const ANSWERER_NO_SIGNING_IDENTITY: &str = "this build carries no signing identity";
 
-/// The designated requirement `min-answerer` must satisfy on macOS: signed
+/// The designated requirement `minzoned` must satisfy on macOS: signed
 /// by Apple's Developer ID chain (the intermediate's Developer ID marker,
 /// the leaf's Developer ID Application marker), by this team, under this
 /// identifier. `None` when either value holds anything but ASCII letters,
@@ -1209,7 +1223,7 @@ fn macos_answerer_requirement(
 /// copy with ([`answerer_requirement`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct VerifiedSource {
-    /// The `min-answerer` the step copies.
+    /// The `minzoned` the step copies.
     pub path: String,
     /// Lowercase hex SHA-256 of the bytes verified at render time.
     pub sha256: String,
@@ -1246,7 +1260,7 @@ const ANSWERER_IDENTITY_BOUND: Duration = Duration::from_secs(5);
 /// Developer ID requirement this build carries ([`answerer_requirement`]),
 /// or unavailable when it carries none. On Linux the identity is the
 /// SHA-256 pin alone ([`answerer_step_with_source`]); link-cleanliness is
-/// proven at release (`scripts/check-answerer-links.sh`), not here.
+/// proven at release (`scripts/check-zoned-links.sh`), not here.
 ///
 /// Skipped for debug and test builds under the same gate as the
 /// channel-path override (`debug_path_override` in minvmd's answerer
@@ -2250,7 +2264,7 @@ fn verified_copy_steps(install: &AnswererInstall, dir: &str, dest: &str, macos: 
          {dq}{d}p{dq}{q}, on the path to {dir}, is not a root-owned, non-sticky directory closed \
          to group and other writes; the answerer service was not installed{q} >&2 ; exit 1 ; }} \
          ; if [ {dq}{d}p{dq} = / ] ; then break ; fi ; p={d}(dirname {dq}{d}p{dq}) ; done \
-         ; t={d}(mktemp {q}{dir}/.{ANSWERER_UNIT_LABEL}.XXXXXX{q}) \
+         ; t={d}(mktemp {q}{dir}/.{ANSWERER_PROGRAM_NAME}.XXXXXX{q}) \
          ; install -m 0755 -o root -g {group} {q}{source}{q} {d}t || {copy_failed} \
          ; h={d}({hash} < {d}t || true) ; h={d}{{h%% *}} \
          ; case {d}h in {sha}) ;; *) rm -f {d}t ; echo {q}minimal: the answerer copy hashes{q} \
@@ -2263,7 +2277,7 @@ fn verified_copy_steps(install: &AnswererInstall, dir: &str, dest: &str, macos: 
 
 /// The macOS answerer steps of the privileged command (NET-122's host
 /// service), after the range's: boot out a running service, copy
-/// `min-answerer` to the root-owned path and write the plist naming it,
+/// `minzoned` to the root-owned path and write the plist naming it,
 /// root's both; ask this CLI's VM host daemons to release the hook port
 /// (the copy's `release` verb, which waits up to 2 s for the port to be
 /// free); then load the plist and wait up to 5 s for the channel. Either
@@ -2288,7 +2302,7 @@ fn macos_answerer_steps(install: &AnswererInstall) -> String {
             format!("\"{copy}\" release-cancel{controls} ; ")
         };
         format!(
-            "{{ (launchctl bootout system/{ANSWERER_UNIT_LABEL} 2>/dev/null || true) ; \
+            "{{ (launchctl bootout system/{ANSWERER_LAUNCHD_LABEL} 2>/dev/null || true) ; \
              rm -f {ANSWERER_PLIST_PATH} \"{copy}\" \"{channel}\" ; {cancel}echo \"minimal: \
              {reason}; the answerer service was not installed\" >&2 ; exit 1 ; }}"
         )
@@ -2303,7 +2317,7 @@ fn macos_answerer_steps(install: &AnswererInstall) -> String {
     };
     format!(
         "{verified_copy} \
-         ; (launchctl bootout system/{ANSWERER_UNIT_LABEL} 2>/dev/null || true) \
+         ; (launchctl bootout system/{ANSWERER_LAUNCHD_LABEL} 2>/dev/null || true) \
          ; mkdir -p \"{channel_dir}\" \
          ; cat > {ANSWERER_PLIST_PATH} <<\\{ANSWERER_PLIST_HEREDOC}\n\
 {answerer_plist}\
@@ -2438,7 +2452,7 @@ pub(crate) fn linux_command(port: u16, install: Option<&AnswererInstall>) -> Str
 
 /// The Linux answerer steps of the privileged command (NET-122's host
 /// service), after the resolver's: stop a running service, copy
-/// `min-answerer` to the root-owned path, write the socket and service
+/// `minzoned` to the root-owned path, write the socket and service
 /// units naming it, root's all three, and enable the socket for every boot
 /// without starting it; ask this CLI's VM host daemons to release the hook
 /// port (the copy's `release` verb, which waits up to 2 s for the port to
@@ -2457,7 +2471,7 @@ fn linux_answerer_steps(install: &AnswererInstall) -> String {
     let controls = control_args(install, '\'');
     let copy = LINUX_ANSWERER_PROGRAM_PATH;
     let channel = &install.channel;
-    let unit = format!("{ANSWERER_UNIT_LABEL}.socket");
+    let unit = format!("{ANSWERER_SYSTEMD_UNIT}.socket");
     let fail = |reason: &str| {
         let cancel = if controls.is_empty() {
             String::new()
@@ -2465,7 +2479,7 @@ fn linux_answerer_steps(install: &AnswererInstall) -> String {
             format!("'{copy}' release-cancel{controls} ; ")
         };
         format!(
-            "{{ systemctl disable --now {unit} {ANSWERER_UNIT_LABEL}.service 2>/dev/null \
+            "{{ systemctl disable --now {unit} {ANSWERER_SYSTEMD_UNIT}.service 2>/dev/null \
              || true ; rm -f {ANSWERER_UNIT_SOCKET_PATH} {ANSWERER_UNIT_SERVICE_PATH} \
              '{copy}' ; systemctl daemon-reload || true ; {cancel}echo 'minimal: {reason}; \
              the answerer service was not installed' >&2 ; exit 1 ; }}"
@@ -2481,7 +2495,7 @@ fn linux_answerer_steps(install: &AnswererInstall) -> String {
     };
     format!(
         "{verified_copy} \
-         ; (systemctl stop {unit} {ANSWERER_UNIT_LABEL}.service 2>/dev/null || true) \
+         ; (systemctl stop {unit} {ANSWERER_SYSTEMD_UNIT}.service 2>/dev/null || true) \
          ; cat > {ANSWERER_UNIT_SOCKET_PATH} <<\\{ANSWERER_SOCKET_HEREDOC}\n\
 {answerer_socket}\
 {ANSWERER_SOCKET_HEREDOC}\n\
@@ -2510,7 +2524,7 @@ chown root:root {ANSWERER_UNIT_SOCKET_PATH} {ANSWERER_UNIT_SERVICE_PATH} \
 /// The exact command that configures this host's resolver for [`ZONE`] at
 /// `port` — the command NET-122's advisory names.
 /// `install` is the answerer step's inputs when the step is offered and
-/// this machine has a `min-answerer` to copy; `None` renders the resolver
+/// this machine has a `minzoned` to copy; `None` renders the resolver
 /// (and, on macOS, the range) alone.
 #[cfg(target_os = "macos")]
 pub(crate) fn command(port: u16, install: Option<&AnswererInstall>) -> String {
@@ -2613,8 +2627,9 @@ fn answerer_fact(answerer: &AnswererStep, carried: bool) -> Option<String> {
 /// the command the advisory names is the whole of the host's missing
 /// configuration: the lead-in says what it does — on macOS "configure
 /// the host's resolver, reserve the local range, and install the
-/// box-zone answerer service", on Linux "configure the host's resolver
-/// and install the box-zone answerer service" — and nothing the note
+/// Minimal box-name service (DNS and addresses for boxes)", on Linux
+/// "configure the host's resolver and install the Minimal box-name service
+/// (DNS and addresses for boxes)" — and nothing the note
 /// asks for stands beside that command unprovided. String assembly only.
 ///
 /// `range_step` is what the detection read beside the hook: the range
@@ -2811,13 +2826,13 @@ pub(crate) fn advisory_at(
                 install.is_some(),
             ) {
                 (true, true) => {
-                    "Configure the host's resolver and install the box-zone \
-                     answerer service with:"
+                    "Configure the host's resolver and install the Minimal box-name \
+                     service (DNS and addresses for boxes) with:"
                 }
                 (true, false) => "Configure the host's resolver for the zone with:",
                 (false, true) => {
                     "Configure the host's resolver, reserve the local range, and \
-                     install the box-zone answerer service with:"
+                     install the Minimal box-name service (DNS and addresses for boxes) with:"
                 }
                 (false, false) => "Configure the host's resolver and reserve the local range with:",
             };
@@ -3549,7 +3564,7 @@ mod tests {
 
     /// `step` with a verified, pinned copy source folded in — what
     /// [`read_answerer_step`] returns for a host that still needs the step
-    /// and has a `min-answerer` that passed its identity check.
+    /// and has a `minzoned` that passed its identity check.
     fn verified(step: AnswererStep) -> AnswererStep {
         AnswererStep::SourceVerified {
             service: Box::new(step),
@@ -3634,14 +3649,14 @@ mod tests {
             operator: "operator".to_string(),
             channel_dir: "/run/minimal".to_string(),
             channel: "/run/minimal/answerer.sock".to_string(),
-            source: "/home/operator/.local/bin/min-answerer".to_string(),
+            source: "/home/operator/.local/bin/minzoned".to_string(),
             sha256: TEST_ANSWERER_SHA256.to_string(),
             requirement: None,
             controls: vec!["/home/operator/.minimal/vm/control.sock".to_string()],
         };
         assert_eq!(unquotable_value(&base), None, "plain paths render");
         let spaced = AnswererInstall {
-            source: "/Users/an operator/Application Support/min-answerer".to_string(),
+            source: "/Users/an operator/Application Support/minzoned".to_string(),
             ..base.clone()
         };
         assert_eq!(
@@ -3651,7 +3666,7 @@ mod tests {
         );
         for bad in ["'", "\"", "$", "`", "\\", "\n", "\r"] {
             let source = AnswererInstall {
-                source: format!("/home/o{bad}brien/min-answerer"),
+                source: format!("/home/o{bad}brien/minzoned"),
                 ..base.clone()
             };
             assert!(
@@ -5869,7 +5884,7 @@ mod tests {
     }
 
     // NET-122's host service, on the advisory's one privileged step: the
-    // command copies `min-answerer` to a root-owned path and installs the
+    // command copies `minzoned` to a root-owned path and installs the
     // service unit pointing at that copy — a launchd plist with socket
     // activation on macOS, a systemd socket and service pair on Linux —
     // run as the operator, never at the user-writable binary it copied
@@ -5964,7 +5979,7 @@ mod tests {
             "the copy is in place before the units are written: {linux}"
         );
         let enable_at = linux
-            .find(&format!("systemctl enable {ANSWERER_UNIT_LABEL}.socket"))
+            .find(&format!("systemctl enable {ANSWERER_SYSTEMD_UNIT}.socket"))
             .expect("the Linux step enables the socket unit");
         assert!(copy_at < chown_at && chown_at < enable_at, "{linux}");
         let socket = answerer_socket_unit(&install);
@@ -6038,7 +6053,7 @@ mod tests {
         .expect("a host without the answerer service is advised");
         assert!(
             advisory.contains("not installed as a host service")
-                && advisory.contains("install the box-zone answerer service"),
+                && advisory.contains("install the Minimal box-name service"),
             "{advisory}"
         );
         assert!(
@@ -6154,7 +6169,7 @@ mod tests {
         };
         let dir = tempfile::tempdir().expect("a temp dir");
         let source = dir.path().join(ANSWERER_PROGRAM_NAME);
-        let bytes = b"min-answerer fixture bytes\n";
+        let bytes = b"minzoned fixture bytes\n";
         std::fs::write(&source, bytes).expect("the fixture source");
         let source = source.display().to_string();
         let pinned = hex::encode(sha2::Sha256::digest(bytes));
@@ -6189,11 +6204,11 @@ mod tests {
             "the service state underneath the refusal survives: {advisory}"
         );
         assert!(
-            !advisory.contains(ANSWERER_UNIT_LABEL) && !advisory.contains(&pinned),
+            !advisory.contains(ANSWERER_PROGRAM_PATH) && !advisory.contains(&pinned),
             "no copy of the program is carried: {advisory}"
         );
         assert!(
-            !advisory.contains("install the box-zone answerer service"),
+            !advisory.contains("install the Minimal box-name service"),
             "the lead-in offers no answerer install: {advisory}"
         );
         assert!(
@@ -6204,7 +6219,7 @@ mod tests {
         // A source that passes: verified and pinned to its bytes' SHA-256,
         // with the requirement the root step re-checks the copy by.
         let requirement =
-            answerer_requirement("3G47C5HY64", "dev.minimal.min-answerer").expect("safe values");
+            answerer_requirement("3G47C5HY64", "dev.minimal.minzoned").expect("safe values");
         let checked = std::sync::Mutex::new(None);
         let passed =
             answerer_step_with_source(AnswererStep::Absent, Some(source.clone()), |path| {
@@ -6237,7 +6252,7 @@ mod tests {
             "the rendered command carries the pinned hash: {advisory}"
         );
         assert!(
-            advisory.contains("install the box-zone answerer service"),
+            advisory.contains("install the Minimal box-name service"),
             "the lead-in offers the answerer install: {advisory}"
         );
         #[cfg(target_os = "macos")]
@@ -6291,7 +6306,7 @@ mod tests {
         }
     }
 
-    /// When the release ships no `min-answerer`, or the build carries no
+    /// When the release ships no `minzoned`, or the build carries no
     /// signing identity to verify one by, the step is unavailable and the
     /// advisory says so by name — it never silently drops the step.
     #[tokio::test]
@@ -6325,7 +6340,7 @@ mod tests {
         let advisory = advise(&unshipped);
         assert!(
             advisory.contains(
-                "this release ships no min-answerer; the answerer service step is unavailable"
+                "this release ships no minzoned; the answerer service step is unavailable"
             ),
             "{advisory}"
         );
@@ -6335,12 +6350,12 @@ mod tests {
         );
         assert!(
             advisory.contains(&format!("\n  {}", command(port, None)))
-                && !advisory.contains("install the box-zone answerer service"),
+                && !advisory.contains("install the Minimal box-name service"),
             "the command carries no answerer step: {advisory}"
         );
 
         // A macOS release build with no TEAMID or identifier compiled in.
-        let no_identity = macos_answerer_requirement(None, Some("dev.minimal.min-answerer"))
+        let no_identity = macos_answerer_requirement(None, Some("dev.minimal.minzoned"))
             .expect_err("no TEAMID, no requirement");
         assert_eq!(
             no_identity,
@@ -6362,17 +6377,17 @@ mod tests {
             "{advisory}"
         );
         assert!(
-            !advisory.contains("install the box-zone answerer service"),
+            !advisory.contains("install the Minimal box-name service"),
             "never a fallback to a weaker check: {advisory}"
         );
 
         // The requirement a build that does carry one checks by.
         assert_eq!(
-            macos_answerer_requirement(Some("3G47C5HY64"), Some("dev.minimal.min-answerer")),
+            macos_answerer_requirement(Some("3G47C5HY64"), Some("dev.minimal.minzoned")),
             Ok(
                 "anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists \
                 and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate \
-                leaf[subject.OU] = \"3G47C5HY64\" and identifier \"dev.minimal.min-answerer\""
+                leaf[subject.OU] = \"3G47C5HY64\" and identifier \"dev.minimal.minzoned\""
                     .to_string()
             )
         );
@@ -6441,7 +6456,7 @@ mod tests {
             let checked: &'static [u8] = b"the bytes the advisory checked\n";
             std::fs::write(&source, checked).unwrap();
             let pinned = hex::encode(sha2::Sha256::digest(checked));
-            let dest = dest_dir.join("dev.minimal.zone-answerer");
+            let dest = dest_dir.join("minzoned");
             CopyHarness {
                 _root: root,
                 stubs,
@@ -6705,14 +6720,14 @@ mod tests {
             install.controls[0], install.controls[1]
         );
         let enable_at = linux
-            .find(&format!("systemctl enable {ANSWERER_UNIT_LABEL}.socket"))
+            .find(&format!("systemctl enable {ANSWERER_SYSTEMD_UNIT}.socket"))
             .expect("the units are enabled");
         let release_at = linux
             .find(&release)
             .expect("the daemons are asked to release");
         let start_at = linux
             .find(&format!(
-                "systemctl start --no-block {ANSWERER_UNIT_LABEL}.socket"
+                "systemctl start --no-block {ANSWERER_SYSTEMD_UNIT}.socket"
             ))
             .expect("the socket unit is started");
         assert!(
@@ -6775,7 +6790,7 @@ mod tests {
         assert!(!direct.contains(" release"), "{direct}");
         assert!(
             direct.contains(&format!(
-                "systemctl start --no-block {ANSWERER_UNIT_LABEL}.socket"
+                "systemctl start --no-block {ANSWERER_SYSTEMD_UNIT}.socket"
             )),
             "{direct}"
         );
@@ -6784,7 +6799,7 @@ mod tests {
 
     /// NET-122's host service on a native host: the advisory offers the
     /// same privileged step a VM-backed host gets — the root-owned copy of
-    /// `min-answerer`, released out of the daemon serving this session and
+    /// `minzoned`, released out of the daemon serving this session and
     /// then started as the manager-held answerer — and the socket the
     /// command asks to release is the native daemon's own, the control
     /// socket beside its ssh socket in the Minimald provider dir this
@@ -6833,7 +6848,7 @@ mod tests {
         .expect("a native host without the answerer service is advised");
         assert!(
             advisory.contains("not installed as a host service")
-                && advisory.contains("install the box-zone answerer service"),
+                && advisory.contains("install the Minimal box-name service"),
             "the native advisory offers the answerer service step: {advisory}"
         );
         assert!(
@@ -6854,7 +6869,7 @@ mod tests {
         #[cfg(not(target_os = "macos"))]
         let start_at = advisory
             .find(&format!(
-                "systemctl start --no-block {ANSWERER_UNIT_LABEL}.socket"
+                "systemctl start --no-block {ANSWERER_SYSTEMD_UNIT}.socket"
             ))
             .expect("the socket unit is started");
         assert!(
@@ -6894,9 +6909,9 @@ mod tests {
         );
     }
 
-    /// `answerer_source` resolves `min-answerer` — beside this `min`, then
+    /// `answerer_source` resolves `minzoned` — beside this `min`, then
     /// on `PATH` — and never names `minvmd`, nor a bare name: with no
-    /// `min-answerer` anywhere it finds nothing, however many `minvmd`s
+    /// `minzoned` anywhere it finds nothing, however many `minvmd`s
     /// sit where it looks.
     #[test]
     fn answerer_source_never_names_an_absent_minvmd() {
@@ -6909,13 +6924,13 @@ mod tests {
         assert_eq!(
             answerer_source_in(Some(beside.path()), Some(&path)),
             None,
-            "no min-answerer anywhere: nothing is named"
+            "no minzoned anywhere: nothing is named"
         );
         std::fs::write(on_path.path().join(ANSWERER_PROGRAM_NAME), b"").expect("on PATH");
         let found =
             answerer_source_in(Some(beside.path()), Some(&path)).expect("the one on PATH is found");
         assert!(
-            found.ends_with("/min-answerer") && found.starts_with('/'),
+            found.ends_with("/minzoned") && found.starts_with('/'),
             "{found}"
         );
         std::fs::write(beside.path().join(ANSWERER_PROGRAM_NAME), b"").expect("beside min");

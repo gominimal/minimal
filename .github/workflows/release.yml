@@ -258,17 +258,17 @@ jobs:
                   mv min minimal-linux-amd64
                   mv minimald minimald-linux-amd64
                   mv minvmd minvmd-linux-amd64
-                  mv min-answerer min-answerer-linux-amd64
-            - name: Re-check min-answerer links on the renamed artifact
+                  mv minzoned minzoned-linux-amd64
+            - name: Re-check minzoned links on the renamed artifact
               # dist-build.sh gated the binary it built; re-run the same gate
               # on the exact file that uploads, so the shipped bytes are the
               # checked bytes.
-              run: scripts/check-answerer-links.sh target/x86_64-unknown-linux-musl/release/min-answerer-linux-amd64
-            - name: Upload binary (min-answerer)
+              run: scripts/check-zoned-links.sh target/x86_64-unknown-linux-musl/release/minzoned-linux-amd64
+            - name: Upload binary (minzoned)
               uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
               with:
-                  name: min-answerer-linux-amd64
-                  path: target/x86_64-unknown-linux-musl/release/min-answerer-linux-amd64
+                  name: minzoned-linux-amd64
+                  path: target/x86_64-unknown-linux-musl/release/minzoned-linux-amd64
                   retention-days: 7
             - name: Upload binary (mip)
               uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -390,15 +390,15 @@ jobs:
                   mv mip mip-linux-arm64
                   mv minimald minimald-linux-arm64
                   mv minvmd minvmd-linux-arm64
-                  mv min-answerer min-answerer-linux-arm64
-            - name: Re-check min-answerer links on the renamed artifact
+                  mv minzoned minzoned-linux-arm64
+            - name: Re-check minzoned links on the renamed artifact
               # See the amd64 job: the gate runs again on the file that uploads.
-              run: scripts/check-answerer-links.sh target/aarch64-unknown-linux-musl/release/min-answerer-linux-arm64
-            - name: Upload binary (min-answerer)
+              run: scripts/check-zoned-links.sh target/aarch64-unknown-linux-musl/release/minzoned-linux-arm64
+            - name: Upload binary (minzoned)
               uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
               with:
-                  name: min-answerer-linux-arm64
-                  path: target/aarch64-unknown-linux-musl/release/min-answerer-linux-arm64
+                  name: minzoned-linux-arm64
+                  path: target/aarch64-unknown-linux-musl/release/minzoned-linux-arm64
                   retention-days: 7
             - name: Upload binary (minimal)
               uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -457,13 +457,13 @@ jobs:
         if: vars.RUN_MACOS_CI != 'false'
         env:
             MINIMAL_RELEASE_VERSION: ${{ needs.assert-version.outputs.release_version }}
-            # The signing identity min-answerer is signed under below, compiled
+            # The signing identity minzoned is signed under below, compiled
             # into `min` (option_env! in crates/minimal/src/resolver.rs): the
             # session advisory verifies the copy source against the Developer
             # ID requirement for this team and identifier, and a `min` built
             # without them offers no answerer step on macOS.
-            MINIMAL_ANSWERER_TEAMID: 3G47C5HY64
-            MINIMAL_ANSWERER_IDENTIFIER: dev.minimal.min-answerer
+            MINIMAL_ZONED_TEAMID: 3G47C5HY64
+            MINIMAL_ZONED_IDENTIFIER: dev.minimal.minzoned
         steps:
             - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
               with:
@@ -506,21 +506,21 @@ jobs:
                     printf '%s\n' "$bad" >&2
                     exit 1
                   fi
-            - name: Build release min-answerer binary
+            - name: Build release minzoned binary
               # Its OWN invocation, like minimal above and for the same reason:
               # beside `-p minvmd` the libkrun feature would unify into the
               # answerer a root host service must never carry. Link-gated as
               # built; the gate runs again on the signed artifact below.
               run: |
-                  cargo build --release --locked -p min-answerer --bin min-answerer
-                  scripts/check-answerer-links.sh target/release/min-answerer
+                  cargo build --release --locked -p minzoned --bin minzoned
+                  scripts/check-zoned-links.sh target/release/minzoned
             - name: Rename binaries with platform suffix
               # download-artifact merge-multiple flattens on basename, so the uploaded
               # file must already carry the platform-suffixed name the release job expects.
               run: |
                   mv target/release/minvmd target/release/minvmd-macos-arm64
                   mv target/release/min target/release/minimal-macos-arm64
-                  mv target/release/min-answerer target/release/min-answerer-macos-arm64
+                  mv target/release/minzoned target/release/minzoned-macos-arm64
             - name: Codesign binaries with Developer ID
               # Sign the two shipped Mach-O binaries with the Developer ID
               # Application identity held in the runner's signing keychain. This
@@ -545,24 +545,24 @@ jobs:
                   codesign --force --timestamp --options runtime \
                     --sign "$IDENTITY" \
                     target/release/minimal-macos-arm64
-                  # min-answerer: no entitlements at all (no hypervisor, no
+                  # minzoned: no entitlements at all (no hypervisor, no
                   # disable-library-validation, no dyld environment, no JIT),
                   # and an explicit identifier, the one `min` checks it by.
                   codesign --force --timestamp --options runtime \
-                    --identifier "$MINIMAL_ANSWERER_IDENTIFIER" \
+                    --identifier "$MINIMAL_ZONED_IDENTIFIER" \
                     --sign "$IDENTITY" \
-                    target/release/min-answerer-macos-arm64
+                    target/release/minzoned-macos-arm64
 
                   codesign --verify --strict --verbose=2 target/release/minvmd-macos-arm64
                   codesign --verify --strict --verbose=2 target/release/minimal-macos-arm64
                   # The exact designated requirement the session advisory and
                   # the privileged step verify the answerer against.
                   codesign --verify --strict --verbose=2 \
-                    -R "=anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = \"$MINIMAL_ANSWERER_TEAMID\" and identifier \"$MINIMAL_ANSWERER_IDENTIFIER\"" \
-                    target/release/min-answerer-macos-arm64
-            - name: Re-check min-answerer links on the signed artifact
+                    -R "=anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = \"$MINIMAL_ZONED_TEAMID\" and identifier \"$MINIMAL_ZONED_IDENTIFIER\"" \
+                    target/release/minzoned-macos-arm64
+            - name: Re-check minzoned links on the signed artifact
               # The last check before upload, on the signed and renamed bytes.
-              run: scripts/check-answerer-links.sh target/release/min-answerer-macos-arm64
+              run: scripts/check-zoned-links.sh target/release/minzoned-macos-arm64
             - name: Notarize binaries
               # Submit each signed binary to Apple's notary service and fail the
               # release unless every result is Accepted. Notarization does not
@@ -594,7 +594,7 @@ jobs:
                   mkdir -p "$work"
                   for f in target/release/minvmd-macos-arm64 \
                            target/release/minimal-macos-arm64 \
-                           target/release/min-answerer-macos-arm64; do
+                           target/release/minzoned-macos-arm64; do
                     name=$(basename "$f")
                     zip="$work/$name.zip"
                     result="$work/$name.json"
@@ -633,11 +633,11 @@ jobs:
                   name: minimal-macos-arm64
                   path: target/release/minimal-macos-arm64
                   retention-days: 7
-            - name: Upload binary (min-answerer)
+            - name: Upload binary (minzoned)
               uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
               with:
-                  name: min-answerer-macos-arm64
-                  path: target/release/min-answerer-macos-arm64
+                  name: minzoned-macos-arm64
+                  path: target/release/minzoned-macos-arm64
                   retention-days: 7
 
     build-libkrun-macos-arm64:
