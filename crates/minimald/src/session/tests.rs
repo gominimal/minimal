@@ -4975,6 +4975,24 @@ async fn shared_address_port_collision_reported_at_finalize_without_attached_cli
         )),
         "the second box's port is published at the number it asked for"
     );
+    // First-come: the collision is recorded on the box that yields the port —
+    // the second — naming the port and the box that holds it, and never on
+    // the holder. The second box's attach reads this record and skips that
+    // forward, so its spawn never fails on the forwarder's refusal and its
+    // other forwards bind (the attach half is
+    // `a_yielded_shared_address_port_is_skipped_and_the_attach_succeeds`).
+    assert_eq!(
+        routes.shared_port_collisions(second),
+        vec![crate::net::dns::SharedPortCollision {
+            port: 18080,
+            other: "first.min.internal".to_string(),
+        }],
+        "the second box records the port it yields and the box that holds it"
+    );
+    assert!(
+        routes.shared_port_collisions(first).is_empty(),
+        "the box that published first holds its port and yields nothing"
+    );
     drop(routes);
 
     // The collision reached the log and named both boxes and the port.
@@ -4998,6 +5016,92 @@ async fn shared_address_port_collision_reported_at_finalize_without_attached_cli
             && collision_lines[0].contains("other=first.min.internal"),
         "the collision line names the publishing box and the other box: {}",
         collision_lines[0]
+    );
+}
+
+/// NET-129 across a daemon restart: the shared-address collision is still
+/// first-come, and still reported, once the boxes come back. A restarted
+/// daemon rebuilds its registry from each box's registration as its session
+/// comes up, so the box that held the port before the restart holds it after
+/// it, the box that yielded it records the yield again — the record its next
+/// spawn's attach reads to skip that forward rather than fail on it — and
+/// the report is said again at that session's start.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shared_address_port_collision_survives_a_daemon_restart() {
+    use minimald_rpc::{SessionDelta, SessionDeltaRequest};
+
+    let shared = std::net::Ipv4Addr::new(127, 0, 64, 9);
+    let capture = crate::test_harness::captured_log();
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let first = finalize_handed_own_ip_session(
+        &mut client,
+        "holds",
+        std::net::Ipv4Addr::new(100, 64, 128, 9),
+        shared,
+    )
+    .await;
+    let second = finalize_handed_own_ip_session(
+        &mut client,
+        "yields",
+        std::net::Ipv4Addr::new(100, 64, 128, 10),
+        shared,
+    )
+    .await;
+    let collision_lines_for_second = |log: &str| {
+        log.lines()
+            .filter(|line| {
+                line.contains("action=\"shared-address-port-collision\"")
+                    && line.contains("port=18080")
+                    && line.contains(&format!("session_id={second}"))
+            })
+            .count()
+    };
+    assert_eq!(
+        collision_lines_for_second(&capture.contents()),
+        1,
+        "the collision is reported at the second box's finalize"
+    );
+
+    // Restart: a stop, not a destroy, then a second daemon on the same state
+    // root.
+    server
+        .state
+        .sessions_manager()
+        .await
+        .shutdown(true)
+        .await
+        .expect("a forced shutdown has nothing left to refuse it");
+    drop(client);
+    let state = server.into_state_dir();
+    let server = TestServer::new_in(state).await;
+    let mut client = server.connect().await;
+    for id in [first, second] {
+        let _ = client
+            .call::<SessionDelta>(&SessionDeltaRequest { id })
+            .await;
+    }
+
+    let registry = server.state.sessions_manager().await.hostnames();
+    let routes = registry.read().expect("registry lock");
+    assert_eq!(
+        routes.shared_port_collisions(second),
+        vec![crate::net::dns::SharedPortCollision {
+            port: 18080,
+            other: "holds.min.internal".to_string(),
+        }],
+        "after the restart the second box still yields the port to the first"
+    );
+    assert!(
+        routes.shared_port_collisions(first).is_empty(),
+        "and the first box still holds it"
+    );
+    drop(routes);
+    assert_eq!(
+        collision_lines_for_second(&capture.contents()),
+        2,
+        "the collision is reported again when the second box's session starts"
     );
 }
 

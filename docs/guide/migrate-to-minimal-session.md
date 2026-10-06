@@ -46,7 +46,7 @@ Prior to v0.5.0, `minimal.toml` had five sections: `upstream`, `harness`, `defau
 | Section | Status |
 |---|---|
 | `[upstream]` | Unchanged |
-| `[harness]` | Renamed to [`[stack]`](../concepts/stacks.md); functionality unchanged |
+| `[harness]` | Renamed to [`[stack]`](../concepts/stacks.md); the `[harness]` spelling is no longer accepted |
 | `[defaults]` | `profiles` deprecated — see [Profiles](#profiles) |
 | `[outputs]` | Unchanged |
 | `[tasks]` | Interactive tasks (bash, shell, interactive agent sessions) moved to [`[session]`](#session-new); non-interactive tasks (test, build) aren't supported in v0.5.0 |

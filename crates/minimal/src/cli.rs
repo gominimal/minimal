@@ -207,7 +207,7 @@ pub enum SessionCommand {
 
 #[derive(Debug, Args)]
 pub struct SetupZedArgs {
-    /// Session identifier (UUID or session name)
+    /// Session identifier (UUID, unique id prefix, or session name)
     #[arg(add = completion::session_completer())]
     pub session: String,
     /// Zed settings file to edit (default: `~/.config/zed/settings.json`)
@@ -221,7 +221,7 @@ pub struct SetupZedArgs {
 /// Args for `min session hooks`.
 #[derive(Debug, Args)]
 pub struct HooksArgs {
-    /// Session identifier (UUID or session name)
+    /// Session identifier (UUID, unique id prefix, or session name)
     #[arg(add = completion::session_completer())]
     pub session: String,
     /// Emit the raw JSON the daemon returned instead of a table
@@ -231,7 +231,7 @@ pub struct HooksArgs {
 
 #[derive(Debug, Args)]
 pub struct ExecArgs {
-    /// Session identifier (UUID or session name).
+    /// Session identifier (UUID, unique id prefix, or session name).
     #[arg(add = completion::session_completer())]
     pub session: String,
     /// Command to execute in the session context
@@ -246,7 +246,7 @@ pub struct ExecArgs {
 
 #[derive(Debug, Args)]
 pub struct SessionRunArgs {
-    /// Session identifier (UUID or session name).
+    /// Session identifier (UUID, unique id prefix, or session name).
     #[arg(add = completion::session_completer())]
     pub session: String,
     /// Name of a task declared in the session project's minimal.toml
@@ -255,7 +255,7 @@ pub struct SessionRunArgs {
 
 #[derive(Debug, Args)]
 pub struct PolicyArgs {
-    /// Session identifier (UUID or session name)
+    /// Session identifier (UUID, unique id prefix, or session name)
     #[arg(add = completion::session_completer())]
     pub session: String,
     /// Write one JSON document instead of text (the default)
@@ -923,9 +923,9 @@ pub(crate) fn parse_forward_spec(spec: &str) -> Result<(u16, u16), anyhow::Error
 
 #[derive(Debug, Args)]
 pub struct AttachArgs {
-    /// Session identifier (UUID or session name). When omitted, `min session attach`
-    /// resolves a session from the current working directory (or the only
-    /// existing session), and opens an interactive picker if the choice is
+    /// Session identifier (UUID, unique id prefix, or session name). When
+    /// omitted, `min session attach` resolves a session from the current
+    /// working directory (or the only existing session), and opens an interactive picker if the choice is
     /// ambiguous. See `--no-input` to skip the picker in scripts.
     #[arg(add = completion::session_completer())]
     pub session: Option<String>,
@@ -945,7 +945,7 @@ pub struct LsArgs {
 #[derive(Debug, Args)]
 #[command(group(ArgGroup::new("target").args(["session", "all"]).required(true).multiple(false)))]
 pub struct DestroyArgs {
-    /// Session identifier (UUID or session name)
+    /// Session identifier (UUID, unique id prefix, or session name)
     #[arg(add = completion::session_completer())]
     pub session: Option<String>,
     /// Destroy all sessions
@@ -976,7 +976,7 @@ pub enum NetCommand {
 
 #[derive(Debug, Args)]
 pub struct NetForwardArgs {
-    /// Session identifier (UUID or session name)
+    /// Session identifier (UUID, unique id prefix, or session name)
     #[arg(add = completion::session_completer())]
     pub session: String,
     /// Ports to relay, as `<LOCAL>:<PORT>` — the laptop-side listener and
@@ -995,7 +995,7 @@ pub struct StopArgs {
 
 #[derive(Debug, Args)]
 pub struct RenameArgs {
-    /// Session identifier (UUID or session name)
+    /// Session identifier (UUID, unique id prefix, or session name)
     #[arg(add = completion::session_completer())]
     pub session: String,
     /// New name for the session
