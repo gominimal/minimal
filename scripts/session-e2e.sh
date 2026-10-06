@@ -18399,7 +18399,7 @@ exit" E2E_PTY_ANSWER=keep \
       echo "alpha's audit: $eib_two_line (the admission's own line in the named VM's owner-only host audit, T84)"
       minvmd status --row "$eib_two_name" >"$WORK/eib-vm-two-default-row.out" 2>/dev/null
       eib_two_drc=$?
-      eib_two_drow="$(cat "$WORK/eib-vm-two-default-row.out" 2>/dev/null | tr -d '\r\n')"
+      eib_two_drow="$(tr -d '\r\n' < "$WORK/eib-vm-two-default-row.out" 2>/dev/null)"
       if [ "$eib_two_drc" -ne 1 ] || [ "$eib_two_drow" != "no row for $eib_two_name" ]; then
         echo "::error::the DEFAULT VM answered the by-name row read for the alpha box — a box on the named VM must not exist on the default one (NET-055)"
         echo "minvmd status --row $eib_two_name -> exit $eib_two_drc: '${eib_two_drow:-<no answer>}'"
