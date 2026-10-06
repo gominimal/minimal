@@ -96,7 +96,7 @@ After this ships, a developer on a stock install with no identity plane runs ses
 - **BOX-010** WHEN a box is renamed THE SYSTEM SHALL change only the alias, leave `box_id`, spec, events and filesystem unchanged, and record a `renamed` event carrying the old and new names.
   tier:     T1
   verify:   cargo nextest run -p sessions rename_changes_only_alias_and_records_event
-  property: For every box and every new name, rename leaves id, spec and filesystem path equal before and after, preserves every prior event, and appends exactly one `renamed` event.
+  property: For every box and every successful rename, rename leaves id, spec and filesystem path equal before and after, preserves every prior event, and appends exactly one `renamed` event.
   - IF the new name is held by a running box on the same host, or is `self`, THEN THE SYSTEM SHALL refuse the rename with exit 2, naming the running box that holds it or the reserved name `self`, and leave the box, its name and its events unchanged.
     tier:   T0
     verify: cargo nextest run -p sessions rename_to_running_held_name_or_self_refused_exit2_names_holder
