@@ -16,8 +16,8 @@
 //!   is the hostname proxy's: the box zone is the VM host daemon's to answer
 //!   (NET-138), so no answerer port is ever handed to a guest.
 //!
-//! Per the spec we keep this minimal and "run as pid-1, revisit if zombie
-//! reaping bites".
+//! pid 1 does not stay the daemon: it forks the daemon off and stays behind
+//! as an orphan reaper (see [`crate::reaper`]).
 
 use std::ffi::CString;
 use std::time::Duration;
@@ -89,6 +89,26 @@ pub fn handed_publish_generation() -> Option<u64> {
 /// Decodes a handed publish generation from its raw boot-token value.
 fn parse_publish_generation(raw: Option<&str>) -> Option<u64> {
     raw?.trim().parse::<u64>().ok()
+}
+
+/// Boot token the VM host puts beside [`HANDED_PROXY_PORT_TOKEN`] to hand the
+/// guest daemon its egress opt-out (NET-077): whether the operator opted the
+/// guest out of the deny-all egress default. Mirrors the token `minvmd`'s
+/// `vm.rs` writes — keep the two in step.
+pub const HANDED_EGRESS_DENY_ALL_OPT_OUT_TOKEN: &str = "MINIMALD_EGRESS_DENY_ALL_OPT_OUT";
+
+/// Whether the VM host handed this boot an egress opt-out (NET-077): the
+/// operator set the opt-out on the host, and the guest daemon runs the egress
+/// default its host was started with. Truthy like the host's reader
+/// (`1`/`true`/`yes`/`on`, case-insensitive); an absent token — an older
+/// minvmd, a native run — or any other value is `false`, the egress default.
+pub fn handed_egress_deny_all_opt_out() -> bool {
+    std::env::var(HANDED_EGRESS_DENY_ALL_OPT_OUT_TOKEN).is_ok_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 
 /// A boot token the host put a port on that does not carry one (NET-025):
@@ -168,14 +188,19 @@ pub fn probe_handed_node_port(proxy_port: Option<u16>) -> std::io::Result<()> {
 /// kernel runs the initramfs `/init` (this binary) as pid-1, and nothing else
 /// satisfies both halves.
 ///
-/// The lib side of the check `main` keeps for its own gating
-/// (`is_minimal_microvm` there, for `reboot(2)`): `argv[0]` is
+/// `main` gates on it too (`is_minimal_microvm` there, for `reboot(2)`):
+/// `argv[0]` is
 /// caller-controlled, so it cannot be trusted alone, and pid-1 alone is also
 /// no proof — a native daemon running as a container's init satisfies it. The
 /// classifier asks it one question only a guest answers "yes" to (design
 /// §7.1): a box this daemon cannot place is a box it refuses.
+///
+/// Also true in the daemon [`crate::reaper::split_init`] forks off the
+/// microVM's init, which is no longer pid 1 itself: only pid 1, having
+/// passed this same check, marks that child, so the mark stays unspoofable.
 pub fn is_microvm_daemon() -> bool {
-    is_microvm_init(std::process::id(), std::env::args_os().next().as_deref())
+    crate::reaper::forked_from_microvm_init()
+        || is_microvm_init(std::process::id(), std::env::args_os().next().as_deref())
 }
 
 /// Pure form of [`is_microvm_daemon`], so the spoofing cases stay testable —
@@ -1641,6 +1666,34 @@ mod tests {
         assert_eq!(parse_publish_generation(Some("42")), Some(42));
         assert_eq!(parse_publish_generation(None), None);
         assert_eq!(parse_publish_generation(Some("not-a-generation")), None);
+    }
+
+    /// The egress opt-out the host handed is read off the boot line (NET-077):
+    /// a truthy token opts out, an absent or non-truthy one runs the default.
+    // SAFETY: env mutation here races only other reads of the same variable,
+    // and nextest runs every test in its own process.
+    #[test]
+    fn the_egress_opt_out_is_read_off_the_boot_line() {
+        unsafe { std::env::set_var(HANDED_EGRESS_DENY_ALL_OPT_OUT_TOKEN, "1") };
+        assert!(handed_egress_deny_all_opt_out());
+
+        unsafe { std::env::set_var(HANDED_EGRESS_DENY_ALL_OPT_OUT_TOKEN, "true") };
+        assert!(handed_egress_deny_all_opt_out());
+
+        unsafe { std::env::set_var(HANDED_EGRESS_DENY_ALL_OPT_OUT_TOKEN, " ON ") };
+        assert!(handed_egress_deny_all_opt_out());
+
+        // Fail closed: anything outside the truthy set keeps the default.
+        for value in ["no", "0", "", "garbage", "enabled", "1x"] {
+            unsafe { std::env::set_var(HANDED_EGRESS_DENY_ALL_OPT_OUT_TOKEN, value) };
+            assert!(
+                !handed_egress_deny_all_opt_out(),
+                "{value:?} must not opt out"
+            );
+        }
+
+        unsafe { std::env::remove_var(HANDED_EGRESS_DENY_ALL_OPT_OUT_TOKEN) };
+        assert!(!handed_egress_deny_all_opt_out());
     }
 
     /// The handed port is read off the environment the kernel passes
