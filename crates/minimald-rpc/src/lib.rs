@@ -2001,6 +2001,11 @@ pub struct LiveMapping {
     /// renderings `min session policy` writes spell that (`unknown` in the
     /// text row, `null` in the JSON document); a daemon that does carry the
     /// field answers `Some(true)` or `Some(false)`, and only those.
+    ///
+    /// Deprecated: daemons from the gate-admits-exposed-ports change onward
+    /// always send `Some(false)`, so the field carries information only from
+    /// an older daemon. Remove it, and the client's `pending` rendering, when
+    /// the support window for those older daemons ends.
     #[serde(default)]
     pub pending: Option<bool>,
 }

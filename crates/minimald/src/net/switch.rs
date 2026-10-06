@@ -3187,6 +3187,66 @@ pub(crate) mod tests {
         );
     }
 
+    /// An expose's revocation on a port a declared mapping also publishes
+    /// withdraws the expose's admission only: the declaration still admits
+    /// the port, so the connection it holds is that admission's and is not
+    /// terminated, and the revocation reports none ended.
+    #[test]
+    fn withdrawing_an_exposed_port_a_declaration_holds_keeps_its_connections() {
+        let policy = sessions::SessionPolicy {
+            ingress: Some(sessions::IngressPolicy {
+                port_mappings: vec![sessions::PortMapping {
+                    external_port: 18080,
+                    internal_port: 80,
+                    proto: sessions::IpProto::Tcp,
+                }],
+                dynamic_allowed_range: None,
+                dynamic_ingress: None,
+            }),
+            egress: None,
+            credentialed_upstream: None,
+        };
+        let gate = SessionGate::for_session(
+            "100.64.0.9".into(),
+            Ipv4Addr::new(100, 64, 0, 9),
+            &policy,
+            SwitchSubnet::default(),
+            None,
+        );
+        gate.admit_exposed(80);
+        assert!(
+            matches!(
+                gate.record_delivered_inbound(&tcp_frame(
+                    ETHERTYPE_IPV4,
+                    IPPROTO_TCP,
+                    SYN,
+                    SRC,
+                    80
+                )),
+                Some(egress::InboundFlow::Recorded { .. })
+            ),
+            "a connection to the declared port opens a reply-flow record"
+        );
+        let reply = egress_tcp_segment(Ipv4Addr::new(100, 64, 0, 9), 80, SRC, 40000, SYN | ACK);
+        assert!(gate.reply_admits_frame(&reply));
+
+        assert_eq!(
+            gate.withdraw_exposed(80),
+            0,
+            "the declaration still admits the port, so no connection is terminated"
+        );
+        assert!(gate.admits_tcp(80), "the declaration's admission stands");
+        assert_eq!(
+            gate.inbound_flow_records(),
+            1,
+            "the declared mapping's connection survives the revocation"
+        );
+        assert!(
+            gate.reply_admits_frame(&reply),
+            "the box's answer on the surviving connection still passes"
+        );
+    }
+
     #[test]
     fn for_session_collects_tcp_internal_ports_only() {
         let policy = sessions::SessionPolicy {

@@ -3286,6 +3286,16 @@ impl Session {
         // listener, and a listener closing later never withdraws this
         // admission — the box's stop does. A box with no relay gate (no
         // switch attached) has nothing in front of it to admit through.
+        //
+        // The gate's sets are keyed by the box's internal port. This admits
+        // `port`, and the stop withdraws `forwarder.internal_port()`; the two
+        // agree only because an expose binds the same number on both sides.
+        // A host-port remap would split them and leave the admission behind,
+        // so the assert pins them to the one internal-port space.
+        debug_assert_eq!(
+            mapping.internal_port, port,
+            "the admitted port must be the forward's internal port, the one the stop withdraws"
+        );
         if let Some(gate) = crate::net::switch::live_gate(switch_address) {
             gate.admit_exposed(port);
         }
