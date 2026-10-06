@@ -578,7 +578,15 @@ fn publish_generation_from_raw(raw: Option<&str>) -> Result<Option<u64>, crate::
 /// `minvmd run`/`boot` reaches the child that composes the boot line.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 fn egress_deny_all_opt_out_from_env() -> bool {
-    std::env::var(EGRESS_DENY_ALL_OPT_OUT_ENV).is_ok_and(|v| {
+    egress_deny_all_opt_out_from_raw(std::env::var(EGRESS_DENY_ALL_OPT_OUT_ENV).ok().as_deref())
+}
+
+/// The parse half of [`egress_deny_all_opt_out_from_env`], split out so the
+/// fail-closed rule is testable without touching the process environment:
+/// only the truthy set opts out; absent or anything else keeps the default.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn egress_deny_all_opt_out_from_raw(raw: Option<&str>) -> bool {
+    raw.is_some_and(|v| {
         matches!(
             v.trim().to_ascii_lowercase().as_str(),
             "1" | "true" | "yes" | "on"
@@ -817,6 +825,19 @@ mod tests {
             "console=hvc0 ipv6.disable=1 MINIMALD_HOSTNAME_PROXY_PORT=7654 \
              MINIMALD_PUBLISH_GENERATION=42 MINIMALD_EGRESS_DENY_ALL_OPT_OUT=1 RUST_LOG=debug"
         );
+    }
+
+    #[test]
+    fn the_egress_opt_out_fails_closed() {
+        // NET-077: unset keeps the deny-all default; only the truthy set that
+        // `MINVMD_VM_OWN_IP` accepts opts out, and anything else fails closed.
+        assert!(!egress_deny_all_opt_out_from_raw(None));
+        for value in ["1", "true", "TRUE", "yes", "on", " On "] {
+            assert!(egress_deny_all_opt_out_from_raw(Some(value)), "{value:?}");
+        }
+        for value in ["", "0", "no", "off", "false", "garbage", "1x", "enabled"] {
+            assert!(!egress_deny_all_opt_out_from_raw(Some(value)), "{value:?}");
+        }
     }
 
     #[test]

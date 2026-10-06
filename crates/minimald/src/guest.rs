@@ -1680,8 +1680,17 @@ mod tests {
         unsafe { std::env::set_var(HANDED_EGRESS_DENY_ALL_OPT_OUT_TOKEN, "true") };
         assert!(handed_egress_deny_all_opt_out());
 
-        unsafe { std::env::set_var(HANDED_EGRESS_DENY_ALL_OPT_OUT_TOKEN, "no") };
-        assert!(!handed_egress_deny_all_opt_out());
+        unsafe { std::env::set_var(HANDED_EGRESS_DENY_ALL_OPT_OUT_TOKEN, " ON ") };
+        assert!(handed_egress_deny_all_opt_out());
+
+        // Fail closed: anything outside the truthy set keeps the default.
+        for value in ["no", "0", "", "garbage", "enabled", "1x"] {
+            unsafe { std::env::set_var(HANDED_EGRESS_DENY_ALL_OPT_OUT_TOKEN, value) };
+            assert!(
+                !handed_egress_deny_all_opt_out(),
+                "{value:?} must not opt out"
+            );
+        }
 
         unsafe { std::env::remove_var(HANDED_EGRESS_DENY_ALL_OPT_OUT_TOKEN) };
         assert!(!handed_egress_deny_all_opt_out());
