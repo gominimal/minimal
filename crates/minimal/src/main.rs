@@ -7,6 +7,8 @@ use std::process::ExitCode;
 use anyhow::Context as _;
 use clap::{CommandFactory as _, Parser};
 use minimal::{ExecArgs, PolicyArgs, PolicyOutputFormat};
+use tracing_subscriber::fmt::format::{FormatEvent, Writer};
+use tracing_subscriber::fmt::{FmtContext, FormatFields};
 use tracing_subscriber::{
     EnvFilter, Layer, fmt, fmt::MakeWriter, prelude::*, registry::LookupSpan,
 };
@@ -255,9 +257,9 @@ fn stdout_is_data_contract(command: &Option<minimal::Command>) -> bool {
     )
 }
 
-/// The console log layer. `plain` (no `RUST_LOG` in effect) drops the
-/// timestamp and target, so a warning reads as one message line; otherwise the
-/// full tracing format is kept for debugging.
+/// The console log layer. `plain` (no `RUST_LOG` in effect) renders through
+/// [`PlainFormat`]: `warning:`/`error:` lines matching the rest of the CLI;
+/// otherwise the full tracing format is kept for debugging.
 fn console_layer<S, W>(writer: W, ansi: bool, plain: bool) -> Box<dyn Layer<S> + Send + Sync>
 where
     S: tracing::Subscriber + for<'a> LookupSpan<'a>,
@@ -265,13 +267,63 @@ where
 {
     let layer = fmt::layer().with_writer(writer).with_ansi(ansi);
     if plain {
-        layer
-            .without_time()
-            .with_target(false)
-            .with_level(true)
-            .boxed()
+        layer.event_format(PlainFormat).boxed()
     } else {
         layer.boxed()
+    }
+}
+
+/// The plain console format: `warning: <message>` for WARN, `error: <message>`
+/// for ERROR, and the bare message for INFO and below. A message that already
+/// starts with `help:` is written as a help line with no level prefix. Span
+/// context is omitted on purpose: these lines are for a person, not debugging.
+struct PlainFormat;
+
+impl<S, N> FormatEvent<S, N> for PlainFormat
+where
+    S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+    N: for<'a> FormatFields<'a> + 'static,
+{
+    fn format_event(
+        &self,
+        ctx: &FmtContext<'_, S, N>,
+        mut writer: Writer<'_>,
+        event: &tracing::Event<'_>,
+    ) -> std::fmt::Result {
+        let mut message = MessageVisitor::default();
+        event.record(&mut message);
+
+        match *event.metadata().level() {
+            tracing::Level::WARN => {
+                if !message.0.as_deref().is_some_and(|m| m.starts_with("help:")) {
+                    write!(writer, "warning: ")?;
+                }
+            }
+            tracing::Level::ERROR => write!(writer, "error: ")?,
+            _ => {}
+        }
+
+        ctx.format_fields(writer.by_ref(), event)?;
+        writeln!(writer)
+    }
+}
+
+/// Captures the event's `message` field, so the formatter can decide whether
+/// to prefix a level.
+#[derive(Default)]
+struct MessageVisitor(Option<String>);
+
+impl tracing::field::Visit for MessageVisitor {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "message" {
+            self.0 = Some(value.to_owned());
+        }
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.0 = Some(format!("{value:?}"));
+        }
     }
 }
 
@@ -405,8 +457,8 @@ mod tests {
         }
     }
 
-    /// Without `RUST_LOG`, a warning renders as one plain line: level and
-    /// message only, no timestamp and no target.
+    /// Without `RUST_LOG`, a warning renders as `warning: <message>` — no
+    /// timestamp and no target.
     #[test]
     fn console_layer_renders_plain_warning() {
         let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -420,7 +472,45 @@ mod tests {
             tracing::warn!(key = "value", "lifecycle_hooks is unknown");
         });
         let out = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
-        assert_eq!(out, " WARN lifecycle_hooks is unknown key=\"value\"\n");
+        assert_eq!(out, "warning: lifecycle_hooks is unknown key=\"value\"\n");
+    }
+
+    /// A WARN event whose message already starts with `help:` renders as a
+    /// bare help line, with no level prefix.
+    #[test]
+    fn console_layer_renders_help_line_without_level() {
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = {
+            let buf = buf.clone();
+            move || BufferWriter(buf.clone())
+        };
+        let layer = console_layer(writer, false, true);
+        let subscriber = tracing_subscriber::registry().with(layer);
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!("help: do you need to update to a newer version of minimal?");
+        });
+        let out = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            out,
+            "help: do you need to update to a newer version of minimal?\n"
+        );
+    }
+
+    /// An ERROR event renders as `error: <message>`.
+    #[test]
+    fn console_layer_renders_plain_error() {
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = {
+            let buf = buf.clone();
+            move || BufferWriter(buf.clone())
+        };
+        let layer = console_layer(writer, false, true);
+        let subscriber = tracing_subscriber::registry().with(layer);
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::error!(key = "value", "something failed");
+        });
+        let out = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert_eq!(out, "error: something failed key=\"value\"\n");
     }
 
     /// With `RUST_LOG` set, the full tracing format (timestamp and target) is
