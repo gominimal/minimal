@@ -1,9 +1,11 @@
 //! `minvmd stop` subcommand (R4.4, R2.3).
 //!
 //! Reads `vmm_pid` from `minvmd.toml`, asks the in-VM minimald to shut down
-//! (drain sessions + quiesce the data volume) over the bridge UDS, then sends
-//! `SIGTERM` to the VMM child, waits up to 5 s, escalates to `SIGKILL` on
-//! timeout, then resets `minvmd.toml` to `Stopped`.
+//! (drain sessions + quiesce the data volume) over the bridge UDS, lets an
+//! acknowledging guest power the VM off by itself for up to
+//! `GUEST_POWEROFF_GRACE` (its exit path carries its last telemetry), then
+//! sends `SIGTERM` to the VMM child if it is still there, waits up to 5 s,
+//! escalates to `SIGKILL` on timeout, then resets `minvmd.toml` to `Stopped`.
 //!
 //! The command is idempotent: if the daemon is already stopped (or has never
 //! been provisioned), it returns successfully with no action. Stale active
@@ -213,8 +215,74 @@ fn quiesce_then_signal(quiesce: Option<GuestQuiesce>, pid: u32, grace: Duration)
             }
         }
     });
-    signal_and_wait(pid, grace)?;
+    settle_vmm(pid, acknowledged, GUEST_POWEROFF_GRACE, grace)?;
     Ok(acknowledged)
+}
+
+/// How long a stop lets an acknowledged guest power the VM off by itself
+/// before it SIGTERMs the VMM (TEL-034, guest-vsock.md). The ack is not the
+/// guest's last word: its `rpc` span for the Shutdown (the guest's one child
+/// of `guest.shutdown`) ends only once the ack is written, and the guest's
+/// exit path (`minimald` `main`: drain, telemetry shutdown, the vsock
+/// sender's drain, then `reboot(2)`) is what carries that span and the
+/// handler's last records to the host. A SIGTERM at the ack races that path
+/// and, on a loaded host, wins (lab 715k on debian-12). The guest powering
+/// off is what makes the VMM exit, as on a `min stop`; a guest that does not
+/// within this bound gets the SIGTERM as before. Typical exit paths take a
+/// few hundred milliseconds, so a healthy stop pays that, not the bound.
+const GUEST_POWEROFF_GRACE: Duration = Duration::from_secs(3);
+
+/// Take the VMM child `pid` down after the quiesce. When the guest
+/// acknowledged the Shutdown RPC (`acked`), first wait up to `poweroff_grace`
+/// (never past `grace`, a stop's whole budget for this child) for the VM to
+/// exit by itself, so the guest's exit-time telemetry flush completes before
+/// the VMM goes; then (or at once, without an ack) [`signal_and_wait`] with
+/// what is left of `grace`.
+fn settle_vmm(pid: u32, acked: bool, poweroff_grace: Duration, grace: Duration) -> Result<()> {
+    if !acked {
+        return signal_and_wait(pid, grace);
+    }
+    let started = Instant::now();
+    let pid_t = libc::pid_t::try_from(pid)
+        .ok()
+        .filter(|p| *p > 0)
+        .ok_or_else(|| anyhow::anyhow!("invalid vmm_pid {pid} in state"))?;
+    if wait_for_exit(pid_t, poweroff_grace.min(grace)) {
+        tracing::debug!(pid, "the guest powered the VM off after its ack");
+        return Ok(());
+    }
+    tracing::info!(
+        pid,
+        grace_ms = u64::try_from(poweroff_grace.as_millis()).unwrap_or(u64::MAX),
+        "the guest acknowledged Shutdown but did not power off within the grace; \
+         signalling the VMM (its last telemetry may not reach the host)"
+    );
+    signal_and_wait(pid, grace.saturating_sub(started.elapsed()))
+}
+
+/// Whether `pid` exists. Errors other than ESRCH count as alive (best effort,
+/// as the SIGTERM wait has always treated them).
+fn pid_alive(pid: libc::pid_t) -> bool {
+    // SAFETY: kill(pid, 0) checks for process existence without delivering a
+    // signal; `pid` is positive (checked by the caller).
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+/// Poll `pid` every 50 ms for up to `timeout`; whether it is gone.
+fn wait_for_exit(pid: libc::pid_t, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if !pid_alive(pid) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// Send `SIGTERM` to `pid`; wait up to `grace`; escalate to `SIGKILL` on
@@ -649,6 +717,62 @@ mod tests {
         assert_eq!(sd.read_state().unwrap().lifecycle, Lifecycle::Stopped);
         drop(done_tx);
         child.wait().unwrap();
+    }
+
+    /// A stand-in VMM: `sh -c <script>`, reaped on its own thread (as the
+    /// supervisor reaps the real one), so its pid disappears when it exits.
+    /// The join handle answers how it ended.
+    fn stand_in_vmm(script: &str) -> (u32, std::thread::JoinHandle<std::process::ExitStatus>) {
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", script])
+            .spawn()
+            .expect("spawn stand-in VMM");
+        let pid = child.id();
+        (pid, std::thread::spawn(move || child.wait().expect("wait")))
+    }
+
+    /// TEL-034 ordering: after an acknowledged Shutdown, the VMM is not
+    /// signalled while the guest is still on its exit path (flushing its
+    /// last telemetry); it is let exit by itself.
+    #[test]
+    fn an_acked_stop_lets_the_guest_power_off_before_any_signal() {
+        use std::os::unix::process::ExitStatusExt as _;
+        // Exits by itself 300 ms after the "ack", as a guest whose exit-time
+        // flush takes that long.
+        let (pid, ended) = stand_in_vmm("sleep 0.3; exit 7");
+        settle_vmm(pid, true, Duration::from_secs(3), Duration::from_secs(5)).unwrap();
+        let status = ended.join().unwrap();
+        assert_eq!(status.signal(), None, "the VMM was signalled: {status:?}");
+        assert_eq!(status.code(), Some(7));
+    }
+
+    /// A guest that acks but never powers off still gets the SIGTERM, once
+    /// the grace is out.
+    #[test]
+    fn an_acked_stop_signals_a_vm_that_outlives_the_grace() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let (pid, ended) = stand_in_vmm("exec sleep 30");
+        let started = std::time::Instant::now();
+        settle_vmm(
+            pid,
+            true,
+            Duration::from_millis(200),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(started.elapsed() >= std::time::Duration::from_millis(200));
+        assert_eq!(ended.join().unwrap().signal(), Some(libc::SIGTERM));
+    }
+
+    /// Without an ack there is no exit path to wait for: SIGTERM at once.
+    #[test]
+    fn an_unacked_stop_signals_at_once() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let (pid, ended) = stand_in_vmm("exec sleep 30");
+        let started = std::time::Instant::now();
+        settle_vmm(pid, false, Duration::from_secs(30), Duration::from_secs(5)).unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(ended.join().unwrap().signal(), Some(libc::SIGTERM));
     }
 
     #[test]

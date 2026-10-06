@@ -729,8 +729,18 @@ impl SpoolFile {
         Self::with_fallback(dir, service, fallback, Limits::DEFAULT)
     }
 
-    /// [`open`](Self::open) with explicit limits and no fallback (tests).
-    #[cfg(test)]
+    /// The directory this spool writes to, once known: `None` for a deferred
+    /// spool that has not been relocated yet (the guest spools go under it).
+    pub(crate) fn dir(&self) -> Option<PathBuf> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .dir
+            .clone()
+    }
+
+    /// [`open`](Self::open) with explicit limits and no fallback (tests, and
+    /// the guest spools).
     pub(crate) fn with_limits(dir: PathBuf, service: &str, limits: Limits) -> Arc<Self> {
         Self::with_fallback(dir, service, None, limits)
     }
@@ -795,11 +805,6 @@ impl SpoolFile {
             path: st.path.take(),
             ..State::default()
         };
-    }
-
-    /// The spool's directory, once it has one.
-    pub(crate) fn dir(&self) -> Option<PathBuf> {
-        self.state.lock().ok().and_then(|st| st.dir.clone())
     }
 
     /// The file written last (or being written), if any.
@@ -1282,7 +1287,7 @@ fn attrs_json<'a>(out: &mut String, kvs: impl Iterator<Item = (&'a Key, &'a Valu
     });
 }
 
-fn resource_json(r: &Resource) -> String {
+pub(crate) fn resource_json(r: &Resource) -> String {
     let mut out = String::from("{\"attributes\":");
     attrs_json(&mut out, r.iter());
     out.push('}');
