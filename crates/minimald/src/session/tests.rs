@@ -7846,6 +7846,85 @@ async fn listen_watcher_skips_an_expose_owned_port() {
     );
 }
 
+/// One port, one row: a port the box's runtime expose published and its own
+/// process then listens on is listed once, as the expose's row. The watcher
+/// never lists it as a listen and never audits a listen publish of it, and
+/// the listener's close leaves the expose's row standing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_exposed_port_listened_on_is_one_expose_row() {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let manager = server.state.sessions_manager().await;
+
+    let port = port_of(&listening_socket());
+    let switch = std::net::Ipv4Addr::new(100, 64, 128, 77);
+    let loopback = std::net::Ipv4Addr::new(127, 0, 64, 77);
+    let (handle, _gate, served) = box_with_listen_plan(
+        &mut client,
+        &manager,
+        "onerow",
+        switch,
+        loopback,
+        (port, port),
+    )
+    .await;
+
+    handle
+        .expose_dynamic(port)
+        .await
+        .expect("the free port publishes");
+    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, port))
+        .expect("the box's process listens on the exposed port");
+
+    // Every read across several of the watcher's polls, with the listener
+    // standing and after it closes: the expose's row, and no listen row.
+    let mut listener = Some(listener);
+    for phase in ["listening", "listener closed"] {
+        if phase == "listener closed" {
+            drop(listener.take());
+        }
+        let until = tokio::time::Instant::now() + Duration::from_millis(900);
+        while tokio::time::Instant::now() < until {
+            let rows = handle.live_ingress().await.expect("the actor answers");
+            let exposed: Vec<u16> = rows.exposed.iter().map(|row| row.internal_port).collect();
+            assert!(
+                rows.listened.is_empty() && exposed == vec![port],
+                "{phase}: one expose row, no listen row: {rows:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+    assert_eq!(
+        served_naming(&served, loopback, port).len(),
+        1,
+        "the expose's bind is the only request the port got"
+    );
+
+    // The audit log holds the expose's one decision for the port, and no
+    // listen publish record beside it.
+    let log = crate::audit::log_path(
+        server
+            .state
+            .minimal_state_dir()
+            .await
+            .as_utf8_path()
+            .as_std_path(),
+    );
+    let text = tokio::fs::read_to_string(&log)
+        .await
+        .expect("the expose was audited");
+    let records: Vec<serde_json_lenient::Value> = text
+        .lines()
+        .map(|line| serde_json_lenient::from_str(line).expect("one line is one record"))
+        .filter(|record: &serde_json_lenient::Value| record["box"] == "onerow")
+        .collect();
+    assert_eq!(records.len(), 1, "the expose's record alone: {text}");
+    assert_eq!(records[0]["port"], port);
+    assert_eq!(records[0]["outcome"], "published");
+
+    handle.stop().await;
+}
+
 /// The plan's one handoff: a launch carries its box's listen plan inside its
 /// own `Launched` — the host that launch builds is the only thing that can
 /// read it — so a launch whose box's facts gathered one starts the box's

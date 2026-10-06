@@ -959,6 +959,27 @@ impl Reservation {
     }
 }
 
+/// Commits a bound listen publication in the order its row's claim needs:
+/// `admit` lets the port through the box's gate first, and only then does
+/// the reservation commit with the row it lists as (NET-044). The row reads
+/// reachable, so it is the last thing made visible: a policy read never
+/// lists a port its gate does not yet admit, and a publish that ends before
+/// the admission lists nothing. The design's own order for a publication —
+/// bind, then admit, then the visible claim (design §7.1) — held for the
+/// listing.
+///
+/// Returns [`Reservation::record_listed`]'s answer: `false` means a
+/// revocation cleared the reservation under the bind, nothing was listed,
+/// and the caller takes back the admission `admit` made.
+fn admit_then_list(
+    reservation: Reservation,
+    row: minimald_rpc::LiveMapping,
+    admit: impl FnOnce(),
+) -> bool {
+    admit();
+    reservation.record_listed(row)
+}
+
 impl Drop for Reservation {
     /// The reservation's own rollback, on every path that is not a
     /// record: release the pending entry this guard wrote, keyed by its
@@ -1608,6 +1629,17 @@ impl WatchState {
                                 );
                             }
                             drop(reservation);
+                            if refusals == 0 {
+                                // The streak's one decision record (NET-046),
+                                // once the port is free again: the allow
+                                // stood, the publish did not.
+                                self.audit_listen(
+                                    port,
+                                    crate::audit::DecisionOutcome::PublishFailed,
+                                    Some(error.to_string()),
+                                )
+                                .await;
+                            }
                             return Appearance::Owing;
                         }
                         // The forward binds before the gate admits — the
@@ -1634,27 +1666,39 @@ impl WatchState {
                         {
                             Ok(mapping) => {
                                 self.reported_contention.remove(&port);
-                                // The bind stood: the reservation commits
-                                // as this watcher's publication, and the
-                                // port is a mapping from here — served,
-                                // listed in `min session policy` as the row
-                                // it carries (NET-044), withdrawable by its
-                                // publisher.
-                                if !reservation.record_listed(minimald_rpc::LiveMapping {
+                                tracing::debug!(
+                                    session = %self.plan.box_name,
+                                    port,
+                                    lease = %self.plan.lease,
+                                    gate = ?Arc::as_ptr(&self.plan.gate),
+                                    is_live_gate = crate::net::switch::live_gate(self.plan.lease)
+                                        .is_some_and(|live| Arc::ptr_eq(&live, &self.plan.gate)),
+                                    "admitting a listen-published port at the box's gate"
+                                );
+                                // The bind stood: the gate admits the port,
+                                // and only then does the reservation commit
+                                // as this watcher's publication — listed in
+                                // `min session policy` as the row it carries
+                                // (NET-044), withdrawable by its publisher.
+                                // The row reads reachable, so it is the last
+                                // thing made visible ([`admit_then_list`]).
+                                let row = minimald_rpc::LiveMapping {
                                     local: mapping.local().to_string(),
                                     internal_port: port,
                                     proto: IpProto::Tcp,
-                                    // The gate admits the port as this
-                                    // publish's own next step, below: a
-                                    // listen-published row is reachable.
                                     pending: Some(false),
+                                };
+                                if !admit_then_list(reservation, row, || {
+                                    self.plan.gate.admit_published(port);
                                 }) {
                                     // A revocation cleared the reservation
                                     // under the bind, so the forward this
                                     // watcher just bound is one it never
-                                    // saw: this watcher unbinds it, admits
-                                    // nothing, and settles — a revoked
-                                    // port is not retried.
+                                    // saw: this watcher takes its admission
+                                    // back, unbinds it, and settles — a
+                                    // revoked port is not retried, and it
+                                    // was never listed.
+                                    self.plan.gate.withdraw_published(port);
                                     self.unbind_revoked(port, &mapping).await;
                                     // Unbind first, then withdraw the report:
                                     // the host's gate retracts a runtime port
@@ -1668,16 +1712,6 @@ impl WatchState {
                                     .await;
                                     return Appearance::Settled;
                                 }
-                                tracing::debug!(
-                                    session = %self.plan.box_name,
-                                    port,
-                                    lease = %self.plan.lease,
-                                    gate = ?Arc::as_ptr(&self.plan.gate),
-                                    is_live_gate = crate::net::switch::live_gate(self.plan.lease)
-                                        .is_some_and(|live| Arc::ptr_eq(&live, &self.plan.gate)),
-                                    "admitting a listen-published port at the box's gate"
-                                );
-                                self.plan.gate.admit_published(port);
                                 self.forwards.insert(port, mapping);
                                 tracing::info!(
                                     session = %self.plan.box_name,
@@ -1688,7 +1722,12 @@ impl WatchState {
                                     refusals,
                                     "published a listening port on the box's address"
                                 );
-                                self.audit_published(port).await;
+                                self.audit_listen(
+                                    port,
+                                    crate::audit::DecisionOutcome::Published,
+                                    None,
+                                )
+                                .await;
                                 Appearance::Settled
                             }
                             Err(e) => {
@@ -1723,6 +1762,20 @@ impl WatchState {
                                     minimald_rpc::PortReportSource::Listen,
                                 )
                                 .await;
+                                if refusals == 0 {
+                                    // The streak's one decision record
+                                    // (NET-046): the allow stood and the bind
+                                    // failed. The retries are the same
+                                    // decision, waited out, and write none;
+                                    // the publish that ends the streak
+                                    // writes its own.
+                                    self.audit_listen(
+                                        port,
+                                        crate::audit::DecisionOutcome::PublishFailed,
+                                        Some(e.to_string()),
+                                    )
+                                    .await;
+                                }
                                 Appearance::Owing
                             }
                         }
@@ -1783,14 +1836,22 @@ impl WatchState {
         }
     }
 
-    /// NET-046: the decision record a published listen owes. The listen was
-    /// a dynamic ingress request — an in-range port, under the box's
-    /// `allow` stance — and the box's own declaration decided it, so the
-    /// record names the box policy as decider and the publish as outcome,
-    /// the same record the runtime expose path writes for an allowed
-    /// request. Written after the publication stands, never before, and
-    /// best-effort the way every audit append is.
-    async fn audit_published(&self, port: u16) {
+    /// NET-046: the decision record a listen the watcher publishes owes.
+    /// The listen was a dynamic ingress request — an in-range port, under
+    /// the box's `allow` stance — and the box's own declaration decided it,
+    /// so the record names the box policy as decider, the same record the
+    /// runtime expose path writes for an allowed request. `outcome` is what
+    /// became of the publish: `Published` once it stands, never before, or
+    /// `PublishFailed` with the failure's text as `reason` on the first
+    /// refusal of a streak — the retries the backoff makes are the same
+    /// decision waited out, and the publish that ends the streak writes its
+    /// own `Published`. Best-effort, the way every audit append is.
+    async fn audit_listen(
+        &self,
+        port: u16,
+        outcome: crate::audit::DecisionOutcome,
+        reason: Option<String>,
+    ) {
         crate::audit::append(
             &self.plan.state_dir,
             &crate::audit::DecisionRecord {
@@ -1799,8 +1860,8 @@ impl WatchState {
                 port,
                 decision: sessions::DynamicIngress::Allow,
                 decided_by: crate::audit::DecidedBy::BoxPolicy,
-                outcome: crate::audit::DecisionOutcome::Published,
-                reason: None,
+                outcome,
+                reason,
             },
         )
         .await;
@@ -2691,6 +2752,215 @@ mod tests {
                 .await
                 .expect("the test's directory reads"),
             "a listen nothing published leaves no decision record"
+        );
+    }
+
+    /// The decision records the test's watcher appended under `dir`, one
+    /// JSON value per line, in the order written — none while the log does
+    /// not exist yet.
+    fn audit_records(dir: &Path) -> Vec<serde_json_lenient::Value> {
+        let text = std::fs::read_to_string(crate::audit::log_path(dir)).unwrap_or_default();
+        text.lines()
+            .map(|line| serde_json_lenient::from_str(line).expect("each line is one JSON record"))
+            .collect()
+    }
+
+    /// A listen row reads reachable, so it is the last thing a publish makes
+    /// visible: at the moment the gate admits the port, the set lists
+    /// nothing for it, and the row stands only once the admission is done.
+    /// A reservation a revocation cleared under the bind lists nothing at
+    /// all, admission or not.
+    #[test]
+    fn a_listen_row_is_listed_only_after_its_admission() {
+        let publications = BoxPublications::default();
+        let row = |port: u16| minimald_rpc::LiveMapping {
+            local: format!("{PUBLISHED}:{port}"),
+            internal_port: port,
+            proto: IpProto::Tcp,
+            pending: Some(false),
+        };
+
+        let reservation = publications
+            .reserve(8080, PublicationOwner::Listen)
+            .expect("nothing holds the port yet");
+        let mut listed_at_admission = None;
+        assert!(
+            admit_then_list(reservation, row(8080), || {
+                listed_at_admission = Some(publications.listen_rows());
+            }),
+            "nothing revoked the reservation"
+        );
+        assert_eq!(
+            listed_at_admission,
+            Some(Vec::new()),
+            "no row is listed while the gate is still admitting the port"
+        );
+        assert_eq!(
+            publications.listen_rows(),
+            vec![row(8080)],
+            "the row stands once the admission is done"
+        );
+
+        // A revocation clears the set under the next bind: the admission the
+        // publish made is the caller's to take back, and nothing is listed.
+        let reservation = publications
+            .reserve(8081, PublicationOwner::Listen)
+            .expect("nothing holds the port yet");
+        publications.revoke_all();
+        let mut admitted = false;
+        assert!(
+            !admit_then_list(reservation, row(8081), || admitted = true),
+            "a revoked reservation does not commit"
+        );
+        assert!(admitted, "the gate was asked before the commit was tried");
+        assert!(
+            publications.listen_rows().is_empty(),
+            "a revoked publish lists nothing"
+        );
+    }
+
+    /// NET-046 for a publish the switch refuses: the box's `allow` decided
+    /// the listen, so the refusal writes one record — decision `allow`,
+    /// outcome `publish-failed`, the failure's own text as reason — on the
+    /// streak's first refusal only. The backoff's retries are the same
+    /// decision waited out and write nothing; the retry that binds writes
+    /// the normal `published` record. No row is listed and nothing is
+    /// admitted while the bind keeps failing.
+    #[tokio::test]
+    async fn a_refused_listen_publish_is_audited_once_per_streak() {
+        let listener = listening_socket();
+        let port = port_of(&listener);
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("gvproxy.sock");
+        let refusing = Arc::new(AtomicBool::new(true));
+        let flag = Arc::clone(&refusing);
+        let (server, mut served) = spawn_forwarder_deciding(sock.clone(), move |served| {
+            if served.path.ends_with("/expose") && flag.load(Ordering::SeqCst) {
+                500
+            } else {
+                200
+            }
+        });
+        let publications = BoxPublications::default();
+        let gate = Arc::new(SessionGate::for_session(
+            "listen-box".into(),
+            LEASE,
+            &permit_policy(port),
+            SwitchSubnet::default(),
+            None,
+        ));
+        let watcher = ListenWatcher::start(
+            ListenPlan::new(
+                "listen-box".into(),
+                LEASE,
+                PUBLISHED,
+                ControlChannel::Unix(sock),
+                Arc::clone(&gate),
+                publications.clone(),
+                dir.path().to_path_buf(),
+            ),
+            Leader::Resolved(std::process::id()),
+        );
+
+        // Three refused attempts: the first and two backoff retries.
+        for _ in 0..3 {
+            let attempt = next_served(&mut served).await;
+            assert_eq!(attempt.path, "/services/forwarder/expose");
+            assert!(
+                publications.listen_rows().is_empty(),
+                "a refused publish lists nothing"
+            );
+            assert!(!gate.admits_tcp(port), "a refused publish admits nothing");
+        }
+        // The third refusal's record, if it wrongly wrote one, follows its
+        // served request: give it the moment it would take.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let records = audit_records(dir.path());
+        assert_eq!(
+            records.len(),
+            1,
+            "one record for the streak, none for its retries: {records:?}"
+        );
+        let refused = &records[0];
+        assert_eq!(refused["box"], "listen-box");
+        assert_eq!(refused["port"], port);
+        assert_eq!(refused["decision"], "allow");
+        assert_eq!(refused["decided_by"], "box-policy");
+        assert_eq!(refused["outcome"], "publish-failed");
+        assert!(
+            refused["reason"].as_str().is_some_and(|r| !r.is_empty()),
+            "the record carries the bind failure's reason: {refused}"
+        );
+
+        // The forwarder accepts: the retry binds, admits, lists, and writes
+        // the publish's own record.
+        refusing.store(false, Ordering::SeqCst);
+        let published = next_served(&mut served).await;
+        assert_eq!(published.path, "/services/forwarder/expose");
+        soon(|| audit_records(dir.path()).len() == 2).await;
+        assert!(gate.admits_tcp(port));
+        assert_eq!(publications.listen_rows().len(), 1);
+        let records = audit_records(dir.path());
+        assert_eq!(records[1]["port"], port);
+        assert_eq!(records[1]["decision"], "allow");
+        assert_eq!(records[1]["outcome"], "published");
+        assert!(records[1].get("reason").is_none(), "{}", records[1]);
+
+        watcher.stop().await;
+        server.abort();
+        drop(listener);
+        assert_eq!(
+            audit_records(dir.path()).len(),
+            2,
+            "the streak's refusal and its publish, nothing else"
+        );
+    }
+
+    /// A port the box's declaration names is the declaration's: the box
+    /// listening on it gets no listen row and no listen decision record,
+    /// and the watcher asks the switch for nothing.
+    #[tokio::test]
+    async fn a_declared_port_is_never_listed_or_audited_by_the_watcher() {
+        let listener = listening_socket();
+        let port = port_of(&listener);
+        let dir = tempfile::tempdir().unwrap();
+        let policy = sessions::SessionPolicy {
+            ingress: Some(sessions::IngressPolicy {
+                port_mappings: vec![sessions::PortMapping {
+                    external_port: port,
+                    internal_port: port,
+                    proto: sessions::IpProto::Tcp,
+                }],
+                dynamic_allowed_range: Some((port, port)),
+                dynamic_ingress: Some(sessions::DynamicIngress::Allow),
+            }),
+            egress: None,
+            credentialed_upstream: None,
+        };
+        let mut shared = None;
+        let (watcher, _gate, server, mut served) =
+            started_watcher_with_publications(&dir, &policy, |publications| {
+                shared = Some(publications.clone());
+            });
+        let publications = shared.expect("the seed hands back the box's set");
+
+        tokio::time::sleep(LISTEN_POLL_INTERVAL * 3).await;
+        assert!(publications.listen_rows().is_empty());
+        drop(listener);
+        tokio::time::sleep(LISTEN_POLL_INTERVAL * 3).await;
+        watcher.stop().await;
+        server.abort();
+        assert!(
+            publications.listen_rows().is_empty(),
+            "a declared port is never a listen row"
+        );
+        assert!(
+            drained(&mut served).is_empty(),
+            "the watcher asked the switch nothing"
+        );
+        assert!(
+            audit_records(dir.path()).is_empty(),
+            "a declared port writes no listen decision record"
         );
     }
 
