@@ -3969,9 +3969,9 @@ mod tests {
         let (events, events_rx) = std::sync::mpsc::channel();
         let (offers, offers_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            asks.serve(&RecordingTerminal(events), |offer| {
+            asks.serve(&RecordingTerminal(events), |offer, _| {
                 let _ = offers.send(offer.clone());
-                dialog(offer)
+                minimal_client::ask_dialog::AskDialogEnd::Answered(dialog(offer))
             });
         });
         (events_rx, offers_rx)
@@ -4037,7 +4037,7 @@ mod tests {
         assert_eq!(offer.name, "web");
         assert_eq!(Some(offer.box_id), web.box_id);
         assert_eq!(
-            minimal_client::attach::ask_dialog_lead_in(&offer),
+            minimal_client::ask_dialog::ask_dialog_lead_in(&offer),
             "web asks to publish port 3000/tcp."
         );
         let minimald_rpc::BoxControlReply::AskAdmit(outcome) =
@@ -4086,18 +4086,18 @@ mod tests {
         let (first_offers, first_offers_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let (events, _) = std::sync::mpsc::channel();
-            first.serve(&RecordingTerminal(events), |offer| {
+            first.serve(&RecordingTerminal(events), |offer, _| {
                 let _ = shown_rx.recv();
                 let _ = first_offers.send(offer.clone());
-                minimald_rpc::AskAnswer::No
+                minimal_client::ask_dialog::AskDialogEnd::Answered(minimald_rpc::AskAnswer::No)
             });
         });
         let (events, events_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            second.serve(&RecordingTerminal(events), |_| {
+            second.serve(&RecordingTerminal(events), |_, _| {
                 let _ = shown.send(());
                 let _ = first_done_rx.recv();
-                minimald_rpc::AskAnswer::Yes
+                minimal_client::ask_dialog::AskDialogEnd::Answered(minimald_rpc::AskAnswer::Yes)
             });
         });
         let reply = stand.guest_ask(&web, 3000);
@@ -4134,32 +4134,90 @@ mod tests {
         );
     }
 
+    /// Two attaches are offered one ask; the first answers yes while the
+    /// second's dialog is still up and unanswered. The host's dismissal takes
+    /// the second dialog down by itself: it records nothing, and its relay
+    /// resumes without anyone pressing a key.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn overtaken_dialog_is_dismissed_and_relay_resumes() {
+        let stand = AskStand::start();
+        let web = stand.register("web", DynamicIngress::Ask).await;
+        let subscribe = || {
+            let control = stand.control.clone();
+            tokio::task::spawn_blocking(move || {
+                minimal_client::attach::HostAsks::subscribe(&control, "web")
+            })
+        };
+        let first = subscribe()
+            .await
+            .unwrap()
+            .expect("the first attach subscribes");
+        let second = subscribe()
+            .await
+            .unwrap()
+            .expect("the second attach subscribes");
+        // The first answers only once the second's dialog is up.
+        let (shown, shown_rx) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let (events, _) = std::sync::mpsc::channel();
+            first.serve(&RecordingTerminal(events), |_, _| {
+                let _ = shown_rx.recv();
+                minimal_client::ask_dialog::AskDialogEnd::Answered(minimald_rpc::AskAnswer::Yes)
+            });
+        });
+        let (ends, ends_rx) = std::sync::mpsc::channel();
+        let (events, events_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            second.serve(&RecordingTerminal(events), |_, watch| {
+                let _ = shown.send(());
+                watch.wait_dismissed();
+                let _ = ends.send(());
+                minimal_client::ask_dialog::AskDialogEnd::Dismissed
+            });
+        });
+        let reply = stand.guest_ask(&web, 3000);
+        let minimald_rpc::BoxControlReply::AskAdmit(outcome) =
+            reply.recv_timeout(ASK_WAIT).unwrap()
+        else {
+            panic!("the guest's ask is answered with its end");
+        };
+        assert!(
+            matches!(
+                outcome,
+                minimald_rpc::AskAdmitOutcome::Admitted { port: 3000, .. }
+            ),
+            "the first attach's yes admits the ask: {outcome:?}"
+        );
+        ends_rx
+            .recv_timeout(ASK_WAIT)
+            .expect("the overtaken dialog is dismissed without an answer");
+        assert_eq!(events_rx.recv_timeout(ASK_WAIT).unwrap(), "suspend");
+        assert_eq!(
+            events_rx.recv_timeout(ASK_WAIT).unwrap(),
+            "resume",
+            "the dismissed dialog resumes the relay"
+        );
+        assert_eq!(
+            stand
+                .registry
+                .row_by_name("web")
+                .unwrap()
+                .runtime_port_numbers(),
+            vec![3000],
+            "the one yes admitted the port once"
+        );
+    }
+
     /// Ctrl-C at the dialog is a no: the client records no through the host
     /// door, nothing is admitted, and the relay resumes. Escape and a closed
-    /// input are a no the same way; no terminal at all is recorded as such.
+    /// input are a no the same way.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ctrl_c_at_ask_dialog_records_no_and_relay_resumes() {
-        use minimal_client::attach::ask_answer_from;
-        assert_eq!(
-            ask_answer_from(Err(inquire::InquireError::OperationInterrupted)),
-            minimald_rpc::AskAnswer::No
-        );
-        assert_eq!(
-            ask_answer_from(Err(inquire::InquireError::OperationCanceled)),
-            minimald_rpc::AskAnswer::No
-        );
-        assert_eq!(
-            ask_answer_from(Err(inquire::InquireError::IO(std::io::Error::from(
-                std::io::ErrorKind::UnexpectedEof
-            )))),
-            minimald_rpc::AskAnswer::No
-        );
-        assert_eq!(
-            ask_answer_from(Err(inquire::InquireError::NotTTY)),
-            minimald_rpc::AskAnswer::NoTty
-        );
-        assert_eq!(ask_answer_from(Ok(false)), minimald_rpc::AskAnswer::No);
-        assert_eq!(ask_answer_from(Ok(true)), minimald_rpc::AskAnswer::Yes);
+        let keys = |keys: &[u8]| minimal_client::ask_dialog::AskSelector::default().feed(keys);
+        assert_eq!(keys(b"\x03"), Some(minimald_rpc::AskAnswer::No));
+        assert_eq!(keys(b"\x1b"), Some(minimald_rpc::AskAnswer::No));
+        assert_eq!(keys(b"\x04"), Some(minimald_rpc::AskAnswer::No));
+        assert_eq!(keys(b"\x1b[B\r"), Some(minimald_rpc::AskAnswer::Yes));
 
         let stand = AskStand::start();
         let web = stand.register("web", DynamicIngress::Ask).await;
@@ -4171,7 +4229,9 @@ mod tests {
         .unwrap()
         .expect("the attach subscribes");
         let (events, offers) = serve_asks(asks, |_| {
-            ask_answer_from(Err(inquire::InquireError::OperationInterrupted))
+            minimal_client::ask_dialog::AskSelector::default()
+                .feed(b"\x03")
+                .expect("Ctrl-C ends the dialog")
         });
         let reply = stand.guest_ask(&web, 3000);
         offers.recv_timeout(ASK_WAIT).expect("the dialog is shown");
