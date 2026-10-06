@@ -53,6 +53,21 @@ pub(crate) const PUBLISH_GENERATION_ENV: &str = "MINVMD_PUBLISH_GENERATION";
 /// step.
 const PUBLISH_GENERATION_TOKEN: &str = "MINIMALD_PUBLISH_GENERATION";
 
+/// The environment variable the operator sets to opt the guest daemon out of
+/// the deny-all egress default (NET-077). Read by the VMM child, which writes
+/// it onto the kernel command line for the guest to read (see
+/// `EGRESS_DENY_ALL_OPT_OUT_TOKEN`). Inherited through the process tree like
+/// [`OWN_IP_ENV`]: the operator sets it in the environment that starts
+/// `minvmd run`/`boot`, and the supervisor hands it to the VMM child by
+/// inheritance.
+pub(crate) const EGRESS_DENY_ALL_OPT_OUT_ENV: &str = "MINVMD_EGRESS_DENY_ALL_OPT_OUT";
+
+/// The boot token the egress opt-out rides to the guest on, beside the port's
+/// token: the guest daemon runs the same egress default its host was started
+/// with. Mirrors minimald's `HANDED_EGRESS_DENY_ALL_OPT_OUT_TOKEN` — keep the
+/// two in step.
+const EGRESS_DENY_ALL_OPT_OUT_TOKEN: &str = "MINIMALD_EGRESS_DENY_ALL_OPT_OUT";
+
 /// Kernel command line every microVM boots with: the console the guest's
 /// stdout/stderr reaches the host boot log through, and IPv6 disabled (the v1
 /// network posture is IPv4-only — design §4.2 keeps IPv6 ULA dual-stack as a
@@ -275,7 +290,13 @@ impl VmConfig {
         let rust_log = std::env::var(GUEST_LOG_ENV).ok();
         let node_proxy_port = node_proxy_port_from_env()?;
         let publish_generation = publish_generation_from_env()?;
-        let cmdline = kernel_cmdline(rust_log.as_deref(), node_proxy_port, publish_generation);
+        let egress_deny_all_opt_out = egress_deny_all_opt_out_from_env();
+        let cmdline = kernel_cmdline(
+            rust_log.as_deref(),
+            node_proxy_port,
+            publish_generation,
+            egress_deny_all_opt_out,
+        );
         // The boot line at info, not debug: the kernel echoes it back as
         // `Kernel command line: …` only once its console is up, and this is
         // the one line that says what the guest was told to boot with — a
@@ -408,10 +429,12 @@ impl VmConfig {
 ///
 /// The values are injected rather than read from the process environment here,
 /// so this stays pure and unit-testable; the caller passes
-/// `std::env::var(GUEST_LOG_ENV).ok()`, `node_proxy_port_from_env()` and
-/// `publish_generation_from_env()` — the boot's publish generation (T93),
-/// which the guest daemon echoes in its publish reports, rides beside the
-/// port and, like it, is never skipped. A
+/// `std::env::var(GUEST_LOG_ENV).ok()`, `node_proxy_port_from_env()`,
+/// `publish_generation_from_env()` and `egress_deny_all_opt_out_from_env()` —
+/// the boot's publish generation (T93), which the guest daemon echoes in its
+/// publish reports, rides beside the port and, like it, is never skipped; the
+/// egress opt-out (NET-077) rides the same way, and is only written when the
+/// operator set it. A
 /// `RUST_LOG` value that cannot survive the boot line is skipped (leaving the
 /// base line plus the port token byte-identical) with a warning, rather than
 /// corrupting the boot: whitespace would be split into separate boot tokens, an
@@ -427,9 +450,11 @@ fn kernel_cmdline(
     rust_log: Option<&str>,
     proxy_port: Option<u16>,
     publish_generation: Option<u64>,
+    egress_deny_all_opt_out: bool,
 ) -> Cow<'static, str> {
     // The port rides the boot line first: base, then the port token, then the
-    // publish generation beside it, then the filter when one is forwarded.
+    // publish generation beside it, then the egress opt-out when the operator
+    // set it, then the filter when one is forwarded.
     let base_with_port = match (proxy_port, publish_generation) {
         (Some(proxy), Some(generation)) => Cow::Owned(format!(
             "{BASE_KERNEL_CMDLINE} {HOSTNAME_PROXY_PORT_TOKEN}={proxy} \
@@ -442,6 +467,14 @@ fn kernel_cmdline(
             "{BASE_KERNEL_CMDLINE} {PUBLISH_GENERATION_TOKEN}={generation}"
         )),
         (None, None) => Cow::Borrowed(BASE_KERNEL_CMDLINE),
+    };
+
+    let base_with_port = if egress_deny_all_opt_out {
+        Cow::Owned(format!(
+            "{base_with_port} {EGRESS_DENY_ALL_OPT_OUT_TOKEN}=1"
+        ))
+    } else {
+        base_with_port
     };
 
     let Some(value) = rust_log else {
@@ -536,6 +569,23 @@ fn publish_generation_from_raw(raw: Option<&str>) -> Result<Option<u64>, crate::
     }
 }
 
+/// Whether the operator opted the guest daemon out of the deny-all egress
+/// default (NET-077), read from [`EGRESS_DENY_ALL_OPT_OUT_ENV`]. Truthy like
+/// [`crate::cmd::own_ip_requested`] (`1`/`true`/`yes`/`on`, case-insensitive);
+/// unset or any other value is `false` — the guest runs the egress default its
+/// host's build ships. The VMM child inherits the operator's environment, so
+/// no explicit handoff is needed: the value set on the process that starts
+/// `minvmd run`/`boot` reaches the child that composes the boot line.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn egress_deny_all_opt_out_from_env() -> bool {
+    std::env::var(EGRESS_DENY_ALL_OPT_OUT_ENV).is_ok_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
 /// Resolve the data-volume `(direct_io, sync_mode)` from the R1.9 environment
 /// tunables ([`DISK_DIRECT_IO_ENV`], [`DISK_SYNC_ENV`]). Defaults: `direct_io =
 /// false`, `sync_mode = Relaxed`.
@@ -588,7 +638,7 @@ mod tests {
         // The base line exactly: console plus IPv6 disabled, no empty token,
         // no trailing space.
         assert_eq!(
-            kernel_cmdline(None, None, None),
+            kernel_cmdline(None, None, None, false),
             "console=hvc0 ipv6.disable=1"
         );
     }
@@ -600,8 +650,8 @@ mod tests {
         // route table never gains an IPv6 entry, loopback's ::1 included —
         // nothing inside the escape boundary gets a v6 family to ride.
         let lines = [
-            kernel_cmdline(None, None, None),
-            kernel_cmdline(Some("debug"), None, None),
+            kernel_cmdline(None, None, None, false),
+            kernel_cmdline(Some("debug"), None, None, false),
         ];
         for line in lines {
             let tokens: Vec<&str> = line.split_whitespace().collect();
@@ -615,7 +665,7 @@ mod tests {
     #[test]
     fn kernel_cmdline_forwards_a_simple_filter() {
         assert_eq!(
-            kernel_cmdline(Some("debug"), None, None),
+            kernel_cmdline(Some("debug"), None, None, false),
             "console=hvc0 ipv6.disable=1 RUST_LOG=debug"
         );
     }
@@ -624,7 +674,7 @@ mod tests {
     fn kernel_cmdline_preserves_comma_separated_directives() {
         // The normal form of a real filter; commas are legal in a boot token.
         assert_eq!(
-            kernel_cmdline(Some("info,russh=debug,minimald=debug"), None, None),
+            kernel_cmdline(Some("info,russh=debug,minimald=debug"), None, None, false),
             "console=hvc0 ipv6.disable=1 RUST_LOG=info,russh=debug,minimald=debug"
         );
     }
@@ -635,11 +685,11 @@ mod tests {
         // corrupting the line, so the whole value is dropped — the base line
         // still boots, IPv6 disabled.
         assert_eq!(
-            kernel_cmdline(Some("info, russh=debug"), None, None),
+            kernel_cmdline(Some("info, russh=debug"), None, None, false),
             "console=hvc0 ipv6.disable=1"
         );
         assert_eq!(
-            kernel_cmdline(Some("info\trussh=debug"), None, None),
+            kernel_cmdline(Some("info\trussh=debug"), None, None, false),
             "console=hvc0 ipv6.disable=1"
         );
     }
@@ -647,7 +697,7 @@ mod tests {
     #[test]
     fn kernel_cmdline_skips_an_empty_filter() {
         assert_eq!(
-            kernel_cmdline(Some(""), None, None),
+            kernel_cmdline(Some(""), None, None, false),
             "console=hvc0 ipv6.disable=1"
         );
     }
@@ -657,7 +707,7 @@ mod tests {
         let huge = "minimald=trace,".repeat(500);
         assert!(huge.len() > COMMAND_LINE_SIZE);
         assert_eq!(
-            kernel_cmdline(Some(&huge), None, None),
+            kernel_cmdline(Some(&huge), None, None, false),
             "console=hvc0 ipv6.disable=1"
         );
     }
@@ -668,13 +718,13 @@ mod tests {
         // value yields a 2047-byte line that fills COMMAND_LINE_SIZE exactly
         // once NUL-terminated.
         let longest = "d".repeat(2010);
-        let line = kernel_cmdline(Some(&longest), None, None);
+        let line = kernel_cmdline(Some(&longest), None, None, false);
         assert_eq!(line.len(), COMMAND_LINE_SIZE - 1);
         assert!(line.ends_with(&longest));
 
         // One byte more must be skipped, not truncated.
         assert_eq!(
-            kernel_cmdline(Some(&"d".repeat(2011)), None, None),
+            kernel_cmdline(Some(&"d".repeat(2011)), None, None, false),
             "console=hvc0 ipv6.disable=1"
         );
     }
@@ -688,7 +738,7 @@ mod tests {
         // answerer (NET-138), so a token carrying one would be an admitted
         // port with nothing behind it.
         let handed = "console=hvc0 ipv6.disable=1 MINIMALD_HOSTNAME_PROXY_PORT=7654";
-        assert_eq!(kernel_cmdline(None, Some(7654), None), handed);
+        assert_eq!(kernel_cmdline(None, Some(7654), None, false), handed);
         assert!(
             !handed.contains("MINIMALD_ZONE_ANSWERER_PORT"),
             "the boot line must not carry a zone-answerer port: {handed}"
@@ -696,17 +746,17 @@ mod tests {
 
         // With both a filter and the port, the tokens share the line.
         assert_eq!(
-            kernel_cmdline(Some("debug"), Some(7654), None),
+            kernel_cmdline(Some("debug"), Some(7654), None, false),
             "console=hvc0 ipv6.disable=1 MINIMALD_HOSTNAME_PROXY_PORT=7654 RUST_LOG=debug"
         );
 
         // A filter that would push the whole line past the buffer is skipped
         // while the port still boots: the line keeps the handed port and
         // drops the filter, rather than corrupting a token the guest binds.
-        let port_only = kernel_cmdline(None, Some(7654), None);
+        let port_only = kernel_cmdline(None, Some(7654), None, false);
         let oversized = "d".repeat(COMMAND_LINE_SIZE - port_only.len() - GUEST_LOG_ENV.len() - 1);
         assert_eq!(
-            kernel_cmdline(Some(&oversized), Some(7654), None),
+            kernel_cmdline(Some(&oversized), Some(7654), None, false),
             port_only,
             "an oversized filter is skipped; the handed port still boots"
         );
@@ -733,7 +783,7 @@ mod tests {
         // T93: the boot's publish generation travels the same way the port
         // does, so the guest can echo it in every publish report.
         assert_eq!(
-            kernel_cmdline(Some("debug"), Some(7654), Some(42)),
+            kernel_cmdline(Some("debug"), Some(7654), Some(42), false),
             "console=hvc0 ipv6.disable=1 MINIMALD_HOSTNAME_PROXY_PORT=7654 \
              MINIMALD_PUBLISH_GENERATION=42 RUST_LOG=debug"
         );
@@ -745,6 +795,27 @@ mod tests {
         assert!(
             garbage.contains(PUBLISH_GENERATION_ENV) && garbage.contains("not-a-generation"),
             "an undecodable value names the variable and the value, got: {garbage}"
+        );
+    }
+
+    #[test]
+    fn the_egress_opt_out_rides_the_boot_line_only_when_set() {
+        // NET-077: the operator's opt-out travels the same way the port does,
+        // so the guest daemon runs the egress default its host was started
+        // with. Unset, the token is absent — the guest runs the default.
+        assert_eq!(
+            kernel_cmdline(None, None, None, false),
+            "console=hvc0 ipv6.disable=1"
+        );
+        assert_eq!(
+            kernel_cmdline(None, None, None, true),
+            "console=hvc0 ipv6.disable=1 MINIMALD_EGRESS_DENY_ALL_OPT_OUT=1"
+        );
+        // Beside the port and generation, the token shares the line.
+        assert_eq!(
+            kernel_cmdline(Some("debug"), Some(7654), Some(42), true),
+            "console=hvc0 ipv6.disable=1 MINIMALD_HOSTNAME_PROXY_PORT=7654 \
+             MINIMALD_PUBLISH_GENERATION=42 MINIMALD_EGRESS_DENY_ALL_OPT_OUT=1 RUST_LOG=debug"
         );
     }
 
