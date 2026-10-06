@@ -687,11 +687,13 @@ pub(crate) async fn activate_session(
             || !args.allow_dns_hosts.is_empty()
             || !args.deny_subnets.is_empty();
         has_egress.then_some(sessions::EgressPolicy {
-            allow_subnets: (!args.allow_subnets.is_empty()).then(|| args.allow_subnets.clone()),
+            allow_subnets: (!args.allow_subnets.is_empty())
+                .then(|| normalize_subnets(&args.allow_subnets)),
             allow_dns_hosts: (!args.allow_dns_hosts.is_empty())
                 .then(|| args.allow_dns_hosts.clone()),
             allow_protocols: (!allow_protocols.is_empty()).then_some(allow_protocols),
-            deny_subnets: (!args.deny_subnets.is_empty()).then(|| args.deny_subnets.clone()),
+            deny_subnets: (!args.deny_subnets.is_empty())
+                .then(|| normalize_subnets(&args.deny_subnets)),
         })
     };
     // NET-043: any dynamic declaration makes the ingress policy too — a
@@ -1300,20 +1302,17 @@ pub(crate) async fn activate_session(
     // the enforcement layer reads it as the masked network (`10.0.0.0/8`).
     // Print a one-line notice naming the normalized form so the user knows
     // how their entry is read, rather than discovering it through a mismatch.
-    if let Some(egress) = &config.policy.egress {
-        if let Some(entries) = &egress.allow_subnets {
-            for entry in entries {
-                if let Some(normalized) = sessions::normalized_cidr(entry) {
-                    eprintln!("--allow-subnets {entry} is read as {normalized}");
-                }
-            }
+    // The notice is computed from the original flags, not the stored policy:
+    // the policy now holds the normalized form, so reading it back would
+    // print nothing.
+    for entry in &args.allow_subnets {
+        if let Some(normalized) = sessions::normalized_cidr(entry) {
+            eprintln!("--allow-subnets {entry} is read as {normalized}");
         }
-        if let Some(entries) = &egress.deny_subnets {
-            for entry in entries {
-                if let Some(normalized) = sessions::normalized_cidr(entry) {
-                    eprintln!("--deny-subnets {entry} is read as {normalized}");
-                }
-            }
+    }
+    for entry in &args.deny_subnets {
+        if let Some(normalized) = sessions::normalized_cidr(entry) {
+            eprintln!("--deny-subnets {entry} is read as {normalized}");
         }
     }
 
@@ -3092,6 +3091,18 @@ async fn session_policy_as_json(global: &GlobalArgs, session: &str) -> Result<()
     Ok(())
 }
 
+/// The normalized form of each subnet flag entry, so the stored policy
+/// holds the masked network the enforcement layer reads (`10.0.0.1/8` →
+/// `10.0.0.0/8`). Entries that are already normalized, invalid, or IPv6 are
+/// kept verbatim: `normalized_cidr` yields `None` for those, and the
+/// enforcement layer's own reading of them is unchanged.
+fn normalize_subnets(entries: &[String]) -> Vec<String> {
+    entries
+        .iter()
+        .map(|entry| sessions::normalized_cidr(entry).unwrap_or_else(|| entry.clone()))
+        .collect()
+}
+
 /// Whether a declared egress section is the deny-all shape: every allow
 /// list present and empty, nothing admitted on any dimension. The same
 /// shape [`sessions::EgressPolicy::deny_all`] writes and `--deny-all-egress`
@@ -3820,6 +3831,26 @@ mod tests {
         DynamicIngress, EffectiveEgress, EffectiveSessionPolicy, IngressPolicy, IpProto,
         NetworkMode, PortMapping,
     };
+
+    #[test]
+    fn normalize_subnets_masks_host_bits_and_keeps_the_rest() {
+        assert_eq!(
+            normalize_subnets(&["10.0.0.1/8".to_string(), "192.168.1.5/24".to_string()]),
+            vec!["10.0.0.0/8".to_string(), "192.168.1.0/24".to_string()]
+        );
+        assert_eq!(
+            normalize_subnets(&[
+                "10.0.0.0/8".to_string(),
+                "fd00::1/8".to_string(),
+                "not-a-cidr".to_string(),
+            ]),
+            vec![
+                "10.0.0.0/8".to_string(),
+                "fd00::1/8".to_string(),
+                "not-a-cidr".to_string()
+            ]
+        );
+    }
 
     #[test]
     fn dynamic_ingress_needs_own_ip() {
