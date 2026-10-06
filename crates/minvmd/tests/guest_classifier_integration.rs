@@ -116,8 +116,10 @@ const RUNNING_TIMEOUT: Duration = Duration::from_secs(90);
 /// Bound on any one `minvmd` subcommand (`run --detach`, `status`, `stop`) so
 /// a wedged daemon fails the test instead of hanging it.
 const SUBPROC_TIMEOUT: Duration = Duration::from_secs(180);
-/// Bound on any one exec inside a box.
-const EXEC_TIMEOUT: Duration = Duration::from_secs(60);
+/// Bound on any one exec inside a box. Cold KVM boots can push the first
+/// exec past a minute, so this is generous enough to absorb that without
+/// masking a genuinely wedged guest.
+const EXEC_TIMEOUT: Duration = Duration::from_secs(120);
 /// How long a boot-log line may take to appear after the guest is Running:
 /// the guest daemon writes them at boot, before it serves, so this only
 /// covers the console flush.
