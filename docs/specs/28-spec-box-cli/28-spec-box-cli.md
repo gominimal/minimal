@@ -267,9 +267,9 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
 - **BCLI-068** WHEN `min box attach <box>` runs without `--exec` against a box whose spec sets `pty_enabled` THE SYSTEM SHALL re-attach the caller's terminal to the box's PTY.
   tier:     T0
   verify:   cargo nextest run -p minimal box_attach_reattaches_pty_box
-  - IF `min box attach <box>` runs without `--exec` against a box whose spec does not set `pty_enabled` THEN THE SYSTEM SHALL fail with exit 2, naming `min box logs <box>`.
+  - IF `min box attach <box>` runs without `--exec` against a running box whose spec does not set `pty_enabled` THEN THE SYSTEM SHALL fail with exit 2, naming `min box logs <box>`; against a stopped or exited box without `pty_enabled`, BCLI-009's restart refusal naming `min task run` applies instead, and `min session attach` (BCLI-032) inherits the same split.
     tier:   T0
-    verify: cargo nextest run -p minimal box_attach_non_pty_box_exit2_names_logs
+    verify: cargo nextest run -p minimal box_attach_running_non_pty_box_exit2_names_logs
   - WHEN `min box attach <box> --exec <exec-id>` names a live PTY exec in the box THE SYSTEM SHALL re-attach the caller's terminal to that exec as BOX-149 defines, resolving the exec id against the live exec ids BOX-159 returns.
     tier:   T0
     verify: cargo nextest run -p minimal box_attach_exec_reattaches_live_pty_exec
