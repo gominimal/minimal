@@ -7469,7 +7469,7 @@ proof_native_resolution_without_proxy_env() {
       # (T90); record the channel it binds BEFORE running it, so a
       # half-failed run still leaves the teardown a service to remove.
       case "$native_cmd" in
-        *zone-answerer*)
+        *minzoned*)
           ANSWERER_SERVICE_CHANNEL="$(answerer_channel_of "$native_cmd")"
           if [ -z "$ANSWERER_SERVICE_CHANNEL" ]; then
             echo "::error::the advisory's command names no answerer channel, so this run could not undo the service it installs; it was not run (got: '$native_cmd')"
@@ -8375,7 +8375,7 @@ proof_box_name_resolves_natively_without_proxy() {
     # A native daemon's advisory carries the manager-held answerer step
     # (T90); record its channel first so the teardown can remove it.
     case "$bn_cmd" in
-      *zone-answerer*)
+      *minzoned*)
         ANSWERER_SERVICE_CHANNEL="$(answerer_channel_of "$bn_cmd")"
         if [ -z "$ANSWERER_SERVICE_CHANNEL" ]; then
           echo "::error::the advisory's command names no answerer channel, so this run could not undo the service it installs; it was not run (got: '$bn_cmd')"
@@ -9045,7 +9045,7 @@ for row in json.load(open(sys.argv[1])):
   local asr_cmd
   asr_cmd="$(advisory_command_from "$asr_a_err" "Configure the host's resolver")"
   case "$asr_cmd" in
-    *zone-answerer*) ;;
+    *minzoned*) ;;
     *)
       echo "::error::node A's session start printed no advisory carrying the answerer service step"
       echo "--- activate stderr ---"; cat "$asr_a_err" 2>/dev/null || true
@@ -9520,7 +9520,7 @@ proof_native_answerer_survives_session_stop() {
   local nasr_cmd
   nasr_cmd="$(advisory_command_from "$nasr_a_err" "Configure the host's resolver")"
   case "$nasr_cmd" in
-    *zone-answerer*) ;;
+    *minzoned*) ;;
     *)
       echo "::error::node A's native session start printed no advisory carrying the answerer service step"
       echo "--- activate stderr ---"; cat "$nasr_a_err" 2>/dev/null || true

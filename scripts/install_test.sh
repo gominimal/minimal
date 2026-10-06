@@ -2091,7 +2091,7 @@ case_answerer_source_installed() {
         sh -c 'find "$1" \( -name "*.plist" -o -name "*.service" -o -name "*.socket" \) -print | grep -q .' sh "$H_A1"
     # shellcheck disable=SC2016  # $2 is awk's second field, not a shell parameter
     want_ok "no record row names a unit, plist, or root-owned answerer path" \
-        awk '$2 ~ /(systemd|launchd|PrivilegedHelperTools|zone-answerer)/ {bad=1} END{exit bad ? 1 : 0}' "$_rec"
+        awk '$2 ~ /(systemd|launchd|PrivilegedHelperTools|lib\/minimal\/minzoned|dev\.gominimal\.zone)/ {bad=1} END{exit bad ? 1 : 0}' "$_rec"
 
     # An upgrade replaces it like the other binaries: a new release's answerer
     # bytes alone re-download and land.
