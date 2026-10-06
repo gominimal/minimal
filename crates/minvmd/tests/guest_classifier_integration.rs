@@ -119,9 +119,10 @@ const SUBPROC_TIMEOUT: Duration = Duration::from_secs(180);
 /// Bound on any one exec inside a box, measured as silence on the channel.
 /// A session's first exec launches its box, and the launch fetches the box's
 /// package closure from the remote cache onto the guest's freshly formatted
-/// data volume before the command runs. On the KVM lane that fetch alone has
-/// taken over 80 s, so the bound covers it with headroom. A guest that stays
-/// silent for two minutes is wedged, not slow.
+/// data volume before the command runs. On the KVM lane two concurrent first
+/// launches have taken 84-122 s; one launch alone usually finishes in under
+/// 40 s, so the bound covers it with headroom. A guest that stays silent for
+/// two minutes is wedged, not slow.
 const EXEC_TIMEOUT: Duration = Duration::from_secs(120);
 /// How long a boot-log line may take to appear after the guest is Running:
 /// the guest daemon writes them at boot, before it serves, so this only
