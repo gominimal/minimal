@@ -942,8 +942,11 @@ const KNOWN_GAPS: &[KnownGap] = &[
     },
     KnownGap {
         id: "TEL-034",
-        covered_by: "lab scenario 715b only, until the VM test lands (the guest's records \
-                     reach the host's collector)",
+        covered_by: "the VM tests \
+                     `the_guest_daemons_records_reach_the_host_spool_and_endpoint_over_vsock` and \
+                     `a_boot_and_stop_share_one_trace_with_the_guest_daemon`, gated \
+                     `MINVMD_E2E=1`, so they run on the VM lane only; lab scenarios 715b, \
+                     715f and 715i to 715l",
         issue: "minimal#2034",
     },
     KnownGap {
@@ -977,7 +980,7 @@ fn known_gap_tel_009_a_daemon_keeps_its_own_switches() {
 }
 
 #[test]
-fn known_gap_tel_034_the_guest_exports_to_a_reachable_collector() {
+fn known_gap_tel_034_the_guest_path_runs_on_the_vm_lane_only() {
     known_gap("TEL-034");
 }
 

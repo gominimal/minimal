@@ -17,6 +17,7 @@ pub mod config;
 pub mod control;
 pub mod diag;
 pub mod error;
+pub mod guest_telemetry;
 pub mod image;
 pub mod lifecycle;
 pub mod metrics;

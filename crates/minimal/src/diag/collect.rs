@@ -441,7 +441,23 @@ pub async fn spool(
 ) -> Result<(), anyhow::Error> {
     let dir = spool_dir(paths, std::env::var_os("MINIMAL_OTEL_SPOOL_DIR"));
     let headers = diagnostics::redact::exporter_header_values(|n| std::env::var(n).ok());
-    spool_in(w, &dir, tail_bytes, &headers).await
+    spool_in(w, &dir, tail_bytes, &headers).await?;
+    // The VMs' guest spools, `<dir>/guest/<vm>/`, each bounded on its own
+    // (`mlog::otel::spool_guest_line`): collected beside the host's. `guest`
+    // itself is taken only as a real directory, the no-follow discipline
+    // `diagnostics::spool::collect` applies to each directory it is handed.
+    let guest = dir.join("guest");
+    let guest_is_dir = tokio::fs::symlink_metadata(&guest)
+        .await
+        .is_ok_and(|m| m.is_dir());
+    if guest_is_dir && let Ok(mut vms) = tokio::fs::read_dir(&guest).await {
+        while let Ok(Some(vm)) = vms.next_entry().await {
+            if vm.file_type().await.is_ok_and(|t| t.is_dir()) {
+                spool_in(w, &vm.path(), tail_bytes, &headers).await?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The spool directory `min bug` reads: `override_dir`, the value of
