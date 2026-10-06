@@ -18177,7 +18177,11 @@ proof_expose_from_inside_box() {
     echo "policy (text): one live row for :$eib_port (NET-044); observed: $eib_policy_row"
 
     # ---- the ask legs: the human attached on the host answers (T96) --------
-    eib_vm_ask_legs "$eib_port" "$eib_lo" "$eib_hi" \
+    # On a VM lane every box publishes at the host's 127.0.0.1, and the allow
+    # box above still holds its expose of $eib_port there, so the ask legs ask
+    # for the next port in the same declared range: a second expose of one
+    # host address:port is gvproxy's "proxy already running", not an answer.
+    eib_vm_ask_legs "$((eib_port + 1))" "$eib_lo" "$eib_hi" \
       "$eib_yes_name" "$eib_no_name" "$eib_nobody_name" 3>>"$eib_vm_sids"
 
     # ---- the deny box: refused inside the box, recorded nowhere -------------
@@ -18253,6 +18257,10 @@ proof_expose_from_inside_box() {
     rm -rf "$EIB_ALLOW_SEED_DIR" "$EIB_DENY_SEED_DIR"
 
     # ---- two named VMs: the expose half of T61 ------------------------------
+    # Alpha's switch publishes at the same host 127.0.0.1 as the default VM,
+    # whose allow and ask-yes boxes still hold their ports there, so this leg
+    # asks for its own port in the declared range.
+    local eib_two_port=$((eib_port + 2))
     # A box on the NON-DEFAULT VM publishes there. `min --vm alpha session
     # activate` creates the box on alpha (autospawning and booting it), the
     # expose runs inside a FLAGLESS `min session attach` by the box's name —
@@ -18336,7 +18344,7 @@ proof_expose_from_inside_box() {
       # session alive for the destroy below.
       # shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
       eib_two_attach="$(
-        E2E_PTY_COMMANDS="/usr/bin/min net expose $eib_port
+        E2E_PTY_COMMANDS="/usr/bin/min net expose $eib_two_port
 sleep 2
 exit" E2E_PTY_ANSWER=keep \
         python3 "$ROOT/scripts/e2e-attach-pty.py" - \
@@ -18356,14 +18364,14 @@ exit" E2E_PTY_ANSWER=keep \
         fail
       fi
       case "$eib_two_attach" in
-        *"published port $eib_port at "*":$eib_port"*) ;;
+        *"published port $eib_two_port at "*":$eib_two_port"*) ;;
         *)
           echo "::error::the expose inside the alpha box did not publish — the reply never rendered on the attached terminal (NET-043)"
           rm -rf "$EIB_TWO_SEED_DIR"
           fail
           ;;
       esac
-      echo "the flagless attach found VM $eib_two_vm from the box name, and the expose typed inside published: $(printf '%s\n' "$eib_two_attach" | grep -F "published port $eib_port" | tail -n1 | tr -d '\r')"
+      echo "the flagless attach found VM $eib_two_vm from the box name, and the expose typed inside published: $(printf '%s\n' "$eib_two_attach" | grep -F "published port $eib_two_port" | tail -n1 | tr -d '\r')"
 
       # The publish's records live on alpha (NET-055): alpha's own row holds
       # the runtime port at alpha's registration address, and alpha's own
@@ -18377,7 +18385,7 @@ exit" E2E_PTY_ANSWER=keep \
         sleep 0.25
       done
       if [ -z "$eib_two_row" ]; then
-        echo "::error::alpha's own row never admitted the runtime port $eib_port at switch address $eib_two_switch — the expose inside its box published nowhere (T94, NET-055)"
+        echo "::error::alpha's own row never admitted the runtime port $eib_two_port at switch address $eib_two_switch — the expose inside its box published nowhere (T94, NET-055)"
         echo "minvmd --vm $eib_two_vm status --row $eib_two_name -> '$(minvmd --vm "$eib_two_vm" status --row "$eib_two_name" 2>&1 || true)'"
         rm -rf "$EIB_TWO_SEED_DIR"
         fail
@@ -18387,7 +18395,7 @@ exit" E2E_PTY_ANSWER=keep \
       eib_two_line=""
       for _ in $(seq 1 20); do
         eib_two_line="$(grep -F "\"box\":\"$eib_two_name\"" "$eib_two_audit" 2>/dev/null \
-          | grep -E "\"port\":${eib_port}[,}]" | grep -F '"source":"expose"' | tail -n1)"
+          | grep -E "\"port\":${eib_two_port}[,}]" | grep -F '"source":"expose"' | tail -n1)"
         [ -n "$eib_two_line" ] && break
         sleep 0.25
       done
