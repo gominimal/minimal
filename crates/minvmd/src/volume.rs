@@ -205,13 +205,15 @@ fn host_overcommit(avail: u64, allocated: u64, apparent: u64) -> Option<u64> {
 fn host_free_bytes(dir: &Path) -> Option<u64> {
     use std::os::unix::ffi::OsStrExt as _;
     let c_path = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `libc::statvfs` is a plain-old-data C struct; all-zero bytes are
+    // a valid value.
     let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
     // SAFETY: valid NUL-terminated path and out-pointer to a zeroed struct.
     if unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) } != 0 {
         return None;
     }
     let frsize = stat.f_frsize as u64;
-    Some(stat.f_bavail as u64 * frsize)
+    Some((stat.f_bavail as u64).saturating_mul(frsize))
 }
 
 /// Warn when the host cannot back the image's apparent size: `statvfs` the
@@ -242,8 +244,9 @@ fn warn_overcommit(path: &Path, avail: u64, allocated: u64, apparent: u64) {
             shortfall_bytes = shortfall,
             "host free disk cannot back the data volume's remaining growth; \
              the guest will hit ENOSPC before its filesystem looks full. \
-             Free host disk space, or set MINVMD_VOLUME_BYTES smaller before \
-             the volume is first created",
+             Free host disk space, or re-provision the volume smaller: its \
+             size is fixed once the image exists, so set MINVMD_VOLUME_BYTES \
+             smaller and delete the image (this discards the volume's data)",
         );
     }
 }
@@ -284,6 +287,30 @@ mod tests {
             "expected a sparse file, but {allocated} bytes are allocated for a {size}-byte image",
         );
         // Best-effort cleanup; a leftover temp dir must not fail the test.
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn warn_stays_silent_when_host_free_space_backs_the_volume() {
+        let buf = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let apparent = 8 * 1024 * 1024 * 1024;
+        warn_overcommit(Path::new("data-vol.raw"), apparent, 0, apparent);
+
+        let logged = buf.contents();
+        assert!(logged.is_empty(), "expected no warning, got: {logged}");
+    }
+
+    #[test]
+    fn host_free_bytes_reads_the_real_filesystem() {
+        let dir = tmpdir("statvfs");
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(host_free_bytes(&dir).is_some_and(|b| b > 0));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
