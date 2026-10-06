@@ -4048,7 +4048,6 @@ dependencies = [
  "async-tar",
  "constcat",
  "indicatif",
- "inquire",
  "libc",
  "minimald-rpc",
  "nix 0.31.3",

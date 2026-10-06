@@ -9,6 +9,7 @@
 use std::path::Path;
 
 use crate::HANDSHAKE_TIMEOUT;
+use crate::ask_dialog::{AskDialogEnd, render_ask_dialog};
 use crate::tty_relay;
 use anyhow::Context as _;
 
@@ -307,6 +308,75 @@ const HOST_ASK_CONTROL_TIMEOUT: std::time::Duration = std::time::Duration::from_
 pub struct HostAsks {
     control_sock: std::path::PathBuf,
     subscription: std::io::BufReader<std::os::unix::net::UnixStream>,
+    /// Lines a dialog read off the subscription while it watched for its
+    /// own dismissal, kept in order for the serving loop.
+    held: std::collections::VecDeque<String>,
+}
+
+/// A dialog's view of the subscription while it is up: whether the host
+/// has taken its ask away. Every other line read here is held, in order,
+/// for the serving loop.
+pub struct AskWatch<'a> {
+    ask_id: minimald_rpc::AskId,
+    subscription: &'a mut std::io::BufReader<std::os::unix::net::UnixStream>,
+    held: &'a mut std::collections::VecDeque<String>,
+}
+
+impl<'a> AskWatch<'a> {
+    pub(crate) fn new(
+        ask_id: minimald_rpc::AskId,
+        subscription: &'a mut std::io::BufReader<std::os::unix::net::UnixStream>,
+        held: &'a mut std::collections::VecDeque<String>,
+    ) -> Self {
+        Self {
+            ask_id,
+            subscription,
+            held,
+        }
+    }
+
+    /// The subscription's socket, for a poll beside the terminal.
+    pub(crate) fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        use std::os::fd::AsFd as _;
+        self.subscription.get_ref().as_fd()
+    }
+
+    /// Whether bytes already read off the socket are waiting: a poll of
+    /// the socket would not see them.
+    pub(crate) fn has_buffered(&self) -> bool {
+        !self.subscription.buffer().is_empty()
+    }
+
+    /// Read one line. `true` when it ends this dialog: the dismissal of
+    /// this ask, or the subscription ending, after which nothing this
+    /// attach records could count. Any other line is held.
+    pub(crate) fn take_line(&mut self) -> bool {
+        use std::io::BufRead as _;
+        let mut line = String::new();
+        match self.subscription.read_line(&mut line) {
+            Ok(0) | Err(_) => return true,
+            Ok(_) => {}
+        }
+        if is_dismissal_of(&line, self.ask_id) {
+            return true;
+        }
+        self.held.push_back(line);
+        false
+    }
+
+    /// Block until the host dismisses this ask or the subscription ends:
+    /// a dialog that never answers.
+    pub fn wait_dismissed(&mut self) {
+        while !self.take_line() {}
+    }
+}
+
+/// Whether `line` is the host's dismissal of `ask_id`.
+fn is_dismissal_of(line: &str, ask_id: minimald_rpc::AskId) -> bool {
+    matches!(
+        serde_json_lenient::from_str(line.trim()),
+        Ok(minimald_rpc::BoxControlReply::PendingAskDismissed { ask_id: id, .. }) if id == ask_id
+    )
 }
 
 /// The terminal side of the ask dialog: the relay's suspend and resume, as
@@ -417,6 +487,7 @@ impl HostAsks {
         Ok(Self {
             control_sock: control_sock.to_path_buf(),
             subscription,
+            held: std::collections::VecDeque::new(),
         })
     }
 
@@ -443,22 +514,34 @@ impl HostAsks {
         Box::new(move |handle| self.serve(handle, render_ask_dialog))
     }
 
+    /// The next subscription line: a held one first, then the socket.
+    /// `None` once the subscription ended.
+    fn next_line(&mut self) -> Option<String> {
+        use std::io::BufRead as _;
+        self.held.pop_front().or_else(|| {
+            let mut line = String::new();
+            match self.subscription.read_line(&mut line) {
+                Ok(0) | Err(_) => None,
+                Ok(_) => Some(line),
+            }
+        })
+    }
+
     /// Serve offers until the subscription ends: for each, suspend the
     /// relay, render the dialog with `dialog`, record its answer through
-    /// the host door, and resume. An offer the daemon already dismissed is
+    /// the host door, and resume. The dialog watches the subscription
+    /// through its [`AskWatch`]: one the host dismisses comes down unanswered
+    /// and records nothing. An offer the daemon already dismissed is
     /// skipped; an attach that ended under the dialog records nothing.
     pub fn serve<T: AskTerminal>(
         mut self,
         terminal: &T,
-        mut dialog: impl FnMut(&minimald_rpc::PendingAskOffer) -> minimald_rpc::AskAnswer,
+        mut dialog: impl FnMut(&minimald_rpc::PendingAskOffer, &mut AskWatch<'_>) -> AskDialogEnd,
     ) {
-        use std::io::BufRead as _;
         loop {
-            let mut line = String::new();
-            match self.subscription.read_line(&mut line) {
-                Ok(0) | Err(_) => return,
-                Ok(_) => {}
-            }
+            let Some(line) = self.next_line() else {
+                return;
+            };
             let offer = match serde_json_lenient::from_str(line.trim()) {
                 Ok(minimald_rpc::BoxControlReply::PendingAskOffer(offer)) => offer,
                 Ok(_) | Err(_) => continue,
@@ -475,10 +558,21 @@ impl HostAsks {
                 port = offer.port,
                 "showing the host-side ask dialog"
             );
-            let answer = dialog(&offer);
+            let end = dialog(
+                &offer,
+                &mut AskWatch::new(offer.ask_id, &mut self.subscription, &mut self.held),
+            );
             if terminal.ask_cancelled() {
                 return;
             }
+            let answer = match end {
+                AskDialogEnd::Answered(answer) => answer,
+                AskDialogEnd::Dismissed => {
+                    tracing::info!(ask_id = %offer.ask_id, "the ask was dismissed; its dialog came down unanswered");
+                    terminal.resume_after_ask();
+                    continue;
+                }
+            };
             tracing::info!(ask_id = %offer.ask_id, answer = ?answer, "the ask dialog was answered");
             match self.record(offer.ask_id, answer) {
                 Ok(None) => {}
@@ -500,16 +594,12 @@ impl HostAsks {
     /// Whether a dismissal for `ask_id` is already buffered behind its
     /// offer: another attach answered first, so there is no dialog to show.
     fn dismissed_already(&self, ask_id: minimald_rpc::AskId) -> bool {
-        String::from_utf8_lossy(self.subscription.buffer())
-            .lines()
-            .filter_map(|line| serde_json_lenient::from_str(line.trim()).ok())
-            .any(|reply| {
-                matches!(
-                    reply,
-                    minimald_rpc::BoxControlReply::PendingAskDismissed { ask_id: id, .. }
-                        if id == ask_id
-                )
-            })
+        let buffered = String::from_utf8_lossy(self.subscription.buffer());
+        self.held
+            .iter()
+            .map(String::as_str)
+            .chain(buffered.lines())
+            .any(|line| is_dismissal_of(line, ask_id))
     }
 
     /// Record `answer` for `ask_id` through the host door. `Ok(Some)` is
@@ -561,53 +651,6 @@ pub fn late_answer_line(
             format!("ask {port}/{proto} was cancelled ({cause})")
         }
     }
-}
-
-/// The ask dialog's question: the native dialog's own frame
-/// (`minimald::session_host::ASK_PROMPT`), so a human, and the e2e's pty
-/// driver, meet one dialog wherever the box runs.
-pub const ASK_DIALOG_PROMPT: &str = "Allow the publish to the host?";
-
-/// The ask dialog's choices, the highlighted refusal first, as the native
-/// dialog orders them.
-const ASK_DIALOG_CHOICES: [&str; 2] = ["Deny", "Allow"];
-
-/// The dialog's lead-in, built from the offer's host-row fields alone: the
-/// box's name as the host row holds it, the port and the protocol. Control
-/// characters are dropped so nothing in a name can drive the terminal.
-#[must_use]
-pub fn ask_dialog_lead_in(offer: &minimald_rpc::PendingAskOffer) -> String {
-    let name: String = offer.name.chars().filter(|c| !c.is_control()).collect();
-    format!(
-        "{name} asks to publish port {}/{}.",
-        offer.port, offer.proto
-    )
-}
-
-/// The dialog's end as the answer recorded for it: a yes only for an
-/// explicit Allow; a no for Deny, Ctrl-C, Escape and a closed or failed
-/// input; and no-tty when there was no terminal to render on.
-#[must_use]
-pub fn ask_answer_from(result: Result<bool, inquire::InquireError>) -> minimald_rpc::AskAnswer {
-    match result {
-        Ok(true) => minimald_rpc::AskAnswer::Yes,
-        Err(inquire::InquireError::NotTTY) => minimald_rpc::AskAnswer::NoTty,
-        Ok(false) | Err(_) => minimald_rpc::AskAnswer::No,
-    }
-}
-
-/// Render the ask dialog with `inquire` on the real terminal, in the
-/// attach-start termios the suspended relay put back: the lead-in, then a
-/// Deny/Allow choice with Deny highlighted.
-#[must_use]
-pub fn render_ask_dialog(offer: &minimald_rpc::PendingAskOffer) -> minimald_rpc::AskAnswer {
-    eprintln!("\r\n{}", ask_dialog_lead_in(offer));
-    ask_answer_from(
-        inquire::Select::new(ASK_DIALOG_PROMPT, ASK_DIALOG_CHOICES.to_vec())
-            .with_help_message("Enter picks; Esc or Ctrl-C denies")
-            .prompt()
-            .map(|choice| choice == "Allow"),
-    )
 }
 
 /// The single command string to hand `ssh`, or `None` for the interactive
