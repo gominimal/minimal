@@ -6,6 +6,7 @@ The order of the work, and the size of each step, for implementing [the BOX spec
 - **Tree surveyed:** `main` at `173f033`, with the BOX, BVOL, BCLI and BRES spec files laid on top.
 - **Method:** the foundry `spec:plan` skill (`spec@foundry` v0.7.0), run up to the drafted plan comment. Nothing is posted on the epic and no issue exists yet. The plan comment in the skill's format lints with `plan-lint`: exit 0, 0 blocking findings, 22 advisory (§7).
 - **Revision 2 (2026-10-06):** refactoring is folded in. Four scripted renames land before the plan (R1–R4, §0), eight refactor pull requests join the plan (T34–T41), and the box naming rule goes into `AGENTS.md`.
+- **Revision 3 (2026-10-06):** a task becomes a box whose entrypoint is the task. One launcher starts every box's entrypoint from its spec (T42), one exit rule keyed on `lifetime` ends it (T9), and `min task run` creates a task box instead of sending a task into a session's box (T43). Revision 2 had T9 patch the task path and the session path separately, which would have kept a code path per type.
 
 ---
 
@@ -26,6 +27,7 @@ The order is:
 > - A **Box Host** is the machine that hosts boxes, so no module or type in a daemon uses that name for anything else.
 > - `box` is a reserved word in Rust: a module about boxes is `boxes` or `box_<noun>`, and a type is `Box<Noun>`, never a bare `Box`, which would shadow `std::boxed::Box`.
 > - No code uses session or task to mean the box. Wire, on-disk, printed and environment names that say session stay only where a spec keeps them for compatibility. The Rust name says box and carries a serde rename or alias.
+> - A box's behaviour follows the settings in its spec (`lifetime`, `pty_enabled`, `timeout`, the network mode), never its Box Type name. Only the code that resolves Box Types reads a type name. A new type, built in or declared by a project, then works with the code paths that exist.
 > - New files, modules and types about the box take box names from the start. A rename of existing names is its own PR, never mixed into a move or a feature.
 
 ### The four rename PRs
@@ -111,13 +113,17 @@ T3 waits on T37–T39 and T41, T6 on T38–T39, T1 on T37 and T41, T2 on T41, T4
 
 ### S2: Tasks leave exited boxes (the session+task unification)
 
-**T40 comes first in this slice: it splits the daemon's exec dispatch.** It is a pure move, so it keeps behaviour. It changes `exec.rs` plus 4 new files, size M (160+60), and it waits on T37. `exec.rs` keeps the `Exec`/`Process` traits and the dispatch entry. The rest moves to `exec/{process, bridge, run, git}.rs`. Eight BOX tasks change `exec.rs`, and after T40 each one touches one concern's file. T9, T10 and the join T11 wait on it.
+**T40 comes first in this slice: it splits the daemon's exec dispatch.** It is a pure move, so it keeps behaviour. It changes `exec.rs` plus 4 new files, size M (160+60), and it waits on T37. `exec.rs` keeps the `Exec`/`Process` traits and the dispatch entry. The rest moves to `exec/{process, bridge, run, git}.rs`. Eight BOX tasks change `exec.rs`, and after T40 each one touches one concern's file. T43 and the join T11 wait on it.
+
+**One launch path, whatever the type.** Today `min task run` creates a box through the session path, then sends the task into it as a second sandboxed process (`ExecRequest::TaskRun`). The box ends because the client set `owns_box`, and `end_run_box` deletes the record. A session's shell exit has its own prompt. After S2, every box runs one entrypoint, `[execution] exec` in its spec. That is the login shell for a session, the task's command line for a task, and whatever a later type's spec says. Its `lifetime` decides what happens when the entrypoint returns, and `pty_enabled` decides whether it can be attached and resumed. Running a declared task inside a box that already exists (`min session run`, or `run_task` from inside the box) stays an exec into that box.
 
 | PR | What it adds | Covers | Files | Size / est | Keeps behaviour? |
 |---|---|---|---|---|---|
-| T9 | `end_run_box` sets the record to exited and keeps it instead of deleting it. Losing the client no longer kills the run. The client stops destroying the task box and creates it with type `task`. A session whose shell exits ends as exited, which **retires the keep/save/delete prompt**. | BOX-015, 038 | minimald exec.rs, session_host.rs, session/tests.rs; minimald-rpc exec.rs; minimal task.rs | L, 420+240 | **No.** Task boxes are retained, Ctrl-C and client loss no longer end a run, and the shell-exit prompt is gone. **This cannot be split:** BOX-038 is one requirement covering both the task end and the session shell exit, and the task-record change only means anything together with it. This is already the smallest unit |
-| T10 | With no client attached, the entrypoint's stdout and stderr are captured to `output.log` and can be read or followed by id. A PTY client loss writes a `detached` event. | BOX-016, 155 | minimald exec.rs, session_host.rs, session_host/tests.rs, rpc.rs; sessions store.rs; minimald-rpc lib.rs | L, 300+200 | Yes (additive) |
-| T11 | **Join** | — | minimald exec.rs (test) | S, 40+120 | Yes |
+| T42 | One launcher starts every box's entrypoint from its stored spec: the argv, the PTY flag, cwd and env. The spec carries `execution.exec`, `lifetime` and `pty_enabled`, from the `[session]` table (login shell, PTY) or the task (its command line, no PTY). No branch in the box runtime reads the type. | (enablement) | mfile spec.rs; minimald session_host/launcher.rs, session_host.rs, session.rs, session_host/mock.rs, session_host/tests.rs | L, 380+240 | Yes: a session's spec names the shell it starts today |
+| T9 | One exit rule, read from `lifetime`: an `until_complete` box whose entrypoint returns ends as exited and keeps its record, with or without a client. Idleness and client loss never stop a box. A session whose shell exits ends the same way, which **retires the keep/save/delete prompt**. | BOX-015, 038 | minimald session_host.rs, session.rs, sessions.rs, session/tests.rs, session_host/tests.rs | L, 360+240 | **No.** The shell-exit prompt is gone and the record is kept |
+| T43 | `min task run` puts the task's command line, bound args, cwd and env into the spec, creates a `task` box, streams its output and returns its exit code. `end_run_box` and the `owns_box` branch go. An older client's `TaskRun` keeps working for one release through the exit rule. | (enablement) | minimal task.rs, cmd/boxes/create.rs; minimald exec/run.rs, exec/process.rs; minimald-rpc exec.rs | L, 420+260 | **No.** Task boxes are retained, Ctrl-C and client loss no longer end a run |
+| T10 | With no client attached, the entrypoint's stdout and stderr are captured to `output.log` and can be read or followed by id. A PTY client loss writes a `detached` event. | BOX-016, 155 | minimald session_host/launcher.rs, session_host.rs, session_host/tests.rs, rpc.rs; sessions store.rs; minimald-rpc lib.rs | L, 300+200 | Yes (additive) |
+| T11 | **Join** | — | minimald session_host/tests.rs (test) | S, 40+120 | Yes |
 
 ### S3: Names follow the id
 
@@ -136,7 +142,7 @@ T3 waits on T37–T39 and T41, T6 on T38–T39, T1 on T37 and T41, T2 on T41, T4
 | T17 | Legacy tables work with a hint for one release: `[session]` reads as `[defaults.session]`, `state_key`/`profile` as `[defaults.task]`, and `[params]` as `[args]`. Flat per-entry keys are accepted. After the grace release these exit 3. `interactive = true` on a task fails with exit 3. | BOX-049, 050, 051, 052, 054 | mfile/src/legacy.rs *new*, lib.rs, tasks.rs | L, 300+360 | Mostly: hints are new output. **`interactive = true` now fails**, and the `crates/mctx/testdata` fixtures use it |
 | T18 | Every Box Spec section (machine, io, execution, network, secrets, params, nesting, volumes) is accepted. **Unknown keys fail with exit 3 instead of a warning.** Unenforced sections warn once at creation. A project `[secret-store-rules]` is dropped with a warning. | BOX-076, 085 | mfile spec.rs, lib.rs; minimald sessions.rs | L, 420+300 | **No:** a minimal.toml with a stray key now fails |
 | T19 | `[network] mode` takes none, host_ip and own_ip. The legacy spellings and flat egress keys are canonicalised with a hint, reusing the hint code the CLI flag already has. `mode = "none"` with egress fails with exit 3. The network, bep and secrets sections pass through unchanged. | BOX-079, 080, 157 | mfile/src/network.rs *new*, lib.rs; minimal cli.rs; minimald-rpc lib.rs | L, 260+240 | Yes |
-| T20 | A `timeout` on an `until_complete` box ends it with reason timeout. `hooks_on_resume` reruns `on_activate`. | BOX-028, 037 | minimald exec.rs, session.rs, session/tests.rs | M, 200+160 | Yes (new keys) |
+| T20 | A `timeout` on an `until_complete` box ends it with reason timeout. `hooks_on_resume` reruns `on_activate`. | BOX-028, 037 | minimald session_host.rs, session.rs, session/tests.rs, session_host/tests.rs | M, 200+160 | Yes (new keys) |
 | T21 | **Join and cutover:** the client sends the expanded entry instead of T5's v0 spec. | — | minimal cmd/session.rs, task.rs, tests.rs | M, 120+120 (**risk: may grow**) | Yes, provided the expansion of a legacy `[session]` matches today's composition |
 
 ### S5: Types only narrow
@@ -184,7 +190,8 @@ Each multi-task slice has a join task (T7, T11, T14, T21, T25, T29, T32). The cr
 - **T1 creates `core/record.rs`**, which T2, T4, T9 and T13 consume.
 - **T2 creates the events file and type**, which T3, T10, T12 and T30 consume.
 - **T3 creates `StopBox`**, which T6 and T8 consume.
-- **T5 creates `mfile/src/spec.rs`**, which T6, T16 and T20 consume.
+- **T5 creates `mfile/src/spec.rs`**, which T6, T16, T20, T42 and T43 consume.
+- **T42 creates `BoxLaunch`**, which T9 and T43 consume. T10 tees the entrypoint's output where T42 launches it.
 - **T16 creates `expand.rs`**, which T17, T18, T19 and T22 consume.
 - **T22 creates `box_types.rs`**, which T23, T24 and T26 consume.
 - **T26 creates `projection.rs`**, which T27 and T28 consume.
@@ -274,22 +281,23 @@ None of these makes a requirement fully built, so the plan's "Already exists" se
 
 ## 5. Totals and critical path
 
-**41 PRs in the plan, plus the 4 scripted renames before it (§0).** The plan holds:
+**43 PRs in the plan, plus the 4 scripted renames before it (§0).** The plan holds:
 - 24 feature PRs;
 - 7 join PRs;
 - 2 single-task slices (T8, T33);
-- 8 refactor PRs (T34–T41).
+- 8 refactor PRs (T34–T41);
+- 2 unification PRs (T42, T43).
 
-By size that is 20 L, 13 M and 8 S.
+By size that is 22 L, 13 M and 8 S.
 
-- **Rough total:** about 18,550 lines, roughly 9,900 code and 8,650 tests. The refactor PRs add about 2,350 of those. At ~1/2/3 days per S/M/L PR that is about 94 PR-days. The four renames add about 4 more days, landed back to back.
+- **Rough total:** about 19,800 lines, roughly 10,650 code and 9,150 tests. The refactor PRs add about 2,350 of those, and the unification about 1,250. At ~1/2/3 days per S/M/L PR that is about 100 PR-days. The four renames add about 4 more days, landed back to back.
 - **How a pure move is sized:** a move's estimate counts only the lines that change (`mod` and `use` lines, visibility), not the moved lines. `git diff --color-moved` shows a reviewer the moved blocks as moved, so they cost little to review. T34 moves about 5,800 lines, T37 about 9,000, T38 about 4,300, T39 about 4,600, T40 about 2,300 and T41 about 1,800.
-- **By slice:** S0 ≈ 5.8k (the refactor PRs add 2.1k), S1 0.7k, S2 1.5k, S3 1.4k, S4 3.6k, S5 1.5k, S6 1.9k, S7 1.5k, S8 0.5k lines.
-- **Critical path:** 16 PRs, about 37 working days (~7.5 weeks), 2 days longer than before:
+- **By slice:** S0 ≈ 5.8k (the refactor PRs add 2.1k), S1 0.7k, S2 2.7k, S3 1.4k, S4 3.6k, S5 1.5k, S6 1.9k, S7 1.5k, S8 0.5k lines.
+- **Critical path:** 18 PRs, about 43 working days (~8.5 weeks), 6 days longer than revision 2:
 
-  T34 → T35 → T36 (CLI refactor) → T5 → T6 → T7 (S0) → T9 (S2) → T20 → T21 (S4 join) → T22 → T23 → T24 → T25 (S5) → T26 → T28 → T29 (S6)
+  T34 → T35 → T36 (CLI refactor) → T5 → T6 → T7 (S0) → T42 → T9 → T43 (S2) → T20 → T21 (S4 join) → T22 → T23 → T24 → T25 (S5) → T26 → T28 → T29 (S6)
 
-  The daemon refactors (T37–T39, T41) run beside the CLI chain and finish before T1–T3 need them. Before this revision the path started T1 → T2 → T3 → T6, and T1 could not start until arch#98 moved. Now the refactor PRs fill that wait. Count the four renames ahead of all of it: about 4 days, so ~8 weeks from the first rename to S6's join.
+  The daemon refactors (T37–T39, T41) run beside the CLI chain and finish before T1–T3 need them. Before this revision the path started T1 → T2 → T3 → T6, and T1 could not start until arch#98 moved. Now the refactor PRs fill that wait. Count the four renames ahead of all of it: about 4 days, so ~9 weeks from the first rename to S6's join.
 
 - **Parallel lanes off the path:**
   - S1 (T8), right after T3. It also waits on NET#1437.
@@ -298,7 +306,7 @@ By size that is 20 L, 13 M and 8 S.
   - S4's T15 can start on day 1, and T16 after T5.
   - S8 waits on T8, T12, T19 and T31.
 
-- **Shortening the path:** the S4 → S2 link exists only because T20's timeout ends a task the way T9 does. Splitting `hooks_on_resume` out of T20, or letting T20 wait only on T5, would let the whole expander lane (S4–S6) run beside S0–S3.
+- **Shortening the path:** the S4 → S2 link exists only because T20's timeout belongs to the exit rule T9 writes, proved on a task box T43 creates. Splitting `hooks_on_resume` out of T20, or letting T20 wait only on T5, would let the whole expander lane (S4–S6) run beside S0–S3.
 
 ---
 
@@ -316,12 +324,13 @@ By size that is 20 L, 13 M and 8 S.
    - Today's stop is a SIGKILL to the container child only, triggered only at daemon shutdown.
    - A whole-box SIGTERM that reaches `setsid` children means walking the cgroup, since `cgroup.kill` only sends KILL.
    - Once T3 writes `stopped`, today's attach-relaunch path (which keys on `Active` with no host) must keep working until T6. If it can't, T3 and T6 become one PR of about 1.4k lines, over the ceiling.
-7. **T9, the unification, is indivisible and changes what users see:**
+7. **The unification (T42, T9, T43) changes what users see, and T43 is the riskiest move in S2:**
    - task boxes are retained;
    - Ctrl-C and client loss no longer end a run;
-   - the shell-exit prompt goes away.
+   - the shell-exit prompt goes away;
+   - task resolution (args binding, `inherit_cwd`, env) moves from the daemon's `TaskExec` into the client's spec, and an own-IP task stops being a second process beside a session's.
 
-   It is safe only after S1's prune exists.
+   It is safe only after S1's prune exists. If T43 outgrows its estimate, the split is the client change first, then removing `end_run_box` and the old path.
 8. **T5 and T21 leave two sources of truth.** Until T21, the daemon composes from the uploaded minimal.toml while also storing the client's spec. T21's cutover (with `build_composables` fed from the spec) is estimated at M and is the PR most likely to become L+.
 9. **T18 turns unknown keys from a warning into exit 3.** That breaks every minimal.toml with a stray key. T17 makes `interactive = true` fail, and `crates/mctx/testdata/*` use it, so T17 may also touch mctx.
 10. **T1 and T12 sit near the ceiling (800–840):**
@@ -342,7 +351,8 @@ By size that is 20 L, 13 M and 8 S.
 - **Z002** (T34 exists only to feed T35): the linter flags T34 as a candidate to fold into T35. Kept separate on purpose: a pure move and a real change in one PR is the diff nobody can review.
 - **F004 ×5:** `session.rs` and `session_host.rs` keep their tests in sibling `tests.rs` files.
   - T38 and T39 move code only, so they add no tests there.
-  - T3, T6 and T9 are unchanged from revision 1.
+  - T3 and T6 are unchanged from revision 1.
+  - T42 changes `session.rs` and puts its test in `session_host/tests.rs`, where the launcher's tests live.
 - **O003 + O004 ×7** (T34, T36, T37, T38, T39, T40, T41): their diagnostics and observability lines are "none: a pure move/rename changes no runtime behaviour". This is right for moves and renames. T35 is not on this list, because it adds a span per step.
 - **O004** (T27): unchanged from revision 1.
 
