@@ -2951,6 +2951,31 @@ const SOCKETCALL_SOCKETPAIR: u32 = 8;
 /// This program is the first instalment of the seccomp profile applied
 /// inside boxes (architecture.md AT9, open gap 2): the family list is
 /// published here, reviewable where the design promised it.
+/// The address families `seal` admits, in the order the verdict tail
+/// compares them. No seal lists `AF_VSOCK`: the family reaches the host
+/// whatever network namespace the caller sits in, so the VM host's vsock
+/// doors (the guest daemon's telemetry port among them, spec 25 TEL-034)
+/// are the guest daemon's alone.
+#[cfg(target_os = "linux")]
+const fn admitted_families(seal: network::SocketSeal) -> &'static [u32] {
+    match seal {
+        network::SocketSeal::Full => &[
+            libc::AF_UNIX as u32,
+            libc::AF_INET as u32,
+            libc::AF_INET6 as u32,
+            libc::AF_NETLINK as u32,
+        ],
+        network::SocketSeal::UnixOnly => &[libc::AF_UNIX as u32],
+        network::SocketSeal::ConfinedFamilies => &[
+            libc::AF_UNIX as u32,
+            libc::AF_INET as u32,
+            libc::AF_INET6 as u32,
+            libc::AF_NETLINK as u32,
+            libc::AF_PACKET as u32,
+        ],
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn build_socket_family_filter(seal: network::SocketSeal) -> SocketFamilyFilter {
     // Return EAFNOSUPPORT for a socket() or socketpair() the seal refuses.
@@ -2983,22 +3008,7 @@ fn build_socket_family_filter(seal: network::SocketSeal) -> SocketFamilyFilter {
     // box can use its own loopback; the confined-families seal adds
     // `AF_PACKET` (refused by the missing `CAP_NET_RAW` no box holds, per
     // NET-083, not by this filter).
-    let admitted: &[u32] = match seal {
-        network::SocketSeal::Full => &[
-            libc::AF_UNIX as u32,
-            libc::AF_INET as u32,
-            libc::AF_INET6 as u32,
-            libc::AF_NETLINK as u32,
-        ],
-        network::SocketSeal::UnixOnly => &[libc::AF_UNIX as u32],
-        network::SocketSeal::ConfinedFamilies => &[
-            libc::AF_UNIX as u32,
-            libc::AF_INET as u32,
-            libc::AF_INET6 as u32,
-            libc::AF_NETLINK as u32,
-            libc::AF_PACKET as u32,
-        ],
-    };
+    let admitted = admitted_families(seal);
 
     // Offsets into struct seccomp_data in bytes:
     //   int nr;                  // 0
@@ -4425,6 +4435,56 @@ ff02::2\tip6-allrouters
             );
         }
         assert_eq!(run(libc::AF_VSOCK), refuse);
+    }
+
+    /// No seal admits `AF_VSOCK`: a box, in any network mode, cannot open
+    /// a vsock socket, so the VM host's guest-to-host doors (the guest
+    /// daemon's telemetry port, spec 25 TEL-034) hear from the guest daemon
+    /// alone.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn no_seal_admits_af_vsock() {
+        for seal in [
+            network::SocketSeal::Full,
+            network::SocketSeal::UnixOnly,
+            network::SocketSeal::ConfinedFamilies,
+        ] {
+            let admitted = admitted_families(seal);
+            assert!(
+                !admitted.contains(&(libc::AF_VSOCK as u32)),
+                "{seal:?} admits AF_VSOCK: {admitted:?}"
+            );
+            assert!(admitted.contains(&(libc::AF_UNIX as u32)), "{seal:?}");
+        }
+    }
+
+    /// The refusal itself, not only the family list: every seal's filter
+    /// answers `socket(AF_VSOCK, ..)` with `EAFNOSUPPORT`, the
+    /// `ConfinedFamilies` seal the isolated and host plans run under as well
+    /// as the `none` plan's. The guest telemetry door in `minvmd` trusts a
+    /// vsock connection as the guest daemon's on this (spec 25 TEL-034).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn every_seal_refuses_a_vsock_socket() {
+        let refuse = libc::SECCOMP_RET_ERRNO | (libc::EAFNOSUPPORT as u32);
+        for seal in [
+            network::SocketSeal::Full,
+            network::SocketSeal::UnixOnly,
+            network::SocketSeal::ConfinedFamilies,
+        ] {
+            let filter = build_socket_family_filter(seal);
+            assert_eq!(
+                run_seccomp_program(
+                    &filter.program,
+                    libc::SYS_socket as u32,
+                    AUDIT_ARCH,
+                    libc::AF_VSOCK as u32,
+                    0
+                ),
+                refuse,
+                "{seal:?}: socket(AF_VSOCK) must fail with EAFNOSUPPORT"
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]

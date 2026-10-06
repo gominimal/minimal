@@ -338,6 +338,11 @@ impl VmConfig {
         let guest_env = crate::telemetry::guest_env(
             |k| std::env::var(k).ok(),
             mlog::otel::telemetry_enabled(),
+            // The forward port crosses when the supervisor bound the door
+            // this child registers the port for (TEL-034).
+            std::env::var_os(crate::guest_telemetry::GUEST_TELEMETRY_SOCK_ENV)
+                .filter(|p| !p.is_empty())
+                .map(|_| crate::guest_telemetry::VSOCK_TELEMETRY_PORT),
             std::env::var(minimald_rpc::trace::TRACEPARENT_ENV)
                 .ok()
                 .as_deref(),
@@ -1804,6 +1809,103 @@ mod tests {
         }
         // With no tokens the line is logged unchanged.
         assert_eq!(loggable_boot_line(&base, &[]), base.as_ref());
+    }
+
+    /// Plan T15, the part that needs no VM (spec 25 TEL-033): the boot line
+    /// the VMM child composes from a host environment holding every
+    /// telemetry setting (endpoints with credentials, headers, a
+    /// certificate path, resource attributes, a filter, a signal off, the
+    /// spool off) adds only allowlisted keys to the base line, carries no
+    /// endpoint, header or credential, and names the forward port and the
+    /// caller's trace. With telemetry off the line is byte for byte the
+    /// line composed with no telemetry environment at all, whatever that
+    /// environment holds. `otel_integration`'s VM test checks the same on
+    /// a booted guest.
+    #[test]
+    fn the_boot_line_carries_only_allowlisted_settings_and_off_is_byte_identical() {
+        /// TEL-033's allowlist: the switch, the spool, the filter, a
+        /// signal turned off, the forward port and the trace context.
+        const ALLOWED: &[&str] = &[
+            "MINIMAL_TELEMETRY",
+            "MINIMAL_OTEL_SPOOL",
+            "MINIMAL_OTEL_FILTER",
+            "MINIMAL_OTEL_TRACES_EXPORTER",
+            "MINIMAL_OTEL_LOGS_EXPORTER",
+            "MINIMAL_OTEL_FORWARD",
+            "TRACEPARENT",
+        ];
+        const TP: &str = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+        let vars: &[(&str, &str)] = &[
+            ("MINIMAL_TELEMETRY", "1"),
+            ("MINIMAL_OTEL_SPOOL", "0"),
+            ("MINIMAL_OTEL_FILTER", "info,minimald=debug"),
+            ("MINIMAL_OTEL_LOGS_EXPORTER", "none"),
+            (
+                "MINIMAL_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+                "https://u:s3cr3tPW@collector.example:4318/v1/traces",
+            ),
+            ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://10.77.0.1:4318"),
+            ("MINIMAL_OTEL_EXPORTER_OTLP_HEADERS", "x-key=s3cr3tKEY1"),
+            (
+                "OTEL_EXPORTER_OTLP_HEADERS",
+                "authorization=Bearer%20s3cr3tTOK",
+            ),
+            ("OTEL_EXPORTER_OTLP_CERTIFICATE", "/etc/ssl/collector.pem"),
+            ("OTEL_RESOURCE_ATTRIBUTES", "team=x"),
+            ("OTEL_SERVICE_NAME", "renamed"),
+        ];
+        let get = |k: &str| {
+            vars.iter()
+                .find(|(n, _)| *n == k)
+                .map(|(_, v)| (*v).to_owned())
+        };
+        let base = kernel_cmdline(Some("info"), Some(7654), Some(42), false);
+
+        let tokens = crate::telemetry::guest_env(get, true, Some(7353), Some(TP));
+        let on = with_guest_env(base.clone(), &tokens);
+        let added = on
+            .strip_prefix(base.as_ref())
+            .unwrap_or_else(|| panic!("the base line is kept as it was: {on}"));
+        let keys: Vec<&str> = added
+            .split_whitespace()
+            .map(|w| w.split_once('=').map_or(w, |(k, _)| k))
+            .collect();
+        for key in &keys {
+            assert!(ALLOWED.contains(key), "{key} is not allowlisted: {on}");
+        }
+        for wanted in ["MINIMAL_TELEMETRY", "MINIMAL_OTEL_FORWARD", "TRACEPARENT"] {
+            assert!(keys.contains(&wanted), "{wanted} missing: {on}");
+        }
+        for leak in [
+            "ENDPOINT",
+            "HEADERS",
+            "CERTIFICATE",
+            "RESOURCE",
+            "SERVICE_NAME",
+            "s3cr3t",
+            "10.77.0.1",
+            "collector.example",
+            "x-key",
+            "/etc/ssl",
+            "team=x",
+            "renamed",
+        ] {
+            assert!(!on.contains(leak), "{leak} reached the boot line: {on}");
+        }
+
+        // Off: the same environment, or none, adds not one byte.
+        let none = |_: &str| None;
+        for off in [
+            crate::telemetry::guest_env(get, false, Some(7353), Some(TP)),
+            crate::telemetry::guest_env(none, false, Some(7353), Some(TP)),
+            crate::telemetry::guest_env(none, false, None, None),
+        ] {
+            assert_eq!(
+                with_guest_env(base.clone(), &off).as_bytes(),
+                base.as_bytes(),
+                "telemetry off changed the boot line"
+            );
+        }
     }
 
     #[test]

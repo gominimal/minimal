@@ -228,6 +228,9 @@ tempfile = "3.27"
 tokio = { version = "1.53", features = ["full"] }
 tokio-stream = "0.1"
 tokio-vsock = "0.7"
+# The blocking AF_VSOCK stream the guest daemon's telemetry sender writes
+# the host over (`minimald::telemetry_forward`), tokio-vsock's own base.
+vsock = "0.5"
 tokio-util = "0.7"
 toml = "1.1"
 toml_edit = "0.25"

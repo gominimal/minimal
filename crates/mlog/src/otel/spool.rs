@@ -1282,7 +1282,7 @@ fn attrs_json<'a>(out: &mut String, kvs: impl Iterator<Item = (&'a Key, &'a Valu
     });
 }
 
-fn resource_json(r: &Resource) -> String {
+pub(crate) fn resource_json(r: &Resource) -> String {
     let mut out = String::from("{\"attributes\":");
     attrs_json(&mut out, r.iter());
     out.push('}');

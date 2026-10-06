@@ -629,6 +629,27 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
         })
         .ok();
 
+    // The guest telemetry door (TEL-034): bound only with telemetry on,
+    // and handed to the VMM child the same way, so the guest daemon's
+    // records reach this process's exporter and spool over the vsock
+    // bridge and the guest needs no endpoint. Best-effort like the doors
+    // above: a bind failure is warned and the VM boots without it, and the
+    // guest then spools alone (TEL-046).
+    let guest_telemetry_door = if mlog::otel::telemetry_enabled() {
+        crate::control::resolve_control_sock()
+            .and_then(|sock_path| crate::guest_telemetry::spawn_guest_telemetry_door(&sock_path))
+            .inspect_err(|error| {
+                tracing::warn!(
+                    %error,
+                    "failed to bind the guest telemetry door; the guest daemon's telemetry \
+                     stays in the guest's own spool"
+                );
+            })
+            .ok()
+    } else {
+        None
+    };
+
     // The host answerer (NET-138): the box zone's answerer on the host
     // loopback, answering from this host-authored table — the same
     // semantics the native daemon's answerer gives, over the same shared
@@ -927,6 +948,9 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
         // names. A redraw hands the same door to the fresh boot.
         if let Some((name, path)) = guest_report_door.as_ref() {
             cmd.env(name, path);
+        }
+        if let Some(path) = guest_telemetry_door.as_ref() {
+            cmd.env(crate::guest_telemetry::GUEST_TELEMETRY_SOCK_ENV, path);
         }
         child = cmd
             .env(MARKER_SOCK_ENV, &marker_sock_path)
@@ -1239,6 +1263,13 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
 
     // ── Phase 3: Supervise until VMM child exits ─────────────────────────────
     let status = child.wait().context("waiting for VMM child")?;
+    // The VM is gone, so the guest telemetry door's connection ends: let
+    // the door hand the guest's last records (its shutdown) to the host's
+    // endpoint before this process exits, bounded (TEL-034). The spool
+    // already holds them either way.
+    if guest_telemetry_door.is_some() {
+        crate::guest_telemetry::drain_at_exit(crate::guest_telemetry::DRAIN_AT_EXIT);
+    }
     // The VM is gone, so no answer to a pending ask can still matter: each
     // is cancelled and audited before the supervisor exits (NET-045).
     crate::control::stop_pending_asks(&boxes);

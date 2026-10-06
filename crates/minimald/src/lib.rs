@@ -28,6 +28,8 @@ pub mod session_sop;
 mod sessions;
 mod sftp;
 mod store;
+#[cfg(target_os = "linux")]
+pub mod telemetry_forward;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_harness;
 pub mod traced;
