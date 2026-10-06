@@ -828,8 +828,8 @@ impl HostnameRegistry {
     /// an address the publish surface cannot bind, so every forward the box
     /// would bind there fails with `EADDRNOTAVAIL`. The name rides along
     /// because the move re-registers the box's route at the interim; a
-    /// publish whose session holds no registered name (a stopped box, one
-    /// whose name another session took over) is not listed — its next
+    /// publish whose session holds no registered name (one whose name
+    /// another session took over) is not listed — its next
     /// finalize is the moment its ask runs again, through the verdict-gated
     /// reads the session actor makes.
     #[must_use]
@@ -856,9 +856,10 @@ impl HostnameRegistry {
     /// hand for a box a creator handed one (never a grant from the pool: a
     /// hand is only ever replaced by `127.0.0.1`), to a grant for a box
     /// nobody handed an address. Each row carries the hand with it, so the
-    /// sweep's move needs no second read. A box whose publish the landing
-    /// misses, because it was stopped across the landing, asks again at its
-    /// next finalize, which does not short-circuit on the interim either.
+    /// sweep's move needs no second read. A stopped box keeps its name, so
+    /// the landing moves it too, its stopped marker intact. A box whose
+    /// publish the landing misses asks again at its next finalize, which
+    /// does not short-circuit on the interim either.
     #[must_use]
     pub fn interim_own_publishes(&self) -> Vec<InterimPublish> {
         self.own_published

@@ -1568,18 +1568,20 @@ impl Session {
     /// the address returns to the host's pool (NET-010) and every later
     /// lookup of the name answers NXDOMAIN (NET-012).
     ///
-    /// A stop is not that: a stopped box still exists — its session record
-    /// survives, and a resume brings the same box back — so `for_good` is
-    /// the destroy paths' alone. A stop withdraws the name's route and
-    /// keeps both halves of the publish, the registry's row and the
-    /// answerer's grant (NET-013: the box's address is its own from
-    /// finalize to destroy, and a stopped box that resumes must find the
-    /// same address waiting, whether the same daemon or a restarted one
-    /// answers — a stop that released the grant would hand the address to
-    /// the next box to finalize and leave the resumed one published
-    /// somewhere else). Shutdown stops every session the same way, which is
-    /// how the grant a restarted daemon re-derives from the answerer's
-    /// record is the very one the box held before the restart.
+    /// `for_good` is the destroy paths' alone; `for_good = false` is the
+    /// rename path, which withdraws the route and re-registers it against
+    /// the same lease. A stop does not come here: a stopped box still
+    /// exists — its session record survives, and a resume brings the same
+    /// box back — so the Stop arm keeps the name's route and both halves of
+    /// the publish, the registry's row and the answerer's grant, and marks
+    /// the box stopped (NET-013: the box's address is its own from finalize
+    /// to destroy, and a stopped box that resumes must find the same
+    /// address waiting, whether the same daemon or a restarted one answers;
+    /// NET-128: the name stays held, answering NODATA while a
+    /// shared-address box is stopped). Shutdown stops every session the
+    /// same way, which is how the grant a restarted daemon re-derives from
+    /// the answerer's record is the very one the box held before the
+    /// restart.
     ///
     /// Gated on [`Self::owns_hostname_route`] rather than relying on the
     /// registry's no-op behavior: the registry is keyed by name alone, so an
