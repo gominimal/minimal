@@ -3326,6 +3326,71 @@ async fn destroyed_box_name_is_nxdomain() {
     );
 }
 
+/// NET-128 session path: a shared-address box stopped through the actor
+/// answers NODATA, not NXDOMAIN — the name stays held, so the zone never
+/// says the box never existed, but the node's own listener at that port
+/// must not answer for a dead box. The existing unit test
+/// `stopped_shared_address_box_is_nodata` calls `mark_stopped` directly;
+/// this test drives the actor's Stop path end-to-end.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stopped_shared_address_box_is_nodata_through_actor() {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let manager = server.state.sessions_manager().await;
+    manager.land_range_verdict(crate::net::dns::RangeVerdict::Present);
+    // The NODATA gate in zone_answer requires the box's address to equal the
+    // node's address (NET-128). After the verdict lands, the node address is
+    // the granted address from the loopback lease book — use it as the shared
+    // address so the stopped box triggers the NODATA path.
+    let shared = manager
+        .hostnames()
+        .read()
+        .expect("registry lock")
+        .node_address();
+    let id = finalize_handed_own_ip_session(
+        &mut client,
+        "sharedbox",
+        std::net::Ipv4Addr::new(100, 64, 128, 9),
+        shared,
+    )
+    .await;
+
+    // The name answers while the box runs.
+    let (_, address) = zone_answer_for(&server, "sharedbox.min.internal")
+        .await
+        .expect("the name answers while the box runs");
+    assert_eq!(
+        address, shared,
+        "the box's name answers at the shared address while it runs"
+    );
+
+    // Stop the box through the actor — the path the issue reports.
+    let handle = manager
+        .get_session(crate::sessions::SessionKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the box resolves while it runs");
+    handle.stop().await;
+
+    // The name is still held (not NXDOMAIN) but answers NODATA — the
+    // shared-address box is stopped, so the node's own listener at that
+    // port must not answer for a dead box.
+    let registry = server.state.sessions_manager().await.hostnames();
+    let entry = registry
+        .read()
+        .expect("registry lock")
+        .zone_entry("sharedbox.min.internal", &[]);
+    assert_eq!(
+        entry,
+        crate::net::dns::ZoneEntry::Held {
+            owner: "sharedbox".to_string(),
+            address: None,
+        },
+        "a stopped shared-address box answers NODATA, not NXDOMAIN"
+    );
+}
+
 /// NET-010's durability half (design §7.1): the hand is the record's row,
 /// not the daemon's memory — a creator wrote the box's addresses into the
 /// session's record at create, and the registry's publish is derived from
