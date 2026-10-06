@@ -1273,7 +1273,7 @@ async fn start_host_proxies(
     // Native (NET-122): the zone is answered by the machine's *one*
     // answerer, and this daemon is its client before it is its host. The
     // acquisition below decides publish-or-host — publish this daemon's
-    // rows into the manager-held `min-answerer` service over the
+    // rows into the manager-held `minzoned` service over the
     // machine-global channel when its channel answers, host the
     // single-operator interim itself only while no channel answers and
     // the hook port is free, never both — and its status cell feeds the

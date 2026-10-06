@@ -188,8 +188,8 @@ trap 'rm -rf "$workdir"' EXIT
 # name. Same mapping as the PKGBUILD's source arrays
 # (min::minimal-linux-amd64, ...), plus minvmd, which every staged row
 # carries — see the file-list decision in packaging/nfpm.yaml's header.
-# min-answerer carries the same rule: it packages beside `min` as
-# /usr/bin/min-answerer (the copy source NET-122's session advisory finds),
+# minzoned carries the same rule: it packages beside `min` as
+# /usr/bin/minzoned (the copy source NET-122's session advisory finds),
 # root-owned like the other packaged binaries, and nothing here installs or
 # enables the answerer service — the advisory's privileged step stays the
 # one privileged step, so a package never writes the unit files or plist.
@@ -199,17 +199,17 @@ ARTIFACTS=(
     "mip|mip"
     "minvmd|minvmd"
     "gvproxy|gvproxy-min"
-    "min-answerer|min-answerer"
+    "minzoned|minzoned"
 )
 artifacts_root="$workdir/artifacts"
 
 # Artifacts whose absence warns and packages without them instead of failing.
 # TEMPORARY (gominimal/inbox#899), the same rule as stage-release.sh's
-# OPTIONAL_COMPONENTS: the frozen release.yml does not build min-answerer yet,
+# OPTIONAL_COMPONENTS: the frozen release.yml does not build minzoned yet,
 # so a versioned release must still package. A package built without it drops
-# the config's marked min-answerer block (see packaging/nfpm.yaml). Empty this
+# the config's marked minzoned block (see packaging/nfpm.yaml). Empty this
 # list once release.yml uploads the artifact.
-OPTIONAL_ARTIFACTS=(min-answerer)
+OPTIONAL_ARTIFACTS=(minzoned)
 
 # is_optional <staged-name> — whether a missing artifact only warns.
 is_optional() {
