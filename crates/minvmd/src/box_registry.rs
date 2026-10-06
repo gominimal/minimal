@@ -90,6 +90,11 @@ const ALLOW_ALL_SUBNET: &str = "0.0.0.0/0";
 /// whether a row goes with its report.
 type WithdrawalReport = Vec<[u8; 4]>;
 
+/// The subscribers to row withdrawals: one sender per subscriber, each told
+/// the switch address of every row the registry removes. Shared by the
+/// registry and every [`BoxTable`] it hands out.
+type RowWithdrawals = Arc<Mutex<Vec<tokio::sync::mpsc::UnboundedSender<[u8; 4]>>>>;
+
 /// The guest node namespace's name in the table: the in-VM daemon, whose own
 /// root-netns tap [`BoxRegistry::register_node_namespace`] publishes.
 const NODE_NAMESPACE: &str = "minimald";
@@ -1617,6 +1622,10 @@ pub struct BoxRegistry {
     /// The receiving end, taken once — by [`Self::spawn_withdrawal_drainer`]
     /// or, in tests, by whatever wants to read the reports directly.
     withdrawal_reports_rx: Mutex<Option<std::sync::mpsc::Receiver<WithdrawalReport>>>,
+    /// The row-withdrawal subscribers ([`BoxTable::subscribe_row_withdrawals`]):
+    /// told the switch address of every row removed, whichever path removed
+    /// it. The egress gate subscribes, to unbind a withdrawn box's forwards.
+    row_withdrawals: RowWithdrawals,
     /// The next switch address the client-driven allocation hands out,
     /// shared by every clone of this registry. Draws from the hand-out run
     /// — the plan run's upper half, above the daemon's self-allocation
@@ -1664,6 +1673,7 @@ impl Clone for BoxRegistry {
             table_pings: Arc::clone(&self.table_pings),
             withdrawal_reports: self.withdrawal_reports.clone(),
             withdrawal_reports_rx: Mutex::new(None),
+            row_withdrawals: Arc::clone(&self.row_withdrawals),
             next_switch_addr: Arc::clone(&self.next_switch_addr),
             #[cfg(test)]
             next_loopback_addr: Arc::clone(&self.next_loopback_addr),
@@ -1691,6 +1701,7 @@ impl BoxRegistry {
             table_pings: Arc::new(Mutex::new(Vec::new())),
             withdrawal_reports: reports,
             withdrawal_reports_rx: Mutex::new(Some(reports_rx)),
+            row_withdrawals: Arc::new(Mutex::new(Vec::new())),
             next_switch_addr: Arc::new(AtomicU32::new(hand_out_run(subnet).0)),
             #[cfg(test)]
             next_loopback_addr: Arc::new(AtomicU32::new(
@@ -2119,10 +2130,16 @@ impl BoxRegistry {
     }
 
     /// Retires a removed row's side facts: its pending asks are cancelled
-    /// (NET-045), its stopped mark is stale with the row gone, and the
-    /// change is a ping like any other.
+    /// (NET-045), its stopped mark is stale with the row gone, the
+    /// row-withdrawal subscribers are told its address (design §7.1: the
+    /// gate unbinds the box's forwards), and the change is a ping like any
+    /// other.
     fn retired(&self, removed: &Option<Arc<BoxRecord>>) {
         if let Some(record) = removed {
+            self.row_withdrawals
+                .lock()
+                .expect("the withdrawal subscribers' lock is held only across pushes and sends")
+                .retain(|subscriber| subscriber.send(record.switch_addr.octets()).is_ok());
             // The row's pending asks go with it (NET-045): with no grant
             // left to publish under, each ends cancelled, and its guest's
             // serving thread audits the cancellation it receives.
@@ -2553,6 +2570,7 @@ impl BoxRegistry {
             rows: Arc::clone(&self.rows),
             subnet: self.subnet,
             withdrawal_reports: self.withdrawal_reports.clone(),
+            row_withdrawals: Arc::clone(&self.row_withdrawals),
         }
     }
 }
@@ -2623,9 +2641,30 @@ pub struct BoxTable {
     rows: Arc<RwLock<Rows>>,
     subnet: SwitchSubnet,
     withdrawal_reports: std::sync::mpsc::Sender<WithdrawalReport>,
+    row_withdrawals: RowWithdrawals,
 }
 
 impl BoxTable {
+    /// Subscribes to row withdrawals: the receiver gets the switch address
+    /// of every row the registry removes from here on, whichever path
+    /// removed it (the drainer's [`BoxRegistry::withdraw`] or the creator's
+    /// [`BoxRegistry::withdraw_client_box`]). Like the withdrawal report,
+    /// this is a fact the host observed, never a row operation: the
+    /// subscriber learns that a box ended and cannot add, replace or
+    /// withdraw a row. The egress gate subscribes, so that it unbinds a
+    /// withdrawn box's forwards and terminates their connections (design
+    /// §7.1, host-side ingress revocation). A subscriber that drops its
+    /// receiver is pruned on the next withdrawal.
+    #[must_use]
+    pub fn subscribe_row_withdrawals(&self) -> tokio::sync::mpsc::UnboundedReceiver<[u8; 4]> {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        self.row_withdrawals
+            .lock()
+            .expect("the withdrawal subscribers' lock is held only across pushes and sends")
+            .push(sender);
+        receiver
+    }
+
     /// The published namespace holding the switch address `src`, when one
     /// does. This is the whole of the gate's per-frame routing: an address a
     /// row holds is decided by that row's rules, and an address no row holds
@@ -3216,6 +3255,48 @@ mod tests {
                 crate::bep_attach::BoxIdText(&web.box_id())
             )),
             "the warn line names the colliding id, got: {logged}"
+        );
+    }
+
+    /// A row-withdrawal subscriber is told every removed row's address,
+    /// whichever path removed it: the drainer's withdrawal and the
+    /// creator's. A withdrawal that removes nothing tells it nothing, and a
+    /// subscriber that dropped its receiver is pruned without failing the
+    /// withdrawal.
+    #[test]
+    fn row_withdrawals_reach_every_subscriber_by_either_path() {
+        let registry = BoxRegistry::new(SUBNET);
+        let spec = |name: &str| ClientBoxSpec {
+            name: name.to_string(),
+            ingress_ports: vec![8080],
+            egress: None,
+            credentialed_upstream: None,
+            dynamic_ingress: None,
+            dynamic_allowed_range: None,
+        };
+        let mut withdrawn = registry.table().subscribe_row_withdrawals();
+        drop(registry.table().subscribe_row_withdrawals());
+        let web = registry
+            .register_client_box(spec("web"))
+            .expect("the plan has an address for the first box");
+        let db = registry
+            .register_client_box(spec("db"))
+            .expect("the plan has an address for the second box");
+
+        assert!(registry.withdraw(web.switch_addr()).is_some());
+        assert!(registry.withdraw(web.switch_addr()).is_none());
+        assert!(
+            registry
+                .withdraw_client_box("db", db.switch_addr(), db.loopback_addr())
+                .expect("the withdrawing client is the row's creator")
+                .is_some()
+        );
+
+        assert_eq!(withdrawn.try_recv(), Ok(web.switch_addr().octets()));
+        assert_eq!(withdrawn.try_recv(), Ok(db.switch_addr().octets()));
+        assert!(
+            withdrawn.try_recv().is_err(),
+            "a withdrawal that removed nothing told the subscriber nothing"
         );
     }
 
