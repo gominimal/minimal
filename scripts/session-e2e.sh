@@ -17990,16 +17990,17 @@ proof_expose_from_inside_box() {
     # Whether a `minvmd status --row` answer is the box's row at its switch
     # address (the one its registration named) with the expose's port in its
     # runtime set.
-    eib_vm_row_holds() {
+    eib_vm_row_holds() { # $1 row, $2 switch address, $3 port (default $eib_port)
+      local p="${3:-$eib_port}"
       [ -n "$2" ] && [[ "$1" == *" switch $2 "* ]] || return 1
-      [[ "$1" =~ runtime\ \[([0-9]+,)*$eib_port(,[0-9]+)*\] ]]
+      [[ "$1" =~ runtime\ \[([0-9]+,)*$p(,[0-9]+)*\] ]]
     }
     # The admission line the VM host audit owes a report a host admitted
     # (T84): the box, the port with its ending delimiter, and the source the
     # report carried — an expose's is 'expose'.
-    eib_vm_admission_line() { # $1 box
+    eib_vm_admission_line() { # $1 box, $2 port (default $eib_port)
       grep -F "\"box\":\"$1\"" "$eib_vm_audit" 2>/dev/null \
-        | grep -E "\"port\":${eib_port}[,}]" \
+        | grep -E "\"port\":${2:-$eib_port}[,}]" \
         | grep -F '"source":"expose"' | tail -n1
     }
     # The named VM's own CLI surface, exactly as a user types it
@@ -18380,7 +18381,7 @@ exit" E2E_PTY_ANSWER=keep \
       eib_two_row=""
       for _ in $(seq 1 40); do
         eib_two_row="$(minvmd --vm "$eib_two_vm" status --row "$eib_two_name" 2>/dev/null || true)"
-        if eib_vm_row_holds "$eib_two_row" "$eib_two_switch"; then break; fi
+        if eib_vm_row_holds "$eib_two_row" "$eib_two_switch" "$eib_two_port"; then break; fi
         eib_two_row=""
         sleep 0.25
       done
