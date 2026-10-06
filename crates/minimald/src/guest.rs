@@ -30,6 +30,13 @@ use tokio_vsock::{VMADDR_CID_HOST, VsockAddr, VsockStream};
 /// booted. The host listens here for the one-shot `READY` marker.
 const BOOT_MARKER_PORT: u32 = 7350;
 
+/// The VM-wide PTY pool the guest init raises `kernel.pty.max` to. Each box's
+/// devpts is capped at [`sandbox2::config::BOX_PTY_MAX`] by its own remount,
+/// but every instance still draws from the one kernel-wide counter, so the
+/// pool must be large enough for several boxes at their cap plus the session
+/// host's own shells. 65536 is a working value.
+const GUEST_PTY_MAX: u32 = 65536;
+
 // ── The node port the boot line hands the daemon ────────────────────────
 
 /// Boot token the VM host puts on the kernel command line to hand the guest
@@ -57,6 +64,31 @@ pub const HANDED_PROXY_PORT_TOKEN: &str = "MINIMALD_HOSTNAME_PROXY_PORT";
 /// ([`HandedPortError`]), never a fallback.
 pub fn handed_proxy_port() -> Result<Option<u16>, HandedPortError> {
     handed_port(HANDED_PROXY_PORT_TOKEN)
+}
+
+/// Boot token the VM host puts beside [`HANDED_PROXY_PORT_TOKEN`] to hand the
+/// guest daemon its boot's publish generation (T93): a value the host draws
+/// fresh for every boot and the daemon echoes in every publish report, so
+/// the host tells this boot's report from a killed boot's even when both
+/// were handed the same port. Mirrors the token `minvmd`'s `vm.rs` writes —
+/// keep the two in step.
+pub const HANDED_PUBLISH_GENERATION_TOKEN: &str = "MINIMALD_PUBLISH_GENERATION";
+
+/// The publish generation the VM host handed this boot, if it handed one: an
+/// older minvmd hands none, and a value that does not parse is treated the
+/// same way — the report then goes out without one, which the host reads as
+/// an older guest's, never as another boot's.
+pub fn handed_publish_generation() -> Option<u64> {
+    parse_publish_generation(
+        std::env::var(HANDED_PUBLISH_GENERATION_TOKEN)
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Decodes a handed publish generation from its raw boot-token value.
+fn parse_publish_generation(raw: Option<&str>) -> Option<u64> {
+    raw?.trim().parse::<u64>().ok()
 }
 
 /// A boot token the host put a port on that does not carry one (NET-025):
@@ -346,6 +378,20 @@ pub fn enter_rootfs(device: &str) -> std::io::Result<()> {
         if let Err(e) = std::os::unix::fs::symlink("pts/ptmx", &ptmx) {
             tracing::warn!(error = %e, "linking /dev/ptmx -> pts/ptmx; interactive PTY sessions may fail");
         }
+    }
+
+    // Raise the VM-wide PTY pool so several boxes at their per-instance cap
+    // still fit. Each box's devpts is remounted with `max=<BOX_PTY_MAX>` in
+    // its pre-exec step, but the guest's own devpts (mounted above) and every
+    // box draw from the one kernel-wide counter bounded by `kernel.pty.max`
+    // minus `kernel.pty.reserve`; the kernel default (4096) leaves room for
+    // only a few boxes at their cap. Best-effort: a guest that cannot raise
+    // it still boots, just with the smaller shared pool.
+    if let Err(e) = std::fs::write(
+        format!("{NEWROOT}/proc/sys/kernel/pty/max"),
+        format!("{GUEST_PTY_MAX}\n"),
+    ) {
+        tracing::warn!(error = %e, "raising kernel.pty.max; several boxes at their PTY cap may exhaust the shared pool");
     }
 
     // NET-079: cgroup2, mounted with `nsdelegate` so the cgroup namespace a
@@ -1069,6 +1115,55 @@ fn set_nofile_limit(soft: libc::rlim_t, hard: libc::rlim_t) -> std::io::Result<(
         .ok_or_else(std::io::Error::last_os_error)
 }
 
+/// The VM-wide kernel settings the microVM's init writes at boot, as paths
+/// under `/proc/sys` and the values written to them.
+///
+/// Every box maps onto the daemon's one kernel uid, so these are shared by all
+/// the sessions on the VM, and the kernel defaults are sized for one user:
+///
+/// * inotify. Every watcher in every box (dev servers, `tsc --watch`, language
+///   servers) charges the same per-uid counters, which default to 128
+///   instances and a watch count scaled to 1% of guest RAM (~31k on a 4 GiB
+///   guest). One session's watchers would exhaust them for every other
+///   session. 8192 instances and 524288 watches are the common dev-machine
+///   values. They are ceilings, not reservations: a watch costs about 1 KiB of
+///   kernel memory on 64-bit only while it exists, charged to the memory cgroup
+///   of the box holding it, so the full 524288 (~512 MiB) is reached only by
+///   boxes that actually watch that many files.
+/// * the kernel log. With `dmesg_restrict` at 0 any box can read the VM's
+///   kernel log, which names other boxes' processes (OOM-kill records among
+///   them). At 1, reading it needs `CAP_SYSLOG`, which no box holds.
+pub const MICROVM_SYSCTLS: &[(&str, &str)] = &[
+    ("fs/inotify/max_user_instances", "8192"),
+    ("fs/inotify/max_user_watches", "524288"),
+    ("kernel/dmesg_restrict", "1"),
+];
+
+/// Writes [`MICROVM_SYSCTLS`] through `/proc/sys`. Best effort: a setting the
+/// kernel refuses is logged and the rest are still applied, since the kernel
+/// default is the prior behaviour, not a reason to refuse to boot.
+pub fn apply_microvm_sysctls() {
+    for (path, error) in write_sysctls(std::path::Path::new("/proc/sys"), MICROVM_SYSCTLS) {
+        tracing::warn!(sysctl = path, error = %error, "could not apply a VM-wide kernel setting");
+    }
+}
+
+/// Writes each `(path, value)` under `root`, continuing past failures, and
+/// returns the ones that failed.
+fn write_sysctls(
+    root: &std::path::Path,
+    settings: &[(&'static str, &str)],
+) -> Vec<(&'static str, std::io::Error)> {
+    settings
+        .iter()
+        .filter_map(|&(path, value)| {
+            std::fs::write(root.join(path), value)
+                .err()
+                .map(|e| (path, e))
+        })
+        .collect()
+}
+
 const NANOS_IN_SECOND: u64 = 1_000_000_000;
 
 /// How far the guest's `CLOCK_REALTIME` may sit from the host's before we step
@@ -1252,7 +1347,6 @@ pub async fn run_timekeep_listener(port: u32) -> std::io::Result<std::convert::I
 /// the caller continues without egress.
 pub async fn bring_up_root_egress() -> std::io::Result<crate::net::switch::SwitchRelay> {
     use crate::net::{DEFAULT_SUBNET, VSOCK_GVPROXY_SHUTTLE_PORT, VSOCK_HOST_CID, switch};
-    use std::net::Ipv4Addr;
 
     const TAP: &str = "eth0";
     let ip = DEFAULT_SUBNET.daemon_ip();
@@ -1268,7 +1362,7 @@ pub async fn bring_up_root_egress() -> std::io::Result<crate::net::switch::Switc
     // ships no `ip`/iproute2 binary, so shelling out is not an option.
     configure_interface_v4(TAP, ip, DEFAULT_SUBNET.prefix(), Some(gateway))?;
     // Bring loopback up too (no address/route needed).
-    configure_interface_v4("lo", Ipv4Addr::LOCALHOST, 8, None)?;
+    bring_up_loopback()?;
 
     // Point the resolver at the switch's DNS server (gvproxy, at the gateway).
     // The rootfs is mounted read-only, so write to the writable /run tmpfs and
@@ -1316,6 +1410,19 @@ fn install_resolv_conf(nameserver: std::net::Ipv4Addr) -> std::io::Result<()> {
         return Err(std::io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// Brings the guest's `lo` up: the interface every loopback address the guest
+/// serves on lives on, and the one its kernel leaves down until something
+/// does this — the microVM's pid-1 has no service manager to bring it up for
+/// it, so until this runs a bind on `127.0.0.1` fails with `EADDRNOTAVAIL` on
+/// a guest whose local table does not carry the address while `lo` is down,
+/// and no connect to it has a route. No address and no route of its own: `lo`
+/// carries `127.0.0.1` the moment it comes up, and the flags ioctl this is
+/// made of is idempotent, so the egress step's own `lo` half and this one
+/// agree however often the boot runs them.
+pub fn bring_up_loopback() -> std::io::Result<()> {
+    configure_interface_v4("lo", std::net::Ipv4Addr::LOCALHOST, 8, None)
 }
 
 /// Assigns `ip`/`prefix` to `ifname`, brings it up, and (when `gateway` is set)
@@ -1526,6 +1633,15 @@ fn mount_if_absent(target: &str, source: &str, fstype: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The publish generation the host handed is echoed as handed; none
+    /// handed, or one that does not parse, is a report without one (T93).
+    #[test]
+    fn the_publish_generation_is_read_off_the_boot_line() {
+        assert_eq!(parse_publish_generation(Some("42")), Some(42));
+        assert_eq!(parse_publish_generation(None), None);
+        assert_eq!(parse_publish_generation(Some("not-a-generation")), None);
+    }
 
     /// The handed port is read off the environment the kernel passes
     /// through from the boot token: a present token parses, an absent one
@@ -1847,5 +1963,52 @@ mod tests {
             before.rlim_max,
             "an unreachable request must still leave us at the hard limit",
         );
+    }
+
+    /// The boot settings raise the shared inotify ceilings to the dev-machine
+    /// values and restrict the kernel log, all as paths relative to
+    /// `/proc/sys` (an absolute one would make `join` drop the root).
+    #[test]
+    fn the_boot_sysctls_widen_inotify_and_restrict_the_kernel_log() {
+        let settings: std::collections::HashMap<_, _> = MICROVM_SYSCTLS.iter().copied().collect();
+        assert_eq!(
+            settings.len(),
+            MICROVM_SYSCTLS.len(),
+            "no setting is listed twice"
+        );
+        assert_eq!(settings["fs/inotify/max_user_instances"], "8192");
+        assert_eq!(settings["fs/inotify/max_user_watches"], "524288");
+        assert_eq!(settings["kernel/dmesg_restrict"], "1");
+        assert!(
+            MICROVM_SYSCTLS
+                .iter()
+                .all(|(path, _)| !path.starts_with('/')),
+            "every path must be relative to /proc/sys",
+        );
+    }
+
+    /// Each setting is written to its file under the root, and one the kernel
+    /// refuses (here, a missing file) is reported without stopping the rest.
+    #[test]
+    fn sysctls_are_written_under_the_root_past_a_failure() {
+        let root = tempfile::tempdir().unwrap();
+        for dir in ["fs/inotify", "kernel"] {
+            std::fs::create_dir_all(root.path().join(dir)).unwrap();
+        }
+        let settings = [
+            ("fs/inotify/max_user_watches", "524288"),
+            ("vm/missing", "1"),
+            ("kernel/dmesg_restrict", "1"),
+        ];
+
+        let failed = write_sysctls(root.path(), &settings);
+
+        assert_eq!(
+            failed.iter().map(|(path, _)| *path).collect::<Vec<_>>(),
+            ["vm/missing"],
+        );
+        let read = |path: &str| std::fs::read_to_string(root.path().join(path)).unwrap();
+        assert_eq!(read("fs/inotify/max_user_watches"), "524288");
+        assert_eq!(read("kernel/dmesg_restrict"), "1");
     }
 }

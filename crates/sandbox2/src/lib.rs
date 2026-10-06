@@ -268,37 +268,14 @@ impl<C: Channel> Sandbox<C> {
                 std::os::unix::fs::symlink("lib", &out_usr_lib64)
                     .map_err(|e| Error::IO("create output usr/lib64 symlink", out_usr_lib64, e))?;
             }
-            WdSetup::BoundDir {
-                path: _,
-                fs_mappings,
-                read_only: _,
-            } => {
+            WdSetup::BoundDir { .. } => {
                 let rootfs_cwd = rootfs.join(config.wd.bound_dir_sandbox_cwd());
                 fs::create_dir_all(&rootfs_cwd)
                     .map_err(|e| Error::IO("create shadow cwd tree", rootfs_cwd, e))?;
-
-                // Create bind-mount targets
-                for m in fs_mappings {
-                    let sp = m.path_in_sandbox();
-                    let sp = match sp.strip_prefix("/") {
-                        Some(stripped) => stripped,
-                        None => &sp,
-                    };
-                    let p = rootfs.join(sp);
-
-                    if m.is_file {
-                        fs::create_dir_all(p.parent().unwrap())
-                            .map_err(|e| Error::IO("create mapping parent", p, e))?;
-                    } else {
-                        fs::create_dir_all(&p)
-                            .map_err(|e| Error::IO("create mapping target", p, e))?;
-                    }
-                }
             }
             WdSetup::Session {
-                home: _,
-                working: _,
                 working_name_override,
+                ..
             } => {
                 let rootfs_cwd = rootfs.join(
                     working_name_override
@@ -311,6 +288,24 @@ impl<C: Channel> Sandbox<C> {
                 let rootfs_home = rootfs.join(SESSION_HOME);
                 fs::create_dir_all(&rootfs_home)
                     .map_err(|e| Error::IO("create home", rootfs_home.clone(), e))?;
+            }
+        }
+
+        // Create bind-mount targets for the file mappings (none for an
+        // isolated working directory).
+        for m in config.wd.fs_mappings() {
+            let sp = m.path_in_sandbox();
+            let sp = match sp.strip_prefix("/") {
+                Some(stripped) => stripped,
+                None => &sp,
+            };
+            let p = rootfs.join(sp);
+
+            if m.is_file {
+                fs::create_dir_all(p.parent().unwrap())
+                    .map_err(|e| Error::IO("create mapping parent", p, e))?;
+            } else {
+                fs::create_dir_all(&p).map_err(|e| Error::IO("create mapping target", p, e))?;
             }
         }
 
@@ -1392,6 +1387,41 @@ fn exec_box_program(
     force_cover_fallback: bool,
     closure_report: Option<&Path>,
 ) -> ! {
+    // Cap the box's PTY count before the credentials drop: PTYs are a
+    // machine-wide pool, and the box's devpts instance was mounted without a
+    // per-instance `max=`, so it draws from the one kernel-wide counter and a
+    // single box can starve every other box and the session host's own
+    // shells. The remount needs CAP_SYS_ADMIN over this mount namespace,
+    // which the box's user namespace still holds here, as it does for the
+    // classifier cover below. Best-effort: a box whose remount is refused
+    // still runs, on the shared pool as today. A leaf-bearing box records the
+    // refusal on its cover line for the daemon to warn; a leaf-less box has
+    // no report to record it in, so its refusal goes unreported (no in-child
+    // log: this runs between fork and exec, where a subscriber lock held at
+    // fork never releases). The refusal rides on the cover line rather than
+    // a line of its own because the report holds one line, and a later line
+    // replaces an earlier one.
+    //
+    // A devpts remount resets every option it is not given, and a remount
+    // without MS_NOSUID/MS_NOEXEC clears those flags, so both the data and
+    // the flags restate what the box's devpts was mounted with.
+    // SAFETY: `mount(2)` with valid C strings; `data` carries the devpts
+    // options and is read for the duration of the call.
+    let devpts_refused = if unsafe {
+        libc::mount(
+            c"devpts".as_ptr(),
+            c"/dev/pts".as_ptr(),
+            c"devpts".as_ptr(),
+            libc::MS_REMOUNT | libc::MS_NOSUID | libc::MS_NOEXEC,
+            config::BOX_DEVPTS_REMOUNT_DATA.as_ptr().cast(),
+        )
+    } == -1
+    {
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        format!("; devpts max={} errno {errno}", config::BOX_PTY_MAX)
+    } else {
+        String::new()
+    };
     // The box's classifier leaf (NET-079), taken in the order the
     // confinement rests on: join first, *then* unshare the cgroup namespace,
     // so its root is the leaf the process just entered — the box's own view
@@ -1463,12 +1493,15 @@ fn exec_box_program(
                 let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
                 refused = Some(format!("errno {errno}"));
             } else {
-                write_closure_report(closure_report, "cover cgroup2");
+                write_closure_report(closure_report, &format!("cover cgroup2{devpts_refused}"));
                 set_box_cover_marker("cgroup2");
             }
         }
         if let Some(why) = refused {
-            write_closure_report(closure_report, &format!("cover tmpfs-fallback {why}"));
+            write_closure_report(
+                closure_report,
+                &format!("cover tmpfs-fallback {why}{devpts_refused}"),
+            );
             set_box_cover_marker("tmpfs-fallback");
             // SAFETY: `mount(2)` as above, with tmpfs, which takes no
             // options but the flags (an empty one is all the cover needs).
@@ -1778,6 +1811,16 @@ impl<C: Channel> Sandbox<C> {
             .tmpfsmount("/tmp")
             .runctl(hakoniwa::Runctl::IgnoreCgroupSetupFailed);
 
+        // The IPC namespace is part of box isolation, whatever the network
+        // plan: every box gets its own System V message queues, semaphores
+        // and shared memory segments, and its own POSIX message queues. Every
+        // box maps onto the daemon's one kernel uid, so IPC permission bits
+        // cannot keep boxes apart; only the namespace does. A `host_ip` box
+        // shares the network namespace, never this one. An mqueue filesystem
+        // is bound to the namespace it was mounted in, so a box that ever
+        // mounts `/dev/mqueue` has to do it after this unshare.
+        container.unshare(hakoniwa::Namespace::Ipc);
+
         // The cgroup namespace, whose root decides what the box can ever
         // reach. A box with no classifier leaf takes it here, in the one
         // `unshare()` every namespace goes through: its root is then the
@@ -2051,6 +2094,7 @@ impl<C: Channel> Sandbox<C> {
                 home,
                 working,
                 working_name_override,
+                ..
             } => {
                 // mount the given home path to /{SESSION_HOME}
                 Self::bind_mount(
@@ -2080,20 +2124,20 @@ impl<C: Channel> Sandbox<C> {
                 )?;
             }
         }
-        // Mount in any file mappings
-        if let WdSetup::BoundDir { fs_mappings, .. } = &self.config.wd {
-            for m in fs_mappings {
-                let opts = BindOpts {
-                    recursive: !m.is_file,
-                    read_only: m.read_only,
-                };
-                Self::bind_mount(
-                    Path::new(&m.host_path),
-                    &m.path_in_sandbox(),
-                    opts,
-                    &mut container,
-                )?;
-            }
+        // Mount in any file mappings. hakoniwa applies mounts sorted by
+        // target, so a mapping inside a session's `/home` or `/workbench`
+        // lands on top of that directory's own mount.
+        for m in self.config.wd.fs_mappings() {
+            let opts = BindOpts {
+                recursive: !m.is_file,
+                read_only: m.read_only,
+            };
+            Self::bind_mount(
+                Path::new(&m.host_path),
+                &m.path_in_sandbox(),
+                opts,
+                &mut container,
+            )?;
         }
 
         if let Some(hn) = &self.config.hostname {
@@ -4843,15 +4887,22 @@ ff02::2\tip6-allrouters
     /// the box can read there, which migration paths open for writing — and
     /// can hold the box in its leaf until a release file appears, so the
     /// test can read the host's side of the tree while the box is still in
-    /// it.
+    /// it. The IPC namespace proof runs it too: it reports the box's
+    /// namespaces and creates or looks up System V and POSIX IPC objects.
     #[cfg(target_os = "linux")]
     const CGROUP_PROBE_C: &str = r#"
+#define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ipc.h>
+#include <sys/msg.h>
+#include <sys/sem.h>
+#include <sys/shm.h>
 #include <sys/statfs.h>
+#include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -4897,13 +4948,30 @@ int main(int argc, char **argv) {
                         leaving the leaf, which is what confinement forbids)
                         and a sibling leaf's cgroup.procs (the file a pid is
                         written into to join another box's verdict);
+         MOUNTINFO:<path>  the mountinfo line of the mount on top of the
+                        path: the box's /dev/pts, after its devpts remount;
+         OPENPTY        whether the box's own user can open a PTY pair;
          HOLD:<path>    stay in the leaf until that path appears, so the test
                         can read the host's side of the tree — the leaf's
                         cgroup.procs, which the kernel empties the moment the
                         box's last process exits — while the box is still in
                         it. The hold runs last, when every line of the report
-                        is already out. */
+                        is already out.
+       and, for the IPC namespace proof:
+         NS:<kind>      the namespace the box is in, /proc/self/ns/<kind>;
+         SYSV:<key>     create a System V message queue, semaphore set and
+                        shared memory segment under that key, removed again
+                        at exit;
+         SYSVGET:<key>  look the three up by key without creating them;
+         MQ:<name>      create a POSIX message queue under that name, unlinked
+                        again at exit (the raw syscall, which takes the name
+                        without its leading slash, so no -lrt is needed);
+         MQOPEN:<name>  open that queue without creating it;
+         MARK:<path>    create that file, telling the test the operations
+                        before it have run. */
     const char *release = NULL;
+    int msq = -1, sem = -1, shm = -1;
+    const char *mq = NULL;
     for (int i = 1; i < argc; i++) {
         if (strncmp(argv[i], "STATFS:", 7) == 0) {
             const char *path = argv[i] + 7;
@@ -4930,8 +4998,82 @@ int main(int argc, char **argv) {
             } else {
                 printf("open %s: errno %d\n", path, errno);
             }
+        } else if (strncmp(argv[i], "MOUNTINFO:", 10) == 0) {
+            /* The last /proc/self/mountinfo line whose mount point is the
+               path: the mount on top, its per-mount flags and its
+               superblock options. */
+            const char *path = argv[i] + 10;
+            char found[1024] = "absent";
+            char row[1024];
+            FILE *mi = fopen("/proc/self/mountinfo", "r");
+            while (mi && fgets(row, sizeof row, mi)) {
+                char point[512];
+                if (sscanf(row, "%*s %*s %*s %*s %511s", point) == 1 &&
+                    strcmp(point, path) == 0) {
+                    row[strcspn(row, "\n")] = 0;
+                    snprintf(found, sizeof found, "%s", row);
+                }
+            }
+            if (mi) fclose(mi);
+            printf("mountinfo %s: %s\n", path, found);
+        } else if (strcmp(argv[i], "OPENPTY") == 0) {
+            /* Whether the box's own user can open a PTY pair: the master
+               through /dev/ptmx, then the slave it names. */
+            printf("openpty uid: %ld\n", (long)getuid());
+            int master = posix_openpt(O_RDWR | O_NOCTTY);
+            int err = 0;
+            if (master < 0) {
+                err = errno;
+            } else if (grantpt(master) != 0 || unlockpt(master) != 0) {
+                err = errno;
+            } else {
+                const char *name = ptsname(master);
+                int slave = name ? open(name, O_RDWR | O_NOCTTY) : -1;
+                if (slave < 0) err = name ? errno : ENOENT;
+                else close(slave);
+            }
+            if (master >= 0) close(master);
+            printf("openpty: errno %d\n", err);
         } else if (strncmp(argv[i], "HOLD:", 5) == 0) {
             release = argv[i] + 5;
+        } else if (strncmp(argv[i], "NS:", 3) == 0) {
+            char path[64], link[128];
+            snprintf(path, sizeof path, "/proc/self/ns/%s", argv[i] + 3);
+            ssize_t n = readlink(path, link, sizeof link - 1);
+            if (n >= 0) {
+                link[n] = 0;
+                printf("ns %s: %s\n", argv[i] + 3, link);
+            } else {
+                printf("ns %s: errno %d\n", argv[i] + 3, errno);
+            }
+        } else if (strncmp(argv[i], "SYSV:", 5) == 0) {
+            key_t key = (key_t)strtol(argv[i] + 5, NULL, 0);
+            msq = msgget(key, IPC_CREAT | IPC_EXCL | 0600);
+            printf("sysv create msg: errno %d\n", msq >= 0 ? 0 : errno);
+            sem = semget(key, 1, IPC_CREAT | IPC_EXCL | 0600);
+            printf("sysv create sem: errno %d\n", sem >= 0 ? 0 : errno);
+            shm = shmget(key, 4096, IPC_CREAT | IPC_EXCL | 0600);
+            printf("sysv create shm: errno %d\n", shm >= 0 ? 0 : errno);
+        } else if (strncmp(argv[i], "SYSVGET:", 8) == 0) {
+            key_t key = (key_t)strtol(argv[i] + 8, NULL, 0);
+            printf("sysv get msg: errno %d\n", msgget(key, 0) >= 0 ? 0 : errno);
+            printf("sysv get sem: errno %d\n", semget(key, 0, 0) >= 0 ? 0 : errno);
+            printf("sysv get shm: errno %d\n", shmget(key, 0, 0) >= 0 ? 0 : errno);
+        } else if (strncmp(argv[i], "MQ:", 3) == 0) {
+            long fd = syscall(SYS_mq_open, argv[i] + 3, O_RDWR | O_CREAT | O_EXCL, 0600, NULL);
+            printf("mq create: errno %d\n", fd >= 0 ? 0 : errno);
+            if (fd >= 0) {
+                mq = argv[i] + 3;
+                close((int)fd);
+            }
+        } else if (strncmp(argv[i], "MQOPEN:", 7) == 0) {
+            long fd = syscall(SYS_mq_open, argv[i] + 7, O_RDWR, 0, NULL);
+            printf("mq open: errno %d\n", fd >= 0 ? 0 : errno);
+            if (fd >= 0) close((int)fd);
+        } else if (strncmp(argv[i], "MARK:", 5) == 0) {
+            int fd = open(argv[i] + 5, O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
+            printf("mark: errno %d\n", fd >= 0 ? 0 : errno);
+            if (fd >= 0) close(fd);
         }
     }
 
@@ -4944,6 +5086,13 @@ int main(int argc, char **argv) {
             nanosleep(&ts, 0);
         }
     }
+
+    /* What SYSV: and MQ: created, removed so a run never leaves them behind
+       in whatever IPC namespace the box was in. */
+    if (msq >= 0) msgctl(msq, IPC_RMID, NULL);
+    if (sem >= 0) semctl(sem, 0, IPC_RMID);
+    if (shm >= 0) shmctl(shm, IPC_RMID, NULL);
+    if (mq) syscall(SYS_mq_unlink, mq);
     return 0;
 }
 "#;
@@ -5165,6 +5314,19 @@ int main(int argc, char **argv) {
         probe_args: &[String],
         force_cover_fallback: bool,
     ) -> HeldProbe {
+        launch_box_probe_under(name, leaf, probe_args, force_cover_fallback, None).await
+    }
+
+    /// [`launch_box_probe`], with the box launched under `plan` in place of
+    /// the sandbox's own built-in plan when one is given.
+    #[cfg(target_os = "linux")]
+    async fn launch_box_probe_under(
+        name: &str,
+        leaf: Option<config::ClassifierLeaf>,
+        probe_args: &[String],
+        force_cover_fallback: bool,
+        plan: Option<network::NetPlan>,
+    ) -> HeldProbe {
         use std::io::Read as _;
 
         let base_dir = box_base_dir(name);
@@ -5190,7 +5352,7 @@ int main(int argc, char **argv) {
             .await
             .expect("building the box");
 
-        let plan = sandbox.built_in_plan();
+        let plan = plan.unwrap_or_else(|| sandbox.built_in_plan());
         let container = sandbox
             .new_container(&plan)
             .expect("building the box's container");
@@ -5282,6 +5444,212 @@ int main(int argc, char **argv) {
         let held = launch_box_probe(name, leaf, probe_args, false).await;
         held.release_hold();
         held.report().await
+    }
+
+    /// The devpts remount, in a real box launched from the production path:
+    /// the box's `/dev/pts` carries the per-instance `max=` cap, keeps the
+    /// `nosuid,noexec` it was mounted with, and keeps `ptmxmode=0666`, so the
+    /// box's own unprivileged user can still open a PTY pair. A remount that
+    /// restated only `max=` would reset `ptmxmode` to 0000 and break every
+    /// PTY in every box; this is the test that catches it.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn box_devpts_is_capped_and_still_opens_a_pty() {
+        if let Some(reason) = user_namespaces_restriction() {
+            eprintln!(
+                "skipping box_devpts_is_capped_and_still_opens_a_pty: this \
+                 host denies the unprivileged user namespace every sandbox \
+                 starts by unsharing: {reason}"
+            );
+            return;
+        }
+        let probe_args = vec!["MOUNTINFO:/dev/pts".to_string(), "OPENPTY".to_string()];
+        let report = box_probe_report("pty-probe", None, &probe_args).await;
+
+        let mount = report
+            .get("mountinfo /dev/pts")
+            .cloned()
+            .unwrap_or_else(|| "no report".to_string());
+        eprintln!("the box's /dev/pts: {mount}");
+        let (per_mount, superblock) = mount
+            .split_once(" - ")
+            .unwrap_or_else(|| panic!("the box's /dev/pts is not a mountinfo line: {mount:?}"));
+        let mount_flags: Vec<&str> = per_mount
+            .split_whitespace()
+            .nth(5)
+            .unwrap_or_default()
+            .split(',')
+            .collect();
+        for flag in ["nosuid", "noexec"] {
+            assert!(
+                mount_flags.contains(&flag),
+                "the box's /dev/pts keeps {flag} across the remount: {mount:?}"
+            );
+        }
+        let super_opts: Vec<&str> = superblock
+            .split_whitespace()
+            .nth(2)
+            .unwrap_or_default()
+            .split(',')
+            .collect();
+        let max = format!("max={}", config::BOX_PTY_MAX);
+        assert!(
+            super_opts.contains(&max.as_str()),
+            "the box's devpts instance is capped at BOX_PTY_MAX: {mount:?}"
+        );
+        assert!(
+            super_opts.contains(&"ptmxmode=666"),
+            "the box's ptmx stays openable by its user: {mount:?}"
+        );
+
+        assert_eq!(
+            report.get("openpty uid").map(String::as_str),
+            Some(config::BOX_UID.to_string().as_str()),
+            "the PTY is opened as the box's own unprivileged user"
+        );
+        assert_eq!(
+            report.get("openpty").map(String::as_str),
+            Some("errno 0"),
+            "the box's user opens a PTY pair after the remount"
+        );
+    }
+
+    /// Every box has its own IPC namespace, whatever its network plan: a
+    /// `host_ip` box, which shares the network namespace, and a `none` box
+    /// each sit in a namespace of their own, distinct from each other and
+    /// from this process's. Box A creates a System V message queue,
+    /// semaphore set and shared memory segment under one key, and a POSIX
+    /// message queue under one name, and finds all four again from inside;
+    /// box B, launched while A still holds them, finds none of them. Run in
+    /// both directions, so neither plan can reach the other's objects.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn every_box_has_its_own_ipc_namespace() {
+        if let Some(reason) = user_namespaces_restriction() {
+            eprintln!(
+                "skipping every_box_has_its_own_ipc_namespace: this host \
+                 denies the unprivileged user namespace every sandbox starts \
+                 by unsharing: {reason}"
+            );
+            return;
+        }
+
+        let own_ipc = std::fs::read_link("/proc/self/ns/ipc")
+            .expect("reading this process's IPC namespace")
+            .to_string_lossy()
+            .into_owned();
+        let enoent = format!("errno {}", libc::ENOENT);
+        let pairs = [
+            (
+                "host_ip",
+                network::NetPlan::host(),
+                "none",
+                network::NetPlan::none(),
+            ),
+            (
+                "none",
+                network::NetPlan::none(),
+                "host_ip",
+                network::NetPlan::host(),
+            ),
+        ];
+        for (round, (a_name, a_plan, b_name, b_plan)) in pairs.into_iter().enumerate() {
+            // Unique per run, so a stale object from an earlier run cannot
+            // stand in for the one this run creates.
+            let key = 0x4d49_0000 + (std::process::id() & 0x0fff) * 4 + round as u32;
+            let mq = format!("minimal-ipc-{}-{round}", std::process::id());
+            let a_args = vec![
+                "NS:ipc".to_string(),
+                format!("SYSV:{key}"),
+                format!("SYSVGET:{key}"),
+                format!("MQ:{mq}"),
+                format!("MQOPEN:{mq}"),
+                "MARK:/run/ipc-ready".to_string(),
+                "HOLD:/run/ipc-release".to_string(),
+            ];
+            let a = launch_box_probe_under(
+                &format!("ipc-a{round}"),
+                None,
+                &a_args,
+                false,
+                Some(a_plan),
+            )
+            .await;
+            // Box B starts only once A's objects exist, so B finding none of
+            // them is the namespace's doing, never a race with A's creation.
+            let ready = a.base.join("run").join("ipc-ready");
+            for _ in 0..200 {
+                if ready.exists() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            let b_args = vec![
+                "NS:ipc".to_string(),
+                format!("SYSVGET:{key}"),
+                format!("MQOPEN:{mq}"),
+            ];
+            let b = launch_box_probe_under(
+                &format!("ipc-b{round}"),
+                None,
+                &b_args,
+                false,
+                Some(b_plan),
+            )
+            .await
+            .release_and_report()
+            .await;
+            let a = a.release_and_report().await;
+
+            let a_ipc = a.get("ns ipc").expect("box A reports its IPC namespace");
+            let b_ipc = b.get("ns ipc").expect("box B reports its IPC namespace");
+            assert_ne!(
+                a_ipc, &own_ipc,
+                "the {a_name} box must not share this process's IPC namespace"
+            );
+            assert_ne!(
+                b_ipc, &own_ipc,
+                "the {b_name} box must not share this process's IPC namespace"
+            );
+            assert_ne!(
+                a_ipc, b_ipc,
+                "the {a_name} and {b_name} boxes must not share an IPC namespace"
+            );
+            for kind in ["msg", "sem", "shm"] {
+                assert_eq!(
+                    a.get(&format!("sysv create {kind}")).map(String::as_str),
+                    Some("errno 0"),
+                    "the {a_name} box creates a System V {kind} object: {a:?}"
+                );
+                assert_eq!(
+                    a.get(&format!("sysv get {kind}")).map(String::as_str),
+                    Some("errno 0"),
+                    "the {a_name} box finds its own System V {kind} object: {a:?}"
+                );
+                assert_eq!(
+                    b.get(&format!("sysv get {kind}")),
+                    Some(&enoent),
+                    "the {b_name} box must not find the {a_name} box's System \
+                     V {kind} object: {b:?}"
+                );
+            }
+            assert_eq!(
+                a.get("mq create").map(String::as_str),
+                Some("errno 0"),
+                "the {a_name} box creates a POSIX message queue: {a:?}"
+            );
+            assert_eq!(
+                a.get("mq open").map(String::as_str),
+                Some("errno 0"),
+                "the {a_name} box opens its own POSIX message queue: {a:?}"
+            );
+            assert_eq!(
+                b.get("mq open"),
+                Some(&enoent),
+                "the {b_name} box must not open the {a_name} box's POSIX \
+                 message queue: {b:?}"
+            );
+        }
     }
 
     /// The daemon-side probe: a throwaway child of this process migrates

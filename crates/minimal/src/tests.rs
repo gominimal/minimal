@@ -15,6 +15,163 @@ fn interactive_attach_requires_a_tty_on_stdin() {
     ensure_interactive_attach_tty(true).expect("a real terminal must pass the guard");
 }
 
+/// The #953 refusal still comes first: a non-terminal stdin is turned away
+/// before the unwind guard arms or the relay opens a pty or touches the
+/// terminal.
+#[test]
+fn non_terminal_stdin_still_refused_before_relay() {
+    let armed = std::cell::Cell::new(false);
+    let relayed = std::cell::Cell::new(false);
+    let err = interactive_attach(
+        std::process::Command::new("ssh"),
+        false,
+        || {
+            armed.set(true);
+            attach::TerminalUnwind::arm_on(Vec::new(), true)
+        },
+        |_| {
+            relayed.set(true);
+            unreachable!("the relay must not run over a non-terminal stdin")
+        },
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("not a TTY"), "{err}");
+    assert!(!armed.get(), "the unwind guard armed before the refusal");
+    assert!(!relayed.get(), "the relay ran before the refusal");
+}
+
+/// The termios the relay put back must be in force before the blind unwind
+/// writes a byte, and the unwind goes to the real terminal (what the user
+/// sees), not to the session's pty. Driven over a pty that stands in for
+/// the user's terminal, through the real relay, with a session that ends
+/// the way a dropped transport does (255) so the guard fires.
+#[test]
+fn relay_restores_termios_before_unwind_codes() {
+    use nix::sys::termios::{LocalFlags, Termios, tcgetattr};
+    use std::io::Read as _;
+    use std::os::fd::OwnedFd;
+    use std::sync::{Arc, Mutex};
+
+    fn mode(t: &Termios) -> String {
+        // PENDIN is kernel bookkeeping on macOS, not a mode anyone set; and
+        // only the named control characters count (Linux's kernel keeps
+        // fewer than libc's `NCCS`, so the array's tail is stack garbage).
+        use nix::sys::termios::SpecialCharacterIndices as C;
+        let cc: Vec<u8> = [
+            C::VEOF,
+            C::VEOL,
+            C::VERASE,
+            C::VINTR,
+            C::VKILL,
+            C::VMIN,
+            C::VQUIT,
+            C::VSTART,
+            C::VSTOP,
+            C::VSUSP,
+            C::VTIME,
+        ]
+        .iter()
+        .map(|&i| t.control_chars[i as usize])
+        .collect();
+        format!(
+            "{:?} {:?} {:?} {:?} {cc:?}",
+            t.input_flags,
+            t.output_flags,
+            t.control_flags,
+            t.local_flags - LocalFlags::PENDIN,
+        )
+    }
+
+    /// Writes to the user's terminal, noting the termios it found there
+    /// at the moment of the first write.
+    struct RealTerminal {
+        tty: std::fs::File,
+        termios_at_write: Arc<Mutex<Option<String>>>,
+    }
+    impl std::io::Write for RealTerminal {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let mut seen = self.termios_at_write.lock().unwrap();
+            if seen.is_none() {
+                *seen = Some(mode(&tcgetattr(&self.tty).unwrap()));
+            }
+            self.tty.write(buf)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.tty.flush()
+        }
+    }
+
+    let pty = nix::pty::openpty(None, None).unwrap();
+    let start = mode(&tcgetattr(&pty.slave).unwrap());
+    let mut master = std::fs::File::from(pty.master);
+    let screen = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&screen);
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match master.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => sink.lock().unwrap().extend_from_slice(&buf[..n]),
+                // A signal can interrupt the read on some targets.
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
+    });
+    let dup = |fd: &OwnedFd| fd.try_clone().unwrap();
+    let termios_at_write = Arc::new(Mutex::new(None));
+
+    let mut session = std::process::Command::new("/bin/sh");
+    session
+        .arg("-c")
+        .arg("stty raw -echo -iexten; printf R; exit 255");
+    let code = interactive_attach(
+        session,
+        true,
+        || {
+            attach::TerminalUnwind::arm_on(
+                RealTerminal {
+                    tty: std::fs::File::from(dup(&pty.slave)),
+                    termios_at_write: Arc::clone(&termios_at_write),
+                },
+                true,
+            )
+        },
+        |ssh| {
+            let real = client::tty_relay::RealTty::from_fds(dup(&pty.slave), dup(&pty.slave));
+            client::attach::run_interactive_attach_on(ssh, real, None)
+        },
+    )
+    .unwrap();
+    assert_eq!(code, 255);
+
+    let at_write = termios_at_write
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("a transport drop arms the blind unwind");
+    assert_eq!(
+        at_write, start,
+        "the unwind wrote before the termios was restored"
+    );
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let seen = screen.lock().unwrap().clone();
+        // The session's output, then the unwind's codes, on the user's
+        // terminal.
+        if seen.starts_with(b"R") && seen.ends_with(b"\x1b[?1004l") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < until,
+            "the unwind codes never reached the terminal: {:?}",
+            String::from_utf8_lossy(&seen)
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
 /// The interactive attach no longer `exec()`s ssh — it waits on it so the
 /// terminal can be put back afterwards (#1210) — so the status ssh reports
 /// has to become this process's own, signalled children included.
@@ -28,6 +185,38 @@ fn ssh_status_becomes_the_clients_exit_code() {
     // A signalled child reports no code of its own; the shell's 128 + n.
     // 9 is SIGKILL, in the low bits where wait(2) puts the signal.
     assert_eq!(exit_code_of(std::process::ExitStatus::from_raw(9)), 137);
+}
+
+/// The exec-path stdout relay copies data from a reader to a writer and
+/// returns `BrokenPipe` when the writer's far end closes (#815).
+#[tokio::test]
+async fn exec_stdout_relay_copies_and_detects_broken_pipe() {
+    use tokio::io::AsyncWriteExt as _;
+
+    // Clean EOF: write "hello\n" then drop the write half, so the read half
+    // yields the bytes and then EOF. The relay should copy and return Ok.
+    let (mut src, mut rx) = tokio::io::duplex(64);
+    src.write_all(b"hello\n").await.unwrap();
+    drop(src);
+    let mut sink = tokio::io::sink();
+    relay_exec_stdout(&mut rx, &mut sink)
+        .await
+        .expect("relay should succeed on clean EOF");
+
+    // BrokenPipe: the writer's far end is closed, so the first write fails.
+    let (mut src, mut rx) = tokio::io::duplex(64);
+    src.write_all(b"world\n").await.unwrap();
+    drop(src);
+    let (mut writer, reader) = tokio::io::duplex(64);
+    drop(reader); // close the read half of the duplex
+    let err = relay_exec_stdout(&mut rx, &mut writer)
+        .await
+        .expect_err("relay should fail when the writer's far end is closed");
+    assert_eq!(
+        err.kind(),
+        std::io::ErrorKind::BrokenPipe,
+        "relay should return BrokenPipe when writer's far end closes"
+    );
 }
 
 /// A CLI upgraded past its daemon must be refused up front, naming both
@@ -475,6 +664,7 @@ fn twin_entry(
         project_path: path.map(|p| paths::HostAbsPath::try_new(p).unwrap()),
         status,
         git: None,
+        host_ip_enforcement: None,
         attrs: None,
     }
 }
@@ -767,6 +957,15 @@ fn sanitize_name_component_trims_and_falls_back() {
     assert_eq!(sanitize_name_component("café"), "caf");
     assert_eq!(sanitize_name_component("...."), "session");
     assert_eq!(sanitize_name_component("a\tb"), "ab");
+    // `_` and `.` map to `-`, so the minted name stays a single DNS label.
+    assert_eq!(sanitize_name_component("my_app.dev"), "my-app-dev");
+    assert_eq!(sanitize_name_component("mnlh.Ab12_"), "mnlh-ab12");
+    // An over-long basename is capped and re-trimmed.
+    assert_eq!(sanitize_name_component(&"a".repeat(100)).len(), 48);
+    assert_eq!(
+        sanitize_name_component(&format!("{}-tail", "b".repeat(47))),
+        "b".repeat(47)
+    );
 }
 
 /// The minted suffix is exactly four lowercase hex digits.
@@ -1102,6 +1301,7 @@ fn session_run_encodes_a_task_form_not_a_command() {
         task: "check".to_string(),
         owns_box: false,
         args: vec![],
+        cwd: String::new(),
     };
     let wire = request.encode();
     assert_eq!(
@@ -1110,6 +1310,7 @@ fn session_run_encodes_a_task_form_not_a_command() {
             task: "check".to_string(),
             owns_box: false,
             args: vec![],
+            cwd: String::new(),
         })
     );
 }
@@ -1220,6 +1421,32 @@ fn ingress_spec_rejects_malformed_and_bad_proto() {
     assert!(parse_ingress_mapping("18080").is_err());
     assert!(parse_ingress_mapping("notaport:80").is_err());
     assert!(parse_ingress_mapping("18080:80/icmp").is_err());
+}
+
+#[test]
+fn forward_spec_accepts_ephemeral_local_port() {
+    let (local, box_port) = parse_forward_spec("0:80").unwrap();
+    assert_eq!(local, 0);
+    assert_eq!(box_port, 80);
+}
+
+#[test]
+fn forward_spec_rejects_zero_box_port() {
+    let err = parse_forward_spec("8080:0").unwrap_err().to_string();
+    assert!(
+        err.contains("box port must be 1-65535"),
+        "expected the box-port message, got: {err}"
+    );
+}
+
+#[test]
+fn forward_spec_rejects_out_of_range_and_malformed() {
+    assert!(parse_forward_spec("8080:99999").is_err());
+    let err = parse_forward_spec("x:80").unwrap_err().to_string();
+    assert!(
+        err.contains("invalid local port"),
+        "expected the local-port message, got: {err}"
+    );
 }
 
 #[test]
@@ -1769,6 +1996,140 @@ fn legacy_network_spellings_parse_with_hint() {
     );
 }
 
+/// `--deny-all-egress` conflicts with every egress rule flag at parse
+/// (NET-075's CLI half): a deny-all declaration admits no exceptions, so
+/// combining it with any `--allow-*`/`--deny-*` rule is refused before the
+/// activation runs, naming both flags — and the refusal is the parser's
+/// conflict, not a later validation, so nothing is half-declared. The one
+/// egress-shaped flag it must combine with is `--credentialed-upstream`
+/// (NET-134): the proxy listener is infrastructure, the machine-internal
+/// analogue of the fabric pin's infrastructure set, so a deny-all box may
+/// still declare the lane — the proxy's own checks govern what the lane
+/// grants, and this flag's conflict is with rules, never with
+/// infrastructure.
+#[test]
+fn deny_all_egress_conflicts_with_every_egress_flag() {
+    use clap::Parser as _;
+
+    for (rule, value) in [
+        ("--allow-subnets", "10.0.0.0/8"),
+        ("--allow-dns-hosts", "github.com"),
+        ("--allow-protocols", "tcp"),
+        ("--deny-subnets", "0.0.0.0/0"),
+    ] {
+        let err = Cli::try_parse_from([
+            "min",
+            "session",
+            "activate",
+            "--deny-all-egress",
+            rule,
+            value,
+        ])
+        .map(|_| ())
+        .expect_err("--deny-all-egress must conflict with every egress rule flag");
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::ArgumentConflict,
+            "the combination must be refused as a parse conflict, not a later \
+             validation: {err}"
+        );
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("--deny-all-egress"),
+            "the refusal must name the deny-all flag: {rendered}"
+        );
+        assert!(
+            rendered.contains(rule),
+            "the refusal must name the rule flag it conflicts with: {rendered}"
+        );
+    }
+
+    // The flag on its own parses, and it carries one meaning wherever the
+    // egress flags appear: a boolean declaration with no value to validate.
+    let args = Cli::try_parse_from(["min", "session", "activate", "--deny-all-egress"])
+        .expect("--deny-all-egress alone must parse");
+    match args.command {
+        Some(Command::Session(SessionArgs {
+            command: SessionCommand::Activate(a),
+        })) => assert!(a.deny_all_egress, "the flag must land on the args"),
+        _ => panic!("expected an activate command"),
+    }
+
+    // The proxy lane is not a rule (NET-134): the two combine.
+    Cli::try_parse_from([
+        "min",
+        "session",
+        "activate",
+        "--deny-all-egress",
+        "--credentialed-upstream",
+    ])
+    .expect("--deny-all-egress must combine with --credentialed-upstream");
+}
+
+/// The dynamic ingress flags parse at the flag (NET-043): a mode with a
+/// range lands as both, a mode alone lands with no range, an unknown mode
+/// is refused by the mode's parser, and a privileged range is refused by
+/// the range's parser in the launch check's own words.
+#[test]
+fn dynamic_ingress_flags_parse() {
+    use clap::Parser as _;
+
+    let activate = |argv: &[&str]| -> ActivateArgs {
+        let args = Cli::try_parse_from(argv)
+            .unwrap_or_else(|error| panic!("{argv:?} must parse: {error}"));
+        match args.command {
+            Some(Command::Session(SessionArgs {
+                command: SessionCommand::Activate(a),
+            })) => a,
+            _ => panic!("expected an activate command"),
+        }
+    };
+
+    let a = activate(&[
+        "min",
+        "session",
+        "activate",
+        "--dynamic-ingress",
+        "allow",
+        "--dynamic-range",
+        "8000-8443",
+    ]);
+    assert_eq!(a.dynamic_ingress, Some(sessions::DynamicIngress::Allow));
+    assert_eq!(a.dynamic_range, Some((8000, 8443)));
+
+    let a = activate(&["min", "session", "activate", "--dynamic-ingress", "ask"]);
+    assert_eq!(a.dynamic_ingress, Some(sessions::DynamicIngress::Ask));
+    assert_eq!(a.dynamic_range, None, "a mode alone carries no range");
+
+    let Err(err) =
+        Cli::try_parse_from(["min", "session", "activate", "--dynamic-ingress", "maybe"])
+    else {
+        panic!("an unknown dynamic ingress mode must not parse");
+    };
+    let rendered = err.to_string();
+    assert!(
+        rendered.contains("unknown mode 'maybe'"),
+        "the refusal must name the mode, got: {rendered}"
+    );
+
+    let Err(err) = Cli::try_parse_from([
+        "min",
+        "session",
+        "activate",
+        "--dynamic-ingress",
+        "allow",
+        "--dynamic-range",
+        "80-90",
+    ]) else {
+        panic!("a privileged dynamic range must not parse");
+    };
+    let rendered = err.to_string();
+    assert!(
+        rendered.contains(&sessions::PolicyError::PrivilegedDynamicRange { lo: 80 }.to_string()),
+        "the refusal must use the launch check's words, got: {rendered}"
+    );
+}
+
 /// The CLI reference documents the network flags on `session activate`
 /// (NET-036), read from the real file so a docs edit cannot silently drop
 /// either row.
@@ -1789,6 +2150,8 @@ fn cli_reference_documents_network_flags() {
     for row in [
         "--network <none|host_ip|own_ip>",
         "--ingress <EXT:INT[/PROTO]>",
+        "--dynamic-ingress <allow|ask|deny>",
+        "--dynamic-range <LO-HI>",
     ] {
         assert!(
             section.contains(row),
@@ -2037,8 +2400,8 @@ async fn ls_shows_vm_per_box() {
             json: false,
         },
         &single[0].resp,
-        surfaces[1],
-        answerers[1],
+        surfaces[1].clone(),
+        answerers[1].clone(),
     )
     .expect("format_ls on the same listing");
     assert_eq!(

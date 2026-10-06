@@ -61,12 +61,36 @@ fn exit_outcome(code: Option<u32>) -> Result<(), anyhow::Error> {
 /// ends the session once the task's exit status is on the wire, whether or
 /// not this process is still there. `--keep` withholds it, because a kept
 /// session is meant to outlive the run — its end stays with whoever holds it.
-fn task_run_request(task: &str, args: &[String], keep: bool) -> minimald_rpc::exec::ExecRequest {
+/// `cwd` is the invocation directory relative to the uploaded tree (see
+/// [`task_run_cwd`]), where a task declaring `inherit_cwd` starts.
+fn task_run_request(
+    task: &str,
+    args: &[String],
+    keep: bool,
+    cwd: String,
+) -> minimald_rpc::exec::ExecRequest {
     minimald_rpc::exec::ExecRequest::TaskRun {
         task: task.to_string(),
         owns_box: !keep,
         args: args.to_vec(),
+        cwd,
     }
+}
+
+/// The invocation directory relative to the upload root, `/`-separated:
+/// `sub/inner` for a run started there, empty when the user is at the root.
+/// The daemon starts a task that declares `inherit_cwd` at the same place
+/// inside the uploaded tree.
+fn task_run_cwd(upload_root: &camino::Utf8Path, invocation_dir: &camino::Utf8Path) -> String {
+    invocation_dir
+        .strip_prefix(upload_root)
+        .map(|rel| {
+            rel.components()
+                .map(|c| c.as_str())
+                .collect::<Vec<_>>()
+                .join("/")
+        })
+        .unwrap_or_default()
 }
 
 /// Mint the ephemeral session name `task-<task>-<hex>`: the task name is
@@ -659,6 +683,13 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     // Upload per the normal activate rules: tarball sync (the default), the
     // same empty/`$HOME` and non-VCS-root gates, no `--sync` escape hatch.
     let upload_root = crate::resolve_upload_root(&utf8_path)?;
+    // Sent only for a task that declares `inherit_cwd`; any other task
+    // starts at the root of the uploaded tree.
+    let task_cwd = if declared.inherit_cwd {
+        task_run_cwd(&upload_root, &utf8_path)
+    } else {
+        String::new()
+    };
     let skip_empty_or_home = crate::file_upload::is_empty_or_home(
         upload_root.as_std_path(),
         std::env::home_dir().as_deref(),
@@ -868,7 +899,7 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     let outcome = match client
         .open_session_exec_channel(
             id,
-            &task_run_request(&args.task, &args.args, args.keep).encode(),
+            &task_run_request(&args.task, &args.args, args.keep, task_cwd).encode(),
             &task_env,
         )
         .await
@@ -1012,29 +1043,60 @@ mod tests {
         use minimald_rpc::exec::ExecRequest;
 
         // A normal run: the request names the box as the run's own.
-        let req = task_run_request("build", &[], false);
+        let req = task_run_request("build", &[], false, String::new());
         assert_eq!(
             req,
             ExecRequest::TaskRun {
                 task: "build".to_string(),
                 owns_box: true,
                 args: vec![],
+                cwd: String::new(),
             }
         );
         // The flag is carried, not inferred: it survives the wire.
         assert_eq!(ExecRequest::parse(&req.encode()), Ok(req.clone()));
 
         // `--keep` keeps the box: no owns-box flag, nothing ends it here.
-        let kept = task_run_request("build", &[], true);
+        let kept = task_run_request("build", &[], true, String::new());
         assert_eq!(
             kept,
             ExecRequest::TaskRun {
                 task: "build".to_string(),
                 owns_box: false,
                 args: vec![],
+                cwd: String::new(),
             }
         );
         assert_eq!(ExecRequest::parse(&kept.encode()), Ok(kept));
+    }
+
+    /// `inherit_cwd` from the client side: the invocation directory is sent
+    /// relative to the upload root — the tree the daemon unpacks at
+    /// `/workbench` — and is empty when the user is at the root itself.
+    #[test]
+    fn task_run_cwd_is_relative_to_the_upload_root() {
+        use camino::Utf8Path;
+
+        let root = Utf8Path::new("/home/dev/project");
+        assert_eq!(
+            task_run_cwd(root, Utf8Path::new("/home/dev/project/sub/inner")),
+            "sub/inner"
+        );
+        assert_eq!(task_run_cwd(root, root), "");
+
+        // The cwd rides the request to the daemon intact.
+        let req = task_run_request(
+            "ic",
+            &[],
+            false,
+            task_run_cwd(root, Utf8Path::new("/home/dev/project/sub")),
+        );
+        let minimald_rpc::exec::ExecRequest::TaskRun { cwd, .. } =
+            minimald_rpc::exec::ExecRequest::parse(&req.encode()).unwrap()
+        else {
+            panic!("a task run must parse back as a task run");
+        };
+        assert_eq!(cwd, "sub");
     }
 
     /// The empty `[vars]` policy — a fresh install, where nothing is

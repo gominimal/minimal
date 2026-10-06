@@ -19,6 +19,7 @@ use std::sync::Arc;
 #[cfg(target_os = "linux")]
 use std::sync::RwLock;
 use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
 
 pub(crate) mod composables;
 #[cfg(test)]
@@ -60,6 +61,24 @@ impl From<SessionKeyPredicate> for RecordPredicate {
 /// Transport / internal error when communicating with the sessions actor.
 type SessionsError = std::io::Error;
 
+/// NET-079's observability, for the create path's half of the refusal: how
+/// many creates this daemon has refused because a host-address box's
+/// declaration named rules the classifier cannot enforce while the host
+/// decided per box. Process-global like the fact it reads — the count is
+/// the daemon's, not a session's — and only counted here: a launch
+/// refused on the same ground is that launch's own refusal, logged beside
+/// the box it refused, never a create this counter saw.
+static REFUSED_UNENFORCEABLE_CREATES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Reads how many creates this daemon has refused over an unenforceable
+/// host-address declaration — the counter's surface, for a diagnostics
+/// pass or a test that wants the count itself rather than the log line
+/// each refusal also writes.
+pub(crate) fn refused_unenforceable_creates() -> u64 {
+    REFUSED_UNENFORCEABLE_CREATES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Assemble a [`sessions::Record`] from the out-of-band session
 /// config and the SSH-supplied username, then validate its policy.
 /// Returns `Err(io::InvalidInput)` if the policy is incompatible
@@ -89,10 +108,14 @@ fn build_record(
         box_addresses: config.box_addresses,
         status,
         hooks_enabled: config.hooks_enabled,
+        // Daemon-owned from its first line: a create holds no launch's
+        // outcome to record, and the key a client might assert in `attrs`
+        // is stripped above, so only a launch ever writes this field.
+        host_ip_enforcement: None,
         attrs: config.attrs,
     };
     record
-        .validate_policy()
+        .validate_new_policy()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     Ok(record)
 }
@@ -156,7 +179,7 @@ enum ManagerMessage {
     #[cfg(test)]
     RunningCount(Responder<usize>),
     CreateSession(Box<CreateSessionMsg>),
-    DeleteSession(SessionId, Responder<()>),
+    DeleteSession(SessionId, Responder<Vec<String>>),
     Shutdown(bool, Responder<Result<(), ()>>),
     /// Bring up the actor of every `Active` record whose box owns a name,
     /// so a restarted daemon routes the names of the sessions it restored
@@ -181,7 +204,10 @@ enum ManagerMessage {
 /// Follows the actor pattern.
 #[derive(Debug)]
 pub struct Manager {
-    in_shutdown: bool,
+    /// Cancelled once a shutdown proceeds, before any session is stopped.
+    /// Shared with every [`ManagerHandle`], so a command the shutdown ends
+    /// can tell (see [`ManagerHandle::is_shutting_down`]).
+    in_shutdown: CancellationToken,
     receiver: mpsc::Receiver<ManagerMessage>,
     running: BTreeMap<SessionId, SessionHandle>,
     store: StoreHandle,
@@ -522,8 +548,10 @@ impl Manager {
             }
             (hostnames, loopback)
         };
+        let in_shutdown = CancellationToken::new();
         let handle = ManagerHandle {
             sender,
+            in_shutdown: in_shutdown.clone(),
             #[cfg(target_os = "linux")]
             hostnames: Arc::clone(&hostnames),
             #[cfg(all(test, target_os = "linux"))]
@@ -533,7 +561,7 @@ impl Manager {
         // so its binding can request destruction (see `weak_self`).
         let weak_self = handle.downgrade();
         let mngr = Self {
-            in_shutdown: false,
+            in_shutdown,
             receiver,
             running,
             store,
@@ -934,7 +962,7 @@ impl Manager {
         &mut self,
         pred: SessionKeyPredicate,
     ) -> Result<Option<SessionHandle>, SessionsError> {
-        if self.in_shutdown {
+        if self.in_shutdown.is_cancelled() {
             return Err(SessionsError::new(
                 std::io::ErrorKind::ConnectionRefused,
                 "in shutdown",
@@ -1077,11 +1105,43 @@ impl Manager {
         config: minimald_rpc::SessionConfig,
         username: Option<String>,
     ) -> Result<SessionId, SessionsError> {
-        if self.in_shutdown {
+        if self.in_shutdown.is_cancelled() {
             return Err(SessionsError::new(
                 std::io::ErrorKind::ConnectionRefused,
                 "in shutdown",
             ));
+        }
+        // NET-079: a host that decides per box refuses a host-address
+        // declaration naming rules its classifier cannot enforce — a denied
+        // range, a narrowing allow list — and refuses it here, before
+        // anything is allocated: no record, no id, no name held, no actor
+        // spawned. The host's state is the daemon's one node fact, read
+        // exactly as the create response reads it — a create is not a place
+        // that decides a box, so it re-probes nothing itself — and the
+        // same `can_decide_per_box` the launch that follows re-reads for
+        // its own gate; a host that cannot decide per box answers `false`
+        // and the create falls through to the exception whole — the box is
+        // created, runs unenforced and is recorded as such, never refused
+        // on this ground. Own-address boxes are untouched here: their
+        // declarations are enforced on the address the box holds, so the
+        // gate is the host-address mode's alone.
+        if let Some(rules) = crate::net::classifier::refuses_unenforceable_declaration(
+            config.network,
+            crate::session_host::host_ip_enforcement_fact().can_decide_per_box(),
+            config.policy.egress.as_ref(),
+        ) {
+            let refusal = crate::net::classifier::unenforceable_declaration_refusal(&rules);
+            REFUSED_UNENFORCEABLE_CREATES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::info!(
+                session_name = ?config.name,
+                network_mode = ?config.network,
+                host_ip_enforcement = %minimald_rpc::HostIpEnforcement::PerBox.machine_str(),
+                refused_unenforceable_creates = refused_unenforceable_creates(),
+                refusal = %refusal,
+                "refused a create whose host-address declaration names rules \
+                 this host's classifier cannot enforce"
+            );
+            return Err(refusal);
         }
         // Allocate the record up front: `store.create` assigns the id and
         // catches a name collision (`AlreadyExists`) before any actor exists.
@@ -1253,7 +1313,7 @@ impl Manager {
             // any), then removes its on-disk record.
             ManagerMessage::DeleteSession(id, r) => {
                 r.handle(async {
-                    if self.in_shutdown {
+                    if self.in_shutdown.is_cancelled() {
                         return Err(SessionsError::new(
                             std::io::ErrorKind::ConnectionRefused,
                             "in shutdown",
@@ -1303,7 +1363,7 @@ impl Manager {
                     };
                     match actor {
                         Some(hnd) => {
-                            hnd.destroy().await?;
+                            let hook_failures = hnd.destroy().await?;
                             // Belt-and-braces: a dead actor (self-terminated
                             // but not yet evicted) reads as `Ok` above, and
                             // may have died *without* deleting its record
@@ -1314,10 +1374,13 @@ impl Manager {
                             {
                                 return Err(e);
                             }
+                            Ok(hook_failures)
                         }
-                        None => handle.delete().await?,
+                        None => {
+                            handle.delete().await?;
+                            Ok(Vec::new())
+                        }
                     }
-                    Ok(())
                 })
                 .await
             }
@@ -1337,7 +1400,7 @@ impl Manager {
                         }
                     }
 
-                    self.in_shutdown = true;
+                    self.in_shutdown.cancel();
                     // Stop live sessions. Each actor kills its host and
                     // withdraws its own PTask hostname (R3.5) on the way
                     // down; records — and, with them, the loopback grants
@@ -1378,6 +1441,8 @@ impl Manager {
 #[derive(Debug, Clone)]
 pub struct ManagerHandle {
     sender: mpsc::Sender<ManagerMessage>,
+    /// The actor's [`Manager::in_shutdown`].
+    in_shutdown: CancellationToken,
     /// A clone of the actor's shared PTask hostname registry, handed to the
     /// host-side proxies so they resolve `Host:` headers without a round-trip
     /// through the actor mainloop.
@@ -1400,6 +1465,8 @@ pub struct ManagerHandle {
 #[derive(Debug, Clone)]
 pub struct WeakManagerHandle {
     sender: mpsc::WeakSender<ManagerMessage>,
+    /// Mirrors [`ManagerHandle::in_shutdown`].
+    in_shutdown: CancellationToken,
     /// Mirrors [`ManagerHandle::hostnames`]; the registry `Arc` is held so an
     /// [`upgrade`](Self::upgrade) can reconstruct a full handle. This does not
     /// keep the actor alive (only live senders do).
@@ -1418,6 +1485,7 @@ impl WeakManagerHandle {
     pub fn upgrade(&self) -> Option<ManagerHandle> {
         Some(ManagerHandle {
             sender: self.sender.upgrade()?,
+            in_shutdown: self.in_shutdown.clone(),
             #[cfg(target_os = "linux")]
             hostnames: Arc::clone(&self.hostnames),
             #[cfg(all(test, target_os = "linux"))]
@@ -1448,7 +1516,7 @@ impl SessionControl {
     /// delete itself fails (e.g. the manager is mid-shutdown).
     pub async fn destroy(&self) -> Result<(), SessionsError> {
         match self.manager.upgrade() {
-            Some(mngr) => mngr.delete_session(self.id).await,
+            Some(mngr) => mngr.delete_session(self.id).await.map(drop),
             None => Err(SessionsError::new(
                 std::io::ErrorKind::NotConnected,
                 "sessions manager is gone",
@@ -1481,11 +1549,19 @@ impl SessionControl {
 }
 
 impl ManagerHandle {
+    /// Whether a shutdown is under way: set before the shutdown stops any
+    /// session, so a command it ends can still see why when it returns.
+    #[must_use]
+    pub fn is_shutting_down(&self) -> bool {
+        self.in_shutdown.is_cancelled()
+    }
+
     /// Returns a non-owning handle to this manager.
     #[must_use]
     pub fn downgrade(&self) -> WeakManagerHandle {
         WeakManagerHandle {
             sender: self.sender.downgrade(),
+            in_shutdown: self.in_shutdown.clone(),
             #[cfg(target_os = "linux")]
             hostnames: Arc::clone(&self.hostnames),
             #[cfg(all(test, target_os = "linux"))]
@@ -1722,8 +1798,9 @@ impl ManagerHandle {
     /// Deletes the session with the given ID, cascadingly tearing down its
     /// running host and actor (if any) before removing its on-disk record.
     ///
+    /// On success, returns one line per `on_destroy` hook that failed.
     /// Returns a `NotFound` error if no session with that ID is known.
-    pub async fn delete_session(&self, id: SessionId) -> Result<(), SessionsError> {
+    pub async fn delete_session(&self, id: SessionId) -> Result<Vec<String>, SessionsError> {
         let (send, recv) = Responder::channel();
         // Ignore send errors - the recv will also fail.
         let _ = self

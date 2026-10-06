@@ -18,7 +18,8 @@
 //! set, so neither a plain `cargo test` run nor the ignored-test sweep attempts
 //! namespace work on a host that may not allow it. Needs unprivileged user
 //! namespaces (no root, unlike the netns proofs), a kernel with
-//! `CONFIG_PROC_CHILDREN`, and `setns` pidfd support (Linux 5.8+):
+//! `CONFIG_PROC_CHILDREN`, `setns` pidfd support (Linux 5.8+), and
+//! util-linux's `ipcmk` and `ipcs` on the host for the IPC proof:
 //! `MINIMALD_NSENTER_TEST=1 cargo test -p minimald --test nsenter_integration -- --include-ignored`
 #![cfg(target_os = "linux")]
 
@@ -53,9 +54,15 @@ fn sandbox(isolate_network: bool) -> hakoniwa::Child {
     container
         .rootfs("/")
         .expect("bind-mounting the host rootfs")
+        // The box uid and gid, mapped as `new_container` maps them: the shim
+        // takes them on before it execs, which fails with EINVAL in a user
+        // namespace that does not map them.
+        .uidmap(sandbox2::config::BOX_UID)
+        .gidmap(sandbox2::config::BOX_GID)
         .devfsmount("/dev")
         .tmpfsmount("/tmp")
         .unshare(hakoniwa::Namespace::Cgroup)
+        .unshare(hakoniwa::Namespace::Ipc)
         .unshare(hakoniwa::Namespace::Uts);
     if isolate_network {
         container.unshare(hakoniwa::Namespace::Network);
@@ -213,6 +220,62 @@ fn injected_process_joins_an_isolated_network_namespace() {
     assert_ne!(
         leader_net_ns, own_net_ns,
         "this sandbox was supposed to have its own network namespace"
+    );
+}
+
+/// Every box has its own IPC namespace, so a process injected into a session
+/// has to land in the session's, never stay in the daemon's: the injected
+/// process reports the session program's IPC namespace, and an object one
+/// injected process creates is there for the next one to find.
+#[test]
+#[ignore = "unshares namespaces; gated on MINIMALD_NSENTER_TEST"]
+fn injected_process_joins_the_sessions_ipc_namespace() {
+    if !gated() {
+        return;
+    }
+
+    let mut sandboxed = sandbox(false);
+    let leader = session_leader_pid(sandboxed.id()).expect("resolving the session program's pid");
+
+    let run = |script: &str| {
+        let output = Injection::new(leader, "/bin/sh", ["-c", script])
+            .with_shim(shim())
+            .command()
+            .expect("building the injected command")
+            .output()
+            .expect("running the injected command");
+        assert!(
+            output.status.success(),
+            "injected `{script}` failed: {:?}\nstderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    };
+    let injected_ipc_ns = run("readlink /proc/self/ns/ipc");
+    // The session's IPC namespace starts empty, so the one queue the first
+    // injection makes is the only one the second can list.
+    run("ipcmk -Q");
+    let queues = run("ipcs -q");
+    let leader_ipc_ns = ns_of(leader, "ipc");
+    let own_ipc_ns = ns_of(std::process::id(), "ipc");
+
+    let _ = sandboxed.kill();
+    let _ = sandboxed.wait();
+
+    assert_eq!(
+        injected_ipc_ns, leader_ipc_ns,
+        "injected process is not in the session's IPC namespace"
+    );
+    assert_ne!(
+        leader_ipc_ns, own_ipc_ns,
+        "the session was supposed to have its own IPC namespace"
+    );
+    assert_eq!(
+        queues.lines().filter(|line| line.starts_with("0x")).count(),
+        1,
+        "an injected process must see the queue an earlier injection made in \
+         the session, and nothing else: {queues}"
     );
 }
 

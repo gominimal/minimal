@@ -6,6 +6,7 @@
 
 pub mod attach;
 pub mod file_upload;
+pub mod tty_relay;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -167,9 +168,9 @@ fn add_patches_bar(total: u64) -> indicatif::ProgressBar {
 }
 
 /// Max retries when connecting to the daemon UDS.
-const CONNECT_RETRIES: u32 = 20;
+pub const CONNECT_RETRIES: u32 = 20;
 /// Delay between connection retries.
-const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(100);
+pub const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(100);
 /// Deadline for the SSH handshake + auth once the socket has accepted.
 ///
 /// A connect is not proof that anyone is home: on the VM backend the socket is

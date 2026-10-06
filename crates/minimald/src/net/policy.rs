@@ -483,17 +483,25 @@ pub enum ExposeRefusal {
     NoDynamicRange,
     /// The requested port lies outside the declared `dynamic_allowed_range`.
     OutOfRange { requested: u16, range: (u16, u16) },
-    /// The box holds no published address — neither the hand a VM host's
-    /// registration gave it (T66) nor an address the hostname registry
-    /// published for it — so there is nowhere to bind. A capability gap:
-    /// waiting does not fix it.
+    /// The box holds no address the hostname registry published for it, so
+    /// there is nowhere to bind. A capability gap: waiting does not fix it.
     NoPublishedAddress,
     /// The box has a published address but no running PTask attached to the
     /// switch — no lease reported yet, or the spawn that held one has ended —
     /// so there is nothing to forward to until the box is started.
     NotAttached,
-    /// The port is published already, live, by this box.
-    AlreadyPublished(u16),
+    /// No box is running behind the session: it was stopped, and its record
+    /// still reads `active` — but the publish has nothing to deliver to, and a
+    /// forward bound for the lease it would name would answer for nothing.
+    /// Starting the box again is what fixes it.
+    NotRunning,
+    /// The port is held already by this box's other runtime surface — the
+    /// reservation or publication that holds it, whichever surface that
+    /// is, named by the owner the loser is refused with.
+    AlreadyPublished {
+        port: u16,
+        owner: super::listeners::PublicationOwner,
+    },
 }
 
 impl fmt::Display for ExposeRefusal {
@@ -523,9 +531,14 @@ impl fmt::Display for ExposeRefusal {
                 f,
                 "this box has no address on the switch yet; start the box and try again"
             ),
-            Self::AlreadyPublished(port) => {
-                write!(f, "port {port} is published already by this box")
+            Self::NotRunning => {
+                write!(f, "this box is not running; start the box and try again")
             }
+            Self::AlreadyPublished { port, owner } => write!(
+                f,
+                "port {port} is published already by this box ({})",
+                owner.as_str()
+            ),
         }
     }
 }
@@ -538,11 +551,25 @@ pub enum ExposeFailure {
     /// The box's `dynamic_ingress` decision refused the port: the switch was
     /// asked nothing, so nothing partial is left behind (NET-047).
     Refused(ExposeRefusal),
-    /// The publish could not be made — the switch refused the bind, never
-    /// answered, or the box's own record could not be read to decide the
-    /// request. One mapping is one request, so a bind that failed bound
+    /// The publish could not be made — the switch refused the bind or never
+    /// answered. One mapping is one request, so a bind that failed bound
     /// nothing and asked nothing further (NET-047).
     Publish { port: u16, source: io::Error },
+    /// The box's own record could not be read to decide the request, so its
+    /// name, its policy and its addresses are all unknown. Refused rather
+    /// than guessed at: the switch was asked nothing, and nothing was bound
+    /// (NET-047). Its own arm — not `Publish` — because a caller that knows
+    /// the box's name without the record (the env channel, from the
+    /// environment's own name) is the one that can still say whose request
+    /// this was in the one line the request owes the log.
+    RecordUnreadable { port: u16, source: io::Error },
+    /// The session actor dropped the request's reply channel before
+    /// answering — the box is stopping or stopped, so nobody is home to
+    /// decide it. The switch was asked nothing and nothing was bound. Its
+    /// own arm — not `Publish` — because the actor never reached the bind:
+    /// a real `ENOTCONN` out of a bind the actor *did* attempt stays a
+    /// `Publish`, and conflating the two would log one request twice.
+    ActorGone { port: u16 },
 }
 
 impl fmt::Display for ExposeFailure {
@@ -551,6 +578,19 @@ impl fmt::Display for ExposeFailure {
             Self::Refused(refusal) => write!(f, "{refusal}"),
             Self::Publish { port, source } => {
                 write!(f, "publishing port {port} failed: {source}")
+            }
+            Self::RecordUnreadable { port, source } => {
+                write!(
+                    f,
+                    "reading the session record for port {port} failed: {source}"
+                )
+            }
+            Self::ActorGone { port } => {
+                write!(
+                    f,
+                    "the session actor for port {port} is gone; the box is \
+                     stopping or stopped"
+                )
             }
         }
     }
@@ -1330,6 +1370,45 @@ mod tests {
         assert_eq!(
             dynamic_ingress_decision(Some(&allow), 3000),
             Ok(sessions::DynamicIngress::Allow),
+        );
+    }
+
+    #[test]
+    fn absent_dynamic_ingress_is_deny() {
+        // NET-043: an absent stance is not a permission waiting to be read.
+        // A declaration can carry a range — or even a mode-allow's range
+        // with the mode itself never spelled — and still deny every runtime
+        // publish, exactly as an explicit deny does: the stance is the fact
+        // the decision turns on, and only a spelled `allow` is an allow.
+        let absent = IngressPolicy {
+            dynamic_ingress: None,
+            dynamic_allowed_range: Some((3000, 3999)),
+            ..Default::default()
+        };
+        let explicit = IngressPolicy {
+            dynamic_ingress: Some(sessions::DynamicIngress::Deny),
+            dynamic_allowed_range: Some((3000, 3999)),
+            ..Default::default()
+        };
+        for port in [2999, 3000, 3500, 3999, 4000] {
+            assert_eq!(
+                dynamic_ingress_decision(Some(&absent), port),
+                dynamic_ingress_decision(Some(&explicit), port),
+                "an absent stance must decide exactly as the explicit deny at port {port}"
+            );
+            assert_eq!(
+                dynamic_ingress_decision(Some(&absent), port),
+                Err(ExposeRefusal::DeniedByPolicy),
+                "an absent stance denies the runtime publish at port {port}"
+            );
+        }
+        // The whole-declaration absence — the bare box's shape — denies the
+        // same way, so the deny is a property of the stance, not of the
+        // declaration around it.
+        assert_eq!(
+            dynamic_ingress_decision(None, 3000),
+            Err(ExposeRefusal::DeniedByPolicy),
+            "a box with no ingress declaration denies the runtime publish"
         );
     }
 

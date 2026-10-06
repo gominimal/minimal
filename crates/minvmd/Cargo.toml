@@ -14,6 +14,11 @@ default = ["libkrun"]
 # default-features = false so libkrun's load command isn't stamped into a binary
 # that calls no krun code.
 libkrun = []
+# Exposes `AnswererStatus::allocating_for_tests` so external crates — the
+# `minimal` CLI's tests — can serve a real control socket whose registrations
+# get an address without a running zone answerer. No production code should
+# depend on this.
+test-support = []
 
 [dependencies]
 anyhow.workspace = true
@@ -67,6 +72,11 @@ russh.workspace = true
 # Canonical state-dir base + provider-instance dir layout (`state`, `sock`,
 # `volume`).
 paths.workspace = true
+# The box ids a proxy attachment names its boxes by (NET-133, BEP-070): one
+# UUIDv7 minted per creation on the host, outside the VM, with its random
+# fields from the OS CSPRNG — never a counter or a digest of the box's
+# facts.
+uuid.workspace = true
 version.workspace = true
 
 [dev-dependencies]

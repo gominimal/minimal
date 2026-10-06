@@ -153,6 +153,11 @@ impl Graph {
         self.by_name.get(name.as_ref())
     }
 
+    /// Returns an iterator over the names of all build specs in the graph.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.by_name.keys().map(|s| s.as_str())
+    }
+
     /// Returns the specification hash of the given build spec.
     pub fn spec_hash(&self, bsr: &BuildSpecRef) -> SpecHash {
         {
