@@ -64,11 +64,11 @@ After this ships, a developer on a stock install with no identity plane runs ses
 
 - **BOX-003** WHEN the daemon starts and finds a record without `box_type` or `parent` THE SYSTEM SHALL migrate it once to `box_type = "session"` with no parent, assigning a fresh id only when the stored id is nil, and leave it unchanged on any later start.
   tier:     T0
-  verify:   cargo nextest run -p sessions restart_migrates_records_missing_type_or_parent_once
+  verify:   cargo nextest run -p boxes restart_migrates_records_missing_type_or_parent_once
 
 - **BOX-004** THE SYSTEM SHALL keep a box name unique among the running boxes of one host, let a stopped or exited box keep its name, and allow a new box on that host to reuse it.
   tier:     T1
-  verify:   cargo nextest run -p sessions name_unique_among_running_on_host_reusable_after_stop
+  verify:   cargo nextest run -p boxes name_unique_among_running_on_host_reusable_after_stop
   property: For every sequence of create, stop, exit, resume, rename and reap operations on one host, with a creation named as BOX-163 states and refused when a running box on the host holds that name, and a rename to a name a running box on the host holds, or to `self`, refused as BOX-010 states, no two running boxes share a name, and a name held by a stopped or exited box is reusable.
 
 - **BOX-163** WHEN a box is created THE SYSTEM SHALL name it with the expanded spec's `[box] name`, else the entry's name.
@@ -80,14 +80,14 @@ After this ships, a developer on a stock install with no identity plane runs ses
 
 - **BOX-005** WHEN an unqualified name is resolved against one host THE SYSTEM SHALL return the running box of that name on that host, else the most recently created box of that name on that host.
   tier:     T1
-  verify:   cargo nextest run -p sessions unqualified_name_resolves_running_else_latest
+  verify:   cargo nextest run -p boxes unqualified_name_resolves_running_else_latest
   property: For every store state of one host and every name, resolution returns the unique running box of that name on that host if one exists, else the most recently created box of that name on that host, else none.
   - IF an unqualified name resolves to running boxes on more than one host THEN THE SYSTEM SHALL refuse the resolution with exit 2, listing each candidate with its host, and pick none (architecture Addressing; BCLI-002 renders it).
     tier:   T0
-    verify: cargo nextest run -p sessions unqualified_name_running_on_two_hosts_refused_exit2_lists_candidates
+    verify: cargo nextest run -p boxes unqualified_name_running_on_two_hosts_refused_exit2_lists_candidates
   - IF no running box holds an unqualified name and records of that name are retained on more than one host THEN THE SYSTEM SHALL refuse the resolution with exit 2, listing each candidate with its host and state, and pick none (architecture Addressing).
     tier:   T0
-    verify: cargo nextest run -p sessions unqualified_name_retained_on_two_hosts_none_running_refused_exit2_lists_candidates
+    verify: cargo nextest run -p boxes unqualified_name_retained_on_two_hosts_none_running_refused_exit2_lists_candidates
 
 - **BOX-007** IF an entry or box is named `self` THEN THE SYSTEM SHALL refuse creation with exit 3.
   tier:     T0
@@ -95,15 +95,15 @@ After this ships, a developer on a stock install with no identity plane runs ses
 
 - **BOX-010** WHEN a box is renamed THE SYSTEM SHALL change only the alias, leave `box_id`, spec, events and filesystem unchanged, and record a `renamed` event carrying the old and new names.
   tier:     T1
-  verify:   cargo nextest run -p sessions rename_changes_only_alias_and_records_event
+  verify:   cargo nextest run -p boxes rename_changes_only_alias_and_records_event
   property: For every box and every successful rename, rename leaves id, spec and filesystem path equal before and after, preserves every prior event, and appends exactly one `renamed` event.
   - IF the new name is held by a running box on the same host, or is `self`, THEN THE SYSTEM SHALL refuse the rename with exit 2, naming the running box that holds it or the reserved name `self`, and leave the box, its name and its events unchanged.
     tier:   T0
-    verify: cargo nextest run -p sessions rename_to_running_held_name_or_self_refused_exit2_names_holder
+    verify: cargo nextest run -p boxes rename_to_running_held_name_or_self_refused_exit2_names_holder
 
 - **BOX-011** THE SYSTEM SHALL hold every box record in exactly one of the states `pending`, `materializing`, `running`, `stopped` or `exited`, and give each `stopped` or `exited` record the `reason`, `exit_code` and `signal` that the table under this requirement states for how the box ended.
   tier:     T2
-  verify:   cargo nextest run -p sessions record_state_is_one_of_five_with_exit_reason
+  verify:   cargo nextest run -p boxes record_state_is_one_of_five_with_exit_reason
   property: For every reachable store state, each record is in exactly one state, `stopped` records carry reason `stopped` and either an exit code when the entrypoint exited on its own, or no exit code and at most one ending signal, never both, and `exited` records carry one of `exit` (with the entrypoint's exit code), `timeout` (with no exit code) or `oom` (with exit code 137).
   harness:  sessions/src/core/record.rs `state_is_exactly_one` over `kani::any::<Record>()`, unwind 1
 
@@ -118,7 +118,7 @@ After this ships, a developer on a stock install with no identity plane runs ses
 
 - **BOX-012** WHEN the daemon restarts THE SYSTEM SHALL reap only records in `pending` or `materializing`.
   tier:     T2
-  verify:   cargo nextest run -p sessions restart_reaps_only_pending_and_materializing
+  verify:   cargo nextest run -p boxes restart_reaps_only_pending_and_materializing
   property: For every store state, restart reaping removes exactly the records in `pending` or `materializing` and no others.
   harness:  sessions/src/core/record.rs `restart_reaps_only_pending_or_materializing` over a bounded store of at most 4 records, unwind 4
 
@@ -480,7 +480,7 @@ Moved to the sibling spec `docs/specs/28-spec-box-cli` (BCLI) when the grammar w
 
 - **BOX-143** THE SYSTEM SHALL key every record, event and audit entry on `box_id`, resolve a CLI name lookup to the current alias's `box_id`, and keep every id-addressed reference resolving across a rename.
   tier:     T1
-  verify:   cargo nextest run -p sessions nothing_keys_on_box_name
+  verify:   cargo nextest run -p boxes nothing_keys_on_box_name
   property: For every id-addressed operation in the record, event and audit APIs, the result is invariant under renaming any box; a name lookup resolves the current alias and only the current alias.
 
 ## Non-goals
