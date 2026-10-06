@@ -45,7 +45,7 @@ After this ships, a developer on a stock install with no identity plane runs ses
 - **BOX-001** WHEN a box is created THE SYSTEM SHALL assign it a UUIDv7 `box_id` whose random fields come from the OS CSPRNG, the `box_id` alone minted by the host-side creator outside any VM and never supplied by the client (BEP-070), record as its `box_type` the type the received expanded spec names (BOX-068), and record as its `parent` none when the caller runs outside any box, which on an un-enrolled host with no nesting is every caller (BOX-140), and otherwise the box the creating daemon stamps from the caller's per-box identity, never one the workload asserts (architecture Retention and reaping).
   tier:     T1
   verify:   cargo nextest run -p minimald create_assigns_uuidv7_id_type_and_parent
-  property: For every store of retained records and every creation over it, the created record's `box_id` is a UUIDv7 that no other retained record names, its `box_type` equals the type the received spec names, and its `parent` is none whenever the caller runs outside any box, whatever the request body carries.
+  property: For every store of retained records and every creation over it, the created record's `box_id` is a UUIDv7 that no other retained record names, its `box_type` equals the type the received spec names when creation sends an expanded spec and the creating verb's type, `session` or `task`, when it sends none, and its `parent` is none whenever the caller runs outside any box, whatever the request body carries.
   - IF a minted `box_id` is named by any retained record THEN THE SYSTEM SHALL refuse the creation (BEP-070).
     tier:   T1
     verify: cargo nextest run -p minimald colliding_box_id_refuses_creation
