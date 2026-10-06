@@ -623,6 +623,11 @@ included, with every refusal logged (NET-001 to NET-004).
     tier:   T0
     verify: cargo nextest run -p minvmd admit_report_refused_outside_range_or_under_deny
     <!-- S10a/AC1; prose 51; unwanted; an absent or `deny` stance, an `ask` stance (an `ask` port enters only on the host-recorded yes), an absent range, or a port outside the range refuses; the in-VM daemon unwinds the publish it reported, so the refusal leaves no partial mapping (NET-047) -->
+  - WHILE a row's `dynamic_ingress` stance is `ask`, THE SYSTEM SHALL add a runtime port to the row's admitted port set only when the attached human's yes is recorded by the host, and IF the in-VM daemon reports the port THEN THE SYSTEM SHALL refuse the report.
+    tier:   T0
+    verify: cargo nextest run -p minvmd ask_admit_from_guest_refused_without_host_record
+    <!-- NET-045; state-driven with an unwanted-behaviour clause; the security property of the runtime path: an escapee inside the VM cannot turn an `ask` stance into an admission by reporting the port, because only the host's own record of the human's yes admits it; the admit half is also proven by `ask_yes_recorded_by_client_admits` -->
+
   - IF the in-VM daemon reports a runtime port for admission to a row that already holds the per-row cap of runtime ports, or reports admissions for a row faster than the per-row report rate THEN THE SYSTEM SHALL refuse the report and keep the port out of the table.
     tier:   T0
     verify: cargo nextest run -p minvmd admit_report_refused_past_row_cap_or_rate
