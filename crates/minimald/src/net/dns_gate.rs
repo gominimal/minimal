@@ -2584,7 +2584,7 @@ pub(crate) mod tests {
             "an A query for a zone name is forwarded"
         );
 
-        // A non-A query for a name outside the zone is forwarded.
+        // A TXT query for a name outside the zone is forwarded.
         assert!(
             gate.intercept_query(
                 &SocketAddrV4::new(RESOLVER, 53),
