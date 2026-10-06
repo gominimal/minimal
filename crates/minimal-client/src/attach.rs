@@ -12,6 +12,13 @@ use crate::HANDSHAKE_TIMEOUT;
 use crate::tty_relay;
 use anyhow::Context as _;
 
+/// Seconds between ssh keepalive probes on a non-interactive exec channel.
+/// With [`EXEC_SERVER_ALIVE_COUNT_MAX`], a peer that stops answering ends the
+/// exec after about 60 s instead of hanging it.
+const EXEC_SERVER_ALIVE_INTERVAL_SECS: u32 = 15;
+/// Unanswered keepalive probes ssh tolerates before it drops an exec channel.
+const EXEC_SERVER_ALIVE_COUNT_MAX: u32 = 4;
+
 /// Read and validate the session-key config, returning the resolved
 /// [`sessions::keys::SessionKeys`] to negotiate at attach. A missing config
 /// file yields the shipped defaults; a present-but-invalid one (e.g. a
@@ -195,9 +202,9 @@ pub fn attach_command(
     if wire.is_some() {
         ssh.args([
             "-o",
-            "ServerAliveInterval=15",
+            &format!("ServerAliveInterval={EXEC_SERVER_ALIVE_INTERVAL_SECS}"),
             "-o",
-            "ServerAliveCountMax=4",
+            &format!("ServerAliveCountMax={EXEC_SERVER_ALIVE_COUNT_MAX}"),
         ]);
     }
 
@@ -769,14 +776,15 @@ mod tests {
         );
 
         let exec_args = args(&exec);
-        assert!(
-            exec_args.iter().any(|a| a == "ServerAliveInterval=15"),
-            "missing ServerAliveInterval in {exec_args:?}",
-        );
-        assert!(
-            exec_args.iter().any(|a| a == "ServerAliveCountMax=4"),
-            "missing ServerAliveCountMax in {exec_args:?}",
-        );
+        for opt in [
+            format!("ServerAliveInterval={EXEC_SERVER_ALIVE_INTERVAL_SECS}"),
+            format!("ServerAliveCountMax={EXEC_SERVER_ALIVE_COUNT_MAX}"),
+        ] {
+            assert!(
+                exec_args.iter().any(|a| a == &opt),
+                "missing {opt} in {exec_args:?}",
+            );
+        }
     }
 
     /// A named VM's socket nests under a per-name subdirectory, so the ssh
