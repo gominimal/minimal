@@ -234,7 +234,9 @@ for _ in $(seq 1 40); do
   [ -n "$after" ] && [ "$after" != "$before" ] && break
   sleep 0.25
 done
-[ -n "$after" ] && [ "$after" != "$before" ] || fail "the service pid did not change ($before -> $after)"
+if [ -z "$after" ] || [ "$after" = "$before" ]; then
+  fail "the service pid did not change ($before -> $after)"
+fi
 expect_answer host.min.internal "NOERROR 127.0.0.1"
 expect_answer "$BOX.min.internal" "NOERROR $(cat "$work/address")"
 echo "restarted ($before -> $after); the node re-published"
