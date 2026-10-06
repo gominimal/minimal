@@ -861,8 +861,10 @@ pub struct File {
     pub defaults: Defaults,
     /// The stack configured on this repository, if any.
     ///
-    /// TODO: Remove `harness` alias after July 2026.
-    #[serde(default, alias = "harness")]
+    /// `[harness]`, the pre-v0.5.0 name of this table, no longer parses: it
+    /// warns as an unknown field and sets no stack, so an old config has to
+    /// rename the table.
+    #[serde(default)]
     pub stack: Option<Stack>,
 
     /// Task definitions, invoked with `minimal run <task name>`.
@@ -915,6 +917,9 @@ pub struct File {
 fn misplaced_top_level_key(key: &str) -> Option<&'static str> {
     match key {
         "lifecycle_hooks" => Some("[[session.lifecycle_hooks]]"),
+        // The pre-v0.5.0 name of `[stack]`, which stopped parsing: point a
+        // straggler config at the rename, not at the upgrade hint.
+        "harness" => Some("[stack]"),
         _ => None,
     }
 }
@@ -997,6 +1002,22 @@ impl File {
                 if s.default.is_none() {
                     return Err(Error::MissingParamDefault(n.clone()));
                 }
+            }
+        }
+        // serde takes one action key as `task.action` and leaves any other in
+        // `task.extra`. Refuse the task here, before `warn_unknown_fields`
+        // would misreport the extra action key as unknown and suggest an
+        // upgrade.
+        for (task_name, task) in &self.tasks {
+            let extra_actions = TaskAction::KEYS
+                .iter()
+                .filter(|k| task.extra.contains_key(**k))
+                .map(|k| k.to_string());
+            let keys: Vec<String> = std::iter::once(task.action.key().to_string())
+                .chain(extra_actions)
+                .collect();
+            if keys.len() > 1 {
+                return Err(Error::MultipleTaskActions(task_name.clone(), keys));
             }
         }
         self.warn_unknown_fields();
@@ -2532,6 +2553,81 @@ mod tests {
         assert_eq!(count_unknown_warnings(&capture), 2);
 
         drop(guard);
+    }
+
+    /// `[harness]` is the pre-v0.5.0 name of `[stack]` and no longer parses:
+    /// the stack it names is ignored, and the load points at `[stack]`
+    /// instead of the generic upgrade hint.
+    #[test]
+    fn harness_table_no_longer_parses() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join(MFILE_NAME), "[harness]\nuse = \"rust\"\n").unwrap();
+
+        let capture = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        let file = File::from_dir(dir.path()).unwrap();
+        drop(guard);
+
+        assert!(file.stack.is_none());
+        let out = capture.contents();
+        assert!(
+            out.contains(
+                "harness is unknown at the top level of minimal.toml; did you mean [stack]?"
+            ),
+            "{out}"
+        );
+        assert!(!out.contains("update to a newer version"), "{out}");
+    }
+
+    /// A task with two action keys is refused with an error naming the task
+    /// and both keys, instead of running one and calling the other unknown.
+    #[test]
+    fn task_with_two_actions_is_refused() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(MFILE_NAME),
+            "[tasks.both]\nexec = [\"echo\", \"from-exec\"]\nbash = \"echo from-bash\"\n",
+        )
+        .unwrap();
+
+        let capture = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        let err = File::from_dir(dir.path()).expect_err("two actions must be refused");
+        drop(guard);
+
+        assert!(matches!(err, Error::MultipleTaskActions(..)), "{err:?}");
+        let msg = err.to_string();
+        assert!(
+            msg.starts_with("task `both` sets more than one action ("),
+            "{msg}"
+        );
+        assert!(msg.contains("exec") && msg.contains("bash"), "{msg}");
+        assert!(msg.ends_with("); set exactly one"), "{msg}");
+        let out = capture.contents();
+        assert!(!out.contains("unknown fields in task"), "{out}");
+        assert!(!out.contains("update to a newer version"), "{out}");
+    }
+
+    #[test]
+    fn task_with_one_action_passes_validate() {
+        for action in [
+            "exec = [\"echo\", \"hi\"]",
+            "bash = \"echo hi\"",
+            "echo = \"hi\"",
+            "cmdcmd = [\"gen\"]",
+        ] {
+            let file: File = toml::from_str(&format!("[tasks.one]\n{action}\n")).unwrap();
+            file.validate().unwrap_or_else(|e| panic!("{action}: {e}"));
+            assert!(file.tasks["one"].extra.is_empty(), "{action}");
+        }
     }
 
     fn count_unknown_warnings(capture: &CaptureWriter) -> usize {

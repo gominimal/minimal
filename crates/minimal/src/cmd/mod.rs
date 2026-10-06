@@ -228,7 +228,8 @@ pub(crate) async fn connect_daemon_unchecked(
 }
 
 /// A session reference parsed from a CLI string: either a UUID or a name.
-/// Used to build the typed request enums both `GetSessionRecord` and
+/// A name lookup that misses falls back to a unique id prefix in
+/// [`get_session_record`]. Used to build the typed request enums both `GetSessionRecord` and
 /// `GetSessionPolicy` expect.
 pub(crate) enum SessionLookup {
     Id(sessions::SessionId),
@@ -273,11 +274,13 @@ impl From<SessionLookup> for minimald_rpc::GetSessionHooksRequest {
     }
 }
 
-/// Resolve a session by UUID or name, returning its record.
+/// Resolve a session by UUID, unique id prefix, or session name, returning
+/// its record.
 ///
 /// Used by commands that need the full record before proceeding (destroy,
 /// rename). If the string parses as a UUID, the session
-/// is looked up by ID; otherwise by name. Bails if no session matches.
+/// is looked up by ID; otherwise by name, then by unique id prefix (see
+/// [`get_session_record`]). Bails if no session matches.
 pub(crate) async fn resolve_session(
     client: &mut client::Client,
     session: &str,
@@ -306,17 +309,95 @@ pub(crate) async fn resolve_session_version_gated(
 }
 
 /// The `GetSessionRecord` round trip both resolvers share.
+///
+/// A name lookup that finds no record falls back to matching `session` as an
+/// id prefix (see [`match_id_prefix`]), so the short id `min ls` prints
+/// resolves. An exact name always wins, because the name is asked first. A
+/// prefix that matches several sessions is an error naming them; one that
+/// matches none returns the empty reply, for the caller's "no session found".
 pub(crate) async fn get_session_record(
     client: &mut client::Client,
     session: &str,
 ) -> Result<minimald_rpc::GetSessionRecordResponse, anyhow::Error> {
-    use minimald_rpc::{GetSessionRecord, GetSessionRecordRequest};
-    let lookup: GetSessionRecordRequest = SessionLookup::parse(session).into();
-    client
-        .oneshot_rpc::<GetSessionRecord>(lookup)
+    use minimald_rpc::{GetSessionRecord, GetSessionRecordRequest, ListSessions};
+    let lookup = SessionLookup::parse(session);
+    let by_name = matches!(lookup, SessionLookup::Name(_));
+    let resp = client
+        .oneshot_rpc::<GetSessionRecord>(GetSessionRecordRequest::from(lookup))
         .await
-        .context("GetSessionRecord RPC failed")
+        .context("GetSessionRecord RPC failed")?;
+    if resp.record.is_some() || !by_name || !is_id_prefix(session) {
+        return Ok(resp);
+    }
+    let listing = client
+        .oneshot_rpc::<ListSessions>(())
+        .await
+        .context("ListSessions RPC failed")?;
+    match match_id_prefix(&listing.sessions, session)? {
+        Some(id) => client
+            .oneshot_rpc::<GetSessionRecord>(GetSessionRecordRequest::Id(id))
+            .await
+            .context("GetSessionRecord RPC failed"),
+        None => Ok(resp),
+    }
 }
+
+/// Whether `s` is shaped like a session id prefix: 4 to 32 hex digits, with
+/// dashes allowed between them.
+pub(crate) fn is_id_prefix(s: &str) -> bool {
+    let digits = s.chars().filter(|c| *c != '-').count();
+    (4..=32).contains(&digits) && s.chars().all(|c| c == '-' || c.is_ascii_hexdigit())
+}
+
+/// Match `session` against the listed sessions: an exact name first, then a
+/// unique id prefix (compared without dashes, ignoring case). `None` when
+/// nothing matches or `session` is not prefix-shaped; an error naming the
+/// candidates when the prefix matches more than one session.
+pub(crate) fn match_id_prefix(
+    entries: &[minimald_rpc::ListSessionsEntry],
+    session: &str,
+) -> Result<Option<sessions::SessionId>, anyhow::Error> {
+    if let Some(entry) = entries.iter().find(|e| e.name.as_deref() == Some(session)) {
+        return Ok(Some(entry.id));
+    }
+    if !is_id_prefix(session) {
+        return Ok(None);
+    }
+    let prefix = session.replace('-', "").to_ascii_lowercase();
+    let matches: Vec<sessions::SessionId> = entries
+        .iter()
+        .map(|e| e.id)
+        .filter(|id| id.as_ref().simple().to_string().starts_with(&prefix))
+        .collect();
+    match matches.as_slice() {
+        [] => Ok(None),
+        [id] => Ok(Some(*id)),
+        several => {
+            let candidates: Vec<String> = several
+                .iter()
+                .map(|id| format!("{}…", &id.as_ref().simple().to_string()[..8]))
+                .collect();
+            Err(AmbiguousIdPrefix(format!(
+                "'{session}' matches sessions {}; use more characters",
+                candidates.join(", ")
+            ))
+            .into())
+        }
+    }
+}
+
+/// An id prefix that matches more than one session; the message names them.
+/// Typed so a caller can tell it from a failed RPC.
+#[derive(Debug)]
+pub(crate) struct AmbiguousIdPrefix(String);
+
+impl std::fmt::Display for AmbiguousIdPrefix {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for AmbiguousIdPrefix {}
 
 /// Unwrap a looked-up record, naming what was asked for when nothing matched.
 pub(crate) fn named_record(
