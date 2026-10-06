@@ -17957,8 +17957,8 @@ proof_expose_from_inside_box() {
     echo "::endgroup::"
     return 0
   fi
-  if [ ! -c /dev/net/tun ]; then
-    echo "expose from inside the box SKIPPED (no /dev/net/tun on this host: an own-IP box cannot open its in-namespace tap; runs for real on a host that has the device)"
+  if [ -z "${E2E_VM:-}" ] && [ ! -c /dev/net/tun ]; then
+    echo "expose from inside the box SKIPPED (no /dev/net/tun on this host: a native own-IP box cannot open its in-namespace tap; a VM lane opens it inside the guest and runs this case)"
     echo "::endgroup::"
     return 0
   fi
@@ -18258,9 +18258,11 @@ proof_expose_from_inside_box() {
     rm -rf "$EIB_ALLOW_SEED_DIR" "$EIB_DENY_SEED_DIR"
 
     # ---- two named VMs: the expose half of T61 ------------------------------
-    # Alpha's switch publishes at the same host 127.0.0.1 as the default VM,
-    # whose allow and ask-yes boxes still hold their ports there, so this leg
-    # asks for its own port in the declared range.
+    # Alpha's switch publishes at the same host 127.0.0.1 as the default VM.
+    # Each host 127.0.0.1:port carries one gvproxy forward, and a forward the
+    # default VM's boxes published can outlive those boxes (a VM box's declared
+    # forwards are not yet unbound when it ends), so this leg asks for its own
+    # port in the declared range.
     local eib_two_port=$((eib_port + 2))
     # A box on the NON-DEFAULT VM publishes there. `min --vm alpha session
     # activate` creates the box on alpha (autospawning and booting it), the
