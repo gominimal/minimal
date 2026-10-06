@@ -2220,13 +2220,16 @@ pub async fn cmd_session_policy(
     // command also resolves the record the policy rides on for its network
     // mode.
     let record = resolve_session(&mut client, &args.session).await?;
+    // The follow-up lookups go by the resolved id, so a session named by an
+    // id prefix reaches the same session they do.
+    let session = record.id.to_string();
 
     // The daemon resolves the effective egress (NET-074/NET-077), because
     // the rollout phase and its opt-out are the daemon's own facts; built
     // here rather than through a `SessionLookup` conversion so the request
     // types stay the rpc crate's, where the wire contract lives.
     use minimald_rpc::{GetEffectiveSessionPolicy, GetEffectiveSessionPolicyRequest};
-    let lookup = match SessionLookup::parse(&args.session) {
+    let lookup = match SessionLookup::parse(&session) {
         SessionLookup::Id(id) => GetEffectiveSessionPolicyRequest::Id(id),
         SessionLookup::Name(n) => GetEffectiveSessionPolicyRequest::Name(n),
     };
@@ -2245,7 +2248,7 @@ pub async fn cmd_session_policy(
     // enforcement row, silently: the row is an optional fact beside the
     // declaration, and the same silence is what a session that is not
     // host-address already prints.
-    let facts_lookup = match SessionLookup::parse(&args.session) {
+    let facts_lookup = match SessionLookup::parse(&session) {
         SessionLookup::Id(id) => minimald_rpc::GetSessionRuntimeFactsRequest::Id(id),
         SessionLookup::Name(n) => minimald_rpc::GetSessionRuntimeFactsRequest::Name(n),
     };
@@ -2261,7 +2264,7 @@ pub async fn cmd_session_policy(
     // shared fetch: warn on stderr and print no section — the JSON
     // rendering below degrades differently, saying the unknown in the
     // document instead.
-    let live = fetch_live_ingress_degrading(&mut client, &args.session).await;
+    let live = fetch_live_ingress_degrading(&mut client, &session).await;
 
     match resp {
         minimald_rpc::Errorable::Ok(policy) => {
@@ -3035,9 +3038,14 @@ async fn session_policy_json_inputs(
     // a lookup that answered with nothing is the not-found itself.
     let resp = get_session_record(&mut client, session)
         .await
-        .map_err(|error| PolicyJsonFailure::DaemonUnreachable(format!("{error:#}")))?;
+        .map_err(|error| match error.downcast_ref::<AmbiguousIdPrefix>() {
+            Some(ambiguous) => PolicyJsonFailure::SessionNotFound(ambiguous.to_string()),
+            None => PolicyJsonFailure::DaemonUnreachable(format!("{error:#}")),
+        })?;
     let record = named_record(resp.record, session)
         .map_err(|error| PolicyJsonFailure::SessionNotFound(error.to_string()))?;
+    // By the resolved id, as the text walk does.
+    let session = &record.id.to_string();
 
     use minimald_rpc::{GetEffectiveSessionPolicy, GetEffectiveSessionPolicyRequest};
     let lookup = match SessionLookup::parse(session) {

@@ -180,7 +180,7 @@ pub const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(100);
 /// the CLI blocks there forever (#730). Generous — a healthy endpoint answers in
 /// milliseconds, so this only bounds the pathological case. Mirrors `minvmd`'s
 /// own client, which guards the same bridge.
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Deadline for a whole oneshot RPC round-trip.
 ///
 /// The handshake deadline covers a peer that never speaks SSH; it does not

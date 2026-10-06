@@ -8,9 +8,17 @@
 
 use std::path::Path;
 
+use crate::HANDSHAKE_TIMEOUT;
 use crate::ask_dialog::{AskDialogEnd, render_ask_dialog};
 use crate::tty_relay;
 use anyhow::Context as _;
+
+/// Seconds between ssh keepalive probes on a non-interactive exec channel.
+/// With [`EXEC_SERVER_ALIVE_COUNT_MAX`], a peer that stops answering ends the
+/// exec after about 60 s instead of hanging it.
+const EXEC_SERVER_ALIVE_INTERVAL_SECS: u32 = 15;
+/// Unanswered keepalive probes ssh tolerates before it drops an exec channel.
+const EXEC_SERVER_ALIVE_COUNT_MAX: u32 = 4;
 
 /// Read and validate the session-key config, returning the resolved
 /// [`sessions::keys::SessionKeys`] to negotiate at attach. A missing config
@@ -137,6 +145,10 @@ pub fn attach_command(
         &strict,
         "-o",
         &known_hosts_file,
+        // Bound the connect and the initial protocol handshake/key exchange so
+        // a bridge that accepts but never serves fails instead of hanging ssh.
+        "-o",
+        &format!("ConnectTimeout={}", HANDSHAKE_TIMEOUT.as_secs()),
     ]);
     // Negotiate the session-key config per channel: send each resolved key
     // as an env var the daemon reads back (alongside MINIMAL_SESSION_ID) and
@@ -182,6 +194,19 @@ pub fn attach_command(
     // forever (#953). Callers must guarantee a terminal on stdin.
     if wire.is_none() {
         ssh.arg("-tt");
+    }
+
+    // A non-interactive exec channel must not hang forever on a peer that
+    // accepted the connection but stopped answering after the handshake:
+    // keepalives end it with exit 255 within about a minute. The interactive
+    // path is left without them so a laptop sleep does not kill the attach.
+    if wire.is_some() {
+        ssh.args([
+            "-o",
+            &format!("ServerAliveInterval={EXEC_SERVER_ALIVE_INTERVAL_SECS}"),
+            "-o",
+            &format!("ServerAliveCountMax={EXEC_SERVER_ALIVE_COUNT_MAX}"),
+        ]);
     }
 
     // The SSH host identity must match the known_hosts entry the daemon wrote,
@@ -758,6 +783,50 @@ mod tests {
         let debug = format!("{cmd:#?}");
         for stdio in ["stdin", "stdout", "stderr"] {
             assert!(!debug.contains(stdio), "{stdio} overridden: {debug}");
+        }
+    }
+
+    /// Every attach bounds its connect and handshake with the shared deadline;
+    /// only the non-interactive exec path adds keepalives, so a peer that
+    /// stops answering ends the exec instead of hanging it.
+    #[test]
+    fn attach_command_bounds_the_handshake() {
+        let sock = PathBuf::from("/tmp/x/providers/local-minimald0/ssh.sock");
+        let interactive = attach_command(&sock, sessions::SessionId::nil(), None, None).unwrap();
+        let exec = attach_command(&sock, sessions::SessionId::nil(), Some("wire"), None).unwrap();
+
+        let args = |cmd: &std::process::Command| -> Vec<String> {
+            cmd.get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        };
+
+        let connect_timeout = format!("ConnectTimeout={}", HANDSHAKE_TIMEOUT.as_secs());
+        for cmd in [&interactive, &exec] {
+            let args = args(cmd);
+            assert!(
+                args.iter().any(|a| a == &connect_timeout),
+                "missing {connect_timeout} in {args:?}",
+            );
+        }
+
+        let interactive_args = args(&interactive);
+        assert!(
+            !interactive_args
+                .iter()
+                .any(|a| a.starts_with("ServerAlive")),
+            "interactive attach must not carry keepalives: {interactive_args:?}",
+        );
+
+        let exec_args = args(&exec);
+        for opt in [
+            format!("ServerAliveInterval={EXEC_SERVER_ALIVE_INTERVAL_SECS}"),
+            format!("ServerAliveCountMax={EXEC_SERVER_ALIVE_COUNT_MAX}"),
+        ] {
+            assert!(
+                exec_args.iter().any(|a| a == &opt),
+                "missing {opt} in {exec_args:?}",
+            );
         }
     }
 

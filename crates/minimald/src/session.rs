@@ -313,6 +313,31 @@ const TEARDOWN_HOOK_BUDGET: std::time::Duration = std::time::Duration::from_secs
 /// against a wedge, not a performance budget.
 const HOOK_LAUNCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// How long [`Session::check_composed_packages`] waits for the session
+/// graph to resolve before stepping aside.
+///
+/// Evaluating the graph can clone the upstream repo when the daemon's
+/// cache is cold — network I/O with no bound of its own — and the check
+/// runs inside the `FinalizeSession` round-trip. The deadline on that
+/// round-trip is otherwise the *client's* (`minimal-client`'s 60 s base
+/// plus the activate-hook budget), and a client that expires does not
+/// cancel the daemon-side finalize: the session actor runs on, and may
+/// promote the record — running the activate hooks on the way — while
+/// the client, which has already reported a failed activation and
+/// best-effort-destroyed the session, believes nothing was activated.
+/// So the daemon bounds the work it adds itself: past this deadline
+/// the check logs a warning and steps aside. Expiry cancels the wait,
+/// not the evaluation — the detached `spawn_blocking` runs to
+/// completion and warms the cache the launch reads — and finalize
+/// proceeds exactly as it did before the check existed, the launch
+/// resolving names at first exec as it always has.
+///
+/// Half the client's 60 s base: a warm cache evaluates in seconds, well
+/// inside it, and what follows the check in finalize — patch
+/// materialization, and the host mint an activate hook needs — keeps
+/// the other half of the base for itself.
+pub(crate) const PACKAGE_CHECK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// This session's workspace baseline for the shell-exit prompt's change
 /// detection, established once before the first host launches and reused
 /// across every host teardown and rebuild. Re-arming the baseline at each
@@ -541,6 +566,13 @@ enum SessionMessage {
     /// deterministically here — without disturbing the lifecycle.
     #[cfg(test)]
     PeekPendingAsks(oneshot::Sender<Vec<(AskId, u16)>>),
+    /// Test-only: turn on the finalize package check that test builds leave
+    /// off (see [`Session::check_packages_at_finalize`]), bounded by the
+    /// carried deadline — [`PACKAGE_CHECK_DEADLINE`] for the production
+    /// bound, shorter to exercise the expiry path. Acknowledged once set,
+    /// so a finalize sent after the ack sees it.
+    #[cfg(test)]
+    CheckPackagesAtFinalize(std::time::Duration, oneshot::Sender<()>),
 }
 
 /// The key an ask parks under (NET-045): minted per request the session
@@ -802,6 +834,20 @@ pub struct Session {
     /// finish; every live one is aborted by [`Session::stop_running`], so a
     /// session that goes away takes its forwards down with it (NET-105).
     forwards: Vec<tokio::task::AbortHandle>,
+
+    /// Whether [`Self::finalize`] resolves the composition's package names
+    /// before promoting the record (see [`Self::check_composed_packages`]).
+    /// On in every production build. Off by default under
+    /// `test`/`test-support`, whose sessions run offline and compose names
+    /// (the scaffolded `base`/`vim`, for one) that only an upstream declares;
+    /// a test that wants the check turns it on through
+    /// [`SessionHandle::check_packages_at_finalize`].
+    check_packages_at_finalize: bool,
+
+    /// The bound on [`Self::check_composed_packages`] —
+    /// [`PACKAGE_CHECK_DEADLINE`] in every build; the test-only switch
+    /// above carries a shorter one to drive the expiry path.
+    package_check_deadline: std::time::Duration,
 }
 
 /// Why a session host was launched.
@@ -872,6 +918,8 @@ impl Session {
             // Forwards are registered as their channels open; a session
             // starts with none.
             forwards: Vec::new(),
+            check_packages_at_finalize: !cfg!(any(test, feature = "test-support")),
+            package_check_deadline: PACKAGE_CHECK_DEADLINE,
             // The same for the ports the box publishes at runtime: nothing is
             // live until a `min net expose` inside it lands (NET-044).
             live_ingress: Default::default(),
@@ -1267,9 +1315,14 @@ impl Session {
                 }
                 if let Some(address) = published {
                     // One warn line per port another box at the same address
-                    // also publishes (NET-129): intrinsic to the shared-address
-                    // mode, reported — the session-start report — and never
-                    // translated.
+                    // already holds (NET-129): intrinsic to the shared-address
+                    // mode, reported — here at finalize and at every later
+                    // session start, since each re-registers — and never
+                    // translated. First-come: the registry records the
+                    // collisions on this box, the one that yields, so its
+                    // attach skips those forwards instead of failing on a bind
+                    // the forwarder refuses. The box activates and stays
+                    // usable; its other forwards bind as usual.
                     reg.publish_own_address(record.id, &name, address, declared.clone());
                 }
                 // A box whose grant was withheld registers no name: the
@@ -1870,6 +1923,16 @@ impl Session {
                         .collect(),
                 );
             }
+            #[cfg(test)]
+            SessionMessage::CheckPackagesAtFinalize(deadline, r) => {
+                self.check_packages_at_finalize = true;
+                self.package_check_deadline = deadline;
+                #[expect(
+                    clippy::let_underscore_must_use,
+                    reason = "the asker may already be gone; there is nothing to answer then"
+                )]
+                let _ = r.send(());
+            }
         }
         ControlFlow::Continue(())
     }
@@ -2192,6 +2255,20 @@ impl Session {
                              (upload hook scripts, then retry FinalizeSession)",
                         ));
                     }
+                }
+
+                // Every composed package name has to resolve before the
+                // record is promoted: otherwise activate hands back an id
+                // for a session whose first spawn fails with `no such
+                // package`. Refusing here leaves the record unpromoted,
+                // and the client's activate cleanup removes it.
+                if self.check_packages_at_finalize
+                    && let SessionInner::Active {
+                        composition: Some(comp),
+                        ..
+                    } = &self.inner
+                {
+                    self.check_composed_packages(comp).await?;
                 }
 
                 // Materialize the composition's patches into the
@@ -4499,6 +4576,98 @@ impl Session {
         mctx::Context::new(self.workspace_config(&wsp)?).map_err(|e| e.to_string())
     }
 
+    /// Refuse a composition that names a package the session's graph does
+    /// not declare, naming each such package and who declared it (the
+    /// project or a loadout).
+    ///
+    /// Resolves names only, through the lookup the launch uses
+    /// ([`crate::env::session_package`]): nothing is built, and the graph is
+    /// dropped here, since the launch evaluates its own. A context or graph
+    /// that cannot be evaluated at all (an upstream that does not resolve)
+    /// is not judged here; the launch reports it, as it did before this
+    /// check existed — and so is one that does not resolve within
+    /// [`PACKAGE_CHECK_DEADLINE`]: the daemon bounds the work the check
+    /// adds to the `FinalizeSession` round-trip itself, because the
+    /// round-trip's other deadline is the client's, and its expiry does not
+    /// cancel the daemon-side finalize. An expired check steps aside,
+    /// warned, and the launch resolves the names at first exec, as it
+    /// always has.
+    async fn check_composed_packages(&self, comp: &Composition) -> Result<(), std::io::Error> {
+        if comp.packages().is_empty() {
+            return Ok(());
+        }
+        let checked: Result<Result<(), std::io::Error>, _> =
+            tokio::time::timeout(self.package_check_deadline, async {
+                let ctx = match self.build_context(true).await {
+                    Ok(ctx) => ctx,
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            "package check skipped at finalize: no session context"
+                        );
+                        return Ok(());
+                    }
+                };
+                // CPU-heavy (nickel evaluation), so on the blocking pool, as the
+                // launch runs it.
+                let graph = tokio::task::spawn_blocking(move || {
+                    let mut ctx = ctx;
+                    ctx.graph_from_all_packages().map_err(|e| e.to_string())
+                })
+                .await
+                .map_err(std::io::Error::other)?;
+                let graph = match graph {
+                    Ok(graph) => graph,
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            "package check skipped at finalize: no package graph"
+                        );
+                        return Ok(());
+                    }
+                };
+                let unknown: Vec<String> = comp
+                    .packages()
+                    .iter()
+                    .filter_map(|p| {
+                        crate::env::session_package(&graph, p.package())
+                            .err()
+                            .map(|e| {
+                                format!(
+                                    "{e} (declared by {})",
+                                    sessions::core::source::Provenanced::source(p)
+                                )
+                            })
+                    })
+                    .collect();
+                if unknown.is_empty() {
+                    return Ok(());
+                }
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("{}; the session was not activated", unknown.join("; ")),
+                ))
+            })
+            .await;
+        match checked {
+            Ok(result) => result,
+            Err(_expired) => {
+                // Stepping aside, not failing: a graph this slow is one the
+                // launch tolerates — it evaluates its own, unbounded, at
+                // first exec — so the check tolerates it too. The evaluation
+                // the timeout detached keeps running on the blocking pool and
+                // warms the cache that launch reads.
+                tracing::warn!(
+                    deadline = ?self.package_check_deadline,
+                    "package check skipped at finalize: the session graph did not \
+                     resolve within its deadline; unknown package names will surface \
+                     at first exec, as before this check existed",
+                );
+                Ok(())
+            }
+        }
+    }
+
     async fn paths(&self) -> SessionPaths {
         let obj = self.record.object().await.unwrap();
 
@@ -4933,6 +5102,23 @@ impl SessionHandle {
         // Ignore send errors - the recv will also fail.
         let _ = self.0.send(SessionMessage::IsBusy(send)).await;
         recv.await.unwrap_or(false)
+    }
+
+    /// Test-only: turn on the finalize package check for this session,
+    /// bounded by `deadline` (see [`SessionMessage::CheckPackagesAtFinalize`]
+    /// and [`PACKAGE_CHECK_DEADLINE`]).
+    #[cfg(test)]
+    pub(crate) async fn check_packages_at_finalize(&self, deadline: std::time::Duration) {
+        let (send, recv) = oneshot::channel();
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "a dead actor fails the recv below"
+        )]
+        let _ = self
+            .0
+            .send(SessionMessage::CheckPackagesAtFinalize(deadline, send))
+            .await;
+        recv.await.expect("the session actor should ack the switch");
     }
 
     /// Test-only peek at the actor's held [`Composition`]. Bumps the

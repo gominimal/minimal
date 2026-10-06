@@ -738,8 +738,9 @@ where
         if let Some(gate) = &gate {
             let udp = parse_ipv4_l4(&buf[..n]).filter(|pkt| pkt.proto == IPPROTO_UDP);
             // NET-136: the box's AAAA, HTTPS and SVCB lookups toward this
-            // switch's resolver are answered NODATA by the relay itself and
-            // never reach the switch. The box gets its empty answer — its own
+            // switch's resolver — and, NET-006, any non-A lookup for a
+            // `*.min.internal` name — are answered NODATA by the relay itself
+            // and never reach the switch or an upstream resolver. The box gets its empty answer — its own
             // query id, so its resolver stack matches the reply — and nothing
             // upstream can answer an empty-records lookup differently.
             if let Some(pkt) = &udp
@@ -1120,11 +1121,12 @@ pub struct SessionGate {
     /// NET-016), kept here beside the egress compilation so both halves of
     /// the box's policy decide on one form of each.
     ingress: IngressRules,
-    /// The DNS gate (NET-066, NET-067, NET-136): the per-box table of the
-    /// addresses its allowed names resolved to, each holding for its
+    /// The DNS gate (NET-066, NET-067, NET-136, NET-006): the per-box table
+    /// of the addresses its allowed names resolved to, each holding for its
     /// admission window — the one thing that can lift an
     /// undeclared-destination drop on the egress leg — plus the
-    /// AAAA/HTTPS/SVCB interception the egress leg answers NODATA with.
+    /// AAAA/HTTPS/SVCB interception, and the interception of any non-A
+    /// query for a `*.min.internal` name, the egress leg answers NODATA with.
     /// Built at attach and shared by both legs through this gate.
     dns: DnsGate,
     /// The reply-flow gate (NET-040's answer half): the per-box table of the
