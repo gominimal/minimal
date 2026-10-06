@@ -1041,6 +1041,8 @@ teardown() {
   # INT leaves a live activation — the same INT, then the KILL backstop.
   if [ -n "$BOXREG_CTRLC_PID" ]; then
     kill -INT "$BOXREG_CTRLC_PID" 2>/dev/null || true
+    # The proof may have left it stopped mid-step; resume it so the INT lands.
+    kill -CONT "$BOXREG_CTRLC_PID" 2>/dev/null || true
     sleep 0.5 2>/dev/null || true
     kill -9 "$BOXREG_CTRLC_PID" 2>/dev/null || true
   fi
@@ -3584,13 +3586,22 @@ proof_daemon_fetch_under_deny_all_host_address_box() {
 #     design blesses on purpose: both ends are a withdrawn row.
 #
 # The Ctrl-C half interrupts in [create returned, session Active] — the
-# window the CLI's interrupt guard covers. It cannot sleep its way in from
-# a hook (on_activate runs daemon-side INSIDE the create, before the guard
-# exists), so the trigger is host-visible instead: the deny-all
-# announcement a bare box prints to stderr immediately before arming the
-# guard (the same NET-076 text the egress proof above asserts), with the
-# fixture's bulk data holding the activation in the window long enough for
-# the SIGINT to land well inside it.
+# window the CLI's interrupt guard covers — and, within it, before the
+# loadout is configured: only a session still in its draft state can be
+# aborted. It cannot hold that window from an on_activate hook. The hook
+# runs in FinalizeSession, inside the guard, but on the session's actor:
+# the guard's AbortSession queues behind the finalize and is refused once
+# it runs, because the session is past its draft state by then. Racing the
+# activation from outside is no good either: a release build finishes the
+# project upload, the configure, and the finalize before a poll-then-signal
+# lands. So the case freezes the CLI instead. It single-steps the activation
+# under SIGSTOP/SIGCONT, so the CLI never runs more than a few milliseconds
+# unobserved. It stops for good once the CLI has printed the deny-all
+# announcement (the same NET-076 text the egress proof above asserts, printed
+# immediately before the guard is armed) AND holds the fixture's bulk data
+# open. That combination means the project upload is under way: after the
+# guard, before the configure. Then the SIGINT lands while the CLI is
+# still frozen there, so the window is held on purpose rather than won.
 #
 # Ordered in the whole-lane run right after `restart`: that proof already
 # stopped and respawned the daemon, so nothing behind it shares a live
@@ -3606,7 +3617,8 @@ proof_own_ip_box_registers_with_the_vm_host_without_a_provider_flag() {
   local boxreg_declared_switch="" boxreg_declared_out="" boxreg_declared_rc=""
   local boxreg_declared_reach_ok="" boxreg_refuse_start_ms=""
   local boxreg_refuse_rc="" boxreg_refuse_elapsed_ms="" boxreg_refuse_status=""
-  local boxreg_refuse_err="" boxreg_gate_drop=""
+  local boxreg_refuse_err="" boxreg_gate_drop="" boxreg_ctrlc_held=""
+  local boxreg_ctrlc_bulk="" boxreg_ctrlc_deadline=""
   echo "::group::own-address box registers with the VM host daemon, no provider flag (T78)"
 
   if [ "$min_daemon" != minvmd ]; then
@@ -3632,11 +3644,11 @@ proof_own_ip_box_registers_with_the_vm_host_without_a_provider_flag() {
   hook_seed_preamble > "$BOXREG_CTRLC_SEED_DIR/minimal.toml"
   mkdir "$BOXREG_CTRLC_SEED_DIR/.git"
   # 64 MiB of random data. The activate that carries it uploads the project
-  # before it can finish, and that upload — over the VM bridge on the lanes
-  # this case runs on — is a multi-second window, so the interrupt below
-  # lands inside [create returned, session Active] rather than racing the
-  # far end of it. A plain byte count, not an `m` suffix: GNU and BSD dd
-  # spell those differently.
+  # before it can finish, and the file being open in the CLI is the host-
+  # visible proof that the upload is under way, so the freeze below stops
+  # the CLI inside [create returned, session Active], before the configure.
+  # The size keeps that file open across many of the freeze's steps. A plain
+  # byte count, not an `m` suffix: GNU and BSD dd spell those differently.
   dd if=/dev/urandom of="$BOXREG_CTRLC_SEED_DIR/bulk.bin" bs=1048576 count=64 \
     >/dev/null 2>&1
 
@@ -3778,9 +3790,11 @@ proof_own_ip_box_registers_with_the_vm_host_without_a_provider_flag() {
   # the guard once the session is Active. The guard aborts the half-built
   # session, withdraws the box row, and exits 130. What the HOST can see of
   # "the create returned" is the deny-all announcement a box with no egress
-  # section prints to stderr immediately before the guard is armed, so this
-  # half polls the backgrounded activation's stderr for it and interrupts
-  # only once it has appeared — never sleeping a fixed delay and hoping.
+  # section prints to stderr immediately before the guard is armed, and of
+  # "the upload is under way" is the bulk file held open. This half freezes
+  # the backgrounded activation once both are true (see the header comment)
+  # and interrupts it there — never sleeping a fixed delay, and never racing
+  # a running activation to the end of the window.
   # Not `mnl ... &`: mnl is a function, so `$!` would be a subshell that
   # ignores SIGINT; exec the binary so the pid is `min`'s and Ctrl-C reaches
   # it.
@@ -3789,22 +3803,46 @@ proof_own_ip_box_registers_with_the_vm_host_without_a_provider_flag() {
     --no-prompt --name e2e-box-ctrlc --network own_ip ) \
     >"$WORK/boxreg-ctrlc.out" 2>"$WORK/boxreg-ctrlc.err" &
   BOXREG_CTRLC_PID=$!
-  # Cold VM boots overrun the 150 s spawn ceiling the recipes pin, so the
-  # poll's budget is a full cold boot (0.5 s × 600) rather than the warm
-  # case's seconds.
-  for _ in $(seq 1 600); do
-    if grep -q "Heads-up: the next release denies all external reach" \
-      "$WORK/boxreg-ctrlc.err" 2>/dev/null; then
+  # Single-step the activation until it is frozen inside the window (see the
+  # header comment): each step stops the CLI, looks, and lets it run ~10 ms
+  # more. Once the deny-all announcement is on stderr the guard is armed, and
+  # once the bulk file is also open the project upload is under way. The CLI
+  # is left stopped there, so nothing it does next can race the interrupt.
+  # lsof reports the resolved path on macOS (/tmp is /private/tmp), so the
+  # match is on the seed dir's own name, not the full path. Cold VM boots
+  # overrun the 150 s spawn ceiling the recipes pin, so the budget is a full
+  # cold boot rather than the warm case's seconds.
+  boxreg_ctrlc_bulk="$(basename "$BOXREG_CTRLC_SEED_DIR")/bulk.bin"
+  boxreg_ctrlc_deadline=$((SECONDS + 300))
+  while [ "$SECONDS" -lt "$boxreg_ctrlc_deadline" ]; do
+    kill -STOP "$BOXREG_CTRLC_PID" 2>/dev/null || break
+    if [ -z "$boxreg_ctrlc_armed" ] \
+      && grep -q "Heads-up: the next release denies all external reach" \
+        "$WORK/boxreg-ctrlc.err" 2>/dev/null; then
       boxreg_ctrlc_armed=1
-      break
     fi
-    if ! kill -0 "$BOXREG_CTRLC_PID" 2>/dev/null; then
-      break
+    if [ -n "$boxreg_ctrlc_armed" ]; then
+      if [ -d "/proc/$BOXREG_CTRLC_PID/fd" ]; then
+        find "/proc/$BOXREG_CTRLC_PID/fd" -lname "*/$boxreg_ctrlc_bulk" 2>/dev/null \
+          | grep -q . && boxreg_ctrlc_held=1
+      else
+        lsof -p "$BOXREG_CTRLC_PID" -Fn 2>/dev/null | grep -qF -- "$boxreg_ctrlc_bulk" \
+          && boxreg_ctrlc_held=1
+      fi
+      [ -n "$boxreg_ctrlc_held" ] && break
     fi
-    sleep 0.5
+    kill -CONT "$BOXREG_CTRLC_PID" 2>/dev/null || true
+    sleep 0.01
   done
   if [ -z "$boxreg_ctrlc_armed" ]; then
     echo "::error::the interrupted activation never announced the deny-all default on stderr — the create did not return (or failed outright), so the Ctrl-C guard was never in play"
+    cat "$WORK/boxreg-ctrlc.err" 2>/dev/null || true
+    kill -9 "$BOXREG_CTRLC_PID" 2>/dev/null || true
+    BOXREG_CTRLC_PID=""
+    fail
+  fi
+  if [ -z "$boxreg_ctrlc_held" ]; then
+    echo "::error::the interrupted activation was never caught holding its bulk data open — it got past the project upload (or exited) without being frozen inside the Ctrl-C guard's abortable window"
     cat "$WORK/boxreg-ctrlc.err" 2>/dev/null || true
     kill -9 "$BOXREG_CTRLC_PID" 2>/dev/null || true
     BOXREG_CTRLC_PID=""
@@ -3828,8 +3866,11 @@ proof_own_ip_box_registers_with_the_vm_host_without_a_provider_flag() {
   fi
   boxreg_ctrlc_switch="$(printf '%s\n' "$boxreg_record" \
     | sed -n 's/.*"switch_address":"\([0-9.]*\)".*/\1/p')"
-  echo "interrupt window: the create returned and the row is registered; sending Ctrl-C"
+  # Queued while the CLI is stopped, so the guard sees it the moment the CLI
+  # resumes, still inside the upload.
+  echo "interrupt window: the guard is armed, the upload is under way, and the row is registered; sending Ctrl-C"
   kill -INT "$BOXREG_CTRLC_PID" 2>/dev/null || true
+  kill -CONT "$BOXREG_CTRLC_PID" 2>/dev/null || true
   for _ in $(seq 1 120); do
     kill -0 "$BOXREG_CTRLC_PID" 2>/dev/null || break
     sleep 0.25
