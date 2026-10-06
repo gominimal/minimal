@@ -81,7 +81,11 @@
 #   own_ip_egress_declared_and_enforced
 #                                    the four egress fields declared, allowed
 #                                    and disallowed connections, the coming
-#                                    deny-all announcement, and the opt-out
+#                                    deny-all announcement, and the opt-out;
+#                                    a deny-all box's names outside the box
+#                                    zone are REFUSED fast at its relay while
+#                                    host.min.internal resolves, and its
+#                                    TCP 53 is dropped (NET-141)
 #   task_run                         `min task run` / `min session run` loop
 #   hooks                            lifecycle hooks, loadouts, patches, shells
 #   skip_scaffold                    the daemon-scaffolded blueprint upload lane
@@ -1642,7 +1646,10 @@ published_loopback_host() {
 # it: while the default is only announced this build still allows a bare
 # own-address box and prints the coming change; an explicit deny-all declaration
 # stands in for the in-force default to show the box reaching nothing; and the
-# announcement names the opt-out flag that keeps the prior default.
+# announcement names the opt-out flag that keeps the prior default. The same
+# deny-all box carries NET-141's deny-all case: its relay answers a name
+# outside the box zone REFUSED, fast, while host.min.internal still resolves,
+# and its TCP to the resolver's port is dropped.
 proof_own_ip_egress_declared_and_enforced() {
   echo "::group::own-IP egress: declared and enforced (NET T20)"
 
@@ -1969,21 +1976,126 @@ proof_own_ip_egress_declared_and_enforced() {
 
   # ---- NET-074 stand-in: no egress section reaches nothing once the default
   # is in force. The shipped phase is announced, so we exercise the
-  # enforcement shape with an explicit deny-all declaration (deny 0.0.0.0/0);
-  # the unit and CLI tests already cover the in-force resolution, and the
-  # announcement above covers the transition notice. This is a stand-in for
-  # NET-074's REACH only: NET-075's observable is the word `deny-all` in
-  # `min session policy`, which an explicit-rule box cannot show — it shows
-  # its rule — so that rendering stays with the CLI tests that pin it.
+  # enforcement shape with an explicit deny-all declaration
+  # (`--deny-all-egress`, every allow list present and empty — the very
+  # section the in-force default materializes); the unit and CLI tests
+  # already cover the in-force resolution, and the announcement above covers
+  # the transition notice. This is a stand-in for NET-074's REACH only:
+  # NET-075's `deny-all` rendering in `min session policy` stays with the CLI
+  # tests that pin it.
   deny_all_sid="$(cd "$EGRESS_SEED_DIR" && mnl session activate . --no-prompt \
     --name e2e-egress-deny-all --network own_ip \
-    --deny-subnets 0.0.0.0/0 \
+    --deny-all-egress \
     2>"$WORK/egress-deny-all.err")" || {
-    echo "::error::'min session activate --deny-subnets 0.0.0.0/0' failed"
+    echo "::error::'min session activate --network own_ip --deny-all-egress' failed"
     cat "$WORK/egress-deny-all.err" 2>/dev/null || true
     fail
   }
   deny_all_sid="$(printf '%s\n' "$deny_all_sid" | tail -n1 | tr -d '\r')"
+
+  # ---- NET-141's deny-all case: the relay's DNS gate answers a deny-all
+  # box's lookup of any name outside the box zone REFUSED itself, whatever
+  # the record type, and forwards nothing; zone names pass; and DNS over TCP
+  # to the resolver is dropped, because the resolver carve-out is UDP alone.
+  # None of it needs the public internet: the refusal is the relay's own
+  # answer, the zone is answered on the switch, and the drop is the box's
+  # own verdict, so these legs are hard assertions on every lane that runs
+  # this proof. The resolver is the one the box's resolv.conf names: the
+  # switch gateway.
+  da_resolv="$(mnl session exec "$deny_all_sid" 'cat /etc/resolv.conf' \
+    2>"$WORK/egress-deny-all-resolv.err" | tr -d '\r')" || true
+  da_ns="$(printf '%s\n' "$da_resolv" | awk '$1 == "nameserver" { print $2; exit }')"
+  if [ -z "$da_ns" ]; then
+    echo "::error::NET-141: the deny-all box's /etc/resolv.conf names no nameserver"
+    printf '%s\n' "$da_resolv"
+    cat "$WORK/egress-deny-all-resolv.err" 2>/dev/null || true
+    fail
+  fi
+  echo "NET-141: the deny-all box's resolver is $da_ns"
+
+  # The rcode itself, read off the wire: a raw query sent from inside the box
+  # with socat, carried in and out as base64 (both launcher baseline
+  # packages), built and parsed host-side with python3 (an e2e prerequisite).
+  # A REFUSED answer to the query's own id is the relay's: NXDOMAIN, an
+  # answer, or silence would each be something else.
+  da_dns_rcode() { # $1 name, $2 qtype number -> prints the rcode, or nothing
+    local q b64
+    q="$(python3 -c '
+import base64, struct, sys
+name, qtype = sys.argv[1], int(sys.argv[2])
+wire = b"".join(bytes([len(l)]) + l.encode() for l in name.split(".")) + b"\0"
+sys.stdout.write(base64.b64encode(
+    struct.pack("!HHHHHH", 0x4d31, 0x0100, 1, 0, 0, 0) + wire + struct.pack("!HH", qtype, 1)
+).decode())' "$1" "$2")"
+    b64="$(mnl session exec "$deny_all_sid" \
+      "printf %s '$q' | /usr/bin/base64 -d | /usr/bin/socat -t 2 - UDP:$da_ns:53 | /usr/bin/base64 -w0" \
+      2>"$WORK/egress-deny-all-rcode.err" | tr -d '\r\n')" || true
+    python3 -c '
+import base64, sys
+try:
+    r = base64.b64decode(sys.argv[1])
+except Exception:
+    sys.exit(0)
+if len(r) >= 4 and r[0:2] == b"\x4d\x31" and r[2] & 0x80:
+    print(r[3] & 0x0f)' "$b64"
+  }
+  for da_q in A:1 AAAA:28 TXT:16; do
+    da_rcode="$(da_dns_rcode example.com "${da_q#*:}")"
+    echo "NET-141: ${da_q%%:*} example.com from the deny-all box -> rcode ${da_rcode:-<no reply>}"
+    if [ "$da_rcode" != 5 ]; then
+      echo "::error::NET-141: the deny-all box's ${da_q%%:*} lookup of example.com, a name outside the box zone, was not answered REFUSED (rcode 5) by its relay (got '${da_rcode:-no reply}')"
+      cat "$WORK/egress-deny-all-rcode.err" 2>/dev/null || true
+      fail
+    fi
+  done
+
+  # Fast, through the box's own resolver stack: the lookup fails inside the
+  # libc resolver's 5 s timeout, so it was answered, never left to time out.
+  # Timed inside the box, so the exec's own round trip is not counted; the
+  # command is single-quoted so the box's shell, not this one, expands it.
+  # shellcheck disable=SC2016
+  da_lookup="$(mnl session exec "$deny_all_sid" \
+    's=$(date +%s%N); getent ahostsv4 example.com; rc=$?; e=$(date +%s%N); echo "rc=$rc ms=$(( (e - s) / 1000000 ))"' \
+    2>"$WORK/egress-deny-all-getent.err" | tr -d '\r' | tail -n1)" || true
+  echo "NET-141: getent ahostsv4 example.com from the deny-all box -> ${da_lookup:-<none>}"
+  da_lookup_rc="$(printf '%s' "$da_lookup" | sed -n 's/^rc=\([0-9]*\) .*/\1/p')"
+  da_lookup_ms="$(printf '%s' "$da_lookup" | sed -n 's/.* ms=\([0-9]*\)$/\1/p')"
+  if [ -z "$da_lookup_rc" ] || [ "$da_lookup_rc" = 0 ] || [ -z "$da_lookup_ms" ] \
+     || [ "$da_lookup_ms" -ge 5000 ]; then
+    echo "::error::NET-141: the deny-all box's lookup of example.com did not fail fast (want a non-zero getent exit inside 5000 ms, got '${da_lookup:-none}')"
+    cat "$WORK/egress-deny-all-getent.err" 2>/dev/null || true
+    fail
+  fi
+
+  # The zone passes (NET-072): host.min.internal resolves from the same box.
+  da_host="$(mnl session exec "$deny_all_sid" "getent ahostsv4 host.min.internal" \
+    2>"$WORK/egress-deny-all-host.err" | awk 'NR == 1 { print $1 }' | tr -d '\r')" || true
+  echo "NET-141: host.min.internal from the deny-all box -> ${da_host:-<none>}"
+  if ! printf '%s' "$da_host" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+    echo "::error::NET-141: host.min.internal, a box-zone name, did not resolve from the deny-all box (got '${da_host:-none}')"
+    cat "$WORK/egress-deny-all-host.err" 2>/dev/null || true
+    fail
+  fi
+
+  # TCP 53 to the resolver is dropped: the carve-out is UDP alone, so the
+  # box's own deny-all decides the connect, silently — it runs out its window
+  # with no reset. A fast failure would be a reject, not the drop.
+  da_tcp_start_ms="$(now_ms)"
+  mnl session exec "$deny_all_sid" \
+    "/usr/bin/socat /dev/null TCP:$da_ns:53,connect-timeout=8" \
+    >/dev/null 2>"$WORK/egress-deny-all-tcp53.err" && {
+    echo "::error::NET-141: the deny-all box completed a TCP connection to its resolver's port 53"
+    fail
+  }
+  da_tcp_ms=$(( $(now_ms) - da_tcp_start_ms ))
+  echo "NET-141: TCP $da_ns:53 from the deny-all box -> elapsed=${da_tcp_ms}ms socat: $(tail -n1 "$WORK/egress-deny-all-tcp53.err" 2>/dev/null)"
+  if grep -qE 'Connection refused|reset|No route to host|unreachable' "$WORK/egress-deny-all-tcp53.err" 2>/dev/null \
+     || [ "$da_tcp_ms" -lt 5000 ]; then
+    echo "::error::NET-141: the deny-all box's TCP to its resolver's port 53 was rejected or failed fast, not silently dropped"
+    cat "$WORK/egress-deny-all-tcp53.err" 2>/dev/null || true
+    fail
+  fi
+  echo "NET-141 OK: the deny-all box's names outside the zone are REFUSED at its relay, host.min.internal resolves, and its TCP 53 is dropped"
 
   # "A box with no effective reach reaches nothing" only means something if
   # the lane can already reach the public internet — otherwise the
@@ -2009,32 +2121,18 @@ proof_own_ip_egress_declared_and_enforced() {
       cat "$WORK/egress-deny-all-curl.err" 2>/dev/null || true
       fail
     fi
-    # Two outcomes are legitimate for this box, and only two: the resolver
-    # refuses the name outright (example.com is in no allow list, and the
-    # address it resolves to sits inside the 0.0.0.0/0 deny), or the SYN
-    # leaves, matches the deny, and gets no answer until the timeout — the
-    # silent drop NET-062 binds, which is what an enforcing filter looks like
-    # from inside the box. A fast failure that is neither of those means the
-    # connection reached something that answered it, and the control that
-    # gated this branch completed https://example.com from the declared box in
-    # this run, so the destination answers on this lane: the fast failure is
-    # the box's own escaping SYN (or a broken probe), never weather. The
-    # disallowed-IP probe above hard-fails this same shape; accepting it here
-    # would print a policy hole as `NET-074 OK`.
-    deny_all_outcome="fast refusal"
+    # One outcome is legitimate for this box: the lookup is refused before any
+    # connection is tried. Its relay answers every name outside the box zone
+    # REFUSED (NET-141, asserted on the wire above), so curl must fail at
+    # resolution, fast. A SYN that left — reset, answered, or silently
+    # dropped — would mean the name resolved, which the refusal rules out.
+    deny_all_outcome="not a resolver refusal"
     if grep -qi 'could not resolve' "$WORK/egress-deny-all-curl.err" 2>/dev/null; then
       deny_all_outcome="fast resolver refusal"
-    elif [ "$deny_all_elapsed_ms" -ge 6000 ]; then
-      deny_all_outcome="timeout with no reset"
     fi
     echo "deny-all GET https://example.com -> rc=$deny_all_rc status=${deny_all_status:-<none>} elapsed=${deny_all_elapsed_ms}ms ($deny_all_outcome) curl: ${deny_all_err:-<none>}"
-    if printf '%s' "$deny_all_err" | grep -qi 'reset by peer'; then
-      echo "::error::NET-074: the deny-all box's connection to https://example.com was reset by the destination — the SYN escaped the 0.0.0.0/0 deny and reached a server this run's control proved answers"
-      cat "$WORK/egress-deny-all-curl.err" 2>/dev/null || true
-      fail
-    fi
-    if [ "$deny_all_outcome" = "fast refusal" ]; then
-      echo "::error::NET-074: the deny-all box failed in ${deny_all_elapsed_ms}ms — a fast refusal that is neither a resolver refusal nor a silent drop. The control above completed https://example.com from the declared box in this run, so the destination answers on this lane and the fast failure is the box's own escaping connection or a broken probe, not weather"
+    if [ "$deny_all_outcome" != "fast resolver refusal" ]; then
+      echo "::error::NET-074/NET-141: the deny-all box's GET https://example.com did not fail at resolution — its relay refuses every name outside the box zone, so no connection should have been tried"
       cat "$WORK/egress-deny-all-curl.err" 2>/dev/null || true
       fail
     fi
