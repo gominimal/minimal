@@ -9,6 +9,8 @@ pub enum Error {
     NotFound,
     ConflictingLayouts(Vec<PathBuf>),
     MissingParamDefault(String),
+    /// A task sets more than one action key: the task name, then the keys.
+    MultipleTaskActions(String, Vec<String>),
 }
 
 impl fmt::Display for Error {
@@ -31,6 +33,12 @@ impl fmt::Display for Error {
             Error::MissingParamDefault(e) => {
                 write!(f, "invalid parameter: `{}` does not define a default", e)
             }
+            Error::MultipleTaskActions(task, keys) => write!(
+                f,
+                "task `{}` sets more than one action ({}); set exactly one",
+                task,
+                keys.join(", ")
+            ),
         }
     }
 }
@@ -43,6 +51,7 @@ impl std::error::Error for Error {
             Error::NotFound => None,
             Error::ConflictingLayouts(_) => None,
             Error::MissingParamDefault(_) => None,
+            Error::MultipleTaskActions(..) => None,
         }
     }
 }
