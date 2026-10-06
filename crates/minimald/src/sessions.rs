@@ -994,10 +994,14 @@ impl Manager {
     /// later RPC that names a resumed session finds its actor there rather
     /// than registering it again.
     ///
-    /// A record whose box name folds to a name another session already
-    /// routes is not resumed: [`crate::net::dns::HostnameRegistry`] lets the
-    /// later registration take the route over, and a restart must not move
-    /// a name from one session to another. That record keeps the lazy path.
+    /// A record whose box name is already routed for another session is not
+    /// resumed: [`crate::net::dns::HostnameRegistry`] lets the later
+    /// registration take the route over, and a restart must not move a name
+    /// from one session to another. The check keys on the session id, not
+    /// the name — two restored sessions can share one registry name
+    /// outright (two unnamed sessions whose project directories share a
+    /// basename), the pair the store's name-uniqueness check never sees, as
+    /// well as fold to one hostname. That record keeps the lazy path.
     /// A record that cannot be read, or whose actor fails to start, is
     /// logged and skipped, so one bad record costs only its own name.
     #[cfg(target_os = "linux")]
@@ -1032,12 +1036,12 @@ impl Manager {
                 continue;
             }
             let name = crate::session::registry_name(&record);
-            let owner = self
+            if let Some(owner) = self
                 .hostnames
                 .read()
                 .expect("hostname registry lock poisoned")
-                .hostname_owner(&name);
-            if let Some(owner) = owner.filter(|owner| *owner != name) {
+                .hostname_held_by_another(session_id, &name)
+            {
                 tracing::warn!(
                     session_id = %session_id,
                     session_name = &name,

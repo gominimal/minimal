@@ -894,16 +894,31 @@ impl HostnameRegistry {
             .is_some_and(|registration| registration.id != session_id)
     }
 
-    /// The session name whose route `session_name`'s box name answers with
-    /// now, if any. The lookup goes through the name's hostname, which is
-    /// case-folded, so it also finds a route registered under a name that
-    /// differs from `session_name` only in ASCII case — the collision
-    /// [`Self::register`] warns about and then overwrites.
+    /// The session name whose route the box name `session_name` answers with
+    /// now, when that route belongs to a session **other than `session_id`**
+    /// — the collision a restart's resume must not overwrite. The lookup
+    /// goes through the name's hostname, which is case-folded, so it also
+    /// finds a route registered under a name that differs from
+    /// `session_name` only in ASCII case; and whether that route is this
+    /// session's own is decided by the `SessionId` it was registered
+    /// under, never by the name — two sessions can share one registry
+    /// name outright (two unnamed sessions whose project directories
+    /// share a basename), so a same-named owner is not necessarily self.
     #[must_use]
-    pub fn hostname_owner(&self, session_name: &str) -> Option<String> {
-        self.by_host
-            .get(&Hostname::for_ptask(session_name))
-            .map(|route| route.session().to_owned())
+    pub fn hostname_held_by_another(
+        &self,
+        session_id: SessionId,
+        session_name: &str,
+    ) -> Option<String> {
+        let owner = self
+            .by_host
+            .get(&Hostname::for_ptask(session_name))?
+            .session()
+            .to_owned();
+        self.by_session
+            .get(&owner)
+            .filter(|registration| registration.id != session_id)
+            .map(|_| owner)
     }
 
     /// Reports the lease an `OwnIp` box attached with (from the attach path)

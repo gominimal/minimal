@@ -3666,6 +3666,74 @@ async fn a_restored_hostname_collision_is_logged_and_skipped() {
     );
 }
 
+/// Two restored sessions that share one registry name *outright* — two
+/// unnamed sessions whose project directories share a basename, the pair
+/// the store's name-uniqueness check never sees, since it only runs for
+/// assigned names. The check keys on the session id, not the name: an
+/// owner carrying the same name string is not this session, so the resume
+/// routes the name for one of them, skips the other with a collision
+/// warning, and never lets the second registration take the first's
+/// route over — which would move the name with no warning at all, both
+/// registrations being under the same name.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restored_session_sharing_another_sessions_registry_name_is_skipped() {
+    use minimald_rpc::{CreateSession, Errorable, FinalizeSession, FinalizeSessionRequest};
+
+    let capture = crate::test_harness::captured_log();
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    for project in ["/a/twins", "/b/twins"] {
+        let mut request = crate::test_harness::create_session_req("unused", project);
+        request.config.name = None;
+        let id = client.call::<CreateSession>(&request).await.unwrap().id;
+        crate::test_harness::unwrap_ready(
+            client
+                .call::<minimald_rpc::ConfigureLoadout>(&minimald_rpc::ConfigureLoadoutRequest {
+                    session_id: id,
+                    contribution: Default::default(),
+                })
+                .await
+                .unwrap(),
+        );
+        match client
+            .call::<FinalizeSession>(&FinalizeSessionRequest { session_id: id })
+            .await
+        {
+            Errorable::Ok(_) => {}
+            Errorable::Err { error } => panic!("FinalizeSession failed: {error}"),
+        }
+    }
+
+    let server = restart(server, client).await;
+    let manager = server.state.sessions_manager().await;
+    assert_eq!(
+        manager.resume_active_sessions().await.unwrap(),
+        1,
+        "only one of the name-sharing sessions is resumed"
+    );
+    assert_eq!(
+        manager.running_count().await,
+        1,
+        "the skipped session never starts an actor, so its registration \
+         cannot take the resumed one's route over"
+    );
+    assert_eq!(
+        route_owner(&server, "twins.min.internal").await,
+        Some("twins".to_owned()),
+        "the shared name routes for the one resumed session"
+    );
+    let logged = capture.contents();
+    assert!(
+        logged
+            .lines()
+            .any(|line| line.contains("hostname-collision")
+                && line.contains("resume:")
+                && line.contains("owner=\"twins\"")),
+        "the skipped session is logged as a collision, got: {logged}"
+    );
+}
+
 /// NET-013 inside the deferred probe's window, without the wait §7.1 keeps
 /// for a first finalize. A microVM daemon cannot measure the range its
 /// publishes bind on — the host's loopback, a machine the guest cannot see —
