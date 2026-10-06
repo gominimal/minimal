@@ -201,10 +201,10 @@ fn host_overcommit(avail: u64, allocated: u64, apparent: u64) -> Option<u64> {
 }
 
 /// Free bytes available to an unprivileged caller on the filesystem holding
-/// `dir` (`f_bavail * f_frsize`), or `None` when `statvfs` fails.
-fn host_free_bytes(dir: &Path) -> Option<u64> {
+/// `path` (`f_bavail * f_frsize`), or `None` when `statvfs` fails.
+fn host_free_bytes(path: &Path) -> Option<u64> {
     use std::os::unix::ffi::OsStrExt as _;
-    let c_path = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
     // SAFETY: `libc::statvfs` is a plain-old-data C struct; all-zero bytes are
     // a valid value.
     let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
@@ -217,16 +217,14 @@ fn host_free_bytes(dir: &Path) -> Option<u64> {
 }
 
 /// Warn when the host cannot back the image's apparent size: `statvfs` the
-/// image's directory for host free bytes, take the image's allocated bytes
+/// image for host free bytes, take the image's allocated bytes
 /// from `st_blocks` and its apparent size from `st_size`, and warn when
 /// `avail + allocated < apparent` (see [`host_overcommit`]).
 fn warn_if_overcommitted(path: &Path, meta: &std::fs::Metadata) {
     use std::os::unix::fs::MetadataExt as _;
-    let dir = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let Some(avail) = host_free_bytes(dir) else {
+    // `statvfs` the image itself, not its parent directory: `metadata(path)`
+    // follows a symlinked image, so both reads must describe the same filesystem.
+    let Some(avail) = host_free_bytes(path) else {
         return;
     };
     warn_overcommit(path, avail, meta.blocks() * 512, meta.len());
