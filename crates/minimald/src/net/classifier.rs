@@ -99,8 +99,11 @@ pub(crate) fn verdict_of(declaration: Option<&sessions::EgressPolicy>) -> Verdic
 /// Whether `section` is the declaration that admits no destination: every
 /// `allow_*` dimension present and empty. `deny_subnets` is not read — it
 /// subtracts from what the `allow_*` fields admit, and there is nothing
-/// there to subtract from.
-fn admits_nothing(section: &sessions::EgressPolicy) -> bool {
+/// there to subtract from. The relay's DNS gate reads the same predicate
+/// for its deny-all refusal ([`super::dns_gate`], NET-141), so the box the
+/// classifier places under `deny` and the box whose names the gate refuses
+/// are one shape.
+pub(crate) fn admits_nothing(section: &sessions::EgressPolicy) -> bool {
     section.allow_subnets.as_ref().is_some_and(Vec::is_empty)
         && section.allow_dns_hosts.as_ref().is_some_and(Vec::is_empty)
         && section.allow_protocols.as_ref().is_some_and(Vec::is_empty)
