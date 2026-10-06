@@ -19,6 +19,7 @@ attachability
 Attrs
 authorized_keys
 autospawn
+autospawning
 autospawns
 autotools
 backgrounded
@@ -95,6 +96,7 @@ Deduplicated
 deliverables
 Demoable
 Deno
+denylist
 deps
 deregister
 deregistered
@@ -125,8 +127,8 @@ endian
 enum
 enums
 Env
-envp
 env_vars
+envp
 errno
 errored
 erroring
@@ -395,8 +397,8 @@ toolsets
 traceparent
 triaging
 trimodal
-trycmd
 try_fold
+trycmd
 tty
 TUI
 tunables
@@ -436,6 +438,7 @@ unwritable
 upload
 uploader
 upstream
+userinfo
 userspace
 ustar
 uuid
