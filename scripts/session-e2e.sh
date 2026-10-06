@@ -83,7 +83,8 @@
 #                                    and disallowed connections, the coming
 #                                    deny-all announcement, and the opt-out;
 #                                    a deny-all box's names outside the box
-#                                    zone are REFUSED fast at its relay while
+#                                    zone are REFUSED fast at its relay, a
+#                                    zone TXT is NODATA there, while
 #                                    host.min.internal resolves, and its
 #                                    TCP 53 is dropped (NET-141)
 #   task_run                         `min task run` / `min session run` loop
@@ -2018,7 +2019,7 @@ proof_own_ip_egress_declared_and_enforced() {
   # packages), built and parsed host-side with python3 (an e2e prerequisite).
   # A REFUSED answer to the query's own id is the relay's: NXDOMAIN, an
   # answer, or silence would each be something else.
-  da_dns_rcode() { # $1 name, $2 qtype number -> prints the rcode, or nothing
+  da_dns_rcode() { # $1 name, $2 qtype number -> prints "rcode ancount", or nothing
     local q b64
     q="$(python3 -c '
 import base64, struct, sys
@@ -2036,11 +2037,12 @@ try:
     r = base64.b64decode(sys.argv[1])
 except Exception:
     sys.exit(0)
-if len(r) >= 4 and r[0:2] == b"\x4d\x31" and r[2] & 0x80:
-    print(r[3] & 0x0f)' "$b64"
+if len(r) >= 8 and r[0:2] == b"\x4d\x31" and r[2] & 0x80:
+    print(r[3] & 0x0f, int.from_bytes(r[6:8], "big"))' "$b64"
   }
   for da_q in A:1 AAAA:28 TXT:16; do
     da_rcode="$(da_dns_rcode example.com "${da_q#*:}")"
+    da_rcode="${da_rcode%% *}"
     echo "NET-141: ${da_q%%:*} example.com from the deny-all box -> rcode ${da_rcode:-<no reply>}"
     if [ "$da_rcode" != 5 ]; then
       echo "::error::NET-141: the deny-all box's ${da_q%%:*} lookup of example.com, a name outside the box zone, was not answered REFUSED (rcode 5) by its relay (got '${da_rcode:-no reply}')"
@@ -2048,6 +2050,19 @@ if len(r) >= 4 and r[0:2] == b"\x4d\x31" and r[2] & 0x80:
       fail
     fi
   done
+
+  # A zone name's non-A query is answered NODATA at the relay too (rcode 0,
+  # no answers, its own id): the switch's resolver answers only A for the
+  # zone and sends every other type on to the host's resolvers, so a TXT for
+  # a made-up zone name would carry the name out if it were forwarded.
+  da_nonce="e2e$(date +%s)$$"
+  da_zone_reply="$(da_dns_rcode "$da_nonce.min.internal" 16)"
+  echo "NET-141: TXT $da_nonce.min.internal from the deny-all box -> rcode/answers ${da_zone_reply:-<no reply>}"
+  if [ "$da_zone_reply" != "0 0" ]; then
+    echo "::error::NET-141: the deny-all box's TXT lookup of $da_nonce.min.internal, a zone name, was not answered NODATA (rcode 0, no answers) by its relay (got '${da_zone_reply:-no reply}')"
+    cat "$WORK/egress-deny-all-rcode.err" 2>/dev/null || true
+    fail
+  fi
 
   # Fast, through the box's own resolver stack: the lookup fails inside the
   # libc resolver's 5 s timeout, so it was answered, never left to time out.
@@ -2095,7 +2110,7 @@ if len(r) >= 4 and r[0:2] == b"\x4d\x31" and r[2] & 0x80:
     cat "$WORK/egress-deny-all-tcp53.err" 2>/dev/null || true
     fail
   fi
-  echo "NET-141 OK: the deny-all box's names outside the zone are REFUSED at its relay, host.min.internal resolves, and its TCP 53 is dropped"
+  echo "NET-141 OK: the deny-all box's names outside the zone are REFUSED at its relay, a zone TXT is NODATA, host.min.internal resolves, and its TCP 53 is dropped"
 
   # "A box with no effective reach reaches nothing" only means something if
   # the lane can already reach the public internet — otherwise the
