@@ -1563,7 +1563,9 @@ async fn relay_control(
     //
     // Noting first is what lets a full ledger refuse the publish
     // ([`PUBLISH_LEDGER_FULL_RULE`]): a forward the ledger cannot hold
-    // could never be unbound at its box's end, so it is never bound. A
+    // could never be unbound at its box's end, so it is never bound — the
+    // interim publish excepted, which the bound evicts instead of refusing
+    // (`note_published`), because no row's end unbinds it either way. A
     // write that fails takes its note back out: a forward the gate could
     // not deliver published nothing.
     let noted = match (verb, forward_listener(verb, &request)) {
@@ -1574,6 +1576,7 @@ async fn relay_control(
                     decision.request.switch_addr(),
                     inside,
                     proto,
+                    decision.applied == Applied::Interim,
                 ) {
                     Ok(noted) => noted.then_some(listener),
                     Err(full) => {
@@ -1878,10 +1881,14 @@ struct ControlDecision {
 ///
 /// The table is bounded at [`PUBLISHED_FORWARDS_TRACKED`]. At the bound a
 /// new publish is refused ([`PUBLISH_LEDGER_FULL_RULE`]) rather than an old
-/// attribution evicted: an evicted entry would be a forward still bound on
-/// the host that its box's end could no longer name, so it would never be
-/// unbound. A box's runtime ports can reach the bound (a wide dynamic range
-/// and a busy box), so the refusal is real, typed and logged.
+/// row-attributed one evicted: an evicted entry would be a forward still
+/// bound on the host that its box's end could no longer name, so it would
+/// never be unbound. The one entry the bound evicts is an interim
+/// attribution ([`Self::note_published`]) — a publish no row's withdrawal
+/// ever unbinds, so keeping it past the bound protects nothing while it
+/// refuses every box's publish. A box's runtime ports can reach the bound
+/// (a wide dynamic range and a busy box), so the refusal is real, typed
+/// and logged.
 #[derive(Debug, Default)]
 struct PublishedForwards {
     applied: Mutex<Vec<AppliedPublish>>,
@@ -1900,8 +1907,11 @@ struct PublishedForwards {
 type Listener = ([u8; 4], u16);
 
 /// One applied publish in the ledger: its listener, the address it was
-/// applied at, the inside port its forward dials and the protocol it named.
-type AppliedPublish = (Listener, [u8; 4], u16, u8);
+/// applied at, the inside port its forward dials, the protocol it named, and
+/// whether the announced interim applied it — a publish at an address no
+/// row holds, which no row's withdrawal ever unbinds and which the ledger's
+/// bound therefore evicts first ([`PublishedForwards::note_published`]).
+type AppliedPublish = (Listener, [u8; 4], u16, u8, bool);
 
 /// How many applied publishes' attributions the ledger keeps. A publish past
 /// the bound is refused ([`LedgerFull`]).
@@ -1949,8 +1959,8 @@ impl PublishedForwards {
     fn published_at(&self, addr: [u8; 4]) -> Vec<(Listener, u16, u8)> {
         self.lock()
             .iter()
-            .filter(|(_, at, _, _)| *at == addr)
-            .map(|(listener, _, inside, proto)| (*listener, *inside, *proto))
+            .filter(|(_, at, _, _, _)| *at == addr)
+            .map(|(listener, _, inside, proto, _)| (*listener, *inside, *proto))
             .collect()
     }
 
@@ -1960,7 +1970,7 @@ impl PublishedForwards {
         let mut applied = self.lock();
         let Some(at) = applied
             .iter()
-            .position(|(held, at, _, _)| *held == listener && *at == addr)
+            .position(|(held, at, _, _, _)| *held == listener && *at == addr)
         else {
             return false;
         };
@@ -1969,31 +1979,54 @@ impl PublishedForwards {
     }
 
     /// Notes a publish the gate is about to apply: the address its listener
-    /// is applied at, the inside port its forward dials and the protocol it
-    /// publishes. The listener is keyed first — gvproxy binds one forwarder
-    /// per loopback listener, so a second publish for a held listener never
-    /// becomes live — and `Ok(false)` says the listener was already held, so
-    /// nothing new was noted.
+    /// is applied at, the inside port its forward dials, the protocol it
+    /// publishes, and whether the announced interim applied it — a publish
+    /// no row holds, so no row's withdrawal ever unbinds it. The listener is
+    /// keyed first — gvproxy binds one forwarder per loopback listener, so a
+    /// second publish for a held listener never becomes live — and
+    /// `Ok(false)` says the listener was already held, so nothing new was
+    /// noted.
     ///
     /// # Errors
     ///
-    /// [`LedgerFull`] at [`PUBLISHED_FORWARDS_TRACKED`]: the publish is
-    /// refused, never an older attribution evicted.
+    /// [`LedgerFull`] at [`PUBLISHED_FORWARDS_TRACKED`] when every entry the
+    /// ledger holds is row-attributed: the publish is refused, never a row's
+    /// attribution evicted — an evicted row entry would be a forward still
+    /// bound on the host that its box's end could no longer name, so it
+    /// would never be unbound. An interim attribution is the one entry the
+    /// bound evicts instead: no row's end could ever unbind it either, so
+    /// holding room for it past the bound protects nothing, while a ledger
+    /// that nothing releases — the interim publishes and failed exposes a
+    /// buggy guest can leave behind — would refuse every box's publish
+    /// until the gate restarts. The eviction's cost is named in its warn
+    /// line: the evicted publish's later retraction is refused as
+    /// unattributed, so its forward stays bound until the guest unexposes
+    /// it or the switch restarts.
     fn note_published(
         &self,
         listener: Listener,
         addr: [u8; 4],
         inside: u16,
         proto: u8,
+        interim: bool,
     ) -> Result<bool, LedgerFull> {
         let mut applied = self.lock();
-        if applied.iter().any(|(held, _, _, _)| *held == listener) {
+        if applied.iter().any(|(held, _, _, _, _)| *held == listener) {
             return Ok(false);
         }
         if applied.len() >= PUBLISHED_FORWARDS_TRACKED {
-            return Err(LedgerFull);
+            let Some(evicted) = applied.iter().position(|(_, _, _, _, interim)| *interim) else {
+                return Err(LedgerFull);
+            };
+            let (_, at, _, _, _) = applied.remove(evicted);
+            tracing::warn!(
+                at = %Ipv4Addr::from(at),
+                "the publish ledger's bound evicted its oldest interim attribution: \
+                 no row's end unbinds an interim forward, so its retraction is refused \
+                 unattributed now and the forward stays bound until the guest unexposes it"
+            );
         }
-        applied.push((listener, addr, inside, proto));
+        applied.push((listener, addr, inside, proto, interim));
         Ok(true)
     }
 
@@ -2010,9 +2043,9 @@ impl PublishedForwards {
         let mut applied = self.lock();
         applied
             .iter()
-            .position(|(held, _, _, _)| *held == listener)
+            .position(|(held, _, _, _, _)| *held == listener)
             .map(|at| {
-                let (_, addr, inside, proto) = applied.remove(at);
+                let (_, addr, inside, proto, _) = applied.remove(at);
                 (addr, inside, proto)
             })
     }
@@ -2022,8 +2055,8 @@ impl PublishedForwards {
     fn address_of(&self, listener: Listener) -> Option<[u8; 4]> {
         self.lock()
             .iter()
-            .find(|(held, _, _, _)| *held == listener)
-            .map(|(_, addr, _, _)| *addr)
+            .find(|(held, _, _, _, _)| *held == listener)
+            .map(|(_, addr, _, _, _)| *addr)
     }
 
     /// The protocol the applied publish of `listener` was published in,
@@ -2031,8 +2064,8 @@ impl PublishedForwards {
     fn protocol_of(&self, listener: Listener) -> Option<u8> {
         self.lock()
             .iter()
-            .find(|(held, _, _, _)| *held == listener)
-            .map(|(_, _, _, proto)| *proto)
+            .find(|(held, _, _, _, _)| *held == listener)
+            .map(|(_, _, _, proto, _)| *proto)
     }
 
     /// Whether an applied publish's forward dials `addr` at `port`: the
@@ -2047,7 +2080,7 @@ impl PublishedForwards {
     fn inside_published(&self, addr: [u8; 4], port: u16) -> bool {
         self.lock()
             .iter()
-            .any(|(_, at, inside, _)| *at == addr && *inside == port)
+            .any(|(_, at, inside, _, _)| *at == addr && *inside == port)
     }
 
     /// Whether an applied publish still dials `addr` at `inside` in
@@ -2057,7 +2090,7 @@ impl PublishedForwards {
     fn still_published(&self, addr: [u8; 4], inside: u16, proto: u8) -> bool {
         self.lock()
             .iter()
-            .any(|(_, at, port, p)| *at == addr && *port == inside && *p == proto)
+            .any(|(_, at, port, p, _)| *at == addr && *port == inside && *p == proto)
     }
 
     /// Notes a rowless address an applied switch request named as the
@@ -2100,7 +2133,7 @@ impl PublishedForwards {
             .lock()
             .expect("the vouched set's lock is held only across a lookup or an update")
             .contains(&addr);
-        vouched || self.lock().iter().any(|(_, at, _, _)| *at == addr)
+        vouched || self.lock().iter().any(|(_, at, _, _, _)| *at == addr)
     }
 
     fn lock(&self) -> MutexGuard<'_, Vec<AppliedPublish>> {
@@ -6959,6 +6992,7 @@ mod tests {
                 LEASE,
                 18080,
                 super::egress::IPPROTO_TCP,
+                false,
             )
             .expect("an empty ledger has room for one publish");
         assert!(
@@ -7101,6 +7135,7 @@ mod tests {
                 node_addr,
                 7654,
                 super::egress::IPPROTO_TCP,
+                false,
             )
             .expect("an empty ledger has room for one publish");
         assert!(
@@ -7262,6 +7297,7 @@ mod tests {
                 LEASE,
                 18080,
                 super::egress::IPPROTO_TCP,
+                false,
             )
             .expect("an empty ledger has room for one publish");
         assert!(
@@ -7980,7 +8016,8 @@ mod tests {
                 ([127, 0, 0, 1], 8080),
                 LEASE,
                 18080,
-                super::egress::IPPROTO_TCP
+                super::egress::IPPROTO_TCP,
+                false
             ),
             Ok(true)
         );
@@ -12677,11 +12714,17 @@ mod tests {
 
         let ledger = super::PublishedForwards::new();
         assert_eq!(
-            ledger.note_published(a, [100, 64, 0, 9], 18080, super::egress::IPPROTO_TCP),
+            ledger.note_published(a, [100, 64, 0, 9], 18080, super::egress::IPPROTO_TCP, false),
             Ok(true)
         );
         assert_eq!(
-            ledger.note_published(b, [100, 64, 0, 10], 18081, super::egress::IPPROTO_UDP),
+            ledger.note_published(
+                b,
+                [100, 64, 0, 10],
+                18081,
+                super::egress::IPPROTO_UDP,
+                false
+            ),
             Ok(true)
         );
         assert_eq!(ledger.address_of(a), Some([100, 64, 0, 9]));
@@ -12727,10 +12770,10 @@ mod tests {
     }
 
     /// At its bound the ledger refuses the next publish with a typed error
-    /// instead of evicting the oldest one: an evicted entry would be a
-    /// forward still bound that its box's end could no longer unbind. A
-    /// listener already held is still answered as held, and a slot freed by
-    /// a retraction takes a publish again.
+    /// instead of evicting a row-attributed one: an evicted row entry would
+    /// be a forward still bound that its box's end could no longer unbind.
+    /// A listener already held is still answered as held, and a slot freed
+    /// by a retraction takes a publish again.
     #[test]
     fn the_ledger_refuses_a_publish_at_its_bound_and_evicts_nothing() {
         let tcp = super::egress::IPPROTO_TCP;
@@ -12742,13 +12785,13 @@ mod tests {
         };
         for n in 0..super::PUBLISHED_FORWARDS_TRACKED {
             assert_eq!(
-                ledger.note_published(listener(n), addr, 18080, tcp),
+                ledger.note_published(listener(n), addr, 18080, tcp, false),
                 Ok(true)
             );
         }
         let past = listener(super::PUBLISHED_FORWARDS_TRACKED);
         assert_eq!(
-            ledger.note_published(past, addr, 18080, tcp),
+            ledger.note_published(past, addr, 18080, tcp, false),
             Err(super::LedgerFull),
             "the publish past the bound is refused"
         );
@@ -12762,12 +12805,71 @@ mod tests {
             super::PUBLISHED_FORWARDS_TRACKED
         );
         assert_eq!(
-            ledger.note_published(listener(0), addr, 18080, tcp),
+            ledger.note_published(listener(0), addr, 18080, tcp, false),
             Ok(false),
             "a held listener is answered as held, not refused"
         );
         assert!(ledger.note_retracted(listener(0)).is_some());
-        assert_eq!(ledger.note_published(past, addr, 18080, tcp), Ok(true));
+        assert_eq!(
+            ledger.note_published(past, addr, 18080, tcp, false),
+            Ok(true)
+        );
+    }
+
+    /// At its bound the ledger evicts the oldest interim attribution rather
+    /// than refusing: an interim publish is one no row's withdrawal ever
+    /// unbinds, so holding room for it past the bound would protect nothing
+    /// while the entries a buggy guest leaves behind — interim publishes
+    /// and failed exposes alike — refuse every box's publish until the
+    /// gate restarts. The evicted publish's own listener goes unattributed;
+    /// a row-attributed entry never does.
+    #[test]
+    fn the_bound_evicts_the_oldest_interim_attribution_before_refusing() {
+        let tcp = super::egress::IPPROTO_TCP;
+        let addr = [100, 64, 0, 9];
+        let ledger = super::PublishedForwards::new();
+        let listener = |n: usize| -> super::Listener {
+            let n = u16::try_from(n).expect("the bound fits a port range");
+            ([127, 0, 64, 9], 10000 + n)
+        };
+        // One interim attribution in the middle of a full table of
+        // row-attributed ones, older row entries ahead of it: the bound
+        // must pick the interim one out, never the oldest row entry.
+        let interim = super::PUBLISHED_FORWARDS_TRACKED / 2;
+        for n in 0..super::PUBLISHED_FORWARDS_TRACKED {
+            assert_eq!(
+                ledger.note_published(listener(n), addr, 18080, tcp, n == interim),
+                Ok(true)
+            );
+        }
+        let past = listener(super::PUBLISHED_FORWARDS_TRACKED);
+        assert_eq!(
+            ledger.note_published(past, addr, 18080, tcp, false),
+            Ok(true),
+            "the bound evicts an interim attribution rather than refusing the publish"
+        );
+        assert_eq!(
+            ledger.address_of(listener(interim)),
+            None,
+            "the interim attribution is the one the bound evicted"
+        );
+        assert_eq!(
+            ledger.address_of(listener(0)),
+            Some(addr),
+            "an older row-attributed entry survives the bound"
+        );
+        assert_eq!(
+            ledger.published_at(addr).len(),
+            super::PUBLISHED_FORWARDS_TRACKED
+        );
+        // No interim attribution is left, so the publish past the bound is
+        // refused again, typed, with the ledger holding exactly the bound.
+        let next = listener(super::PUBLISHED_FORWARDS_TRACKED + 1);
+        assert_eq!(
+            ledger.note_published(next, addr, 18080, tcp, false),
+            Err(super::LedgerFull),
+            "with no interim attribution left the bound refuses again"
+        );
     }
 
     #[test]
@@ -12779,11 +12881,11 @@ mod tests {
         let addr = [100, 64, 0, 9];
         let ledger = super::PublishedForwards::new();
         assert_eq!(
-            ledger.note_published(([127, 0, 0, 1], 8080), addr, 18080, tcp),
+            ledger.note_published(([127, 0, 0, 1], 8080), addr, 18080, tcp, false),
             Ok(true)
         );
         assert_eq!(
-            ledger.note_published(([127, 0, 0, 1], 8081), addr, 18080, tcp),
+            ledger.note_published(([127, 0, 0, 1], 8081), addr, 18080, tcp, false),
             Ok(true)
         );
         assert_eq!(
@@ -12792,6 +12894,7 @@ mod tests {
                 addr,
                 18080,
                 super::egress::IPPROTO_UDP,
+                false,
             ),
             Ok(true)
         );
