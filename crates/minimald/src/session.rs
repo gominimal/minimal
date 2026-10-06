@@ -3212,11 +3212,10 @@ impl Session {
             local: forwarder.local().to_string(),
             internal_port: forwarder.internal_port(),
             proto: sessions::IpProto::Tcp,
-            // A fact about the box's relay gate, not about the bind: the
-            // serving handler fills it on every read, from the gate's
-            // compile set. Stored as `Some(false)` here — never rendered
-            // from the stored cell, and never the unknown `None` that a
-            // reply from a daemon older than the field decodes as.
+            // Never pending: the box's relay gate admits the port in the
+            // same turn the mapping is recorded (NET-044, below). `Some`,
+            // never the unknown `None` that a reply from a daemon older
+            // than the field decodes as.
             pending: Some(false),
         };
         if !self.has_live_host() {
@@ -3269,6 +3268,16 @@ impl Session {
             // is no caller left to propagate a failure to.
             crate::net::listeners::unreport_port(&control, switch_address, port, source).await;
             return Err(ExposeFailure::Refused(ExposeRefusal::NotAttached));
+        }
+        // The publish stands, so the box's relay gate admits the port now,
+        // in the same turn (NET-044): a publish is reachable, never a bound
+        // forward the gate refuses. Nothing listening yet is answered by the
+        // box's own kernel with a reset, so no gate state waits on a
+        // listener, and a listener closing later never withdraws this
+        // admission — the box's stop does. A box with no relay gate (no
+        // switch attached) has nothing in front of it to admit through.
+        if let Some(gate) = crate::net::switch::live_gate(switch_address) {
+            gate.admit_exposed(port);
         }
         Ok(mapping)
     }
@@ -3326,6 +3335,18 @@ impl Session {
         let forwarders = self.live_ingress.take_all();
         self.publications.revoke_all();
         if !forwarders.is_empty() {
+            // The expose's revocation withdraws its admission at the box's
+            // gate first (NET-044), so no new connection crosses the gap
+            // between a port the gate still admits and a forward that is
+            // coming down. A relay already gone took its gate with it.
+            if let Some(gate) = self
+                .reported_switch_address
+                .and_then(crate::net::switch::live_gate)
+            {
+                for forwarder in &forwarders {
+                    gate.withdraw_exposed(forwarder.internal_port());
+                }
+            }
             let control = self.switch_control().await;
             crate::net::policy::remove_ingress(&control, &forwarders).await;
             // The VM host daemon's row entries go with the forwards (T94,

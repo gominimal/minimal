@@ -1378,16 +1378,10 @@ async fn serve_get_effective_session_policy(
 /// empty list — the honest answer for a box that is not running, since a
 /// publish lives only while its box does.
 ///
-/// Each row's reachability state is filled here, at read time, from the same
-/// set the box's relay gate was compiled from — the declared ports
-/// [`declared_ingress_ports`] — because it is a fact about the box, not about
-/// the bind: a runtime-published port is bound on the host at once, but the
-/// frame only reaches the box through the relay gate its attach installed,
-/// and that gate admits the ports the *declaration* named. So a runtime
-/// publish reads `pending` until the gate's admitted set grows to include
-/// runtime-published ports, and a publish of a port the declaration already
-/// names — the one overlap — is not pending, because the declared forward is
-/// what answers at that address.
+/// Every row reads not pending: a runtime publish admits its port at the
+/// box's relay gate in the same turn it records the mapping (NET-044), so a
+/// listed publish is reachable. The `pending` field stays on the wire so a
+/// client can still tell this daemon's rows from an older daemon's.
 async fn serve_get_live_ingress(
     s: ServerStateHandle,
     c: RuChannel<Msg>,
@@ -1407,37 +1401,14 @@ async fn serve_get_live_ingress(
                 None => Ok(Errorable::Err {
                     error: "no session found".to_string(),
                 }),
-                Some(session) => {
-                    // The admitted set the gate is compiled from, per
-                    // mapping's transport — an unreadable record reads as
-                    // "nothing admitted", so its mappings all read pending: a
-                    // row is reachable only when the gate is known to admit
-                    // it.
-                    let record = session.record().await.ok();
-                    let policy = record.as_ref().map(|record| &record.policy);
-                    match session.live_ingress().await {
-                        Ok(live) => Ok(Errorable::Ok(
-                            live.into_iter()
-                                .map(|mut mapping| {
-                                    let admitted = crate::net::switch::declared_ingress_ports(
-                                        policy,
-                                        mapping.proto,
-                                    );
-                                    // The daemon knows the state, so it says
-                                    // it: `Some`, never the unknown a reply
-                                    // from a daemon older than the field
-                                    // decodes as.
-                                    mapping.pending =
-                                        Some(!admitted.contains(&mapping.internal_port));
-                                    mapping
-                                })
-                                .collect(),
-                        )),
-                        Err(e) => Ok(Errorable::Err {
-                            error: e.to_string(),
-                        }),
-                    }
-                }
+                Some(session) => match session.live_ingress().await {
+                    // The actor's own rows, `pending: Some(false)` each: the
+                    // publish admitted the port when it recorded the row.
+                    Ok(live) => Ok(Errorable::Ok(live)),
+                    Err(e) => Ok(Errorable::Err {
+                        error: e.to_string(),
+                    }),
+                },
             }
         })
         .await

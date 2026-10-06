@@ -1987,17 +1987,12 @@ pub struct LiveMapping {
     pub internal_port: u16,
     /// The transport the forward carries.
     pub proto: IpProto,
-    /// Whether the box's own relay gate has admitted the port yet. A runtime
-    /// publish binds on the host at once, but the frame only reaches the box
-    /// through the relay gate its attach installed — and that gate admits the
-    /// ports the *declaration* named, so a port published at runtime is
-    /// refused at the relay until the gate's admitted set grows to include
-    /// runtime-published ports. A mapping that reads `pending` is bound, and
-    /// a connection to its `local` is answered by the relay, not by the box.
-    ///
-    /// Filled by the daemon at read time (the serving handler compares the
-    /// mapping against the gate's compile set), never stored with the
-    /// forwarder — the state is a fact about the box, not about the bind.
+    /// Whether the box's own relay gate has not admitted the port. A current
+    /// daemon admits a runtime publish at the gate in the same step it binds
+    /// the forward (NET-044), so it always answers `Some(false)`. Only a
+    /// daemon from before that change answers `Some(true)`: its gate admitted
+    /// only the declared ports, so a connection to such a row's `local` was
+    /// answered by the relay, not by the box.
     ///
     /// An `Option`, defaulted on the wire, so a reply from a daemon older
     /// than the field — one that carries no `pending` key — still decodes,

@@ -1469,7 +1469,11 @@ impl WatchState {
                         // never retried, because the settlement enters
                         // the port in the poll's book and a backoff is
                         // for a publish that failed, not for a
-                        // publication that already stands.
+                        // publication that already stands. Nor is the
+                        // port admitted here: the expose admitted it at the
+                        // gate when it published (NET-044), and that
+                        // admission is the expose's to withdraw, not this
+                        // listener's.
                         self.reported_contention.remove(&port);
                         tracing::info!(
                             session = %self.plan.box_name,
@@ -3326,7 +3330,7 @@ mod tests {
         let listener = listening_socket();
         let port = port_of(&listener);
         let dir = tempfile::tempdir().unwrap();
-        let (_watcher, _gate, server, mut served) = started_watcher_with_publications(
+        let (_watcher, gate, server, mut served) = started_watcher_with_publications(
             &dir,
             &permit_policy(port),
             // The expose surface's own publication of the port, standing
@@ -3339,6 +3343,9 @@ mod tests {
                 assert!(reservation.record(), "nothing revoked the reservation");
             },
         );
+        // The expose's own admission at the gate (NET-044), made when it
+        // published: the watcher must leave it alone.
+        gate.admit_exposed(port);
         let (lines, _guard) = captured_lines();
 
         // Several poll intervals with the listener standing: the watcher
@@ -3391,6 +3398,10 @@ mod tests {
         assert!(
             lines_saying(&log, "published a listening port on the box's address").is_empty(),
             "the port the expose surface holds is never bound by the watcher: {log}"
+        );
+        assert!(
+            gate.admits_tcp(port),
+            "a listener closing never withdraws an exposed port's admission"
         );
         server.abort();
     }

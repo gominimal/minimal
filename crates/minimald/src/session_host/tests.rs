@@ -5497,6 +5497,92 @@ async fn expose_ask_prompts_attached_human() {
     assert!(records[0].get("reason").is_none());
 }
 
+/// NET-044/NET-045: an `ask` answered yes admits the port at the box's relay
+/// gate the way an `allow` does — the publish the human allowed is reachable
+/// — while a port nobody published stays refused. The gate is registered
+/// under the box's switch address the way its relay's spawn registers it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expose_ask_yes_admits_the_port_at_the_box_gate() {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let manager = server.state.sessions_manager().await;
+    manager.land_range_verdict(crate::net::dns::RangeVerdict::Present);
+    // An address no other test's box uses: the live-gate table is
+    // process-wide.
+    let switch = std::net::Ipv4Addr::new(100, 64, 128, 92);
+    let web = finalize_dynamic_ingress_session(
+        &mut client,
+        "askgate",
+        switch,
+        std::net::Ipv4Addr::new(127, 0, 64, 92),
+        Some(sessions::DynamicIngress::Ask),
+        Some((3000, 3999)),
+    )
+    .await;
+    let handle = manager
+        .get_session(crate::sessions::SessionKeyPredicate::Id(web))
+        .await
+        .unwrap()
+        .expect("the asking box resolves");
+    let gate = std::sync::Arc::new(crate::net::switch::SessionGate::for_session(
+        "askgate".to_string(),
+        switch,
+        &sessions::SessionPolicy::default(),
+        crate::net::SwitchSubnet::default(),
+        None,
+    ));
+    crate::net::switch::register_live_gate_for_test(switch, &gate);
+    let sock = handle
+        .net_switch()
+        .await
+        .unwrap()
+        .lock()
+        .await
+        .control_socket();
+    let (forwarder, _served) = fake_forwarder(sock, 200).await;
+
+    // Attach the human the ask will be routed to, and prove the binding is
+    // live before asking.
+    let mut channel = client.open_shell(web).await;
+    channel.data_bytes(b"hello\n".to_vec()).await.unwrap();
+    let mut live = Vec::new();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            match channel.wait().await {
+                Some(russh::ChannelMsg::Data { data }) => {
+                    live.extend_from_slice(&data);
+                    if String::from_utf8_lossy(&live).contains("got:hello") {
+                        return;
+                    }
+                }
+                Some(_) => {}
+                None => panic!("the channel closed before the shell came up"),
+            }
+        }
+    })
+    .await
+    .expect("the attached shell should echo within the bound");
+
+    assert!(!gate.admits_tcp(3000), "nothing is published yet");
+    let asked = tokio::spawn(async move { handle.expose_dynamic(3000).await });
+    answer_ask_on(&mut channel, true).await;
+    tokio::time::timeout(Duration::from_secs(30), asked)
+        .await
+        .expect("the ask should be answered once the human answers")
+        .expect("the spawned request should not panic")
+        .expect("the human's allow publishes the port");
+    forwarder.abort();
+
+    assert!(
+        gate.admits_tcp(3000),
+        "the port the human allowed is admitted at the box's relay gate"
+    );
+    assert!(
+        !gate.admits_tcp(3001),
+        "a port nobody published stays refused"
+    );
+}
+
 /// NET-045's unwanted branch: a box decided `ask` with nobody attached — no
 /// client ever bound, so no human to render the dialog to — is refused with
 /// the typed error that says nobody is attached to answer, the switch is

@@ -158,9 +158,8 @@
 #                                    3000' from inside the box, every stance
 #                                    end to end — allow publishes at the
 #                                    address the daemon's expose record
-#                                    names (the pending contract pinned:
-#                                    bound and listed, honestly not yet
-#                                    reachable, T97's to flip), ask routes
+#                                    names, and the host reaches the
+#                                    in-box server through it, ask routes
 #                                    its dialog to a human attached through
 #                                    a real pty and publishes on their
 #                                    Allow, records nothing on their deny,
@@ -174,9 +173,8 @@
 #                                    crosses its host-side admission (the
 #                                    row holds the port, the owner-only
 #                                    host audit carries the line, the
-#                                    host reaches the in-box server, a
-#                                    known gap until gominimal/inbox#933
-#                                    lands), the ask is offered to the
+#                                    host reaches the in-box server),
+#                                    the ask is offered to the
 #                                    human attached on the host (whose
 #                                    Allow publishes, whose deny records
 #                                    nothing — a later expose asks again —
@@ -16854,12 +16852,9 @@ PY
 
   # ---- the ask: an in-range port of an allow box --------------------------
   # The reply is the box's own word that the publish stood: the address its
-  # forward bound, spelled host:port. A runtime-only port's reply carries the
-  # honesty caveat NET-047 pins — bound, but the relay gate has not admitted
-  # it — and this box declared no static mapping, so the caveat is expected;
-  # the case prints whichever reply it got and asserts only the publish line
-  # itself. A native host has no host gate in the ask's way, so any refusal
-  # here is a failure.
+  # forward bound, spelled host:port, with no caveat — the publish admitted
+  # the port at the box's relay gate (NET-044). A native host has no host
+  # gate in the ask's way, so any refusal here is a failure.
   mnl session exec "$mnx_sid" "/usr/bin/min net expose $mnx_port" \
     >"$WORK/mnx-expose.out" 2>"$WORK/mnx-expose.err"
   mnx_expose_rc=$?
@@ -16872,7 +16867,6 @@ PY
     fail
   fi
   case "$mnx_expose_out" in
-    "published port $mnx_port at "*":$mnx_port; not yet reachable") ;;
     "published port $mnx_port at "*":$mnx_port") ;;
     *)
       echo "::error::the expose's reply is not a publish line naming the port and its address (got: '$mnx_expose_out')"
@@ -17879,17 +17873,11 @@ exit" E2E_PTY_ASK="$2" E2E_PTY_ANSWER=keep \
 #     info line NET-044's observability owes every decided request; the
 #     NET-040 attach record names only a create's declared mappings, and
 #     this box declares none) records the same address, and the host's own
-#     probe at that address meets the contract NET-047 pins for a
-#     runtime-only port: the publish is BOUND on the host, but the box's
-#     relay gate has not admitted it — the gate's set is the declared ports
-#     plus the listen watcher's publishes (switch.rs `admits_tcp`), and an
-#     expose publishes without admitting, so the live row reads
-#     `(pending; not yet reachable)` and a host connect delivers nothing of
-#     the box. The listener stands inside the box first, so the refusal
-#     cannot be blamed on a port nothing answers for. The reach itself —
-#     the gate growing to admit runtime publishes — is T97's work
-#     (gominimal/minimal#1897), and this case asserts today's contract so
-#     that task has a leg to flip;
+#     probe at that address reaches the in-box server and gets its
+#     response (NET-044): the publish admits the port at the box's relay
+#     gate (switch.rs `admits_tcp`) as it binds the forward, so the live
+#     row carries no pending caveat. The listener stands inside the box
+#     first, so a miss cannot be blamed on a port nothing answers for;
 #   * an ask box, answered YES through a real pty attach
 #     (scripts/e2e-attach-pty.py, `E2E_PTY_ASK=allow`) — the request is
 #     driven from an exec OUTSIDE the attach, so the dialog reaching the
@@ -17925,9 +17913,7 @@ exit" E2E_PTY_ASK="$2" E2E_PTY_ANSWER=keep \
 # the box, so nothing crosses and nothing may exist on the host: no live
 # row, an empty runtime set, and no audit line at all, asserted all three
 # ways. The host's own probe at the published address must reach the
-# in-box server and get its response (NET-044); until the guest relay gate
-# admits an allow-exposed port, a miss is carried as a known gap
-# (gominimal/inbox#933), never as the contract. The ask legs
+# in-box server and get its response (NET-044). The ask legs
 # (`eib_vm_ask_legs` above) are the host-attached human's. And the expose half of T61 lands on this lane: a
 # box created on the non-default VM (`min --vm alpha session activate`,
 # autospawning the VM) publishes an in-box expose THERE, driven through
@@ -17941,7 +17927,8 @@ proof_expose_from_inside_box() {
   local eib_allow_sid="" eib_yes_sid="" eib_no_sid="" eib_nobody_sid="" eib_deny_sid=""
   local eib_out="" eib_rc="" eib_err="" eib_addr="" eib_log="" eib_rec="" eib_hrc="" eib_hms=""
   local eib_rec_addr="" eib_t0="" eib_t1=""
-  local eib_policy="" eib_pid="" eib_prc="" eib_live="" eib_listening="" eib_hstatus="" eib_body=""
+  local eib_policy="" eib_pid="" eib_prc="" eib_live="" eib_listening="" eib_hstatus=""
+  local eib_reached="" eib_policy_row=""
   local eib_allow_name="e2e-inside-allow" eib_yes_name="e2e-inside-ask-yes"
   local eib_no_name="e2e-inside-ask-no" eib_nobody_name="e2e-inside-ask-nobody"
   local eib_deny_name="e2e-inside-deny"
@@ -17983,7 +17970,6 @@ proof_expose_from_inside_box() {
     local eib_two_line="" eib_two_attach="" eib_two_skip=""
     local eib_two_audit="" eib_two_drc=0 eib_two_drow=""
     local eib_two_stopped="" eib_vm_ok="" EIB_TWO_SEED_DIR=""
-    local eib_reached="" eib_policy_row=""
     eib_vm_sids="$WORK/eib-vm-sids"
     : > "$eib_vm_sids"
 
@@ -18056,7 +18042,6 @@ proof_expose_from_inside_box() {
       fail
     fi
     case "$eib_out" in
-      "published port $eib_port at "*":$eib_port; not yet reachable") ;;
       "published port $eib_port at "*":$eib_port") ;;
       *)
         echo "::error::the expose's reply is not a publish line naming the port and its address (got: '$eib_out')"
@@ -18134,11 +18119,7 @@ proof_expose_from_inside_box() {
     # The host's own probe at the published address (NET-044): an allowed
     # expose is reachable, so the probe must reach the in-box server through
     # the published address and get its response, the marker. Polled, so a
-    # forward still settling is not a verdict. Not a hard assertion yet: the
-    # guest relay gate does not admit an allow-exposed port today, so on
-    # main this leg is expected to find the port unreached. Carried as a
-    # known gap until that lands (gominimal/inbox#933); delete the known_gap
-    # branch then, and let a miss `fail`.
+    # forward still settling is not a verdict.
     eib_reached=""
     for _ in $(seq 1 20); do
       eib_t0=$(now_ms)
@@ -18157,12 +18138,12 @@ proof_expose_from_inside_box() {
       sleep 0.25
     done
     echo "host probe: GET http://$eib_addr:$eib_port/ -> curl exit $eib_hrc in ${eib_hms}ms (status ${eib_hstatus:-none})"
-    if [ -n "$eib_reached" ]; then
-      echo "the host probe reached the allow box's in-box server through the published address and got its marker (NET-044)"
-    else
-      known_gap proof_expose_from_inside_box \
-        "the host probe at $eib_addr:$eib_port did not reach the allow box's in-box server on a VM lane (curl exit $eib_hrc, status ${eib_hstatus:-none}), so the allow-exposed port is not admitted at the guest relay gate, NET-044 — https://github.com/gominimal/inbox/issues/933"
+    if [ -z "$eib_reached" ]; then
+      echo "::error::the host probe at $eib_addr:$eib_port did not reach the allow box's in-box server on a VM lane (curl exit $eib_hrc, status ${eib_hstatus:-none}) — the allow-exposed port is not admitted at the guest relay gate (NET-044)"
+      cat "$WORK/eib-vm-host.err" 2>/dev/null || true
+      fail
     fi
+    echo "the host probe reached the allow box's in-box server through the published address and got its marker (NET-044)"
 
     # The publish listed beside the declaration, read the way a person reads
     # it (NET-044): one live row for the port. The row's trailing text is
@@ -18451,10 +18432,7 @@ exit" E2E_PTY_ANSWER=keep \
       echo "two named VMs: the expose inside the box on $eib_two_vm published on $eib_two_vm, and the named VM is stopped again (NET-055, NET-058)"
     fi
 
-    local eib_vm_reach="the host reached the in-box server through the published address"
-    [ -n "$eib_reached" ] \
-      || eib_vm_reach="the host reaching it is a KNOWN GAP (gominimal/inbox#933)"
-    eib_vm_ok="expose from inside the box OK on a VM lane (the allow stance published through the VM host daemon's admission — the row holds the port at the registration's switch address and the owner-only host audit carries the line, and $eib_vm_reach; the host's attached human's Allow published and their deny recorded nothing, a later expose asked again, nobody attached was refused, the deny box was refused with nothing recorded on the host, and every decision is a line in the VM host daemon's own audit"
+    eib_vm_ok="expose from inside the box OK on a VM lane (the allow stance published through the VM host daemon's admission — the row holds the port at the registration's switch address and the owner-only host audit carries the line, and the host reached the in-box server through the published address; the host's attached human's Allow published and their deny recorded nothing, a later expose asked again, nobody attached was refused, the deny box was refused with nothing recorded on the host, and every decision is a line in the VM host daemon's own audit"
     if [ -n "$eib_two_skip" ]; then
       echo "$eib_vm_ok; the two named VMs leg SKIPPED: $eib_two_skip)"
     else
@@ -18621,7 +18599,6 @@ PY
     fail
   fi
   case "$eib_out" in
-    "published port $eib_port at "*":$eib_port; not yet reachable") ;;
     "published port $eib_port at "*":$eib_port") ;;
     *)
       echo "::error::the expose's reply is not a publish line naming the port and its address (got: '$eib_out')"
@@ -18665,11 +18642,10 @@ PY
   # The listener inside the box, started after the publish the way the mnx
   # case starts its own: its own direct answer proves the port answers
   # inside the box, so the host probe below cannot blame a port nothing
-  # listens on — and the watcher that sees the LISTEN settles it against the
-  # publication the expose already holds, without admitting it at the gate
-  # (listeners.rs: "left a listening port the runtime expose already
-  # published"), so the pending contract below is the gate's, not the
-  # listener's absence.
+  # listens on. The watcher that sees the LISTEN settles it against the
+  # publication the expose already holds (listeners.rs: "left a listening
+  # port the runtime expose already published"); the admission at the gate
+  # is the expose's own, made when it published (NET-044).
   mnl session exec "$eib_allow_sid" \
     "body=$eib_marker; printf \"HTTP/1.1 200 OK\r\nContent-Length: \${#body}\r\nConnection: close\r\n\r\n%s\" \"\$body\" > /home/eib-http200" \
     >/dev/null 2>"$WORK/eib-allow-responder.err" \
@@ -18696,50 +18672,55 @@ PY
   fi
   echo "listener: socat now serves port $eib_port inside the allow box (its own loopback answers $eib_marker)"
 
-  # The host's own probe at the recorded address — the pinned contract for a
-  # runtime-only publish (NET-047): the forward is BOUND on the host at the
-  # recorded address, but the box's relay gate has not admitted the port, so
-  # the connection is the relay's to answer, not the box's. Asserted as what
-  # the tree pins — never a delivered answer — with the mode the refusal took
-  # reported beside it; the reach is T97's to add (gominimal/minimal#1897),
-  # and its landing flips this leg to the delivered marker.
-  eib_t0=$(now_ms)
-  env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy \
-    -u ALL_PROXY -u all_proxy -u NO_PROXY -u no_proxy \
-    curl -sS --max-time 8 -o "$WORK/eib-host.body" -w '%{http_code}' \
-    "http://$eib_rec_addr/" >"$WORK/eib-host.out" 2>"$WORK/eib-host.err"
-  eib_hrc=$?
-  eib_t1=$(now_ms)
-  eib_hms=$((eib_t1 - eib_t0))
-  eib_hstatus="$(tail -n1 "$WORK/eib-host.out" 2>/dev/null | tr -d '\r\n')"
-  eib_body="$(cat "$WORK/eib-host.body" 2>/dev/null || true)"
-  echo "host probe: GET http://$eib_rec_addr/ -> curl exit $eib_hrc in ${eib_hms}ms (status ${eib_hstatus:-none}) — bound at the recorded address, and the relay gate has not admitted it (NET-047's pending contract)"
-  if [ "$eib_hrc" -eq 0 ] || [ "$eib_hstatus" = "200" ]; then
-    echo "::error::the host probe reached the allow box's runtime publish — the gate admitted a port no declaration names and no watcher published (NET-047)"
+  # The host's own probe at the recorded address (NET-044): an allowed
+  # expose is reachable, so the probe must reach the in-box server through
+  # the recorded address and get its response, the marker. Polled, so a
+  # forward still settling is not a verdict.
+  eib_reached=""
+  for _ in $(seq 1 20); do
+    eib_t0=$(now_ms)
+    env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy \
+      -u ALL_PROXY -u all_proxy -u NO_PROXY -u no_proxy \
+      curl -sS --max-time 3 -o "$WORK/eib-host.body" -w '%{http_code}' \
+      "http://$eib_rec_addr/" >"$WORK/eib-host.out" 2>"$WORK/eib-host.err"
+    eib_hrc=$?
+    eib_t1=$(now_ms)
+    eib_hms=$((eib_t1 - eib_t0))
+    eib_hstatus="$(tail -n1 "$WORK/eib-host.out" 2>/dev/null | tr -d '\r\n')"
+    if grep -qF "$eib_marker" "$WORK/eib-host.body" 2>/dev/null; then
+      eib_reached=1
+      break
+    fi
+    sleep 0.25
+  done
+  echo "host probe: GET http://$eib_rec_addr/ -> curl exit $eib_hrc in ${eib_hms}ms (status ${eib_hstatus:-none})"
+  if [ -z "$eib_reached" ]; then
+    echo "::error::the host probe at $eib_rec_addr did not reach the allow box's in-box server (curl exit $eib_hrc, status ${eib_hstatus:-none}) — the allow-exposed port is not admitted at the box's relay gate (NET-044)"
+    cat "$WORK/eib-host.err" 2>/dev/null || true
     eib_restore_log
     fail
   fi
-  if printf '%s' "$eib_body" | grep -qF "$eib_marker"; then
-    echo "::error::the host probe delivered the box's marker through a runtime publish the gate has not admitted (NET-047)"
-    eib_restore_log
-    fail
-  fi
+  echo "the host probe reached the allow box's in-box server through the recorded address and got its marker (NET-044)"
 
   # The publish listed beside the declaration, read the way a person reads it
-  # (NET-044): the live row carries the pending reading, spelled as the
-  # rendering pins it, until the gate admits the port.
+  # (NET-044): one live row for the port, with no pending caveat — the
+  # publish admitted the port at the gate.
   eib_policy="$(mnl session policy "$eib_allow_sid" 2>"$WORK/eib-allow-policy.err")" \
     || { echo "::error::'min session policy' failed for the allow box"; cat "$WORK/eib-allow-policy.err" 2>/dev/null || true; eib_restore_log; fail; }
   echo "--- min session policy (text, the allow box) ---"; printf '%s\n' "$eib_policy" | sed 's/^/  /'
-  case "$eib_policy" in
-    *":$eib_port → :$eib_port  (pending; not yet reachable)"*) ;;
-    *)
-      echo "::error::the live row for :$eib_port does not read '(pending; not yet reachable)' — the runtime publish is listed as reachable before the gate admitted it (NET-044, NET-047)"
+  eib_policy_row="$(printf '%s\n' "$eib_policy" | grep -F ":$eib_port → :$eib_port" | head -n1)"
+  case "$eib_policy_row" in
+    "") echo "::error::min session policy lists no live row for :$eib_port — the runtime publish is not listed beside the declaration (NET-044)"
+      eib_restore_log
+      fail
+      ;;
+    *"(pending"*|*"(unknown"*)
+      echo "::error::the live row for :$eib_port carries a reachability caveat ('$eib_policy_row') — the publish admitted the port at the gate, so the row must read as reachable (NET-044)"
       eib_restore_log
       fail
       ;;
   esac
-  echo "policy (text): one live row for :$eib_port, reading (pending; not yet reachable) — bound, listed, and honestly not reachable yet (NET-044, NET-047)"
+  echo "policy (text): one live row for :$eib_port, listed as reachable (NET-044): $eib_policy_row"
 
   if ! eib_audit_assert "$eib_allow_name" "$eib_port" allow box-policy published - \
       >"$WORK/eib-allow-audit.out" 2>"$WORK/eib-allow-audit.err"; then
@@ -18826,7 +18807,6 @@ exit' E2E_PTY_ASK=allow E2E_PTY_ANSWER=keep \
     fail
   fi
   case "$eib_out" in
-    "published port $eib_port at "*":$eib_port; not yet reachable") ;;
     "published port $eib_port at "*":$eib_port") ;;
     *)
       echo "::error::the answered-yes expose's reply is not a publish line naming the port and its address (got: '$eib_out')"
