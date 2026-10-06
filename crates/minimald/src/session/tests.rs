@@ -7162,6 +7162,27 @@ async fn soon(mut what: impl FnMut() -> bool) {
     }
 }
 
+/// The box's live ingress rows, read until `holds` accepts them, or fails the
+/// proof: the watcher commits and withdraws its rows on its own cadence, so a
+/// row it owes is read on a later poll, never on the one the caller missed.
+async fn listed_once(
+    handle: &crate::session::SessionHandle,
+    holds: impl Fn(&crate::session::LiveIngressRows) -> bool,
+) -> crate::session::LiveIngressRows {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let rows = handle.live_ingress().await.expect("the actor answers");
+        if holds(&rows) {
+            return rows;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the box's live ingress did not reach the awaited rows in the bound: {rows:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
 /// The control requests the fake forwarder served that name `published:port`
 /// as their bind — the expose and unexpose verbs of one publication, from
 /// whichever of the box's two runtime surfaces sent them.
@@ -7359,10 +7380,22 @@ async fn listen_publish_and_runtime_expose_never_double_bind() {
         },
         "the expose binds where the box's watcher binds, at its own port number"
     );
+    // Both surfaces' publications are listed (NET-044), each once, by the
+    // surface that owns it: the runtime expose's row, and the watcher's row
+    // for the in-range listen its box's `allow` stance published.
     assert_eq!(
         handle.live_ingress().await.expect("the actor answers"),
-        vec![mapping],
-        "the runtime publish is listed as the box's live ingress"
+        crate::session::LiveIngressRows {
+            exposed: vec![mapping],
+            listened: vec![minimald_rpc::LiveMapping {
+                local: format!("{loopback}:{listen_port}"),
+                internal_port: listen_port,
+                proto: sessions::IpProto::Tcp,
+                pending: Some(false),
+            }],
+        },
+        "the runtime publish and the listen publication are both listed as the \
+         box's live ingress"
     );
     let second_listener =
         std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, exposed_port))
@@ -7409,6 +7442,18 @@ async fn listen_publish_and_runtime_expose_never_double_bind() {
     assert!(
         listen_records[1].starts_with("POST /services/forwarder/unexpose "),
         "the watcher's own withdrawal unpublishes its port: {listen_records:?}"
+    );
+    // The listen's row goes with its publication, and the expose's stays:
+    // the set gives the port back once the unexpose stood, so the row is
+    // awaited, not assumed.
+    let rows = listed_once(&handle, |rows| rows.listened.is_empty()).await;
+    assert_eq!(
+        rows.exposed
+            .iter()
+            .map(|row| row.internal_port)
+            .collect::<Vec<_>>(),
+        vec![exposed_port],
+        "the expose's row outlives the listen's: {rows:?}"
     );
 
     // The listener on the expose's port closes too — and nothing happens: the
@@ -7548,7 +7593,9 @@ async fn expose_on_listen_published_port_is_already_published() {
     }
 
     // One request, the watcher's publish: the refused request bound nothing,
-    // and the box lists no live ingress for the port.
+    // and the box lists the port once — the watcher's row for the listen its
+    // `allow` stance published (NET-044), never a row for the refused
+    // expose.
     let requests = served_naming(&served, loopback, port);
     assert_eq!(requests.len(), 1, "the port was bound once: {requests:?}");
     assert!(
@@ -7557,8 +7604,16 @@ async fn expose_on_listen_published_port_is_already_published() {
     );
     assert_eq!(
         handle.live_ingress().await.expect("the actor answers"),
-        Vec::new(),
-        "the refused request published nothing the box lists"
+        crate::session::LiveIngressRows {
+            exposed: Vec::new(),
+            listened: vec![minimald_rpc::LiveMapping {
+                local: format!("{loopback}:{port}"),
+                internal_port: port,
+                proto: sessions::IpProto::Tcp,
+                pending: Some(false),
+            }],
+        },
+        "the refused request published nothing; the listen's publication is listed once"
     );
 
     // The refusal is one line naming the port, the owner that holds it, and
@@ -7596,6 +7651,102 @@ async fn expose_on_listen_published_port_is_already_published() {
         "the withdrawal is the publisher's own: {requests:?}"
     );
     drop(listener);
+}
+
+/// NET-044 and NET-046 for the listen surface: an in-range listen under
+/// `allow` is a dynamic ingress request the box's stance decided, so the
+/// publication the watcher makes of it is listed by `min session policy`'s
+/// RPC — reachable, because the watcher admitted it at the gate — until the
+/// listener closes, and its decision lands in the daemon's audit log as one
+/// record, decided by the box's policy, outcome published.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn listen_publication_is_listed_and_audited() {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let manager = server.state.sessions_manager().await;
+
+    let listener = listening_socket();
+    let port = port_of(&listener);
+    let switch = std::net::Ipv4Addr::new(100, 64, 128, 76);
+    let loopback = std::net::Ipv4Addr::new(127, 0, 64, 76);
+    let (handle, gate, served) = box_with_listen_plan(
+        &mut client,
+        &manager,
+        "listedlisten",
+        switch,
+        loopback,
+        (port, port),
+    )
+    .await;
+    soon(|| gate.admits_tcp(port)).await;
+
+    // The listing: the RPC `min session policy` reads serves the watcher's
+    // row, by name, reachable.
+    let row = minimald_rpc::LiveMapping {
+        local: format!("{loopback}:{port}"),
+        internal_port: port,
+        proto: sessions::IpProto::Tcp,
+        pending: Some(false),
+    };
+    let listed: minimald_rpc::Errorable<Vec<minimald_rpc::LiveMapping>> = client
+        .call::<minimald_rpc::GetLiveIngress>(&minimald_rpc::GetLiveIngressRequest::Name(
+            "listedlisten".to_string(),
+        ))
+        .await;
+    assert_eq!(
+        listed,
+        minimald_rpc::Errorable::Ok(vec![row]),
+        "the in-range listen is listed as the box's live ingress"
+    );
+
+    // The audit: one record for the one publish. The record follows the
+    // gate's admission inside the same poll, so it is awaited, not assumed.
+    let log = crate::audit::log_path(
+        server
+            .state
+            .minimal_state_dir()
+            .await
+            .as_utf8_path()
+            .as_std_path(),
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let text = loop {
+        let text = tokio::fs::read_to_string(&log).await.unwrap_or_default();
+        if text.contains("\"listedlisten\"") {
+            break text;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the publish was never audited: {text}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
+    let records: Vec<serde_json_lenient::Value> = text
+        .lines()
+        .map(|line| serde_json_lenient::from_str(line).expect("one line is one record"))
+        .filter(|record: &serde_json_lenient::Value| record["box"] == "listedlisten")
+        .collect();
+    assert_eq!(records.len(), 1, "one publish, one record: {text}");
+    assert_eq!(records[0]["port"], port);
+    assert_eq!(records[0]["decision"], "allow");
+    assert_eq!(records[0]["decided_by"], "box-policy");
+    assert_eq!(records[0]["outcome"], "published");
+
+    // The close: the row goes with the listener.
+    drop(listener);
+    soon(|| served_naming(&served, loopback, port).len() == 2).await;
+    listed_once(&handle, |rows| rows.listened.is_empty()).await;
+    let after: minimald_rpc::Errorable<Vec<minimald_rpc::LiveMapping>> = client
+        .call::<minimald_rpc::GetLiveIngress>(&minimald_rpc::GetLiveIngressRequest::Name(
+            "listedlisten".to_string(),
+        ))
+        .await;
+    assert_eq!(
+        after,
+        minimald_rpc::Errorable::Ok(Vec::new()),
+        "a closed listener's publication is no longer listed"
+    );
+    handle.stop().await;
 }
 
 /// NET-047's other order: a port the box's runtime expose published, then

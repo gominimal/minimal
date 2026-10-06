@@ -110,11 +110,20 @@
 //! the box, and whether the rules permitted it — so the diagnostics
 //! bundle's daemon log tail reads the whole surface (the observability
 //! contract of the story this module implements).
+//!
+//! A listen the watcher publishes is a dynamic ingress request the box's
+//! `allow` stance decided: every `Publish` verdict is an in-range port under
+//! `allow`, because a port the declaration names is `Declared` and never the
+//! watcher's. So the publication owes what NET-044 and NET-046 owe every
+//! allowed request: its row in `min session policy` — the committed entry
+//! carries the mapping it lists as ([`BoxPublications::listen_rows`]), and
+//! the row goes with the entry when the listener closes — and its decision
+//! record in the local audit log ([`crate::audit`]).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::net::Ipv4Addr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::LazyLock;
 use std::sync::{Arc, Mutex};
@@ -616,8 +625,10 @@ async fn withdraw_report(
 /// it — the gvproxy control channel the forwarder verbs ride, the box's
 /// session gate, which holds the shared permit decision
 /// ([`SessionGate::listen_verdict`]) and the admission a published port is
-/// given through, and the box's publication set, shared with the runtime
-/// expose surface so neither binds a port the other already holds.
+/// given through, the box's publication set, shared with the runtime
+/// expose surface so neither binds a port the other already holds, and the
+/// daemon's state directory, under which each publication's decision record
+/// is appended (NET-046).
 pub struct ListenPlan {
     /// The box's name, as the daemon's own session lines name it.
     box_name: String,
@@ -635,6 +646,9 @@ pub struct ListenPlan {
     /// ([`crate::session::Session`]): the one set both read before they
     /// bind, and the one place a publication's owner is written down.
     publications: BoxPublications,
+    /// The daemon's state directory: the audit log the publication's
+    /// decision record is appended to lives under it ([`crate::audit`]).
+    state_dir: PathBuf,
 }
 
 impl ListenPlan {
@@ -643,7 +657,9 @@ impl ListenPlan {
     /// publication forwards are admitted by on their way through the
     /// relay — and the publication set must be the one the session's
     /// runtime expose surface reads, so the two surfaces never bind the
-    /// same port.
+    /// same port. `state_dir` is the daemon's state directory, the one the
+    /// runtime expose path audits its decisions under, so both surfaces'
+    /// records land in the one log.
     #[must_use]
     pub fn new(
         box_name: String,
@@ -652,6 +668,7 @@ impl ListenPlan {
         control: ControlChannel,
         gate: Arc<SessionGate>,
         publications: BoxPublications,
+        state_dir: PathBuf,
     ) -> Self {
         Self {
             box_name,
@@ -660,6 +677,7 @@ impl ListenPlan {
             control,
             gate,
             publications,
+            state_dir,
         }
     }
 }
@@ -720,6 +738,12 @@ struct PublicationEntry {
     /// is in flight: the port is held against the other surface, but no
     /// mapping stands and none is listed anywhere.
     published: bool,
+    /// The row the publication is listed as in `min session policy`, when
+    /// its owner lists it from this set: the listen watcher's publications
+    /// (NET-044), committed with [`Reservation::record_listed`]. `None` for
+    /// a pending entry, and for the expose path's publications, whose rows
+    /// the session's runtime-ingress table holds beside their forwarders.
+    listed: Option<minimald_rpc::LiveMapping>,
 }
 
 /// The box's runtime publications, one entry per port one of its surfaces
@@ -752,7 +776,9 @@ pub struct BoxPublications {
 /// reused for two reservations of one set.
 #[derive(Debug, Default)]
 struct PublicationSet {
-    ports: HashMap<u16, PublicationEntry>,
+    /// Ordered by port, so the rows [`BoxPublications::listen_rows`] lists
+    /// read the same way on every call.
+    ports: BTreeMap<u16, PublicationEntry>,
     next_token: u64,
 }
 
@@ -783,6 +809,7 @@ impl BoxPublications {
                         owner,
                         token,
                         published: false,
+                        listed: None,
                     },
                 );
                 Ok(Reservation {
@@ -807,6 +834,24 @@ impl BoxPublications {
             .ports
             .get(&port)
             .map(|entry| entry.owner)
+    }
+
+    /// The rows the listen watcher's standing publications are listed as in
+    /// `min session policy` (NET-044), in port order: one per port the
+    /// watcher published and has not withdrawn. A pending reservation lists
+    /// nothing, and neither does a publication of the expose path — its row
+    /// is the session's runtime-ingress table's — so a port is never listed
+    /// twice, and a row goes the moment its entry does: the listener's
+    /// close, or a revocation.
+    pub fn listen_rows(&self) -> Vec<minimald_rpc::LiveMapping> {
+        self.set
+            .lock()
+            .expect("box publications lock poisoned")
+            .ports
+            .values()
+            .filter(|entry| entry.owner == PublicationOwner::Listen && entry.published)
+            .filter_map(|entry| entry.listed.clone())
+            .collect()
     }
 
     /// Withdraws `port` from the set — `owner`'s own publication only. The
@@ -880,7 +925,23 @@ impl Reservation {
     /// the caller unbinds it itself — ingress revocation unbinds (design
     /// §7.1), and nothing else names that forward to take it down.
     #[must_use = "a `false` record leaves a bound forward only its caller can unbind"]
-    pub fn record(mut self) -> bool {
+    pub fn record(self) -> bool {
+        self.commit(None)
+    }
+
+    /// [`Self::record`], with the row the publication is listed as in
+    /// `min session policy` (NET-044) kept on its entry, for a surface that
+    /// lists its publications from this set — the listen watcher, whose
+    /// forwards no other table holds. The row stands exactly as long as the
+    /// entry does.
+    #[must_use = "a `false` record leaves a bound forward only its caller can unbind"]
+    pub fn record_listed(self, row: minimald_rpc::LiveMapping) -> bool {
+        self.commit(Some(row))
+    }
+
+    /// The commit both records share: the entry this guard wrote, still its
+    /// own by token, turns published and takes `listed` as its row.
+    fn commit(mut self, listed: Option<minimald_rpc::LiveMapping>) -> bool {
         self.recorded = true;
         let mut set = self.set.set.lock().expect("box publications lock poisoned");
         match set
@@ -890,6 +951,7 @@ impl Reservation {
         {
             Some(entry) => {
                 entry.published = true;
+                entry.listed = listed;
                 true
             }
             None => false,
@@ -1575,8 +1637,18 @@ impl WatchState {
                                 // The bind stood: the reservation commits
                                 // as this watcher's publication, and the
                                 // port is a mapping from here — served,
-                                // listed, withdrawable by its publisher.
-                                if !reservation.record() {
+                                // listed in `min session policy` as the row
+                                // it carries (NET-044), withdrawable by its
+                                // publisher.
+                                if !reservation.record_listed(minimald_rpc::LiveMapping {
+                                    local: mapping.local().to_string(),
+                                    internal_port: port,
+                                    proto: IpProto::Tcp,
+                                    // The gate admits the port as this
+                                    // publish's own next step, below: a
+                                    // listen-published row is reachable.
+                                    pending: Some(false),
+                                }) {
                                     // A revocation cleared the reservation
                                     // under the bind, so the forward this
                                     // watcher just bound is one it never
@@ -1616,6 +1688,7 @@ impl WatchState {
                                     refusals,
                                     "published a listening port on the box's address"
                                 );
+                                self.audit_published(port).await;
                                 Appearance::Settled
                             }
                             Err(e) => {
@@ -1708,6 +1781,29 @@ impl WatchState {
                 Appearance::Settled
             }
         }
+    }
+
+    /// NET-046: the decision record a published listen owes. The listen was
+    /// a dynamic ingress request — an in-range port, under the box's
+    /// `allow` stance — and the box's own declaration decided it, so the
+    /// record names the box policy as decider and the publish as outcome,
+    /// the same record the runtime expose path writes for an allowed
+    /// request. Written after the publication stands, never before, and
+    /// best-effort the way every audit append is.
+    async fn audit_published(&self, port: u16) {
+        crate::audit::append(
+            &self.plan.state_dir,
+            &crate::audit::DecisionRecord {
+                ts: chrono::Utc::now().to_rfc3339(),
+                box_name: self.plan.box_name.clone(),
+                port,
+                decision: sessions::DynamicIngress::Allow,
+                decided_by: crate::audit::DecidedBy::BoxPolicy,
+                outcome: crate::audit::DecisionOutcome::Published,
+                reason: None,
+            },
+        )
+        .await;
     }
 
     /// Unbinds the forward a publish bound under a reservation a revocation
@@ -2202,6 +2298,7 @@ mod tests {
             SwitchSubnet::default(),
             None,
         ));
+        let state_dir = state_dir_beside(&sock);
         let plan = ListenPlan::new(
             "listen-box".into(),
             LEASE,
@@ -2209,8 +2306,18 @@ mod tests {
             ControlChannel::Unix(sock),
             Arc::clone(&gate),
             BoxPublications::default(),
+            state_dir,
         );
         (ListenWatcher::start(plan, leader), gate)
+    }
+
+    /// The state directory a test's watcher audits under: the test's own
+    /// temporary directory, the one its fake forwarder's socket sits in, so
+    /// each test reads only the decision records its own watcher wrote.
+    fn state_dir_beside(sock: &Path) -> PathBuf {
+        sock.parent()
+            .expect("the forwarder's socket sits in the test's directory")
+            .to_path_buf()
     }
 
     /// The box's watcher, this process its leader: the watcher's own `/proc`
@@ -2273,6 +2380,7 @@ mod tests {
             ControlChannel::Unix(sock),
             Arc::clone(&gate),
             publications,
+            dir.path().to_path_buf(),
         );
         let watcher = ListenWatcher::start(plan, Leader::Resolved(std::process::id()));
         (watcher, gate, server, served)
@@ -2485,6 +2593,105 @@ mod tests {
         let last = next_served(&mut served).await;
         assert_eq!(last.path, "/services/forwarder/unexpose");
         server.abort();
+    }
+
+    /// NET-044: an in-range listen under `allow` is a dynamic ingress request
+    /// the box's stance decided, so its publication is listed — one row at
+    /// the box's address, at the listener's own port, reachable — for as long
+    /// as the listener holds the port, and the row goes when the listener
+    /// closes.
+    #[tokio::test]
+    async fn a_listen_publication_is_listed_until_its_listener_closes() {
+        let listener = listening_socket();
+        let port = port_of(&listener);
+        let dir = tempfile::tempdir().unwrap();
+        let mut shared = None;
+        let (watcher, gate, server, mut served) =
+            started_watcher_with_publications(&dir, &permit_policy(port), |publications| {
+                shared = Some(publications.clone());
+            });
+        let publications = shared.expect("the seed hands back the box's set");
+
+        let published = next_served(&mut served).await;
+        assert_eq!(published.path, "/services/forwarder/expose");
+        soon(|| gate.admits_tcp(port)).await;
+        assert_eq!(
+            publications.listen_rows(),
+            vec![minimald_rpc::LiveMapping {
+                local: format!("{PUBLISHED}:{port}"),
+                internal_port: port,
+                proto: IpProto::Tcp,
+                pending: Some(false),
+            }],
+            "the published listen is listed as the box's live ingress"
+        );
+
+        drop(listener);
+        let withdrawn = next_served(&mut served).await;
+        assert_eq!(withdrawn.path, "/services/forwarder/unexpose");
+        soon(|| publications.listen_rows().is_empty()).await;
+
+        watcher.stop().await;
+        server.abort();
+    }
+
+    /// NET-046: each listen the watcher publishes leaves one decision record
+    /// in the local audit log — the box, the port, the `allow` its stance
+    /// made, decided by the box's own policy, outcome published — and a
+    /// listen it does not publish leaves none.
+    #[tokio::test]
+    async fn a_listen_publication_is_audited() {
+        let listener = listening_socket();
+        let port = port_of(&listener);
+        let dir = tempfile::tempdir().unwrap();
+        let (watcher, gate, server, mut served) = started_watcher(&dir, &permit_policy(port));
+
+        next_served(&mut served).await;
+        soon(|| gate.admits_tcp(port)).await;
+        // The record is the publish's last step, inside the poll that
+        // admitted the port, and the stop is taken only between polls: once
+        // the stop returns, the record is on disk.
+        watcher.stop().await;
+        server.abort();
+        drop(listener);
+
+        let text = tokio::fs::read_to_string(crate::audit::log_path(dir.path()))
+            .await
+            .expect("the audit log was written");
+        let records: Vec<serde_json_lenient::Value> = text
+            .lines()
+            .map(|line| serde_json_lenient::from_str(line).expect("each line is one JSON record"))
+            .collect();
+        assert_eq!(records.len(), 1, "one publish, one record: {text}");
+        let record = &records[0];
+        assert_eq!(record["box"], "listen-box");
+        assert_eq!(record["port"], port);
+        assert_eq!(record["decision"], "allow");
+        assert_eq!(record["decided_by"], "box-policy");
+        assert_eq!(record["outcome"], "published");
+        assert!(record.get("reason").is_none(), "{record}");
+    }
+
+    /// NET-046's other half, for the watcher: a listen the rules leave
+    /// unpublished was no allowed request, and writes no record.
+    #[tokio::test]
+    async fn an_unpublished_listen_is_not_audited() {
+        let listener = listening_socket();
+        let port = port_of(&listener);
+        let dir = tempfile::tempdir().unwrap();
+        // A range that does not cover the listener: the verdict is `Deny`.
+        let other = if port == u16::MAX { port - 1 } else { port + 1 };
+        let (watcher, _gate, server, _served) = started_watcher(&dir, &permit_policy(other));
+        tokio::time::sleep(LISTEN_POLL_INTERVAL * 3).await;
+        watcher.stop().await;
+        server.abort();
+        drop(listener);
+        assert!(
+            !tokio::fs::try_exists(crate::audit::log_path(dir.path()))
+                .await
+                .expect("the test's directory reads"),
+            "a listen nothing published leaves no decision record"
+        );
     }
 
     /// The leader is not a precondition of the watcher's start: a box whose
@@ -3725,6 +3932,7 @@ mod tests {
                 ControlChannel::Unix(sock.clone()),
                 Arc::clone(&gate),
                 BoxPublications::default(),
+                dir.path().to_path_buf(),
             ),
             Leader::Resolved(std::process::id()),
         );
