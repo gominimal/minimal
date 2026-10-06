@@ -1041,6 +1041,8 @@ teardown() {
   # INT leaves a live activation — the same INT, then the KILL backstop.
   if [ -n "$BOXREG_CTRLC_PID" ]; then
     kill -INT "$BOXREG_CTRLC_PID" 2>/dev/null || true
+    # The proof may have left it stopped mid-step; resume it so the INT lands.
+    kill -CONT "$BOXREG_CTRLC_PID" 2>/dev/null || true
     sleep 0.5 2>/dev/null || true
     kill -9 "$BOXREG_CTRLC_PID" 2>/dev/null || true
   fi
@@ -3584,13 +3586,22 @@ proof_daemon_fetch_under_deny_all_host_address_box() {
 #     design blesses on purpose: both ends are a withdrawn row.
 #
 # The Ctrl-C half interrupts in [create returned, session Active] — the
-# window the CLI's interrupt guard covers. It cannot sleep its way in from
-# a hook (on_activate runs daemon-side INSIDE the create, before the guard
-# exists), so the trigger is host-visible instead: the deny-all
-# announcement a bare box prints to stderr immediately before arming the
-# guard (the same NET-076 text the egress proof above asserts), with the
-# fixture's bulk data holding the activation in the window long enough for
-# the SIGINT to land well inside it.
+# window the CLI's interrupt guard covers — and, within it, before the
+# loadout is configured: only a session still in its draft state can be
+# aborted. It cannot hold that window from an on_activate hook. The hook
+# runs in FinalizeSession, inside the guard, but on the session's actor:
+# the guard's AbortSession queues behind the finalize and is refused once
+# it runs, because the session is past its draft state by then. Racing the
+# activation from outside is no good either: a release build finishes the
+# project upload, the configure, and the finalize before a poll-then-signal
+# lands. So the case freezes the CLI instead. It single-steps the activation
+# under SIGSTOP/SIGCONT, so the CLI never runs more than a few milliseconds
+# unobserved. It stops for good once the CLI has printed the deny-all
+# announcement (the same NET-076 text the egress proof above asserts, printed
+# immediately before the guard is armed) AND holds the fixture's bulk data
+# open. That combination means the project upload is under way: after the
+# guard, before the configure. Then the SIGINT lands while the CLI is
+# still frozen there, so the window is held on purpose rather than won.
 #
 # Ordered in the whole-lane run right after `restart`: that proof already
 # stopped and respawned the daemon, so nothing behind it shares a live
@@ -3606,7 +3617,8 @@ proof_own_ip_box_registers_with_the_vm_host_without_a_provider_flag() {
   local boxreg_declared_switch="" boxreg_declared_out="" boxreg_declared_rc=""
   local boxreg_declared_reach_ok="" boxreg_refuse_start_ms=""
   local boxreg_refuse_rc="" boxreg_refuse_elapsed_ms="" boxreg_refuse_status=""
-  local boxreg_refuse_err="" boxreg_gate_drop=""
+  local boxreg_refuse_err="" boxreg_gate_drop="" boxreg_ctrlc_held=""
+  local boxreg_ctrlc_bulk="" boxreg_ctrlc_deadline=""
   echo "::group::own-address box registers with the VM host daemon, no provider flag (T78)"
 
   if [ "$min_daemon" != minvmd ]; then
@@ -3632,11 +3644,11 @@ proof_own_ip_box_registers_with_the_vm_host_without_a_provider_flag() {
   hook_seed_preamble > "$BOXREG_CTRLC_SEED_DIR/minimal.toml"
   mkdir "$BOXREG_CTRLC_SEED_DIR/.git"
   # 64 MiB of random data. The activate that carries it uploads the project
-  # before it can finish, and that upload — over the VM bridge on the lanes
-  # this case runs on — is a multi-second window, so the interrupt below
-  # lands inside [create returned, session Active] rather than racing the
-  # far end of it. A plain byte count, not an `m` suffix: GNU and BSD dd
-  # spell those differently.
+  # before it can finish, and the file being open in the CLI is the host-
+  # visible proof that the upload is under way, so the freeze below stops
+  # the CLI inside [create returned, session Active], before the configure.
+  # The size keeps that file open across many of the freeze's steps. A plain
+  # byte count, not an `m` suffix: GNU and BSD dd spell those differently.
   dd if=/dev/urandom of="$BOXREG_CTRLC_SEED_DIR/bulk.bin" bs=1048576 count=64 \
     >/dev/null 2>&1
 
@@ -3778,9 +3790,11 @@ proof_own_ip_box_registers_with_the_vm_host_without_a_provider_flag() {
   # the guard once the session is Active. The guard aborts the half-built
   # session, withdraws the box row, and exits 130. What the HOST can see of
   # "the create returned" is the deny-all announcement a box with no egress
-  # section prints to stderr immediately before the guard is armed, so this
-  # half polls the backgrounded activation's stderr for it and interrupts
-  # only once it has appeared — never sleeping a fixed delay and hoping.
+  # section prints to stderr immediately before the guard is armed, and of
+  # "the upload is under way" is the bulk file held open. This half freezes
+  # the backgrounded activation once both are true (see the header comment)
+  # and interrupts it there — never sleeping a fixed delay, and never racing
+  # a running activation to the end of the window.
   # Not `mnl ... &`: mnl is a function, so `$!` would be a subshell that
   # ignores SIGINT; exec the binary so the pid is `min`'s and Ctrl-C reaches
   # it.
@@ -3789,22 +3803,46 @@ proof_own_ip_box_registers_with_the_vm_host_without_a_provider_flag() {
     --no-prompt --name e2e-box-ctrlc --network own_ip ) \
     >"$WORK/boxreg-ctrlc.out" 2>"$WORK/boxreg-ctrlc.err" &
   BOXREG_CTRLC_PID=$!
-  # Cold VM boots overrun the 150 s spawn ceiling the recipes pin, so the
-  # poll's budget is a full cold boot (0.5 s × 600) rather than the warm
-  # case's seconds.
-  for _ in $(seq 1 600); do
-    if grep -q "Heads-up: the next release denies all external reach" \
-      "$WORK/boxreg-ctrlc.err" 2>/dev/null; then
+  # Single-step the activation until it is frozen inside the window (see the
+  # header comment): each step stops the CLI, looks, and lets it run ~10 ms
+  # more. Once the deny-all announcement is on stderr the guard is armed, and
+  # once the bulk file is also open the project upload is under way. The CLI
+  # is left stopped there, so nothing it does next can race the interrupt.
+  # lsof reports the resolved path on macOS (/tmp is /private/tmp), so the
+  # match is on the seed dir's own name, not the full path. Cold VM boots
+  # overrun the 150 s spawn ceiling the recipes pin, so the budget is a full
+  # cold boot rather than the warm case's seconds.
+  boxreg_ctrlc_bulk="$(basename "$BOXREG_CTRLC_SEED_DIR")/bulk.bin"
+  boxreg_ctrlc_deadline=$((SECONDS + 300))
+  while [ "$SECONDS" -lt "$boxreg_ctrlc_deadline" ]; do
+    kill -STOP "$BOXREG_CTRLC_PID" 2>/dev/null || break
+    if [ -z "$boxreg_ctrlc_armed" ] \
+      && grep -q "Heads-up: the next release denies all external reach" \
+        "$WORK/boxreg-ctrlc.err" 2>/dev/null; then
       boxreg_ctrlc_armed=1
-      break
     fi
-    if ! kill -0 "$BOXREG_CTRLC_PID" 2>/dev/null; then
-      break
+    if [ -n "$boxreg_ctrlc_armed" ]; then
+      if [ -d "/proc/$BOXREG_CTRLC_PID/fd" ]; then
+        find "/proc/$BOXREG_CTRLC_PID/fd" -lname "*/$boxreg_ctrlc_bulk" 2>/dev/null \
+          | grep -q . && boxreg_ctrlc_held=1
+      else
+        lsof -p "$BOXREG_CTRLC_PID" -Fn 2>/dev/null | grep -qF -- "$boxreg_ctrlc_bulk" \
+          && boxreg_ctrlc_held=1
+      fi
+      [ -n "$boxreg_ctrlc_held" ] && break
     fi
-    sleep 0.5
+    kill -CONT "$BOXREG_CTRLC_PID" 2>/dev/null || true
+    sleep 0.01
   done
   if [ -z "$boxreg_ctrlc_armed" ]; then
     echo "::error::the interrupted activation never announced the deny-all default on stderr — the create did not return (or failed outright), so the Ctrl-C guard was never in play"
+    cat "$WORK/boxreg-ctrlc.err" 2>/dev/null || true
+    kill -9 "$BOXREG_CTRLC_PID" 2>/dev/null || true
+    BOXREG_CTRLC_PID=""
+    fail
+  fi
+  if [ -z "$boxreg_ctrlc_held" ]; then
+    echo "::error::the interrupted activation was never caught holding its bulk data open — it got past the project upload (or exited) without being frozen inside the Ctrl-C guard's abortable window"
     cat "$WORK/boxreg-ctrlc.err" 2>/dev/null || true
     kill -9 "$BOXREG_CTRLC_PID" 2>/dev/null || true
     BOXREG_CTRLC_PID=""
@@ -3828,8 +3866,11 @@ proof_own_ip_box_registers_with_the_vm_host_without_a_provider_flag() {
   fi
   boxreg_ctrlc_switch="$(printf '%s\n' "$boxreg_record" \
     | sed -n 's/.*"switch_address":"\([0-9.]*\)".*/\1/p')"
-  echo "interrupt window: the create returned and the row is registered; sending Ctrl-C"
+  # Queued while the CLI is stopped, so the guard sees it the moment the CLI
+  # resumes, still inside the upload.
+  echo "interrupt window: the guard is armed, the upload is under way, and the row is registered; sending Ctrl-C"
   kill -INT "$BOXREG_CTRLC_PID" 2>/dev/null || true
+  kill -CONT "$BOXREG_CTRLC_PID" 2>/dev/null || true
   for _ in $(seq 1 120); do
     kill -0 "$BOXREG_CTRLC_PID" 2>/dev/null || break
     sleep 0.25
@@ -15912,6 +15953,7 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
   PO_OUTLIVE_CLIENT_NAME="e2e-port-out-client" # the detach half's outside client, on a VM lane
   PO_EXT=18096                         # the declared — published — port
   PO_UNDECLARED=18097                  # a listen no declaration names
+  PO_HOLD=18099                        # a second declared port, whose connection is held across the destroy
   PO_DETACH_PORT=18098                 # the detach box's server, on the shared loopback
   PO_MARKER="PO_PUBLISH_OK"            # what the port half's box answers with
   PO_OUTLIVE_MARKER="PO_OUTLIVE_OK"    # what the detach box answers with
@@ -15954,6 +15996,10 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
       echo "::error::127.0.0.1:$PO_EXT already answers on this host; the port-publish half needs it free"
       fail
     fi
+    if curl -sS --max-time 2 -o /dev/null "http://127.0.0.1:$PO_HOLD/" 2>/dev/null; then
+      echo "::error::127.0.0.1:$PO_HOLD already answers on this host; the port-publish half needs it free"
+      fail
+    fi
 
     # The watcher's records and the expose record both live at info under
     # modules the lane's `warn` filter drops, so a readable-log lane restarts
@@ -15977,8 +16023,8 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
     mkdir "$PO_OWNIP_SEED_DIR/.git"
     po_sid="$(cd "$PO_OWNIP_SEED_DIR" && mnl session activate . --no-prompt \
       --name "$PO_BOX_NAME" --network own_ip \
-      --ingress "$PO_EXT:$PO_EXT" 2>"$WORK/po-activate.err")" || {
-      echo "::error::'min session activate --network own_ip --ingress $PO_EXT:$PO_EXT' failed"
+      --ingress "$PO_EXT:$PO_EXT" --ingress "$PO_HOLD:$PO_HOLD" 2>"$WORK/po-activate.err")" || {
+      echo "::error::'min session activate --network own_ip --ingress $PO_EXT:$PO_EXT --ingress $PO_HOLD:$PO_HOLD' failed"
       echo "--- stderr ---"; cat "$WORK/po-activate.err" 2>/dev/null || true
       fail
     }
@@ -16322,29 +16368,114 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
     fi
     echo "the box outlived its detached client and still serves by name (NET-015)"
 
+    # Ingress revocation also terminates the connections a forward already
+    # carries (design §7.1), so one is held open across the destroy: the
+    # second declared port's in-box server accepts, marks the accept, and
+    # then says nothing, so the host's connection stays established until
+    # something ends it.
+    po_hold_pid=""
+    if [ -n "$po_addr" ]; then
+      mnl session exec "$po_sid" \
+        "nohup /usr/bin/socat TCP-LISTEN:$PO_HOLD,reuseaddr,fork SYSTEM:\"touch /home/po-held; sleep 600\" >/dev/null 2>&1 &" \
+        >/dev/null 2>>"$WORK/po-responder.err" \
+        || { echo "::error::could not start the in-box holder on the second declared port"; cat "$WORK/po-responder.err" 2>/dev/null || true; fail; }
+      # Up when a direct connect inside the box is accepted and held: curl
+      # times out (exit 28) instead of being refused (exit 7).
+      po_hold_listening=""
+      for _ in $(seq 1 40); do
+        if mnl session exec "$po_sid" \
+          "curl -sS --max-time 1 -o /dev/null http://127.0.0.1:$PO_HOLD/; test \$? -eq 28" \
+          >/dev/null 2>&1; then
+          po_hold_listening=1
+          break
+        fi
+        sleep 0.25
+      done
+      if [ -z "$po_hold_listening" ]; then
+        echo "::error::the in-box holder on the second declared port never accepted a direct connect"
+        echo "--- socat exec stderr ---"; cat "$WORK/po-responder.err" 2>/dev/null || true
+        fail
+      fi
+      mnl session exec "$po_sid" 'rm -f /home/po-held' >/dev/null 2>&1 || true
+      curl -sS --max-time 120 -o /dev/null "http://$po_addr:$PO_HOLD/" \
+        >/dev/null 2>"$WORK/po-held.err" &
+      po_hold_pid=$!
+      po_held=""
+      for _ in $(seq 1 40); do
+        if mnl session exec "$po_sid" 'test -e /home/po-held' >/dev/null 2>&1; then
+          po_held=1
+          break
+        fi
+        sleep 0.25
+      done
+      if [ -z "$po_held" ] || ! kill -0 "$po_hold_pid" 2>/dev/null; then
+        kill "$po_hold_pid" 2>/dev/null || true
+        wait "$po_hold_pid" 2>/dev/null || true
+        echo "::error::the host's connection to the second declared port $po_addr:$PO_HOLD was not held open by the box before the destroy (reached the box: ${po_held:-no}; $(head -n1 "$WORK/po-held.err" 2>/dev/null || true))"
+        fail
+      fi
+      echo "held: a host connection to $po_addr:$PO_HOLD is established through its declared forward, and the box holds it open"
+    fi
+
     mnl session destroy --force "$po_sid" >/dev/null 2>&1 || true
+    po_destroyed_ms=$(now_ms)
 
     # After the box ends, its declared port's published address must refuse a
     # host connect fast: nothing in the box answers, so a forward still bound
-    # there is a bind that outlived its box. Not a hard assertion yet: the
-    # host's egress gate refuses the guest's retraction of a declared port's
-    # forward by design (sessions::core::switch_request, Refusal::Unheld), and
-    # nothing on the host unbinds it at box end, so on main this leg is
-    # expected to find the bind still standing. Carried as a known gap until
-    # the host-side unbind lands (gominimal/inbox#915); flip it to `fail` then.
+    # there is a bind that outlived its box (design §7.1, NET-121). On a
+    # VM-backed host the guest cannot retract a declared forward (the host's
+    # egress gate refuses it by design); the host unbinds it when the box's
+    # row is withdrawn, which `session destroy` does before it returns. The
+    # unbind itself runs just after the withdrawal, so the probe allows a
+    # short settle window: each try is bounded at 2s, and the leg passes on
+    # the first refusal that came back in under 4s.
     if [ -n "$po_addr" ]; then
-      po_t0=$(now_ms)
-      curl -sS --max-time 8 -o /dev/null "http://$po_addr:$PO_EXT/" \
-        >/dev/null 2>"$WORK/po-after-destroy.err"
-      po_gone_rc=$?
-      po_t1=$(now_ms)
-      echo "after destroy: GET http://$po_addr:$PO_EXT/ -> curl exit $po_gone_rc in $((po_t1 - po_t0))ms ($(head -n1 "$WORK/po-after-destroy.err" 2>/dev/null || true))"
-      if [ "$po_gone_rc" -eq 7 ] && [ $((po_t1 - po_t0)) -lt 4000 ]; then
+      po_gone_rc=-1; po_gone_ms=0; po_settle_t0=$(now_ms)
+      while [ $(($(now_ms) - po_settle_t0)) -lt 10000 ]; do
+        po_t0=$(now_ms)
+        curl -sS --max-time 2 -o /dev/null "http://$po_addr:$PO_EXT/" \
+          >/dev/null 2>"$WORK/po-after-destroy.err"
+        po_gone_rc=$?
+        po_gone_ms=$(($(now_ms) - po_t0))
+        if [ "$po_gone_rc" -eq 7 ] && [ "$po_gone_ms" -lt 4000 ]; then
+          break
+        fi
+        sleep 0.5
+      done
+      echo "after destroy: GET http://$po_addr:$PO_EXT/ -> curl exit $po_gone_rc in ${po_gone_ms}ms, $(($(now_ms) - po_settle_t0))ms after the destroy returned ($(head -n1 "$WORK/po-after-destroy.err" 2>/dev/null || true))"
+      if [ "$po_gone_rc" -eq 7 ] && [ "$po_gone_ms" -lt 4000 ]; then
         echo "declared port refused fast after its box ended: no bind outlived the box"
       else
-        known_gap proof_port_publishes_on_listen_and_box_outlives_client \
-          "the declared port $po_addr:$PO_EXT was not refused fast after its box was destroyed (curl exit $po_gone_rc in $((po_t1 - po_t0))ms), so the declared forward's bind outlived the box — https://github.com/gominimal/inbox/issues/915"
+        echo "::error::the declared port $po_addr:$PO_EXT was not refused fast after its box was destroyed (curl exit $po_gone_rc in ${po_gone_ms}ms), so the declared forward's bind outlived the box (design §7.1, NET-121)"
+        fail
       fi
+    fi
+
+    # The held connection must end within the bound once the box is gone:
+    # closed or reset by the host's revocation, never left to wait out its
+    # TCP timeouts against a box that no longer exists (design §7.1). curl
+    # reports the end as 52 (closed, empty reply) or 56 (reset); 28 would be
+    # its own 120s timeout, far past the bound.
+    if [ -n "$po_hold_pid" ]; then
+      while kill -0 "$po_hold_pid" 2>/dev/null \
+        && [ $(($(now_ms) - po_destroyed_ms)) -lt 15000 ]; do
+        sleep 0.25
+      done
+      po_hold_ms=$(($(now_ms) - po_destroyed_ms))
+      if kill -0 "$po_hold_pid" 2>/dev/null; then
+        kill "$po_hold_pid" 2>/dev/null || true
+        wait "$po_hold_pid" 2>/dev/null || true
+        echo "::error::the connection held through the declared forward $po_addr:$PO_HOLD was still open ${po_hold_ms}ms after its box was destroyed, so revocation did not terminate it (design §7.1)"
+        fail
+      fi
+      po_hold_rc=0
+      wait "$po_hold_pid" || po_hold_rc=$?
+      echo "after destroy: the held connection to $po_addr:$PO_HOLD ended with curl exit $po_hold_rc, ${po_hold_ms}ms after the destroy returned ($(head -n1 "$WORK/po-held.err" 2>/dev/null || true))"
+      if [ "$po_hold_rc" -eq 0 ] || [ "$po_hold_rc" -eq 28 ]; then
+        echo "::error::the held connection to $po_addr:$PO_HOLD did not end closed or reset (curl exit $po_hold_rc) after its box was destroyed (design §7.1)"
+        fail
+      fi
+      echo "the connection the declared forward carried was closed when its box ended: revocation terminated it"
     fi
 
     rm -rf "$PO_OWNIP_SEED_DIR"; PO_OWNIP_SEED_DIR=""

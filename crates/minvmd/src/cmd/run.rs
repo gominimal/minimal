@@ -520,7 +520,9 @@ fn run_foreground() -> Result<()> {
     let ports_dir = node_ports_dir().context("opening the node-port reservation directory")?;
     let mut node_port =
         assign_node_proxy_port(&ports_dir).context("assigning the node's proxy port")?;
-    boxes.register_node_namespace(node_port.port);
+    boxes
+        .try_register_node_namespace(node_port.port)
+        .context("publishing the node namespace's row")?;
     // A box's row goes with its shuttle connection: the gate reports which
     // addresses each relay carried at the relay's end, and this drainer thread
     // applies the reports for the life of the process (NET-133).
@@ -1007,7 +1009,13 @@ fn run_foreground() -> Result<()> {
                 drop(node_port);
                 node_port = assign_node_proxy_port(&ports_dir)
                     .context("redrawing the node's proxy port after a refused publish")?;
-                boxes.register_node_namespace(node_port.port);
+                // A row the redraw cannot publish fails the start, which
+                // discards a fresh volume image like every other failed boot.
+                if let Err(error) = boxes.try_register_node_namespace(node_port.port) {
+                    crate::cmd::discard_fresh_volume_image(&volume_path, volume_preexisted);
+                    return Err(error)
+                        .context("publishing the node namespace's row after a redraw");
+                }
                 continue;
             }
             crate::control::PublishDecision::FailStart {

@@ -758,7 +758,7 @@ pub(crate) fn draw_interim_upgrades(
 /// The present landing's second half: re-publish one drawn box at the
 /// address it was drawn — under the write lock, and only if the box still
 /// exists. The draw ran outside every registry lock, so between it and this
-/// the box may have been stopped or destroyed, its name taken over by a
+/// the box may have been destroyed, its name taken over by a
 /// rename or a later session, or its publish moved off the interim by its
 /// own next registration; names are first-writer-owned, so any of those
 /// means the move publishes nothing. `true` when the move was made, `false`
@@ -769,8 +769,10 @@ pub(crate) fn draw_interim_upgrades(
 /// then hold spoken for. One whose publish still stands keeps the grant:
 /// the grant is idempotent by namespace, so a box that moved off the
 /// interim through its own re-registration stands at the very address the
-/// draw recorded, and a stopped or renamed one is answered with it at its
-/// next registration; releasing it would free an address a live box holds.
+/// draw recorded, and a renamed one is answered with it at its next
+/// registration; releasing it would free an address a live box holds. A
+/// stopped box keeps its name, so the move applies to it with its stopped
+/// marker intact.
 ///
 /// The re-check is a runtime one, not an ordering argument: the landing
 /// runs on the deferred walk's own spawned task
