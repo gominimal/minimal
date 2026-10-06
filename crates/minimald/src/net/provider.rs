@@ -133,6 +133,19 @@ impl RuntimeIngress {
             .collect()
     }
 
+    /// Takes the one runtime forward published for `port`, for the session
+    /// actor to unbind: the publish it recorded is being withdrawn because
+    /// its allow could not be audited (NET-046). `None` when no forward for
+    /// the port is recorded — a spawn's end took it first.
+    pub(crate) fn take(&self, port: u16) -> Option<crate::net::policy::PortForwarder> {
+        let mut state = self.state();
+        let position = state
+            .forwards
+            .iter()
+            .position(|live| live.mapping.internal_port == port)?;
+        Some(state.forwards.remove(position).forwarder)
+    }
+
     /// The box stopped: takes every runtime forward for the session actor to
     /// unbind.
     pub(crate) fn take_all(&self) -> Vec<crate::net::policy::PortForwarder> {

@@ -6,9 +6,14 @@
 //! box's own declaration, asked of the attached human and answered either
 //! way (NET-045), or failed closed because nobody was attached to answer.
 //! The log is append-only and lives under the daemon's state directory, so
-//! it outlives the session the decision was about and reads without one;
-//! the diagnostic bundle ships its tail through [`crate::diag`]'s audit
-//! collector, at the same [`LOG_RELATIVE`] path it holds here.
+//! it outlives the session the decision was about and reads without one. It
+//! is bounded: past [`MAX_LOG_BYTES`] it rotates to one kept generation
+//! ([`ROTATED_RELATIVE`]), so a box asking for ports in a loop cannot fill
+//! the state volume with it;
+//! the diagnostic bundle ships the tail of both files through
+//! [`crate::diag`]'s audit collector, at the same paths they hold here.
+//! An allow whose record cannot be written is refused (fail closed); a
+//! refusal whose record cannot be written still refuses.
 //!
 //! One record per decision, each naming the box, the port, the decision the
 //! box's `dynamic_ingress` setting made, who actually decided it, and the
@@ -22,7 +27,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
-use nix::fcntl::{OFlag, open, openat};
+use nix::fcntl::{OFlag, open, openat, renameat};
 #[cfg(unix)]
 use nix::sys::stat::Mode;
 use serde::Serialize;
@@ -103,66 +108,32 @@ pub(crate) struct DecisionRecord {
     pub(crate) reason: Option<String>,
 }
 
-/// Appends one decision to the log (NET-046). Best-effort by necessity: the
-/// decision is already made and its effects stand, so a record that cannot
-/// be written is a warned-about loss, never a refusal of the decision it
-/// names — the daemon's own log, which the diagnostic bundle ships beside
-/// this file's tail, carries the failure either way.
+/// The size the live log may reach before it rotates: the append that would
+/// carry it past this renames it to [`ROTATED_RELATIVE`] first, replacing
+/// the generation rotated before it, and starts a fresh one. One rotated
+/// generation is kept, so the log never holds more than twice this on disk,
+/// and the newest records are always in the live file.
+pub(crate) const MAX_LOG_BYTES: u64 = 1024 * 1024;
+
+/// The one rotated generation's location under the daemon's state
+/// directory, spelled the same relative way in the diagnostic bundle.
+pub(crate) const ROTATED_RELATIVE: &str = "audit/decisions.log.1";
+
+/// The rotated generation's own path under `state_dir`.
+pub(crate) fn rotated_path(state_dir: &Path) -> PathBuf {
+    state_dir.join(ROTATED_RELATIVE)
+}
+
+/// Appends one decision to the log (NET-046), best-effort: a record that
+/// cannot be written is a warned-about loss, never a change to the decision
+/// it names. That is right for a decision whose effect is a refusal —
+/// undoing a refusal because it went unrecorded would open the port — and
+/// for nothing else: an allow is recorded through [`try_append`], whose
+/// failure the caller fails closed on. The daemon's own log, which the
+/// diagnostic bundle ships beside this file's tail, carries the failure
+/// either way.
 pub(crate) async fn append(state_dir: &Path, record: &DecisionRecord) {
-    let path = log_path(state_dir);
-    // Made on every append rather than once at daemon start: the log is the
-    // state directory's child, and a daemon asked to audit its first-ever
-    // decision on a fresh install should make the directory it was asked to
-    // write in, not fail on one it never owned. It resolves a link planted
-    // where the directory should be — `create_dir_all` follows it — and so
-    // cannot be the guard itself; the open below is, because an open is the
-    // one step here that can refuse one.
-    if let Some(parent) = path.parent()
-        && let Err(e) = tokio::fs::create_dir_all(parent).await
-    {
-        tracing::warn!(
-            box = %record.box_name,
-            port = record.port,
-            error = %e,
-            "the dynamic ingress decision could not be audited: the audit \
-             directory could not be made"
-        );
-        return;
-    }
-    // Serialization of a plain derived struct cannot fail; the guard is for
-    // the day the record grows a type that can.
-    let Ok(mut line) = serde_json_lenient::to_string(record) else {
-        tracing::warn!(
-            box = %record.box_name,
-            port = record.port,
-            "the dynamic ingress decision could not be audited: its record \
-             did not serialize"
-        );
-        return;
-    };
-    line.push('\n');
-    let mut file = match open_log(&path).await {
-        Ok(file) => file,
-        Err(e) => {
-            tracing::warn!(
-                box = %record.box_name,
-                port = record.port,
-                error = %e,
-                "the dynamic ingress decision could not be audited"
-            );
-            return;
-        }
-    };
-    // One append is one line, and the line is flushed before this returns:
-    // `tokio::fs::File` buffers into its background pool, and an audit log
-    // that could lose its most recent records to a crash on close is not
-    // worth the buffer.
-    let flushed = async {
-        file.write_all(line.as_bytes()).await?;
-        file.flush().await
-    }
-    .await;
-    if let Err(e) = flushed {
+    if let Err(e) = try_append(state_dir, record).await {
         tracing::warn!(
             box = %record.box_name,
             port = record.port,
@@ -172,8 +143,74 @@ pub(crate) async fn append(state_dir: &Path, record: &DecisionRecord) {
     }
 }
 
+/// Appends one decision to the log (NET-046), rotating it first when the
+/// line would carry it past [`MAX_LOG_BYTES`], and says whether the record
+/// landed: the caller of an allow refuses the exposure on an `Err`, because
+/// NET-046 requires every decision recorded and an allow is the one decision
+/// that can still be taken back.
+pub(crate) async fn try_append(state_dir: &Path, record: &DecisionRecord) -> std::io::Result<()> {
+    try_append_capped(state_dir, record, MAX_LOG_BYTES).await
+}
+
+/// [`try_append`] with the rotation threshold passed in, so a test can rotate
+/// the log without writing a mebibyte of records.
+pub(crate) async fn try_append_capped(
+    state_dir: &Path,
+    record: &DecisionRecord,
+    cap: u64,
+) -> std::io::Result<()> {
+    let path = log_path(state_dir);
+    // Made on every append rather than once at daemon start: the log is the
+    // state directory's child, and a daemon asked to audit its first-ever
+    // decision on a fresh install should make the directory it was asked to
+    // write in, not fail on one it never owned. It resolves a link planted
+    // where the directory should be — `create_dir_all` follows it — and so
+    // cannot be the guard itself; the open below is, because an open is the
+    // one step here that can refuse one.
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await.map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("the audit directory could not be made: {e}"),
+            )
+        })?;
+    }
+    // Serialization of a plain derived struct cannot fail; the guard is for
+    // the day the record grows a type that can.
+    let mut line = serde_json_lenient::to_string(record).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("the record did not serialize: {e}"),
+        )
+    })?;
+    line.push('\n');
+    let mut file = open_log(&path, line.len() as u64, cap).await?;
+    // One append is one line, and the line is flushed before this returns:
+    // `tokio::fs::File` buffers into its background pool, and an audit log
+    // that could lose its most recent records to a crash on close is not
+    // worth the buffer.
+    file.write_all(line.as_bytes()).await?;
+    file.flush().await
+}
+
+/// Whether a log already holding `len` bytes rotates before an `incoming`
+/// line lands: only when the line would carry it past `cap`, and never when
+/// it is empty, so a single line longer than the cap goes into a fresh file
+/// rather than rotating on every append.
+fn rotates(len: u64, incoming: u64, cap: u64) -> bool {
+    len > 0 && len.saturating_add(incoming) > cap
+}
+
+/// The rotated generation's file name beside the live log's.
+fn rotated_name(file_name: &std::ffi::OsStr) -> std::ffi::OsString {
+    let mut rotated = file_name.to_os_string();
+    rotated.push(".1");
+    rotated
+}
+
 /// Opens the log for appending, refusing to follow a link at *any* component
-/// of the log's own path.
+/// of the log's own path, and rotates it first when an `incoming` line would
+/// carry it past `cap`.
 ///
 /// The state volume is guest-writable on a VM host, so the `audit/` directory
 /// is as attacker-controlled as the log file inside it — the same reason
@@ -189,8 +226,13 @@ pub(crate) async fn append(state_dir: &Path, record: &DecisionRecord) {
 /// at the moment they are opened, and there is no window at all; a link
 /// standing in either place is refused at open, exactly the way
 /// [`diagnostics::open_regular_nofollow`] refuses this same file for reading.
+///
+/// The rotation runs through the same pinned directory: `renameat` moves a
+/// name, never what a link at it points to, so a link planted at either name
+/// is moved or replaced rather than followed, and the fresh log is opened
+/// under the same `O_NOFOLLOW` guard as the first.
 #[cfg(unix)]
-async fn open_log(path: &Path) -> std::io::Result<tokio::fs::File> {
+async fn open_log(path: &Path, incoming: u64, cap: u64) -> std::io::Result<tokio::fs::File> {
     let (dir, file_name) = match (path.parent(), path.file_name()) {
         (Some(dir), Some(file_name)) => (dir, file_name),
         // `LOG_RELATIVE` always names a file inside a directory, so this is
@@ -211,22 +253,56 @@ async fn open_log(path: &Path) -> std::io::Result<tokio::fs::File> {
         Mode::empty(),
     )
     .map_err(|e| open_refused("the audit directory", e))?;
-    let log = openat(
-        &directory,
-        file_name,
-        OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_APPEND | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
-        // The daemon's own log, readable by nobody else: the only reader is
-        // the diagnostic collector, in this process.
-        Mode::S_IRUSR | Mode::S_IWUSR,
-    )
-    .map_err(|e| open_refused("the audit log", e))?;
-    Ok(tokio::fs::File::from(log))
+    let open_at = || {
+        openat(
+            &directory,
+            file_name,
+            OFlag::O_WRONLY
+                | OFlag::O_CREAT
+                | OFlag::O_APPEND
+                | OFlag::O_NOFOLLOW
+                | OFlag::O_CLOEXEC,
+            // The daemon's own log, readable by nobody else: the only reader
+            // is the diagnostic collector, in this process.
+            Mode::S_IRUSR | Mode::S_IWUSR,
+        )
+        .map(std::fs::File::from)
+        .map_err(|e| open_refused("the audit log", e))
+    };
+    let mut log = open_at()?;
+    if rotates(log.metadata()?.len(), incoming, cap) {
+        renameat(
+            &directory,
+            file_name,
+            &directory,
+            rotated_name(file_name).as_os_str(),
+        )
+        .map_err(|e| {
+            let error = std::io::Error::from(e);
+            std::io::Error::new(
+                error.kind(),
+                format!("the audit log could not be rotated: {error}"),
+            )
+        })?;
+        log = open_at()?;
+    }
+    Ok(tokio::fs::File::from_std(log))
 }
 
 /// Off unix there is no `openat` to open the log through, so it is opened by
 /// name; this crate's hosts are Linux, so the guard is unix's to keep.
 #[cfg(not(unix))]
-async fn open_log(path: &Path) -> std::io::Result<tokio::fs::File> {
+async fn open_log(path: &Path, incoming: u64, cap: u64) -> std::io::Result<tokio::fs::File> {
+    let len = match tokio::fs::metadata(path).await {
+        Ok(meta) => meta.len(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(e) => return Err(e),
+    };
+    if rotates(len, incoming, cap)
+        && let Some(file_name) = path.file_name()
+    {
+        tokio::fs::rename(path, path.with_file_name(rotated_name(file_name))).await?;
+    }
     tokio::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -396,5 +472,116 @@ mod tests {
                 "the symlinked directory is a warned-about loss, not a silent one: {log}"
             );
         }
+    }
+
+    /// The record the rotation tests write, one per port.
+    fn record_for(port: u16) -> DecisionRecord {
+        DecisionRecord {
+            ts: chrono::Utc::now().to_rfc3339(),
+            box_name: "web".to_string(),
+            port,
+            decision: sessions::DynamicIngress::Allow,
+            decided_by: DecidedBy::BoxPolicy,
+            outcome: DecisionOutcome::Published,
+            reason: None,
+        }
+    }
+
+    /// The ports a log file's records name, in the order they were written.
+    fn ports_in(path: &Path) -> Vec<u64> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .map(|line| {
+                let record: serde_json_lenient::Value =
+                    serde_json_lenient::from_str(line).expect("one line is one record");
+                record["port"].as_u64().expect("every record names a port")
+            })
+            .collect()
+    }
+
+    /// The log stays within its bound however many decisions land: past the
+    /// cap it rotates to one kept generation, so neither file grows past the
+    /// cap, the newest record is always the live file's last line, and the
+    /// two files together hold an unbroken run of the newest records, with
+    /// only the oldest dropped.
+    #[tokio::test]
+    async fn the_log_rotates_within_its_bound_and_keeps_the_newest_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path();
+        let line_len = serde_json_lenient::to_string(&record_for(1000))
+            .unwrap()
+            .len() as u64
+            + 1;
+        // Room for a handful of records per file, so a hundred appends
+        // rotate many times over.
+        let cap = line_len * 5;
+
+        for port in 1000..1100 {
+            try_append_capped(state_dir, &record_for(port), cap)
+                .await
+                .expect("an append to a healthy log lands");
+            let live = std::fs::metadata(log_path(state_dir)).unwrap().len();
+            assert!(
+                live <= cap,
+                "the live log stays within its cap: {live} > {cap}"
+            );
+            if let Ok(rotated) = std::fs::metadata(rotated_path(state_dir)) {
+                assert!(
+                    rotated.len() <= cap,
+                    "the rotated generation stays within its cap: {} > {cap}",
+                    rotated.len()
+                );
+            }
+        }
+        assert!(
+            !state_dir.join("audit/decisions.log.2").exists(),
+            "one rotated generation is kept, never more"
+        );
+
+        let rotated = ports_in(&rotated_path(state_dir));
+        let live = ports_in(&log_path(state_dir));
+        assert_eq!(
+            live.last(),
+            Some(&1099),
+            "the newest record is the live log's last line"
+        );
+        let kept: Vec<u64> = rotated.into_iter().chain(live).collect();
+        let first = *kept.first().expect("rotation keeps records");
+        assert_eq!(
+            kept,
+            (first..1100).collect::<Vec<u64>>(),
+            "the two files hold an unbroken run of the newest records"
+        );
+        assert!(
+            kept.len() >= 5,
+            "a rotation keeps at least a full generation: {kept:?}"
+        );
+    }
+
+    /// The fail-closed caller's half of the symlink guard: `try_append`
+    /// reports a refused open as an error rather than swallowing it, so an
+    /// allow decided behind a planted link is never answered as recorded.
+    #[tokio::test]
+    async fn try_append_reports_a_refused_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path();
+        let planted_dir = dir.path().join("planted");
+        std::fs::create_dir_all(&planted_dir).unwrap();
+        std::os::unix::fs::symlink(&planted_dir, state_dir.join("audit")).unwrap();
+
+        let error = try_append(state_dir, &record_for(3000))
+            .await
+            .expect_err("a symlinked audit directory refuses the append");
+        assert!(
+            error
+                .to_string()
+                .contains("the audit directory could not be opened"),
+            "the error names the half of the path that refused: {error}"
+        );
+        assert!(
+            !planted_dir.join("decisions.log").exists(),
+            "the refused append leaves the link's target untouched"
+        );
     }
 }

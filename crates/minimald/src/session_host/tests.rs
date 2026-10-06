@@ -5645,6 +5645,92 @@ async fn expose_unenrolled_decision_audited() {
     );
 }
 
+/// NET-046 fails closed on an unrecordable allow: with a link planted where
+/// the audit directory should be, every append is refused, so the allowing
+/// box's publish is withdrawn — the switch asked to unbind what it bound, no
+/// live mapping left — and the caller hears a failed publish naming the
+/// audit log, with the refusal in the daemon's log. A deny under the same
+/// refusal still refuses: an unrecordable deny is never turned into a
+/// publish. The link's target is untouched either way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expose_unrecordable_allow_is_refused_and_deny_still_refuses() {
+    let capture = captured_log();
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let (_web, web_handle) = dynamic_ingress_box(
+        &server,
+        &mut client,
+        "web",
+        Some(sessions::DynamicIngress::Allow),
+        Some((3000, 3999)),
+    )
+    .await;
+    let (_db, db_handle) = dynamic_ingress_box(&server, &mut client, "db", None, None).await;
+    web_handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("the allowing box launches its host");
+    let sock = web_handle
+        .net_switch()
+        .await
+        .unwrap()
+        .lock()
+        .await
+        .control_socket();
+    let (forwarder, served) = fake_forwarder(sock, 200).await;
+
+    let state_dir = server.state.minimal_state_dir().await;
+    let state_dir = state_dir.as_utf8_path().as_std_path();
+    let planted = state_dir.join("planted");
+    std::fs::create_dir_all(&planted).unwrap();
+    std::os::unix::fs::symlink(&planted, state_dir.join("audit")).unwrap();
+
+    match web_handle.expose_dynamic(3000).await {
+        Err(crate::net::policy::ExposeFailure::Publish { port: 3000, source }) => assert!(
+            source.to_string().contains("audit log"),
+            "the failure says the decision could not be recorded: {source}"
+        ),
+        other => panic!("an allow that cannot be audited is refused: {other:?}"),
+    }
+    assert!(
+        web_handle
+            .live_ingress()
+            .await
+            .expect("the actor answers")
+            .is_empty(),
+        "the withdrawn publish leaves no live mapping"
+    );
+    assert!(
+        served
+            .lock()
+            .expect("served lock")
+            .iter()
+            .any(|line| line.starts_with("POST /services/forwarder/unexpose ")),
+        "the forward the publish bound is unbound again"
+    );
+    match db_handle.expose_dynamic(3000).await {
+        Err(crate::net::policy::ExposeFailure::Refused(
+            crate::net::policy::ExposeRefusal::DeniedByPolicy,
+        )) => {}
+        other => panic!("an unrecordable deny still refuses: {other:?}"),
+    }
+    forwarder.abort();
+
+    let log = capture.contents();
+    assert!(
+        log.contains("the dynamic ingress allow could not be audited"),
+        "the refused allow is said in the daemon's log: {log}"
+    );
+    assert!(
+        log.contains("the dynamic ingress decision could not be audited"),
+        "the unrecordable refusals are warned about, not silent: {log}"
+    );
+    assert!(
+        !planted.join("decisions.log").exists(),
+        "the planted link's target is untouched"
+    );
+}
+
 /// The host-level half of NET-045's no-client case: an ask reaching a host
 /// nobody is bound to answers no-one rather than parking — the dialog has no
 /// terminal to render on — which is the fail-closed answer the session turns

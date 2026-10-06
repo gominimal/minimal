@@ -2879,6 +2879,39 @@ impl Session {
             Result<minimald_rpc::LiveMapping, crate::net::policy::ExposeFailure>,
         >,
     ) {
+        let state_dir = self
+            .minimal_state_dir
+            .as_utf8_path()
+            .as_std_path()
+            .to_path_buf();
+        // An allow that stands is recorded before anything else is said
+        // about it, and only a recorded one is answered as published
+        // (NET-046): an allow whose record cannot be written is withdrawn and
+        // answered as a failed publish, which the arms below then log and —
+        // best-effort, like every refusal — audit like any other.
+        let (outcome, recorded) = match outcome {
+            Ok(mapping) => {
+                let record = crate::audit::DecisionRecord {
+                    ts: chrono::Utc::now().to_rfc3339(),
+                    box_name: box_name.to_string(),
+                    port,
+                    decision,
+                    decided_by,
+                    outcome: crate::audit::DecisionOutcome::Published,
+                    reason: None,
+                };
+                match crate::audit::try_append(&state_dir, &record).await {
+                    Ok(()) => (Ok(mapping), true),
+                    Err(error) => (
+                        Err(self
+                            .withdraw_unaudited(box_name, port, decision, error)
+                            .await),
+                        false,
+                    ),
+                }
+            }
+            refused => (refused, false),
+        };
         let (audited, reason) = match &outcome {
             Ok(mapping) => {
                 tracing::info!(
@@ -2979,25 +3012,78 @@ impl Session {
                 )
             }
         };
-        let reason = because.map(str::to_string).or(reason);
-        crate::audit::append(
-            self.minimal_state_dir.as_utf8_path().as_std_path(),
-            &crate::audit::DecisionRecord {
-                ts: chrono::Utc::now().to_rfc3339(),
-                box_name: box_name.to_string(),
-                port,
-                decision,
-                decided_by,
-                outcome: audited,
-                reason,
-            },
-        )
-        .await;
+        // A refusal is recorded best-effort: it already refused, and a record
+        // that cannot be written must not undo it — that would open the port.
+        if !recorded {
+            let reason = because.map(str::to_string).or(reason);
+            crate::audit::append(
+                &state_dir,
+                &crate::audit::DecisionRecord {
+                    ts: chrono::Utc::now().to_rfc3339(),
+                    box_name: box_name.to_string(),
+                    port,
+                    decision,
+                    decided_by,
+                    outcome: audited,
+                    reason,
+                },
+            )
+            .await;
+        }
         #[expect(
             clippy::let_underscore_must_use,
             reason = "the asker may already be gone; there is nothing to answer then"
         )]
         let _ = reply.send(outcome);
+    }
+
+    /// Fails an allow closed whose audit record could not be written
+    /// (NET-046): the publish that stood is withdrawn the way a publish a
+    /// spawn's end overtook is — the forward unbound first, then the port
+    /// given back in the box's publication set, then the VM host daemon's
+    /// row withdrawn, because the host's gate retracts a runtime port only
+    /// while the row still holds it — and the caller hears a failed publish
+    /// that says why. The warn line is the refusal's record of last resort:
+    /// the audit log that refused the allow may refuse the refusal too.
+    async fn withdraw_unaudited(
+        &mut self,
+        box_name: &str,
+        port: u16,
+        decision: sessions::DynamicIngress,
+        error: std::io::Error,
+    ) -> crate::net::policy::ExposeFailure {
+        tracing::warn!(
+            name = %box_name,
+            port,
+            decision = %decision,
+            error = %error,
+            "the dynamic ingress allow could not be audited; the publish is \
+             withdrawn and the request refused"
+        );
+        // The surface the publish reported under: an answered ask was
+        // recorded at the host as one (NET-045), every other allow is the
+        // box's own expose.
+        let source = if decision == sessions::DynamicIngress::Ask {
+            minimald_rpc::PortReportSource::Ask
+        } else {
+            minimald_rpc::PortReportSource::Expose
+        };
+        let control = self.switch_control().await;
+        if let Some(forwarder) = self.live_ingress.take(port) {
+            crate::net::policy::remove_ingress(&control, &[forwarder]).await;
+        }
+        self.publications
+            .withdraw(port, crate::net::listeners::PublicationOwner::Expose);
+        if let Some(switch_address) = self.reported_switch_address {
+            crate::net::listeners::unreport_port(&control, switch_address, port, source).await;
+        }
+        crate::net::policy::ExposeFailure::Publish {
+            port,
+            source: std::io::Error::new(
+                error.kind(),
+                format!("the decision could not be recorded in the audit log: {error}"),
+            ),
+        }
     }
 
     /// The actor's own answer to "is a box running behind this session": an
