@@ -89,7 +89,11 @@
 //!   case-sensitive suffix match), and sends the apex or `x.MIN.INTERNAL`
 //!   upstream; any such zone name, of any type, is answered NXDOMAIN here
 //!   instead. Every question in a query is read, not only the first, since
-//!   the switch's resolver walks them all.
+//!   the switch's resolver walks them all. A zone name whose first label is
+//!   not lowercase (`X.min.internal`) still has the exact suffix, so the
+//!   switch's resolver answers it on the machine; its record lookup is
+//!   case-sensitive, so `HOST.min.internal` gets NXDOMAIN, not the host
+//!   address.
 //!
 //! What the gate deliberately is not: a DNS server. Only the resolver
 //! Minimal owns for the box is watched, only standard queries to it are
