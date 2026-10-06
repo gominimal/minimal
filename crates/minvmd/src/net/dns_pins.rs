@@ -1252,12 +1252,23 @@ pub(crate) struct DenyAllRefusal {
     pub(crate) query_type: Option<RecordType>,
 }
 
-/// Whether `name` is in the box zone (NET-072): the apex `min.internal` or
-/// any name under it, compared label by label and ignoring ASCII case — so
-/// a label that carries an escaped dot (`evil\.min` under `internal`) is
-/// not mistaken for a zone name the way a string-suffix match would be.
+/// Whether `name` is a zone name the switch's resolver answers locally for
+/// a deny-all row: at least one label strictly below the apex, whose last
+/// two wire labels are exactly the lowercase bytes of `min.internal`.
+///
+/// This is gvproxy's own test, not the zone's: it treats a name as local
+/// only on a case-sensitive `.min.internal.` suffix, so a name that spells
+/// the apex in any other case (`x.MIN.INTERNAL`), and the apex itself, are
+/// forwarded to the host's upstream resolvers and must be dropped here.
+/// The labels below the apex may carry any case. Comparing raw label bytes
+/// also keeps a label that carries an escaped dot (`evil\.min` under
+/// `internal`) from passing the way a string-suffix match would.
 fn is_zone_name(name: &Name) -> bool {
-    Name::from_ascii(sessions::core::zone_answer::ZONE_APEX).is_ok_and(|apex| apex.zone_of(name))
+    let mut labels = name.iter();
+    sessions::core::zone_answer::ZONE_APEX
+        .rsplit('.')
+        .all(|apex_label| labels.next_back() == Some(apex_label.as_bytes()))
+        && labels.next_back().is_some()
 }
 
 /// The host-side deny-all DNS gate (NET-141's deny-all case, decided
@@ -1270,8 +1281,9 @@ fn is_zone_name(name: &Name) -> bool {
 /// is decided here. For such a row the resolver carve-out (NET-079, UDP
 /// only) is the one thing the frame verdict admits, so the carve-out is
 /// narrowed to what the switch's resolver answers on its own: a standard
-/// query whose every question is an A lookup of a box-zone name.
-/// gvproxy's resolver answers zone names locally for A alone and hands
+/// query whose every question is an A lookup of a box-zone name strictly
+/// below the apex, the apex spelled in lowercase ([`is_zone_name`]).
+/// gvproxy's resolver answers those names locally for A alone and hands
 /// every other type, and every name outside the zone, to the host's
 /// upstream resolvers — a forwarded question carries data out in its name
 /// even when no connection follows. So the datagram is dropped when:
@@ -3037,18 +3049,40 @@ pub(crate) mod tests {
             "a label holding an escaped dot is not a zone name"
         );
 
-        // Zone A lookups pass: a sibling, the host row (NET-003), the apex,
-        // case and the root dot notwithstanding.
+        // The case-bearing names below are built with `from_ascii`, which
+        // keeps the case as the guest would put it on the wire; `qname`
+        // (`from_utf8`) folds it to lowercase.
+        let cased = |name: &str| Name::from_ascii(name).expect("query name parses");
+
+        // Zone A lookups pass: a sibling and the host row (NET-003), the
+        // root dot and the case of the labels below the apex notwithstanding.
         for name in [
             "web.min.internal.",
             "host.min.internal.",
-            "HOST.Min.Internal",
-            "min.internal.",
+            "host.min.internal",
+            "X.min.internal.",
+            "HOST.min.internal",
         ] {
             assert_eq!(
-                decide(&dns_query_of(&[(qname(name), RecordType::A)])),
+                decide(&dns_query_of(&[(cased(name), RecordType::A)])),
                 None,
                 "an A lookup of {name} passes"
+            );
+        }
+        // The switch's resolver matches the zone by a case-sensitive
+        // `.min.internal.` suffix, so it forwards upstream an A lookup that
+        // spells the apex in any other case, and the apex itself: both drop.
+        for name in [
+            "x.MIN.INTERNAL.",
+            "x.Min.Internal.",
+            "x.min.INTERNAL.",
+            "HOST.Min.Internal",
+            "min.internal.",
+            "MIN.INTERNAL.",
+        ] {
+            assert!(
+                decide(&dns_query_of(&[(cased(name), RecordType::A)])).is_some(),
+                "an A lookup of {name} is dropped"
             );
         }
         // Two zone A questions pass together.
