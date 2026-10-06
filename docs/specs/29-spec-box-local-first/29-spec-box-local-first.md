@@ -5,7 +5,7 @@ owner: mitodrummer
 epic: gominimal/inbox#731
 arch: https://github.com/gominimal/arch/blob/2e11b6d2354911f0c14b83dc38dfb29166833577/architecture.md
 arch_sha: "2e11b6d2354911f0c14b83dc38dfb29166833577"
-updated: 2026-10-05
+updated: 2026-10-06
 ---
 
 # BOX — Box — one record and one spec for every session and task on a stock install
@@ -397,6 +397,10 @@ After this ships, a developer on a stock install with no identity plane runs ses
   tier:     T0
   verify:   cargo nextest run -p mfile params_accepted_and_rendered
 
+
+### O3 One grammar
+
+Moved to the sibling spec `docs/specs/28-spec-box-cli` (BCLI) when the grammar was split out.
 
 ### O4 Exec
 
