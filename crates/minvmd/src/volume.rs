@@ -196,7 +196,7 @@ fn create_sparse_raw(path: &Path, size_bytes: u64) -> Result<(), VolumeError> {
 /// `Some(apparent - (avail + allocated))` when `avail + allocated < apparent`,
 /// else `None`. Pure, for unit testing.
 fn host_overcommit(avail: u64, allocated: u64, apparent: u64) -> Option<u64> {
-    let backed = avail + allocated;
+    let backed = avail.saturating_add(allocated);
     (backed < apparent).then(|| apparent - backed)
 }
 
@@ -237,9 +237,13 @@ fn warn_overcommit(path: &Path, avail: u64, allocated: u64, apparent: u64) {
         tracing::warn!(
             path = %path.display(),
             host_free_bytes = avail,
+            allocated_bytes = allocated,
             advertised_bytes = apparent,
             shortfall_bytes = shortfall,
-            "host has less free disk than the data volume advertises",
+            "host free disk cannot back the data volume's remaining growth; \
+             the guest will hit ENOSPC before its filesystem looks full. \
+             Free host disk space, or set MINVMD_VOLUME_BYTES smaller before \
+             the volume is first created",
         );
     }
 }
@@ -378,7 +382,7 @@ mod tests {
 
         let logged = buf.contents();
         assert!(
-            logged.contains("host has less free disk than the data volume advertises"),
+            logged.contains("host free disk cannot back the data volume's remaining growth"),
             "expected overcommit warning, got: {logged}",
         );
         // Best-effort cleanup; a leftover temp dir must not fail the test.
