@@ -38,7 +38,15 @@ pub(crate) async fn cmd_bare(global: &GlobalArgs) -> Result<(), anyhow::Error> {
                 session_name = ?entry.name,
                 "found session"
             );
-            session_via_ssh(&sock, entry.id, None, global.config_dir.as_deref()).await
+            let host_asks = super::session::host_asks_box(global, entry.name.as_deref());
+            session_via_ssh(
+                &sock,
+                entry.id,
+                None,
+                global.config_dir.as_deref(),
+                host_asks.as_deref(),
+            )
+            .await
         }
         // Two ways to land on create-and-attach: no sessions exist at all
         // (first run), or the ambiguity picker's `+ Create a new session`
@@ -65,10 +73,13 @@ pub(crate) fn bare_activate_args() -> ActivateArgs {
         sync: None,
         network: CliNetworkMode::HostNet,
         ingress: Vec::new(),
+        dynamic_ingress: None,
+        dynamic_range: None,
         allow_subnets: Vec::new(),
         allow_dns_hosts: Vec::new(),
         allow_protocols: Vec::new(),
         deny_subnets: Vec::new(),
+        deny_all_egress: false,
         credentialed_upstream: false,
         loadout: Vec::new(),
         no_loadouts: false,
@@ -575,7 +586,7 @@ pub async fn cmd_ls(global: &GlobalArgs, args: LsArgs) -> Result<(), anyhow::Err
         if let Some(status) = status
             && let Some(slot) = surfaces.get_mut(index)
         {
-            *slot = crate::resolver::vm_host_name_surface(*status).await;
+            *slot = crate::resolver::vm_host_name_surface(status.clone()).await;
         }
     }
     format_ls_across_vms(
@@ -802,34 +813,42 @@ pub fn format_ls(
     // the two surfaces present the same session attributes.
     writeln!(
         out,
-        "{:<36}  {:<20}  {:<13}  {:<20}  {:<19}  PROJECT PATH",
-        "SESSION ID", "NAME", "STATUS", "TITLE", "LAST ACTIVITY"
+        "{:<36}  {:<20}  {:<13}  {:<7}  {:<20}  {:<19}  PROJECT PATH",
+        "SESSION ID", "NAME", "STATUS", "EGRESS", "TITLE", "LAST ACTIVITY"
     )?;
     writeln!(
         out,
-        "{:-<36}  {:-<20}  {:-<13}  {:-<20}  {:-<19}  {:-<24}",
-        "", "", "", "", "", ""
+        "{:-<36}  {:-<20}  {:-<13}  {:-<7}  {:-<20}  {:-<19}  {:-<24}",
+        "", "", "", "", "", "", ""
     )?;
 
     for entry in &resp.sessions {
-        let [id, name, status, title, last_activity, project_path] = session_cells(entry);
+        let [id, name, status, egress, title, last_activity, project_path] = session_cells(entry);
         writeln!(
             out,
-            "{id:<36}  {name:<20}  {status:<13}  {title:<20}  {last_activity:<19}  {project_path}"
+            "{id:<36}  {name:<20}  {status:<13}  {egress:<7}  {title:<20}  {last_activity:<19}  {project_path}"
         )?;
     }
 
     Ok(())
 }
 
-/// The cells of one session row — id, name, status, title, last activity,
-/// project path — shared by the single-VM table ([`format_ls`]) and the
-/// multi-VM one ([`format_ls_across_vms`]), so the two surfaces present the
-/// same session attributes.
-fn session_cells(entry: &minimald_rpc::ListSessionsEntry) -> [String; 6] {
+/// The cells of one session row — id, name, status, egress enforcement,
+/// title, last activity, project path — shared by the single-VM table
+/// ([`format_ls`]) and the multi-VM one ([`format_ls_across_vms`]), so the
+/// two surfaces present the same session attributes.
+///
+/// The egress cell is a host-address box's enforcement (NET-079) in the
+/// spelling `--json` carries, `per_box` or `none`; every other box shows
+/// `-`, because the daemon reports no enforcement for it.
+fn session_cells(entry: &minimald_rpc::ListSessionsEntry) -> [String; 7] {
     let id = entry.id.to_string();
     let name = entry.name.as_deref().unwrap_or("-").to_string();
     let status = status_label(entry.status).to_string();
+    let egress = entry
+        .host_ip_enforcement
+        .map_or("-", minimald_rpc::HostIpEnforcement::machine_str)
+        .to_string();
     let project_path = entry
         .project_path
         .as_ref()
@@ -855,7 +874,7 @@ fn session_cells(entry: &minimald_rpc::ListSessionsEntry) -> [String; 6] {
         }
         None => ("-".to_string(), "-".to_string()),
     };
-    [id, name, status, title, last_activity, project_path]
+    [id, name, status, egress, title, last_activity, project_path]
 }
 
 /// The width of the VM column in the multi-VM table: enough for the default
@@ -893,11 +912,11 @@ pub fn format_ls_across_vms(
     // The verdict of the listing at `index`, `None` when the caller passed
     // none for it — a machine mode never prints the line, and a direct
     // caller may have computed nothing.
-    let surface_at = |index: usize| surfaces.get(index).copied().flatten();
+    let surface_at = |index: usize| surfaces.get(index).cloned().flatten();
     // The host answerer's state for the listing at `index`, `None` when no
     // read was made for that VM — a machine mode reads nothing, and a
     // socket or daemon that did not answer keeps the same silence.
-    let answerer_at = |index: usize| vm_answerers.get(index).copied().flatten();
+    let answerer_at = |index: usize| vm_answerers.get(index).cloned().flatten();
     if let [only] = listings {
         return format_ls(out, args, &only.resp, surface_at(0), answerer_at(0));
     }
@@ -1067,18 +1086,20 @@ pub fn format_ls_across_vms(
     // leading them (NET-057: the listing shows the VM per box).
     writeln!(
         out,
-        "{:<vm_width$}  {:<36}  {:<20}  {:<13}  {:<20}  {:<19}  PROJECT PATH",
+        "{:<vm_width$}  {:<36}  {:<20}  {:<13}  {:<7}  {:<20}  {:<19}  PROJECT PATH",
         "VM",
         "SESSION ID",
         "NAME",
         "STATUS",
+        "EGRESS",
         "TITLE",
         "LAST ACTIVITY",
         vm_width = VM_COLUMN_WIDTH,
     )?;
     writeln!(
         out,
-        "{:<vm_width$}  {:-<36}  {:-<20}  {:-<13}  {:-<20}  {:-<19}  {:-<24}",
+        "{:<vm_width$}  {:-<36}  {:-<20}  {:-<13}  {:-<7}  {:-<20}  {:-<19}  {:-<24}",
+        "",
         "",
         "",
         "",
@@ -1090,10 +1111,11 @@ pub fn format_ls_across_vms(
     )?;
     for listing in listings {
         for entry in &listing.resp.sessions {
-            let [id, name, status, title, last_activity, project_path] = session_cells(entry);
+            let [id, name, status, egress, title, last_activity, project_path] =
+                session_cells(entry);
             writeln!(
                 out,
-                "{:<vm_width$}  {id:<36}  {name:<20}  {status:<13}  {title:<20}  {last_activity:<19}  {project_path}",
+                "{:<vm_width$}  {id:<36}  {name:<20}  {status:<13}  {egress:<7}  {title:<20}  {last_activity:<19}  {project_path}",
                 listing.vm,
                 vm_width = VM_COLUMN_WIDTH,
             )?;

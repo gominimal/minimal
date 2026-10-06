@@ -204,8 +204,12 @@ const FLOW_CHUNK_LEN: usize = 4096;
 /// daemon log tail, with the count it suppressed.
 const WARN_INTERVAL: StackDuration = StackDuration::from_secs(1);
 
-/// A box's identity in a delivery: 16 opaque bytes, all-zero until the
-/// box-id task (T44) fills them from the registry's rows.
+/// A box's identity in a delivery: 16 opaque bytes — the box's own id,
+/// minted once per box by the host-side creator outside the VM (BEP-070)
+/// and held by the row and the attachment the pool's source names. The
+/// all-zero id is not one and never names a box: the acceptor that reads a
+/// delivered header refuses it like any other id the source's attachment
+/// does not hold.
 pub type BoxId = [u8; 16];
 
 /// The delivery header ahead of a flow's bytes: what tells the proxy which
@@ -214,7 +218,7 @@ pub type BoxId = [u8; 16];
 /// One fixed layout, [`DELIVERY_HEADER_LEN`] bytes:
 ///
 /// - byte 0: the wire version, [`DELIVERY_HEADER_VERSION`] (1)
-/// - bytes 1..17: the box id, all-zero until T44 fills it
+/// - bytes 1..17: the box's id, filled from its attachment
 /// - bytes 17..21: the box's switch address, the source the flow is
 ///   presented from
 /// - bytes 21..23: the box's source port
@@ -225,7 +229,7 @@ pub type BoxId = [u8; 16];
 /// them on the wire themselves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeliveryHeader {
-    /// The flow's box, all-zero until T44 fills it.
+    /// The flow's box, named by the id its attachment holds.
     pub box_id: BoxId,
     /// The source the flow is presented from: the box's own switch address.
     pub source: IpEndpoint,
@@ -235,11 +239,16 @@ pub struct DeliveryHeader {
 
 impl DeliveryHeader {
     /// The header for a flow the pool accepted from `source` to
-    /// `destination`. The box id is all-zero until T44 fills it.
+    /// `destination`, its box named by `box_id` — the id the source's
+    /// attachment holds, looked up before the dial: the box's own
+    /// identity, never a fact the flow carries. The all-zero id is no
+    /// mint's output and no box's identity; the acceptor that reads a
+    /// header carrying it refuses it like any other id the attachment does
+    /// not hold.
     #[must_use]
-    pub fn for_flow(source: IpEndpoint, destination: IpEndpoint) -> Self {
+    pub fn for_flow(box_id: BoxId, source: IpEndpoint, destination: IpEndpoint) -> Self {
         Self {
-            box_id: [0; 16],
+            box_id,
             source,
             destination,
         }
@@ -303,6 +312,21 @@ pub trait BepBoxSource: Send + Sync {
     /// The switch addresses of every row currently registered, in row
     /// order.
     fn box_switch_addresses(&self) -> Vec<Ipv4Addr>;
+
+    /// The box id the attachment held for the box at `source` holds, or
+    /// `None` when the source's box holds no attachment (NET-133): what
+    /// [`DeliveryHeader::for_flow`] fills the delivery's id from, and the
+    /// pool's one test for a box-plane source it may not attribute a
+    /// delivery to — no attachment, no delivery. Read fresh for every
+    /// accepted flow, so an attachment the host withdrew takes effect on
+    /// the next connection's dial, never a stale id.
+    ///
+    /// The default is the empty source's answer — no row, no attachment —
+    /// so a source that holds no attachments at all refuses every
+    /// delivery without a change.
+    fn box_id_for_source(&self, _source: Ipv4Addr) -> Option<BoxId> {
+        None
+    }
 }
 
 /// A box source with no rows: the wiring that binds nothing. A socket in
@@ -1475,7 +1499,20 @@ impl BepStack {
             let local = self
                 .slot_local(idx)
                 .expect("an accepted socket names the address it arrived at");
-            self.request_dial(idx, remote, local);
+            // The delivery's id is the box's own, looked up from the
+            // attachment its row's source resolves to — never a fact the
+            // flow carries. A source the pool accepted — its row holds a
+            // share, so the pre-screen passed it — whose attachment is gone
+            // is a box-plane source with nothing to attribute a delivery
+            // to: aborted, nothing delivered, the refusal charged to the
+            // shared audit. The node namespace never reaches here: it holds
+            // no row's share, so the pre-screen refuses its SYN before a
+            // slot ever carries one.
+            let IpAddress::Ipv4(source) = remote.addr;
+            match self.boxes.box_id_for_source(source) {
+                Some(box_id) => self.request_dial(idx, remote, local, box_id),
+                None => self.refuse_without_attachment(idx, source),
+            }
             return;
         }
         if let Flow::Live { pipes } = &mut self.slots[idx].flow {
@@ -1485,10 +1522,11 @@ impl BepStack {
     }
 
     /// Deliver the slot's connection: spawn the dial that connects to the
-    /// acceptor, writes the per-boot token and the fixed header, and starts
-    /// the two pumps. The dial's answer comes back on the stack's channel
-    /// and wakes its turn.
-    fn request_dial(&mut self, idx: usize, remote: IpEndpoint, local: IpEndpoint) {
+    /// acceptor, writes the per-boot token and the fixed header — the
+    /// box's own id ahead of its flow bytes — and starts the two pumps.
+    /// The dial's answer comes back on the stack's channel and wakes its
+    /// turn.
+    fn request_dial(&mut self, idx: usize, remote: IpEndpoint, local: IpEndpoint, box_id: BoxId) {
         let ticket = self.next_ticket;
         self.next_ticket += 1;
         self.slots[idx].flow = Flow::Dialing {
@@ -1500,12 +1538,43 @@ impl BepStack {
         let wire = self.wire.clone();
         let notify = self.waker();
         tokio::spawn(async move {
-            let result = dial_acceptor(&wire, remote, local, Arc::clone(&notify)).await;
+            let result = dial_acceptor(&wire, box_id, remote, local, Arc::clone(&notify)).await;
             let _ = done_tx.send(DialDone { ticket, result });
             // The dial's answer is on the channel; the poll loop takes it on
             // the next turn, so wake it now.
             notify.notify_one();
         });
+    }
+
+    /// Abort a box-plane source's accepted connection: its row holds a
+    /// share — the pre-screen passed the SYN — but no attachment names the
+    /// box, so nothing may be attributed to the identity it claims. The
+    /// abort resets the connection — nothing is presented from it, no
+    /// flow byte moves — and the refusal is charged to the shared audit,
+    /// its window's one line, in the format every refusal leg uses
+    /// (NET-133).
+    fn refuse_without_attachment(&mut self, idx: usize, source: Ipv4Addr) {
+        let refusal = refusal::Refusal {
+            class: refusal::NO_ATTACHMENT,
+            source,
+            address: Ipv4Addr::from(u32::from_be_bytes(self.host.ip().octets())),
+            about: refusal::About::Port(PROXY_PORT),
+        };
+        // The abort is this refusal's reply, so it is charged to the
+        // source's quota like the pre-screen's reset: a source that has
+        // spent its window gets no reset, and its slot goes back to the pool
+        // without one, as `refuse_syn` drops its reply.
+        match self
+            .refusals
+            .refuse(&refusal, true, std::time::Instant::now())
+        {
+            refusal::Outcome::Suppressed => self.retire_slot(idx),
+            refusal::Outcome::Quiet => self.abort_slot(idx),
+            refusal::Outcome::Emit(line) => {
+                self.abort_slot(idx);
+                tracing::warn!("{line}");
+            }
+        }
     }
 
     /// One slot's socket's remote endpoint, if it is carrying a connection.
@@ -1821,12 +1890,14 @@ fn move_live_bytes(socket: &mut tcp::Socket, pipes: &mut FlowPipes) {
 /// Dial the acceptor for one flow and start its two pumps: one connection
 /// per flow, never reused — a dead flow's connection closes with it.
 ///
-/// The dial carries the per-boot token and then the fixed header ahead of
-/// any flow byte, so the acceptor learns the box's source before the flow's
-/// data starts. A connect failure or a refused head is the caller's abort:
-/// an acceptor that is down resets the box's connection.
+/// The dial carries the per-boot token and then the fixed header — the
+/// box's own `box_id`, then its source — ahead of any flow byte, so the
+/// acceptor learns which box's connection this is before the flow's data
+/// starts. A connect failure or a refused head is the caller's abort: an
+/// acceptor that is down resets the box's connection.
 async fn dial_acceptor(
     wire: &BepWire,
+    box_id: BoxId,
     remote: IpEndpoint,
     local: IpEndpoint,
     notify: Arc<Notify>,
@@ -1834,7 +1905,7 @@ async fn dial_acceptor(
     let mut stream = UnixStream::connect(wire.proxy_sock()).await?;
     let mut head = Vec::with_capacity(TOKEN_LEN + DELIVERY_HEADER_LEN);
     head.extend_from_slice(&wire.token);
-    DeliveryHeader::for_flow(remote, local).emit_into(&mut head);
+    DeliveryHeader::for_flow(box_id, remote, local).emit_into(&mut head);
     stream.write_all(&head).await?;
     let (read_half, write_half) = stream.into_split();
     let (to_proxy, to_proxy_rx) = channel::<Vec<u8>>(FLOW_CHANNEL_CAP);
@@ -3149,26 +3220,80 @@ mod tests {
     // they do behind a spawned peer, only the switch lane is channel-wired
     // so the tests own every turn.
 
+    /// One fixture row: the box's switch address, and the id its
+    /// attachment holds — `None` once the attachment is dropped while the
+    /// row stands.
+    type TestRow = (Ipv4Addr, Option<BoxId>);
+
     /// A mutable stand-in for the registry's rows: what the pool
     /// partitions by, driven by hand in the tests the way `minvmd`'s table
-    /// is driven by its control socket.
+    /// is driven by its control socket. Each row carries its box's id —
+    /// what a delivery the pool accepts from it is delivered under — and
+    /// the id can be dropped while the row stands: the shape whose
+    /// deliveries the pool aborts.
     #[derive(Clone, Default)]
-    struct TestBoxes(StdArc<StdMutex<Vec<Ipv4Addr>>>);
+    struct TestBoxes(StdArc<StdMutex<Vec<TestRow>>>);
 
     impl TestBoxes {
+        /// Registers a box at `ip` named by the id the fixture derives for
+        /// the address ([`fixture_id`]).
         fn register(&self, ip: Ipv4Addr) {
-            self.0.lock().unwrap().push(ip);
+            self.register_with_id(ip, fixture_id(ip));
+        }
+
+        /// Registers a box at `ip` named by the id the test hands — the
+        /// id the box's attachment holds, exactly as the registry hands
+        /// one over.
+        fn register_with_id(&self, ip: Ipv4Addr, id: BoxId) {
+            self.0.lock().unwrap().push((ip, Some(id)));
+        }
+
+        /// Drops the box's attachment while its row stands: the row keeps
+        /// its share — the pre-screen still admits its SYN — but no id
+        /// names the box, so the pool aborts what it accepts from it.
+        fn drop_attachment(&self, ip: Ipv4Addr) {
+            self.0
+                .lock()
+                .unwrap()
+                .iter_mut()
+                .find(|(row, _)| *row == ip)
+                .expect("the fixture's row stands while its attachment goes")
+                .1 = None;
         }
 
         fn withdraw(&self, ip: Ipv4Addr) {
-            self.0.lock().unwrap().retain(|row| *row != ip);
+            self.0.lock().unwrap().retain(|(row, _)| *row != ip);
         }
     }
 
     impl BepBoxSource for TestBoxes {
         fn box_switch_addresses(&self) -> Vec<Ipv4Addr> {
-            self.0.lock().unwrap().clone()
+            self.0.lock().unwrap().iter().map(|(row, _)| *row).collect()
         }
+
+        fn box_id_for_source(&self, source: Ipv4Addr) -> Option<BoxId> {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(row, _)| *row == source)
+                .and_then(|(_, id)| *id)
+        }
+    }
+
+    /// The id the fixture registers a box at `ip` under: the address's own
+    /// octets, repeated — a fixed derivation, so an assertion can name a
+    /// box's id without consulting the fixture, and one that never lands
+    /// on the all-zero id no mint names a box with. A test's stand-in
+    /// fact, never a production mint: the registry's rows are named by
+    /// UUIDv7s.
+    fn fixture_id(ip: Ipv4Addr) -> BoxId {
+        let mut id = [0u8; 16];
+        let (lanes, _) = id.as_chunks_mut::<4>();
+        for lane in lanes {
+            lane.copy_from_slice(&ip.octets());
+        }
+        id
     }
 
     /// What one stand-in acceptor took: the header a delivery presented.
@@ -3472,7 +3597,12 @@ mod tests {
             assert_eq!(header.source.addr, IpAddress::Ipv4(box_ip));
             assert_eq!(header.destination.addr, IpAddress::Ipv4(proxy_ip));
             assert_eq!(header.destination.port, PROXY_PORT);
-            assert_eq!(header.box_id, [0u8; 16], "the box id stays zero until T44");
+            assert_eq!(
+                header.box_id,
+                fixture_id(box_ip),
+                "the delivery names the box by its attachment's own id, never the \
+                 all-zero id"
+            );
         }
         // ... and both answers came back to the box.
         for flow in [within, within2] {
@@ -3496,6 +3626,100 @@ mod tests {
         );
         // The pool still holds exactly the one box's share.
         assert_eq!(h.lane.pool_len(), cap);
+    }
+
+    /// NET-133: every delivered flow carries its own box's non-zero id,
+    /// filled from the attachment the row holds — and a box-plane source
+    /// whose row stands while its attachment does not is aborted, nothing
+    /// delivered for it.
+    #[tokio::test]
+    async fn delivered_header_box_id_matches_attachment() {
+        let (mut h, _proxy_sock, _token) = harness(1, Stall::None, true).await;
+        let subnet = SwitchSubnet::default();
+        let proxy_ip = subnet.box_egress_proxy_address();
+        let box_a = Ipv4Addr::from(subnet.first_ptask());
+        let box_b = Ipv4Addr::from(subnet.first_ptask() + 1);
+        // Box A's id is handed in, box B's the fixture's own derivation:
+        // either way the id is the box's attachment's fact, not a shape the
+        // delivery derives. Both are non-zero — no mint names a box with
+        // the all-zero id — and no two boxes share one.
+        let a_id: BoxId = [
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0x70, 0xcd, 0x80, 0x12, 0x34, 0x56, 0x78, 0x9a,
+            0xbc, 0xef,
+        ];
+        let b_id = fixture_id(box_b);
+        assert_ne!(a_id, [0u8; 16], "the id the attachment holds is a box's");
+        assert_ne!(b_id, [0u8; 16], "the id the attachment holds is a box's");
+        assert_ne!(a_id, b_id, "one id names one box");
+
+        h.boxes.register_with_id(box_a, a_id);
+        h.boxes.register(box_b);
+        drive(&mut h.lane, 2).await;
+        h.lane.add_box(box_a);
+        h.lane.add_box(box_b);
+        drive(&mut h.lane, 1).await;
+        h.lane.boxes_mut()[0].arp_for(proxy_ip);
+        h.lane.boxes_mut()[1].arp_for(proxy_ip);
+        drive(&mut h.lane, 3).await;
+
+        let a_flow = h.lane.boxes_mut()[0].connect(proxy_ip, PROXY_PORT);
+        let b_flow = h.lane.boxes_mut()[1].connect(proxy_ip, PROXY_PORT);
+        drive(&mut h.lane, 40).await;
+
+        // Both flows were delivered, each under its own box's id.
+        let accepted = h.acceptor.as_ref().expect("acceptor").accepted();
+        assert_eq!(accepted.len(), 2, "one connection per delivered flow");
+        let a_header = accepted
+            .iter()
+            .find(|header| header.source.addr == IpAddress::Ipv4(box_a))
+            .expect("A's flow was delivered");
+        let b_header = accepted
+            .iter()
+            .find(|header| header.source.addr == IpAddress::Ipv4(box_b))
+            .expect("B's flow was delivered");
+        assert_eq!(a_header.box_id, a_id, "A's delivery carries A's own id");
+        assert_eq!(b_header.box_id, b_id, "B's delivery carries B's own id");
+        for answer in [
+            read_flow(&mut h.lane, 0, a_flow, 8).await,
+            read_flow(&mut h.lane, 1, b_flow, 8).await,
+        ] {
+            assert!(
+                answer.starts_with(b"source="),
+                "the acceptor's answer arrived: {:?}",
+                String::from_utf8_lossy(&answer)
+            );
+        }
+
+        // A third box whose row stands while its attachment does not: its
+        // SYN passes the pre-screen — the row holds a share — but the pool
+        // aborts what it accepts. Nothing is delivered for it: the
+        // acceptor took no new connection, and the box's flow was reset.
+        let box_c = Ipv4Addr::from(subnet.first_ptask() + 2);
+        h.boxes.register(box_c);
+        drive(&mut h.lane, 2).await;
+        h.lane.add_box(box_c);
+        drive(&mut h.lane, 1).await;
+        h.lane.boxes_mut()[2].arp_for(proxy_ip);
+        drive(&mut h.lane, 3).await;
+        h.boxes.drop_attachment(box_c);
+        let c_flow = h.lane.boxes_mut()[2].connect(proxy_ip, PROXY_PORT);
+        drive(&mut h.lane, 40).await;
+        assert_eq!(
+            h.lane.boxes()[2].flow_state(c_flow),
+            State::Closed,
+            "a box-plane source with no attachment is aborted: its \
+             connection was reset"
+        );
+        assert_eq!(
+            h.acceptor.as_ref().expect("acceptor").connections(),
+            2,
+            "nothing was delivered for the source with no attachment"
+        );
+        assert_eq!(
+            h.acceptor.as_ref().expect("acceptor").accepted().len(),
+            2,
+            "no header was presented for the source with no attachment"
+        );
     }
 
     /// NET-132/T69: one box's exhaustion never starves a sibling — and
@@ -4733,7 +4957,8 @@ mod tests {
     }
 
     /// The delivery header is exactly the fixed layout the acceptor reads:
-    /// version, box id, source, destination — network byte order.
+    /// version, the box's own id, source, destination — network byte
+    /// order.
     #[test]
     fn delivery_header_round_trips() {
         let source = IpEndpoint {
@@ -4744,18 +4969,22 @@ mod tests {
             addr: IpAddress::Ipv4(Ipv4Addr::new(100, 64, 255, 252)),
             port: PROXY_PORT,
         };
-        let header = DeliveryHeader::for_flow(source, destination);
+        let box_id: BoxId = [
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0x70, 0xcd, 0x80, 0x12, 0x34, 0x56, 0x78, 0x9a,
+            0xbc, 0xef,
+        ];
+        let header = DeliveryHeader::for_flow(box_id, source, destination);
         let mut buf = Vec::new();
         header.emit_into(&mut buf);
         assert_eq!(buf.len(), DELIVERY_HEADER_LEN);
         assert_eq!(buf[0], DELIVERY_HEADER_VERSION);
-        assert_eq!(&buf[1..17], &[0u8; 16]);
+        assert_eq!(&buf[1..17], &box_id);
         assert_eq!(&buf[17..21], &[100, 64, 0, 9]);
         assert_eq!(&buf[21..23], &41_234u16.to_be_bytes());
         assert_eq!(&buf[23..27], &[100, 64, 255, 252]);
         assert_eq!(&buf[27..29], &PROXY_PORT.to_be_bytes());
         assert_eq!(DeliveryHeader::parse(&buf), Some(header));
         assert_eq!(DeliveryHeader::parse(&buf[..buf.len() - 1]), None);
-        assert_eq!(header.box_id, [0u8; 16]);
+        assert_eq!(header.box_id, box_id);
     }
 }

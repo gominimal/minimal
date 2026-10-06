@@ -312,6 +312,18 @@ Declares named parameters available to tasks across the repository, using the
 same `{type, help, default}` shape as per-task [`args`](./tasks.md). Every
 `[params]` entry must declare a `default`.
 
+Each parameter acts as a defaulted arg on every task: a command reads it as
+`%{name}`, and `--name <value>` overrides it for one run. A task that
+declares an arg of the same name uses its own arg instead.
+
+```toml
+[params]
+greeting = { type = "string", default = "hi" }
+
+[tasks.hello]
+bash = "echo %{greeting}"  # `hi`, or `bye` with `--greeting bye`
+```
+
 ### `[cache]` - Artifact cache behavior {#cache}
 
 ```toml

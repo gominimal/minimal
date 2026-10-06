@@ -3,8 +3,8 @@
 use anyhow::{Context as _, bail};
 use std::io::IsTerminal as _;
 use std::io::Write as _;
-use std::os::unix::process::CommandExt as _;
 use std::path::PathBuf;
+use tokio::io::AsyncReadExt as _;
 use tokio::io::AsyncWriteExt as _;
 
 // The version gate lives in `minimal-client`, next to the transport it guards,
@@ -127,9 +127,15 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
 /// existing session built from the same directory.
 pub(crate) const AUTOGEN_NAME_RETRIES: u32 = 8;
 
-/// Reduce a directory basename to the characters a session name should carry —
-/// ASCII alphanumerics plus `-`, `_`, `.`, lowercased — dropping everything
-/// else (spaces, unicode) so the minted handle is typable and clears
+/// Longest component [`sanitize_name_component`] returns, so a minted
+/// `task-<component>-<hex>` (the longest wrapper) stays inside the 63-octet
+/// DNS label `validate_session_name` requires.
+const NAME_COMPONENT_MAX: usize = 48;
+
+/// Reduce a directory basename to the characters a session name may carry —
+/// ASCII alphanumerics, lowercased, with `-`, `_` and `.` each mapped to `-` —
+/// dropping everything else (spaces, unicode) and capping the length, so the
+/// minted handle is typable and is a single DNS label that clears
 /// `validate_session_name`. Falls back to `session` when nothing survives.
 pub(crate) fn sanitize_name_component(basename: &str) -> String {
     let filtered: String = basename
@@ -138,13 +144,14 @@ pub(crate) fn sanitize_name_component(basename: &str) -> String {
             if c.is_ascii_alphanumeric() {
                 Some(c.to_ascii_lowercase())
             } else if matches!(c, '-' | '_' | '.') {
-                Some(c)
+                Some('-')
             } else {
                 None
             }
         })
+        .take(NAME_COMPONENT_MAX)
         .collect();
-    let trimmed = filtered.trim_matches(|c| matches!(c, '-' | '_' | '.'));
+    let trimmed = filtered.trim_matches('-');
     if trimmed.is_empty() {
         "session".to_string()
     } else {

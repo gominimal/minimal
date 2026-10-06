@@ -904,10 +904,12 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
                 Effect::Attach(key) => match providers.iter().find(|p| p.label == key.provider) {
                     Some(p) => {
                         let sock = p.sock.clone();
+                        let box_name = model.entry(&key).and_then(|entry| entry.name.clone());
                         attach_and_resume(
                             &mut terminal,
                             &sock,
                             key.id,
+                            box_name.as_deref(),
                             opts.config_dir.as_deref(),
                             &mut model,
                         );
@@ -1087,10 +1089,16 @@ async fn exec_effect(
 /// detaches), then resume. The session-key config is resolved from
 /// `config_dir` so the daemon adopts the user's detach/forward chord; a bad
 /// config is reported in the status bar rather than aborting the TUI.
+///
+/// On a VM-backed daemon the attach subscribes to `box_name`'s pending asks
+/// on the VM host daemon and answers them the way `min session attach`
+/// does (NET-045); the dash's list view never subscribes, so only an attach
+/// counts as an attached client.
 fn attach_and_resume(
     terminal: &mut TerminalGuard,
     sock: &std::path::Path,
     id: SessionId,
+    box_name: Option<&str>,
     config_dir: Option<&std::path::Path>,
     model: &mut Model,
 ) {
@@ -1102,15 +1110,16 @@ fn attach_and_resume(
         }
     };
     let result = minimal_client::attach::attach_command(sock, id, None, session_keys.as_ref())
-        .and_then(|mut cmd| {
-            terminal.suspend();
-            let status = cmd.status();
-            // A failed resume leaves the TUI unusable; report it over the
-            // attach outcome.
-            terminal
-                .resume()
-                .context("restoring terminal after detach")?;
-            status.context("running ssh attach")
+        .and_then(|cmd| {
+            attach_through_relay(terminal, cmd, |cmd| {
+                let host_asks = box_name.and_then(|name| {
+                    minimal_client::attach::HostAsks::subscribe_beside(sock, name)
+                });
+                minimal_client::attach::run_interactive_attach(
+                    cmd,
+                    host_asks.map(minimal_client::attach::HostAsks::into_hook),
+                )
+            })
         });
     match result {
         Ok(status) => {
@@ -1121,6 +1130,36 @@ fn attach_and_resume(
         }
         Err(e) => model.status = Some(format!("error: attach failed: {e:#}")),
     }
+}
+
+/// The terminal the dash hands over for an attach and takes back after.
+trait SuspendableTerminal {
+    /// Leave raw mode and the alternate screen, releasing the terminal.
+    fn suspend(&mut self);
+    /// Take the terminal back for the TUI.
+    fn resume(&mut self) -> std::io::Result<()>;
+}
+
+/// Run an attach with the TUI suspended around it. crossterm releases the
+/// terminal first (raw mode off, alternate screen left), and only then does
+/// `relay` start, so the termios the relay captures, and puts back when the
+/// attach ends, is the released terminal's, never crossterm's raw mode. The
+/// relay's [`minimal_client::tty_relay::RealTty::acquire`] picks the fd by
+/// crossterm's own rule (stdin when a tty, else `/dev/tty`), so both act on
+/// the same terminal.
+fn attach_through_relay(
+    terminal: &mut impl SuspendableTerminal,
+    cmd: std::process::Command,
+    relay: impl FnOnce(std::process::Command) -> Result<std::process::ExitStatus, anyhow::Error>,
+) -> Result<std::process::ExitStatus, anyhow::Error> {
+    terminal.suspend();
+    let status = relay(cmd);
+    // A failed resume leaves the TUI unusable; report it over the attach
+    // outcome.
+    terminal
+        .resume()
+        .context("restoring terminal after detach")?;
+    status.context("running ssh attach")
 }
 
 /// Enters the alternate screen on construction and restores the terminal
@@ -1146,16 +1185,18 @@ impl TerminalGuard {
             None => Err(std::io::Error::other("terminal suspended")),
         }
     }
+}
 
+impl SuspendableTerminal for TerminalGuard {
     /// Leave the alternate screen and drop the terminal, handing the TTY to
-    /// a child process.
+    /// the attach.
     fn suspend(&mut self) {
         if self.0.take().is_some() {
             ratatui::restore();
         }
     }
 
-    /// Re-enter the alternate screen after the child exits.
+    /// Re-enter the alternate screen after the attach ends.
     fn resume(&mut self) -> std::io::Result<()> {
         let mut terminal = ratatui::init();
         terminal.clear()?;
@@ -1199,6 +1240,7 @@ mod tests {
             project_path: Some(paths::HostAbsPath::try_new(project).unwrap()),
             status: sessions::SessionStatus::Active,
             git: None,
+            host_ip_enforcement: None,
             attrs: None,
         }
     }
@@ -1706,6 +1748,115 @@ mod tests {
         assert_eq!(
             model.status.as_deref(),
             Some("error: provider 'vm' is unreachable")
+        );
+    }
+
+    /// `min dash` hands the terminal to the attach the same way the CLI
+    /// does, through the relay, and crossterm lets go first: the relay
+    /// starts only after the release, so the termios it puts back when the
+    /// attach ends is the released terminal's, not crossterm's raw mode.
+    #[test]
+    fn dash_attach_goes_through_relay_after_crossterm_release() {
+        use nix::sys::termios::{LocalFlags, SetArg, Termios, cfmakeraw, tcgetattr, tcsetattr};
+        use std::io::Read as _;
+        use std::os::fd::OwnedFd;
+        use std::sync::{Arc, Mutex};
+
+        fn mode(t: &Termios) -> String {
+            // PENDIN is kernel bookkeeping on macOS, not a mode anyone set; and
+            // only the named control characters count (Linux's kernel keeps
+            // fewer than libc's `NCCS`, so the array's tail is stack garbage).
+            use nix::sys::termios::SpecialCharacterIndices as C;
+            let cc: Vec<u8> = [
+                C::VEOF,
+                C::VEOL,
+                C::VERASE,
+                C::VINTR,
+                C::VKILL,
+                C::VMIN,
+                C::VQUIT,
+                C::VSTART,
+                C::VSTOP,
+                C::VSUSP,
+                C::VTIME,
+            ]
+            .iter()
+            .map(|&i| t.control_chars[i as usize])
+            .collect();
+            format!(
+                "{:?} {:?} {:?} {:?} {cc:?}",
+                t.input_flags,
+                t.output_flags,
+                t.control_flags,
+                t.local_flags - LocalFlags::PENDIN,
+            )
+        }
+
+        /// The TUI's terminal on a pty: raw (crossterm's) until suspended,
+        /// the shell's own termios after.
+        struct Tui {
+            tty: OwnedFd,
+            released: Termios,
+            steps: Arc<Mutex<Vec<String>>>,
+        }
+        impl SuspendableTerminal for Tui {
+            fn suspend(&mut self) {
+                tcsetattr(&self.tty, SetArg::TCSANOW, &self.released).unwrap();
+                self.steps.lock().unwrap().push("release".into());
+            }
+            fn resume(&mut self) -> std::io::Result<()> {
+                let now = mode(&tcgetattr(&self.tty).unwrap());
+                self.steps.lock().unwrap().push(format!("resume in {now}"));
+                Ok(())
+            }
+        }
+
+        let pty = nix::pty::openpty(None, None).unwrap();
+        let released = tcgetattr(&pty.slave).unwrap();
+        let mut crossterm_raw = released.clone();
+        cfmakeraw(&mut crossterm_raw);
+        tcsetattr(&pty.slave, SetArg::TCSANOW, &crossterm_raw).unwrap();
+        let mut master = std::fs::File::from(pty.master);
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            loop {
+                match master.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    // A signal can interrupt the read on some targets.
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let steps = Arc::new(Mutex::new(Vec::new()));
+        let mut tui = Tui {
+            tty: pty.slave.try_clone().unwrap(),
+            released: released.clone(),
+            steps: Arc::clone(&steps),
+        };
+        let mut session = std::process::Command::new("/bin/sh");
+        session
+            .arg("-c")
+            .arg("stty raw -echo -iexten; printf R; exit 0");
+        let status = attach_through_relay(&mut tui, session, |cmd| {
+            steps.lock().unwrap().push("relay".into());
+            let real = minimal_client::tty_relay::RealTty::from_fds(
+                pty.slave.try_clone().unwrap(),
+                pty.slave.try_clone().unwrap(),
+            );
+            minimal_client::attach::run_interactive_attach_on(cmd, real, None)
+        })
+        .unwrap();
+        assert!(status.success());
+        assert_eq!(
+            *steps.lock().unwrap(),
+            vec![
+                "release".to_string(),
+                "relay".to_string(),
+                format!("resume in {}", mode(&released)),
+            ],
         );
     }
 }

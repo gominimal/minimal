@@ -23,6 +23,7 @@ members = [
     "crates/minimald",
     "crates/minimald-rpc",
     "crates/minvmd",
+    "crates/min-answerer",
     "crates/mlog",
     "crates/remote-client",
     "crates/remote-proto",
