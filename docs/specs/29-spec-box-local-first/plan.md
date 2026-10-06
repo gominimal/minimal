@@ -4,7 +4,7 @@ The order of the work, and the size of each step, for implementing [the BOX spec
 
 - **Status: draft, out of date with the spec.** It was drawn against spec commit `0d37c6a`, when the spec was numbered 25, and the spec has moved since. Re-run the plan after the renames in §0, then render the issues.
 - **Tree surveyed:** `main` at `173f033`, with the BOX, BVOL, BCLI and BRES spec files laid on top.
-- **Method:** the foundry `spec:plan` skill (`spec@foundry` v0.7.0), run up to the drafted plan comment. Nothing is posted on the epic and no issue exists yet. The plan comment in the skill's format lints with `plan-lint`: exit 0, 0 blocking findings, 22 advisory (§7).
+- **Method:** the foundry `spec:plan` skill (`spec@foundry` v0.7.0), run up to the drafted plan comment. Nothing is posted on the epic and no issue exists yet. The plan comment in the skill's format lints with `plan-lint`: exit 0, 0 blocking findings, 24 advisory (§7).
 - **Revision 2 (2026-10-06):** refactoring is folded in. Four scripted renames land before the plan (R1–R4, §0), eight refactor pull requests join the plan (T34–T41), and the box naming rule goes into `AGENTS.md`.
 - **Revision 3 (2026-10-06):** a task becomes a box whose entrypoint is the task. One launcher starts every box's entrypoint from its spec (T42), one exit rule keyed on `lifetime` ends it (T9), and `min task run` creates a task box instead of sending a task into a session's box (T43). Revision 2 had T9 patch the task path and the session path separately, which would have kept a code path per type.
 
@@ -140,6 +140,7 @@ T3 waits on T37–T39 and T41, T6 on T38–T39, T1 on T37 and T41, T2 on T41, T4
 | T15 | `[sessions.*]`, `[agents.*]`, `[services.*]` and `[boxes.*]` become box entries. Invalid entry names and `self` fail with exit 3. | BOX-007, 046 | mfile/src/entry.rs *new*, mfile lib.rs, error.rs | M, 220+180 | Yes (additive) |
 | T16 | The layer fold: upstream, type defaults, `[defaults]`, `[defaults.<type>]`, the entry, loadouts, then command-line overrides. Lists are unioned and scalars replaced. Serialisation is stable, a per-value layer report sits outside the spec bytes, and an invalid key fails with exit 3 naming the layer. Adds proptest to `mfile`. | BOX-048, 064, 065, 066, 161 | mfile/src/expand.rs *new*, lib.rs, error.rs, Cargo.toml, Cargo.lock | L, 380+360 | Yes (not wired in until T21) |
 | T17 | Legacy tables work with a hint for one release: `[session]` reads as `[defaults.session]`, `state_key`/`profile` as `[defaults.task]`, and `[params]` as `[args]`. Flat per-entry keys are accepted. After the grace release these exit 3. `interactive = true` on a task fails with exit 3. | BOX-049, 050, 051, 052, 054 | mfile/src/legacy.rs *new*, lib.rs, tasks.rs | L, 300+360 | Mostly: hints are new output. **`interactive = true` now fails**, and the `crates/mctx/testdata` fixtures use it |
+| T44 | The repository's own files stop using the legacy tables: `.minimal/minimal.toml`, the sessions example project, a minvmd test fixture, the `minimal.toml` reference and four guides, plus the daemon's scaffold for a project with no `minimal.toml`. `[session]` becomes `[sessions.default]`. A test reads every `minimal.toml` in the repository and fails on any legacy hint. | (enablement) | minimald session.rs; mfile legacy.rs; .minimal/minimal.toml; sessions example_project/minimal.toml; minvmd egress_allowlist_integration.rs; docs/reference/minimal-dot-toml.md; docs/guide/{dev-shell,setup,packages,agents}.md | M, 120+120 | Yes: the files mean what they meant |
 | T18 | Every Box Spec section (machine, io, execution, network, secrets, params, nesting, volumes) is accepted. **Unknown keys fail with exit 3 instead of a warning.** Unenforced sections warn once at creation. A project `[secret-store-rules]` is dropped with a warning. | BOX-076, 085 | mfile spec.rs, lib.rs; minimald sessions.rs | L, 420+300 | **No:** a minimal.toml with a stray key now fails |
 | T19 | `[network] mode` takes none, host_ip and own_ip. The legacy spellings and flat egress keys are canonicalised with a hint, reusing the hint code the CLI flag already has. `mode = "none"` with egress fails with exit 3. The network, bep and secrets sections pass through unchanged. | BOX-079, 080, 157 | mfile/src/network.rs *new*, lib.rs; minimal cli.rs; minimald-rpc lib.rs | L, 260+240 | Yes |
 | T20 | A `timeout` on an `until_complete` box ends it with reason timeout. `hooks_on_resume` reruns `on_activate`. | BOX-028, 037 | minimald session_host.rs, session.rs, session/tests.rs, session_host/tests.rs | M, 200+160 | Yes (new keys) |
@@ -205,6 +206,7 @@ Each multi-task slice has a join task (T7, T11, T14, T21, T25, T29, T32). The cr
 | **BCLI** | BCLI-001/003 render list and show in the first slice. The spec pulls them forward, but they have no BOX requirement. | **Under the default taken, BCLI's plan owns them, and they must land with or before T7.** The recommended flip is to have the join T7 carry them, adding about 250 lines to `crates/minimal` (see §8). |
 | BCLI | BCLI's first slice (`min box list\|show\|stop\|rm`) needs `StopBox` and `ReapBox`. | BOX T3 and T8 produce the operations, and BCLI-059/060 render them. **BCLI's first slice therefore waits on BOX S1.** |
 | BCLI | BCLI-024 command-line override layer → BOX-064 | T16 leaves the slot; BCLI fills it. |
+| BCLI | BCLI-017's `min init` scaffold in the entry-based shape | Today's writer (`crates/op/src/project/init.rs`) emits `[session]` and a top-level `state_key`, both legacy under T17. **BCLI's plan owns the rewrite.** T44 covers only the daemon's own scaffold. |
 | BCLI | BCLI-002 ambiguity rendering / BCLI-013 exit 137 for BOX-154 records | T12 produces the candidate list and T3 the record; BCLI renders both. |
 | BCLI | Process exit codes 2/3/5 and the `{code, message, hint}` envelope (`MachineModeFailure` exists). The epic comment ties inbox#755 to it. | The BOX errors in mfile and minimald carry the code (T15, T16, T12, T33), and BCLI maps them to process exits. Until BCLI lands, BOX tests assert the error kind, not the process exit. |
 | **BVOL** | BVOL-013's volume-hold check sits in the resume refusal order. | T6 leaves the slot, and BVOL inserts the check. |
@@ -281,18 +283,19 @@ None of these makes a requirement fully built, so the plan's "Already exists" se
 
 ## 5. Totals and critical path
 
-**43 PRs in the plan, plus the 4 scripted renames before it (§0).** The plan holds:
+**44 PRs in the plan, plus the 4 scripted renames before it (§0).** The plan holds:
 - 24 feature PRs;
 - 7 join PRs;
 - 2 single-task slices (T8, T33);
 - 8 refactor PRs (T34–T41);
-- 2 unification PRs (T42, T43).
+- 2 unification PRs (T42, T43);
+- 1 PR moving the repository's own files off the legacy tables (T44).
 
-By size that is 22 L, 13 M and 8 S.
+By size that is 22 L, 14 M and 8 S.
 
-- **Rough total:** about 19,800 lines, roughly 10,650 code and 9,150 tests. The refactor PRs add about 2,350 of those, and the unification about 1,250. At ~1/2/3 days per S/M/L PR that is about 100 PR-days. The four renames add about 4 more days, landed back to back.
+- **Rough total:** about 20,050 lines, roughly 10,750 code and 9,300 tests. The refactor PRs add about 2,350 of those, and the unification about 1,250. At ~1/2/3 days per S/M/L PR that is about 102 PR-days. The four renames add about 4 more days, landed back to back.
 - **How a pure move is sized:** a move's estimate counts only the lines that change (`mod` and `use` lines, visibility), not the moved lines. `git diff --color-moved` shows a reviewer the moved blocks as moved, so they cost little to review. T34 moves about 5,800 lines, T37 about 9,000, T38 about 4,300, T39 about 4,600, T40 about 2,300 and T41 about 1,800.
-- **By slice:** S0 ≈ 5.8k (the refactor PRs add 2.1k), S1 0.7k, S2 2.7k, S3 1.4k, S4 3.6k, S5 1.5k, S6 1.9k, S7 1.5k, S8 0.5k lines.
+- **By slice:** S0 ≈ 5.8k (the refactor PRs add 2.1k), S1 0.7k, S2 2.7k, S3 1.4k, S4 3.8k, S5 1.5k, S6 1.9k, S7 1.5k, S8 0.5k lines.
 - **Critical path:** 18 PRs, about 43 working days (~8.5 weeks), 6 days longer than revision 2:
 
   T34 → T35 → T36 (CLI refactor) → T5 → T6 → T7 (S0) → T42 → T9 → T43 (S2) → T20 → T21 (S4 join) → T22 → T23 → T24 → T25 (S5) → T26 → T28 → T29 (S6)
@@ -344,17 +347,19 @@ By size that is 22 L, 13 M and 8 S.
 
 ---
 
-## 7. Linter output (advisory only, exit 0, 22 findings)
+## 7. Linter output (advisory only, exit 0, 24 findings)
 
 - **V004 is gone.** Before this revision every S0 task waited on an issue outside the plan. The refactor PRs wait on nothing, so the first slice can start.
 - **Q003:** OQ7 needs an issue. T31 carries the dependency in its body until one exists.
 - **Z002** (T34 exists only to feed T35): the linter flags T34 as a candidate to fold into T35. Kept separate on purpose: a pure move and a real change in one PR is the diff nobody can review.
-- **F004 ×5:** `session.rs` and `session_host.rs` keep their tests in sibling `tests.rs` files.
+- **F004 ×6:** `session.rs` and `session_host.rs` keep their tests in sibling `tests.rs` files.
   - T38 and T39 move code only, so they add no tests there.
   - T3 and T6 are unchanged from revision 1.
   - T42 changes `session.rs` and puts its test in `session_host/tests.rs`, where the launcher's tests live.
+  - T44's scaffold test sits beside the scaffold, whichever file T38 moved it to.
 - **O003 + O004 ×7** (T34, T36, T37, T38, T39, T40, T41): their diagnostics and observability lines are "none: a pure move/rename changes no runtime behaviour". This is right for moves and renames. T35 is not on this list, because it adds a span per step.
 - **O004** (T27): unchanged from revision 1.
+- **O004** (T44): it rewrites files and adds no runtime behaviour to trace.
 
 ---
 
