@@ -16314,24 +16314,32 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
 
     # After the box ends, its declared port's published address must refuse a
     # host connect fast: nothing in the box answers, so a forward still bound
-    # there is a bind that outlived its box. Not a hard assertion yet: the
-    # host's egress gate refuses the guest's retraction of a declared port's
-    # forward by design (sessions::core::switch_request, Refusal::Unheld), and
-    # nothing on the host unbinds it at box end, so on main this leg is
-    # expected to find the bind still standing. Carried as a known gap until
-    # the host-side unbind lands (gominimal/inbox#915); flip it to `fail` then.
+    # there is a bind that outlived its box (design §7.1, NET-121). On a
+    # VM-backed host the guest cannot retract a declared forward (the host's
+    # egress gate refuses it by design); the host unbinds it when the box's
+    # row is withdrawn, which `session destroy` does before it returns. The
+    # unbind itself runs just after the withdrawal, so the probe allows a
+    # short settle window: each try is bounded at 2s, and the leg passes on
+    # the first refusal that came back in under 4s.
     if [ -n "$po_addr" ]; then
-      po_t0=$(now_ms)
-      curl -sS --max-time 8 -o /dev/null "http://$po_addr:$PO_EXT/" \
-        >/dev/null 2>"$WORK/po-after-destroy.err"
-      po_gone_rc=$?
-      po_t1=$(now_ms)
-      echo "after destroy: GET http://$po_addr:$PO_EXT/ -> curl exit $po_gone_rc in $((po_t1 - po_t0))ms ($(head -n1 "$WORK/po-after-destroy.err" 2>/dev/null || true))"
-      if [ "$po_gone_rc" -eq 7 ] && [ $((po_t1 - po_t0)) -lt 4000 ]; then
+      po_gone_rc=-1; po_gone_ms=0; po_settle_t0=$(now_ms)
+      while [ $(($(now_ms) - po_settle_t0)) -lt 10000 ]; do
+        po_t0=$(now_ms)
+        curl -sS --max-time 2 -o /dev/null "http://$po_addr:$PO_EXT/" \
+          >/dev/null 2>"$WORK/po-after-destroy.err"
+        po_gone_rc=$?
+        po_gone_ms=$(($(now_ms) - po_t0))
+        if [ "$po_gone_rc" -eq 7 ] && [ "$po_gone_ms" -lt 4000 ]; then
+          break
+        fi
+        sleep 0.5
+      done
+      echo "after destroy: GET http://$po_addr:$PO_EXT/ -> curl exit $po_gone_rc in ${po_gone_ms}ms, $(($(now_ms) - po_settle_t0))ms after the destroy returned ($(head -n1 "$WORK/po-after-destroy.err" 2>/dev/null || true))"
+      if [ "$po_gone_rc" -eq 7 ] && [ "$po_gone_ms" -lt 4000 ]; then
         echo "declared port refused fast after its box ended: no bind outlived the box"
       else
-        known_gap proof_port_publishes_on_listen_and_box_outlives_client \
-          "the declared port $po_addr:$PO_EXT was not refused fast after its box was destroyed (curl exit $po_gone_rc in $((po_t1 - po_t0))ms), so the declared forward's bind outlived the box — https://github.com/gominimal/inbox/issues/915"
+        echo "::error::the declared port $po_addr:$PO_EXT was not refused fast after its box was destroyed (curl exit $po_gone_rc in ${po_gone_ms}ms), so the declared forward's bind outlived the box (design §7.1, NET-121)"
+        fail
       fi
     fi
 
