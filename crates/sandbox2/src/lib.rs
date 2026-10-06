@@ -5739,10 +5739,14 @@ int main(int argc, char **argv) {
             .join(config::DENY_DIR);
         std::fs::create_dir(&deny).expect("creating the deny subtree");
 
+        // Four probes are enough to exercise the race and eight is the cap:
+        // every probe forks a child, so an unbounded count on a high-core CI
+        // host can exhaust a restrictive process limit and fail the test for
+        // a resource reason rather than a placement one.
         let n: usize = std::thread::available_parallelism()
             .map(|p| p.get())
             .unwrap_or(4)
-            .max(4);
+            .clamp(4, 8);
         let results: Vec<_> = (0..n)
             .map(|_| {
                 let root = tree.path().to_path_buf();
