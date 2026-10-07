@@ -35,6 +35,24 @@ pub enum NetworkMode {
     OwnIp,
 }
 
+impl NetworkMode {
+    /// The word naming this mode in the CLI's `--network` values and the
+    /// spec: `none`, `host_ip`, `own_ip`. It is not the serde form: the
+    /// derive serializes `no_net`, `host_net`, `own_ip`, so the two differ
+    /// for [`NetworkMode::NoNet`] and [`NetworkMode::HostNet`]. Policy
+    /// refusals and the daemon's `network_mode` log field use this word,
+    /// never Rust `Debug`. Deliberately not `Display`, so a format string
+    /// cannot pick one spelling by accident.
+    #[must_use]
+    pub fn word(self) -> &'static str {
+        match self {
+            NetworkMode::NoNet => "none",
+            NetworkMode::HostNet => "host_ip",
+            NetworkMode::OwnIp => "own_ip",
+        }
+    }
+}
+
 /// An IP transport protocol, used in egress/ingress policy rules.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -495,17 +513,6 @@ pub fn egress_deny_all_opt_out_from_raw(raw: Option<&str>) -> bool {
 /// CLI's `--dynamic-range` flag, so the two can never disagree.
 pub const MIN_DYNAMIC_INGRESS_PORT: u16 = 1024;
 
-/// The word naming `mode` (`none`, `host_ip`, `own_ip`): the spec's and the
-/// CLI's vocabulary, never Rust `Debug`. A policy refusal names the box's mode
-/// with it.
-fn network_mode_word(mode: NetworkMode) -> &'static str {
-    match mode {
-        NetworkMode::NoNet => "none",
-        NetworkMode::HostNet => "host_ip",
-        NetworkMode::OwnIp => "own_ip",
-    }
-}
-
 /// The refusal for a non-empty `ingress` on a box that is not own-IP: a
 /// dynamic declaration (a range or a non-deny stance) names the dynamic
 /// fields, otherwise the refusal names the port mappings. The dynamic check
@@ -540,7 +547,7 @@ pub enum PolicyError {
     #[error(
         "ingress port mappings need network mode own_ip (this box is {}): only an own-IP \
          box has a published address to apply them to",
-        network_mode_word(*.mode)
+        .mode.word()
     )]
     IngressRequiresOwnIp { mode: NetworkMode },
     /// A dynamic ingress declaration (a non-deny `dynamic_ingress` stance or a
@@ -550,7 +557,7 @@ pub enum PolicyError {
     #[error(
         "ingress dynamic_ingress and dynamic_allowed_range need network mode own_ip (this \
          box is {}): only an own-IP box has a published address to apply them to",
-        network_mode_word(*.mode)
+        .mode.word()
     )]
     DynamicIngressRequiresOwnIp { mode: NetworkMode },
     /// An ingress port mapping used a transport gvproxy's forwarder cannot
@@ -1156,6 +1163,21 @@ impl Record {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `word()` pins the CLI and spec vocabulary, and stays distinct from
+    /// the serde form where the two spellings differ: a refactor that
+    /// routed either through the other would rename a log field or a wire
+    /// value.
+    #[test]
+    fn network_mode_word_is_the_cli_word_not_the_serde_form() {
+        assert_eq!(NetworkMode::NoNet.word(), "none");
+        assert_eq!(NetworkMode::HostNet.word(), "host_ip");
+        assert_eq!(NetworkMode::OwnIp.word(), "own_ip");
+        for mode in [NetworkMode::NoNet, NetworkMode::HostNet] {
+            let serde = serde_json_lenient::to_string(&mode).unwrap();
+            assert_ne!(mode.word(), serde.trim_matches('"'), "{mode:?}");
+        }
+    }
 
     fn record_with(network: NetworkMode, policy: SessionPolicy) -> Record {
         Record {

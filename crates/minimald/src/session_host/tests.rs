@@ -3456,6 +3456,7 @@ async fn launch_refuses_unenforceable_host_ip_declaration_after_host_gains_per_b
         logged.lines().any(|line| {
             line.contains("refusing a host-address box whose declaration names rules")
                 && line.contains("session=race-proof-after")
+                && line.contains("network_mode=host_ip")
                 && line.contains("host_ip_enforcement=per_box")
                 && line.contains("deny_subnets 0.0.0.0/0")
         }),

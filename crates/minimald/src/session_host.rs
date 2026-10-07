@@ -4162,7 +4162,7 @@ impl SessionLauncher for SandboxLauncher {
                 let refusal = crate::net::classifier::unenforceable_declaration_refusal(&rules);
                 tracing::info!(
                     session = %session_name,
-                    network_mode = ?network_mode,
+                    network_mode = %network_mode.word(),
                     host_ip_enforcement = %HostIpEnforcement::PerBox.machine_str(),
                     refusal = %refusal,
                     "refusing a host-address box whose declaration names rules \
@@ -4227,7 +4227,7 @@ impl SessionLauncher for SandboxLauncher {
         ) {
             tracing::error!(
                 session = %session_name,
-                network_mode = ?network_mode,
+                network_mode = %network_mode.word(),
                 tree = %classifier_root.display(),
                 placed = leaf.is_some(),
                 refusal = %refusal,
