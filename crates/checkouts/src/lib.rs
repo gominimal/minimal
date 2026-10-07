@@ -3,7 +3,7 @@
 //! This crate provides abstractions for creating and maintaining checkouts of git repositories
 //! at specific versions.
 
-use fd_lock::RwLock;
+use fd_lock::{RwLock, RwLockWriteGuard};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -12,7 +12,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 use tempfile::tempdir_in;
-use tracing::trace;
+use tracing::{trace, warn};
 
 mod error;
 pub use error::Error;
@@ -302,6 +302,25 @@ impl Manager {
         Ok(RwLock::new(file))
     }
 
+    /// Takes the exclusive lock, blocking until it is free. A holder can sit
+    /// on it for a whole network fetch, so a contended lock is reported
+    /// before the wait starts rather than leaving the caller to hang
+    /// silently behind another manager.
+    fn lock_exclusive<'a>(
+        &self,
+        lock: &'a mut RwLock<File>,
+    ) -> Result<RwLockWriteGuard<'a, File>, Error> {
+        // Probe without blocking; an acquired probe guard is dropped at once
+        // and the blocking `write` below takes the lock for real.
+        if matches!(lock.try_write(), Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock) {
+            warn!(
+                "waiting for the checkouts cache lock at {} (held by another process or manager)",
+                self.lock_path().display()
+            );
+        }
+        Ok(lock.write()?)
+    }
+
     /// Updates all repos to latest - does nothing for refs which arent symbolic (i.e. commits).
     /// In offline mode, returns [Error::OfflineCacheMiss] — `update` is fundamentally
     /// a network operation, and silently lameducking it would mask hard-to-debug bugs
@@ -312,7 +331,7 @@ impl Manager {
         // against the same bare repo would otherwise race this fetch/checkout
         // inside the shared worktree (`index.lock: File exists`).
         let mut lock = self.acquire_lock()?;
-        let _guard = lock.write()?;
+        let _guard = self.lock_exclusive(&mut lock)?;
         if self.offline {
             // Pick the first known remote for the error message; if there are
             // no known remotes there's nothing to update, so a synthetic
@@ -349,7 +368,7 @@ impl Manager {
     /// subsequent [`Self::checkout_of`] clones it on first use.
     pub fn update_remote(&mut self, remote: &str) -> Result<(), Error> {
         let mut lock = self.acquire_lock()?;
-        let _guard = lock.write()?;
+        let _guard = self.lock_exclusive(&mut lock)?;
         let Some(id) = self.state.git_remotes.get(remote).cloned() else {
             return Ok(());
         };
@@ -377,7 +396,7 @@ impl Manager {
         // Same serialization rationale as `update`: the fetch and worktree
         // checkout below mutate shared git state across managers.
         let mut lock = self.acquire_lock()?;
-        let _guard = lock.write()?;
+        let _guard = self.lock_exclusive(&mut lock)?;
 
         let out = match self.state.git_remotes.get(remote) {
             // This remote is already managed
@@ -1040,6 +1059,47 @@ mod tests {
         for h in handles {
             h.join().unwrap().unwrap();
         }
+    }
+
+    /// A holder of `<base>/.lock` outside any manager (another process, in
+    /// the field) keeps `checkout_of` waiting until it lets go, and the
+    /// waiter then completes rather than failing.
+    #[test]
+    fn checkout_of_waits_for_an_external_lock_holder() {
+        let (src, hash) = make_local_repo("main");
+        let remote = src.path().to_str().unwrap().to_string();
+        let base = tempfile::tempdir().unwrap();
+        let mut mgr = Manager::new_in_dir(base.path()).unwrap();
+
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(base.path().join(".lock"))
+            .unwrap();
+        let mut held = RwLock::new(file);
+        let guard = held.write().unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let out = mgr.checkout_of(&remote, GitRef::Branch("main".to_string()));
+            tx.send(out.map(|(_, rev)| rev).map_err(|e| e.to_string()))
+                .unwrap();
+        });
+
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(500))
+                .is_err(),
+            "checkout_of must not proceed while another holder has the lock"
+        );
+        drop(guard);
+        let rev = rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("checkout_of completes once the lock is released")
+            .unwrap();
+        assert_eq!(rev, hash);
+        waiter.join().unwrap();
     }
 
     #[test]
