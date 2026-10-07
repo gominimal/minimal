@@ -75,10 +75,10 @@ where
     let (mut rx, mut tx) = stream.into_split();
 
     let to_sock = async {
-        tokio::io::copy(&mut stdin, &mut tx).await?;
+        ignore_broken_pipe(tokio::io::copy(&mut stdin, &mut tx).await)?;
         tx.shutdown().await
     };
-    let from_sock = tokio::io::copy(&mut rx, &mut stdout);
+    let from_sock = async { ignore_broken_pipe(tokio::io::copy(&mut rx, &mut stdout).await) };
     tokio::pin!(from_sock);
 
     tokio::select! {
@@ -91,6 +91,21 @@ where
         }
     }
     Ok(())
+}
+
+/// Treat a `BrokenPipe` from either copy direction as normal termination.
+///
+/// The reader on the downstream side may close the pipe before the copy
+/// finishes (for example `yes | ssh host 'cmd'`, where `cmd` never reads
+/// stdin): the peer tears the stream down and `tokio::io::copy` reports
+/// `BrokenPipe`. That is not a proxy failure, so it is mapped to a
+/// successful zero-byte copy instead of surfacing `error: proxy: Broken
+/// pipe (os error 32)`.
+fn ignore_broken_pipe(result: std::io::Result<u64>) -> std::io::Result<u64> {
+    match result {
+        Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => Ok(0),
+        other => other,
+    }
 }
 
 /// The local mesh-enrolment record path. `--minimal-dir` still wins for
@@ -430,5 +445,75 @@ mod tests {
         drop(stream);
         drop(held);
         acceptor.join().expect("the acceptor thread");
+    }
+
+    /// A downstream writer that fails every write with the given error kind.
+    struct FailingWriter(std::io::ErrorKind);
+
+    impl tokio::io::AsyncWrite for FailingWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Err(std::io::Error::from(self.0)))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Write a couple of bytes down the daemon side and then shut it down, so
+    /// the bridge's socket-to-stdout copy has something to deliver.
+    fn writing_daemon(mut stream: tokio::net::UnixStream) {
+        tokio::spawn(async move {
+            stream
+                .write_all(b"hello")
+                .await
+                .expect("daemon writes its greeting");
+            stream.shutdown().await.expect("daemon shuts down");
+        });
+    }
+
+    /// When the downstream reader closes early (BrokenPipe), the bridge treats
+    /// it as normal termination rather than surfacing `error: proxy: Broken
+    /// pipe (os error 32)`.
+    #[tokio::test]
+    async fn proxy_bridge_exits_quietly_on_broken_pipe() {
+        let (bridge, daemon) = tokio::net::UnixStream::pair().expect("socket pair");
+        writing_daemon(daemon);
+        let stdout = FailingWriter(std::io::ErrorKind::BrokenPipe);
+
+        proxy_bridge(bridge, &[][..], stdout)
+            .await
+            .expect("a broken pipe downstream is not a proxy failure");
+    }
+
+    /// Any error other than BrokenPipe is still surfaced with the `proxy`
+    /// context intact.
+    #[tokio::test]
+    async fn proxy_bridge_reports_non_broken_pipe_errors() {
+        let (bridge, daemon) = tokio::net::UnixStream::pair().expect("socket pair");
+        writing_daemon(daemon);
+        let stdout = FailingWriter(std::io::ErrorKind::Other);
+
+        let err = proxy_bridge(bridge, &[][..], stdout)
+            .await
+            .expect_err("a non-broken-pipe write failure must surface");
+        assert!(
+            format!("{err:#}").contains("proxy"),
+            "the error must carry the proxy context: {err:#}"
+        );
     }
 }
