@@ -854,9 +854,11 @@ pub fn shim_main(args: ShimArgs) -> Result<i32, NsenterError> {
 ///
 /// The caller must pass the group-lead of a live group it is entitled to
 /// signal, or `0` (a no-op, so a handler that fires after the child was reaped
-/// cannot hit a recycled pid).
+/// cannot hit a recycled pid). Any `pgid <= 1` is a no-op: `kill(0, …)` would
+/// signal the shim's own group and `kill(-1, …)` every process it may signal,
+/// so neither can ever be the target.
 unsafe fn kill_group(pgid: i32) {
-    if pgid == 0 {
+    if pgid <= 1 {
         return;
     }
     // SAFETY: only async-signal-safe calls follow, so this is legal from a
@@ -1120,6 +1122,16 @@ mod tests {
             // process this test forked.
             let exists = unsafe { libc::kill(grandchild, 0) } == 0;
             if !exists {
+                assert_eq!(
+                    std::io::Error::last_os_error().raw_os_error(),
+                    Some(libc::ESRCH),
+                    "the grandchild must be gone, not just invisible"
+                );
+                break;
+            }
+            // Killed but not yet reaped: a container's PID 1 need not reap
+            // the orphans reparented to it, so a zombie counts as dead.
+            if is_zombie(grandchild) {
                 break;
             }
             assert!(
@@ -1128,11 +1140,32 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        assert_eq!(
-            std::io::Error::last_os_error().raw_os_error(),
-            Some(libc::ESRCH),
-            "the grandchild must be gone, not just invisible"
-        );
+    }
+
+    /// Whether `pid` is a zombie, per the state field of `/proc/<pid>/stat`
+    /// (the first field after the parenthesised comm).
+    fn is_zombie(pid: i32) -> bool {
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| {
+                let (_, after_comm) = stat.rsplit_once(')')?;
+                after_comm
+                    .split_whitespace()
+                    .next()
+                    .map(|state| state == "Z")
+            })
+            .unwrap_or(false)
+    }
+
+    /// The handler's guard: `kill_group` never signals the shim's own group
+    /// (`0`) or every process it may signal (`-1`, from a `pgid` of `1`), nor
+    /// a negative id. Reaching any `kill` here would take the test runner down.
+    #[test]
+    fn kill_group_ignores_pgids_that_name_no_child_group() {
+        for pgid in [i32::MIN, -1, 0, 1] {
+            // SAFETY: every value is below the guard, so no signal is sent.
+            unsafe { kill_group(pgid) };
+        }
     }
 
     /// The production path: no shim is named per injection (only tests do

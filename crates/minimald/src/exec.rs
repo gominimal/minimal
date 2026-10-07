@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Display;
 use std::io;
 use std::process::Stdio;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use futures::{
     StreamExt,
@@ -899,12 +899,15 @@ impl Exec for SessionExec {
 }
 
 /// `Process` implementation backed by [`tokio::process::Child`].
+///
+/// The flag records whether [`Process::start_kill`] asked the child to exit,
+/// which arms the SIGTERM-to-SIGKILL escalation in [`Process::wait`].
 #[derive(Debug)]
-pub struct TokioProcess(Child, Option<Instant>);
+pub struct TokioProcess(Child, bool);
 
 impl TokioProcess {
     fn new(child: Child) -> Self {
-        Self(child, None)
+        Self(child, false)
     }
 }
 
@@ -922,17 +925,17 @@ impl Process for TokioProcess {
     }
 
     async fn wait(&mut self) -> io::Result<Option<i32>> {
-        match self.1 {
-            Some(_) => match tokio::time::timeout(Duration::from_secs(2), self.0.wait()).await {
-                Ok(status) => status.map(|s| s.code()),
-                // SIGTERM did not take: escalate to SIGKILL and wait it out.
-                Err(_elapsed) => {
-                    self.0.start_kill()?;
-                    self.0.wait().await.map(|s| s.code())
-                }
-            },
-            // Never asked to die: a plain wait, as before.
-            None => self.0.wait().await.map(|s| s.code()),
+        // Never asked to die: a plain wait, as before.
+        if !self.1 {
+            return self.0.wait().await.map(|s| s.code());
+        }
+        match tokio::time::timeout(Duration::from_secs(2), self.0.wait()).await {
+            Ok(status) => status.map(|s| s.code()),
+            // SIGTERM did not take: escalate to SIGKILL and wait it out.
+            Err(_elapsed) => {
+                self.0.start_kill()?;
+                self.0.wait().await.map(|s| s.code())
+            }
         }
     }
 
@@ -953,7 +956,7 @@ impl Process for TokioProcess {
                 }
             }
         }
-        self.1 = Some(Instant::now());
+        self.1 = true;
         Ok(())
     }
 }
