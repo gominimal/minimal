@@ -32,6 +32,7 @@ use nix::fcntl::{OFlag, open, openat, renameat};
 use nix::sys::stat::Mode;
 use serde::Serialize;
 use tokio::io::AsyncWriteExt;
+use tokio::sync::Mutex;
 
 /// The log's location under the daemon's state directory, spelled the same
 /// relative way in the diagnostic bundle so a reader of one finds the other.
@@ -119,6 +120,21 @@ pub(crate) const MAX_LOG_BYTES: u64 = 1024 * 1024;
 /// directory, spelled the same relative way in the diagnostic bundle.
 pub(crate) const ROTATED_RELATIVE: &str = "audit/decisions.log.1";
 
+/// The append lock: one per daemon, held across the whole append — the
+/// open, the rotation decision, the rename, the reopen, and the write.
+///
+/// The log is one file under the daemon's shared state directory, written
+/// by whichever session actor runs [`try_append`] at the time, and each
+/// actor is its own spawned task, so two sessions can decide a rotation on
+/// the same live file together. Nothing below would stop them: the size
+/// read and the rename are two steps, and the second `renameat` would move
+/// the fresh log the first session just created onto `.1`, taking with it
+/// the entire generation the first rotation kept — the very history
+/// NET-046 says must be preserved. Holding one lock across the append
+/// makes the decision and the moves one step; a `tokio::sync::Mutex`
+/// because the steps it serializes await.
+static APPEND: Mutex<()> = Mutex::const_new(());
+
 /// The rotated generation's own path under `state_dir`.
 pub(crate) fn rotated_path(state_dir: &Path) -> PathBuf {
     state_dir.join(ROTATED_RELATIVE)
@@ -159,6 +175,12 @@ pub(crate) async fn try_append_capped(
     record: &DecisionRecord,
     cap: u64,
 ) -> std::io::Result<()> {
+    // One append at a time, across every session's actor: the rotation the
+    // append may run is an open→stat→rename→reopen sequence on the one log
+    // they share, so two of them crossing the cap together would race (see
+    // [`APPEND`]). Held until the line is flushed, so no append starts its
+    // size read against a file another is mid-rotation on.
+    let _append = APPEND.lock().await;
     let path = log_path(state_dir);
     // Made on every append rather than once at daemon start: the log is the
     // state directory's child, and a daemon asked to audit its first-ever
@@ -190,7 +212,9 @@ pub(crate) async fn try_append_capped(
     // that could lose its most recent records to a crash on close is not
     // worth the buffer.
     file.write_all(line.as_bytes()).await?;
-    file.flush().await
+    let flushed = file.flush().await;
+    drop(_append);
+    flushed
 }
 
 /// Whether a log already holding `len` bytes rotates before an `incoming`
@@ -583,5 +607,113 @@ mod tests {
             !planted_dir.join("decisions.log").exists(),
             "the refused append leaves the link's target untouched"
         );
+    }
+
+    /// [`record_for`] with the timestamp a rotation test can order by: a
+    /// fixed-width sequence number rather than a clock, so the records two
+    /// tasks append interleaved still read in the order they were written —
+    /// the order a raced rotation would delete from the middle of.
+    fn sequenced_record(port: u16, sequence: u64) -> DecisionRecord {
+        DecisionRecord {
+            ts: format!("{sequence:012}"),
+            box_name: "web".to_string(),
+            port,
+            decision: sessions::DynamicIngress::Allow,
+            decided_by: DecidedBy::BoxPolicy,
+            outcome: DecisionOutcome::Published,
+            reason: None,
+        }
+    }
+
+    /// The sequence numbers a log file's records name, in file order.
+    fn sequences_in(path: &Path) -> Vec<u64> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .map(|line| {
+                let record: serde_json_lenient::Value =
+                    serde_json_lenient::from_str(line).expect("one line is one record");
+                record["ts"]
+                    .as_str()
+                    .expect("every record names its timestamp")
+                    .parse()
+                    .expect("the test's timestamps are sequence numbers")
+            })
+            .collect()
+    }
+
+    /// The rotation is the one multi-step thing the log does, and the log is
+    /// shared: every session's actor appends to the same file, and each is
+    /// its own spawned task, so two of them can reach a rotation together.
+    /// Unserialized, both would pass `rotates` against the same live file,
+    /// and the second rename would carry away the fresh log the first just
+    /// created — deleting the generation the first rotation kept. With the
+    /// append held under one lock, the records both files hold are the
+    /// newest ones in an unbroken write-order run: the files follow each
+    /// other in the order their records were written, nothing is held
+    /// twice, and the live file's last line is the very newest record.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_appends_rotating_together_lose_no_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("daemon");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        // The sequence's fixed width keeps every line the same length, so a
+        // cap of a few lines is a cap the concurrent appends keep crossing.
+        let line_len = serde_json_lenient::to_string(&sequenced_record(1000, 0))
+            .unwrap()
+            .len() as u64
+            + 1;
+        let cap = line_len * 3;
+        let per_task = 200u64;
+        let tasks = 2u64;
+        let written = tasks * per_task;
+        let sequence = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        let mut spawned = Vec::new();
+        for _ in 0..tasks {
+            let state_dir = state_dir.clone();
+            let sequence = sequence.clone();
+            spawned.push(tokio::spawn(async move {
+                for _ in 0..per_task {
+                    let next = sequence.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    try_append_capped(&state_dir, &sequenced_record(next as u16, next), cap)
+                        .await
+                        .expect("an append to a healthy log lands");
+                }
+            }));
+        }
+        for task in spawned {
+            task.await.expect("the appending task finishes");
+        }
+
+        let rotated = sequences_in(&rotated_path(&state_dir));
+        let live = sequences_in(&log_path(&state_dir));
+        let kept: Vec<u64> = rotated.into_iter().chain(live).collect();
+        assert_eq!(
+            kept,
+            (written - kept.len() as u64..written).collect::<Vec<u64>>(),
+            "the two files hold an unbroken run of the newest records, each once"
+        );
+        assert_eq!(
+            kept.last(),
+            Some(&(written - 1)),
+            "the newest record is the live log's last line"
+        );
+        assert!(
+            !state_dir.join("audit/decisions.log.2").exists(),
+            "one rotated generation is kept, never more"
+        );
+        for (what, len) in [
+            (
+                "the live log",
+                std::fs::metadata(log_path(&state_dir)).unwrap().len(),
+            ),
+            (
+                "the rotated generation",
+                std::fs::metadata(rotated_path(&state_dir)).unwrap().len(),
+            ),
+        ] {
+            assert!(len <= cap, "{what} stays within its cap: {len} > {cap}");
+        }
     }
 }
