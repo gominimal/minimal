@@ -22,13 +22,22 @@ pub(crate) fn session_announce_label(id: &sessions::SessionId, name: Option<&str
     }
 }
 
-/// The advisory as one line: its facts and lead-in, without the command
-/// block that follows the first newline.
+/// The advisory as one line, for a session start that is not interactive:
+/// its facts and lead-in, without the command block that follows the first
+/// newline, plus where to get that command. Every fact is kept — only the
+/// multi-line command is dropped. A note that names no command (a blocker
+/// note, one line already) is returned unchanged: there is no command to
+/// point at.
 fn short_advisory(advisory: &str) -> String {
-    let first_line = advisory.split('\n').next().unwrap_or(advisory);
+    let Some((first_line, _command)) = advisory.split_once('\n') else {
+        return advisory.to_string();
+    };
     let first_line = first_line.strip_suffix(" with:").unwrap_or(first_line);
     let first_line = first_line.strip_suffix('.').unwrap_or(first_line);
-    format!("{first_line}. Run `min session activate` in a terminal to print the command.")
+    format!(
+        "{first_line}. Run `min session activate` in a terminal, without \
+         --no-prompt or --no-input, to print the command."
+    )
 }
 
 /// Create a new session via the `CreateSession` RPC.
@@ -3913,26 +3922,19 @@ mod tests {
             !short.contains("sudo"),
             "the short advisory never carries the command, got: {short}"
         );
-        assert!(
-            short.ends_with(". Run `min session activate` in a terminal to print the command."),
-            "the short advisory ends with the hint, got: {short}"
-        );
         assert_eq!(
             short,
             "note: the resolver file is missing. Configure the host's \
-             resolver. Run `min session activate` in a terminal to print the command."
+             resolver. Run `min session activate` in a terminal, without \
+             --no-prompt or --no-input, to print the command."
         );
     }
 
     #[test]
-    fn short_advisory_keeps_a_commandless_note() {
-        let advisory = "note: this host's resolver is not configured for the zone.";
-        let short = short_advisory(advisory);
-        assert_eq!(
-            short,
-            "note: this host's resolver is not configured for the zone. \
-             Run `min session activate` in a terminal to print the command."
-        );
+    fn short_advisory_keeps_a_commandless_note_unchanged() {
+        // A blocker note names no command, so it gets no hint pointing at one.
+        let advisory = "note: this host's lookups bypass the resolver.";
+        assert_eq!(short_advisory(advisory), advisory);
     }
 
     #[test]
