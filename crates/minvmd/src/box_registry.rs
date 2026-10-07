@@ -99,8 +99,8 @@ type RowWithdrawals = Arc<Mutex<Vec<tokio::sync::mpsc::UnboundedSender<RowWithdr
 /// revocation to release the addresses it asks for, before it is refused
 /// with [`AllocationError::RevocationPending`]. A revocation that goes well
 /// holds an address for one unexpose per forward, which takes milliseconds.
-/// The bound is for a switch that is slow to answer, and it keeps the serial
-/// control door from waiting on a switch that never answers.
+/// The bound is for a switch that is slow to answer, and it keeps a control
+/// connection's thread from waiting on a switch that never answers.
 pub const REVOCATION_WAIT: Duration = Duration::from_secs(5);
 
 /// The addresses a withdrawn box's revocation still holds against reuse

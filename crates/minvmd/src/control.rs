@@ -173,15 +173,15 @@ enum ControlDoor {
 
 /// How long the server waits for a registration's one request line before
 /// dropping the connection. Generous against a slow starter; a hung client
-/// must not pin the serving thread — connections are served one at a
-/// time — forever.
+/// must not pin its connection's thread, and the door slot it holds,
+/// forever.
 const REGISTER_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long the guest door waits for the in-VM daemon to close its end
 /// after its reply is written. The wait is the G-N8 workaround's other
 /// half, so the bound only ends a client that read its reply and never
-/// closed: a wedged reporter cannot pin the door's serial accept loop the
-/// way an honest one never does.
+/// closed: a wedged reporter cannot pin its connection's thread, and the
+/// door slot it holds, the way an honest one never does.
 const GUEST_REPORT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The largest request line the server will read. A registration carries a
@@ -496,6 +496,7 @@ pub fn spawn(
                 proxy_publish,
                 ControlDoor::Host,
                 &audit_path,
+                MAX_CONTROL_CONNECTIONS,
             )
         })
 }
@@ -510,8 +511,9 @@ pub fn spawn(
 /// The door is the port reports' alone: the admit-port and withdraw-port
 /// verbs answer on it and nothing else does, so the grant a row's
 /// registration holds — never the peer, whose uid the socket posture
-/// already gates — decides what a report records. It serves one connection
-/// at a time on its own thread beside the host socket's thread, and never
+/// already gates — decides what a report records. Its accept loop runs on
+/// its own thread beside the host socket's, each connection on a thread of
+/// its own, and it never
 /// closes a connection first: after its reply is written it waits for the
 /// reporter's close, because the KVM shuttle drops a server-initiated
 /// close's still-buffered reply bytes on the way to the guest (G-N8).
@@ -555,6 +557,7 @@ pub fn spawn_guest_reports_door(
                 proxy_publish,
                 ControlDoor::GuestReports,
                 &audit_path,
+                MAX_CONTROL_CONNECTIONS,
             )
         })
         // The door's bound path is the handle the caller pairs with the
@@ -568,6 +571,12 @@ pub fn spawn_guest_reports_door(
 /// holds only that thread, while every other request is accepted and
 /// served behind it. The two doors are served on two threads, so a report
 /// the grant refuses never waits behind a registration.
+///
+/// At most `cap` connection threads live at once per door: past it a
+/// connection is refused on the accept loop's own turn, before any thread
+/// is spawned, so a peer that opens connections in a loop cannot grow
+/// threads without limit. A slot is freed when its connection's thread
+/// ends.
 fn accept_loop(
     listener: UnixListener,
     boxes: BoxRegistry,
@@ -575,10 +584,28 @@ fn accept_loop(
     proxy_publish: ProxyPublishStatus,
     door: ControlDoor,
     audit_path: &Path,
+    cap: usize,
 ) {
+    let connections = Arc::new(crate::box_registry::ConnectionGauge::default());
     for stream in listener.incoming() {
         match stream {
-            Ok(stream) => {
+            Ok(mut stream) => {
+                let Some(slot) = connections.try_acquire(cap) else {
+                    tracing::debug!(
+                        cap,
+                        "refused a box control connection past the VM host daemon's cap"
+                    );
+                    let _ = write_reply(
+                        &mut stream,
+                        &BoxControlReply::Error {
+                            error: format!(
+                                "the VM host daemon is already serving {cap} control \
+                                 connections; try again once one ends"
+                            ),
+                        },
+                    );
+                    continue;
+                };
                 let boxes = boxes.clone();
                 let answerer = answerer.clone();
                 let proxy_publish = proxy_publish.clone();
@@ -586,6 +613,7 @@ fn accept_loop(
                 if let Err(error) = std::thread::Builder::new()
                     .name("minvmd-control-conn".to_string())
                     .spawn(move || {
+                        let _slot = slot;
                         if let Err(error) = serve_connection(
                             stream,
                             &boxes,
@@ -665,9 +693,9 @@ fn serve_connection(
     }
     // The ask verbs hold their connection open for as long as the ask or
     // the subscription lives (NET-045), so each runs on a thread of its
-    // own: a door serves its other connections one at a time, and an ask
-    // waiting on a human must not hold a report or a registration behind
-    // it.
+    // own under its kind's cap, freeing this connection's door slot at
+    // once: an ask waiting on a human must not hold a slot a report or a
+    // registration needs.
     //
     // Each kind is capped ([`MAX_GUEST_ASK_CONNECTIONS`],
     // [`MAX_ASK_SUBSCRIPTIONS`]): past the cap the connection is refused on
@@ -743,13 +771,13 @@ fn serve_connection(
 /// Wait for the peer's close on a guest-door connection whose reply was
 /// already written: read until EOF — the reporter closing its end, which
 /// it does once it has the reply — or until the drain bound ends a client
-/// that never closes, so a wedged reporter cannot pin the door's serial
-/// accept loop. Bytes past the request line, if any, are discarded: the
+/// that never closes, so a wedged reporter cannot pin its connection's
+/// thread and door slot. Bytes past the request line, if any, are discarded: the
 /// door's protocol is one line each way.
 fn drain_until_peer_closes(stream: &mut UnixStream) {
     if let Err(error) = stream.set_read_timeout(Some(GUEST_REPORT_DRAIN_TIMEOUT)) {
-        // Without the bound a reporter that never closes would pin the
-        // door's serial accept loop, so a timeout that cannot be set ends
+        // Without the bound a reporter that never closes would pin its
+        // connection's thread and door slot, so a timeout that cannot be set ends
         // the drain here: the reply is already written, and the peer's
         // close ends the connection all the same.
         tracing::debug!(error = %error, "the guest report drain could not arm its bound");
@@ -1442,7 +1470,7 @@ fn append_audit_line(path: &Path, line: &impl serde::Serialize) {
 
 /// Run one ask verb's connection on a thread of its own (NET-045): the ask
 /// or the subscription holds the connection open, so it must not hold the
-/// door's serial accept loop with it. A thread that cannot be spawned is
+/// door's connection slot with it. A thread that cannot be spawned is
 /// answered on the spot with the reason, and the connection closes.
 fn spawn_ask_thread(
     mut stream: UnixStream,
@@ -1508,6 +1536,13 @@ pub(crate) const MAX_GUEST_ASK_CONNECTIONS: usize = crate::box_registry::PENDING
 /// How many host-client ask subscriptions are served at once (NET-045):
 /// one per interactive attach, bounded the same way.
 pub(crate) const MAX_ASK_SUBSCRIPTIONS: usize = MAX_GUEST_ASK_CONNECTIONS;
+
+/// How many connection threads each control door runs at once. A request
+/// connection's thread lives for one request line (at most
+/// [`REGISTER_READ_TIMEOUT`]) plus, on the guest door, the drain bound; an
+/// ask verb's connection hands off to its own capped thread and frees its
+/// slot at once.
+pub(crate) const MAX_CONTROL_CONNECTIONS: usize = 64;
 
 /// When the last connection-cap warn line was written: rate-limited like
 /// the queue-full line.
@@ -4399,5 +4434,55 @@ mod tests {
             "the second connection is served without waiting out the silent \
              connection's read bound"
         );
+    }
+
+    /// Past the door's connection cap a connection is refused on the
+    /// accept loop's own turn, before any thread is spawned; a slot freed
+    /// by a connection's end admits the next.
+    #[test]
+    fn control_connections_refused_past_the_cap() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let sock_path = dir.path().join(CONTROL_SOCK_FILE);
+        let listener = UnixListener::bind(&sock_path).expect("socket binds");
+        let boxes = BoxRegistry::new(SUBNET);
+        let answerer = AnswererStatus::allocating_for_tests("control-test-node");
+        let proxy_publish = ProxyPublishStatus::new();
+        let audit_path = audit_log_path(&sock_path);
+        std::thread::spawn(move || {
+            accept_loop(
+                listener,
+                boxes,
+                answerer,
+                proxy_publish,
+                ControlDoor::Host,
+                &audit_path,
+                1,
+            )
+        });
+
+        // The silent connection takes the one slot.
+        let silent = TestStream::connect(&sock_path).expect("socket accepts");
+        let refused = control(&sock_path, &BoxControlRequest::AnswererStatus)
+            .expect("the refusal is answered");
+        assert!(
+            matches!(&refused, BoxControlReply::Error { error } if error.contains("1 control")),
+            "a connection past the cap is refused: {refused:?}"
+        );
+
+        // Its close frees the slot for the next connection.
+        drop(silent);
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let reply = control(&sock_path, &BoxControlRequest::AnswererStatus)
+                .expect("the request is answered");
+            if !matches!(reply, BoxControlReply::Error { .. }) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < until,
+                "the freed slot never admitted a connection: {reply:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 }
