@@ -52,6 +52,7 @@ impl<'a, SF: crate::SourceFetcher> Runnable for PatchedBuild<'a, SF> {
             .collect();
 
         let mut missing = Vec::new();
+        let mut unfetched = Vec::new();
         for bsr in build_deps.iter() {
             let dep_build = opts.graph.get(bsr).unwrap();
             let cache_dir = match opts.cache.unsafe_get_build_by_name(&dep_build.name) {
@@ -75,18 +76,22 @@ impl<'a, SF: crate::SourceFetcher> Runnable for PatchedBuild<'a, SF> {
                                         .await
                                     {
                                         Ok(fetched) => fetched,
-                                        Err(e) => {
-                                            // A plain miss is already reported in
-                                            // the final error; only warn on a real
-                                            // failure (fetch, hash mismatch, IO).
-                                            if !matches!(e, rcache::Error::NotFound) {
-                                                tracing::warn!(
-                                                    dep = %dep_build.name,
-                                                    error = %e,
-                                                    "patched-build remote-cache lookup failed"
-                                                );
-                                            }
+                                        Err(rcache::Error::NotFound) => {
+                                            // A plain miss: the dependency is
+                                            // reported in the final error.
                                             missing.push(dep_build.name.clone());
+                                            continue;
+                                        }
+                                        Err(e) => {
+                                            // A real failure (fetch, hash mismatch,
+                                            // IO) is not an absence; report it as a
+                                            // fetch failure, not as "could not find".
+                                            tracing::warn!(
+                                                dep = %dep_build.name,
+                                                error = %e,
+                                                "patched-build remote-cache lookup failed"
+                                            );
+                                            unfetched.push(format!("{} ({e})", dep_build.name));
                                             continue;
                                         }
                                     };
@@ -113,10 +118,23 @@ impl<'a, SF: crate::SourceFetcher> Runnable for PatchedBuild<'a, SF> {
             dependencies.insert(cache_dir.path().to_path_buf());
         }
 
+        let mut problems = Vec::new();
         if !missing.is_empty() {
-            return Err(Error::Other(anyhow!(
-                "patched-build could not find builds of: {}, locally or in the remote cache",
+            problems.push(format!(
+                "could not find builds of: {}, locally or in the remote cache",
                 missing.join(", ")
+            ));
+        }
+        if !unfetched.is_empty() {
+            problems.push(format!(
+                "could not fetch from the remote cache: {}",
+                unfetched.join(", ")
+            ));
+        }
+        if !problems.is_empty() {
+            return Err(Error::Other(anyhow!(
+                "patched-build {}",
+                problems.join("; ")
             )));
         }
 
@@ -396,6 +414,55 @@ mod tests {
             assert!(entry.path().join("marker").exists());
             assert!(!entry.path().join("remote.txt").exists());
         }
+    }
+
+    /// A dependency the remote index lists but whose artifact cannot be
+    /// fetched is reported as a fetch failure, not as absent.
+    #[tokio::test]
+    async fn reports_remote_fetch_failure_distinctly_from_a_miss() {
+        let tmp = TempDir::new().unwrap();
+        let cache = Cache::at_dir(tmp.path()).unwrap();
+        let dg = graph_from(THREE_DEPS);
+
+        fake_build(&cache, &dg, "dep-a", "dep-a");
+        fake_build(&cache, &dg, "dep-c", "dep-c");
+
+        // The index lists dep-b, but its artifact 404s.
+        let dep_b_hash = dg.spec_hash(dg.by_name("dep-b").unwrap());
+        let (index_bytes, _, _) = remote_artifact(std::slice::from_ref(&dep_b_hash));
+        let base = serve_objects(vec![(INDEX_FILENAME.to_string(), index_bytes)]);
+        let remote_cache = RemoteCache::new_any_https(&base, None, None, IndexSource::Root)
+            .await
+            .expect("build remote cache over local server")
+            .with_fetch_retries(0);
+
+        let bsr = *dg.by_name("top").unwrap();
+        let fetcher = UnusedFetcher;
+        let mut pb = PatchedBuild {
+            spec: &bsr,
+            remote_fetcher: &fetcher,
+            stdout_writer: None,
+            stderr_writer: None,
+            remote_cache: Some(&remote_cache),
+        };
+        let opts = Options {
+            cache: cache.clone(),
+            graph: &dg,
+            exec_base: "/not-exists".into(),
+            ot: None,
+            daemon_id: None,
+        };
+
+        let err = pb.run(&opts).await.err().expect("dep-b cannot be fetched");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("could not fetch from the remote cache: dep-b"),
+            "dep-b must be reported as a fetch failure, got: {msg}"
+        );
+        assert!(
+            !msg.contains("could not find"),
+            "a fetch failure must not be reported as an absence, got: {msg}"
+        );
     }
 
     /// A remote cache with no entry for a locally-missing dependency still
