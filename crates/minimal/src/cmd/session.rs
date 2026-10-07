@@ -2581,11 +2581,11 @@ pub fn format_policy(
 /// (NET-044): one row a publish — the address its forward is bound on, and
 /// the in-box port it forwards to — shaped like the declared mapping rows
 /// above it, so the two read as one surface: what the box declared, and what
-/// it went on to publish. A row whose port the box's relay gate has not
-/// admitted yet says so rather than reading as reachable: the publish is
-/// bound on the host, but a connection to it is answered by the relay, not by
-/// the box, until the gate's admitted set grows to include runtime-published
-/// ports. A row from a daemon older than the `pending` field — one that
+/// it went on to publish. A current daemon admits every runtime publish at
+/// the box's relay gate as it binds it (NET-044), so its rows carry no
+/// caveat. A row marked pending comes only from an older daemon whose gate
+/// did not admit runtime publishes, and says so rather than reading as
+/// reachable. A row from a daemon older than the `pending` field — one that
 /// could not classify the port either way — says *unknown* and why, never
 /// the reachable reading a missing state must not default itself into. A
 /// box that published nothing prints no section: an empty header would
@@ -4914,9 +4914,9 @@ mod tests {
         );
     }
 
-    /// A runtime mapping is bound on the host before the box's own relay gate
-    /// has admitted the port, so the publish is a fact with a caveat until the
-    /// gate's admitted set grows to include runtime-published ports. Both
+    /// A daemon older than NET-044's gate admission bound a runtime mapping
+    /// without admitting its port at the box's relay gate, so its row is a
+    /// fact with a caveat. Both
     /// surfaces `min session policy` reads say it: the rendered text marks
     /// the row pending rather than letting it read as reachable, and the
     /// mapping's JSON — the shape any client of the RPC reads, and the data

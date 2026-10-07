@@ -5766,13 +5766,9 @@ async fn expose_allow_publishes_and_lists() {
     );
 
     // The publish is listed where `min session policy` reads it, by name and
-    // by id alike — and it reads as what it is: pending, because the box's
-    // relay gate admits the ports the *declaration* named, and this port
-    // was published at runtime, outside it.
-    let listed = minimald_rpc::LiveMapping {
-        pending: Some(true),
-        ..mapping.clone()
-    };
+    // by id alike — and it reads as reachable: the publish admitted the port
+    // at the box's relay gate (NET-044).
+    let listed = mapping.clone();
     let by_name: minimald_rpc::Errorable<Vec<minimald_rpc::LiveMapping>> = client
         .call::<minimald_rpc::GetLiveIngress>(&minimald_rpc::GetLiveIngressRequest::Name(
             "listweb".to_string(),
@@ -5810,6 +5806,78 @@ async fn expose_allow_publishes_and_lists() {
             && line.contains("local=127.0.64.21:3000"),
         "the publish line names the box, the port, the decision and the \
          outcome: {line}"
+    );
+}
+
+/// NET-044: an expose decided `allow` admits its port at the box's relay
+/// gate in the same turn it publishes — reachable, never a bound forward the
+/// gate refuses — while a port nobody published stays refused, and the box's
+/// stop (the expose's revocation) withdraws the admission. The gate is
+/// registered under the box's switch address the way its relay's spawn
+/// registers it, so the publish finds it exactly as it does in production.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expose_allow_admits_the_port_at_the_box_gate_until_stop() {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let manager = server.state.sessions_manager().await;
+    manager.land_range_verdict(crate::net::dns::RangeVerdict::Present);
+    // An address no other test's box uses: the live-gate table is
+    // process-wide.
+    let switch = std::net::Ipv4Addr::new(100, 64, 128, 91);
+    let web = finalize_dynamic_ingress_session(
+        &mut client,
+        "gateweb",
+        switch,
+        std::net::Ipv4Addr::new(127, 0, 64, 91),
+        Some(sessions::DynamicIngress::Allow),
+        Some((3000, 3999)),
+    )
+    .await;
+    let handle = manager
+        .get_session(crate::sessions::SessionKeyPredicate::Id(web))
+        .await
+        .unwrap()
+        .expect("the allowing box resolves");
+    handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("the allowing box launches its host");
+    let gate = std::sync::Arc::new(crate::net::switch::SessionGate::for_session(
+        "gateweb".to_string(),
+        switch,
+        &sessions::SessionPolicy::default(),
+        crate::net::SwitchSubnet::default(),
+        None,
+    ));
+    crate::net::switch::register_live_gate_for_test(switch, &gate);
+    let sock = handle
+        .net_switch()
+        .await
+        .unwrap()
+        .lock()
+        .await
+        .control_socket();
+    let (forwarder, _served) = fake_forwarder(sock, 200).await;
+
+    assert!(!gate.admits_tcp(3000), "nothing is published yet");
+    handle
+        .expose_dynamic(3000)
+        .await
+        .expect("the allowed port publishes");
+    assert!(
+        gate.admits_tcp(3000),
+        "the published port is admitted at the box's relay gate"
+    );
+    assert!(
+        !gate.admits_tcp(3001),
+        "a port nobody published stays refused"
+    );
+
+    handle.stop().await;
+    forwarder.abort();
+    assert!(
+        !gate.admits_tcp(3000),
+        "the box's stop revokes the expose and withdraws its admission"
     );
 }
 
@@ -6305,12 +6373,12 @@ async fn expose_self_allocated_box_publishes_at_its_registered_address() {
             "selfweb".to_string(),
         ))
         .await;
-    // The row reads as what it is: pending, the gate not having admitted a
-    // runtime-published port yet.
+    // The row reads as reachable: the publish admitted the port at the
+    // box's relay gate (NET-044).
     assert_eq!(
         live,
         minimald_rpc::Errorable::Ok(vec![minimald_rpc::LiveMapping {
-            pending: Some(true),
+            pending: Some(false),
             ..mapping
         }]),
         "the live mapping is listed beside the declaration"
@@ -6778,9 +6846,9 @@ async fn expose_colliding_on_shared_address_is_a_bind_error() {
             local: "127.0.0.1:3000".to_string(),
             internal_port: 3000,
             proto: sessions::IpProto::Tcp,
-            // The box declared no port mappings, so its relay gate admits
-            // nothing: the runtime publish reads pending.
-            pending: Some(true),
+            // The publish admitted the port at the box's relay gate
+            // (NET-044), so the row is never pending.
+            pending: Some(false),
         }]),
         "the first box's publish is untouched by the collision"
     );
@@ -6908,9 +6976,9 @@ async fn expose_publishes_at_the_registered_address() {
             local: "127.0.0.1:3000".to_string(),
             internal_port: 3000,
             proto: sessions::IpProto::Tcp,
-            // The box declared no port mappings, so its relay gate admits
-            // nothing: the runtime publish reads pending.
-            pending: Some(true),
+            // The publish admitted the port at the box's relay gate
+            // (NET-044), so the row is never pending.
+            pending: Some(false),
         }]),
         "the live mapping names the registered address the publish bound at"
     );
