@@ -460,6 +460,22 @@ pub fn effective_egress(
     }
 }
 
+/// Reads the deny-all opt-out (NET-077) off its raw environment spelling:
+/// the one parse the VM host daemon (`MINVMD_EGRESS_DENY_ALL_OPT_OUT`) and
+/// the guest daemon (the boot token it is handed) share, so the two can
+/// never read the same value differently. Only `1`, `true`, `yes` or `on`
+/// opt out, case-insensitive and trimmed; absent or anything else fails
+/// closed to the build's egress default.
+#[must_use]
+pub fn egress_deny_all_opt_out_from_raw(raw: Option<&str>) -> bool {
+    raw.is_some_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
 /// The lowest host port a dynamic ingress range may start at: below it a
 /// port is privileged, and the rootless switch cannot publish one. One
 /// definition for the launch check ([`Record::validate_policy`]) and the
@@ -1214,6 +1230,19 @@ mod tests {
             ),
         );
         assert!(record.validate_policy().is_ok());
+    }
+
+    /// NET-077: the opt-out's parse fails closed — only the truthy set opts
+    /// out; absent or anything else keeps the build's egress default.
+    #[test]
+    fn the_egress_opt_out_fails_closed() {
+        assert!(!egress_deny_all_opt_out_from_raw(None));
+        for value in ["1", "true", "TRUE", "yes", "on", " On "] {
+            assert!(egress_deny_all_opt_out_from_raw(Some(value)), "{value:?}");
+        }
+        for value in ["", "0", "no", "off", "false", "garbage", "1x", "enabled"] {
+            assert!(!egress_deny_all_opt_out_from_raw(Some(value)), "{value:?}");
+        }
     }
 
     /// NET-074/NET-075/NET-076/NET-077: what an absent `egress` section
