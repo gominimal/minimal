@@ -103,6 +103,14 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
         // logging may need stdout too.
         Some(Command::Version) => cmd_version(&cli.global_args, &mut std::io::stdout()).await,
         Some(Command::Spin(args)) => cmd_spin(&cli.global_args, args).await,
+        #[cfg(debug_assertions)]
+        Some(Command::DebugAnswererCommand) => {
+            println!(
+                "{}",
+                crate::resolver::answerer_command_for_this_host().await?
+            );
+            Ok(())
+        }
         Some(Command::Init(args)) => cmd_init(&cli.global_args, args)
             .await
             .map_err(|e| anyhow::anyhow!("{e}")),
@@ -350,9 +358,12 @@ pub(crate) fn is_id_prefix(s: &str) -> bool {
 }
 
 /// Match `session` against the listed sessions: an exact name first, then a
-/// unique id prefix (compared without dashes, ignoring case). `None` when
-/// nothing matches or `session` is not prefix-shaped; an error naming the
-/// candidates when the prefix matches more than one session.
+/// name that matches ignoring ASCII case (the fold names are made unique
+/// under), then a unique id prefix (compared without dashes, ignoring case).
+/// A case-folded name that matches several sessions (written before names
+/// were made unique that way) resolves to none of them, not to an id prefix
+/// either. `None` when nothing matches or `session` is not prefix-shaped; an
+/// error naming the candidates when the prefix matches more than one session.
 pub(crate) fn match_id_prefix(
     entries: &[minimald_rpc::ListSessionsEntry],
     session: &str,
@@ -360,22 +371,54 @@ pub(crate) fn match_id_prefix(
     if let Some(entry) = entries.iter().find(|e| e.name.as_deref() == Some(session)) {
         return Ok(Some(entry.id));
     }
+    let mut folded = entries.iter().filter(|e| {
+        e.name
+            .as_deref()
+            .is_some_and(|n| n.eq_ignore_ascii_case(session))
+    });
+    match (folded.next(), folded.next()) {
+        (Some(entry), None) => return Ok(Some(entry.id)),
+        (Some(_), Some(_)) => return Ok(None),
+        _ => {}
+    }
     if !is_id_prefix(session) {
         return Ok(None);
     }
     let prefix = session.replace('-', "").to_ascii_lowercase();
-    let matches: Vec<sessions::SessionId> = entries
+    let matches: Vec<&minimald_rpc::ListSessionsEntry> = entries
         .iter()
-        .map(|e| e.id)
-        .filter(|id| id.as_ref().simple().to_string().starts_with(&prefix))
+        .filter(|e| e.id.as_ref().simple().to_string().starts_with(&prefix))
         .collect();
     match matches.as_slice() {
         [] => Ok(None),
-        [id] => Ok(Some(*id)),
+        [entry] => Ok(Some(entry.id)),
         several => {
+            // `min ls` shows sessions cut to eight digits, but sessions made
+            // close together share a long UUIDv7 prefix, so the refusal names
+            // each candidate at the shortest length that keeps them distinct.
+            let simples: Vec<String> = several
+                .iter()
+                .map(|e| e.id.as_ref().simple().to_string())
+                .collect();
+            let cut = (8..=32)
+                .find(|&n| {
+                    let prefixes: Vec<&str> = simples.iter().map(|s| &s[..n]).collect();
+                    let mut seen = std::collections::HashSet::new();
+                    prefixes.iter().all(|p| seen.insert(*p))
+                })
+                .unwrap_or(32);
+            // Only a shortened id gets an ellipsis; a full id is not cut.
+            let ellipsis = if cut < 32 { "…" } else { "" };
             let candidates: Vec<String> = several
                 .iter()
-                .map(|id| format!("{}…", &id.as_ref().simple().to_string()[..8]))
+                .zip(&simples)
+                .map(|(entry, simple)| {
+                    let mut candidate = format!("{}{ellipsis}", &simple[..cut]);
+                    if let Some(name) = entry.name.as_deref() {
+                        candidate.push_str(&format!(" ({name})"));
+                    }
+                    candidate
+                })
                 .collect();
             Err(AmbiguousIdPrefix(format!(
                 "'{session}' matches sessions {}; use more characters",
@@ -717,6 +760,13 @@ pub(crate) async fn upload_and_finalize(
                         eprintln!();
                     }
                 }
+            }
+            if ok.package_check_skipped {
+                eprintln!(
+                    "warning: the session package check was skipped (the package graph \
+                     did not resolve in time or could not be evaluated; see the daemon \
+                     log); unknown package names will surface at first exec"
+                );
             }
             Ok(())
         }

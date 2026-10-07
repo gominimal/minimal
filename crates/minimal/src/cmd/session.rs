@@ -634,16 +634,38 @@ fn refuse_dynamic_ingress_off_own_ip(
     Ok(())
 }
 
+/// Refuses a static ingress mapping on a box that is not `own_ip`: only an
+/// own-IP box has a published address a static forwarder could apply to, so
+/// a mapping on a `host_ip` or `none` box would be recorded and shown with
+/// no publish surface to honour it. The CLI reference documents the flag as
+/// requiring `--network own_ip`.
+fn refuse_ingress_off_own_ip(
+    network: crate::cli::CliNetworkMode,
+    has_ingress: bool,
+) -> Result<(), anyhow::Error> {
+    if network != crate::cli::CliNetworkMode::OwnIp && has_ingress {
+        anyhow::bail!(
+            "--ingress needs --network own_ip: only an own-IP box has a published \
+             address to apply it to"
+        );
+    }
+    Ok(())
+}
+
 pub(crate) async fn activate_session(
     global: &GlobalArgs,
     args: ActivateArgs,
     offer_scaffold: bool,
 ) -> Result<(), anyhow::Error> {
-    ensure_daemon(global)?;
-    // Before anything is created: a dynamic declaration needs an own-IP
-    // box. Every stance stands on a VM-backed host: an `ask` there is
+    // Before anything is created, and before the daemon is spawned (a cold
+    // VM boot), since both are argument errors: a dynamic declaration needs
+    // an own-IP box. Every stance stands on a VM-backed host: an `ask` there is
     // answered by the human attached on the host (NET-045).
     refuse_dynamic_ingress_off_own_ip(args.network, args.dynamic_ingress, args.dynamic_range)?;
+    // A static mapping needs an own-IP box too: only it has a published
+    // address a static forwarder could apply to.
+    refuse_ingress_off_own_ip(args.network, !args.ingress.is_empty())?;
+    ensure_daemon(global)?;
 
     let effective_path = match (&args.path, &global.repo_dir) {
         (Some(p), _) => std::path::PathBuf::from(p),
@@ -687,11 +709,13 @@ pub(crate) async fn activate_session(
             || !args.allow_dns_hosts.is_empty()
             || !args.deny_subnets.is_empty();
         has_egress.then_some(sessions::EgressPolicy {
-            allow_subnets: (!args.allow_subnets.is_empty()).then(|| args.allow_subnets.clone()),
+            allow_subnets: (!args.allow_subnets.is_empty())
+                .then(|| normalize_subnets(&args.allow_subnets)),
             allow_dns_hosts: (!args.allow_dns_hosts.is_empty())
                 .then(|| args.allow_dns_hosts.clone()),
             allow_protocols: (!allow_protocols.is_empty()).then_some(allow_protocols),
-            deny_subnets: (!args.deny_subnets.is_empty()).then(|| args.deny_subnets.clone()),
+            deny_subnets: (!args.deny_subnets.is_empty())
+                .then(|| normalize_subnets(&args.deny_subnets)),
         })
     };
     // NET-043: any dynamic declaration makes the ingress policy too — a
@@ -1230,7 +1254,11 @@ pub(crate) async fn activate_session(
             &answerer_step,
         );
         if let Some(advisory) = &name_advisory {
-            eprintln!("{advisory}");
+            // Printed whole on every start, interactive or not (NET-122:
+            // the start names the exact command, and a scripted start's log
+            // is its only record), after a blank line so the note and its
+            // command block stand apart from the lines above them.
+            eprintln!("\n{advisory}");
         }
         if let Some(verdict) = surface_verdict {
             // The host-side record of that verdict, the half the daemon's own
@@ -1291,7 +1319,10 @@ pub(crate) async fn activate_session(
     if config.network == minimald_rpc::NetworkMode::OwnIp
         && config.policy.egress.is_none()
         && created.deny_all_opt_out != Some(true)
-        && let Some(notice) = deny_all_default_notice(sessions::EGRESS_DEFAULT_PHASE)
+        && let Some(notice) = deny_all_default_notice(
+            sessions::EGRESS_DEFAULT_PHASE,
+            kind == paths::ProviderKind::Minvmd,
+        )
     {
         eprintln!("{notice}");
     }
@@ -1300,20 +1331,17 @@ pub(crate) async fn activate_session(
     // the enforcement layer reads it as the masked network (`10.0.0.0/8`).
     // Print a one-line notice naming the normalized form so the user knows
     // how their entry is read, rather than discovering it through a mismatch.
-    if let Some(egress) = &config.policy.egress {
-        if let Some(entries) = &egress.allow_subnets {
-            for entry in entries {
-                if let Some(normalized) = sessions::normalized_cidr(entry) {
-                    eprintln!("--allow-subnets {entry} is read as {normalized}");
-                }
-            }
+    // The notice is computed from the original flags, not the stored policy:
+    // the policy now holds the normalized form, so reading it back would
+    // print nothing.
+    for entry in &args.allow_subnets {
+        if let Some(normalized) = sessions::normalized_cidr(entry) {
+            eprintln!("--allow-subnets {entry} is read as {normalized}");
         }
-        if let Some(entries) = &egress.deny_subnets {
-            for entry in entries {
-                if let Some(normalized) = sessions::normalized_cidr(entry) {
-                    eprintln!("--deny-subnets {entry} is read as {normalized}");
-                }
-            }
+    }
+    for entry in &args.deny_subnets {
+        if let Some(normalized) = sessions::normalized_cidr(entry) {
+            eprintln!("--deny-subnets {entry} is read as {normalized}");
         }
     }
 
@@ -2312,15 +2340,29 @@ pub async fn cmd_session_policy(
 /// the client, knows whether it set `--egress-deny-all-opt-out` (NET-077),
 /// so [`activate_session`] reads it off the create reply and stays silent
 /// for a deployment the change is not coming for.
-pub fn deny_all_default_notice(phase: sessions::EgressDefaultPhase) -> Option<&'static str> {
-    match phase {
-        sessions::EgressDefaultPhase::Announced => Some(
+///
+/// `vm_backed` picks the remedy the host can actually take: a native daemon
+/// takes the `--egress-deny-all-opt-out` flag, while on a VM-backed host the
+/// daemon is the VM's pid-1 and has no flags to read, so the opt-out is
+/// `MINVMD_EGRESS_DENY_ALL_OPT_OUT`, set for the VM host daemon's next start.
+pub fn deny_all_default_notice(
+    phase: sessions::EgressDefaultPhase,
+    vm_backed: bool,
+) -> Option<&'static str> {
+    match (phase, vm_backed) {
+        (sessions::EgressDefaultPhase::Announced, false) => Some(
             "Heads-up: the next release denies all external reach for an own-address \
              session that declares no egress. Declare what the session needs with the \
              activate egress flags, or start the daemon with \
              --egress-deny-all-opt-out to keep this default.",
         ),
-        sessions::EgressDefaultPhase::InForce => None,
+        (sessions::EgressDefaultPhase::Announced, true) => Some(
+            "Heads-up: the next release denies all external reach for an own-address \
+             session that declares no egress. Declare what the session needs with the \
+             activate egress flags, or restart the VM host daemon (minvmd) with \
+             MINVMD_EGRESS_DENY_ALL_OPT_OUT=1 to keep this default.",
+        ),
+        (sessions::EgressDefaultPhase::InForce, _) => None,
     }
 }
 
@@ -2582,11 +2624,11 @@ pub fn format_policy(
 /// (NET-044): one row a publish — the address its forward is bound on, and
 /// the in-box port it forwards to — shaped like the declared mapping rows
 /// above it, so the two read as one surface: what the box declared, and what
-/// it went on to publish. A row whose port the box's relay gate has not
-/// admitted yet says so rather than reading as reachable: the publish is
-/// bound on the host, but a connection to it is answered by the relay, not by
-/// the box, until the gate's admitted set grows to include runtime-published
-/// ports. A row from a daemon older than the `pending` field — one that
+/// it went on to publish. A current daemon admits every runtime publish at
+/// the box's relay gate as it binds it (NET-044), so its rows carry no
+/// caveat. A row marked pending comes only from an older daemon whose gate
+/// did not admit runtime publishes, and says so rather than reading as
+/// reachable. A row from a daemon older than the `pending` field — one that
 /// could not classify the port either way — says *unknown* and why, never
 /// the reachable reading a missing state must not default itself into. A
 /// box that published nothing prints no section: an empty header would
@@ -3090,6 +3132,18 @@ async fn session_policy_as_json(global: &GlobalArgs, session: &str) -> Result<()
     write_policy_json(&mut out, &policy, record.network, fabric, live).context(OutputWriteError)?;
     out.flush().context(OutputWriteError)?;
     Ok(())
+}
+
+/// The normalized form of each subnet flag entry, so the stored policy
+/// holds the masked network the enforcement layer reads (`10.0.0.1/8` →
+/// `10.0.0.0/8`). Entries that are already normalized, invalid, or IPv6 are
+/// kept verbatim: `normalized_cidr` yields `None` for those, and the
+/// enforcement layer's own reading of them is unchanged.
+fn normalize_subnets(entries: &[String]) -> Vec<String> {
+    entries
+        .iter()
+        .map(|entry| sessions::normalized_cidr(entry).unwrap_or_else(|| entry.clone()))
+        .collect()
 }
 
 /// Whether a declared egress section is the deny-all shape: every allow
@@ -3822,6 +3876,26 @@ mod tests {
     };
 
     #[test]
+    fn normalize_subnets_masks_host_bits_and_keeps_the_rest() {
+        assert_eq!(
+            normalize_subnets(&["10.0.0.1/8".to_string(), "192.168.1.5/24".to_string()]),
+            vec!["10.0.0.0/8".to_string(), "192.168.1.0/24".to_string()]
+        );
+        assert_eq!(
+            normalize_subnets(&[
+                "10.0.0.0/8".to_string(),
+                "fd00::1/8".to_string(),
+                "not-a-cidr".to_string(),
+            ]),
+            vec![
+                "10.0.0.0/8".to_string(),
+                "fd00::1/8".to_string(),
+                "not-a-cidr".to_string()
+            ]
+        );
+    }
+
+    #[test]
     fn dynamic_ingress_needs_own_ip() {
         use crate::cli::CliNetworkMode::{HostNet, NoNet, OwnIp};
         for network in [HostNet, NoNet] {
@@ -3842,6 +3916,17 @@ mod tests {
         }
         refuse_dynamic_ingress_off_own_ip(OwnIp, Some(DynamicIngress::Allow), Some((8000, 8443)))
             .expect("an own-IP box keeps its dynamic declaration");
+    }
+
+    #[test]
+    fn ingress_needs_own_ip() {
+        use crate::cli::CliNetworkMode::{HostNet, NoNet, OwnIp};
+        for network in [HostNet, NoNet] {
+            refuse_ingress_off_own_ip(network, true)
+                .expect_err("an ingress mapping off own_ip is refused");
+            refuse_ingress_off_own_ip(network, false).expect("no ingress mapping is never refused");
+        }
+        refuse_ingress_off_own_ip(OwnIp, true).expect("an own-IP box keeps its ingress mapping");
     }
 
     /// A host-side ask stand: the real VM host daemon's control server and
@@ -3977,9 +4062,9 @@ mod tests {
         let (events, events_rx) = std::sync::mpsc::channel();
         let (offers, offers_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            asks.serve(&RecordingTerminal(events), |offer| {
+            asks.serve(&RecordingTerminal(events), |offer, _| {
                 let _ = offers.send(offer.clone());
-                dialog(offer)
+                minimal_client::ask_dialog::AskDialogEnd::Answered(dialog(offer))
             });
         });
         (events_rx, offers_rx)
@@ -4045,7 +4130,7 @@ mod tests {
         assert_eq!(offer.name, "web");
         assert_eq!(Some(offer.box_id), web.box_id);
         assert_eq!(
-            minimal_client::attach::ask_dialog_lead_in(&offer),
+            minimal_client::ask_dialog::ask_dialog_lead_in(&offer),
             "web asks to publish port 3000/tcp."
         );
         let minimald_rpc::BoxControlReply::AskAdmit(outcome) =
@@ -4094,18 +4179,18 @@ mod tests {
         let (first_offers, first_offers_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let (events, _) = std::sync::mpsc::channel();
-            first.serve(&RecordingTerminal(events), |offer| {
+            first.serve(&RecordingTerminal(events), |offer, _| {
                 let _ = shown_rx.recv();
                 let _ = first_offers.send(offer.clone());
-                minimald_rpc::AskAnswer::No
+                minimal_client::ask_dialog::AskDialogEnd::Answered(minimald_rpc::AskAnswer::No)
             });
         });
         let (events, events_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            second.serve(&RecordingTerminal(events), |_| {
+            second.serve(&RecordingTerminal(events), |_, _| {
                 let _ = shown.send(());
                 let _ = first_done_rx.recv();
-                minimald_rpc::AskAnswer::Yes
+                minimal_client::ask_dialog::AskDialogEnd::Answered(minimald_rpc::AskAnswer::Yes)
             });
         });
         let reply = stand.guest_ask(&web, 3000);
@@ -4142,32 +4227,90 @@ mod tests {
         );
     }
 
+    /// Two attaches are offered one ask; the first answers yes while the
+    /// second's dialog is still up and unanswered. The host's dismissal takes
+    /// the second dialog down by itself: it records nothing, and its relay
+    /// resumes without anyone pressing a key.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn overtaken_dialog_is_dismissed_and_relay_resumes() {
+        let stand = AskStand::start();
+        let web = stand.register("web", DynamicIngress::Ask).await;
+        let subscribe = || {
+            let control = stand.control.clone();
+            tokio::task::spawn_blocking(move || {
+                minimal_client::attach::HostAsks::subscribe(&control, "web")
+            })
+        };
+        let first = subscribe()
+            .await
+            .unwrap()
+            .expect("the first attach subscribes");
+        let second = subscribe()
+            .await
+            .unwrap()
+            .expect("the second attach subscribes");
+        // The first answers only once the second's dialog is up.
+        let (shown, shown_rx) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let (events, _) = std::sync::mpsc::channel();
+            first.serve(&RecordingTerminal(events), |_, _| {
+                let _ = shown_rx.recv();
+                minimal_client::ask_dialog::AskDialogEnd::Answered(minimald_rpc::AskAnswer::Yes)
+            });
+        });
+        let (ends, ends_rx) = std::sync::mpsc::channel();
+        let (events, events_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            second.serve(&RecordingTerminal(events), |_, watch| {
+                let _ = shown.send(());
+                watch.wait_dismissed();
+                let _ = ends.send(());
+                minimal_client::ask_dialog::AskDialogEnd::Dismissed
+            });
+        });
+        let reply = stand.guest_ask(&web, 3000);
+        let minimald_rpc::BoxControlReply::AskAdmit(outcome) =
+            reply.recv_timeout(ASK_WAIT).unwrap()
+        else {
+            panic!("the guest's ask is answered with its end");
+        };
+        assert!(
+            matches!(
+                outcome,
+                minimald_rpc::AskAdmitOutcome::Admitted { port: 3000, .. }
+            ),
+            "the first attach's yes admits the ask: {outcome:?}"
+        );
+        ends_rx
+            .recv_timeout(ASK_WAIT)
+            .expect("the overtaken dialog is dismissed without an answer");
+        assert_eq!(events_rx.recv_timeout(ASK_WAIT).unwrap(), "suspend");
+        assert_eq!(
+            events_rx.recv_timeout(ASK_WAIT).unwrap(),
+            "resume",
+            "the dismissed dialog resumes the relay"
+        );
+        assert_eq!(
+            stand
+                .registry
+                .row_by_name("web")
+                .unwrap()
+                .runtime_port_numbers(),
+            vec![3000],
+            "the one yes admitted the port once"
+        );
+    }
+
     /// Ctrl-C at the dialog is a no: the client records no through the host
     /// door, nothing is admitted, and the relay resumes. Escape and a closed
-    /// input are a no the same way; no terminal at all is recorded as such.
+    /// input are a no the same way.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ctrl_c_at_ask_dialog_records_no_and_relay_resumes() {
-        use minimal_client::attach::ask_answer_from;
-        assert_eq!(
-            ask_answer_from(Err(inquire::InquireError::OperationInterrupted)),
-            minimald_rpc::AskAnswer::No
-        );
-        assert_eq!(
-            ask_answer_from(Err(inquire::InquireError::OperationCanceled)),
-            minimald_rpc::AskAnswer::No
-        );
-        assert_eq!(
-            ask_answer_from(Err(inquire::InquireError::IO(std::io::Error::from(
-                std::io::ErrorKind::UnexpectedEof
-            )))),
-            minimald_rpc::AskAnswer::No
-        );
-        assert_eq!(
-            ask_answer_from(Err(inquire::InquireError::NotTTY)),
-            minimald_rpc::AskAnswer::NoTty
-        );
-        assert_eq!(ask_answer_from(Ok(false)), minimald_rpc::AskAnswer::No);
-        assert_eq!(ask_answer_from(Ok(true)), minimald_rpc::AskAnswer::Yes);
+        let keys = |keys: &[u8]| minimal_client::ask_dialog::AskSelector::default().feed(keys);
+        assert_eq!(keys(b"\x03"), Some(minimald_rpc::AskAnswer::No));
+        assert_eq!(keys(b"\x1b"), Some(minimald_rpc::AskAnswer::No));
+        assert_eq!(keys(b"\x04"), Some(minimald_rpc::AskAnswer::No));
+        assert_eq!(keys(b"\x1b[B\r"), Some(minimald_rpc::AskAnswer::Yes));
 
         let stand = AskStand::start();
         let web = stand.register("web", DynamicIngress::Ask).await;
@@ -4179,7 +4322,9 @@ mod tests {
         .unwrap()
         .expect("the attach subscribes");
         let (events, offers) = serve_asks(asks, |_| {
-            ask_answer_from(Err(inquire::InquireError::OperationInterrupted))
+            minimal_client::ask_dialog::AskSelector::default()
+                .feed(b"\x03")
+                .expect("Ctrl-C ends the dialog")
         });
         let reply = stand.guest_ask(&web, 3000);
         offers.recv_timeout(ASK_WAIT).expect("the dialog is shown");
@@ -4823,9 +4968,9 @@ mod tests {
         );
     }
 
-    /// A runtime mapping is bound on the host before the box's own relay gate
-    /// has admitted the port, so the publish is a fact with a caveat until the
-    /// gate's admitted set grows to include runtime-published ports. Both
+    /// A daemon older than NET-044's gate admission bound a runtime mapping
+    /// without admitting its port at the box's relay gate, so its row is a
+    /// fact with a caveat. Both
     /// surfaces `min session policy` reads say it: the rendered text marks
     /// the row pending rather than letting it read as reachable, and the
     /// mapping's JSON — the shape any client of the RPC reads, and the data

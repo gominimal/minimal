@@ -89,9 +89,19 @@ impl AttrValue {
             return Ok(Some(Self::Map(map)));
         }
         if let Some(a) = rt.as_array() {
+            // Element contracts are pending on the array; without applying
+            // them a bad element is accepted on every consumer path.
+            let pending = a.iter_pending_contracts().cloned().collect::<Vec<_>>();
             return Ok(Some(Self::List(
                 a.iter()
-                    .map(|e| Self::from_term_at(e, program, depth + 1))
+                    .map(|e| {
+                        let e = RuntimeContract::apply_all(
+                            e.clone(),
+                            pending.iter().cloned(),
+                            e.pos_idx(),
+                        );
+                        Self::from_term_at(&e, program, depth + 1)
+                    })
                     .collect::<Result<Vec<_>, Error>>()?
                     .into_iter()
                     .flatten()
@@ -258,6 +268,70 @@ mod tests {
         assert!(matches!(&list[1], AttrValue::String(a, _) if a == "b"));
     }
 
+    /// A valid array-of-record attribute (e.g. `env_dir_mappings`) must decode
+    /// to the same value whether or not its element contracts are applied. No
+    /// element contract in `attr_classes.ncl` carries a `default`, so applying
+    /// them is a no-op for valid inputs. Pin the decoded value so a future
+    /// `default` on an element contract changes this assertion and fails loudly.
+    #[test]
+    fn array_of_records_decodes_to_pinned_value() {
+        let (term, mut program, _origin, _target) = Loader::new(
+            "let {Attrs, ..} = import \"minimal.ncl\" in \
+                 {env_dir_mappings = [\
+                    {read_only = true, path = \"/data\", class = 'State},\
+                    {read_only = false, path = \"/secrets\", class = 'Credential}\
+                 ]} | Attrs",
+            None,
+            &LoadOptions::for_test(),
+        )
+        .unwrap_or_else(|e| {
+            e.report_to_stderr();
+            panic!("load failed");
+        })
+        .finish()
+        .unwrap_or_else(|e| {
+            e.report_to_stderr();
+            panic!("finish failed");
+        });
+
+        let result = AttrValue::from_term(&term, &mut program).unwrap().unwrap();
+        let attrs = result.as_map().unwrap();
+        let mappings = attrs.get("env_dir_mappings").unwrap().as_list().unwrap();
+
+        assert_eq!(mappings.len(), 2);
+
+        let first = mappings[0].as_map().unwrap();
+        // A `default` on an element contract would add a key here.
+        assert_eq!(first.len(), 3, "element keys: {:?}", first.keys());
+        assert!(matches!(
+            first.get("read_only").unwrap(),
+            AttrValue::Bool(true)
+        ));
+        assert!(matches!(
+            first.get("path").unwrap(),
+            AttrValue::String(p, _) if p == "/data"
+        ));
+        assert!(matches!(
+            first.get("class").unwrap(),
+            AttrValue::String(c, _) if c == "State"
+        ));
+
+        let second = mappings[1].as_map().unwrap();
+        assert_eq!(second.len(), 3, "element keys: {:?}", second.keys());
+        assert!(matches!(
+            second.get("read_only").unwrap(),
+            AttrValue::Bool(false)
+        ));
+        assert!(matches!(
+            second.get("path").unwrap(),
+            AttrValue::String(p, _) if p == "/secrets"
+        ));
+        assert!(matches!(
+            second.get("class").unwrap(),
+            AttrValue::String(c, _) if c == "Credential"
+        ));
+    }
+
     /// Config that nests attribute values past the cap must surface a
     /// structured [`Error::AttrTooDeep`] rather than aborting the process with a
     /// stack overflow. Evaluation forces one level per nested list, so the
@@ -322,6 +396,74 @@ mod tests {
 
         assert!(res.is_err());
         assert!(matches!(res, Err(Error::Nickel(_))));
+    }
+
+    #[test]
+    fn attr_array_element_contract_nickel_err() {
+        let (term, mut program, _origin, _target) = Loader::new(
+            "let {Attrs, ..} = import \"minimal.ncl\" in {env_dir_mappings = [42]} | Attrs",
+            None,
+            &LoadOptions::for_test(),
+        )
+        .unwrap_or_else(|e| {
+            e.report_to_stderr();
+            panic!("load failed");
+        })
+        .finish()
+        .unwrap_or_else(|e| {
+            e.report_to_stderr();
+            panic!("finish failed");
+        });
+
+        let err = AttrValue::from_term(&term, &mut program).expect_err("element contract");
+        assert!(matches!(err, Error::Nickel(_)), "got {err:?}");
+
+        // The element contract fired, and its report points at the element.
+        let mut buf = codespan_reporting::term::termcolor::Buffer::no_color();
+        err.report_to(&mut buf);
+        let out = String::from_utf8(buf.into_inner()).unwrap();
+        assert!(out.contains("contract broken"), "report: {out}");
+        assert!(out.contains("[42]"), "report: {out}");
+    }
+
+    fn decode_src(src: &str) -> Result<Option<AttrValue>, Error> {
+        let (term, mut program, _origin, _target) =
+            Loader::new(src, None, &LoadOptions::for_test())
+                .unwrap()
+                .finish()
+                .unwrap();
+        AttrValue::from_term(&term, &mut program)
+    }
+
+    #[test]
+    fn array_element_contracts_reach_nested_values() {
+        // Elements reached through an array of records and an array of arrays
+        // are checked against the element contract.
+        assert!(matches!(
+            decode_src("[{a = 1}] | Array {a | String}"),
+            Err(Error::Nickel(_))
+        ));
+        assert!(matches!(
+            decode_src("[[1]] | Array (Array String)"),
+            Err(Error::Nickel(_))
+        ));
+
+        // Elements that satisfy the contract still decode.
+        let nested = decode_src("[[\"x\"]] | Array (Array String)")
+            .unwrap()
+            .unwrap();
+        let inner = nested.as_list().unwrap()[0].as_list().unwrap();
+        assert!(matches!(&inner[0], AttrValue::String(s, _) if s == "x"));
+        let records = decode_src(
+            "let {Attrs, ..} = import \"minimal.ncl\" in \
+             {env_dir_mappings = [{read_only = true, path = \"p\", class = 'State}]} | Attrs",
+        )
+        .unwrap()
+        .unwrap();
+        let AttrValue::Map(m) = records else {
+            panic!("expected a map, got {records:?}");
+        };
+        assert_eq!(m["env_dir_mappings"].as_list().unwrap().len(), 1);
     }
 
     #[test]
