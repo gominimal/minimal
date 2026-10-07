@@ -1343,6 +1343,34 @@ mod tests {
             }
             .admits_nothing()
         );
+        // Two dimensions present and empty is not enough: the third, absent
+        // or non-empty, still admits something.
+        assert!(
+            !EgressPolicy {
+                allow_subnets: Some(vec![]),
+                allow_dns_hosts: Some(vec![]),
+                ..EgressPolicy::default()
+            }
+            .admits_nothing()
+        );
+        assert!(
+            !EgressPolicy {
+                allow_subnets: Some(vec![]),
+                allow_dns_hosts: Some(vec![]),
+                allow_protocols: Some(vec![IpProto::Tcp]),
+                ..EgressPolicy::default()
+            }
+            .admits_nothing()
+        );
+        // `deny_subnets` is not read: the deny-all shape stays deny-all
+        // with a subtraction set.
+        assert!(
+            EgressPolicy {
+                deny_subnets: Some(vec!["10.0.0.0/8".into()]),
+                ..EgressPolicy::deny_all()
+            }
+            .admits_nothing()
+        );
     }
 
     #[test]
