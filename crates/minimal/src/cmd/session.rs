@@ -22,6 +22,15 @@ pub(crate) fn session_announce_label(id: &sessions::SessionId, name: Option<&str
     }
 }
 
+/// The advisory as one line: its facts and lead-in, without the command
+/// block that follows the first newline.
+fn short_advisory(advisory: &str) -> String {
+    let first_line = advisory.split('\n').next().unwrap_or(advisory);
+    let first_line = first_line.strip_suffix(" with:").unwrap_or(first_line);
+    let first_line = first_line.strip_suffix('.').unwrap_or(first_line);
+    format!("{first_line}. Run `min session activate` in a terminal to print the command.")
+}
+
 /// Create a new session via the `CreateSession` RPC.
 pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(), anyhow::Error> {
     activate_session(global, args, true).await
@@ -1254,7 +1263,11 @@ pub(crate) async fn activate_session(
             &answerer_step,
         );
         if let Some(advisory) = &name_advisory {
-            eprintln!("{advisory}");
+            if !args.no_prompt && should_announce_session(global) {
+                eprintln!("{advisory}");
+            } else {
+                eprintln!("{}", short_advisory(advisory));
+            }
         }
         if let Some(verdict) = surface_verdict {
             // The host-side record of that verdict, the half the daemon's own
@@ -3888,6 +3901,37 @@ mod tests {
                 "fd00::1/8".to_string(),
                 "not-a-cidr".to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn short_advisory_drops_the_command_line() {
+        let advisory = "note: the resolver file is missing. Configure the host's \
+                        resolver with:\n  sudo sh -c '…'";
+        let short = short_advisory(advisory);
+        assert!(
+            !short.contains("sudo"),
+            "the short advisory never carries the command, got: {short}"
+        );
+        assert!(
+            short.ends_with(". Run `min session activate` in a terminal to print the command."),
+            "the short advisory ends with the hint, got: {short}"
+        );
+        assert_eq!(
+            short,
+            "note: the resolver file is missing. Configure the host's \
+             resolver. Run `min session activate` in a terminal to print the command."
+        );
+    }
+
+    #[test]
+    fn short_advisory_keeps_a_commandless_note() {
+        let advisory = "note: this host's resolver is not configured for the zone.";
+        let short = short_advisory(advisory);
+        assert_eq!(
+            short,
+            "note: this host's resolver is not configured for the zone. \
+             Run `min session activate` in a terminal to print the command."
         );
     }
 
