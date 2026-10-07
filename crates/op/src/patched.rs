@@ -76,11 +76,16 @@ impl<'a, SF: crate::SourceFetcher> Runnable for PatchedBuild<'a, SF> {
                                     {
                                         Ok(fetched) => fetched,
                                         Err(e) => {
-                                            tracing::warn!(
-                                                dep = %dep_build.name,
-                                                error = %e,
-                                                "patched-build remote-cache lookup failed"
-                                            );
+                                            // A plain miss is already reported in
+                                            // the final error; only warn on a real
+                                            // failure (fetch, hash mismatch, IO).
+                                            if !matches!(e, rcache::Error::NotFound) {
+                                                tracing::warn!(
+                                                    dep = %dep_build.name,
+                                                    error = %e,
+                                                    "patched-build remote-cache lookup failed"
+                                                );
+                                            }
                                             missing.push(dep_build.name.clone());
                                             continue;
                                         }
@@ -221,9 +226,10 @@ mod tests {
             .expect("finalize cache entry");
     }
 
-    /// Serializes `sha256`'s payload as a compressed artifact and returns the
-    /// index wire bytes mapping `spec_hash ->` it, plus the artifact bytes.
-    fn remote_artifact(spec_hash: &SpecHash) -> (Vec<u8>, [u8; 32], Vec<u8>) {
+    /// Serializes a one-file payload as a compressed artifact and returns the
+    /// index wire bytes mapping every one of `spec_hashes ->` it, plus the
+    /// artifact's sha256 and bytes.
+    fn remote_artifact(spec_hashes: &[SpecHash]) -> (Vec<u8>, [u8; 32], Vec<u8>) {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("remote.txt"), b"from remote cache").unwrap();
         let (mut f, sha256) = archive::compress_dir(dir.path(), None, &None).unwrap();
@@ -231,7 +237,7 @@ mod tests {
         std::io::Read::read_to_end(&mut f, &mut artifact).unwrap();
 
         let mut index = IndexFile::default();
-        index.extend(std::iter::once((spec_hash.clone(), sha256)));
+        index.extend(spec_hashes.iter().map(|h| (h.clone(), sha256)));
         let mut index_bytes = Vec::new();
         index.write_to(&mut index_bytes).unwrap();
 
@@ -270,10 +276,12 @@ mod tests {
         format!("http://{addr}/")
     }
 
-    /// Builds a [`RemoteCache`] over a local server that serves `spec_hash`'s
-    /// artifact and nothing else.
-    async fn remote_cache_for(spec_hash: &SpecHash) -> RemoteCache<common::fetchers::AnyBackend> {
-        let (index_bytes, sha256, artifact) = remote_artifact(spec_hash);
+    /// Builds a [`RemoteCache`] over a local server that serves an artifact
+    /// for each of `spec_hashes` and nothing else.
+    async fn remote_cache_for(
+        spec_hashes: &[SpecHash],
+    ) -> RemoteCache<common::fetchers::AnyBackend> {
+        let (index_bytes, sha256, artifact) = remote_artifact(spec_hashes);
         let objects = vec![
             (INDEX_FILENAME.to_string(), index_bytes),
             (format!("{}.zst", hex::encode(sha256)), artifact),
@@ -299,7 +307,8 @@ mod tests {
 
         let bsr = *dg.by_name("top").unwrap();
         let dep_b_bsr = dg.by_name("dep-b").unwrap();
-        let remote_cache = remote_cache_for(&dg.spec_hash(dep_b_bsr)).await;
+        let dep_b_hash = dg.spec_hash(dep_b_bsr);
+        let remote_cache = remote_cache_for(std::slice::from_ref(&dep_b_hash)).await;
 
         let fetcher = UnusedFetcher;
         let mut pb = PatchedBuild {
@@ -327,11 +336,70 @@ mod tests {
             msg.contains("locally or in the remote cache"),
             "the error must say how to recover, got: {msg}"
         );
+
+        // dep-b was materialized from the remote cache and finalized into the
+        // local cache as a fetched entry.
+        let entry = cache
+            .read_dir(&dep_b_hash)
+            .expect("dep-b is in the local cache");
+        assert!(entry.path().join("remote.txt").exists());
+        let meta = cache.read_meta(&dep_b_hash).expect("dep-b meta");
+        assert!(meta.fetched, "dep-b must be recorded as fetched");
+    }
+
+    /// A local build, by name or by spec hash, wins over a remote-cache entry
+    /// for the same dependency: the remote cache is never consulted.
+    #[tokio::test]
+    async fn local_build_wins_over_remote_cache() {
+        let tmp = TempDir::new().unwrap();
+        let cache = Cache::at_dir(tmp.path()).unwrap();
+        let dg = graph_from(THREE_DEPS);
+
+        // dep-a and dep-c resolve by name; dep-b only by spec hash.
+        fake_build(&cache, &dg, "dep-a", "dep-a");
+        fake_build(&cache, &dg, "dep-b", "some-other-name");
+        fake_build(&cache, &dg, "dep-c", "dep-c");
+
+        let hashes: Vec<SpecHash> = ["dep-a", "dep-b", "dep-c"]
+            .iter()
+            .map(|n| dg.spec_hash(dg.by_name(n).unwrap()))
+            .collect();
+        // The remote cache serves all three dependencies too.
+        let remote_cache = remote_cache_for(&hashes).await;
+
+        let bsr = *dg.by_name("top").unwrap();
+        let fetcher = UnusedFetcher;
+        let mut pb = PatchedBuild {
+            spec: &bsr,
+            remote_fetcher: &fetcher,
+            stdout_writer: None,
+            stderr_writer: None,
+            remote_cache: Some(&remote_cache),
+        };
+        let opts = Options {
+            cache: cache.clone(),
+            graph: &dg,
+            exec_base: "/not-exists".into(),
+            ot: None,
+            daemon_id: None,
+        };
+
+        pb.run(&opts).await.expect("all dependencies are local");
+
+        for hash in &hashes {
+            let meta = cache.read_meta(hash).expect("local meta");
+            assert!(
+                !meta.fetched,
+                "a local build must not be replaced by a fetch"
+            );
+            let entry = cache.read_dir(hash).expect("local entry");
+            assert!(entry.path().join("marker").exists());
+            assert!(!entry.path().join("remote.txt").exists());
+        }
     }
 
     /// A remote cache with no entry for a locally-missing dependency still
-    /// reports it missing, and a local by-name/spec-hash build still wins
-    /// over the remote cache.
+    /// reports it missing.
     #[tokio::test]
     async fn reports_missing_when_remote_cache_lacks_dependency() {
         let tmp = TempDir::new().unwrap();
@@ -343,7 +411,7 @@ mod tests {
         let bsr = *dg.by_name("top").unwrap();
         // Serve an index for an unrelated hash, so the remote cache has no
         // entry for dep-b or dep-c.
-        let remote_cache = remote_cache_for(&SpecHash::from_bytes([0xEE; 32])).await;
+        let remote_cache = remote_cache_for(&[SpecHash::from_bytes([0xEE; 32])]).await;
 
         let fetcher = UnusedFetcher;
         let mut pb = PatchedBuild {
