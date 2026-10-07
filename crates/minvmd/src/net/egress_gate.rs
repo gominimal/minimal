@@ -1361,8 +1361,8 @@ fn refuse_head(limiter: &DropLimiter, refused: &RefusedHead) {
               it would hide one of them"
 )]
 async fn relay_frames(
-    guest: Prefixed<OwnedReadHalf>,
-    switch_tx: OwnedWriteHalf,
+    mut guest: Prefixed<OwnedReadHalf>,
+    mut switch_tx: OwnedWriteHalf,
     switch_rx: OwnedReadHalf,
     guest_tx: OwnedWriteHalf,
     table: BoxTable,
@@ -1390,14 +1390,14 @@ async fn relay_frames(
     // through it.
     let mut attributed: Vec<[u8; 4]> = Vec::new();
     {
-        let egress = relay_guest_to_switch(
-            guest,
-            switch_tx,
+        let egress = relay_frames_to_switch(
+            &mut guest,
+            &mut switch_tx,
             &table,
             &pins,
             &replies,
-            baseline,
-            limiter,
+            &baseline,
+            &limiter,
             &forwards,
             &mut attributed,
         );
@@ -1463,12 +1463,21 @@ async fn relay_frames(
     // after the select, rather than inside the egress leg, so the ingress
     // leg's win still files it: a leg dropped un-polled never reached its own
     // tail.
+    //
+    // The leg that lost the race is torn down with the relay, not left to
+    // hold what the guest or the switch end of it was holding — and torn
+    // down before the retires, not after: abort only asks, so an ingress leg
+    // left running could still pin a DNS reply or record a reply flow for a
+    // source the retires below have already cleared. Awaiting it makes it
+    // gone first. A leg that already finished has had its output taken (or
+    // is done with nothing left to pin), so it is not polled again.
+    if !ingress.is_finished() {
+        ingress.abort();
+        let _ = (&mut ingress).await;
+    }
     pins.retire(&attributed);
     replies.retire(&attributed);
     table.report_withdrawals(std::mem::take(&mut attributed));
-    // The leg that lost the race is torn down with the relay, not left to
-    // hold what the guest or the switch end of it was holding.
-    ingress.abort();
 }
 
 /// One control request on a connection, decided before any of it is written
@@ -3231,47 +3240,10 @@ async fn relay_switch_frames_to_guest(
     }
 }
 
-/// guest → switch: the frame relay's loop ([`relay_frames_to_switch`]).
-/// The end-of-connection attribution — the withdrawal report and the pin and
-/// reply-flow retires — is owned by the caller ([`relay_frames`]), which runs
-/// it after whichever relay leg ends first, so it files on every exit and
-/// not only on this leg's own.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the two socket halves, the table, the DNS admission table, the reply-flow \
-              tables, the baseline, the limiter, the publish ledger and the attribution \
-              are each a distinct input to the relay's loop; grouping them would name the \
-              bundle without naming the members"
-)]
-async fn relay_guest_to_switch(
-    mut guest: Prefixed<OwnedReadHalf>,
-    mut switch: OwnedWriteHalf,
-    table: &BoxTable,
-    pins: &dns_pins::DnsPins,
-    replies: &ReplyTables,
-    baseline: NodePlaneBaseline,
-    limiter: Arc<DropLimiter>,
-    forwards: &PublishedForwards,
-    attributed: &mut Vec<[u8; 4]>,
-) -> io::Result<()> {
-    relay_frames_to_switch(
-        &mut guest,
-        &mut switch,
-        table,
-        pins,
-        replies,
-        &baseline,
-        &limiter,
-        forwards,
-        attributed,
-    )
-    .await
-}
-
-/// The frame relay's loop, inside [`relay_guest_to_switch`], fed by the
-/// relay's attribution: read one length-framed Ethernet frame, decide it
-/// against the host-side table ([`gate_verdict`]), and write the frame on
-/// only when it is
+/// guest → switch: the frame relay's loop, fed by the relay's attribution,
+/// which its caller ([`relay_frames`]) files after whichever relay leg ends
+/// first: read one length-framed Ethernet frame, decide it against the
+/// host-side table ([`gate_verdict`]), and write the frame on only when it is
 /// admitted. A dropped frame is simply not written on — nothing is sent back
 /// toward the guest either; a drop is not a reset (NET-062) — and its class
 /// says so once per source address per rule per interval, so a flood inside
@@ -13714,6 +13686,99 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    /// The pins retire on the ingress-wins interleaving too, beside the
+    /// withdrawal report: the switch closes its side while the guest is still
+    /// on the connection, and the entry the connection's lookups filled is
+    /// dropped all the same. No drainer, so the row stays published and the
+    /// retire is watched on the record the entry was built from, as in
+    /// `a_closed_relay_connection_retires_the_pins_it_filled`.
+    #[tokio::test]
+    async fn pins_retired_when_the_switch_closes_first() {
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register(
+            BoxRegistration::new("weather", Ipv4Addr::from(LEASE), Ipv4Addr::LOCALHOST)
+                .with_admitted_ports([8080])
+                .with_egress_policy(EgressPolicy {
+                    allow_protocols: Some(vec![sessions::IpProto::Tcp]),
+                    allow_subnets: Some(vec!["203.0.113.0/24".to_string()]),
+                    allow_dns_hosts: Some(vec!["example.com".to_string()]),
+                    deny_subnets: None,
+                }),
+        );
+        let reports = registry
+            .take_withdrawal_reports()
+            .expect("the withdrawal reports' receiver is taken once");
+        let mut h = gate_over(registry).await;
+
+        // The box's own lookup and its reply: the entry for its row holds a
+        // live pin when the switch closes.
+        let answer = Ipv4Addr::new(93, 184, 216, 34);
+        let lookup = dns_pins::tests::udp_payload_frame(
+            Ipv4Addr::from(LEASE),
+            40000,
+            SUBNET.dns_server(),
+            53,
+            &dns_pins::tests::dns_query("example.com"),
+        );
+        let reply = dns_pins::tests::udp_payload_frame(
+            SUBNET.dns_server(),
+            53,
+            Ipv4Addr::from(LEASE),
+            40000,
+            &dns_pins::tests::dns_response("example.com", &[answer]),
+        );
+        send_frame(&mut h.guest, &lookup).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            lookup,
+            "the box's own query reaches the switch"
+        );
+        send_frame(&mut h.switch, &reply).await;
+        assert_eq!(
+            expect_frame(&mut h.guest).await,
+            reply,
+            "the reply reaches the box in full"
+        );
+        wait_for_log(&h.log, "filled the box's host-side DNS admission table").await;
+        let record = h.table.by_source(LEASE).expect("the box's row is held");
+        assert!(
+            h.pins
+                .admits_frame(&record, answer.octets(), None, Instant::now()),
+            "before the close, the box's own answer admits for its row"
+        );
+
+        // The switch closes its side while the guest is still on it.
+        h.switch
+            .shutdown()
+            .await
+            .expect("closing the switch's side");
+
+        // The report is filed after the retire, so waiting for it is waiting
+        // for the retire.
+        let deadline = tokio::time::Instant::now() + DEADLINE;
+        let report = loop {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the withdrawal report is not filed within {DEADLINE:?}"
+            );
+            match reports.try_recv() {
+                Ok(report) => break report,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    panic!("the withdrawal channel is down; nothing will file a report")
+                }
+            }
+        };
+        assert_eq!(report, vec![LEASE], "the report names the box");
+        assert!(
+            !h.pins
+                .admits_frame(&record, answer.octets(), None, Instant::now()),
+            "the switch-side close retired the pins the connection filled"
+        );
     }
 
     /// The node's own row outlives every relay that carried its frames. A
