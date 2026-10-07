@@ -79,9 +79,12 @@
 //! check cannot tell the activating client's registrations apart from
 //! another process running as the same user. If box rows ever have to
 //! come only from the host-side creator, a per-boot token minted by that
-//! creator is the pattern to use; this socket does not build one. Requests
-//! are served serially, one connection at a time, each read bounded by a
-//! 30-second timeout. That is what v1 ships, not a design endpoint.
+//! creator is the pattern to use; this socket does not build one. Each
+//! connection is served on a thread of its own, so the accept loop never
+//! blocks on a read: a connection that opens and never sends a line holds
+//! only its own thread, bounded by a 30-second read timeout, while every
+//! other request is accepted and served behind it. That is what v1 ships,
+//! not a design endpoint.
 //!
 //! A box whose row is gone — never registered, or withdrawn at destroy —
 //! is dropped by the gate's unregistered rule unconditionally (NET-085);
@@ -559,12 +562,12 @@ pub fn spawn_guest_reports_door(
         .map(|_| sock_path)
 }
 
-/// Accept and serve box control requests until the daemon exits. One
-/// connection at a time per door: a request is a row's map write or
-/// removal, served serially so the table sees its requests in arrival
-/// order — and the status and row reads ride the same serial turn. The
-/// two doors are served on two threads, so a report the grant refuses
-/// never waits behind a registration.
+/// Accept and serve box control requests until the daemon exits. The
+/// accept loop never blocks on a read: each connection is handed to a
+/// thread of its own, so a connection that opens and never sends a line
+/// holds only that thread, while every other request is accepted and
+/// served behind it. The two doors are served on two threads, so a report
+/// the grant refuses never waits behind a registration.
 fn accept_loop(
     listener: UnixListener,
     boxes: BoxRegistry,
@@ -576,10 +579,26 @@ fn accept_loop(
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                if let Err(error) =
-                    serve_connection(stream, &boxes, &answerer, &proxy_publish, door, audit_path)
+                let boxes = boxes.clone();
+                let answerer = answerer.clone();
+                let proxy_publish = proxy_publish.clone();
+                let audit_path = audit_path.to_path_buf();
+                if let Err(error) = std::thread::Builder::new()
+                    .name("minvmd-control-conn".to_string())
+                    .spawn(move || {
+                        if let Err(error) = serve_connection(
+                            stream,
+                            &boxes,
+                            &answerer,
+                            &proxy_publish,
+                            door,
+                            &audit_path,
+                        ) {
+                            tracing::debug!(error = %error, "box control connection failed");
+                        }
+                    })
                 {
-                    tracing::debug!(error = %error, "box control connection failed");
+                    tracing::debug!(error = %error, "could not start a box control connection thread");
                 }
             }
             Err(error) => tracing::debug!(error = %error, "control socket accept failed"),
@@ -654,8 +673,9 @@ fn serve_connection(
     // [`MAX_ASK_SUBSCRIPTIONS`]): past the cap the connection is refused on
     // this door's own turn, before any thread is spawned, so a guest that
     // opens asks in a loop cannot grow threads without limit. The first
-    // request line is read under [`REGISTER_READ_TIMEOUT`] before any of
-    // this, so a connection that never sends one costs no thread at all.
+    // request line is read under [`REGISTER_READ_TIMEOUT`] on this
+    // connection's own thread, so a connection that never sends one holds
+    // only that thread, never the accept loop.
     let gauges = boxes.ask_gauges();
     let served = match (&request, door) {
         (BoxControlRequest::AdmitAsk(ask), ControlDoor::GuestReports) => {
@@ -4340,5 +4360,44 @@ mod tests {
             "the second subscription is refused at the cap: {refused_sub:?}"
         );
         held.clear();
+    }
+
+    /// A connection that opens and never sends a request line must not pin
+    /// the accept loop: a second connection is still served promptly while
+    /// the silent one holds only its own thread.
+    #[test]
+    fn silent_connection_does_not_pin_the_accept_loop() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (sock_path, _server, _registry, _answerer, _proxy_publish) =
+            spawn_server(dir.path()).expect("server binds");
+
+        // Open a connection and send nothing: it holds its own thread,
+        // waiting on the read timeout, while the accept loop moves on.
+        let _silent = TestStream::connect(&sock_path).expect("socket accepts");
+
+        // A second connection is accepted and served without waiting out
+        // the silent connection's 30-second read bound.
+        let started = std::time::Instant::now();
+        let reply = register(
+            &sock_path,
+            &RegisterBoxRequest {
+                name: "web".to_string(),
+                ingress_ports: vec![8080],
+                egress: None,
+                credentialed_upstream: None,
+                dynamic_ingress: None,
+                dynamic_allowed_range: None,
+            },
+        )
+        .expect("the second connection is served");
+        assert!(
+            matches!(reply, BoxControlReply::Registered(_)),
+            "the second connection is answered, got {reply:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the second connection is served without waiting out the silent \
+             connection's read bound"
+        );
     }
 }
