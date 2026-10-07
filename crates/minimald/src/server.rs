@@ -355,6 +355,12 @@ pub struct ServerState {
     sessions: sessions::ManagerHandle,
     daemon_id: String,
 
+    /// The daemon-scoped gvproxy switch, cloned beside the copy the sessions
+    /// manager owns, so daemon-level startup work that runs after the manager
+    /// took its copy — [`HostProxyStartup::record_serving`] — can update the
+    /// switch's hostname-proxy port to the port the proxy actually bound.
+    net_switch: Arc<Mutex<crate::net::SwitchClient>>,
+
     /// Daemon-scoped mctx state (dirs, VCS, local cache, stdlib), built once
     /// at startup and shared with the sessions manager. Held here too so
     /// daemon-level work that belongs to no session — [`crate::maintenance`]'s
@@ -470,8 +476,9 @@ impl ServerState {
         // (in a microVM, the host-handed) port, or the documented default —
         // is the node address's interim opening in every box's own-address
         // set (design §7.1). The OS-picks `0` names no port, so no opening.
-        // An OS-picked port the bind lands on instead is not opened; the
-        // proxy warns when it serves there (see gominimal/minimal#1952).
+        // When the bind lands elsewhere (an OS-chosen port, NET-025), the
+        // opening is re-pointed to the port actually bound once the proxy is
+        // serving (see `record_serving`).
         #[cfg(target_os = "linux")]
         let hostname_proxy_port = ProxyPort::from_config(
             config.hostname_proxy_port,
@@ -541,7 +548,7 @@ impl ServerState {
                 minimal_state_dir,
                 minimal_cache_dir,
                 Arc::clone(&daemon_ctx),
-                net_switch,
+                Arc::clone(&net_switch),
                 // Threaded into every session actor so the launcher and the
                 // task path resolve the same effective egress the daemon
                 // was started with (NET-074/NET-077).
@@ -550,6 +557,7 @@ impl ServerState {
             .await?,
             config,
             daemon_id,
+            net_switch,
             daemon_ctx,
             maintenance: None,
             shutdown: CancellationToken::new(),
@@ -746,12 +754,30 @@ impl ServerStateHandle {
         self.0.lock().await.hostname_proxy_port = Some(port);
     }
 
+    /// Re-points the switch's node-address opening to the port the proxy
+    /// actually bound — distinct from [`Self::hostname_proxy_port`], which
+    /// carries the port a *client* dials. Boxes reach the bound port on the
+    /// loopback they share with the daemon, so their own-address openings
+    /// compile from it, not the configured port the daemon may have moved off.
+    pub(crate) async fn set_switch_hostname_proxy_port(&self, port: Option<u16>) {
+        let switch = Arc::clone(&self.0.lock().await.net_switch);
+        switch.lock().await.set_hostname_proxy_port(port);
+    }
+
     /// The port the hostname proxy listens on, or `None` while it is still
     /// coming up. Filled on the `ListSessions` and `CreateSession` replies
     /// so a client can print — and point `HTTP(S)_PROXY` at — the port this
     /// daemon is on (NET-026).
     pub(crate) async fn hostname_proxy_port(&self) -> Option<u16> {
         self.0.lock().await.hostname_proxy_port
+    }
+
+    /// The switch's hostname-proxy port — the node address's interim opening
+    /// every box's own-address set compiles (design §7.1).
+    #[cfg(test)]
+    async fn switch_hostname_proxy_port(&self) -> Option<u16> {
+        let switch = Arc::clone(&self.0.lock().await.net_switch);
+        switch.lock().await.hostname_proxy_port()
     }
 
     /// Records the port the box-zone answerer actually listens on (UDP),
@@ -1609,7 +1635,7 @@ impl HostProxyStartup {
         reported_port: u16,
     ) {
         match self {
-            Self::Egress { port, .. } => {
+            Self::Egress { .. } => {
                 tracing::info!(
                     component = self.component(),
                     port = bound_port,
@@ -1618,32 +1644,16 @@ impl HostProxyStartup {
                     "hostname proxy is serving on its {} port",
                     source.as_str()
                 );
-                warn_if_proxy_opening_missed(port.opening_port(), bound_port);
                 state.set_hostname_proxy_port(reported_port).await;
+                // The switch's node-address opening follows the port this
+                // daemon's boxes reach on the loopback they share with it —
+                // the bound port — so an unpinned daemon whose default was
+                // busy re-compiles its own-address boxes at the port it
+                // actually landed on, not the configured one it moved off.
+                state.set_switch_hostname_proxy_port(Some(bound_port)).await;
             }
         }
     }
-}
-
-/// Warns, once at the proxy's startup, when the port it bound is not the
-/// port every box's own-address set opens at the node address (the
-/// interim opening, design §7.1): an unpinned daemon that found the default
-/// busy and took an OS-picked port, or a pinned `0`. Boxes on the switch
-/// then cannot reach the proxy at all. Returns whether it warned.
-#[cfg(target_os = "linux")]
-fn warn_if_proxy_opening_missed(opening: Option<u16>, bound_port: u16) -> bool {
-    if opening == Some(bound_port) {
-        return false;
-    }
-    let opening = opening.map_or_else(|| "none".to_string(), |port| port.to_string());
-    tracing::warn!(
-        bound_port,
-        opening_port = %opening,
-        "hostname proxy bound port {bound_port} but the switch opening is at port \
-         {opening}: own-address boxes cannot reach the hostname proxy; pin \
-         hostname_proxy_port"
-    );
-    true
 }
 
 /// Drives the hostname-routing proxy (the B5 egress proxy — the listener
@@ -2686,30 +2696,42 @@ mod tests {
         super::test_config(dir.path())
     }
 
-    /// The interim node-address opening is compiled at the port the
-    /// proxy's first bind asks for; when the bind lands elsewhere (an
-    /// OS-picked port), the daemon says so once, naming both ports and the
-    /// consequence, and says nothing when the ports agree
-    /// (gominimal/minimal#1952).
+    /// The node address's interim opening follows the port the proxy actually
+    /// bound, not the configured one the switch was built with: a daemon whose
+    /// default was busy binds an OS-chosen port, and `record_serving` re-points
+    /// the switch's opening there so own-address boxes reach the proxy.
     #[cfg(target_os = "linux")]
-    #[test]
-    fn proxy_opening_mismatch_warns_once_naming_both_ports() {
-        let capture = crate::test_harness::captured_log();
-        let line = "hostname proxy bound port 41913 but the switch opening is at port 7654: \
-                    own-address boxes cannot reach the hostname proxy; pin hostname_proxy_port";
+    #[tokio::test]
+    async fn record_serving_points_the_switch_opening_at_the_bound_port() {
+        let dir = TempDir::new().unwrap();
+        let state = ServerStateHandle::new(test_config(&dir), None)
+            .await
+            .unwrap();
 
-        assert!(!warn_if_proxy_opening_missed(Some(7654), 7654));
-        assert!(
-            !capture
-                .contents()
-                .contains("the switch opening is at port 7654"),
-            "equal ports say nothing"
+        // Built from the documented default, before the proxy serves.
+        assert_eq!(
+            state.switch_hostname_proxy_port().await,
+            Some(crate::net::proxy::DEFAULT_EGRESS_PROXY_PORT),
         );
 
-        assert!(warn_if_proxy_opening_missed(Some(7654), 41913));
-        let logged = capture.contents();
-        assert_eq!(logged.matches(line).count(), 1, "one line: {logged}");
-        assert!(logged.contains("WARN"), "a warn line: {logged}");
+        // The default was busy, so the bind asked the OS and landed on 41913.
+        HostProxyStartup::Egress {
+            bind_base: std::net::Ipv4Addr::LOCALHOST.into(),
+            port: ProxyPort::from_config(None, crate::net::proxy::DEFAULT_EGRESS_PROXY_PORT),
+        }
+        .record_serving(&state, 41913, PortSource::Selected, 41913)
+        .await;
+
+        assert_eq!(
+            state.switch_hostname_proxy_port().await,
+            Some(41913),
+            "the switch opening follows the bound port"
+        );
+        assert_eq!(
+            state.hostname_proxy_port().await,
+            Some(41913),
+            "the discovery field carries the bound port"
+        );
     }
 
     /// The volume-log release must run exactly once no matter how many
