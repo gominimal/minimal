@@ -179,6 +179,19 @@ impl EgressPolicy {
             deny_subnets: None,
         }
     }
+
+    /// Whether this section is the deny-all shape: every `allow_*` dimension
+    /// present and empty. `deny_subnets` is not read — it subtracts from
+    /// what the `allow_*` fields admit, and there is nothing there to
+    /// subtract from. The one predicate the in-VM classifier and the
+    /// host-side registry share, so the box each treats as deny-all is one
+    /// shape.
+    #[must_use]
+    pub fn admits_nothing(&self) -> bool {
+        self.allow_subnets.as_ref().is_some_and(Vec::is_empty)
+            && self.allow_dns_hosts.as_ref().is_some_and(Vec::is_empty)
+            && self.allow_protocols.as_ref().is_some_and(Vec::is_empty)
+    }
 }
 
 /// The first entry of an optional CIDR list that is not a syntactically valid
@@ -1327,6 +1340,65 @@ mod tests {
             EgressRules::from_policy(Some(&EgressPolicy::deny_all()), resolver, lease),
             EgressRules::new(Some(Vec::new()), Some(Vec::new()), None, resolver, lease),
             "the deny-all section must compile to rules that admit nothing",
+        );
+    }
+
+    #[test]
+    fn admits_nothing_reads_the_deny_all_shape() {
+        // The deny-all predicate is the one shape the egress gate refuses:
+        // every `allow_*` dimension present and empty. An absent dimension
+        // is allow-all for that dimension, and one non-empty list admits
+        // something, so neither is deny-all.
+        assert!(EgressPolicy::deny_all().admits_nothing());
+        assert!(!EgressPolicy::default().admits_nothing());
+        assert!(
+            !EgressPolicy {
+                allow_subnets: Some(vec!["10.0.0.0/8".into()]),
+                ..EgressPolicy::default()
+            }
+            .admits_nothing()
+        );
+        assert!(
+            !EgressPolicy {
+                allow_dns_hosts: Some(vec!["example.com".into()]),
+                ..EgressPolicy::default()
+            }
+            .admits_nothing()
+        );
+        assert!(
+            !EgressPolicy {
+                allow_protocols: Some(vec![IpProto::Tcp]),
+                ..EgressPolicy::default()
+            }
+            .admits_nothing()
+        );
+        // Two dimensions present and empty is not enough: the third, absent
+        // or non-empty, still admits something.
+        assert!(
+            !EgressPolicy {
+                allow_subnets: Some(vec![]),
+                allow_dns_hosts: Some(vec![]),
+                ..EgressPolicy::default()
+            }
+            .admits_nothing()
+        );
+        assert!(
+            !EgressPolicy {
+                allow_subnets: Some(vec![]),
+                allow_dns_hosts: Some(vec![]),
+                allow_protocols: Some(vec![IpProto::Tcp]),
+                ..EgressPolicy::default()
+            }
+            .admits_nothing()
+        );
+        // `deny_subnets` is not read: the deny-all shape stays deny-all
+        // with a subtraction set.
+        assert!(
+            EgressPolicy {
+                deny_subnets: Some(vec!["10.0.0.0/8".into()]),
+                ..EgressPolicy::deny_all()
+            }
+            .admits_nothing()
         );
     }
 

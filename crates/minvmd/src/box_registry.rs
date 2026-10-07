@@ -255,18 +255,6 @@ pub fn node_zone_name() -> String {
 /// every time (a hash map's would vary run to run).
 type Rows = BTreeMap<[u8; 4], Arc<BoxRecord>>;
 
-/// Whether `section` is the declaration that admits no destination: every
-/// `allow_*` dimension present and empty. `deny_subnets` is not read — it
-/// subtracts from what the `allow_*` fields admit, and there is nothing
-/// there to subtract from. The same predicate the in-VM classifier places a
-/// box under `deny` by, so the box the host treats as deny-all and the box
-/// the guest does are one shape.
-fn admits_nothing(section: &EgressPolicy) -> bool {
-    section.allow_subnets.as_ref().is_some_and(Vec::is_empty)
-        && section.allow_dns_hosts.as_ref().is_some_and(Vec::is_empty)
-        && section.allow_protocols.as_ref().is_some_and(Vec::is_empty)
-}
-
 /// One published namespace's row in the host-side table. Of what it holds,
 /// two dimensions decide a frame from this namespace's address: its switch
 /// address, the lease the shared verdict checks every frame's source against
@@ -297,8 +285,8 @@ pub struct BoxRecord {
     resolves_names: bool,
     dns_hosts: Vec<String>,
     /// Whether the declaration the host registered the row with is the
-    /// deny-all shape ([`admits_nothing`]). Read off the registration's own
-    /// policy, never off anything the guest reports.
+    /// deny-all shape ([`EgressPolicy::admits_nothing`]). Read off the
+    /// registration's own policy, never off anything the guest reports.
     deny_all: bool,
     credentialed_upstream: bool,
     /// The box's dynamic-ingress stance (NET-045): the stance half of the
@@ -2018,7 +2006,10 @@ impl BoxRegistry {
             .cloned()
             .unwrap_or_default();
         let resolves_names = !dns_hosts.is_empty();
-        let deny_all = registration.egress.as_ref().is_some_and(admits_nothing);
+        let deny_all = registration
+            .egress
+            .as_ref()
+            .is_some_and(EgressPolicy::admits_nothing);
         // The box's own id (BEP-070): the one a client-driven registration
         // minted and checked ([`Self::register_client_box_at`]), or a fresh
         // UUIDv7 minted here for this creation — never a counter, never a
