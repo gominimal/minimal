@@ -2,7 +2,7 @@
 
 The order of the work, and the size of each step, for implementing [the BOX spec](29-spec-box-local-first.md) (gominimal/inbox#731). Each row in §1 is a candidate pull request.
 
-- **Status: draft.** Drawn against the spec at `cd2e3090` (PR #1697, still open) and `main` at `2aa1a7f6`. The plan comment in the skill's format lints with `plan-lint` against that spec: exit 0, 0 blocking findings, 27 advisory (§7). Nothing is posted on the epic and no issue exists yet.
+- **Status: draft.** Drawn against the spec at `444d7029` (PR #1697, approved) and `main` at `da8d8bbf`. The plan comment in the skill's format lints with `plan-lint` against that spec: exit 0, 0 blocking findings, 27 advisory (§7). Nothing is posted on the epic and no issue exists yet.
 - **Method:** the foundry `spec:plan` skill (`spec@foundry` v0.7.0), run up to the drafted plan comment.
 - **Revision 2 (2026-10-06):** refactoring is folded in. Scripted renames land before the plan (§0), eight refactor pull requests join the plan (T34–T41), and the box naming rule goes into `AGENTS.md`.
 - **Revision 3 (2026-10-06):** a task becomes a box whose entrypoint is the task. One launcher starts every box's entrypoint from its spec (T42), one exit rule keyed on `lifetime` ends it (T9), and `min task run` creates a task box instead of sending a task into a session's box (T43). T44 moves the repository's own files off the legacy tables.
@@ -380,7 +380,7 @@ By review size that is 31 L, 12 M and 4 S. By the linted estimate, which counts 
 7. **Parking:** *A task that waits*, so nothing is parked.
 8. **Checkpoint-2 advisories:** F004 *leave as is*. O004 *right, leave it*. T019 *two tasks, on purpose* (§7).
 9. **"Post this plan on the epic?"** → *Not yet*. The plan is posted on the epic once the spec merges and the paths are re-mapped.
-10. **The sentinel's `commit=`** is `main` at `2aa1a7f6`, the tree the survey read, with the spec at `cd2e3090` laid on top.
+10. **The sentinel's `commit=`** is `main` at `da8d8bbf`, the tree the survey read, with the spec at `444d7029` laid on top.
 11. **Revision 2 choices (refactoring; the names were confirmed on 2026-10-06):**
     - The renames come first and sit outside the plan as scripted PRs. The linter's 10-file cap cannot hold a rename of dozens of files, and a rename is reviewed by its script (§0).
     - Naming is planned work, not left to whichever task touches a file.
