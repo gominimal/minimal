@@ -109,8 +109,8 @@ async fn run() -> ExitCode {
     } else {
         registry
             .with(console_layer(
-                ot::StdoutWriter::new,
-                std::io::stdout().is_terminal(),
+                ot::StderrWriter::new,
+                std::io::stderr().is_terminal(),
                 !rust_log_set,
             ))
             .init();

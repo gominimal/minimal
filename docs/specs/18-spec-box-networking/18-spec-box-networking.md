@@ -317,7 +317,7 @@ included, with every refusal logged (NET-001 to NET-004).
 - **NET-044** WHEN a dynamic ingress request is decided `allow` THE SYSTEM SHALL publish the port and show the mapping in `min session policy`.
   tier:     T0
   verify:   cargo nextest run -p minimald expose_allow_publishes_and_lists
-  <!-- S5/AC2; prose 29; event-driven -->
+  <!-- S5/AC2; prose 29; event-driven; "publish" means reachable, as in NET-040 and NET-016: the box's relay gate admits the port in the same step the forward is bound, for an `allow` and for a yes-answered `ask` (NET-045) alike, and no pending window exists; with nothing listening on the port yet, the box's own kernel answers with a reset; the admission is kept apart from NET-016/NET-017's listen-published set, so a listener closing never withdraws it, and the expose's revocation (the box's stop) does -->
   - IF a dynamic ingress request is decided `deny` THEN THE SYSTEM SHALL refuse it with a typed error.
     tier:   T0
     verify: cargo nextest run -p minimald expose_deny_typed_error

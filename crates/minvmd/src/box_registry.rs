@@ -255,6 +255,18 @@ pub fn node_zone_name() -> String {
 /// every time (a hash map's would vary run to run).
 type Rows = BTreeMap<[u8; 4], Arc<BoxRecord>>;
 
+/// Whether `section` is the declaration that admits no destination: every
+/// `allow_*` dimension present and empty. `deny_subnets` is not read — it
+/// subtracts from what the `allow_*` fields admit, and there is nothing
+/// there to subtract from. The same predicate the in-VM classifier places a
+/// box under `deny` by, so the box the host treats as deny-all and the box
+/// the guest does are one shape.
+fn admits_nothing(section: &EgressPolicy) -> bool {
+    section.allow_subnets.as_ref().is_some_and(Vec::is_empty)
+        && section.allow_dns_hosts.as_ref().is_some_and(Vec::is_empty)
+        && section.allow_protocols.as_ref().is_some_and(Vec::is_empty)
+}
+
 /// One published namespace's row in the host-side table. Of what it holds,
 /// two dimensions decide a frame from this namespace's address: its switch
 /// address, the lease the shared verdict checks every frame's source against
@@ -284,6 +296,10 @@ pub struct BoxRecord {
     egress: EgressRules,
     resolves_names: bool,
     dns_hosts: Vec<String>,
+    /// Whether the declaration the host registered the row with is the
+    /// deny-all shape ([`admits_nothing`]). Read off the registration's own
+    /// policy, never off anything the guest reports.
+    deny_all: bool,
     credentialed_upstream: bool,
     /// The box's dynamic-ingress stance (NET-045): the stance half of the
     /// grant a runtime port report is checked against. Carried from the
@@ -338,6 +354,7 @@ impl PartialEq for BoxRecord {
             && self.egress == other.egress
             && self.resolves_names == other.resolves_names
             && self.dns_hosts == other.dns_hosts
+            && self.deny_all == other.deny_all
             && self.credentialed_upstream == other.credentialed_upstream
             && self.dynamic_ingress == other.dynamic_ingress
             && self.dynamic_range == other.dynamic_range
@@ -489,6 +506,23 @@ impl BoxRecord {
     #[must_use]
     pub fn allow_dns_hosts(&self) -> &[String] {
         &self.dns_hosts
+    }
+
+    /// Whether the row's egress is the deny-all shape: every `allow_*`
+    /// dimension present and empty, the section
+    /// [`EgressPolicy::deny_all`] materializes (NET-141's deny-all case).
+    ///
+    /// Derived once, at registration, from the egress policy the host
+    /// registered the row with — the host-side create inputs, never a guest
+    /// report — so nothing inside the VM can flip it: the runtime half the
+    /// guest's reports fill ([`RowRuntime`]) is not read. A row with no
+    /// egress declaration (the node namespace's among them, which carries
+    /// every host-address box's frames) is never deny-all. The host-side
+    /// gate reads this to drop a deny-all box's DNS queries for names
+    /// outside the box zone ([`crate::net::dns_pins::deny_all_refusal`]).
+    #[must_use]
+    pub fn is_deny_all(&self) -> bool {
+        self.deny_all
     }
 
     /// Whether this box's declaration named a credentialed upstream
@@ -1984,6 +2018,7 @@ impl BoxRegistry {
             .cloned()
             .unwrap_or_default();
         let resolves_names = !dns_hosts.is_empty();
+        let deny_all = registration.egress.as_ref().is_some_and(admits_nothing);
         // The box's own id (BEP-070): the one a client-driven registration
         // minted and checked ([`Self::register_client_box_at`]), or a fresh
         // UUIDv7 minted here for this creation — never a counter, never a
@@ -2023,6 +2058,7 @@ impl BoxRegistry {
             ),
             resolves_names,
             dns_hosts,
+            deny_all,
             // NET-134: the lane is the one egress dimension that compiles
             // to nothing in the frame rules — a declaration, not a rule —
             // so it travels in the row itself, reduced to the fact the
@@ -4953,6 +4989,63 @@ mod tests {
             fresh.runtime_port_numbers().is_empty(),
             "a re-registration starts the runtime set empty — the newest declaration never \
              inherits the row it replaced's runtime facts"
+        );
+    }
+
+    /// The host-side deny-all predicate is the host-registered declaration's
+    /// own fact: the deny-all shape — and only it — reads deny-all, and
+    /// nothing the guest reports moves it. A runtime port report, the one
+    /// row dimension the in-VM daemon fills, leaves both rows as they were.
+    #[test]
+    fn deny_all_predicate_reads_the_host_registration_only() {
+        let registry = BoxRegistry::new(SUBNET);
+        let sealed = registry.register(
+            BoxRegistration::new("sealed", Ipv4Addr::new(100, 64, 0, 9), Ipv4Addr::LOCALHOST)
+                .with_dynamic_ingress(DynamicIngress::Allow, Some((3000, 3999)))
+                .with_egress_policy(EgressPolicy::deny_all()),
+        );
+        let open = registry.register(
+            BoxRegistration::new("open", Ipv4Addr::new(100, 64, 0, 10), Ipv4Addr::LOCALHOST)
+                .with_dynamic_ingress(DynamicIngress::Allow, Some((3000, 3999))),
+        );
+        let listed = registry.register(
+            BoxRegistration::new("listed", Ipv4Addr::new(100, 64, 0, 11), Ipv4Addr::LOCALHOST)
+                .with_egress_policy(EgressPolicy {
+                    allow_protocols: Some(Vec::new()),
+                    allow_subnets: Some(Vec::new()),
+                    allow_dns_hosts: Some(vec!["example.com".to_string()]),
+                    deny_subnets: None,
+                }),
+        );
+        let node = registry.register_node_namespace(7655);
+        assert!(sealed.is_deny_all(), "the deny-all section reads deny-all");
+        assert!(!open.is_deny_all(), "no egress declaration is not deny-all");
+        assert!(!listed.is_deny_all(), "one declared name is not deny-all");
+        assert!(
+            !node.is_deny_all(),
+            "the node namespace, which host-address boxes ride, is never deny-all"
+        );
+
+        let now = Instant::now();
+        for row in [&sealed, &open] {
+            registry
+                .admit_runtime_port(row.switch_addr(), 3000, IpProto::Tcp, now)
+                .expect("the report is inside the host's grant");
+        }
+        let table = registry.table();
+        let sealed_now = table
+            .by_source(sealed.switch_addr().octets())
+            .expect("the sealed row is published");
+        let open_now = table
+            .by_source(open.switch_addr().octets())
+            .expect("the open row is published");
+        assert!(
+            sealed_now.is_deny_all(),
+            "a guest report never lifts the host's deny-all"
+        );
+        assert!(
+            !open_now.is_deny_all(),
+            "a guest report never makes a row deny-all"
         );
     }
 }

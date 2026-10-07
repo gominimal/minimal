@@ -308,12 +308,13 @@ live ingress (published at runtime)
   tcp  127.0.64.21:3000 → :3000
 ```
 
-The host binds a runtime publish at once. A frame reaches the box only
-through the relay gate its attach installed, and that gate admits only the
-ports the declaration named. So a port the box published at runtime reads
-`(pending; not yet reachable)` until the gate admits it. A row from a daemon
-older than the `pending` field reads `(unknown; daemon predates this field)`.
-The CLI never shows such a row as reachable.
+A listed runtime publish is reachable. The daemon admits the port at the
+box's relay gate when it binds the forward. If nothing in the box listens on
+the port yet, the box itself refuses a connection to it.
+A row from an older daemon whose gate did not admit runtime publishes reads
+`(pending; not yet reachable)`. A row from a daemon older than the `pending`
+field reads `(unknown; daemon predates this field)`. The CLI never shows
+either row as reachable.
 
 `-o json` (`--output json`) prints one `min/v1/session-policy` document on
 stdout instead of text. Each block the text output prints becomes a key:

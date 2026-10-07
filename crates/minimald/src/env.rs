@@ -1633,20 +1633,10 @@ impl SessionChannel {
         };
         match session.expose_dynamic(port_number).await {
             Ok(mapping) => {
-                // The same admission set `serve_get_live_ingress` reads —
-                // `declared_ingress_ports`, on this channel's own fetch of
-                // the record — decides the reply's honesty (NET-047): a port
-                // the box declared was admitted when it attached, so it is
-                // reachable now; one published only at runtime waits for the
-                // gate. A record that does not read leaves the set empty, so
-                // the port reads as waiting — the fail-closed read the RPC
-                // gives the same box.
-                let record = session.record().await.ok();
-                let pending = !crate::net::switch::declared_ingress_ports(
-                    record.as_ref().map(|record| &record.policy),
-                    mapping.proto,
-                )
-                .contains(&mapping.internal_port);
+                // The publish admitted the port at the box's relay gate
+                // before it answered (NET-044), so the port is reachable
+                // now; nothing listening on it yet is answered by the box's
+                // own kernel, not by the gate.
                 #[expect(
                     clippy::let_underscore_must_use,
                     reason = "the reply channel is best-effort: a peer may be gone before \
@@ -1654,10 +1644,8 @@ impl SessionChannel {
                 )]
                 let _ = writeln!(
                     stream,
-                    "msg:published port {} at {}{}",
-                    mapping.internal_port,
-                    mapping.local,
-                    if pending { "; not yet reachable" } else { "" }
+                    "msg:published port {} at {}",
+                    mapping.internal_port, mapping.local
                 );
             }
             Err(failure) => {
@@ -2735,14 +2723,12 @@ exit $rc
         );
     }
 
-    /// The publish reply's honesty (NET-047) rides the same admission set the
-    /// live-ingress list reads — `declared_ingress_ports` — so a port the box
-    /// declared, admitted when it attached, is reachable the moment it
-    /// publishes and its reply says so, while a runtime-only port in the same
-    /// range is bound but not yet answered by the box, and its reply says
-    /// that. One box, one flow, no second list of declared ports to drift.
+    /// The publish reply is a plain fact for every port (NET-044): a port
+    /// the box declared was admitted when it attached, and a runtime-only
+    /// port in the same range is admitted by the publish itself, so neither
+    /// reply carries a "not yet reachable" caveat. One box, one flow.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn expose_reply_says_not_yet_reachable_only_for_runtime_ports() {
+    async fn expose_reply_is_a_plain_publish_for_declared_and_runtime_ports() {
         let server = crate::test_harness::TestServer::new().await;
         let mut client = server.connect().await;
         // The hand vouched for, so the registry publishes it: both publishes
@@ -2791,8 +2777,8 @@ exit $rc
             "a declared port's reply carries no reachability caveat"
         );
 
-        // A runtime-only port in the same range: bound on the host, but the
-        // gate has not admitted it, so the reply says what it is.
+        // A runtime-only port in the same range: the publish admitted it at
+        // the box's gate, so its reply is the same plain fact.
         let (mut ours, theirs) = UnixStream::pair().unwrap();
         #[expect(
             clippy::large_futures,
@@ -2803,8 +2789,8 @@ exit $rc
         drop(ours);
         assert_eq!(
             read_lines(&theirs),
-            vec!["msg:published port 3200 at 127.0.64.51:3200; not yet reachable"],
-            "a runtime-only port's reply says it is not yet reachable"
+            vec!["msg:published port 3200 at 127.0.64.51:3200"],
+            "a runtime-only port's reply carries no reachability caveat"
         );
         forwarder.abort();
         assert_eq!(
@@ -2892,9 +2878,8 @@ exit $rc
         drop(ours);
         assert_eq!(
             read_lines(&theirs),
-            vec!["msg:published port 3000 at 127.0.64.61:3000; not yet reachable"],
-            "the allowed publish is a fact — runtime-only, so the reply says \
-             so, the honesty the admission set owes (NET-047)"
+            vec!["msg:published port 3000 at 127.0.64.61:3000"],
+            "the allowed publish is a fact, admitted at the gate (NET-044)"
         );
 
         // The refusal the range gives a port outside it — decided against

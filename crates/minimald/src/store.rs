@@ -477,6 +477,11 @@ mod tests {
             handle.record().await.unwrap().name.as_deref(),
             Some("named")
         );
+
+        // A different casing resolves to the same record: names are unique
+        // under ASCII case folding.
+        let folded = open(&store, RecordPredicate::Name("NAMED".to_string())).await;
+        assert_eq!(*folded.id(), ids[0]);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

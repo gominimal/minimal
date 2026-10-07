@@ -3401,6 +3401,205 @@ async fn stopped_shared_address_box_is_nodata_through_actor() {
     );
 }
 
+/// NET-128's resume half: a shared-address box stopped through the actor
+/// resumes at its address — the stop is a state, not an end. The actor's
+/// Stop arm marks the name stopped (NODATA at the shared address), and the
+/// resume path — a fresh actor re-registering the name, then a host start
+/// clearing the marker — brings the name back to answering A at the same
+/// address. The re-registration is not refused as "name taken": the
+/// registry's register overwrites the route, so the resumed box's name is
+/// held again rather than dropped.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stopped_shared_address_box_resumes_at_its_address_through_actor() {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let manager = server.state.sessions_manager().await;
+    manager.land_range_verdict(crate::net::dns::RangeVerdict::Present);
+    let shared = manager
+        .hostnames()
+        .read()
+        .expect("registry lock")
+        .node_address();
+    let id = finalize_handed_own_ip_session(
+        &mut client,
+        "resumebox",
+        std::net::Ipv4Addr::new(100, 64, 128, 9),
+        shared,
+    )
+    .await;
+
+    // The name answers while the box runs.
+    let (_, address) = zone_answer_for(&server, "resumebox.min.internal")
+        .await
+        .expect("the name answers while the box runs");
+    assert_eq!(
+        address, shared,
+        "the box's name answers at the shared address while it runs"
+    );
+
+    // Stop the box through the actor — the path the issue reports. The Stop
+    // arm must not panic; it marks the name stopped and returns.
+    let handle = manager
+        .get_session(crate::sessions::SessionKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the box resolves while it runs");
+    handle.stop().await;
+
+    let registry = server.state.sessions_manager().await.hostnames();
+    assert_eq!(
+        registry
+            .read()
+            .expect("registry lock")
+            .zone_entry("resumebox.min.internal", &[]),
+        crate::net::dns::ZoneEntry::Held {
+            owner: "resumebox".to_string(),
+            address: None,
+        },
+        "a stopped shared-address box answers NODATA, not NXDOMAIN"
+    );
+    assert_eq!(
+        registry
+            .read()
+            .expect("registry lock")
+            .resolve("resumebox.min.internal"),
+        None,
+        "the proxy must not forward a stopped shared-address box to the node"
+    );
+
+    // Resume: evict the dead actor and re-resolve, so a fresh actor comes up
+    // from the record and re-registers the name — the registration is not
+    // refused as "name taken". Then launch a host, whose start clears the
+    // stopped marker, and the name answers again at the same address.
+    manager.evict(id).await;
+    let handle = manager
+        .get_session(crate::sessions::SessionKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the box resolves after eviction");
+    handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("an Active session should be able to launch a host");
+
+    // The host's `mainloop` marks the name running on its own spawned task,
+    // so poll the zone until the marker is cleared rather than racing it.
+    let (owner, resumed) = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let registry = server.state.sessions_manager().await.hostnames();
+            if let crate::net::dns::ZoneEntry::Held {
+                owner,
+                address: Some(address),
+            } = registry
+                .read()
+                .expect("registry lock")
+                .zone_entry("resumebox.min.internal", &[])
+            {
+                return (owner, address);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the name answers again after the host starts");
+    assert_eq!(
+        owner, "resumebox",
+        "the session owns its box name across the resume"
+    );
+    assert_eq!(
+        resumed, shared,
+        "the resumed box answers at the address it held before the stop"
+    );
+    // The host-side proxy follows the same marker: once the host start has
+    // cleared it, the resumed box's name routes again.
+    assert!(
+        server
+            .state
+            .sessions_manager()
+            .await
+            .hostnames()
+            .read()
+            .expect("registry lock")
+            .resolve("resumebox.min.internal")
+            .is_some(),
+        "the proxy routes to the resumed box again"
+    );
+}
+
+/// NET-128 fail-closed: a Stop whose session record cannot be read still
+/// marks the box's name stopped. The marker is keyed by the session id the
+/// actor holds without the record, so a shared-address name never keeps
+/// answering (or routing) for a box that is no longer there.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_with_unreadable_record_still_marks_name_stopped() {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let manager = server.state.sessions_manager().await;
+    manager.land_range_verdict(crate::net::dns::RangeVerdict::Present);
+    let shared = manager
+        .hostnames()
+        .read()
+        .expect("registry lock")
+        .node_address();
+    let id = finalize_handed_own_ip_session(
+        &mut client,
+        "unreadbox",
+        std::net::Ipv4Addr::new(100, 64, 128, 9),
+        shared,
+    )
+    .await;
+    let handle = manager
+        .get_session(crate::sessions::SessionKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the box resolves while it runs");
+
+    // Make the record unreadable: the store reads `record.json` from disk on
+    // every get, so garbage there turns the Stop arm's read into an `Err`.
+    let sessions_dir = server
+        .state
+        .minimal_state_dir()
+        .await
+        .as_utf8_path()
+        .as_std_path()
+        .join("sessions");
+    let mut corrupted = 0;
+    for entry in std::fs::read_dir(&sessions_dir).expect("the sessions dir exists") {
+        let record = entry.unwrap().path().join("record.json");
+        if record.is_file() {
+            std::fs::write(&record, b"not json").expect("overwrite the record");
+            corrupted += 1;
+        }
+    }
+    assert_eq!(corrupted, 1, "exactly the one box's record is corrupted");
+
+    // The Stop arm must neither panic nor leave the name answering.
+    handle.stop().await;
+
+    let registry = server.state.sessions_manager().await.hostnames();
+    assert_eq!(
+        registry
+            .read()
+            .expect("registry lock")
+            .zone_entry("unreadbox.min.internal", &[]),
+        crate::net::dns::ZoneEntry::Held {
+            owner: "unreadbox".to_string(),
+            address: None,
+        },
+        "an unreadable record still leaves the stopped box answering NODATA"
+    );
+    assert_eq!(
+        registry
+            .read()
+            .expect("registry lock")
+            .resolve("unreadbox.min.internal"),
+        None,
+        "the proxy must not forward a stopped box whose record is unreadable"
+    );
+}
+
 /// NET-010's durability half (design §7.1): the hand is the record's row,
 /// not the daemon's memory — a creator wrote the box's addresses into the
 /// session's record at create, and the registry's publish is derived from
@@ -5281,7 +5480,7 @@ pub(crate) async fn finalize_declared_dynamic_ingress_session(
 /// framing [`crate::net::policy`] writes, so the stand-in forwarder below
 /// never blocks reading past what the daemon sent. `None` when the client
 /// went away mid-request.
-async fn read_control_request(stream: &mut tokio::net::UnixStream) -> Option<String> {
+pub(crate) async fn read_control_request(stream: &mut tokio::net::UnixStream) -> Option<String> {
     use tokio::io::AsyncReadExt;
     let mut buf = Vec::with_capacity(256);
     let mut scratch = [0u8; 512];
@@ -5342,8 +5541,10 @@ pub(crate) async fn fake_forwarder(
 /// can have the switch accept one bind and refuse the next, the way the real
 /// forwarder answers a duplicate of a bind another forward already holds.
 /// Everything else is [`fake_forwarder`]'s contract: one request per
-/// connection, each recorded as `"<request line>\n<body>"`.
-async fn scripted_forwarder(
+/// connection, each recorded as `"<request line>\n<body>"`. `pub(crate)`:
+/// the fail-closed audit tests drive an unaudited publish's withdrawal
+/// through the same stand-in, one whose unexpose the switch refuses.
+pub(crate) async fn scripted_forwarder(
     sock: std::path::PathBuf,
     script: Vec<u16>,
 ) -> (
@@ -5766,13 +5967,9 @@ async fn expose_allow_publishes_and_lists() {
     );
 
     // The publish is listed where `min session policy` reads it, by name and
-    // by id alike — and it reads as what it is: pending, because the box's
-    // relay gate admits the ports the *declaration* named, and this port
-    // was published at runtime, outside it.
-    let listed = minimald_rpc::LiveMapping {
-        pending: Some(true),
-        ..mapping.clone()
-    };
+    // by id alike — and it reads as reachable: the publish admitted the port
+    // at the box's relay gate (NET-044).
+    let listed = mapping.clone();
     let by_name: minimald_rpc::Errorable<Vec<minimald_rpc::LiveMapping>> = client
         .call::<minimald_rpc::GetLiveIngress>(&minimald_rpc::GetLiveIngressRequest::Name(
             "listweb".to_string(),
@@ -5810,6 +6007,78 @@ async fn expose_allow_publishes_and_lists() {
             && line.contains("local=127.0.64.21:3000"),
         "the publish line names the box, the port, the decision and the \
          outcome: {line}"
+    );
+}
+
+/// NET-044: an expose decided `allow` admits its port at the box's relay
+/// gate in the same turn it publishes — reachable, never a bound forward the
+/// gate refuses — while a port nobody published stays refused, and the box's
+/// stop (the expose's revocation) withdraws the admission. The gate is
+/// registered under the box's switch address the way its relay's spawn
+/// registers it, so the publish finds it exactly as it does in production.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expose_allow_admits_the_port_at_the_box_gate_until_stop() {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let manager = server.state.sessions_manager().await;
+    manager.land_range_verdict(crate::net::dns::RangeVerdict::Present);
+    // An address no other test's box uses: the live-gate table is
+    // process-wide.
+    let switch = std::net::Ipv4Addr::new(100, 64, 128, 91);
+    let web = finalize_dynamic_ingress_session(
+        &mut client,
+        "gateweb",
+        switch,
+        std::net::Ipv4Addr::new(127, 0, 64, 91),
+        Some(sessions::DynamicIngress::Allow),
+        Some((3000, 3999)),
+    )
+    .await;
+    let handle = manager
+        .get_session(crate::sessions::SessionKeyPredicate::Id(web))
+        .await
+        .unwrap()
+        .expect("the allowing box resolves");
+    handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("the allowing box launches its host");
+    let gate = std::sync::Arc::new(crate::net::switch::SessionGate::for_session(
+        "gateweb".to_string(),
+        switch,
+        &sessions::SessionPolicy::default(),
+        crate::net::SwitchSubnet::default(),
+        None,
+    ));
+    crate::net::switch::register_live_gate_for_test(switch, &gate);
+    let sock = handle
+        .net_switch()
+        .await
+        .unwrap()
+        .lock()
+        .await
+        .control_socket();
+    let (forwarder, _served) = fake_forwarder(sock, 200).await;
+
+    assert!(!gate.admits_tcp(3000), "nothing is published yet");
+    handle
+        .expose_dynamic(3000)
+        .await
+        .expect("the allowed port publishes");
+    assert!(
+        gate.admits_tcp(3000),
+        "the published port is admitted at the box's relay gate"
+    );
+    assert!(
+        !gate.admits_tcp(3001),
+        "a port nobody published stays refused"
+    );
+
+    handle.stop().await;
+    forwarder.abort();
+    assert!(
+        !gate.admits_tcp(3000),
+        "the box's stop revokes the expose and withdraws its admission"
     );
 }
 
@@ -6305,12 +6574,12 @@ async fn expose_self_allocated_box_publishes_at_its_registered_address() {
             "selfweb".to_string(),
         ))
         .await;
-    // The row reads as what it is: pending, the gate not having admitted a
-    // runtime-published port yet.
+    // The row reads as reachable: the publish admitted the port at the
+    // box's relay gate (NET-044).
     assert_eq!(
         live,
         minimald_rpc::Errorable::Ok(vec![minimald_rpc::LiveMapping {
-            pending: Some(true),
+            pending: Some(false),
             ..mapping
         }]),
         "the live mapping is listed beside the declaration"
@@ -6778,9 +7047,9 @@ async fn expose_colliding_on_shared_address_is_a_bind_error() {
             local: "127.0.0.1:3000".to_string(),
             internal_port: 3000,
             proto: sessions::IpProto::Tcp,
-            // The box declared no port mappings, so its relay gate admits
-            // nothing: the runtime publish reads pending.
-            pending: Some(true),
+            // The publish admitted the port at the box's relay gate
+            // (NET-044), so the row is never pending.
+            pending: Some(false),
         }]),
         "the first box's publish is untouched by the collision"
     );
@@ -6908,9 +7177,9 @@ async fn expose_publishes_at_the_registered_address() {
             local: "127.0.0.1:3000".to_string(),
             internal_port: 3000,
             proto: sessions::IpProto::Tcp,
-            // The box declared no port mappings, so its relay gate admits
-            // nothing: the runtime publish reads pending.
-            pending: Some(true),
+            // The publish admitted the port at the box's relay gate
+            // (NET-044), so the row is never pending.
+            pending: Some(false),
         }]),
         "the live mapping names the registered address the publish bound at"
     );

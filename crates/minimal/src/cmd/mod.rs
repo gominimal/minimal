@@ -358,15 +358,28 @@ pub(crate) fn is_id_prefix(s: &str) -> bool {
 }
 
 /// Match `session` against the listed sessions: an exact name first, then a
-/// unique id prefix (compared without dashes, ignoring case). `None` when
-/// nothing matches or `session` is not prefix-shaped; an error naming the
-/// candidates when the prefix matches more than one session.
+/// name that matches ignoring ASCII case (the fold names are made unique
+/// under), then a unique id prefix (compared without dashes, ignoring case).
+/// A case-folded name that matches several sessions (written before names
+/// were made unique that way) resolves to none of them, not to an id prefix
+/// either. `None` when nothing matches or `session` is not prefix-shaped; an
+/// error naming the candidates when the prefix matches more than one session.
 pub(crate) fn match_id_prefix(
     entries: &[minimald_rpc::ListSessionsEntry],
     session: &str,
 ) -> Result<Option<sessions::SessionId>, anyhow::Error> {
     if let Some(entry) = entries.iter().find(|e| e.name.as_deref() == Some(session)) {
         return Ok(Some(entry.id));
+    }
+    let mut folded = entries.iter().filter(|e| {
+        e.name
+            .as_deref()
+            .is_some_and(|n| n.eq_ignore_ascii_case(session))
+    });
+    match (folded.next(), folded.next()) {
+        (Some(entry), None) => return Ok(Some(entry.id)),
+        (Some(_), Some(_)) => return Ok(None),
+        _ => {}
     }
     if !is_id_prefix(session) {
         return Ok(None);
