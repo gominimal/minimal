@@ -6,6 +6,7 @@ use clap::{ArgGroup, Args, Subcommand, ValueEnum};
 // layout did.
 pub(crate) use clap::Parser;
 use clap_complete::Shell;
+use std::os::fd::AsFd as _;
 use std::path::PathBuf;
 
 use crate::completion;
@@ -771,7 +772,20 @@ pub(crate) fn parse_network_mode(raw: &str) -> Result<CliNetworkMode, String> {
         }
     };
     if let Some(hint) = legacy_network_hint(raw) {
-        eprintln!("{hint}");
+        // Straight to stderr's fd, not `eprintln!`: test harnesses that
+        // capture per-thread output (plain `cargo test`'s libtest) divert a
+        // std `eprintln!` into their per-test sink before it reaches the
+        // file descriptor, so an fd-level capture (`capture_stderr` in
+        // tests.rs) reads an empty pipe — the same print passed or failed
+        // depending on which harness ran the test. A write to borrowed fd 2
+        // has no std layer to divert it, so the hint is a process fact in
+        // every harness, exactly as the fd-level test asserts.
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "a closed stderr has no reader left to tell, and a hint \
+                      that cannot print must not fail a parse that succeeded"
+        )]
+        let _ = nix::unistd::write(std::io::stderr().as_fd(), format!("{hint}\n").as_bytes());
     }
     Ok(mode)
 }

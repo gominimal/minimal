@@ -1892,13 +1892,18 @@ fn activate_help_shows_network_flags() {
 /// Runs `f` with the process's stderr redirected into a pipe and returns
 /// what it wrote alongside `f`'s result.
 ///
-/// The capture watches the real fd 2, so it observes what `eprintln!` prints
-/// while it prints — a dropped or rerouted diagnostic fails the caller's
-/// assertion instead of only going missing for users.
+/// The capture watches the real fd 2, so it observes what `f` writes at the
+/// fd level while it writes — a dropped or rerouted diagnostic fails the
+/// caller's assertion instead of only going missing for users. That is why
+/// the hint under test (`parse_network_mode`) writes fd 2 raw: a std
+/// `eprintln!` is diverted into libtest's per-thread capture before it ever
+/// reaches the file descriptor, so under plain `cargo test` this pipe would
+/// read as empty while nextest — the lane this crate's tests run in, which
+/// captures nothing — passes. Whatever `f` captures has to go to the fd.
 ///
 /// Serialized by a process-wide lock: plain `cargo test` shares fd 2 across
-/// test threads, so two captures must never overlap. Under nextest — the lane
-/// this crate's tests run in — every test owns its process to begin with.
+/// test threads, so two captures must never overlap. Under nextest every
+/// test owns its process to begin with.
 fn capture_stderr<T>(f: impl FnOnce() -> T) -> (String, T) {
     use std::io::Read as _;
 
