@@ -89,9 +89,19 @@ impl AttrValue {
             return Ok(Some(Self::Map(map)));
         }
         if let Some(a) = rt.as_array() {
+            // Element contracts are pending on the array; without applying
+            // them a bad element is accepted on every consumer path.
+            let pending = a.iter_pending_contracts().cloned().collect::<Vec<_>>();
             return Ok(Some(Self::List(
                 a.iter()
-                    .map(|e| Self::from_term_at(e, program, depth + 1))
+                    .map(|e| {
+                        let e = RuntimeContract::apply_all(
+                            e.clone(),
+                            pending.iter().cloned(),
+                            e.pos_idx(),
+                        );
+                        Self::from_term_at(&e, program, depth + 1)
+                    })
                     .collect::<Result<Vec<_>, Error>>()?
                     .into_iter()
                     .flatten()
@@ -322,6 +332,29 @@ mod tests {
 
         assert!(res.is_err());
         assert!(matches!(res, Err(Error::Nickel(_))));
+    }
+
+    #[test]
+    fn attr_array_element_contract_nickel_err() {
+        let (term, mut program, _origin, _target) = Loader::new(
+            "let {Attrs, ..} = import \"minimal.ncl\" in {env_dir_mappings = [42]} | Attrs",
+            None,
+            &LoadOptions::for_test(),
+        )
+        .unwrap_or_else(|e| {
+            e.report_to_stderr();
+            panic!("load failed");
+        })
+        .finish()
+        .unwrap_or_else(|e| {
+            e.report_to_stderr();
+            panic!("finish failed");
+        });
+
+        assert!(matches!(
+            AttrValue::from_term(&term, &mut program),
+            Err(Error::Nickel(_))
+        ));
     }
 
     #[test]
