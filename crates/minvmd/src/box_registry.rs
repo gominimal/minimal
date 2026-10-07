@@ -43,7 +43,7 @@
 //! guest says still passes that check; a row's other facts stay host-sourced
 //! alone.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock};
@@ -823,6 +823,11 @@ pub enum AllocationError {
         /// The held address: a switch address or a published loopback one.
         addr: Ipv4Addr,
     },
+    /// A withdrawal under the box's name landed while the answerer was
+    /// allocating its published address: the withdrawal is ordered after
+    /// the registration was read, so the registration writes no row.
+    #[error("the box was withdrawn while its address was being allocated")]
+    WithdrawnWhileAllocating,
 }
 
 /// Why a client-driven withdrawal was refused. The pair a withdrawal
@@ -1842,6 +1847,14 @@ pub struct BoxRegistry {
     asks: Arc<Mutex<AskBook>>,
     /// The ask verbs' connection gauges (NET-045), shared by every clone.
     ask_gauges: Arc<AskGauges>,
+    /// Each box name's withdrawal generation, bumped by every path that
+    /// withdraws a row under that name, under the row lock it withdraws
+    /// under. A registration reads its name's generation before the
+    /// answerer allocates its address and is refused when it moved
+    /// ([`Self::register_client_box_since`]): a withdrawal that landed while
+    /// the address was being allocated outranks the registration it raced.
+    /// Shared by every clone.
+    withdrawal_generations: Arc<Mutex<HashMap<String, u64>>>,
 }
 
 /// A clone shares the live rows, the allocation cursors, and the withdrawal
@@ -1867,6 +1880,7 @@ impl Clone for BoxRegistry {
             attachments: self.attachments.clone(),
             asks: Arc::clone(&self.asks),
             ask_gauges: Arc::clone(&self.ask_gauges),
+            withdrawal_generations: Arc::clone(&self.withdrawal_generations),
         }
     }
 }
@@ -1898,7 +1912,31 @@ impl BoxRegistry {
             attachments: None,
             asks: Arc::new(Mutex::new(AskBook::default())),
             ask_gauges: Arc::new(AskGauges::default()),
+            withdrawal_generations: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Box `name`'s withdrawal generation: how many withdrawals under that
+    /// name this registry has applied. A registration reads it before its
+    /// address is allocated ([`Self::register_client_box_since`]).
+    #[must_use]
+    pub fn withdrawal_generation(&self, name: &str) -> u64 {
+        self.generations().get(name).copied().unwrap_or(0)
+    }
+
+    /// Bump box `name`'s withdrawal generation. Every withdrawal path calls
+    /// it under the row lock it withdraws under, so a registration's check
+    /// under the same lock sees every withdrawal ordered before it.
+    fn bump_withdrawal_generation(&self, name: &str) {
+        let mut generations = self.generations();
+        let generation = generations.entry(name.to_string()).or_insert(0);
+        *generation = generation.wrapping_add(1);
+    }
+
+    fn generations(&self) -> MutexGuard<'_, HashMap<String, u64>> {
+        self.withdrawal_generations
+            .lock()
+            .expect("the withdrawal generations' lock is held only across a map read or bump")
     }
 
     /// Hands this registry the proxy's attachment table to feed
@@ -1963,6 +2001,19 @@ impl BoxRegistry {
     pub fn try_register(
         &self,
         registration: BoxRegistration,
+    ) -> Result<Arc<BoxRecord>, AllocationError> {
+        self.try_register_since(registration, None)
+    }
+
+    /// [`Self::try_register`], refused with
+    /// [`AllocationError::WithdrawnWhileAllocating`] when `generation` is
+    /// given and the box name's withdrawal generation is no longer it. The
+    /// check runs under the row lock every withdrawal bumps the generation
+    /// under, before anything is published.
+    fn try_register_since(
+        &self,
+        registration: BoxRegistration,
+        generation: Option<u64>,
     ) -> Result<Arc<BoxRecord>, AllocationError> {
         // The name-based admission lives beside the frame rules, not in
         // them: whether a row's undeclared destinations are the DNS
@@ -2074,6 +2125,10 @@ impl BoxRegistry {
             );
             return Err(AllocationError::RevocationPending { addr });
         }
+        if generation.is_some_and(|read| read != self.withdrawal_generation(record.name())) {
+            drop(rows);
+            return Err(AllocationError::WithdrawnWhileAllocating);
+        }
         if let Some(attachments) = &self.attachments
             && record.switch_addr != self.subnet.daemon_ip()
         {
@@ -2137,6 +2192,9 @@ impl BoxRegistry {
             .write()
             .expect("the row lock is never held across a panic, so it cannot be poisoned");
         let removed = rows.remove(&switch_addr.octets());
+        if let Some(record) = &removed {
+            self.bump_withdrawal_generation(record.name());
+        }
         // The hold is taken under the same lock the row leaves under, so no
         // registration can land at the address in between.
         let withdrawal = removed
@@ -2217,7 +2275,27 @@ impl BoxRegistry {
         spec: ClientBoxSpec,
         loopback_addr: Ipv4Addr,
     ) -> Result<Arc<BoxRecord>, AllocationError> {
-        self.register_client_box_as(spec, loopback_addr, crate::bep_attach::mint_box_id())
+        self.register_client_box_as(spec, loopback_addr, crate::bep_attach::mint_box_id(), None)
+    }
+
+    /// [`Self::register_client_box_at`] for a registration that read its
+    /// name's [`Self::withdrawal_generation`] as `generation` before the
+    /// answerer allocated `loopback_addr`. When a withdrawal under the name
+    /// landed since, the registration is refused with
+    /// [`AllocationError::WithdrawnWhileAllocating`]: no row, no attachment,
+    /// and the caller hands the address back to the answerer.
+    pub fn register_client_box_since(
+        &self,
+        spec: ClientBoxSpec,
+        loopback_addr: Ipv4Addr,
+        generation: u64,
+    ) -> Result<Arc<BoxRecord>, AllocationError> {
+        self.register_client_box_as(
+            spec,
+            loopback_addr,
+            crate::bep_attach::mint_box_id(),
+            Some(generation),
+        )
     }
 
     /// [`Self::register_client_box_at`] with the freshly minted `id` it
@@ -2228,6 +2306,7 @@ impl BoxRegistry {
         spec: ClientBoxSpec,
         loopback_addr: Ipv4Addr,
         id: BoxId,
+        generation: Option<u64>,
     ) -> Result<Arc<BoxRecord>, AllocationError> {
         // One id names one box (BEP-070): the check runs before any
         // address is spent, so a refused registration leaves nothing
@@ -2260,6 +2339,13 @@ impl BoxRegistry {
             );
             return Err(AllocationError::RevocationPending { addr });
         }
+        // A withdrawal that landed while the address was being allocated
+        // refuses the registration before a switch address is spent; the
+        // check under the row lock in `try_register_since` is the one that
+        // decides.
+        if generation.is_some_and(|read| read != self.withdrawal_generation(&spec.name)) {
+            return Err(AllocationError::WithdrawnWhileAllocating);
+        }
         let (hand_out_first, hand_out_last) = hand_out_run(self.subnet);
         let switch_addr = take_next(&self.next_switch_addr, hand_out_first, hand_out_last)
             .ok_or(AllocationError::SwitchExhausted)?;
@@ -2279,7 +2365,7 @@ impl BoxRegistry {
             registration = registration.with_dynamic_ingress(stance, spec.dynamic_allowed_range);
         }
         registration.box_id = Some(id);
-        self.try_register(registration)
+        self.try_register_since(registration, generation)
     }
 
     /// [`Self::register_client_box_at`] with the published loopback address
@@ -2365,6 +2451,10 @@ impl BoxRegistry {
             .write()
             .expect("the row lock is never held across a panic, so it cannot be poisoned");
         let Some(record) = rows.get(&switch_addr.octets()) else {
+            // Nothing to remove, but the withdrawal still counts: a
+            // registration under the name whose address is still being
+            // allocated must not land after it.
+            self.bump_withdrawal_generation(name);
             return Ok(None);
         };
         if record.name() != name {
@@ -2390,6 +2480,7 @@ impl BoxRegistry {
         // together — so the order never inverts.
         self.retire_proxy_attachment(switch_addr, Instant::now());
         let removed = rows.remove(&switch_addr.octets());
+        self.bump_withdrawal_generation(name);
         let withdrawal = removed
             .as_deref()
             .and_then(|record| self.begin_revocation(record));
@@ -3536,6 +3627,7 @@ mod tests {
                 },
                 Ipv4Addr::from(u32::from(web.loopback_addr()) + 1),
                 web.box_id(),
+                None,
             )
             .expect_err("an id a live box holds is not a second box's");
         assert_eq!(

@@ -2659,6 +2659,23 @@ impl AnswererStatus {
     #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub fn allocating_for_tests(node: &str) -> Self {
+        Self::allocating_for_tests_with(node, || {}, |_, _| {})
+    }
+
+    /// [`Self::allocating_for_tests`] that runs `before_allocate` on the
+    /// book's thread ahead of answering each allocation, and `on_release`
+    /// with the box's name and the address it freed, if it held one, after
+    /// each release: a test holds an allocation
+    /// in flight by blocking in the first, and sees the releases through the
+    /// second. Releases queue behind a held allocation, as they do behind a
+    /// slow answerer.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn allocating_for_tests_with(
+        node: &str,
+        mut before_allocate: impl FnMut() + Send + 'static,
+        mut on_release: impl FnMut(&str, Option<Ipv4Addr>) + Send + 'static,
+    ) -> Self {
         let status = Self::starting();
         let commands = status.attach_commands();
         let node = node.to_string();
@@ -2667,10 +2684,12 @@ impl AnswererStatus {
             while let Ok(command) = commands.recv() {
                 match command {
                     HandoverCommand::Allocate { name, reply } => {
+                        before_allocate();
                         let _ = reply.send(book.allocate(&node, &box_zone_name(&name)));
                     }
                     HandoverCommand::ReleaseAddress { name } => {
-                        book.release(&node, &box_zone_name(&name));
+                        let released = book.release(&node, &box_zone_name(&name));
+                        on_release(&name, released);
                     }
                     other => refuse_command(other, NO_ANSWERER),
                 }

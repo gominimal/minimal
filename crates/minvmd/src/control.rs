@@ -891,10 +891,13 @@ fn serve_request(
             // The published address is asked of the answerer before the
             // ticket: the allocation can wait out a handover, and no turn
             // is held across it.
+            // The name's withdrawal generation is read before the
+            // allocation: a withdrawal that lands while the address is
+            // being allocated refuses the registration in its turn.
+            let generation = boxes.withdrawal_generation(&request.name);
             let reply = match allocate_box_address(answerer, &request.name) {
-                Ok(loopback_addr) => {
-                    order.apply(|| register_box(boxes, answerer, request, loopback_addr))
-                }
+                Ok(loopback_addr) => order
+                    .apply(|| register_box(boxes, answerer, request, loopback_addr, generation)),
                 Err(reply) => reply,
             };
             write_reply(stream, &reply)
@@ -1170,6 +1173,7 @@ fn register_box(
     answerer: &AnswererStatus,
     request: RegisterBoxRequest,
     loopback_addr: std::net::Ipv4Addr,
+    generation: u64,
 ) -> BoxControlReply {
     // The declaration as the row received it; `null` for a box with no
     // egress section. A plain struct of strings serialises infallibly.
@@ -1188,7 +1192,7 @@ fn register_box(
         dynamic_ingress: request.dynamic_ingress,
         dynamic_allowed_range: request.dynamic_allowed_range,
     };
-    match boxes.register_client_box_at(spec, loopback_addr) {
+    match boxes.register_client_box_since(spec, loopback_addr, generation) {
         Ok(record) => {
             tracing::info!(
                 box = %record.name(),
@@ -1611,9 +1615,18 @@ fn watch_peer_close(
 /// preempted could still lose the lock to a later request. Instead each
 /// request takes a monotonic [`Ticket`] in a short critical section right
 /// after its read and validation, and waits on the condvar until every
-/// earlier ticket has had its turn. Only mutating verbs take one; nothing
-/// slow — no read, no answerer allocation, no ask hand-off, no drain —
-/// runs between taking a ticket and the end of its turn.
+/// earlier ticket has had its turn. Only mutating verbs take one, and
+/// nothing unbounded runs in a turn: no read, no answerer allocation, no
+/// ask hand-off, no drain. The one bounded wait is the address-reuse
+/// revocation wait, up to [`crate::box_registry::REVOCATION_WAIT`] (5 s),
+/// which must run after every earlier withdrawal, so it stays inside the
+/// registration's turn.
+///
+/// A registration's answerer allocation runs before its ticket, so a
+/// withdrawal can land while the address is being allocated. The
+/// registration reads its name's withdrawal generation before it asks for
+/// the address, and the registry refuses it in its turn when the
+/// generation moved ([`BoxRegistry::register_client_box_since`]).
 #[derive(Debug, Default)]
 pub(crate) struct ApplyOrder {
     state: Mutex<ApplyState>,
@@ -4844,5 +4857,130 @@ mod tests {
                 .expect("a fresh ticket gets its turn"),
             7
         );
+    }
+
+    /// A registration whose address is still being allocated when a
+    /// withdrawal for its name applies is refused in its turn: it writes no
+    /// row, and the address the answerer drew for it goes back, so the box
+    /// created again takes it.
+    #[test]
+    fn registration_withdrawn_while_allocating_is_refused() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let sock_path = dir.path().join(CONTROL_SOCK_FILE);
+        let boxes = BoxRegistry::new(SUBNET);
+
+        // The first allocation blocks on the answerer's thread until the
+        // test lets it go; every release is recorded with what it freed.
+        let (entered, allocation_entered) = std::sync::mpsc::channel::<()>();
+        let (release_allocation, allocation_held) = std::sync::mpsc::channel::<()>();
+        let gate = Mutex::new(Some((entered, allocation_held)));
+        let releases = Arc::new(Mutex::new(Vec::<(String, Option<Ipv4Addr>)>::new()));
+        let answerer = {
+            let releases = Arc::clone(&releases);
+            AnswererStatus::allocating_for_tests_with(
+                "control-test-node",
+                move || {
+                    let held = gate.lock().expect("gate").take();
+                    if let Some((entered, held)) = held {
+                        let _ = entered.send(());
+                        let _ = held.recv();
+                    }
+                },
+                move |name, freed| {
+                    releases
+                        .lock()
+                        .expect("releases")
+                        .push((name.to_string(), freed));
+                },
+            )
+        };
+        spawn(
+            sock_path.clone(),
+            boxes.clone(),
+            answerer,
+            ProxyPublishStatus::new(),
+        )
+        .expect("server binds");
+        for _ in 0..500 {
+            if TestStream::connect(&sock_path).is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let web = RegisterBoxRequest {
+            name: "web".to_string(),
+            ingress_ports: Vec::new(),
+            egress: None,
+            credentialed_upstream: None,
+            dynamic_ingress: None,
+            dynamic_allowed_range: None,
+        };
+
+        // The registration reads its generation and blocks in the
+        // allocation, outside any turn.
+        let registering = {
+            let sock_path = sock_path.clone();
+            let web = web.clone();
+            std::thread::spawn(move || register(&sock_path, &web))
+        };
+        allocation_entered
+            .recv_timeout(ASK_WAIT)
+            .expect("the registration reaches the allocation");
+
+        // The box's destroy withdraws it while the address is allocated:
+        // no row yet, so the withdrawal is the goal state already holding.
+        let withdrawn = control(
+            &sock_path,
+            &BoxControlRequest::Withdraw(WithdrawBoxRequest {
+                name: "web".to_string(),
+                switch_address: Ipv4Addr::new(100, 64, 0, 200),
+                loopback_address: Ipv4Addr::new(127, 64, 0, 2),
+            }),
+        )
+        .expect("the withdrawal is answered without waiting on the allocation");
+        assert!(
+            matches!(withdrawn, BoxControlReply::Addresses(_)),
+            "the withdrawal is answered, got {withdrawn:?}"
+        );
+
+        release_allocation.send(()).expect("the allocation waits");
+        let refused = registering
+            .join()
+            .expect("the registering client ends")
+            .expect("the registration is answered");
+        assert!(
+            matches!(
+                &refused,
+                BoxControlReply::Error { error }
+                    if error == "the box was withdrawn while its address was being allocated"
+            ),
+            "the registration the withdrawal raced is refused, got {refused:?}"
+        );
+        assert!(
+            boxes.row_by_name("web").is_none(),
+            "a refused registration writes no row"
+        );
+
+        // The withdrawal's release and the refusal's both reach the
+        // answerer; the address the registration drew is free again.
+        let until = std::time::Instant::now() + ASK_WAIT;
+        let freed = loop {
+            let seen = releases.lock().expect("releases").clone();
+            let web_releases: Vec<_> = seen.iter().filter(|(name, _)| name == "web").collect();
+            if web_releases.len() >= 2 {
+                break web_releases.iter().find_map(|(_, freed)| *freed);
+            }
+            assert!(
+                std::time::Instant::now() < until,
+                "the refusal never released the address: {seen:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let freed = freed.expect("the address the registration drew was released");
+
+        // The box created again takes the freed address and fills its row.
+        let again = handed(register(&sock_path, &web).expect("the registration is answered"));
+        assert_eq!(again.loopback_address, freed);
+        assert!(boxes.row_by_name("web").is_some());
     }
 }
