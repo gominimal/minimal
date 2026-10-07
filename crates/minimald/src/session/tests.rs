@@ -3459,6 +3459,14 @@ async fn stopped_shared_address_box_resumes_at_its_address_through_actor() {
         },
         "a stopped shared-address box answers NODATA, not NXDOMAIN"
     );
+    assert_eq!(
+        registry
+            .read()
+            .expect("registry lock")
+            .resolve("resumebox.min.internal"),
+        None,
+        "the proxy must not forward a stopped shared-address box to the node"
+    );
 
     // Resume: evict the dead actor and re-resolve, so a fresh actor comes up
     // from the record and re-registers the name — the registration is not
@@ -3502,6 +3510,93 @@ async fn stopped_shared_address_box_resumes_at_its_address_through_actor() {
     assert_eq!(
         resumed, shared,
         "the resumed box answers at the address it held before the stop"
+    );
+    // The host-side proxy follows the same marker: once the host start has
+    // cleared it, the resumed box's name routes again.
+    assert!(
+        server
+            .state
+            .sessions_manager()
+            .await
+            .hostnames()
+            .read()
+            .expect("registry lock")
+            .resolve("resumebox.min.internal")
+            .is_some(),
+        "the proxy routes to the resumed box again"
+    );
+}
+
+/// NET-128 fail-closed: a Stop whose session record cannot be read still
+/// marks the box's name stopped. The marker is keyed by the session id the
+/// actor holds without the record, so a shared-address name never keeps
+/// answering (or routing) for a box that is no longer there.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_with_unreadable_record_still_marks_name_stopped() {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let manager = server.state.sessions_manager().await;
+    manager.land_range_verdict(crate::net::dns::RangeVerdict::Present);
+    let shared = manager
+        .hostnames()
+        .read()
+        .expect("registry lock")
+        .node_address();
+    let id = finalize_handed_own_ip_session(
+        &mut client,
+        "unreadbox",
+        std::net::Ipv4Addr::new(100, 64, 128, 9),
+        shared,
+    )
+    .await;
+    let handle = manager
+        .get_session(crate::sessions::SessionKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the box resolves while it runs");
+
+    // Make the record unreadable: the store reads `record.json` from disk on
+    // every get, so garbage there turns the Stop arm's read into an `Err`.
+    let sessions_dir = server
+        .state
+        .minimal_state_dir()
+        .await
+        .as_utf8_path()
+        .as_std_path()
+        .join("sessions");
+    let mut corrupted = 0;
+    for entry in std::fs::read_dir(&sessions_dir).expect("the sessions dir exists") {
+        let record = entry.unwrap().path().join("record.json");
+        if record.is_file() {
+            std::fs::write(&record, b"not json").expect("overwrite the record");
+            corrupted += 1;
+        }
+    }
+    assert_eq!(corrupted, 1, "exactly the one box's record is corrupted");
+
+    // The Stop arm must neither panic nor leave the name answering.
+    handle.stop().await;
+
+    let registry = server.state.sessions_manager().await.hostnames();
+    assert_eq!(
+        registry
+            .read()
+            .expect("registry lock")
+            .zone_entry("unreadbox.min.internal", &[]),
+        crate::net::dns::ZoneEntry::Held {
+            owner: "unreadbox".to_string(),
+            address: None,
+        },
+        "an unreadable record still leaves the stopped box answering NODATA"
+    );
+    assert_eq!(
+        registry
+            .read()
+            .expect("registry lock")
+            .resolve("unreadbox.min.internal"),
+        None,
+        "the proxy must not forward a stopped box whose record is unreadable"
     );
 }
 
