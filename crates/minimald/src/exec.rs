@@ -2529,6 +2529,57 @@ mod tests {
         tokio::sync::watch::channel(false).1
     }
 
+    /// `start_kill` asks the shim to exit with SIGTERM, not SIGKILL: SIGTERM
+    /// is what runs the shim's handler, which kills the injected process's
+    /// whole group. A SIGKILL here would leave the grandchildren running.
+    #[tokio::test]
+    async fn start_kill_sends_sigterm() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        use super::{Process as _, TokioProcess};
+
+        let child = tokio::process::Command::new("sleep")
+            .arg("600")
+            .spawn()
+            .expect("spawning sleep");
+        let mut process = TokioProcess::new(child);
+        process.start_kill().expect("signalling the child");
+        let status = tokio::time::timeout(std::time::Duration::from_secs(10), process.0.wait())
+            .await
+            .expect("the child exits on SIGTERM")
+            .expect("reaping the child");
+        assert_eq!(status.signal(), Some(libc::SIGTERM), "{status:?}");
+    }
+
+    /// A child that ignores SIGTERM is not waited on forever: after the grace
+    /// period, `wait` escalates to SIGKILL.
+    #[tokio::test]
+    async fn wait_escalates_to_sigkill_when_sigterm_is_ignored() {
+        use super::{Process as _, TokioProcess};
+
+        // The ignored disposition survives the `exec`, so `sleep` itself
+        // ignores SIGTERM. The marker line says the trap is installed.
+        let child = tokio::process::Command::new("/bin/sh")
+            .args(["-c", "trap '' TERM; echo ready; exec sleep 600"])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawning sh");
+        let mut process = TokioProcess::new(child);
+        let mut stdout = process.0.stdout.take().expect("piped stdout");
+        let mut ready = [0u8; 6];
+        stdout
+            .read_exact(&mut ready)
+            .await
+            .expect("reading the ready marker");
+
+        process.start_kill().expect("signalling the child");
+        let code = tokio::time::timeout(std::time::Duration::from_secs(10), process.wait())
+            .await
+            .expect("the escalation to SIGKILL ends the wait")
+            .expect("reaping the child");
+        assert_eq!(code, None, "a signalled child has no exit code");
+    }
+
     /// `inherit_cwd` on the daemon side: a task that declares it starts at
     /// `/workbench/<cwd>` when that directory is in the uploaded tree, and
     /// falls back to `/workbench` with a stderr notice when it is not. A task

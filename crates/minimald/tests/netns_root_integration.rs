@@ -19,6 +19,9 @@
 //!   execs with the box's credentials: the box uid and gid, `no_new_privs`,
 //!   and the same empty capability sets the box's own processes exec with,
 //!   so joining a running box cannot open a raw socket either.
+//! * `sigterm_to_the_shim_kills_the_injected_group` — a SIGTERM to the
+//!   injection shim kills the injected process's whole process group, the
+//!   grandchild it forked included.
 //!
 //! The sandbox-layer half of NET-083 is another crate's test binary,
 //! `crates/sandbox2/tests/caps_root_integration.rs`
@@ -195,7 +198,8 @@ fn sudo(args: &[&str]) -> Output {
 /// `SHELL` on stdout, then sleeps forever so the sandbox stays alive for
 /// attach tests; with argument `caps` it reports its identity and capability
 /// sets and the errno of a raw socket, an ordinary stream socket, and a vsock
-/// socket; with argument `attach` it checks that `AF_UNIX` is still
+/// socket; with argument `group` it forks a child that sleeps forever, prints
+/// `forked` and waits; with argument `attach` it checks that `AF_UNIX` is still
 /// usable inside an injected process and reports the same two lines.
 const SOCKET_PROBE_C: &str = r#"
 #include <sys/socket.h>
@@ -255,6 +259,18 @@ int main(int argc, char **argv) {
         if (fd >= 0) close(fd);
         fflush(stdout);
         return 0;
+    }
+
+    /* A process with a descendant in its own process group: fork a child
+     * that sleeps forever, say so, then wait forever. The group kill must
+     * take the child as well as this process. */
+    if (argc > 1 && strcmp(argv[1], "group") == 0) {
+        pid_t pid = fork();
+        if (pid < 0) { perror("fork"); return 40; }
+        if (pid == 0) { while (1) sleep(60); }
+        printf("forked\n");
+        fflush(stdout);
+        while (1) pause();
     }
 
     if (argc > 1 && strcmp(argv[1], "attach") == 0) {
@@ -1189,6 +1205,145 @@ async fn injected_process_lacks_cap_net_raw() {
         stream, 0,
         "the injected process must still be able to open an ordinary socket: \
          the box's posture denies capabilities, not networking"
+    );
+}
+
+/// Whether `pid` is gone or a zombie, per `/proc/<pid>/stat`. The grandchild
+/// is reparented to the box's PID 1, which need not reap it, so a zombie
+/// counts as dead.
+fn dead_or_zombie(pid: u32) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return true;
+    };
+    stat.rsplit_once(')')
+        .and_then(|(_, rest)| rest.split_whitespace().next())
+        .is_some_and(|state| state == "Z")
+}
+
+/// The daemon cancels an exec whose client is gone with a SIGTERM to the
+/// injection shim (`TokioProcess::start_kill`). The shim's handler kills the
+/// injected process's whole process group, which `setpgid(0, 0)` in the shim's
+/// pre-exec made, so a grandchild the injected process forked dies with it
+/// rather than run on under the box's PID 1. The shim's exit code, 128 +
+/// SIGTERM, proves the handler ran: the default disposition would have killed
+/// the shim by the signal, with no code.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sigterm_to_the_shim_kills_the_injected_group() {
+    if let Some(reason) = sandbox2::user_namespaces_restriction() {
+        eprintln!(
+            "skipping sigterm_to_the_shim_kills_the_injected_group: this host \
+             denies the unprivileged user namespace every sandbox starts by \
+             unsharing: {reason}"
+        );
+        return;
+    }
+    announce_to_the_runner("sigterm_to_the_shim_kills_the_injected_group");
+    use minimald::nsenter::{Injection, session_leader_pid};
+    use std::io::BufRead as _;
+
+    let proofs = proof_base_dir();
+    let no_base_dir = format!("base temp dir under {}", proofs.display());
+    let base = tempfile::tempdir_in(&proofs).expect(&no_base_dir);
+    let probe = compile_socket_probe(base.path());
+    let source = base.path().join("rootfs-src");
+    probe_rootfs(&source, &probe);
+
+    let config = Config::new("group-kill")
+        .with_rootfs(std::iter::once(SandboxMapped::Dir(source)))
+        .with_dns(false)
+        .with_plan(NetPlan::host());
+    let no_sandbox_dir = format!("sandbox temp dir under {}", proofs.display());
+    let sandbox_base = tempfile::tempdir_in(&proofs).expect(&no_sandbox_dir);
+    let mut sandbox = config
+        .build(sandbox_base.path().join("sandbox"), ())
+        .await
+        .expect("building the open-box sandbox");
+    let plan = sandbox.built_in_plan();
+    let container = sandbox
+        .new_container(&plan)
+        .expect("building the open-box container");
+
+    let mut hold = sandbox
+        .command(
+            &container,
+            "/usr/bin/probe",
+            ["hold"],
+            std::iter::empty::<(&str, &str)>(),
+        )
+        .expect("building hold command");
+    hold.stdout(hakoniwa::Stdio::MakePipe);
+    let mut child = hold.spawn().expect("spawning hold process in open box");
+    let hold_stdout = child.stdout.take().expect("hold process stdout pipe");
+    let mut guard = LiveBox::new(child);
+    let hold_report = tokio::task::spawn_blocking(move || {
+        let mut line = String::new();
+        let _read = std::io::BufReader::new(hold_stdout).read_line(&mut line);
+        line
+    })
+    .await
+    .expect("spawn_blocking join");
+    if !hold_report.starts_with("cwd=") {
+        let end = guard.stop();
+        panic!("the hold process did not report: {hold_report:?}\nstatus: {end:?}");
+    }
+    let leader =
+        session_leader_pid(guard.child_id()).expect("resolving the open box's program pid");
+    guard.holds(leader);
+
+    let injection = Injection::new(leader, "/usr/bin/probe", ["group"])
+        .with_shim(shim())
+        .with_cwd(sandbox.command_cwd().expect("resolving sandbox cwd"))
+        .with_env(sandbox.command_env());
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(30),
+        tokio::task::spawn_blocking(move || {
+            let mut shim = injection
+                .command()
+                .expect("building injection command")
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawning the injection shim");
+            let mut line = String::new();
+            std::io::BufReader::new(shim.stdout.take().expect("piped stdout"))
+                .read_line(&mut line)
+                .expect("reading the probe's fork report");
+            assert_eq!(line.trim(), "forked", "the probe did not fork");
+
+            // Host pids: the shim's sole child is the injected probe, whose
+            // sole child is the grandchild it forked.
+            let injected = session_leader_pid(shim.id()).expect("resolving the injected pid");
+            let grandchild = session_leader_pid(injected).expect("resolving the grandchild pid");
+
+            let shim_pid = i32::try_from(shim.id()).expect("the shim pid fits an i32");
+            // SAFETY: `kill` is a plain syscall on a pid this proof spawned.
+            assert_eq!(unsafe { libc::kill(shim_pid, libc::SIGTERM) }, 0);
+            let status = shim.wait().expect("reaping the shim");
+
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while !dead_or_zombie(grandchild) && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            (status, injected, grandchild)
+        }),
+    )
+    .await
+    .expect("the group-kill proof timed out")
+    .expect("spawn_blocking join");
+    let (status, injected, grandchild) = outcome;
+    let grandchild_dead = dead_or_zombie(grandchild);
+    let injected_dead = dead_or_zombie(injected);
+
+    let _stopped = guard.stop();
+
+    assert_eq!(
+        status.code(),
+        Some(128 + libc::SIGTERM),
+        "the shim must exit through its SIGTERM handler: {status:?}"
+    );
+    assert!(injected_dead, "the injected process {injected} survived");
+    assert!(
+        grandchild_dead,
+        "the grandchild {grandchild} survived the group kill"
     );
 }
 

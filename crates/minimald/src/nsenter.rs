@@ -26,7 +26,7 @@ static SHIM_EXE: OnceLock<PathBuf> = OnceLock::new();
 /// process this shim injected into the session, published after spawn so the
 /// SIGTERM/SIGHUP handlers can reap the whole group — the injected program and
 /// every descendant it forked — rather than leaving grandchildren reparented to
-/// PID 1. `0` before the spawn and after the child has been reaped.
+/// PID 1. `0` before the spawn and once the child has exited, before its reap.
 static CHILD_PGID: AtomicI32 = AtomicI32::new(0);
 
 /// Registers `path` as the [`SUBCOMMAND`] shim, overriding `current_exe()` for
@@ -817,18 +817,42 @@ pub fn shim_main(args: ShimArgs) -> Result<i32, NsenterError> {
     // for that one window. The store is the async-signal-safe way to hand the
     // pid to the handlers; nothing else off the child-process path is.
     CHILD_PGID.store(child.id() as i32, Ordering::Release);
+    // SAFETY: shim_main runs before any runtime is built (see its doc), so this
+    // process is single-threaded and no handler can interrupt half-initialised
+    // state.
     unsafe {
         install_kill_group_handlers();
     }
+
+    // Wait for the child to exit without reaping it: until it is reaped its pid
+    // stays allocated, so the handlers cannot target a recycled group. Only
+    // then are the handlers disarmed and the child reaped. The handler always
+    // `_exit`s, so this wait is never resumed after an interruption.
+    // SAFETY: `waitid` writes only into `info`, a zeroed `siginfo_t` we own.
+    let observed = unsafe {
+        let mut info: libc::siginfo_t = std::mem::zeroed();
+        libc::waitid(
+            libc::P_PID,
+            child.id(),
+            &raw mut info,
+            libc::WEXITED | libc::WNOWAIT,
+        )
+    };
+    if observed == -1 {
+        return Err(NsenterError::Wait {
+            program,
+            source: std::io::Error::last_os_error(),
+        });
+    }
+    // The group it led died with it (or the daemon already killed it); from
+    // here the handlers must be no-ops so a straggler SIGTERM/SIGHUP does not
+    // target a pid that the reap below frees for reuse.
+    CHILD_PGID.store(0, Ordering::Release);
 
     let status = child.wait().map_err(|source| NsenterError::Wait {
         program: program.clone(),
         source,
     })?;
-    // The group it led died with it (or the daemon already killed it); from
-    // here the handlers must be no-ops so a straggler SIGTERM/SIGHUP does not
-    // target a recycled pid.
-    CHILD_PGID.store(0, Ordering::Release);
 
     // Mirror the shell's convention for a signalled child so the daemon sees
     // the same code it would from a direct spawn.
@@ -873,7 +897,7 @@ unsafe fn kill_group(pgid: i32) {
 extern "C" fn on_term_or_hup(signum: libc::c_int) {
     let pgid = CHILD_PGID.load(Ordering::Acquire);
     // SAFETY: `pgid` is the group lead this shim spawned and owns; `0` if the
-    // child has already been reaped, which `kill_group` treats as a no-op.
+    // child has already exited, which `kill_group` treats as a no-op.
     unsafe { kill_group(pgid) };
     // `_exit`, not `std::process::exit`: the handler runs on whatever thread
     // took the signal, where atexit hooks and stdio flushing are not legal.
@@ -893,8 +917,9 @@ unsafe fn install_kill_group_handlers() {
         // SAFETY: an all-zero `sigaction` is a valid disposition (empty mask,
         // SIG_DFL); `sigemptyset` writes only the mask; `sigaction` installs a
         // handler whose body is limited to the async-signal-safe calls above.
-        // No flags: SA_RESTART is irrelevant, the shim's only wait is the `spawn`
-        // it already passed, and there is no handler chaining to preserve.
+        // No flags: the handler always `_exit`s, so it never returns into the
+        // interrupted wait and SA_RESTART is moot; there is no handler chaining
+        // to preserve.
         let installed = unsafe {
             let mut action: libc::sigaction = std::mem::zeroed();
             action.sa_sigaction = on_term_or_hup as extern "C" fn(libc::c_int) as usize;
