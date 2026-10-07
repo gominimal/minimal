@@ -240,6 +240,16 @@ impl EnvChannel<'_> {
                 .remote_storage()
                 .await
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
+            let remote_cache = if build_ctx.use_remote_cache() {
+                Some(
+                    build_ctx
+                        .remote_cache(false, false)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("{}", e))?,
+                )
+            } else {
+                None
+            };
 
             let output_base = build_ctx.builds_base_dir();
             std::fs::create_dir_all(&output_base).ok();
@@ -251,7 +261,7 @@ impl EnvChannel<'_> {
                 remote_fetcher: &remote_storage,
                 stdout_writer: Some(Box::new(stdout_writer)),
                 stderr_writer: Some(Box::new(stderr_writer)),
-                remote_cache: None,
+                remote_cache: remote_cache.as_ref(),
             }
             .run(&op::Options {
                 cache,
