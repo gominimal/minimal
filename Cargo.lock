@@ -765,7 +765,6 @@ name = "checkouts"
 version = "0.0.1"
 dependencies = [
  "common",
- "fd-lock",
  "mfile",
  "rand 0.10.3",
  "serde",

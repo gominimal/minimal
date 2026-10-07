@@ -30,10 +30,10 @@ impl Repo {
                 .current_dir(&base)
                 // Explicit GIT_DIR so git recognises the bare repo as
                 // intentional even when `safe.bareRepository = explicit` is
-                // set (the default since git 2.49). Missing it makes this
-                // command fail and fall through to a clone into the
-                // already-populated directory, which is how a second manager
-                // over a shared cache dir surfaced `clone ... already exists`.
+                // configured (planned as the default in Git 3.0). Under that
+                // setting, missing it makes this command fail and fall
+                // through to a clone into the already-populated directory,
+                // which can surface as `clone ... already exists`.
                 .env("GIT_DIR", &base)
                 .output()?;
 
@@ -247,7 +247,8 @@ impl Repo {
             .current_dir(self.bare_repo_path())
             // Explicitly set GIT_DIR so git recognises the bare repo as
             // intentional even when `safe.bareRepository = explicit` is set
-            // in the system or global config (the default since git 2.49).
+            // in the system or global config (planned as the default in
+            // Git 3.0).
             .env("GIT_DIR", self.bare_repo_path())
             .args(&args)
             .output()?;

@@ -3,13 +3,13 @@
 //! This crate provides abstractions for creating and maintaining checkouts of git repositories
 //! at specific versions.
 
-use fd_lock::{RwLock, RwLockWriteGuard};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
-    fs::{self, File, OpenOptions},
+    fs::{self, File, OpenOptions, TryLockError},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 use tempfile::tempdir_in;
 use tracing::{trace, warn};
@@ -123,57 +123,89 @@ impl ManagerState {
     }
 
     /// serializes the state to the statefile in the given base directory.
+    ///
+    /// The file is written beside `state.json` and renamed over it, so a
+    /// reader that does not hold the cache lock (the [`Manager`] constructor)
+    /// sees either the old registry or the new one, never a torn write.
     fn write_to(&self, dir: &Path) -> Result<(), Error> {
         let path = dir.join("state.json");
-        let f = fs::File::create(path)?;
-        match serde_json_lenient::to_writer(f, self) {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                if e.is_io() {
-                    Err(std::io::Error::new(
-                        e.io_error_kind().unwrap(),
-                        format!("writing state: {}", dir.join("state.json").display()),
-                    )
-                    .into())
-                } else {
-                    todo!("serde error: {:?}", e)
-                }
+        let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+        if let Err(e) = serde_json_lenient::to_writer(&mut tmp, self) {
+            if e.is_io() {
+                return Err(std::io::Error::new(
+                    e.io_error_kind().unwrap(),
+                    format!("writing state: {}", path.display()),
+                )
+                .into());
+            } else {
+                todo!("serde error: {:?}", e)
             }
         }
+        tmp.as_file().sync_all()?;
+        tmp.persist(&path).map_err(|e| e.error)?;
+        Ok(())
     }
 }
 
-/// Opens (creating if absent) `<base_dir>/.lock`, the file serializing every
-/// manager over one cache dir. It is opened fresh on every call so two
+/// How long [`lock_cache`] waits for another holder before giving up. A
+/// holder keeps the lock for a whole clone or fetch; a stuck one (a hung
+/// `git fetch`) must fail the waiter with a diagnostic, not hang it forever.
+/// `MINIMAL_VCS_LOCK_TIMEOUT_SECS` overrides the default for slow remotes.
+fn lock_timeout() -> Duration {
+    std::env::var("MINIMAL_VCS_LOCK_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(600))
+}
+
+/// Takes `<base_dir>/.lock` exclusively, the lock serializing every manager
+/// over one cache dir, and returns the open file holding it; dropping the
+/// file releases the lock. The file is opened fresh on every call so two
 /// managers in a single process also exclude each other: `flock` is per open
 /// file description, not per inode.
-fn open_cache_lock(base_dir: &Path) -> Result<RwLock<File>, Error> {
+///
+/// A holder can sit on the lock for a whole network fetch, so a contended
+/// lock is reported before the wait starts, and a wait that outlasts
+/// `timeout` fails naming the lock file rather than hanging behind a stuck
+/// holder.
+fn lock_cache(base_dir: &Path, timeout: Duration) -> Result<File, Error> {
+    let lock_path = base_dir.join(".lock");
     let file = OpenOptions::new()
         .create(true)
         .read(true)
         .write(true)
         .truncate(false)
-        .open(base_dir.join(".lock"))?;
-    Ok(RwLock::new(file))
-}
-
-/// Takes the cache lock exclusively, blocking until it is free. A holder can
-/// sit on it for a whole network fetch, so a contended lock is reported
-/// before the wait starts rather than leaving the caller to hang silently
-/// behind another manager.
-fn lock_exclusive<'a>(
-    lock: &'a mut RwLock<File>,
-    base_dir: &Path,
-) -> Result<RwLockWriteGuard<'a, File>, Error> {
-    // Probe without blocking; an acquired probe guard is dropped at once and
-    // the blocking `write` below takes the lock for real.
-    if matches!(lock.try_write(), Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock) {
-        warn!(
-            "waiting for the checkouts cache lock at {} (held by another process or manager)",
-            base_dir.join(".lock").display()
-        );
+        .open(&lock_path)?;
+    let deadline = Instant::now() + timeout;
+    let mut backoff = Duration::from_millis(10);
+    let mut warned = false;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(TryLockError::WouldBlock) => {}
+            Err(TryLockError::Error(e)) => return Err(e.into()),
+        }
+        if !warned {
+            warn!(
+                "waiting for the checkouts cache lock at {} (held by another process or manager)",
+                lock_path.display()
+            );
+            warned = true;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(Error::Other(format!(
+                "timed out after {}s waiting for the checkouts cache lock at {}; another \
+                 process or manager still holds it (set MINIMAL_VCS_LOCK_TIMEOUT_SECS to \
+                 wait longer)",
+                timeout.as_secs(),
+                lock_path.display()
+            )));
+        }
+        std::thread::sleep(backoff.min(deadline - now));
+        backoff = (backoff * 2).min(Duration::from_secs(1));
     }
-    Ok(lock.write()?)
 }
 
 fn create_unique_id_and_dir(base_dir: &Path, prefix: String) -> std::io::Result<(String, PathBuf)> {
@@ -282,17 +314,16 @@ impl Manager {
         fs::create_dir_all(&db_path)?;
         fs::create_dir_all(base_dir.join("git").join("checkouts"))?;
 
-        // Read the registry under the cache lock: another manager holding it
-        // may be rewriting `state.json`, which a bare read could see half
-        // written.
-        let mut lock = open_cache_lock(&base_dir)?;
-        let guard = lock_exclusive(&mut lock, &base_dir)?;
+        // Read without the cache lock: a holder can keep it for a whole
+        // network fetch, and this constructor runs on async workers in the
+        // daemon. `write_to` replaces `state.json` atomically, so this read
+        // never sees it half written, and every mutating path re-reads the
+        // registry under the lock before writing it back.
         let state = ManagerState::in_dir_or_default(&base_dir)?;
         let mut repos = HashMap::new();
         for (remote, id) in state.git_remotes.iter() {
             repos.insert(id.clone(), Repo::new(remote, db_path.join(id))?);
         }
-        drop(guard);
 
         // For now we depend on the git command line tool. Shelling out when git doesn't exist
         // gives an incomprehensible NotFound error, so lets explicitly check that git is in PATH
@@ -344,8 +375,7 @@ impl Manager {
         // itself is only per-repository; a second `min session activate`
         // against the same bare repo would otherwise race this fetch/checkout
         // inside the shared worktree (`index.lock: File exists`).
-        let mut lock = open_cache_lock(&self.base_dir)?;
-        let _guard = lock_exclusive(&mut lock, &self.base_dir)?;
+        let _lock = lock_cache(&self.base_dir, lock_timeout())?;
         self.reload_state()?;
         if self.offline {
             // Pick the first known remote for the error message; if there are
@@ -382,8 +412,7 @@ impl Manager {
     /// needs `remote` fresh. A remote not yet registered is a no-op: a
     /// subsequent [`Self::checkout_of`] clones it on first use.
     pub fn update_remote(&mut self, remote: &str) -> Result<(), Error> {
-        let mut lock = open_cache_lock(&self.base_dir)?;
-        let _guard = lock_exclusive(&mut lock, &self.base_dir)?;
+        let _lock = lock_cache(&self.base_dir, lock_timeout())?;
         self.reload_state()?;
         let Some(id) = self.state.git_remotes.get(remote).cloned() else {
             return Ok(());
@@ -411,8 +440,7 @@ impl Manager {
 
         // Same serialization rationale as `update`: the fetch and worktree
         // checkout below mutate shared git state across managers.
-        let mut lock = open_cache_lock(&self.base_dir)?;
-        let _guard = lock_exclusive(&mut lock, &self.base_dir)?;
+        let _lock = lock_cache(&self.base_dir, lock_timeout())?;
         self.reload_state()?;
 
         let out = match self.state.git_remotes.get(remote) {
@@ -901,8 +929,8 @@ mod tests {
             .args(["update-ref", "-d", "refs/remotes/origin/main"])
             .current_dir(&bare)
             // Match Repo::run_git_bare: explicit GIT_DIR keeps git operating
-            // on the bare repo when `safe.bareRepository = explicit` (default
-            // since git 2.49) is set.
+            // on the bare repo even when `safe.bareRepository = explicit` is
+            // configured (planned as the default in Git 3.0).
             .env("GIT_DIR", &bare)
             .output()
             .unwrap();
@@ -1131,8 +1159,7 @@ mod tests {
             .truncate(false)
             .open(base.path().join(".lock"))
             .unwrap();
-        let mut held = RwLock::new(file);
-        let guard = held.write().unwrap();
+        file.lock().unwrap();
 
         let (tx, rx) = std::sync::mpsc::channel();
         let waiter = std::thread::spawn(move || {
@@ -1146,13 +1173,45 @@ mod tests {
                 .is_err(),
             "checkout_of must not proceed while another holder has the lock"
         );
-        drop(guard);
+        drop(file);
         let rev = rx
             .recv_timeout(std::time::Duration::from_secs(60))
             .expect("checkout_of completes once the lock is released")
             .unwrap();
         assert_eq!(rev, hash);
         waiter.join().unwrap();
+    }
+
+    /// A holder that never lets go fails the waiter once the bound passes,
+    /// naming the lock file, instead of hanging it forever.
+    #[test]
+    fn lock_cache_times_out_on_a_stuck_holder() {
+        let base = tempfile::tempdir().unwrap();
+        let held = lock_cache(base.path(), Duration::from_secs(1)).unwrap();
+        let err = lock_cache(base.path(), Duration::from_millis(200)).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("timed out"), "{msg}");
+        assert!(
+            msg.contains(&base.path().join(".lock").display().to_string()),
+            "the error names the lock file: {msg}"
+        );
+        drop(held);
+        lock_cache(base.path(), Duration::from_millis(200)).expect("free once released");
+    }
+
+    /// The constructor reads `state.json` without the cache lock, so it
+    /// must not wait behind a holder.
+    #[test]
+    fn constructor_does_not_wait_for_the_cache_lock() {
+        let base = tempfile::tempdir().unwrap();
+        let _held = lock_cache(base.path(), Duration::from_secs(1)).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let dir = base.path().to_path_buf();
+        std::thread::spawn(move || tx.send(Manager::new_in_dir(dir).is_ok()).unwrap());
+        assert!(
+            rx.recv_timeout(Duration::from_secs(30))
+                .expect("constructor returns while the lock is held")
+        );
     }
 
     #[test]

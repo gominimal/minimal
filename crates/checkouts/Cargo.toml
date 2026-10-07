@@ -15,7 +15,6 @@ tracing.workspace = true
 serde.workspace = true
 serde_json_lenient.workspace = true
 thiserror.workspace = true
-fd-lock.workspace = true
 
 common.workspace = true
 mfile.workspace = true

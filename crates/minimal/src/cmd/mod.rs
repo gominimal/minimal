@@ -843,7 +843,9 @@ pub(crate) fn arm_activation_interrupt(
 /// two steps.
 pub(crate) fn composition_failure_message(project_dir: &camino::Utf8Path, error: &str) -> String {
     format!(
-        "composing a session environment for {project_dir} failed, so no session was activated. \
-         If the cause below names the project configuration, fix it there; otherwise re-run.\n\ncause: {error}"
+        "Cannot start a session for {project_dir}: composing a session environment from \
+         that directory's project configuration failed, so no session was activated. If \
+         the cause below names the project configuration, fix it there; otherwise re-run.\
+         \n\ncause: {error}"
     )
 }
