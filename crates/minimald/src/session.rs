@@ -1052,7 +1052,7 @@ impl Session {
             tracing::info!(
                 session = %record.id,
                 name = ?record.name,
-                network = ?record.network,
+                network = %record.network.word(),
                 egress_default_phase = ?sessions::EGRESS_DEFAULT_PHASE,
                 deny_all_opt_out = conf.deny_all_opt_out,
                 effective_egress = ?sessions::effective_egress(

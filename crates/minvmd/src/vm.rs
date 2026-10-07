@@ -346,7 +346,7 @@ impl VmConfig {
         // device wiring (tap fd handed to gvproxy over the per-PTask vsock
         // shuttle) is driven by the switch handle, not configured here; record
         // the selected mode so a stuck boot can be diagnosed.
-        tracing::debug!(network_mode = ?self.network_mode, "VM network mode selected");
+        tracing::debug!(network_mode = %self.network_mode.word(), "VM network mode selected");
 
         // R3.1: register the host UDS bridge (listen=true). libkrun listens on
         // the host UDS and bridges each accepted connection to the guest process
