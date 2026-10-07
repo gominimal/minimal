@@ -3963,11 +3963,9 @@ impl Session {
         // replaced either, because ending its PTask ends the shuttle
         // connection the host-side row is tied to. Both cases ride on the
         // per-attach environment the host republishes instead.
-        let respawn_for_terminal = replaces_host_for_terminal(
-            self.host_origin,
-            attach_env.declares_terminal(),
-            holds_host_row,
-        );
+        let would_respawn =
+            replaces_host_for_terminal(self.host_origin, attach_env.declares_terminal(), false);
+        let respawn_for_terminal = would_respawn && !holds_host_row;
         if respawn_for_terminal
             && let SessionInner::Active {
                 host: slot @ Some(_),
@@ -3982,10 +3980,7 @@ impl Session {
             // loop rather than parking the attach behind it. Same bounded
             // kill-and-stop as shutdown; see [`Session::kill_and_stop_loop`].
             Self::kill_and_stop_loop(&handle, &mut join, false).await;
-        } else if self.host_origin == HostOrigin::Hooks
-            && attach_env.declares_terminal()
-            && holds_host_row
-        {
+        } else if would_respawn && holds_host_row {
             tracing::info!(
                 "kept the hook-launched session shell: replacing it would end the box's \
                  host-side row; the terminal's environment rides the per-attach republish"
