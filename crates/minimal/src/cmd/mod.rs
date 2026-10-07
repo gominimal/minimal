@@ -407,11 +407,13 @@ pub(crate) fn match_id_prefix(
                     prefixes.iter().all(|p| seen.insert(*p))
                 })
                 .unwrap_or(32);
+            // Only a shortened id gets an ellipsis; a full id is not cut.
+            let ellipsis = if cut < 32 { "…" } else { "" };
             let candidates: Vec<String> = several
                 .iter()
                 .zip(&simples)
                 .map(|(entry, simple)| {
-                    let mut candidate = format!("{}…", &simple[..cut]);
+                    let mut candidate = format!("{}{ellipsis}", &simple[..cut]);
                     if let Some(name) = entry.name.as_deref() {
                         candidate.push_str(&format!(" ({name})"));
                     }
