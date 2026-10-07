@@ -498,10 +498,14 @@ mod tests {
         }
     }
 
-    /// The record the rotation tests write, one per port.
+    /// The record the rotation tests write, one per port. The timestamp is
+    /// fixed to nanoseconds so every serialized record is the same length —
+    /// the rotation tests' byte-length oracles (`rotated == cap` / `<= cap`)
+    /// rest on that equality, and `to_rfc3339()` trims trailing zeros off the
+    /// seconds fraction, which would make lines of differing widths.
     fn record_for(port: u16) -> DecisionRecord {
         DecisionRecord {
-            ts: chrono::Utc::now().to_rfc3339(),
+            ts: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
             box_name: "web".to_string(),
             port,
             decision: sessions::DynamicIngress::Allow,
