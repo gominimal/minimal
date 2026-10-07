@@ -3158,22 +3158,61 @@ fn a_unique_id_prefix_resolves_to_its_session() {
 }
 
 /// A prefix several sessions share is refused, naming each candidate by its
-/// short id; one more character that tells them apart resolves.
+/// short id and its session name; one more character that tells them apart
+/// resolves.
 #[test]
 fn an_ambiguous_id_prefix_names_the_candidates() {
     use sessions::SessionStatus::Active;
     let entries = vec![
-        twin_entry("a1b2c3d4-0a99-78b1-9165-0809440f0052", None, None, Active),
-        twin_entry("a1b29e8f-0a99-78b1-9165-0809440f0052", None, None, Active),
+        twin_entry(
+            "a1b2c3d4-0a99-78b1-9165-0809440f0052",
+            Some("web"),
+            None,
+            Active,
+        ),
+        twin_entry(
+            "a1b29e8f-0a99-78b1-9165-0809440f0052",
+            Some("db"),
+            None,
+            Active,
+        ),
     ];
     let err = match_id_prefix(&entries, "a1b2").unwrap_err();
     assert!(err.downcast_ref::<AmbiguousIdPrefix>().is_some());
     assert_eq!(
         err.to_string(),
-        "'a1b2' matches sessions a1b2c3d4…, a1b29e8f…; use more characters"
+        "'a1b2' matches sessions a1b2c3d4… (web), a1b29e8f… (db); use more characters"
     );
     assert_eq!(
         match_id_prefix(&entries, "a1b29").unwrap(),
+        Some(entries[1].id)
+    );
+}
+
+/// Candidates that share more than eight hex digits are cut only as far as
+/// needed to be told apart: each rendered id is distinct and exactly as long
+/// as the first differing digit.
+#[test]
+fn an_ambiguous_id_prefix_cuts_at_the_first_differing_digit() {
+    use sessions::SessionStatus::Active;
+    let entries = vec![
+        twin_entry("a1b2c3d4-e50f-78b1-9165-0809440f0052", None, None, Active),
+        twin_entry("a1b2c3d4-e51f-78b1-9165-0809440f0052", None, None, Active),
+    ];
+    // The two ids share their first ten hex digits; the eleventh diverges.
+    let err = match_id_prefix(&entries, "a1b2c3d4e5").unwrap_err();
+    assert!(err.downcast_ref::<AmbiguousIdPrefix>().is_some());
+    assert_eq!(
+        err.to_string(),
+        "'a1b2c3d4e5' matches sessions a1b2c3d4e50…, a1b2c3d4e51…; use more characters"
+    );
+    // Each rendered candidate resolves back to exactly its own session.
+    assert_eq!(
+        match_id_prefix(&entries, "a1b2c3d4e50").unwrap(),
+        Some(entries[0].id)
+    );
+    assert_eq!(
+        match_id_prefix(&entries, "a1b2c3d4e51").unwrap(),
         Some(entries[1].id)
     );
 }
