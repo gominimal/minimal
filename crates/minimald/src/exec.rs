@@ -884,7 +884,7 @@ impl Exec for SessionExec {
             // This spawns the shim — us, re-exec'd — not the user's command, so
             // a bare ENOENT reads as a missing shell. Name the path (#1175).
             let shim = command.as_std().get_program().to_owned();
-            command.spawn().map(TokioProcess::new).map_err(|e| {
+            command.spawn().map(TokioProcess::shim).map_err(|e| {
                 io::Error::new(
                     e.kind(),
                     format!(
@@ -899,15 +899,36 @@ impl Exec for SessionExec {
 }
 
 /// `Process` implementation backed by [`tokio::process::Child`].
-///
-/// The flag records whether [`Process::start_kill`] asked the child to exit,
-/// which arms the SIGTERM-to-SIGKILL escalation in [`Process::wait`].
 #[derive(Debug)]
-pub struct TokioProcess(Child, bool);
+pub struct TokioProcess {
+    child: Child,
+    /// Whether [`Process::start_kill`] sends SIGTERM, with a SIGKILL
+    /// escalation in [`Process::wait`], rather than an immediate SIGKILL.
+    /// Only the injection shim handles SIGTERM by killing its whole process
+    /// group; any other child gets the immediate SIGKILL.
+    graceful: bool,
+    /// Whether a graceful [`Process::start_kill`] has asked the child to
+    /// exit, which arms the escalation in [`Process::wait`].
+    terminating: bool,
+}
 
 impl TokioProcess {
+    /// A child that [`Process::start_kill`] SIGKILLs at once.
     fn new(child: Child) -> Self {
-        Self(child, false)
+        Self {
+            child,
+            graceful: false,
+            terminating: false,
+        }
+    }
+
+    /// The injection shim, which [`Process::start_kill`] SIGTERMs so its
+    /// handler can kill the injected process's whole group.
+    fn shim(child: Child) -> Self {
+        Self {
+            graceful: true,
+            ..Self::new(child)
+        }
     }
 }
 
@@ -918,33 +939,36 @@ impl Process for TokioProcess {
 
     fn take_stdio(&mut self) -> Option<(Self::Stdin, Self::Stdout, Self::Stderr)> {
         Some((
-            self.0.stdin.take()?,
-            self.0.stdout.take()?,
-            self.0.stderr.take()?,
+            self.child.stdin.take()?,
+            self.child.stdout.take()?,
+            self.child.stderr.take()?,
         ))
     }
 
     async fn wait(&mut self) -> io::Result<Option<i32>> {
         // Never asked to die: a plain wait, as before.
-        if !self.1 {
-            return self.0.wait().await.map(|s| s.code());
+        if !self.terminating {
+            return self.child.wait().await.map(|s| s.code());
         }
-        match tokio::time::timeout(Duration::from_secs(2), self.0.wait()).await {
+        match tokio::time::timeout(Duration::from_secs(2), self.child.wait()).await {
             Ok(status) => status.map(|s| s.code()),
             // SIGTERM did not take: escalate to SIGKILL and wait it out.
             Err(_elapsed) => {
-                self.0.start_kill()?;
-                self.0.wait().await.map(|s| s.code())
+                self.child.start_kill()?;
+                self.child.wait().await.map(|s| s.code())
             }
         }
     }
 
     fn start_kill(&mut self) -> io::Result<()> {
+        if !self.graceful {
+            return self.child.start_kill();
+        }
         // The shim is the direct child; SIGTERM reaches it and, through the
         // handler it installs, its whole process group. If it does not exit
         // within the grace period, `wait` escalates to SIGKILL (below).
         // `id()` is `None` once the child has been reaped; nothing to signal.
-        if let Some(pid) = self.0.id() {
+        if let Some(pid) = self.child.id() {
             // SAFETY: `pid` is the live shim pid `Child` holds; `kill(2)` is
             // async-signal-safe and has no Rust-side invariants.
             if unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) } == -1 {
@@ -956,7 +980,7 @@ impl Process for TokioProcess {
                 }
             }
         }
-        self.1 = true;
+        self.terminating = true;
         Ok(())
     }
 }
@@ -2542,13 +2566,34 @@ mod tests {
             .arg("600")
             .spawn()
             .expect("spawning sleep");
-        let mut process = TokioProcess::new(child);
+        let mut process = TokioProcess::shim(child);
         process.start_kill().expect("signalling the child");
-        let status = tokio::time::timeout(std::time::Duration::from_secs(10), process.0.wait())
+        let status = tokio::time::timeout(std::time::Duration::from_secs(10), process.child.wait())
             .await
             .expect("the child exits on SIGTERM")
             .expect("reaping the child");
         assert_eq!(status.signal(), Some(libc::SIGTERM), "{status:?}");
+    }
+
+    /// Any child other than the shim (the git service path's `/bin/sh -c`)
+    /// has no group-kill handler, so `start_kill` SIGKILLs it at once.
+    #[tokio::test]
+    async fn start_kill_sigkills_a_plain_child() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        use super::{Process as _, TokioProcess};
+
+        let child = tokio::process::Command::new("sleep")
+            .arg("600")
+            .spawn()
+            .expect("spawning sleep");
+        let mut process = TokioProcess::new(child);
+        process.start_kill().expect("signalling the child");
+        let status = tokio::time::timeout(std::time::Duration::from_secs(10), process.child.wait())
+            .await
+            .expect("the child exits on SIGKILL")
+            .expect("reaping the child");
+        assert_eq!(status.signal(), Some(libc::SIGKILL), "{status:?}");
     }
 
     /// A child that ignores SIGTERM is not waited on forever: after the grace
@@ -2564,8 +2609,8 @@ mod tests {
             .stdout(std::process::Stdio::piped())
             .spawn()
             .expect("spawning sh");
-        let mut process = TokioProcess::new(child);
-        let mut stdout = process.0.stdout.take().expect("piped stdout");
+        let mut process = TokioProcess::shim(child);
+        let mut stdout = process.child.stdout.take().expect("piped stdout");
         let mut ready = [0u8; 6];
         stdout
             .read_exact(&mut ready)
