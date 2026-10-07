@@ -2,7 +2,7 @@
 
 The order of the work, and the size of each step, for implementing [the BOX spec](29-spec-box-local-first.md) (gominimal/inbox#731). Each row in §1 is a candidate pull request.
 
-- **Status: draft.** Drawn against the spec at `28d8723d` (PR #1697, still open) and `main` at `2aa1a7f6`. The plan comment in the skill's format lints with `plan-lint` against that spec: exit 0, 0 blocking findings, 27 advisory (§7). Nothing is posted on the epic and no issue exists yet.
+- **Status: draft.** Drawn against the spec at `cd2e3090` (PR #1697, still open) and `main` at `2aa1a7f6`. The plan comment in the skill's format lints with `plan-lint` against that spec: exit 0, 0 blocking findings, 27 advisory (§7). Nothing is posted on the epic and no issue exists yet.
 - **Method:** the foundry `spec:plan` skill (`spec@foundry` v0.7.0), run up to the drafted plan comment.
 - **Revision 2 (2026-10-06):** refactoring is folded in. Scripted renames land before the plan (§0), eight refactor pull requests join the plan (T34–T41), and the box naming rule goes into `AGENTS.md`.
 - **Revision 3 (2026-10-06):** a task becomes a box whose entrypoint is the task. One launcher starts every box's entrypoint from its spec (T42), one exit rule keyed on `lifetime` ends it (T9), and `min task run` creates a task box instead of sending a task into a session's box (T43). T44 moves the repository's own files off the legacy tables.
@@ -15,6 +15,11 @@ The order of the work, and the size of each step, for implementing [the BOX spec
   - The `SessionId` merge is a planned task, T45, not part of a scripted rename.
   - The renames start after NET's open pull requests merge.
   - Each move PR shows the lines it changes and the lines it moves, and is sized for review by the lines it moves.
+- **Revision 5 (2026-10-07):** spec 29 re-pinned to arch `823f45f` (`cd2e3090`).
+  - The spec turned eight open questions into citations, so the plan drops its edges to gominimal/arch#98, #99, #112, #113, #122 and #123. Three questions remain (§3).
+  - T46 adds the fresh-instance rule: a run, or a start with `--new`, takes `<name>-<n>` instead of being refused.
+  - A new task, T47, gives a project with no session entry an implicit `default` session entry (BOX-165), and T27's golden vectors gain that case.
+  - T26's proof flips: a deny subnet is now in the projection, so changing one changes the digest.
 
 ---
 
@@ -138,7 +143,7 @@ T5's change lands in `cmd/boxes/create.rs`, which T34 creates.
 | PR | What it adds | Covers | Files | Size / est | Keeps behaviour? |
 |---|---|---|---|---|---|
 | T12 | The index maps one name to many records. A name is unique only among running boxes. Resolution prefers the running box, then the latest, and returns exit 2 with a candidate list when hosts are ambiguous. Rename refuses a name a running box holds, or `self`, and writes a `renamed` event. Adds proptest to `sessions`. | BOX-004, 005, 010, 143 | sessions store.rs, lib.rs, Cargo.toml, Cargo.lock; minimald session.rs, session/tests.rs | L, 360+480 | Mostly: it loosens uniqueness. The `index.json` format changes, but the existing self_heal reindex rebuilds it from the records |
-| T46 | A box is named from its spec's `[box] name`, else its entry's name. A creation whose name a running box on the host holds is refused with exit 2 naming the holder, and creates nothing. Waits on gominimal/arch#122 (OQ9). | BOX-163 | mfile spec.rs; minimald sessions.rs | M, 160+120 | **No:** a held name refuses instead of suffixing |
+| T46 | A box is named from its spec's `[box] name`, else its entry's name. A plain start whose name a running box on the host holds is refused with exit 2 naming the holder, and creates nothing. A run, or a start with `--new`, takes `<name>-<n>`, the smallest `n` no retained record on the host uses (gominimal/arch#117). | BOX-163 | mfile spec.rs; minimald sessions.rs | M, 200+180 | **Partly:** a plain start onto a held name now fails |
 | T13 | minvmd passes its minted `BoxId` into the guest's create. The guest takes the id only from the VM host and never from the client. The in-box `box_id` comes from the record. | BOX-002 | minvmd control.rs, minimald sessions.rs, minimald env.rs | M, 220+160 (the VM test is deferred to the vm lane) | Yes |
 | T14 | **Join** | — | minimald sessions.rs (test) | S, 40+120 | Yes |
 
@@ -149,8 +154,9 @@ T5's change lands in `cmd/boxes/create.rs`, which T34 creates.
 | T15 | `[sessions.*]`, `[agents.*]`, `[services.*]` and `[boxes.*]` become box entries. Invalid entry names and `self` fail with exit 3. | BOX-007, 046 | mfile/src/entry.rs *new*, mfile lib.rs, error.rs | M, 220+180 | Yes (additive) |
 | T16 | The layer fold: upstream, type defaults, `[defaults]`, `[defaults.<type>]`, the entry, loadouts, then command-line overrides (gominimal/arch#113, closed). Lists are unioned and scalars replaced. Serialisation is stable, a per-value layer report sits outside the spec bytes, and an invalid key fails with exit 3 naming the layer. Adds proptest to `mfile`. | BOX-048, 064, 065, 066, 161 | mfile/src/expand.rs *new*, lib.rs, error.rs, Cargo.toml, Cargo.lock | L, 380+360 | Yes (not wired in until T21) |
 | T17 | Legacy tables work with a hint for one release: `[session]` reads as `[defaults.session]`, `state_key`/`profile` as `[defaults.task]`, and `[params]` as `[args]`. Flat per-entry keys are accepted. After the grace release these exit 3. `interactive = true` on a task fails with exit 3. | BOX-049, 050, 051, 052, 054 | mfile/src/legacy.rs *new*, lib.rs, tasks.rs | L, 300+360 | Mostly: hints are new output. **`interactive = true` now fails**, and the `crates/mctx/testdata` fixtures use it |
+| T47 | A project with no session entry and no entry named `default` gets an implicit `default` session entry, expanded from its other layers. A non-session entry named `default` blocks it. The expansion report marks the entry implicit (gominimal/arch#124). | BOX-165, 161 | mfile entry.rs, expand.rs | M, 140+180 | Yes: a `[session]`-only project starts the same session it does today |
 | T44 | The repository's own files stop using the legacy tables: `.minimal/minimal.toml`, the sessions example project, a minvmd test fixture, the `minimal.toml` reference and four guides, plus the daemon's scaffold for a project with no `minimal.toml`. `[session]` becomes `[sessions.default]`. A test reads every `minimal.toml` in the repository and fails on any legacy hint. | (enablement) | minimald session.rs; mfile legacy.rs; .minimal/minimal.toml; sessions example_project/minimal.toml; minvmd egress_allowlist_integration.rs; docs/reference/minimal-dot-toml.md; docs/guide/{dev-shell,setup,packages,agents}.md | M, 120+120 | Yes: the files mean what they meant |
-| T18 | Every Box Spec section (machine, io, execution, network, secrets, params, nesting, volumes) is accepted. **Unknown keys fail with exit 3 instead of a warning.** Unenforced sections warn once at creation. A project's `[secret-store-rules]`, `[package-file-rules]` and `[loadout-file-rules]` are dropped with a warning. Waits on gominimal/arch#123 (OQ10, open). | BOX-076, 085 | mfile spec.rs, lib.rs; minimald sessions.rs | L, 420+300 | **No:** a minimal.toml with a stray key now fails |
+| T18 | Every Box Spec section (machine, io, execution, network, secrets, params, nesting, volumes) is accepted. **Unknown keys fail with exit 3 instead of a warning.** Unenforced sections warn once at creation. A project's `[secret-store-rules]`, `[package-file-rules]` and `[loadout-file-rules]` are dropped with a warning (gominimal/arch#123, closed). Waits on gominimal/arch#100 (OQ2, open) for `[params]`. | BOX-076, 085 | mfile spec.rs, lib.rs; minimald sessions.rs | L, 420+300 | **No:** a minimal.toml with a stray key now fails |
 | T19 | `[network] mode` takes none, host_ip and own_ip. The legacy spellings and flat egress keys are canonicalised with a hint, reusing the hint code the CLI flag already has. `mode = "none"` with egress fails with exit 3. The network, bep and secrets sections pass through unchanged. | BOX-079, 080, 157 | mfile/src/network.rs *new*, lib.rs; minimal cli.rs; minimald-rpc lib.rs | L, 260+240 | Yes |
 | T20 | A `timeout` on an `until_complete` box sends SIGTERM then SIGKILL to the box and its execs and ends it with reason timeout. `hooks_on_resume` reruns `on_activate`. | BOX-028, 037 | minimald session_host.rs, session.rs, session/tests.rs, session_host/tests.rs | M, 200+160 | Yes (new keys) |
 | T21 | **Join and cutover:** the client sends the expanded entry instead of T5's v0 spec. | — | minimal cmd/boxes/create.rs, task.rs, tests.rs | M, 120+120 (**risk: may grow**) | Yes, provided the expansion of a legacy `[session]` matches today's composition |
@@ -169,7 +175,7 @@ T5's change lands in `cmd/boxes/create.rs`, which T34 creates.
 | PR | What it adds | Covers | Files | Size / est | Keeps behaviour? |
 |---|---|---|---|---|---|
 | T26 | The §6.3.2 projection, its egress field mapping, the token-mode/quic443/steering fills, and a base64url SHA-256 over JCS bytes. Expansion writes each store reference's `upstream` and `inject` into its `[secrets]` entry. The client sends its digest and the daemon recomputes it and stores both. | BOX-071, 142 | mfile/src/projection.rs *new*, lib.rs, Cargo.toml (sha2, base64, a JCS crate), Cargo.lock; minimald-rpc lib.rs; minimald sessions.rs | L, 460+360 | Yes |
-| T27 | Golden vectors for the architecture's example and the six built-ins. | BOX-145 | mfile/tests/golden.rs *new* plus 2 fixture files *new* | M, 60+360 | Yes |
+| T27 | Golden vectors for the architecture's example, the implicit `default` entry of a file with only `[defaults.session]`, and the six built-ins. Waits on T47. | BOX-145 | mfile/tests/golden.rs *new* plus 3 fixture files *new* | M, 60+360 | Yes |
 | T28 | A digest mismatch refuses creation. No policy is evaluated while un-enrolled. `GetVersion` reports the expander version, and the client prints both versions and continues. | BOX-072, 073, 074 | minimald sessions.rs; minimald-rpc lib.rs; minimal cmd/boxes/create.rs, tests.rs | L, 280+300 | Yes. The existing binary-version gate (`must_match_version`) is untouched |
 | T29 | **Join** | — | minimald sessions.rs (test) | S, 40+120 | Yes |
 
@@ -218,7 +224,8 @@ Each multi-task slice has a join task (T7, T11, T14, T21, T25, T29, T32). The cr
 | BCLI | BCLI-024 command-line override layer → BOX-064 | T16 leaves the slot; BCLI fills it. |
 | BCLI | BCLI-017's `min init` scaffold in the entry-based shape | Today's writer (`crates/op/src/project/init.rs`) emits `[session]` and a top-level `state_key`, both legacy under T17. **BCLI's plan owns the rewrite.** T44 covers only the daemon's own scaffold. |
 | BCLI | BCLI-002 ambiguity rendering / BCLI-013 exit 137 for BOX-154 records | T12 produces the candidate list and T3 the record; BCLI renders both. |
-| BCLI | BCLI-069's `--name` and the held-name refusal | T46 refuses with exit 2; BCLI adds the `--name` hint. |
+| BCLI | BCLI-069's `--name`, `--new` and the held-name refusal | T46 refuses a plain start with exit 2 and suffixes a fresh instance; BCLI maps `run` and `--new` onto a fresh instance and adds the hint. |
+| BCLI | A bare `min session start` / `min box start` picks `default`, else the sole entry | T47 supplies the implicit `default` entry; BCLI chooses the entry and owns the exit 2 when a non-session `default` blocks it. |
 | BCLI | Process exit codes 2/3/5 and the `{code, message, hint}` envelope (`MachineModeFailure` exists). The epic comment ties inbox#755 to it. | The BOX errors in mfile and minimald carry the code (T15, T16, T12, T33), and BCLI maps them to process exits. Until BCLI lands, BOX tests assert the error kind, not the process exit. |
 | **BVOL** | BVOL-013's volume-hold check sits in the resume refusal order. | T6 leaves the slot, and BVOL inserts the check. |
 | BVOL | `volumes` items are bare names (BVOL-001). | T18 accepts the key, and BVOL owns its meaning. |
@@ -227,7 +234,7 @@ Each multi-task slice has a join task (T7, T11, T14, T21, T25, T29, T32). The cr
 | BVOL | Merge rules (BOX-048/064/065) | T16 |
 | **BRES** | `[machine]` / `on_oom` keys | T17 and T18 accept and render them; BRES owns their meaning. |
 | BRES | Exited reason `oom` with exit 137, and the `oom_killed` event | T1 defines the state and T2 the event kind. BRES writes them. |
-| **NET** | OQ2 asks which state "exists" and "destroyed" mean. | gominimal/minimal#2041 decides it, and T8 waits on it. |
+| **NET** | OQ1 asks which state "exists" and "destroyed" mean. | gominimal/minimal#2041 decides it, and T8 waits on it. |
 | NET | Name registration on resume (NET-011) and NODATA for a retained box | NET owns them. T6 consumes the registration hook. Today stop withdraws the route and keeps the lease. |
 | NET | The stop cases NET-015 lacks | T9 (entrypoint return) and T20 (timeout) produce them; NET lists them. |
 | NET | Legacy mode spellings (NET-037) and nested egress (NET-060) | T19, which shares the hint code with `crates/minimal/src/cli.rs`. |
@@ -241,23 +248,13 @@ Each multi-task slice has a join task (T7, T11, T14, T21, T25, T29, T32). The cr
 
 ## 3. Open questions
 
-A question whose deciding issue has closed is decided, and no task waits on it. The plan comment keeps the edge to the closed issue, with `closed 2026-10-06` on its line, until the spec author removes the question from the spec, as the skill requires. Three questions still wait on an open issue, and one needs an issue.
+Spec 29 at `cd2e3090` has three open questions. The eight others are now citations of merged architecture changes: the stop grace, the event list and states, `[args]` (gominimal/arch#98), nested egress keys and the projected deny field (gominimal/arch#99), prune's `--stopped` (gominimal/arch#112), the override layer (gominimal/arch#113), the fresh-instance name (gominimal/arch#117, closing #122) and the file-rule sections (gominimal/arch#116, closing #123). No task waits on any of those.
 
 | # | Sev | Question (short) | State | What it holds back |
 |---|---|---|---|---|
-| OQ1 | MEDIUM | Stop grace duration | **Closed 2026-10-06** (gominimal/arch#98): SIGTERM, a grace period the daemon owns, 10 s unless configured, then SIGKILL; `--force` kills at once. | nothing |
-| OQ2 | **HIGH** | NET's "exists", "destroyed" and "removed" against the retained states | Waits on **gominimal/minimal#2041** (open), which asks NET and GWI to confirm the spec's reading. | T8 (S1) |
-| OQ3 | MEDIUM | The event list and box states lack renamed, resumed, detached, the stop/exit fields and `hooks_on_resume` | **Closed 2026-10-06** (gominimal/arch#98): the five states, `reason`/`exit_code`/`signal`, the `renamed`, `resumed`, `detached` and exec events, and `hooks_on_resume` as an `[execution]` key, default false. | nothing |
-| OQ4 | MEDIUM | `box.toml` flat vs nested egress keys | **Closed 2026-10-06** (gominimal/arch#99): nested wins, flat accepted for one release with a hint. **The ruling also puts `egress_deny_subnets` into the §6.3.2 projection, while BOX-071 projects it nowhere.** The spec needs that change before T26. | nothing in the plan; BOX-071 in the spec |
-| OQ5 | LOW | `[args]` is missing from the architecture's layout | **Closed 2026-10-06** (gominimal/arch#98): `[args]` added as the argument schema, formerly the top-level `[params]`. | nothing |
-| OQ6 | LOW | How `[params]` values reach the entrypoint | Waits on **gominimal/arch#100** (open) | T18 |
-| OQ7 | LOW | `[io] exec_enabled` is still marked proposed | **Needs an issue**: whoever rules on it in the architecture | T31 |
-| OQ8 | LOW | `min box prune --stopped` narrows nothing | **Closed 2026-10-06** (gominimal/arch#112): the selector is dropped. | nothing |
-| OQ9 | MEDIUM | A held name at creation: refuse or suffix | Waits on **gominimal/arch#122** (open) | T46 |
-| OQ10 | LOW | A project cannot supply the file-rule sections | Waits on **gominimal/arch#123** (open) | T18, and through it the S4 join |
-| OQ11 | MEDIUM | The command-line override layer in the expansion order | **Closed 2026-10-06** (gominimal/arch#113): the layer is added, last. | nothing |
-
-**For the spec author:** six markers in spec 29 (OQ1, OQ3, OQ4, OQ5, OQ8 and OQ11) are decided by closed issues. Removing them from the spec, and applying arch#99's projection ruling to BOX-071, lets the next plan run drop their edges.
+| OQ1 | **HIGH** | NET's "exists", "destroyed" and "removed" against the retained states | Waits on **gominimal/minimal#2041** (open), which asks NET and GWI to confirm the spec's reading. | T8 (S1) |
+| OQ2 | LOW | How `[params]` values reach the entrypoint | Waits on **gominimal/arch#100** (open) | T18, and through it the S4 join |
+| OQ3 | LOW | `[io] exec_enabled` is still marked proposed | **Needs an issue**: whoever rules on it in the architecture | T31 |
 
 ---
 
@@ -295,25 +292,23 @@ Line numbers are from the first survey at `173f033` and may have drifted by a fe
 
 ## 5. Totals and critical path
 
-**46 PRs in the plan, plus the 5 scripted renames before it (§0).** The plan holds:
-- 28 feature PRs, including the two single-task slices (T8, T33);
+**47 PRs in the plan, plus the 5 scripted renames before it (§0).** The plan holds:
+- 29 feature PRs, including the two single-task slices (T8, T33);
 - 7 join PRs;
 - 8 refactor PRs (T34–T41), six of them pure moves;
 - 3 enablement PRs: T42 (one launcher), T44 (the repository's own files) and T45 (one `BoxId`).
 
-By review size that is 31 L, 11 M and 4 S. By the linted estimate, which counts only the lines a move changes, it is 25 L, 15 M and 6 S.
+By review size that is 31 L, 12 M and 4 S. By the linted estimate, which counts only the lines a move changes, it is 25 L, 16 M and 6 S.
 
-- **Rough total:** about 22,300 lines, roughly 11,700 code and 10,600 tests, not counting the ~27,800 lines the six moves carry unchanged. At ~1/2/3 days per S/M/L PR by review size, that is about 119 PR-days. The five renames add about 5 more days, landed back to back.
-- **By slice:** S0 ≈ 7.1k (the refactor PRs add 2.1k), S1 0.7k, S2 3.2k, S3 1.7k, S4 3.9k, S5 1.6k, S6 2.0k, S7 1.6k, S8 0.5k lines.
+- **Rough total:** about 22,700 lines, roughly 11,900 code and 10,800 tests, not counting the ~27,800 lines the six moves carry unchanged. At ~1/2/3 days per S/M/L PR by review size, that is about 121 PR-days. The five renames add about 5 more days, landed back to back.
+- **By slice:** S0 ≈ 7.1k (the refactor PRs add 2.1k), S1 0.7k, S2 3.2k, S3 1.8k, S4 4.2k, S5 1.6k, S6 2.0k, S7 1.6k, S8 0.5k lines.
 - **Critical path:** 18 PRs, about 47 working days (~9.5 weeks):
 
   T37 (test move) → T1 → T2 → T3 → T6 → T7 (S0) → T42 → T9 → T43 (S2) → T20 → T21 (S4 join) → T22 → T23 → T24 → T25 (S5) → T26 → T28 → T29 (S6)
 
   The CLI refactor chain (T34 → T35 → T36 → T5) runs beside it and joins at T7. Count the renames ahead of all of it, after NET's open pull requests merge: about 5 days, so ~10.5 weeks from the first rename to S6's join.
 
-- **Two open architecture issues sit on or beside the path:**
-  - gominimal/arch#123 (OQ10) holds T18, and the S4 join T21 waits on T18. If it is still open when T20 lands, it holds the whole path.
-  - gominimal/arch#122 (OQ9) holds T46, off the path.
+- **One open architecture issue sits beside the path:** gominimal/arch#100 (OQ2) holds T18, and the S4 join T21 waits on T18. If it is still open when T20 lands, it holds the whole path. T47 also feeds T21 but is short and starts after T16 and T17.
 
 - **Parallel lanes off the path:**
   - S1 (T8), right after T3, once gominimal/minimal#2041 is decided.
@@ -353,7 +348,7 @@ By review size that is 31 L, 11 M and 4 S. By the linted estimate, which counts 
    - T12 rewrites the 1:1 name index, and cross-host resolution today lives client-side (`format_ls_across_vms`).
 10. **Unknown ground:**
     - T13: the id has to flow from minvmd into the guest without going through the client, and that channel may not exist.
-    - T26: choosing the JCS crate, matching the §6.3.2 field set, and the deny field arch#99 adds (§3).
+    - T26: choosing the JCS crate, matching the §6.3.2 field set, and the deny field BOX-071 now projects.
     - T30: PTY exec, which today is refused outright.
 11. **Lanes the plan's executor lacks:** BOX-002's VM test is deferred to the vm lane. The Kani harnesses for BOX-011/012 run only in the advisory `ci-kani` lane.
 
@@ -361,7 +356,7 @@ By review size that is 31 L, 11 M and 4 S. By the linted estimate, which counts 
 
 ## 7. Linter output (advisory only, exit 0, 27 findings)
 
-- **Q003:** OQ7 needs an issue. T31 carries the dependency in its body until one exists.
+- **Q003:** OQ3 needs an issue. T31 carries the dependency in its body until one exists.
 - **Z002** (T34 exists only to feed T35): the linter flags T34 as a candidate to fold into T35. Kept separate on purpose: a pure move and a real change in one PR is the diff nobody can review.
 - **T019 ×2** (T9 and T43 run the same two spec tests): BOX-015 and BOX-038 hold for every box, so T9 extends the tests for sessions and T43 for tasks. They are two tasks because each is already near the ceiling.
 - **F004 ×6:** `session.rs` and `session_host.rs` keep their tests in sibling `tests.rs` files.
@@ -381,11 +376,11 @@ By review size that is 31 L, 11 M and 4 S. By the linted estimate, which counts 
 3. **"Already has X, is that this requirement?"** One candidate: SFTP serving a stopped box's files, for BOX-017. Default taken: *keep a task that only tests it*, folded into T8.
 4. **Missing check, who adds it:** not asked.
 5. **Missing crate:** the survey reports `boxes` missing, because spec 29's tests name it. R2 creates it by renaming `sessions` before the plan runs.
-6. **Open-question states:** each question with a deciding issue waits on that issue (`blocked by`). A closed deciding issue keeps its edge in the plan comment, marked closed, until the spec author removes the question (§3). OQ7 has no issue, so it is "needs an issue". OQ2 now has its own issue, gominimal/minimal#2041.
+6. **Open-question states:** each question with a deciding issue waits on that issue (`blocked by`). The spec removed the questions whose issues closed, so their edges are gone (§3). OQ3 has no issue, so it is "needs an issue". OQ1 has its own issue, gominimal/minimal#2041.
 7. **Parking:** *A task that waits*, so nothing is parked.
 8. **Checkpoint-2 advisories:** F004 *leave as is*. O004 *right, leave it*. T019 *two tasks, on purpose* (§7).
 9. **"Post this plan on the epic?"** → *Not yet*. The plan is posted on the epic once the spec merges and the paths are re-mapped.
-10. **The sentinel's `commit=`** is `main` at `2aa1a7f6`, the tree the survey read, with the spec at `28d8723d` laid on top.
+10. **The sentinel's `commit=`** is `main` at `2aa1a7f6`, the tree the survey read, with the spec at `cd2e3090` laid on top.
 11. **Revision 2 choices (refactoring; the names were confirmed on 2026-10-06):**
     - The renames come first and sit outside the plan as scripted PRs. The linter's 10-file cap cannot hold a rename of dozens of files, and a rename is reviewed by its script (§0).
     - Naming is planned work, not left to whichever task touches a file.
@@ -398,3 +393,6 @@ By review size that is 31 L, 11 M and 4 S. By the linted estimate, which counts 
     - OQ2 gets its own deciding issue, gominimal/minimal#2041.
     - The `SessionId` merge is a planned task (T45), and only pure renames stay scripted.
     - A move PR is sized for review by the lines it moves.
+13. **Revision 5 decisions (2026-10-07, after the architecture review of spec 29):**
+    - A creation that asks for a fresh instance takes `<name>-<n>`; only a plain start refuses a held name (gominimal/arch#117).
+    - The implicit `default` session entry is a permanent rule, planned as T47 in S4, before the join.
