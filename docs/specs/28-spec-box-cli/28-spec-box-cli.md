@@ -196,13 +196,13 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
   tier:     T0
   verify:   cargo nextest run -p minimal help_and_completions_from_one_model
 
-- **BCLI-029** WHEN `min session start [<entry>]` runs THE SYSTEM SHALL create the box and attach, or print the id and return under `--detach`.
+- **BCLI-029** WHEN `min box start [<entry>]` or `min session start [<entry>]` runs THE SYSTEM SHALL create the box and, where its spec sets `pty_enabled`, attach the caller's terminal to it unless `--detach` is given; under `--detach`, or for a box whose spec does not set `pty_enabled`, it SHALL print the id and return.
   <!-- was BOX-089 -->
   tier:     T0
-  verify:   cargo nextest run -p minimal session_start_attaches_or_detaches
-  - IF `min session start` without `--detach` runs off a TTY THEN THE SYSTEM SHALL fail with exit 2 naming `session start --detach`.
+  verify:   cargo nextest run -p minimal start_attaches_pty_box_unless_detached
+  - IF `min box start` or `min session start` without `--detach` runs off a TTY for an entry whose spec sets `pty_enabled` THEN THE SYSTEM SHALL fail with exit 2 naming `--detach`.
     tier:   T0
-    verify: cargo nextest run -p minimal session_start_off_tty_exit2_names_detach
+    verify: cargo nextest run -p minimal start_off_tty_exit2_names_detach
 
 - **BCLI-069** WHERE `--name <name>` is given to `min box start`, `min box run`, `min session start` or `min task run` THE SYSTEM SHALL pass it to BOX-064's command-line override layer as `[box] name`, so BOX-163 names the box with it, or bases a fresh instance's `<name>-<n>` on it.
   tier:     T0
