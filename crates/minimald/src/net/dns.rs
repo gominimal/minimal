@@ -78,11 +78,23 @@ pub const HOSTNAME_SUFFIX: &str = "min.internal";
 /// lowercased, no root dot, exactly what [`super::dns_gate`]'s gate asks
 /// about. The match is by labels, not by string suffix: a single label
 /// holding an escaped dot, `evil\.min` under `internal`, renders as
-/// `evil\.min.internal` but sits under `internal`, not under the zone. A
-/// name that does not parse is not the zone.
+/// `evil\.min.internal` but sits under `internal`, not under the zone.
+///
+/// Parsed permissively on purpose. A qname off the wire can hold a label no
+/// presentation parser accepts — `Name::from_ascii` rejects a non-ASCII byte,
+/// so a box asking for `héllo.min.internal`, whose UTF-8 label the wire
+/// carries raw, would render as `h\303\251llo.min.internal` and fail there —
+/// while the wire form itself is unambiguously under the zone. Saying "not
+/// the zone" for such a name would hand it to whichever branch reads the
+/// same question the other way, and the gate's two zone tests
+/// ([`super::dns_gate`]'s `answered_on_the_switch`, which reads the parsed
+/// `Name`, and its NODATA branch, which reads this) would disagree: for a
+/// deny-all box the name would slip past both and be forwarded, carrying it
+/// to a resolver beyond the one Minimal owns (NET-141). A name that does not
+/// parse at all is not the zone.
 #[must_use]
 pub fn is_zone_name(name: &str) -> bool {
-    match (Name::from_ascii(name), Name::from_ascii(HOSTNAME_SUFFIX)) {
+    match (Name::from_utf8(name), Name::from_ascii(HOSTNAME_SUFFIX)) {
         (Ok(name), Ok(zone)) => zone.zone_of(&name),
         _ => false,
     }
@@ -2489,6 +2501,19 @@ mod tests {
         assert!(
             is_zone_name("a\\.b.min.internal"),
             "the escape is below the zone"
+        );
+        // A label the wire carries as bytes no presentation parser spells
+        // plain — a non-ASCII label, which renders as octal escapes — is
+        // still under the zone: the zone is the suffix, and only the labels
+        // below it are the query's own business. `héllo` is that on the wire
+        // (UTF-8 `\303\251`), and both spellings of it are the zone.
+        assert!(
+            is_zone_name("h\\303\\251llo.min.internal"),
+            "a non-ASCII label's escaped form is under the zone"
+        );
+        assert!(
+            is_zone_name("h\u{e9}llo.min.internal"),
+            "a non-ASCII label's raw form is under the zone"
         );
     }
 

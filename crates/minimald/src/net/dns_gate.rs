@@ -537,31 +537,44 @@ impl DnsGate {
         if query.metadata.message_type != MessageType::Query {
             return None;
         }
-        let question = query.queries.first().cloned()?;
-        let rtype = question.query_type();
-        let name = normalized(&question.name().to_lowercase().to_string());
         // Every question is read, not only the first: the switch's resolver
         // walks them all, so a name behind the first would otherwise ride a
         // query the first one let through.
-        if self.deny_all
-            && query
-                .queries
-                .iter()
-                .any(|q| !answered_on_the_switch(q.name()))
-        {
+        // The question a rule fired on, as the pair its log line names: the
+        // question's own name and type, so an operator reading the line is
+        // pointed at the question that decided the answer, never at a first
+        // question the rule never read.
+        let decided = |fired: &Query| {
+            (
+                normalized(&fired.name().to_lowercase().to_string()),
+                fired.query_type(),
+            )
+        };
+        let fired = self
+            .deny_all
+            .then(|| {
+                query
+                    .queries
+                    .iter()
+                    .find(|q| !answered_on_the_switch(q.name()))
+            })
+            .flatten();
+        if let Some(fired) = fired {
             // REFUSED (NET-141): answered here, so no resolver beyond this
             // one ever sees the name.
+            let (name, rtype) = decided(fired);
             return self.answer(query, ResponseCode::Refused, &name, rtype);
         }
-        if query
+        let fired = query
             .queries
             .iter()
-            .any(|q| in_zone(q) && !answered_on_the_switch(q.name()))
-        {
+            .find(|q| in_zone(q) && !answered_on_the_switch(q.name()));
+        if let Some(fired) = fired {
             // NXDOMAIN (NET-006): a zone name the switch's resolver would send
             // on to the host's resolvers — the apex, or a zone suffix not in
             // exact lowercase — is answered here, so no zone name is ever
             // answered from off the machine.
+            let (name, rtype) = decided(fired);
             return self.answer(query, ResponseCode::NXDomain, &name, rtype);
         }
         // NODATA (NET-136, NET-006): an AAAA, HTTPS or SVCB question, or a
@@ -569,16 +582,15 @@ impl DnsGate {
         // answers a zone A itself and sends every other type on to the
         // host's resolvers. Every name a deny-all box has left here is in
         // the zone, so its query is forwarded only when every question is A.
-        let nodata = query.queries.iter().any(|q| {
+        let fired = query.queries.iter().find(|q| {
             let rtype = q.query_type();
             matches!(
                 rtype,
                 RecordType::AAAA | RecordType::HTTPS | RecordType::SVCB
             ) || (rtype != RecordType::A && in_zone(q))
         });
-        if !nodata {
-            return None;
-        }
+        let fired = fired?;
+        let (name, rtype) = decided(fired);
         self.answer(query, ResponseCode::NoError, &name, rtype)
     }
 
@@ -925,6 +937,36 @@ pub(crate) mod tests {
     use std::io::{Read, Write};
     use std::os::fd::AsRawFd;
     use tokio::io::AsyncWriteExt;
+
+    /// Same helper as `answerer`'s tests: log capture is per-module
+    /// scaffolding, and a thread-local subscriber (`set_default`) keeps the
+    /// assertions here off the process-wide buffer the warn-line proofs
+    /// share.
+    #[derive(Clone, Default)]
+    struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl CaptureWriter {
+        fn contents(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    impl io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl tracing_subscriber::fmt::MakeWriter<'_> for CaptureWriter {
+        type Writer = CaptureWriter;
+        fn make_writer(&self) -> Self::Writer {
+            self.clone()
+        }
+    }
 
     /// The default switch subnet's gateway: the resolver every rule set and
     /// frame below is keyed to, the one the carve-out admits and this gate
@@ -2978,6 +3020,35 @@ pub(crate) mod tests {
         let reply = Message::from_vec(&reply).unwrap();
         assert_eq!(reply.metadata.response_code, ResponseCode::Refused);
 
+        // A zone name whose label below the zone holds a non-ASCII byte is
+        // still the zone, so the NODATA rule still holds it here: the wire
+        // carries the label raw (no parser spells it plain), the switch's
+        // own zone match answers it on the machine, and the gate's own
+        // wider zone match must agree — a disagreement between the two would
+        // hand the name to a resolver beyond the one Minimal owns for the
+        // box, which NET-141 forbids. Built from labels, the way the wire
+        // carries it, so no presentation form is trusted on the way in.
+        let mut non_ascii = Message::query();
+        non_ascii.add_query(Query::query(
+            Name::from_labels(["h\u{e9}llo".as_bytes(), &b"min"[..], &b"internal"[..]]).unwrap(),
+            RecordType::TXT,
+        ));
+        let id = non_ascii.metadata.id;
+        let reply = gate
+            .intercept_query(
+                &SocketAddrV4::new(RESOLVER, 53),
+                &non_ascii.to_vec().unwrap(),
+            )
+            .expect("a non-ASCII zone name's query is answered at the gate");
+        let reply = Message::from_vec(&reply).unwrap();
+        assert_eq!(
+            reply.metadata.response_code,
+            ResponseCode::NoError,
+            "a non-ASCII label under the zone is NODATA, never forwarded"
+        );
+        assert_eq!(reply.metadata.id, id, "the reply echoes the query's id");
+        assert!(reply.answers.is_empty());
+
         // Still only this box's resolver at DNS's port.
         assert!(
             gate.intercept_query(
@@ -3212,6 +3283,85 @@ pub(crate) mod tests {
                 rcode_of(&gate, &multi_query(&[(name, RecordType::A)])),
                 Some(ResponseCode::Refused),
                 "{name} stays REFUSED for a deny-all box"
+            );
+        }
+    }
+
+    /// Every decision branch reads every question, so the line its `answer`
+    /// writes names the question the rule fired on — the one that decided
+    /// the reply — never the first question in the query, which the rule
+    /// never read and which may be one the rule would never touch. An
+    /// operator reading `name` and `query_type` is pointed at the question
+    /// to take away, so the line must not send them to the wrong one.
+    #[test]
+    fn the_answer_log_names_the_question_the_rule_fired_on() {
+        let buf = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // The capture is thread-local here, so the gate is driven on this
+        // thread: `intercept_query` is synchronous, and the line it writes
+        // rides this thread's subscriber.
+        let refuse = multi_query(&[
+            ("host.min.internal.", RecordType::A),
+            ("example.com.", RecordType::A),
+        ]);
+        let nodata = multi_query(&[
+            ("host.min.internal.", RecordType::A),
+            ("x.min.internal.", RecordType::TXT),
+        ]);
+        let nxdomain = multi_query(&[
+            ("example.com.", RecordType::A),
+            ("x.MIN.INTERNAL.", RecordType::A),
+        ]);
+
+        let gate = gate_for(&deny_all_egress());
+        for (query, rcode) in [
+            (&refuse, ResponseCode::Refused),
+            (&nodata, ResponseCode::NoError),
+        ] {
+            assert_eq!(rcode_of(&gate, query), Some(rcode));
+        }
+        let gate = test_gate();
+        assert_eq!(
+            rcode_of(&gate, &nxdomain),
+            Some(ResponseCode::NXDomain),
+            "an ordinary box keeps its NXDOMAIN for the same names"
+        );
+
+        // Each line carries its decision's own question: the refused line
+        // names the outside name behind the zone's, the NODATA line the
+        // zone TXT behind the zone's A, the NXDOMAIN line the mixed-case
+        // zone name behind the first — and none of them the first question
+        // the rule did not read.
+        let log = buf.contents();
+        for (answer, fired_name, fired_type, first_name) in [
+            ("Refused", "example.com", "A", "host.min.internal"),
+            ("NoError", "x.min.internal", "TXT", "host.min.internal"),
+            ("NXDomain", "x.min.internal", "A", "example.com"),
+        ] {
+            let line = log
+                .lines()
+                .find(|l| {
+                    l.contains("answered a lookup at the relay instead of forwarding it")
+                        && l.contains(&format!("answer={answer}"))
+                })
+                .unwrap_or_else(|| panic!("the {answer} line is missing from the log: {log}"));
+            assert!(
+                line.contains(&format!("name=\"{fired_name}\"")),
+                "the {answer} line names the question the rule fired on, got: {line}"
+            );
+            assert!(
+                line.contains(&format!("query_type={fired_type}")),
+                "the {answer} line names the fired question's type, got: {line}"
+            );
+            assert!(
+                !line.contains(first_name),
+                "the {answer} line does not name the first question the rule never read: {line}"
             );
         }
     }
