@@ -3770,13 +3770,15 @@ impl ReplyTables {
     /// A frame sourced from the switch subnet's Box Egress Proxy address
     /// records nothing: the decline comes before any record is consulted or
     /// minted, and the frame itself is still delivered (only the reply-flow
-    /// recording is declined). The proxy is
-    /// host-side infrastructure no box ever dials through, so the stream it
-    /// originates must never open a reply flow the box could reverse-answer
+    /// recording is declined). A box on a credentialed lane does dial the
+    /// proxy's listener (NET-134), but the proxy only answers: it never opens
+    /// a connection toward a box, so a proxy-sourced opening packet at a
+    /// box's published port has no legitimate origin, and the stream it
+    /// would open must never become a reply flow the box could reverse-answer
     /// ([`gate_verdict`]'s reply-flow admit). Defense in depth — the
-    /// destination arm of [`gate_verdict`] already refuses a box's frames
-    /// *to* the proxy, but a proxy-sourced frame wearing the box's lease
-    /// would otherwise record, and `None` declines to.
+    /// reply-flow admit in [`gate_verdict`] itself never admits a frame to
+    /// the proxy's address, whatever record exists, and leaves it to the
+    /// lane arm; this decline keeps such a record from being minted at all.
     pub(crate) fn observe_delivered(
         &self,
         record: &Arc<BoxRecord>,
@@ -4066,6 +4068,9 @@ fn reply_tuple_of(pkt: &dns_pins::L4Packet) -> egress::FlowTuple {
 /// source's attribution (a baseline-decided node frame, a row, or the phase's
 /// unknown-source decision), then the infrastructure set, then the proxy
 /// lane, then the row's rules, then the pin arm.
+/// The reply-flow record never admits a frame to the proxy's address: such
+/// a frame skips it and goes on down the order to the proxy lane arm, which
+/// decides it by the row's lane declaration (NET-134).
 ///
 /// The reply-flow record goes ahead of the control-surface check because the
 /// answer to a host-published port's connection is a frame *to the gateway*:
@@ -4129,7 +4134,13 @@ fn gate_verdict(
     // this admission — it can only answer a flow a client's packet earned.
     // A frame no record admits stays exactly where it was, with every check
     // below deciding it as it always has.
+    // A frame to the Box Egress Proxy's address is never a record's to
+    // admit: the proxy only answers a lane's dial and never opens a flow
+    // toward a box (NET-134), so no record can legitimately reverse to it,
+    // and the frame goes on down the order to the lane arm below, which
+    // decides it by the row's lane declaration.
     if let Some(pkt) = l4
+        && summary.destination() != Some(table.subnet().box_egress_proxy_address().octets())
         && let Some(record) = table.by_source(src)
         && replies.reply_admits(&record, pkt, Instant::now())
     {
@@ -7268,11 +7279,13 @@ mod tests {
     }
 
     /// A frame the ingress leg is about to deliver that is *sourced from* the
-    /// Box Egress Proxy's address records nothing: the proxy is host-side
-    /// infrastructure no box ever dials through, so the stream it originates
-    /// must never open a reply flow the box could reverse-answer. The
-    /// decline is defense in depth — the destination arm of the verdict
-    /// already refuses a box's frames *to* the proxy — and it precedes the
+    /// Box Egress Proxy's address records nothing: a box on a credentialed
+    /// lane dials the proxy's listener (NET-134), but the proxy only answers
+    /// and never opens a connection toward a box, so a proxy-sourced opening
+    /// packet at a published port has no legitimate origin and must never
+    /// open a reply flow the box could reverse-answer. The decline is defense
+    /// in depth — the verdict's reply-flow admit never admits a frame to the
+    /// proxy's address either — and it precedes the
     /// record itself, so a proxy-sourced dial mints no entry
     /// ([`ReplyTables::record_count_of`] is `None`, not `Some(0)`) and the
     /// box's answer to it is refused as the proxy-lane drop, the record's
@@ -7361,6 +7374,84 @@ mod tests {
             }),
             "the box's answer to the proxy is the proxy-lane refusal, no \
              record notwithstanding"
+        );
+    }
+
+    /// The verdict's reply-flow admit never admits a frame to the Box Egress
+    /// Proxy's address, whatever record exists: a record whose reverse
+    /// targets the proxy is minted here directly on the box's entry — the
+    /// entry's flow table `observe_inbound`, the call
+    /// [`ReplyTables::observe_delivered`] makes after its proxy-source
+    /// decline, so this bypasses that decline — and the box's answer to the
+    /// proxy from a row with no lane is still the proxy-lane drop.
+    #[test]
+    fn reply_flow_record_never_admits_a_frame_to_the_proxy() {
+        let registry = BoxRegistry::new(SUBNET);
+        let record = registry.register(
+            BoxRegistration::new("web", Ipv4Addr::from(LEASE), Ipv4Addr::LOCALHOST)
+                .with_admitted_ports([8080])
+                .with_egress_policy(EgressPolicy {
+                    allow_protocols: None,
+                    allow_subnets: Some(vec![]),
+                    allow_dns_hosts: None,
+                    deny_subnets: None,
+                }),
+        );
+        let table = registry.table();
+        let baseline = NodePlaneBaseline::built_in(SUBNET);
+        let pins = dns_pins::DnsPins::new(SUBNET);
+        let replies = ReplyTables::new();
+
+        let proxy = SUBNET.box_egress_proxy_address();
+        let dial = dns_pins::tests::tcp_frame(
+            proxy,
+            40000,
+            Ipv4Addr::from(LEASE),
+            18080,
+            sessions::core::egress::TCP_SYN,
+        );
+        let dial_l4 =
+            dns_pins::parse_ipv4_l4(&dial).expect("the frame builder's IPv4 header always parses");
+        let outcome = replies
+            .entry(&record)
+            .flows
+            .lock()
+            .expect("the reply-flow table's lock is uncontended in the test")
+            .observe_inbound(
+                super::reply_tuple_of(&dial_l4),
+                dial_l4.tcp_flags,
+                Instant::now(),
+            );
+        assert!(
+            matches!(outcome, InboundFlow::Recorded { .. }),
+            "the direct insertion records the proxy-sourced flow"
+        );
+
+        let answer = dns_pins::tests::tcp_frame(
+            Ipv4Addr::from(LEASE),
+            18080,
+            proxy,
+            40000,
+            sessions::core::egress::TCP_SYN | sessions::core::egress::TCP_ACK,
+        );
+        let answer_l4 = dns_pins::parse_ipv4_l4(&answer)
+            .expect("the frame builder's IPv4 header always parses");
+        let summary = sessions::core::egress::summarize(&answer);
+        assert_eq!(
+            gate_verdict(
+                &summary,
+                Some(&answer_l4),
+                &table,
+                &baseline,
+                &pins,
+                &replies
+            ),
+            Err(GateDrop::ProxyLane {
+                src: LEASE,
+                dst: proxy.octets(),
+                dst_port: 40000
+            }),
+            "a record reversing to the proxy admits nothing: the lane arm decides"
         );
     }
 
