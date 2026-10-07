@@ -19,12 +19,22 @@ pub async fn cmd_pkg_patched_build(
     let remote_storage = ctx.remote_storage().await.unwrap();
 
     let remote_cache = if ctx.use_remote_cache() {
-        Some(ctx.remote_cache(false, false).await.map_err(|e| {
-            Error::Other(anyhow!(
-                "failed to set up remote cache: {} — pass --no-fetch to build without it",
-                e
-            ))
-        })?)
+        // Through `Error::from` first: it renders rcache's `Config` cleanly.
+        // `{:#}` keeps the cause visible, since `Error::Other` displays with `{}`.
+        Some(
+            ctx.remote_cache(false, false)
+                .await
+                .map_err(|e| match Error::from(e) {
+                    Error::Other(cause) => Error::Other(anyhow!(
+                        "{:#}",
+                        cause.context(
+                            "failed to set up the remote artifact cache \
+                             (pass --no-fetch to build without it)"
+                        )
+                    )),
+                    other => other,
+                })?,
+        )
     } else {
         None
     };

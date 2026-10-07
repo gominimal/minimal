@@ -1271,16 +1271,23 @@ impl SessionChannel {
 
         let result: std::io::Result<()> = async {
             let remote_storage = ctx.remote_storage().await.map_err(err_to_io)?;
-            let remote_cache = if ctx.use_remote_cache() {
-                Some(ctx.remote_cache(false, false).await.map_err(|e| {
-                    std::io::Error::other(format!(
-                        "failed to set up remote cache: {} — pass --no-fetch to build without it",
-                        e
-                    ))
-                })?)
-            } else {
-                None
-            };
+            let remote_cache =
+                if ctx.use_remote_cache() {
+                    // No flag to name: the daemon's context never sets no_fetch
+                    // and the in-sandbox `min` helper takes no flags. `Error::from`
+                    // renders rcache's `Config` cleanly; `{:#}` keeps the cause.
+                    Some(ctx.remote_cache(false, false).await.map_err(|e| {
+                        match Error::from(e) {
+                            Error::Other(cause) => std::io::Error::other(format!(
+                                "{:#}",
+                                cause.context("failed to set up the remote artifact cache")
+                            )),
+                            other => err_to_io(other),
+                        }
+                    })?)
+                } else {
+                    None
+                };
             let output_base = ctx.builds_base_dir();
             let _ = std::fs::create_dir_all(&output_base);
 
