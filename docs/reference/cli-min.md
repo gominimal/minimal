@@ -212,6 +212,17 @@ its own stdout and stderr and drops the ones it inherited, so nothing about it
 depends on the exec channel at all. The same applies to `session run` and
 `task run`, which relay over the same channel.
 
+If the client goes away while the command is still running, the exec ends its
+whole process group: SIGTERM, a grace period, then SIGKILL. A `nohup`'d job
+stays in that group, so it ends too. Start a job that must outlive the client
+with `setsid`, which puts it in a session and group of its own:
+
+```
+min session exec web 'setsid nohup ./server >/dev/null 2>&1 &'
+```
+
+A command that exits by itself ends nothing: its background jobs keep running.
+
 ### `session run`
 
 ```
