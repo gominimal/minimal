@@ -89,9 +89,19 @@ impl AttrValue {
             return Ok(Some(Self::Map(map)));
         }
         if let Some(a) = rt.as_array() {
+            // Element contracts are pending on the array; without applying
+            // them a bad element is accepted on every consumer path.
+            let pending = a.iter_pending_contracts().cloned().collect::<Vec<_>>();
             return Ok(Some(Self::List(
                 a.iter()
-                    .map(|e| Self::from_term_at(e, program, depth + 1))
+                    .map(|e| {
+                        let e = RuntimeContract::apply_all(
+                            e.clone(),
+                            pending.iter().cloned(),
+                            e.pos_idx(),
+                        );
+                        Self::from_term_at(&e, program, depth + 1)
+                    })
                     .collect::<Result<Vec<_>, Error>>()?
                     .into_iter()
                     .flatten()
@@ -322,6 +332,74 @@ mod tests {
 
         assert!(res.is_err());
         assert!(matches!(res, Err(Error::Nickel(_))));
+    }
+
+    #[test]
+    fn attr_array_element_contract_nickel_err() {
+        let (term, mut program, _origin, _target) = Loader::new(
+            "let {Attrs, ..} = import \"minimal.ncl\" in {env_dir_mappings = [42]} | Attrs",
+            None,
+            &LoadOptions::for_test(),
+        )
+        .unwrap_or_else(|e| {
+            e.report_to_stderr();
+            panic!("load failed");
+        })
+        .finish()
+        .unwrap_or_else(|e| {
+            e.report_to_stderr();
+            panic!("finish failed");
+        });
+
+        let err = AttrValue::from_term(&term, &mut program).expect_err("element contract");
+        assert!(matches!(err, Error::Nickel(_)), "got {err:?}");
+
+        // The element contract fired, and its report points at the element.
+        let mut buf = codespan_reporting::term::termcolor::Buffer::no_color();
+        err.report_to(&mut buf);
+        let out = String::from_utf8(buf.into_inner()).unwrap();
+        assert!(out.contains("contract broken"), "report: {out}");
+        assert!(out.contains("[42]"), "report: {out}");
+    }
+
+    fn decode_src(src: &str) -> Result<Option<AttrValue>, Error> {
+        let (term, mut program, _origin, _target) =
+            Loader::new(src, None, &LoadOptions::for_test())
+                .unwrap()
+                .finish()
+                .unwrap();
+        AttrValue::from_term(&term, &mut program)
+    }
+
+    #[test]
+    fn array_element_contracts_reach_nested_values() {
+        // Elements reached through an array of records and an array of arrays
+        // are checked against the element contract.
+        assert!(matches!(
+            decode_src("[{a = 1}] | Array {a | String}"),
+            Err(Error::Nickel(_))
+        ));
+        assert!(matches!(
+            decode_src("[[1]] | Array (Array String)"),
+            Err(Error::Nickel(_))
+        ));
+
+        // Elements that satisfy the contract still decode.
+        let nested = decode_src("[[\"x\"]] | Array (Array String)")
+            .unwrap()
+            .unwrap();
+        let inner = nested.as_list().unwrap()[0].as_list().unwrap();
+        assert!(matches!(&inner[0], AttrValue::String(s, _) if s == "x"));
+        let records = decode_src(
+            "let {Attrs, ..} = import \"minimal.ncl\" in \
+             {env_dir_mappings = [{read_only = true, path = \"p\", class = 'State}]} | Attrs",
+        )
+        .unwrap()
+        .unwrap();
+        let AttrValue::Map(m) = records else {
+            panic!("expected a map, got {records:?}");
+        };
+        assert_eq!(m["env_dir_mappings"].as_list().unwrap().len(), 1);
     }
 
     #[test]

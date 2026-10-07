@@ -789,9 +789,10 @@ impl DiskLoader {
 /// Session names that collide with infrastructure names once the daemon
 /// renders them into box names (`<name>.min.internal`): `host` is the zone's
 /// fixed host row, `local` is the legacy three-label form's host-id label,
-/// and `localhost` is the loopback name. Refused under ASCII case folding
-/// because box names are lower-cased.
-const RESERVED_SESSION_NAMES: [&str; 3] = ["host", "local", "localhost"];
+/// `localhost` is the loopback name, and `minimald` is the node namespace's
+/// row in the zone. Refused under ASCII case folding because box names are
+/// lower-cased.
+const RESERVED_SESSION_NAMES: [&str; 4] = ["host", "local", "localhost", "minimald"];
 
 /// Reject a session name that would break a downstream output contract.
 ///
@@ -1381,7 +1382,15 @@ mod tests {
 
     #[test]
     fn validate_session_name_rejects_reserved_names() {
-        for bad in ["host", "local", "localhost", "HOST", "Localhost"] {
+        for bad in [
+            "host",
+            "local",
+            "localhost",
+            "minimald",
+            "HOST",
+            "Localhost",
+            "MINIMALD",
+        ] {
             assert_eq!(
                 validate_session_name(bad).err().map(|e| e.kind()),
                 Some(ErrorKind::InvalidInput),
@@ -1423,6 +1432,8 @@ mod tests {
         validate_session_name("host-a").unwrap();
         validate_session_name("my-localhost").unwrap();
         validate_session_name("localdev").unwrap();
+        validate_session_name("minimald-dev").unwrap();
+        validate_session_name("my-minimald").unwrap();
     }
 
     #[test]
