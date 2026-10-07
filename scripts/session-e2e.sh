@@ -11423,7 +11423,7 @@ $(cat "$WORK/goa-$label-1.err" "$WORK/goa-$label-2.err" 2>/dev/null || true)"
       "/usr/bin/timeout 20 python3 /workbench/e2e-dns-probe.py github.com $qtype" \
       2>"$WORK/goa-probe-$qtype.err")"
     rc=$?
-    goa_print_net_since "$before" "answered an empty-records lookup"
+    goa_print_net_since "$before" "answered a lookup at the relay"
     echo "probe $qtype github.com -> ${out:-<none>} (exit $rc)"
     if [ "$rc" -ne 0 ]; then
       echo "::error::the $qtype probe did not complete (exit $rc)"
@@ -11434,7 +11434,7 @@ $(cat "$WORK/goa-$label-1.err" "$WORK/goa-$label-2.err" 2>/dev/null || true)"
       echo "::error::the $qtype lookup for github.com did not come back empty: got '${out:-<none>}' (NET-136 wants NOERROR with zero answers)"
       fail
     fi
-    if [[ "$GOA_RECORDS" != *"answered an empty-records lookup"* ]]; then
+    if [[ "$GOA_RECORDS" != *"answered a lookup at the relay"*"answer=NoError"* ]]; then
       echo "::error::the daemon log does not record the relay answering the $qtype lookup — the evidence that the empty answer came from the relay rather than an empty upstream is missing"
       fail
     fi
