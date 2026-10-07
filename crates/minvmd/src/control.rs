@@ -171,6 +171,24 @@ enum ControlDoor {
     GuestReports,
 }
 
+impl ControlDoor {
+    /// The door's name as a log line names it.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Host => "host control",
+            Self::GuestReports => "guest reports",
+        }
+    }
+
+    /// The door's own connection-cap warn stamp.
+    fn cap_warned(self) -> &'static Mutex<Option<std::time::Instant>> {
+        match self {
+            Self::Host => &HOST_CONTROL_CAP_WARNED,
+            Self::GuestReports => &GUEST_REPORTS_CAP_WARNED,
+        }
+    }
+}
+
 /// How long the server waits for a registration's one request line before
 /// dropping the connection. Generous against a slow starter; a hung client
 /// must not pin its connection's thread, and the door slot it holds,
@@ -576,7 +594,13 @@ pub fn spawn_guest_reports_door(
 /// connection is refused on the accept loop's own turn, before any thread
 /// is spawned, so a peer that opens connections in a loop cannot grow
 /// threads without limit. A slot is freed when its connection's thread
-/// ends.
+/// ends. Each door has its own gauge and its own [`ApplyOrder`]: a guest
+/// flooding its report door fills the guest door's slots, never the host's.
+///
+/// The connections are served concurrently, but each door's mutations
+/// apply one at a time, in the order their requests were read and
+/// validated ([`ApplyOrder`]): the read, the ask hand-off and the guest
+/// door's drain stay concurrent, and only the registry write takes turns.
 fn accept_loop(
     listener: UnixListener,
     boxes: BoxRegistry,
@@ -587,6 +611,7 @@ fn accept_loop(
     cap: usize,
 ) {
     let connections = Arc::new(crate::box_registry::ConnectionGauge::default());
+    let order = Arc::new(ApplyOrder::default());
     for stream in listener.incoming() {
         match stream {
             Ok(mut stream) => {
@@ -601,7 +626,7 @@ fn accept_loop(
                     // in-VM daemon may read a bare EOF. The connection is
                     // refused either way.
                     if let Err(error) =
-                        refuse_past_cap(&mut stream, "control", cap, &CONTROL_CAP_WARNED)
+                        refuse_past_cap(&mut stream, "control", door.name(), cap, door.cap_warned())
                     {
                         tracing::debug!(%error, "could not write the control-cap refusal");
                     }
@@ -611,6 +636,7 @@ fn accept_loop(
                 let answerer = answerer.clone();
                 let proxy_publish = proxy_publish.clone();
                 let audit_path = audit_path.to_path_buf();
+                let order = Arc::clone(&order);
                 if let Err(error) = std::thread::Builder::new()
                     .name("minvmd-control-conn".to_string())
                     .spawn(move || {
@@ -622,6 +648,7 @@ fn accept_loop(
                             &proxy_publish,
                             door,
                             &audit_path,
+                            &order,
                         ) {
                             tracing::debug!(error = %error, "box control connection failed");
                         }
@@ -643,6 +670,7 @@ fn serve_connection(
     proxy_publish: &ProxyPublishStatus,
     door: ControlDoor,
     audit_path: &Path,
+    order: &Arc<ApplyOrder>,
 ) -> std::io::Result<()> {
     let mut stream = stream;
     stream.set_read_timeout(Some(REGISTER_READ_TIMEOUT))?;
@@ -725,6 +753,7 @@ fn serve_connection(
                 None => refuse_past_cap(
                     &mut stream,
                     "guest ask",
+                    door.name(),
                     gauges.guest_ask_cap(),
                     &ASK_CAP_WARNED,
                 ),
@@ -748,6 +777,7 @@ fn serve_connection(
                 None => refuse_past_cap(
                     &mut stream,
                     "ask subscription",
+                    door.name(),
                     gauges.subscription_cap(),
                     &ASK_CAP_WARNED,
                 ),
@@ -760,6 +790,7 @@ fn serve_connection(
             proxy_publish,
             door,
             audit_path,
+            order,
             request,
         ),
     };
@@ -837,6 +868,10 @@ fn root_may_ask(request: &BoxControlRequest) -> bool {
 /// registration holds decides. A verb on the wrong door is refused with
 /// its reason — never parsed into the other door's posture, because the
 /// peer a door serves is exactly what the verb decides what it may do.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the door's shared state, passed through as serve_connection holds it"
+)]
 fn serve_request(
     stream: &mut UnixStream,
     boxes: &BoxRegistry,
@@ -844,14 +879,29 @@ fn serve_request(
     proxy_publish: &ProxyPublishStatus,
     door: ControlDoor,
     audit_path: &Path,
+    order: &Arc<ApplyOrder>,
     request: BoxControlRequest,
 ) -> std::io::Result<()> {
+    // The mutating verbs apply in their door's order ([`ApplyOrder`]): each
+    // takes its ticket here, after its line was read, parsed and its door
+    // checked, applies in its turn, and writes its reply once the turn has
+    // ended. The read-only verbs and the answerer handover take no ticket.
     match (request, door) {
         (BoxControlRequest::Register(request), ControlDoor::Host) => {
-            register_and_reply(stream, boxes, answerer, request)
+            // The published address is asked of the answerer before the
+            // ticket: the allocation can wait out a handover, and no turn
+            // is held across it.
+            let reply = match allocate_box_address(answerer, &request.name) {
+                Ok(loopback_addr) => {
+                    order.apply(|| register_box(boxes, answerer, request, loopback_addr))
+                }
+                Err(reply) => reply,
+            };
+            write_reply(stream, &reply)
         }
         (BoxControlRequest::Withdraw(request), ControlDoor::Host) => {
-            withdraw_and_reply(stream, boxes, answerer, request)
+            let reply = order.apply(|| withdraw_box(boxes, answerer, request));
+            write_reply(stream, &reply)
         }
         (BoxControlRequest::AnswererStatus, ControlDoor::Host) => {
             // The read-only status answers the host facts the CLI's
@@ -869,13 +919,16 @@ fn serve_request(
             read_row_and_reply(stream, boxes, request)
         }
         (BoxControlRequest::RecordAskAnswer(request), ControlDoor::Host) => {
-            record_ask_answer_and_reply(stream, boxes, audit_path, request)
+            let reply = order.apply(|| record_ask_answer(boxes, audit_path, request));
+            write_reply(stream, &reply)
         }
         (BoxControlRequest::AdmitPort(request), ControlDoor::GuestReports) => {
-            admit_report_and_reply(stream, boxes, audit_path, request)
+            let reply = order.apply(|| admit_report(boxes, audit_path, &request));
+            write_reply(stream, &reply)
         }
         (BoxControlRequest::WithdrawPort(request), ControlDoor::GuestReports) => {
-            withdraw_report_and_reply(stream, boxes, request)
+            let reply = order.apply(|| withdraw_report(boxes, &request));
+            write_reply(stream, &reply)
         }
         (BoxControlRequest::ReleaseAnswerer, ControlDoor::Host) => {
             let reply = answerer.release();
@@ -1100,7 +1153,7 @@ fn parse_request(line: &str) -> Result<BoxControlRequest, serde_json_lenient::Er
     serde_json_lenient::from_str(line)
 }
 
-/// Allocate the box into the table and write the reply — the addresses and
+/// Allocate the box into the table and build the reply — the addresses and
 /// the box id on success, the reason on a refusal. One info line per
 /// registration names the box, its id, both addresses and the declared
 /// egress the row carries: the diagnostic a bundle's VM host daemon log is
@@ -1109,12 +1162,15 @@ fn parse_request(line: &str) -> Result<BoxControlRequest, serde_json_lenient::Er
 /// The box's published address is the machine answerer's to hand out
 /// (design §7.1), asked for before the row is filled: a node never
 /// self-assigns one, so two state dirs' boxes never share an address.
-fn register_and_reply(
-    stream: &mut UnixStream,
+///
+/// The address is asked for first ([`allocate_box_address`]), outside the
+/// door's apply order; the row is filled here, in the registration's turn.
+fn register_box(
     boxes: &BoxRegistry,
     answerer: &AnswererStatus,
     request: RegisterBoxRequest,
-) -> std::io::Result<()> {
+    loopback_addr: std::net::Ipv4Addr,
+) -> BoxControlReply {
     // The declaration as the row received it; `null` for a box with no
     // egress section. A plain struct of strings serialises infallibly.
     let declared_egress = serde_json_lenient::to_string(&request.egress).unwrap_or_default();
@@ -1132,23 +1188,7 @@ fn register_and_reply(
         dynamic_ingress: request.dynamic_ingress,
         dynamic_allowed_range: request.dynamic_allowed_range,
     };
-    let loopback_addr = match answerer.allocate(&request.name) {
-        Ok(address) => address,
-        Err(reason) => {
-            tracing::warn!(
-                box = %request.name,
-                %reason,
-                "box registration refused: the zone answerer handed out no address"
-            );
-            return write_reply(
-                stream,
-                &BoxControlReply::Error {
-                    error: format!("the zone answerer could not allocate a box address: {reason}"),
-                },
-            );
-        }
-    };
-    let reply = match boxes.register_client_box_at(spec, loopback_addr) {
+    match boxes.register_client_box_at(spec, loopback_addr) {
         Ok(record) => {
             tracing::info!(
                 box = %record.name(),
@@ -1176,23 +1216,41 @@ fn register_and_reply(
                 error: error.to_string(),
             }
         }
-    };
-    write_reply(stream, &reply)
+    }
 }
 
-/// Remove the row the request's pair proves its client created, and write
+/// Ask the machine's answerer for box `name`'s published address, or the
+/// refusal to answer with when it hands none out. The wait can run as long
+/// as an answerer handover, so it runs before the registration takes its
+/// place in the door's apply order, never inside its turn.
+fn allocate_box_address(
+    answerer: &AnswererStatus,
+    name: &str,
+) -> Result<std::net::Ipv4Addr, BoxControlReply> {
+    answerer.allocate(name).map_err(|reason| {
+        tracing::warn!(
+            box = %name,
+            %reason,
+            "box registration refused: the zone answerer handed out no address"
+        );
+        BoxControlReply::Error {
+            error: format!("the zone answerer could not allocate a box address: {reason}"),
+        }
+    })
+}
+
+/// Remove the row the request's pair proves its client created, and build
 /// the reply — the pair echoed back on success, the reason on a refusal.
 /// One info line per withdrawal names the box and both addresses, mirroring
 /// the registration's; a withdrawal that finds no row is the goal state
 /// already holding (already withdrawn, or the daemon restarted since) and
 /// is a debug line, not an error.
-fn withdraw_and_reply(
-    stream: &mut UnixStream,
+fn withdraw_box(
     boxes: &BoxRegistry,
     answerer: &AnswererStatus,
     request: WithdrawBoxRequest,
-) -> std::io::Result<()> {
-    let reply = match boxes.withdraw_client_box(
+) -> BoxControlReply {
+    match boxes.withdraw_client_box(
         &request.name,
         request.switch_address,
         request.loopback_address,
@@ -1231,8 +1289,7 @@ fn withdraw_and_reply(
                 error: error.to_string(),
             }
         }
-    };
-    write_reply(stream, &reply)
+    }
 }
 
 fn write_reply(stream: &mut UnixStream, reply: &BoxControlReply) -> std::io::Result<()> {
@@ -1256,14 +1313,13 @@ fn write_reply(stream: &mut UnixStream, reply: &BoxControlReply) -> std::io::Res
 /// The refusal answers `Error` with the grant's own sentence, so the
 /// guest's publish unwinds on the check that refused it: nothing was
 /// recorded, and the in-VM mapping is the caller's to take down.
-fn admit_report_and_reply(
-    stream: &mut UnixStream,
+fn admit_report(
     boxes: &BoxRegistry,
     audit_path: &Path,
-    request: AdmitPortRequest,
-) -> std::io::Result<()> {
+    request: &AdmitPortRequest,
+) -> BoxControlReply {
     let source = source_text(request.source);
-    let reply = match boxes.admit_runtime_port(
+    match boxes.admit_runtime_port(
         request.switch_address,
         request.port,
         request.proto,
@@ -1278,7 +1334,7 @@ fn admit_report_and_reply(
                 source = %source,
                 "recorded the box's runtime-admitted port in the host-held grant"
             );
-            append_audit_copy(audit_path, &record, &request);
+            append_audit_copy(audit_path, &record, request);
             BoxControlReply::PortRecorded {
                 port: request.port,
                 proto: request.proto,
@@ -1300,8 +1356,7 @@ fn admit_report_and_reply(
                 error: refusal.to_string(),
             }
         }
-    };
-    write_reply(stream, &reply)
+    }
 }
 
 /// Serve the in-VM daemon's withdrawal report (NET-138): remove the
@@ -1311,11 +1366,7 @@ fn admit_report_and_reply(
 /// that holds nothing the report names is already the report's goal
 /// state. One info line per report, the same shape the admit path's
 /// answers with.
-fn withdraw_report_and_reply(
-    stream: &mut UnixStream,
-    boxes: &BoxRegistry,
-    request: WithdrawPortRequest,
-) -> std::io::Result<()> {
+fn withdraw_report(boxes: &BoxRegistry, request: &WithdrawPortRequest) -> BoxControlReply {
     let source = source_text(request.source);
     let row = boxes.withdraw_runtime_port(request.switch_address, request.port, request.proto);
     match &row {
@@ -1335,13 +1386,10 @@ fn withdraw_report_and_reply(
             "no live row holds the withdrawn port; the grant's goal state already holds"
         ),
     }
-    write_reply(
-        stream,
-        &BoxControlReply::PortRecorded {
-            port: request.port,
-            proto: request.proto,
-        },
-    )
+    BoxControlReply::PortRecorded {
+        port: request.port,
+        proto: request.proto,
+    }
 }
 
 /// Serve the read-only row verb (NET-138): the live row the asked-for name
@@ -1537,6 +1585,111 @@ fn watch_peer_close(
     Ok(closed_rx)
 }
 
+/// The order one door's mutations apply in: one turn at a time, in the
+/// order their requests finished being read, parsed and validated.
+///
+/// Each door serves its connections on threads of their own, so without an
+/// order two requests for the same box could apply in either order: the
+/// in-VM daemon's report exchange gives up on an attempt whose reply is
+/// late, abandons that connection, and sends the unwinding withdrawal on a
+/// new one — and the abandoned admit, still on its way to the registry,
+/// could then apply after the withdrawal and re-open the port it withdrew
+/// (NET-012, NET-128). A registration racing its box's destroy has the same
+/// shape.
+///
+/// The order is the order the requests were read: a client writes its
+/// request line before it starts waiting for the reply, and the door's
+/// thread reads that line as soon as it runs, so what a client times out
+/// on is the apply step, not the read. A request whose client gave up was
+/// therefore read before the client's next connection opened — and so
+/// holds the earlier ticket — or its read never completes and it applies
+/// nothing: the read is bounded by [`REGISTER_READ_TIMEOUT`].
+///
+/// Reading the line and applying it are separate steps on separate
+/// threads, so ordering by "whoever takes a lock first after its read"
+/// would leave a window: a thread that finished its read and was then
+/// preempted could still lose the lock to a later request. Instead each
+/// request takes a monotonic [`Ticket`] in a short critical section right
+/// after its read and validation, and waits on the condvar until every
+/// earlier ticket has had its turn. Only mutating verbs take one; nothing
+/// slow — no read, no answerer allocation, no ask hand-off, no drain —
+/// runs between taking a ticket and the end of its turn.
+#[derive(Debug, Default)]
+pub(crate) struct ApplyOrder {
+    state: Mutex<ApplyState>,
+    turn: std::sync::Condvar,
+}
+
+#[derive(Debug, Default)]
+struct ApplyState {
+    /// The next ticket to hand out.
+    issued: u64,
+    /// The ticket whose turn it is.
+    serving: u64,
+}
+
+/// One request's place in its door's [`ApplyOrder`]. Its turn ends when the
+/// ticket drops — on the apply path, on an early return, and on a panic's
+/// unwind alike — so a request that never applies still hands the turn on
+/// and the tickets behind it never wedge.
+#[derive(Debug)]
+pub(crate) struct Ticket {
+    order: Arc<ApplyOrder>,
+    number: u64,
+}
+
+impl ApplyOrder {
+    fn state(&self) -> std::sync::MutexGuard<'_, ApplyState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Take the next ticket: the request's place in the apply order.
+    pub(crate) fn take(self: &Arc<Self>) -> Ticket {
+        let mut state = self.state();
+        let number = state.issued;
+        state.issued = state.issued.wrapping_add(1);
+        Ticket {
+            order: Arc::clone(self),
+            number,
+        }
+    }
+
+    /// Run `apply` in a fresh ticket's turn and hand back what it answers.
+    /// The turn ends before the caller writes the reply.
+    fn apply<R>(self: &Arc<Self>, apply: impl FnOnce() -> R) -> R {
+        let ticket = self.take();
+        ticket.wait_turn();
+        apply()
+    }
+}
+
+impl Ticket {
+    /// Block until every earlier ticket's turn has ended.
+    pub(crate) fn wait_turn(&self) {
+        let mut state = self.order.state();
+        while state.serving != self.number {
+            state = self
+                .order
+                .turn
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+}
+
+impl Drop for Ticket {
+    fn drop(&mut self) {
+        // A ticket that never waited for its turn still takes it before
+        // handing it on, so the order holds for every ticket behind it.
+        self.wait_turn();
+        let mut state = self.order.state();
+        state.serving = state.serving.wrapping_add(1);
+        self.order.turn.notify_all();
+    }
+}
+
 /// How many guest-door ask connections are served at once (NET-045): the
 /// per-row queue bound across a generous number of rows. Each holds a
 /// serving thread and a watcher thread for the ask's life.
@@ -1557,9 +1710,13 @@ pub(crate) const MAX_CONTROL_CONNECTIONS: usize = 64;
 /// like the queue-full line.
 static ASK_CAP_WARNED: Mutex<Option<std::time::Instant>> = Mutex::new(None);
 
-/// When the last control-door connection-cap warn line was written,
-/// rate-limited the same way.
-static CONTROL_CAP_WARNED: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+/// When the host control socket's last connection-cap warn line was
+/// written, rate-limited the same way. Each door keeps its own stamp, so a
+/// guest flooding its door never silences the host door's line.
+static HOST_CONTROL_CAP_WARNED: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
+/// When the guest report door's last connection-cap warn line was written.
+static GUEST_REPORTS_CAP_WARNED: Mutex<Option<std::time::Instant>> = Mutex::new(None);
 
 /// Whether a rate-limited warn line is due, stamping it when it is.
 fn warn_due(last: &Mutex<Option<std::time::Instant>>) -> bool {
@@ -1576,21 +1733,26 @@ fn warn_due(last: &Mutex<Option<std::time::Instant>>) -> bool {
 
 /// Refuse a connection past its kind's cap, before any thread is spawned:
 /// an error reply naming the cap, and a warn line rate-limited by `warned`.
+/// The line names the `door` the connection arrived on, so a guest flooding
+/// its report door reads apart from the host's own clients.
 fn refuse_past_cap(
     stream: &mut UnixStream,
     kind: &str,
+    door: &str,
     cap: usize,
     warned: &Mutex<Option<std::time::Instant>>,
 ) -> std::io::Result<()> {
     if warn_due(warned) {
         tracing::warn!(
             kind,
+            door,
             cap,
             "refused a connection past the VM host daemon's cap"
         );
     } else {
         tracing::debug!(
             kind,
+            door,
             cap,
             "refused a connection past the VM host daemon's cap"
         );
@@ -1937,14 +2099,13 @@ fn unsubscribe_and_log(boxes: &BoxRegistry, box_id: crate::bep_attach::BoxId, su
 /// takes the answered ask's place. An answer for an id the book does not
 /// hold — unknown, cancelled, or already answered — records nothing, is
 /// audited as refused, and answers an error.
-fn record_ask_answer_and_reply(
-    stream: &mut UnixStream,
+fn record_ask_answer(
     boxes: &BoxRegistry,
     audit_path: &Path,
     request: minimald_rpc::RecordAskAnswerRequest,
-) -> std::io::Result<()> {
+) -> BoxControlReply {
     let ask_id = request.ask_id;
-    let reply = match boxes.record_ask_answer(ask_id, request.answer) {
+    match boxes.record_ask_answer(ask_id, request.answer) {
         Ok(ended) => {
             tracing::info!(
                 %ask_id,
@@ -1994,8 +2155,7 @@ fn record_ask_answer_and_reply(
                 error: format!("no pending or recently ended ask holds id {ask_id}"),
             }
         }
-    };
-    write_reply(stream, &reply)
+    }
 }
 
 /// Log an offer — how many attached clients it reached — and audit it.
@@ -4524,5 +4684,165 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    /// The admit an abandoned connection carries and the withdrawal the
+    /// reporter's unwind sends on a new one, for port 3000 on `web`.
+    fn admit_then_withdraw(web: &RegisteredBox) -> (AdmitPortRequest, WithdrawPortRequest) {
+        (
+            AdmitPortRequest {
+                switch_address: web.switch_address,
+                port: 3000,
+                proto: sessions::IpProto::Tcp,
+                source: PortReportSource::Expose,
+            },
+            WithdrawPortRequest {
+                switch_address: web.switch_address,
+                port: 3000,
+                proto: sessions::IpProto::Tcp,
+                source: PortReportSource::Expose,
+            },
+        )
+    }
+
+    /// A row named `web` whose grant admits runtime ports 3000-3999.
+    fn allow_box(sock_path: &std::path::Path) -> RegisteredBox {
+        handed(
+            register(
+                sock_path,
+                &RegisterBoxRequest {
+                    name: "web".to_string(),
+                    ingress_ports: Vec::new(),
+                    egress: None,
+                    credentialed_upstream: None,
+                    dynamic_ingress: Some(sessions::DynamicIngress::Allow),
+                    dynamic_allowed_range: Some((3000, 3999)),
+                },
+            )
+            .expect("the registration is answered"),
+        )
+    }
+
+    /// A mutation whose request was read first applies first, even when its
+    /// thread is held between taking its ticket and applying: the
+    /// withdrawal read after it waits its turn, so the stale admit can
+    /// never re-open the port the withdrawal closed (NET-012, NET-128).
+    #[test]
+    fn earlier_ticket_applies_first_though_delayed_before_its_turn() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (sock_path, _server, boxes, _answerer, _proxy_publish) =
+            spawn_server(dir.path()).expect("server binds");
+        let web = allow_box(&sock_path);
+        let (admit, withdraw) = admit_then_withdraw(&web);
+        let audit_path = audit_log_path(&sock_path);
+        let order = Arc::new(ApplyOrder::default());
+        let applied = Arc::new(Mutex::new(Vec::new()));
+
+        // The admit's read finished first, the withdrawal's second.
+        let admit_ticket = order.take();
+        let withdraw_ticket = order.take();
+
+        // The admit's thread is held between its ticket and its turn until
+        // the test lets it go: the preempted thread of the race.
+        let (release_admit, admit_held) = std::sync::mpsc::channel::<()>();
+        let admit_thread = {
+            let boxes = boxes.clone();
+            let applied = Arc::clone(&applied);
+            std::thread::spawn(move || {
+                admit_held.recv().expect("the test releases the admit");
+                admit_ticket.wait_turn();
+                let reply = admit_report(&boxes, &audit_path, &admit);
+                applied.lock().expect("log").push("admit");
+                drop(admit_ticket);
+                reply
+            })
+        };
+        let (withdrawn, withdraw_done) = std::sync::mpsc::channel();
+        let withdraw_thread = {
+            let boxes = boxes.clone();
+            let applied = Arc::clone(&applied);
+            std::thread::spawn(move || {
+                withdraw_ticket.wait_turn();
+                let reply = withdraw_report(&boxes, &withdraw);
+                applied.lock().expect("log").push("withdraw");
+                drop(withdraw_ticket);
+                let _ = withdrawn.send(());
+                reply
+            })
+        };
+
+        // While the admit is held, the later withdrawal does not apply.
+        assert!(
+            withdraw_done
+                .recv_timeout(Duration::from_millis(300))
+                .is_err(),
+            "the later withdrawal applied ahead of the earlier admit"
+        );
+        assert!(applied.lock().expect("log").is_empty());
+
+        release_admit.send(()).expect("the admit thread waits");
+        let admit_reply = admit_thread.join().expect("the admit thread ends");
+        let withdraw_reply = withdraw_thread.join().expect("the withdraw thread ends");
+        assert!(
+            matches!(
+                admit_reply,
+                BoxControlReply::PortRecorded { port: 3000, .. }
+            ),
+            "the admit is recorded in its turn, got {admit_reply:?}"
+        );
+        assert!(
+            matches!(
+                withdraw_reply,
+                BoxControlReply::PortRecorded { port: 3000, .. }
+            ),
+            "the withdrawal is answered in its turn, got {withdraw_reply:?}"
+        );
+        assert_eq!(*applied.lock().expect("log"), ["admit", "withdraw"]);
+        let row = boxes.row_by_name("web").expect("the row is live");
+        assert!(
+            row.runtime_port_numbers().is_empty(),
+            "the withdrawal, read last, is the state that holds: {:?}",
+            row.runtime_port_numbers()
+        );
+    }
+
+    /// A ticket whose thread panics before its turn still hands the turn
+    /// on through its drop: the tickets behind it apply, and the door's
+    /// order never wedges.
+    #[test]
+    fn ticket_whose_thread_panics_hands_the_turn_on() {
+        let order = Arc::new(ApplyOrder::default());
+        let doomed = order.take();
+        let next = order.take();
+
+        let panicked = std::thread::spawn(move || {
+            let _ticket = doomed;
+            panic!("the request's thread dies between its ticket and its turn");
+        })
+        .join();
+        assert!(panicked.is_err(), "the doomed thread panicked");
+
+        let (applied, applied_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            next.wait_turn();
+            let _ = applied.send(());
+        });
+        applied_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the ticket behind the dead one gets its turn");
+
+        // The order keeps serving after both.
+        let (later, later_rx) = std::sync::mpsc::channel();
+        let order_after = Arc::clone(&order);
+        std::thread::spawn(move || {
+            let answer = order_after.apply(|| 7);
+            let _ = later.send(answer);
+        });
+        assert_eq!(
+            later_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("a fresh ticket gets its turn"),
+            7
+        );
     }
 }
