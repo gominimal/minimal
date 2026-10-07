@@ -39,6 +39,7 @@ orchestrator.workspace = true
 stdlib.workspace = true
 
 [dev-dependencies]
+decode.workspace = true
 indoc.workspace = true
 serial_test.workspace = true
 

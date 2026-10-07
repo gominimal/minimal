@@ -268,37 +268,14 @@ impl<C: Channel> Sandbox<C> {
                 std::os::unix::fs::symlink("lib", &out_usr_lib64)
                     .map_err(|e| Error::IO("create output usr/lib64 symlink", out_usr_lib64, e))?;
             }
-            WdSetup::BoundDir {
-                path: _,
-                fs_mappings,
-                read_only: _,
-            } => {
+            WdSetup::BoundDir { .. } => {
                 let rootfs_cwd = rootfs.join(config.wd.bound_dir_sandbox_cwd());
                 fs::create_dir_all(&rootfs_cwd)
                     .map_err(|e| Error::IO("create shadow cwd tree", rootfs_cwd, e))?;
-
-                // Create bind-mount targets
-                for m in fs_mappings {
-                    let sp = m.path_in_sandbox();
-                    let sp = match sp.strip_prefix("/") {
-                        Some(stripped) => stripped,
-                        None => &sp,
-                    };
-                    let p = rootfs.join(sp);
-
-                    if m.is_file {
-                        fs::create_dir_all(p.parent().unwrap())
-                            .map_err(|e| Error::IO("create mapping parent", p, e))?;
-                    } else {
-                        fs::create_dir_all(&p)
-                            .map_err(|e| Error::IO("create mapping target", p, e))?;
-                    }
-                }
             }
             WdSetup::Session {
-                home: _,
-                working: _,
                 working_name_override,
+                ..
             } => {
                 let rootfs_cwd = rootfs.join(
                     working_name_override
@@ -311,6 +288,24 @@ impl<C: Channel> Sandbox<C> {
                 let rootfs_home = rootfs.join(SESSION_HOME);
                 fs::create_dir_all(&rootfs_home)
                     .map_err(|e| Error::IO("create home", rootfs_home.clone(), e))?;
+            }
+        }
+
+        // Create bind-mount targets for the file mappings (none for an
+        // isolated working directory).
+        for m in config.wd.fs_mappings() {
+            let sp = m.path_in_sandbox();
+            let sp = match sp.strip_prefix("/") {
+                Some(stripped) => stripped,
+                None => &sp,
+            };
+            let p = rootfs.join(sp);
+
+            if m.is_file {
+                fs::create_dir_all(p.parent().unwrap())
+                    .map_err(|e| Error::IO("create mapping parent", p, e))?;
+            } else {
+                fs::create_dir_all(&p).map_err(|e| Error::IO("create mapping target", p, e))?;
             }
         }
 
@@ -797,21 +792,24 @@ pub mod classifier {
     #[cfg(target_os = "linux")]
     pub fn probe_child_placement(root: &Path, verdict: config::Verdict) -> std::io::Result<()> {
         // A throwaway leaf under the cohort, in the verdict's subtree, named
-        // by this daemon's pid so two daemons probing one tree never share
-        // one, and removed first so a probe that died before its own cleanup
-        // cannot wedge the next.
+        // by this daemon's pid and a per-process counter so two concurrent
+        // probes in one daemon never share one. The counter is a static
+        // atomic: the probe is called from a single daemon process, and the
+        // counter's only job is to make each probe's leaf unique within that
+        // process.
+        static PROBE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = PROBE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let leaf = box_leaf(
             root,
-            &format!("placement-probe-{}", std::process::id()),
+            &format!("placement-probe-{}-{}", std::process::id(), n),
             verdict,
         );
-        let _ = std::fs::remove_dir(&leaf);
         std::fs::create_dir(&leaf)?;
         let placed = place_child_in(&leaf.join("cgroup.procs"));
         // The throwaway leaf is owed its removal. The child is gone by now,
         // so over a real tree the kernel allows it; a refusal here is left
-        // alone — the probe has its answer, and a stuck probe leaf says so
-        // at the next probe, which removes it first.
+        // alone — the probe has its answer, and the empty leaf is swept at
+        // the next daemon start by `sweep_box_leaves`.
         let _ = std::fs::remove_dir(&leaf);
         placed
     }
@@ -1392,6 +1390,41 @@ fn exec_box_program(
     force_cover_fallback: bool,
     closure_report: Option<&Path>,
 ) -> ! {
+    // Cap the box's PTY count before the credentials drop: PTYs are a
+    // machine-wide pool, and the box's devpts instance was mounted without a
+    // per-instance `max=`, so it draws from the one kernel-wide counter and a
+    // single box can starve every other box and the session host's own
+    // shells. The remount needs CAP_SYS_ADMIN over this mount namespace,
+    // which the box's user namespace still holds here, as it does for the
+    // classifier cover below. Best-effort: a box whose remount is refused
+    // still runs, on the shared pool as today. A leaf-bearing box records the
+    // refusal on its cover line for the daemon to warn; a leaf-less box has
+    // no report to record it in, so its refusal goes unreported (no in-child
+    // log: this runs between fork and exec, where a subscriber lock held at
+    // fork never releases). The refusal rides on the cover line rather than
+    // a line of its own because the report holds one line, and a later line
+    // replaces an earlier one.
+    //
+    // A devpts remount resets every option it is not given, and a remount
+    // without MS_NOSUID/MS_NOEXEC clears those flags, so both the data and
+    // the flags restate what the box's devpts was mounted with.
+    // SAFETY: `mount(2)` with valid C strings; `data` carries the devpts
+    // options and is read for the duration of the call.
+    let devpts_refused = if unsafe {
+        libc::mount(
+            c"devpts".as_ptr(),
+            c"/dev/pts".as_ptr(),
+            c"devpts".as_ptr(),
+            libc::MS_REMOUNT | libc::MS_NOSUID | libc::MS_NOEXEC,
+            config::BOX_DEVPTS_REMOUNT_DATA.as_ptr().cast(),
+        )
+    } == -1
+    {
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        format!("; devpts max={} errno {errno}", config::BOX_PTY_MAX)
+    } else {
+        String::new()
+    };
     // The box's classifier leaf (NET-079), taken in the order the
     // confinement rests on: join first, *then* unshare the cgroup namespace,
     // so its root is the leaf the process just entered — the box's own view
@@ -1463,12 +1496,15 @@ fn exec_box_program(
                 let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
                 refused = Some(format!("errno {errno}"));
             } else {
-                write_closure_report(closure_report, "cover cgroup2");
+                write_closure_report(closure_report, &format!("cover cgroup2{devpts_refused}"));
                 set_box_cover_marker("cgroup2");
             }
         }
         if let Some(why) = refused {
-            write_closure_report(closure_report, &format!("cover tmpfs-fallback {why}"));
+            write_closure_report(
+                closure_report,
+                &format!("cover tmpfs-fallback {why}{devpts_refused}"),
+            );
             set_box_cover_marker("tmpfs-fallback");
             // SAFETY: `mount(2)` as above, with tmpfs, which takes no
             // options but the flags (an empty one is all the cover needs).
@@ -2061,6 +2097,7 @@ impl<C: Channel> Sandbox<C> {
                 home,
                 working,
                 working_name_override,
+                ..
             } => {
                 // mount the given home path to /{SESSION_HOME}
                 Self::bind_mount(
@@ -2090,20 +2127,20 @@ impl<C: Channel> Sandbox<C> {
                 )?;
             }
         }
-        // Mount in any file mappings
-        if let WdSetup::BoundDir { fs_mappings, .. } = &self.config.wd {
-            for m in fs_mappings {
-                let opts = BindOpts {
-                    recursive: !m.is_file,
-                    read_only: m.read_only,
-                };
-                Self::bind_mount(
-                    Path::new(&m.host_path),
-                    &m.path_in_sandbox(),
-                    opts,
-                    &mut container,
-                )?;
-            }
+        // Mount in any file mappings. hakoniwa applies mounts sorted by
+        // target, so a mapping inside a session's `/home` or `/workbench`
+        // lands on top of that directory's own mount.
+        for m in self.config.wd.fs_mappings() {
+            let opts = BindOpts {
+                recursive: !m.is_file,
+                read_only: m.read_only,
+            };
+            Self::bind_mount(
+                Path::new(&m.host_path),
+                &m.path_in_sandbox(),
+                opts,
+                &mut container,
+            )?;
         }
 
         if let Some(hn) = &self.config.hostname {
@@ -4857,6 +4894,7 @@ ff02::2\tip6-allrouters
     /// namespaces and creates or looks up System V and POSIX IPC objects.
     #[cfg(target_os = "linux")]
     const CGROUP_PROBE_C: &str = r#"
+#define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -4913,6 +4951,9 @@ int main(int argc, char **argv) {
                         leaving the leaf, which is what confinement forbids)
                         and a sibling leaf's cgroup.procs (the file a pid is
                         written into to join another box's verdict);
+         MOUNTINFO:<path>  the mountinfo line of the mount on top of the
+                        path: the box's /dev/pts, after its devpts remount;
+         OPENPTY        whether the box's own user can open a PTY pair;
          HOLD:<path>    stay in the leaf until that path appears, so the test
                         can read the host's side of the tree — the leaf's
                         cgroup.procs, which the kernel empties the moment the
@@ -4960,6 +5001,42 @@ int main(int argc, char **argv) {
             } else {
                 printf("open %s: errno %d\n", path, errno);
             }
+        } else if (strncmp(argv[i], "MOUNTINFO:", 10) == 0) {
+            /* The last /proc/self/mountinfo line whose mount point is the
+               path: the mount on top, its per-mount flags and its
+               superblock options. */
+            const char *path = argv[i] + 10;
+            char found[1024] = "absent";
+            char row[1024];
+            FILE *mi = fopen("/proc/self/mountinfo", "r");
+            while (mi && fgets(row, sizeof row, mi)) {
+                char point[512];
+                if (sscanf(row, "%*s %*s %*s %*s %511s", point) == 1 &&
+                    strcmp(point, path) == 0) {
+                    row[strcspn(row, "\n")] = 0;
+                    snprintf(found, sizeof found, "%s", row);
+                }
+            }
+            if (mi) fclose(mi);
+            printf("mountinfo %s: %s\n", path, found);
+        } else if (strcmp(argv[i], "OPENPTY") == 0) {
+            /* Whether the box's own user can open a PTY pair: the master
+               through /dev/ptmx, then the slave it names. */
+            printf("openpty uid: %ld\n", (long)getuid());
+            int master = posix_openpt(O_RDWR | O_NOCTTY);
+            int err = 0;
+            if (master < 0) {
+                err = errno;
+            } else if (grantpt(master) != 0 || unlockpt(master) != 0) {
+                err = errno;
+            } else {
+                const char *name = ptsname(master);
+                int slave = name ? open(name, O_RDWR | O_NOCTTY) : -1;
+                if (slave < 0) err = name ? errno : ENOENT;
+                else close(slave);
+            }
+            if (master >= 0) close(master);
+            printf("openpty: errno %d\n", err);
         } else if (strncmp(argv[i], "HOLD:", 5) == 0) {
             release = argv[i] + 5;
         } else if (strncmp(argv[i], "NS:", 3) == 0) {
@@ -5372,6 +5449,74 @@ int main(int argc, char **argv) {
         held.report().await
     }
 
+    /// The devpts remount, in a real box launched from the production path:
+    /// the box's `/dev/pts` carries the per-instance `max=` cap, keeps the
+    /// `nosuid,noexec` it was mounted with, and keeps `ptmxmode=0666`, so the
+    /// box's own unprivileged user can still open a PTY pair. A remount that
+    /// restated only `max=` would reset `ptmxmode` to 0000 and break every
+    /// PTY in every box; this is the test that catches it.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn box_devpts_is_capped_and_still_opens_a_pty() {
+        if let Some(reason) = user_namespaces_restriction() {
+            eprintln!(
+                "skipping box_devpts_is_capped_and_still_opens_a_pty: this \
+                 host denies the unprivileged user namespace every sandbox \
+                 starts by unsharing: {reason}"
+            );
+            return;
+        }
+        let probe_args = vec!["MOUNTINFO:/dev/pts".to_string(), "OPENPTY".to_string()];
+        let report = box_probe_report("pty-probe", None, &probe_args).await;
+
+        let mount = report
+            .get("mountinfo /dev/pts")
+            .cloned()
+            .unwrap_or_else(|| "no report".to_string());
+        eprintln!("the box's /dev/pts: {mount}");
+        let (per_mount, superblock) = mount
+            .split_once(" - ")
+            .unwrap_or_else(|| panic!("the box's /dev/pts is not a mountinfo line: {mount:?}"));
+        let mount_flags: Vec<&str> = per_mount
+            .split_whitespace()
+            .nth(5)
+            .unwrap_or_default()
+            .split(',')
+            .collect();
+        for flag in ["nosuid", "noexec"] {
+            assert!(
+                mount_flags.contains(&flag),
+                "the box's /dev/pts keeps {flag} across the remount: {mount:?}"
+            );
+        }
+        let super_opts: Vec<&str> = superblock
+            .split_whitespace()
+            .nth(2)
+            .unwrap_or_default()
+            .split(',')
+            .collect();
+        let max = format!("max={}", config::BOX_PTY_MAX);
+        assert!(
+            super_opts.contains(&max.as_str()),
+            "the box's devpts instance is capped at BOX_PTY_MAX: {mount:?}"
+        );
+        assert!(
+            super_opts.contains(&"ptmxmode=666"),
+            "the box's ptmx stays openable by its user: {mount:?}"
+        );
+
+        assert_eq!(
+            report.get("openpty uid").map(String::as_str),
+            Some(config::BOX_UID.to_string().as_str()),
+            "the PTY is opened as the box's own unprivileged user"
+        );
+        assert_eq!(
+            report.get("openpty").map(String::as_str),
+            Some("errno 0"),
+            "the box's user opens a PTY pair after the remount"
+        );
+    }
+
     /// Every box has its own IPC namespace, whatever its network plan: a
     /// `host_ip` box, which shares the network namespace, and a `none` box
     /// each sit in a namespace of their own, distinct from each other and
@@ -5551,13 +5696,16 @@ int main(int argc, char **argv) {
 
         // The leaf the probe made is not left behind by the failure either:
         // the probe owes the throwaway its removal whatever the answer was.
+        // The leaf is named by pid and a per-process counter, so the exact
+        // name is not knowable here; what is knowable is that no
+        // `placement-probe-` leaf survives the probe.
+        let leftover = std::fs::read_dir(&deny)
+            .expect("reading the deny subtree")
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .any(|name| name.starts_with("placement-probe-"));
         assert!(
-            !classifier::box_leaf(
-                tree.path(),
-                &format!("placement-probe-{}", std::process::id()),
-                config::Verdict::Deny,
-            )
-            .exists(),
+            !leftover,
             "the throwaway leaf the probe made is gone, failure or not"
         );
 
@@ -5572,6 +5720,68 @@ int main(int argc, char **argv) {
             bare.kind(),
             std::io::ErrorKind::NotFound,
             "a missing cohort is a missing tree, not a probe that passes"
+        );
+    }
+
+    /// Concurrent placement probes each get their own throwaway leaf, so
+    /// they never race on a shared name. N probes over a stand-in tree all
+    /// report the same answer (the tree has no cgroup.procs, so every probe
+    /// fails with `NotFound`), and no probe leaf is left behind.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn concurrent_probes_each_get_their_own_leaf() {
+        let tree = tempfile::tempdir().expect("a temp dir standing in for the tree");
+        std::fs::create_dir_all(tree.path().join(classifier::BOXES_DIR))
+            .expect("creating the cohort directory");
+        let deny = tree
+            .path()
+            .join(classifier::BOXES_DIR)
+            .join(config::DENY_DIR);
+        std::fs::create_dir(&deny).expect("creating the deny subtree");
+
+        // Four probes are enough to exercise the race and eight is the cap:
+        // every probe forks a child, so an unbounded count on a high-core CI
+        // host can exhaust a restrictive process limit and fail the test for
+        // a resource reason rather than a placement one.
+        let n: usize = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(4)
+            .clamp(4, 8);
+        let results: Vec<_> = (0..n)
+            .map(|_| {
+                let root = tree.path().to_path_buf();
+                std::thread::spawn(move || {
+                    classifier::probe_child_placement(&root, config::Verdict::Deny)
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|handle| handle.join().expect("probe thread panicked"))
+            .collect();
+
+        // Every probe reports the same answer: the stand-in tree has no
+        // cgroup.procs, so every child's write fails with NotFound.
+        for result in &results {
+            let e = result
+                .as_ref()
+                .expect_err("over a stand-in tree every probe should fail");
+            assert_eq!(
+                e.kind(),
+                std::io::ErrorKind::NotFound,
+                "every probe's child opens the leaf's cgroup.procs without \
+                 creating it: a missing one is a missing leaf"
+            );
+        }
+
+        // No probe leaf is left behind.
+        let leftover = std::fs::read_dir(&deny)
+            .expect("reading the deny subtree")
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .any(|name| name.starts_with("placement-probe-"));
+        assert!(
+            !leftover,
+            "no throwaway probe leaf is left behind after {n} concurrent probes"
         );
     }
 

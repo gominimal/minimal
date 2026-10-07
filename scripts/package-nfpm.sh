@@ -188,14 +188,42 @@ trap 'rm -rf "$workdir"' EXIT
 # name. Same mapping as the PKGBUILD's source arrays
 # (min::minimal-linux-amd64, ...), plus minvmd, which every staged row
 # carries — see the file-list decision in packaging/nfpm.yaml's header.
+# minzoned carries the same rule: it packages beside `min` as
+# /usr/bin/minzoned (the copy source NET-122's session advisory finds),
+# root-owned like the other packaged binaries, and nothing here installs or
+# enables the answerer service — the advisory's privileged step stays the
+# one privileged step, so a package never writes the unit files or plist.
 ARTIFACTS=(
     "minimal|min"
     "minimald|minimald"
     "mip|mip"
     "minvmd|minvmd"
     "gvproxy|gvproxy-min"
+    "minzoned|minzoned"
 )
 artifacts_root="$workdir/artifacts"
+
+# Artifacts whose absence warns and packages without them instead of failing.
+# TEMPORARY (gominimal/inbox#899), the same rule as stage-release.sh's
+# OPTIONAL_COMPONENTS: release.yml now uploads minzoned on every platform, but
+# this list stays until stage-release.sh's does, so a versioned release without
+# the artifact still packages. A package built without it drops the config's
+# marked minzoned block (see packaging/nfpm.yaml). Empty both lists together.
+OPTIONAL_ARTIFACTS=(minzoned)
+
+# is_optional <staged-name> — whether a missing artifact only warns.
+is_optional() {
+    local a
+    for a in "${OPTIONAL_ARTIFACTS[@]}"; do
+        [ "$a" = "$1" ] && return 0
+    done
+    return 1
+}
+
+# warn_optional <name> <arch> — say an optional artifact is left out.
+warn_optional() {
+    echo "package-nfpm: warning: optional artifact $1-linux-$2 missing, packaging without it (temporary, gominimal/inbox#899)" >&2
+}
 
 if [ -n "${ARTIFACTS_DIR:-}" ]; then
     # Local build output: the release run's own artifacts, not yet staged.
@@ -209,6 +237,10 @@ if [ -n "${ARTIFACTS_DIR:-}" ]; then
         for entry in "${ARTIFACTS[@]}"; do
             IFS='|' read -r staged installed <<<"$entry"
             src="$ARTIFACTS_DIR/${staged}-linux-${arch}"
+            if [ ! -f "$src" ] && is_optional "$staged"; then
+                warn_optional "$staged" "$arch"
+                continue
+            fi
             [ -f "$src" ] || die "missing local artifact $src (the release build did not produce it?)"
             cp "$src" "$art_dir/$installed"
             chmod +x "$art_dir/$installed"
@@ -247,6 +279,10 @@ else
         for entry in "${ARTIFACTS[@]}"; do
             IFS='|' read -r staged installed <<<"$entry"
             url="$BUCKET_URL/versions/$PKGVER/${staged}-linux-${arch}"
+            if [ -z "${manifest_sha[${staged}-linux-${arch}]:-}" ] && is_optional "$staged"; then
+                warn_optional "$staged" "$arch"
+                continue
+            fi
             curl -fsSL --retry 3 -o "$art_dir/$installed" "$url" \
                 || die "cannot download $url — is $PKGVER staged in the bucket? (see stage-release.sh)"
             want="${manifest_sha[${staged}-linux-${arch}]:-}"
@@ -318,6 +354,20 @@ EOF
 # One nfpm run per (format, arch): the config's ${NFPM_ARCH} and the
 # per-arch ${ARTIFACT_DIR} come from the environment, as do the other
 # expanded fields (see packaging/nfpm.yaml's header).
+# The config each arch packages with: the repo's own, or — when an optional
+# artifact is missing for that arch — a copy with that artifact's marked block
+# (`# BEGIN optional <name>` .. `# END optional <name>`) removed, so nfpm is
+# never handed a src that does not exist.
+config_for() {
+    local arch="$1" config="$ROOT/packaging/nfpm.yaml" a
+    for a in "${OPTIONAL_ARTIFACTS[@]}"; do
+        [ -f "$artifacts_root/$arch/$a" ] && continue
+        sed "/^ *# BEGIN optional $a\$/,/^ *# END optional $a\$/d" "$config" >"$workdir/nfpm-$arch.yaml"
+        config="$workdir/nfpm-$arch.yaml"
+    done
+    printf '%s\n' "$config"
+}
+
 for format in "${FORMATS_OUT[@]}"; do
     for arch in amd64 arm64; do
         echo "package-nfpm: $format/$arch -> $OUT_DIR"
@@ -328,7 +378,7 @@ for format in "${FORMATS_OUT[@]}"; do
         APPARMOR_DIR="$ROOT/packaging/apparmor" \
         APPARMOR_LOADER="$ROOT/scripts/install-apparmor-profile.sh" \
             "$nfpm_bin" package \
-                --config "$ROOT/packaging/nfpm.yaml" \
+                --config "$(config_for "$arch")" \
                 --packager "$format" \
                 --target "$OUT_DIR" \
             || die "nfpm package $format/$arch failed"

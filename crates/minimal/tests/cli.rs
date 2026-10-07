@@ -15,7 +15,7 @@ use sessions::SessionId;
 use minimald::test_harness::unwrap_ready;
 
 use serde_json_lenient::Value;
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _};
 
 // --- version ---
 
@@ -92,6 +92,7 @@ fn ls_shows_shared_resource_pool() {
             project_path: Some(paths::HostAbsPath::try_new("/p").unwrap()),
             status: sessions::SessionStatus::Active,
             git: None,
+            host_ip_enforcement: None,
             attrs: None,
         }],
     };
@@ -130,6 +131,7 @@ fn ls_table_exposes_project_path_and_status() {
             project_path: Some(paths::HostAbsPath::try_new("/work/proj").unwrap()),
             status: sessions::SessionStatus::Active,
             git: None,
+            host_ip_enforcement: None,
             attrs: None,
         }],
     };
@@ -158,6 +160,135 @@ fn ls_table_exposes_project_path_and_status() {
         text.contains("/work/proj"),
         "row should show project path: {text}"
     );
+}
+
+/// NET-079's proof names the listing: a host-address box that runs
+/// unenforced shows egress enforcement `none` in the human `min ls`, not
+/// only in `--json`; one decided per box shows `per_box`; a box the daemon
+/// reports no enforcement for shows `-`.
+#[test]
+fn ls_table_shows_host_address_enforcement() {
+    let entry = |name: &str, n: u64, enforcement| minimald_rpc::ListSessionsEntry {
+        id: SessionId::parse_str(&format!("00000000-0000-0000-0000-{n:012}")).unwrap(),
+        name: Some(name.to_string()),
+        project_path: Some(paths::HostAbsPath::try_new("/work/proj").unwrap()),
+        status: sessions::SessionStatus::Active,
+        git: None,
+        host_ip_enforcement: enforcement,
+        attrs: None,
+    };
+    let resp = ListSessionsResponse {
+        daemon_version: None,
+        hostname_routing_unavailable: None,
+        hostname_proxy_port: None,
+        zone_answerer_port: None,
+        answerer_bound: false,
+        resource_pool: None,
+        sessions: vec![
+            entry("decided", 1, Some(minimald_rpc::HostIpEnforcement::PerBox)),
+            entry("unenforced", 2, Some(minimald_rpc::HostIpEnforcement::None)),
+            entry("own-address", 3, None),
+        ],
+    };
+    let mut out = Vec::new();
+
+    format_ls(
+        &mut out,
+        &LsArgs {
+            raw: false,
+            json: false,
+        },
+        &resp,
+        None,
+        None,
+    )
+    .unwrap();
+
+    let text = String::from_utf8(out).unwrap();
+    let cells_of = |name: &str| -> Vec<String> {
+        text.lines()
+            .find(|l| l.contains(name))
+            .unwrap_or_else(|| panic!("a row for {name} in:\n{text}"))
+            .split_whitespace()
+            .map(str::to_string)
+            .collect()
+    };
+    assert!(text.contains("EGRESS"), "header should list EGRESS: {text}");
+    assert_eq!(cells_of("decided")[3], "per_box", "got:\n{text}");
+    assert_eq!(cells_of("unenforced")[3], "none", "got:\n{text}");
+    assert_eq!(cells_of("own-address")[3], "-", "got:\n{text}");
+}
+
+/// The multi-VM table carries the same EGRESS cell, one column right of the
+/// single-VM one because each row leads with its VM.
+#[test]
+fn ls_across_vms_table_shows_host_address_enforcement() {
+    let entry = |name: &str, n: u64, enforcement| minimald_rpc::ListSessionsEntry {
+        id: SessionId::parse_str(&format!("00000000-0000-0000-0000-{n:012}")).unwrap(),
+        name: Some(name.to_string()),
+        project_path: Some(paths::HostAbsPath::try_new("/work/proj").unwrap()),
+        status: sessions::SessionStatus::Active,
+        git: None,
+        host_ip_enforcement: enforcement,
+        attrs: None,
+    };
+    let listing = |vm: &str, sessions| VmListing {
+        vm: vm.to_string(),
+        resp: ListSessionsResponse {
+            daemon_version: None,
+            hostname_routing_unavailable: None,
+            hostname_proxy_port: None,
+            zone_answerer_port: None,
+            answerer_bound: false,
+            resource_pool: None,
+            sessions,
+        },
+        control_sock: None,
+    };
+    let listings = vec![
+        listing(
+            "default",
+            vec![
+                entry("decided", 1, Some(minimald_rpc::HostIpEnforcement::PerBox)),
+                entry("own-address", 3, None),
+            ],
+        ),
+        listing(
+            "alpha",
+            vec![entry(
+                "unenforced",
+                2,
+                Some(minimald_rpc::HostIpEnforcement::None),
+            )],
+        ),
+    ];
+    let mut out = Vec::new();
+
+    format_ls_across_vms(
+        &mut out,
+        &LsArgs {
+            raw: false,
+            json: false,
+        },
+        &listings,
+        &[None, None],
+        &[None, None],
+    )
+    .unwrap();
+
+    let text = String::from_utf8(out).unwrap();
+    let cells_of = |name: &str| -> Vec<String> {
+        text.lines()
+            .find(|l| l.contains(name))
+            .unwrap_or_else(|| panic!("a row for {name} in:\n{text}"))
+            .split_whitespace()
+            .map(str::to_string)
+            .collect()
+    };
+    assert!(text.contains("EGRESS"), "header should list EGRESS: {text}");
+    assert_eq!(cells_of("decided")[4], "per_box", "got:\n{text}");
+    assert_eq!(cells_of("unenforced")[4], "none", "got:\n{text}");
+    assert_eq!(cells_of("own-address")[4], "-", "got:\n{text}");
 }
 
 #[tokio::test]
@@ -324,10 +455,13 @@ async fn activate_creates_session() {
         sync: Some(SyncMode::Tarball),
         network: CliNetworkMode::NoNet,
         ingress: vec![],
+        dynamic_ingress: None,
+        dynamic_range: None,
         allow_subnets: vec![],
         allow_dns_hosts: vec![],
         allow_protocols: vec![],
         deny_subnets: vec![],
+        deny_all_egress: false,
         credentialed_upstream: false,
         loadout: vec![],
         no_loadouts: false,
@@ -372,10 +506,13 @@ async fn activate_uploads_project_files() {
         sync: Some(SyncMode::Tarball),
         network: CliNetworkMode::NoNet,
         ingress: vec![],
+        dynamic_ingress: None,
+        dynamic_range: None,
         allow_subnets: vec![],
         allow_dns_hosts: vec![],
         allow_protocols: vec![],
         deny_subnets: vec![],
+        deny_all_egress: false,
         credentialed_upstream: false,
         loadout: vec![],
         no_loadouts: false,
@@ -459,10 +596,13 @@ async fn activate_uses_repo_dir_when_no_positional_path() {
         sync: Some(SyncMode::Tarball),
         network: CliNetworkMode::NoNet,
         ingress: vec![],
+        dynamic_ingress: None,
+        dynamic_range: None,
         allow_subnets: vec![],
         allow_dns_hosts: vec![],
         allow_protocols: vec![],
         deny_subnets: vec![],
+        deny_all_egress: false,
         credentialed_upstream: false,
         loadout: vec![],
         no_loadouts: false,
@@ -491,6 +631,343 @@ async fn activate_uses_repo_dir_when_no_positional_path() {
     let sftp = client.open_sftp(session.id).await;
     let hello = sftp.read("/workbench/hello.txt").await.unwrap();
     assert_eq!(hello, b"hello world");
+}
+
+// --- dynamic ingress declaration (NET-043/NET-044) ---
+
+/// NET-043: `min session create` carries the box's dynamic ingress stance
+/// into the create request's `IngressPolicy`. `--dynamic-ingress allow
+/// --dynamic-range 8000-8443` reaches the record the daemon holds as
+/// exactly that — mode and range — and the stance alone makes the ingress
+/// declaration (no static mapping was given), while a create that set
+/// nothing keeps `ingress` `None`: the deny-all default, not an empty
+/// declaration. Read back through `GetSessionPolicy`, so what is asserted
+/// is the declaration the record stores, not the args the client parsed.
+#[tokio::test]
+async fn create_carries_dynamic_ingress() {
+    let (_daemon, args) = setup().await;
+
+    for (name, dynamic_ingress, dynamic_range) in [
+        (
+            "dyn-allow",
+            Some(sessions::DynamicIngress::Allow),
+            Some((8000, 8443)),
+        ),
+        // The mode alone, with no range and no static mapping, still makes
+        // the declaration.
+        ("dyn-ask", Some(sessions::DynamicIngress::Ask), None),
+        ("dyn-bare", None, None),
+    ] {
+        let project = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(project.path().join(".git")).unwrap();
+        std::fs::write(
+            project.path().join("minimal.toml"),
+            "# test minimal.toml\n[stack]\nuse = \"shell\"\n",
+        )
+        .unwrap();
+        cmd_activate(
+            &args,
+            ActivateArgs {
+                name: Some(name.to_string()),
+                path: Some(project.path().to_string_lossy().to_string()),
+                sync: Some(SyncMode::Tarball),
+                network: CliNetworkMode::OwnIp,
+                ingress: vec![],
+                dynamic_ingress,
+                dynamic_range,
+                allow_subnets: vec![],
+                allow_dns_hosts: vec![],
+                allow_protocols: vec![],
+                deny_subnets: vec![],
+                deny_all_egress: false,
+                credentialed_upstream: false,
+                loadout: vec![],
+                no_loadouts: false,
+                no_hooks: false,
+                no_prompt: false,
+                attach: false,
+            },
+        )
+        .await
+        .unwrap_or_else(|error| panic!("activating {name} must succeed: {error:#}"));
+    }
+
+    let mut client = connect_daemon(&args).await.unwrap();
+    use minimald_rpc::{GetSessionPolicy, GetSessionPolicyRequest};
+    for (name, declared) in [
+        (
+            "dyn-allow",
+            Some((sessions::DynamicIngress::Allow, Some((8000, 8443)))),
+        ),
+        ("dyn-ask", Some((sessions::DynamicIngress::Ask, None))),
+        ("dyn-bare", None),
+    ] {
+        let resp = client
+            .oneshot_rpc::<GetSessionPolicy>(GetSessionPolicyRequest::Name(name.to_string()))
+            .await
+            .unwrap();
+        let policy = match resp {
+            minimald_rpc::Errorable::Ok(policy) => policy,
+            minimald_rpc::Errorable::Err { error } => {
+                panic!("GetSessionPolicy failed for {name}: {error}")
+            }
+        };
+        match declared {
+            Some((mode, range)) => {
+                let ingress = policy.ingress.unwrap_or_else(|| {
+                    panic!("the stance alone must make {name}'s ingress declaration")
+                });
+                assert_eq!(
+                    ingress.dynamic_ingress,
+                    Some(mode),
+                    "the record must hold the mode the flag named"
+                );
+                assert_eq!(
+                    ingress.dynamic_allowed_range, range,
+                    "the record must hold the range the flag named"
+                );
+                assert!(
+                    ingress.port_mappings.is_empty(),
+                    "no static mapping was given, so none may appear"
+                );
+            }
+            None => assert!(
+                policy.ingress.is_none(),
+                "nothing set must keep ingress None, the deny-all default"
+            ),
+        }
+    }
+}
+
+/// NET-043's create-time errors, each named at the flag it belongs to: a
+/// malformed range (no `-`, a non-numeric end) and an inverted one (`hi`
+/// below `lo`) are refused by the range's own parser, and a range with no
+/// mode is refused by the flag's `requires` — the half-declared stance can
+/// never read as a deliberate allow. Driven through the compiled binary so
+/// the assertion is on the create the user runs: the process exits nonzero
+/// with the reason on stderr, and no session is left behind a rejected
+/// flag.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn create_rejects_bad_dynamic_range() {
+    let (_daemon, args) = setup().await;
+    let project = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir(project.path().join(".git")).unwrap();
+    std::fs::write(
+        project.path().join("minimal.toml"),
+        "# test minimal.toml\n[stack]\nuse = \"shell\"\n",
+    )
+    .unwrap();
+
+    let project_path = project.path().to_str().unwrap();
+    for (extra, needle) in [
+        (
+            &["--dynamic-ingress", "allow", "--dynamic-range", "8000"][..],
+            "expected LO-HI",
+        ),
+        (
+            &["--dynamic-ingress", "allow", "--dynamic-range", "abc-8443"][..],
+            "'abc' is not a valid port number",
+        ),
+        (
+            &["--dynamic-ingress", "allow", "--dynamic-range", "8443-8000"][..],
+            "the upper end must not be below the lower end",
+        ),
+        (
+            &["--dynamic-ingress", "allow", "--dynamic-range", "80-90"][..],
+            "minimald refuses to publish host ports below 1024",
+        ),
+        // A range with no mode: clap's `requires` names the missing flag, so
+        // the stance the range would imply is spelled by the person, not
+        // defaulted by the parser.
+        (&["--dynamic-range", "8000-8443"][..], "--dynamic-ingress"),
+    ] {
+        let mut argv = vec![
+            "session",
+            "activate",
+            project_path,
+            "--name",
+            "bad-range",
+            "--network",
+            "own_ip",
+            "--no-input",
+        ];
+        argv.extend(extra.iter().copied());
+        let out = run_min(&args, &argv).await;
+        assert!(
+            !out.status.success(),
+            "the create with {extra:?} must fail, but the binary exited \
+             {}:\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr),
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains(needle),
+            "the refusal must say {needle:?}, got:\n{stderr}"
+        );
+    }
+}
+
+/// NET-043/NET-044: `min session policy` shows the resolved dynamic ingress
+/// stance — in the text render and in the JSON document, on the deny-all
+/// default as much as on a declared one. The `allow` stance a box was
+/// created with over a range reads as its row and its key with the range
+/// beside it; a box that set nothing reads as deny, the evaluation the
+/// absent setting takes, in both surfaces — the deny_all kind and the
+/// text's deny-all line carry the resolved key too, so a parser of either
+/// surface answers "which stance does this box run under" without
+/// defaulting a null itself. An explicit `deny` reads the same, through
+/// the declared kind, minus the absent setting's `(default)` mark and with
+/// `dynamic_ingress_source` `declared` rather than `default`.
+#[tokio::test]
+async fn policy_shows_resolved_dynamic_ingress() {
+    let (daemon, args) = setup().await;
+    let allowed_id = create_session_with_policy(
+        &daemon,
+        "dyn-allow-policy",
+        sessions::NetworkMode::OwnIp,
+        sessions::SessionPolicy::new(
+            None,
+            Some(sessions::IngressPolicy {
+                port_mappings: vec![],
+                dynamic_allowed_range: Some((8000, 8443)),
+                dynamic_ingress: Some(sessions::DynamicIngress::Allow),
+            }),
+        ),
+    )
+    .await;
+    let declared_deny_id = create_session_with_policy(
+        &daemon,
+        "dyn-explicit-deny-policy",
+        sessions::NetworkMode::OwnIp,
+        sessions::SessionPolicy::new(
+            None,
+            Some(sessions::IngressPolicy {
+                port_mappings: vec![],
+                dynamic_allowed_range: None,
+                dynamic_ingress: Some(sessions::DynamicIngress::Deny),
+            }),
+        ),
+    )
+    .await;
+    let bare_id = create_session_with_policy(
+        &daemon,
+        "dyn-bare-policy",
+        sessions::NetworkMode::OwnIp,
+        sessions::SessionPolicy::default(),
+    )
+    .await;
+
+    let mut client = connect_daemon(&args).await.unwrap();
+    use minimald_rpc::{GetEffectiveSessionPolicy, GetEffectiveSessionPolicyRequest};
+    for (name, id, (mode, range, declared)) in [
+        (
+            "the allow stance over a range",
+            allowed_id,
+            (
+                sessions::DynamicIngress::Allow,
+                Some((8000u16, 8443u16)),
+                true,
+            ),
+        ),
+        (
+            "the explicit deny stance",
+            declared_deny_id,
+            (sessions::DynamicIngress::Deny, None, true),
+        ),
+        (
+            "no dynamic flag given",
+            bare_id,
+            (sessions::DynamicIngress::Deny, None, false),
+        ),
+    ] {
+        let resp = client
+            .oneshot_rpc::<GetEffectiveSessionPolicy>(GetEffectiveSessionPolicyRequest::Id(id))
+            .await
+            .unwrap();
+        let policy = match resp {
+            minimald_rpc::Errorable::Ok(policy) => policy,
+            minimald_rpc::Errorable::Err { error } => {
+                panic!("GetEffectiveSessionPolicy failed for {name}: {error}")
+            }
+        };
+
+        let mut out = Vec::new();
+        format_policy(&mut out, &policy, sessions::NetworkMode::OwnIp, None, None).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        let row = if declared {
+            format!("  dynamic ingress  {mode}\n")
+        } else {
+            format!("  dynamic ingress  {mode} (default)\n")
+        };
+        assert!(
+            text.contains(&row),
+            "{name}: the resolved stance, marked (default) only when absent, must show in \
+             the text:\n{text}"
+        );
+        if let Some((lo, hi)) = range {
+            assert!(
+                text.contains(&format!("  dynamic ports  {lo}–{hi}")),
+                "{name}: the range must show in the text:\n{text}"
+            );
+        }
+
+        let mut out = Vec::new();
+        write_policy_json(
+            &mut out,
+            &policy,
+            sessions::NetworkMode::OwnIp,
+            None,
+            Ok(vec![]),
+        )
+        .unwrap();
+        let document: Value = serde_json_lenient::from_slice(&out).unwrap();
+        let ingress = &document["ingress"];
+        assert_eq!(
+            ingress["dynamic_ingress"],
+            mode.to_string(),
+            "{name}: the resolved stance must show in the document:\n{document}"
+        );
+        assert_eq!(
+            ingress["dynamic_ingress_source"],
+            if declared { "declared" } else { "default" },
+            "{name}: the stance's source must show in the document:\n{document}"
+        );
+        if declared {
+            assert_eq!(
+                ingress["kind"], "declared",
+                "{name}: a declared stance keeps the declared kind:\n{document}"
+            );
+        } else {
+            assert_eq!(
+                ingress["kind"], "deny_all",
+                "{name}: no declaration reads as the deny_all kind:\n{document}"
+            );
+        }
+        match range {
+            Some((lo, hi)) => {
+                let carried = ingress["dynamic_allowed_range"]
+                    .as_array()
+                    .unwrap_or_else(|| panic!("{name}: the range rides as an array:\n{document}"));
+                assert_eq!(
+                    (carried[0].as_u64(), carried[1].as_u64(),),
+                    (Some(u64::from(lo)), Some(u64::from(hi))),
+                    "{name}: the range's ends must survive the document:\n{document}"
+                );
+            }
+            None => {
+                if declared {
+                    assert_eq!(
+                        ingress["dynamic_allowed_range"],
+                        Value::Null,
+                        "{name}: no range declared carries null, not a phantom \
+                         one:\n{document}"
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// `min session activate` puts a session id on stdout only for a session
@@ -549,6 +1026,56 @@ async fn activate_prints_no_session_id_when_composition_fails() {
     assert!(
         stderr.contains(project_canon.to_str().unwrap()),
         "the error must name the directory the activation ran from: {stderr}"
+    );
+}
+
+/// Plain-mode tracing warnings must land on stderr, never stdout: a script
+/// piping `min loadout list` captures the table on stdout, and a `warning:`
+/// line mixed into it would corrupt that output. Driven through the compiled
+/// binary, not `cmd_loadout_list`, because the contract under test is which
+/// stream the process writes to. The warning is triggered deterministically
+/// by a loadout file carrying a vestigial `name` field.
+#[tokio::test]
+async fn loadout_list_warning_goes_to_stderr_not_stdout() {
+    let (_daemon, args) = setup().await;
+    let minimal_dir = args.minimal_dir.clone().expect("setup points at a tempdir");
+
+    // A loadout whose file still declares the now-vestigial `name` field
+    // makes `list_loadouts` emit a `tracing::warn!` during parsing.
+    let loadouts_dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        loadouts_dir.path().join("dev.toml"),
+        "name = \"dev\"\ndescription = \"development\"\n",
+    )
+    .unwrap();
+
+    // An empty config dir keeps the developer's own loadouts and policy
+    // out of the run.
+    let config_dir = tempfile::TempDir::new().unwrap();
+    let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_min"))
+        .args(["--minimal-dir".as_ref(), minimal_dir.as_os_str()])
+        .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
+        .arg("--no-input")
+        .args(["loadout", "list", "--dir"])
+        .arg(loadouts_dir.path())
+        .env_remove("RUST_LOG")
+        .output()
+        .await
+        .expect("the min binary should be invocable");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "loadout list must succeed: stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("warning:") && stderr.contains("declares a `name` field"),
+        "the vestigial-name warning must land on stderr, got: {stderr}"
+    );
+    assert!(
+        !stdout.contains("warning:"),
+        "a plain-mode warning must not pollute stdout, got: {stdout}"
     );
 }
 
@@ -864,10 +1391,275 @@ async fn session_policy_succeeds() {
         &args,
         PolicyArgs {
             session: session_id.to_string(),
+            output: None,
         },
     )
     .await
     .unwrap();
+}
+
+/// `min session policy -o json` writes one `min/v1/session-policy` document:
+/// the schema stamp a client checks before anything else, the policy's
+/// blocks as keys, and the live mappings as the wire's own rows with each
+/// one's `pending` state carried (NET-044) — a port published at runtime
+/// that the relay gate has not admitted must not read as reachable to
+/// something parsing the document, and the port the declaration named must
+/// read as the admitted forward it is. Driven through `write_policy_json`,
+/// the renderer the command goes through, with the effective policy fetched
+/// the way the command fetches it (the effective-policy RPC, NET-074) from
+/// a real session that really declares the port that reads `pending:
+/// false` — so the two rows are grounded in a declaration, not in a
+/// hand-built pair.
+#[tokio::test]
+async fn policy_json_carries_schema_and_pending() {
+    let (daemon, args) = setup().await;
+    let session_id = create_session_with_policy(
+        &daemon,
+        "policy-json",
+        sessions::NetworkMode::OwnIp,
+        sessions::SessionPolicy::new(
+            None,
+            Some(sessions::IngressPolicy {
+                port_mappings: vec![sessions::PortMapping {
+                    external_port: 3000,
+                    internal_port: 3000,
+                    proto: sessions::IpProto::Tcp,
+                }],
+                dynamic_allowed_range: None,
+                dynamic_ingress: None,
+            }),
+        ),
+    )
+    .await;
+
+    let mut client = connect_daemon(&args).await.unwrap();
+    use minimald_rpc::{GetEffectiveSessionPolicy, GetEffectiveSessionPolicyRequest};
+    let resp = client
+        .oneshot_rpc::<GetEffectiveSessionPolicy>(GetEffectiveSessionPolicyRequest::Id(session_id))
+        .await
+        .unwrap();
+    let policy = match resp {
+        minimald_rpc::Errorable::Ok(policy) => policy,
+        minimald_rpc::Errorable::Err { error } => {
+            panic!("GetEffectiveSessionPolicy failed: {error}")
+        }
+    };
+    assert!(
+        policy
+            .ingress
+            .as_ref()
+            .is_some_and(|ingress| ingress.port_mappings.len() == 1),
+        "the stored declaration must survive the record round trip"
+    );
+
+    // The live rows the way the daemon serves them: a runtime-only port the
+    // declaration never named, beside the declared one.
+    let live = vec![
+        minimald_rpc::LiveMapping {
+            local: "127.0.0.1:3200".to_string(),
+            internal_port: 3200,
+            proto: sessions::IpProto::Tcp,
+            pending: Some(true),
+        },
+        minimald_rpc::LiveMapping {
+            local: "127.0.0.1:3000".to_string(),
+            internal_port: 3000,
+            proto: sessions::IpProto::Tcp,
+            pending: Some(false),
+        },
+    ];
+
+    let mut out = Vec::new();
+    write_policy_json(
+        &mut out,
+        &policy,
+        sessions::NetworkMode::OwnIp,
+        None,
+        Ok(live),
+    )
+    .unwrap();
+    let document: Value = serde_json_lenient::from_slice(&out).unwrap();
+    assert_eq!(
+        document["schema"], "min/v1/session-policy",
+        "the document must open with the schema stamp:\n{document}"
+    );
+    assert_eq!(
+        document["network"], "own_ip",
+        "the mode names which surface the policy describes:\n{document}"
+    );
+    assert_eq!(
+        document["ingress"]["kind"], "declared",
+        "the declared block is carried as the declaration:\n{document}"
+    );
+    let declared = document["ingress"]["port_mappings"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the declared mappings ride as an array: {document}"));
+    assert_eq!(
+        declared[0]["internal_port"].as_u64(),
+        Some(3000),
+        "the declaration the pending rows are measured against:\n{document}"
+    );
+
+    let live_rows = document["live_ingress"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the live mappings ride as an array: {document}"));
+    assert_eq!(live_rows.len(), 2, "every mapping carried: {document}");
+    let pending_of = |port: u16| {
+        live_rows
+            .iter()
+            .find(|row| row["internal_port"].as_u64() == Some(u64::from(port)))
+            .unwrap_or_else(|| panic!("no live row for port {port}: {document}"))["pending"]
+            .clone()
+    };
+    assert_eq!(
+        pending_of(3200).as_bool(),
+        Some(true),
+        "a port the declaration never named is carried as pending:\n{document}"
+    );
+    assert_eq!(
+        pending_of(3000).as_bool(),
+        Some(false),
+        "the port the declaration named is carried as admitted:\n{document}"
+    );
+
+    // A row from a daemon that predates the field — one that carried no
+    // `pending` key — rides the document as `null`, the JSON surface's own
+    // way of saying the state is unknown rather than reachable (NET-044).
+    let pre_field = minimald_rpc::LiveMapping {
+        local: "127.0.0.1:3400".to_string(),
+        internal_port: 3400,
+        proto: sessions::IpProto::Tcp,
+        pending: None,
+    };
+    let mut out = Vec::new();
+    write_policy_json(
+        &mut out,
+        &policy,
+        sessions::NetworkMode::OwnIp,
+        None,
+        Ok(vec![pre_field]),
+    )
+    .unwrap();
+    let document: Value = serde_json_lenient::from_slice(&out).unwrap();
+    let rows = document["live_ingress"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the live mappings ride as an array: {document}"));
+    assert_eq!(
+        rows[0]["pending"],
+        Value::Null,
+        "a pre-field row's unknown state rides the document as null, never as a bool:\n{document}"
+    );
+}
+
+/// The `live_ingress` key carries three states a client must be able to tell
+/// apart, because each says a different thing: the rows the daemon served —
+/// an empty list included, which is the claim that the box published
+/// nothing — `null` for the view the daemon could not serve, which is no
+/// claim at all (the box may have published anything, and the run cannot
+/// warn in prose: a `-o json` run's stderr is the error object's alone), and
+/// no key at all for a mode without the surface. A degraded fetch — an
+/// older daemon without the subsystem, a session mid-teardown — is the
+/// middle one, never collapsed into the first.
+#[test]
+fn policy_json_distinguishes_unavailable_live_rows_from_none_published() {
+    let policy = sessions::EffectiveSessionPolicy {
+        egress: sessions::EffectiveEgress::AllowAll,
+        ingress: None,
+    };
+
+    // A box that published nothing: the empty list is an authoritative
+    // claim about the box.
+    let mut out = Vec::new();
+    write_policy_json(
+        &mut out,
+        &policy,
+        sessions::NetworkMode::OwnIp,
+        None,
+        Ok(Vec::new()),
+    )
+    .unwrap();
+    let document: Value = serde_json_lenient::from_slice(&out).unwrap();
+    assert_eq!(
+        document.get("live_ingress"),
+        Some(&Value::Array(Vec::new())),
+        "a served empty view is the box's own claim that it published nothing:\n{document}"
+    );
+
+    // A view the daemon could not serve: `null`, the document's unknown —
+    // present as a key, so it is not the mode's absence either.
+    let mut out = Vec::new();
+    write_policy_json(
+        &mut out,
+        &policy,
+        sessions::NetworkMode::OwnIp,
+        None,
+        Err("live port mappings are unavailable: no session found".to_string()),
+    )
+    .unwrap();
+    let document: Value = serde_json_lenient::from_slice(&out).unwrap();
+    assert_eq!(
+        document.get("live_ingress"),
+        Some(&Value::Null),
+        "an unavailable live view rides the document as null, never as an empty list:\n{document}"
+    );
+
+    // A mode without the surface: no key at all, a third state again.
+    let mut out = Vec::new();
+    write_policy_json(
+        &mut out,
+        &policy,
+        sessions::NetworkMode::NoNet,
+        None,
+        Ok(Vec::new()),
+    )
+    .unwrap();
+    let document: Value = serde_json_lenient::from_slice(&out).unwrap();
+    assert_eq!(
+        document.get("live_ingress"),
+        None,
+        "a mode without a live-ingress surface leaves the key out entirely:\n{document}"
+    );
+}
+
+/// A `-o json` run that fails answers with the mode's error contract, not a
+/// plain-text line: the failure crosses to `main` as the typed
+/// `MachineModeFailure` — the generic payload every `-o json` command fails
+/// into, which `main`'s machine-mode error emitter (keyed on the output
+/// mode, shared by every command that takes `-o json`) writes as the one
+/// `min/v1/error` object on stderr, its one-object shape pinned by `main`'s
+/// own unit test. A missing session carries the architecture's `not_found`
+/// code — never a policy-specific spelling — with the kind of thing that
+/// was missing, a session, in the message and the hint.
+#[tokio::test]
+async fn policy_json_failure_answers_with_the_error_contract() {
+    let (_daemon, args) = setup().await;
+    let err = cmd_session_policy(
+        &args,
+        PolicyArgs {
+            session: "no-such-session".to_string(),
+            output: Some(PolicyOutputFormat::Json),
+        },
+    )
+    .await
+    .unwrap_err();
+    let failure = err
+        .downcast_ref::<MachineModeFailure>()
+        .expect("the failure crosses as the payload the emitter writes, not a message");
+    assert_eq!(
+        failure.code(),
+        "not_found",
+        "a missing session is the architecture's not-found code: {err:#}"
+    );
+    assert!(
+        failure.message().contains("session"),
+        "the message names the kind of thing that was missing: {}",
+        failure.message()
+    );
+    assert!(
+        failure.hint().contains("session"),
+        "the hint names the kind of thing that was missing: {}",
+        failure.hint()
+    );
 }
 
 /// `min session policy` shows the effective egress rules (NET-061): the four
@@ -914,7 +1706,7 @@ async fn policy_shows_effective_egress() {
     );
 
     let mut out = Vec::new();
-    format_policy(&mut out, &policy, sessions::NetworkMode::OwnIp, None).unwrap();
+    format_policy(&mut out, &policy, sessions::NetworkMode::OwnIp, None, None).unwrap();
     let text = String::from_utf8(out).unwrap();
     assert!(
         text.contains("subnets  10.0.0.0/8"),
@@ -936,7 +1728,7 @@ async fn policy_shows_effective_egress() {
     // The same egress is accepted on a host-address box (NET-120), but the
     // ingress block is suppressed there: a host-address session shares its
     // host's namespace, so minimald applies no per-session ingress to it and
-    // a `deny all` row would claim a deny-rule that does not exist. The TUI's
+    // a `deny-all` row would claim a deny-rule that does not exist. The TUI's
     // detail pane suppresses the block for the same reason.
     let host_id = create_session_with_policy(
         &daemon,
@@ -956,7 +1748,14 @@ async fn policy_shows_effective_egress() {
         }
     };
     let mut out = Vec::new();
-    format_policy(&mut out, &policy, sessions::NetworkMode::HostNet, None).unwrap();
+    format_policy(
+        &mut out,
+        &policy,
+        sessions::NetworkMode::HostNet,
+        None,
+        None,
+    )
+    .unwrap();
     let text = String::from_utf8(out).unwrap();
     assert!(
         text.contains("subnets  10.0.0.0/8"),
@@ -967,9 +1766,49 @@ async fn policy_shows_effective_egress() {
         "a host-address session has no per-session ingress policy to show:\n{text}"
     );
 
+    // NET-079: the per-box enforcement state rides its own runtime-facts
+    // reply beside the rules — never a field on the policy, whose strict
+    // shape an older `min` would reject over a key it has no field for —
+    // and the row the render prints is the state that reply carried, in the
+    // machine spelling. Whatever this host actually decides is what shows:
+    // the assertion is on the agreement between the reply and the row, not
+    // on the state, which is the host's to answer.
+    use minimald_rpc::{GetSessionRuntimeFacts, GetSessionRuntimeFactsRequest};
+    let resp = client
+        .oneshot_rpc::<GetSessionRuntimeFacts>(GetSessionRuntimeFactsRequest::Id(host_id))
+        .await
+        .unwrap();
+    let facts = match resp {
+        minimald_rpc::Errorable::Ok(facts) => facts,
+        minimald_rpc::Errorable::Err { error } => {
+            panic!("GetSessionRuntimeFacts failed: {error}")
+        }
+    };
+    let host_ip_enforcement = facts
+        .host_ip_enforcement
+        .expect("a host-address session answers a state");
+    let mut out = Vec::new();
+    format_policy(
+        &mut out,
+        &policy,
+        sessions::NetworkMode::HostNet,
+        Some(host_ip_enforcement),
+        None,
+    )
+    .unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert!(
+        text.contains(&format!(
+            "  per-box enforcement  {}\n",
+            host_ip_enforcement.machine_str()
+        )),
+        "the enforcement row must carry the runtime-facts reply's state, in \
+         its own machine spelling:\n{text}"
+    );
+
     // A none box has no network, so it can carry no egress or ingress
     // declaration at all — the whole policy is replaced by the one-line
-    // note the TUI's detail pane shows, since `egress / allow all` there
+    // note the TUI's detail pane shows, since `egress / allow-all` there
     // would claim a reach a box with no network does not have.
     let none_id = create_session_with_policy(
         &daemon,
@@ -989,7 +1828,7 @@ async fn policy_shows_effective_egress() {
         }
     };
     let mut out = Vec::new();
-    format_policy(&mut out, &policy, sessions::NetworkMode::NoNet, None).unwrap();
+    format_policy(&mut out, &policy, sessions::NetworkMode::NoNet, None, None).unwrap();
     let text = String::from_utf8(out).unwrap();
     assert_eq!(
         text, "No network policy (NoNet)\n",
@@ -1062,14 +1901,22 @@ async fn policy_shows_deny_all_default() {
         "the in-force default for a bare own-address box is deny-all"
     );
     let mut out = Vec::new();
-    format_policy(&mut out, &in_force, sessions::NetworkMode::OwnIp, None).unwrap();
+    format_policy(
+        &mut out,
+        &in_force,
+        sessions::NetworkMode::OwnIp,
+        None,
+        None,
+    )
+    .unwrap();
     let text = String::from_utf8(out).unwrap();
     assert!(
-        text.contains("egress\n  deny all\n"),
-        "a bare own-address box must print deny-all once in force:\n{text}"
+        text.contains("egress\n  deny-all (default)\n"),
+        "a bare own-address box must print deny-all once in force, marked \
+         as the default it resolved to:\n{text}"
     );
     assert!(
-        !text.contains("allow all"),
+        !text.contains("allow-all"),
         "deny-all must not also print the allow-all row:\n{text}"
     );
 
@@ -1112,11 +1959,491 @@ async fn policy_shows_deny_all_default() {
     };
     assert_eq!(policy.egress, sessions::EffectiveEgress::AllowAll);
     let mut out = Vec::new();
-    format_policy(&mut out, &policy, sessions::NetworkMode::HostNet, None).unwrap();
+    format_policy(
+        &mut out,
+        &policy,
+        sessions::NetworkMode::HostNet,
+        None,
+        None,
+    )
+    .unwrap();
     let text = String::from_utf8(out).unwrap();
     assert!(
-        text.contains("egress\n  allow all\n"),
-        "a bare host-address box keeps the shipped allow-all:\n{text}"
+        text.contains("egress\n  allow-all (default)\n"),
+        "a bare host-address box keeps the shipped allow-all, marked as the \
+         default:\n{text}"
+    );
+}
+
+/// `--deny-all-egress` declares the deny-all section (NET-075's CLI half):
+/// the activation's record carries `sessions::EgressPolicy::deny_all()` —
+/// every allow list present and empty, nothing denied on top — the shape the
+/// host-address classifier decides its deny verdict on (NET-079), not four
+/// absent lists: present-and-empty is the declaration that reaches nothing,
+/// `None` is the allow-all default, and a box that declared deny-all by flag
+/// must read in the record exactly like one that declared it in its
+/// `minimal.toml`.
+#[tokio::test]
+async fn deny_all_egress_flag_declares_every_allow_list_empty() {
+    let (_daemon, args) = setup().await;
+
+    // The project dir ritual every `cmd_activate` test carries: a minimal.toml
+    // so the missing-mfile prompt doesn't fire, a `.git` root so the non-VCS
+    // upload confirmation short-circuits.
+    let project = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir(project.path().join(".git")).unwrap();
+    std::fs::write(
+        project.path().join("minimal.toml"),
+        "# test minimal.toml\n[stack]\nuse = \"shell\"\n",
+    )
+    .unwrap();
+
+    cmd_activate(
+        &args,
+        ActivateArgs {
+            name: Some("flag-declared-deny-all".to_string()),
+            path: Some(project.path().to_string_lossy().to_string()),
+            sync: Some(SyncMode::Tarball),
+            network: CliNetworkMode::HostNet,
+            ingress: vec![],
+            dynamic_ingress: None,
+            dynamic_range: None,
+            allow_subnets: vec![],
+            allow_dns_hosts: vec![],
+            allow_protocols: vec![],
+            deny_subnets: vec![],
+            deny_all_egress: true,
+            credentialed_upstream: false,
+            loadout: vec![],
+            no_loadouts: false,
+            no_hooks: false,
+            no_prompt: true,
+            attach: false,
+        },
+    )
+    .await
+    .expect("a deny-all declaration is accepted wherever egress declarations are");
+
+    let mut client = connect_daemon(&args).await.unwrap();
+    use minimald_rpc::{GetSessionPolicy, GetSessionPolicyRequest};
+    let strict = client
+        .oneshot_rpc::<GetSessionPolicy>(GetSessionPolicyRequest::Name(
+            "flag-declared-deny-all".to_string(),
+        ))
+        .await
+        .unwrap();
+    let strict = match strict {
+        minimald_rpc::Errorable::Ok(strict) => strict,
+        minimald_rpc::Errorable::Err { error } => {
+            panic!("GetSessionPolicy failed: {error}")
+        }
+    };
+    // Every allow list present and empty, `deny_subnets` unset: the one
+    // `EgressRules::from_policy` shape that admits nothing, with nothing
+    // left to subtract from.
+    assert_eq!(
+        strict.egress,
+        Some(sessions::EgressPolicy::deny_all()),
+        "the flag must declare the deny-all section, every allow list \
+         present and empty"
+    );
+
+    // The effective answer keeps the declaration's verdict: a declared
+    // section resolves to itself whatever the rollout phase is doing, so
+    // `min session policy` renders it as the deny-all name (the declared
+    // case of NET-075's rendering) rather than the default's.
+    use minimald_rpc::{GetEffectiveSessionPolicy, GetEffectiveSessionPolicyRequest};
+    let resp = client
+        .oneshot_rpc::<GetEffectiveSessionPolicy>(GetEffectiveSessionPolicyRequest::Name(
+            "flag-declared-deny-all".to_string(),
+        ))
+        .await
+        .unwrap();
+    let policy = match resp {
+        minimald_rpc::Errorable::Ok(policy) => policy,
+        minimald_rpc::Errorable::Err { error } => {
+            panic!("GetEffectiveSessionPolicy failed: {error}")
+        }
+    };
+    assert_eq!(
+        policy.egress,
+        sessions::EffectiveEgress::Declared(sessions::EgressPolicy::deny_all()),
+        "a declared deny-all box's effective egress is its declaration, never \
+         the default"
+    );
+}
+
+/// An empty value for an egress rule flag stays a typed validation error,
+/// never an empty list (NET-075's CLI half): `Some(vec![])` on an allow
+/// dimension is the deny-all section, so a value that silently vanished
+/// would turn a typo into deny-all — the strongest posture the box can
+/// carry, reached by accident. The CIDR and hostname dimensions are refused
+/// by the daemon's policy validation naming the entry, and the protocol
+/// dimension by the CLI's own parser.
+#[tokio::test]
+async fn empty_egress_flag_value_is_a_validation_error() {
+    let (_daemon, args) = setup().await;
+
+    let project = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir(project.path().join(".git")).unwrap();
+    std::fs::write(
+        project.path().join("minimal.toml"),
+        "# test minimal.toml\n[stack]\nuse = \"shell\"\n",
+    )
+    .unwrap();
+    let project_path = project.path().to_string_lossy().to_string();
+
+    let activate_args = |allow_subnets: Vec<String>,
+                         allow_dns_hosts: Vec<String>,
+                         allow_protocols: Vec<String>,
+                         deny_subnets: Vec<String>| {
+        ActivateArgs {
+            name: Some("empty-egress-value".to_string()),
+            path: Some(project_path.clone()),
+            sync: Some(SyncMode::Tarball),
+            network: CliNetworkMode::HostNet,
+            ingress: vec![],
+            dynamic_ingress: None,
+            dynamic_range: None,
+            allow_subnets,
+            allow_dns_hosts,
+            allow_protocols,
+            deny_subnets,
+            deny_all_egress: false,
+            credentialed_upstream: false,
+            loadout: vec![],
+            no_loadouts: false,
+            no_hooks: false,
+            no_prompt: true,
+            attach: false,
+        }
+    };
+
+    // `--allow-subnets ""`: an invalid CIDR, named by the daemon's typed
+    // validation rather than dropped into an empty allow list.
+    let err = cmd_activate(
+        &args,
+        activate_args(vec![String::new()], vec![], vec![], vec![]),
+    )
+    .await
+    .expect_err("an empty allow-subnets value is not a CIDR");
+    let rendered = format!("{err:#}");
+    assert!(
+        rendered.contains("allow_subnets entry"),
+        "the refusal must name the dimension: {rendered}"
+    );
+    assert!(
+        rendered.contains("is not a valid CIDR prefix"),
+        "the refusal must name the typed reason: {rendered}"
+    );
+
+    // `--deny-subnets ""`: the same check on the denied dimension.
+    let err = cmd_activate(
+        &args,
+        activate_args(vec![], vec![], vec![], vec![String::new()]),
+    )
+    .await
+    .expect_err("an empty deny-subnets value is not a CIDR");
+    let rendered = format!("{err:#}");
+    assert!(
+        rendered.contains("deny_subnets entry"),
+        "the refusal must name the dimension: {rendered}"
+    );
+    assert!(
+        rendered.contains("is not a valid CIDR prefix"),
+        "the refusal must name the typed reason: {rendered}"
+    );
+
+    // `--allow-protocols ""`: refused by the CLI's own parser, before any
+    // declaration is built.
+    let err = cmd_activate(
+        &args,
+        activate_args(vec![], vec![], vec![String::new()], vec![]),
+    )
+    .await
+    .expect_err("an empty allow-protocols value is not a protocol");
+    let rendered = format!("{err:#}");
+    assert!(
+        rendered.contains("unsupported protocol"),
+        "the refusal must name the typed reason: {rendered}"
+    );
+
+    // `--allow-dns-hosts ""`: not a DNS hostname, so the daemon's typed
+    // validation names the entry rather than dropping it into an empty list.
+    let err = cmd_activate(
+        &args,
+        activate_args(vec![], vec![String::new()], vec![], vec![]),
+    )
+    .await
+    .expect_err("an empty allow-dns-hosts value is not a hostname");
+    let rendered = format!("{err:#}");
+    assert!(
+        rendered.contains("allow_dns_hosts entry"),
+        "the refusal must name the dimension: {rendered}"
+    );
+    assert!(
+        rendered.contains("is not a valid DNS hostname"),
+        "the refusal must name the typed reason: {rendered}"
+    );
+}
+
+/// A box with no egress section shows its effective default by name in
+/// `min session policy` (NET-075): never the dimension rows a declared
+/// section prints, and never nothing — the default the daemon resolved the
+/// absence to, which is the shipped phase's answer for an own-address box
+/// and the allow-all a host-address box always keeps, marked as a default
+/// on the row itself so it never reads as a declaration, while the strict
+/// record keeps the absence. The same distinction rides the JSON document
+/// as `source`, asserted here against a declared deny-all box rendered
+/// beside the unset one: the default's row carries the mark and the
+/// `default` source, the declared box's a bare row and the `declared`
+/// source, so neither a person reading the text nor a consumer parsing
+/// the document can mistake one for the other. On a host-address box the
+/// name sits beside the per-box enforcement value the runtime-facts reply
+/// carries (T73).
+#[tokio::test]
+async fn policy_shows_unset_egress_as_named_default() {
+    let (daemon, args) = setup().await;
+    let mut client = connect_daemon(&args).await.unwrap();
+    use minimald_rpc::{GetEffectiveSessionPolicy, GetEffectiveSessionPolicyRequest};
+
+    // Own-address, no section: the shipped phase's resolution, rendered by
+    // its own name — whatever the phase this build ships resolves the
+    // absence to, the render must say that name, marked as the default it
+    // is, never dimension rows.
+    let own_id = create_session_with_policy(
+        &daemon,
+        "unset-own-ip",
+        sessions::NetworkMode::OwnIp,
+        sessions::SessionPolicy::default(),
+    )
+    .await;
+    let resp = client
+        .oneshot_rpc::<GetEffectiveSessionPolicy>(GetEffectiveSessionPolicyRequest::Id(own_id))
+        .await
+        .unwrap();
+    let own_policy = match resp {
+        minimald_rpc::Errorable::Ok(policy) => policy,
+        minimald_rpc::Errorable::Err { error } => {
+            panic!("GetEffectiveSessionPolicy failed: {error}")
+        }
+    };
+    assert_eq!(
+        own_policy.egress,
+        sessions::effective_egress(
+            None,
+            sessions::NetworkMode::OwnIp,
+            sessions::EGRESS_DEFAULT_PHASE,
+            false
+        ),
+        "a box with no section resolves to the shipped phase's default"
+    );
+    let mut out = Vec::new();
+    format_policy(
+        &mut out,
+        &own_policy,
+        sessions::NetworkMode::OwnIp,
+        None,
+        None,
+    )
+    .unwrap();
+    let own_text = String::from_utf8(out).unwrap();
+    let name = match own_policy.egress {
+        sessions::EffectiveEgress::DenyAll => "  deny-all (default)\n",
+        sessions::EffectiveEgress::AllowAll => "  allow-all (default)\n",
+        sessions::EffectiveEgress::Declared(_) => {
+            panic!("a box with no section must never resolve to a declaration")
+        }
+    };
+    assert!(
+        own_text.contains(&format!("egress\n{name}")),
+        "the unset box's default must render by name, marked as the \
+         default: {own_text}"
+    );
+    for row in ["  subnets", "  dns hosts", "  protocols"] {
+        assert!(
+            !own_text.contains(row),
+            "an unset box must not render as declaration rows: {own_text}"
+        );
+    }
+    // The document a `-o json` run writes carries the same distinction
+    // (NET-075): the verdict's name in `effective`, its origin in `source`,
+    // so a consumer never recomputes the rollout rule to know the row it
+    // read was a default and not a declaration.
+    let mut out = Vec::new();
+    write_policy_json(
+        &mut out,
+        &own_policy,
+        sessions::NetworkMode::OwnIp,
+        None,
+        Ok(Vec::new()),
+    )
+    .unwrap();
+    let own_document: Value = serde_json_lenient::from_slice(&out).unwrap();
+    let own_name = match own_policy.egress {
+        sessions::EffectiveEgress::DenyAll => "deny-all",
+        sessions::EffectiveEgress::AllowAll => "allow-all",
+        sessions::EffectiveEgress::Declared(_) => {
+            panic!("a box with no section must never resolve to a declaration")
+        }
+    };
+    assert_eq!(
+        own_document["egress"]["effective"], own_name,
+        "the document names the default by the token the text row prints:\n{own_document}"
+    );
+    assert_eq!(
+        own_document["egress"]["source"], "default",
+        "a resolved default says so in the document, so no consumer \
+         recomputes the rollout rule:\n{own_document}"
+    );
+
+    // Host-address, no section: the shipped allow-all — the default is
+    // scoped to own-address boxes (NET-074) — beside the per-box
+    // enforcement value the facts reply carries, in its machine spelling.
+    let host_id = create_session_with_policy(
+        &daemon,
+        "unset-host-ip",
+        sessions::NetworkMode::HostNet,
+        sessions::SessionPolicy::default(),
+    )
+    .await;
+    let resp = client
+        .oneshot_rpc::<GetEffectiveSessionPolicy>(GetEffectiveSessionPolicyRequest::Id(host_id))
+        .await
+        .unwrap();
+    let host_policy = match resp {
+        minimald_rpc::Errorable::Ok(policy) => policy,
+        minimald_rpc::Errorable::Err { error } => {
+            panic!("GetEffectiveSessionPolicy failed: {error}")
+        }
+    };
+    assert_eq!(
+        host_policy.egress,
+        sessions::EffectiveEgress::AllowAll,
+        "a bare host-address box keeps the shipped allow-all"
+    );
+    use minimald_rpc::{GetSessionRuntimeFacts, GetSessionRuntimeFactsRequest};
+    let resp = client
+        .oneshot_rpc::<GetSessionRuntimeFacts>(GetSessionRuntimeFactsRequest::Id(host_id))
+        .await
+        .unwrap();
+    let facts = match resp {
+        minimald_rpc::Errorable::Ok(facts) => facts,
+        minimald_rpc::Errorable::Err { error } => {
+            panic!("GetSessionRuntimeFacts failed: {error}")
+        }
+    };
+    let enforcement = facts
+        .host_ip_enforcement
+        .expect("a host-address session answers a state");
+    let mut out = Vec::new();
+    format_policy(
+        &mut out,
+        &host_policy,
+        sessions::NetworkMode::HostNet,
+        Some(enforcement),
+        None,
+    )
+    .unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert!(
+        text.contains(&format!(
+            "egress\n  allow-all (default)\n  per-box enforcement  {}\n",
+            enforcement.machine_str()
+        )),
+        "the host-address default sits beside the per-box enforcement value: {text}"
+    );
+
+    // A declared deny-all box beside the unset one: the same surface, a
+    // different origin, and both the render and the document carry the
+    // difference — the declared row is bare where the default's is marked,
+    // and the declared `source` says `declared` where the default's says
+    // `default` — so a default never reads as something the box chose.
+    let declared_id = create_session_with_policy(
+        &daemon,
+        "unset-beside-declared-deny-all",
+        sessions::NetworkMode::OwnIp,
+        sessions::SessionPolicy::new(Some(sessions::EgressPolicy::deny_all()), None),
+    )
+    .await;
+    let resp = client
+        .oneshot_rpc::<GetEffectiveSessionPolicy>(GetEffectiveSessionPolicyRequest::Id(declared_id))
+        .await
+        .unwrap();
+    let declared_policy = match resp {
+        minimald_rpc::Errorable::Ok(policy) => policy,
+        minimald_rpc::Errorable::Err { error } => {
+            panic!("GetEffectiveSessionPolicy failed: {error}")
+        }
+    };
+    assert_eq!(
+        declared_policy.egress,
+        sessions::EffectiveEgress::Declared(sessions::EgressPolicy::deny_all()),
+        "a declared deny-all box's effective egress is its declaration"
+    );
+    let mut out = Vec::new();
+    format_policy(
+        &mut out,
+        &declared_policy,
+        sessions::NetworkMode::OwnIp,
+        None,
+        None,
+    )
+    .unwrap();
+    let declared_text = String::from_utf8(out).unwrap();
+    assert!(
+        declared_text.contains("egress\n  deny-all\n"),
+        "the declared box's row is the name, bare:\n{declared_text}"
+    );
+    assert!(
+        !declared_text.contains("deny-all (default)"),
+        "the declared row carries no default mark, so it never reads as \
+         one:\n{declared_text}"
+    );
+    assert_ne!(
+        own_text, declared_text,
+        "the default and the declared renders must differ"
+    );
+    let mut out = Vec::new();
+    write_policy_json(
+        &mut out,
+        &declared_policy,
+        sessions::NetworkMode::OwnIp,
+        None,
+        Ok(Vec::new()),
+    )
+    .unwrap();
+    let declared_document: Value = serde_json_lenient::from_slice(&out).unwrap();
+    assert_eq!(
+        declared_document["egress"]["effective"], "deny-all",
+        "the declared verdict is named by the same token:\n{declared_document}"
+    );
+    assert_eq!(
+        declared_document["egress"]["source"], "declared",
+        "the declared box's document says declared:\n{declared_document}"
+    );
+    assert_ne!(
+        own_document["egress"]["source"], declared_document["egress"]["source"],
+        "the default and the declared documents must differ in their source"
+    );
+
+    // And the strict record keeps the absence, which is what marks the row
+    // above as the default: the box declared nothing, and the render is the
+    // gate's resolution of that, never a section the box carries.
+    use minimald_rpc::{GetSessionPolicy, GetSessionPolicyRequest};
+    let strict = client
+        .oneshot_rpc::<GetSessionPolicy>(GetSessionPolicyRequest::Id(host_id))
+        .await
+        .unwrap();
+    let strict = match strict {
+        minimald_rpc::Errorable::Ok(strict) => strict,
+        minimald_rpc::Errorable::Err { error } => {
+            panic!("GetSessionPolicy failed: {error}")
+        }
+    };
+    assert_eq!(
+        strict.egress, None,
+        "the record must keep the absence the render resolved to a default"
     );
 }
 
@@ -1156,12 +2483,13 @@ fn policy_shows_baseline_set() {
         &mut out,
         &deny_all,
         sessions::NetworkMode::OwnIp,
+        None,
         Some(fabric),
     )
     .unwrap();
     let text = String::from_utf8(out).unwrap();
     assert!(
-        text.contains("egress\n  deny all\n"),
+        text.contains("egress\n  deny-all (default)\n"),
         "the box's own rules are shown:\n{text}"
     );
     // The posture is spelled beside the set, the way the daemon's start-up
@@ -1217,6 +2545,7 @@ fn policy_shows_baseline_set() {
         &mut out,
         &deny_all,
         sessions::NetworkMode::HostNet,
+        None,
         Some(fabric),
     )
     .unwrap();
@@ -1231,7 +2560,14 @@ fn policy_shows_baseline_set() {
     // and the set is left out rather than printed from the microVM plan the
     // session does not attach to.
     let mut out = Vec::new();
-    format_policy(&mut out, &deny_all, sessions::NetworkMode::OwnIp, None).unwrap();
+    format_policy(
+        &mut out,
+        &deny_all,
+        sessions::NetworkMode::OwnIp,
+        None,
+        None,
+    )
+    .unwrap();
     let text = String::from_utf8(out).unwrap();
     assert!(
         !text.contains("node-plane baseline set"),
@@ -1844,7 +3180,7 @@ async fn activate_and_ls_report_native_surface() {
         "activate must print the naming advisory beside the surface line, got: {activate_stderr}"
     );
     assert!(
-        activate_stderr.contains("Configure the host's resolver for the zone")
+        activate_stderr.contains("Configure the host's resolver")
             || activate_stderr.contains("bypass systemd-resolved"),
         "the advisory names what is missing — the command to run, or the host fact that \
          makes one dead: {activate_stderr}"
@@ -2543,6 +3879,81 @@ async fn net_forward_closes_with_session() {
         .expect("the forward must end once its session is destroyed")
         .expect("the forward task must not panic")
         .expect("the forward must exit cleanly");
+    echo.abort();
+}
+
+/// A local port of 0 asks the OS to pick a free port, and the forward must
+/// announce the port it actually bound — not `localhost:0`, which names
+/// nothing the user can connect to. The compiled binary is driven so the
+/// assertion reads the same stderr line the user sees.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn net_forward_announces_the_bound_local_port() {
+    let (daemon, args) = setup().await;
+    let _id = create_session_with_policy(
+        &daemon,
+        "web",
+        sessions::NetworkMode::HostNet,
+        sessions::SessionPolicy::default(),
+    )
+    .await;
+
+    let (box_port, echo) = spawn_echo_server().await;
+    let minimal_dir = args
+        .minimal_dir
+        .as_ref()
+        .expect("setup points at a tempdir");
+    let config_dir = tempfile::TempDir::new().unwrap();
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_min"))
+        .args(["--minimal-dir".as_ref(), minimal_dir.as_os_str()])
+        .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
+        .arg("--no-input")
+        .args(["net", "forward", "web", &format!("0:{box_port}")])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("the min binary should be invocable");
+
+    // Tracing also writes to stderr (warnings, or anything `RUST_LOG`
+    // enables), so skip ahead to the announcement rather than assuming it is
+    // the first line.
+    let mut stderr = tokio::io::BufReader::new(child.stderr.take().expect("stderr is piped"));
+    let line = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let n = stderr
+                .read_line(&mut line)
+                .await
+                .expect("reading the forward's stderr");
+            assert!(n > 0, "the forward closed stderr before announcing");
+            if line.contains("Forwarding localhost:") {
+                return line;
+            }
+        }
+    })
+    .await
+    .expect("the forward must announce its listener");
+
+    let announced = line
+        .split_once("localhost:")
+        .and_then(|(_, rest)| rest.split_once(' ').map(|(port, _)| port))
+        .unwrap_or_else(|| panic!("announcement must name the bound port: {line}"));
+    let announced_port: u16 = announced
+        .parse()
+        .unwrap_or_else(|_| panic!("announced port must be numeric: {line}"));
+    assert_ne!(announced_port, 0, "the bound port must be non-zero: {line}");
+
+    let mut conn = connect_with_retry(announced_port).await;
+    conn.write_all(b"ping").await.expect("write to the forward");
+    let mut echoed = [0u8; 4];
+    conn.read_exact(&mut echoed)
+        .await
+        .expect("read the box's answer back through the forward");
+    assert_eq!(echoed, *b"ping", "the forward must relay on the bound port");
+
+    child.kill().await.ok();
     echo.abort();
 }
 

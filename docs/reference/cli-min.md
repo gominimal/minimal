@@ -95,6 +95,8 @@ the current directory).
 | `--sync <MODE>` | | How to load project files into the session: `tarball` (default: stream a tarball of your project and unpack it) or `none` (do not populate the worktree. The session starts from a default project configuration and does not apply the project's `minimal.toml`) |
 | `--network <none\|host_ip\|own_ip>` | | Network mode for the session: `none` gives it no network (every socket it opens to a destination outside itself fails), `host_ip` shares the host's network namespace (the default), and `own_ip` gives it an IP of its own on the host's switch so `--ingress` can publish ports. The old hyphenated spellings `no-net`, `host-net`, and `own-ip` still work for one release, with a one-line hint naming the current spelling |
 | `--ingress <EXT:INT[/PROTO]>` | | Static ingress port mapping `EXT:INT[/PROTO]` (PROTO = tcp or udp, default tcp). Repeatable. Requires `--network own_ip` |
+| `--dynamic-ingress <allow\|ask\|deny>` | | Sets the stance that decides the box's own requests to publish a port (`min net expose`, or a listen inside `--dynamic-range`). `allow` publishes them, `ask` asks the attached person, and `deny` refuses every one, the same as leaving the flag unset. Setting it declares ingress even with no `--ingress` mapping. Requires `--network own_ip`. A VM-backed host refuses `allow` and `ask` before it creates the box, until the host side can admit a publish the box requests ([gominimal/minimal#1897](https://github.com/gominimal/minimal/issues/1897)). Every macOS host is VM-backed |
+| `--dynamic-range <LO-HI>` | | Inclusive host port range, such as `8000-8443`, inside which `--dynamic-ingress allow` publishes. A port outside it gets the out-of-range refusal. Requires `--dynamic-ingress`. Setting it declares ingress even with no `--ingress` mapping. The flag refuses a range that starts below 1024, a privileged port |
 | `--loadout <NAME>` | | Apply the named loadout from `<config>/minimal/loadouts/<NAME>.toml` or `<config>/minimal/loadouts/<NAME>/loadout.toml`. Repeatable; if given, config-file `default_loadouts` are ignored |
 | `--no-loadouts` | | Apply no loadouts at all (also skips the config's `default_loadouts`). Conflicts with `--loadout` |
 | `--no-hooks` | | Run none of the session's [lifecycle hooks](./loadouts.md#lifecycle_hooks---scripts-at-session-transition-points), from either the loadouts or the project's `minimal.toml`. Recorded on the session, so it applies to the later attach, detach, and destroy transitions too |
@@ -104,10 +106,12 @@ the current directory).
 | `--allow-dns-hosts <HOST>` | | Destination DNS hostname the box may resolve and reach (e.g. `github.com`). Repeatable; unset means allow all |
 | `--allow-protocols <PROTO>` | | Outbound transport protocol the box may use: `tcp`, `udp`, or `icmp`. Repeatable; unset means allow all |
 | `--deny-subnets <CIDR>` | | Destination subnet the box may not reach, in CIDR form — subtracted from what the allow flags admit. Repeatable; unset means nothing is denied |
+| `--deny-all-egress` | | Declare deny-all egress: the box reaches no external address. Writes the deny-all `egress` section, every allow list present and empty. A box declared by flag reads in the record exactly like one whose `minimal.toml` carries the section. On a host-address box the host's classifier decides a declared deny-all per box. An undeclared box keeps the default the rollout phase resolves. Conflicts with every `--allow-*`/`--deny-*` rule flag |
 
-Together the four `--allow-*`/`--deny-*` flags form the box's `egress`
-declaration; naming any one of them stores it on the session, and `min
-session policy` shows what the session ended up with.
+Together the four `--allow-*`/`--deny-*` rule flags form the box's `egress`
+declaration. Naming one of them stores it on the session, and `min session
+policy` shows what the session ended up with. `--deny-all-egress` declares
+the whole section in one flag and cannot combine with them.
 
 Activating a path that already has a session is allowed, but warns: `min` names
 the existing session and creates a second one anyway. With two sessions on one
@@ -132,10 +136,18 @@ of this, so an unknown loadout name errors even in a directory with no config.
 min session attach [SESSION]
 ```
 
-Attaches to an existing session, identified by UUID or session name. When
-`SESSION` is omitted, `min session attach` resolves a session from the current
-working directory (or the only existing session) and opens an interactive
-picker if the choice is ambiguous (`--no-input` errors instead).
+Attaches to an existing session, identified by UUID, unique id prefix, or
+session name. An exact session name wins over an id prefix. A prefix that
+matches more than one session fails with an error that names the candidates.
+When `SESSION` is omitted, `min session attach` resolves a session from the
+current working directory (or the only existing session) and opens an
+interactive picker if the choice is ambiguous (`--no-input` errors instead).
+
+`min session attach` exits 0 when you detach or the session's shell exits.
+It prints a one-line notice and exits 254 when the daemon ends the attach.
+That happens when someone destroys the session, another connection attaches
+to it, or the daemon shuts down. It exits 255 when the connection fails, or
+when the daemon disconnects a terminal that stopped keeping up with output.
 
 ### `session exec`
 
@@ -145,6 +157,9 @@ min session exec <SESSION> <COMMAND>...
 
 Runs a command in an existing session, non-interactively, relaying its
 stdout, stderr and exit code.
+When a daemon shutdown stops the command, `min` prints
+`minimald is shutting down; the command was stopped` on stderr and exits with
+the command's own status.
 
 How `COMMAND` is read depends on how many arguments you give it:
 
@@ -235,11 +250,11 @@ Renames an existing session.
 ### `session policy`
 
 ```
-min session policy <SESSION>
+min session policy <SESSION> [-o json]
 ```
 
-Prints the effective networking rules for `SESSION` (a UUID or session
-name). Resolved from the daemon, which answers from the policy stored at
+Prints the effective networking rules for `SESSION` (a UUID, unique id
+prefix, or session name). Resolved from the daemon, which answers from the policy stored at
 activation; each rule line shows what the session ended up with, not just
 what was typed.
 
@@ -249,25 +264,91 @@ to its rule or its default:
 ```
 egress
   subnets  10.0.0.0/8
-  dns hosts  allow all
+  dns hosts  allow-all
   protocols  tcp, udp
   deny subnets  169.254.169.254/32
 ```
 
-`subnets`, `dns hosts`, and `protocols` each read `allow all` when the
-matching flag was not given; `deny subnets` reads `(none)` when nothing is
-denied. The ingress block lists the published port mappings the session's
-`--ingress` flags declared (or `deny all` when none were), plus the dynamic
-port range when one is configured:
+`subnets`, `dns hosts`, and `protocols` each read `allow-all` when the
+matching flag was not given. `deny subnets` reads `(none)` when the
+declaration denies nothing. A deny-all declaration, the `egress` section
+with every allow list present and empty, prints as the one row `deny-all`.
+A box without an `egress` section prints the default the daemon resolved
+the absence to, by name and marked as what it is. `deny-all (default)`
+marks an own-address box once the deny-all default is in force.
+`allow-all (default)` marks a box behind the opt-out or one that shares
+its host's network namespace. The `(default)` mark distinguishes a verdict
+the box declared from the same verdict the default gave it. The ingress
+block lists the published port mappings the session's `--ingress` flags
+declared (or `deny-all` when the box leaves ingress undeclared). The
+`dynamic ports` row joins them when the box declared a `--dynamic-range`.
+The `dynamic ingress` row always prints, with the stance that decides the
+box's own publish requests. A box that set no `--dynamic-ingress`
+reads `deny (default)`, the deny the absence evaluates to, marked the way
+the egress block marks a default. A box that declared `deny` reads plain
+`deny`:
 
 ```
 ingress
   tcp  :8080 → :80
+  dynamic ports  8000–8443
+  dynamic ingress  allow
 ```
 
 A host-address (`--network host_ip`) session prints no ingress block at all:
 it shares its host's network namespace, so minimald applies no per-session
 ingress to it and there is no rule to state.
+
+The `live ingress` block lists the ports the box published at runtime with
+`min net expose`. Each row shows the address the forward binds on and the
+in-box port it delivers to:
+
+```
+live ingress (published at runtime)
+  tcp  127.0.64.21:3000 → :3000
+```
+
+A listed runtime publish is reachable. The daemon admits the port at the
+box's relay gate when it binds the forward. If nothing in the box listens on
+the port yet, the box itself refuses a connection to it.
+A row from an older daemon whose gate did not admit runtime publishes reads
+`(pending; not yet reachable)`. A row from a daemon older than the `pending`
+field reads `(unknown; daemon predates this field)`. The CLI never shows
+either row as reachable.
+
+`-o json` (`--output json`) prints one `min/v1/session-policy` document on
+stdout instead of text. Each block the text output prints becomes a key:
+`network`, `egress`, `ingress`, and `live_ingress`. The `egress` object
+carries the verdict the gate enforces as `effective` and its origin as
+`source`. `effective` reads `deny-all`, `allow-all`, or `rules` when the
+declaration's own lists say the verdict. `source` reads `default` for the
+rollout's resolution of an absent section, `declared` for the box's own.
+A declared section appears under `rules`, its lists as the record holds
+them. The fields match the text output's `(default)` mark, so a client
+never recomputes the default rule to tell a declaration from a default.
+Each `live_ingress` row is the daemon's mapping object, with its `pending`
+state (`true`, `false`, or `null` for a daemon older than the field). The
+document leaves out the blocks the text output leaves out. A host-address
+session has no `ingress` key, and a `--network none` box has only `schema`
+and `network`. The `ingress` block has a `kind` tag, `deny_all` or
+`declared`, so a client reads one field to branch. Both kinds carry
+`dynamic_ingress`, the resolved stance: `allow`, `ask`, or `deny`, never
+`null`. Both also carry `dynamic_ingress_source`. It reads `declared` when
+the box set `--dynamic-ingress`, and `default` when the stance is the deny
+an absent setting gives. Both keys are new in the `min/v1/session-policy`
+shape. A client written against the earlier document ignores them. A
+client that reads them finds a value in every `ingress` object.
+
+With `-o json`, a failed run writes one `min/v1/error` object on stderr and
+exits non-zero, with no plain-text error line. The `code` field names the
+failure: `not_found` for a missing session, `daemon_unreachable`, or
+`policy_unavailable`. The code is `output_failed` when the CLI cannot write
+its own document to stdout, such as on a full disk. Any other failure has
+the code `unspecified`. The `message` field holds the text mode's error
+chain, and `hint` says what to do next. An `unspecified` object has no
+`hint`. When the
+reader closes stdout early, the run writes nothing and exits 141,
+the shell's SIGPIPE convention.
 
 ### `session hooks`
 
@@ -276,7 +357,7 @@ min session hooks <SESSION> [--json]
 ```
 
 Lists the [lifecycle hooks](./loadouts.md#lifecycle_hooks---scripts-at-session-transition-points)
-composed into `SESSION` (a UUID or session name), one row per script, with
+composed into `SESSION` (a UUID, unique id prefix, or session name), one row per script, with
 the transition it runs on, whether it is inline or external, its timeout, and
 the loadout or project that declared it.
 
@@ -303,7 +384,8 @@ Forwards a port from a session's box to the laptop: binds
 SSH channel to `127.0.0.1:<PORT>` inside the box, so a service running in
 the session answers on the laptop with nothing else installed or configured
 on the remote side. `min net forward web 8080:3000` puts the box's port 3000
-on `localhost:8080`.
+on `localhost:8080`. A `<LOCAL>` of `0` binds a free port the OS picks, and
+the forward prints the port it bound. `<PORT>` must be 1-65535.
 
 Each accepted connection gets its own SSH channel, and the daemon dials
 `127.0.0.1:<PORT>` on the box's side of the session: inside the box's own
@@ -504,7 +586,7 @@ the shell to ask `min` itself what to offer. That indirection is what makes
 session arguments completable — `min session attach <TAB>` lists live session
 names, and `min session attach 019<TAB>` lists session IDs, neither of which
 exists at the time a static script would be written. Every argument documented
-as "UUID or session name" completes this way: `session attach`,
+as "UUID, unique id prefix, or session name" completes this way: `session attach`,
 `session exec`, `session run`, `session destroy`, `session rename`, and
 `session policy`.
 

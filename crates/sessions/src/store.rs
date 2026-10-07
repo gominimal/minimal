@@ -316,6 +316,23 @@ impl Index {
             .map(|(_, id)| id)
     }
 
+    /// Returns the session ID whose name folds to `name`, only when exactly
+    /// one indexed name does. Sessions written before names were made unique
+    /// under case folding can still sit side by side on disk (`Case-R` and
+    /// `case-r`); a lookup that folds to both is ambiguous and resolves to
+    /// neither rather than picking one.
+    fn find_by_name_folded_unique(&self, name: &str) -> Option<&SessionId> {
+        let mut matches = self
+            .name_to_id
+            .iter()
+            .filter(|(existing, _)| existing.eq_ignore_ascii_case(name))
+            .map(|(_, id)| id);
+        match (matches.next(), matches.next()) {
+            (Some(id), None) => Some(id),
+            _ => None,
+        }
+    }
+
     /// Returns the session ID corresponding to the given short name, if known.
     pub fn find_by_short<S: AsRef<str>>(&self, name: S) -> Option<&SessionId> {
         self.short_to_id.get(name.as_ref())
@@ -783,7 +800,11 @@ const RESERVED_SESSION_NAMES: [&str; 3] = ["host", "local", "localhost"];
 /// tab or newline in particular — splits one row into several, and an empty
 /// or whitespace-padded name is useless as an addressable handle. Enforced
 /// here beside the name-collision check so both name writers (`create` for
-/// `activate --name`, `save` for `rename`) share one gate.
+/// `activate --name`, `save` for `rename`) share one gate. The name must
+/// also be a single DNS label (ASCII letters, digits and `-`, 1 to 63
+/// octets, no `-` at either end) because the daemon renders it into
+/// `<name>.min.internal`. A name that parses as a session UUID is refused,
+/// because the CLI resolves a UUID before a name.
 fn validate_session_name(name: &str) -> Result<(), std::io::Error> {
     let invalid = |msg: &str| {
         std::io::Error::new(
@@ -805,6 +826,22 @@ fn validate_session_name(name: &str) -> Result<(), std::io::Error> {
         .find(|reserved| name.eq_ignore_ascii_case(reserved))
     {
         return Err(invalid(&format!("`{reserved}` is reserved")));
+    }
+    // Lookups try a UUID before a name, so a UUID-shaped name would be
+    // shadowed by (or shadow) the session that id belongs to.
+    if SessionId::parse_str(name).is_ok() {
+        return Err(invalid("must not be a session id"));
+    }
+    // Session names are rendered into `<name>.min.internal` box names, so a
+    // name must be a single DNS label: ASCII letters, digits and `-`, 1 to 63
+    // octets, not starting or ending with `-`.
+    let is_ldh = |c: char| c.is_ascii_alphanumeric() || c == '-';
+    if name.len() > 63 || !name.chars().all(is_ldh) || name.starts_with('-') || name.ends_with('-')
+    {
+        return Err(invalid(
+            "must be a DNS label: ASCII letters, digits and `-`, \
+             1 to 63 characters, not starting or ending with `-`",
+        ));
     }
     Ok(())
 }
@@ -871,7 +908,12 @@ impl Loader for DiskLoader {
         }))
     }
     fn find_by_name<S: AsRef<str>>(&self, name: S) -> Result<Option<Self::Key>, std::io::Error> {
-        match self.index.find_by_name(name) {
+        let name = name.as_ref();
+        let uuid = self
+            .index
+            .find_by_name(name)
+            .or_else(|| self.index.find_by_name_folded_unique(name));
+        match uuid {
             Some(uuid) => self.find_by_id(uuid),
             None => Ok(None),
         }
@@ -1164,6 +1206,12 @@ mod tests {
                 switch_address: std::net::Ipv4Addr::new(100, 64, 0, 2),
                 loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 0),
             }),
+            // `None` is the honest value for this own-address record: only a
+            // host-address box's launch ever writes the field, so a
+            // `Some` here would model a record no daemon writes. The
+            // round-trip of a `Some` is proved at the daemon's own launch
+            // record, which a client reads back through `GetSessionRecord`.
+            host_ip_enforcement: None,
             attrs: [("color".to_string(), "blue".to_string())]
                 .into_iter()
                 .collect(),
@@ -1248,9 +1296,76 @@ mod tests {
     }
 
     #[test]
+    fn find_by_name_resolves_case_insensitively() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        let mut record = sample_record();
+        record.name = Some("My-Session".to_string());
+        let key = loader.create(record).unwrap();
+
+        // The exact name resolves, and so does any casing of it: names are
+        // unique under ASCII case folding, so the fallback is unambiguous.
+        assert_eq!(
+            loader.find_by_name("My-Session").unwrap(),
+            Some(key.clone())
+        );
+        assert_eq!(
+            loader.find_by_name("my-session").unwrap(),
+            Some(key.clone())
+        );
+        assert_eq!(loader.find_by_name("MY-SESSION").unwrap(), Some(key));
+    }
+
+    /// Sessions written before names were unique under case folding can sit
+    /// side by side in the index. An exact name still resolves to its own
+    /// session, and a casing that folds to both resolves to neither.
+    #[test]
+    fn find_by_name_prefers_exact_and_refuses_an_ambiguous_fold() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        let mut upper = sample_record();
+        upper.name = Some("Case-R".to_string());
+        let upper_key = loader.create(upper).unwrap();
+        let mut lower = sample_record();
+        lower.name = Some("Case-X".to_string());
+        let lower_key = loader.create(lower).unwrap();
+        // Plant the legacy case-only duplicate the create path now refuses.
+        loader.index.name_to_id.remove("Case-X");
+        loader
+            .index
+            .name_to_id
+            .insert("case-r".to_string(), lower_key.session_id);
+
+        assert_eq!(loader.find_by_name("Case-R").unwrap(), Some(upper_key));
+        assert_eq!(loader.find_by_name("case-r").unwrap(), Some(lower_key));
+        assert_eq!(loader.find_by_name("CASE-R").unwrap(), None);
+    }
+
+    #[test]
     fn validate_session_name_accepts_ordinary_names() {
         assert!(validate_session_name("debug-qa").is_ok());
-        assert!(validate_session_name("my session").is_ok());
+        assert!(validate_session_name("my-session").is_ok());
+        assert!(validate_session_name("a".repeat(63).as_str()).is_ok());
+    }
+
+    #[test]
+    fn validate_session_name_rejects_non_ldh_labels() {
+        for bad in [
+            "bad name/y",
+            "dot.ted.name",
+            "Ünï-cødé",
+            "-leading",
+            "trailing-",
+            "a".repeat(64).as_str(),
+        ] {
+            assert_eq!(
+                validate_session_name(bad).err().map(|e| e.kind()),
+                Some(ErrorKind::InvalidInput),
+                "expected `{bad:?}` to be rejected",
+            );
+        }
     }
 
     #[test]
@@ -1273,6 +1388,34 @@ mod tests {
                 "expected `{bad:?}` to be rejected",
             );
         }
+    }
+
+    #[test]
+    fn create_and_rename_refuse_a_uuid_shaped_name() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+        let uuid = "019f5d0f-0a99-78b1-9165-0809440f0052";
+
+        for name in [uuid, "019f5d0f0a9978b191650809440f0052"] {
+            let mut record = sample_record();
+            record.name = Some(name.to_string());
+            let err = loader.create(record).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput, "create `{name}`");
+            assert!(
+                err.to_string().contains("must not be a session id"),
+                "{err}"
+            );
+        }
+        assert!(loader.keys().next().is_none());
+
+        let key = loader.create(sample_record()).unwrap();
+        let err = loader.rename(&key, uuid.to_string()).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("must not be a session id"),
+            "{err}"
+        );
+        assert_eq!(loader.find_by_name("my-session").unwrap(), Some(key));
     }
 
     #[test]
@@ -1362,6 +1505,23 @@ mod tests {
     }
 
     #[test]
+    fn create_rejects_a_non_ldh_name_and_creates_no_session_dir() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        for bad in ["bad name/y", "dot.ted.name", "Ünï-cødé", "-lead", "trail-"] {
+            let mut record = sample_record();
+            record.name = Some(bad.to_string());
+            assert_eq!(
+                loader.create(record).err().map(|e| e.kind()),
+                Some(ErrorKind::InvalidInput),
+                "expected `{bad:?}` to be rejected",
+            );
+        }
+        assert!(loader.keys().next().is_none());
+    }
+
+    #[test]
     fn rename_rejects_a_control_character_name_and_keeps_the_old_one() {
         let tmp = TempDir::new().unwrap();
         let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
@@ -1380,6 +1540,92 @@ mod tests {
             loader.get(&key).unwrap().record().name.as_deref(),
             Some("my-session"),
             "a rejected rename must leave the original name intact"
+        );
+    }
+
+    #[test]
+    fn rename_rejects_a_non_ldh_name_and_keeps_the_old_one() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        let key = loader.create(sample_record()).unwrap();
+        assert_eq!(
+            loader
+                .rename(&key, "dot.ted.name".to_string())
+                .err()
+                .map(|e| e.kind()),
+            Some(ErrorKind::InvalidInput)
+        );
+        assert_eq!(
+            loader.get(&key).unwrap().record().name.as_deref(),
+            Some("my-session"),
+            "a rejected rename must leave the original name intact"
+        );
+    }
+
+    #[test]
+    fn rename_of_a_legacy_invalid_named_session_to_a_valid_name_succeeds() {
+        let tmp = TempDir::new().unwrap();
+        let root = loader_dir(&tmp);
+
+        // Plant a record with a pre-existing invalid name directly on disk
+        // (create refuses it now), then reopen so self-heal indexes it.
+        let orphan_short = "zzzzz";
+        let orphan_dir = root.as_utf8_path().join("sessions").join(orphan_short);
+        std::fs::create_dir_all(orphan_dir.as_std_path()).unwrap();
+        let mut orphan_record = sample_record();
+        orphan_record.id = SessionId(uuid::Uuid::from_u128(0xDEAD_BEEF));
+        orphan_record.name = Some("bad name/y".to_string());
+        std::fs::write(
+            orphan_dir.join("record.json").as_std_path(),
+            serde_json_lenient::to_vec(&orphan_record).unwrap(),
+        )
+        .unwrap();
+
+        let mut loader = DiskLoader::new(root).unwrap();
+        let key = loader
+            .find_by_name("bad name/y")
+            .unwrap()
+            .expect("re-indexed");
+
+        loader.rename(&key, "good-name".to_string()).unwrap();
+        assert_eq!(
+            loader.get(&key).unwrap().record().name.as_deref(),
+            Some("good-name"),
+        );
+    }
+
+    #[test]
+    fn loading_a_store_with_a_legacy_invalid_name_succeeds() {
+        let tmp = TempDir::new().unwrap();
+        let root = loader_dir(&tmp);
+
+        let orphan_short = "zzzzz";
+        let orphan_dir = root.as_utf8_path().join("sessions").join(orphan_short);
+        std::fs::create_dir_all(orphan_dir.as_std_path()).unwrap();
+        let mut orphan_record = sample_record();
+        orphan_record.id = SessionId(uuid::Uuid::from_u128(0xDEAD_BEEF));
+        orphan_record.name = Some("dot.ted.name".to_string());
+        std::fs::write(
+            orphan_dir.join("record.json").as_std_path(),
+            serde_json_lenient::to_vec(&orphan_record).unwrap(),
+        )
+        .unwrap();
+
+        let mut loader = DiskLoader::new(root).unwrap();
+        let key = loader
+            .find_by_name("dot.ted.name")
+            .unwrap()
+            .expect("re-indexed");
+
+        // Re-saving the record with its legacy name unchanged (e.g. a status
+        // promotion) must not re-validate the name.
+        let mut promoted = loader.get(&key).unwrap().record().clone();
+        promoted.status = SessionStatus::Active;
+        loader.save(&key, &promoted).unwrap();
+        assert_eq!(
+            loader.get(&key).unwrap().record().status,
+            SessionStatus::Active,
         );
     }
 
@@ -2143,10 +2389,11 @@ mod tests {
 
         let loader = DiskLoader::new(root.clone()).unwrap();
         // The live session still resolves; the case-colliding orphan is not
-        // indexed.
-        assert_eq!(loader.find_by_id(&a_id).unwrap(), Some(a_key));
+        // indexed. Its name resolves to the live session under the
+        // case-insensitive lookup, not to the orphan.
+        assert_eq!(loader.find_by_id(&a_id).unwrap(), Some(a_key.clone()));
         assert_eq!(loader.find_by_id(&orphan_record.id).unwrap(), None);
-        assert_eq!(loader.find_by_name("MY-SESSION").unwrap(), None);
+        assert_eq!(loader.find_by_name("MY-SESSION").unwrap(), Some(a_key));
         // The orphan dir is left on disk for manual triage.
         assert!(
             session_dir_path(&root, orphan_short).exists(),

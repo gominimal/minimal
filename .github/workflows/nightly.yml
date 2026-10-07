@@ -134,3 +134,26 @@ jobs:
                     --channel nightly \
                     --version "$SHA" \
                     --bucket gs://minimal-one
+
+    # Tell the team when a scheduled nightly goes red. Nothing else does:
+    # a failed release skips promote-nightly, so the `nightly` channel quietly
+    # stays on an older build. Same webhook and pinned action as promote.yml's
+    # approval post. A dry_run dispatch is someone watching already, so it
+    # stays silent.
+    notify-failure:
+        needs: [check, release, promote-nightly]
+        if: ${{ always() && !inputs.dry_run && (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')) }}
+        runs-on: ubuntu-latest
+        timeout-minutes: 5
+        permissions: {}
+        steps:
+            - name: Notify Slack — nightly failed
+              continue-on-error: true
+              uses: slackapi/slack-github-action@dcb1066f776dd043e64d0e8ba94ca15cc7e1875d # v4.0.0
+              with:
+                  webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+                  webhook-type: incoming-webhook
+                  payload: |
+                      {
+                        "text": "*Nightly failed:* `${{ github.repository }}` at `${{ needs.check.outputs.sha }}`; the `nightly` channel did not advance.\ncheck: ${{ needs.check.result }} · release: ${{ needs.release.result }} · promote-nightly: ${{ needs.promote-nightly.result }}\nRun: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                      }

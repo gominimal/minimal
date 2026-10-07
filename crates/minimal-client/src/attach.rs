@@ -1,12 +1,24 @@
 //! Building the `ssh` invocation for attaching to a session.
 //!
-//! Shared between the `min session attach` CLI path (which `exec()`s the
-//! command, replacing itself) and the `min dash` TUI (which spawns it as a
-//! child while the TUI is suspended and resumes when ssh exits).
+//! Shared between the `min session attach` CLI path and the `min dash` TUI
+//! (which suspends itself around the attach). Both run the interactive
+//! attach through the client-owned terminal relay
+//! ([`run_interactive_attach`]); the CLI's exec path runs the command
+//! itself, with no pty of its own.
 
 use std::path::Path;
 
+use crate::HANDSHAKE_TIMEOUT;
+use crate::ask_dialog::{AskDialogEnd, render_ask_dialog};
+use crate::tty_relay;
 use anyhow::Context as _;
+
+/// Seconds between ssh keepalive probes on a non-interactive exec channel.
+/// With [`EXEC_SERVER_ALIVE_COUNT_MAX`], a peer that stops answering ends the
+/// exec after about 60 s instead of hanging it.
+const EXEC_SERVER_ALIVE_INTERVAL_SECS: u32 = 15;
+/// Unanswered keepalive probes ssh tolerates before it drops an exec channel.
+const EXEC_SERVER_ALIVE_COUNT_MAX: u32 = 4;
 
 /// Read and validate the session-key config, returning the resolved
 /// [`sessions::keys::SessionKeys`] to negotiate at attach. A missing config
@@ -78,10 +90,9 @@ pub fn host_key_opts(known_hosts: &Path) -> [String; 2] {
 /// this function never has to guess what a caller meant.
 ///
 /// The interactive path (`wire: None`) forces a PTY with `-tt` — the
-/// daemon's shell_request handler mints the PTY-backed session shell, and
-/// ssh handles termios/PTY management. The caller decides how to run the
-/// command: `min session attach` `exec()`s it, `min dash` spawns it as a
-/// child while suspended.
+/// daemon's shell_request handler mints the PTY-backed session shell. Its
+/// callers run the command through [`run_interactive_attach`], which owns
+/// the user's terminal and relays it to ssh over a local pty.
 ///
 /// `session_keys` negotiates the configurable detach/forward chord per
 /// channel: when `Some`, each resolved key is sent as an env var (with a
@@ -134,6 +145,10 @@ pub fn attach_command(
         &strict,
         "-o",
         &known_hosts_file,
+        // Bound the connect and the initial protocol handshake/key exchange so
+        // a bridge that accepts but never serves fails instead of hanging ssh.
+        "-o",
+        &format!("ConnectTimeout={}", HANDSHAKE_TIMEOUT.as_secs()),
     ]);
     // Negotiate the session-key config per channel: send each resolved key
     // as an env var the daemon reads back (alongside MINIMAL_SESSION_ID) and
@@ -181,6 +196,19 @@ pub fn attach_command(
         ssh.arg("-tt");
     }
 
+    // A non-interactive exec channel must not hang forever on a peer that
+    // accepted the connection but stopped answering after the handshake:
+    // keepalives end it with exit 255 within about a minute. The interactive
+    // path is left without them so a laptop sleep does not kill the attach.
+    if wire.is_some() {
+        ssh.args([
+            "-o",
+            &format!("ServerAliveInterval={EXEC_SERVER_ALIVE_INTERVAL_SECS}"),
+            "-o",
+            &format!("ServerAliveCountMax={EXEC_SERVER_ALIVE_COUNT_MAX}"),
+        ]);
+    }
+
     // The SSH host identity must match the known_hosts entry the daemon wrote,
     // which it keys on [`paths::ssh_host_alias`] (`local-minimald<N>` /
     // `local-minvmd<N>` for the default VM, `<vm>.local-minvmd<N>` for a named
@@ -200,6 +228,429 @@ pub fn attach_command(
     }
 
     Ok(ssh)
+}
+
+/// Run an interactive attach (`wire: None`) through the client-owned
+/// [relay](tty_relay) on the real terminal ([`tty_relay::RealTty::acquire`]):
+/// ssh goes on the slave end of a pty pair, the relay keeps the real
+/// terminal in ssh's own raw set, restores its attach-start termios on every
+/// exit path, and returns ssh's exit status unchanged, death by a signal
+/// included. The termios is restored by the time this returns, so any
+/// unwind codes the caller still owes the terminal land on a cooked tty.
+///
+/// `suspend` is the hook a prompt uses to borrow the real terminal
+/// mid-attach (the dynamic-ingress `ask` flow, NET-045): it runs on its
+/// own thread for the duration of the attach with a
+/// [`tty_relay::RelayHandle`], whose `suspend` hands the terminal over
+/// (attach-start termios, session output buffered) and whose `resume`
+/// takes it back. The hook thread is not joined: an attach that ends
+/// while a prompt is up still exits with ssh's status, and every handle
+/// call after that is a no-op or an error. The VM-backed attach hands
+/// [`HostAsks::into_hook`]; `None` for callers that just attach.
+///
+/// The exec path (`wire: Some`) never comes here: the caller runs ssh
+/// itself, with no relay and no pty.
+pub fn run_interactive_attach(
+    ssh: std::process::Command,
+    suspend: Option<tty_relay::SuspendHook>,
+) -> Result<std::process::ExitStatus, anyhow::Error> {
+    let real = tty_relay::RealTty::acquire()
+        .context("the interactive attach needs a terminal, but none could be taken")?;
+    run_interactive_attach_on(ssh, real, suspend)
+}
+
+/// [`run_interactive_attach`] on a terminal the caller already holds.
+pub fn run_interactive_attach_on(
+    ssh: std::process::Command,
+    real: tty_relay::RealTty,
+    suspend: Option<tty_relay::SuspendHook>,
+) -> Result<std::process::ExitStatus, anyhow::Error> {
+    let relay = tty_relay::Relay::start(ssh, real)?;
+    if let Some(hook) = suspend {
+        let handle = relay.handle();
+        // A hook that cannot get a thread just never prompts; the attach
+        // itself is unaffected.
+        if let Err(e) = std::thread::Builder::new()
+            .name("tty-relay-suspend-hook".into())
+            .spawn(move || hook(&handle))
+        {
+            tracing::warn!("tty relay: could not start the suspend hook: {e}");
+        }
+    }
+    relay.join(None)
+}
+
+// ---------------------------------------------------------------------------
+// Host-side asks (NET-045)
+// ---------------------------------------------------------------------------
+
+/// The VM host daemon's control socket's file name beside its ssh socket:
+/// `minvmd::control::CONTROL_SOCK_FILE`, spelled here because this crate
+/// does not depend on the VM host daemon; the CLI's tests pin the two equal.
+pub const VM_HOST_CONTROL_SOCK_FILE: &str = "control.sock";
+
+/// How long one exchange with the VM host daemon's control socket may take:
+/// the row read, the subscription's acknowledgement, and a recorded answer.
+/// The subscription itself is held for the whole attach, with no bound.
+const HOST_ASK_CONTROL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// An interactive attach's subscription to its box's pending asks on a
+/// VM-backed host (NET-045): the VM host daemon offers each ask the in-VM
+/// daemon raises to every interactive attach subscribed to the box's row,
+/// and this side renders the dialog on the real terminal and records the
+/// human's answer through the host door. Only an interactive relay attach
+/// subscribes: an exec channel, a task and `min dash`'s list view never do,
+/// so none of them counts as attached.
+///
+/// Opened before the attach starts, so the subscription is in place by the
+/// time the human could expose a port; served for the attach's duration
+/// by the relay's suspend hook ([`Self::into_hook`]).
+pub struct HostAsks {
+    control_sock: std::path::PathBuf,
+    subscription: std::io::BufReader<std::os::unix::net::UnixStream>,
+    /// Lines a dialog read off the subscription while it watched for its
+    /// own dismissal, kept in order for the serving loop.
+    held: std::collections::VecDeque<String>,
+}
+
+/// A dialog's view of the subscription while it is up: whether the host
+/// has taken its ask away. Every other line read here is held, in order,
+/// for the serving loop.
+pub struct AskWatch<'a> {
+    ask_id: minimald_rpc::AskId,
+    subscription: &'a mut std::io::BufReader<std::os::unix::net::UnixStream>,
+    held: &'a mut std::collections::VecDeque<String>,
+}
+
+impl<'a> AskWatch<'a> {
+    pub(crate) fn new(
+        ask_id: minimald_rpc::AskId,
+        subscription: &'a mut std::io::BufReader<std::os::unix::net::UnixStream>,
+        held: &'a mut std::collections::VecDeque<String>,
+    ) -> Self {
+        Self {
+            ask_id,
+            subscription,
+            held,
+        }
+    }
+
+    /// The subscription's socket, for a poll beside the terminal.
+    pub(crate) fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        use std::os::fd::AsFd as _;
+        self.subscription.get_ref().as_fd()
+    }
+
+    /// Whether bytes already read off the socket are waiting: a poll of
+    /// the socket would not see them.
+    pub(crate) fn has_buffered(&self) -> bool {
+        !self.subscription.buffer().is_empty()
+    }
+
+    /// Read one line. `true` when it ends this dialog: the dismissal of
+    /// this ask, or the subscription ending, after which nothing this
+    /// attach records could count. Any other line is held.
+    pub(crate) fn take_line(&mut self) -> bool {
+        use std::io::BufRead as _;
+        let mut line = String::new();
+        match self.subscription.read_line(&mut line) {
+            Ok(0) | Err(_) => return true,
+            Ok(_) => {}
+        }
+        if is_dismissal_of(&line, self.ask_id) {
+            return true;
+        }
+        self.held.push_back(line);
+        false
+    }
+
+    /// Block until the host dismisses this ask or the subscription ends:
+    /// a dialog that never answers.
+    pub fn wait_dismissed(&mut self) {
+        while !self.take_line() {}
+    }
+}
+
+/// Whether `line` is the host's dismissal of `ask_id`.
+fn is_dismissal_of(line: &str, ask_id: minimald_rpc::AskId) -> bool {
+    matches!(
+        serde_json_lenient::from_str(line.trim()),
+        Ok(minimald_rpc::BoxControlReply::PendingAskDismissed { ask_id: id, .. }) if id == ask_id
+    )
+}
+
+/// The terminal side of the ask dialog: the relay's suspend and resume, as
+/// a trait so the serving loop is testable without a pty.
+pub trait AskTerminal {
+    /// Hand the real terminal to the dialog: the relay stops forwarding and
+    /// puts the attach-start termios back. Errors once the attach ended.
+    fn suspend_for_ask(&self) -> Result<(), anyhow::Error>;
+    /// Take the terminal back and resume relaying.
+    fn resume_after_ask(&self);
+    /// Whether the session ended while the dialog held the terminal: a
+    /// cancelled dialog records nothing.
+    fn ask_cancelled(&self) -> bool;
+}
+
+impl AskTerminal for tty_relay::RelayHandle {
+    fn suspend_for_ask(&self) -> Result<(), anyhow::Error> {
+        // The lease is not held: the handle's resume ends the suspension.
+        self.suspend().map(drop)
+    }
+
+    fn resume_after_ask(&self) {
+        self.resume();
+    }
+
+    fn ask_cancelled(&self) -> bool {
+        self.is_cancelled()
+    }
+}
+
+/// One request line to the VM host daemon's control socket, one reply line
+/// back, both bounded by [`HOST_ASK_CONTROL_TIMEOUT`]; the connection is
+/// handed back for a caller that keeps it.
+fn host_control(
+    control_sock: &Path,
+    request: &minimald_rpc::BoxControlRequest,
+) -> Result<
+    (
+        minimald_rpc::BoxControlReply,
+        std::io::BufReader<std::os::unix::net::UnixStream>,
+    ),
+    anyhow::Error,
+> {
+    use std::io::{BufRead as _, Write as _};
+    let mut stream = std::os::unix::net::UnixStream::connect(control_sock).with_context(|| {
+        format!(
+            "connecting to the VM host daemon's control socket at {}",
+            control_sock.display()
+        )
+    })?;
+    stream.set_read_timeout(Some(HOST_ASK_CONTROL_TIMEOUT))?;
+    stream.set_write_timeout(Some(HOST_ASK_CONTROL_TIMEOUT))?;
+    let mut line = serde_json_lenient::to_string(request).context("serializing the request")?;
+    line.push('\n');
+    stream.write_all(line.as_bytes())?;
+    let mut reader = std::io::BufReader::new(stream);
+    let mut reply = String::new();
+    reader.read_line(&mut reply)?;
+    if reply.trim().is_empty() {
+        anyhow::bail!("the VM host daemon closed its control socket without answering");
+    }
+    let reply = serde_json_lenient::from_str(reply.trim())
+        .with_context(|| format!("the VM host daemon's reply did not parse: {reply}"))?;
+    Ok((reply, reader))
+}
+
+impl HostAsks {
+    /// Subscribe to the pending asks of the box whose row is named
+    /// `box_name` on the VM host daemon at `control_sock`: the row read
+    /// answers the row's host-minted box id, and the subscription is keyed
+    /// by that id, never by a name a guest could report.
+    ///
+    /// # Errors
+    ///
+    /// The socket did not answer, no live row carries the name, or the
+    /// daemon refused the subscription.
+    pub fn subscribe(control_sock: &Path, box_name: &str) -> Result<Self, anyhow::Error> {
+        let (row, _) = host_control(
+            control_sock,
+            &minimald_rpc::BoxControlRequest::ReadRow(minimald_rpc::ReadRowRequest {
+                name: box_name.to_string(),
+            }),
+        )?;
+        let box_id = match row {
+            minimald_rpc::BoxControlReply::Row(row) => row.box_id,
+            minimald_rpc::BoxControlReply::NoRow { .. } => {
+                anyhow::bail!("the VM host daemon holds no row for box {box_name:?}")
+            }
+            other => anyhow::bail!("the VM host daemon answered the row read with {other:?}"),
+        };
+        let (ack, subscription) = host_control(
+            control_sock,
+            &minimald_rpc::BoxControlRequest::SubscribeAsks(minimald_rpc::SubscribeAsksRequest {
+                box_id,
+            }),
+        )?;
+        match ack {
+            minimald_rpc::BoxControlReply::AsksSubscribed { .. } => {}
+            minimald_rpc::BoxControlReply::Error { error } => {
+                anyhow::bail!("the VM host daemon refused the ask subscription: {error}")
+            }
+            other => anyhow::bail!("the VM host daemon answered the subscription with {other:?}"),
+        }
+        // Held for the attach's whole life: offers arrive whenever the box
+        // asks, so the read has no bound.
+        subscription.get_ref().set_read_timeout(None)?;
+        tracing::info!(box = %box_name, "subscribed to the box's pending asks on the VM host");
+        Ok(Self {
+            control_sock: control_sock.to_path_buf(),
+            subscription,
+            held: std::collections::VecDeque::new(),
+        })
+    }
+
+    /// [`Self::subscribe`] on the VM host daemon's control socket beside
+    /// the daemon's ssh socket `ssh_sock`, for a caller that does not know
+    /// whether the daemon is VM-backed: anything but a subscription — no
+    /// such socket, a native daemon's socket that serves no rows, no row
+    /// for the box — is `None`, said at debug.
+    pub fn subscribe_beside(ssh_sock: &Path, box_name: &str) -> Option<Self> {
+        let control_sock = ssh_sock.parent()?.join(VM_HOST_CONTROL_SOCK_FILE);
+        if !control_sock.exists() {
+            return None;
+        }
+        Self::subscribe(&control_sock, box_name)
+            .inspect_err(|error| {
+                tracing::debug!(box = %box_name, error = %format!("{error:#}"), "no host-side ask subscription");
+            })
+            .ok()
+    }
+
+    /// The relay's suspend hook: serve the subscription for the attach's
+    /// duration, rendering each offer with [`render_ask_dialog`].
+    pub fn into_hook(self) -> tty_relay::SuspendHook {
+        Box::new(move |handle| self.serve(handle, render_ask_dialog))
+    }
+
+    /// The next subscription line: a held one first, then the socket.
+    /// `None` once the subscription ended.
+    fn next_line(&mut self) -> Option<String> {
+        use std::io::BufRead as _;
+        self.held.pop_front().or_else(|| {
+            let mut line = String::new();
+            match self.subscription.read_line(&mut line) {
+                Ok(0) | Err(_) => None,
+                Ok(_) => Some(line),
+            }
+        })
+    }
+
+    /// Serve offers until the subscription ends: for each, suspend the
+    /// relay, render the dialog with `dialog`, record its answer through
+    /// the host door, and resume. The dialog watches the subscription
+    /// through its [`AskWatch`]: one the host dismisses comes down unanswered
+    /// and records nothing. An offer the daemon already dismissed is
+    /// skipped; an attach that ended under the dialog records nothing.
+    pub fn serve<T: AskTerminal>(
+        mut self,
+        terminal: &T,
+        mut dialog: impl FnMut(&minimald_rpc::PendingAskOffer, &mut AskWatch<'_>) -> AskDialogEnd,
+    ) {
+        loop {
+            let Some(line) = self.next_line() else {
+                return;
+            };
+            let offer = match serde_json_lenient::from_str(line.trim()) {
+                Ok(minimald_rpc::BoxControlReply::PendingAskOffer(offer)) => offer,
+                Ok(_) | Err(_) => continue,
+            };
+            if self.dismissed_already(offer.ask_id) {
+                continue;
+            }
+            if terminal.suspend_for_ask().is_err() {
+                return;
+            }
+            tracing::info!(
+                ask_id = %offer.ask_id,
+                box = %offer.name,
+                port = offer.port,
+                "showing the host-side ask dialog"
+            );
+            let end = dialog(
+                &offer,
+                &mut AskWatch::new(offer.ask_id, &mut self.subscription, &mut self.held),
+            );
+            if terminal.ask_cancelled() {
+                return;
+            }
+            let answer = match end {
+                AskDialogEnd::Answered(answer) => answer,
+                AskDialogEnd::Dismissed => {
+                    tracing::info!(ask_id = %offer.ask_id, "the ask was dismissed; its dialog came down unanswered");
+                    terminal.resume_after_ask();
+                    continue;
+                }
+            };
+            tracing::info!(ask_id = %offer.ask_id, answer = ?answer, "the ask dialog was answered");
+            match self.record(offer.ask_id, answer) {
+                Ok(None) => {}
+                // Another attach ended the ask first: say how it really
+                // ended, not what this dialog chose.
+                Ok(Some(late)) => {
+                    tracing::info!(ask_id = %offer.ask_id, %late, "the ask had already ended");
+                    eprintln!("{late}");
+                }
+                Err(error) => {
+                    tracing::warn!(ask_id = %offer.ask_id, %error, "the ask answer was not recorded");
+                    eprintln!("The answer was not recorded: {error:#}");
+                }
+            }
+            terminal.resume_after_ask();
+        }
+    }
+
+    /// Whether a dismissal for `ask_id` is already buffered behind its
+    /// offer: another attach answered first, so there is no dialog to show.
+    fn dismissed_already(&self, ask_id: minimald_rpc::AskId) -> bool {
+        let buffered = String::from_utf8_lossy(self.subscription.buffer());
+        self.held
+            .iter()
+            .map(String::as_str)
+            .chain(buffered.lines())
+            .any(|line| is_dismissal_of(line, ask_id))
+    }
+
+    /// Record `answer` for `ask_id` through the host door. `Ok(Some)` is
+    /// the line saying how the ask had already ended when the answer came
+    /// late; nothing was recorded then.
+    fn record(
+        &self,
+        ask_id: minimald_rpc::AskId,
+        answer: minimald_rpc::AskAnswer,
+    ) -> Result<Option<String>, anyhow::Error> {
+        let (reply, _) = host_control(
+            &self.control_sock,
+            &minimald_rpc::BoxControlRequest::RecordAskAnswer(
+                minimald_rpc::RecordAskAnswerRequest { ask_id, answer },
+            ),
+        )?;
+        match reply {
+            minimald_rpc::BoxControlReply::AskAnswerRecorded { .. } => Ok(None),
+            minimald_rpc::BoxControlReply::AskAlreadyEnded {
+                port,
+                proto,
+                already_ended,
+                ..
+            } => Ok(Some(late_answer_line(port, proto, already_ended))),
+            minimald_rpc::BoxControlReply::Error { error } => {
+                anyhow::bail!("the VM host daemon refused it: {error}")
+            }
+            other => anyhow::bail!("the VM host daemon answered with {other:?}"),
+        }
+    }
+}
+
+/// The one line a late answer prints: how the ask it answered had already
+/// ended, as the VM host daemon recorded it.
+#[must_use]
+pub fn late_answer_line(
+    port: u16,
+    proto: sessions::IpProto,
+    end: minimald_rpc::AskLateEnd,
+) -> String {
+    match end {
+        minimald_rpc::AskLateEnd::Allowed => {
+            format!("ask {port}/{proto} was already allowed by another attach")
+        }
+        minimald_rpc::AskLateEnd::Denied => {
+            format!("ask {port}/{proto} was already denied by another attach")
+        }
+        minimald_rpc::AskLateEnd::Cancelled { cause } => {
+            format!("ask {port}/{proto} was cancelled ({cause})")
+        }
+    }
 }
 
 /// The single command string to hand `ssh`, or `None` for the interactive
@@ -234,10 +685,70 @@ pub fn remote_command(command: &[String]) -> Option<String> {
     }
 }
 
+/// The largest encoded exec command `min session exec` will hand to ssh.
+///
+/// Linux caps a single argument at `MAX_ARG_STRLEN` (128 KiB), so a command
+/// that large already fails with `E2BIG` on the box; larger still, the exec
+/// request exceeds the SSH transport's packet limit and tears the connection
+/// down instead of erroring, leaving the client with ssh's rc 255 — the same
+/// status a command's own `exit 255` produces. Refusing here, before ssh is
+/// contacted, keeps the failure a clear client-side error.
+///
+/// The limit applies to the whole encoded wire for both forms on purpose. A
+/// multi-word argv is stricter than it needs to be for `E2BIG` alone, since
+/// each word is its own `execve` argument, but the whole wire still rides in
+/// one SSH exec request and must fit the transport's packet limit. Do not
+/// relax this into a per-word check without also bounding the packet.
+pub const MAX_EXEC_COMMAND_BYTES: usize = 128 * 1024;
+
+/// Encode a command for the wire, refusing one that exceeds
+/// [`MAX_EXEC_COMMAND_BYTES`].
+///
+/// Returns the encoded command when it fits, or an error naming the size and
+/// pointing large data at stdin or a file under `/workbench`.
+pub fn checked_remote_command(command: &[String]) -> anyhow::Result<Option<String>> {
+    let wire = remote_command(command);
+    if let Some(wire) = wire.as_deref()
+        && wire.len() >= MAX_EXEC_COMMAND_BYTES
+    {
+        anyhow::bail!(
+            "the command is {} bytes once encoded; min session exec needs it under {} KiB once encoded; pass large data on stdin or in a file under /workbench",
+            wire.len(),
+            MAX_EXEC_COMMAND_BYTES / 1024,
+        );
+    }
+    Ok(wire)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    /// A late answer prints exactly how the ask had already ended.
+    #[test]
+    fn late_answer_line_names_the_real_end() {
+        use minimald_rpc::{AskCancelCause, AskLateEnd};
+        let tcp = sessions::IpProto::Tcp;
+        assert_eq!(
+            late_answer_line(3000, tcp, AskLateEnd::Allowed),
+            "ask 3000/tcp was already allowed by another attach"
+        );
+        assert_eq!(
+            late_answer_line(3000, tcp, AskLateEnd::Denied),
+            "ask 3000/tcp was already denied by another attach"
+        );
+        assert_eq!(
+            late_answer_line(
+                3000,
+                tcp,
+                AskLateEnd::Cancelled {
+                    cause: AskCancelCause::GuestClosed
+                }
+            ),
+            "ask 3000/tcp was cancelled (the guest connection closed)"
+        );
+    }
 
     #[test]
     fn attach_command_targets_the_provider_alias() {
@@ -253,6 +764,70 @@ mod tests {
             args.iter()
                 .any(|a| a.starts_with("ProxyCommand=") && a.contains("proxy --socket"))
         );
+    }
+
+    /// The exec path (`wire: Some`) is not the relay's: its command carries
+    /// no stdio of its own (ssh inherits whatever the caller does not
+    /// override) and no `-tt` forces a pty.
+    #[test]
+    fn exec_path_keeps_inherited_stdio() {
+        let sock = PathBuf::from("/tmp/x/providers/local-minimald0/ssh.sock");
+        let cmd = attach_command(&sock, sessions::SessionId::nil(), Some("wire"), None).unwrap();
+        let args: Vec<_> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(!args.iter().any(|a| a == "-tt"));
+        assert_eq!(args.last().map(String::as_str), Some("wire"));
+        // `Command`'s alternate Debug names every stdio override set on it.
+        let debug = format!("{cmd:#?}");
+        for stdio in ["stdin", "stdout", "stderr"] {
+            assert!(!debug.contains(stdio), "{stdio} overridden: {debug}");
+        }
+    }
+
+    /// Every attach bounds its connect and handshake with the shared deadline;
+    /// only the non-interactive exec path adds keepalives, so a peer that
+    /// stops answering ends the exec instead of hanging it.
+    #[test]
+    fn attach_command_bounds_the_handshake() {
+        let sock = PathBuf::from("/tmp/x/providers/local-minimald0/ssh.sock");
+        let interactive = attach_command(&sock, sessions::SessionId::nil(), None, None).unwrap();
+        let exec = attach_command(&sock, sessions::SessionId::nil(), Some("wire"), None).unwrap();
+
+        let args = |cmd: &std::process::Command| -> Vec<String> {
+            cmd.get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        };
+
+        let connect_timeout = format!("ConnectTimeout={}", HANDSHAKE_TIMEOUT.as_secs());
+        for cmd in [&interactive, &exec] {
+            let args = args(cmd);
+            assert!(
+                args.iter().any(|a| a == &connect_timeout),
+                "missing {connect_timeout} in {args:?}",
+            );
+        }
+
+        let interactive_args = args(&interactive);
+        assert!(
+            !interactive_args
+                .iter()
+                .any(|a| a.starts_with("ServerAlive")),
+            "interactive attach must not carry keepalives: {interactive_args:?}",
+        );
+
+        let exec_args = args(&exec);
+        for opt in [
+            format!("ServerAliveInterval={EXEC_SERVER_ALIVE_INTERVAL_SECS}"),
+            format!("ServerAliveCountMax={EXEC_SERVER_ALIVE_COUNT_MAX}"),
+        ] {
+            assert!(
+                exec_args.iter().any(|a| a == &opt),
+                "missing {opt} in {exec_args:?}",
+            );
+        }
     }
 
     /// A named VM's socket nests under a per-name subdirectory, so the ssh
@@ -341,6 +916,33 @@ mod tests {
                 "min --version".to_string()
             ))
         );
+    }
+
+    /// A command just under the limit encodes and passes the guard; one byte
+    /// over is refused with the size in the message, before any ssh command is
+    /// built.
+    #[test]
+    fn checked_remote_command_refuses_an_oversized_command() {
+        // A lone argument encodes as `min://shell <cmd>`; size the payload so
+        // the wire lands exactly on the boundary.
+        let prefix_len = "min://shell ".len();
+        let under = "x".repeat(MAX_EXEC_COMMAND_BYTES - prefix_len - 1);
+        let wire = checked_remote_command(&[under]).unwrap().unwrap();
+        assert_eq!(wire.len(), MAX_EXEC_COMMAND_BYTES - 1);
+
+        // The per-argument limit includes the terminating NUL, so a wire of
+        // exactly the limit still fails with E2BIG once ssh execs it. Refuse
+        // the boundary too, not just lengths above it.
+        let at_limit = "x".repeat(MAX_EXEC_COMMAND_BYTES - prefix_len);
+        let boundary_wire = remote_command(std::slice::from_ref(&at_limit)).unwrap();
+        assert_eq!(boundary_wire.len(), MAX_EXEC_COMMAND_BYTES);
+        assert!(checked_remote_command(&[at_limit]).is_err());
+
+        let over = "x".repeat(MAX_EXEC_COMMAND_BYTES - prefix_len + 1);
+        let err = checked_remote_command(&[over]).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("needs it under 128 KiB once encoded"));
+        assert!(msg.contains(&format!("{} bytes", MAX_EXEC_COMMAND_BYTES + 1)));
     }
 
     /// The interactive attach path negotiates the session-key config: each

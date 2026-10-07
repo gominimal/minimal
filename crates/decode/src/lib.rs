@@ -115,7 +115,12 @@ impl Layer {
 
     /// Simple builder of literal nickel for a test.
     pub fn new_for_test(s: String) -> Result<Self, Error> {
-        let l = load::Loader::new(s, None, &load::LoadOptions::for_test())?;
+        Self::new_for_test_with(s, &load::LoadOptions::for_test())
+    }
+
+    /// Like [`Layer::new_for_test`], but with explicit [`LoadOptions`].
+    pub fn new_for_test_with(s: String, opts: &LoadOptions) -> Result<Self, Error> {
+        let l = load::Loader::new(s, None, opts)?;
         Self::from_loader(l, None)
     }
 

@@ -186,6 +186,7 @@ async fn minimald_exec_over_bridge() {
             task: "echo_ok".to_string(),
             owns_box: false,
             args: vec![],
+            cwd: String::new(),
         }
         .encode();
         result = run_session_exec(&guest.sock_path, Some(&mfile), &task).await;

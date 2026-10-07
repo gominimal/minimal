@@ -58,6 +58,13 @@ enum Command {
         /// Print status as a JSON object.
         #[arg(long)]
         json: bool,
+        /// Print the read-only row verb's reply for this box's row
+        /// (NET-138) instead of the lifecycle report: the row's switch
+        /// address, egress allow-list and declared and runtime-admitted
+        /// ports while a live box holds the name, the no-row marker once
+        /// none does. Exit 0 when a row answered, 1 on the no-row marker.
+        #[arg(long, value_name = "NAME")]
+        row: Option<String>,
     },
     /// Show or set persisted per-VM resource configuration (applied next boot).
     Config {
@@ -120,8 +127,8 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Run { detach, timeout } => minvmd::cmd::run::run(detach, timeout),
-        Command::Status { json } => {
-            let exit = minvmd::cmd::status::run(json)?;
+        Command::Status { json, row } => {
+            let exit = minvmd::cmd::status::run(json, row)?;
             let code = exit.code();
             if code != 0 {
                 std::process::exit(code);

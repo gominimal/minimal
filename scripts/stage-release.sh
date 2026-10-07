@@ -229,11 +229,26 @@ fi
 # there. The bytes are stock gvproxy (pinned and SHA-256-verified by
 # scripts/fetch-gvproxy.sh); only the installed name is ours, and
 # `switch::GVPROXY_FILE` is the resolver's matching definition.
+#
+# minzoned stages as `bin/minzoned` beside `min` on every platform
+# that stages `min` — exactly where the session advisory's `answerer_source`
+# looks for it (beside the running `min` first, then PATH). The staged copy is
+# only the COPY SOURCE for NET-122's one privileged step: the advisory's
+# command copies it to a root-owned path (`answerer` in the minimal crate's
+# resolver) and installs the service from that; no service unit or launchd
+# plist references the user-prefix path, and neither does this table. It
+# carries no lib/ component on any platform: the Linux builds are static musl
+# and the macOS build links only system libraries (the rule
+# scripts/check-zoned-links.sh gates before the binary can leave the build).
+#
+# minzoned is OPTIONAL, with a warning, where every other binary is
+# required: see OPTIONAL_COMPONENTS below.
 COMPONENTS=(
     # Linux amd64
     "minimald|linux|amd64|file|bin/minimald|minimald-linux-amd64"
     "mip|linux|amd64|file|bin/mip|mip-linux-amd64"
     "minimal|linux|amd64|file|bin/min|minimal-linux-amd64"
+    "minzoned|linux|amd64|file|bin/minzoned|minzoned-linux-amd64"
     "git-remote-min|linux|amd64|symlink|bin/git-remote-min|min"
     "gvproxy-min|linux|amd64|file|bin/gvproxy-min|gvproxy-linux-amd64"
     "minvmd|linux|amd64|file|bin/minvmd|minvmd-linux-amd64"
@@ -244,6 +259,7 @@ COMPONENTS=(
     "minimald|linux|arm64|file|bin/minimald|minimald-linux-arm64"
     "mip|linux|arm64|file|bin/mip|mip-linux-arm64"
     "minimal|linux|arm64|file|bin/min|minimal-linux-arm64"
+    "minzoned|linux|arm64|file|bin/minzoned|minzoned-linux-arm64"
     "git-remote-min|linux|arm64|symlink|bin/git-remote-min|min"
     "gvproxy-min|linux|arm64|file|bin/gvproxy-min|gvproxy-linux-arm64"
     "minvmd|linux|arm64|file|bin/minvmd|minvmd-linux-arm64"
@@ -252,6 +268,7 @@ COMPONENTS=(
     "vmlinuz|linux|arm64|file|data/vmlinuz|vmlinuz-arm64"
     # macOS arm64 (darwin)
     "minimal|darwin|arm64|file|bin/min|minimal-macos-arm64"
+    "minzoned|darwin|arm64|file|bin/minzoned|minzoned-macos-arm64"
     "git-remote-min|darwin|arm64|symlink|bin/git-remote-min|min"
     "minvmd|darwin|arm64|file|bin/minvmd|minvmd-macos-arm64"
     # The trimmed libkrun minvmd links against (built by the release workflow's
@@ -277,6 +294,24 @@ COMPONENTS=(
     "apparmor-installer|linux|amd64|file|data/apparmor/install-apparmor-profile.sh|install-apparmor-profile.sh"
     "apparmor-installer|linux|arm64|file|data/apparmor/install-apparmor-profile.sh|install-apparmor-profile.sh"
 )
+
+# Components whose missing artifact warns and is omitted instead of failing
+# the stage. TEMPORARY (gominimal/inbox#899): .github/workflows/release.yml now
+# builds, signs and uploads minzoned on every platform, but a release cut before
+# that change ships no minzoned, and the session advisory names that state
+# ("this release ships no minzoned; the answerer service step is unavailable")
+# instead of offering the step. Once releases with the artifact are the norm,
+# empty this list so a missing answerer fails the stage like any other binary.
+OPTIONAL_COMPONENTS=(minzoned)
+
+# is_optional <component> — whether a missing artifact for it only warns.
+is_optional() {
+    local c
+    for c in "${OPTIONAL_COMPONENTS[@]}"; do
+        [ "$c" = "$1" ] && return 0
+    done
+    return 1
+}
 
 # Stage the AppArmor components from the checkout this script runs in. They are
 # repo files rather than release-workflow artifacts, so copy them into the
@@ -331,6 +366,11 @@ for entry in "${COMPONENTS[@]}"; do
     [ -f "$file" ] || file="$ARTIFACTS_DIR/$basename"
 
     if [ ! -f "$file" ]; then
+        if is_optional "$comp"; then
+            printf 'stage-release: warning: optional artifact missing, omitting %s/%s/%s: %s (temporary, gominimal/inbox#899)\n' \
+                "$comp" "$os" "$arch" "$file" >&2
+            continue
+        fi
         if [ "$ALLOW_MISSING" -eq 1 ]; then
             printf 'stage-release: warning: missing artifact, omitting %s/%s/%s: %s\n' \
                 "$comp" "$os" "$arch" "$file" >&2
