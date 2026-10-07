@@ -25,6 +25,13 @@ impl Repo {
             let output = Command::new("git")
                 .args(["remote", "get-url", "origin"])
                 .current_dir(&base)
+                // Explicit GIT_DIR so git recognises the bare repo as
+                // intentional even when `safe.bareRepository = explicit` is
+                // set (the default since git 2.49). Missing it makes this
+                // command fail and fall through to a clone into the
+                // already-populated directory, which is how a second manager
+                // over a shared cache dir surfaced `clone ... already exists`.
+                .env("GIT_DIR", &base)
                 .output()?;
 
             if output.status.success() {

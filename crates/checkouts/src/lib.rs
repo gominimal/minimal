@@ -3,10 +3,11 @@
 //! This crate provides abstractions for creating and maintaining checkouts of git repositories
 //! at specific versions.
 
+use fd_lock::RwLock;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
-    fs,
+    fs::{self, File, OpenOptions},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -279,11 +280,39 @@ impl Manager {
         self.base_dir.join("git").join("db")
     }
 
+    /// Path to the lock file serializing operations over the shared cache
+    /// directory. `.lock` at the base so every manager over the same dir —
+    /// and every manager in the same process — contends on one file, not on
+    /// per-repo git internals.
+    fn lock_path(&self) -> PathBuf {
+        self.base_dir.join(".lock")
+    }
+
+    /// Opens (creating if absent) the lock file and wraps it for exclusive
+    /// locking. The file is opened fresh on every call so two managers in a
+    /// single process also exclude each other: `flock` is per open file
+    /// description, not per inode.
+    fn acquire_lock(&self) -> Result<RwLock<File>, Error> {
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(self.lock_path())?;
+        Ok(RwLock::new(file))
+    }
+
     /// Updates all repos to latest - does nothing for refs which arent symbolic (i.e. commits).
     /// In offline mode, returns [Error::OfflineCacheMiss] — `update` is fundamentally
     /// a network operation, and silently lameducking it would mask hard-to-debug bugs
     /// for callers like `minimal update` that explicitly want fresh state.
     pub fn update(&mut self) -> Result<(), Error> {
+        // Serialize against every other manager over the same cache dir. Git
+        // itself is only per-repository; a second `min session activate`
+        // against the same bare repo would otherwise race this fetch/checkout
+        // inside the shared worktree (`index.lock: File exists`).
+        let mut lock = self.acquire_lock()?;
+        let _guard = lock.write()?;
         if self.offline {
             // Pick the first known remote for the error message; if there are
             // no known remotes there's nothing to update, so a synthetic
@@ -319,6 +348,8 @@ impl Manager {
     /// needs `remote` fresh. A remote not yet registered is a no-op: a
     /// subsequent [`Self::checkout_of`] clones it on first use.
     pub fn update_remote(&mut self, remote: &str) -> Result<(), Error> {
+        let mut lock = self.acquire_lock()?;
+        let _guard = lock.write()?;
         let Some(id) = self.state.git_remotes.get(remote).cloned() else {
             return Ok(());
         };
@@ -342,6 +373,11 @@ impl Manager {
     /// commit hash at the given ref.
     pub fn checkout_of(&mut self, remote: &str, at: GitRef) -> Result<(PathBuf, String), Error> {
         trace!("checkout_of {} at {:?}", remote, at);
+
+        // Same serialization rationale as `update`: the fetch and worktree
+        // checkout below mutate shared git state across managers.
+        let mut lock = self.acquire_lock()?;
+        let _guard = lock.write()?;
 
         let out = match self.state.git_remotes.get(remote) {
             // This remote is already managed
@@ -828,6 +864,10 @@ mod tests {
         let out = Command::new("git")
             .args(["update-ref", "-d", "refs/remotes/origin/main"])
             .current_dir(&bare)
+            // Match Repo::run_git_bare: explicit GIT_DIR keeps git operating
+            // on the bare repo when `safe.bareRepository = explicit` (default
+            // since git 2.49) is set.
+            .env("GIT_DIR", &bare)
             .output()
             .unwrap();
         assert!(out.status.success());
@@ -920,6 +960,86 @@ mod tests {
         let base_dir = tempdir().unwrap();
         let manager = Manager::new_in_dir(base_dir.path()).unwrap();
         assert!(!manager.0.lock().unwrap().offline);
+    }
+
+    /// Many managers converging on one cache dir — the exact shape of
+    /// concurrent `min session activate` invocations, each building its own
+    /// manager against the shared vcs cache — must not race each other's
+    /// git operations into `index.lock` and must all land a usable checkout.
+    #[test]
+    fn concurrent_checkout_of_managers_share_one_cache_dir() {
+        let (src, hash) = make_local_repo("main");
+        let remote = src.path().to_str().unwrap().to_string();
+        let base = tempfile::tempdir().unwrap();
+
+        // The intended failure mode: every manager holds its own directory
+        // snapshot at construction. Two managers constructed together see the
+        // same (empty) state, so each tries an independent clone + worktree
+        // add for the same ref unless the lock serializes them.
+        let n_threads = 8;
+        let results: Vec<_> = (0..n_threads)
+            .map(|_| {
+                let (remote, base) = (remote.clone(), base.path().to_path_buf());
+                std::thread::spawn(move || {
+                    let mut mgr = Manager::new_in_dir(base).unwrap();
+                    let (path, rev) = mgr
+                        .checkout_of(&remote, GitRef::Branch("main".to_string()))
+                        .map_err(|e| e.to_string())?;
+                    assert!(path.join("hello.txt").exists());
+                    Ok::<_, String>(rev)
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .collect::<Vec<_>>();
+
+        // Every thread must succeed rather than trip over `index.lock`.
+        for result in results {
+            assert_eq!(result.unwrap(), hash, "manager checkout failed");
+        }
+
+        // No `index.lock` may be left stranded inside any worktree.
+        let checkouts = base.path().join("git").join("checkouts");
+        for entry in std::fs::read_dir(checkouts).unwrap().flatten() {
+            assert!(
+                !entry.path().join(".git").join("index.lock").exists(),
+                "stranded index.lock in {}",
+                entry.path().display()
+            );
+        }
+    }
+
+    /// Concurrency over the same remote through separate `update_remote`
+    /// managers: one manager's worktree refresh must not see another's git
+    /// state mid-flux (the other half of the reported `index.lock` race).
+    #[test]
+    fn concurrent_update_remote_does_not_race() {
+        let (src, _) = make_local_repo("main");
+        let remote = src.path().to_str().unwrap().to_string();
+        let base = tempfile::tempdir().unwrap();
+
+        // One manager registers the remote, so the others see it in state.json.
+        let mut first = Manager::new_in_dir(base.path()).unwrap();
+        first
+            .checkout_of(&remote, GitRef::Branch("main".to_string()))
+            .unwrap();
+
+        let n_threads = 8;
+        let handles: Vec<_> = (0..n_threads)
+            .map(|_| {
+                let base = base.path().to_path_buf();
+                let remote = remote.clone();
+                std::thread::spawn(move || {
+                    let mut mgr = Manager::new_in_dir(base).unwrap();
+                    mgr.update_remote(&remote).map_err(|e| e.to_string())
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap().unwrap();
+        }
     }
 
     #[test]
