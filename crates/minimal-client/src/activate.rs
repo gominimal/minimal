@@ -102,6 +102,11 @@ pub struct ActivateRequest {
     /// cannot corrupt their frame; `min session activate` says `true`, keeping
     /// the spinner it printed before the sequence was shared.
     pub upload_progress: bool,
+    /// Print activation-hook receipts — what each `on_activate` hook ran, and
+    /// its captured output — to stderr. The front-ends that own the screen
+    /// themselves (the dashboard) say `false`, so inline hook output cannot
+    /// corrupt their frame; `min session activate` and a task run say `true`.
+    pub hook_receipts: bool,
     /// The loadout contribution to compose.
     pub contribution: sessions::wire::request::WireContribution,
     /// External hook scripts staged for upload alongside the composition's
@@ -270,14 +275,14 @@ pub async fn activate<G: ActivationGate>(
         .await;
         return Err(error);
     }
-    gate.on_created(&created, config.name.as_deref(), config.box_addresses)
-        .await;
     let id = created.id;
 
     // From here the session exists on the daemon in an unfinalized state.
-    // Arm a Ctrl-C guard so an interrupt during the (blocking) gating prompt
-    // tears it down instead of orphaning it in `Pending`. Dropped once the
-    // session is `Active`.
+    // Arm a Ctrl-C guard before the create announcements: `on_created` reads
+    // host state over control sockets and can block, and an interrupt in that
+    // window must tear the session down rather than let the default SIGINT
+    // orphan it in `Pending` and leave its box row published (T66). Dropped
+    // once the session is `Active`.
     let _interrupt = request.interrupt_socket.as_deref().map(|sock| {
         ActivationInterrupt::arm_with_box(
             Some(sock),
@@ -287,6 +292,9 @@ pub async fn activate<G: ActivationGate>(
             config.box_addresses,
         )
     });
+
+    gate.on_created(&created, config.name.as_deref(), config.box_addresses)
+        .await;
 
     // Everything from the upload through the finalize runs in one fallible
     // scope so that any failure — an RPC blip, a refused composition, a gate
@@ -356,6 +364,7 @@ pub async fn activate<G: ActivationGate>(
             &patches,
             &request.hook_scripts,
             request.hook_budget,
+            request.hook_receipts,
         )
         .await
     }
@@ -368,9 +377,10 @@ pub async fn activate<G: ActivationGate>(
             // Ctrl-C guard first: left armed, an interrupt in the window below
             // fires a second teardown over a fresh connection, races the one in
             // flight, and `exit(130)`s mid-cleanup with the primary error still
-            // unspoken. A Ctrl-C past this point is the default SIGINT, and the
-            // daemon's connection-close reap is the backstop for what the abort
-            // cannot deliver.
+            // unspoken. Disarming does not restore the default SIGINT — tokio
+            // keeps its handler installed for the process's life — so the
+            // daemon's connection-close reap is the backstop for what this
+            // abort cannot deliver.
             drop(_interrupt);
             // The core's teardown of the half-built record, and the box row the
             // registration bought with it (T66) — a failed activation owes both.
@@ -408,12 +418,18 @@ pub async fn activate<G: ActivationGate>(
 ///
 /// The returned flag is the reply's `package_check_skipped`: the front-end
 /// says so its own way.
+///
+/// `hook_receipts` says whether to announce the `on_activate` hooks the finalize
+/// ran — their declared-by labels and captured output — on stderr. A
+/// screen-owning front-end passes `false` so that output cannot corrupt its
+/// frame.
 pub async fn upload_and_finalize(
     client: &mut Client,
     session_id: sessions::SessionId,
     patches: &[(PathBuf, paths::SandboxRelPath)],
     hook_scripts: &[sessions::client::hookscripts::StagedScript],
     hook_budget: Duration,
+    hook_receipts: bool,
 ) -> Result<bool, anyhow::Error> {
     client
         .upload_patches(session_id, patches)
@@ -436,19 +452,22 @@ pub async fn upload_and_finalize(
         Errorable::Ok(ok) => {
             // An activate hook runs headlessly, so without this the only trace
             // of it is the daemon log. Say what ran — the user agreed to let
-            // this code execute, and is owed the receipt.
-            for hook in &ok.activate_hooks {
-                match hook.description.as_deref() {
-                    Some(d) => eprintln!("Ran activation hook from {}: {d}", hook.declared_by),
-                    None => eprintln!("Ran activation hook from {}", hook.declared_by),
-                }
-                // The description is an author-supplied label; what the hook
-                // actually said is its captured output. Echo it to stderr —
-                // stdout is reserved for the bare session id.
-                if !hook.output.is_empty() {
-                    eprint!("{}", hook.output);
-                    if !hook.output.ends_with('\n') {
-                        eprintln!();
+            // this code execute, and is owed the receipt. A screen-owning
+            // front-end suppresses it and reports the session its own way.
+            if hook_receipts {
+                for hook in &ok.activate_hooks {
+                    match hook.description.as_deref() {
+                        Some(d) => eprintln!("Ran activation hook from {}: {d}", hook.declared_by),
+                        None => eprintln!("Ran activation hook from {}", hook.declared_by),
+                    }
+                    // The description is an author-supplied label; what the hook
+                    // actually said is its captured output. Echo it to stderr —
+                    // stdout is reserved for the bare session id.
+                    if !hook.output.is_empty() {
+                        eprint!("{}", hook.output);
+                        if !hook.output.ends_with('\n') {
+                            eprintln!();
+                        }
                     }
                 }
             }
@@ -532,7 +551,8 @@ pub async fn best_effort_destroy(client: &mut Client, session_id: sessions::Sess
 /// connection-close reap is the backstop if the abort can't be delivered.
 ///
 /// Dropping the guard cancels the handler, so a Ctrl-C after the session is
-/// safely `Active` no longer tears it down.
+/// safely `Active` no longer tears it down (it is swallowed until the front-end
+/// installs a handler of its own, as the attach path does).
 pub struct ActivationInterrupt {
     task: tokio::task::JoinHandle<()>,
 }
@@ -557,11 +577,20 @@ impl ActivationInterrupt {
     ) -> Self {
         let sock = sock.map(Path::to_path_buf);
         let task = tokio::spawn(async move {
-            // Only the first Ctrl-C is intercepted; a second falls through to
-            // the default disposition so a wedged cleanup can still be killed.
+            // The first Ctrl-C starts the cleanup below. tokio keeps its SIGINT
+            // handler installed for the process's whole life, so a second
+            // Ctrl-C does not fall through to the default disposition: arm an
+            // explicit listener that exits, so a cleanup wedged on a hung
+            // daemon can still be killed.
             if tokio::signal::ctrl_c().await.is_err() {
                 return;
             }
+            tokio::spawn(async {
+                if tokio::signal::ctrl_c().await.is_err() {
+                    return;
+                }
+                std::process::exit(130);
+            });
             eprintln!("\nAborting activation; cleaning up session {session_id}…");
             // Deliberately not version-gated: this is the cleanup half of an
             // activation the gate already cleared, and a cleanup that refuses

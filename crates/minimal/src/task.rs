@@ -882,6 +882,7 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
         &collected_patches,
         &hook_scripts,
         finalize_hook_budget,
+        true,
     )
     .await
     {

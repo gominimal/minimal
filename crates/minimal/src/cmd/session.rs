@@ -1074,6 +1074,9 @@ pub(crate) async fn activate_session(
         // The terminal is the CLI's to draw on: keep the upload's spinner,
         // which the activation already printed before the sequence was shared.
         upload_progress: true,
+        // A hook's receipt goes to this terminal; the operator agreed to let
+        // the code run and is owed the trace.
+        hook_receipts: true,
         contribution,
         hook_scripts,
         hook_budget: finalize_hook_budget,

@@ -356,6 +356,9 @@ pub async fn activate(
         // The dashboard owns the whole screen — a spinner would corrupt its
         // frame, so the upload runs quiet.
         upload_progress: false,
+        // The dashboard owns the screen — an inline `on_activate` hook's
+        // receipt would land in the middle of its frame.
+        hook_receipts: false,
         contribution,
         hook_scripts: Vec::new(),
         // The dashboard runs no activate hooks of its own, so the finalize
