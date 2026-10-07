@@ -634,16 +634,38 @@ fn refuse_dynamic_ingress_off_own_ip(
     Ok(())
 }
 
+/// Refuses a static ingress mapping on a box that is not `own_ip`: only an
+/// own-IP box has a published address a static forwarder could apply to, so
+/// a mapping on a `host_ip` or `none` box would be recorded and shown with
+/// no publish surface to honour it. The CLI reference documents the flag as
+/// requiring `--network own_ip`.
+fn refuse_ingress_off_own_ip(
+    network: crate::cli::CliNetworkMode,
+    has_ingress: bool,
+) -> Result<(), anyhow::Error> {
+    if network != crate::cli::CliNetworkMode::OwnIp && has_ingress {
+        anyhow::bail!(
+            "--ingress needs --network own_ip: only an own-IP box has a published \
+             address to apply it to"
+        );
+    }
+    Ok(())
+}
+
 pub(crate) async fn activate_session(
     global: &GlobalArgs,
     args: ActivateArgs,
     offer_scaffold: bool,
 ) -> Result<(), anyhow::Error> {
-    ensure_daemon(global)?;
-    // Before anything is created: a dynamic declaration needs an own-IP
-    // box. Every stance stands on a VM-backed host: an `ask` there is
+    // Before anything is created, and before the daemon is spawned (a cold
+    // VM boot), since both are argument errors: a dynamic declaration needs
+    // an own-IP box. Every stance stands on a VM-backed host: an `ask` there is
     // answered by the human attached on the host (NET-045).
     refuse_dynamic_ingress_off_own_ip(args.network, args.dynamic_ingress, args.dynamic_range)?;
+    // A static mapping needs an own-IP box too: only it has a published
+    // address a static forwarder could apply to.
+    refuse_ingress_off_own_ip(args.network, !args.ingress.is_empty())?;
+    ensure_daemon(global)?;
 
     let effective_path = match (&args.path, &global.repo_dir) {
         (Some(p), _) => std::path::PathBuf::from(p),
@@ -3873,6 +3895,17 @@ mod tests {
         }
         refuse_dynamic_ingress_off_own_ip(OwnIp, Some(DynamicIngress::Allow), Some((8000, 8443)))
             .expect("an own-IP box keeps its dynamic declaration");
+    }
+
+    #[test]
+    fn ingress_needs_own_ip() {
+        use crate::cli::CliNetworkMode::{HostNet, NoNet, OwnIp};
+        for network in [HostNet, NoNet] {
+            refuse_ingress_off_own_ip(network, true)
+                .expect_err("an ingress mapping off own_ip is refused");
+            refuse_ingress_off_own_ip(network, false).expect("no ingress mapping is never refused");
+        }
+        refuse_ingress_off_own_ip(OwnIp, true).expect("an own-IP box keeps its ingress mapping");
     }
 
     /// A host-side ask stand: the real VM host daemon's control server and
