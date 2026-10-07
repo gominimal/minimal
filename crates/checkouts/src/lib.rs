@@ -143,6 +143,39 @@ impl ManagerState {
     }
 }
 
+/// Opens (creating if absent) `<base_dir>/.lock`, the file serializing every
+/// manager over one cache dir. It is opened fresh on every call so two
+/// managers in a single process also exclude each other: `flock` is per open
+/// file description, not per inode.
+fn open_cache_lock(base_dir: &Path) -> Result<RwLock<File>, Error> {
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(base_dir.join(".lock"))?;
+    Ok(RwLock::new(file))
+}
+
+/// Takes the cache lock exclusively, blocking until it is free. A holder can
+/// sit on it for a whole network fetch, so a contended lock is reported
+/// before the wait starts rather than leaving the caller to hang silently
+/// behind another manager.
+fn lock_exclusive<'a>(
+    lock: &'a mut RwLock<File>,
+    base_dir: &Path,
+) -> Result<RwLockWriteGuard<'a, File>, Error> {
+    // Probe without blocking; an acquired probe guard is dropped at once and
+    // the blocking `write` below takes the lock for real.
+    if matches!(lock.try_write(), Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock) {
+        warn!(
+            "waiting for the checkouts cache lock at {} (held by another process or manager)",
+            base_dir.join(".lock").display()
+        );
+    }
+    Ok(lock.write()?)
+}
+
 fn create_unique_id_and_dir(base_dir: &Path, prefix: String) -> std::io::Result<(String, PathBuf)> {
     let candidate = base_dir.join(&prefix);
     if !candidate.exists() {
@@ -249,11 +282,17 @@ impl Manager {
         fs::create_dir_all(&db_path)?;
         fs::create_dir_all(base_dir.join("git").join("checkouts"))?;
 
+        // Read the registry under the cache lock: another manager holding it
+        // may be rewriting `state.json`, which a bare read could see half
+        // written.
+        let mut lock = open_cache_lock(&base_dir)?;
+        let guard = lock_exclusive(&mut lock, &base_dir)?;
         let state = ManagerState::in_dir_or_default(&base_dir)?;
         let mut repos = HashMap::new();
         for (remote, id) in state.git_remotes.iter() {
             repos.insert(id.clone(), Repo::new(remote, db_path.join(id))?);
         }
+        drop(guard);
 
         // For now we depend on the git command line tool. Shelling out when git doesn't exist
         // gives an incomprehensible NotFound error, so lets explicitly check that git is in PATH
@@ -280,45 +319,20 @@ impl Manager {
         self.base_dir.join("git").join("db")
     }
 
-    /// Path to the lock file serializing operations over the shared cache
-    /// directory. `.lock` at the base so every manager over the same dir —
-    /// and every manager in the same process — contends on one file, not on
-    /// per-repo git internals.
-    fn lock_path(&self) -> PathBuf {
-        self.base_dir.join(".lock")
-    }
-
-    /// Opens (creating if absent) the lock file and wraps it for exclusive
-    /// locking. The file is opened fresh on every call so two managers in a
-    /// single process also exclude each other: `flock` is per open file
-    /// description, not per inode.
-    fn acquire_lock(&self) -> Result<RwLock<File>, Error> {
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(self.lock_path())?;
-        Ok(RwLock::new(file))
-    }
-
-    /// Takes the exclusive lock, blocking until it is free. A holder can sit
-    /// on it for a whole network fetch, so a contended lock is reported
-    /// before the wait starts rather than leaving the caller to hang
-    /// silently behind another manager.
-    fn lock_exclusive<'a>(
-        &self,
-        lock: &'a mut RwLock<File>,
-    ) -> Result<RwLockWriteGuard<'a, File>, Error> {
-        // Probe without blocking; an acquired probe guard is dropped at once
-        // and the blocking `write` below takes the lock for real.
-        if matches!(lock.try_write(), Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock) {
-            warn!(
-                "waiting for the checkouts cache lock at {} (held by another process or manager)",
-                self.lock_path().display()
-            );
+    /// Re-reads the registry, keeping every repo already opened. Called with
+    /// the cache lock held: the snapshot taken at construction goes stale as
+    /// soon as another manager over the same dir records a remote or a
+    /// checkout, and writing it back would drop that manager's entries.
+    fn reload_state(&mut self) -> Result<(), Error> {
+        self.state = ManagerState::in_dir_or_default(&self.base_dir)?;
+        let db_path = self.git_bares_dir();
+        for (remote, id) in self.state.git_remotes.iter() {
+            if !self.repos.contains_key(id) {
+                self.repos
+                    .insert(id.clone(), Repo::new(remote, db_path.join(id))?);
+            }
         }
-        Ok(lock.write()?)
+        Ok(())
     }
 
     /// Updates all repos to latest - does nothing for refs which arent symbolic (i.e. commits).
@@ -330,8 +344,9 @@ impl Manager {
         // itself is only per-repository; a second `min session activate`
         // against the same bare repo would otherwise race this fetch/checkout
         // inside the shared worktree (`index.lock: File exists`).
-        let mut lock = self.acquire_lock()?;
-        let _guard = self.lock_exclusive(&mut lock)?;
+        let mut lock = open_cache_lock(&self.base_dir)?;
+        let _guard = lock_exclusive(&mut lock, &self.base_dir)?;
+        self.reload_state()?;
         if self.offline {
             // Pick the first known remote for the error message; if there are
             // no known remotes there's nothing to update, so a synthetic
@@ -367,8 +382,9 @@ impl Manager {
     /// needs `remote` fresh. A remote not yet registered is a no-op: a
     /// subsequent [`Self::checkout_of`] clones it on first use.
     pub fn update_remote(&mut self, remote: &str) -> Result<(), Error> {
-        let mut lock = self.acquire_lock()?;
-        let _guard = self.lock_exclusive(&mut lock)?;
+        let mut lock = open_cache_lock(&self.base_dir)?;
+        let _guard = lock_exclusive(&mut lock, &self.base_dir)?;
+        self.reload_state()?;
         let Some(id) = self.state.git_remotes.get(remote).cloned() else {
             return Ok(());
         };
@@ -395,8 +411,9 @@ impl Manager {
 
         // Same serialization rationale as `update`: the fetch and worktree
         // checkout below mutate shared git state across managers.
-        let mut lock = self.acquire_lock()?;
-        let _guard = self.lock_exclusive(&mut lock)?;
+        let mut lock = open_cache_lock(&self.base_dir)?;
+        let _guard = lock_exclusive(&mut lock, &self.base_dir)?;
+        self.reload_state()?;
 
         let out = match self.state.git_remotes.get(remote) {
             // This remote is already managed
@@ -770,9 +787,9 @@ mod tests {
 
         assert_eq!(rev1, hash);
         assert_eq!(rev2, hash);
-        assert_ne!(
+        assert_eq!(
             path1, path2,
-            "the stale manager cannot know the first's checkout"
+            "the stale manager re-reads the registry under the lock and reuses the first's checkout"
         );
         assert!(path2.join("hello.txt").exists());
     }
@@ -1018,6 +1035,17 @@ mod tests {
             assert_eq!(result.unwrap(), hash, "manager checkout failed");
         }
 
+        // Each manager re-reads the registry under the lock, so the first
+        // clone is reused rather than duplicated under a suffixed id.
+        let state = ManagerState::in_dir_or_default(base.path()).unwrap();
+        assert_eq!(state.git_remotes.len(), 1, "one remote: {state:?}");
+        let id = &state.git_remotes[&remote];
+        assert_eq!(
+            state.repos[id].checkouts.len(),
+            1,
+            "one checkout: {state:?}"
+        );
+
         // No `index.lock` may be left stranded inside any worktree.
         let checkouts = base.path().join("git").join("checkouts");
         for entry in std::fs::read_dir(checkouts).unwrap().flatten() {
@@ -1059,6 +1087,31 @@ mod tests {
         for h in handles {
             h.join().unwrap().unwrap();
         }
+    }
+
+    /// Two managers built before either records anything both register
+    /// their remote: the second re-reads `state.json` under the lock instead
+    /// of writing back its empty construction-time snapshot over the first.
+    #[test]
+    fn stale_manager_keeps_another_managers_remote() {
+        let (src_a, _) = make_local_repo("main");
+        let (src_b, _) = make_local_repo("main");
+        let remote_a = src_a.path().to_str().unwrap().to_string();
+        let remote_b = src_b.path().to_str().unwrap().to_string();
+        let base = tempfile::tempdir().unwrap();
+
+        let mut first = Manager::new_in_dir(base.path()).unwrap();
+        let mut second = Manager::new_in_dir(base.path()).unwrap();
+        first
+            .checkout_of(&remote_a, GitRef::Branch("main".to_string()))
+            .unwrap();
+        second
+            .checkout_of(&remote_b, GitRef::Branch("main".to_string()))
+            .unwrap();
+
+        let state = ManagerState::in_dir_or_default(base.path()).unwrap();
+        assert!(state.git_remotes.contains_key(&remote_a), "{state:?}");
+        assert!(state.git_remotes.contains_key(&remote_b), "{state:?}");
     }
 
     /// A holder of `<base>/.lock` outside any manager (another process, in

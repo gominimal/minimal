@@ -18,7 +18,10 @@ impl Repo {
     /// given path with be re-used if it is already initialized.
     pub fn new<S: Into<String>, P: Into<PathBuf>>(url: S, base: P) -> Result<Self, Error> {
         let url = url.into();
-        let base = base.into();
+        // Absolute, because every git call below pairs `current_dir(base)`
+        // with `GIT_DIR=base`, and git resolves a relative `GIT_DIR` against
+        // that new working directory.
+        let base = std::path::absolute(base.into())?;
 
         if base.join("HEAD").exists() {
             // Double-check its the right remote
