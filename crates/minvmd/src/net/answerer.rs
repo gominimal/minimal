@@ -16,7 +16,7 @@
 //! That rule is **who holds the answerer**. The answerer port is the
 //! machine's, so exactly one process on the host may serve it — and the one
 //! that should is the **installed host service** the privileged step
-//! installs (NET-122's sub-requirement): `min-answerer`, which the service
+//! installs (NET-122's sub-requirement): `minzoned`, which the service
 //! manager runs as the operator, its listener and its machine-global
 //! channel socket the manager's own, so the zone survives every session on
 //! the host. This daemon is one of that service's *nodes*. Whether the
@@ -210,10 +210,10 @@ pub const GLOBAL_CHANNEL_SOCK: &str = "/run/minimal/answerer.sock";
 /// The channel socket's path existing never says so: a stale socket file
 /// with no marker beside it is a leftover, not a service.
 #[cfg(target_os = "macos")]
-pub const INSTALL_MARKER: &str = "/Library/LaunchDaemons/dev.minimal.zone-answerer.plist";
+pub const INSTALL_MARKER: &str = "/Library/LaunchDaemons/dev.gominimal.zone.plist";
 /// See the macOS arm.
 #[cfg(not(target_os = "macos"))]
-pub const INSTALL_MARKER: &str = "/etc/systemd/system/dev.minimal.zone-answerer.socket";
+pub const INSTALL_MARKER: &str = "/etc/systemd/system/minzoned.socket";
 
 /// The variable that overrides [`GLOBAL_CHANNEL_SOCK`] — read only by test
 /// and debug builds (the e2e harness's), never by a release build, so no

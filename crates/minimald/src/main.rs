@@ -248,7 +248,7 @@ pub struct ListenArgs {
     /// deployment pins one — the port the host's resolver is pointed at to
     /// answer `*.min.internal`, whose documented default is 7656. On a
     /// native host the daemon is first a client of the installed
-    /// `min-answerer` service (its rows publish over the machine-global
+    /// `minzoned` service (its rows publish over the machine-global
     /// channel and it hosts nothing); the port is the hook port it hosts
     /// the single-operator interim on while no service serves, and
     /// unlike the hostname proxy there is no select-when-busy for it: the
@@ -764,6 +764,10 @@ async fn async_main() -> Result<(), MainError> {
         let identity = std::net::IpAddr::V4(minimald::net::DEFAULT_SUBNET.daemon_ip());
         let render = minimald::net::classifier::GuestRender {
             tree_root,
+            // The resolver every host-address box on the guest is pointed
+            // at, deny-all ones included: the node's DNS layer at the switch
+            // gateway, which the deny subtree's carve-out admits (NET-003).
+            gateway_resolver: minimald::net::DEFAULT_SUBNET.dns_server(),
             cohort_address: identity,
             node_plane_address: identity,
             ct_mark_mask: minimald::net::classifier::GUEST_CT_MARK_MASK,

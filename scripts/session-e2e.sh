@@ -746,11 +746,11 @@ else
     echo "no usable 'min' on PATH and no build under target/; building the pair this run drives (cargo build --locked -p minimal --bin min -p $min_daemon --bin $min_daemon)"
     # A VM-backed run also needs the answerer program the advisory's command
     # copies into place (beside min). It builds in its own invocation, as
-    # `just answerer-build` does: beside `-p minvmd`, cargo would unify
+    # `just zoned-build` does: beside `-p minvmd`, cargo would unify
     # minvmd's `libkrun` feature into the root-run program.
     if (cd "$ROOT" && cargo build --locked -p minimal --bin min \
         -p "$min_daemon" --bin "$min_daemon" \
-        && { [ "$min_daemon" != minvmd ] || cargo build --locked -p min-answerer; }) \
+        && { [ "$min_daemon" != minvmd ] || cargo build --locked -p minzoned; }) \
         >"$WORK/cli-build.log" 2>&1; then
       for d in "$ROOT/target/debug" "${CARGO_TARGET_DIR:-/nonexistent}/debug"; do
         if [ -x "$d/min" ]; then
@@ -4321,7 +4321,7 @@ esac
 # this branch, and the native CI lane — where the tap root integration harness
 # already builds a tap — runs the case for real.
 if [ ! -c /dev/net/tun ]; then
-  echo "fresh-install loopback publish SKIPPED (no /dev/net/tun on this host: an own-IP box cannot open its in-namespace tap; runs for real on a host that has the device)"
+  echo "fresh-install loopback publish SKIPPED (no /dev/net/tun on this host: this case is native-only, so its own-IP box opens its in-namespace tap on this host and needs the host device; runs for real on a host that has it)"
   return 0
 fi
 
@@ -4790,7 +4790,7 @@ proof_network_posture_from_stock_install() {
     np_want_switch=1
   else
     np_want_switch=0
-    echo "own-IP half SKIPPED (no /dev/net/tun: an own-IP box cannot open its in-namespace tap; the help, hint, none-box and stock-posture halves still run)"
+    echo "own-IP half SKIPPED (no /dev/net/tun on this host: this case is native-only, so its own-IP box opens its in-namespace tap on this host and needs the host device; the help, hint, none-box and stock-posture halves still run)"
   fi
 
   echo "::group::network posture from a stock install (help, hints, none box, own-ip, reach)"
@@ -5431,7 +5431,7 @@ exit' E2E_PTY_ANSWER=keep python3 "$ROOT/scripts/e2e-attach-pty.py" - \
         sleep 0.25
       done
     else
-      echo "own-IP half SKIPPED (no /dev/net/tun: the fresh install ships no switch and the half is gated on the tap — see the skip note at the top)"
+      echo "own-IP half SKIPPED (no /dev/net/tun on this host, which this native-only case needs for its own-IP box's tap: the fresh install ships no switch and the half is gated on the tap — see the skip note at the top)"
     fi
 
     # Leave the lane as it was: the installed daemon stopped, so the next
@@ -6843,8 +6843,8 @@ proof_local_range_reserved_by_privileged_step() {
     echo "removing a leftover range unit from a prior run, so this proof starts from the advisory's own premise"
     range_remove_unit
   fi
-  if [ -e /Library/LaunchDaemons/dev.minimal.zone-answerer.plist ] \
-     || [ -e /Library/PrivilegedHelperTools/dev.minimal.zone-answerer ]; then
+  if [ -e /Library/LaunchDaemons/dev.gominimal.zone.plist ] \
+     || [ -e /Library/PrivilegedHelperTools/minzoned ]; then
     echo "removing a leftover answerer service from a prior run, for the same reason"
     ANSWERER_SERVICE_CHANNEL="${ANSWERER_SERVICE_CHANNEL:-/nonexistent}"
     answerer_service_teardown
@@ -6886,7 +6886,7 @@ proof_local_range_reserved_by_privileged_step() {
   # on macOS it spans several lines, because the two files' bytes ride
   # inside it as quoted heredocs, so the extraction runs from the
   # de-indented `sudo` line to the closing quote.
-  range_cmd="$(awk -v lead="Configure the host's resolver, reserve the local range, and install the box-zone answerer service with:" -v q="'" '
+  range_cmd="$(awk -v lead="Configure the host's resolver, reserve the local range, and install the Minimal box-name service (DNS and addresses for boxes) with:" -v q="'" '
     index($0, lead) > 0 { started = 1; next }
     started && !first { sub(/^  /, ""); first = 1 }
     started { print; if (substr($0, length($0), 1) == q) exit }
@@ -7186,19 +7186,19 @@ range_teardown_unit() {
 answerer_service_teardown() {
   [ -n "${ANSWERER_SERVICE_CHANNEL:-}" ] || return 0
   if [ "$(uname -s)" = Darwin ]; then
-    sudo -n launchctl bootout "system/dev.minimal.zone-answerer" >/dev/null 2>&1 || true
-    sudo -n rm -f "/Library/LaunchDaemons/dev.minimal.zone-answerer.plist" \
-      "/Library/PrivilegedHelperTools/dev.minimal.zone-answerer" >/dev/null 2>&1 || true
+    sudo -n launchctl bootout "system/dev.gominimal.zone" >/dev/null 2>&1 || true
+    sudo -n rm -f "/Library/LaunchDaemons/dev.gominimal.zone.plist" \
+      "/Library/PrivilegedHelperTools/minzoned" >/dev/null 2>&1 || true
   else
-    sudo -n systemctl disable --now dev.minimal.zone-answerer.socket \
-      dev.minimal.zone-answerer.service >/dev/null 2>&1 || true
-    sudo -n rm -f /etc/systemd/system/dev.minimal.zone-answerer.socket \
-      /etc/systemd/system/dev.minimal.zone-answerer.service \
-      /usr/local/lib/minimal/dev.minimal.zone-answerer >/dev/null 2>&1 || true
+    sudo -n systemctl disable --now minzoned.socket \
+      minzoned.service >/dev/null 2>&1 || true
+    sudo -n rm -f /etc/systemd/system/minzoned.socket \
+      /etc/systemd/system/minzoned.service \
+      /usr/local/lib/minimal/minzoned >/dev/null 2>&1 || true
     sudo -n rmdir /usr/local/lib/minimal >/dev/null 2>&1 || true
     sudo -n systemctl daemon-reload >/dev/null 2>&1 || true
-    sudo -n systemctl reset-failed dev.minimal.zone-answerer.socket \
-      dev.minimal.zone-answerer.service >/dev/null 2>&1 || true
+    sudo -n systemctl reset-failed minzoned.socket \
+      minzoned.service >/dev/null 2>&1 || true
   fi
   sudo -n rm -f "$ANSWERER_SERVICE_CHANNEL" >/dev/null 2>&1 || true
   # And the directory it sat in, when the command made it and it is now
@@ -7352,9 +7352,10 @@ proof_native_resolution_without_proxy_env() {
 
   # The command the advisory named: the line after its lead-in, de-indented —
   # exactly what a user would have copied off the terminal. The lead-in's
-  # shared prefix matches both platforms' wording ("…and install the box-zone
-  # answerer service with:" on Linux, "…reserve the local range, and install
-  # the box-zone answerer service with:" on macOS, whose command
+  # shared prefix matches both platforms' wording ("…and install the Minimal
+  # box-name service (DNS and addresses for boxes) with:" on Linux, "…reserve the
+  # local range, and install the Minimal box-name service (DNS and addresses
+  # for boxes) with:" on macOS, whose command
   # carries the range step NET-123 folds into it); the range-reserving case
   # below extracts the multi-line command whole.
   native_cmd="$(advisory_command_from "$native_err" "Configure the host's resolver")"
@@ -7509,7 +7510,7 @@ proof_native_resolution_without_proxy_env() {
       # (T90); record the channel it binds BEFORE running it, so a
       # half-failed run still leaves the teardown a service to remove.
       case "$native_cmd" in
-        *zone-answerer*)
+        *minzoned*)
           ANSWERER_SERVICE_CHANNEL="$(answerer_channel_of "$native_cmd")"
           if [ -z "$ANSWERER_SERVICE_CHANNEL" ]; then
             echo "::error::the advisory's command names no answerer channel, so this run could not undo the service it installs; it was not run (got: '$native_cmd')"
@@ -8040,7 +8041,7 @@ proof_box_name_resolves_natively_without_proxy() {
   # switch so a host that cannot use one never pays for fetching it.
   bn_tun=""
   if [ ! -c /dev/net/tun ]; then
-    bn_tun="no /dev/net/tun on this host, so an own-IP box cannot open its in-namespace tap and no box can serve a page"
+    bn_tun="no /dev/net/tun on this host, and this native-only case opens its own-IP box's in-namespace tap on this host, so no box can serve a page"
   fi
   # The switch that box's session program must spawn, placed where the
   # daemon's own probe (switch::installed_gvproxy_bin, which reads
@@ -8415,7 +8416,7 @@ proof_box_name_resolves_natively_without_proxy() {
     # A native daemon's advisory carries the manager-held answerer step
     # (T90); record its channel first so the teardown can remove it.
     case "$bn_cmd" in
-      *zone-answerer*)
+      *minzoned*)
         ANSWERER_SERVICE_CHANNEL="$(answerer_channel_of "$bn_cmd")"
         if [ -z "$ANSWERER_SERVICE_CHANNEL" ]; then
           echo "::error::the advisory's command names no answerer channel, so this run could not undo the service it installs; it was not run (got: '$bn_cmd')"
@@ -8774,33 +8775,33 @@ proof_box_name_resolves_natively_without_proxy() {
 # Every host change — the units, the program copy, the channel socket, the
 # resolver link (Linux) or file (macOS), the second node — is undone here
 # and again by the EXIT trap, so the shared runner is left as found.
-# Makes the min-answerer program findable for this run: beside `min` or on
-# PATH already, or built by `just answerer-build` (else that recipe's own
+# Makes the minzoned program findable for this run: beside `min` or on
+# PATH already, or built by `just zoned-build` (else that recipe's own
 # cargo line) and staged on PATH. A lane that can do neither fails: the
 # case must prove the handover there, never record it as not run.
 asr_answerer_ready() {
   local min_dir built
   min_dir="$(dirname -- "$(command -v min)")"
-  if [ -x "$min_dir/min-answerer" ]; then
-    echo "min-answerer: beside min at $min_dir/min-answerer"
+  if [ -x "$min_dir/minzoned" ]; then
+    echo "minzoned: beside min at $min_dir/minzoned"
     return 0
   fi
-  if command -v min-answerer >/dev/null 2>&1; then
-    echo "min-answerer: on PATH at $(command -v min-answerer)"
+  if command -v minzoned >/dev/null 2>&1; then
+    echo "minzoned: on PATH at $(command -v minzoned)"
     return 0
   fi
-  echo "min-answerer is not beside min or on PATH; building it (just answerer-build)"
+  echo "minzoned is not beside min or on PATH; building it (just zoned-build)"
   if command -v just >/dev/null 2>&1; then
-    (cd "$ROOT" && just answerer-build) >"$WORK/answerer-build.log" 2>&1 || {
-      echo "::error::'just answerer-build' failed"; tail -20 "$WORK/answerer-build.log"; fail; }
+    (cd "$ROOT" && just zoned-build) >"$WORK/zoned-build.log" 2>&1 || {
+      echo "::error::'just zoned-build' failed"; tail -20 "$WORK/zoned-build.log"; fail; }
   elif command -v cargo >/dev/null 2>&1; then
-    (cd "$ROOT" && cargo build -p min-answerer --locked) >"$WORK/answerer-build.log" 2>&1 || {
-      echo "::error::'cargo build -p min-answerer --locked' failed"; tail -20 "$WORK/answerer-build.log"; fail; }
+    (cd "$ROOT" && cargo build -p minzoned --locked) >"$WORK/zoned-build.log" 2>&1 || {
+      echo "::error::'cargo build -p minzoned --locked' failed"; tail -20 "$WORK/zoned-build.log"; fail; }
   else
-    echo "::error::this lane has no min-answerer and neither just nor cargo to build it; the handover cannot be proved"
+    echo "::error::this lane has no minzoned and neither just nor cargo to build it; the handover cannot be proved"
     fail
   fi
-  built="${CARGO_TARGET_DIR:-$ROOT/target}/debug/min-answerer"
+  built="${CARGO_TARGET_DIR:-$ROOT/target}/debug/minzoned"
   if [ ! -x "$built" ]; then
     echo "::error::the answerer build left no program at $built"
     fail
@@ -8808,11 +8809,11 @@ asr_answerer_ready() {
   # Staged alone: target/debug also holds a min and a minvmd this run must
   # not pick up in place of the lane's own.
   mkdir -p "$WORK/answerer-bin"
-  cp "$built" "$WORK/answerer-bin/min-answerer"
+  cp "$built" "$WORK/answerer-bin/minzoned"
   # shellcheck disable=SC2031 # other proofs change PATH in their own subshells; this runs in the main shell
   PATH="$WORK/answerer-bin:$PATH"
   export PATH
-  echo "min-answerer: built and staged at $WORK/answerer-bin/min-answerer"
+  echo "minzoned: built and staged at $WORK/answerer-bin/minzoned"
 }
 
 proof_answerer_survives_session_stop() {
@@ -8826,7 +8827,7 @@ proof_answerer_survives_session_stop() {
   case "$asr_os" in
     Linux)
       asr_channel=/run/minimal/answerer.sock
-      asr_marker=/etc/systemd/system/dev.minimal.zone-answerer.socket
+      asr_marker=/etc/systemd/system/minzoned.socket
       if ! command -v systemctl >/dev/null 2>&1 || ! command -v resolvectl >/dev/null 2>&1 \
          || ! command -v ip >/dev/null 2>&1 || ! command -v dig >/dev/null 2>&1 \
          || ! sudo -n true >/dev/null 2>&1; then
@@ -8836,7 +8837,7 @@ proof_answerer_survives_session_stop() {
       ;;
     Darwin)
       asr_channel="/Library/Application Support/minimal/run/answerer.sock"
-      asr_marker=/Library/LaunchDaemons/dev.minimal.zone-answerer.plist
+      asr_marker=/Library/LaunchDaemons/dev.gominimal.zone.plist
       if ! command -v launchctl >/dev/null 2>&1 || ! command -v dig >/dev/null 2>&1 \
          || ! sudo -n true >/dev/null 2>&1; then
         echo "::error::this macOS host cannot install the answerer LaunchDaemon (needs launchctl, dig and passwordless sudo); the case fails rather than self-skips, so the pin is never silent"
@@ -8853,8 +8854,8 @@ proof_answerer_survives_session_stop() {
   # channel client from its first start, so the interim this case hands
   # over could never exist. Remove it first, the range case's reasoning.
   if [ -e "$asr_marker" ] || [ -e "$asr_channel" ] \
-     || [ -e /usr/local/lib/minimal/dev.minimal.zone-answerer ] \
-     || [ -e /Library/PrivilegedHelperTools/dev.minimal.zone-answerer ]; then
+     || [ -e /usr/local/lib/minimal/minzoned ] \
+     || [ -e /Library/PrivilegedHelperTools/minzoned ]; then
     echo "removing a leftover answerer service from a prior run, so node A starts from the interim"
     ANSWERER_SERVICE_CHANNEL="$asr_channel"
     answerer_service_teardown
@@ -9000,10 +9001,10 @@ for row in json.load(open(sys.argv[1])):
     fail
   }
 
-  # The advisory's command copies the min-answerer program found beside
+  # The advisory's command copies the minzoned program found beside
   # min or on PATH; a lane whose testbed carries only min and minvmd has
   # none, and its advisory then omits the step. Build it here, through
-  # `just answerer-build` — its own invocation, never beside -p minvmd (the
+  # `just zoned-build` — its own invocation, never beside -p minvmd (the
   # libkrun feature would unify in) — or that recipe's exact cargo line
   # where just is absent, and put it on PATH for this run.
   asr_answerer_ready
@@ -9085,7 +9086,7 @@ for row in json.load(open(sys.argv[1])):
   local asr_cmd
   asr_cmd="$(advisory_command_from "$asr_a_err" "Configure the host's resolver")"
   case "$asr_cmd" in
-    *zone-answerer*) ;;
+    *minzoned*) ;;
     *)
       echo "::error::node A's session start printed no advisory carrying the answerer service step"
       echo "--- activate stderr ---"; cat "$asr_a_err" 2>/dev/null || true
@@ -9144,9 +9145,9 @@ for row in json.load(open(sys.argv[1])):
     fail
   fi
   if [ "$asr_os" = Linux ]; then
-    if ! systemctl is-active --quiet dev.minimal.zone-answerer.socket; then
+    if ! systemctl is-active --quiet minzoned.socket; then
       echo "::error::the answerer socket unit is not active after the command"
-      systemctl status dev.minimal.zone-answerer.socket 2>&1 | tail -n 15 || true
+      systemctl status minzoned.socket 2>&1 | tail -n 15 || true
       fail
     fi
     asr_holders="$(sudo -n ss -lunp 2>/dev/null | grep -F -- "127.0.0.1:$asr_port " || true)"
@@ -9158,7 +9159,7 @@ for row in json.load(open(sys.argv[1])):
     esac
     echo "  the hook port's holder: ${asr_holders:-<none listed>}"
   else
-    if ! sudo -n launchctl print system/dev.minimal.zone-answerer >/dev/null 2>&1; then
+    if ! sudo -n launchctl print system/dev.gominimal.zone >/dev/null 2>&1; then
       echo "::error::the answerer LaunchDaemon is not loaded after the command"
       fail
     fi
@@ -9249,15 +9250,15 @@ for row in json.load(open(sys.argv[1])):
   # ---- 4. a service restart answers both names again -------------------------
   local asr_pid_before asr_pid_after
   if [ "$asr_os" = Linux ]; then
-    asr_pid_before="$(systemctl show -p MainPID --value dev.minimal.zone-answerer.service)"
-    sudo -n systemctl restart dev.minimal.zone-answerer.service
-    asr_pid_after="$(systemctl show -p MainPID --value dev.minimal.zone-answerer.service)"
+    asr_pid_before="$(systemctl show -p MainPID --value minzoned.service)"
+    sudo -n systemctl restart minzoned.service
+    asr_pid_after="$(systemctl show -p MainPID --value minzoned.service)"
   else
-    asr_pid_before="$(sudo -n launchctl print system/dev.minimal.zone-answerer 2>/dev/null \
+    asr_pid_before="$(sudo -n launchctl print system/dev.gominimal.zone 2>/dev/null \
       | sed -n 's/^[[:space:]]*pid = //p' | head -n1)"
-    sudo -n launchctl kickstart -k system/dev.minimal.zone-answerer
+    sudo -n launchctl kickstart -k system/dev.gominimal.zone
     sleep 1
-    asr_pid_after="$(sudo -n launchctl print system/dev.minimal.zone-answerer 2>/dev/null \
+    asr_pid_after="$(sudo -n launchctl print system/dev.gominimal.zone 2>/dev/null \
       | sed -n 's/^[[:space:]]*pid = //p' | head -n1)"
   fi
   echo "4. restarted the answerer service (pid ${asr_pid_before:-?} -> ${asr_pid_after:-on demand})"
@@ -9410,7 +9411,7 @@ proof_native_answerer_survives_session_stop() {
   echo "::group::the native daemon publishes into the manager-held answerer, which survives a session stop (NET-122, T90)"
 
   local nasr_channel=/run/minimal/answerer.sock
-  local nasr_marker=/etc/systemd/system/dev.minimal.zone-answerer.socket
+  local nasr_marker=/etc/systemd/system/minzoned.socket
   local nasr_base_a="$XDG_STATE_HOME/minimal"
   local nasr_log_filter="warn,minimald::rpc=info,minimald::net::answerer=info"
   local nasr_port=""
@@ -9419,7 +9420,7 @@ proof_native_answerer_survives_session_stop() {
   # client from its first start, so the interim this case hands over could
   # never exist. Remove it first.
   if [ -e "$nasr_marker" ] || [ -e "$nasr_channel" ] \
-     || [ -e /usr/local/lib/minimal/dev.minimal.zone-answerer ]; then
+     || [ -e /usr/local/lib/minimal/minzoned ]; then
     echo "removing a leftover answerer service from a prior run, so node A starts from the interim"
     ANSWERER_SERVICE_CHANNEL="$nasr_channel"
     answerer_service_teardown
@@ -9523,7 +9524,7 @@ proof_native_answerer_survives_session_stop() {
     fail
   }
 
-  # The advisory's command copies the min-answerer program found beside min
+  # The advisory's command copies the minzoned program found beside min
   # or on PATH; the answerer-service case's helper builds and stages it.
   asr_answerer_ready
   NASR_SEED_DIR="$(hook_mktemp /tmp/mnlnasr.XXXXXX)"
@@ -9560,7 +9561,7 @@ proof_native_answerer_survives_session_stop() {
   local nasr_cmd
   nasr_cmd="$(advisory_command_from "$nasr_a_err" "Configure the host's resolver")"
   case "$nasr_cmd" in
-    *zone-answerer*) ;;
+    *minzoned*) ;;
     *)
       echo "::error::node A's native session start printed no advisory carrying the answerer service step"
       echo "--- activate stderr ---"; cat "$nasr_a_err" 2>/dev/null || true
@@ -9610,9 +9611,9 @@ proof_native_answerer_survives_session_stop() {
     nasr_dump_log "$nasr_base_a"
     fail
   fi
-  if ! systemctl is-active --quiet dev.minimal.zone-answerer.socket; then
+  if ! systemctl is-active --quiet minzoned.socket; then
     echo "::error::the answerer socket unit is not active after the command"
-    systemctl status dev.minimal.zone-answerer.socket 2>&1 | tail -n 15 || true
+    systemctl status minzoned.socket 2>&1 | tail -n 15 || true
     fail
   fi
   local nasr_holders
@@ -15484,10 +15485,10 @@ proof_own_ip_deny_all_box_answers_published_port() {
   # The box opens /dev/net/tun for its in-namespace tap; without the device
   # its session program cannot spawn, and a host that is itself a sandbox
   # cannot mknod one either. Skip rather than fail: the failure would say
-  # nothing about this branch, and the native CI lane — where the tap root
-  # integration harness already builds a tap — runs the case for real.
-  if [ ! -c /dev/net/tun ]; then
-    echo "deny-all answer proof SKIPPED (no /dev/net/tun on this host: an own-IP box cannot open its in-namespace tap; runs for real on a host that has the device)"
+  # nothing about this branch. Only a native box opens its tap on this host;
+  # a VM lane opens it inside the guest, so the host check gates native runs.
+  if [ -z "${E2E_VM:-}" ] && [ ! -c /dev/net/tun ]; then
+    echo "deny-all answer proof SKIPPED (no /dev/net/tun on this host: a native own-IP box cannot open its in-namespace tap; a VM lane opens it inside the guest and runs this case)"
     echo "::endgroup::"
     return 0
   fi
@@ -15984,8 +15985,8 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
       echo "port-publish half SKIPPED (no MINVMD_GVPROXY_BIN: this target has no switch)"
       return 0
     fi
-    if [ ! -c /dev/net/tun ]; then
-      echo "port-publish half SKIPPED (no /dev/net/tun on this host: an own-IP box cannot open its in-namespace tap; runs for real on a host that has the device)"
+    if [ -z "${E2E_VM:-}" ] && [ ! -c /dev/net/tun ]; then
+      echo "port-publish half SKIPPED (no /dev/net/tun on this host: a native own-IP box cannot open its in-namespace tap; a VM lane opens it inside the guest and runs this case)"
       return 0
     fi
 
@@ -16869,8 +16870,8 @@ proof_min_net_expose_publishes_lists_and_refuses() {
     echo "::endgroup::"
     return 0
   fi
-  if [ ! -c /dev/net/tun ]; then
-    echo "min net expose SKIPPED (no /dev/net/tun on this host: an own-IP box cannot open its in-namespace tap; runs for real on a host that has the device)"
+  if [ -z "${E2E_VM:-}" ] && [ ! -c /dev/net/tun ]; then
+    echo "min net expose SKIPPED (no /dev/net/tun on this host: a native own-IP box cannot open its in-namespace tap; a VM lane opens it inside the guest and runs this case)"
     echo "::endgroup::"
     return 0
   fi
@@ -17122,7 +17123,7 @@ PY
       fail
     fi
     case "$policy" in
-      *"  dynamic ports  $mnx_lo–$mnx_hi"*) ;;
+      *"  dynamic ports  ${mnx_lo}–${mnx_hi}"*) ;;
       *) echo "::error::the text policy does not show the declared dynamic range $mnx_lo-$mnx_hi"; fail ;;
     esac
     if [ "$mode" = "live" ]; then
@@ -17134,7 +17135,7 @@ PY
         *":$mnx_port → :$mnx_port"*) ;;
         *) echo "::error::the live-ingress section carries no row for the exposed port $mnx_port"; fail ;;
       esac
-      echo "policy (text): stance allow over $mnx_lo–$mnx_hi, one live row for :$mnx_port (NET-043, NET-044)"
+      echo "policy (text): stance allow over ${mnx_lo}–${mnx_hi}, one live row for :$mnx_port (NET-043, NET-044)"
     else
       case "$policy" in
         *"live ingress (published at runtime)"*)
@@ -17142,7 +17143,7 @@ PY
           fail
           ;;
       esac
-      echo "policy (text): stance deny over $mnx_lo–$mnx_hi, and no live-ingress section — a box that published nothing lists nothing (NET-044, fail-closed)"
+      echo "policy (text): stance deny over ${mnx_lo}–${mnx_hi}, and no live-ingress section — a box that published nothing lists nothing (NET-044, fail-closed)"
     fi
 
     json="$(mnl session policy "$sid" -o json 2>"$WORK/mnx-json-$stance.err")" \
@@ -17215,6 +17216,7 @@ proof_listen_published_port_reaches_peer_and_host() {
   local lp_sid="" lp_peer_sid="" lp_peer_host="" lp_peer_why=""
   local lp_ans_port="" lp_addr="" lp_listening="" lp_published="" lp_refused=""
   local lp_rc="" lp_status="" lp_body="" lp_hrc="" lp_hstatus="" lp_hbody="" lp_hms=""
+  local lp_unlisted=""               # set once the policy stops listing the closed listen
   local lp_target_name="e2e-dyn-listen" lp_peer_name="e2e-dyn-peer"
   local lp_lo=18110 lp_hi=18115      # the declared dynamic range (this case's band)
   local lp_listen_port=18112         # in-range: the listen that publishes
@@ -17589,19 +17591,16 @@ proof_listen_published_port_reaches_peer_and_host() {
     sleep 0.25
   done
   # An in-range listen under allow is a dynamic ingress request, so NET-044
-  # owes its row in `min session policy`. The watcher commits only to the
-  # box's publications today, never to the runtime-ingress table the policy
-  # renders: a known gap, carried as one until gominimal/inbox#912 lands and
-  # this turns into a hard assertion. The peer and host legs below prove
-  # the publish itself (NET-016) — on a VM lane, through the VM host
-  # daemon's admission (T94).
-  if [ -n "$lp_live" ]; then
-    echo "listen: the in-range listen on port $lp_listen_port is listed as published in min session policy (NET-044)"
-  else
-    known_gap listen_published_port_reaches_peer_and_host \
-      "the in-range listen on port $lp_listen_port is not listed in min session policy, NET-044 — https://github.com/gominimal/inbox/issues/912"
-    lp_live=1
+  # owes its row in `min session policy`: the watcher's publication is
+  # listed beside the runtime exposes for as long as the listener holds the
+  # port. The peer and host legs below prove the publish itself (NET-016) —
+  # on a VM lane, through the VM host daemon's admission (T94).
+  if [ -z "$lp_live" ]; then
+    echo "::error::the in-range listen on port $lp_listen_port is not listed in min session policy — an allowed dynamic ingress request must show its mapping (NET-044)"
+    echo "--- min session policy ---"; printf '%s\n' "${lp_policy:-<no answer>}"
+    fail
   fi
+  echo "listen: the in-range listen on port $lp_listen_port is listed as published in min session policy (NET-044)"
 
   if [ -n "$lp_live" ] && [ -n "$lp_peer_host" ]; then
   # ---- reach: the peer, polled — the watcher publishes within its own poll
@@ -17681,9 +17680,15 @@ proof_listen_published_port_reaches_peer_and_host() {
   fi
 
   # ---- the audit: the allow decision has its decisions.log line (NET-046) --
-  # The watcher writes no decision record today; carried as a known gap until
-  # gominimal/inbox#912 lands, when this turns into a hard assertion.
-  if python3 - "$lp_target_name" "$lp_listen_port" \
+  # The watcher appends one record per listen it publishes, to the audit log
+  # of the daemon that runs the box. On a VM lane that daemon is the guest's,
+  # whose state directory this host does not read — the same split the
+  # expose case's guest-audit legs carry — so the leg is counted NOT RUN
+  # there and asserted everywhere else.
+  if [ -n "${E2E_VM:-}" ]; then
+    not_run listen_published_port_reaches_peer_and_host \
+      "VM lane: the listen's decision record is in the guest daemon's audit file, which this host does not read (NET-046)"
+  elif python3 - "$lp_target_name" "$lp_listen_port" \
       "$XDG_STATE_HOME/minimal/audit/decisions.log" <<'PY'
 import json
 import sys
@@ -17696,7 +17701,13 @@ try:
                 record = json.loads(line)
             except ValueError:
                 continue
-            if record.get("box") == box and record.get("port") == port:
+            if (
+                record.get("box") == box
+                and record.get("port") == port
+                and record.get("decision") == "allow"
+                and record.get("decided_by") == "box-policy"
+                and record.get("outcome") == "published"
+            ):
                 print(f"  {line.strip()}")
                 sys.exit(0)
 except FileNotFoundError:
@@ -17704,10 +17715,11 @@ except FileNotFoundError:
 sys.exit(1)
 PY
   then
-    echo "audit: the listen's allow decision has its decisions.log line (NET-046)"
+    echo "audit: the listen's allow decision has its decisions.log line, decided by the box's policy, outcome published (NET-046)"
   else
-    known_gap listen_published_port_reaches_peer_and_host \
-      "no decisions.log line for the in-range listen on port $lp_listen_port, NET-046 — https://github.com/gominimal/inbox/issues/912"
+    echo "::error::no decisions.log line records box $lp_target_name port $lp_listen_port as allowed by the box's policy and published — the listen's decision was never audited (NET-046)"
+    tail -n 20 "$XDG_STATE_HOME/minimal/audit/decisions.log" 2>/dev/null || echo "(no audit log)"
+    fail
   fi
 
   # ---- the close: the publication withdraws with the listener -------------
@@ -17740,6 +17752,26 @@ PY
     fail
   fi
   echo "peer, after the close: the same GET -> connection refused (curl exit $lp_rc) $(( $(now_ms) - lp_close_start ))ms after the kill — the listen's publication withdrew with its listener (NET-017)"
+  # The row goes with the publication (NET-044): a policy that still lists
+  # the port names a mapping nothing publishes. An empty answer is no
+  # reading at all, so only an answer that names the box ends the poll.
+  lp_unlisted=""
+  for _ in $(seq 1 16); do
+    lp_policy="$(mnl session policy "$lp_sid" 2>/dev/null || true)"
+    if [ -n "$lp_policy" ]; then
+      case "$lp_policy" in
+        *":$lp_listen_port → :$lp_listen_port"*) ;;
+        *) lp_unlisted=1; break ;;
+      esac
+    fi
+    sleep 0.25
+  done
+  if [ -z "$lp_unlisted" ]; then
+    echo "::error::min session policy still lists port $lp_listen_port after its listener closed — the row must go with the publication (NET-044)"
+    echo "--- min session policy ---"; printf '%s\n' "${lp_policy:-<no answer>}"
+    fail
+  fi
+  echo "policy, after the close: port $lp_listen_port is no longer listed (NET-044)"
   if [ -n "$lp_bridge_switch" ]; then
     lp_bridge_row=""
     for _ in $(seq 1 20); do
@@ -18088,8 +18120,8 @@ proof_expose_from_inside_box() {
     echo "::endgroup::"
     return 0
   fi
-  if [ ! -c /dev/net/tun ]; then
-    echo "expose from inside the box SKIPPED (no /dev/net/tun on this host: an own-IP box cannot open its in-namespace tap; runs for real on a host that has the device)"
+  if [ -z "${E2E_VM:-}" ] && [ ! -c /dev/net/tun ]; then
+    echo "expose from inside the box SKIPPED (no /dev/net/tun on this host: a native own-IP box cannot open its in-namespace tap; a VM lane opens it inside the guest and runs this case)"
     echo "::endgroup::"
     return 0
   fi
@@ -18389,9 +18421,11 @@ proof_expose_from_inside_box() {
     rm -rf "$EIB_ALLOW_SEED_DIR" "$EIB_DENY_SEED_DIR"
 
     # ---- two named VMs: the expose half of T61 ------------------------------
-    # Alpha's switch publishes at the same host 127.0.0.1 as the default VM,
-    # whose allow and ask-yes boxes still hold their ports there, so this leg
-    # asks for its own port in the declared range.
+    # Alpha's switch publishes at the same host 127.0.0.1 as the default VM.
+    # Each host 127.0.0.1:port carries one gvproxy forward, and a forward the
+    # default VM's boxes published can outlive those boxes (a VM box's declared
+    # forwards are not yet unbound when it ends), so this leg asks for its own
+    # port in the declared range.
     local eib_two_port=$((eib_port + 2))
     # A box on the NON-DEFAULT VM publishes there. `min --vm alpha session
     # activate` creates the box on alpha (autospawning and booting it), the

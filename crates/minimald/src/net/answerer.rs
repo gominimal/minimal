@@ -5,7 +5,7 @@
 //! the other half of resolution — the DNS reply the host's own resolver gets
 //! when a process looks a box name up, no proxy variable involved. On a
 //! native host the zone is answered by the machine's *one* answerer
-//! (NET-122): the root-installed `min-answerer` service the manager holds
+//! (NET-122): the root-installed `minzoned` service the manager holds
 //! when the host is hooked, and until then the interim this daemon itself
 //! hosts. The acquisition below decides which — publish-or-host, never both
 //! — over the machine-global channel (`acquire`), the same machine contract
@@ -497,7 +497,7 @@ pub async fn serve<T: Zone>(socket: UdpSocket, answerer: ZoneAnswerer<T>) -> io:
 // ── the acquisition: publish-or-host over the machine-global channel ─────────
 //
 // NET-122's host half: on a hooked host the zone is answered by the one
-// root-installed `min-answerer` service the service manager holds, and this
+// root-installed `minzoned` service the service manager holds, and this
 // daemon is that answerer's *client* — it connects to the machine-global
 // channel, says its node id, and keeps its zone rows published there for as
 // long as the connection lives. Until the host is hooked, nothing serves
@@ -531,7 +531,7 @@ pub const GLOBAL_CHANNEL_SOCK: &str = "/run/minimal/answerer.sock";
 /// and only whose presence — says the answerer service is installed on
 /// this host. The channel socket's path existing never says so: a stale
 /// socket file with no marker beside it is a leftover, not a service.
-pub const INSTALL_MARKER: &str = "/etc/systemd/system/dev.minimal.zone-answerer.socket";
+pub const INSTALL_MARKER: &str = "/etc/systemd/system/minzoned.socket";
 
 /// The variable that overrides [`GLOBAL_CHANNEL_SOCK`] — read only by test
 /// and debug builds (the e2e harness's), never by a release build, so no
@@ -3171,7 +3171,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("a tempdir for the unit and the channel");
         let paths = AnswererPaths {
             channel: dir.path().join("answerer.sock"),
-            marker: dir.path().join("dev.minimal.zone-answerer.socket"),
+            marker: dir.path().join("minzoned.socket"),
             release_window: RELEASE_WINDOW,
         };
         std::fs::write(
@@ -3218,7 +3218,7 @@ mod tests {
     #[test]
     fn recorded_service_bind_reads_the_installed_unit() {
         let dir = tempfile::tempdir().expect("a tempdir for the unit");
-        let unit = dir.path().join("dev.minimal.zone-answerer.socket");
+        let unit = dir.path().join("minzoned.socket");
         std::fs::write(
             &unit,
             b"[Socket]\nListenDatagram=127.0.0.1:17999\nListenStream=/run/minimal/answerer.sock\n",
@@ -3255,7 +3255,7 @@ mod tests {
             .register_host_net(SessionId::nil(), "web");
         let dir = tempfile::tempdir().expect("a tempdir for the channel and the marker");
         let channel = dir.path().join("answerer.sock");
-        let marker = dir.path().join("dev.minimal.zone-answerer.socket");
+        let marker = dir.path().join("minzoned.socket");
         std::fs::write(&marker, b"[Socket]\nListenDatagram=not-an-address\n")
             .expect("the install marker is written");
         let service = fake_manager_held_service(channel.clone());
@@ -3326,7 +3326,7 @@ mod tests {
         let server = crate::test_harness::TestServer::new().await;
         let dir = tempfile::tempdir().expect("a tempdir for the channel and the marker");
         let channel = dir.path().join("answerer.sock");
-        let marker = dir.path().join("dev.minimal.zone-answerer.socket");
+        let marker = dir.path().join("minzoned.socket");
         std::fs::write(&marker, b"[Socket]\nListenDatagram=127.0.0.1:17999\n")
             .expect("the install marker is written");
         let service = fake_manager_held_service(channel.clone());
@@ -3405,7 +3405,7 @@ mod tests {
             .register_host_net(SessionId::nil(), "web");
         let dir = tempfile::tempdir().expect("a tempdir for the channel and the marker");
         let channel = dir.path().join("answerer.sock");
-        let marker = dir.path().join("dev.minimal.zone-answerer.socket");
+        let marker = dir.path().join("minzoned.socket");
         std::fs::write(&marker, b"[Socket]\nListenDatagram=127.0.0.1:17656\n")
             .expect("the install marker is written");
         let service = fake_manager_held_service(channel.clone());
@@ -3530,7 +3530,7 @@ mod tests {
             .register_host_net(SessionId::nil(), "web");
         let dir = tempfile::tempdir().expect("a tempdir for the channel and the marker");
         let channel = dir.path().join("answerer.sock");
-        let marker = dir.path().join("dev.minimal.zone-answerer.socket");
+        let marker = dir.path().join("minzoned.socket");
         std::fs::write(&marker, b"[Socket]\nListenDatagram=127.0.0.1:17656\n")
             .expect("the install marker is written");
         let service = fake_manager_held_service(channel.clone());
@@ -3836,7 +3836,7 @@ mod tests {
             status.clone(),
             AnswererPaths {
                 channel: dir.path().join("answerer.sock"),
-                marker: dir.path().join("dev.minimal.zone-answerer.socket"),
+                marker: dir.path().join("minzoned.socket"),
                 release_window: RELEASE_WINDOW,
             },
             shutdown.clone(),
@@ -4013,7 +4013,7 @@ mod tests {
             status.clone(),
             AnswererPaths {
                 channel: dir.path().join("answerer.sock"),
-                marker: dir.path().join("dev.minimal.zone-answerer.socket"),
+                marker: dir.path().join("minzoned.socket"),
                 release_window: Duration::from_secs(1),
             },
             shutdown.clone(),
