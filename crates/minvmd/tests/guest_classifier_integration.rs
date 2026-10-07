@@ -116,8 +116,14 @@ const RUNNING_TIMEOUT: Duration = Duration::from_secs(90);
 /// Bound on any one `minvmd` subcommand (`run --detach`, `status`, `stop`) so
 /// a wedged daemon fails the test instead of hanging it.
 const SUBPROC_TIMEOUT: Duration = Duration::from_secs(180);
-/// Bound on any one exec inside a box.
-const EXEC_TIMEOUT: Duration = Duration::from_secs(60);
+/// Bound on any one exec inside a box, measured as silence on the channel.
+/// A session's first exec launches its box, and the launch fetches the box's
+/// package closure from the remote cache onto the guest's freshly formatted
+/// data volume before the command runs. On the KVM lane two concurrent first
+/// launches have taken 84-122 s; one launch alone usually finishes in under
+/// 40 s, so the bound covers it with headroom. A guest that stays silent for
+/// two minutes is wedged, not slow.
+const EXEC_TIMEOUT: Duration = Duration::from_secs(120);
 /// How long a boot-log line may take to appear after the guest is Running:
 /// the guest daemon writes them at boot, before it serves, so this only
 /// covers the console flush.
@@ -1245,6 +1251,21 @@ async fn guest_deny_all_box_answers_inbound_through_the_proxy() {
     )
     .await
     .expect("the plain box that asks is an ordinary launch");
+    // Launch each box with a no-op exec, one after the other. A box's first
+    // exec fetches its package closure, so the second launch reads the cache
+    // the first one filled. Otherwise both fetches run inside the concurrent
+    // exchange below, where they have outrun EXEC_TIMEOUT.
+    for (label, session) in [("server", &mut serving), ("client", &mut client)] {
+        let (_, stderr, exit) = session
+            .exec("true")
+            .await
+            .unwrap_or_else(|e| panic!("the {label} box's launch exec ran: {e}"));
+        assert_eq!(
+            exit,
+            Some(0),
+            "the {label} box did not launch; stderr: {stderr}"
+        );
+    }
 
     const SERVE_PORT: u16 = 8412;
     // One-shot server in the deny-all box: bind, accept one, answer, exit.

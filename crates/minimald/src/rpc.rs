@@ -1387,7 +1387,11 @@ async fn serve_get_effective_session_policy(
 /// publish reads `pending` until the gate's admitted set grows to include
 /// runtime-published ports, and a publish of a port the declaration already
 /// names — the one overlap — is not pending, because the declared forward is
-/// what answers at that address.
+/// what answers at that address. The listen watcher's rows — the in-range
+/// listens the box's `allow` stance published — are the exception that
+/// growth already made: the watcher admits each port at the gate as its
+/// publish's last step, so they are served as they stand, reachable, after
+/// the exposes' rows.
 async fn serve_get_live_ingress(
     s: ServerStateHandle,
     c: RuChannel<Msg>,
@@ -1416,8 +1420,12 @@ async fn serve_get_live_ingress(
                     let record = session.record().await.ok();
                     let policy = record.as_ref().map(|record| &record.policy);
                     match session.live_ingress().await {
+                        // The listen watcher's rows follow the exposes' as
+                        // they stand: the gate admitted each one as its
+                        // publish's last step, so they read reachable.
                         Ok(live) => Ok(Errorable::Ok(
-                            live.into_iter()
+                            live.exposed
+                                .into_iter()
                                 .map(|mut mapping| {
                                     let admitted = crate::net::switch::declared_ingress_ports(
                                         policy,
@@ -1431,6 +1439,7 @@ async fn serve_get_live_ingress(
                                         Some(!admitted.contains(&mapping.internal_port));
                                     mapping
                                 })
+                                .chain(live.listened)
                                 .collect(),
                         )),
                         Err(e) => Ok(Errorable::Err {
