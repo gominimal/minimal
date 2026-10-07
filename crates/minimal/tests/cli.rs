@@ -1058,6 +1058,7 @@ async fn loadout_list_warning_goes_to_stderr_not_stdout() {
         .arg("--no-input")
         .args(["loadout", "list", "--dir"])
         .arg(loadouts_dir.path())
+        .env_remove("RUST_LOG")
         .output()
         .await
         .expect("the min binary should be invocable");
