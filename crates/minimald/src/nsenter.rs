@@ -12,6 +12,7 @@ use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicI32, Ordering};
 
 use nix::sched::CloneFlags;
 
@@ -20,6 +21,13 @@ pub const SUBCOMMAND: &str = "__nsenter";
 
 /// Where this daemon can re-exec itself from. Registered by [`set_shim_exe`].
 static SHIM_EXE: OnceLock<PathBuf> = OnceLock::new();
+
+/// The process-group id (== pid, see `setpgid(0, 0)` in [`shim_main`]) of the
+/// process this shim injected into the session, published after spawn so the
+/// SIGTERM/SIGHUP handlers can reap the whole group — the injected program and
+/// every descendant it forked — rather than leaving grandchildren reparented to
+/// PID 1. `0` before the spawn and after the child has been reaped.
+static CHILD_PGID: AtomicI32 = AtomicI32::new(0);
 
 /// Registers `path` as the [`SUBCOMMAND`] shim, overriding `current_exe()` for
 /// every later [`Injection`].
@@ -725,6 +733,14 @@ pub fn shim_main(args: ShimArgs) -> Result<i32, NsenterError> {
     // and capture only a static reference.
     unsafe {
         cmd.pre_exec(|| {
+            // Make the injected process the leader of a new process group
+            // (pid == pgid). Nothing else does: the shim sits outside the
+            // session's PID namespace, so the group ids the session's shell
+            // already assigned do not help it name "the shim's child and its
+            // descendants" for a later group kill.
+            if libc::setpgid(0, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
             // Tie the injected process's lifetime to this shim's. Nothing else
             // does: the shim is its parent but sits outside the session's PID
             // namespace, and killing the shim is exactly how the daemon cancels
@@ -793,10 +809,26 @@ pub fn shim_main(args: ShimArgs) -> Result<i32, NsenterError> {
             return Ok(code);
         }
     };
+
+    // Publish the child's group lead (its own pid, from `setpgid(0, 0)` above)
+    // before installing the handlers: a signal delivered in the gap between the
+    // spawn's return and this store finds the handlers not yet installed and
+    // falls back to the default action, which is exactly the pre-fix behaviour
+    // for that one window. The store is the async-signal-safe way to hand the
+    // pid to the handlers; nothing else off the child-process path is.
+    CHILD_PGID.store(child.id() as i32, Ordering::Release);
+    unsafe {
+        install_kill_group_handlers();
+    }
+
     let status = child.wait().map_err(|source| NsenterError::Wait {
         program: program.clone(),
         source,
     })?;
+    // The group it led died with it (or the daemon already killed it); from
+    // here the handlers must be no-ops so a straggler SIGTERM/SIGHUP does not
+    // target a recycled pid.
+    CHILD_PGID.store(0, Ordering::Release);
 
     // Mirror the shell's convention for a signalled child so the daemon sees
     // the same code it would from a direct spawn.
@@ -804,6 +836,74 @@ pub fn shim_main(args: ShimArgs) -> Result<i32, NsenterError> {
         .code()
         .or_else(|| status.signal().map(|sig| 128 + sig))
         .unwrap_or(1))
+}
+
+/// Kill every process in the process group led by `pgid` — the injected program
+/// and every descendant that has not left the group.
+///
+/// The daemon cancels a `min session exec` by signalling the shim, whose
+/// handlers call this with the group lead captured at spawn. Without the group
+/// kill, only the shim's direct child dies and its grandchildren are reparented
+/// to PID 1 to run on indefinitely (#948).
+///
+/// A descendant that calls `setsid(2)` leaves the group and escapes this kill
+/// (and the shim's `wait`); it is bounded by the sandbox's PID namespace dying
+/// with its session shell, the same bound the pre-fix race already relied on.
+///
+/// # Safety
+///
+/// The caller must pass the group-lead of a live group it is entitled to
+/// signal, or `0` (a no-op, so a handler that fires after the child was reaped
+/// cannot hit a recycled pid).
+unsafe fn kill_group(pgid: i32) {
+    if pgid == 0 {
+        return;
+    }
+    // SAFETY: only async-signal-safe calls follow, so this is legal from a
+    // signal handler. SIGKILL is uncatchable, so nothing in the group can
+    // survive it; ESRCH means the group is already gone, and `_exit` never
+    // returns to fall through to the default disposition.
+    unsafe {
+        libc::kill(-pgid, libc::SIGKILL);
+    }
+}
+
+extern "C" fn on_term_or_hup(signum: libc::c_int) {
+    let pgid = CHILD_PGID.load(Ordering::Acquire);
+    // SAFETY: `pgid` is the group lead this shim spawned and owns; `0` if the
+    // child has already been reaped, which `kill_group` treats as a no-op.
+    unsafe { kill_group(pgid) };
+    // `_exit`, not `std::process::exit`: the handler runs on whatever thread
+    // took the signal, where atexit hooks and stdio flushing are not legal.
+    unsafe { libc::_exit(128 + signum) };
+}
+
+/// Install `on_term_or_hup` for SIGTERM and SIGHUP — the two the daemon uses to
+/// cancel a shim whose client died.
+///
+/// # Safety
+///
+/// Must run while the process is single-threaded (before the tokio runtime is
+/// built, which [`shim_main`] guarantees) so a handler cannot interrupt a
+/// half-initialised data structure.
+unsafe fn install_kill_group_handlers() {
+    for signum in [libc::SIGTERM, libc::SIGHUP] {
+        // SAFETY: an all-zero `sigaction` is a valid disposition (empty mask,
+        // SIG_DFL); `sigemptyset` writes only the mask; `sigaction` installs a
+        // handler whose body is limited to the async-signal-safe calls above.
+        // No flags: SA_RESTART is irrelevant, the shim's only wait is the `spawn`
+        // it already passed, and there is no handler chaining to preserve.
+        let installed = unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = on_term_or_hup as extern "C" fn(libc::c_int) as usize;
+            libc::sigemptyset(&raw mut action.sa_mask);
+            libc::sigaction(signum, &raw const action, std::ptr::null_mut())
+        };
+        debug_assert_eq!(
+            installed, 0,
+            "installing the kill-group handler for signal {signum}"
+        );
+    }
 }
 
 /// Maps a failed `spawn` to the shell's exit-code and message conventions:
@@ -974,6 +1074,65 @@ mod tests {
         let _ = sh.kill();
         let _ = sh.wait();
         assert_eq!(resolved.expect("resolving the sole child"), expected);
+    }
+
+    /// The group kill reaches a descendant, not just the direct child: `sh`
+    /// puts its background `sleep` in the group, and after [`kill_group`] on the
+    /// group lead, `kill(grandchild, 0)` reports `ESRCH` — the descendant is
+    /// gone, not reparented and left running.
+    #[test]
+    fn kill_group_reaches_the_grandchild() {
+        use std::io::BufRead as _;
+        use std::os::unix::process::CommandExt as _;
+        use std::time::Instant;
+
+        let mut sh = Command::new("/bin/sh");
+        sh.arg("-c")
+            .arg("sleep 600 & echo $!; wait")
+            .stdout(std::process::Stdio::piped());
+        // SAFETY: the closure only calls `setpgid(2)`, which is
+        // async-signal-safe, in the forked pre-exec child.
+        unsafe {
+            sh.pre_exec(|| {
+                if libc::setpgid(0, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut sh = sh.spawn().expect("spawning /bin/sh");
+
+        let mut out = String::new();
+        std::io::BufReader::new(sh.stdout.as_mut().expect("piped stdout"))
+            .read_line(&mut out)
+            .expect("reading the grandchild pid");
+        let grandchild: i32 = out.trim().parse().expect("sh printed a pid");
+
+        // SAFETY: `sh.id()` is the group lead the pre_exec created; it is the
+        // group this test spawned and owns.
+        unsafe { kill_group(sh.id() as i32) };
+        let _ = sh.wait();
+
+        // The descendant must disappear quickly rather than linger under PID 1.
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            // SAFETY: `kill(pid, 0)` only probes existence; `grandchild` names a
+            // process this test forked.
+            let exists = unsafe { libc::kill(grandchild, 0) } == 0;
+            if !exists {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "grandchild {grandchild} survived the group kill"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH),
+            "the grandchild must be gone, not just invisible"
+        );
     }
 
     /// The production path: no shim is named per injection (only tests do

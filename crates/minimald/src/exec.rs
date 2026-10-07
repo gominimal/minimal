@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Display;
 use std::io;
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::{
     StreamExt,
@@ -786,7 +786,7 @@ impl Exec for TokioExec {
             for name in &self.drop_env {
                 cmd.env_remove(name);
             }
-            cmd.spawn().map(TokioProcess)
+            cmd.spawn().map(TokioProcess::new)
         })
         .boxed()
     }
@@ -884,7 +884,7 @@ impl Exec for SessionExec {
             // This spawns the shim — us, re-exec'd — not the user's command, so
             // a bare ENOENT reads as a missing shell. Name the path (#1175).
             let shim = command.as_std().get_program().to_owned();
-            command.spawn().map(TokioProcess).map_err(|e| {
+            command.spawn().map(TokioProcess::new).map_err(|e| {
                 io::Error::new(
                     e.kind(),
                     format!(
@@ -900,7 +900,13 @@ impl Exec for SessionExec {
 
 /// `Process` implementation backed by [`tokio::process::Child`].
 #[derive(Debug)]
-pub struct TokioProcess(Child);
+pub struct TokioProcess(Child, Option<Instant>);
+
+impl TokioProcess {
+    fn new(child: Child) -> Self {
+        Self(child, None)
+    }
+}
 
 impl Process for TokioProcess {
     type Stdin = ChildStdin;
@@ -916,11 +922,39 @@ impl Process for TokioProcess {
     }
 
     async fn wait(&mut self) -> io::Result<Option<i32>> {
-        self.0.wait().await.map(|s| s.code())
+        match self.1 {
+            Some(_) => match tokio::time::timeout(Duration::from_secs(2), self.0.wait()).await {
+                Ok(status) => status.map(|s| s.code()),
+                // SIGTERM did not take: escalate to SIGKILL and wait it out.
+                Err(_elapsed) => {
+                    self.0.start_kill()?;
+                    self.0.wait().await.map(|s| s.code())
+                }
+            },
+            // Never asked to die: a plain wait, as before.
+            None => self.0.wait().await.map(|s| s.code()),
+        }
     }
 
     fn start_kill(&mut self) -> io::Result<()> {
-        self.0.start_kill()
+        // The shim is the direct child; SIGTERM reaches it and, through the
+        // handler it installs, its whole process group. If it does not exit
+        // within the grace period, `wait` escalates to SIGKILL (below).
+        // `id()` is `None` once the child has been reaped; nothing to signal.
+        if let Some(pid) = self.0.id() {
+            // SAFETY: `pid` is the live shim pid `Child` holds; `kill(2)` is
+            // async-signal-safe and has no Rust-side invariants.
+            if unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) } == -1 {
+                let err = io::Error::last_os_error();
+                // ESRCH means it already exited between `id()` and `kill`; that
+                // is success, not an error the caller must handle.
+                if err.raw_os_error() != Some(libc::ESRCH) {
+                    return Err(err);
+                }
+            }
+        }
+        self.1 = Some(Instant::now());
+        Ok(())
     }
 }
 
