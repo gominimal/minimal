@@ -244,15 +244,12 @@ impl EnvChannel<'_> {
                 // No flag to name: the in-sandbox `min` helper takes none, and
                 // only a sandbox started by `mip --no-fetch run` has no_fetch
                 // set (a daemon-launched task has no switch at all).
-                // `Error::from` renders rcache's `Config` cleanly.
-                Some(build_ctx.remote_cache(false, false).await.map_err(|e| {
-                    match Error::from(e) {
-                        Error::Other(cause) => {
-                            cause.context("failed to set up the remote artifact cache")
-                        }
-                        other => anyhow::anyhow!("{}", other),
-                    }
-                })?)
+                Some(
+                    build_ctx
+                        .remote_cache(false, false)
+                        .await
+                        .map_err(|e| crate::remote_cache_setup_error(e, None))?,
+                )
             } else {
                 None
             };
