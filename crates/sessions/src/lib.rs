@@ -493,10 +493,16 @@ fn network_flag_value(mode: NetworkMode) -> &'static str {
 }
 
 /// The refusal for a non-empty `ingress` on a box that is not own-IP: a
-/// static mapping names `--ingress`, a dynamic-only declaration names the
-/// dynamic flags.
+/// dynamic declaration (a range or a non-deny stance) names the dynamic
+/// flags, otherwise the static mapping names `--ingress`. The dynamic check
+/// comes first, in the same order as the CLI's refusals, so a policy carrying
+/// both gets the same first complaint from either surface.
 fn ingress_requires_own_ip(ingress: &IngressPolicy, mode: NetworkMode) -> PolicyError {
-    if ingress.port_mappings.is_empty() {
+    let dynamic = ingress.dynamic_allowed_range.is_some()
+        || ingress
+            .dynamic_ingress
+            .is_some_and(|d| d != DynamicIngress::Deny);
+    if dynamic {
         PolicyError::DynamicIngressRequiresOwnIp { mode }
     } else {
         PolicyError::IngressRequiresOwnIp { mode }
@@ -523,7 +529,7 @@ pub enum PolicyError {
     )]
     IngressRequiresOwnIp { mode: NetworkMode },
     /// A dynamic ingress declaration (a non-deny `dynamic_ingress` stance or a
-    /// `dynamic_allowed_range`) with no static mapping was set on a `PTask`
+    /// `dynamic_allowed_range`), with or without a static mapping, was set on a `PTask`
     /// that is not [`NetworkMode::OwnIp`]. Worded like the CLI's
     /// `--dynamic-ingress`/`--dynamic-range` refusal.
     #[error(
@@ -1043,9 +1049,9 @@ impl Record {
     ///
     /// Returns [`PolicyError::EgressRequiresNetwork`] when an egress policy is
     /// set on a none (`NoNet`) `PTask`, or
-    /// [`PolicyError::IngressRequiresOwnIp`] when a static ingress mapping, or
-    /// [`PolicyError::DynamicIngressRequiresOwnIp`] when only a dynamic ingress
-    /// declaration, is set on anything but an `OwnIp` `PTask`. Returns
+    /// [`PolicyError::DynamicIngressRequiresOwnIp`] when a dynamic ingress
+    /// declaration, or [`PolicyError::IngressRequiresOwnIp`] when only a static
+    /// ingress mapping, is set on anything but an `OwnIp` `PTask`. Returns
     /// [`PolicyError::UnsupportedIngressProtocol`] for an ingress mapping whose
     /// transport gvproxy's forwarder cannot expose,
     /// [`PolicyError::PrivilegedPort`] for one that publishes a host port below
@@ -1464,6 +1470,25 @@ mod tests {
             err.to_string(),
             "--dynamic-ingress and --dynamic-range need --network own_ip (this box is \
              --network none): only an own-IP box has a published address to apply them to"
+        );
+
+        // A static mapping alongside a dynamic declaration names the dynamic
+        // flags first, matching the CLI's check order.
+        let mixed = IngressPolicy {
+            port_mappings: vec![PortMapping {
+                external_port: 18080,
+                internal_port: 80,
+                proto: IpProto::Tcp,
+            }],
+            dynamic_allowed_range: None,
+            dynamic_ingress: Some(DynamicIngress::Allow),
+        };
+        assert_eq!(
+            record_with(NetworkMode::HostNet, SessionPolicy::new(None, Some(mixed)))
+                .validate_policy(),
+            Err(PolicyError::DynamicIngressRequiresOwnIp {
+                mode: NetworkMode::HostNet
+            })
         );
     }
 
