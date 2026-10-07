@@ -203,6 +203,9 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
   - IF `min box start` or `min session start` without `--detach` runs off a TTY for an entry whose spec sets `pty_enabled` THEN THE SYSTEM SHALL fail with exit 2 naming `--detach`.
     tier:   T0
     verify: cargo nextest run -p minimal start_off_tty_exit2_names_detach
+  - WHERE `min box start` or `min session start` returns without attaching THE SYSTEM SHALL close the box's stdin at creation, and, for an entry whose spec does not set `pty_enabled`, print one stderr hint naming `min box run` for wired stdio and `min box logs` and `min box wait` for the output and exit code.
+    tier:   T0
+    verify: cargo nextest run -p minimal unattached_start_closes_stdin_and_hints_run_logs_wait
 
 - **BCLI-069** WHERE `--name <name>` is given to `min box start`, `min box run`, `min session start` or `min task run` THE SYSTEM SHALL pass it to BOX-064's command-line override layer as `[box] name`, so BOX-163 names the box with it, or bases a fresh instance's `<name>-<n>` on it.
   tier:     T0
@@ -214,6 +217,9 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
 - **BCLI-070** WHEN `min task run` or `min box run` runs, or `min box start` or `min session start` runs with `--new`, THE SYSTEM SHALL request a fresh instance, so BOX-163 names the box `<name>-<n>` and never refuses it for a held name.
   tier:     T0
   verify:   cargo nextest run -p minimal run_and_start_new_request_fresh_instance
+  - WHERE `min box run` targets an entry whose spec sets `pty_enabled` THE SYSTEM SHALL attach the caller's terminal to the box's PTY as `min box start --new` does, and return the entrypoint's exit code when it exits.
+    tier:   T0
+    verify: cargo nextest run -p minimal box_run_pty_entry_attaches_like_start_new
 
 - **BCLI-071** WHEN `min session start` runs with no entry THE SYSTEM SHALL start the session entry named `default`, else the project's only session entry, counting the implicit `default` entry BOX-165 expands.
   tier:     T0
@@ -457,3 +463,4 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
 ## Open questions
 
 - [NEEDS CLARIFICATION (MEDIUM): NET-035 binds `--help` to `min session activate`, and NET-061 and the draft GWI-003 cite `min session policy`; both are BCLI-042 aliases for one release, and NET-035, NET-061 and GWI-003 should re-cite `min session start` and `min box show --network` (BCLI-025) before the aliases are removed.]
+- [NEEDS CLARIFICATION (LOW): the architecture's `min box run` wires stdio for any entry and does not say whether it allocates a PTY for an entry whose spec sets `pty_enabled`; BCLI-070's sub-bullet attaches it as `start --new` does, pending an architecture line (gominimal/arch#127).]
