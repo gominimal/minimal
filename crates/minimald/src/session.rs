@@ -2055,31 +2055,38 @@ impl Session {
         //
         // Fenced: the scaffold resolves the default package repo over the
         // network and runs inline on the session actor, so an unfenced call
-        // would pin a worker for the whole fetch. Flavor-guarded because
-        // `block_in_place` panics on a current-thread runtime.
-        let scaffold = || self.scaffold_mfile_if_missing(&workspace_path);
-        match tokio::runtime::Handle::current().runtime_flavor() {
-            tokio::runtime::RuntimeFlavor::MultiThread => tokio::task::block_in_place(scaffold),
-            _ => scaffold(),
-        }
-        .map_err(|e| std::io::Error::other(format!("scaffolding a default mfile: {e}")))?;
-
-        // Phase 1+2: resolve the project and drive the composer. Kept fully
-        // synchronous — its non-`Send` intermediaries must not cross an
-        // `.await`.
-        // A session activated with `--no-hooks` drops the project's
-        // hooks here, the same way the client already dropped its
-        // loadouts' before sending. Both ends honour the flag, so the
-        // composition — and the snapshot persisted from it — records
-        // that the session has no hooks at all, rather than carrying
-        // hooks that every later transition has to remember to skip.
-        let outcome = composables::run_compose(
-            &self.daemon_ctx,
-            &workspace_path,
-            &self.record.record().await?.project_path,
-            contribution,
-            hooks_enabled,
-        )?;
+        // would pin a worker for the whole fetch. The compose shares the
+        // fence: it resolves the graph through the checkouts cache, whose
+        // lock may block for up to the lock timeout, and that wait must not
+        // park a tokio worker. Flavor-guarded because `block_in_place`
+        // panics on a current-thread runtime.
+        let declared_path = self.record.record().await?.project_path;
+        let scaffold_and_compose = || {
+            self.scaffold_mfile_if_missing(&workspace_path)
+                .map_err(|e| std::io::Error::other(format!("scaffolding a default mfile: {e}")))?;
+            // Phase 1+2: resolve the project and drive the composer. Kept
+            // fully synchronous — its non-`Send` intermediaries must not
+            // cross an `.await`; `block_in_place` keeps them on this thread.
+            // A session activated with `--no-hooks` drops the project's
+            // hooks here, the same way the client already dropped its
+            // loadouts' before sending. Both ends honour the flag, so the
+            // composition — and the snapshot persisted from it — records
+            // that the session has no hooks at all, rather than carrying
+            // hooks that every later transition has to remember to skip.
+            composables::run_compose(
+                &self.daemon_ctx,
+                &workspace_path,
+                &declared_path,
+                contribution,
+                hooks_enabled,
+            )
+        };
+        let outcome = match tokio::runtime::Handle::current().runtime_flavor() {
+            tokio::runtime::RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(scaffold_and_compose)
+            }
+            _ => scaffold_and_compose(),
+        }?;
 
         match outcome {
             // The composition is complete: promote the record
@@ -4835,7 +4842,16 @@ impl Session {
     async fn build_context(&self, scaffold_if_missing: bool) -> Result<mctx::Context, String> {
         let wsp = self.record.object().await.unwrap().workspace_path();
         if scaffold_if_missing {
-            self.scaffold_mfile_if_missing(&wsp)?;
+            // Fenced: the scaffold updates the default package checkout,
+            // whose checkouts cache lock may block for up to the lock
+            // timeout, and that wait must not park a tokio worker.
+            // Flavor-guarded because `block_in_place` panics on a
+            // current-thread runtime.
+            let scaffold = || self.scaffold_mfile_if_missing(&wsp);
+            match tokio::runtime::Handle::current().runtime_flavor() {
+                tokio::runtime::RuntimeFlavor::MultiThread => tokio::task::block_in_place(scaffold),
+                _ => scaffold(),
+            }?;
         }
         mctx::Context::new(self.workspace_config(&wsp)?).map_err(|e| e.to_string())
     }
