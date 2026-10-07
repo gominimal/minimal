@@ -122,6 +122,26 @@ impl ManagerState {
         }
     }
 
+    /// The recorded checkout of `remote` that already serves `at`, as its dir
+    /// under the checkouts root and its commit.
+    fn existing_checkout(&self, remote: &str, at: &GitRef) -> Option<(String, String)> {
+        let id = self.git_remotes.get(remote)?;
+        for (dir, checkout) in self.repos.get(id)?.checkouts.iter() {
+            if &checkout.version == at {
+                return Some((dir.clone(), checkout.rev.clone()));
+            }
+            // Its possible to have a checkout thats tracking a branch, but right now it points
+            // to a commit which was requested. We can just use that checkout rather than making
+            // one that points to just a commit in this case.
+            if let GitRef::Commit(rev) = at
+                && &checkout.rev == rev
+            {
+                return Some((dir.clone(), rev.clone()));
+            }
+        }
+        None
+    }
+
     /// serializes the state to the statefile in the given base directory.
     ///
     /// The file is written beside `state.json` and renamed over it, so a
@@ -376,14 +396,15 @@ impl Manager {
         // itself is only per-repository; a second `min session activate`
         // against the same bare repo would otherwise race this fetch/checkout
         // inside the shared worktree (`index.lock: File exists`).
-        let _lock = lock_cache(&self.base_dir, lock_timeout())?;
-        self.reload_state()?;
         if self.offline {
-            // Pick the first known remote for the error message; if there are
-            // no known remotes there's nothing to update, so a synthetic
-            // placeholder is clearer than a misleading Ok.
-            let remote = self
-                .state
+            // Offline touches nothing, so answer from an unlocked read
+            // (`state.json` is replaced atomically) rather than wait behind
+            // another manager's fetch. Pick the first known remote for the
+            // error message; if there are no known remotes there's nothing to
+            // update, so a synthetic placeholder is clearer than a misleading
+            // Ok.
+            let state = ManagerState::in_dir_or_default(&self.base_dir)?;
+            let remote = state
                 .git_remotes
                 .keys()
                 .next()
@@ -391,6 +412,8 @@ impl Manager {
                 .unwrap_or_else(|| "<no remotes>".to_string());
             return Err(Error::OfflineCacheMiss { remote });
         }
+        let _lock = lock_cache(&self.base_dir, lock_timeout())?;
+        self.reload_state()?;
         let checkouts_dir = self.git_checkouts_dir();
         for id in self.state.git_remotes.values_mut() {
             let repo = self.repos.get_mut(id).unwrap();
@@ -413,16 +436,22 @@ impl Manager {
     /// needs `remote` fresh. A remote not yet registered is a no-op: a
     /// subsequent [`Self::checkout_of`] clones it on first use.
     pub fn update_remote(&mut self, remote: &str) -> Result<(), Error> {
+        if self.offline {
+            // As in `update`: offline touches nothing, so it never waits on
+            // the lock. An unregistered remote is still a no-op.
+            let state = ManagerState::in_dir_or_default(&self.base_dir)?;
+            if !state.git_remotes.contains_key(remote) {
+                return Ok(());
+            }
+            return Err(Error::OfflineCacheMiss {
+                remote: remote.to_string(),
+            });
+        }
         let _lock = lock_cache(&self.base_dir, lock_timeout())?;
         self.reload_state()?;
         let Some(id) = self.state.git_remotes.get(remote).cloned() else {
             return Ok(());
         };
-        if self.offline {
-            return Err(Error::OfflineCacheMiss {
-                remote: remote.to_string(),
-            });
-        }
         let checkouts_dir = self.git_checkouts_dir();
         let repo = self.repos.get_mut(&id).unwrap();
         trace!("updating repo {}", repo.url());
@@ -439,6 +468,20 @@ impl Manager {
     pub fn checkout_of(&mut self, remote: &str, at: GitRef) -> Result<(PathBuf, String), Error> {
         trace!("checkout_of {} at {:?}", remote, at);
 
+        // A ref already checked out, and an offline miss on an unknown
+        // remote, are answered from an unlocked read (`state.json` is
+        // replaced atomically): neither touches the cache, so neither waits
+        // behind another manager's fetch.
+        let fresh = ManagerState::in_dir_or_default(&self.base_dir)?;
+        if let Some((dir, rev)) = fresh.existing_checkout(remote, &at) {
+            return Ok((self.git_checkouts_dir().join(dir), rev));
+        }
+        if self.offline && !fresh.git_remotes.contains_key(remote) {
+            return Err(Error::OfflineCacheMiss {
+                remote: remote.to_string(),
+            });
+        }
+
         // Same serialization rationale as `update`: the fetch and worktree
         // checkout below mutate shared git state across managers.
         let _lock = lock_cache(&self.base_dir, lock_timeout())?;
@@ -447,19 +490,10 @@ impl Manager {
         let out = match self.state.git_remotes.get(remote) {
             // This remote is already managed
             Some(id) => {
-                // See if theres already a checkout of this ref
-                for (dir, checkout) in self.state.repos[id].checkouts.iter() {
-                    if checkout.version == at {
-                        return Ok((self.git_checkouts_dir().join(dir), checkout.rev.clone()));
-                    }
-                    // Its possible to have a checkout thats tracking a branch, but right now it points
-                    // to a commit which was requested. We can just use that checkout rather than making
-                    // one that points to just a commit in this case.
-                    if let GitRef::Commit(ref rev) = at
-                        && &checkout.rev == rev
-                    {
-                        return Ok((self.git_checkouts_dir().join(dir), rev.clone()));
-                    }
+                // See if theres already a checkout of this ref (another
+                // manager may have made it while this one waited).
+                if let Some((dir, rev)) = self.state.existing_checkout(remote, &at) {
+                    return Ok((self.git_checkouts_dir().join(dir), rev));
                 }
                 // There's not a checkout of this ref, lets create it.
                 let checkout_dir = tempdir_in(self.git_checkouts_dir())?.keep();
@@ -1075,12 +1109,17 @@ mod tests {
             "one checkout: {state:?}"
         );
 
-        // No `index.lock` may be left stranded inside any worktree.
+        // No `index.lock` may be left stranded in any worktree. A linked
+        // worktree's `.git` is a file pointing at its gitdir under the bare
+        // repo, which is where the index (and its lock) lives.
         let checkouts = base.path().join("git").join("checkouts");
         for entry in std::fs::read_dir(checkouts).unwrap().flatten() {
+            let pointer = std::fs::read_to_string(entry.path().join(".git")).unwrap();
+            let gitdir = PathBuf::from(pointer.trim().strip_prefix("gitdir: ").unwrap());
+            assert!(gitdir.is_dir(), "worktree gitdir {}", gitdir.display());
             assert!(
-                !entry.path().join(".git").join("index.lock").exists(),
-                "stranded index.lock in {}",
+                !gitdir.join("index.lock").exists(),
+                "stranded index.lock for {}",
                 entry.path().display()
             );
         }
