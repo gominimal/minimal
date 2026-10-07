@@ -197,8 +197,9 @@ fn lock_cache(base_dir: &Path, timeout: Duration) -> Result<File, Error> {
         if now >= deadline {
             return Err(Error::Other(format!(
                 "timed out after {}s waiting for the checkouts cache lock at {}; another \
-                 process or manager still holds it (set MINIMAL_VCS_LOCK_TIMEOUT_SECS to \
-                 wait longer)",
+                 process or manager still holds it. If that holder is stuck (for example on \
+                 a hung git fetch), stop it and re-run; if it is only slow, set \
+                 MINIMAL_VCS_LOCK_TIMEOUT_SECS to wait longer",
                 timeout.as_secs(),
                 lock_path.display()
             )));
