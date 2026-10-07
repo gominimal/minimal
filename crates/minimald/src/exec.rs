@@ -950,9 +950,12 @@ impl Process for TokioProcess {
         if !self.terminating {
             return self.child.wait().await.map(|s| s.code());
         }
-        match tokio::time::timeout(Duration::from_secs(2), self.child.wait()).await {
+        // Longer than the shim's own grace period for the group, so the shim
+        // always delivers the group's SIGKILL itself; this one is the fallback
+        // for a wedged shim (see `nsenter::GROUP_GRACE`).
+        match tokio::time::timeout(crate::nsenter::SHIM_ESCALATION, self.child.wait()).await {
             Ok(status) => status.map(|s| s.code()),
-            // SIGTERM did not take: escalate to SIGKILL and wait it out.
+            // The shim did not exit: escalate to SIGKILL and wait it out.
             Err(_elapsed) => {
                 self.child.start_kill()?;
                 self.child.wait().await.map(|s| s.code())
@@ -965,8 +968,9 @@ impl Process for TokioProcess {
             return self.child.start_kill();
         }
         // The shim is the direct child; SIGTERM reaches it and, through the
-        // handler it installs, its whole process group. If it does not exit
-        // within the grace period, `wait` escalates to SIGKILL (below).
+        // handler it installs, its whole process group, which the shim SIGKILLs
+        // after its grace period. If the shim itself does not exit within
+        // `SHIM_ESCALATION`, `wait` escalates to SIGKILL (above).
         // `id()` is `None` once the child has been reaped; nothing to signal.
         if let Some(pid) = self.child.id() {
             // SAFETY: `pid` is the live shim pid `Child` holds; `kill(2)` is
@@ -1231,7 +1235,10 @@ where
 ///
 /// The trade is that a grandchild's output after we return is silently
 /// discarded; `nohup cmd >/dev/null 2>&1 &` is the way to detach
-/// cleanly (documented in `docs/reference/cli-min.md`).
+/// cleanly (documented in `docs/reference/cli-min.md`). A `nohup`'d job
+/// stays in the exec's process group, which a client lost mid-exec ends
+/// (see `nsenter::GROUP_GRACE`), so a job that must survive the client
+/// going away is started with `setsid`: `setsid nohup cmd >/dev/null 2>&1 &`.
 ///
 /// Polling the I/O sources in a single `select!` lets a slow consumer
 /// on one side apply backpressure without starving the others, which is
@@ -1438,6 +1445,7 @@ where
     // on a full pipe and never be reapable. Kill, then fall through to
     // the `wait` below.
     if ssh_write_failed {
+        // A `--detach` exec, if one is ever added, must not reach this client-loss kill.
         let _ = process.start_kill();
     }
 
@@ -1500,6 +1508,8 @@ where
                             %channel_id,
                             "exec: ssh client disconnected; killing child",
                         );
+                        // A `--detach` exec, if one is ever added, must not reach this
+                        // client-loss kill.
                         let _ = process.start_kill();
                     }
                     process.wait().await
