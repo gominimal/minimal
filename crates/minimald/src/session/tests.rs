@@ -3326,6 +3326,145 @@ async fn destroyed_box_name_is_nxdomain() {
     );
 }
 
+/// Drives Create → ConfigureLoadout for an own-address box with a declared
+/// ingress, a handed address, and `hook` in its composition, leaving the
+/// finalize to the caller — the shape `min session activate --network
+/// own_ip --ingress …` takes for a project or loadout with an `on_activate`
+/// hook (#2070).
+#[cfg(target_os = "linux")]
+async fn create_handed_own_ip_session_with_hook(
+    client: &mut TestClient,
+    name: &str,
+    switch: std::net::Ipv4Addr,
+    loopback: std::net::Ipv4Addr,
+    hook: sessions::wire::primitives::WireLifecycleHook,
+) -> SessionId {
+    use minimald_rpc::{ConfigureLoadout, ConfigureLoadoutRequest, CreateSession};
+    let id = client
+        .call::<CreateSession>(&own_ip_handed_session_req(name, switch, loopback))
+        .await
+        .unwrap()
+        .id;
+    crate::test_harness::unwrap_ready(
+        client
+            .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
+                session_id: id,
+                contribution: contribution_with_hook(hook),
+            })
+            .await
+            .unwrap(),
+    );
+    id
+}
+
+/// #2070: an own-address box that declares ingress *and* carries an
+/// activate hook activates. Finalize launches the box to run the hook, and
+/// that launch is the box's first attach — which binds the declared
+/// forwards at the box's published address and fails with "no published
+/// address handed" when there is none (NET-010, NET-121). So finalize
+/// publishes the address and registers the name before the hook launch:
+/// the launch finds the hand already published, the hook runs, the session
+/// comes back `Active`, and its name answers at the hand.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_activate_hook_launch_finds_the_box_s_address_already_published() {
+    let handed = std::net::Ipv4Addr::new(127, 0, 64, 21);
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("activated");
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = create_handed_own_ip_session_with_hook(
+        &mut client,
+        "hooked-web",
+        std::net::Ipv4Addr::new(100, 64, 128, 21),
+        handed,
+        sessions::wire::primitives::WireLifecycleHook {
+            on_activate: Some(inline(marker_body(&marker))),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(
+        super::launch_publish_seam::observed(id).is_empty(),
+        "nothing launches the box before its finalize"
+    );
+
+    finalize_session(&mut client, id).await;
+
+    assert!(marker.exists(), "on_activate did not run");
+    assert_eq!(
+        super::launch_publish_seam::observed(id).first().copied(),
+        Some(Some(handed)),
+        "the activate hook's launch — the box's first attach — must find the \
+         hand already published, or the attach of a box that declared \
+         ingress fails with \"no published address handed\""
+    );
+    assert_eq!(
+        record_status(&mut client, id).await,
+        Some(sessions::SessionStatus::Active),
+        "a box with ingress and an activate hook activates"
+    );
+    let (owner, address) = zone_answer_for(&server, "hooked-web.min.internal")
+        .await
+        .expect("the name is held from finalize");
+    assert_eq!(owner, "hooked-web");
+    assert_eq!(address, handed, "the name answers at the hand, exactly");
+}
+
+/// #2070's error path: the publish now precedes the activate hooks, so a
+/// hook that fails leaves it standing on the unpromoted record — and the
+/// destroy the client's activate cleanup sends withdraws it with the name,
+/// so nothing the failed activation published outlives it (NET-010,
+/// NET-012).
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_activate_hook_s_publish_is_withdrawn_by_the_destroy() {
+    use minimald_rpc::{Errorable, FinalizeSession, FinalizeSessionRequest};
+
+    let handed = std::net::Ipv4Addr::new(127, 0, 64, 22);
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = create_handed_own_ip_session_with_hook(
+        &mut client,
+        "hooked-fails",
+        std::net::Ipv4Addr::new(100, 64, 128, 22),
+        handed,
+        sessions::wire::primitives::WireLifecycleHook {
+            on_activate: Some(inline("exit 3".to_string())),
+            ..Default::default()
+        },
+    )
+    .await;
+    match client
+        .call::<FinalizeSession>(&FinalizeSessionRequest { session_id: id })
+        .await
+    {
+        Errorable::Err { .. } => {}
+        Errorable::Ok(_) => panic!("finalize should have failed on the activate hook"),
+    }
+    assert_ne!(
+        record_status(&mut client, id).await,
+        Some(sessions::SessionStatus::Active),
+        "a box whose activate hook failed is not promoted"
+    );
+
+    destroy_session(&mut client, id).await;
+
+    assert_eq!(
+        zone_answer_for(&server, "hooked-fails.min.internal").await,
+        None,
+        "the failed activation's name is gone after the destroy"
+    );
+    let registry = server.state.sessions_manager().await.hostnames();
+    let routes = registry.read().expect("registry lock");
+    assert_eq!(routes.resolve("hooked-fails.min.internal"), None);
+    assert_eq!(
+        routes.published_own_address(id),
+        None,
+        "the failed activation's publish is withdrawn by the destroy"
+    );
+}
+
 /// NET-128 session path: a shared-address box stopped through the actor
 /// answers NODATA, not NXDOMAIN — the name stays held, so the zone never
 /// says the box never existed, but the node's own listener at that port
