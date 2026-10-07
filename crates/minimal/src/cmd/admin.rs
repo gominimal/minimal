@@ -523,4 +523,44 @@ mod tests {
             "the error must carry the proxy context: {err:#}"
         );
     }
+
+    /// When the daemon stops reading first, the stdin-to-socket copy hits
+    /// `BrokenPipe`. The bridge treats that as normal termination and still
+    /// drains the daemon's remaining output to stdout instead of failing or
+    /// truncating it. Linux only: there a write to a peer that shut down its
+    /// read side fails with `EPIPE` at once.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn proxy_bridge_drains_daemon_output_after_stdin_broken_pipe() {
+        let (bridge, daemon) = std::os::unix::net::UnixStream::pair().expect("socket pair");
+        daemon
+            .shutdown(std::net::Shutdown::Read)
+            .expect("daemon stops reading");
+        for s in [&bridge, &daemon] {
+            s.set_nonblocking(true).expect("non-blocking");
+        }
+        let bridge = tokio::net::UnixStream::from_std(bridge).expect("bridge stream");
+        let mut daemon = tokio::net::UnixStream::from_std(daemon).expect("daemon stream");
+
+        // Hold the daemon's write side open until well after the bridge's
+        // first write has failed, so the socket-to-stdout copy cannot finish
+        // first and the BrokenPipe arm is the one that runs.
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            daemon
+                .write_all(b"hello")
+                .await
+                .expect("daemon writes its reply");
+        });
+
+        let mut stdout = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            proxy_bridge(bridge, tokio::io::repeat(b'x'), &mut stdout),
+        )
+        .await
+        .expect("the bridge must not hang after a broken pipe")
+        .expect("a broken pipe towards the daemon is not a proxy failure");
+        assert_eq!(stdout, b"hello", "the daemon's output must be drained");
+    }
 }
