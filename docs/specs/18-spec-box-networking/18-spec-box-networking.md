@@ -317,7 +317,7 @@ included, with every refusal logged (NET-001 to NET-004).
 - **NET-044** WHEN a dynamic ingress request is decided `allow` THE SYSTEM SHALL publish the port and show the mapping in `min session policy`.
   tier:     T0
   verify:   cargo nextest run -p minimald expose_allow_publishes_and_lists
-  <!-- S5/AC2; prose 29; event-driven -->
+  <!-- S5/AC2; prose 29; event-driven; "publish" means reachable, as in NET-040 and NET-016: the box's relay gate admits the port in the same step the forward is bound, for an `allow` and for a yes-answered `ask` (NET-045) alike, and no pending window exists; with nothing listening on the port yet, the box's own kernel answers with a reset; the admission is kept apart from NET-016/NET-017's listen-published set, so a listener closing never withdraws it, and the expose's revocation (the box's stop) does -->
   - IF a dynamic ingress request is decided `deny` THEN THE SYSTEM SHALL refuse it with a typed error.
     tier:   T0
     verify: cargo nextest run -p minimald expose_deny_typed_error
@@ -637,7 +637,7 @@ included, with every refusal logged (NET-001 to NET-004).
 - **NET-137** THE SYSTEM SHALL refuse a process in a box every socket whose family the box's network namespace does not confine, `AF_VSOCK` included, whatever the box's network mode.
   tier:     T0
   verify:   cargo nextest run -p sandbox2 every_box_refuses_namespace_bypass_families
-  <!-- S10a/AC3; prose 53; ubiquitous; design §4.1's precision rule (no reachable switch or tunnel control surface, by socket permissions) as the box-level seal: a vsock socket is not scoped by the box's network namespace and reaches the host-side helper's listeners directly, which is the seal a `none` box already carries (NET-038); own-address and host-address boxes keep their inet families -->
+  <!-- S10a/AC3; prose 53; ubiquitous; design §4.1's precision rule (no reachable switch or tunnel control surface, by socket permissions) as the box-level seal: a vsock socket is not scoped by the box's network namespace and reaches the host-side helper's listeners directly, which is the seal a `none` box already carries (NET-038); every box whose network namespace confines the inet families keeps them, a `none` box included, because its fresh namespace holds only loopback -->
   - WHEN the daemon starts a process inside a running box by joining its namespaces (exec, attach, a hook) THE SYSTEM SHALL apply the same refusal to that process.
     tier:   T0
     verify: cargo nextest run -p minimald joined_process_refuses_namespace_bypass_families

@@ -59,6 +59,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
+use hickory_proto::rr::Name;
 use serde::Serialize;
 use sessions::core::egress::EgressRules;
 #[cfg(target_os = "linux")]
@@ -73,15 +74,18 @@ use super::SwitchSubnet;
 pub const HOSTNAME_SUFFIX: &str = "min.internal";
 
 /// Whether `name` is a box-zone name — the zone apex itself or any name under
-/// it (NET-072). `name` is an already-normalized qname: lowercased, no root
-/// dot, exactly what [`super::dns_gate`]'s gate asks about. Mirrors the
-/// answerer's zone-suffix match so both layers cannot drift.
+/// it (NET-072). `name` is an already-normalized qname in presentation form:
+/// lowercased, no root dot, exactly what [`super::dns_gate`]'s gate asks
+/// about. The match is by labels, not by string suffix: a single label
+/// holding an escaped dot, `evil\.min` under `internal`, renders as
+/// `evil\.min.internal` but sits under `internal`, not under the zone. A
+/// name that does not parse is not the zone.
 #[must_use]
 pub fn is_zone_name(name: &str) -> bool {
-    name == HOSTNAME_SUFFIX
-        || name
-            .strip_suffix(HOSTNAME_SUFFIX)
-            .is_some_and(|stem| stem.ends_with('.'))
+    match (Name::from_ascii(name), Name::from_ascii(HOSTNAME_SUFFIX)) {
+        (Ok(name), Ok(zone)) => zone.zone_of(&name),
+        _ => false,
+    }
 }
 
 /// Default `<host-id>` of the deprecated three-label zone: a stable short name
@@ -828,8 +832,8 @@ impl HostnameRegistry {
     /// an address the publish surface cannot bind, so every forward the box
     /// would bind there fails with `EADDRNOTAVAIL`. The name rides along
     /// because the move re-registers the box's route at the interim; a
-    /// publish whose session holds no registered name (a stopped box, one
-    /// whose name another session took over) is not listed — its next
+    /// publish whose session holds no registered name (one whose name
+    /// another session took over) is not listed — its next
     /// finalize is the moment its ask runs again, through the verdict-gated
     /// reads the session actor makes.
     #[must_use]
@@ -856,9 +860,10 @@ impl HostnameRegistry {
     /// hand for a box a creator handed one (never a grant from the pool: a
     /// hand is only ever replaced by `127.0.0.1`), to a grant for a box
     /// nobody handed an address. Each row carries the hand with it, so the
-    /// sweep's move needs no second read. A box whose publish the landing
-    /// misses, because it was stopped across the landing, asks again at its
-    /// next finalize, which does not short-circuit on the interim either.
+    /// sweep's move needs no second read. A stopped box keeps its name, so
+    /// the landing moves it too, its stopped marker intact. A box whose
+    /// publish the landing misses asks again at its next finalize, which
+    /// does not short-circuit on the interim either.
     #[must_use]
     pub fn interim_own_publishes(&self) -> Vec<InterimPublish> {
         self.own_published
@@ -1323,7 +1328,32 @@ impl HostnameRegistry {
             );
             route = self.by_host.get(&Hostname(two_label)).cloned();
         }
-        route
+        // NET-128, mirrored from the zone (`zone_answer`): a box stopped on
+        // the node's shared address keeps its name held, but nothing may be
+        // forwarded there — the node's own listener at that port would answer
+        // for the dead box.
+        route.filter(|route| !self.stopped_on_shared_address(route))
+    }
+
+    /// Whether `route`'s box is stopped while publishing on the node's shared
+    /// address (NET-128). Its name stays held, but neither the zone nor the
+    /// host-side proxy may point a client at the node for it.
+    fn stopped_on_shared_address(&self, route: &Route) -> bool {
+        let Some(id) = self
+            .by_session
+            .get(route.session())
+            .map(|registration| registration.id)
+        else {
+            return false;
+        };
+        if !self.stopped.contains(&id) {
+            return false;
+        }
+        let address = self
+            .own_published
+            .get(&id)
+            .map_or_else(|| route.address(), |own| own.address);
+        address == self.node
     }
 
     /// The two-label name a deprecated three-label one maps to, when `host` is
@@ -2453,6 +2483,13 @@ mod tests {
         assert!(!is_zone_name("webmin.internal"));
         assert!(!is_zone_name("example.com"));
         assert!(!is_zone_name(""), "no name is no zone");
+        // One label holding an escaped dot sits under `internal`, not under
+        // the zone, though its presentation form ends in `.min.internal`.
+        assert!(!is_zone_name("evil\\.min.internal"));
+        assert!(
+            is_zone_name("a\\.b.min.internal"),
+            "the escape is below the zone"
+        );
     }
 
     /// Proof artifact 1 (registry/proxy contract): registering a `HostNet`
@@ -2822,6 +2859,18 @@ mod tests {
                 address: Some(Ipv4Addr::new(127, 0, 64, 9)),
             },
             "a stopped box on its own address keeps answering A"
+        );
+
+        // The host-side proxy applies the same gate: nothing is forwarded to
+        // the node for the stopped shared-address box, while the box on its
+        // own address still routes.
+        assert!(
+            reg.resolve("shared.min.internal").is_none(),
+            "the proxy must not forward a stopped shared-address box to the node"
+        );
+        assert!(
+            reg.resolve("own.min.internal").is_some(),
+            "a stopped box on its own address keeps its route"
         );
 
         // The same view in the zone table the state dump carries: name order

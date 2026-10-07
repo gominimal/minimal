@@ -86,6 +86,7 @@ pub(crate) mod dns_pins;
 pub(crate) mod egress_gate;
 pub use egress_gate::EgressGate;
 pub mod answerer;
+mod forward_revoke;
 mod shuttle;
 pub use shuttle::{VSOCK_GVPROXY_SHUTTLE_PORT, resolve_gate_sock, resolve_switch_sock};
 mod baseline;

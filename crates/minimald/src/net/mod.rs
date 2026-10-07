@@ -439,10 +439,12 @@ pub struct SwitchClient {
     /// DNS names under so two daemons on one host mint distinct ones
     /// (NET-027). Defaults to the single-daemon id `local`.
     host_id: String,
-    /// The port this daemon's hostname proxy listens on, as configured (or
-    /// the documented default when none is pinned): the node address's one
-    /// interim opening in every box's own-address set (design §7.1).
-    /// `None` when no port is known, which leaves the node with no opening.
+    /// The hostname proxy's port this switch's boxes are compiled with, as
+    /// the node address's one interim opening in every box's own-address set
+    /// (design §7.1): built from the configured port (or the documented
+    /// default when none is pinned), then re-pointed to the port the proxy
+    /// actually bound once its startup retry has it serving. `None` when no
+    /// port is known, which leaves the node with no opening.
     hostname_proxy_port: Option<u16>,
 }
 
@@ -507,6 +509,14 @@ impl SwitchClient {
     #[must_use]
     pub fn hostname_proxy_port(&self) -> Option<u16> {
         self.hostname_proxy_port
+    }
+
+    /// Re-points the port this switch's boxes are compiled with to the port
+    /// the proxy actually bound, called once its startup retry has it serving
+    /// (see [`crate::net::switch::compiled_egress`]): an OS-selected port
+    /// replaces the configured/default opening the switch was built with.
+    pub fn set_hostname_proxy_port(&mut self, port: Option<u16>) {
+        self.hostname_proxy_port = port;
     }
 
     /// Sets how PTask taps reach the switch. The DM2 default is

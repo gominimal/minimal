@@ -136,10 +136,12 @@ of this, so an unknown loadout name errors even in a directory with no config.
 min session attach [SESSION]
 ```
 
-Attaches to an existing session, identified by UUID or session name. When
-`SESSION` is omitted, `min session attach` resolves a session from the current
-working directory (or the only existing session) and opens an interactive
-picker if the choice is ambiguous (`--no-input` errors instead).
+Attaches to an existing session, identified by UUID, unique id prefix, or
+session name. An exact session name wins over an id prefix. A prefix that
+matches more than one session fails with an error that names the candidates.
+When `SESSION` is omitted, `min session attach` resolves a session from the
+current working directory (or the only existing session) and opens an
+interactive picker if the choice is ambiguous (`--no-input` errors instead).
 
 `min session attach` exits 0 when you detach or the session's shell exits.
 It prints a one-line notice and exits 254 when the daemon ends the attach.
@@ -210,6 +212,17 @@ its own stdout and stderr and drops the ones it inherited, so nothing about it
 depends on the exec channel at all. The same applies to `session run` and
 `task run`, which relay over the same channel.
 
+If the client goes away while the command is still running, the exec ends its
+whole process group: SIGTERM, a grace period, then SIGKILL. A `nohup`'d job
+stays in that group, so it ends too. Start a job that must outlive the client
+with `setsid`, which puts it in a session and group of its own:
+
+```
+min session exec web 'setsid nohup ./server >/dev/null 2>&1 &'
+```
+
+A command that exits by itself ends nothing: its background jobs keep running.
+
 ### `session run`
 
 ```
@@ -251,8 +264,8 @@ Renames an existing session.
 min session policy <SESSION> [-o json]
 ```
 
-Prints the effective networking rules for `SESSION` (a UUID or session
-name). Resolved from the daemon, which answers from the policy stored at
+Prints the effective networking rules for `SESSION` (a UUID, unique id
+prefix, or session name). Resolved from the daemon, which answers from the policy stored at
 activation; each rule line shows what the session ended up with, not just
 what was typed.
 
@@ -306,12 +319,13 @@ live ingress (published at runtime)
   tcp  127.0.64.21:3000 → :3000
 ```
 
-The host binds a runtime publish at once. A frame reaches the box only
-through the relay gate its attach installed, and that gate admits only the
-ports the declaration named. So a port the box published at runtime reads
-`(pending; not yet reachable)` until the gate admits it. A row from a daemon
-older than the `pending` field reads `(unknown; daemon predates this field)`.
-The CLI never shows such a row as reachable.
+A listed runtime publish is reachable. The daemon admits the port at the
+box's relay gate when it binds the forward. If nothing in the box listens on
+the port yet, the box itself refuses a connection to it.
+A row from an older daemon whose gate did not admit runtime publishes reads
+`(pending; not yet reachable)`. A row from a daemon older than the `pending`
+field reads `(unknown; daemon predates this field)`. The CLI never shows
+either row as reachable.
 
 `-o json` (`--output json`) prints one `min/v1/session-policy` document on
 stdout instead of text. Each block the text output prints becomes a key:
@@ -354,7 +368,7 @@ min session hooks <SESSION> [--json]
 ```
 
 Lists the [lifecycle hooks](./loadouts.md#lifecycle_hooks---scripts-at-session-transition-points)
-composed into `SESSION` (a UUID or session name), one row per script, with
+composed into `SESSION` (a UUID, unique id prefix, or session name), one row per script, with
 the transition it runs on, whether it is inline or external, its timeout, and
 the loadout or project that declared it.
 
@@ -583,7 +597,7 @@ the shell to ask `min` itself what to offer. That indirection is what makes
 session arguments completable — `min session attach <TAB>` lists live session
 names, and `min session attach 019<TAB>` lists session IDs, neither of which
 exists at the time a static script would be written. Every argument documented
-as "UUID or session name" completes this way: `session attach`,
+as "UUID, unique id prefix, or session name" completes this way: `session attach`,
 `session exec`, `session run`, `session destroy`, `session rename`, and
 `session policy`.
 

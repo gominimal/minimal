@@ -84,10 +84,15 @@ pub async fn cmd_net_forward(
     let session_id = record.id;
     let mut relays: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     let mut poll = tokio::time::interval(SESSION_POLL_INTERVAL);
+    // Registered once, outside the loop: a fresh `ctrl_c()` per iteration
+    // leaves a window between arms where no listener is installed, so a
+    // SIGINT landing there is dropped.
+    let ctrl_c = tokio::signal::ctrl_c();
+    tokio::pin!(ctrl_c);
     loop {
         tokio::select! {
             // Ctrl-C is the manual half of the forward's lifecycle.
-            _ = tokio::signal::ctrl_c() => break,
+            _ = &mut ctrl_c => break,
 
             // The other half: a session that is gone — destroyed, or lost
             // with its daemon — ends the forward rather than leaving a

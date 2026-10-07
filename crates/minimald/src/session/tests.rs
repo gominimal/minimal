@@ -3326,6 +3326,419 @@ async fn destroyed_box_name_is_nxdomain() {
     );
 }
 
+/// Drives Create → ConfigureLoadout for an own-address box with a declared
+/// ingress, a handed address, and `hook` in its composition, leaving the
+/// finalize to the caller — the shape `min session activate --network
+/// own_ip --ingress …` takes for a project or loadout with an `on_activate`
+/// hook (#2070).
+#[cfg(target_os = "linux")]
+async fn create_handed_own_ip_session_with_hook(
+    client: &mut TestClient,
+    name: &str,
+    switch: std::net::Ipv4Addr,
+    loopback: std::net::Ipv4Addr,
+    hook: sessions::wire::primitives::WireLifecycleHook,
+) -> SessionId {
+    use minimald_rpc::{ConfigureLoadout, ConfigureLoadoutRequest, CreateSession};
+    let id = client
+        .call::<CreateSession>(&own_ip_handed_session_req(name, switch, loopback))
+        .await
+        .unwrap()
+        .id;
+    crate::test_harness::unwrap_ready(
+        client
+            .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
+                session_id: id,
+                contribution: contribution_with_hook(hook),
+            })
+            .await
+            .unwrap(),
+    );
+    id
+}
+
+/// #2070: an own-address box that declares ingress *and* carries an
+/// activate hook activates. Finalize launches the box to run the hook, and
+/// that launch is the box's first attach — which binds the declared
+/// forwards at the box's published address and fails with "no published
+/// address handed" when there is none (NET-010, NET-121). So finalize
+/// publishes the address and registers the name before the hook launch:
+/// the launch finds the hand already published, the hook runs, the session
+/// comes back `Active`, and its name answers at the hand.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_activate_hook_launch_finds_the_box_s_address_already_published() {
+    let handed = std::net::Ipv4Addr::new(127, 0, 64, 21);
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("activated");
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = create_handed_own_ip_session_with_hook(
+        &mut client,
+        "hooked-web",
+        std::net::Ipv4Addr::new(100, 64, 128, 21),
+        handed,
+        sessions::wire::primitives::WireLifecycleHook {
+            on_activate: Some(inline(marker_body(&marker))),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(
+        super::launch_publish_seam::observed(id).is_empty(),
+        "nothing launches the box before its finalize"
+    );
+
+    finalize_session(&mut client, id).await;
+
+    assert!(marker.exists(), "on_activate did not run");
+    assert_eq!(
+        super::launch_publish_seam::observed(id).first().copied(),
+        Some(Some(handed)),
+        "the activate hook's launch — the box's first attach — must find the \
+         hand already published, or the attach of a box that declared \
+         ingress fails with \"no published address handed\""
+    );
+    assert_eq!(
+        record_status(&mut client, id).await,
+        Some(sessions::SessionStatus::Active),
+        "a box with ingress and an activate hook activates"
+    );
+    let (owner, address) = zone_answer_for(&server, "hooked-web.min.internal")
+        .await
+        .expect("the name is held from finalize");
+    assert_eq!(owner, "hooked-web");
+    assert_eq!(address, handed, "the name answers at the hand, exactly");
+}
+
+/// #2070's error path: the publish now precedes the activate hooks, so a
+/// hook that fails leaves it standing on the unpromoted record — and the
+/// destroy the client's activate cleanup sends withdraws it with the name,
+/// so nothing the failed activation published outlives it (NET-010,
+/// NET-012).
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_activate_hook_s_publish_is_withdrawn_by_the_destroy() {
+    use minimald_rpc::{Errorable, FinalizeSession, FinalizeSessionRequest};
+
+    let handed = std::net::Ipv4Addr::new(127, 0, 64, 22);
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = create_handed_own_ip_session_with_hook(
+        &mut client,
+        "hooked-fails",
+        std::net::Ipv4Addr::new(100, 64, 128, 22),
+        handed,
+        sessions::wire::primitives::WireLifecycleHook {
+            on_activate: Some(inline("exit 3".to_string())),
+            ..Default::default()
+        },
+    )
+    .await;
+    match client
+        .call::<FinalizeSession>(&FinalizeSessionRequest { session_id: id })
+        .await
+    {
+        Errorable::Err { .. } => {}
+        Errorable::Ok(_) => panic!("finalize should have failed on the activate hook"),
+    }
+    assert_ne!(
+        record_status(&mut client, id).await,
+        Some(sessions::SessionStatus::Active),
+        "a box whose activate hook failed is not promoted"
+    );
+
+    destroy_session(&mut client, id).await;
+
+    assert_eq!(
+        zone_answer_for(&server, "hooked-fails.min.internal").await,
+        None,
+        "the failed activation's name is gone after the destroy"
+    );
+    let registry = server.state.sessions_manager().await.hostnames();
+    let routes = registry.read().expect("registry lock");
+    assert_eq!(routes.resolve("hooked-fails.min.internal"), None);
+    assert_eq!(
+        routes.published_own_address(id),
+        None,
+        "the failed activation's publish is withdrawn by the destroy"
+    );
+}
+
+/// NET-128 session path: a shared-address box stopped through the actor
+/// answers NODATA, not NXDOMAIN — the name stays held, so the zone never
+/// says the box never existed, but the node's own listener at that port
+/// must not answer for a dead box. The existing unit test
+/// `stopped_shared_address_box_is_nodata` calls `mark_stopped` directly;
+/// this test drives the actor's Stop path end-to-end.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stopped_shared_address_box_is_nodata_through_actor() {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let manager = server.state.sessions_manager().await;
+    manager.land_range_verdict(crate::net::dns::RangeVerdict::Present);
+    // The NODATA gate in zone_answer requires the box's address to equal the
+    // node's address (NET-128). After the verdict lands, the node address is
+    // the granted address from the loopback lease book — use it as the shared
+    // address so the stopped box triggers the NODATA path.
+    let shared = manager
+        .hostnames()
+        .read()
+        .expect("registry lock")
+        .node_address();
+    let id = finalize_handed_own_ip_session(
+        &mut client,
+        "sharedbox",
+        std::net::Ipv4Addr::new(100, 64, 128, 9),
+        shared,
+    )
+    .await;
+
+    // The name answers while the box runs.
+    let (_, address) = zone_answer_for(&server, "sharedbox.min.internal")
+        .await
+        .expect("the name answers while the box runs");
+    assert_eq!(
+        address, shared,
+        "the box's name answers at the shared address while it runs"
+    );
+
+    // Stop the box through the actor — the path the issue reports.
+    let handle = manager
+        .get_session(crate::sessions::SessionKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the box resolves while it runs");
+    handle.stop().await;
+
+    // The name is still held (not NXDOMAIN) but answers NODATA — the
+    // shared-address box is stopped, so the node's own listener at that
+    // port must not answer for a dead box.
+    let registry = server.state.sessions_manager().await.hostnames();
+    let entry = registry
+        .read()
+        .expect("registry lock")
+        .zone_entry("sharedbox.min.internal", &[]);
+    assert_eq!(
+        entry,
+        crate::net::dns::ZoneEntry::Held {
+            owner: "sharedbox".to_string(),
+            address: None,
+        },
+        "a stopped shared-address box answers NODATA, not NXDOMAIN"
+    );
+    // The host-side proxy keeps the same gate: the route is held, but nothing
+    // is forwarded to the node's own listener for the stopped box.
+    assert_eq!(
+        registry
+            .read()
+            .expect("registry lock")
+            .resolve("sharedbox.min.internal"),
+        None,
+        "the proxy must not forward a stopped shared-address box to the node"
+    );
+}
+
+/// NET-128's resume half: a shared-address box stopped through the actor
+/// resumes at its address — the stop is a state, not an end. The actor's
+/// Stop arm marks the name stopped (NODATA at the shared address), and the
+/// resume path — a fresh actor re-registering the name, then a host start
+/// clearing the marker — brings the name back to answering A at the same
+/// address. The re-registration is not refused as "name taken": the
+/// registry's register overwrites the route, so the resumed box's name is
+/// held again rather than dropped.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stopped_shared_address_box_resumes_at_its_address_through_actor() {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let manager = server.state.sessions_manager().await;
+    manager.land_range_verdict(crate::net::dns::RangeVerdict::Present);
+    let shared = manager
+        .hostnames()
+        .read()
+        .expect("registry lock")
+        .node_address();
+    let id = finalize_handed_own_ip_session(
+        &mut client,
+        "resumebox",
+        std::net::Ipv4Addr::new(100, 64, 128, 9),
+        shared,
+    )
+    .await;
+
+    // The name answers while the box runs.
+    let (_, address) = zone_answer_for(&server, "resumebox.min.internal")
+        .await
+        .expect("the name answers while the box runs");
+    assert_eq!(
+        address, shared,
+        "the box's name answers at the shared address while it runs"
+    );
+
+    // Stop the box through the actor — the path the issue reports. The Stop
+    // arm must not panic; it marks the name stopped and returns.
+    let handle = manager
+        .get_session(crate::sessions::SessionKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the box resolves while it runs");
+    handle.stop().await;
+
+    let registry = server.state.sessions_manager().await.hostnames();
+    assert_eq!(
+        registry
+            .read()
+            .expect("registry lock")
+            .zone_entry("resumebox.min.internal", &[]),
+        crate::net::dns::ZoneEntry::Held {
+            owner: "resumebox".to_string(),
+            address: None,
+        },
+        "a stopped shared-address box answers NODATA, not NXDOMAIN"
+    );
+    assert_eq!(
+        registry
+            .read()
+            .expect("registry lock")
+            .resolve("resumebox.min.internal"),
+        None,
+        "the proxy must not forward a stopped shared-address box to the node"
+    );
+
+    // Resume: evict the dead actor and re-resolve, so a fresh actor comes up
+    // from the record and re-registers the name — the registration is not
+    // refused as "name taken". Then launch a host, whose start clears the
+    // stopped marker, and the name answers again at the same address.
+    manager.evict(id).await;
+    let handle = manager
+        .get_session(crate::sessions::SessionKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the box resolves after eviction");
+    handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("an Active session should be able to launch a host");
+
+    // The host's `mainloop` marks the name running on its own spawned task,
+    // so poll the zone until the marker is cleared rather than racing it.
+    let (owner, resumed) = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let registry = server.state.sessions_manager().await.hostnames();
+            if let crate::net::dns::ZoneEntry::Held {
+                owner,
+                address: Some(address),
+            } = registry
+                .read()
+                .expect("registry lock")
+                .zone_entry("resumebox.min.internal", &[])
+            {
+                return (owner, address);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the name answers again after the host starts");
+    assert_eq!(
+        owner, "resumebox",
+        "the session owns its box name across the resume"
+    );
+    assert_eq!(
+        resumed, shared,
+        "the resumed box answers at the address it held before the stop"
+    );
+    // The host-side proxy follows the same marker: once the host start has
+    // cleared it, the resumed box's name routes again.
+    assert!(
+        server
+            .state
+            .sessions_manager()
+            .await
+            .hostnames()
+            .read()
+            .expect("registry lock")
+            .resolve("resumebox.min.internal")
+            .is_some(),
+        "the proxy routes to the resumed box again"
+    );
+}
+
+/// NET-128 fail-closed: a Stop whose session record cannot be read still
+/// marks the box's name stopped. The marker is keyed by the session id the
+/// actor holds without the record, so a shared-address name never keeps
+/// answering (or routing) for a box that is no longer there.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_with_unreadable_record_still_marks_name_stopped() {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let manager = server.state.sessions_manager().await;
+    manager.land_range_verdict(crate::net::dns::RangeVerdict::Present);
+    let shared = manager
+        .hostnames()
+        .read()
+        .expect("registry lock")
+        .node_address();
+    let id = finalize_handed_own_ip_session(
+        &mut client,
+        "unreadbox",
+        std::net::Ipv4Addr::new(100, 64, 128, 9),
+        shared,
+    )
+    .await;
+    let handle = manager
+        .get_session(crate::sessions::SessionKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the box resolves while it runs");
+
+    // Make the record unreadable: the store reads `record.json` from disk on
+    // every get, so garbage there turns the Stop arm's read into an `Err`.
+    let sessions_dir = server
+        .state
+        .minimal_state_dir()
+        .await
+        .as_utf8_path()
+        .as_std_path()
+        .join("sessions");
+    let mut corrupted = 0;
+    for entry in std::fs::read_dir(&sessions_dir).expect("the sessions dir exists") {
+        let record = entry.unwrap().path().join("record.json");
+        if record.is_file() {
+            std::fs::write(&record, b"not json").expect("overwrite the record");
+            corrupted += 1;
+        }
+    }
+    assert_eq!(corrupted, 1, "exactly the one box's record is corrupted");
+
+    // The Stop arm must neither panic nor leave the name answering.
+    handle.stop().await;
+
+    let registry = server.state.sessions_manager().await.hostnames();
+    assert_eq!(
+        registry
+            .read()
+            .expect("registry lock")
+            .zone_entry("unreadbox.min.internal", &[]),
+        crate::net::dns::ZoneEntry::Held {
+            owner: "unreadbox".to_string(),
+            address: None,
+        },
+        "an unreadable record still leaves the stopped box answering NODATA"
+    );
+    assert_eq!(
+        registry
+            .read()
+            .expect("registry lock")
+            .resolve("unreadbox.min.internal"),
+        None,
+        "the proxy must not forward a stopped box whose record is unreadable"
+    );
+}
+
 /// NET-010's durability half (design §7.1): the hand is the record's row,
 /// not the daemon's memory — a creator wrote the box's addresses into the
 /// session's record at create, and the registry's publish is derived from
@@ -5206,7 +5619,7 @@ pub(crate) async fn finalize_declared_dynamic_ingress_session(
 /// framing [`crate::net::policy`] writes, so the stand-in forwarder below
 /// never blocks reading past what the daemon sent. `None` when the client
 /// went away mid-request.
-async fn read_control_request(stream: &mut tokio::net::UnixStream) -> Option<String> {
+pub(crate) async fn read_control_request(stream: &mut tokio::net::UnixStream) -> Option<String> {
     use tokio::io::AsyncReadExt;
     let mut buf = Vec::with_capacity(256);
     let mut scratch = [0u8; 512];
@@ -5267,8 +5680,10 @@ pub(crate) async fn fake_forwarder(
 /// can have the switch accept one bind and refuse the next, the way the real
 /// forwarder answers a duplicate of a bind another forward already holds.
 /// Everything else is [`fake_forwarder`]'s contract: one request per
-/// connection, each recorded as `"<request line>\n<body>"`.
-async fn scripted_forwarder(
+/// connection, each recorded as `"<request line>\n<body>"`. `pub(crate)`:
+/// the fail-closed audit tests drive an unaudited publish's withdrawal
+/// through the same stand-in, one whose unexpose the switch refuses.
+pub(crate) async fn scripted_forwarder(
     sock: std::path::PathBuf,
     script: Vec<u16>,
 ) -> (
@@ -5691,13 +6106,9 @@ async fn expose_allow_publishes_and_lists() {
     );
 
     // The publish is listed where `min session policy` reads it, by name and
-    // by id alike — and it reads as what it is: pending, because the box's
-    // relay gate admits the ports the *declaration* named, and this port
-    // was published at runtime, outside it.
-    let listed = minimald_rpc::LiveMapping {
-        pending: Some(true),
-        ..mapping.clone()
-    };
+    // by id alike — and it reads as reachable: the publish admitted the port
+    // at the box's relay gate (NET-044).
+    let listed = mapping.clone();
     let by_name: minimald_rpc::Errorable<Vec<minimald_rpc::LiveMapping>> = client
         .call::<minimald_rpc::GetLiveIngress>(&minimald_rpc::GetLiveIngressRequest::Name(
             "listweb".to_string(),
@@ -5735,6 +6146,78 @@ async fn expose_allow_publishes_and_lists() {
             && line.contains("local=127.0.64.21:3000"),
         "the publish line names the box, the port, the decision and the \
          outcome: {line}"
+    );
+}
+
+/// NET-044: an expose decided `allow` admits its port at the box's relay
+/// gate in the same turn it publishes — reachable, never a bound forward the
+/// gate refuses — while a port nobody published stays refused, and the box's
+/// stop (the expose's revocation) withdraws the admission. The gate is
+/// registered under the box's switch address the way its relay's spawn
+/// registers it, so the publish finds it exactly as it does in production.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expose_allow_admits_the_port_at_the_box_gate_until_stop() {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let manager = server.state.sessions_manager().await;
+    manager.land_range_verdict(crate::net::dns::RangeVerdict::Present);
+    // An address no other test's box uses: the live-gate table is
+    // process-wide.
+    let switch = std::net::Ipv4Addr::new(100, 64, 128, 91);
+    let web = finalize_dynamic_ingress_session(
+        &mut client,
+        "gateweb",
+        switch,
+        std::net::Ipv4Addr::new(127, 0, 64, 91),
+        Some(sessions::DynamicIngress::Allow),
+        Some((3000, 3999)),
+    )
+    .await;
+    let handle = manager
+        .get_session(crate::sessions::SessionKeyPredicate::Id(web))
+        .await
+        .unwrap()
+        .expect("the allowing box resolves");
+    handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("the allowing box launches its host");
+    let gate = std::sync::Arc::new(crate::net::switch::SessionGate::for_session(
+        "gateweb".to_string(),
+        switch,
+        &sessions::SessionPolicy::default(),
+        crate::net::SwitchSubnet::default(),
+        None,
+    ));
+    crate::net::switch::register_live_gate_for_test(switch, &gate);
+    let sock = handle
+        .net_switch()
+        .await
+        .unwrap()
+        .lock()
+        .await
+        .control_socket();
+    let (forwarder, _served) = fake_forwarder(sock, 200).await;
+
+    assert!(!gate.admits_tcp(3000), "nothing is published yet");
+    handle
+        .expose_dynamic(3000)
+        .await
+        .expect("the allowed port publishes");
+    assert!(
+        gate.admits_tcp(3000),
+        "the published port is admitted at the box's relay gate"
+    );
+    assert!(
+        !gate.admits_tcp(3001),
+        "a port nobody published stays refused"
+    );
+
+    handle.stop().await;
+    forwarder.abort();
+    assert!(
+        !gate.admits_tcp(3000),
+        "the box's stop revokes the expose and withdraws its admission"
     );
 }
 
@@ -6230,12 +6713,12 @@ async fn expose_self_allocated_box_publishes_at_its_registered_address() {
             "selfweb".to_string(),
         ))
         .await;
-    // The row reads as what it is: pending, the gate not having admitted a
-    // runtime-published port yet.
+    // The row reads as reachable: the publish admitted the port at the
+    // box's relay gate (NET-044).
     assert_eq!(
         live,
         minimald_rpc::Errorable::Ok(vec![minimald_rpc::LiveMapping {
-            pending: Some(true),
+            pending: Some(false),
             ..mapping
         }]),
         "the live mapping is listed beside the declaration"
@@ -6703,9 +7186,9 @@ async fn expose_colliding_on_shared_address_is_a_bind_error() {
             local: "127.0.0.1:3000".to_string(),
             internal_port: 3000,
             proto: sessions::IpProto::Tcp,
-            // The box declared no port mappings, so its relay gate admits
-            // nothing: the runtime publish reads pending.
-            pending: Some(true),
+            // The publish admitted the port at the box's relay gate
+            // (NET-044), so the row is never pending.
+            pending: Some(false),
         }]),
         "the first box's publish is untouched by the collision"
     );
@@ -6833,9 +7316,9 @@ async fn expose_publishes_at_the_registered_address() {
             local: "127.0.0.1:3000".to_string(),
             internal_port: 3000,
             proto: sessions::IpProto::Tcp,
-            // The box declared no port mappings, so its relay gate admits
-            // nothing: the runtime publish reads pending.
-            pending: Some(true),
+            // The publish admitted the port at the box's relay gate
+            // (NET-044), so the row is never pending.
+            pending: Some(false),
         }]),
         "the live mapping names the registered address the publish bound at"
     );
@@ -7266,6 +7749,27 @@ async fn soon(mut what: impl FnMut() -> bool) {
     }
 }
 
+/// The box's live ingress rows, read until `holds` accepts them, or fails the
+/// proof: the watcher commits and withdraws its rows on its own cadence, so a
+/// row it owes is read on a later poll, never on the one the caller missed.
+async fn listed_once(
+    handle: &crate::session::SessionHandle,
+    holds: impl Fn(&crate::session::LiveIngressRows) -> bool,
+) -> crate::session::LiveIngressRows {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let rows = handle.live_ingress().await.expect("the actor answers");
+        if holds(&rows) {
+            return rows;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the box's live ingress did not reach the awaited rows in the bound: {rows:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
 /// The control requests the fake forwarder served that name `published:port`
 /// as their bind — the expose and unexpose verbs of one publication, from
 /// whichever of the box's two runtime surfaces sent them.
@@ -7463,10 +7967,35 @@ async fn listen_publish_and_runtime_expose_never_double_bind() {
         },
         "the expose binds where the box's watcher binds, at its own port number"
     );
+    // Both surfaces' publications are listed (NET-044), each once, by the
+    // surface that owns it: the runtime expose's row, and the watcher's row
+    // for the in-range listen its box's `allow` stance published. The range
+    // spans two ephemeral ports, so other tests' listeners can land in it
+    // and be listed too: the listen rows are read for this test's ports.
+    let rows = handle.live_ingress().await.expect("the actor answers");
     assert_eq!(
-        handle.live_ingress().await.expect("the actor answers"),
+        rows.exposed,
         vec![mapping],
-        "the runtime publish is listed as the box's live ingress"
+        "the runtime publish is listed as the box's live ingress: {rows:?}"
+    );
+    assert_eq!(
+        rows.listened
+            .iter()
+            .filter(|row| row.internal_port == listen_port)
+            .collect::<Vec<_>>(),
+        vec![&minimald_rpc::LiveMapping {
+            local: format!("{loopback}:{listen_port}"),
+            internal_port: listen_port,
+            proto: sessions::IpProto::Tcp,
+            pending: Some(false),
+        }],
+        "the listen publication is listed once as the box's live ingress: {rows:?}"
+    );
+    assert!(
+        rows.listened
+            .iter()
+            .all(|row| row.internal_port != exposed_port),
+        "the exposed port is never also a listen row: {rows:?}"
     );
     let second_listener =
         std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, exposed_port))
@@ -7513,6 +8042,23 @@ async fn listen_publish_and_runtime_expose_never_double_bind() {
     assert!(
         listen_records[1].starts_with("POST /services/forwarder/unexpose "),
         "the watcher's own withdrawal unpublishes its port: {listen_records:?}"
+    );
+    // The listen's row goes with its publication, and the expose's stays:
+    // the set gives the port back once the unexpose stood, so the row is
+    // awaited, not assumed.
+    let rows = listed_once(&handle, |rows| {
+        rows.listened
+            .iter()
+            .all(|row| row.internal_port != listen_port)
+    })
+    .await;
+    assert_eq!(
+        rows.exposed
+            .iter()
+            .map(|row| row.internal_port)
+            .collect::<Vec<_>>(),
+        vec![exposed_port],
+        "the expose's row outlives the listen's: {rows:?}"
     );
 
     // The listener on the expose's port closes too — and nothing happens: the
@@ -7652,7 +8198,9 @@ async fn expose_on_listen_published_port_is_already_published() {
     }
 
     // One request, the watcher's publish: the refused request bound nothing,
-    // and the box lists no live ingress for the port.
+    // and the box lists the port once — the watcher's row for the listen its
+    // `allow` stance published (NET-044), never a row for the refused
+    // expose.
     let requests = served_naming(&served, loopback, port);
     assert_eq!(requests.len(), 1, "the port was bound once: {requests:?}");
     assert!(
@@ -7661,8 +8209,16 @@ async fn expose_on_listen_published_port_is_already_published() {
     );
     assert_eq!(
         handle.live_ingress().await.expect("the actor answers"),
-        Vec::new(),
-        "the refused request published nothing the box lists"
+        crate::session::LiveIngressRows {
+            exposed: Vec::new(),
+            listened: vec![minimald_rpc::LiveMapping {
+                local: format!("{loopback}:{port}"),
+                internal_port: port,
+                proto: sessions::IpProto::Tcp,
+                pending: Some(false),
+            }],
+        },
+        "the refused request published nothing; the listen's publication is listed once"
     );
 
     // The refusal is one line naming the port, the owner that holds it, and
@@ -7700,6 +8256,102 @@ async fn expose_on_listen_published_port_is_already_published() {
         "the withdrawal is the publisher's own: {requests:?}"
     );
     drop(listener);
+}
+
+/// NET-044 and NET-046 for the listen surface: an in-range listen under
+/// `allow` is a dynamic ingress request the box's stance decided, so the
+/// publication the watcher makes of it is listed by `min session policy`'s
+/// RPC — reachable, because the watcher admitted it at the gate — until the
+/// listener closes, and its decision lands in the daemon's audit log as one
+/// record, decided by the box's policy, outcome published.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn listen_publication_is_listed_and_audited() {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let manager = server.state.sessions_manager().await;
+
+    let listener = listening_socket();
+    let port = port_of(&listener);
+    let switch = std::net::Ipv4Addr::new(100, 64, 128, 76);
+    let loopback = std::net::Ipv4Addr::new(127, 0, 64, 76);
+    let (handle, gate, served) = box_with_listen_plan(
+        &mut client,
+        &manager,
+        "listedlisten",
+        switch,
+        loopback,
+        (port, port),
+    )
+    .await;
+    soon(|| gate.admits_tcp(port)).await;
+
+    // The listing: the RPC `min session policy` reads serves the watcher's
+    // row, by name, reachable.
+    let row = minimald_rpc::LiveMapping {
+        local: format!("{loopback}:{port}"),
+        internal_port: port,
+        proto: sessions::IpProto::Tcp,
+        pending: Some(false),
+    };
+    let listed: minimald_rpc::Errorable<Vec<minimald_rpc::LiveMapping>> = client
+        .call::<minimald_rpc::GetLiveIngress>(&minimald_rpc::GetLiveIngressRequest::Name(
+            "listedlisten".to_string(),
+        ))
+        .await;
+    assert_eq!(
+        listed,
+        minimald_rpc::Errorable::Ok(vec![row]),
+        "the in-range listen is listed as the box's live ingress"
+    );
+
+    // The audit: one record for the one publish. The record follows the
+    // gate's admission inside the same poll, so it is awaited, not assumed.
+    let log = crate::audit::log_path(
+        server
+            .state
+            .minimal_state_dir()
+            .await
+            .as_utf8_path()
+            .as_std_path(),
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let text = loop {
+        let text = tokio::fs::read_to_string(&log).await.unwrap_or_default();
+        if text.contains("\"listedlisten\"") {
+            break text;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the publish was never audited: {text}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
+    let records: Vec<serde_json_lenient::Value> = text
+        .lines()
+        .map(|line| serde_json_lenient::from_str(line).expect("one line is one record"))
+        .filter(|record: &serde_json_lenient::Value| record["box"] == "listedlisten")
+        .collect();
+    assert_eq!(records.len(), 1, "one publish, one record: {text}");
+    assert_eq!(records[0]["port"], port);
+    assert_eq!(records[0]["decision"], "allow");
+    assert_eq!(records[0]["decided_by"], "box-policy");
+    assert_eq!(records[0]["outcome"], "published");
+
+    // The close: the row goes with the listener.
+    drop(listener);
+    soon(|| served_naming(&served, loopback, port).len() == 2).await;
+    listed_once(&handle, |rows| rows.listened.is_empty()).await;
+    let after: minimald_rpc::Errorable<Vec<minimald_rpc::LiveMapping>> = client
+        .call::<minimald_rpc::GetLiveIngress>(&minimald_rpc::GetLiveIngressRequest::Name(
+            "listedlisten".to_string(),
+        ))
+        .await;
+    assert_eq!(
+        after,
+        minimald_rpc::Errorable::Ok(Vec::new()),
+        "a closed listener's publication is no longer listed"
+    );
+    handle.stop().await;
 }
 
 /// NET-047's other order: a port the box's runtime expose published, then
@@ -7797,6 +8449,85 @@ async fn listen_watcher_skips_an_expose_owned_port() {
         requests[1].starts_with("POST /services/forwarder/unexpose "),
         "the withdrawal is the publisher's own: {requests:?}"
     );
+}
+
+/// One port, one row: a port the box's runtime expose published and its own
+/// process then listens on is listed once, as the expose's row. The watcher
+/// never lists it as a listen and never audits a listen publish of it, and
+/// the listener's close leaves the expose's row standing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_exposed_port_listened_on_is_one_expose_row() {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let manager = server.state.sessions_manager().await;
+
+    let port = port_of(&listening_socket());
+    let switch = std::net::Ipv4Addr::new(100, 64, 128, 77);
+    let loopback = std::net::Ipv4Addr::new(127, 0, 64, 77);
+    let (handle, _gate, served) = box_with_listen_plan(
+        &mut client,
+        &manager,
+        "onerow",
+        switch,
+        loopback,
+        (port, port),
+    )
+    .await;
+
+    handle
+        .expose_dynamic(port)
+        .await
+        .expect("the free port publishes");
+    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, port))
+        .expect("the box's process listens on the exposed port");
+
+    // Every read across several of the watcher's polls, with the listener
+    // standing and after it closes: the expose's row, and no listen row.
+    let mut listener = Some(listener);
+    for phase in ["listening", "listener closed"] {
+        if phase == "listener closed" {
+            drop(listener.take());
+        }
+        let until = tokio::time::Instant::now() + Duration::from_millis(900);
+        while tokio::time::Instant::now() < until {
+            let rows = handle.live_ingress().await.expect("the actor answers");
+            let exposed: Vec<u16> = rows.exposed.iter().map(|row| row.internal_port).collect();
+            assert!(
+                rows.listened.is_empty() && exposed == vec![port],
+                "{phase}: one expose row, no listen row: {rows:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+    assert_eq!(
+        served_naming(&served, loopback, port).len(),
+        1,
+        "the expose's bind is the only request the port got"
+    );
+
+    // The audit log holds the expose's one decision for the port, and no
+    // listen publish record beside it.
+    let log = crate::audit::log_path(
+        server
+            .state
+            .minimal_state_dir()
+            .await
+            .as_utf8_path()
+            .as_std_path(),
+    );
+    let text = tokio::fs::read_to_string(&log)
+        .await
+        .expect("the expose was audited");
+    let records: Vec<serde_json_lenient::Value> = text
+        .lines()
+        .map(|line| serde_json_lenient::from_str(line).expect("one line is one record"))
+        .filter(|record: &serde_json_lenient::Value| record["box"] == "onerow")
+        .collect();
+    assert_eq!(records.len(), 1, "the expose's record alone: {text}");
+    assert_eq!(records[0]["port"], port);
+    assert_eq!(records[0]["outcome"], "published");
+
+    handle.stop().await;
 }
 
 /// The plan's one handoff: a launch carries its box's listen plan inside its

@@ -49,6 +49,8 @@ permissions:
     contents: read
     # dorny/paths-filter reads the PR file list on pull_request events.
     pull-requests: read
+    # await-kvm reads the KVM lane's check run on the PR head.
+    checks: read
 
 jobs:
     changes:
@@ -73,10 +75,12 @@ jobs:
               with:
                   filters: |
                       macos:
-                        - "crates/minvmd/**"
-                        - "crates/minimald/**" # guest daemon: pid-1 in the e2e/boot VM
-                        - "crates/minimal/**"
-                        - "crates/sessions/**" # platform-sensitive: canonicalization, symlinks
+                        # Every crate, not a named few: min, minvmd and the
+                        # guest minimald together link nearly the whole
+                        # workspace, so a change to any dependency (switch,
+                        # minimald-rpc, sandbox2, ...) can break the e2e. A
+                        # named list goes stale the day a dependency lands.
+                        - "crates/**"
                         - "Cargo.toml"
                         - "Cargo.lock"
                         # The toolchain pin: a rustc bump must re-run the Rust lanes.
@@ -167,7 +171,7 @@ jobs:
                   arch: aarch64
                   channel: unstable
             - name: Install cross
-              uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2
+              uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
               with:
                   tool: cross
             - name: Build guest initramfs (minimald as /init)
@@ -206,6 +210,61 @@ jobs:
                       ~/.cargo/git/db/
                       target/
                   key: ${{ steps.stage2-cache.outputs.cache-primary-key }}
+
+    await-kvm:
+        # PR runs only: hold the e2e until the KVM lane has passed on the same
+        # head commit. Both lanes run the same scripts/session-e2e.sh, and when
+        # KVM fails the mac e2e almost always fails with it, so running it then
+        # spends the single self-hosted runner repeating a known result. A
+        # superseded push is cancelled here, before it reaches the runner.
+        #
+        # Fails closed: a red KVM lane makes this job red, not skipped. If it
+        # merely skipped the e2e, the aggregator would read that as pass, and a
+        # KVM rerun that went green would leave the PR mergeable with no mac
+        # e2e ever run. Re-run this lane after KVM passes.
+        #
+        # Pushes, dispatches and nightly calls skip this job and run the e2e
+        # directly. Same fork guard and kill switch as the e2e.
+        needs: [changes]
+        if: >-
+            ${{ vars.RUN_MACOS_CI != 'false'
+            && github.event_name == 'pull_request'
+            && needs.changes.outputs.macos == 'true'
+            && github.event.pull_request.head.repo.full_name == github.repository }}
+        runs-on: ubuntu-latest
+        # Covers a cold KVM lane (~40 min) plus its queueing.
+        timeout-minutes: 75
+        steps:
+            - name: Wait for ci-linux-kvm-success on the PR head
+              env:
+                  GH_TOKEN: ${{ github.token }}
+                  REPO: ${{ github.repository }}
+                  SHA: ${{ github.event.pull_request.head.sha }}
+              run: |
+                  set -euo pipefail
+                  while :; do
+                      # Newest run of the check on this commit; a rerun adds
+                      # a new check run rather than replacing the old one.
+                      run=$(gh api "repos/$REPO/commits/$SHA/check-runs?check_name=ci-linux-kvm-success&filter=latest" \
+                          --jq '.check_runs | sort_by(.started_at) | last | "\(.status) \(.conclusion) \(.html_url)"') \
+                          || run="" # a transient API error: poll again
+                      # Before the KVM lane registers its check: "null null null".
+                      read -r status conclusion url <<<"${run:-none none none}"
+                      if [ "$status" = completed ]; then
+                          case "$conclusion" in
+                              success | skipped | neutral)
+                                  echo "KVM lane passed: $url"
+                                  exit 0
+                                  ;;
+                              *)
+                                  echo "::error::KVM lane concluded '$conclusion' ($url); the mac e2e did not run. Re-run this lane once KVM passes."
+                                  exit 1
+                                  ;;
+                          esac
+                      fi
+                      echo "KVM lane: ${status} — waiting"
+                      sleep 30
+                  done
 
     e2e:
         # Hypervisor E2E on real hardware — the mac lane's TEST phase. The
@@ -252,13 +311,20 @@ jobs:
         #
         # Fork PRs get `skipped`, which the ci-macos-success aggregator counts
         # as pass, so this does not wedge the required check.
+        #
+        # await-kvm is skipped outside PRs, so the e2e checks each need's
+        # result itself rather than relying on the implicit success().
         if: >-
-            ${{ vars.RUN_MACOS_CI != 'false'
+            ${{ !cancelled()
+            && needs.artifacts.result == 'success'
+            && needs.unit.result == 'success'
+            && (needs.await-kvm.result == 'success' || needs.await-kvm.result == 'skipped')
+            && vars.RUN_MACOS_CI != 'false'
             && github.event_name != 'merge_group'
             && (github.event_name != 'pull_request'
                 || (needs.changes.outputs.macos == 'true'
                     && github.event.pull_request.head.repo.full_name == github.repository)) }}
-        needs: [changes, artifacts, unit]
+        needs: [changes, artifacts, unit, await-kvm]
         runs-on: [self-hosted, macOS, ARM64]
         timeout-minutes: 30
         steps:
@@ -286,7 +352,7 @@ jobs:
                   name: mac-testbed
                   path: ${{ runner.temp }}/testbed
             - name: Install nextest
-              uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2
+              uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
               with:
                   tool: nextest
             - name: Unpack testbed + resolve paths
@@ -487,7 +553,7 @@ jobs:
             - name: Provision libkrun (pinned own build)
               uses: ./.github/actions/setup-libkrun-macos
             - name: Install nextest
-              uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2
+              uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
               with:
                   tool: nextest
             - name: Clippy (minvmd)
@@ -565,13 +631,55 @@ jobs:
                   if-no-files-found: error
                   retention-days: 3
 
+    zoned:
+        # The box-name service (minzoned) as a real LaunchDaemon: the
+        # privileged command `min` hands an operator, run for real, then the
+        # service proved through the system resolver, its channel, a restart
+        # and a clean teardown (scripts/zoned-macos-e2e.sh). It needs root,
+        # and the self-hosted fleet has no sudo because it runs PR code, so
+        # this runs on a GitHub-hosted runner: ephemeral, sudo without a
+        # password, no VM needed (a script stands in for the node). The
+        # debug `min` skips the codesign requirement check, so that part
+        # stays unproved here.
+        needs: [changes]
+        if: github.event_name != 'merge_group' && (github.event_name != 'pull_request' || needs.changes.outputs.macos == 'true')
+        runs-on: macos-latest
+        timeout-minutes: 30
+        env:
+            CARGO_PROFILE_DEV_DEBUG: line-tables-only
+        steps:
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+              with:
+                  persist-credentials: false
+            - name: Toolchain
+              uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+              with:
+                  toolchain: stable
+            - name: Cache cargo registry and build artifacts
+              uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2 # zizmor: ignore[cache-poisoning] test-only lane, nothing published; save-if keeps every non-main ref read-only
+              with:
+                  shared-key: mac-zoned
+                  save-if: ${{ github.ref == 'refs/heads/main' }}
+            - name: Build minzoned and min
+              # Two invocations, as the unit job builds its testbed: one
+              # cargo call would unify features across both packages.
+              # `min` finds `minzoned` beside its own executable.
+              run: |
+                  set -euo pipefail
+                  cargo build -p minzoned --locked
+                  cargo build -p minimal --bin min --locked
+            - name: Prove the service install
+              env:
+                  MINIMAL_E2E_PRIVILEGED: "1"
+              run: scripts/zoned-macos-e2e.sh target/debug/min
+
     # Single required status check for this lane (branch-protection context:
     # ci-macos-success). Green when every gating job succeeded OR was
     # path-skipped (or the RUN_MACOS_CI kill-switch skipped the e2e); red only
     # on failure/cancellation.
     ci-macos-success:
         if: always()
-        needs: [changes, artifacts, e2e, unit]
+        needs: [changes, artifacts, await-kvm, e2e, unit, zoned]
         runs-on: ubuntu-latest
         timeout-minutes: 5
         steps:

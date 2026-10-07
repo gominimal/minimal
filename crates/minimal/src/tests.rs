@@ -1996,6 +1996,21 @@ fn legacy_network_spellings_parse_with_hint() {
     );
 }
 
+/// The `--network` parser accepts every [`sessions::NetworkMode::word`] and
+/// maps it back to the same mode, so the word the daemon logs and the
+/// refusals print is always one a person can type.
+#[test]
+fn network_parser_round_trips_every_mode_word() {
+    for mode in [
+        sessions::NetworkMode::NoNet,
+        sessions::NetworkMode::HostNet,
+        sessions::NetworkMode::OwnIp,
+    ] {
+        let parsed = parse_network_mode(mode.word()).expect("a mode word must parse");
+        assert_eq!(sessions::NetworkMode::from(parsed), mode, "{}", mode.word());
+    }
+}
+
 /// `--deny-all-egress` conflicts with every egress rule flag at parse
 /// (NET-075's CLI half): a deny-all declaration admits no exceptions, so
 /// combining it with any `--allow-*`/`--deny-*` rule is refused before the
@@ -3082,4 +3097,195 @@ async fn walked_proxy_port_reported_at_start_and_in_ls() {
              line"
         );
     }
+}
+
+/// Two listed sessions for the id-prefix tests: an unnamed `01a0fe9d…` and
+/// `a1b2c3d4…` named `web`.
+fn prefix_entries() -> Vec<minimald_rpc::ListSessionsEntry> {
+    use sessions::SessionStatus::Active;
+    vec![
+        twin_entry("01a0fe9d-0a99-78b1-9165-0809440f0052", None, None, Active),
+        twin_entry(
+            "a1b2c3d4-0a99-78b1-9165-0809440f0052",
+            Some("web"),
+            None,
+            Active,
+        ),
+    ]
+}
+
+/// The short id `min ls` prints resolves as a unique id prefix, with or
+/// without dashes and in either case; a prefix nothing matches resolves to
+/// nothing, leaving the caller's "no session found".
+#[test]
+fn a_unique_id_prefix_resolves_to_its_session() {
+    let entries = prefix_entries();
+    for prefix in ["01a0fe9d", "01A0", "01a0fe9d-0a", "01a0fe9d0a99"] {
+        assert_eq!(
+            match_id_prefix(&entries, prefix).unwrap(),
+            Some(entries[0].id),
+            "`{prefix}` resolves"
+        );
+    }
+    assert_eq!(match_id_prefix(&entries, "ffff").unwrap(), None);
+}
+
+/// A prefix several sessions share is refused, naming each candidate by its
+/// short id and its session name; one more character that tells them apart
+/// resolves.
+#[test]
+fn an_ambiguous_id_prefix_names_the_candidates() {
+    use sessions::SessionStatus::Active;
+    let entries = vec![
+        twin_entry(
+            "a1b2c3d4-0a99-78b1-9165-0809440f0052",
+            Some("web"),
+            None,
+            Active,
+        ),
+        twin_entry(
+            "a1b29e8f-0a99-78b1-9165-0809440f0052",
+            Some("db"),
+            None,
+            Active,
+        ),
+    ];
+    let err = match_id_prefix(&entries, "a1b2").unwrap_err();
+    assert!(err.downcast_ref::<AmbiguousIdPrefix>().is_some());
+    assert_eq!(
+        err.to_string(),
+        "'a1b2' matches sessions a1b2c3d4… (web), a1b29e8f… (db); use more characters"
+    );
+    assert_eq!(
+        match_id_prefix(&entries, "a1b29").unwrap(),
+        Some(entries[1].id)
+    );
+}
+
+/// Candidates that share more than eight hex digits are cut only as far as
+/// needed to be told apart: each rendered id is distinct and exactly as long
+/// as the first differing digit.
+#[test]
+fn an_ambiguous_id_prefix_cuts_at_the_first_differing_digit() {
+    use sessions::SessionStatus::Active;
+    let entries = vec![
+        twin_entry("a1b2c3d4-e50f-78b1-9165-0809440f0052", None, None, Active),
+        twin_entry("a1b2c3d4-e51f-78b1-9165-0809440f0052", None, None, Active),
+    ];
+    // The two ids share their first ten hex digits; the eleventh diverges.
+    let err = match_id_prefix(&entries, "a1b2c3d4e5").unwrap_err();
+    assert!(err.downcast_ref::<AmbiguousIdPrefix>().is_some());
+    assert_eq!(
+        err.to_string(),
+        "'a1b2c3d4e5' matches sessions a1b2c3d4e50…, a1b2c3d4e51…; use more characters"
+    );
+    // Each rendered candidate resolves back to exactly its own session.
+    assert_eq!(
+        match_id_prefix(&entries, "a1b2c3d4e50").unwrap(),
+        Some(entries[0].id)
+    );
+    assert_eq!(
+        match_id_prefix(&entries, "a1b2c3d4e51").unwrap(),
+        Some(entries[1].id)
+    );
+}
+
+/// Only 4 to 32 hex digits (dashes allowed) are tried as a prefix: anything
+/// else stays a plain name, so a miss is the usual "no session found".
+#[test]
+fn a_non_hex_or_short_input_is_not_an_id_prefix() {
+    let (max, over) = ("0".repeat(32), "0".repeat(33));
+    for not_prefix in ["01a", "01a0fe9z", "web-01a0", "", "----", over.as_str()] {
+        assert!(!is_id_prefix(not_prefix), "`{not_prefix}` is not a prefix");
+    }
+    for prefix in ["01a0", "01A0FE9D", "01a0fe9d-0a99", max.as_str()] {
+        assert!(is_id_prefix(prefix), "`{prefix}` is a prefix");
+    }
+    // `01a0fe9z` would match the first session's id were it read as hex.
+    assert_eq!(
+        match_id_prefix(&prefix_entries(), "01a0fe9z").unwrap(),
+        None
+    );
+}
+
+/// A session named with a string that is also another session's id prefix
+/// resolves by its name: an exact name wins over a prefix.
+#[test]
+fn an_exact_name_wins_over_an_id_prefix() {
+    use sessions::SessionStatus::Active;
+    let mut entries = prefix_entries();
+    entries.push(twin_entry(
+        "ffffffff-0a99-78b1-9165-0809440f0052",
+        Some("01a0fe9d"),
+        None,
+        Active,
+    ));
+    assert_eq!(
+        match_id_prefix(&entries, "01a0fe9d").unwrap(),
+        Some(entries[2].id)
+    );
+}
+
+/// A name resolves in any casing, matching how names are made unique: a
+/// session named `Beef-Cafe` is found by `beef-cafe` (and vice versa). The
+/// names are hex-shaped, because only those reach this match on a name miss,
+/// and a folded name wins over a session whose id starts with the same hex.
+#[test]
+fn a_name_resolves_case_insensitively() {
+    use sessions::SessionStatus::Active;
+    let entries = vec![
+        twin_entry(
+            "ffffffff-0a99-78b1-9165-0809440f0052",
+            Some("Beef-Cafe"),
+            None,
+            Active,
+        ),
+        twin_entry("beefcafe-0a99-78b1-9165-0809440f0054", None, None, Active),
+    ];
+    assert_eq!(
+        match_id_prefix(&entries, "beef-cafe").unwrap(),
+        Some(entries[0].id)
+    );
+    assert_eq!(
+        match_id_prefix(&entries, "BEEF-CAFE").unwrap(),
+        Some(entries[0].id)
+    );
+}
+
+/// An exact name wins over a case-folded one, and a casing that folds to two
+/// sessions (case-only duplicates written before names were made unique
+/// under case folding) resolves to neither rather than picking one, nor
+/// falls through to a session whose id starts with that prefix.
+#[test]
+fn an_exact_name_wins_and_an_ambiguous_fold_resolves_to_none() {
+    use sessions::SessionStatus::Active;
+    let entries = vec![
+        twin_entry(
+            "ffffffff-0a99-78b1-9165-0809440f0052",
+            Some("Beef-Cafe"),
+            None,
+            Active,
+        ),
+        twin_entry(
+            "eeeeeeee-0a99-78b1-9165-0809440f0053",
+            Some("beef-cafe"),
+            None,
+            Active,
+        ),
+        twin_entry("beefcafe-0a99-78b1-9165-0809440f0054", None, None, Active),
+    ];
+    assert_eq!(
+        match_id_prefix(&entries, "beef-cafe").unwrap(),
+        Some(entries[1].id)
+    );
+    assert_eq!(
+        match_id_prefix(&entries, "Beef-Cafe").unwrap(),
+        Some(entries[0].id)
+    );
+    assert_eq!(match_id_prefix(&entries, "BEEF-CAFE").unwrap(), None);
+    // The id prefix alone, with no name folding to it, still resolves.
+    assert_eq!(
+        match_id_prefix(&entries, "beefcafe").unwrap(),
+        Some(entries[2].id)
+    );
 }

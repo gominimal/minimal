@@ -2,13 +2,12 @@ use futures::StreamExt as _;
 use minimald_rpc::{
     AbortSession, AbortSessionResponse, BoxControlReply, BoxControlRequest, CleanCacheRequest,
     CleanCacheUpdate, CreateSession, DestroySession, DestroySessionResponse, Errorable,
-    FinalizeSession, FinalizeSessionResponse, GetEffectiveSessionPolicy,
-    GetEffectiveSessionPolicyRequest, GetMeshStatus, GetSessionPolicy, GetSessionPolicyRequest,
-    GetSessionRecord, GetSessionRecordRequest, GetSessionRecordResponse, GetSessionScreen,
-    GetVersion, GetVersionResponse, ListSessions, ListSessionsEntry, ListSessionsResponse,
-    OneshotSshRpc, RPC_SUBSYSTEM_PREFIX, RenameSession, RenameSessionResponse, ResourcePool,
-    SessionDelta, SessionDeltaRequest, SessionDeltaResponse, Shutdown, ShutdownRequest,
-    ShutdownResponse, SubmitVerdict,
+    FinalizeSession, GetEffectiveSessionPolicy, GetEffectiveSessionPolicyRequest, GetMeshStatus,
+    GetSessionPolicy, GetSessionPolicyRequest, GetSessionRecord, GetSessionRecordRequest,
+    GetSessionRecordResponse, GetSessionScreen, GetVersion, GetVersionResponse, ListSessions,
+    ListSessionsEntry, ListSessionsResponse, OneshotSshRpc, RPC_SUBSYSTEM_PREFIX, RenameSession,
+    RenameSessionResponse, ResourcePool, SessionDelta, SessionDeltaRequest, SessionDeltaResponse,
+    Shutdown, ShutdownRequest, ShutdownResponse, SubmitVerdict,
 };
 use russh::{
     Channel as RuChannel, ChannelId,
@@ -312,6 +311,10 @@ async fn serve_create_session(
             // manager: the success record below needs it, and the reply
             // carries only the assigned id.
             let session_name = req.config.name.clone();
+            // Read the network mode off the config for the same reason: the
+            // manager consumes it, and the mode the session activated with is
+            // what the field below reports beside the "session created" line.
+            let network = req.config.network;
             // Read the egress rule counts off the config for the same reason:
             // the manager consumes it, and the stored record's egress is what
             // the counts below report beside the "session created" line.
@@ -378,6 +381,7 @@ async fn serve_create_session(
                     tracing::info!(
                         session_id = %id,
                         session_name = session_name.as_deref().unwrap_or(ANONYMOUS_SESSION),
+                        network_mode = %network.word(),
                         egress_allow_subnets = egress_counts.allow_subnets,
                         egress_allow_protocols = egress_counts.allow_protocols,
                         egress_allow_dns_hosts = egress_counts.allow_dns_hosts,
@@ -1083,7 +1087,7 @@ async fn serve_finalize_session(
                 });
             };
             Ok(match h.finalize().await {
-                Ok(activate_hooks) => Errorable::Ok(FinalizeSessionResponse { activate_hooks }),
+                Ok(response) => Errorable::Ok(response),
                 Err(e) => Errorable::Err {
                     error: e.to_string(),
                 },
@@ -1378,16 +1382,13 @@ async fn serve_get_effective_session_policy(
 /// empty list — the honest answer for a box that is not running, since a
 /// publish lives only while its box does.
 ///
-/// Each row's reachability state is filled here, at read time, from the same
-/// set the box's relay gate was compiled from — the declared ports
-/// [`declared_ingress_ports`] — because it is a fact about the box, not about
-/// the bind: a runtime-published port is bound on the host at once, but the
-/// frame only reaches the box through the relay gate its attach installed,
-/// and that gate admits the ports the *declaration* named. So a runtime
-/// publish reads `pending` until the gate's admitted set grows to include
-/// runtime-published ports, and a publish of a port the declaration already
-/// names — the one overlap — is not pending, because the declared forward is
-/// what answers at that address.
+/// Every row reads not pending: a runtime publish admits its port at the
+/// box's relay gate in the same turn it records the mapping (NET-044), so a
+/// listed publish is reachable. The `pending` field stays on the wire so a
+/// client can still tell this daemon's rows from an older daemon's. The
+/// listen watcher's rows — the in-range listens the box's `allow` stance
+/// published — follow the exposes' rows, reachable too: the watcher admits
+/// each port at the gate as its publish's last step.
 async fn serve_get_live_ingress(
     s: ServerStateHandle,
     c: RuChannel<Msg>,
@@ -1407,37 +1408,19 @@ async fn serve_get_live_ingress(
                 None => Ok(Errorable::Err {
                     error: "no session found".to_string(),
                 }),
-                Some(session) => {
-                    // The admitted set the gate is compiled from, per
-                    // mapping's transport — an unreadable record reads as
-                    // "nothing admitted", so its mappings all read pending: a
-                    // row is reachable only when the gate is known to admit
-                    // it.
-                    let record = session.record().await.ok();
-                    let policy = record.as_ref().map(|record| &record.policy);
-                    match session.live_ingress().await {
-                        Ok(live) => Ok(Errorable::Ok(
-                            live.into_iter()
-                                .map(|mut mapping| {
-                                    let admitted = crate::net::switch::declared_ingress_ports(
-                                        policy,
-                                        mapping.proto,
-                                    );
-                                    // The daemon knows the state, so it says
-                                    // it: `Some`, never the unknown a reply
-                                    // from a daemon older than the field
-                                    // decodes as.
-                                    mapping.pending =
-                                        Some(!admitted.contains(&mapping.internal_port));
-                                    mapping
-                                })
-                                .collect(),
-                        )),
-                        Err(e) => Ok(Errorable::Err {
-                            error: e.to_string(),
-                        }),
-                    }
-                }
+                Some(session) => match session.live_ingress().await {
+                    // The actor's own rows, `pending: Some(false)` each: the
+                    // publish admitted the port when it recorded the row. The
+                    // listen watcher's rows follow the exposes' as they
+                    // stand: the gate admitted each one as its publish's
+                    // last step.
+                    Ok(live) => Ok(Errorable::Ok(
+                        live.exposed.into_iter().chain(live.listened).collect(),
+                    )),
+                    Err(e) => Ok(Errorable::Err {
+                        error: e.to_string(),
+                    }),
+                },
             }
         })
         .await
@@ -2565,8 +2548,9 @@ mod tests {
     use minimald_rpc::{
         CreateSession, CreateSessionRequest, DestroySessionRequest, EffectiveEgress,
         EffectiveSessionPolicy, EgressPolicy, GetEffectiveSessionPolicy,
-        GetEffectiveSessionPolicyRequest, GetSessionPolicy, GetSessionPolicyRequest,
-        RenameSessionRequest, SessionPolicy, Shutdown, ShutdownRequest, ShutdownResponse,
+        GetEffectiveSessionPolicyRequest, GetSessionPolicy, GetSessionPolicyRequest, IngressPolicy,
+        IpProto, PortMapping, RenameSessionRequest, SessionPolicy, Shutdown, ShutdownRequest,
+        ShutdownResponse,
     };
     use paths::HostAbsPath;
     use sessions::{NetworkMode, SessionId};
@@ -4353,6 +4337,7 @@ mod tests {
                 logged.lines().any(|line| {
                     line.contains("refused a create whose host-address declaration names rules")
                         && line.contains(&format!("session_name=Some(\"{name}\")"))
+                        && line.contains("network_mode=host_ip")
                         && line.contains("host_ip_enforcement=per_box")
                         && line.contains(rule)
                 }),
@@ -5929,6 +5914,52 @@ mod tests {
         );
     }
 
+    /// The `session created` log line names the session's network mode beside
+    /// its id and name, in the CLI's `--network` spellings (`none` / `host_ip`
+    /// / `own_ip`) so the bundle's tail reads like the command a person typed.
+    /// Attributed by session id, because under libtest the capture buffer is
+    /// shared by every test in the binary — assertions on it say `contains`,
+    /// never `equals`.
+    #[tokio::test]
+    async fn session_created_line_names_the_network_mode() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let capture = crate::test_harness::captured_log();
+
+        // One box per mode: the default (host-address), a NoNet box, and an
+        // own-address box. Each create succeeds because none declares egress
+        // (so the unenforceable-declaration gate never fires) and the native
+        // test host is not a microVM (so an own-address box needs no handed
+        // addresses).
+        let host_ip = req("host-address", "/uwu");
+        let host_id = client.call::<CreateSession>(&host_ip).await.unwrap().id;
+
+        let mut no_net = req("no-network", "/uwu");
+        no_net.config.network = NetworkMode::NoNet;
+        let none_id = client.call::<CreateSession>(&no_net).await.unwrap().id;
+
+        let mut own_ip = req("own-address", "/uwu");
+        own_ip.config.network = NetworkMode::OwnIp;
+        let own_id = client.call::<CreateSession>(&own_ip).await.unwrap().id;
+
+        let log = capture.contents();
+        for (id, spelling) in [
+            (&host_id, "host_ip"),
+            (&none_id, "none"),
+            (&own_id, "own_ip"),
+        ] {
+            assert!(
+                log.lines().any(|line| {
+                    line.contains("session created")
+                        && line.contains(&format!("session_id={id}"))
+                        && line.contains(&format!("network_mode={spelling} "))
+                }),
+                "the session created line for {id} must name its network mode \
+                 {spelling}, got: {log}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn create_session_rejects_policy_incompatible_with_network_mode() {
         let server = TestServer::new().await;
@@ -5962,6 +5993,54 @@ mod tests {
             resp,
             Errorable::Err {
                 error: "egress policy is only valid for an own-IP or host-address PTask, not NoNet"
+                    .to_string()
+            }
+        );
+
+        // The rejected session left nothing behind in the store.
+        let mngr = server.state.sessions_manager().await;
+        assert!(mngr.list().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_session_rejects_static_ingress_on_host_net() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+
+        // A static ingress mapping on a host-address box is a configuration the
+        // daemon refuses at create time, naming the policy field and the box's
+        // mode (not a CLI flag: any client may send this): an own-IP box is the
+        // only mode with a published address to apply the mapping to. Built by
+        // hand to bypass the CLI-side refusal so the daemon path itself is what
+        // is exercised.
+        let ingress = IngressPolicy {
+            port_mappings: vec![PortMapping {
+                external_port: 18080,
+                internal_port: 80,
+                proto: IpProto::Tcp,
+            }],
+            dynamic_allowed_range: None,
+            dynamic_ingress: None,
+        };
+        let resp = client
+            .call::<CreateSession>(&CreateSessionRequest {
+                config: minimald_rpc::SessionConfig {
+                    name: Some("bad-ingress".to_string()),
+                    project_path: HostAbsPath::try_new("/uwu").unwrap(),
+                    network: NetworkMode::HostNet,
+                    policy: SessionPolicy::new(None, Some(ingress)),
+                    box_addresses: None,
+                    hooks_enabled: true,
+                    attrs: Default::default(),
+                },
+                must_match_version: None,
+            })
+            .await;
+        assert_eq!(
+            resp,
+            Errorable::Err {
+                error: "ingress port mappings need network mode own_ip (this box is host_ip): \
+                        only an own-IP box has a published address to apply them to"
                     .to_string()
             }
         );
