@@ -493,7 +493,9 @@ pub enum PolicyError {
     #[error("egress policy is only valid for an own-IP or host-address PTask, not {mode:?}")]
     EgressRequiresNetwork { mode: NetworkMode },
     /// An ingress policy was set on a `PTask` that is not [`NetworkMode::OwnIp`].
-    #[error("ingress policy is only valid for an own-IP PTask, not {mode:?}")]
+    #[error(
+        "--ingress needs --network own_ip: only an own-IP box has a published address to apply it to"
+    )]
     IngressRequiresOwnIp { mode: NetworkMode },
     /// An ingress port mapping used a transport gvproxy's forwarder cannot
     /// expose. gvproxy only forwards TCP and UDP, so any other protocol (e.g.

@@ -2544,8 +2544,9 @@ mod tests {
     use minimald_rpc::{
         CreateSession, CreateSessionRequest, DestroySessionRequest, EffectiveEgress,
         EffectiveSessionPolicy, EgressPolicy, GetEffectiveSessionPolicy,
-        GetEffectiveSessionPolicyRequest, GetSessionPolicy, GetSessionPolicyRequest,
-        RenameSessionRequest, SessionPolicy, Shutdown, ShutdownRequest, ShutdownResponse,
+        GetEffectiveSessionPolicyRequest, GetSessionPolicy, GetSessionPolicyRequest, IngressPolicy,
+        IpProto, PortMapping, RenameSessionRequest, SessionPolicy, Shutdown, ShutdownRequest,
+        ShutdownResponse,
     };
     use paths::HostAbsPath;
     use sessions::{NetworkMode, SessionId};
@@ -5941,6 +5942,52 @@ mod tests {
             resp,
             Errorable::Err {
                 error: "egress policy is only valid for an own-IP or host-address PTask, not NoNet"
+                    .to_string()
+            }
+        );
+
+        // The rejected session left nothing behind in the store.
+        let mngr = server.state.sessions_manager().await;
+        assert!(mngr.list().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_session_rejects_static_ingress_on_host_net_with_cli_message() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+
+        // A static ingress mapping on a host-address box is a configuration the
+        // daemon refuses at create time, spelling out the same remediation the
+        // CLI gives: an own-IP box is the only mode with a published address to
+        // apply the mapping to. Built by hand to bypass the CLI-side refusal so
+        // the daemon path itself is what is exercised.
+        let ingress = IngressPolicy {
+            port_mappings: vec![PortMapping {
+                external_port: 18080,
+                internal_port: 80,
+                proto: IpProto::Tcp,
+            }],
+            dynamic_allowed_range: None,
+            dynamic_ingress: None,
+        };
+        let resp = client
+            .call::<CreateSession>(&CreateSessionRequest {
+                config: minimald_rpc::SessionConfig {
+                    name: Some("bad-ingress".to_string()),
+                    project_path: HostAbsPath::try_new("/uwu").unwrap(),
+                    network: NetworkMode::HostNet,
+                    policy: SessionPolicy::new(None, Some(ingress)),
+                    box_addresses: None,
+                    hooks_enabled: true,
+                    attrs: Default::default(),
+                },
+                must_match_version: None,
+            })
+            .await;
+        assert_eq!(
+            resp,
+            Errorable::Err {
+                error: "--ingress needs --network own_ip: only an own-IP box has a published address to apply it to"
                     .to_string()
             }
         );
