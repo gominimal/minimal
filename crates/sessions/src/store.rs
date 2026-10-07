@@ -316,6 +316,23 @@ impl Index {
             .map(|(_, id)| id)
     }
 
+    /// Returns the session ID whose name folds to `name`, only when exactly
+    /// one indexed name does. Sessions written before names were made unique
+    /// under case folding can still sit side by side on disk (`Case-R` and
+    /// `case-r`); a lookup that folds to both is ambiguous and resolves to
+    /// neither rather than picking one.
+    fn find_by_name_folded_unique(&self, name: &str) -> Option<&SessionId> {
+        let mut matches = self
+            .name_to_id
+            .iter()
+            .filter(|(existing, _)| existing.eq_ignore_ascii_case(name))
+            .map(|(_, id)| id);
+        match (matches.next(), matches.next()) {
+            (Some(id), None) => Some(id),
+            _ => None,
+        }
+    }
+
     /// Returns the session ID corresponding to the given short name, if known.
     pub fn find_by_short<S: AsRef<str>>(&self, name: S) -> Option<&SessionId> {
         self.short_to_id.get(name.as_ref())
@@ -891,7 +908,12 @@ impl Loader for DiskLoader {
         }))
     }
     fn find_by_name<S: AsRef<str>>(&self, name: S) -> Result<Option<Self::Key>, std::io::Error> {
-        match self.index.find_by_name(name) {
+        let name = name.as_ref();
+        let uuid = self
+            .index
+            .find_by_name(name)
+            .or_else(|| self.index.find_by_name_folded_unique(name));
+        match uuid {
             Some(uuid) => self.find_by_id(uuid),
             None => Ok(None),
         }
@@ -1271,6 +1293,54 @@ mod tests {
             loader.create(record).err().map(|e| e.kind()),
             Some(ErrorKind::AlreadyExists)
         );
+    }
+
+    #[test]
+    fn find_by_name_resolves_case_insensitively() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        let mut record = sample_record();
+        record.name = Some("My-Session".to_string());
+        let key = loader.create(record).unwrap();
+
+        // The exact name resolves, and so does any casing of it: names are
+        // unique under ASCII case folding, so the fallback is unambiguous.
+        assert_eq!(
+            loader.find_by_name("My-Session").unwrap(),
+            Some(key.clone())
+        );
+        assert_eq!(
+            loader.find_by_name("my-session").unwrap(),
+            Some(key.clone())
+        );
+        assert_eq!(loader.find_by_name("MY-SESSION").unwrap(), Some(key));
+    }
+
+    /// Sessions written before names were unique under case folding can sit
+    /// side by side in the index. An exact name still resolves to its own
+    /// session, and a casing that folds to both resolves to neither.
+    #[test]
+    fn find_by_name_prefers_exact_and_refuses_an_ambiguous_fold() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        let mut upper = sample_record();
+        upper.name = Some("Case-R".to_string());
+        let upper_key = loader.create(upper).unwrap();
+        let mut lower = sample_record();
+        lower.name = Some("Case-X".to_string());
+        let lower_key = loader.create(lower).unwrap();
+        // Plant the legacy case-only duplicate the create path now refuses.
+        loader.index.name_to_id.remove("Case-X");
+        loader
+            .index
+            .name_to_id
+            .insert("case-r".to_string(), lower_key.session_id);
+
+        assert_eq!(loader.find_by_name("Case-R").unwrap(), Some(upper_key));
+        assert_eq!(loader.find_by_name("case-r").unwrap(), Some(lower_key));
+        assert_eq!(loader.find_by_name("CASE-R").unwrap(), None);
     }
 
     #[test]
@@ -2319,10 +2389,11 @@ mod tests {
 
         let loader = DiskLoader::new(root.clone()).unwrap();
         // The live session still resolves; the case-colliding orphan is not
-        // indexed.
-        assert_eq!(loader.find_by_id(&a_id).unwrap(), Some(a_key));
+        // indexed. Its name resolves to the live session under the
+        // case-insensitive lookup, not to the orphan.
+        assert_eq!(loader.find_by_id(&a_id).unwrap(), Some(a_key.clone()));
         assert_eq!(loader.find_by_id(&orphan_record.id).unwrap(), None);
-        assert_eq!(loader.find_by_name("MY-SESSION").unwrap(), None);
+        assert_eq!(loader.find_by_name("MY-SESSION").unwrap(), Some(a_key));
         // The orphan dir is left on disk for manual triage.
         assert!(
             session_dir_path(&root, orphan_short).exists(),
