@@ -241,11 +241,14 @@ impl EnvChannel<'_> {
                 .await
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
             let remote_cache = if build_ctx.use_remote_cache() {
+                // No flag to name: the in-sandbox `min` helper takes none, and
+                // only a sandbox started by `mip --no-fetch run` has no_fetch
+                // set (a daemon-launched task has no switch at all).
                 Some(
                     build_ctx
                         .remote_cache(false, false)
                         .await
-                        .map_err(|e| anyhow::anyhow!("{}", e))?,
+                        .map_err(|e| crate::remote_cache_setup_error(e, None))?,
                 )
             } else {
                 None
@@ -278,7 +281,7 @@ impl EnvChannel<'_> {
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
             Ok::<(), anyhow::Error>(())
         }) {
-            writeln!(stream, "error: {}", e).ok();
+            writeln!(stream, "error: {:#}", e).ok();
             return;
         };
         writeln!(

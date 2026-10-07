@@ -19,7 +19,7 @@ use ot::OpTracker;
 use rcache::{Error as RemoteError, RemoteBinProvider, RemoteCache, RemoteCacheWriter};
 
 mod error;
-pub use error::Error;
+pub use error::{Error, remote_cache_setup_error};
 mod config;
 pub use config::{Config, ConfigBuilder, ConfigError, DEFAULT_REMOTE_CACHE_BUCKET};
 mod env;

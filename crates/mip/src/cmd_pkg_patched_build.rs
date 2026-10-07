@@ -19,7 +19,13 @@ pub async fn cmd_pkg_patched_build(
     let remote_storage = ctx.remote_storage().await.unwrap();
 
     let remote_cache = if ctx.use_remote_cache() {
-        Some(ctx.remote_cache(false, false).await?)
+        // `{:#}` keeps the cause visible, since `Error::Other` displays with `{}`.
+        Some(ctx.remote_cache(false, false).await.map_err(|e| {
+            Error::Other(anyhow!(
+                "{:#}",
+                mctx::remote_cache_setup_error(e, Some("pass --no-fetch to build without it"))
+            ))
+        })?)
     } else {
         None
     };
