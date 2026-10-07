@@ -268,6 +268,67 @@ mod tests {
         assert!(matches!(&list[1], AttrValue::String(a, _) if a == "b"));
     }
 
+    /// A valid array-of-record attribute (e.g. `env_dir_mappings`) must decode
+    /// to the same value whether or not its element contracts are applied. No
+    /// element contract in `attr_classes.ncl` carries a `default`, so applying
+    /// them is a no-op for valid inputs. Pin the decoded value so a future
+    /// `default` on an element contract changes this assertion and fails loudly.
+    #[test]
+    fn array_of_records_decodes_to_pinned_value() {
+        let (term, mut program, _origin, _target) = Loader::new(
+            "let {Attrs, ..} = import \"minimal.ncl\" in \
+                 {env_dir_mappings = [\
+                    {read_only = true, path = \"/data\", class = 'State},\
+                    {read_only = false, path = \"/secrets\", class = 'Credential}\
+                 ]} | Attrs",
+            None,
+            &LoadOptions::for_test(),
+        )
+        .unwrap_or_else(|e| {
+            e.report_to_stderr();
+            panic!("load failed");
+        })
+        .finish()
+        .unwrap_or_else(|e| {
+            e.report_to_stderr();
+            panic!("finish failed");
+        });
+
+        let result = AttrValue::from_term(&term, &mut program).unwrap().unwrap();
+        let attrs = result.as_map().unwrap();
+        let mappings = attrs.get("env_dir_mappings").unwrap().as_list().unwrap();
+
+        assert_eq!(mappings.len(), 2);
+
+        let first = mappings[0].as_map().unwrap();
+        assert!(matches!(
+            first.get("read_only").unwrap(),
+            AttrValue::Bool(true)
+        ));
+        assert!(matches!(
+            first.get("path").unwrap(),
+            AttrValue::String(p, _) if p == "/data"
+        ));
+        assert!(matches!(
+            first.get("class").unwrap(),
+            AttrValue::String(c, _) if c == "State"
+        ));
+
+        let second = mappings[1].as_map().unwrap();
+        assert!(matches!(
+            second.get("read_only").unwrap(),
+            AttrValue::Bool(false)
+        ));
+        assert!(matches!(
+            second.get("path").unwrap(),
+            AttrValue::String(p, _) if p == "/secrets"
+        ));
+        assert!(matches!(
+            second.get("class").unwrap(),
+            AttrValue::String(c, _) if c == "Credential"
+        ));
+    }
+
     /// Config that nests attribute values past the cap must surface a
     /// structured [`Error::AttrTooDeep`] rather than aborting the process with a
     /// stack overflow. Evaluation forces one level per nested list, so the
