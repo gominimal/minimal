@@ -364,6 +364,14 @@ pub async fn activate<G: ActivationGate>(
     let package_check_skipped = match result {
         Ok(skipped) => skipped,
         Err(e) => {
+            // The failed flow hands the record to this teardown, so disarm the
+            // Ctrl-C guard first: left armed, an interrupt in the window below
+            // fires a second teardown over a fresh connection, races the one in
+            // flight, and `exit(130)`s mid-cleanup with the primary error still
+            // unspoken. A Ctrl-C past this point is the default SIGINT, and the
+            // daemon's connection-close reap is the backstop for what the abort
+            // cannot deliver.
+            drop(_interrupt);
             // The core's teardown of the half-built record, and the box row the
             // registration bought with it (T66) — a failed activation owes both.
             tear_down(client, id).await;
