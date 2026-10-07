@@ -7948,14 +7948,17 @@ mod tests {
             .await
             .expect("the gate dials the switch to write the resets")
             .expect("accepting the gate's reset connection");
-        let mut written = Vec::new();
-        tokio::time::timeout(DEADLINE, resets.read_to_end(&mut written))
+        tokio::time::timeout(
+            DEADLINE,
+            super::forward_revoke::tests::answer_the_probe(&mut resets, CONNECT_REQUEST),
+        )
+        .await
+        .expect("the reset connection is upgraded and probed first");
+        let mut frames = Vec::new();
+        tokio::time::timeout(DEADLINE, resets.read_to_end(&mut frames))
             .await
             .expect("the gate closes its reset connection")
             .expect("reading the resets");
-        let frames = written
-            .strip_prefix(CONNECT_REQUEST)
-            .expect("the reset connection is upgraded to a frame stream first");
         let len = usize::from(u16::from_le_bytes([frames[0], frames[1]]));
         let reset = super::forward_revoke::parse_tcp_segment(&frames[2..2 + len])
             .expect("the first frame is a TCP segment");
@@ -8130,14 +8133,17 @@ mod tests {
             .await
             .expect("the gate dials the switch to write the resets")
             .expect("accepting the gate's reset connection");
-        let mut written = Vec::new();
-        tokio::time::timeout(DEADLINE, resets.read_to_end(&mut written))
+        tokio::time::timeout(
+            DEADLINE,
+            super::forward_revoke::tests::answer_the_probe(&mut resets, CONNECT_REQUEST),
+        )
+        .await
+        .expect("the reset connection is upgraded and probed first");
+        let mut frames = Vec::new();
+        tokio::time::timeout(DEADLINE, resets.read_to_end(&mut frames))
             .await
             .expect("the gate closes its reset connection")
             .expect("reading the resets");
-        let frames = written
-            .strip_prefix(CONNECT_REQUEST)
-            .expect("the reset connection is upgraded to a frame stream first");
         let len = usize::from(u16::from_le_bytes([frames[0], frames[1]]));
         let reset = super::forward_revoke::parse_tcp_segment(&frames[2..2 + len])
             .expect("the first frame is a TCP segment");
