@@ -75,8 +75,15 @@ where
     let (mut rx, mut tx) = stream.into_split();
 
     let to_sock = async {
-        ignore_broken_pipe(tokio::io::copy(&mut stdin, &mut tx).await)?;
-        tx.shutdown().await
+        match tokio::io::copy(&mut stdin, &mut tx).await {
+            // The daemon closed its end, so there is no write half left to
+            // shut down: macOS fails that shutdown with ENOTCONN.
+            Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+            res => {
+                res?;
+                tx.shutdown().await
+            }
+        }
     };
     let from_sock = async { ignore_broken_pipe(tokio::io::copy(&mut rx, &mut stdout).await) };
     tokio::pin!(from_sock);
@@ -93,7 +100,7 @@ where
     Ok(())
 }
 
-/// Treat a `BrokenPipe` from either copy direction as normal termination.
+/// Treat a `BrokenPipe` from the socket-to-stdout copy as normal termination.
 ///
 /// The reader on the downstream side may close the pipe before the copy
 /// finishes (for example `yes | ssh host 'cmd'`, where `cmd` never reads
