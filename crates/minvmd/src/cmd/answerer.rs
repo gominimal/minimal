@@ -1,4 +1,4 @@
-//! The `min-answerer` program: the one the privileged step copies to a
+//! The `minzoned` program: the one the privileged step copies to a
 //! root-owned path and installs as the host's box-zone answerer service,
 //! and the handover's client verbs the same step runs as root.
 //!
@@ -106,7 +106,7 @@ const CONTROL_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 pub fn release(controls: &[std::path::PathBuf], port: u16) -> Result<()> {
     for control in controls {
         if let Some(reply) = ask(control, &minimald_rpc::BoxControlRequest::ReleaseAnswerer)? {
-            eprintln!("min-answerer: {}: {reply}", control.display());
+            eprintln!("minzoned: {}: {reply}", control.display());
         }
     }
     let deadline = std::time::Instant::now() + PORT_FREE_WAIT;
@@ -137,9 +137,9 @@ pub fn release_cancel(controls: &[std::path::PathBuf]) {
             control,
             &minimald_rpc::BoxControlRequest::ReleaseAnswererCancel,
         ) {
-            Ok(Some(reply)) => eprintln!("min-answerer: {}: {reply}", control.display()),
+            Ok(Some(reply)) => eprintln!("minzoned: {}: {reply}", control.display()),
             Ok(None) => {}
-            Err(error) => eprintln!("min-answerer: {}: {error:#}", control.display()),
+            Err(error) => eprintln!("minzoned: {}: {error:#}", control.display()),
         }
     }
 }

@@ -11,7 +11,7 @@
 # Build shape (extracted from those jobs; do not recollapse without cutting
 # the release profile's link-time memory first):
 #   - ONE cargo invocation per package (mip, minimal, minimald, minvmd,
-#     min-answerer), not one combined build. `[profile.release]` is fat LTO with
+#     minzoned), not one combined build. `[profile.release]` is fat LTO with
 #     codegen-units = 1, so a combined build lets cargo schedule all the final
 #     LTO links concurrently — the peak that SIGTERMed the arm64 release job
 #     (exit 143). Sequential invocations share dependency artifacts through
@@ -20,7 +20,7 @@
 #   - `minvmd` is built in its OWN invocation, after the rest: `min` depends
 #     on the minvmd crate with default-features = false, and one combined
 #     invocation would unify the `libkrun` feature into the CLI's copy.
-#     `min-answerer` is the rule pointed the other way: it also depends on
+#     `minzoned` is the rule pointed the other way: it also depends on
 #     the minvmd crate with default-features = false, and beside `-p minvmd`
 #     it would unify the KVM backend into the answerer a root host service
 #     must never carry — so it gets its OWN invocation too, and its built
@@ -132,15 +132,15 @@ case "$TARGET" in
         ;;
 esac
 
-# min-answerer: its OWN invocation, never beside `-p minvmd` and never
+# minzoned: its OWN invocation, never beside `-p minvmd` and never
 # through a `--workspace` build, for the feature-unification reason the
 # header's last bullet names. It is the crate T71 created — no libkrun, no
 # KVM backend, only what a root host service needs — and this is the step
 # that keeps a release build from growing them back.
-cargo build --release --locked --target "$TARGET" --package min-answerer
+cargo build --release --locked --target "$TARGET" --package minzoned
 
 # THE link gate on what this script just built (the rule
-# scripts/check-answerer-links.sh documents): the answerer runs as a root
+# scripts/check-zoned-links.sh documents): the answerer runs as a root
 # host service that every process on the machine resolves through, so a
 # dynamic dependency in a user-writable path — or an RPATH/RUNPATH entry
 # baked into the binary pointing at one — is user-chosen code as root. The
@@ -148,7 +148,7 @@ cargo build --release --locked --target "$TARGET" --package min-answerer
 # leaves this machine as a release artifact; the release workflow runs it
 # again on every signed and renamed artifact before upload, so the shipped
 # bytes stay the checked bytes.
-"$ROOT/scripts/check-answerer-links.sh" "$BIN_DIR/min-answerer"
+"$ROOT/scripts/check-zoned-links.sh" "$BIN_DIR/minzoned"
 
 # Completions from the built `min`, the technique packaging/arch/PKGBUILD-bin.tmpl
 # uses: XDG
@@ -200,4 +200,4 @@ else
     echo "dist-build: completions -> $COMPLETIONS_DIR"
 fi
 
-echo "dist-build: $TARGET built -> $BIN_DIR (mip, min, minimald, minvmd, min-answerer)"
+echo "dist-build: $TARGET built -> $BIN_DIR (mip, min, minimald, minvmd, minzoned)"

@@ -746,11 +746,11 @@ else
     echo "no usable 'min' on PATH and no build under target/; building the pair this run drives (cargo build --locked -p minimal --bin min -p $min_daemon --bin $min_daemon)"
     # A VM-backed run also needs the answerer program the advisory's command
     # copies into place (beside min). It builds in its own invocation, as
-    # `just answerer-build` does: beside `-p minvmd`, cargo would unify
+    # `just zoned-build` does: beside `-p minvmd`, cargo would unify
     # minvmd's `libkrun` feature into the root-run program.
     if (cd "$ROOT" && cargo build --locked -p minimal --bin min \
         -p "$min_daemon" --bin "$min_daemon" \
-        && { [ "$min_daemon" != minvmd ] || cargo build --locked -p min-answerer; }) \
+        && { [ "$min_daemon" != minvmd ] || cargo build --locked -p minzoned; }) \
         >"$WORK/cli-build.log" 2>&1; then
       for d in "$ROOT/target/debug" "${CARGO_TARGET_DIR:-/nonexistent}/debug"; do
         if [ -x "$d/min" ]; then
@@ -6843,8 +6843,8 @@ proof_local_range_reserved_by_privileged_step() {
     echo "removing a leftover range unit from a prior run, so this proof starts from the advisory's own premise"
     range_remove_unit
   fi
-  if [ -e /Library/LaunchDaemons/dev.minimal.zone-answerer.plist ] \
-     || [ -e /Library/PrivilegedHelperTools/dev.minimal.zone-answerer ]; then
+  if [ -e /Library/LaunchDaemons/dev.gominimal.zone.plist ] \
+     || [ -e /Library/PrivilegedHelperTools/minzoned ]; then
     echo "removing a leftover answerer service from a prior run, for the same reason"
     ANSWERER_SERVICE_CHANNEL="${ANSWERER_SERVICE_CHANNEL:-/nonexistent}"
     answerer_service_teardown
@@ -6886,7 +6886,7 @@ proof_local_range_reserved_by_privileged_step() {
   # on macOS it spans several lines, because the two files' bytes ride
   # inside it as quoted heredocs, so the extraction runs from the
   # de-indented `sudo` line to the closing quote.
-  range_cmd="$(awk -v lead="Configure the host's resolver, reserve the local range, and install the box-zone answerer service with:" -v q="'" '
+  range_cmd="$(awk -v lead="Configure the host's resolver, reserve the local range, and install the Minimal box-name service (DNS and addresses for boxes) with:" -v q="'" '
     index($0, lead) > 0 { started = 1; next }
     started && !first { sub(/^  /, ""); first = 1 }
     started { print; if (substr($0, length($0), 1) == q) exit }
@@ -7186,19 +7186,19 @@ range_teardown_unit() {
 answerer_service_teardown() {
   [ -n "${ANSWERER_SERVICE_CHANNEL:-}" ] || return 0
   if [ "$(uname -s)" = Darwin ]; then
-    sudo -n launchctl bootout "system/dev.minimal.zone-answerer" >/dev/null 2>&1 || true
-    sudo -n rm -f "/Library/LaunchDaemons/dev.minimal.zone-answerer.plist" \
-      "/Library/PrivilegedHelperTools/dev.minimal.zone-answerer" >/dev/null 2>&1 || true
+    sudo -n launchctl bootout "system/dev.gominimal.zone" >/dev/null 2>&1 || true
+    sudo -n rm -f "/Library/LaunchDaemons/dev.gominimal.zone.plist" \
+      "/Library/PrivilegedHelperTools/minzoned" >/dev/null 2>&1 || true
   else
-    sudo -n systemctl disable --now dev.minimal.zone-answerer.socket \
-      dev.minimal.zone-answerer.service >/dev/null 2>&1 || true
-    sudo -n rm -f /etc/systemd/system/dev.minimal.zone-answerer.socket \
-      /etc/systemd/system/dev.minimal.zone-answerer.service \
-      /usr/local/lib/minimal/dev.minimal.zone-answerer >/dev/null 2>&1 || true
+    sudo -n systemctl disable --now minzoned.socket \
+      minzoned.service >/dev/null 2>&1 || true
+    sudo -n rm -f /etc/systemd/system/minzoned.socket \
+      /etc/systemd/system/minzoned.service \
+      /usr/local/lib/minimal/minzoned >/dev/null 2>&1 || true
     sudo -n rmdir /usr/local/lib/minimal >/dev/null 2>&1 || true
     sudo -n systemctl daemon-reload >/dev/null 2>&1 || true
-    sudo -n systemctl reset-failed dev.minimal.zone-answerer.socket \
-      dev.minimal.zone-answerer.service >/dev/null 2>&1 || true
+    sudo -n systemctl reset-failed minzoned.socket \
+      minzoned.service >/dev/null 2>&1 || true
   fi
   sudo -n rm -f "$ANSWERER_SERVICE_CHANNEL" >/dev/null 2>&1 || true
   # And the directory it sat in, when the command made it and it is now
@@ -7352,9 +7352,10 @@ proof_native_resolution_without_proxy_env() {
 
   # The command the advisory named: the line after its lead-in, de-indented —
   # exactly what a user would have copied off the terminal. The lead-in's
-  # shared prefix matches both platforms' wording ("…and install the box-zone
-  # answerer service with:" on Linux, "…reserve the local range, and install
-  # the box-zone answerer service with:" on macOS, whose command
+  # shared prefix matches both platforms' wording ("…and install the Minimal
+  # box-name service (DNS and addresses for boxes) with:" on Linux, "…reserve the
+  # local range, and install the Minimal box-name service (DNS and addresses
+  # for boxes) with:" on macOS, whose command
   # carries the range step NET-123 folds into it); the range-reserving case
   # below extracts the multi-line command whole.
   native_cmd="$(advisory_command_from "$native_err" "Configure the host's resolver")"
@@ -7509,7 +7510,7 @@ proof_native_resolution_without_proxy_env() {
       # (T90); record the channel it binds BEFORE running it, so a
       # half-failed run still leaves the teardown a service to remove.
       case "$native_cmd" in
-        *zone-answerer*)
+        *minzoned*)
           ANSWERER_SERVICE_CHANNEL="$(answerer_channel_of "$native_cmd")"
           if [ -z "$ANSWERER_SERVICE_CHANNEL" ]; then
             echo "::error::the advisory's command names no answerer channel, so this run could not undo the service it installs; it was not run (got: '$native_cmd')"
@@ -8415,7 +8416,7 @@ proof_box_name_resolves_natively_without_proxy() {
     # A native daemon's advisory carries the manager-held answerer step
     # (T90); record its channel first so the teardown can remove it.
     case "$bn_cmd" in
-      *zone-answerer*)
+      *minzoned*)
         ANSWERER_SERVICE_CHANNEL="$(answerer_channel_of "$bn_cmd")"
         if [ -z "$ANSWERER_SERVICE_CHANNEL" ]; then
           echo "::error::the advisory's command names no answerer channel, so this run could not undo the service it installs; it was not run (got: '$bn_cmd')"
@@ -8774,33 +8775,33 @@ proof_box_name_resolves_natively_without_proxy() {
 # Every host change — the units, the program copy, the channel socket, the
 # resolver link (Linux) or file (macOS), the second node — is undone here
 # and again by the EXIT trap, so the shared runner is left as found.
-# Makes the min-answerer program findable for this run: beside `min` or on
-# PATH already, or built by `just answerer-build` (else that recipe's own
+# Makes the minzoned program findable for this run: beside `min` or on
+# PATH already, or built by `just zoned-build` (else that recipe's own
 # cargo line) and staged on PATH. A lane that can do neither fails: the
 # case must prove the handover there, never record it as not run.
 asr_answerer_ready() {
   local min_dir built
   min_dir="$(dirname -- "$(command -v min)")"
-  if [ -x "$min_dir/min-answerer" ]; then
-    echo "min-answerer: beside min at $min_dir/min-answerer"
+  if [ -x "$min_dir/minzoned" ]; then
+    echo "minzoned: beside min at $min_dir/minzoned"
     return 0
   fi
-  if command -v min-answerer >/dev/null 2>&1; then
-    echo "min-answerer: on PATH at $(command -v min-answerer)"
+  if command -v minzoned >/dev/null 2>&1; then
+    echo "minzoned: on PATH at $(command -v minzoned)"
     return 0
   fi
-  echo "min-answerer is not beside min or on PATH; building it (just answerer-build)"
+  echo "minzoned is not beside min or on PATH; building it (just zoned-build)"
   if command -v just >/dev/null 2>&1; then
-    (cd "$ROOT" && just answerer-build) >"$WORK/answerer-build.log" 2>&1 || {
-      echo "::error::'just answerer-build' failed"; tail -20 "$WORK/answerer-build.log"; fail; }
+    (cd "$ROOT" && just zoned-build) >"$WORK/zoned-build.log" 2>&1 || {
+      echo "::error::'just zoned-build' failed"; tail -20 "$WORK/zoned-build.log"; fail; }
   elif command -v cargo >/dev/null 2>&1; then
-    (cd "$ROOT" && cargo build -p min-answerer --locked) >"$WORK/answerer-build.log" 2>&1 || {
-      echo "::error::'cargo build -p min-answerer --locked' failed"; tail -20 "$WORK/answerer-build.log"; fail; }
+    (cd "$ROOT" && cargo build -p minzoned --locked) >"$WORK/zoned-build.log" 2>&1 || {
+      echo "::error::'cargo build -p minzoned --locked' failed"; tail -20 "$WORK/zoned-build.log"; fail; }
   else
-    echo "::error::this lane has no min-answerer and neither just nor cargo to build it; the handover cannot be proved"
+    echo "::error::this lane has no minzoned and neither just nor cargo to build it; the handover cannot be proved"
     fail
   fi
-  built="${CARGO_TARGET_DIR:-$ROOT/target}/debug/min-answerer"
+  built="${CARGO_TARGET_DIR:-$ROOT/target}/debug/minzoned"
   if [ ! -x "$built" ]; then
     echo "::error::the answerer build left no program at $built"
     fail
@@ -8808,11 +8809,11 @@ asr_answerer_ready() {
   # Staged alone: target/debug also holds a min and a minvmd this run must
   # not pick up in place of the lane's own.
   mkdir -p "$WORK/answerer-bin"
-  cp "$built" "$WORK/answerer-bin/min-answerer"
+  cp "$built" "$WORK/answerer-bin/minzoned"
   # shellcheck disable=SC2031 # other proofs change PATH in their own subshells; this runs in the main shell
   PATH="$WORK/answerer-bin:$PATH"
   export PATH
-  echo "min-answerer: built and staged at $WORK/answerer-bin/min-answerer"
+  echo "minzoned: built and staged at $WORK/answerer-bin/minzoned"
 }
 
 proof_answerer_survives_session_stop() {
@@ -8826,7 +8827,7 @@ proof_answerer_survives_session_stop() {
   case "$asr_os" in
     Linux)
       asr_channel=/run/minimal/answerer.sock
-      asr_marker=/etc/systemd/system/dev.minimal.zone-answerer.socket
+      asr_marker=/etc/systemd/system/minzoned.socket
       if ! command -v systemctl >/dev/null 2>&1 || ! command -v resolvectl >/dev/null 2>&1 \
          || ! command -v ip >/dev/null 2>&1 || ! command -v dig >/dev/null 2>&1 \
          || ! sudo -n true >/dev/null 2>&1; then
@@ -8836,7 +8837,7 @@ proof_answerer_survives_session_stop() {
       ;;
     Darwin)
       asr_channel="/Library/Application Support/minimal/run/answerer.sock"
-      asr_marker=/Library/LaunchDaemons/dev.minimal.zone-answerer.plist
+      asr_marker=/Library/LaunchDaemons/dev.gominimal.zone.plist
       if ! command -v launchctl >/dev/null 2>&1 || ! command -v dig >/dev/null 2>&1 \
          || ! sudo -n true >/dev/null 2>&1; then
         echo "::error::this macOS host cannot install the answerer LaunchDaemon (needs launchctl, dig and passwordless sudo); the case fails rather than self-skips, so the pin is never silent"
@@ -8853,8 +8854,8 @@ proof_answerer_survives_session_stop() {
   # channel client from its first start, so the interim this case hands
   # over could never exist. Remove it first, the range case's reasoning.
   if [ -e "$asr_marker" ] || [ -e "$asr_channel" ] \
-     || [ -e /usr/local/lib/minimal/dev.minimal.zone-answerer ] \
-     || [ -e /Library/PrivilegedHelperTools/dev.minimal.zone-answerer ]; then
+     || [ -e /usr/local/lib/minimal/minzoned ] \
+     || [ -e /Library/PrivilegedHelperTools/minzoned ]; then
     echo "removing a leftover answerer service from a prior run, so node A starts from the interim"
     ANSWERER_SERVICE_CHANNEL="$asr_channel"
     answerer_service_teardown
@@ -9000,10 +9001,10 @@ for row in json.load(open(sys.argv[1])):
     fail
   }
 
-  # The advisory's command copies the min-answerer program found beside
+  # The advisory's command copies the minzoned program found beside
   # min or on PATH; a lane whose testbed carries only min and minvmd has
   # none, and its advisory then omits the step. Build it here, through
-  # `just answerer-build` — its own invocation, never beside -p minvmd (the
+  # `just zoned-build` — its own invocation, never beside -p minvmd (the
   # libkrun feature would unify in) — or that recipe's exact cargo line
   # where just is absent, and put it on PATH for this run.
   asr_answerer_ready
@@ -9085,7 +9086,7 @@ for row in json.load(open(sys.argv[1])):
   local asr_cmd
   asr_cmd="$(advisory_command_from "$asr_a_err" "Configure the host's resolver")"
   case "$asr_cmd" in
-    *zone-answerer*) ;;
+    *minzoned*) ;;
     *)
       echo "::error::node A's session start printed no advisory carrying the answerer service step"
       echo "--- activate stderr ---"; cat "$asr_a_err" 2>/dev/null || true
@@ -9144,9 +9145,9 @@ for row in json.load(open(sys.argv[1])):
     fail
   fi
   if [ "$asr_os" = Linux ]; then
-    if ! systemctl is-active --quiet dev.minimal.zone-answerer.socket; then
+    if ! systemctl is-active --quiet minzoned.socket; then
       echo "::error::the answerer socket unit is not active after the command"
-      systemctl status dev.minimal.zone-answerer.socket 2>&1 | tail -n 15 || true
+      systemctl status minzoned.socket 2>&1 | tail -n 15 || true
       fail
     fi
     asr_holders="$(sudo -n ss -lunp 2>/dev/null | grep -F -- "127.0.0.1:$asr_port " || true)"
@@ -9158,7 +9159,7 @@ for row in json.load(open(sys.argv[1])):
     esac
     echo "  the hook port's holder: ${asr_holders:-<none listed>}"
   else
-    if ! sudo -n launchctl print system/dev.minimal.zone-answerer >/dev/null 2>&1; then
+    if ! sudo -n launchctl print system/dev.gominimal.zone >/dev/null 2>&1; then
       echo "::error::the answerer LaunchDaemon is not loaded after the command"
       fail
     fi
@@ -9249,15 +9250,15 @@ for row in json.load(open(sys.argv[1])):
   # ---- 4. a service restart answers both names again -------------------------
   local asr_pid_before asr_pid_after
   if [ "$asr_os" = Linux ]; then
-    asr_pid_before="$(systemctl show -p MainPID --value dev.minimal.zone-answerer.service)"
-    sudo -n systemctl restart dev.minimal.zone-answerer.service
-    asr_pid_after="$(systemctl show -p MainPID --value dev.minimal.zone-answerer.service)"
+    asr_pid_before="$(systemctl show -p MainPID --value minzoned.service)"
+    sudo -n systemctl restart minzoned.service
+    asr_pid_after="$(systemctl show -p MainPID --value minzoned.service)"
   else
-    asr_pid_before="$(sudo -n launchctl print system/dev.minimal.zone-answerer 2>/dev/null \
+    asr_pid_before="$(sudo -n launchctl print system/dev.gominimal.zone 2>/dev/null \
       | sed -n 's/^[[:space:]]*pid = //p' | head -n1)"
-    sudo -n launchctl kickstart -k system/dev.minimal.zone-answerer
+    sudo -n launchctl kickstart -k system/dev.gominimal.zone
     sleep 1
-    asr_pid_after="$(sudo -n launchctl print system/dev.minimal.zone-answerer 2>/dev/null \
+    asr_pid_after="$(sudo -n launchctl print system/dev.gominimal.zone 2>/dev/null \
       | sed -n 's/^[[:space:]]*pid = //p' | head -n1)"
   fi
   echo "4. restarted the answerer service (pid ${asr_pid_before:-?} -> ${asr_pid_after:-on demand})"
@@ -9410,7 +9411,7 @@ proof_native_answerer_survives_session_stop() {
   echo "::group::the native daemon publishes into the manager-held answerer, which survives a session stop (NET-122, T90)"
 
   local nasr_channel=/run/minimal/answerer.sock
-  local nasr_marker=/etc/systemd/system/dev.minimal.zone-answerer.socket
+  local nasr_marker=/etc/systemd/system/minzoned.socket
   local nasr_base_a="$XDG_STATE_HOME/minimal"
   local nasr_log_filter="warn,minimald::rpc=info,minimald::net::answerer=info"
   local nasr_port=""
@@ -9419,7 +9420,7 @@ proof_native_answerer_survives_session_stop() {
   # client from its first start, so the interim this case hands over could
   # never exist. Remove it first.
   if [ -e "$nasr_marker" ] || [ -e "$nasr_channel" ] \
-     || [ -e /usr/local/lib/minimal/dev.minimal.zone-answerer ]; then
+     || [ -e /usr/local/lib/minimal/minzoned ]; then
     echo "removing a leftover answerer service from a prior run, so node A starts from the interim"
     ANSWERER_SERVICE_CHANNEL="$nasr_channel"
     answerer_service_teardown
@@ -9523,7 +9524,7 @@ proof_native_answerer_survives_session_stop() {
     fail
   }
 
-  # The advisory's command copies the min-answerer program found beside min
+  # The advisory's command copies the minzoned program found beside min
   # or on PATH; the answerer-service case's helper builds and stages it.
   asr_answerer_ready
   NASR_SEED_DIR="$(hook_mktemp /tmp/mnlnasr.XXXXXX)"
@@ -9560,7 +9561,7 @@ proof_native_answerer_survives_session_stop() {
   local nasr_cmd
   nasr_cmd="$(advisory_command_from "$nasr_a_err" "Configure the host's resolver")"
   case "$nasr_cmd" in
-    *zone-answerer*) ;;
+    *minzoned*) ;;
     *)
       echo "::error::node A's native session start printed no advisory carrying the answerer service step"
       echo "--- activate stderr ---"; cat "$nasr_a_err" 2>/dev/null || true
@@ -9610,9 +9611,9 @@ proof_native_answerer_survives_session_stop() {
     nasr_dump_log "$nasr_base_a"
     fail
   fi
-  if ! systemctl is-active --quiet dev.minimal.zone-answerer.socket; then
+  if ! systemctl is-active --quiet minzoned.socket; then
     echo "::error::the answerer socket unit is not active after the command"
-    systemctl status dev.minimal.zone-answerer.socket 2>&1 | tail -n 15 || true
+    systemctl status minzoned.socket 2>&1 | tail -n 15 || true
     fail
   fi
   local nasr_holders
