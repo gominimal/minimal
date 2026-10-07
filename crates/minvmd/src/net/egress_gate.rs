@@ -3767,8 +3767,10 @@ impl ReplyTables {
     /// the table's own transitions, so a diagnostic bundle's daemon log tail
     /// reads a box whose replies were or were not being admitted (R2.7).
     ///
-    /// A frame sourced from the switch subnet's Box Egress Proxy address is
-    /// refused before any record is consulted or minted: the proxy is
+    /// A frame sourced from the switch subnet's Box Egress Proxy address
+    /// records nothing: the decline comes before any record is consulted or
+    /// minted, and the frame itself is still delivered (only the reply-flow
+    /// recording is declined). The proxy is
     /// host-side infrastructure no box ever dials through, so the stream it
     /// originates must never open a reply flow the box could reverse-answer
     /// ([`gate_verdict`]'s reply-flow admit). Defense in depth — the
