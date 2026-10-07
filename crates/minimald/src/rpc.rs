@@ -5952,15 +5952,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_session_rejects_static_ingress_on_host_net_with_cli_message() {
+    async fn create_session_rejects_static_ingress_on_host_net() {
         let server = TestServer::new().await;
         let mut client = server.connect().await;
 
         // A static ingress mapping on a host-address box is a configuration the
-        // daemon refuses at create time, spelling out the same remediation the
-        // CLI gives: an own-IP box is the only mode with a published address to
-        // apply the mapping to. Built by hand to bypass the CLI-side refusal so
-        // the daemon path itself is what is exercised.
+        // daemon refuses at create time, naming the policy field and the box's
+        // mode (not a CLI flag: any client may send this): an own-IP box is the
+        // only mode with a published address to apply the mapping to. Built by
+        // hand to bypass the CLI-side refusal so the daemon path itself is what
+        // is exercised.
         let ingress = IngressPolicy {
             port_mappings: vec![PortMapping {
                 external_port: 18080,
@@ -5987,8 +5988,8 @@ mod tests {
         assert_eq!(
             resp,
             Errorable::Err {
-                error: "--ingress needs --network own_ip (this box is --network host_ip): only \
-                        an own-IP box has a published address to apply it to"
+                error: "ingress port mappings need network mode own_ip (this box is host_ip): \
+                        only an own-IP box has a published address to apply them to"
                     .to_string()
             }
         );

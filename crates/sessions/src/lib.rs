@@ -482,9 +482,10 @@ pub fn egress_deny_all_opt_out_from_raw(raw: Option<&str>) -> bool {
 /// CLI's `--dynamic-range` flag, so the two can never disagree.
 pub const MIN_DYNAMIC_INGRESS_PORT: u16 = 1024;
 
-/// The `--network` value naming `mode`, so a policy refusal names the box's
-/// mode in the vocabulary its remediation uses.
-fn network_flag_value(mode: NetworkMode) -> &'static str {
+/// The word naming `mode` (`none`, `host_ip`, `own_ip`): the spec's and the
+/// CLI's vocabulary, never Rust `Debug`. A policy refusal names the box's mode
+/// with it.
+fn network_mode_word(mode: NetworkMode) -> &'static str {
     match mode {
         NetworkMode::NoNet => "none",
         NetworkMode::HostNet => "host_ip",
@@ -494,7 +495,7 @@ fn network_flag_value(mode: NetworkMode) -> &'static str {
 
 /// The refusal for a non-empty `ingress` on a box that is not own-IP: a
 /// dynamic declaration (a range or a non-deny stance) names the dynamic
-/// flags, otherwise the static mapping names `--ingress`. The dynamic check
+/// fields, otherwise the refusal names the port mappings. The dynamic check
 /// comes first, in the same order as the CLI's refusals, so a policy carrying
 /// both gets the same first complaint from either surface.
 fn ingress_requires_own_ip(ingress: &IngressPolicy, mode: NetworkMode) -> PolicyError {
@@ -520,22 +521,23 @@ pub enum PolicyError {
     #[error("egress policy is only valid for an own-IP or host-address PTask, not {mode:?}")]
     EgressRequiresNetwork { mode: NetworkMode },
     /// A static ingress port mapping was set on a `PTask` that is not
-    /// [`NetworkMode::OwnIp`]. Worded like the CLI's `--ingress` refusal so
-    /// both surfaces name the same remediation.
+    /// [`NetworkMode::OwnIp`]. Names the policy fields and the mode word, not
+    /// CLI flags: every client reads this refusal, and the CLI names its own
+    /// flags in a refusal of its own before the request is sent.
     #[error(
-        "--ingress needs --network own_ip (this box is --network {}): only an own-IP box \
-         has a published address to apply it to",
-        network_flag_value(*.mode)
+        "ingress port mappings need network mode own_ip (this box is {}): only an own-IP \
+         box has a published address to apply them to",
+        network_mode_word(*.mode)
     )]
     IngressRequiresOwnIp { mode: NetworkMode },
     /// A dynamic ingress declaration (a non-deny `dynamic_ingress` stance or a
     /// `dynamic_allowed_range`), with or without a static mapping, was set on a `PTask`
-    /// that is not [`NetworkMode::OwnIp`]. Worded like the CLI's
-    /// `--dynamic-ingress`/`--dynamic-range` refusal.
+    /// that is not [`NetworkMode::OwnIp`]. Neutral wording, as for
+    /// [`PolicyError::IngressRequiresOwnIp`].
     #[error(
-        "--dynamic-ingress and --dynamic-range need --network own_ip (this box is \
-         --network {}): only an own-IP box has a published address to apply them to",
-        network_flag_value(*.mode)
+        "ingress dynamic_ingress and dynamic_allowed_range need network mode own_ip (this \
+         box is {}): only an own-IP box has a published address to apply them to",
+        network_mode_word(*.mode)
     )]
     DynamicIngressRequiresOwnIp { mode: NetworkMode },
     /// An ingress port mapping used a transport gvproxy's forwarder cannot
@@ -1424,10 +1426,10 @@ mod tests {
     }
 
     #[test]
-    fn own_ip_refusals_name_the_flag_that_caused_them() {
-        // A static mapping names `--ingress`; a dynamic-only declaration names
-        // the dynamic flags, never `--ingress`. Both name the box's mode in
-        // `--network` vocabulary.
+    fn own_ip_refusals_name_the_fields_that_caused_them() {
+        // A static mapping names the port mappings; a dynamic-only declaration
+        // names the dynamic fields. Both name the box's mode as a word and no
+        // CLI flag.
         let static_ingress = IngressPolicy {
             port_mappings: vec![PortMapping {
                 external_port: 18080,
@@ -1445,8 +1447,8 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             err.to_string(),
-            "--ingress needs --network own_ip (this box is --network host_ip): only an \
-             own-IP box has a published address to apply it to"
+            "ingress port mappings need network mode own_ip (this box is host_ip): only an \
+             own-IP box has a published address to apply them to"
         );
 
         let range_only = IngressPolicy {
@@ -1468,12 +1470,12 @@ mod tests {
         );
         assert_eq!(
             err.to_string(),
-            "--dynamic-ingress and --dynamic-range need --network own_ip (this box is \
-             --network none): only an own-IP box has a published address to apply them to"
+            "ingress dynamic_ingress and dynamic_allowed_range need network mode own_ip (this \
+             box is none): only an own-IP box has a published address to apply them to"
         );
 
         // A static mapping alongside a dynamic declaration names the dynamic
-        // flags first, matching the CLI's check order.
+        // fields first, matching the CLI's check order.
         let mixed = IngressPolicy {
             port_mappings: vec![PortMapping {
                 external_port: 18080,
