@@ -351,10 +351,15 @@ mod tests {
             panic!("finish failed");
         });
 
-        assert!(matches!(
-            AttrValue::from_term(&term, &mut program),
-            Err(Error::Nickel(_))
-        ));
+        let err = AttrValue::from_term(&term, &mut program).expect_err("element contract");
+        assert!(matches!(err, Error::Nickel(_)), "got {err:?}");
+
+        // The element contract fired, and its report points at the element.
+        let mut buf = codespan_reporting::term::termcolor::Buffer::no_color();
+        err.report_to(&mut buf);
+        let out = String::from_utf8(buf.into_inner()).unwrap();
+        assert!(out.contains("contract broken"), "report: {out}");
+        assert!(out.contains("[42]"), "report: {out}");
     }
 
     fn decode_src(src: &str) -> Result<Option<AttrValue>, Error> {
