@@ -1712,8 +1712,21 @@ proof_own_ip_egress_declared_and_enforced() {
     cat "$WORK/egress-announce.err" 2>/dev/null || true
     fail
   fi
-  if ! grep -q -- "--egress-deny-all-opt-out" "$WORK/egress-announce.err"; then
-    echo "::error::the deny-all announcement did not name the opt-out flag"
+  # A VM-backed lane names the VM host's variable, never the native flag:
+  # the flag does not reach the guest's egress default.
+  if [ "$min_daemon" = minvmd ]; then
+    if ! grep -qF -- "MINVMD_EGRESS_DENY_ALL_OPT_OUT=1" "$WORK/egress-announce.err"; then
+      echo "::error::the deny-all announcement did not name MINVMD_EGRESS_DENY_ALL_OPT_OUT=1 (VM lane)"
+      cat "$WORK/egress-announce.err" 2>/dev/null || true
+      fail
+    fi
+    if grep -qF -- "--egress-deny-all-opt-out" "$WORK/egress-announce.err"; then
+      echo "::error::the VM-lane deny-all announcement named the native --egress-deny-all-opt-out flag"
+      cat "$WORK/egress-announce.err" 2>/dev/null || true
+      fail
+    fi
+  elif ! grep -qF -- "--egress-deny-all-opt-out" "$WORK/egress-announce.err"; then
+    echo "::error::the deny-all announcement did not name the --egress-deny-all-opt-out flag"
     cat "$WORK/egress-announce.err" 2>/dev/null || true
     fail
   fi

@@ -733,8 +733,9 @@ pub struct ClientBoxSpec {
     /// expanded them.
     pub ingress_ports: Vec<u16>,
     /// The box's egress policy, as the client declared it. Absent compiles
-    /// the allow-all default, the same meaning the create request's absent
-    /// policy carries.
+    /// the egress default the registry's phase and opt-out resolve
+    /// (`sessions::effective_egress`), the same meaning the create request's
+    /// absent policy carries in the guest.
     pub egress: Option<EgressPolicy>,
     /// The box's declaration of a credentialed upstream (NET-134), carried
     /// from the session's policy: `Some` makes the Box Egress Proxy's
@@ -1842,6 +1843,20 @@ pub struct BoxRegistry {
     asks: Arc<Mutex<AskBook>>,
     /// The ask verbs' connection gauges (NET-045), shared by every clone.
     ask_gauges: Arc<AskGauges>,
+    /// The egress default's rollout phase a client box with no `egress`
+    /// section is compiled under: the gate's own phase
+    /// ([`crate::net::egress_gate::UNREGISTERED_SOURCE_PHASE`]), so the row's
+    /// frame half and the gate's publish half read one constant.
+    egress_default_phase: sessions::EgressDefaultPhase,
+    /// The operator's deny-all opt-out (NET-077), read from
+    /// `MINVMD_EGRESS_DENY_ALL_OPT_OUT` by the supervisor: with it set, a
+    /// client box with no `egress` section keeps the shipped allow-all in
+    /// every phase — the same default the guest daemon is handed on its boot
+    /// line, so the host gate never denies what the guest allows. That
+    /// agreement also needs this registry's phase to match the guest's
+    /// (`sessions::EGRESS_DEFAULT_PHASE`); if the two constants diverge, the
+    /// stricter side wins.
+    egress_deny_all_opt_out: bool,
 }
 
 /// A clone shares the live rows, the allocation cursors, and the withdrawal
@@ -1867,6 +1882,8 @@ impl Clone for BoxRegistry {
             attachments: self.attachments.clone(),
             asks: Arc::clone(&self.asks),
             ask_gauges: Arc::clone(&self.ask_gauges),
+            egress_default_phase: self.egress_default_phase,
+            egress_deny_all_opt_out: self.egress_deny_all_opt_out,
         }
     }
 }
@@ -1898,7 +1915,32 @@ impl BoxRegistry {
             attachments: None,
             asks: Arc::new(Mutex::new(AskBook::default())),
             ask_gauges: Arc::new(AskGauges::default()),
+            egress_default_phase: crate::net::egress_gate::UNREGISTERED_SOURCE_PHASE
+                .into_sessions_phase(),
+            egress_deny_all_opt_out: false,
         }
+    }
+
+    /// Sets the operator's deny-all opt-out (NET-077) this registry compiles
+    /// a client box with no `egress` section under: `true` keeps the shipped
+    /// allow-all whatever the phase, `false` (the default) lets the phase
+    /// decide. The supervisor passes the value it read from
+    /// `MINVMD_EGRESS_DENY_ALL_OPT_OUT`, the same one the VMM child hands the
+    /// guest daemon. Returns `self`, for the supervisor's call chain.
+    #[must_use]
+    pub fn with_egress_deny_all_opt_out(mut self, opt_out: bool) -> Self {
+        self.egress_deny_all_opt_out = opt_out;
+        self
+    }
+
+    /// Builds this registry under the egress default's other phase arm, for
+    /// the tests that pin what an undeclared row compiles to once the
+    /// default is in force — the arm the shipped constant flips onto.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_egress_default_phase(mut self, phase: sessions::EgressDefaultPhase) -> Self {
+        self.egress_default_phase = phase;
+        self
     }
 
     /// Hands this registry the proxy's attachment table to feed
@@ -2265,7 +2307,23 @@ impl BoxRegistry {
             .ok_or(AllocationError::SwitchExhausted)?;
         let mut registration = BoxRegistration::new(spec.name, switch_addr, loopback_addr)
             .with_admitted_ports(spec.ingress_ports);
-        if let Some(policy) = spec.egress {
+        // A client box is an own-address box (only those register), so an
+        // absent `egress` section is the egress default's to fill, exactly as
+        // the guest daemon fills it (NET-074/NET-077): deny-all once the
+        // default is in force, unless the operator opted out — the shipped
+        // allow-all otherwise. The row is compiled from what the box is held
+        // to, so the host gate and the guest's gate agree.
+        let egress = match sessions::effective_egress(
+            spec.egress.as_ref(),
+            sessions::NetworkMode::OwnIp,
+            self.egress_default_phase,
+            self.egress_deny_all_opt_out,
+        ) {
+            sessions::EffectiveEgress::Declared(policy) => Some(policy),
+            sessions::EffectiveEgress::DenyAll => Some(EgressPolicy::deny_all()),
+            sessions::EffectiveEgress::AllowAll => None,
+        };
+        if let Some(policy) = egress {
             registration = registration.with_egress_policy(policy);
         }
         if let Some(declaration) = spec.credentialed_upstream {
@@ -3407,6 +3465,82 @@ mod tests {
             ),
             "the re-registration's reach is what the gate now decides by"
         );
+    }
+
+    /// NET-074/NET-077 at the host gate: a client box with no `egress`
+    /// section is compiled under the egress default's phase and the
+    /// operator's opt-out — the same pair the guest daemon resolves it by —
+    /// so an opted-out VM host never denies at the host what the guest
+    /// allows. Announced, it allows all; in force, it denies all unless the
+    /// opt-out is set, when it keeps the shipped allow-all. A declared
+    /// section is carried verbatim in every arm.
+    #[test]
+    fn undeclared_row_default_follows_phase_and_opt_out() {
+        use sessions::EgressDefaultPhase::{Announced, InForce};
+
+        let reach_to = |phase, opt_out, egress: Option<EgressPolicy>, dest: [u8; 4]| {
+            let registry = BoxRegistry::new(SUBNET)
+                .with_egress_default_phase(phase)
+                .with_egress_deny_all_opt_out(opt_out);
+            let row = registry
+                .register_client_box(ClientBoxSpec {
+                    name: "web".to_string(),
+                    ingress_ports: Vec::new(),
+                    egress,
+                    credentialed_upstream: None,
+                    dynamic_ingress: None,
+                    dynamic_allowed_range: None,
+                })
+                .expect("the default plan hands out a client box");
+            let outside = sessions::core::egress::summarize(&ipv4_frame(
+                row.switch_addr().octets(),
+                6,
+                dest,
+                443,
+            ));
+            matches!(
+                sessions::core::egress::verdict(&outside, row.egress()),
+                FrameVerdict::Admit
+            )
+        };
+        let reach = |phase, opt_out, egress| reach_to(phase, opt_out, egress, [203, 0, 113, 7]);
+
+        assert!(
+            reach(Announced, false, None),
+            "announced, an undeclared box keeps the shipped allow-all"
+        );
+        assert!(
+            reach(InForce, true, None),
+            "in force but opted out (NET-077), an undeclared box keeps allow-all"
+        );
+        assert!(
+            !reach(InForce, false, None),
+            "in force and not opted out (NET-074), an undeclared box reaches nothing"
+        );
+
+        // A declaration is the box's own and survives every arm untouched.
+        let lan_only = EgressPolicy {
+            allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
+            ..EgressPolicy::default()
+        };
+        // Both directions are pinned: the declared allow is still admitted
+        // (deny-all would refuse it) and the outside stays refused
+        // (allow-all would admit it), so neither default can stand in.
+        for (phase, opt_out) in [
+            (Announced, false),
+            (Announced, true),
+            (InForce, false),
+            (InForce, true),
+        ] {
+            assert!(
+                reach_to(phase, opt_out, Some(lan_only.clone()), [10, 1, 2, 3]),
+                "a declared LAN-only box still reaches the LAN under {phase:?}, opt-out {opt_out}"
+            );
+            assert!(
+                !reach(phase, opt_out, Some(lan_only.clone())),
+                "a declared LAN-only box stays LAN-only under {phase:?}, opt-out {opt_out}"
+            );
+        }
     }
 
     /// The host hands registered boxes only from the hand-out run — the plan
