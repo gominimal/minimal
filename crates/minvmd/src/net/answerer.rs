@@ -753,9 +753,27 @@ impl AddressBook {
     }
 }
 
-/// The canonical zone name of a box a node names by its registry name.
+/// The canonical zone name of a box a node names by its registry name: the
+/// key the address book holds a box's address under, built from
+/// [`canonical_box_name`], so every name that folds to the same box shares
+/// one address.
 fn box_zone_name(name: &str) -> String {
-    canonical(&format!("{name}.{}", zone_answer::ZONE_APEX))
+    canonical(&format!(
+        "{}.{}",
+        canonical_box_name(name),
+        zone_answer::ZONE_APEX
+    ))
+}
+
+/// The one form a box's registry name is compared in wherever it keys the
+/// box's published address: the answerer's allocations and releases
+/// ([`box_zone_name`]) and the box registry's in-flight registrations
+/// ([`crate::box_registry::BoxRegistry::begin_registration`]). Names are
+/// DNS labels, so the fold is ASCII lower-case: "Web" and "web" are one
+/// box to the answerer, and must be one to everything its hold is checked
+/// against.
+pub(crate) fn canonical_box_name(name: &str) -> String {
+    name.to_ascii_lowercase()
 }
 
 /// The rows other VM host daemons published over the channel, keyed by the

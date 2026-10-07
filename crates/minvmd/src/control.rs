@@ -4874,16 +4874,26 @@ mod tests {
     /// it freed, if it held one.
     type Releases = Arc<Mutex<Vec<(String, Option<Ipv4Addr>)>>>;
 
-    /// A host door over a test answerer whose first allocation's reply is
-    /// held until the test opens its gate, with every release recorded.
+    /// The gate the next allocation's reply is held behind: a channel the
+    /// answerer signals when it holds a reply, and the receiver it waits on.
+    type AllocationGate =
+        Arc<Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>>;
+
+    /// A host door over a test answerer that holds an armed allocation's
+    /// reply until the test lets it go, with every release recorded.
     struct SlowAllocation {
         _dir: tempfile::TempDir,
         sock_path: PathBuf,
         boxes: BoxRegistry,
         answerer: AnswererStatus,
-        allocation_entered: std::sync::mpsc::Receiver<()>,
-        release_allocation: std::sync::mpsc::Sender<()>,
+        gate: AllocationGate,
         releases: Releases,
+    }
+
+    /// A registration whose allocation reply is held.
+    struct HeldRegistration {
+        registering: JoinHandle<std::io::Result<BoxControlReply>>,
+        release: std::sync::mpsc::Sender<()>,
     }
 
     impl SlowAllocation {
@@ -4891,11 +4901,10 @@ mod tests {
             let dir = tempfile::TempDir::new().expect("temp dir");
             let sock_path = dir.path().join(CONTROL_SOCK_FILE);
             let boxes = BoxRegistry::new(SUBNET);
-            let (entered, allocation_entered) = std::sync::mpsc::channel::<()>();
-            let (release_allocation, allocation_held) = std::sync::mpsc::channel::<()>();
-            let gate = Mutex::new(Some((entered, allocation_held)));
+            let gate: AllocationGate = Arc::new(Mutex::new(None));
             let releases: Releases = Arc::new(Mutex::new(Vec::new()));
             let answerer = {
+                let gate = Arc::clone(&gate);
                 let releases = Arc::clone(&releases);
                 AnswererStatus::allocating_for_tests_with(
                     "control-test-node",
@@ -4932,38 +4941,47 @@ mod tests {
                 sock_path,
                 boxes,
                 answerer,
-                allocation_entered,
-                release_allocation,
+                gate,
                 releases,
             }
         }
 
-        /// Register `request` on a thread of its own, returning once its
-        /// allocation is held.
-        fn register_held(
-            &self,
-            request: &RegisterBoxRequest,
-        ) -> JoinHandle<std::io::Result<BoxControlReply>> {
+        /// Register `name` on a thread of its own, returning once the
+        /// answerer holds its allocation's reply.
+        fn register_held(&self, name: &str) -> HeldRegistration {
+            let (entered, allocation_entered) = std::sync::mpsc::channel();
+            let (release, held) = std::sync::mpsc::channel();
+            *self.gate.lock().expect("gate") = Some((entered, held));
             let registering = {
                 let sock_path = self.sock_path.clone();
-                let request = request.clone();
+                let request = box_request(name);
                 std::thread::spawn(move || register(&sock_path, &request))
             };
-            self.allocation_entered
+            allocation_entered
                 .recv_timeout(ASK_WAIT)
                 .expect("the registration reaches the allocation");
-            registering
+            HeldRegistration {
+                registering,
+                release,
+            }
         }
 
-        /// Withdraw `name` while no row is held for it yet: the goal state
-        /// already holding, answered without waiting on the allocation.
-        fn withdraw_unregistered(&self, name: &str) {
+        /// Register `name` and expect its row.
+        fn register_live(&self, name: &str) -> RegisteredBox {
+            handed(
+                register(&self.sock_path, &box_request(name))
+                    .expect("the registration is answered"),
+            )
+        }
+
+        /// Withdraw `name` at `switch_address` and `loopback_address`.
+        fn withdraw(&self, name: &str, switch_address: Ipv4Addr, loopback_address: Ipv4Addr) {
             let withdrawn = control(
                 &self.sock_path,
                 &BoxControlRequest::Withdraw(WithdrawBoxRequest {
                     name: name.to_string(),
-                    switch_address: Ipv4Addr::new(100, 64, 0, 200),
-                    loopback_address: Ipv4Addr::new(127, 64, 0, 2),
+                    switch_address,
+                    loopback_address,
                 }),
             )
             .expect("the withdrawal is answered without waiting on the allocation");
@@ -4973,36 +4991,47 @@ mod tests {
             );
         }
 
-        /// Let the held allocation's reply go and answer the registration.
-        fn finish(
-            &self,
-            registering: JoinHandle<std::io::Result<BoxControlReply>>,
-        ) -> BoxControlReply {
-            self.release_allocation.send(()).expect("the reply waits");
-            registering
-                .join()
-                .expect("the registering client ends")
-                .expect("the registration is answered")
+        /// Withdraw `name` while no row is held for it yet: the goal state
+        /// already holding.
+        fn withdraw_unregistered(&self, name: &str) {
+            self.withdraw(
+                name,
+                Ipv4Addr::new(100, 64, 0, 200),
+                Ipv4Addr::new(127, 64, 0, 2),
+            );
         }
 
-        /// The releases of `name` the answerer has served so far. A probe
-        /// allocation first drains every command queued ahead of it: the
-        /// book serves them in order.
+        /// Let the held allocation's reply go and answer the registration,
+        /// with how long the answer took from the reply's release.
+        fn finish(&self, held: HeldRegistration) -> (BoxControlReply, Duration) {
+            let released_at = std::time::Instant::now();
+            held.release.send(()).expect("the reply waits");
+            let reply = held
+                .registering
+                .join()
+                .expect("the registering client ends")
+                .expect("the registration is answered");
+            (reply, released_at.elapsed())
+        }
+
+        /// The releases of names that fold to `name` the answerer has served
+        /// so far. A probe allocation first drains every command queued
+        /// ahead of it: the book serves them in order.
         fn releases_of(&self, name: &str) -> Vec<Option<Ipv4Addr>> {
             let _ = self.answerer.allocate("release-probe");
             self.releases
                 .lock()
                 .expect("releases")
                 .iter()
-                .filter(|(released, _)| released == name)
+                .filter(|(released, _)| released.eq_ignore_ascii_case(name))
                 .map(|(_, freed)| *freed)
                 .collect()
         }
     }
 
-    fn web_request() -> RegisterBoxRequest {
+    fn box_request(name: &str) -> RegisterBoxRequest {
         RegisterBoxRequest {
-            name: "web".to_string(),
+            name: name.to_string(),
             ingress_ports: Vec::new(),
             egress: None,
             credentialed_upstream: None,
@@ -5011,14 +5040,22 @@ mod tests {
         }
     }
 
-    fn assert_withdrawn_while_allocating(reply: &BoxControlReply) {
+    /// The registration was refused as withdrawn while allocating — not as
+    /// a revocation still pending — and without waiting out the revocation
+    /// bound.
+    fn assert_withdrawn_while_allocating(reply: &BoxControlReply, took: Duration) {
         assert!(
             matches!(
                 reply,
                 BoxControlReply::Error { error }
-                    if error == "the box was withdrawn while its address was being allocated"
+                    if *error == AllocationError::WithdrawnWhileAllocating.to_string()
             ),
-            "the registration the withdrawal raced is refused, got {reply:?}"
+            "the registration the withdrawal raced is refused as withdrawn while allocating, \
+             got {reply:?}"
+        );
+        assert!(
+            took < crate::box_registry::REVOCATION_WAIT / 5,
+            "the refusal waited {took:?}, near the revocation bound"
         );
     }
 
@@ -5029,10 +5066,10 @@ mod tests {
     #[test]
     fn registration_withdrawn_while_allocating_is_refused() {
         let host = SlowAllocation::start();
-        let registering = host.register_held(&web_request());
+        let held = host.register_held("web");
         host.withdraw_unregistered("web");
-        let refused = host.finish(registering);
-        assert_withdrawn_while_allocating(&refused);
+        let (refused, took) = host.finish(held);
+        assert_withdrawn_while_allocating(&refused, took);
         assert!(
             host.boxes.row_by_name("web").is_none(),
             "a refused registration writes no row"
@@ -5053,9 +5090,7 @@ mod tests {
             .expect("the address the registration drew was released");
 
         // The box created again takes the freed address and fills its row.
-        let again = handed(
-            register(&host.sock_path, &web_request()).expect("the registration is answered"),
-        );
+        let again = host.register_live("web");
         assert_eq!(again.loopback_address, freed);
         assert!(host.boxes.row_by_name("web").is_some());
     }
@@ -5067,17 +5102,15 @@ mod tests {
     #[test]
     fn refused_registration_keeps_the_live_rows_address() {
         let host = SlowAllocation::start();
-        let stale = host.register_held(&web_request());
+        let stale = host.register_held("web");
         host.withdraw_unregistered("web");
 
         // The box is created again while the stale registration's reply is
         // still held, and its row lands.
-        let live = handed(
-            register(&host.sock_path, &web_request()).expect("the registration is answered"),
-        );
+        let live = host.register_live("web");
 
-        let refused = host.finish(stale);
-        assert_withdrawn_while_allocating(&refused);
+        let (refused, took) = host.finish(stale);
+        assert_withdrawn_while_allocating(&refused, took);
         let row = host.boxes.row_by_name("web").expect("the live row stands");
         assert_eq!(row.loopback_addr(), live.loopback_address);
 
@@ -5103,5 +5136,85 @@ mod tests {
             !host.boxes.tracks_registrations_of("web"),
             "the name's entry goes once both registrations ended"
         );
+    }
+
+    /// The answerer allocates per canonical name, so a withdrawal of "web"
+    /// refuses a registration of "Web" still allocating: one box to the
+    /// answerer is one box to the withdrawal generation.
+    #[test]
+    fn mixed_case_registration_withdrawn_while_allocating_is_refused() {
+        let host = SlowAllocation::start();
+        let held = host.register_held("Web");
+        host.withdraw_unregistered("web");
+        let (refused, took) = host.finish(held);
+        assert_withdrawn_while_allocating(&refused, took);
+        assert!(host.boxes.row_by_name("Web").is_none());
+        assert!(host.boxes.row_by_name("web").is_none());
+        assert!(!host.boxes.tracks_registrations_of("Web"));
+        let releases = host.releases_of("web");
+        assert_eq!(
+            releases.len(),
+            2,
+            "the withdrawal and the refusal each release: {releases:?}"
+        );
+        assert!(releases.iter().any(Option::is_some));
+    }
+
+    /// A live row named "WEB" holds its address against a refused
+    /// registration of "Web": the ownership check compares names in the
+    /// answerer's canonical form.
+    #[test]
+    fn mixed_case_live_row_keeps_the_address() {
+        let host = SlowAllocation::start();
+        let stale = host.register_held("Web");
+        host.withdraw_unregistered("web");
+        let live = host.register_live("WEB");
+
+        let (refused, took) = host.finish(stale);
+        assert_withdrawn_while_allocating(&refused, took);
+        let row = host.boxes.row_by_name("WEB").expect("the live row stands");
+        assert_eq!(row.loopback_addr(), live.loopback_address);
+        let releases = host.releases_of("web");
+        assert_eq!(
+            releases.len(),
+            1,
+            "only the withdrawal released: {releases:?}"
+        );
+        assert_eq!(
+            host.answerer.allocate("web"),
+            Ok(live.loopback_address),
+            "the answerer still holds the live row's address"
+        );
+        assert!(!host.boxes.tracks_registrations_of("web"));
+        assert!(!host.boxes.tracks_registrations_of("WEB"));
+    }
+
+    /// A registration raced by its box's withdrawal is refused at once as
+    /// withdrawn while allocating, even when the withdrawal's revocation
+    /// still holds the address: the generation check runs before the
+    /// revocation wait, which would otherwise run out its bound and answer
+    /// a pending revocation instead.
+    #[test]
+    fn raced_registration_is_refused_without_waiting_out_the_revocation() {
+        let host = SlowAllocation::start();
+        // A subscriber that never acts holds every withdrawn row's
+        // revocation, the way a gate still unbinding forwards does.
+        let table = host.boxes.table();
+        let _revocations = table.subscribe_row_withdrawals();
+        let old = host.register_live("web");
+
+        // The box's next registration draws the same address (the
+        // answerer's hold is per name) and is held in the allocation.
+        let held = host.register_held("web");
+        host.withdraw("web", old.switch_address, old.loopback_address);
+        assert!(
+            table.revocation_pending(old.loopback_address.octets()),
+            "the withdrawn row's revocation holds the address"
+        );
+
+        let (refused, took) = host.finish(held);
+        assert_withdrawn_while_allocating(&refused, took);
+        assert!(host.boxes.row_by_name("web").is_none());
+        assert!(!host.boxes.tracks_registrations_of("web"));
     }
 }
