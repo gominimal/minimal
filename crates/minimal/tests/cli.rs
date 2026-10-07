@@ -2653,8 +2653,23 @@ async fn deny_all_announcement_printed() {
     // The other phase, gated by construction: once the default is in
     // force the change is no longer coming, and nothing prints.
     assert!(
-        deny_all_default_notice(sessions::EgressDefaultPhase::InForce).is_none(),
+        deny_all_default_notice(sessions::EgressDefaultPhase::InForce, false).is_none()
+            && deny_all_default_notice(sessions::EgressDefaultPhase::InForce, true).is_none(),
         "the notice must not print once the default is in force"
+    );
+
+    // On a VM-backed host the daemon is the VM's pid-1 and reads no flags:
+    // the remedy the notice names is the VM host daemon's variable, and the
+    // native flag is not offered there.
+    let vm_notice = deny_all_default_notice(sessions::EgressDefaultPhase::Announced, true)
+        .expect("the notice prints on a VM-backed host while announced");
+    assert!(
+        vm_notice.contains("MINVMD_EGRESS_DENY_ALL_OPT_OUT=1"),
+        "a VM-backed host's notice must name the variable that opts it out: {vm_notice}"
+    );
+    assert!(
+        !vm_notice.contains("--egress-deny-all-opt-out"),
+        "a VM-backed host's notice must not name the native daemon's flag: {vm_notice}"
     );
 }
 

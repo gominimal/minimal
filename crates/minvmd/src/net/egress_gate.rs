@@ -3499,7 +3499,7 @@ impl UnregisteredSourcePhase {
     /// ([`EgressDefaultPhase`]): the publish half and the undeclared-row
     /// half read one phase, so T66's flip of [`UNREGISTERED_SOURCE_PHASE`]
     /// moves both at once and neither can drift ahead of the other.
-    fn into_sessions_phase(self) -> EgressDefaultPhase {
+    pub(crate) fn into_sessions_phase(self) -> EgressDefaultPhase {
         match self {
             Self::Announced => EgressDefaultPhase::Announced,
             Self::InForce => EgressDefaultPhase::InForce,

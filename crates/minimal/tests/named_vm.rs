@@ -13,16 +13,26 @@ use std::process::Command;
 /// Where the stub `minvmd` records the argv it was spawned with.
 const ARGV_RECORD_ENV: &str = "MINIMAL_TEST_MINVMD_ARGV";
 
+/// The variable the operator opts a VM out of the deny-all egress default
+/// with (NET-077); the stub records the value it inherited beside its argv.
+const EGRESS_OPT_OUT_ENV: &str = "MINVMD_EGRESS_DENY_ALL_OPT_OUT";
+
 /// Writes a `minvmd` stub into `bin_dir` that records its argv to the file
-/// named by [`ARGV_RECORD_ENV`] and exits 0. Autospawn treats exit 0 as "the
-/// VM is serving", so the command under test then fails at its socket connect
-/// — the fact this file asserts on is the argv, recorded before that failure.
+/// named by [`ARGV_RECORD_ENV`] — and the [`EGRESS_OPT_OUT_ENV`] value it
+/// inherited, or `<unset>`, to the same path plus `.opt-out` — and exits 0.
+/// Autospawn treats exit 0 as "the VM is serving", so the command under test
+/// then fails at its socket connect — the facts this file asserts on are
+/// recorded before that failure.
 fn stub_minvmd(bin_dir: &Path) {
     std::fs::create_dir_all(bin_dir).unwrap();
     let stub = bin_dir.join("minvmd");
     std::fs::write(
         &stub,
-        format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"${{{ARGV_RECORD_ENV}}}\"\nexit 0\n"),
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"${{{ARGV_RECORD_ENV}}}\"\n\
+             printf '%s' \"${{{EGRESS_OPT_OUT_ENV}-<unset>}}\" > \"${{{ARGV_RECORD_ENV}}}.opt-out\"\n\
+             exit 0\n"
+        ),
     )
     .unwrap();
     use std::os::unix::fs::PermissionsExt as _;
@@ -37,6 +47,16 @@ fn stub_minvmd(bin_dir: &Path) {
 /// status is the caller's to read — every command here ends in a connect
 /// failure once the stub has been spawned, which is the expected shape.
 fn run_min(dir: &Path, args: &[&str]) -> (std::process::Output, PathBuf) {
+    run_min_with_env(dir, args, &[])
+}
+
+/// [`run_min`] with extra variables set on the `min` process, for the
+/// assertions that read what the spawned daemon inherited.
+fn run_min_with_env(
+    dir: &Path,
+    args: &[&str],
+    envs: &[(&str, &str)],
+) -> (std::process::Output, PathBuf) {
     let record = dir.join("argv.txt");
     let bin_dir = dir.join("stub-bin");
     stub_minvmd(&bin_dir);
@@ -55,6 +75,7 @@ fn run_min(dir: &Path, args: &[&str]) -> (std::process::Output, PathBuf) {
         // environment, both of which the child inherits.
         .env("PATH", path)
         .env(ARGV_RECORD_ENV, &record)
+        .envs(envs.iter().copied())
         // Piped, so nothing this test runs needs (or gets) a terminal.
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -158,5 +179,25 @@ fn default_vm_autospawn_is_unchanged() {
     assert!(
         !tmp.path().join("providers/local-minvmd0/alpha").exists(),
         "no per-name subdirectory may appear without --vm"
+    );
+}
+
+/// The operator's egress opt-out (NET-077) set on the `min` command reaches
+/// the `minvmd` it autospawns: the spawn inherits `min`'s environment, so the
+/// supervisor — and the VMM child and guest daemon after it — run the
+/// default the operator chose.
+#[test]
+fn egress_opt_out_reaches_autospawned_minvmd() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (output, record) = run_min_with_env(
+        tmp.path(),
+        &["--provider", "local-minvmd"],
+        &[(EGRESS_OPT_OUT_ENV, "1")],
+    );
+    recorded_argv(&output, &record);
+    assert_eq!(
+        std::fs::read_to_string(format!("{}.opt-out", record.display())).unwrap(),
+        "1",
+        "the opt-out set for `min` must reach the minvmd it spawns"
     );
 }

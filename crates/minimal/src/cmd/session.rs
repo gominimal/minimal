@@ -1291,7 +1291,10 @@ pub(crate) async fn activate_session(
     if config.network == minimald_rpc::NetworkMode::OwnIp
         && config.policy.egress.is_none()
         && created.deny_all_opt_out != Some(true)
-        && let Some(notice) = deny_all_default_notice(sessions::EGRESS_DEFAULT_PHASE)
+        && let Some(notice) = deny_all_default_notice(
+            sessions::EGRESS_DEFAULT_PHASE,
+            kind == paths::ProviderKind::Minvmd,
+        )
     {
         eprintln!("{notice}");
     }
@@ -2312,15 +2315,29 @@ pub async fn cmd_session_policy(
 /// the client, knows whether it set `--egress-deny-all-opt-out` (NET-077),
 /// so [`activate_session`] reads it off the create reply and stays silent
 /// for a deployment the change is not coming for.
-pub fn deny_all_default_notice(phase: sessions::EgressDefaultPhase) -> Option<&'static str> {
-    match phase {
-        sessions::EgressDefaultPhase::Announced => Some(
+///
+/// `vm_backed` picks the remedy the host can actually take: a native daemon
+/// takes the `--egress-deny-all-opt-out` flag, while on a VM-backed host the
+/// daemon is the VM's pid-1 and has no flags to read, so the opt-out is
+/// `MINVMD_EGRESS_DENY_ALL_OPT_OUT`, set for the VM host daemon's next start.
+pub fn deny_all_default_notice(
+    phase: sessions::EgressDefaultPhase,
+    vm_backed: bool,
+) -> Option<&'static str> {
+    match (phase, vm_backed) {
+        (sessions::EgressDefaultPhase::Announced, false) => Some(
             "Heads-up: the next release denies all external reach for an own-address \
              session that declares no egress. Declare what the session needs with the \
              activate egress flags, or start the daemon with \
              --egress-deny-all-opt-out to keep this default.",
         ),
-        sessions::EgressDefaultPhase::InForce => None,
+        (sessions::EgressDefaultPhase::Announced, true) => Some(
+            "Heads-up: the next release denies all external reach for an own-address \
+             session that declares no egress. Declare what the session needs with the \
+             activate egress flags, or restart the VM host daemon (minvmd) with \
+             MINVMD_EGRESS_DENY_ALL_OPT_OUT=1 to keep this default.",
+        ),
+        (sessions::EgressDefaultPhase::InForce, _) => None,
     }
 }
 
