@@ -819,6 +819,56 @@ pub enum AllocationError {
     WithdrawnWhileAllocating,
 }
 
+/// One box name's registration bookkeeping: how many registrations of it
+/// are in flight — between reading the generation and the end of their
+/// turn — and how many withdrawals under the name landed while they were.
+/// A registration is refused when the generation moved past the one it
+/// read ([`BoxRegistry::register_client_box_since`]).
+#[derive(Debug, Default)]
+pub struct NameRegistrations {
+    generation: u64,
+    in_flight: u32,
+}
+
+fn lock_generations(
+    generations: &Mutex<HashMap<String, NameRegistrations>>,
+) -> MutexGuard<'_, HashMap<String, NameRegistrations>> {
+    generations
+        .lock()
+        .expect("the withdrawal generations' lock is held only across a map read or update")
+}
+
+/// One registration of a box name in flight
+/// ([`BoxRegistry::begin_registration`]). Dropping it ends the count, and
+/// the name's entry goes with its last registration, so the map holds only
+/// names with a registration in flight.
+#[derive(Debug)]
+pub struct RegistrationClaim {
+    generations: Arc<Mutex<HashMap<String, NameRegistrations>>>,
+    name: String,
+    generation: u64,
+}
+
+impl RegistrationClaim {
+    /// The name's withdrawal generation when the registration began.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+impl Drop for RegistrationClaim {
+    fn drop(&mut self) {
+        let mut generations = lock_generations(&self.generations);
+        if let Some(entry) = generations.get_mut(&self.name) {
+            entry.in_flight = entry.in_flight.saturating_sub(1);
+            if entry.in_flight == 0 {
+                generations.remove(&self.name);
+            }
+        }
+    }
+}
+
 /// Why a client-driven withdrawal was refused. The pair a withdrawal
 /// presents is the proof that its client is the row's creator (T66), so a
 /// refusal is the daemon saying the proof does not match the row the
@@ -1836,14 +1886,11 @@ pub struct BoxRegistry {
     asks: Arc<Mutex<AskBook>>,
     /// The ask verbs' connection gauges (NET-045), shared by every clone.
     ask_gauges: Arc<AskGauges>,
-    /// Each box name's withdrawal generation, bumped by every path that
-    /// withdraws a row under that name, under the row lock it withdraws
-    /// under. A registration reads its name's generation before the
-    /// answerer allocates its address and is refused when it moved
-    /// ([`Self::register_client_box_since`]): a withdrawal that landed while
-    /// the address was being allocated outranks the registration it raced.
-    /// Shared by every clone.
-    withdrawal_generations: Arc<Mutex<HashMap<String, u64>>>,
+    /// The registrations in flight per box name, with the name's withdrawal
+    /// generation ([`NameRegistrations`]). Shared by every clone, and
+    /// bounded by the registrations in flight: an entry goes once its last
+    /// registration ends.
+    withdrawal_generations: Arc<Mutex<HashMap<String, NameRegistrations>>>,
     /// The egress default's rollout phase a client box with no `egress`
     /// section is compiled under: the gate's own phase
     /// ([`crate::net::egress_gate::UNREGISTERED_SOURCE_PHASE`]), so the row's
@@ -1946,27 +1993,76 @@ impl BoxRegistry {
         self
     }
 
-    /// Box `name`'s withdrawal generation: how many withdrawals under that
-    /// name this registry has applied. A registration reads it before its
-    /// address is allocated ([`Self::register_client_box_since`]).
+    /// Start a registration of box `name`: count it in flight and read the
+    /// name's withdrawal generation, before the answerer allocates its
+    /// address. The claim is held until the registration's turn ends, and
+    /// its drop ends the count — on success, refusal and panic alike.
     #[must_use]
-    pub fn withdrawal_generation(&self, name: &str) -> u64 {
-        self.generations().get(name).copied().unwrap_or(0)
+    pub fn begin_registration(&self, name: &str) -> RegistrationClaim {
+        let mut generations = self.generations();
+        let entry = generations.entry(name.to_string()).or_default();
+        entry.in_flight = entry.in_flight.saturating_add(1);
+        RegistrationClaim {
+            generations: Arc::clone(&self.withdrawal_generations),
+            name: name.to_string(),
+            generation: entry.generation,
+        }
+    }
+
+    /// Box `name`'s withdrawal generation, as an in-flight registration
+    /// compares it to the one its claim read. A name with no registration
+    /// in flight reads 0.
+    fn withdrawal_generation(&self, name: &str) -> u64 {
+        self.generations()
+            .get(name)
+            .map_or(0, |entry| entry.generation)
     }
 
     /// Bump box `name`'s withdrawal generation. Every withdrawal path calls
     /// it under the row lock it withdraws under, so a registration's check
-    /// under the same lock sees every withdrawal ordered before it.
+    /// under the same lock sees every withdrawal ordered before it. A name
+    /// with no registration in flight has nobody to tell, so nothing is
+    /// kept for it.
     fn bump_withdrawal_generation(&self, name: &str) {
-        let mut generations = self.generations();
-        let generation = generations.entry(name.to_string()).or_insert(0);
-        *generation = generation.wrapping_add(1);
+        if let Some(entry) = self.generations().get_mut(name) {
+            entry.generation = entry.generation.wrapping_add(1);
+        }
     }
 
-    fn generations(&self) -> MutexGuard<'_, HashMap<String, u64>> {
-        self.withdrawal_generations
-            .lock()
-            .expect("the withdrawal generations' lock is held only across a map read or bump")
+    /// Hand a refused registration's address back to the answerer, by
+    /// running `release`, unless something else owns it: a live row under
+    /// the claim's name, or another registration of the name still in
+    /// flight. The answerer allocates per name, so either one holds the
+    /// very address a release by name would free. Decided under the row
+    /// lock and the generations' lock, and `release` runs under both, so no
+    /// registration of the name can start between the decision and the
+    /// release. Returns whether `release` ran.
+    pub fn release_unless_owned(&self, claim: &RegistrationClaim, release: impl FnOnce()) -> bool {
+        let rows = self
+            .rows
+            .read()
+            .expect("the row lock is never held across a panic, so it cannot be poisoned");
+        let generations = self.generations();
+        let row_holds = rows.values().any(|record| record.name() == claim.name);
+        let others_in_flight = generations
+            .get(&claim.name)
+            .map_or(0, |entry| entry.in_flight.saturating_sub(1));
+        if row_holds || others_in_flight > 0 {
+            return false;
+        }
+        release();
+        true
+    }
+
+    /// Whether the registry keeps an entry for box `name`: only while a
+    /// registration of it is in flight.
+    #[cfg(test)]
+    pub(crate) fn tracks_registrations_of(&self, name: &str) -> bool {
+        self.generations().contains_key(name)
+    }
+
+    fn generations(&self) -> MutexGuard<'_, HashMap<String, NameRegistrations>> {
+        lock_generations(&self.withdrawal_generations)
     }
 
     /// Hands this registry the proxy's attachment table to feed
@@ -2312,11 +2408,13 @@ impl BoxRegistry {
     }
 
     /// [`Self::register_client_box_at`] for a registration that read its
-    /// name's [`Self::withdrawal_generation`] as `generation` before the
-    /// answerer allocated `loopback_addr`. When a withdrawal under the name
+    /// name's withdrawal generation as `generation`
+    /// ([`Self::begin_registration`]) before the answerer allocated
+    /// `loopback_addr`. When a withdrawal under the name
     /// landed since, the registration is refused with
     /// [`AllocationError::WithdrawnWhileAllocating`]: no row, no attachment,
-    /// and the caller hands the address back to the answerer.
+    /// and the caller hands the address back to the answerer unless
+    /// something else owns it ([`Self::release_unless_owned`]).
     pub fn register_client_box_since(
         &self,
         spec: ClientBoxSpec,

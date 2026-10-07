@@ -2659,21 +2659,20 @@ impl AnswererStatus {
     #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub fn allocating_for_tests(node: &str) -> Self {
-        Self::allocating_for_tests_with(node, || {}, |_, _| {})
+        Self::allocating_for_tests_with(node, || None, |_, _| {})
     }
 
-    /// [`Self::allocating_for_tests`] that runs `before_allocate` on the
-    /// book's thread ahead of answering each allocation, and `on_release`
-    /// with the box's name and the address it freed, if it held one, after
-    /// each release: a test holds an allocation
-    /// in flight by blocking in the first, and sees the releases through the
-    /// second. Releases queue behind a held allocation, as they do behind a
-    /// slow answerer.
+    /// [`Self::allocating_for_tests`] that asks `hold_reply` after each
+    /// allocation, and runs `on_release` with the box's name and the address
+    /// it freed, if it held one, after each release. When `hold_reply`
+    /// hands back a gate, the allocation's reply is held until the gate
+    /// opens (a send or a drop) while the book goes on serving: a slow
+    /// answerer's late reply, the address already recorded against the box.
     #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub fn allocating_for_tests_with(
         node: &str,
-        mut before_allocate: impl FnMut() + Send + 'static,
+        mut hold_reply: impl FnMut() -> Option<std::sync::mpsc::Receiver<()>> + Send + 'static,
         mut on_release: impl FnMut(&str, Option<Ipv4Addr>) + Send + 'static,
     ) -> Self {
         let status = Self::starting();
@@ -2684,8 +2683,18 @@ impl AnswererStatus {
             while let Ok(command) = commands.recv() {
                 match command {
                     HandoverCommand::Allocate { name, reply } => {
-                        before_allocate();
-                        let _ = reply.send(book.allocate(&node, &box_zone_name(&name)));
+                        let answer = book.allocate(&node, &box_zone_name(&name));
+                        match hold_reply() {
+                            Some(gate) => {
+                                std::thread::spawn(move || {
+                                    let _ = gate.recv();
+                                    let _ = reply.send(answer);
+                                });
+                            }
+                            None => {
+                                let _ = reply.send(answer);
+                            }
+                        }
                     }
                     HandoverCommand::ReleaseAddress { name } => {
                         let released = book.release(&node, &box_zone_name(&name));
