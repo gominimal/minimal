@@ -396,7 +396,7 @@ async fn serve_create_session(
                     tracing::info!(
                         session_id = %id,
                         session_name = session_name.as_deref().unwrap_or(ANONYMOUS_SESSION),
-                        network = network_mode_label(network),
+                        network_mode = network_mode_label(network),
                         egress_allow_subnets = egress_counts.allow_subnets,
                         egress_allow_protocols = egress_counts.allow_protocols,
                         egress_allow_dns_hosts = egress_counts.allow_dns_hosts,
@@ -5940,8 +5940,10 @@ mod tests {
         let capture = crate::test_harness::captured_log();
 
         // One box per mode: the default (host-address), a NoNet box, and an
-        // own-address box. Each create succeeds here because no egress policy
-        // rides a NoNet box and the native test host is not a microVM.
+        // own-address box. Each create succeeds because none declares egress
+        // (so the unenforceable-declaration gate never fires) and the native
+        // test host is not a microVM (so an own-address box needs no handed
+        // addresses).
         let host_ip = req("host-address", "/uwu");
         let host_id = client.call::<CreateSession>(&host_ip).await.unwrap().id;
 
@@ -5963,7 +5965,7 @@ mod tests {
                 log.lines().any(|line| {
                     line.contains("session created")
                         && line.contains(&format!("session_id={id}"))
-                        && line.contains(&format!("network=\"{spelling}\""))
+                        && line.contains(&format!("network_mode=\"{spelling}\""))
                 }),
                 "the session created line for {id} must name its network mode \
                  {spelling}, got: {log}"
