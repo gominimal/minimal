@@ -9628,3 +9628,28 @@ async fn stop_unexposes_before_withdrawing_the_report() {
     door.abort();
     crate::net::listeners::clear_vm_report_door_for_tests(&sock);
 }
+
+/// A `Hooks`-origin host whose record holds a registered host-side row is not
+/// replaced for an attaching terminal: ending its PTask would end the shuttle
+/// connection the row is tied to, and the in-VM daemon cannot re-register it.
+#[test]
+fn replaces_host_for_terminal_skips_a_registered_box() {
+    use super::{HostOrigin, replaces_host_for_terminal};
+    assert!(!replaces_host_for_terminal(HostOrigin::Hooks, true, true));
+}
+
+/// Without a host-side row the respawn behaviour is unchanged: a
+/// `Hooks`-origin host with a terminal-declaring attach is replaced, and no
+/// other origin is replaced regardless.
+#[test]
+fn replaces_host_for_terminal_keeps_native_respawn() {
+    use super::{HostOrigin, replaces_host_for_terminal};
+    assert!(replaces_host_for_terminal(HostOrigin::Hooks, true, false));
+    assert!(!replaces_host_for_terminal(HostOrigin::Hooks, false, false));
+    assert!(!replaces_host_for_terminal(HostOrigin::Exec, true, false));
+    assert!(!replaces_host_for_terminal(
+        HostOrigin::Interactive,
+        true,
+        false
+    ));
+}

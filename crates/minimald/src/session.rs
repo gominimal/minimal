@@ -902,6 +902,22 @@ enum HostOrigin {
     Exec,
 }
 
+/// Whether replacing a live host for an attaching terminal is safe for the
+/// box it serves. A [`HostOrigin::Hooks`] host is replaceable — nothing of
+/// the user's runs in it — unless the record holds a registered host-side
+/// row: on a VM-backed host, ending that host's PTask ends the shuttle
+/// connection the row is tied to, and the in-VM daemon cannot re-register
+/// it, so a respawn would strand the box with no row. Such a box is kept,
+/// and the terminal rides the per-attach environment the host republishes,
+/// exactly as it does for an [`HostOrigin::Exec`] host.
+fn replaces_host_for_terminal(
+    origin: HostOrigin,
+    declares_terminal: bool,
+    holds_host_row: bool,
+) -> bool {
+    origin == HostOrigin::Hooks && declares_terminal && !holds_host_row
+}
+
 impl Session {
     /// Assembles the actor from its seed, mailbox, and initial state. The
     /// caller decides when to enter [`Self::mainloop`].
@@ -3924,7 +3940,7 @@ impl Session {
         // and materializing without them would produce a broken
         // sandbox rootfs. See [`Session::finalize`] for the
         // transition.
-        {
+        let holds_host_row = {
             let record = self
                 .record
                 .record()
@@ -3933,7 +3949,8 @@ impl Session {
             if record.status != SessionStatus::Active {
                 return Err(AttachError::SessionPending);
             }
-        }
+            record.box_addresses.is_some()
+        };
 
         // A host minted to run hooks has an environment that describes no
         // terminal, because there was none — and the shell's `environ` cannot
@@ -3942,10 +3959,15 @@ impl Session {
         // attach can arrive), so replace it with one minted for the terminal
         // that is actually here. An `Exec`-minted host is deliberately not
         // replaced: a command is live inside that sandbox, and killing it to
-        // improve `TERM` is a bad trade. That case rides on the per-attach
-        // environment the host republishes instead.
-        let respawn_for_terminal =
-            self.host_origin == HostOrigin::Hooks && attach_env.declares_terminal();
+        // improve `TERM` is a bad trade. A box the host registered is not
+        // replaced either, because ending its PTask ends the shuttle
+        // connection the host-side row is tied to. Both cases ride on the
+        // per-attach environment the host republishes instead.
+        let respawn_for_terminal = replaces_host_for_terminal(
+            self.host_origin,
+            attach_env.declares_terminal(),
+            holds_host_row,
+        );
         if respawn_for_terminal
             && let SessionInner::Active {
                 host: slot @ Some(_),
@@ -3960,6 +3982,14 @@ impl Session {
             // loop rather than parking the attach behind it. Same bounded
             // kill-and-stop as shutdown; see [`Session::kill_and_stop_loop`].
             Self::kill_and_stop_loop(&handle, &mut join, false).await;
+        } else if self.host_origin == HostOrigin::Hooks
+            && attach_env.declares_terminal()
+            && holds_host_row
+        {
+            tracing::info!(
+                "kept the hook-launched session shell: replacing it would end the box's \
+                 host-side row; the terminal's environment rides the per-attach republish"
+            );
         }
 
         let host = match &mut self.inner {
