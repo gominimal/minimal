@@ -385,18 +385,38 @@ pub(crate) fn match_id_prefix(
         return Ok(None);
     }
     let prefix = session.replace('-', "").to_ascii_lowercase();
-    let matches: Vec<sessions::SessionId> = entries
+    let matches: Vec<&minimald_rpc::ListSessionsEntry> = entries
         .iter()
-        .map(|e| e.id)
-        .filter(|id| id.as_ref().simple().to_string().starts_with(&prefix))
+        .filter(|e| e.id.as_ref().simple().to_string().starts_with(&prefix))
         .collect();
     match matches.as_slice() {
         [] => Ok(None),
-        [id] => Ok(Some(*id)),
+        [entry] => Ok(Some(entry.id)),
         several => {
+            // `min ls` shows sessions cut to eight digits, but sessions made
+            // close together share a long UUIDv7 prefix, so the refusal names
+            // each candidate at the shortest length that keeps them distinct.
+            let simples: Vec<String> = several
+                .iter()
+                .map(|e| e.id.as_ref().simple().to_string())
+                .collect();
+            let cut = (8..=32)
+                .find(|&n| {
+                    let prefixes: Vec<&str> = simples.iter().map(|s| &s[..n]).collect();
+                    let mut seen = std::collections::HashSet::new();
+                    prefixes.iter().all(|p| seen.insert(*p))
+                })
+                .unwrap_or(32);
             let candidates: Vec<String> = several
                 .iter()
-                .map(|id| format!("{}…", &id.as_ref().simple().to_string()[..8]))
+                .zip(&simples)
+                .map(|(entry, simple)| {
+                    let mut candidate = format!("{}…", &simple[..cut]);
+                    if let Some(name) = entry.name.as_deref() {
+                        candidate.push_str(&format!(" ({name})"));
+                    }
+                    candidate
+                })
                 .collect();
             Err(AmbiguousIdPrefix(format!(
                 "'{session}' matches sessions {}; use more characters",
