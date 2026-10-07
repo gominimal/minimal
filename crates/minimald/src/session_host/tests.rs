@@ -5699,6 +5699,7 @@ async fn expose_unrecordable_allow_is_refused_and_deny_still_refuses() {
             .live_ingress()
             .await
             .expect("the actor answers")
+            .exposed
             .is_empty(),
         "the withdrawn publish leaves no live mapping"
     );
@@ -5931,7 +5932,7 @@ async fn unaudited_allow_keeps_a_forward_the_switch_would_not_unbind() {
         .live_ingress()
         .await
         .expect("the actor answers")
-        .clone();
+        .exposed;
     assert_eq!(
         live.len(),
         1,
