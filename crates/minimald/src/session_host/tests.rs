@@ -2695,6 +2695,8 @@ fn launcher_with(
         // run no runtime expose surface and carry no listen plan, so no
         // publication ever enters it.
         publications: Default::default(),
+        // The test's own state directory, the one its context builds under.
+        state_dir: state_path.to_path_buf(),
     }
 }
 
@@ -6060,12 +6062,9 @@ async fn ask_no_or_no_tty_records_nothing() {
         requests.try_recv().is_err(),
         "nothing was reported to the host past the asks"
     );
-    assert!(
-        handle
-            .live_ingress()
-            .await
-            .expect("the session answers")
-            .is_empty(),
+    assert_eq!(
+        handle.live_ingress().await.expect("the session answers"),
+        crate::session::LiveIngressRows::default(),
         "no mapping stands"
     );
     let records = audit_records(&server.state.minimal_state_dir().await).await;

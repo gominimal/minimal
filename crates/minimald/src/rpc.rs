@@ -1381,7 +1381,10 @@ async fn serve_get_effective_session_policy(
 /// Every row reads not pending: a runtime publish admits its port at the
 /// box's relay gate in the same turn it records the mapping (NET-044), so a
 /// listed publish is reachable. The `pending` field stays on the wire so a
-/// client can still tell this daemon's rows from an older daemon's.
+/// client can still tell this daemon's rows from an older daemon's. The
+/// listen watcher's rows — the in-range listens the box's `allow` stance
+/// published — follow the exposes' rows, reachable too: the watcher admits
+/// each port at the gate as its publish's last step.
 async fn serve_get_live_ingress(
     s: ServerStateHandle,
     c: RuChannel<Msg>,
@@ -1403,8 +1406,13 @@ async fn serve_get_live_ingress(
                 }),
                 Some(session) => match session.live_ingress().await {
                     // The actor's own rows, `pending: Some(false)` each: the
-                    // publish admitted the port when it recorded the row.
-                    Ok(live) => Ok(Errorable::Ok(live)),
+                    // publish admitted the port when it recorded the row. The
+                    // listen watcher's rows follow the exposes' as they
+                    // stand: the gate admitted each one as its publish's
+                    // last step.
+                    Ok(live) => Ok(Errorable::Ok(
+                        live.exposed.into_iter().chain(live.listened).collect(),
+                    )),
                     Err(e) => Ok(Errorable::Err {
                         error: e.to_string(),
                     }),

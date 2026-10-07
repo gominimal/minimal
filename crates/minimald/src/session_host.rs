@@ -2950,6 +2950,10 @@ pub(crate) struct SandboxLauncher {
     /// half, and the answer `min net expose` gets when the listener
     /// watcher published its port first).
     pub(crate) publications: crate::net::listeners::BoxPublications,
+    /// The daemon's state directory, handed to this launch's listen plan:
+    /// its watcher appends each listen it publishes to the audit log under
+    /// it, the one the session's runtime expose path audits in (NET-046).
+    pub(crate) state_dir: std::path::PathBuf,
 }
 
 /// Reaps a freshly-spawned sandbox process if the launch is abandoned
@@ -4672,6 +4676,7 @@ impl SessionLauncher for SandboxLauncher {
                     control,
                     gate,
                     self.publications,
+                    self.state_dir,
                 ))
             }
             _ => None,
