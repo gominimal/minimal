@@ -1664,6 +1664,22 @@ pub struct FinalizeSessionResponse {
     /// Serde-defaulted so a daemon that predates the field still answers.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub activate_hooks: Vec<RanHook>,
+    /// True when the finalize's package check stepped aside — its deadline
+    /// expired, or the session context or package graph could not be
+    /// evaluated — rather than refusing an unknown package. The session
+    /// still activates; the client warns so the operator knows unknown
+    /// names will surface at first exec. Serde-defaulted and omitted when
+    /// false so a daemon that predates the field still answers to an older
+    /// client.
+    #[serde(default, skip_serializing_if = "package_check_skipped_is_false")]
+    pub package_check_skipped: bool,
+}
+
+/// Serde helper: omit [`FinalizeSessionResponse::package_check_skipped`]
+/// when it is `false`, so the common success payload is unchanged for
+/// clients that predate the field.
+fn package_check_skipped_is_false(v: &bool) -> bool {
+    !*v
 }
 
 /// One hook that ran, as reported back to the client.
@@ -2442,6 +2458,7 @@ mod tests {
                 description: Some("emit to stdout and stderr".to_string()),
                 output: "HOOK_STDOUT_VISIBLE\nHOOK_STDERR_VISIBLE\n".to_string(),
             }],
+            ..Default::default()
         };
         let wire = serde_json_lenient::to_string(&resp).expect("must serialize");
         let back: FinalizeSessionResponse =
@@ -2461,6 +2478,32 @@ mod tests {
             Errorable::Ok(ok) => assert!(ok.activate_hooks[0].output.is_empty()),
             Errorable::Err { error } => panic!("a success decoded as an error: {error}"),
         }
+    }
+
+    /// `package_check_skipped` is omitted from the wire when false, so a
+    /// client that predates the field still decodes the common success
+    /// payload; when true it is present so the client can warn.
+    #[test]
+    fn package_check_skipped_is_omitted_when_false() {
+        let wire = serde_json_lenient::to_string(&FinalizeSessionResponse::default())
+            .expect("must serialize");
+        assert!(
+            !wire.contains("package_check_skipped"),
+            "a false skip must not be serialized, got {wire:?}"
+        );
+
+        let skipped = FinalizeSessionResponse {
+            package_check_skipped: true,
+            ..Default::default()
+        };
+        let wire = serde_json_lenient::to_string(&skipped).expect("must serialize");
+        assert!(
+            wire.contains("package_check_skipped"),
+            "a true skip must be serialized, got {wire:?}"
+        );
+        let back: FinalizeSessionResponse =
+            serde_json_lenient::from_str(&wire).expect("must decode");
+        assert!(back.package_check_skipped);
     }
 
     /// An empty request body must decode with the documented defaults so a

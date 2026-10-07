@@ -189,6 +189,16 @@ pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// forever. Generous — a healthy daemon answers in milliseconds, so this
 /// only bounds the pathological case.
 const RPC_TIMEOUT: Duration = Duration::from_secs(60);
+/// The budget the client grants the daemon's package check inside
+/// `FinalizeSession`, on top of [`RPC_TIMEOUT`] and the activate-hook
+/// budget. The check resolves the session's package names against the
+/// package graph, which can clone the upstream repo when the daemon's
+/// cache is cold — network I/O with no bound of its own. It must match the
+/// daemon's own `PACKAGE_CHECK_DEADLINE` (`minimald`), which steps aside
+/// and reports the skip when it expires; the client's deadline is the
+/// round-trip's outer bound, so it grants the check the same budget the
+/// daemon gives it.
+const PACKAGE_CHECK_BUDGET: Duration = Duration::from_secs(120);
 /// The leash a caller is expected to run a [`Client::probe`] under: the
 /// probe's connect, its handshake, and the one RPC the caller makes on it,
 /// end to end. The retry ([`CONNECT_RETRIES`]), the handshake deadline and
@@ -432,13 +442,16 @@ impl Client {
     }
 
     /// Issue a oneshot RPC whose deadline is [`RPC_TIMEOUT`] plus
-    /// `hook_budget`, for `FinalizeSession`: it runs the composition's
-    /// `on_activate` hooks inside the single round-trip, and those hooks run
-    /// sequentially and without an aggregate budget on the daemon, so the
-    /// call can legitimately take as long as the summed declared hook
-    /// timeouts. The client knows that sum before the call; the base
-    /// [`RPC_TIMEOUT`] still covers the non-hook finalize work (the sandbox
-    /// build), so a zero budget behaves exactly like [`Self::oneshot_rpc`].
+    /// `hook_budget` plus [`PACKAGE_CHECK_BUDGET`], for `FinalizeSession`:
+    /// it runs the composition's `on_activate` hooks and the package check
+    /// inside the single round-trip. The hooks run sequentially and without
+    /// an aggregate budget on the daemon, so the call can legitimately take
+    /// as long as the summed declared hook timeouts; the package check can
+    /// clone the upstream repo when the daemon's cache is cold, so it gets
+    /// its own budget. The client knows the hook sum before the call; the
+    /// base [`RPC_TIMEOUT`] still covers the non-hook finalize work (the
+    /// sandbox build), so a zero hook budget behaves exactly like
+    /// [`Self::oneshot_rpc`] plus the package-check budget.
     pub async fn oneshot_rpc_with_hook_budget<R: OneshotSshRpc>(
         &mut self,
         request: R::Request<'_>,
@@ -447,7 +460,7 @@ impl Client {
     where
         <R as OneshotSshRpc>::Response: serde::de::DeserializeOwned,
     {
-        self.oneshot_rpc_within::<R>(request, RPC_TIMEOUT + hook_budget)
+        self.oneshot_rpc_within::<R>(request, RPC_TIMEOUT + hook_budget + PACKAGE_CHECK_BUDGET)
             .await
     }
 

@@ -2736,7 +2736,7 @@ pub(crate) mod tests {
         TempDir,
         ManagerHandle,
         SessionId,
-        Result<Vec<minimald_rpc::RanHook>, std::io::Error>,
+        Result<minimald_rpc::FinalizeSessionResponse, std::io::Error>,
     ) {
         let (state, cache, mngr) = manager().await;
         let id = mngr.create_session(sample_config(), None).await.unwrap();
@@ -2827,7 +2827,11 @@ pub(crate) mod tests {
         let (_state, _cache, mngr, id, outcome) =
             finalize_with_package_check(&[], WireContribution::default(), PACKAGE_CHECK_DEADLINE)
                 .await;
-        outcome.expect("a session whose packages resolve should finalize");
+        let response = outcome.expect("a session whose packages resolve should finalize");
+        assert!(
+            !response.package_check_skipped,
+            "a check that ran to a verdict is not skipped"
+        );
         assert_eq!(status_of(&mngr, id).await, sessions::SessionStatus::Active);
     }
 
@@ -2855,7 +2859,11 @@ pub(crate) mod tests {
             std::time::Duration::ZERO,
         )
         .await;
-        outcome.expect("an expired check steps aside; the session still activates");
+        let response = outcome.expect("an expired check steps aside; the session still activates");
+        assert!(
+            response.package_check_skipped,
+            "an expired check reports the skip so the client can warn"
+        );
         assert_eq!(status_of(&mngr, id).await, sessions::SessionStatus::Active);
     }
 

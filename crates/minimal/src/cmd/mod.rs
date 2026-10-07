@@ -739,6 +739,13 @@ pub(crate) async fn upload_and_finalize(
                     }
                 }
             }
+            if ok.package_check_skipped {
+                eprintln!(
+                    "warning: the session package check was skipped (the package graph \
+                     did not resolve in time); unknown package names will surface at \
+                     first exec"
+                );
+            }
             Ok(())
         }
         minimald_rpc::Errorable::Err { error } => {
