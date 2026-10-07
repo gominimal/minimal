@@ -1254,7 +1254,11 @@ pub(crate) async fn activate_session(
             &answerer_step,
         );
         if let Some(advisory) = &name_advisory {
-            eprintln!("{advisory}");
+            // Printed whole on every start, interactive or not (NET-122:
+            // the start names the exact command, and a scripted start's log
+            // is its only record), after a blank line so the note and its
+            // command block stand apart from the lines above them.
+            eprintln!("\n{advisory}");
         }
         if let Some(verdict) = surface_verdict {
             // The host-side record of that verdict, the half the daemon's own
