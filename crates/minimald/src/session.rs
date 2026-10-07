@@ -907,9 +907,11 @@ enum HostOrigin {
 /// the user's runs in it — unless the record holds a registered host-side
 /// row: on a VM-backed host, ending that host's PTask ends the shuttle
 /// connection the row is tied to, and the in-VM daemon cannot re-register
-/// it, so a respawn would strand the box with no row. Such a box is kept,
-/// and the terminal rides the per-attach environment the host republishes,
-/// exactly as it does for an [`HostOrigin::Exec`] host.
+/// it, so a respawn would strand the box with no row. The guard is the
+/// record's handed `box_addresses`, not a VM check, so any registered box is
+/// kept, native ones included: keeping costs nothing, because the terminal
+/// rides the per-attach environment the host republishes, exactly as it does
+/// for an [`HostOrigin::Exec`] host.
 fn replaces_host_for_terminal(
     origin: HostOrigin,
     declares_terminal: bool,
@@ -3963,9 +3965,12 @@ impl Session {
         // replaced either, because ending its PTask ends the shuttle
         // connection the host-side row is tied to. Both cases ride on the
         // per-attach environment the host republishes instead.
-        let would_respawn =
-            replaces_host_for_terminal(self.host_origin, attach_env.declares_terminal(), false);
-        let respawn_for_terminal = would_respawn && !holds_host_row;
+        let declares_terminal = attach_env.declares_terminal();
+        let respawn_for_terminal =
+            replaces_host_for_terminal(self.host_origin, declares_terminal, holds_host_row);
+        // Kept only for its row: the same host would be replaced without one.
+        let kept_for_host_row = !respawn_for_terminal
+            && replaces_host_for_terminal(self.host_origin, declares_terminal, false);
         if respawn_for_terminal
             && let SessionInner::Active {
                 host: slot @ Some(_),
@@ -3980,7 +3985,7 @@ impl Session {
             // loop rather than parking the attach behind it. Same bounded
             // kill-and-stop as shutdown; see [`Session::kill_and_stop_loop`].
             Self::kill_and_stop_loop(&handle, &mut join, false).await;
-        } else if would_respawn && holds_host_row {
+        } else if kept_for_host_row {
             tracing::info!(
                 "kept the hook-launched session shell: replacing it would end the box's \
                  host-side row; the terminal's environment rides the per-attach republish"
