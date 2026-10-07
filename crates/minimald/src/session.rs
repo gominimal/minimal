@@ -582,6 +582,17 @@ enum SessionMessage {
     /// deterministically here — without disturbing the lifecycle.
     #[cfg(test)]
     PeekPendingAsks(oneshot::Sender<Vec<(AskId, u16)>>),
+    /// Test-only inspection: clones of the box's shared runtime ingress cell
+    /// and publication set, the two a spawn's end reaches without going
+    /// through this actor — so a test can end the spawn while the actor is
+    /// mid-turn, the way the spawn's guard does in production.
+    #[cfg(test)]
+    PeekIngressCells(
+        oneshot::Sender<(
+            crate::net::provider::RuntimeIngress,
+            crate::net::listeners::BoxPublications,
+        )>,
+    ),
     /// Test-only: turn on the finalize package check that test builds leave
     /// off (see [`Session::check_packages_at_finalize`]), bounded by the
     /// carried deadline — [`PACKAGE_CHECK_DEADLINE`] for the production
@@ -1950,6 +1961,14 @@ impl Session {
                 );
             }
             #[cfg(test)]
+            SessionMessage::PeekIngressCells(r) => {
+                #[expect(
+                    clippy::let_underscore_must_use,
+                    reason = "the asker may already be gone; there is nothing to answer then"
+                )]
+                let _ = r.send((self.live_ingress.clone(), self.publications.clone()));
+            }
+            #[cfg(test)]
             SessionMessage::CheckPackagesAtFinalize(deadline, r) => {
                 self.check_packages_at_finalize = true;
                 self.package_check_deadline = deadline;
@@ -3082,7 +3101,10 @@ impl Session {
     /// and the VM host daemon's row entry are held back with it: a row
     /// withdrawn while its forward still stands leaves the host holding a
     /// port its retraction rule can no longer reach, so the withdrawal
-    /// follows the unexpose the way it does everywhere else.
+    /// follows the unexpose the way it does everywhere else. The one forward
+    /// that cannot be kept is one whose spawn ended mid-unbind: the cell
+    /// refuses it back, so it is unbound once more, best-effort, and the
+    /// port is given back like every detached publish's.
     async fn withdraw_unaudited(
         &mut self,
         box_name: &str,
@@ -3107,13 +3129,10 @@ impl Session {
             minimald_rpc::PortReportSource::Expose
         };
         let control = self.switch_control().await;
-        let forwarder = self.live_ingress.take(port);
+        let live = self.live_ingress.take(port);
         let mut unbound = true;
-        if let Some(forwarder) = forwarder {
-            match forwarder
-                .revoke(&control, &std::collections::HashSet::new())
-                .await
-            {
+        if let Some(live) = live {
+            match crate::net::policy::unexpose_forwarder(&control, &live.forwarder).await {
                 // Unbound: the switch holds no forward at its `local` any
                 // more, so the row entry and the publication-set entry go
                 // with it below.
@@ -3131,32 +3150,25 @@ impl Session {
                     // it: the host's gate retracts a runtime port only while
                     // the row still holds it, so a withdrawal that ran
                     // first would strand the forward — bound, and
-                    // retractable by nothing. Recorded back rather than
-                    // never taken, because the sweep that would retry the
-                    // unexpose — [`Self::stop_running`] — draws from the
-                    // same cell.
-                    let mapping = minimald_rpc::LiveMapping {
-                        local: forwarder.local().to_string(),
-                        internal_port: forwarder.internal_port(),
-                        proto: sessions::IpProto::Tcp,
-                        pending: Some(false),
-                    };
-                    if let Err(unrecorded) = self
-                        .live_ingress
-                        .record(crate::net::provider::LiveIngressForward { forwarder, mapping })
-                    {
+                    // retractable by nothing. Recorded back, mapping and
+                    // all, rather than never taken, because the sweep that
+                    // would retry the unexpose — [`Self::stop_running`] —
+                    // draws from the same cell.
+                    if let Err(unrecorded) = self.live_ingress.record(live) {
                         // The spawn ended while this withdrawal was in
                         // flight, so the cell refuses the record and the
                         // guard that emptied it cannot unbind this one —
                         // we still hold it. Best-effort, like every other
-                        // unwind's unexpose: the publish is refused either
-                        // way, and a forward the switch kept is what the
-                        // warn line above already said.
+                        // unwind's unexpose; then the port is given back
+                        // below, as every detached publish's is: no sweep
+                        // is left to retry it, so holding the publication
+                        // and the row back would only strand them.
                         crate::net::policy::remove_ingress(
                             &control,
                             std::slice::from_ref(&unrecorded.forwarder),
                         )
                         .await;
+                        unbound = true;
                     }
                 }
             }
@@ -5164,6 +5176,25 @@ impl SessionHandle {
         // that — which is also the truth about a session that stopped, since
         // `stop_running` answered them all fail-closed first.
         recv.await.unwrap_or_default()
+    }
+
+    /// Test-only: clones of the box's shared runtime ingress cell and
+    /// publication set (see [`SessionMessage::PeekIngressCells`]). `None` once
+    /// the actor is gone.
+    #[cfg(test)]
+    pub(crate) async fn ingress_cells(
+        &self,
+    ) -> Option<(
+        crate::net::provider::RuntimeIngress,
+        crate::net::listeners::BoxPublications,
+    )> {
+        let (send, recv) = oneshot::channel();
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "the actor may already be gone; the recv below reports that"
+        )]
+        let _ = self.0.send(SessionMessage::PeekIngressCells(send)).await;
+        recv.await.ok()
     }
 
     /// The live dynamic-ingress mappings this box published at runtime

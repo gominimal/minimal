@@ -5281,7 +5281,7 @@ pub(crate) async fn finalize_declared_dynamic_ingress_session(
 /// framing [`crate::net::policy`] writes, so the stand-in forwarder below
 /// never blocks reading past what the daemon sent. `None` when the client
 /// went away mid-request.
-async fn read_control_request(stream: &mut tokio::net::UnixStream) -> Option<String> {
+pub(crate) async fn read_control_request(stream: &mut tokio::net::UnixStream) -> Option<String> {
     use tokio::io::AsyncReadExt;
     let mut buf = Vec::with_capacity(256);
     let mut scratch = [0u8; 512];

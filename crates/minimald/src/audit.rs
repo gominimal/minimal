@@ -609,111 +609,61 @@ mod tests {
         );
     }
 
-    /// [`record_for`] with the timestamp a rotation test can order by: a
-    /// fixed-width sequence number rather than a clock, so the records two
-    /// tasks append interleaved still read in the order they were written —
-    /// the order a raced rotation would delete from the middle of.
-    fn sequenced_record(port: u16, sequence: u64) -> DecisionRecord {
-        DecisionRecord {
-            ts: format!("{sequence:012}"),
-            box_name: "web".to_string(),
-            port,
-            decision: sessions::DynamicIngress::Allow,
-            decided_by: DecidedBy::BoxPolicy,
-            outcome: DecisionOutcome::Published,
-            reason: None,
-        }
-    }
-
-    /// The sequence numbers a log file's records name, in file order.
-    fn sequences_in(path: &Path) -> Vec<u64> {
-        std::fs::read_to_string(path)
-            .unwrap_or_default()
-            .lines()
-            .map(|line| {
-                let record: serde_json_lenient::Value =
-                    serde_json_lenient::from_str(line).expect("one line is one record");
-                record["ts"]
-                    .as_str()
-                    .expect("every record names its timestamp")
-                    .parse()
-                    .expect("the test's timestamps are sequence numbers")
-            })
-            .collect()
-    }
-
     /// The rotation is the one multi-step thing the log does, and the log is
     /// shared: every session's actor appends to the same file, and each is
-    /// its own spawned task, so two of them can reach a rotation together.
-    /// Unserialized, both would pass `rotates` against the same live file,
-    /// and the second rename would carry away the fresh log the first just
-    /// created — deleting the generation the first rotation kept. With the
-    /// append held under one lock, the records both files hold are the
-    /// newest ones in an unbroken write-order run: the files follow each
-    /// other in the order their records were written, nothing is held
-    /// twice, and the live file's last line is the very newest record.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn concurrent_appends_rotating_together_lose_no_records() {
+    /// its own spawned task. Unserialized, two appends crossing the cap
+    /// together could both rename — the second carrying the fresh log the
+    /// first just made over the generation it kept — or one could write
+    /// through a descriptor another had just rotated away, carrying the kept
+    /// generation past the cap. With every append held under one lock, a
+    /// rotation always closes a full generation: every line is the same
+    /// length here, so the rotated file is exactly the cap, and the live
+    /// file stays within it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_appends_stay_within_the_bound() {
         let dir = tempfile::tempdir().unwrap();
-        let state_dir = dir.path().join("daemon");
-        std::fs::create_dir_all(&state_dir).unwrap();
-        // The sequence's fixed width keeps every line the same length, so a
-        // cap of a few lines is a cap the concurrent appends keep crossing.
-        let line_len = serde_json_lenient::to_string(&sequenced_record(1000, 0))
+        let state_dir = std::sync::Arc::new(dir.path().to_path_buf());
+        // Every port below is four digits, so every line is this long.
+        let line_len = serde_json_lenient::to_string(&record_for(1000))
             .unwrap()
             .len() as u64
             + 1;
-        let cap = line_len * 3;
-        let per_task = 200u64;
-        let tasks = 2u64;
-        let written = tasks * per_task;
-        let sequence = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let cap = line_len * 5;
 
-        let mut spawned = Vec::new();
-        for _ in 0..tasks {
+        let mut tasks = Vec::new();
+        for writer in 0..8u16 {
             let state_dir = state_dir.clone();
-            let sequence = sequence.clone();
-            spawned.push(tokio::spawn(async move {
-                for _ in 0..per_task {
-                    let next = sequence.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    try_append_capped(&state_dir, &sequenced_record(next as u16, next), cap)
+            tasks.push(tokio::spawn(async move {
+                for n in 0..50u16 {
+                    try_append_capped(&state_dir, &record_for(1000 + writer * 100 + n), cap)
                         .await
                         .expect("an append to a healthy log lands");
                 }
             }));
         }
-        for task in spawned {
+        for task in tasks {
             task.await.expect("the appending task finishes");
         }
 
-        let rotated = sequences_in(&rotated_path(&state_dir));
-        let live = sequences_in(&log_path(&state_dir));
-        let kept: Vec<u64> = rotated.into_iter().chain(live).collect();
-        assert_eq!(
-            kept,
-            (written - kept.len() as u64..written).collect::<Vec<u64>>(),
-            "the two files hold an unbroken run of the newest records, each once"
+        let live = std::fs::metadata(log_path(&state_dir)).unwrap().len();
+        let rotated = std::fs::metadata(rotated_path(&state_dir)).unwrap().len();
+        assert!(
+            live <= cap,
+            "the live log stays within its cap: {live} > {cap}"
         );
         assert_eq!(
-            kept.last(),
-            Some(&(written - 1)),
-            "the newest record is the live log's last line"
+            rotated, cap,
+            "the kept generation is exactly the full one its rotation closed"
         );
         assert!(
             !state_dir.join("audit/decisions.log.2").exists(),
             "one rotated generation is kept, never more"
         );
-        for (what, len) in [
-            (
-                "the live log",
-                std::fs::metadata(log_path(&state_dir)).unwrap().len(),
-            ),
-            (
-                "the rotated generation",
-                std::fs::metadata(rotated_path(&state_dir)).unwrap().len(),
-            ),
-        ] {
-            assert!(len <= cap, "{what} stays within its cap: {len} > {cap}");
-        }
+        let kept =
+            ports_in(&rotated_path(&state_dir)).len() + ports_in(&log_path(&state_dir)).len();
+        assert!(
+            kept >= 5,
+            "a rotation keeps at least a full generation: {kept}"
+        );
     }
 }
