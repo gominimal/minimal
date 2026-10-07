@@ -1818,7 +1818,10 @@ pub struct BoxRegistry {
     /// `MINVMD_EGRESS_DENY_ALL_OPT_OUT` by the supervisor: with it set, a
     /// client box with no `egress` section keeps the shipped allow-all in
     /// every phase — the same default the guest daemon is handed on its boot
-    /// line, so the host gate never denies what the guest allows.
+    /// line, so the host gate never denies what the guest allows. That
+    /// agreement also needs this registry's phase to match the guest's
+    /// (`sessions::EGRESS_DEFAULT_PHASE`); if the two constants diverge, the
+    /// stricter side wins.
     egress_deny_all_opt_out: bool,
 }
 
@@ -3439,7 +3442,7 @@ mod tests {
     fn undeclared_row_default_follows_phase_and_opt_out() {
         use sessions::EgressDefaultPhase::{Announced, InForce};
 
-        let reach = |phase, opt_out, egress: Option<EgressPolicy>| {
+        let reach_to = |phase, opt_out, egress: Option<EgressPolicy>, dest: [u8; 4]| {
             let registry = BoxRegistry::new(SUBNET)
                 .with_egress_default_phase(phase)
                 .with_egress_deny_all_opt_out(opt_out);
@@ -3456,7 +3459,7 @@ mod tests {
             let outside = sessions::core::egress::summarize(&ipv4_frame(
                 row.switch_addr().octets(),
                 6,
-                [203, 0, 113, 7],
+                dest,
                 443,
             ));
             matches!(
@@ -3464,6 +3467,7 @@ mod tests {
                 FrameVerdict::Admit
             )
         };
+        let reach = |phase, opt_out, egress| reach_to(phase, opt_out, egress, [203, 0, 113, 7]);
 
         assert!(
             reach(Announced, false, None),
@@ -3483,7 +3487,19 @@ mod tests {
             allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
             ..EgressPolicy::default()
         };
-        for (phase, opt_out) in [(Announced, false), (InForce, false), (InForce, true)] {
+        // Both directions are pinned: the declared allow is still admitted
+        // (deny-all would refuse it) and the outside stays refused
+        // (allow-all would admit it), so neither default can stand in.
+        for (phase, opt_out) in [
+            (Announced, false),
+            (Announced, true),
+            (InForce, false),
+            (InForce, true),
+        ] {
+            assert!(
+                reach_to(phase, opt_out, Some(lan_only.clone()), [10, 1, 2, 3]),
+                "a declared LAN-only box still reaches the LAN under {phase:?}, opt-out {opt_out}"
+            );
             assert!(
                 !reach(phase, opt_out, Some(lan_only.clone())),
                 "a declared LAN-only box stays LAN-only under {phase:?}, opt-out {opt_out}"
