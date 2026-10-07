@@ -283,20 +283,6 @@ impl EgressRuleCounts {
     }
 }
 
-/// The daemon-log spelling of a session's network mode: the CLI's `--network`
-/// names (`none` / `host_ip` / `own_ip`) rather than the snake_case wire form,
-/// so the `session created` line names what a person typed. The wildcard arm
-/// keeps a future mode from being silently misreported — `NetworkMode` is
-/// `#[non_exhaustive]`.
-fn network_mode_label(network: minimald_rpc::NetworkMode) -> &'static str {
-    match network {
-        minimald_rpc::NetworkMode::NoNet => "none",
-        minimald_rpc::NetworkMode::HostNet => "host_ip",
-        minimald_rpc::NetworkMode::OwnIp => "own_ip",
-        _ => "unknown",
-    }
-}
-
 /// `CreateSession`: allocates the session's record and brings its actor
 /// up, replying with the assigned id. The loadout is composed separately,
 /// by the `ConfigureLoadout` that follows.
@@ -395,7 +381,7 @@ async fn serve_create_session(
                     tracing::info!(
                         session_id = %id,
                         session_name = session_name.as_deref().unwrap_or(ANONYMOUS_SESSION),
-                        network_mode = network_mode_label(network),
+                        network_mode = %network.word(),
                         egress_allow_subnets = egress_counts.allow_subnets,
                         egress_allow_protocols = egress_counts.allow_protocols,
                         egress_allow_dns_hosts = egress_counts.allow_dns_hosts,
@@ -4351,6 +4337,7 @@ mod tests {
                 logged.lines().any(|line| {
                     line.contains("refused a create whose host-address declaration names rules")
                         && line.contains(&format!("session_name=Some(\"{name}\")"))
+                        && line.contains("network_mode=host_ip")
                         && line.contains("host_ip_enforcement=per_box")
                         && line.contains(rule)
                 }),
@@ -5965,7 +5952,7 @@ mod tests {
                 log.lines().any(|line| {
                     line.contains("session created")
                         && line.contains(&format!("session_id={id}"))
-                        && line.contains(&format!("network_mode=\"{spelling}\""))
+                        && line.contains(&format!("network_mode={spelling} "))
                 }),
                 "the session created line for {id} must name its network mode \
                  {spelling}, got: {log}"

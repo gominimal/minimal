@@ -1043,7 +1043,7 @@ impl Manager {
             REFUSED_UNENFORCEABLE_CREATES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             tracing::info!(
                 session_name = ?config.name,
-                network_mode = ?config.network,
+                network_mode = %config.network.word(),
                 host_ip_enforcement = %minimald_rpc::HostIpEnforcement::PerBox.machine_str(),
                 refused_unenforceable_creates = refused_unenforceable_creates(),
                 refusal = %refusal,
