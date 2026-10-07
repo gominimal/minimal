@@ -1823,12 +1823,31 @@ impl Session {
                 // is cleared on resume when the host starts.
                 #[cfg(target_os = "linux")]
                 {
-                    let record = self.record.record().await.unwrap();
-                    if self.owns_hostname_route(&record) {
+                    // An unreadable record must not panic the Stop arm, and it
+                    // must not fail open either: the box is stopped whether or
+                    // not its record reads, and a shared-address name left
+                    // answering would let a dead box speak for the node's own
+                    // listener. The marker is keyed by the session id, which
+                    // the actor holds without the record, so when the network
+                    // mode cannot be read the name is marked stopped on the
+                    // `Active` half of the route gate alone.
+                    let owns_route = match self.record.record().await {
+                        Ok(record) => self.owns_hostname_route(&record),
+                        Err(e) => {
+                            tracing::warn!(
+                                session_id = %self.record.id(),
+                                error = %e,
+                                "reading the session record failed while stopping; \
+                                 marking the box's name stopped by its id",
+                            );
+                            matches!(self.inner, SessionInner::Active { .. })
+                        }
+                    };
+                    if owns_route {
                         self.hostnames
                             .write()
                             .expect("hostname registry lock poisoned")
-                            .mark_stopped(record.id);
+                            .mark_stopped(*self.record.id());
                     }
                 }
                 let _ = r.send(());
