@@ -5987,7 +5987,8 @@ mod tests {
         assert_eq!(
             resp,
             Errorable::Err {
-                error: "--ingress needs --network own_ip: only an own-IP box has a published address to apply it to"
+                error: "--ingress needs --network own_ip (this box is --network host_ip): only \
+                        an own-IP box has a published address to apply it to"
                     .to_string()
             }
         );

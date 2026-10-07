@@ -482,6 +482,27 @@ pub fn egress_deny_all_opt_out_from_raw(raw: Option<&str>) -> bool {
 /// CLI's `--dynamic-range` flag, so the two can never disagree.
 pub const MIN_DYNAMIC_INGRESS_PORT: u16 = 1024;
 
+/// The `--network` value naming `mode`, so a policy refusal names the box's
+/// mode in the vocabulary its remediation uses.
+fn network_flag_value(mode: NetworkMode) -> &'static str {
+    match mode {
+        NetworkMode::NoNet => "none",
+        NetworkMode::HostNet => "host_ip",
+        NetworkMode::OwnIp => "own_ip",
+    }
+}
+
+/// The refusal for a non-empty `ingress` on a box that is not own-IP: a
+/// static mapping names `--ingress`, a dynamic-only declaration names the
+/// dynamic flags.
+fn ingress_requires_own_ip(ingress: &IngressPolicy, mode: NetworkMode) -> PolicyError {
+    if ingress.port_mappings.is_empty() {
+        PolicyError::DynamicIngressRequiresOwnIp { mode }
+    } else {
+        PolicyError::IngressRequiresOwnIp { mode }
+    }
+}
+
 /// Why a session's networking policy is incompatible with its network mode.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 #[non_exhaustive]
@@ -492,11 +513,25 @@ pub enum PolicyError {
     /// nothing to enforce the declaration on and it is rejected.
     #[error("egress policy is only valid for an own-IP or host-address PTask, not {mode:?}")]
     EgressRequiresNetwork { mode: NetworkMode },
-    /// An ingress policy was set on a `PTask` that is not [`NetworkMode::OwnIp`].
+    /// A static ingress port mapping was set on a `PTask` that is not
+    /// [`NetworkMode::OwnIp`]. Worded like the CLI's `--ingress` refusal so
+    /// both surfaces name the same remediation.
     #[error(
-        "--ingress needs --network own_ip: only an own-IP box has a published address to apply it to"
+        "--ingress needs --network own_ip (this box is --network {}): only an own-IP box \
+         has a published address to apply it to",
+        network_flag_value(*.mode)
     )]
     IngressRequiresOwnIp { mode: NetworkMode },
+    /// A dynamic ingress declaration (a non-deny `dynamic_ingress` stance or a
+    /// `dynamic_allowed_range`) with no static mapping was set on a `PTask`
+    /// that is not [`NetworkMode::OwnIp`]. Worded like the CLI's
+    /// `--dynamic-ingress`/`--dynamic-range` refusal.
+    #[error(
+        "--dynamic-ingress and --dynamic-range need --network own_ip (this box is \
+         --network {}): only an own-IP box has a published address to apply them to",
+        network_flag_value(*.mode)
+    )]
+    DynamicIngressRequiresOwnIp { mode: NetworkMode },
     /// An ingress port mapping used a transport gvproxy's forwarder cannot
     /// expose. gvproxy only forwards TCP and UDP, so any other protocol (e.g.
     /// ICMP) must be rejected at validation time rather than silently mapped.
@@ -1008,8 +1043,9 @@ impl Record {
     ///
     /// Returns [`PolicyError::EgressRequiresNetwork`] when an egress policy is
     /// set on a none (`NoNet`) `PTask`, or
-    /// [`PolicyError::IngressRequiresOwnIp`] when a non-empty ingress policy is
-    /// set on anything but an `OwnIp` `PTask`. Returns
+    /// [`PolicyError::IngressRequiresOwnIp`] when a static ingress mapping, or
+    /// [`PolicyError::DynamicIngressRequiresOwnIp`] when only a dynamic ingress
+    /// declaration, is set on anything but an `OwnIp` `PTask`. Returns
     /// [`PolicyError::UnsupportedIngressProtocol`] for an ingress mapping whose
     /// transport gvproxy's forwarder cannot expose,
     /// [`PolicyError::PrivilegedPort`] for one that publishes a host port below
@@ -1033,13 +1069,8 @@ impl Record {
             if self.policy.egress.is_some() {
                 return Err(PolicyError::EgressRequiresNetwork { mode: self.network });
             }
-            if self
-                .policy
-                .ingress
-                .as_ref()
-                .is_some_and(|ingress| !ingress.is_empty())
-            {
-                return Err(PolicyError::IngressRequiresOwnIp { mode: self.network });
+            if let Some(ingress) = self.policy.ingress.as_ref().filter(|i| !i.is_empty()) {
+                return Err(ingress_requires_own_ip(ingress, self.network));
             }
             return Ok(());
         }
@@ -1094,13 +1125,8 @@ impl Record {
         // Host-address box: egress is accepted, but ingress still requires an
         // own address — the switch's forwarder is the only per-session ingress
         // surface, and a host-address box shares its host's namespace.
-        if self
-            .policy
-            .ingress
-            .as_ref()
-            .is_some_and(|ingress| !ingress.is_empty())
-        {
-            return Err(PolicyError::IngressRequiresOwnIp { mode: self.network });
+        if let Some(ingress) = self.policy.ingress.as_ref().filter(|i| !i.is_empty()) {
+            return Err(ingress_requires_own_ip(ingress, self.network));
         }
         Ok(())
     }
@@ -1388,6 +1414,56 @@ mod tests {
             Err(PolicyError::IngressRequiresOwnIp {
                 mode: NetworkMode::HostNet
             })
+        );
+    }
+
+    #[test]
+    fn own_ip_refusals_name_the_flag_that_caused_them() {
+        // A static mapping names `--ingress`; a dynamic-only declaration names
+        // the dynamic flags, never `--ingress`. Both name the box's mode in
+        // `--network` vocabulary.
+        let static_ingress = IngressPolicy {
+            port_mappings: vec![PortMapping {
+                external_port: 18080,
+                internal_port: 80,
+                proto: IpProto::Tcp,
+            }],
+            dynamic_allowed_range: None,
+            dynamic_ingress: None,
+        };
+        let err = record_with(
+            NetworkMode::HostNet,
+            SessionPolicy::new(None, Some(static_ingress)),
+        )
+        .validate_policy()
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "--ingress needs --network own_ip (this box is --network host_ip): only an \
+             own-IP box has a published address to apply it to"
+        );
+
+        let range_only = IngressPolicy {
+            port_mappings: vec![],
+            dynamic_allowed_range: Some((8000, 8443)),
+            dynamic_ingress: None,
+        };
+        let err = record_with(
+            NetworkMode::NoNet,
+            SessionPolicy::new(None, Some(range_only)),
+        )
+        .validate_policy()
+        .unwrap_err();
+        assert_eq!(
+            err,
+            PolicyError::DynamicIngressRequiresOwnIp {
+                mode: NetworkMode::NoNet
+            }
+        );
+        assert_eq!(
+            err.to_string(),
+            "--dynamic-ingress and --dynamic-range need --network own_ip (this box is \
+             --network none): only an own-IP box has a published address to apply them to"
         );
     }
 
@@ -1889,7 +1965,7 @@ mod tests {
                 let record = record_with(network, SessionPolicy::new(None, Some(ingest)));
                 assert_eq!(
                     record.validate_policy(),
-                    Err(PolicyError::IngressRequiresOwnIp { mode: network }),
+                    Err(PolicyError::DynamicIngressRequiresOwnIp { mode: network }),
                     "dynamic_ingress = {mode} must be rejected on {network:?}"
                 );
             }
