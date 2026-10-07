@@ -753,9 +753,27 @@ impl AddressBook {
     }
 }
 
-/// The canonical zone name of a box a node names by its registry name.
+/// The canonical zone name of a box a node names by its registry name: the
+/// key the address book holds a box's address under, built from
+/// [`canonical_box_name`], so every name that folds to the same box shares
+/// one address.
 fn box_zone_name(name: &str) -> String {
-    canonical(&format!("{name}.{}", zone_answer::ZONE_APEX))
+    canonical(&format!(
+        "{}.{}",
+        canonical_box_name(name),
+        zone_answer::ZONE_APEX
+    ))
+}
+
+/// The one form a box's registry name is compared in wherever it keys the
+/// box's published address: the answerer's allocations and releases
+/// ([`box_zone_name`]) and the box registry's in-flight registrations
+/// ([`crate::box_registry::BoxRegistry::begin_registration`]). Names are
+/// DNS labels, so the fold is ASCII lower-case: "Web" and "web" are one
+/// box to the answerer, and must be one to everything its hold is checked
+/// against.
+pub(crate) fn canonical_box_name(name: &str) -> String {
+    name.to_ascii_lowercase()
 }
 
 /// The rows other VM host daemons published over the channel, keyed by the
@@ -2659,6 +2677,22 @@ impl AnswererStatus {
     #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub fn allocating_for_tests(node: &str) -> Self {
+        Self::allocating_for_tests_with(node, || None, |_, _| {})
+    }
+
+    /// [`Self::allocating_for_tests`] that asks `hold_reply` after each
+    /// allocation, and runs `on_release` with the box's name and the address
+    /// it freed, if it held one, after each release. When `hold_reply`
+    /// hands back a gate, the allocation's reply is held until the gate
+    /// opens (a send or a drop) while the book goes on serving: a slow
+    /// answerer's late reply, the address already recorded against the box.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn allocating_for_tests_with(
+        node: &str,
+        mut hold_reply: impl FnMut() -> Option<std::sync::mpsc::Receiver<()>> + Send + 'static,
+        mut on_release: impl FnMut(&str, Option<Ipv4Addr>) + Send + 'static,
+    ) -> Self {
         let status = Self::starting();
         let commands = status.attach_commands();
         let node = node.to_string();
@@ -2667,10 +2701,22 @@ impl AnswererStatus {
             while let Ok(command) = commands.recv() {
                 match command {
                     HandoverCommand::Allocate { name, reply } => {
-                        let _ = reply.send(book.allocate(&node, &box_zone_name(&name)));
+                        let answer = book.allocate(&node, &box_zone_name(&name));
+                        match hold_reply() {
+                            Some(gate) => {
+                                std::thread::spawn(move || {
+                                    let _ = gate.recv();
+                                    let _ = reply.send(answer);
+                                });
+                            }
+                            None => {
+                                let _ = reply.send(answer);
+                            }
+                        }
                     }
                     HandoverCommand::ReleaseAddress { name } => {
-                        book.release(&node, &box_zone_name(&name));
+                        let released = book.release(&node, &box_zone_name(&name));
+                        on_release(&name, released);
                     }
                     other => refuse_command(other, NO_ANSWERER),
                 }
