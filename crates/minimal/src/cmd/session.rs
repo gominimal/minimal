@@ -657,14 +657,15 @@ pub(crate) async fn activate_session(
     args: ActivateArgs,
     offer_scaffold: bool,
 ) -> Result<(), anyhow::Error> {
-    ensure_daemon(global)?;
-    // Before anything is created: a dynamic declaration needs an own-IP
-    // box. Every stance stands on a VM-backed host: an `ask` there is
+    // Before anything is created, and before the daemon is spawned (a cold
+    // VM boot), since both are argument errors: a dynamic declaration needs
+    // an own-IP box. Every stance stands on a VM-backed host: an `ask` there is
     // answered by the human attached on the host (NET-045).
     refuse_dynamic_ingress_off_own_ip(args.network, args.dynamic_ingress, args.dynamic_range)?;
     // A static mapping needs an own-IP box too: only it has a published
     // address a static forwarder could apply to.
     refuse_ingress_off_own_ip(args.network, !args.ingress.is_empty())?;
+    ensure_daemon(global)?;
 
     let effective_path = match (&args.path, &global.repo_dir) {
         (Some(p), _) => std::path::PathBuf::from(p),
