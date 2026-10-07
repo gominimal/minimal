@@ -313,7 +313,7 @@ pub async fn activate(
     project_path: paths::HostAbsPath,
     network: NetworkMode,
     contribution: sessions::wire::request::WireContribution,
-) -> Result<SessionId, anyhow::Error> {
+) -> Result<Activated, anyhow::Error> {
     let mut client = Client::connect(sock).await?;
     // The dashboard's own copy of the create/upload/configure/finalize
     // sequence, so it needs the same gate `min session activate` gets: on a
@@ -409,7 +409,7 @@ pub async fn activate(
             .await
             .context("FinalizeSession RPC failed")?
         {
-            Errorable::Ok(_) => Ok(()),
+            Errorable::Ok(ok) => Ok(ok.package_check_skipped),
             Errorable::Err { error } => anyhow::bail!("{error}"),
         }
     }
@@ -417,13 +417,27 @@ pub async fn activate(
 
     // A failed flow must not orphan the record: a `Pending` stub would hold
     // its name and be reaped at the next daemon restart anyway.
-    if let Err(e) = flow {
-        let _ = client
-            .oneshot_rpc::<minimald_rpc::AbortSession>(minimald_rpc::AbortSessionRequest { id })
-            .await;
-        return Err(e);
+    match flow {
+        Ok(package_check_skipped) => Ok(Activated {
+            id,
+            package_check_skipped,
+        }),
+        Err(e) => {
+            let _ = client
+                .oneshot_rpc::<minimald_rpc::AbortSession>(minimald_rpc::AbortSessionRequest { id })
+                .await;
+            Err(e)
+        }
     }
-    Ok(id)
+}
+
+/// A session the dashboard created and activated.
+#[derive(Debug)]
+pub struct Activated {
+    pub id: SessionId,
+    /// The daemon's package check stepped aside at finalize, so unknown
+    /// package names surface at first exec; the status line says so.
+    pub package_check_skipped: bool,
 }
 
 /// Resolves the directory whose tree should be uploaded as the session

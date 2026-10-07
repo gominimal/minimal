@@ -320,9 +320,9 @@ const HOOK_LAUNCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// cache is cold — network I/O with no bound of its own — and the check
 /// runs inside the `FinalizeSession` round-trip. The deadline on that
 /// round-trip is otherwise the *client's* (`minimal-client`'s 60 s base
-/// plus the activate-hook budget plus its package-check budget), and a
-/// client that expires does not cancel the daemon-side finalize: the
-/// session actor runs on, and may promote the record — running the
+/// plus the activate-hook budget; the dashboard grants only the base),
+/// and a client that expires does not cancel the daemon-side finalize:
+/// the session actor runs on, and may promote the record — running the
 /// activate hooks on the way — while the client, which has already
 /// reported a failed activation and best-effort-destroyed the session,
 /// believes nothing was activated. So the daemon bounds the work it
@@ -333,13 +333,11 @@ const HOOK_LAUNCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// proceeds exactly as it did before the check existed, the launch
 /// resolving names at first exec as it always has.
 ///
-/// Matches the client's package-check budget (`minimal-client`'s
-/// `PACKAGE_CHECK_BUDGET`): a warm cache evaluates in seconds, well
-/// inside it, and a cold-cache clone gets the full budget before the
-/// check steps aside. What follows the check in finalize — patch
+/// Half the client's 60 s base: a warm cache evaluates in seconds, well
+/// inside it, and what follows the check in finalize — patch
 /// materialization, and the host mint an activate hook needs — keeps
-/// the client's 60 s base for itself.
-pub(crate) const PACKAGE_CHECK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
+/// the other half of the base for itself.
+pub(crate) const PACKAGE_CHECK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// This session's workspace baseline for the shell-exit prompt's change
 /// detection, established once before the first host launches and reused
@@ -2207,7 +2205,9 @@ impl Session {
         match record.status {
             SessionStatus::Active => {
                 // Already finalized — retry is a no-op, and its hooks ran
-                // on the finalize that did the work.
+                // on the finalize that did the work. Like the hooks, a
+                // skipped package check is reported only by that first
+                // finalize; a retry does not re-report it.
                 Ok(minimald_rpc::FinalizeSessionResponse::default())
             }
             SessionStatus::Materializing => {
