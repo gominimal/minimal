@@ -22,7 +22,11 @@
 //!    at the sequence number the switch expects next. A reset at any other
 //!    in-window number draws a challenge ACK (RFC 5961) carrying the exact
 //!    number, and the gate answers that with one more reset, once per
-//!    connection.
+//!    connection. The resets go out only once the switch has answered a
+//!    probe on that connection ([`arp_probe`]): gvproxy hijacks the
+//!    connection out of its HTTP server, and every byte the server read
+//!    ahead of the hijack is dropped with the server's buffer, so a reset
+//!    written in the same breath as the upgrade never reaches the switch.
 //!
 //! The long-term home for the second step is the switch itself: gvproxy's
 //! forwarder should close the connections it accepted on a listener when
@@ -48,6 +52,26 @@ const ETH_HDR: usize = 14;
 
 /// EtherType for IPv4.
 const ETHERTYPE_IPV4: u16 = 0x0800;
+
+/// EtherType for ARP.
+const ETHERTYPE_ARP: u16 = 0x0806;
+
+/// An ARP request's operation code.
+const ARP_REQUEST: u16 = 1;
+
+/// An ARP reply's operation code.
+const ARP_REPLY: u16 = 2;
+
+/// How long one frame connection is given to answer the gate's probe before
+/// the gate drops it and dials again. gVisor's stack answers an ARP request
+/// for its own address at once, so a connection that stays silent this long
+/// lost the probe to the hijack ([`dial_frames`]).
+const PROBE_WINDOW: Duration = Duration::from_millis(250);
+
+/// How long the gate waits after writing the upgrade before it writes the
+/// probe, on the first dial. Each later dial waits one step longer, so a
+/// switch slow to hijack is given more room every time.
+const UPGRADE_SETTLE: Duration = Duration::from_millis(10);
 
 /// The bound on one switch exchange made at box end: an unexpose, or the
 /// write of the resets. A switch that accepts the connection and then
@@ -527,14 +551,91 @@ fn take_frame(buf: &mut Vec<u8>) -> Option<Vec<u8>> {
     Some(frame)
 }
 
+/// The probe that proves a frame connection reaches the switch: an ARP
+/// request from the box's hardware and network address for the address of
+/// the switch's stack. The stack answers it toward the box's hardware
+/// address, which the switch has just learned on this connection, so the
+/// answer comes back here ([`is_probe_answer`]). It teaches the switch
+/// nothing the resets would not: they come from the same hardware address.
+pub(crate) fn arp_probe(key: &FlowKey, tail: &FlowTail) -> Vec<u8> {
+    let (box_addr, _, peer_addr, _) = *key;
+    let mut frame = Vec::with_capacity(ETH_HDR + 28);
+    frame.extend_from_slice(&[0xff; 6]);
+    frame.extend_from_slice(&tail.box_mac);
+    frame.extend_from_slice(&ETHERTYPE_ARP.to_be_bytes());
+    frame.extend_from_slice(&1u16.to_be_bytes()); // hardware: Ethernet
+    frame.extend_from_slice(&ETHERTYPE_IPV4.to_be_bytes());
+    frame.extend_from_slice(&[6, 4]); // address lengths
+    frame.extend_from_slice(&ARP_REQUEST.to_be_bytes());
+    frame.extend_from_slice(&tail.box_mac);
+    frame.extend_from_slice(&box_addr);
+    frame.extend_from_slice(&[0; 6]);
+    frame.extend_from_slice(&peer_addr);
+    frame
+}
+
+/// Whether `frame` answers [`arp_probe`] for `key` and `tail`: an ARP reply
+/// from the switch stack's address, to the box's hardware address.
+pub(crate) fn is_probe_answer(frame: &[u8], key: &FlowKey, tail: &FlowTail) -> bool {
+    let (_, _, peer_addr, _) = *key;
+    frame.get(12..14) == Some(&ETHERTYPE_ARP.to_be_bytes()[..])
+        && frame.get(ETH_HDR + 6..ETH_HDR + 8) == Some(&ARP_REPLY.to_be_bytes()[..])
+        && frame.get(ETH_HDR + 14..ETH_HDR + 18) == Some(&peer_addr[..])
+        && frame.get(ETH_HDR + 18..ETH_HDR + 24) == Some(&tail.box_mac[..])
+}
+
+/// Dials the switch at `switch_sock` until a frame connection answers the
+/// probe for `probe_flow` ([`arp_probe`]), and returns that connection with
+/// whatever it read past the answer. gvproxy upgrades a connection by
+/// hijacking it out of its HTTP server and writes nothing back, and the
+/// bytes its server read ahead of the hijack are dropped with the server's
+/// buffer. So the gate writes the upgrade alone, waits, writes the probe,
+/// and takes an answer within [`PROBE_WINDOW`] as proof that its frames now
+/// reach the switch whole. A connection that stays silent lost the probe,
+/// or part of it, to the hijack, and is dropped for a fresh one that waits
+/// longer before its probe.
+async fn dial_frames(
+    switch_sock: &Path,
+    connect_request: &[u8],
+    probe_flow: &(FlowKey, FlowTail),
+) -> io::Result<(UnixStream, Vec<u8>)> {
+    let (key, tail) = probe_flow;
+    let mut probe = Vec::new();
+    frame_onto(&mut probe, &[arp_probe(key, tail)])?;
+    let mut settle = UPGRADE_SETTLE;
+    loop {
+        let mut switch = UnixStream::connect(switch_sock).await?;
+        switch.write_all(connect_request).await?;
+        tokio::time::sleep(settle).await;
+        switch.write_all(&probe).await?;
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 2048];
+        let window_end = tokio::time::Instant::now() + PROBE_WINDOW;
+        while let Ok(read) = tokio::time::timeout_at(window_end, switch.read(&mut chunk)).await {
+            let n = read?;
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(chunk.get(..n).unwrap_or_default());
+            while let Some(frame) = take_frame(&mut buf) {
+                if is_probe_answer(&frame, key, tail) {
+                    return Ok((switch, buf));
+                }
+            }
+        }
+        settle += UPGRADE_SETTLE;
+    }
+}
+
 /// Ends the tracked connections `flows` at the switch at `switch_sock`,
 /// over a frame connection of the gate's own, bounded by `bound`. It writes
-/// the `connect_request` upgrade, then each connection's resets
+/// the `connect_request` upgrade and waits for the switch to answer a probe
+/// on it ([`dial_frames`]), then writes each connection's resets
 /// ([`reset_frames`]), each frame behind its little-endian length. Then it
 /// listens for `challenge_window` and answers each challenge ACK with one
 /// reset at the number the ACK carries ([`challenge_reset`]), at most once
 /// per connection. The switch learns the box's hardware address from the
-/// resets, so it sends the challenge ACKs back over this connection. The
+/// probe, so it sends the challenge ACKs back over this connection. The
 /// gate then closes its side. Returns how many challenge ACKs it answered.
 ///
 /// # Errors
@@ -547,17 +648,19 @@ pub(crate) async fn inject(
     bound: Duration,
     challenge_window: Duration,
 ) -> io::Result<usize> {
+    let Some(probe_flow) = flows.first() else {
+        return Ok(0);
+    };
     let resets: Vec<Vec<u8>> = flows
         .iter()
         .flat_map(|(key, tail)| reset_frames(key, tail))
         .collect();
-    let mut stream = connect_request.to_vec();
+    let mut stream = Vec::new();
     frame_onto(&mut stream, &resets)?;
     tokio::time::timeout(bound, async {
-        let mut switch = UnixStream::connect(switch_sock).await?;
+        let (mut switch, mut buf) = dial_frames(switch_sock, connect_request, probe_flow).await?;
         switch.write_all(&stream).await?;
         let mut answered = BTreeSet::new();
-        let mut buf = Vec::new();
         let mut chunk = [0u8; 2048];
         let window_end = tokio::time::Instant::now() + challenge_window;
         while answered.len() < flows.len() {
@@ -585,19 +688,119 @@ pub(crate) async fn inject(
     .map_err(|_elapsed| {
         io::Error::new(
             io::ErrorKind::TimedOut,
-            format!("the switch did not take the resets within {bound:?}"),
+            format!("the switch did not answer the probe or take the resets within {bound:?}"),
         )
     })?
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     const BOX: [u8; 4] = [100, 64, 0, 9];
     const PEER: [u8; 4] = [100, 64, 0, 1];
     const BOX_MAC: [u8; 6] = [0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xee];
     const PEER_MAC: [u8; 6] = [0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xdd];
+
+    /// The answer the switch's stack gives `request`, an ARP request, from
+    /// the address it asks for; `None` for any other frame.
+    fn arp_answer(request: &[u8]) -> Option<Vec<u8>> {
+        let asked = request.get(ETH_HDR..ETH_HDR + 28)?;
+        if request.get(12..14)? != ETHERTYPE_ARP.to_be_bytes()
+            || asked.get(6..8)? != ARP_REQUEST.to_be_bytes()
+        {
+            return None;
+        }
+        let (requester_mac, requester) = (asked.get(8..14)?, asked.get(14..18)?);
+        let mut answer = Vec::new();
+        answer.extend_from_slice(requester_mac);
+        answer.extend_from_slice(&PEER_MAC);
+        answer.extend_from_slice(&ETHERTYPE_ARP.to_be_bytes());
+        answer.extend_from_slice(asked.get(..6)?);
+        answer.extend_from_slice(&ARP_REPLY.to_be_bytes());
+        answer.extend_from_slice(&PEER_MAC);
+        answer.extend_from_slice(asked.get(24..28)?);
+        answer.extend_from_slice(requester_mac);
+        answer.extend_from_slice(requester);
+        Some(answer)
+    }
+
+    /// Stands in for the switch on a frame connection the gate dialed, up to
+    /// its resets: reads the upgrade `connect_request`, then the gate's
+    /// probe, and answers the probe as the switch's stack does.
+    pub(crate) async fn answer_the_probe(switch: &mut UnixStream, connect_request: &[u8]) {
+        let mut head = vec![0u8; connect_request.len()];
+        switch
+            .read_exact(&mut head)
+            .await
+            .expect("reading the upgrade");
+        assert_eq!(head, connect_request, "the upgrade comes first, alone");
+        let mut len = [0u8; 2];
+        switch
+            .read_exact(&mut len)
+            .await
+            .expect("reading the probe's length");
+        let mut probe = vec![0u8; usize::from(u16::from_le_bytes(len))];
+        switch
+            .read_exact(&mut probe)
+            .await
+            .expect("reading the probe");
+        let answer = arp_answer(&probe).expect("the probe is an ARP request");
+        let mut framed = Vec::new();
+        frame_onto(&mut framed, &[answer]).expect("framing the answer");
+        switch
+            .write_all(&framed)
+            .await
+            .expect("answering the probe");
+    }
+
+    /// Stands in for gvproxy's switch socket as its HTTP server hands a
+    /// connection to the switch: the server reads the upgrade together with
+    /// whatever arrived behind it, the hijack drops all of that with the
+    /// server's buffer, and only the bytes read after it reach the switch.
+    /// Each ARP request that reaches it is answered as the switch's stack
+    /// answers it, and each reset is sent on `resets`.
+    async fn hijacking_switch(
+        listener: tokio::net::UnixListener,
+        resets: tokio::sync::mpsc::UnboundedSender<TcpSegment>,
+    ) {
+        loop {
+            let Ok((mut conn, _)) = listener.accept().await else {
+                return;
+            };
+            let resets = resets.clone();
+            tokio::spawn(async move {
+                let mut chunk = [0u8; 4096];
+                let mut head = Vec::new();
+                while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+                    match conn.read(&mut chunk).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => head.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                let mut buf = Vec::new();
+                while let Ok(n) = conn.read(&mut chunk).await {
+                    if n == 0 {
+                        return;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    while let Some(frame) = take_frame(&mut buf) {
+                        if let Some(answer) = arp_answer(&frame) {
+                            let mut framed = Vec::new();
+                            frame_onto(&mut framed, &[answer]).expect("framing the answer");
+                            if conn.write_all(&framed).await.is_err() {
+                                return;
+                            }
+                        } else if let Some(segment) = parse_tcp_segment(&frame)
+                            && segment.flags & TCP_RST != 0
+                        {
+                            let _ = resets.send(segment);
+                        }
+                    }
+                }
+            });
+        }
+    }
 
     /// A TCP frame with sequence state and `payload` bytes of data.
     fn segment(
@@ -769,6 +972,53 @@ mod tests {
         );
     }
 
+    /// Design §7.1 against the switch as gvproxy hands it a connection: its
+    /// HTTP server reads the upgrade with whatever arrived behind it, and
+    /// the hijack drops all of that. Resets written in the same breath as
+    /// the upgrade were dropped every time, so a connection held through a
+    /// forward outlived its box. The gate holds its resets until the switch
+    /// has answered its probe, and they arrive, at both readings of the
+    /// sequence number the switch expects.
+    #[tokio::test]
+    async fn the_resets_reach_a_switch_that_drops_what_was_read_before_its_hijack() {
+        let dir = tempfile::TempDir::new().expect("a tempdir");
+        let sock = dir.path().join("switch.sock");
+        let listener = tokio::net::UnixListener::bind(&sock).expect("binding the stand-in switch");
+        let (resets_tx, mut resets_rx) = tokio::sync::mpsc::unbounded_channel();
+        let switch = tokio::spawn(hijacking_switch(listener, resets_tx));
+        let flows = ForwardedFlows::default();
+        let now = Instant::now();
+        flows.observe_toward_box(&toward_box(1, 0, TCP_SYN, 0), now);
+        flows.observe_from_box(&from_box(500, 2, TCP_SYN | TCP_ACK, 0), now);
+        flows.observe_toward_box(&toward_box(2, 501, TCP_ACK, 3), now);
+        flows.observe_from_box(&from_box(501, 5, TCP_ACK, 100), now);
+        let taken = flows.take_at(BOX);
+
+        let answered = inject(
+            &sock,
+            b"POST /connect HTTP/1.0\r\nHost: localhost\r\n\r\n",
+            &taken,
+            Duration::from_secs(5),
+            Duration::from_millis(100),
+        )
+        .await
+        .expect("the inject");
+        assert_eq!(answered, 0, "no challenge ACK was drawn");
+
+        let mut seqs = Vec::new();
+        while seqs.len() < 2 {
+            let reset = tokio::time::timeout(Duration::from_secs(5), resets_rx.recv())
+                .await
+                .expect("the gate's resets reach the switch")
+                .expect("the stand-in switch is up");
+            assert_eq!((reset.src, reset.src_port), (BOX, 8080));
+            assert_eq!((reset.dst, reset.dst_port), (PEER, 40000));
+            seqs.push(reset.seq);
+        }
+        assert_eq!(seqs, [601, 501]);
+        switch.abort();
+    }
+
     /// The frames in `bytes`, each behind its little-endian length.
     fn frames_in(mut bytes: Vec<u8>) -> Vec<Vec<u8>> {
         let mut frames = Vec::new();
@@ -810,12 +1060,7 @@ mod tests {
         });
 
         let (mut switch, _) = listener.accept().await.expect("accepting the gate's dial");
-        let mut head = vec![0u8; connect.len()];
-        switch
-            .read_exact(&mut head)
-            .await
-            .expect("reading the upgrade");
-        assert_eq!(head, connect);
+        answer_the_probe(&mut switch, connect).await;
         // The two first resets: past the box's last segment, and at the
         // switch's last acknowledgement.
         let mut first = vec![0u8; 2 * (2 + ETH_HDR + 40)];

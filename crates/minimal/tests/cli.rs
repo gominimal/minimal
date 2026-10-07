@@ -1029,6 +1029,56 @@ async fn activate_prints_no_session_id_when_composition_fails() {
     );
 }
 
+/// Plain-mode tracing warnings must land on stderr, never stdout: a script
+/// piping `min loadout list` captures the table on stdout, and a `warning:`
+/// line mixed into it would corrupt that output. Driven through the compiled
+/// binary, not `cmd_loadout_list`, because the contract under test is which
+/// stream the process writes to. The warning is triggered deterministically
+/// by a loadout file carrying a vestigial `name` field.
+#[tokio::test]
+async fn loadout_list_warning_goes_to_stderr_not_stdout() {
+    let (_daemon, args) = setup().await;
+    let minimal_dir = args.minimal_dir.clone().expect("setup points at a tempdir");
+
+    // A loadout whose file still declares the now-vestigial `name` field
+    // makes `list_loadouts` emit a `tracing::warn!` during parsing.
+    let loadouts_dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        loadouts_dir.path().join("dev.toml"),
+        "name = \"dev\"\ndescription = \"development\"\n",
+    )
+    .unwrap();
+
+    // An empty config dir keeps the developer's own loadouts and policy
+    // out of the run.
+    let config_dir = tempfile::TempDir::new().unwrap();
+    let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_min"))
+        .args(["--minimal-dir".as_ref(), minimal_dir.as_os_str()])
+        .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
+        .arg("--no-input")
+        .args(["loadout", "list", "--dir"])
+        .arg(loadouts_dir.path())
+        .env_remove("RUST_LOG")
+        .output()
+        .await
+        .expect("the min binary should be invocable");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "loadout list must succeed: stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("warning:") && stderr.contains("declares a `name` field"),
+        "the vestigial-name warning must land on stderr, got: {stderr}"
+    );
+    assert!(
+        !stdout.contains("warning:"),
+        "a plain-mode warning must not pollute stdout, got: {stdout}"
+    );
+}
+
 /// `min session attach` with no session argument and `--no-input` errors cleanly when
 /// no sessions exist, rather than hanging or shelling out to ssh. The error
 /// surfaces before any ssh exec, so it is deterministic in a test environment.

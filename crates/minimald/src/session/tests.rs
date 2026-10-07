@@ -5480,7 +5480,7 @@ pub(crate) async fn finalize_declared_dynamic_ingress_session(
 /// framing [`crate::net::policy`] writes, so the stand-in forwarder below
 /// never blocks reading past what the daemon sent. `None` when the client
 /// went away mid-request.
-async fn read_control_request(stream: &mut tokio::net::UnixStream) -> Option<String> {
+pub(crate) async fn read_control_request(stream: &mut tokio::net::UnixStream) -> Option<String> {
     use tokio::io::AsyncReadExt;
     let mut buf = Vec::with_capacity(256);
     let mut scratch = [0u8; 512];
@@ -5541,8 +5541,10 @@ pub(crate) async fn fake_forwarder(
 /// can have the switch accept one bind and refuse the next, the way the real
 /// forwarder answers a duplicate of a bind another forward already holds.
 /// Everything else is [`fake_forwarder`]'s contract: one request per
-/// connection, each recorded as `"<request line>\n<body>"`.
-async fn scripted_forwarder(
+/// connection, each recorded as `"<request line>\n<body>"`. `pub(crate)`:
+/// the fail-closed audit tests drive an unaudited publish's withdrawal
+/// through the same stand-in, one whose unexpose the switch refuses.
+pub(crate) async fn scripted_forwarder(
     sock: std::path::PathBuf,
     script: Vec<u16>,
 ) -> (
