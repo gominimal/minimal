@@ -759,9 +759,10 @@ impl ServerStateHandle {
     /// carries the port a *client* dials. Boxes reach the bound port on the
     /// loopback they share with the daemon, so their own-address openings
     /// compile from it, not the configured port the daemon may have moved off.
-    pub(crate) async fn set_switch_hostname_proxy_port(&self, port: Option<u16>) {
+    #[cfg(target_os = "linux")]
+    pub(crate) async fn set_switch_hostname_proxy_port(&self, port: u16) {
         let switch = Arc::clone(&self.0.lock().await.net_switch);
-        switch.lock().await.set_hostname_proxy_port(port);
+        switch.lock().await.set_hostname_proxy_port(Some(port));
     }
 
     /// The port the hostname proxy listens on, or `None` while it is still
@@ -1635,7 +1636,7 @@ impl HostProxyStartup {
         reported_port: u16,
     ) {
         match self {
-            Self::Egress { .. } => {
+            Self::Egress { port, .. } => {
                 tracing::info!(
                     component = self.component(),
                     port = bound_port,
@@ -1644,16 +1645,41 @@ impl HostProxyStartup {
                     "hostname proxy is serving on its {} port",
                     source.as_str()
                 );
+                note_switch_opening_moved(port.opening_port(), bound_port);
                 state.set_hostname_proxy_port(reported_port).await;
                 // The switch's node-address opening follows the port this
                 // daemon's boxes reach on the loopback they share with it —
                 // the bound port — so an unpinned daemon whose default was
                 // busy re-compiles its own-address boxes at the port it
                 // actually landed on, not the configured one it moved off.
-                state.set_switch_hostname_proxy_port(Some(bound_port)).await;
+                state.set_switch_hostname_proxy_port(bound_port).await;
             }
         }
     }
+}
+
+/// Logs, once at the proxy's startup, when the port it bound is not the
+/// port the switch's node-address opening was built with (design §7.1): an
+/// unpinned daemon that found the default busy and took an OS-chosen port,
+/// or a pinned `0`. The opening is re-pointed to the bound port, but a box
+/// reads it once, when it attaches, so a box that attached before the proxy
+/// was serving keeps the old opening until it reattaches or restarts.
+/// Returns whether it logged.
+#[cfg(target_os = "linux")]
+fn note_switch_opening_moved(opening: Option<u16>, bound_port: u16) -> bool {
+    if opening == Some(bound_port) {
+        return false;
+    }
+    let opening = opening.map_or_else(|| "none".to_string(), |port| port.to_string());
+    tracing::warn!(
+        bound_port,
+        opening_port = %opening,
+        "hostname proxy bound port {bound_port}, not the switch opening's port \
+         {opening}: boxes attached from now on compile the opening at port \
+         {bound_port}; a box attached earlier cannot reach the hostname proxy \
+         until it reattaches or restarts"
+    );
+    true
 }
 
 /// Drives the hostname-routing proxy (the B5 egress proxy — the listener
@@ -2703,6 +2729,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn record_serving_points_the_switch_opening_at_the_bound_port() {
+        let capture = crate::test_harness::captured_log();
         let dir = TempDir::new().unwrap();
         let state = ServerStateHandle::new(test_config(&dir), None)
             .await
@@ -2731,6 +2758,35 @@ mod tests {
             state.hostname_proxy_port().await,
             Some(41913),
             "the discovery field carries the bound port"
+        );
+        let logged = capture.contents();
+        assert_eq!(
+            logged
+                .matches("hostname proxy bound port 41913, not the switch opening's port 7654")
+                .count(),
+            1,
+            "one line naming both ports: {logged}"
+        );
+    }
+
+    /// The moved-opening note names both ports and the earlier-attached
+    /// boxes it leaves behind, and says nothing when the ports agree.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn switch_opening_moved_notes_only_a_mismatch() {
+        let capture = crate::test_harness::captured_log();
+        assert!(!note_switch_opening_moved(Some(7654), 7654));
+        assert!(note_switch_opening_moved(None, 41914));
+        let logged = capture.contents();
+        assert!(
+            !logged.contains("bound port 7654,"),
+            "equal ports say nothing: {logged}"
+        );
+        assert!(
+            logged.contains("hostname proxy bound port 41914, not the switch opening's port none")
+                && logged.contains("until it reattaches or restarts")
+                && logged.contains("WARN"),
+            "a warn line naming both ports: {logged}"
         );
     }
 
