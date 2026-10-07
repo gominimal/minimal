@@ -1185,9 +1185,10 @@ refusal holds only inside the VM, below the escape boundary.
 - **Invariant:** THE SYSTEM SHALL carry no name that a box's allow list does
   not match, outside the box zone, beyond the resolver Minimal owns for the
   box, for every query that reaches that resolver.
-  enforced by: the refusal at the resolver Minimal owns for the box; on a
-  VM-backed host, decided host-side (minvmd's DNS gate, outside the VM escape
-  boundary), with the in-VM gate as the precision copy
+  enforced by: the refusal at the resolver Minimal owns for the box. On a
+  VM-backed host the in-VM gate makes it, until minvmd's host-side DNS gate
+  can refuse a query itself. That residual and the native host-address box's
+  bypass are the two limits stated in the design reasoning.
   covered by: NET-141
 - **Invariant:** THE SYSTEM SHALL publish a dynamically requested port only
   under a recorded allow decision.
