@@ -301,6 +301,8 @@ mod tests {
         assert_eq!(mappings.len(), 2);
 
         let first = mappings[0].as_map().unwrap();
+        // A `default` on an element contract would add a key here.
+        assert_eq!(first.len(), 3, "element keys: {:?}", first.keys());
         assert!(matches!(
             first.get("read_only").unwrap(),
             AttrValue::Bool(true)
@@ -315,6 +317,7 @@ mod tests {
         ));
 
         let second = mappings[1].as_map().unwrap();
+        assert_eq!(second.len(), 3, "element keys: {:?}", second.keys());
         assert!(matches!(
             second.get("read_only").unwrap(),
             AttrValue::Bool(false)
