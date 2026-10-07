@@ -79,6 +79,20 @@ pub(crate) fn refused_unenforceable_creates() -> u64 {
     REFUSED_UNENFORCEABLE_CREATES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// The daemon-log spelling of a session's network mode: the CLI's
+/// `--network` names (`none` / `host_ip` / `own_ip`) rather than the
+/// snake_case wire form, so every log line names what a person typed. The
+/// wildcard arm keeps a future mode from being silently misreported —
+/// `NetworkMode` is `#[non_exhaustive]`.
+pub(crate) fn network_mode_label(network: sessions::NetworkMode) -> &'static str {
+    match network {
+        sessions::NetworkMode::NoNet => "none",
+        sessions::NetworkMode::HostNet => "host_ip",
+        sessions::NetworkMode::OwnIp => "own_ip",
+        _ => "unknown",
+    }
+}
+
 /// Assemble a [`sessions::Record`] from the out-of-band session
 /// config and the SSH-supplied username, then validate its policy.
 /// Returns `Err(io::InvalidInput)` if the policy is incompatible
@@ -1043,7 +1057,7 @@ impl Manager {
             REFUSED_UNENFORCEABLE_CREATES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             tracing::info!(
                 session_name = ?config.name,
-                network_mode = ?config.network,
+                network_mode = %network_mode_label(config.network),
                 host_ip_enforcement = %minimald_rpc::HostIpEnforcement::PerBox.machine_str(),
                 refused_unenforceable_creates = refused_unenforceable_creates(),
                 refusal = %refusal,

@@ -4331,6 +4331,7 @@ mod tests {
                 logged.lines().any(|line| {
                     line.contains("refused a create whose host-address declaration names rules")
                         && line.contains(&format!("session_name=Some(\"{name}\")"))
+                        && line.contains("network_mode=host_ip")
                         && line.contains("host_ip_enforcement=per_box")
                         && line.contains(rule)
                 }),

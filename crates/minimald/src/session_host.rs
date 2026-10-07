@@ -28,6 +28,7 @@ use crate::RequestedPty;
 use crate::session::SessionPaths;
 use crate::session_delta::DeltaSource;
 use crate::sessions::SessionControl;
+use crate::sessions::network_mode_label;
 use sessions::NetworkMode;
 use sessions::keys::{ChordMatcher, FeedOutcome, KeyAction, SessionKeys};
 // The one per-box egress enforcement type (NET-079): shared with the session
@@ -4162,7 +4163,7 @@ impl SessionLauncher for SandboxLauncher {
                 let refusal = crate::net::classifier::unenforceable_declaration_refusal(&rules);
                 tracing::info!(
                     session = %session_name,
-                    network_mode = ?network_mode,
+                    network_mode = %network_mode_label(network_mode),
                     host_ip_enforcement = %HostIpEnforcement::PerBox.machine_str(),
                     refusal = %refusal,
                     "refusing a host-address box whose declaration names rules \
@@ -4227,7 +4228,7 @@ impl SessionLauncher for SandboxLauncher {
         ) {
             tracing::error!(
                 session = %session_name,
-                network_mode = ?network_mode,
+                network_mode = %network_mode_label(network_mode),
                 tree = %classifier_root.display(),
                 placed = leaf.is_some(),
                 refusal = %refusal,
