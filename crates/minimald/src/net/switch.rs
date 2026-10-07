@@ -441,9 +441,39 @@ pub async fn attach_to_switch_vsock(
     lease: Ipv4Addr,
     subnet: SwitchSubnet,
 ) -> io::Result<SwitchRelay> {
+    let sock = connect_switch_vsock(cid, port).await?;
+    let (sock_rx, sock_tx) = tokio::io::split(sock);
+    spawn_relay(tap_fd, sock_rx, sock_tx, gate, lease, subnet)
+}
+
+/// Attaches the guest's **root** namespace tap — the daemon's own, which
+/// every host-address box on the guest shares — to the host gvproxy switch
+/// over AF_VSOCK, the way [`attach_to_switch_vsock`] attaches a box's, with
+/// no session gate (the daemon is not a box) but carrying the node's DNS
+/// layer ([`spawn_node_relay`]): the namespace's lookups to the switch's
+/// resolver reach upstream only through it (NET-003).
+///
+/// # Errors
+///
+/// As [`attach_to_switch_vsock`].
+pub async fn attach_node_to_switch_vsock(
+    tap_fd: OwnedFd,
+    cid: u32,
+    port: u32,
+    lease: Ipv4Addr,
+    subnet: SwitchSubnet,
+) -> io::Result<SwitchRelay> {
+    let sock = connect_switch_vsock(cid, port).await?;
+    let (sock_rx, sock_tx) = tokio::io::split(sock);
+    spawn_node_relay(tap_fd, sock_rx, sock_tx, lease, subnet)
+}
+
+/// Connects to the host gvproxy switch over AF_VSOCK and upgrades the stream
+/// with the `/connect` request, bounded by [`VSOCK_CONNECT_TIMEOUT`].
+async fn connect_switch_vsock(cid: u32, port: u32) -> io::Result<tokio_vsock::VsockStream> {
     // Bound the connect + `/connect` upgrade: a wedged or absent host gvproxy
     // must fail the attach fast, not stall OwnIp bring-up forever.
-    let sock = tokio::time::timeout(VSOCK_CONNECT_TIMEOUT, async {
+    tokio::time::timeout(VSOCK_CONNECT_TIMEOUT, async {
         let mut sock =
             tokio_vsock::VsockStream::connect(tokio_vsock::VsockAddr::new(cid, port)).await?;
         // `VsockStream` has an inherent (blocking, std::io) `write_all` that
@@ -461,9 +491,63 @@ pub async fn attach_to_switch_vsock(
                  timed out after {VSOCK_CONNECT_TIMEOUT:?}"
             ),
         )
-    })??;
-    let (sock_rx, sock_tx) = tokio::io::split(sock);
-    spawn_relay(tap_fd, sock_rx, sock_tx, gate, lease, subnet)
+    })?
+}
+
+/// The node's DNS layer on the daemon's own relay (NET-003, NET-136): the
+/// same DNS gate a box's relay carries, built for the guest's root namespace
+/// — no session policy, so it declares no names and pins nothing, keyed to
+/// the switch's resolver at the gateway and to the daemon's own address as
+/// the source its frames carry. What it does on this relay is the egress
+/// leg's half of the gate: an AAAA, HTTPS or SVCB lookup to the resolver is
+/// answered NODATA here and never reaches the switch, and every other
+/// lookup is forwarded on. The namespace is the daemon's and every
+/// host-address box's on the guest alike, and a frame cannot tell them
+/// apart, so the layer serves them all — the daemon's own lookups included,
+/// which lose nothing by it: the guest runs without IPv6 (NET-082), so an
+/// AAAA answer carried nothing it could use.
+fn node_dns_layer(subnet: SwitchSubnet, lease: Ipv4Addr) -> DnsGate {
+    DnsGate::new(
+        "node",
+        None,
+        compiled_egress(None, subnet, lease, None),
+        egress::InfrastructureDenySet::new(
+            subnet.dns_server().octets(),
+            subnet.host_alias().octets(),
+        ),
+        subnet.host_alias().octets(),
+        Arc::new(PolicyWarnLimiter::new()),
+    )
+}
+
+/// The daemon's own relay, carrying the node's DNS layer
+/// ([`node_dns_layer`]): ungated like every daemon relay — the daemon is not
+/// a box, and its frames, and those of the host-address boxes sharing its
+/// namespace, are decided by the guest's table and the host-side gate, not
+/// a session's rules — while the namespace's lookups to the switch's
+/// resolver ride the node's DNS layer on their way out (NET-003). The
+/// guest's root egress attaches through it ([`attach_node_to_switch_vsock`]).
+pub(crate) fn spawn_node_relay<R, W>(
+    tap_fd: OwnedFd,
+    sock_rx: R,
+    sock_tx: W,
+    lease: Ipv4Addr,
+    subnet: SwitchSubnet,
+) -> io::Result<SwitchRelay>
+where
+    R: AsyncReadExt + Unpin + Send + 'static,
+    W: AsyncWriteExt + Unpin + Send + 'static,
+{
+    let node_dns = node_dns_layer(subnet, lease);
+    spawn_relay_with(
+        tap_fd,
+        sock_rx,
+        sock_tx,
+        None,
+        Some(node_dns),
+        lease,
+        subnet,
+    )
 }
 
 /// Wires `tap_fd` into the bidirectional frame relay against an already-connected,
@@ -483,6 +567,25 @@ fn spawn_relay<R, W>(
     sock_rx: R,
     sock_tx: W,
     gate: Option<Arc<SessionGate>>,
+    lease: Ipv4Addr,
+    subnet: SwitchSubnet,
+) -> io::Result<SwitchRelay>
+where
+    R: AsyncReadExt + Unpin + Send + 'static,
+    W: AsyncWriteExt + Unpin + Send + 'static,
+{
+    spawn_relay_with(tap_fd, sock_rx, sock_tx, gate, None, lease, subnet)
+}
+
+/// [`spawn_relay`], with the node's DNS layer the daemon's own relay carries
+/// ([`spawn_node_relay`]); `None` for every other relay, whose DNS gate, if
+/// any, is its session gate's own.
+fn spawn_relay_with<R, W>(
+    tap_fd: OwnedFd,
+    sock_rx: R,
+    sock_tx: W,
+    gate: Option<Arc<SessionGate>>,
+    node_dns: Option<DnsGate>,
     lease: Ipv4Addr,
     subnet: SwitchSubnet,
 ) -> io::Result<SwitchRelay>
@@ -536,6 +639,7 @@ where
         Arc::clone(&tap),
         Arc::clone(&sock_tx),
         gate.clone(),
+        node_dns,
         legacy_notice,
         reject,
     ));
@@ -609,7 +713,9 @@ async fn write_box_resets(
 /// actually forwards (so its reply is allowed back in — finding #2, UDP; only
 /// a declared, forwarded datagram opens a window), prepend its 2-byte LE length,
 /// and write the framed packet to the control socket. `gate` is `None` for the
-/// daemon relay, which is not a box and forwards its own frames unchecked.
+/// daemon relay, which is not a box and forwards its own frames unchecked —
+/// save the lookups the node's DNS layer answers itself, when the relay
+/// carries one (`node_dns`, the guest's root egress: [`spawn_node_relay`]).
 #[expect(
     clippy::indexing_slicing,
     reason = "every `buf[..n]` is bounded by `n`, the count this loop's own read of `buf` returned"
@@ -618,6 +724,7 @@ async fn relay_tap_to_switch<W>(
     tap: Arc<AsyncFd<std::fs::File>>,
     sock: Arc<AsyncMutex<W>>,
     gate: Option<Arc<SessionGate>>,
+    node_dns: Option<DnsGate>,
     notice: Option<LegacyHostNotice>,
     reject: ForeignSourceReject,
 ) -> io::Result<()>
@@ -762,6 +869,20 @@ where
             if let Some(pkt) = &udp {
                 gate.conntrack.record_egress(pkt);
             }
+        }
+        // The node's DNS layer on the daemon's own relay (NET-003, NET-136):
+        // the guest's root namespace — the daemon's, and every host-address
+        // box's on the guest — sends its lookups to the switch's resolver
+        // through here, so the layer answers AAAA, HTTPS and SVCB itself, as
+        // a box's own relay does, and forwards every other lookup on.
+        if let Some(node_dns) = &node_dns
+            && let Some(pkt) = parse_ipv4_l4(&buf[..n]).filter(|pkt| pkt.proto == IPPROTO_UDP)
+            && let Some(payload) = udp_payload(&buf[..n], &pkt)
+            && let Some(reply) = node_dns.intercept_query(&pkt.dst, payload)
+        {
+            let frame = udp_reply_frame(&buf[..n], &pkt, &reply);
+            write_tap_frame(&tap, &frame).await?;
+            continue;
         }
         // One combined write keeps the length prefix and frame atomic even if
         // the socket closes between writes.
@@ -3345,14 +3466,16 @@ pub(crate) mod tests {
         spawn_relay_for(LEASE, Some(policy), configure)
     }
 
-    /// Spawns the daemon's own relay shape: no gate, the daemon's address as
-    /// its lease — what the guest's root egress attach runs (`guest.rs`).
-    fn spawn_daemon_relay(lease: Ipv4Addr) -> RelayHarness {
+    /// Spawns the daemon's own relay shape: no gate, the node's DNS layer, the
+    /// daemon's address as its lease — what the guest's root egress attach
+    /// runs (`guest.rs`, through [`spawn_node_relay`]).
+    pub(crate) fn spawn_daemon_relay(lease: Ipv4Addr) -> RelayHarness {
         spawn_relay_for(lease, None, |_| {})
     }
 
     /// The relay both harnesses share: a box's gated relay under `policy`, or
-    /// the daemon's own ungated one (`policy` is `None`), attached with
+    /// the daemon's own ungated one carrying the node's DNS layer (`policy`
+    /// is `None`), attached with
     /// `lease` on the default switch subnet. The gate, when there is one, is
     /// handed to `configure` before the relay takes it — the DNS-gate proofs
     /// are the callers, for the things a policy cannot say.
@@ -3387,14 +3510,20 @@ pub(crate) mod tests {
                 configure(&mut gate);
                 Arc::new(gate)
             });
-        let relay = spawn_relay(
-            tap_fd,
-            sock_rx,
-            sock_tx,
-            gate.clone(),
-            lease,
-            SwitchSubnet::default(),
-        )
+        // The daemon's own relay is the one the guest's root egress attaches
+        // (`attach_node_to_switch_vsock`): ungated, carrying the node's DNS
+        // layer.
+        let relay = match gate.clone() {
+            Some(gate) => spawn_relay(
+                tap_fd,
+                sock_rx,
+                sock_tx,
+                Some(gate),
+                lease,
+                SwitchSubnet::default(),
+            ),
+            None => spawn_node_relay(tap_fd, sock_rx, sock_tx, lease, SwitchSubnet::default()),
+        }
         .expect("the harness relay spawns");
         RelayHarness {
             box_end,

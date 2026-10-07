@@ -832,8 +832,8 @@ impl HostnameRegistry {
     /// an address the publish surface cannot bind, so every forward the box
     /// would bind there fails with `EADDRNOTAVAIL`. The name rides along
     /// because the move re-registers the box's route at the interim; a
-    /// publish whose session holds no registered name (a stopped box, one
-    /// whose name another session took over) is not listed — its next
+    /// publish whose session holds no registered name (one whose name
+    /// another session took over) is not listed — its next
     /// finalize is the moment its ask runs again, through the verdict-gated
     /// reads the session actor makes.
     #[must_use]
@@ -860,9 +860,10 @@ impl HostnameRegistry {
     /// hand for a box a creator handed one (never a grant from the pool: a
     /// hand is only ever replaced by `127.0.0.1`), to a grant for a box
     /// nobody handed an address. Each row carries the hand with it, so the
-    /// sweep's move needs no second read. A box whose publish the landing
-    /// misses, because it was stopped across the landing, asks again at its
-    /// next finalize, which does not short-circuit on the interim either.
+    /// sweep's move needs no second read. A stopped box keeps its name, so
+    /// the landing moves it too, its stopped marker intact. A box whose
+    /// publish the landing misses asks again at its next finalize, which
+    /// does not short-circuit on the interim either.
     #[must_use]
     pub fn interim_own_publishes(&self) -> Vec<InterimPublish> {
         self.own_published
@@ -1327,7 +1328,32 @@ impl HostnameRegistry {
             );
             route = self.by_host.get(&Hostname(two_label)).cloned();
         }
-        route
+        // NET-128, mirrored from the zone (`zone_answer`): a box stopped on
+        // the node's shared address keeps its name held, but nothing may be
+        // forwarded there — the node's own listener at that port would answer
+        // for the dead box.
+        route.filter(|route| !self.stopped_on_shared_address(route))
+    }
+
+    /// Whether `route`'s box is stopped while publishing on the node's shared
+    /// address (NET-128). Its name stays held, but neither the zone nor the
+    /// host-side proxy may point a client at the node for it.
+    fn stopped_on_shared_address(&self, route: &Route) -> bool {
+        let Some(id) = self
+            .by_session
+            .get(route.session())
+            .map(|registration| registration.id)
+        else {
+            return false;
+        };
+        if !self.stopped.contains(&id) {
+            return false;
+        }
+        let address = self
+            .own_published
+            .get(&id)
+            .map_or_else(|| route.address(), |own| own.address);
+        address == self.node
     }
 
     /// The two-label name a deprecated three-label one maps to, when `host` is
@@ -2833,6 +2859,18 @@ mod tests {
                 address: Some(Ipv4Addr::new(127, 0, 64, 9)),
             },
             "a stopped box on its own address keeps answering A"
+        );
+
+        // The host-side proxy applies the same gate: nothing is forwarded to
+        // the node for the stopped shared-address box, while the box on its
+        // own address still routes.
+        assert!(
+            reg.resolve("shared.min.internal").is_none(),
+            "the proxy must not forward a stopped shared-address box to the node"
+        );
+        assert!(
+            reg.resolve("own.min.internal").is_some(),
+            "a stopped box on its own address keeps its route"
         );
 
         // The same view in the zone table the state dump carries: name order

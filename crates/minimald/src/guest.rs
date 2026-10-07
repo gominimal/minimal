@@ -91,6 +91,26 @@ fn parse_publish_generation(raw: Option<&str>) -> Option<u64> {
     raw?.trim().parse::<u64>().ok()
 }
 
+/// Boot token the VM host puts beside [`HANDED_PROXY_PORT_TOKEN`] to hand the
+/// guest daemon its egress opt-out (NET-077): whether the operator opted the
+/// guest out of the deny-all egress default. Mirrors the token `minvmd`'s
+/// `vm.rs` writes — keep the two in step.
+pub const HANDED_EGRESS_DENY_ALL_OPT_OUT_TOKEN: &str = "MINIMALD_EGRESS_DENY_ALL_OPT_OUT";
+
+/// Whether the VM host handed this boot an egress opt-out (NET-077): the
+/// operator set the opt-out on the host, and the guest daemon runs the egress
+/// default its host was started with. Truthy like the host's reader
+/// (`1`/`true`/`yes`/`on`, case-insensitive); an absent token — an older
+/// minvmd, a native run — or any other value is `false`, the egress default.
+pub fn handed_egress_deny_all_opt_out() -> bool {
+    std::env::var(HANDED_EGRESS_DENY_ALL_OPT_OUT_TOKEN).is_ok_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
 /// A boot token the host put a port on that does not carry one (NET-025):
 /// present on the command line but not a port number. Surfaced, not
 /// swallowed: a handoff that arrived broken is a host or transport fault
@@ -1381,12 +1401,14 @@ pub async fn bring_up_root_egress() -> std::io::Result<crate::net::switch::Switc
     // daemon relay carries no gate, so it emits no deprecation notice; its
     // lease is the daemon's own address (NET-084: a frame out of this tap
     // whose source is anything else is rejected at the relay), and the
-    // subnet passed is the one the guest is configured on above.
-    let relay = switch::attach_to_switch_vsock(
+    // subnet passed is the one the guest is configured on above. It carries
+    // the node's DNS layer: every host-address box shares this namespace, so
+    // its lookups to the gateway leave through here and reach upstream only
+    // through that layer (NET-003).
+    let relay = switch::attach_node_to_switch_vsock(
         tap_fd,
         VSOCK_HOST_CID,
         VSOCK_GVPROXY_SHUTTLE_PORT,
-        None,
         ip,
         DEFAULT_SUBNET,
     )
@@ -1646,6 +1668,34 @@ mod tests {
         assert_eq!(parse_publish_generation(Some("42")), Some(42));
         assert_eq!(parse_publish_generation(None), None);
         assert_eq!(parse_publish_generation(Some("not-a-generation")), None);
+    }
+
+    /// The egress opt-out the host handed is read off the boot line (NET-077):
+    /// a truthy token opts out, an absent or non-truthy one runs the default.
+    // SAFETY: env mutation here races only other reads of the same variable,
+    // and nextest runs every test in its own process.
+    #[test]
+    fn the_egress_opt_out_is_read_off_the_boot_line() {
+        unsafe { std::env::set_var(HANDED_EGRESS_DENY_ALL_OPT_OUT_TOKEN, "1") };
+        assert!(handed_egress_deny_all_opt_out());
+
+        unsafe { std::env::set_var(HANDED_EGRESS_DENY_ALL_OPT_OUT_TOKEN, "true") };
+        assert!(handed_egress_deny_all_opt_out());
+
+        unsafe { std::env::set_var(HANDED_EGRESS_DENY_ALL_OPT_OUT_TOKEN, " ON ") };
+        assert!(handed_egress_deny_all_opt_out());
+
+        // Fail closed: anything outside the truthy set keeps the default.
+        for value in ["no", "0", "", "garbage", "enabled", "1x"] {
+            unsafe { std::env::set_var(HANDED_EGRESS_DENY_ALL_OPT_OUT_TOKEN, value) };
+            assert!(
+                !handed_egress_deny_all_opt_out(),
+                "{value:?} must not opt out"
+            );
+        }
+
+        unsafe { std::env::remove_var(HANDED_EGRESS_DENY_ALL_OPT_OUT_TOKEN) };
+        assert!(!handed_egress_deny_all_opt_out());
     }
 
     /// The handed port is read off the environment the kernel passes

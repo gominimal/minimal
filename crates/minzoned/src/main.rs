@@ -1,4 +1,4 @@
-//! `min-answerer`: the host's box-zone answerer service (NET-122's host
+//! `minzoned`: the host's box-zone answerer service (NET-122's host
 //! service), as a program of its own.
 //!
 //! The privileged step copies this binary to a root-owned path and installs
@@ -21,8 +21,10 @@ use clap::{Parser, Subcommand};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 #[derive(Parser)]
-#[command(name = "min-answerer", version = version::VERSION, long_version = version::LONG_VERSION)]
-#[command(about = "The host's box-zone answerer service, run by the service manager")]
+#[command(name = "minzoned", version = version::VERSION, long_version = version::LONG_VERSION)]
+#[command(
+    about = "The Minimal box-name service (DNS and addresses for boxes), run by the service manager"
+)]
 struct Cli {
     /// Print the answerer channel protocol version this copy speaks and exit.
     #[arg(long)]
