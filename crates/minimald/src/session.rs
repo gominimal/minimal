@@ -3125,7 +3125,7 @@ impl Session {
                         proto: sessions::IpProto::Tcp,
                         pending: Some(false),
                     };
-                    if let Err(unowned) = self
+                    if let Err(unrecorded) = self
                         .live_ingress
                         .record(crate::net::provider::LiveIngressForward { forwarder, mapping })
                     {
@@ -3138,7 +3138,7 @@ impl Session {
                         // warn line above already said.
                         crate::net::policy::remove_ingress(
                             &control,
-                            std::slice::from_ref(&unowned.forwarder),
+                            std::slice::from_ref(&unrecorded.forwarder),
                         )
                         .await;
                     }
