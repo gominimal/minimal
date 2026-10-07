@@ -3525,6 +3525,26 @@ impl UnregisteredSourcePhase {
 pub(crate) const UNREGISTERED_SOURCE_PHASE: UnregisteredSourcePhase =
     UnregisteredSourcePhase::Announced;
 
+// The host gate's phase and the guest daemon's (`sessions::EGRESS_DEFAULT_PHASE`)
+// are one rollout: an undeclared own-address box is compiled under this
+// constant on the host and under the guest's on its boot line. If only one
+// flipped, the host could allow what the guest denies, and after an escape
+// only the host side holds. The build refuses that split.
+const _: () = assert!(
+    matches!(
+        (UNREGISTERED_SOURCE_PHASE, sessions::EGRESS_DEFAULT_PHASE),
+        (
+            UnregisteredSourcePhase::Announced,
+            sessions::EgressDefaultPhase::Announced
+        ) | (
+            UnregisteredSourcePhase::InForce,
+            sessions::EgressDefaultPhase::InForce
+        )
+    ),
+    "flip both constants together: minvmd's UNREGISTERED_SOURCE_PHASE and \
+     sessions::EGRESS_DEFAULT_PHASE are one egress-default rollout"
+);
+
 /// What the gate decided one frame's admission by: which of the three ways in
 /// — the node-plane baseline set, a published namespace's own rules, or a
 /// row's declared credentialed lane. A source the plan could have leased but
