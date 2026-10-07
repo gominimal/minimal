@@ -97,6 +97,11 @@ pub struct ActivateRequest {
     /// skips the upload (the caller's `--sync none`, or a tree it decided not
     /// to send).
     pub upload_root: Option<PathBuf>,
+    /// Show the workspace upload's progress spinner. The front-ends that own
+    /// the screen themselves (the dashboard) say `false`, so the spinner
+    /// cannot corrupt their frame; `min session activate` says `true`, keeping
+    /// the spinner it printed before the sequence was shared.
+    pub upload_progress: bool,
     /// The loadout contribution to compose.
     pub contribution: sessions::wire::request::WireContribution,
     /// External hook scripts staged for upload alongside the composition's
@@ -291,10 +296,12 @@ pub async fn activate<G: ActivationGate>(
     // just refuse: no `on_pending` implementation has to remember to abort.
     let result: Result<bool, anyhow::Error> = async {
         if let Some(root) = request.upload_root.as_deref() {
-            client
-                .upload_workspace_files_quiet(id, root)
-                .await
-                .context("Failed to upload project files")?;
+            let uploaded = if request.upload_progress {
+                client.upload_workspace_files(id, root).await
+            } else {
+                client.upload_workspace_files_quiet(id, root).await
+            };
+            uploaded.context("Failed to upload project files")?;
         }
 
         // Client-side patches (from loadouts) land in the final Composition

@@ -1075,6 +1075,9 @@ pub(crate) async fn activate_session(
     let request = client::activate::ActivateRequest {
         config,
         upload_root: upload.map(|p| p.into_std_path_buf()),
+        // The terminal is the CLI's to draw on: keep the upload's spinner,
+        // which the activation already printed before the sequence was shared.
+        upload_progress: true,
         contribution,
         hook_scripts,
         hook_budget: finalize_hook_budget,

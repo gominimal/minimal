@@ -353,6 +353,9 @@ pub async fn activate(
             attrs: Default::default(),
         },
         upload_root: Some(upload_root.into_std_path_buf()),
+        // The dashboard owns the whole screen — a spinner would corrupt its
+        // frame, so the upload runs quiet.
+        upload_progress: false,
         contribution,
         hook_scripts: Vec::new(),
         // The dashboard runs no activate hooks of its own, so the finalize
