@@ -1,12 +1,12 @@
 //! Headless session activation: the create → upload → configure → gate →
-//! finalize sequence every front-end shares.
+//! finalize sequence its front-ends share.
 //!
-//! The front-ends (`min session activate`, `min task run`, the dashboard) own
-//! everything the sequence is *told*: path and loadout resolution, the
-//! `minimal.toml` scaffold offer, config and policy reads, working-directory
-//! announcements, and the interactive prompt. This module owns the daemon
-//! conversation, the gate callback for a `Pending` composition, and the
-//! cleanup around a half-built record.
+//! The front-ends (`min session activate` and the dashboard) own everything
+//! the sequence is *told*: path and loadout resolution, the `minimal.toml`
+//! scaffold offer, config and policy reads, working-directory announcements,
+//! and the interactive prompt. This module owns the daemon conversation, the
+//! gate callback for a `Pending` composition, and the cleanup around a
+//! half-built record.
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -579,5 +579,70 @@ impl ActivationInterrupt {
 impl Drop for ActivationInterrupt {
     fn drop(&mut self) {
         self.task.abort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The front-ends' source-scanning tripwires (`minimal/src/tests.rs`,
+    //! `minimal-tui/src/rpc.rs`) pin only that each front-end *delegates* to
+    //! this core — they cannot see inside it, because this crate sits below
+    //! the scanner's crate. These are the core's own halves of the same
+    //! recorded judgement: the create asserts the daemon build, and the
+    //! one connection the core opens is deliberately ungated.
+
+    /// Built by concatenation so this scanner does not match itself.
+    const CREATE_NEEDLE: &str = concat!("CreateSession", "Request {");
+    const ASSERT_NEEDLE: &str = concat!("must_match_version: version_", "assertion()");
+    const ECHO_NEEDLE: &str = concat!("ensure_version_", "reported");
+    const CONNECT_NEEDLE: &str = concat!("Client", "::connect(");
+    /// The on-code justification for the cleanup connection's ungated
+    /// disposition, split for the same reason.
+    const UNGATED_NOTE: &str = concat!("Deliberately not version-", "gated");
+
+    /// The core's `CreateSession` asserts its build on the request itself and
+    /// checks the build the reply echoes back — the gate each front-end's
+    /// delegation test relies on. The assertion must ride the create: the
+    /// front-ends' own tripwires forbid a `GetVersion` round trip, so a core
+    /// that dropped its assertion would silently leave every activation path
+    /// ungated. A second create site in this module has to be classified here
+    /// the same way, like the `minimal` crate's own create inventory does.
+    #[test]
+    fn the_core_gates_the_create_it_rides_for_the_front_ends() {
+        let src = include_str!("activate.rs");
+        assert_eq!(
+            src.matches(CREATE_NEEDLE).count(),
+            1,
+            "the core's CreateSession sites changed — reclassify each one here"
+        );
+        assert!(
+            src.contains(ASSERT_NEEDLE),
+            "the core's create no longer asserts the daemon build — every activation front-end would go ungated"
+        );
+        assert!(
+            src.contains(ECHO_NEEDLE),
+            "the core no longer checks the build the create reply echoes back"
+        );
+    }
+
+    /// The Ctrl-C cleanup reconnects deliberately ungated: it is the cleanup
+    /// half of an activation whose gate already cleared, and a cleanup that
+    /// refuses to run is the orphaned session the teardown exists to prevent.
+    /// This records that judgement where its justification lives, so the
+    /// ungated connect cannot appear, move, or gain a sibling without this
+    /// test noticing. (A `GetVersion` here would also add the round trip the
+    /// front-ends' tripwires forbade on their half of the path.)
+    #[test]
+    fn the_interrupt_cleanup_connects_deliberately_ungated() {
+        let src = include_str!("activate.rs");
+        assert_eq!(
+            src.matches(CONNECT_NEEDLE).count(),
+            1,
+            "the core's connection sites changed — classify each one here"
+        );
+        assert!(
+            src.contains(UNGATED_NOTE),
+            "the cleanup connection's ungated disposition lost its on-record justification"
+        );
     }
 }

@@ -860,10 +860,6 @@ pub(crate) async fn activate_session(
     // the `CreateSession` below rather than on a `GetVersion` sent ahead of it.
     // Activation is the hot path #1251's gate landed on, and it must not pay a
     // round trip for a check its own first RPC can make.
-    // Deliberately not `connect_daemon`: this path's version gate travels on
-    // the `CreateSession` below rather than on a `GetVersion` sent ahead of it.
-    // Activation is the hot path #1251's gate landed on, and it must not pay a
-    // round trip for a check its own first RPC can make.
     let mut client = connect_daemon_unchecked(global).await?;
 
     // Warn before minting a second session for a path that already has one:
@@ -1041,8 +1037,8 @@ pub(crate) async fn activate_session(
         }
     };
 
-    // The create/upload/configure/finalize sequence is shared with the TUI and
-    // with `min mcp`; the headless core lives in `minimal-client`. Everything
+    // The create/upload/configure/finalize sequence is shared with the TUI's
+    // dashboard; the headless core lives in `minimal-client`. Everything
     // above this line is resolution the front-end owns — loadouts, policy, the
     // scaffold offer, the upload gate. The gate below carries the interactive
     // half: the announcements the create reply feeds, and the user-policy
