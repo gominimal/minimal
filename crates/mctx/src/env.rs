@@ -241,12 +241,12 @@ impl EnvChannel<'_> {
                 .await
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
             let remote_cache = if build_ctx.use_remote_cache() {
-                Some(
-                    build_ctx
-                        .remote_cache(false, false)
-                        .await
-                        .map_err(|e| anyhow::anyhow!("{}", e))?,
-                )
+                Some(build_ctx.remote_cache(false, false).await.map_err(|e| {
+                    anyhow::anyhow!(
+                        "failed to set up remote cache: {} — pass --no-fetch to build without it",
+                        e
+                    )
+                })?)
             } else {
                 None
             };

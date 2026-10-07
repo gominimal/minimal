@@ -1272,11 +1272,12 @@ impl SessionChannel {
         let result: std::io::Result<()> = async {
             let remote_storage = ctx.remote_storage().await.map_err(err_to_io)?;
             let remote_cache = if ctx.use_remote_cache() {
-                Some(
-                    ctx.remote_cache(false, false)
-                        .await
-                        .map_err(|e| std::io::Error::other(e.to_string()))?,
-                )
+                Some(ctx.remote_cache(false, false).await.map_err(|e| {
+                    std::io::Error::other(format!(
+                        "failed to set up remote cache: {} — pass --no-fetch to build without it",
+                        e
+                    ))
+                })?)
             } else {
                 None
             };

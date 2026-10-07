@@ -19,7 +19,12 @@ pub async fn cmd_pkg_patched_build(
     let remote_storage = ctx.remote_storage().await.unwrap();
 
     let remote_cache = if ctx.use_remote_cache() {
-        Some(ctx.remote_cache(false, false).await?)
+        Some(ctx.remote_cache(false, false).await.map_err(|e| {
+            Error::Other(anyhow!(
+                "failed to set up remote cache: {} — pass --no-fetch to build without it",
+                e
+            ))
+        })?)
     } else {
         None
     };
