@@ -5342,8 +5342,10 @@ pub(crate) async fn fake_forwarder(
 /// can have the switch accept one bind and refuse the next, the way the real
 /// forwarder answers a duplicate of a bind another forward already holds.
 /// Everything else is [`fake_forwarder`]'s contract: one request per
-/// connection, each recorded as `"<request line>\n<body>"`.
-async fn scripted_forwarder(
+/// connection, each recorded as `"<request line>\n<body>"`. `pub(crate)`:
+/// the fail-closed audit tests drive an unaudited publish's withdrawal
+/// through the same stand-in, one whose unexpose the switch refuses.
+pub(crate) async fn scripted_forwarder(
     sock: std::path::PathBuf,
     script: Vec<u16>,
 ) -> (

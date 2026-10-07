@@ -3048,13 +3048,25 @@ impl Session {
     }
 
     /// Fails an allow closed whose audit record could not be written
-    /// (NET-046): the publish that stood is withdrawn the way a publish a
-    /// spawn's end overtook is — the forward unbound first, then the port
-    /// given back in the box's publication set, then the VM host daemon's
-    /// row withdrawn, because the host's gate retracts a runtime port only
-    /// while the row still holds it — and the caller hears a failed publish
-    /// that says why. The warn line is the refusal's record of last resort:
-    /// the audit log that refused the allow may refuse the refusal too.
+    /// (NET-046): the publish that stood is withdrawn — the forward unbound
+    /// first, then the port given back in the box's publication set, then
+    /// the VM host daemon's row withdrawn, because the host's gate retracts
+    /// a runtime port only while the row still holds it — and the caller
+    /// hears a failed publish that says why. The warn line is the refusal's
+    /// record of last resort: the audit log that refused the allow may
+    /// refuse the refusal too.
+    ///
+    /// The withdrawal is fallible, and the forward is *retained* until it
+    /// takes: an unexpose the switch refuses leaves a forward standing that
+    /// nothing else names, so taking it out of the set here would leave the
+    /// switch exposing a port whose allow was never recorded and nothing
+    /// able to unexpose it again — the box's stop sweep
+    /// ([`Self::stop_running`]) and the spawn's teardown both draw their
+    /// retries from [`Self::live_ingress`]. The box's publication-set entry
+    /// and the VM host daemon's row entry are held back with it: a row
+    /// withdrawn while its forward still stands leaves the host holding a
+    /// port its retraction rule can no longer reach, so the withdrawal
+    /// follows the unexpose the way it does everywhere else.
     async fn withdraw_unaudited(
         &mut self,
         box_name: &str,
@@ -3079,13 +3091,66 @@ impl Session {
             minimald_rpc::PortReportSource::Expose
         };
         let control = self.switch_control().await;
-        if let Some(forwarder) = self.live_ingress.take(port) {
-            crate::net::policy::remove_ingress(&control, &[forwarder]).await;
+        let forwarder = self.live_ingress.take(port);
+        let mut unbound = true;
+        if let Some(forwarder) = forwarder {
+            match forwarder
+                .revoke(&control, &std::collections::HashSet::new())
+                .await
+            {
+                // Unbound: the switch holds no forward at its `local` any
+                // more, so the row entry and the publication-set entry go
+                // with it below.
+                Ok(()) => {}
+                Err(unexpose) => {
+                    tracing::warn!(
+                        name = %box_name,
+                        port,
+                        error = %unexpose,
+                        "the unaudited publish's forward could not be unbound; \
+                         it stays recorded for the box's stop to unbind again"
+                    );
+                    unbound = false;
+                    // The forward stays recorded, and the row entry with
+                    // it: the host's gate retracts a runtime port only while
+                    // the row still holds it, so a withdrawal that ran
+                    // first would strand the forward — bound, and
+                    // retractable by nothing. Recorded back rather than
+                    // never taken, because the sweep that would retry the
+                    // unexpose — [`Self::stop_running`] — draws from the
+                    // same cell.
+                    let mapping = minimald_rpc::LiveMapping {
+                        local: forwarder.local().to_string(),
+                        internal_port: forwarder.internal_port(),
+                        proto: sessions::IpProto::Tcp,
+                        pending: Some(false),
+                    };
+                    if let Err(unowned) = self
+                        .live_ingress
+                        .record(crate::net::provider::LiveIngressForward { forwarder, mapping })
+                    {
+                        // The spawn ended while this withdrawal was in
+                        // flight, so the cell refuses the record and the
+                        // guard that emptied it cannot unbind this one —
+                        // we still hold it. Best-effort, like every other
+                        // unwind's unexpose: the publish is refused either
+                        // way, and a forward the switch kept is what the
+                        // warn line above already said.
+                        crate::net::policy::remove_ingress(
+                            &control,
+                            std::slice::from_ref(&unowned.forwarder),
+                        )
+                        .await;
+                    }
+                }
+            }
         }
-        self.publications
-            .withdraw(port, crate::net::listeners::PublicationOwner::Expose);
-        if let Some(switch_address) = self.reported_switch_address {
-            crate::net::listeners::unreport_port(&control, switch_address, port, source).await;
+        if unbound {
+            self.publications
+                .withdraw(port, crate::net::listeners::PublicationOwner::Expose);
+            if let Some(switch_address) = self.reported_switch_address {
+                crate::net::listeners::unreport_port(&control, switch_address, port, source).await;
+            }
         }
         crate::net::policy::ExposeFailure::Publish {
             port,

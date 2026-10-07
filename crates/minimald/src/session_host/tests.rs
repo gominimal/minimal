@@ -5850,6 +5850,124 @@ async fn unaudited_allow_withdraws_the_vm_row_under_its_source() {
     }
 }
 
+/// The unaudited withdrawal keeps what it cannot take down: a forward whose
+/// unexpose the switch refuses — the very failure the fail-closed path can
+/// meet on a switch that is wedged or gone — stays recorded in the box's
+/// live set, `unrevoked`, so the box's stop sweep can ask for it again, and
+/// the VM host daemon's row entry stays beside it, because the host's gate
+/// retracts a runtime port only while the row still holds it. What the
+/// caller hears does not change: the publish is refused either way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unaudited_allow_keeps_a_forward_the_switch_would_not_unbind() {
+    let capture = captured_log();
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let (_web, handle) = dynamic_ingress_box(
+        &server,
+        &mut client,
+        "web",
+        Some(sessions::DynamicIngress::Allow),
+        Some((3000, 3999)),
+    )
+    .await;
+    handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("the allowing box launches its host");
+    let sock = handle
+        .net_switch()
+        .await
+        .unwrap()
+        .lock()
+        .await
+        .control_socket();
+    // VM-backed, so the publish is admitted at a report door the test owns
+    // and the withdrawal would report back to it.
+    let door_sock = sock.with_file_name("report-door.sock");
+    let (door, mut requests, replies) = fake_report_door(&door_sock).await;
+    crate::net::listeners::seed_vm_report_door_for_tests(&sock, &door_sock);
+    // The switch accepts the publish's bind and then refuses the
+    // withdrawal's unexpose — the failure the retention is for.
+    let (forwarder, served) =
+        crate::session::tests::scripted_forwarder(sock.clone(), vec![200, 500]).await;
+
+    // Every append is refused: the audit directory is a planted link.
+    let state_dir = server.state.minimal_state_dir().await;
+    let state_dir = state_dir.as_utf8_path().as_std_path();
+    let planted = state_dir.join("planted");
+    std::fs::create_dir_all(&planted).unwrap();
+    std::os::unix::fs::symlink(&planted, state_dir.join("audit")).unwrap();
+
+    let exposing = handle.clone();
+    let expose = tokio::spawn(async move { exposing.expose_dynamic(3000).await });
+    // The publish reports its port first; the door admits it.
+    let admit = tokio::time::timeout(Duration::from_secs(10), requests.recv())
+        .await
+        .expect("the publish reaches the VM host daemon's door")
+        .expect("the report door stand-in lives");
+    assert!(
+        matches!(admit, minimald_rpc::BoxControlRequest::AdmitPort(_)),
+        "an allow reports the port before it binds: {admit:?}"
+    );
+    replies
+        .send(minimald_rpc::BoxControlReply::PortRecorded {
+            port: 3000,
+            proto: sessions::IpProto::Tcp,
+        })
+        .expect("the report door stand-in lives");
+    // The caller hears the failed publish the fail-closed path owes, naming
+    // the audit log.
+    match expose.await.expect("the expose task should not panic") {
+        Err(crate::net::policy::ExposeFailure::Publish { port: 3000, source }) => assert!(
+            source.to_string().contains("audit log"),
+            "the failure says the decision could not be recorded: {source}"
+        ),
+        other => panic!("an allow that cannot be audited is refused: {other:?}"),
+    }
+
+    let live = handle
+        .live_ingress()
+        .await
+        .expect("the actor answers")
+        .clone();
+    assert_eq!(
+        live.len(),
+        1,
+        "the forward the switch would not unbind stays recorded for the \
+         box's stop to ask for again: {live:?}"
+    );
+    assert_eq!(
+        live[0].internal_port, 3000,
+        "the recorded forward is the unaudited publish's own"
+    );
+    let served = served.lock().expect("served lock").clone();
+    assert_eq!(
+        served.len(),
+        2,
+        "the publish's bind and the withdrawal's refused unexpose: {served:?}"
+    );
+    assert!(
+        served[1].starts_with("POST /services/forwarder/unexpose "),
+        "the withdrawal did ask the switch to unbind: {served:?}"
+    );
+    // No withdrawal report reached the door: the row entry stays with the
+    // forward, so the host's gate can still retract the port.
+    match tokio::time::timeout(Duration::from_millis(200), requests.recv()).await {
+        Err(_) => {}
+        Ok(received) => {
+            panic!("the row entry is held back with the forward it names: {received:?}")
+        }
+    }
+    let log = capture.contents();
+    assert!(
+        log.contains("the unaudited publish's forward could not be unbound"),
+        "the refused unexpose is said, not silent: {log}"
+    );
+    forwarder.abort();
+    door.abort();
+    crate::net::listeners::clear_vm_report_door_for_tests(&sock);
+}
+
 /// The host-level half of NET-045's no-client case: an ask reaching a host
 /// nobody is bound to answers no-one rather than parking — the dialog has no
 /// terminal to render on — which is the fail-closed answer the session turns
