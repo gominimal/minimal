@@ -422,8 +422,12 @@ fn answered_on_the_switch(name: &Name) -> bool {
 /// included: the gate's own, wider match, read beside
 /// [`answered_on_the_switch`] to find the zone names the switch's resolver
 /// would send on to the host's resolvers.
+///
+/// The match is on the parsed name's labels, as [`answered_on_the_switch`]'s
+/// is, so the two agree on every name a box can send: a label below the
+/// zone holding a non-ASCII byte is still the zone.
 fn in_zone(question: &Query) -> bool {
-    super::dns::is_zone_name(&normalized(&question.name().to_lowercase().to_string()))
+    Name::from_ascii(super::dns::HOSTNAME_SUFFIX).is_ok_and(|zone| zone.zone_of(question.name()))
 }
 
 impl DnsGate {
@@ -537,54 +541,53 @@ impl DnsGate {
         if query.metadata.message_type != MessageType::Query {
             return None;
         }
-        let question = query.queries.first().cloned()?;
-        let rtype = question.query_type();
+        let (question, rcode) = self.decide(&query)?;
         let name = normalized(&question.name().to_lowercase().to_string());
-        // Every question is read, not only the first: the switch's resolver
-        // walks them all, so a name behind the first would otherwise ride a
-        // query the first one let through.
+        let rtype = question.query_type();
+        self.answer(query, rcode, &name, rtype)
+    }
+
+    /// The answer the relay writes itself for `query`, with the question
+    /// that decided it — the one the log line names — or `None` to forward
+    /// it. Every question is read, not only the first: the switch's resolver
+    /// walks them all, so a name behind the first would otherwise ride a
+    /// query the first one let through.
+    fn decide(&self, query: &Message) -> Option<(Query, ResponseCode)> {
+        let questions = || query.queries.iter();
+        // REFUSED (NET-141): answered here, so no resolver beyond this one
+        // ever sees the name.
         if self.deny_all
-            && query
-                .queries
-                .iter()
-                .any(|q| !answered_on_the_switch(q.name()))
+            && let Some(q) = questions().find(|q| !answered_on_the_switch(q.name()))
         {
-            // REFUSED (NET-141): answered here, so no resolver beyond this
-            // one ever sees the name.
-            return self.answer(query, ResponseCode::Refused, &name, rtype);
+            return Some((q.clone(), ResponseCode::Refused));
         }
-        if query
-            .queries
-            .iter()
-            .any(|q| in_zone(q) && !answered_on_the_switch(q.name()))
-        {
-            // NXDOMAIN (NET-006): a zone name the switch's resolver would send
-            // on to the host's resolvers — the apex, or a zone suffix not in
-            // exact lowercase — is answered here, so no zone name is ever
-            // answered from off the machine.
-            return self.answer(query, ResponseCode::NXDomain, &name, rtype);
+        // NXDOMAIN (NET-006): a zone name the switch's resolver would send
+        // on to the host's resolvers — the apex, or a zone suffix not in
+        // exact lowercase — is answered here, so no zone name is ever
+        // answered from off the machine.
+        if let Some(q) = questions().find(|q| in_zone(q) && !answered_on_the_switch(q.name())) {
+            return Some((q.clone(), ResponseCode::NXDomain));
         }
         // NODATA (NET-136, NET-006): an AAAA, HTTPS or SVCB question, or a
         // zone name's question of any type but A — the switch's resolver
         // answers a zone A itself and sends every other type on to the
         // host's resolvers. Every name a deny-all box has left here is in
         // the zone, so its query is forwarded only when every question is A.
-        let nodata = query.queries.iter().any(|q| {
-            let rtype = q.query_type();
-            matches!(
-                rtype,
-                RecordType::AAAA | RecordType::HTTPS | RecordType::SVCB
-            ) || (rtype != RecordType::A && in_zone(q))
-        });
-        if !nodata {
-            return None;
-        }
-        self.answer(query, ResponseCode::NoError, &name, rtype)
+        questions()
+            .find(|q| {
+                let rtype = q.query_type();
+                matches!(
+                    rtype,
+                    RecordType::AAAA | RecordType::HTTPS | RecordType::SVCB
+                ) || (rtype != RecordType::A && in_zone(q))
+            })
+            .map(|q| (q.clone(), ResponseCode::NoError))
     }
 
     /// The reply the relay writes back for `query` instead of forwarding it:
     /// `rcode`, every question echoed back, no answers, and the query's id,
-    /// so the box's resolver stack matches the reply to its own query.
+    /// so the box's resolver stack matches the reply to its own query. The
+    /// log line names `name` and `rtype`, the question that decided `rcode`.
     fn answer(
         &self,
         query: Message,
@@ -3213,6 +3216,88 @@ pub(crate) mod tests {
                 Some(ResponseCode::Refused),
                 "{name} stays REFUSED for a deny-all box"
             );
+        }
+    }
+
+    /// The question the relay names in its log line is the one that decided
+    /// its answer, not the first: a zone name in front of an outside name is
+    /// not what a deny-all box's refusal is for, and an ordinary A in front
+    /// of a forwarded zone name or an AAAA is not what NXDOMAIN or NODATA
+    /// answered.
+    #[test]
+    fn the_deciding_question_is_the_one_named() {
+        let decided = |gate: &DnsGate, questions: &[(&str, RecordType)]| {
+            gate.decide(&multi_query(questions)).map(|(q, rcode)| {
+                (
+                    normalized(&q.name().to_lowercase().to_string()),
+                    q.query_type(),
+                    rcode,
+                )
+            })
+        };
+
+        let deny_all = gate_for(&deny_all_egress());
+        assert_eq!(
+            decided(
+                &deny_all,
+                &[
+                    ("host.min.internal.", RecordType::A),
+                    ("example.com.", RecordType::A),
+                ]
+            ),
+            Some(("example.com".into(), RecordType::A, ResponseCode::Refused)),
+        );
+
+        for gate in forwarding_gates() {
+            assert_eq!(
+                decided(
+                    &gate,
+                    &[
+                        ("github.com.", RecordType::A),
+                        ("x.MIN.INTERNAL.", RecordType::TXT),
+                    ]
+                ),
+                Some((
+                    "x.min.internal".into(),
+                    RecordType::TXT,
+                    ResponseCode::NXDomain
+                )),
+            );
+            assert_eq!(
+                decided(
+                    &gate,
+                    &[
+                        ("github.com.", RecordType::A),
+                        ("github.com.", RecordType::AAAA),
+                    ]
+                ),
+                Some(("github.com".into(), RecordType::AAAA, ResponseCode::NoError)),
+            );
+        }
+    }
+
+    /// A zone name whose label below the zone holds a non-ASCII byte is
+    /// still the zone to the NODATA rule, as it is to the switch: its non-A
+    /// query is answered NODATA at the relay, never forwarded upstream, and
+    /// its A query is forwarded like any zone A.
+    #[test]
+    fn a_non_ascii_label_below_the_zone_is_the_zone() {
+        let name = Name::from_labels(["h\u{e9}llo".as_bytes(), b"min", b"internal"]).unwrap();
+        let query = |rtype: RecordType| {
+            let mut query = Message::query();
+            query.add_query(Query::query(name.clone(), rtype));
+            query
+        };
+        let [allow_list, allow_all] = forwarding_gates();
+        for gate in [allow_list, allow_all, gate_for(&deny_all_egress())] {
+            for rtype in [RecordType::TXT, RecordType::MX] {
+                assert_eq!(
+                    rcode_of(&gate, &query(rtype)),
+                    Some(ResponseCode::NoError),
+                    "{rtype:?} for a non-ASCII zone name is NODATA"
+                );
+            }
+            assert_eq!(rcode_of(&gate, &query(RecordType::A)), None);
         }
     }
 
