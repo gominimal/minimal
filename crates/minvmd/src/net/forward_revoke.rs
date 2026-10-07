@@ -688,7 +688,7 @@ pub(crate) async fn inject(
     .map_err(|_elapsed| {
         io::Error::new(
             io::ErrorKind::TimedOut,
-            format!("the switch did not take the resets within {bound:?}"),
+            format!("the switch did not answer the probe or take the resets within {bound:?}"),
         )
     })?
 }
