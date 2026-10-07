@@ -260,9 +260,13 @@ pub async fn cmd_spin(_global: &GlobalArgs, args: SpinArgs) -> Result<(), anyhow
     // window smoothing so the reported `{bytes_per_sec}` stays
     // legible instead of dancing every tick.
     let mut fake_throughput = tokio::time::interval(Duration::from_millis(50));
+    // Registered once, outside the loop, for the same reason as `net forward`:
+    // a fresh `ctrl_c()` per iteration can drop a SIGINT between arms.
+    let ctrl_c = tokio::signal::ctrl_c();
+    tokio::pin!(ctrl_c);
     loop {
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => break,
+            _ = &mut ctrl_c => break,
             _ = &mut deadline => break,
             _ = fake_throughput.tick() => bar.inc(4096),
         }
