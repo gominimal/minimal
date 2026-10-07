@@ -284,6 +284,20 @@ impl EgressRuleCounts {
     }
 }
 
+/// The daemon-log spelling of a session's network mode: the CLI's `--network`
+/// names (`none` / `host_ip` / `own_ip`) rather than the snake_case wire form,
+/// so the `session created` line names what a person typed. The wildcard arm
+/// keeps a future mode from being silently misreported — `NetworkMode` is
+/// `#[non_exhaustive]`.
+fn network_mode_label(network: minimald_rpc::NetworkMode) -> &'static str {
+    match network {
+        minimald_rpc::NetworkMode::NoNet => "none",
+        minimald_rpc::NetworkMode::HostNet => "host_ip",
+        minimald_rpc::NetworkMode::OwnIp => "own_ip",
+        _ => "unknown",
+    }
+}
+
 /// `CreateSession`: allocates the session's record and brings its actor
 /// up, replying with the assigned id. The loadout is composed separately,
 /// by the `ConfigureLoadout` that follows.
@@ -312,6 +326,10 @@ async fn serve_create_session(
             // manager: the success record below needs it, and the reply
             // carries only the assigned id.
             let session_name = req.config.name.clone();
+            // Read the network mode off the config for the same reason: the
+            // manager consumes it, and the mode the session activated with is
+            // what the field below reports beside the "session created" line.
+            let network = req.config.network;
             // Read the egress rule counts off the config for the same reason:
             // the manager consumes it, and the stored record's egress is what
             // the counts below report beside the "session created" line.
@@ -378,6 +396,7 @@ async fn serve_create_session(
                     tracing::info!(
                         session_id = %id,
                         session_name = session_name.as_deref().unwrap_or(ANONYMOUS_SESSION),
+                        network = network_mode_label(network),
                         egress_allow_subnets = egress_counts.allow_subnets,
                         egress_allow_protocols = egress_counts.allow_protocols,
                         egress_allow_dns_hosts = egress_counts.allow_dns_hosts,
@@ -5906,6 +5925,50 @@ mod tests {
                 error: "A session with that name already exists".to_string()
             }
         );
+    }
+
+    /// The `session created` log line names the session's network mode beside
+    /// its id and name, in the CLI's `--network` spellings (`none` / `host_ip`
+    /// / `own_ip`) so the bundle's tail reads like the command a person typed.
+    /// Attributed by session id, because under libtest the capture buffer is
+    /// shared by every test in the binary — assertions on it say `contains`,
+    /// never `equals`.
+    #[tokio::test]
+    async fn session_created_line_names_the_network_mode() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let capture = crate::test_harness::captured_log();
+
+        // One box per mode: the default (host-address), a NoNet box, and an
+        // own-address box. Each create succeeds here because no egress policy
+        // rides a NoNet box and the native test host is not a microVM.
+        let host_ip = req("host-address", "/uwu");
+        let host_id = client.call::<CreateSession>(&host_ip).await.unwrap().id;
+
+        let mut no_net = req("no-network", "/uwu");
+        no_net.config.network = NetworkMode::NoNet;
+        let none_id = client.call::<CreateSession>(&no_net).await.unwrap().id;
+
+        let mut own_ip = req("own-address", "/uwu");
+        own_ip.config.network = NetworkMode::OwnIp;
+        let own_id = client.call::<CreateSession>(&own_ip).await.unwrap().id;
+
+        let log = capture.contents();
+        for (id, spelling) in [
+            (&host_id, "host_ip"),
+            (&none_id, "none"),
+            (&own_id, "own_ip"),
+        ] {
+            assert!(
+                log.lines().any(|line| {
+                    line.contains("session created")
+                        && line.contains(&format!("session_id={id}"))
+                        && line.contains(&format!("network=\"{spelling}\""))
+                }),
+                "the session created line for {id} must name its network mode \
+                 {spelling}, got: {log}"
+            );
+        }
     }
 
     #[tokio::test]
