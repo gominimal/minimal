@@ -320,14 +320,15 @@ const HOOK_LAUNCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// cache is cold — network I/O with no bound of its own — and the check
 /// runs inside the `FinalizeSession` round-trip. The deadline on that
 /// round-trip is otherwise the *client's* (`minimal-client`'s 60 s base
-/// plus the activate-hook budget), and a client that expires does not
-/// cancel the daemon-side finalize: the session actor runs on, and may
-/// promote the record — running the activate hooks on the way — while
-/// the client, which has already reported a failed activation and
-/// best-effort-destroyed the session, believes nothing was activated.
-/// So the daemon bounds the work it adds itself: past this deadline
-/// the check logs a warning and steps aside. Expiry cancels the wait,
-/// not the evaluation — the detached `spawn_blocking` runs to
+/// plus the activate-hook budget; the dashboard grants only the base),
+/// and a client that expires does not cancel the daemon-side finalize:
+/// the session actor runs on, and may promote the record — running the
+/// activate hooks on the way — while the client, which has already
+/// reported a failed activation and best-effort-destroyed the session,
+/// believes nothing was activated. So the daemon bounds the work it
+/// adds itself: past this deadline the check logs a warning, steps
+/// aside, and reports the skip back to the client. Expiry cancels the
+/// wait, not the evaluation — the detached `spawn_blocking` runs to
 /// completion and warms the cache the launch reads — and finalize
 /// proceeds exactly as it did before the check existed, the launch
 /// resolving names at first exec as it always has.
@@ -477,7 +478,7 @@ enum SessionMessage {
     /// patches-ready marker under `<workspace>/patches/`. Idempotent
     /// on an already-`Active` session; refused with `InvalidInput`
     /// on `Pending` (configure the loadout first).
-    Finalize(oneshot::Sender<Result<Vec<minimald_rpc::RanHook>, std::io::Error>>),
+    Finalize(oneshot::Sender<Result<minimald_rpc::FinalizeSessionResponse, std::io::Error>>),
     /// Run this session's `on_detach` hooks, sent by a binding that has
     /// left a session which outlives it. Answered when they have run (or
     /// been skipped), so a departing binding can await them.
@@ -2199,13 +2200,15 @@ impl Session {
     /// with `WrongState`; refuses `Materializing` sessions without
     /// a patches-ready marker with a "patches upload never
     /// finished" fault.
-    async fn finalize(&mut self) -> Result<Vec<minimald_rpc::RanHook>, std::io::Error> {
+    async fn finalize(&mut self) -> Result<minimald_rpc::FinalizeSessionResponse, std::io::Error> {
         let record = self.record.record().await?;
         match record.status {
             SessionStatus::Active => {
                 // Already finalized — retry is a no-op, and its hooks ran
-                // on the finalize that did the work.
-                Ok(Vec::new())
+                // on the finalize that did the work. Like the hooks, a
+                // skipped package check is reported only by that first
+                // finalize; a retry does not re-report it.
+                Ok(minimald_rpc::FinalizeSessionResponse::default())
             }
             SessionStatus::Materializing => {
                 // Guard against a `Materializing` record whose
@@ -2326,13 +2329,14 @@ impl Session {
                 // for a session whose first spawn fails with `no such
                 // package`. Refusing here leaves the record unpromoted,
                 // and the client's activate cleanup removes it.
+                let mut package_check_skipped = false;
                 if self.check_packages_at_finalize
                     && let SessionInner::Active {
                         composition: Some(comp),
                         ..
                     } = &self.inner
                 {
-                    self.check_composed_packages(comp).await?;
+                    package_check_skipped = self.check_composed_packages(comp).await?;
                 }
 
                 // Materialize the composition's patches into the
@@ -2415,7 +2419,10 @@ impl Session {
                 // wait for the range verdict (NET-123 §7.1).
                 #[cfg(target_os = "linux")]
                 self.register_hostname(&record, true).await;
-                Ok(ran)
+                Ok(minimald_rpc::FinalizeSessionResponse {
+                    activate_hooks: ran,
+                    package_check_skipped,
+                })
             }
             SessionStatus::Pending => Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -4849,11 +4856,16 @@ impl Session {
     /// cancel the daemon-side finalize. An expired check steps aside,
     /// warned, and the launch resolves the names at first exec, as it
     /// always has.
-    async fn check_composed_packages(&self, comp: &Composition) -> Result<(), std::io::Error> {
+    ///
+    /// Returns `Ok(true)` when the check stepped aside (expired deadline,
+    /// no session context, or no package graph) so the client can warn the
+    /// operator; `Ok(false)` when it ran to a verdict (nothing unknown, or
+    /// an unknown package refused via `Err`).
+    async fn check_composed_packages(&self, comp: &Composition) -> Result<bool, std::io::Error> {
         if comp.packages().is_empty() {
-            return Ok(());
+            return Ok(false);
         }
-        let checked: Result<Result<(), std::io::Error>, _> =
+        let checked: Result<Result<bool, std::io::Error>, _> =
             tokio::time::timeout(self.package_check_deadline, async {
                 let ctx = match self.build_context(true).await {
                     Ok(ctx) => ctx,
@@ -4862,7 +4874,7 @@ impl Session {
                             %error,
                             "package check skipped at finalize: no session context"
                         );
-                        return Ok(());
+                        return Ok(true);
                     }
                 };
                 // CPU-heavy (nickel evaluation), so on the blocking pool, as the
@@ -4880,7 +4892,7 @@ impl Session {
                             %error,
                             "package check skipped at finalize: no package graph"
                         );
-                        return Ok(());
+                        return Ok(true);
                     }
                 };
                 let unknown: Vec<String> = comp
@@ -4898,7 +4910,7 @@ impl Session {
                     })
                     .collect();
                 if unknown.is_empty() {
-                    return Ok(());
+                    return Ok(false);
                 }
                 Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
@@ -4920,7 +4932,7 @@ impl Session {
                      resolve within its deadline; unknown package names will surface \
                      at first exec, as before this check existed",
                 );
-                Ok(())
+                Ok(true)
             }
         }
     }
@@ -5341,7 +5353,9 @@ impl SessionHandle {
     /// `WorkspacePatchesTarZst` upload. Idempotent on already-Active
     /// sessions. See [`Session::finalize`] for the state-machine
     /// contract.
-    pub(crate) async fn finalize(&self) -> Result<Vec<minimald_rpc::RanHook>, std::io::Error> {
+    pub(crate) async fn finalize(
+        &self,
+    ) -> Result<minimald_rpc::FinalizeSessionResponse, std::io::Error> {
         let (send, recv) = oneshot::channel();
         // Ignore send errors - the recv will also fail.
         let _ = self.0.send(SessionMessage::Finalize(send)).await;

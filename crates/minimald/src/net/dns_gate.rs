@@ -352,7 +352,7 @@ pub(crate) struct DnsGate {
     /// names, which pins nothing (see the module doc).
     names: Option<HashSet<String>>,
     /// Whether the box's egress is the deny-all shape
-    /// ([`super::classifier::admits_nothing`]): every query it sends for a
+    /// ([`sessions::EgressPolicy::admits_nothing`]): every query it sends for a
     /// name outside the box zone is answered REFUSED here and never
     /// forwarded (NET-141).
     deny_all: bool,
@@ -449,7 +449,7 @@ impl DnsGate {
             names: policy
                 .and_then(|policy| policy.allow_dns_hosts.as_ref())
                 .map(|hosts| hosts.iter().map(|host| normalized(host)).collect()),
-            deny_all: policy.is_some_and(super::classifier::admits_nothing),
+            deny_all: policy.is_some_and(sessions::EgressPolicy::admits_nothing),
             rules,
             infrastructure,
             host_alias,

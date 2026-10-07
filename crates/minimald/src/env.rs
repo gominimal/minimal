@@ -1271,6 +1271,15 @@ impl SessionChannel {
 
         let result: std::io::Result<()> = async {
             let remote_storage = ctx.remote_storage().await.map_err(err_to_io)?;
+            let remote_cache = if ctx.use_remote_cache() {
+                Some(
+                    ctx.remote_cache(false, false)
+                        .await
+                        .map_err(|e| std::io::Error::other(e.to_string()))?,
+                )
+            } else {
+                None
+            };
             let output_base = ctx.builds_base_dir();
             let _ = std::fs::create_dir_all(&output_base);
 
@@ -1281,6 +1290,7 @@ impl SessionChannel {
                 remote_fetcher: &remote_storage,
                 stdout_writer: Some(Box::new(stdout_writer)),
                 stderr_writer: Some(Box::new(stderr_writer)),
+                remote_cache: remote_cache.as_ref(),
             }
             .run(&op::Options {
                 cache,

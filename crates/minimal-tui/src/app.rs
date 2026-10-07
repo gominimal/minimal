@@ -128,6 +128,8 @@ pub enum Msg {
     Created {
         provider: String,
         id: SessionId,
+        /// The daemon's package check stepped aside at finalize.
+        package_check_skipped: bool,
     },
 }
 
@@ -508,8 +510,18 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
             }
             vec![Effect::Refresh]
         }
-        Msg::Created { provider, id } => {
-            model.status = Some("session created".to_string());
+        Msg::Created {
+            provider,
+            id,
+            package_check_skipped,
+        } => {
+            model.status = Some(if package_check_skipped {
+                "session created; warning: the package check was skipped, so unknown \
+                 package names will surface at first exec"
+                    .to_string()
+            } else {
+                "session created".to_string()
+            });
             model.pending_focus = Some((provider, id));
             vec![Effect::Refresh]
         }
@@ -952,7 +964,14 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
                             }
                             .await;
                             let msg = match result {
-                                Ok(id) => Msg::Created { provider, id },
+                                Ok(rpc::Activated {
+                                    id,
+                                    package_check_skipped,
+                                }) => Msg::Created {
+                                    provider,
+                                    id,
+                                    package_check_skipped,
+                                },
                                 Err(e) => Msg::ActionDone(Err(format!("{e:#}"))),
                             };
                             let _ = tx.send(msg).await;

@@ -90,23 +90,10 @@ pub const ANSWERER_ADDRESS: Ipv4Addr = Ipv4Addr::LOCALHOST;
 /// default's to decide, never a deny-all here — the deny-all default is an
 /// own-address box's (NET-074).
 pub(crate) fn verdict_of(declaration: Option<&sessions::EgressPolicy>) -> Verdict {
-    if declaration.is_some_and(admits_nothing) {
+    if declaration.is_some_and(sessions::EgressPolicy::admits_nothing) {
         return Verdict::Deny;
     }
     Verdict::Allow
-}
-
-/// Whether `section` is the declaration that admits no destination: every
-/// `allow_*` dimension present and empty. `deny_subnets` is not read — it
-/// subtracts from what the `allow_*` fields admit, and there is nothing
-/// there to subtract from. The relay's DNS gate reads the same predicate
-/// for its deny-all refusal ([`super::dns_gate`], NET-141), so the box the
-/// classifier places under `deny` and the box whose names the gate refuses
-/// are one shape.
-pub(crate) fn admits_nothing(section: &sessions::EgressPolicy) -> bool {
-    section.allow_subnets.as_ref().is_some_and(Vec::is_empty)
-        && section.allow_dns_hosts.as_ref().is_some_and(Vec::is_empty)
-        && section.allow_protocols.as_ref().is_some_and(Vec::is_empty)
 }
 
 /// One rule of a host-address box's egress declaration that this host's
@@ -172,7 +159,7 @@ pub(crate) fn unenforceable_rules(
     let Some(section) = declaration else {
         return Vec::new();
     };
-    if admits_nothing(section) {
+    if section.admits_nothing() {
         return Vec::new();
     }
     let mut rules = Vec::new();
