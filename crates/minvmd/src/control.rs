@@ -591,19 +591,20 @@ fn accept_loop(
         match stream {
             Ok(mut stream) => {
                 let Some(slot) = connections.try_acquire(cap) else {
-                    tracing::debug!(
-                        cap,
-                        "refused a box control connection past the VM host daemon's cap"
-                    );
-                    let _ = write_reply(
-                        &mut stream,
-                        &BoxControlReply::Error {
-                            error: format!(
-                                "the VM host daemon is already serving {cap} control \
-                                 connections; try again once one ends"
-                            ),
-                        },
-                    );
+                    // The refusal is written and the connection closed on
+                    // the accept loop's own turn, without reading the
+                    // request line or draining: either would block the
+                    // loop. The reply is best-effort: a client whose write
+                    // lands after the close sees a broken pipe, and on the
+                    // guest door the KVM shuttle can drop the buffered
+                    // reply of a server-initiated close (G-N8), so the
+                    // in-VM daemon may read a bare EOF. The connection is
+                    // refused either way.
+                    if let Err(error) =
+                        refuse_past_cap(&mut stream, "control", cap, &CONTROL_CAP_WARNED)
+                    {
+                        tracing::debug!(%error, "could not write the control-cap refusal");
+                    }
                     continue;
                 };
                 let boxes = boxes.clone();
@@ -721,7 +722,12 @@ fn serve_connection(
                         },
                     );
                 }
-                None => refuse_past_ask_cap(&mut stream, "guest ask", gauges.guest_ask_cap()),
+                None => refuse_past_cap(
+                    &mut stream,
+                    "guest ask",
+                    gauges.guest_ask_cap(),
+                    &ASK_CAP_WARNED,
+                ),
             }
         }
         (BoxControlRequest::SubscribeAsks(subscribe), ControlDoor::Host) => {
@@ -739,9 +745,12 @@ fn serve_connection(
                         },
                     );
                 }
-                None => {
-                    refuse_past_ask_cap(&mut stream, "ask subscription", gauges.subscription_cap())
-                }
+                None => refuse_past_cap(
+                    &mut stream,
+                    "ask subscription",
+                    gauges.subscription_cap(),
+                    &ASK_CAP_WARNED,
+                ),
             }
         }
         _ => serve_request(
@@ -1544,9 +1553,13 @@ pub(crate) const MAX_ASK_SUBSCRIPTIONS: usize = MAX_GUEST_ASK_CONNECTIONS;
 /// slot at once.
 pub(crate) const MAX_CONTROL_CONNECTIONS: usize = 64;
 
-/// When the last connection-cap warn line was written: rate-limited like
-/// the queue-full line.
+/// When the last ask connection-cap warn line was written: rate-limited
+/// like the queue-full line.
 static ASK_CAP_WARNED: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
+/// When the last control-door connection-cap warn line was written,
+/// rate-limited the same way.
+static CONTROL_CAP_WARNED: Mutex<Option<std::time::Instant>> = Mutex::new(None);
 
 /// Whether a rate-limited warn line is due, stamping it when it is.
 fn warn_due(last: &Mutex<Option<std::time::Instant>>) -> bool {
@@ -1561,20 +1574,25 @@ fn warn_due(last: &Mutex<Option<std::time::Instant>>) -> bool {
     due
 }
 
-/// Refuse an ask verb's connection past its cap, before any thread is
-/// spawned: an error reply naming the cap, and a rate-limited warn line.
-fn refuse_past_ask_cap(stream: &mut UnixStream, kind: &str, cap: usize) -> std::io::Result<()> {
-    if warn_due(&ASK_CAP_WARNED) {
+/// Refuse a connection past its kind's cap, before any thread is spawned:
+/// an error reply naming the cap, and a warn line rate-limited by `warned`.
+fn refuse_past_cap(
+    stream: &mut UnixStream,
+    kind: &str,
+    cap: usize,
+    warned: &Mutex<Option<std::time::Instant>>,
+) -> std::io::Result<()> {
+    if warn_due(warned) {
         tracing::warn!(
             kind,
             cap,
-            "refused an ask connection past the VM host daemon's cap"
+            "refused a connection past the VM host daemon's cap"
         );
     } else {
         tracing::debug!(
             kind,
             cap,
-            "refused an ask connection past the VM host daemon's cap"
+            "refused a connection past the VM host daemon's cap"
         );
     }
     write_reply(
@@ -4460,10 +4478,30 @@ mod tests {
             )
         });
 
+        // The refusal closes without reading the request line, so a
+        // client's write can lose the race to the close (a broken pipe):
+        // the reply already written is still read. `None` is a connection
+        // whose reply could not be read at all.
+        let control_past_cap = |request: &BoxControlRequest| -> Option<BoxControlReply> {
+            let mut stream = TestStream::connect(&sock_path).expect("socket accepts");
+            let mut line = serde_json_lenient::to_string(request).expect("request serializes");
+            line.push('\n');
+            if let Err(error) = stream.write_all(line.as_bytes()) {
+                assert_eq!(
+                    error.kind(),
+                    std::io::ErrorKind::BrokenPipe,
+                    "write: {error}"
+                );
+            }
+            let mut reply = String::new();
+            BufReader::new(stream).read_line(&mut reply).ok()?;
+            serde_json_lenient::from_str(reply.trim()).ok()
+        };
+
         // The silent connection takes the one slot.
         let silent = TestStream::connect(&sock_path).expect("socket accepts");
-        let refused = control(&sock_path, &BoxControlRequest::AnswererStatus)
-            .expect("the refusal is answered");
+        let refused =
+            control_past_cap(&BoxControlRequest::AnswererStatus).expect("the refusal is answered");
         assert!(
             matches!(&refused, BoxControlReply::Error { error } if error.contains("1 control")),
             "a connection past the cap is refused: {refused:?}"
@@ -4473,9 +4511,11 @@ mod tests {
         drop(silent);
         let until = std::time::Instant::now() + Duration::from_secs(5);
         loop {
-            let reply = control(&sock_path, &BoxControlRequest::AnswererStatus)
-                .expect("the request is answered");
-            if !matches!(reply, BoxControlReply::Error { .. }) {
+            let reply = control_past_cap(&BoxControlRequest::AnswererStatus);
+            if reply
+                .as_ref()
+                .is_some_and(|reply| !matches!(reply, BoxControlReply::Error { .. }))
+            {
                 break;
             }
             assert!(
