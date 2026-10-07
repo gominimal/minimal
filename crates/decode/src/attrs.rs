@@ -357,6 +357,46 @@ mod tests {
         ));
     }
 
+    fn decode_src(src: &str) -> Result<Option<AttrValue>, Error> {
+        let (term, mut program, _origin, _target) =
+            Loader::new(src, None, &LoadOptions::for_test())
+                .unwrap()
+                .finish()
+                .unwrap();
+        AttrValue::from_term(&term, &mut program)
+    }
+
+    #[test]
+    fn array_element_contracts_reach_nested_values() {
+        // Elements reached through an array of records and an array of arrays
+        // are checked against the element contract.
+        assert!(matches!(
+            decode_src("[{a = 1}] | Array {a | String}"),
+            Err(Error::Nickel(_))
+        ));
+        assert!(matches!(
+            decode_src("[[1]] | Array (Array String)"),
+            Err(Error::Nickel(_))
+        ));
+
+        // Elements that satisfy the contract still decode.
+        let nested = decode_src("[[\"x\"]] | Array (Array String)")
+            .unwrap()
+            .unwrap();
+        let inner = nested.as_list().unwrap()[0].as_list().unwrap();
+        assert!(matches!(&inner[0], AttrValue::String(s, _) if s == "x"));
+        let records = decode_src(
+            "let {Attrs, ..} = import \"minimal.ncl\" in \
+             {env_dir_mappings = [{read_only = true, path = \"p\", class = 'State}]} | Attrs",
+        )
+        .unwrap()
+        .unwrap();
+        let AttrValue::Map(m) = records else {
+            panic!("expected a map, got {records:?}");
+        };
+        assert_eq!(m["env_dir_mappings"].as_list().unwrap().len(), 1);
+    }
+
     #[test]
     fn attr_binary_from_ok() {
         let res = Loader::new(
