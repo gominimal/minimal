@@ -2,9 +2,9 @@
 //! proof that the table the guest daemon renders and loads at boot is the
 //! table the native installer renders for the same parameters, and that a
 //! loaded table decides a deny-all host-address box per box — refusing what
-//! the box originates, its DNS to the gateway included (a VM-backed guest
-//! renders no resolver carve-out, follow-up gominimal/inbox#897), and
-//! recording the effect probe's per-family errno.
+//! the box originates, keeping the one carve-out (the node's DNS layer at
+//! the gateway, port 53 over UDP and TCP) answering, and recording the
+//! effect probe's per-family errno.
 //!
 //! Eight proofs, one VM boot each, all through the supervisor path
 //! (`minvmd run --detach`, `status --json` until Running, `stop` on drop):
@@ -32,9 +32,11 @@
 //!   address off the guest is refused, and the errno the box reads is
 //!   EHOSTUNREACH — the `reject with icmpx admin-prohibited` verdict as
 //!   IPv4 surfaces it.
-//! - `guest_deny_all_dns_to_gateway_refused`: the same box's udp and tcp 53
-//!   to the gateway (100.64.0.1) is refused — a VM-backed guest renders no
-//!   resolver carve-out (follow-up gominimal/inbox#897).
+//! - `guest_deny_all_resolver_reachable`: the same box resolves
+//!   `host.min.internal` through the node's DNS layer at the gateway
+//!   (100.64.0.1), the one carve-out the deny chain admits on port 53 over
+//!   UDP and TCP; its AAAA lookup is answered NODATA by that layer on the
+//!   daemon's relay; and its connect to the address it resolved is refused.
 //! - `guest_deny_all_box_answers_inbound_through_the_proxy`: a connection
 //!   another box opens to it through the hostname proxy is answered — the
 //!   reply-direction admission that lets a deny-all box serve what reaches
@@ -129,11 +131,12 @@ const EXEC_TIMEOUT: Duration = Duration::from_secs(120);
 /// covers the console flush.
 const LOG_DEADLINE: Duration = Duration::from_secs(30);
 
-/// The guest daemon's log filter: info everywhere, with the classifier's and
-/// the answerer's debug lines promoted — the probe's per-family record and
-/// the answerer's per-lookup lines are the evidence two of these proofs read
-/// off the guest's console.
-const GUEST_LOG_FILTER: &str = "info,minimald::net::classifier=debug,minimald::net::answerer=debug";
+/// The guest daemon's log filter: info everywhere, with the classifier's, the
+/// answerer's and the DNS gate's debug lines promoted — the probe's
+/// per-family record and the node's DNS layer's per-lookup lines are
+/// evidence these proofs read off the guest's console.
+const GUEST_LOG_FILTER: &str = "info,minimald::net::classifier=debug,minimald::net::answerer=debug,\
+                                minimald::net::dns_gate=debug";
 
 /// Env var the server reads to scope an exec to a session.
 const MINIMAL_SESSION_ID_ENV: &str = "MINIMAL_SESSION_ID";
@@ -1111,20 +1114,26 @@ async fn guest_deny_all_probe_refused() {
     );
 }
 
-/// A deny-all box's DNS to the gateway is refused like any other destination:
-/// on a VM-backed host the guest renders no resolver carve-out, because the
-/// node's DNS layer applies no per-box name rule to host-address boxes
-/// (follow-up gominimal/inbox#897). The deny chain ends in `reject with icmpx
-/// admin-prohibited`, so the TCP connect to 53 must read an errno in the
-/// reject set. A UDP send to a refused destination often succeeds locally,
-/// so the UDP leg asserts only that no reply arrives within a bounded wait:
-/// the wait running out, or the reject's errno coming back on the connected
-/// socket (ECONNREFUSED included), passes; an answer fails. The render's own
-/// line is on the guest's console.
+/// A deny-all host-address box still resolves (NET-003, NET-079): its one
+/// carve-out is the resolver Minimal owns for it, which on a VM-backed host is
+/// the node's DNS layer at the gateway, port 53 over UDP and TCP. Four reads
+/// from inside the box:
+///
+/// - `a`: its lookup of `host.min.internal` through its own `/etc/resolv.conf`
+///   answers the switch's host alias, the address the zone holds for the host;
+/// - `aaaa`: a raw AAAA query to the gateway comes back NOERROR with no
+///   answers, the NODATA the node's DNS layer on the daemon's relay answers
+///   itself (NET-136), and the guest's console carries that layer's own line
+///   for it under the node's label, so the lookup travelled the layer;
+/// - `tcp`: a TCP connect to the gateway's port 53 is not refused by the
+///   table (it connects, or the resolver itself resets it), so the TCP half
+///   of the carve-out is rendered;
+/// - `reach`: a connect to the address it resolved is refused with an errno
+///   in the reject set, so the box resolves the name and reaches nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 #[ignore = "gated MINVMD_E2E=1; requires libkrun, kernel/rootfs/initramfs images, and the gvproxy switch"]
-async fn guest_deny_all_dns_to_gateway_refused() {
+async fn guest_deny_all_resolver_reachable() {
     let Some(gvproxy) = e2e_enabled() else {
         return;
     };
@@ -1141,79 +1150,129 @@ async fn guest_deny_all_dns_to_gateway_refused() {
 
     assert!(
         guest.boot_log_contains(
-            "deny-all host-address box on VM host: no resolver carve-out \
-             (follow-up gominimal/inbox#897)"
+            "deny-all host-address box on VM host: resolver carve-out is the node's DNS \
+             layer at the gateway, port 53 over udp and tcp"
         ),
-        "the guest's render did not log that it carves no resolver out:\n{}",
+        "the guest's render did not log the gateway resolver carve-out:\n{}",
         guest.boot_log(),
     );
 
     // Python's blocks need their indentation, which a `\`-continued Rust
-    // literal strips, so the script is joined from lines that keep it. A
-    // standard A query for example.com, as hex so no quoting reaches it.
+    // literal strips, so the script is joined from lines that keep it. The
+    // AAAA query for example.com is hex, so no quoting reaches it.
     let gateway = switch::DEFAULT_SUBNET.gateway();
+    let host_alias = switch::DEFAULT_SUBNET.host_alias();
     let script = [
         "import socket".to_string(),
-        "def udp():".to_string(),
+        "def a():".to_string(),
+        "    infos = socket.getaddrinfo(\"host.min.internal\", 80, socket.AF_INET, \
+         socket.SOCK_STREAM)"
+            .to_string(),
+        "    return \",\".join(sorted({i[4][0] for i in infos}))".to_string(),
+        "def aaaa():".to_string(),
         "    u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)".to_string(),
         "    u.settimeout(5)".to_string(),
         format!("    u.connect((\"{gateway}\", 53))"),
-        "    q = bytes.fromhex(\"123401000001000000000000076578616d706c6503636f6d0000010001\")"
+        "    q = bytes.fromhex(\"123401000001000000000000076578616d706c6503636f6d00001c0001\")"
             .to_string(),
         "    try:".to_string(),
         "        u.send(q)".to_string(),
-        "        u.recv(512)".to_string(),
-        "        return \"answered\"".to_string(),
+        "        r = u.recv(512)".to_string(),
         "    except socket.timeout:".to_string(),
         "        return \"timeout\"".to_string(),
         "    except OSError as e:".to_string(),
-        "        return str(e.errno)".to_string(),
+        "        return \"errno \" + str(e.errno)".to_string(),
+        "    return str(r[3] & 15) + \" \" + str(int.from_bytes(r[6:8], \"big\"))".to_string(),
         "def tcp():".to_string(),
         "    t = socket.socket()".to_string(),
         "    t.settimeout(5)".to_string(),
-        format!("    return str(t.connect_ex((\"{gateway}\", 53)))"),
-        "print(\"udp\", udp())".to_string(),
+        "    try:".to_string(),
+        format!("        return str(t.connect_ex((\"{gateway}\", 53)))"),
+        "    except socket.timeout:".to_string(),
+        "        return \"timeout\"".to_string(),
+        "def reach(addr):".to_string(),
+        "    s = socket.socket()".to_string(),
+        "    s.settimeout(10)".to_string(),
+        "    try:".to_string(),
+        "        return str(s.connect_ex((addr, 80)))".to_string(),
+        "    except socket.timeout:".to_string(),
+        "        return \"timeout\"".to_string(),
+        "resolved = a()".to_string(),
+        "print(\"a\", resolved)".to_string(),
+        "print(\"aaaa\", aaaa())".to_string(),
         "print(\"tcp\", tcp())".to_string(),
+        "print(\"reach\", reach(resolved.split(\",\")[0]))".to_string(),
     ]
     .join("\n");
     let (stdout, stderr, exit) = box_session
         .exec(&format!("python3 -c '{script}'"))
         .await
-        .expect("the box runs its own DNS probes");
+        .expect("the box runs its own lookups");
     assert_eq!(
         exit,
         Some(0),
-        "the DNS probes did not run in the box; stderr: {stderr}"
+        "the lookups did not run in the box; stderr: {stderr}"
     );
+    let read = |what: &str| {
+        stdout
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{what} ")))
+            .unwrap_or("missing")
+            .to_string()
+    };
+    let context = || {
+        format!(
+            "--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}\n--- guest boot log ---\n{}",
+            guest.boot_log()
+        )
+    };
+
+    let resolved = read("a");
+    assert_eq!(
+        resolved,
+        host_alias.to_string(),
+        "a deny-all box must resolve host.min.internal to the host alias through the \
+         gateway's resolver\n{}",
+        context(),
+    );
+
+    let aaaa = read("aaaa");
+    assert_eq!(
+        aaaa,
+        "0 0",
+        "the AAAA lookup must come back NODATA (rcode 0, no answers) from the node's \
+         DNS layer\n{}",
+        context(),
+    );
+    assert!(
+        guest
+            .boot_log_lines(&["answered an empty-records lookup at the relay"])
+            .iter()
+            .any(|line| line.contains("session_id=node") && line.contains("example.com")),
+        "the node's DNS layer on the daemon's relay never answered the box's AAAA lookup; \
+         the lookup did not travel it\n{}",
+        context(),
+    );
+
     let reject_set = [
         ERRNO_EHOSTUNREACH.to_string(),
         ERRNO_EACCES.to_string(),
         ERRNO_EPERM.to_string(),
     ];
-    let read = |transport: &str| {
-        stdout
-            .lines()
-            .find_map(|line| line.strip_prefix(&format!("{transport} ")))
-            .unwrap_or("missing")
-            .to_string()
-    };
-    // UDP: no reply within the bound. The reject's errno, or ECONNREFUSED,
-    // read back on the connected socket is the same refusal seen sooner.
-    let udp = read("udp");
-    assert!(
-        udp == "timeout" || udp == ERRNO_ECONNREFUSED.to_string() || reject_set.contains(&udp),
-        "a deny-all box's udp 53 to the gateway {gateway} must get no reply; read {udp}\n\
-         --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}\n--- guest boot log ---\n{}",
-        guest.boot_log(),
-    );
-    // TCP: the deny chain rejects, so the connect reads the reject's errno.
     let tcp = read("tcp");
     assert!(
-        reject_set.contains(&tcp),
-        "a deny-all box's tcp 53 to the gateway {gateway} must be refused with an errno in \
-         EHOSTUNREACH, EACCES and EPERM (the deny chain rejects); read {tcp}\n\
-         --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}\n--- guest boot log ---\n{}",
-        guest.boot_log(),
+        tcp == "0" || tcp == ERRNO_ECONNREFUSED.to_string(),
+        "a deny-all box's tcp 53 to the gateway {gateway} must pass the table (connect, or \
+         the resolver's own reset); read {tcp}\n{}",
+        context(),
+    );
+
+    let reach = read("reach");
+    assert!(
+        reject_set.contains(&reach),
+        "a deny-all box must reach nothing it resolves: its connect to {resolved}:80 must \
+         read an errno in EHOSTUNREACH, EACCES and EPERM; read {reach}\n{}",
+        context(),
     );
 }
 
@@ -1547,7 +1606,8 @@ fn probe_families(record: &str) -> Vec<(&str, &str)> {
 }
 
 /// The sha256 of the native installer's `--print-ruleset` output for the
-/// guest's own parameters: the same tree root, no resolver carve-out, the
+/// guest's own parameters: the same tree root, the gateway's resolver as the
+/// carve-out, the
 /// two source identities the guest's boot hands as its one address
 /// (NET-078), and the same ct-mark bits — rendered over a stand-in mount
 /// table that spells the guest's own cgroup2 mount (`/sys/fs/cgroup`, root
@@ -1574,13 +1634,17 @@ fn native_ruleset_digest() -> String {
     // switch address on the default subnet, which is what the guest's boot
     // renders with (`DEFAULT_SUBNET.daemon_ip()` in its `main`).
     let identity = switch::DEFAULT_SUBNET.daemon_ip();
+    // The guest's resolver carve-out: the node's DNS layer at the switch
+    // gateway (`DEFAULT_SUBNET.dns_server()` in its `main`).
+    let resolver = switch::DEFAULT_SUBNET.dns_server();
     let out = Command::new("bash")
         .arg(&script)
         .args([
             "--print-ruleset",
             "--root",
             GUEST_TREE_ROOT,
-            "--no-resolver-carve-out",
+            "--gateway-resolver",
+            &resolver.to_string(),
             "--cohort-address",
             &identity.to_string(),
             "--node-plane-address",
