@@ -18706,7 +18706,7 @@ if problems:
 PY
   }
 
-  # ---- the allow box: the publish, its recorded address, the pending gate ---
+  # ---- the allow box: the publish, its recorded address, its admission -----
   EIB_ALLOW_SEED_DIR="$(hook_mktemp /tmp/mnleia.XXXXXX)"
   hook_seed_preamble > "$EIB_ALLOW_SEED_DIR/minimal.toml"
   mkdir "$EIB_ALLOW_SEED_DIR/.git"
@@ -19186,7 +19186,7 @@ exit' E2E_PTY_ASK=deny E2E_PTY_ANSWER=keep \
   mnl session destroy --force "$eib_deny_sid" >/dev/null 2>&1 || true
   rm -rf "$EIB_ALLOW_SEED_DIR" "$EIB_YES_SEED_DIR" "$EIB_NO_SEED_DIR" \
     "$EIB_NOBODY_SEED_DIR" "$EIB_DENY_SEED_DIR"
-  echo "expose from inside the box OK (allow published at the recorded address and listed pending; the attached human's Allow published and their deny refused it; nobody attached and the deny box were refused with their own typed errors; every decision carries its audit line)"
+  echo "expose from inside the box OK (allow published at the recorded address and listed reachable; the attached human's Allow published and their deny refused it; nobody attached and the deny box were refused with their own typed errors; every decision carries its audit line)"
   echo "::endgroup::"
 }
 
