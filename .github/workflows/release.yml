@@ -449,7 +449,11 @@ jobs:
         # build-macos). Gated on RUN_MACOS_CI so it's skipped while the single
         # self-hosted runner is offline — a skip here also skips `release`, which
         # needs it.
-        runs-on: [self-hosted, macOS, ARM64]
+        #
+        # minimal-signing: the codesign step needs the Developer ID keychain,
+        # which only the signing Mac holds; the other fleet Macs carry the base
+        # labels only (docs/internal/macos-runner-setup.md).
+        runs-on: [self-hosted, macOS, ARM64, minimal-signing]
         # 60, not 45: the build takes about 15 minutes, and the notarization
         # step below waits on Apple's notary service for three submissions.
         timeout-minutes: 60
@@ -684,8 +688,9 @@ jobs:
         #
         # Artifacts come as the output of other jobs under a `temp-` prefixed
         # artifact, are signed on the self-hosted runner that holds the keychain,
-        # then are re-uploaded under their final names.
-        runs-on: [self-hosted, macOS, ARM64]
+        # then are re-uploaded under their final names. minimal-signing routes
+        # it to that runner (docs/internal/macos-runner-setup.md).
+        runs-on: [self-hosted, macOS, ARM64, minimal-signing]
         timeout-minutes: 15
         if: vars.RUN_MACOS_CI != 'false'
         needs: [build-libkrun-macos-arm64, fetch-release-guest-artifacts]

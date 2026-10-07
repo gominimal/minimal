@@ -9,6 +9,7 @@ and process detail.
 
 | Document | Contents |
 |---|---|
+| [macos-runner-setup.md](macos-runner-setup.md) | Adding an Apple Silicon Mac to the self-hosted runner fleet: label routing, setup, registration, and checks. |
 | [licensing.md](licensing.md) | Licensing decisions and per-file/per-crate license layout for the workspace. |
 | [session-domain-diag.md](session-domain-diag.md) | Session domain model: provider/session vernacular, deployment diagrams, socket lifecycle, and bootstrap rules. |
 
