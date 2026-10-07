@@ -22,24 +22,6 @@ pub(crate) fn session_announce_label(id: &sessions::SessionId, name: Option<&str
     }
 }
 
-/// The advisory as one line, for a session start that is not interactive:
-/// its facts and lead-in, without the command block that follows the first
-/// newline, plus where to get that command. Every fact is kept — only the
-/// multi-line command is dropped. A note that names no command (a blocker
-/// note, one line already) is returned unchanged: there is no command to
-/// point at.
-fn short_advisory(advisory: &str) -> String {
-    let Some((first_line, _command)) = advisory.split_once('\n') else {
-        return advisory.to_string();
-    };
-    let first_line = first_line.strip_suffix(" with:").unwrap_or(first_line);
-    let first_line = first_line.strip_suffix('.').unwrap_or(first_line);
-    format!(
-        "{first_line}. Run `min session activate` in a terminal, without \
-         --no-prompt or --no-input, to print the command."
-    )
-}
-
 /// Create a new session via the `CreateSession` RPC.
 pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(), anyhow::Error> {
     activate_session(global, args, true).await
@@ -1272,11 +1254,11 @@ pub(crate) async fn activate_session(
             &answerer_step,
         );
         if let Some(advisory) = &name_advisory {
-            if !args.no_prompt && should_announce_session(global) {
-                eprintln!("{advisory}");
-            } else {
-                eprintln!("{}", short_advisory(advisory));
-            }
+            // Printed whole on every start, interactive or not (NET-122:
+            // the start names the exact command, and a scripted start's log
+            // is its only record), after a blank line so the note and its
+            // command block stand apart from the lines above them.
+            eprintln!("\n{advisory}");
         }
         if let Some(verdict) = surface_verdict {
             // The host-side record of that verdict, the half the daemon's own
@@ -3911,30 +3893,6 @@ mod tests {
                 "not-a-cidr".to_string()
             ]
         );
-    }
-
-    #[test]
-    fn short_advisory_drops_the_command_line() {
-        let advisory = "note: the resolver file is missing. Configure the host's \
-                        resolver with:\n  sudo sh -c '…'";
-        let short = short_advisory(advisory);
-        assert!(
-            !short.contains("sudo"),
-            "the short advisory never carries the command, got: {short}"
-        );
-        assert_eq!(
-            short,
-            "note: the resolver file is missing. Configure the host's \
-             resolver. Run `min session activate` in a terminal, without \
-             --no-prompt or --no-input, to print the command."
-        );
-    }
-
-    #[test]
-    fn short_advisory_keeps_a_commandless_note_unchanged() {
-        // A blocker note names no command, so it gets no hint pointing at one.
-        let advisory = "note: this host's lookups bypass the resolver.";
-        assert_eq!(short_advisory(advisory), advisory);
     }
 
     #[test]
