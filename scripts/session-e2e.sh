@@ -4321,7 +4321,7 @@ esac
 # this branch, and the native CI lane — where the tap root integration harness
 # already builds a tap — runs the case for real.
 if [ ! -c /dev/net/tun ]; then
-  echo "fresh-install loopback publish SKIPPED (no /dev/net/tun on this host: an own-IP box cannot open its in-namespace tap; runs for real on a host that has the device)"
+  echo "fresh-install loopback publish SKIPPED (no /dev/net/tun on this host: this case is native-only, so its own-IP box opens its in-namespace tap on this host and needs the host device; runs for real on a host that has it)"
   return 0
 fi
 
@@ -4790,7 +4790,7 @@ proof_network_posture_from_stock_install() {
     np_want_switch=1
   else
     np_want_switch=0
-    echo "own-IP half SKIPPED (no /dev/net/tun: an own-IP box cannot open its in-namespace tap; the help, hint, none-box and stock-posture halves still run)"
+    echo "own-IP half SKIPPED (no /dev/net/tun on this host: this case is native-only, so its own-IP box opens its in-namespace tap on this host and needs the host device; the help, hint, none-box and stock-posture halves still run)"
   fi
 
   echo "::group::network posture from a stock install (help, hints, none box, own-ip, reach)"
@@ -5431,7 +5431,7 @@ exit' E2E_PTY_ANSWER=keep python3 "$ROOT/scripts/e2e-attach-pty.py" - \
         sleep 0.25
       done
     else
-      echo "own-IP half SKIPPED (no /dev/net/tun: the fresh install ships no switch and the half is gated on the tap — see the skip note at the top)"
+      echo "own-IP half SKIPPED (no /dev/net/tun on this host, which this native-only case needs for its own-IP box's tap: the fresh install ships no switch and the half is gated on the tap — see the skip note at the top)"
     fi
 
     # Leave the lane as it was: the installed daemon stopped, so the next
@@ -8040,7 +8040,7 @@ proof_box_name_resolves_natively_without_proxy() {
   # switch so a host that cannot use one never pays for fetching it.
   bn_tun=""
   if [ ! -c /dev/net/tun ]; then
-    bn_tun="no /dev/net/tun on this host, so an own-IP box cannot open its in-namespace tap and no box can serve a page"
+    bn_tun="no /dev/net/tun on this host, and this native-only case opens its own-IP box's in-namespace tap on this host, so no box can serve a page"
   fi
   # The switch that box's session program must spawn, placed where the
   # daemon's own probe (switch::installed_gvproxy_bin, which reads
@@ -15484,10 +15484,10 @@ proof_own_ip_deny_all_box_answers_published_port() {
   # The box opens /dev/net/tun for its in-namespace tap; without the device
   # its session program cannot spawn, and a host that is itself a sandbox
   # cannot mknod one either. Skip rather than fail: the failure would say
-  # nothing about this branch, and the native CI lane — where the tap root
-  # integration harness already builds a tap — runs the case for real.
-  if [ ! -c /dev/net/tun ]; then
-    echo "deny-all answer proof SKIPPED (no /dev/net/tun on this host: an own-IP box cannot open its in-namespace tap; runs for real on a host that has the device)"
+  # nothing about this branch. Only a native box opens its tap on this host;
+  # a VM lane opens it inside the guest, so the host check gates native runs.
+  if [ -z "${E2E_VM:-}" ] && [ ! -c /dev/net/tun ]; then
+    echo "deny-all answer proof SKIPPED (no /dev/net/tun on this host: a native own-IP box cannot open its in-namespace tap; a VM lane opens it inside the guest and runs this case)"
     echo "::endgroup::"
     return 0
   fi
@@ -15984,8 +15984,8 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
       echo "port-publish half SKIPPED (no MINVMD_GVPROXY_BIN: this target has no switch)"
       return 0
     fi
-    if [ ! -c /dev/net/tun ]; then
-      echo "port-publish half SKIPPED (no /dev/net/tun on this host: an own-IP box cannot open its in-namespace tap; runs for real on a host that has the device)"
+    if [ -z "${E2E_VM:-}" ] && [ ! -c /dev/net/tun ]; then
+      echo "port-publish half SKIPPED (no /dev/net/tun on this host: a native own-IP box cannot open its in-namespace tap; a VM lane opens it inside the guest and runs this case)"
       return 0
     fi
 
@@ -16869,8 +16869,8 @@ proof_min_net_expose_publishes_lists_and_refuses() {
     echo "::endgroup::"
     return 0
   fi
-  if [ ! -c /dev/net/tun ]; then
-    echo "min net expose SKIPPED (no /dev/net/tun on this host: an own-IP box cannot open its in-namespace tap; runs for real on a host that has the device)"
+  if [ -z "${E2E_VM:-}" ] && [ ! -c /dev/net/tun ]; then
+    echo "min net expose SKIPPED (no /dev/net/tun on this host: a native own-IP box cannot open its in-namespace tap; a VM lane opens it inside the guest and runs this case)"
     echo "::endgroup::"
     return 0
   fi
@@ -17122,7 +17122,7 @@ PY
       fail
     fi
     case "$policy" in
-      *"  dynamic ports  $mnx_lo–$mnx_hi"*) ;;
+      *"  dynamic ports  ${mnx_lo}–${mnx_hi}"*) ;;
       *) echo "::error::the text policy does not show the declared dynamic range $mnx_lo-$mnx_hi"; fail ;;
     esac
     if [ "$mode" = "live" ]; then
@@ -17134,7 +17134,7 @@ PY
         *":$mnx_port → :$mnx_port"*) ;;
         *) echo "::error::the live-ingress section carries no row for the exposed port $mnx_port"; fail ;;
       esac
-      echo "policy (text): stance allow over $mnx_lo–$mnx_hi, one live row for :$mnx_port (NET-043, NET-044)"
+      echo "policy (text): stance allow over ${mnx_lo}–${mnx_hi}, one live row for :$mnx_port (NET-043, NET-044)"
     else
       case "$policy" in
         *"live ingress (published at runtime)"*)
@@ -17142,7 +17142,7 @@ PY
           fail
           ;;
       esac
-      echo "policy (text): stance deny over $mnx_lo–$mnx_hi, and no live-ingress section — a box that published nothing lists nothing (NET-044, fail-closed)"
+      echo "policy (text): stance deny over ${mnx_lo}–${mnx_hi}, and no live-ingress section — a box that published nothing lists nothing (NET-044, fail-closed)"
     fi
 
     json="$(mnl session policy "$sid" -o json 2>"$WORK/mnx-json-$stance.err")" \
@@ -18119,8 +18119,8 @@ proof_expose_from_inside_box() {
     echo "::endgroup::"
     return 0
   fi
-  if [ ! -c /dev/net/tun ]; then
-    echo "expose from inside the box SKIPPED (no /dev/net/tun on this host: an own-IP box cannot open its in-namespace tap; runs for real on a host that has the device)"
+  if [ -z "${E2E_VM:-}" ] && [ ! -c /dev/net/tun ]; then
+    echo "expose from inside the box SKIPPED (no /dev/net/tun on this host: a native own-IP box cannot open its in-namespace tap; a VM lane opens it inside the guest and runs this case)"
     echo "::endgroup::"
     return 0
   fi
@@ -18420,9 +18420,11 @@ proof_expose_from_inside_box() {
     rm -rf "$EIB_ALLOW_SEED_DIR" "$EIB_DENY_SEED_DIR"
 
     # ---- two named VMs: the expose half of T61 ------------------------------
-    # Alpha's switch publishes at the same host 127.0.0.1 as the default VM,
-    # whose allow and ask-yes boxes still hold their ports there, so this leg
-    # asks for its own port in the declared range.
+    # Alpha's switch publishes at the same host 127.0.0.1 as the default VM.
+    # Each host 127.0.0.1:port carries one gvproxy forward, and a forward the
+    # default VM's boxes published can outlive those boxes (a VM box's declared
+    # forwards are not yet unbound when it ends), so this leg asks for its own
+    # port in the declared range.
     local eib_two_port=$((eib_port + 2))
     # A box on the NON-DEFAULT VM publishes there. `min --vm alpha session
     # activate` creates the box on alpha (autospawning and booting it), the
