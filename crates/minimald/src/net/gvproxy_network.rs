@@ -136,9 +136,11 @@ impl NetGuard for OwnIpGuard {
         Box::pin(async move {
             // Remove ingress forwards (R2.3 teardown) before detaching: detach
             // may stop gvproxy once the last PTask leaves, so the unexpose must
-            // reach a still-running switch first.
+            // reach a still-running switch first. On a VM-backed host the
+            // declared forwards are the host's to unbind at box end, so this
+            // asks the switch for nothing there.
             if !self.exposed.is_empty() {
-                crate::net::policy::remove_ingress(&self.control, &self.exposed).await;
+                crate::net::policy::release_declared_ingress(&self.control, &self.exposed).await;
             }
             // The runtime publishes deliver to the same lease, so they take
             // the same path down — and the box refuses new ones until its

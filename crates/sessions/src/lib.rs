@@ -35,6 +35,24 @@ pub enum NetworkMode {
     OwnIp,
 }
 
+impl NetworkMode {
+    /// The word naming this mode in the CLI's `--network` values and the
+    /// spec: `none`, `host_ip`, `own_ip`. It is not the serde form: the
+    /// derive serializes `no_net`, `host_net`, `own_ip`, so the two differ
+    /// for [`NetworkMode::NoNet`] and [`NetworkMode::HostNet`]. Policy
+    /// refusals and the daemon's `network_mode` log field use this word,
+    /// never Rust `Debug`. Deliberately not `Display`, so a format string
+    /// cannot pick one spelling by accident.
+    #[must_use]
+    pub fn word(self) -> &'static str {
+        match self {
+            NetworkMode::NoNet => "none",
+            NetworkMode::HostNet => "host_ip",
+            NetworkMode::OwnIp => "own_ip",
+        }
+    }
+}
+
 /// An IP transport protocol, used in egress/ingress policy rules.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -178,6 +196,19 @@ impl EgressPolicy {
             allow_protocols: Some(Vec::new()),
             deny_subnets: None,
         }
+    }
+
+    /// Whether this section is the deny-all shape: every `allow_*` dimension
+    /// present and empty. `deny_subnets` is not read — it subtracts from
+    /// what the `allow_*` fields admit, and there is nothing there to
+    /// subtract from. The one predicate the in-VM classifier and the
+    /// host-side registry share, so the box each treats as deny-all is one
+    /// shape.
+    #[must_use]
+    pub fn admits_nothing(&self) -> bool {
+        self.allow_subnets.as_ref().is_some_and(Vec::is_empty)
+            && self.allow_dns_hosts.as_ref().is_some_and(Vec::is_empty)
+            && self.allow_protocols.as_ref().is_some_and(Vec::is_empty)
     }
 }
 
@@ -460,11 +491,44 @@ pub fn effective_egress(
     }
 }
 
+/// Reads the deny-all opt-out (NET-077) off its raw environment spelling:
+/// the one parse the VM host daemon (`MINVMD_EGRESS_DENY_ALL_OPT_OUT`) and
+/// the guest daemon (the boot token it is handed) share, so the two can
+/// never read the same value differently. Only `1`, `true`, `yes` or `on`
+/// opt out, case-insensitive and trimmed; absent or anything else fails
+/// closed to the build's egress default.
+#[must_use]
+pub fn egress_deny_all_opt_out_from_raw(raw: Option<&str>) -> bool {
+    raw.is_some_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
 /// The lowest host port a dynamic ingress range may start at: below it a
 /// port is privileged, and the rootless switch cannot publish one. One
 /// definition for the launch check ([`Record::validate_policy`]) and the
 /// CLI's `--dynamic-range` flag, so the two can never disagree.
 pub const MIN_DYNAMIC_INGRESS_PORT: u16 = 1024;
+
+/// The refusal for a non-empty `ingress` on a box that is not own-IP: a
+/// dynamic declaration (a range or a non-deny stance) names the dynamic
+/// fields, otherwise the refusal names the port mappings. The dynamic check
+/// comes first, in the same order as the CLI's refusals, so a policy carrying
+/// both gets the same first complaint from either surface.
+fn ingress_requires_own_ip(ingress: &IngressPolicy, mode: NetworkMode) -> PolicyError {
+    let dynamic = ingress.dynamic_allowed_range.is_some()
+        || ingress
+            .dynamic_ingress
+            .is_some_and(|d| d != DynamicIngress::Deny);
+    if dynamic {
+        PolicyError::DynamicIngressRequiresOwnIp { mode }
+    } else {
+        PolicyError::IngressRequiresOwnIp { mode }
+    }
+}
 
 /// Why a session's networking policy is incompatible with its network mode.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -476,9 +540,26 @@ pub enum PolicyError {
     /// nothing to enforce the declaration on and it is rejected.
     #[error("egress policy is only valid for an own-IP or host-address PTask, not {mode:?}")]
     EgressRequiresNetwork { mode: NetworkMode },
-    /// An ingress policy was set on a `PTask` that is not [`NetworkMode::OwnIp`].
-    #[error("ingress policy is only valid for an own-IP PTask, not {mode:?}")]
+    /// A static ingress port mapping was set on a `PTask` that is not
+    /// [`NetworkMode::OwnIp`]. Names the policy fields and the mode word, not
+    /// CLI flags: every client reads this refusal, and the CLI names its own
+    /// flags in a refusal of its own before the request is sent.
+    #[error(
+        "ingress port mappings need network mode own_ip (this box is {}): only an own-IP \
+         box has a published address to apply them to",
+        .mode.word()
+    )]
     IngressRequiresOwnIp { mode: NetworkMode },
+    /// A dynamic ingress declaration (a non-deny `dynamic_ingress` stance or a
+    /// `dynamic_allowed_range`), with or without a static mapping, was set on a `PTask`
+    /// that is not [`NetworkMode::OwnIp`]. Neutral wording, as for
+    /// [`PolicyError::IngressRequiresOwnIp`].
+    #[error(
+        "ingress dynamic_ingress and dynamic_allowed_range need network mode own_ip (this \
+         box is {}): only an own-IP box has a published address to apply them to",
+        .mode.word()
+    )]
+    DynamicIngressRequiresOwnIp { mode: NetworkMode },
     /// An ingress port mapping used a transport gvproxy's forwarder cannot
     /// expose. gvproxy only forwards TCP and UDP, so any other protocol (e.g.
     /// ICMP) must be rejected at validation time rather than silently mapped.
@@ -990,8 +1071,9 @@ impl Record {
     ///
     /// Returns [`PolicyError::EgressRequiresNetwork`] when an egress policy is
     /// set on a none (`NoNet`) `PTask`, or
-    /// [`PolicyError::IngressRequiresOwnIp`] when a non-empty ingress policy is
-    /// set on anything but an `OwnIp` `PTask`. Returns
+    /// [`PolicyError::DynamicIngressRequiresOwnIp`] when a dynamic ingress
+    /// declaration, or [`PolicyError::IngressRequiresOwnIp`] when only a static
+    /// ingress mapping, is set on anything but an `OwnIp` `PTask`. Returns
     /// [`PolicyError::UnsupportedIngressProtocol`] for an ingress mapping whose
     /// transport gvproxy's forwarder cannot expose,
     /// [`PolicyError::PrivilegedPort`] for one that publishes a host port below
@@ -1015,13 +1097,8 @@ impl Record {
             if self.policy.egress.is_some() {
                 return Err(PolicyError::EgressRequiresNetwork { mode: self.network });
             }
-            if self
-                .policy
-                .ingress
-                .as_ref()
-                .is_some_and(|ingress| !ingress.is_empty())
-            {
-                return Err(PolicyError::IngressRequiresOwnIp { mode: self.network });
+            if let Some(ingress) = self.policy.ingress.as_ref().filter(|i| !i.is_empty()) {
+                return Err(ingress_requires_own_ip(ingress, self.network));
             }
             return Ok(());
         }
@@ -1076,13 +1153,8 @@ impl Record {
         // Host-address box: egress is accepted, but ingress still requires an
         // own address — the switch's forwarder is the only per-session ingress
         // surface, and a host-address box shares its host's namespace.
-        if self
-            .policy
-            .ingress
-            .as_ref()
-            .is_some_and(|ingress| !ingress.is_empty())
-        {
-            return Err(PolicyError::IngressRequiresOwnIp { mode: self.network });
+        if let Some(ingress) = self.policy.ingress.as_ref().filter(|i| !i.is_empty()) {
+            return Err(ingress_requires_own_ip(ingress, self.network));
         }
         Ok(())
     }
@@ -1091,6 +1163,21 @@ impl Record {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `word()` pins the CLI and spec vocabulary, and stays distinct from
+    /// the serde form where the two spellings differ: a refactor that
+    /// routed either through the other would rename a log field or a wire
+    /// value.
+    #[test]
+    fn network_mode_word_is_the_cli_word_not_the_serde_form() {
+        assert_eq!(NetworkMode::NoNet.word(), "none");
+        assert_eq!(NetworkMode::HostNet.word(), "host_ip");
+        assert_eq!(NetworkMode::OwnIp.word(), "own_ip");
+        for mode in [NetworkMode::NoNet, NetworkMode::HostNet] {
+            let serde = serde_json_lenient::to_string(&mode).unwrap();
+            assert_ne!(mode.word(), serde.trim_matches('"'), "{mode:?}");
+        }
+    }
 
     fn record_with(network: NetworkMode, policy: SessionPolicy) -> Record {
         Record {
@@ -1216,6 +1303,19 @@ mod tests {
         assert!(record.validate_policy().is_ok());
     }
 
+    /// NET-077: the opt-out's parse fails closed — only the truthy set opts
+    /// out; absent or anything else keeps the build's egress default.
+    #[test]
+    fn the_egress_opt_out_fails_closed() {
+        assert!(!egress_deny_all_opt_out_from_raw(None));
+        for value in ["1", "true", "TRUE", "yes", "on", " On "] {
+            assert!(egress_deny_all_opt_out_from_raw(Some(value)), "{value:?}");
+        }
+        for value in ["", "0", "no", "off", "false", "garbage", "1x", "enabled"] {
+            assert!(!egress_deny_all_opt_out_from_raw(Some(value)), "{value:?}");
+        }
+    }
+
     /// NET-074/NET-075/NET-076/NET-077: what an absent `egress` section
     /// resolves to, by rollout phase, opt-out, and network mode — and that
     /// the deny-all arm is not a label but the section whose compiled rules
@@ -1302,6 +1402,65 @@ mod tests {
     }
 
     #[test]
+    fn admits_nothing_reads_the_deny_all_shape() {
+        // The deny-all predicate is the one shape the egress gate refuses:
+        // every `allow_*` dimension present and empty. An absent dimension
+        // is allow-all for that dimension, and one non-empty list admits
+        // something, so neither is deny-all.
+        assert!(EgressPolicy::deny_all().admits_nothing());
+        assert!(!EgressPolicy::default().admits_nothing());
+        assert!(
+            !EgressPolicy {
+                allow_subnets: Some(vec!["10.0.0.0/8".into()]),
+                ..EgressPolicy::default()
+            }
+            .admits_nothing()
+        );
+        assert!(
+            !EgressPolicy {
+                allow_dns_hosts: Some(vec!["example.com".into()]),
+                ..EgressPolicy::default()
+            }
+            .admits_nothing()
+        );
+        assert!(
+            !EgressPolicy {
+                allow_protocols: Some(vec![IpProto::Tcp]),
+                ..EgressPolicy::default()
+            }
+            .admits_nothing()
+        );
+        // Two dimensions present and empty is not enough: the third, absent
+        // or non-empty, still admits something.
+        assert!(
+            !EgressPolicy {
+                allow_subnets: Some(vec![]),
+                allow_dns_hosts: Some(vec![]),
+                ..EgressPolicy::default()
+            }
+            .admits_nothing()
+        );
+        assert!(
+            !EgressPolicy {
+                allow_subnets: Some(vec![]),
+                allow_dns_hosts: Some(vec![]),
+                allow_protocols: Some(vec![IpProto::Tcp]),
+                ..EgressPolicy::default()
+            }
+            .admits_nothing()
+        );
+        // `deny_subnets` is not read: the deny-all shape stays deny-all
+        // with a subtraction set.
+        assert!(
+            EgressPolicy {
+                deny_subnets: Some(vec!["10.0.0.0/8".into()]),
+                ..EgressPolicy::deny_all()
+            }
+            .admits_nothing()
+        );
+    }
+
+    #[test]
     fn egress_on_none_box_is_validation_error() {
         // NET-065: a none box has no network, so there is nothing to enforce
         // an egress declaration on. It is the only mode that rejects egress.
@@ -1355,6 +1514,75 @@ mod tests {
         assert_eq!(
             record.validate_policy(),
             Err(PolicyError::IngressRequiresOwnIp {
+                mode: NetworkMode::HostNet
+            })
+        );
+    }
+
+    #[test]
+    fn own_ip_refusals_name_the_fields_that_caused_them() {
+        // A static mapping names the port mappings; a dynamic-only declaration
+        // names the dynamic fields. Both name the box's mode as a word and no
+        // CLI flag.
+        let static_ingress = IngressPolicy {
+            port_mappings: vec![PortMapping {
+                external_port: 18080,
+                internal_port: 80,
+                proto: IpProto::Tcp,
+            }],
+            dynamic_allowed_range: None,
+            dynamic_ingress: None,
+        };
+        let err = record_with(
+            NetworkMode::HostNet,
+            SessionPolicy::new(None, Some(static_ingress)),
+        )
+        .validate_policy()
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "ingress port mappings need network mode own_ip (this box is host_ip): only an \
+             own-IP box has a published address to apply them to"
+        );
+
+        let range_only = IngressPolicy {
+            port_mappings: vec![],
+            dynamic_allowed_range: Some((8000, 8443)),
+            dynamic_ingress: None,
+        };
+        let err = record_with(
+            NetworkMode::NoNet,
+            SessionPolicy::new(None, Some(range_only)),
+        )
+        .validate_policy()
+        .unwrap_err();
+        assert_eq!(
+            err,
+            PolicyError::DynamicIngressRequiresOwnIp {
+                mode: NetworkMode::NoNet
+            }
+        );
+        assert_eq!(
+            err.to_string(),
+            "ingress dynamic_ingress and dynamic_allowed_range need network mode own_ip (this \
+             box is none): only an own-IP box has a published address to apply them to"
+        );
+
+        // A static mapping alongside a dynamic declaration names the dynamic
+        // fields first, matching the CLI's check order.
+        let mixed = IngressPolicy {
+            port_mappings: vec![PortMapping {
+                external_port: 18080,
+                internal_port: 80,
+                proto: IpProto::Tcp,
+            }],
+            dynamic_allowed_range: None,
+            dynamic_ingress: Some(DynamicIngress::Allow),
+        };
+        assert_eq!(
+            record_with(NetworkMode::HostNet, SessionPolicy::new(None, Some(mixed)))
+                .validate_policy(),
+            Err(PolicyError::DynamicIngressRequiresOwnIp {
                 mode: NetworkMode::HostNet
             })
         );
@@ -1858,7 +2086,7 @@ mod tests {
                 let record = record_with(network, SessionPolicy::new(None, Some(ingest)));
                 assert_eq!(
                     record.validate_policy(),
-                    Err(PolicyError::IngressRequiresOwnIp { mode: network }),
+                    Err(PolicyError::DynamicIngressRequiresOwnIp { mode: network }),
                     "dynamic_ingress = {mode} must be rejected on {network:?}"
                 );
             }

@@ -36,8 +36,8 @@
 # stripped by its markers).
 #
 # Every component the manifest carries installs by the same generic loop, and
-# one of them carries a contract worth naming: `min-answerer` (NET-122's
-# box-zone answerer) installs as `bin/min-answerer` beside `min` on every
+# one of them carries a contract worth naming: `minzoned` (NET-122's
+# box-zone answerer) installs as `bin/minzoned` beside `min` on every
 # platform the manifest ships `min` for, and an upgrade replaces it like every
 # other `bin` row — same SHA-256 compare, same swap. The installed copy is
 # ONLY the copy source: the session-start advisory finds it beside `min` and

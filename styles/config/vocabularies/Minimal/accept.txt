@@ -226,6 +226,7 @@ minimald
 minimald_rpc
 minirootfs
 minvmd
+minzoned
 mip
 miri
 misconfigure

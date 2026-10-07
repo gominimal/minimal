@@ -1664,6 +1664,22 @@ pub struct FinalizeSessionResponse {
     /// Serde-defaulted so a daemon that predates the field still answers.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub activate_hooks: Vec<RanHook>,
+    /// True when the finalize's package check stepped aside — its deadline
+    /// expired, or the session context or package graph could not be
+    /// evaluated — rather than refusing an unknown package. The session
+    /// still activates; the client warns so the operator knows unknown
+    /// names will surface at first exec. Serde-defaulted and omitted when
+    /// false so a daemon that predates the field still answers to an older
+    /// client.
+    #[serde(default, skip_serializing_if = "package_check_skipped_is_false")]
+    pub package_check_skipped: bool,
+}
+
+/// Serde helper: omit [`FinalizeSessionResponse::package_check_skipped`]
+/// when it is `false`, so the common success payload is unchanged for
+/// clients that predate the field.
+fn package_check_skipped_is_false(v: &bool) -> bool {
+    !*v
 }
 
 /// One hook that ran, as reported back to the client.
@@ -1987,17 +2003,12 @@ pub struct LiveMapping {
     pub internal_port: u16,
     /// The transport the forward carries.
     pub proto: IpProto,
-    /// Whether the box's own relay gate has admitted the port yet. A runtime
-    /// publish binds on the host at once, but the frame only reaches the box
-    /// through the relay gate its attach installed — and that gate admits the
-    /// ports the *declaration* named, so a port published at runtime is
-    /// refused at the relay until the gate's admitted set grows to include
-    /// runtime-published ports. A mapping that reads `pending` is bound, and
-    /// a connection to its `local` is answered by the relay, not by the box.
-    ///
-    /// Filled by the daemon at read time (the serving handler compares the
-    /// mapping against the gate's compile set), never stored with the
-    /// forwarder — the state is a fact about the box, not about the bind.
+    /// Whether the box's own relay gate has not admitted the port. A current
+    /// daemon admits a runtime publish at the gate in the same step it binds
+    /// the forward (NET-044), so it always answers `Some(false)`. Only a
+    /// daemon from before that change answers `Some(true)`: its gate admitted
+    /// only the declared ports, so a connection to such a row's `local` was
+    /// answered by the relay, not by the box.
     ///
     /// An `Option`, defaulted on the wire, so a reply from a daemon older
     /// than the field — one that carries no `pending` key — still decodes,
@@ -2006,6 +2017,11 @@ pub struct LiveMapping {
     /// renderings `min session policy` writes spell that (`unknown` in the
     /// text row, `null` in the JSON document); a daemon that does carry the
     /// field answers `Some(true)` or `Some(false)`, and only those.
+    ///
+    /// Deprecated: daemons from the gate-admits-exposed-ports change onward
+    /// always send `Some(false)`, so the field carries information only from
+    /// an older daemon. Remove it, and the client's `pending` rendering, when
+    /// the support window for those older daemons ends.
     #[serde(default)]
     pub pending: Option<bool>,
 }
@@ -2442,6 +2458,7 @@ mod tests {
                 description: Some("emit to stdout and stderr".to_string()),
                 output: "HOOK_STDOUT_VISIBLE\nHOOK_STDERR_VISIBLE\n".to_string(),
             }],
+            ..Default::default()
         };
         let wire = serde_json_lenient::to_string(&resp).expect("must serialize");
         let back: FinalizeSessionResponse =
@@ -2461,6 +2478,32 @@ mod tests {
             Errorable::Ok(ok) => assert!(ok.activate_hooks[0].output.is_empty()),
             Errorable::Err { error } => panic!("a success decoded as an error: {error}"),
         }
+    }
+
+    /// `package_check_skipped` is omitted from the wire when false, so a
+    /// client that predates the field still decodes the common success
+    /// payload; when true it is present so the client can warn.
+    #[test]
+    fn package_check_skipped_is_omitted_when_false() {
+        let wire = serde_json_lenient::to_string(&FinalizeSessionResponse::default())
+            .expect("must serialize");
+        assert!(
+            !wire.contains("package_check_skipped"),
+            "a false skip must not be serialized, got {wire:?}"
+        );
+
+        let skipped = FinalizeSessionResponse {
+            package_check_skipped: true,
+            ..Default::default()
+        };
+        let wire = serde_json_lenient::to_string(&skipped).expect("must serialize");
+        assert!(
+            wire.contains("package_check_skipped"),
+            "a true skip must be serialized, got {wire:?}"
+        );
+        let back: FinalizeSessionResponse =
+            serde_json_lenient::from_str(&wire).expect("must decode");
+        assert!(back.package_check_skipped);
     }
 
     /// An empty request body must decode with the documented defaults so a

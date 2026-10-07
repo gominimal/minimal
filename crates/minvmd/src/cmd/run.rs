@@ -503,8 +503,18 @@ fn run_foreground() -> Result<()> {
     // table and its one line per attachment are the host's own state, ready
     // for the acceptor that reads them.
     let proxy_attachments = crate::bep_attach::Attachments::new();
+    // The operator's deny-all opt-out (NET-077), read once here as the VMM
+    // child reads it for the boot line: the registry compiles a client box
+    // with no `egress` section by it, so the host gate keeps the default the
+    // guest daemon was handed.
+    let egress_deny_all_opt_out = crate::vm::egress_deny_all_opt_out_from_env();
+    tracing::info!(
+        egress_deny_all_opt_out,
+        "host-side egress default opt-out for undeclared boxes"
+    );
     let boxes = crate::box_registry::BoxRegistry::new(switch::DEFAULT_SUBNET)
-        .feeding_proxy_attachments(proxy_attachments.clone());
+        .feeding_proxy_attachments(proxy_attachments.clone())
+        .with_egress_deny_all_opt_out(egress_deny_all_opt_out);
     // The node's own proxy port is resolved once before the VM boots — the
     // operator's override (`MINVMD_NODE_PROXY_PORT` in this supervisor's env)
     // or the default-first probe, so a VM sharing a host with a native daemon
@@ -520,7 +530,9 @@ fn run_foreground() -> Result<()> {
     let ports_dir = node_ports_dir().context("opening the node-port reservation directory")?;
     let mut node_port =
         assign_node_proxy_port(&ports_dir).context("assigning the node's proxy port")?;
-    boxes.register_node_namespace(node_port.port);
+    boxes
+        .try_register_node_namespace(node_port.port)
+        .context("publishing the node namespace's row")?;
     // A box's row goes with its shuttle connection: the gate reports which
     // addresses each relay carried at the relay's end, and this drainer thread
     // applies the reports for the life of the process (NET-133).
@@ -1007,7 +1019,13 @@ fn run_foreground() -> Result<()> {
                 drop(node_port);
                 node_port = assign_node_proxy_port(&ports_dir)
                     .context("redrawing the node's proxy port after a refused publish")?;
-                boxes.register_node_namespace(node_port.port);
+                // A row the redraw cannot publish fails the start, which
+                // discards a fresh volume image like every other failed boot.
+                if let Err(error) = boxes.try_register_node_namespace(node_port.port) {
+                    crate::cmd::discard_fresh_volume_image(&volume_path, volume_preexisted);
+                    return Err(error)
+                        .context("publishing the node namespace's row after a redraw");
+                }
                 continue;
             }
             crate::control::PublishDecision::FailStart {

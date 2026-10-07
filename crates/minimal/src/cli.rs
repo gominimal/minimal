@@ -124,6 +124,15 @@ pub enum Command {
     /// on Ctrl-C, whichever comes first.
     #[command(hide = true)]
     Spin(SpinArgs),
+    /// Print the privileged command that installs this host's resolver,
+    /// local range and box-name service (development aid).
+    ///
+    /// The command a session start's advisory prints, rendered without a
+    /// daemon, so the service install can be tested on a host that cannot
+    /// boot a VM. Debug builds only.
+    #[cfg(debug_assertions)]
+    #[command(name = "debug-answerer-command", hide = true)]
+    DebugAnswererCommand,
     /// Print session-identifier completion candidates (used by the shell).
     ///
     /// The completion path a shell actually takes runs in-process (see
