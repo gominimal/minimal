@@ -18,6 +18,12 @@ pub async fn cmd_pkg_patched_build(
 
     let remote_storage = ctx.remote_storage().await.unwrap();
 
+    let remote_cache = if ctx.use_remote_cache() {
+        Some(ctx.remote_cache(false, false).await?)
+    } else {
+        None
+    };
+
     let bsr = graph.top_levels[0];
 
     let output_base = ctx.builds_base_dir();
@@ -27,6 +33,7 @@ pub async fn cmd_pkg_patched_build(
         remote_fetcher: &remote_storage,
         stdout_writer: Some(Box::new(common::TracingWriter::stdout())),
         stderr_writer: Some(Box::new(common::TracingWriter::stderr())),
+        remote_cache: remote_cache.as_ref(),
     }
     .run(&op::Options {
         cache,

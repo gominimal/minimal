@@ -251,6 +251,7 @@ impl EnvChannel<'_> {
                 remote_fetcher: &remote_storage,
                 stdout_writer: Some(Box::new(stdout_writer)),
                 stderr_writer: Some(Box::new(stderr_writer)),
+                remote_cache: None,
             }
             .run(&op::Options {
                 cache,
