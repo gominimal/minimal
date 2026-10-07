@@ -76,6 +76,20 @@ pub enum ControlChannel {
     Vsock { cid: u32, port: u32 },
 }
 
+impl ControlChannel {
+    /// Whether the host, not this daemon, unbinds a declared port's forward.
+    /// On a VM-backed host (the vsock channel) every control request passes
+    /// the host's egress gate first. The gate refuses any withdrawal of a
+    /// declared port (NET-081's withdrawal rule) and unbinds the declared
+    /// forwards itself when the box's row is withdrawn (design §7.1:
+    /// host-side ingress revocation). On a native host the daemon drives the
+    /// switch directly, and the unbind is its own job.
+    #[must_use]
+    pub fn host_unbinds_declared_forwards(&self) -> bool {
+        matches!(self, Self::Vsock { .. })
+    }
+}
+
 /// gvproxy's wire spelling of an [`IpProto`] in a forwarder request.
 fn protocol_str(proto: IpProto) -> &'static str {
     match proto {
@@ -369,7 +383,7 @@ pub async fn apply_ingress(
                 );
                 // Roll back what we managed to expose so a half-applied policy
                 // does not leave dangling forwards on the shared switch.
-                remove_ingress(control, &bound).await;
+                release_declared_ingress(control, &bound).await;
                 return Err(e);
             }
         }
@@ -413,6 +427,34 @@ pub async fn remove_ingress(control: &ControlChannel, bound: &[PortForwarder]) {
                 );
             }
         }
+    }
+}
+
+/// Ends the declared ports' forwards in `bound` when their box stops (NET-121)
+/// or when a partial apply rolls back. Who unbinds them depends on the host
+/// ([`ControlChannel::host_unbinds_declared_forwards`]):
+///
+/// - On a native host the daemon asks the switch itself, through
+///   [`remove_ingress`].
+/// - On a VM-backed host the daemon asks nothing. The host's egress gate
+///   refuses any withdrawal of a declared port, by dropping the request
+///   unanswered. Asking anyway only produced a misleading "malformed status
+///   line" warning per port. The host unbinds the forwards and terminates
+///   their connections when it withdraws the box's row. Each forward still
+///   gets one info line, so the log keeps NET-121's bind/unbind pair.
+pub async fn release_declared_ingress(control: &ControlChannel, bound: &[PortForwarder]) {
+    if !control.host_unbinds_declared_forwards() {
+        remove_ingress(control, bound).await;
+        return;
+    }
+    for forwarder in bound.iter().filter(|forwarder| !forwarder.is_revoked()) {
+        let (host, external_port) = forwarder.host_port().unwrap_or(("", 0));
+        tracing::info!(
+            host,
+            port = external_port,
+            reason = "box stopped",
+            "left the declared ingress forwarder for the host to unbind"
+        );
     }
 }
 
@@ -1806,7 +1848,7 @@ mod tests {
         /// for the one test that needs a forwarder slower than its budget.
         /// Every round's `local` is handed to the returned receiver; the
         /// returned handle aborts the server when the test is done with it.
-        fn spawn_forwarder_answering(
+        pub(super) fn spawn_forwarder_answering(
             path: PathBuf,
             delay: Duration,
             decide: impl Fn(&str) -> u16 + Send + Sync + 'static,
@@ -2116,6 +2158,87 @@ mod tests {
 
             assert_eq!(asked_expose, format!("127.0.64.1:{RANGE_PROBE_PORT}"));
             assert_eq!(asked_unexpose, asked_expose);
+        }
+    }
+
+    // ---- who unbinds a declared forward when its box stops (NET-121) ------
+    mod declared_release {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+        use std::time::Duration;
+
+        use super::super::{
+            ControlChannel, ExposedMapping, PortForwarder, release_declared_ingress,
+        };
+        use super::forwarder_probe::spawn_forwarder_answering;
+
+        /// A declared forwarder bound at `local`, as `apply_ingress` builds
+        /// one, with no session gate behind it.
+        fn declared_at(local: &str) -> PortForwarder {
+            PortForwarder {
+                mapping: ExposedMapping {
+                    local: local.to_string(),
+                    protocol: "tcp".to_string(),
+                },
+                internal_port: 80,
+                gate: None,
+                revoked: Arc::new(AtomicBool::new(false)),
+            }
+        }
+
+        /// On a VM-backed host the host's egress gate refuses any withdrawal
+        /// of a declared port and unbinds the forward itself at box end, so
+        /// the daemon asks the switch for nothing. It says one info line per
+        /// forward, and no "removing ingress port mapping" warning.
+        #[tokio::test]
+        async fn declared_forwards_left_to_the_host_on_a_vm_host() {
+            let log = crate::test_harness::captured_log();
+            let control = ControlChannel::Vsock { cid: 2, port: 1 };
+            assert!(control.host_unbinds_declared_forwards());
+            let bound = [declared_at("127.0.64.201:18201")];
+
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                release_declared_ingress(&control, &bound),
+            )
+            .await
+            .expect("releasing on a VM host asks nothing of the switch, so it returns at once");
+
+            let logged = log.contents();
+            assert!(
+                logged.lines().any(|line| line
+                    .contains("left the declared ingress forwarder for the host to unbind")
+                    && line.contains("port=18201")),
+                "each declared forward says it was left to the host, got: {logged}"
+            );
+            assert!(
+                !logged
+                    .lines()
+                    .any(|line| line.contains("127.0.64.201:18201")
+                        && line.contains("removing ingress port mapping")),
+                "no retraction was attempted, so none failed, got: {logged}"
+            );
+        }
+
+        /// On a native host the daemon drives the switch directly, so it
+        /// still unbinds a declared forward itself when the box stops.
+        #[tokio::test]
+        async fn declared_forwards_unbound_by_the_daemon_on_a_native_host() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let sock = dir.path().join("gvproxy.sock");
+            let (forwarder, mut asked) =
+                spawn_forwarder_answering(sock.clone(), Duration::ZERO, |_| 200);
+            let control = ControlChannel::Unix(sock);
+            assert!(!control.host_unbinds_declared_forwards());
+
+            release_declared_ingress(&control, &[declared_at("127.0.64.202:18202")]).await;
+            forwarder.abort();
+
+            assert_eq!(
+                asked.recv().await.as_deref(),
+                Some("127.0.64.202:18202"),
+                "the daemon asked the switch to unbind the declared forward"
+            );
         }
     }
 }

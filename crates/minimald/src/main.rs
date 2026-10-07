@@ -248,7 +248,7 @@ pub struct ListenArgs {
     /// deployment pins one — the port the host's resolver is pointed at to
     /// answer `*.min.internal`, whose documented default is 7656. On a
     /// native host the daemon is first a client of the installed
-    /// `min-answerer` service (its rows publish over the machine-global
+    /// `minzoned` service (its rows publish over the machine-global
     /// channel and it hosts nothing); the port is the hook port it hosts
     /// the single-operator interim on while no service serves, and
     /// unlike the hostname proxy there is no select-when-busy for it: the
@@ -510,11 +510,12 @@ async fn async_main() -> Result<(), MainError> {
                 // construction has nowhere to raise.
                 hostname_proxy_port: None,
                 zone_answerer_port: None,
-                // The microVM's pid-1 has no flags to read: the guest runs
-                // the egress default its host's build ships — the rollout
-                // phase [`sessions::EGRESS_DEFAULT_PHASE`] carries — not
-                // opted out.
-                egress_deny_all_opt_out: false,
+                // The microVM's pid-1 has no flags to read, but the host
+                // hands it the operator's opt-out on the boot line (NET-077):
+                // the guest runs the egress default its host was started with
+                // — the rollout phase [`sessions::EGRESS_DEFAULT_PHASE`]
+                // carries — unless the operator opted out.
+                egress_deny_all_opt_out: guest::handed_egress_deny_all_opt_out(),
             }),
             global_args: GlobalArgs {
                 minimal_state_dir: Some(DaemonAbsPath::try_new("/run/minimal").unwrap().into()),
@@ -576,6 +577,13 @@ async fn async_main() -> Result<(), MainError> {
         let proxy = guest::handed_proxy_port().map_err(|e| MainError::Other(e.to_string()))?;
         guest::probe_handed_node_port(proxy)
             .map_err(|e| MainError::IO(e, "binding the handed node port"))?;
+        // The egress opt-out was read off the boot line once, at `Cli`
+        // construction; say what the guest runs with, so a diag bundle shows
+        // whether the deny-all default was opted out (NET-077).
+        tracing::info!(
+            egress_deny_all_opt_out = listen_args.egress_deny_all_opt_out,
+            "guest egress deny-all opt-out from the boot line"
+        );
         (proxy, None)
     } else {
         (
