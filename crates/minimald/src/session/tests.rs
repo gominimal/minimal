@@ -3401,6 +3401,110 @@ async fn stopped_shared_address_box_is_nodata_through_actor() {
     );
 }
 
+/// NET-128's resume half: a shared-address box stopped through the actor
+/// resumes at its address — the stop is a state, not an end. The actor's
+/// Stop arm marks the name stopped (NODATA at the shared address), and the
+/// resume path — a fresh actor re-registering the name, then a host start
+/// clearing the marker — brings the name back to answering A at the same
+/// address. The re-registration is not refused as "name taken": the
+/// registry's register overwrites the route, so the resumed box's name is
+/// held again rather than dropped.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stopped_shared_address_box_resumes_at_its_address_through_actor() {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let manager = server.state.sessions_manager().await;
+    manager.land_range_verdict(crate::net::dns::RangeVerdict::Present);
+    let shared = manager
+        .hostnames()
+        .read()
+        .expect("registry lock")
+        .node_address();
+    let id = finalize_handed_own_ip_session(
+        &mut client,
+        "resumebox",
+        std::net::Ipv4Addr::new(100, 64, 128, 9),
+        shared,
+    )
+    .await;
+
+    // The name answers while the box runs.
+    let (_, address) = zone_answer_for(&server, "resumebox.min.internal")
+        .await
+        .expect("the name answers while the box runs");
+    assert_eq!(
+        address, shared,
+        "the box's name answers at the shared address while it runs"
+    );
+
+    // Stop the box through the actor — the path the issue reports. The Stop
+    // arm must not panic; it marks the name stopped and returns.
+    let handle = manager
+        .get_session(crate::sessions::SessionKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the box resolves while it runs");
+    handle.stop().await;
+
+    let registry = server.state.sessions_manager().await.hostnames();
+    assert_eq!(
+        registry
+            .read()
+            .expect("registry lock")
+            .zone_entry("resumebox.min.internal", &[]),
+        crate::net::dns::ZoneEntry::Held {
+            owner: "resumebox".to_string(),
+            address: None,
+        },
+        "a stopped shared-address box answers NODATA, not NXDOMAIN"
+    );
+
+    // Resume: evict the dead actor and re-resolve, so a fresh actor comes up
+    // from the record and re-registers the name — the registration is not
+    // refused as "name taken". Then launch a host, whose start clears the
+    // stopped marker, and the name answers again at the same address.
+    manager.evict(id).await;
+    let handle = manager
+        .get_session(crate::sessions::SessionKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the box resolves after eviction");
+    handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("an Active session should be able to launch a host");
+
+    // The host's `mainloop` marks the name running on its own spawned task,
+    // so poll the zone until the marker is cleared rather than racing it.
+    let (owner, resumed) = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let registry = server.state.sessions_manager().await.hostnames();
+            if let crate::net::dns::ZoneEntry::Held {
+                owner,
+                address: Some(address),
+            } = registry
+                .read()
+                .expect("registry lock")
+                .zone_entry("resumebox.min.internal", &[])
+            {
+                return (owner, address);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the name answers again after the host starts");
+    assert_eq!(
+        owner, "resumebox",
+        "the session owns its box name across the resume"
+    );
+    assert_eq!(
+        resumed, shared,
+        "the resumed box answers at the address it held before the stop"
+    );
+}
+
 /// NET-010's durability half (design §7.1): the hand is the record's row,
 /// not the daemon's memory — a creator wrote the box's addresses into the
 /// session's record at create, and the registry's publish is derived from

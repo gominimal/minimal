@@ -1823,12 +1823,28 @@ impl Session {
                 // is cleared on resume when the host starts.
                 #[cfg(target_os = "linux")]
                 {
-                    let record = self.record.record().await.unwrap();
-                    if self.owns_hostname_route(&record) {
-                        self.hostnames
-                            .write()
-                            .expect("hostname registry lock poisoned")
-                            .mark_stopped(record.id);
+                    match self.record.record().await {
+                        Ok(record) => {
+                            if self.owns_hostname_route(&record) {
+                                self.hostnames
+                                    .write()
+                                    .expect("hostname registry lock poisoned")
+                                    .mark_stopped(record.id);
+                            }
+                        }
+                        // An unreadable record must not panic the Stop arm:
+                        // the box is still stopped, only its name is not
+                        // marked stopped, so a shared-address name keeps
+                        // answering where the node's listener no longer
+                        // speaks for it. Say so and move on.
+                        Err(e) => {
+                            tracing::warn!(
+                                session_id = %self.record.id(),
+                                error = %e,
+                                "reading the session record failed; the stopped \
+                                 box's name is not marked stopped",
+                            );
+                        }
                     }
                 }
                 let _ = r.send(());
