@@ -856,14 +856,18 @@ pub(crate) fn arm_activation_interrupt(
 
 /// The user-facing text for a session that could not be composed, by
 /// either route: a refused `ConfigureLoadout` or failed gating of what it
-/// sent back. The underlying error names an internal step the caller never
-/// asked for, so the directory leads and that text follows as the only
-/// diagnostic there is. Shared with `min task run` (`crate::task`), which
-/// creates a session through the same two steps.
+/// sent back. The underlying error often names an internal step the caller
+/// never asked for (a package server, a git lock), so the directory leads
+/// and that text follows as the only diagnostic there is. The cause may or
+/// may not implicate the project configuration, so the remedy is phrased
+/// conditionally rather than assuming the config is at fault. Shared with
+/// `min task run` (`crate::task`), which creates a session through the same
+/// two steps.
 pub(crate) fn composition_failure_message(project_dir: &camino::Utf8Path, error: &str) -> String {
     format!(
         "Cannot start a session for {project_dir}: composing a session environment from \
-         that directory's project configuration failed, so no session was activated. Fix \
-         the configuration there, then re-run.\n\ncause: {error}"
+         that directory's project configuration failed, so no session was activated. If \
+         the cause below names the project configuration, fix it there; otherwise re-run.\
+         \n\ncause: {error}"
     )
 }

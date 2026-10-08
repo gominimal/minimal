@@ -18,13 +18,23 @@ impl Repo {
     /// given path with be re-used if it is already initialized.
     pub fn new<S: Into<String>, P: Into<PathBuf>>(url: S, base: P) -> Result<Self, Error> {
         let url = url.into();
-        let base = base.into();
+        // Absolute, because every git call below pairs `current_dir(base)`
+        // with `GIT_DIR=base`, and git resolves a relative `GIT_DIR` against
+        // that new working directory.
+        let base = std::path::absolute(base.into())?;
 
         if base.join("HEAD").exists() {
             // Double-check its the right remote
             let output = Command::new("git")
                 .args(["remote", "get-url", "origin"])
                 .current_dir(&base)
+                // Explicit GIT_DIR so git recognises the bare repo as
+                // intentional even when `safe.bareRepository = explicit` is
+                // configured (planned as the default in Git 3.0). Under that
+                // setting, missing it makes this command fail and fall
+                // through to a clone into the already-populated directory,
+                // which can surface as `clone ... already exists`.
+                .env("GIT_DIR", &base)
                 .output()?;
 
             if output.status.success() {
@@ -237,7 +247,8 @@ impl Repo {
             .current_dir(self.bare_repo_path())
             // Explicitly set GIT_DIR so git recognises the bare repo as
             // intentional even when `safe.bareRepository = explicit` is set
-            // in the system or global config (the default since git 2.49).
+            // in the system or global config (planned as the default in
+            // Git 3.0).
             .env("GIT_DIR", self.bare_repo_path())
             .args(&args)
             .output()?;

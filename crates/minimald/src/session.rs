@@ -902,6 +902,24 @@ enum HostOrigin {
     Exec,
 }
 
+/// Whether replacing a live host for an attaching terminal is safe for the
+/// box it serves. A [`HostOrigin::Hooks`] host is replaceable — nothing of
+/// the user's runs in it — unless the record holds a registered host-side
+/// row: on a VM-backed host, ending that host's PTask ends the shuttle
+/// connection the row is tied to, and the in-VM daemon cannot re-register
+/// it, so a respawn would strand the box with no row. The guard is the
+/// record's handed `box_addresses`, not a VM check, so any registered box is
+/// kept, native ones included: keeping costs nothing, because the terminal
+/// rides the per-attach environment the host republishes, exactly as it does
+/// for an [`HostOrigin::Exec`] host.
+fn replaces_host_for_terminal(
+    origin: HostOrigin,
+    declares_terminal: bool,
+    holds_host_row: bool,
+) -> bool {
+    origin == HostOrigin::Hooks && declares_terminal && !holds_host_row
+}
+
 impl Session {
     /// Assembles the actor from its seed, mailbox, and initial state. The
     /// caller decides when to enter [`Self::mainloop`].
@@ -2055,31 +2073,38 @@ impl Session {
         //
         // Fenced: the scaffold resolves the default package repo over the
         // network and runs inline on the session actor, so an unfenced call
-        // would pin a worker for the whole fetch. Flavor-guarded because
-        // `block_in_place` panics on a current-thread runtime.
-        let scaffold = || self.scaffold_mfile_if_missing(&workspace_path);
-        match tokio::runtime::Handle::current().runtime_flavor() {
-            tokio::runtime::RuntimeFlavor::MultiThread => tokio::task::block_in_place(scaffold),
-            _ => scaffold(),
-        }
-        .map_err(|e| std::io::Error::other(format!("scaffolding a default mfile: {e}")))?;
-
-        // Phase 1+2: resolve the project and drive the composer. Kept fully
-        // synchronous — its non-`Send` intermediaries must not cross an
-        // `.await`.
-        // A session activated with `--no-hooks` drops the project's
-        // hooks here, the same way the client already dropped its
-        // loadouts' before sending. Both ends honour the flag, so the
-        // composition — and the snapshot persisted from it — records
-        // that the session has no hooks at all, rather than carrying
-        // hooks that every later transition has to remember to skip.
-        let outcome = composables::run_compose(
-            &self.daemon_ctx,
-            &workspace_path,
-            &self.record.record().await?.project_path,
-            contribution,
-            hooks_enabled,
-        )?;
+        // would pin a worker for the whole fetch. The compose shares the
+        // fence: it resolves the graph through the checkouts cache, whose
+        // lock may block for up to the lock timeout, and that wait must not
+        // park a tokio worker. Flavor-guarded because `block_in_place`
+        // panics on a current-thread runtime.
+        let declared_path = self.record.record().await?.project_path;
+        let scaffold_and_compose = || {
+            self.scaffold_mfile_if_missing(&workspace_path)
+                .map_err(|e| std::io::Error::other(format!("scaffolding a default mfile: {e}")))?;
+            // Phase 1+2: resolve the project and drive the composer. Kept
+            // fully synchronous — its non-`Send` intermediaries must not
+            // cross an `.await`; `block_in_place` keeps them on this thread.
+            // A session activated with `--no-hooks` drops the project's
+            // hooks here, the same way the client already dropped its
+            // loadouts' before sending. Both ends honour the flag, so the
+            // composition — and the snapshot persisted from it — records
+            // that the session has no hooks at all, rather than carrying
+            // hooks that every later transition has to remember to skip.
+            composables::run_compose(
+                &self.daemon_ctx,
+                &workspace_path,
+                &declared_path,
+                contribution,
+                hooks_enabled,
+            )
+        };
+        let outcome = match tokio::runtime::Handle::current().runtime_flavor() {
+            tokio::runtime::RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(scaffold_and_compose)
+            }
+            _ => scaffold_and_compose(),
+        }?;
 
         match outcome {
             // The composition is complete: promote the record
@@ -3924,7 +3949,7 @@ impl Session {
         // and materializing without them would produce a broken
         // sandbox rootfs. See [`Session::finalize`] for the
         // transition.
-        {
+        let holds_host_row = {
             let record = self
                 .record
                 .record()
@@ -3933,7 +3958,8 @@ impl Session {
             if record.status != SessionStatus::Active {
                 return Err(AttachError::SessionPending);
             }
-        }
+            record.box_addresses.is_some()
+        };
 
         // A host minted to run hooks has an environment that describes no
         // terminal, because there was none — and the shell's `environ` cannot
@@ -3942,10 +3968,16 @@ impl Session {
         // attach can arrive), so replace it with one minted for the terminal
         // that is actually here. An `Exec`-minted host is deliberately not
         // replaced: a command is live inside that sandbox, and killing it to
-        // improve `TERM` is a bad trade. That case rides on the per-attach
-        // environment the host republishes instead.
+        // improve `TERM` is a bad trade. A box the host registered is not
+        // replaced either, because ending its PTask ends the shuttle
+        // connection the host-side row is tied to. Both cases ride on the
+        // per-attach environment the host republishes instead.
+        let declares_terminal = attach_env.declares_terminal();
         let respawn_for_terminal =
-            self.host_origin == HostOrigin::Hooks && attach_env.declares_terminal();
+            replaces_host_for_terminal(self.host_origin, declares_terminal, holds_host_row);
+        // Kept only for its row: the same host would be replaced without one.
+        let kept_for_host_row = !respawn_for_terminal
+            && replaces_host_for_terminal(self.host_origin, declares_terminal, false);
         if respawn_for_terminal
             && let SessionInner::Active {
                 host: slot @ Some(_),
@@ -3960,6 +3992,11 @@ impl Session {
             // loop rather than parking the attach behind it. Same bounded
             // kill-and-stop as shutdown; see [`Session::kill_and_stop_loop`].
             Self::kill_and_stop_loop(&handle, &mut join, false).await;
+        } else if kept_for_host_row {
+            tracing::info!(
+                "kept the hook-launched session shell: replacing it would end the box's \
+                 host-side row; the terminal's environment rides the per-attach republish"
+            );
         }
 
         let host = match &mut self.inner {
@@ -4871,7 +4908,16 @@ impl Session {
     async fn build_context(&self, scaffold_if_missing: bool) -> Result<mctx::Context, String> {
         let wsp = self.record.object().await.unwrap().workspace_path();
         if scaffold_if_missing {
-            self.scaffold_mfile_if_missing(&wsp)?;
+            // Fenced: the scaffold updates the default package checkout,
+            // whose checkouts cache lock may block for up to the lock
+            // timeout, and that wait must not park a tokio worker.
+            // Flavor-guarded because `block_in_place` panics on a
+            // current-thread runtime.
+            let scaffold = || self.scaffold_mfile_if_missing(&wsp);
+            match tokio::runtime::Handle::current().runtime_flavor() {
+                tokio::runtime::RuntimeFlavor::MultiThread => tokio::task::block_in_place(scaffold),
+                _ => scaffold(),
+            }?;
         }
         mctx::Context::new(self.workspace_config(&wsp)?).map_err(|e| e.to_string())
     }
