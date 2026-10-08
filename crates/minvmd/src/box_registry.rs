@@ -3145,18 +3145,15 @@ impl BoxRegistry {
 /// slice that starts at or ends on one of them keeps it out of a box's
 /// hands too.
 ///
-/// That interior is the answerer's own hand-out run
-/// (`minimald::net::answerer`'s `box_address_range`, restated against the
-/// range's one definition in the switch crate so the two cannot drift);
-/// this run is the tests' single-node cursor clamped to it, so a test box
-/// never holds an address the answerer would refuse.
+/// That interior is the answerer's own hand-out run, read from its one
+/// definition ([`crate::net::answerer::box_address_range`]) rather than
+/// restated; this run is the tests' single-node cursor clamped to it, so a
+/// test box never holds an address the answerer would refuse.
 #[cfg(test)]
 fn box_loopback_run(slice: switch::LoopbackSlice) -> (u32, u32) {
-    let (network, prefix) = switch::RESERVED_LOCAL_RANGE;
-    let size = 1u32 << (32 - u32::from(prefix));
-    let range_first = u32::from(network);
-    let first = u32::from(slice.first()).max(range_first + 2);
-    let last = u32::from(slice.last()).min(range_first + size - 2);
+    let (box_first, box_last) = crate::net::answerer::box_address_range();
+    let first = u32::from(slice.first()).max(u32::from(box_first));
+    let last = u32::from(slice.last()).min(u32::from(box_last));
     (first, last)
 }
 
@@ -3916,6 +3913,19 @@ mod tests {
                 Err(AllocationError::LoopbackExhausted)
             ),
             "exhaustion stays explicit and never wraps"
+        );
+
+        // A slice inside the range touches none of its reserved ends, so
+        // the clamp keeps every one of its addresses.
+        let middle = switch::AddressPlan::default()
+            .loopback_slice_for_switch(
+                SwitchSubnet::new(Ipv4Addr::new(100, 64, 3, 0), 24).expect("valid"),
+            )
+            .expect("a middle slice is planned");
+        assert_eq!(
+            box_loopback_run(middle),
+            (u32::from(middle.first()), u32::from(middle.last())),
+            "a middle slice loses no address to the clamp"
         );
     }
 

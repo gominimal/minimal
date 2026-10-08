@@ -598,7 +598,7 @@ const REUSE_QUARANTINE: Duration = Duration::from_secs(zone_answer::ANSWER_TTL_S
 /// The box addresses the answerer hands out: the reserved local range's
 /// `.2` to its last-but-one address (`.254` of the /24). The network
 /// address, `.1` and the broadcast address are never a box's.
-fn box_address_range() -> (Ipv4Addr, Ipv4Addr) {
+pub(crate) fn box_address_range() -> (Ipv4Addr, Ipv4Addr) {
     let (network, prefix) = switch::RESERVED_LOCAL_RANGE;
     let size = 1u32 << (32 - u32::from(prefix));
     let first = u32::from(network);
