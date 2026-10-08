@@ -514,12 +514,15 @@ async fn hold_box_name_with_vm_host(
     let request = minimald_rpc::HoldBoxNameRequest {
         name: name.to_string(),
     };
-    let (verb, held) = if hold {
-        (minimald_rpc::BoxControlRequest::HoldBoxName(request), true)
+    let (verb, operation) = if hold {
+        (
+            minimald_rpc::BoxControlRequest::HoldBoxName(request),
+            "hold",
+        )
     } else {
         (
             minimald_rpc::BoxControlRequest::ReleaseBoxName(request),
-            false,
+            "release",
         )
     };
     let Some(sock_path) = control_sock else {
@@ -539,9 +542,9 @@ async fn hold_box_name_with_vm_host(
     if let Some(reason) = failure {
         tracing::warn!(
             box = %name,
-            held,
-            "the box name hold could not be made ({reason}); the name answers \
-             as it did before"
+            operation,
+            "the box name {operation} could not be made ({reason}); the name \
+             answers as it did before"
         );
     }
 }
@@ -1784,6 +1787,13 @@ pub(crate) async fn activate_session(
     // the session is active, so an activation that dies or fails earlier
     // — its unfinalized session reaped with the connection — leaves no
     // hold behind; the destroy releases it ([`release_held_box_name`]).
+    // Only this activate/destroy pair holds: `min task run` (task.rs) mints
+    // an ephemeral, auto-generated host_ip session through raw
+    // `CreateSession`/`DestroySession` RPCs and never passes through here,
+    // so its name is neither held nor released — a task box's name is not
+    // meant to be reached, and widening the interim to that path is a
+    // design ruling for the name-registry work, not a change a review
+    // pass may make in passing.
     if kind == paths::ProviderKind::Minvmd
         && config.network == sessions::NetworkMode::HostNet
         && let Some(name) = config.name.as_deref()
