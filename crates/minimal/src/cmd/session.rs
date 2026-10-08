@@ -294,9 +294,15 @@ pub(crate) fn start_advisory_text(advisory: &str, interactive: bool) -> String {
 /// The one-line form of an advisory: its first line, the `note: <facts>.`
 /// a full advisory starts with, without the trailing "… with:" lead-in
 /// sentence that introduces the command block, followed by
-/// [`NET_SETUP_HINT`].
+/// [`NET_SETUP_HINT`]. An advisory with no command block (a blocker names
+/// no command) is already one line and is kept as it is: there is no
+/// command for `min net setup` to print.
 pub(crate) fn short_advisory(advisory: &str) -> String {
-    let first = advisory.lines().next().unwrap_or_default().trim_end();
+    let mut lines = advisory.lines();
+    let first = lines.next().unwrap_or_default().trim_end();
+    if lines.next().is_none() {
+        return first.to_string();
+    }
     let facts = if first.ends_with(" with:") {
         // The lead-in is the last sentence; the facts end at the period
         // before it.
@@ -3960,14 +3966,12 @@ mod tests {
         assert!(short.ends_with(NET_SETUP_HINT), "{short}");
     }
 
-    /// A one-line advisory (no command block) is kept whole, plus the hint.
+    /// A one-line advisory (a blocker, no command block) is kept as it is:
+    /// there is no command for `min net setup` to print, so no hint.
     #[test]
     fn short_advisory_keeps_a_one_line_advisory() {
         let advisory = "note: host lookups bypass the resolver.";
-        assert_eq!(
-            short_advisory(advisory),
-            format!("{advisory} {NET_SETUP_HINT}")
-        );
+        assert_eq!(short_advisory(advisory), advisory);
     }
 
     #[test]
