@@ -24,10 +24,10 @@ impl Repo {
         let base = std::path::absolute(base.into())?;
 
         if base.join("HEAD").exists() {
-            // Double-check its the right remote. Read the stored config value,
+            // Double-check its the right remote. Read the clone's stored value,
             // not `git remote get-url`: the latter applies `url.<base>.insteadOf`
-            // rewrites from the user's global config, so a rewritten clone would
-            // never match and every cache open would fail with InvalidPath.
+            // rewrites from any config level, so a rewritten clone would never
+            // match and every cache open would fail with InvalidPath.
             // `--local` so a `remote.origin.url` in global or system config
             // cannot stand in for a cache whose own config lacks one.
             let output = Command::new("git")

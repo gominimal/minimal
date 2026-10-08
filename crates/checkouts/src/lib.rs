@@ -1286,61 +1286,48 @@ mod tests {
         );
     }
 
-    /// Runs `f` with git's global config replaced by `gitconfig` and the
-    /// system config disabled, so the developer's real config never leaks
-    /// into the test. nextest runs each test in its own process, so the env
-    /// change is not seen by other tests.
-    fn with_git_config<T>(gitconfig: &str, f: impl FnOnce() -> T) -> T {
-        let config = tempfile::tempdir().unwrap();
-        let config_path = config.path().join("gitconfig");
-        std::fs::write(&config_path, gitconfig).unwrap();
-
-        let vars = ["GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM"];
-        let previous: Vec<_> = vars.iter().map(std::env::var_os).collect();
-        unsafe {
-            std::env::set_var("GIT_CONFIG_GLOBAL", &config_path);
-            std::env::set_var("GIT_CONFIG_NOSYSTEM", "1");
-        }
-
-        let result = f();
-
-        for (var, previous) in vars.iter().zip(previous) {
-            match previous {
-                Some(previous) => unsafe { std::env::set_var(var, previous) },
-                None => unsafe { std::env::remove_var(var) },
-            }
-        }
-        result
+    /// Writes `url.<base>.insteadOf = <instead_of>` into the bare clone's own
+    /// config. The rewrite can come from any config level; the clone's own
+    /// config is used so the test never touches the process environment.
+    fn add_insteadof(cache: &std::path::Path, base: &str, instead_of: &str) {
+        let output = std::process::Command::new("git")
+            .arg("config")
+            .arg("--file")
+            .arg(cache.join("config"))
+            .arg(format!("url.{base}.insteadOf"))
+            .arg(instead_of)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git config insteadOf failed");
     }
 
-    /// A global `url.<base>.insteadOf` rewrite used to break the cache
-    /// validation in `Repo::new`: `git remote get-url` applies rewrites, the
-    /// clone stores the un-rewritten `remote.origin.url`, so the second open
-    /// of the same cache dir failed with `Error::InvalidPath`.
+    /// A `url.<base>.insteadOf` rewrite, at any config level, used to break
+    /// the cache validation in `Repo::new`: `git remote get-url` applies
+    /// rewrites, the clone stores the un-rewritten `remote.origin.url`, so
+    /// the second open of the same cache dir failed with
+    /// `Error::InvalidPath`.
     #[test]
     fn accepts_a_cached_clone_whose_origin_is_rewritten_by_insteadof() {
         let (src, _) = make_local_repo("main");
         let src = src.path().to_string_lossy().into_owned();
         let cache = tempfile::tempdir().unwrap();
 
-        // Rewrite the plain path to a `file://` URL, as a user's global
-        // config might.
-        let gitconfig = format!("[url \"file://{src}\"]\n\tinsteadOf = {src}\n");
-        let result = with_git_config(&gitconfig, || {
-            let mut repo = Repo::new(&src, cache.path())?;
-            repo.fetch()?;
-            // Second open revalidates the cached clone instead of cloning.
-            Repo::new(&src, cache.path())?;
-            Ok::<_, crate::Error>(())
-        });
+        Repo::new(&src, cache.path()).expect("first open clones");
+        // Rewrite the plain path to a `file://` URL, as a user's config might.
+        add_insteadof(cache.path(), &format!("file://{src}"), &src);
 
-        result.expect("both opens of the rewritten cache dir succeed");
+        // Second open revalidates the cached clone instead of cloning, and
+        // fetches still go through the rewrite.
+        let mut repo = Repo::new(&src, cache.path()).expect("rewritten cache reopens");
+        repo.fetch().expect("fetch through the rewrite succeeds");
     }
 
     /// The cache identity check compares the url the caller asked for with
     /// the url the cache was cloned from, both un-rewritten: an `insteadOf`
     /// mapping the requested url onto the cached one does not make a cache
-    /// of another remote pass.
+    /// of another remote pass. The pre-fix code refused this too; the test
+    /// pins that refusal so a later loosening (for example comparing
+    /// rewritten urls on both sides) cannot slip through.
     #[test]
     fn refuses_a_cached_clone_of_another_remote_even_under_insteadof() {
         let (cached, _) = make_local_repo("main");
@@ -1349,11 +1336,9 @@ mod tests {
         let requested = requested.path().to_string_lossy().into_owned();
         let cache = tempfile::tempdir().unwrap();
 
-        let gitconfig = format!("[url \"{cached}\"]\n\tinsteadOf = {requested}\n");
-        let result = with_git_config(&gitconfig, || {
-            Repo::new(&cached, cache.path()).expect("first open clones");
-            Repo::new(&requested, cache.path()).map(|_| ())
-        });
+        Repo::new(&cached, cache.path()).expect("first open clones");
+        add_insteadof(cache.path(), &cached, &requested);
+        let result = Repo::new(&requested, cache.path()).map(|_| ());
 
         assert!(
             matches!(result, Err(crate::Error::InvalidPath)),
