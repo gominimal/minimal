@@ -675,10 +675,12 @@ fn run_foreground() -> Result<()> {
             // the pidfd stop paths are clean-stop-only and gvproxy holds no
             // alive lock, so nothing reaps it. Unlinking the stale socket
             // below would let the fresh gvproxy bind while the leftover still
-            // holds the host-side forwards. Kill it first — cmdline-matched on
-            // both the gvproxy binary and this VM's switch socket, the
-            // anchoring reap-vms.sh uses; this supervisor's alive lock rules
-            // out a live same-instance supervisor.
+            // holds the host-side forwards. Kill it first — matched on exact
+            // argv tokens: argv[0] is the gvproxy binary and `-listen` names
+            // this VM's switch socket. This supervisor's alive lock rules out
+            // a live same-instance supervisor. This thread is the synchronous
+            // supervisor thread, not a tokio worker, so the reap's bounded
+            // wait may block it.
             crate::net::reap_stale_gvproxy(&binary, &switch_sock);
             crate::sock::remove_stale_socket(&switch_sock)
                 .context("removing stale switch socket")?;
