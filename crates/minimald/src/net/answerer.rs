@@ -3646,7 +3646,10 @@ mod tests {
                 .unwrap(),
         );
         client
-            .call::<FinalizeSession>(&FinalizeSessionRequest { session_id: id })
+            .call::<FinalizeSession>(&FinalizeSessionRequest {
+                session_id: id,
+                report_shared_port_collisions: false,
+            })
             .await
             .unwrap();
 

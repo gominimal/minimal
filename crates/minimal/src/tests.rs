@@ -665,6 +665,7 @@ fn twin_entry(
         status,
         git: None,
         host_ip_enforcement: None,
+        shared_port_collisions: Vec::new(),
         attrs: None,
     }
 }
@@ -2280,7 +2281,10 @@ async fn create_box_on(
         Errorable::Err { error } => panic!("ConfigureLoadout failed: {error}"),
     }
     match client
-        .call::<FinalizeSession>(&FinalizeSessionRequest { session_id: id })
+        .call::<FinalizeSession>(&FinalizeSessionRequest {
+            session_id: id,
+            report_shared_port_collisions: false,
+        })
         .await
     {
         Errorable::Ok(_) => id,

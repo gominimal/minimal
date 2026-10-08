@@ -1154,7 +1154,10 @@ kill "$peer" 2>/dev/null
                 .unwrap(),
         );
         match client
-            .call::<FinalizeSession>(&FinalizeSessionRequest { session_id })
+            .call::<FinalizeSession>(&FinalizeSessionRequest {
+                session_id,
+                report_shared_port_collisions: false,
+            })
             .await
         {
             Errorable::Ok(_) => {}
