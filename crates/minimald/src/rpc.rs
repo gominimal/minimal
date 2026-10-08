@@ -855,7 +855,12 @@ async fn serve_answerer_control(
                 return;
             }
             match request {
-                BoxControlRequest::AnswererStatus => BoxControlReply::Status(status.get()),
+                BoxControlRequest::AnswererStatus => {
+                    BoxControlReply::Status(minimald_rpc::AnswererStatusReply {
+                        answerer: status.get(),
+                        proxy_down: None,
+                    })
+                }
                 BoxControlRequest::ReleaseAnswerer => {
                     let reply = status.release().await;
                     tracing::info!(

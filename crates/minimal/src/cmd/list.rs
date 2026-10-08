@@ -557,7 +557,7 @@ pub async fn cmd_ls(global: &GlobalArgs, args: LsArgs) -> Result<(), anyhow::Err
     // modes that can print them, like the detection below it: `--json` and
     // `--raw` are machine-readable-only and pay no host read, socket or
     // query either one.
-    let vm_answerers: Vec<Option<minimald_rpc::ZoneAnswererStatus>> = if args.json || args.raw {
+    let vm_answerers: Vec<Option<minimald_rpc::AnswererStatusReply>> = if args.json || args.raw {
         Vec::new()
     } else {
         let mut read = Vec::with_capacity(listings.len());
@@ -582,11 +582,11 @@ pub async fn cmd_ls(global: &GlobalArgs, args: LsArgs) -> Result<(), anyhow::Err
     // daemon's report would have decided: the read that cannot be made —
     // no control socket, the deadline, a daemon that predates the verb —
     // keeps the silence a daemon-report verdict is, for that VM alone.
-    for (index, status) in vm_answerers.iter().enumerate() {
-        if let Some(status) = status
+    for (index, reply) in vm_answerers.iter().enumerate() {
+        if let Some(reply) = reply
             && let Some(slot) = surfaces.get_mut(index)
         {
-            *slot = crate::resolver::vm_host_name_surface(status.clone()).await;
+            *slot = crate::resolver::vm_host_name_surface(reply.clone()).await;
         }
     }
     format_ls_across_vms(
@@ -714,7 +714,7 @@ pub fn format_ls(
     args: &LsArgs,
     resp: &minimald_rpc::ListSessionsResponse,
     surface: Option<crate::resolver::LiveSurface>,
-    vm_answerer: Option<minimald_rpc::ZoneAnswererStatus>,
+    vm_answerer: Option<minimald_rpc::AnswererStatusReply>,
 ) -> Result<(), anyhow::Error> {
     if args.json {
         let json = serde_json_lenient::to_string_pretty(resp)
@@ -761,10 +761,20 @@ pub fn format_ls(
                 "HOSTNAME PROXY:  listening on 127.0.0.1:{port} · <name>.min.internal routes through it"
             )?;
         }
-        // The VM host daemon's line is computed once here, because the
+        // The VM host daemon's two facts are computed here, because the
         // blank line below rides on what printed, not on what was read:
-        // the pre-acquisition state prints no line and forces no blank one.
-        let vm_answerer_line = vm_answerer.and_then(crate::resolver::vm_host_answerer_line);
+        // the pre-acquisition state prints no answerer line and forces no
+        // blank one, and a proxy cause rides beside whatever the answerer's
+        // own state decided — displacing nothing, displaced by nothing.
+        let vm_answerer_line = vm_answerer
+            .as_ref()
+            .and_then(|reply| crate::resolver::vm_host_answerer_line(reply.answerer.clone()));
+        let proxy_down_line = vm_answerer.as_ref().and_then(|reply| {
+            reply
+                .proxy_down
+                .as_ref()
+                .map(crate::resolver::proxy_down_line)
+        });
         if let Some(answerer) = resp.zone_answerer_port {
             writeln!(
                 out,
@@ -772,6 +782,15 @@ pub fn format_ls(
             )?;
         } else if let Some(line) = &vm_answerer_line {
             writeln!(out, "ZONE ANSWERER:   {line}")?;
+        }
+        // T93's sibling, in the list's own voice: when the reply carries
+        // the proxy's publish outcome as well as the answerer's state —
+        // the daemon naming both services in one reply — the failure is
+        // said beside the answerer's line, in the row the serving proxy
+        // names itself in. A daemon with no proxy cause, serving or
+        // merely silent, prints nothing here.
+        if let Some(line) = &proxy_down_line {
+            writeln!(out, "HOSTNAME PROXY:  {line}")?;
         }
         // NET-018: say which of the two surfaces is live — the one verdict
         // both verbs share ([`resolver::live_name_surfaces`]). `None` — the
@@ -790,6 +809,7 @@ pub fn format_ls(
         if resp.hostname_proxy_port.is_some()
             || resp.zone_answerer_port.is_some()
             || vm_answerer_line.is_some()
+            || proxy_down_line.is_some()
         {
             writeln!(out)?;
         }
@@ -907,7 +927,7 @@ pub fn format_ls_across_vms(
     args: &LsArgs,
     listings: &[VmListing],
     surfaces: &[Option<crate::resolver::LiveSurface>],
-    vm_answerers: &[Option<minimald_rpc::ZoneAnswererStatus>],
+    vm_answerers: &[Option<minimald_rpc::AnswererStatusReply>],
 ) -> Result<(), anyhow::Error> {
     // The verdict of the listing at `index`, `None` when the caller passed
     // none for it — a machine mode never prints the line, and a direct
@@ -1027,12 +1047,32 @@ pub fn format_ls_across_vms(
                     width = VM_COLUMN_WIDTH,
                 )?;
                 facts += 1;
-            } else if let Some(line) =
-                answerer_at(index).and_then(crate::resolver::vm_host_answerer_line)
+            } else if let Some(line) = answerer_at(index)
+                .as_ref()
+                .and_then(|reply| crate::resolver::vm_host_answerer_line(reply.answerer.clone()))
             {
                 writeln!(
                     out,
                     "ZONE ANSWERER:   {vm:<width$} {line}",
+                    vm = listing.vm,
+                    width = VM_COLUMN_WIDTH,
+                )?;
+                facts += 1;
+            }
+            // T93's sibling, in the multi-VM list's own voice: the proxy's
+            // publish outcome, named with the VM it belongs to beside that
+            // VM's answerer line — the same words the single-VM listing
+            // prints — because each VM's proxy publishes on a host port of
+            // its own and fails on its own.
+            if let Some(line) = answerer_at(index).as_ref().and_then(|reply| {
+                reply
+                    .proxy_down
+                    .as_ref()
+                    .map(crate::resolver::proxy_down_line)
+            }) {
+                writeln!(
+                    out,
+                    "HOSTNAME PROXY:  {vm:<width$} {line}",
                     vm = listing.vm,
                     width = VM_COLUMN_WIDTH,
                 )?;

@@ -3279,7 +3279,10 @@ fn ls_names_the_vm_host_daemon_as_the_zone_answerer() {
         },
         &resp,
         Some(resolver::LiveSurface::Native),
-        Some(minimald_rpc::ZoneAnswererStatus::Holder { port: 7_656 }),
+        Some(minimald_rpc::AnswererStatusReply {
+            answerer: minimald_rpc::ZoneAnswererStatus::Holder { port: 7_656 },
+            proxy_down: None,
+        }),
     )
     .unwrap();
     let holder_ls = String::from_utf8(out).unwrap();
@@ -3316,7 +3319,10 @@ fn ls_names_the_vm_host_daemon_as_the_zone_answerer() {
         },
         &resp,
         Some(resolver::LiveSurface::Proxy),
-        Some(minimald_rpc::ZoneAnswererStatus::PortHeldNoChannel { port: 7_656 }),
+        Some(minimald_rpc::AnswererStatusReply {
+            answerer: minimald_rpc::ZoneAnswererStatus::PortHeldNoChannel { port: 7_656 },
+            proxy_down: None,
+        }),
     )
     .unwrap();
     let held_ls = String::from_utf8(out).unwrap();
@@ -3343,7 +3349,10 @@ fn ls_names_the_vm_host_daemon_as_the_zone_answerer() {
         },
         &resp,
         None,
-        Some(minimald_rpc::ZoneAnswererStatus::Holder { port: 7_656 }),
+        Some(minimald_rpc::AnswererStatusReply {
+            answerer: minimald_rpc::ZoneAnswererStatus::Holder { port: 7_656 },
+            proxy_down: None,
+        }),
     )
     .unwrap();
     let raw_ls = String::from_utf8(out).unwrap();
@@ -3363,13 +3372,141 @@ fn ls_names_the_vm_host_daemon_as_the_zone_answerer() {
         },
         &resp,
         None,
-        Some(minimald_rpc::ZoneAnswererStatus::Starting),
+        Some(minimald_rpc::AnswererStatusReply {
+            answerer: minimald_rpc::ZoneAnswererStatus::Starting,
+            proxy_down: None,
+        }),
     )
     .unwrap();
     let starting_ls = String::from_utf8(out).unwrap();
     assert_eq!(
         starting_ls, "No active sessions.\n",
         "a status with nothing to say yet prints nothing: {starting_ls}"
+    );
+}
+
+/// T93's sibling, as the list renders it: a reply that carries the
+/// answerer's own state *and* the hostname proxy's publish outcome keeps
+/// both — the ZONE ANSWERER row prints from the answerer field while the
+/// proxy is down or its publish unconfirmed, and the cause names itself
+/// on a `HOSTNAME PROXY` row of its own, never in place of the answerer's
+/// and never claiming to be the live surface. The cause row carries the
+/// blank-line bookkeeping on its own, so it separates the header from the
+/// body exactly as a printed answerer row does.
+#[test]
+fn ls_keeps_the_answerer_row_beside_a_down_proxy() {
+    let resp = ListSessionsResponse {
+        daemon_version: None,
+        hostname_routing_unavailable: None,
+        hostname_proxy_port: None,
+        zone_answerer_port: None,
+        answerer_bound: false,
+        resource_pool: None,
+        sessions: Vec::new(),
+    };
+
+    // A holder answering the zone while another process on the host holds
+    // the proxy's port: both rows print, each naming its own service.
+    let mut out = Vec::new();
+    format_ls(
+        &mut out,
+        &LsArgs {
+            raw: false,
+            json: false,
+        },
+        &resp,
+        None,
+        Some(minimald_rpc::AnswererStatusReply {
+            answerer: minimald_rpc::ZoneAnswererStatus::Holder { port: 7_656 },
+            proxy_down: Some(minimald_rpc::ProxyDown {
+                port: 19_911,
+                cause: minimald_rpc::ProxyDownCause::PortHeld,
+            }),
+        }),
+    )
+    .unwrap();
+    let held_ls = String::from_utf8(out).unwrap();
+    assert!(
+        held_ls
+            .contains("ZONE ANSWERER:   answered by the VM host daemon (single-operator interim)"),
+        "the answerer row prints even while the proxy is down: {held_ls}"
+    );
+    assert!(
+        held_ls.contains("this VM's minvmd holds it on 127.0.0.1:7656 (UDP)"),
+        "and it still names the holder: {held_ls}"
+    );
+    assert!(
+        held_ls.contains(
+            "HOSTNAME PROXY:  the hostname proxy is not serving — another \
+             process on the host holds 127.0.0.1:19911"
+        ),
+        "the cause names itself on a row of its own: {held_ls}"
+    );
+    assert!(
+        !held_ls.contains("the hostname proxy is the live name surface; it is not serving"),
+        "the cause row must not claim to be the surface the names resolve through: {held_ls}"
+    );
+    assert!(
+        held_ls.contains("\n\nNo active sessions."),
+        "the two rows carry the blank line before the body: {held_ls}"
+    );
+
+    // The unconfirmed publish, beside a pre-acquisition answerer: the
+    // answerer row keeps its silence, and the cause row — the only thing
+    // that printed — carries the blank line on its own.
+    let mut out = Vec::new();
+    format_ls(
+        &mut out,
+        &LsArgs {
+            raw: false,
+            json: false,
+        },
+        &resp,
+        None,
+        Some(minimald_rpc::AnswererStatusReply {
+            answerer: minimald_rpc::ZoneAnswererStatus::Starting,
+            proxy_down: Some(minimald_rpc::ProxyDown {
+                port: 19_917,
+                cause: minimald_rpc::ProxyDownCause::PublishUnconfirmed,
+            }),
+        }),
+    )
+    .unwrap();
+    let unconfirmed_ls = String::from_utf8(out).unwrap();
+    assert!(
+        !unconfirmed_ls.contains("ZONE ANSWERER:"),
+        "the pre-acquisition state still prints no answerer row: {unconfirmed_ls}"
+    );
+    assert!(
+        unconfirmed_ls.starts_with("HOSTNAME PROXY:  hostname proxy publish unconfirmed"),
+        "the unconfirmed publish is the row that prints: {unconfirmed_ls}"
+    );
+    assert!(
+        unconfirmed_ls.contains("\n\nNo active sessions."),
+        "a cause row on its own still separates the header from the body: {unconfirmed_ls}"
+    );
+
+    // A reply with no cause prints no proxy row at all — a serving or a
+    // merely silent proxy claims nothing here.
+    let mut out = Vec::new();
+    format_ls(
+        &mut out,
+        &LsArgs {
+            raw: false,
+            json: false,
+        },
+        &resp,
+        None,
+        Some(minimald_rpc::AnswererStatusReply {
+            answerer: minimald_rpc::ZoneAnswererStatus::Holder { port: 7_656 },
+            proxy_down: None,
+        }),
+    )
+    .unwrap();
+    let plain_ls = String::from_utf8(out).unwrap();
+    assert!(
+        !plain_ls.contains("HOSTNAME PROXY:"),
+        "a reply without a cause prints no proxy row: {plain_ls}"
     );
 }
 

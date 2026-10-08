@@ -2348,8 +2348,14 @@ async fn ls_shows_vm_per_box() {
         Some(crate::resolver::LiveSurface::Native),
     ];
     let answerers = vec![
-        Some(minimald_rpc::ZoneAnswererStatus::Holder { port: 7_656 }),
-        Some(minimald_rpc::ZoneAnswererStatus::Registered { port: 7_656 }),
+        Some(minimald_rpc::AnswererStatusReply {
+            answerer: minimald_rpc::ZoneAnswererStatus::Holder { port: 7_656 },
+            proxy_down: None,
+        }),
+        Some(minimald_rpc::AnswererStatusReply {
+            answerer: minimald_rpc::ZoneAnswererStatus::Registered { port: 7_656 },
+            proxy_down: None,
+        }),
     ];
     let mut out = Vec::new();
     format_ls_across_vms(

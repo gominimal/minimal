@@ -104,7 +104,7 @@ use std::time::Duration;
 use minimald_rpc::{
     AdmitPortRequest, BoxAddresses, BoxControlReply, BoxControlRequest, BoxRow, IpProto,
     PortReportSource, ProxyDownCause, ReadRowRequest, RegisterBoxRequest, RegisteredBox,
-    WithdrawBoxRequest, WithdrawPortRequest, ZoneAnswererStatus,
+    WithdrawBoxRequest, WithdrawPortRequest,
 };
 
 use crate::box_registry::{BoxRegistry, ClientBoxSpec};
@@ -448,15 +448,15 @@ impl ProxyPublishStatus {
         }
     }
 
-    /// The status to serve the read-only verb with: the proxy-down cause
-    /// when the supervisor wrote one, or `None` to let the answerer's state
-    /// answer as it always did.
-    pub(crate) fn down(&self) -> Option<ZoneAnswererStatus> {
+    /// The proxy-down fact to serve beside the read-only verb's answer
+    /// (T93): the port and the cause the supervisor wrote, for the reply
+    /// to carry next to the answerer's own state — or `None`, to let the
+    /// answerer's state answer alone as it always did.
+    pub(crate) fn down(&self) -> Option<(u16, ProxyDownCause)> {
         self.0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
-            .map(|(port, cause)| ZoneAnswererStatus::ProxyNotServing { port, cause })
     }
 }
 
@@ -908,15 +908,19 @@ fn serve_request(
             write_reply(stream, &reply)
         }
         (BoxControlRequest::AnswererStatus, ControlDoor::Host) => {
-            // The read-only status answers the host facts the CLI's
-            // surfaces read (T93): why the hostname proxy is not serving
-            // when the supervisor reached a cause that names it, and
-            // otherwise the answerer's state as it always did — the
-            // proxy-down cause is the exception, not a new shape.
-            let reply = match proxy_publish.down() {
-                Some(status) => BoxControlReply::Status(status),
-                None => BoxControlReply::Status(answerer.get()),
-            };
+            // The read-only status answers both host facts the CLI's
+            // surfaces read (T93): the answerer's own state, always —
+            // never substituted away — and beside it, when the supervisor
+            // reached one, the cause that names why the hostname proxy
+            // is not serving. Two facts, one reply: the answerer's state
+            // decides the zone-answerer row and the native-DNS probe,
+            // the sibling cause the proxy's own line.
+            let reply = BoxControlReply::Status(minimald_rpc::AnswererStatusReply {
+                answerer: answerer.get(),
+                proxy_down: proxy_publish
+                    .down()
+                    .map(|(port, cause)| minimald_rpc::ProxyDown { port, cause }),
+            });
             write_reply(stream, &reply)
         }
         (BoxControlRequest::ReadRow(request), ControlDoor::Host) => {
@@ -3081,7 +3085,10 @@ mod tests {
             .expect("the status read is answered");
         assert_eq!(
             reply,
-            BoxControlReply::Status(ZoneAnswererStatus::Starting),
+            BoxControlReply::Status(minimald_rpc::AnswererStatusReply {
+                answerer: ZoneAnswererStatus::Starting,
+                proxy_down: None,
+            }),
             "the read answers the cell the daemon starts with"
         );
 
@@ -3100,7 +3107,10 @@ mod tests {
                 .expect("the status read is answered");
             assert_eq!(
                 reply,
-                BoxControlReply::Status(state),
+                BoxControlReply::Status(minimald_rpc::AnswererStatusReply {
+                    answerer: state,
+                    proxy_down: None,
+                }),
                 "the read answers the state the loop last wrote"
             );
         }
@@ -3276,9 +3286,9 @@ mod tests {
         }
     }
 
-    /// The unconfirmed state rides the status read until the guest's late
-    /// report confirms the port, and a confirm never clears a terminal
-    /// cause or another port's state.
+    /// The unconfirmed state rides the status read beside the answerer's
+    /// own state until the guest's late report confirms the port, and a
+    /// confirm never clears a terminal cause or another port's state.
     #[test]
     fn unconfirmed_publish_rides_the_read_until_confirmed() {
         let port = 19_916;
@@ -3289,35 +3299,36 @@ mod tests {
         proxy_publish.set_unconfirmed(port);
         assert_eq!(
             control(&sock_path, &BoxControlRequest::AnswererStatus).expect("the read is answered"),
-            BoxControlReply::Status(ZoneAnswererStatus::ProxyNotServing {
-                port,
-                cause: ProxyDownCause::PublishUnconfirmed,
+            BoxControlReply::Status(minimald_rpc::AnswererStatusReply {
+                answerer: ZoneAnswererStatus::Holder { port: 7_656 },
+                proxy_down: Some(minimald_rpc::ProxyDown {
+                    port,
+                    cause: ProxyDownCause::PublishUnconfirmed,
+                }),
             }),
-            "an unconfirmed publish is what the read answers"
+            "the read answers the answerer's own state with the unconfirmed \
+             publish beside it — the cause never takes the state's place"
         );
         proxy_publish.confirm(port + 1);
         assert_eq!(
             proxy_publish.down(),
-            Some(ZoneAnswererStatus::ProxyNotServing {
-                port,
-                cause: ProxyDownCause::PublishUnconfirmed,
-            }),
+            Some((port, ProxyDownCause::PublishUnconfirmed)),
             "another port's report confirms nothing"
         );
         proxy_publish.confirm(port);
         assert_eq!(
             control(&sock_path, &BoxControlRequest::AnswererStatus).expect("the read is answered"),
-            BoxControlReply::Status(ZoneAnswererStatus::Holder { port: 7_656 }),
-            "the late report clears it; the answerer's state answers again"
+            BoxControlReply::Status(minimald_rpc::AnswererStatusReply {
+                answerer: ZoneAnswererStatus::Holder { port: 7_656 },
+                proxy_down: None,
+            }),
+            "the late report clears it; the answerer's state answers alone again"
         );
         proxy_publish.set_down(port, ProxyDownCause::PortHeld);
         proxy_publish.confirm(port);
         assert_eq!(
             proxy_publish.down(),
-            Some(ZoneAnswererStatus::ProxyNotServing {
-                port,
-                cause: ProxyDownCause::PortHeld,
-            }),
+            Some((port, ProxyDownCause::PortHeld)),
             "a confirm never clears a terminal cause"
         );
         // A late refusal after an unconfirmed start: the VM stays up, and the
@@ -3330,8 +3341,12 @@ mod tests {
         proxy_publish.confirm(port);
         assert_eq!(
             control(&sock_path, &BoxControlRequest::AnswererStatus).expect("the read is answered"),
-            BoxControlReply::Status(ZoneAnswererStatus::ProxyNotServing { port, cause: late }),
-            "a late refusal rides the read with its holder, and a confirm never clears it"
+            BoxControlReply::Status(minimald_rpc::AnswererStatusReply {
+                answerer: ZoneAnswererStatus::Holder { port: 7_656 },
+                proxy_down: Some(minimald_rpc::ProxyDown { port, cause: late }),
+            }),
+            "a late refusal rides beside the answerer's state with its \
+             holder, and a confirm never clears it"
         );
     }
 
@@ -3366,33 +3381,45 @@ mod tests {
         }
 
         // And the failure's cause rides the read-only verb the CLI's
-        // surfaces read: once the supervisor writes it, the status read
-        // answers the port and the cause, not the answerer's state.
+        // surfaces read — beside the answerer's own state, never in its
+        // place: once the supervisor writes it, the status read answers
+        // the port and the cause as a sibling of the answerer's state.
         let dir = tempfile::TempDir::new().expect("temp dir");
         let (sock_path, _server, _boxes, answerer, proxy_publish) =
             spawn_server(dir.path()).expect("server binds");
         assert_eq!(
             control(&sock_path, &BoxControlRequest::AnswererStatus).expect("the read is answered"),
-            BoxControlReply::Status(ZoneAnswererStatus::Starting),
-            "before any cause, the read answers the answerer's state as it always did"
+            BoxControlReply::Status(minimald_rpc::AnswererStatusReply {
+                answerer: ZoneAnswererStatus::Starting,
+                proxy_down: None,
+            }),
+            "before any cause, the read answers the answerer's state alone"
         );
         proxy_publish.set_down(port, ProxyDownCause::PortHeld);
         assert_eq!(
             control(&sock_path, &BoxControlRequest::AnswererStatus).expect("the read is answered"),
-            BoxControlReply::Status(ZoneAnswererStatus::ProxyNotServing {
-                port,
-                cause: ProxyDownCause::PortHeld,
+            BoxControlReply::Status(minimald_rpc::AnswererStatusReply {
+                answerer: ZoneAnswererStatus::Starting,
+                proxy_down: Some(minimald_rpc::ProxyDown {
+                    port,
+                    cause: ProxyDownCause::PortHeld,
+                }),
             }),
-            "the read answers the cause the supervisor reached, naming the port"
+            "the read answers the cause the supervisor reached as a sibling, \
+             naming the port"
         );
         answerer.set(ZoneAnswererStatus::Holder { port: 7_656 });
         assert_eq!(
             control(&sock_path, &BoxControlRequest::AnswererStatus).expect("the read is answered"),
-            BoxControlReply::Status(ZoneAnswererStatus::ProxyNotServing {
-                port,
-                cause: ProxyDownCause::PortHeld,
+            BoxControlReply::Status(minimald_rpc::AnswererStatusReply {
+                answerer: ZoneAnswererStatus::Holder { port: 7_656 },
+                proxy_down: Some(minimald_rpc::ProxyDown {
+                    port,
+                    cause: ProxyDownCause::PortHeld,
+                }),
             }),
-            "the cause outranks the answerer's state while the supervisor holds it"
+            "the cause rides beside the answerer's own state while the \
+             supervisor holds it — the answerer's state is never dropped"
         );
     }
 
