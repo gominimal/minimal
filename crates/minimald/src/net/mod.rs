@@ -469,8 +469,11 @@ pub struct SwitchClient {
     /// compiled with no opening because the proxy was still not serving past
     /// its settle: told in-session at launch, said again with the remedy when
     /// the serving transition lands ([`Self::set_hostname_proxy_port`] hands
-    /// the count back and clears it), and dropped at detach — a set keyed by
-    /// lease, so one box is counted once and a box that left is not counted.
+    /// the count back), and dropped only at detach — the box keeps its
+    /// openingless rules until then, so the transition never clears it, and
+    /// a launch that reads it after the bind still tells its session. A set
+    /// keyed by lease, so one box is counted once and a box that left is not
+    /// counted.
     hostname_proxy_stranded: std::collections::HashSet<Ipv4Addr>,
 }
 
@@ -592,11 +595,17 @@ impl SwitchClient {
     /// switch was built with. This call is also the serving transition: from
     /// it on, the port is one a box may compile its node address's opening
     /// from. Returns how many boxes attached openingless before it (see
-    /// [`hostname_proxy_serving_port`]), clearing the count.
+    /// [`hostname_proxy_serving_port`]) — on the transition only, so a
+    /// repeat call answers `0` — leaving each box's own marker in place
+    /// until it detaches.
     pub fn set_hostname_proxy_port(&mut self, port: Option<u16>) -> usize {
         self.hostname_proxy_port = port;
-        self.hostname_proxy_serving = true;
-        std::mem::take(&mut self.hostname_proxy_stranded).len()
+        let was_serving = std::mem::replace(&mut self.hostname_proxy_serving, true);
+        if was_serving {
+            0
+        } else {
+            self.hostname_proxy_stranded.len()
+        }
     }
 
     /// Sets how PTask taps reach the switch. The DM2 default is
@@ -1430,7 +1439,9 @@ mod tests {
         // The box that failed closed above is counted — once, however many
         // times its own lookups fail closed, and never for a lookup that
         // compiles no box's opening (a caller-check registration) — and the
-        // serving transition hands the count back once (for its remedy line).
+        // serving transition hands the count back once (for its remedy line),
+        // keeping the box's own marker: it stays openingless until it
+        // detaches, and a launch reading it after the bind still says so.
         assert!(seeded.lock().await.hostname_proxy_stranded(lease));
         assert_eq!(
             hostname_proxy_serving_port(&seeded, Some(lease)).await,
@@ -1438,7 +1449,7 @@ mod tests {
         );
         assert_eq!(hostname_proxy_serving_port(&seeded, None).await, None);
         assert_eq!(seeded.lock().await.set_hostname_proxy_port(Some(41914)), 1);
-        assert!(!seeded.lock().await.hostname_proxy_stranded(lease));
+        assert!(seeded.lock().await.hostname_proxy_stranded(lease));
         assert_eq!(seeded.lock().await.set_hostname_proxy_port(Some(41914)), 0);
 
         // A final seed (a pinned port, which never relocates) answers at
