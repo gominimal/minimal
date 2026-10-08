@@ -228,6 +228,12 @@ async fn register_box_with_vm_host(
                  marker for {name:?}; the registration did not happen"
             )
         }
+        minimald_rpc::BoxControlReply::RowStanding { switch_address, .. } => {
+            anyhow::bail!(
+                "the VM host daemon answered the box registration with the row-standing \
+                 read for {switch_address}; the registration did not happen"
+            )
+        }
         minimald_rpc::BoxControlReply::NameHeld { name, .. } => {
             anyhow::bail!(
                 "the VM host daemon answered the box registration with the name-hold \
@@ -481,6 +487,42 @@ pub(crate) async fn withdraw_box_row(
             box = %name,
             "the VM host daemon did not answer the box row withdrawal in \
              time; the row stays published"
+        );
+    }
+}
+
+/// Asks the VM host daemon beside `sock` for the session's box row back
+/// before an attach or an exec runs in the box (NET-138): the box's host
+/// may have ended and stayed down past the daemon's detach grace, or the
+/// daemon may have restarted under the session, and the in-VM daemon
+/// relaunches a box's host only while the host's row stands for it. The
+/// creator — this client, presenting the name and the pair `record`
+/// carries — is the one side that may ask; the daemon reinstates the row
+/// from its own record of the registration. Best-effort, bounded by
+/// [`BOX_CONTROL_TIMEOUT`], and silent for a session with no box row (a
+/// native host, a `host_ip` or `none` box).
+async fn resume_box_row(sock: &std::path::Path, record: Option<&sessions::Record>) {
+    let Some(control_sock) = control_sock_beside(sock) else {
+        return;
+    };
+    let Some((name, addresses)) =
+        record.and_then(|record| Some((record.name.clone()?, record.box_addresses?)))
+    else {
+        return;
+    };
+    let box_name = name.clone();
+    let resumed = tokio::time::timeout(
+        BOX_CONTROL_TIMEOUT,
+        tokio::task::spawn_blocking(move || {
+            minimal_client::attach::resume_box_row_at(&control_sock, &box_name, addresses, None)
+        }),
+    )
+    .await;
+    if resumed.is_err() {
+        tracing::warn!(
+            after = ?BOX_CONTROL_TIMEOUT,
+            box = %name,
+            "the VM host daemon did not answer the box row resume in time"
         );
     }
 }
@@ -2342,6 +2384,16 @@ pub(crate) async fn session_via_ssh(
     let mut ssh =
         minimal_client::attach::attach_command(sock, id, wire.as_deref(), session_keys.as_ref())?;
 
+    // The session's record, read before the attach or the exec on a
+    // VM-backed host — one with a VM host daemon's control socket beside
+    // `sock` — for the pair its box's row was registered with. A lookup
+    // that fails reads as no row.
+    let record = match control_sock_beside(sock).filter(|control| control.exists()) {
+        Some(_) => attached_session_record(sock, id).await.ok().flatten(),
+        None => None,
+    };
+    resume_box_row(sock, record.as_ref()).await;
+
     if wire.is_none() {
         let stdin_is_tty = std::io::stdin().is_terminal();
         let host_asks = host_asks_for
@@ -2349,13 +2401,9 @@ pub(crate) async fn session_via_ssh(
         // The pair the box's row was registered with, read before the
         // attach: an attach that ends in a daemon-side destroy leaves no
         // record to read it from, and the row is still this client's to
-        // withdraw. A lookup that fails reads as no row.
+        // withdraw.
         let box_addresses = match host_asks_for {
-            Some(_) => attached_session_record(sock, id)
-                .await
-                .ok()
-                .flatten()
-                .and_then(|record| record.box_addresses),
+            Some(_) => record.and_then(|record| record.box_addresses),
             None => None,
         };
         // The relay blocks its thread until ssh exits, so it runs off the

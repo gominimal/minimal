@@ -921,6 +921,21 @@ fn serve_request(
             let reply = order.apply(|| withdraw_box(boxes, answerer, request));
             write_reply(stream, &reply)
         }
+        (BoxControlRequest::ResumeBox(request), ControlDoor::Host) => {
+            let reply = resume_reply(boxes, answerer, order, request);
+            write_reply(stream, &reply)
+        }
+        // A read of the host's own table, like the row read: no ticket.
+        (BoxControlRequest::RowStanding(request), ControlDoor::GuestReports) => {
+            let reply = BoxControlReply::RowStanding {
+                switch_address: request.switch_address,
+                row_standing: boxes
+                    .table()
+                    .by_source(request.switch_address.octets())
+                    .is_some(),
+            };
+            write_reply(stream, &reply)
+        }
         // The hold and its release take a ticket like the verbs they
         // bracket: each changes the table the answerer answers from, so
         // each publishes in its own turn, never mid-fold.
@@ -1025,6 +1040,56 @@ fn registration_reply(
         }
         Err(reply) => reply,
     }
+}
+
+/// Resume a box's row for its creator ([`BoxRegistry::resume_client_box`],
+/// NET-138) in its door's apply order and build the reply: the shape of a
+/// registration, because a resume whose row was withdrawn is one — counted
+/// in flight under the name and its published address asked of the
+/// answerer before the ticket, which hands the name back the address it
+/// holds or held for it. A refusal hands that address back unless
+/// something else owns it, as a refused registration does.
+fn resume_reply(
+    boxes: &BoxRegistry,
+    answerer: &AnswererStatus,
+    order: &Arc<ApplyOrder>,
+    request: minimald_rpc::ResumeBoxRequest,
+) -> BoxControlReply {
+    let claim = boxes.begin_registration(&request.name);
+    let allocated = match allocate_box_address(answerer, &request.name) {
+        Ok(allocated) => allocated,
+        Err(reply) => return reply,
+    };
+    order.apply(move || {
+        match boxes.resume_client_box(
+            &request.name,
+            request.switch_address,
+            request.loopback_address,
+            request.box_id.map(minimald_rpc::BoxId::to_bytes),
+            allocated,
+            claim.generation(),
+        ) {
+            Ok(record) => BoxControlReply::Registered(RegisteredBox {
+                switch_address: record.switch_addr(),
+                loopback_address: record.loopback_addr(),
+                box_id: minimald_rpc::BoxId::from_bytes(record.box_id()),
+            }),
+            Err(error) => {
+                let released = boxes.release_unless_owned(&claim, || {
+                    answerer.release_address(&request.name);
+                });
+                tracing::info!(
+                    address_released = released,
+                    box = %request.name,
+                    error = %error,
+                    "box row resume refused"
+                );
+                BoxControlReply::Error {
+                    error: error.to_string(),
+                }
+            }
+        }
+    })
 }
 
 /// Serve a held registration ([`RegisterBoxRequest::hold`]): register the
@@ -1210,6 +1275,8 @@ fn request_verb(request: &BoxControlRequest) -> &'static str {
         BoxControlRequest::AdmitAsk(_) => "admit_ask",
         BoxControlRequest::RecordAskAnswer(_) => "record_ask_answer",
         BoxControlRequest::SubscribeAsks(_) => "subscribe_asks",
+        BoxControlRequest::ResumeBox(_) => "resume_box",
+        BoxControlRequest::RowStanding(_) => "row_standing",
     }
 }
 
@@ -2759,6 +2826,9 @@ mod tests {
                      reply for {port}/{proto:?}"
                 )
             }
+            other @ BoxControlReply::RowStanding { .. } => {
+                panic!("a box verb is never answered with a row-standing read, got {other:?}")
+            }
             BoxControlReply::AnswererRelease { detail, .. } => {
                 panic!("a box verb is never answered with a release reply, got {detail}")
             }
@@ -3165,6 +3235,9 @@ mod tests {
             BoxControlReply::PortRecorded { .. } => {
                 panic!("a withdrawal echoes the pair it went by, never a port report")
             }
+            other @ BoxControlReply::RowStanding { .. } => {
+                panic!("a box verb is never answered with a row-standing read, got {other:?}")
+            }
             BoxControlReply::AnswererRelease { detail, .. } => {
                 panic!("a box verb is never answered with a release reply, got {detail}")
             }
@@ -3270,6 +3343,9 @@ mod tests {
                 BoxControlReply::PortRecorded { .. } => {
                     panic!("a foreign pair's withdrawal must be refused, got a port report")
                 }
+                other @ BoxControlReply::RowStanding { .. } => {
+                    panic!("a box verb is never answered with a row-standing read, got {other:?}")
+                }
                 BoxControlReply::AnswererRelease { detail, .. } => {
                     panic!("a box verb is never answered with a release reply, got {detail}")
                 }
@@ -3334,6 +3410,9 @@ mod tests {
             }
             BoxControlReply::PortRecorded { .. } => {
                 panic!("a repeat withdrawal echoes the pair, never a port report")
+            }
+            other @ BoxControlReply::RowStanding { .. } => {
+                panic!("a box verb is never answered with a row-standing read, got {other:?}")
             }
             BoxControlReply::AnswererRelease { detail, .. } => {
                 panic!("a box verb is never answered with a release reply, got {detail}")

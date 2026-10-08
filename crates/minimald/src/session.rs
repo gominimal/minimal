@@ -67,13 +67,15 @@ pub enum AttachError {
     /// The session host is alive but busy (its mailbox stayed full past the
     /// attach deadline). The client should retry.
     SessionBusy,
-    /// This box carries host-handed addresses (T66) and the launch that bound
+    /// This box carries host-handed addresses (T66), the launch that bound
     /// its host-side row no longer holds the slot — its loop ended, a later
-    /// launch replaced it, or the daemon restarted — so the row is withdrawn
-    /// (NET-138). The host gate drops frames from an unregistered source, so
-    /// any host handed out now would be "rowless". Only the box's
-    /// creator registers a row, and today only a session activation does, so
-    /// the message names that as the way forward.
+    /// launch replaced it, or the daemon restarted — and the VM host daemon
+    /// holds no row for it (NET-138): the row was withdrawn after its detach
+    /// grace and its creator did not resume it. The host gate drops frames
+    /// from an unregistered source, so any host handed out now would be
+    /// "rowless". Only the box's creator registers or resumes a row, and the
+    /// client resumes it before every attach and exec, so the message names
+    /// a new session as the way forward.
     BoxHostRowEnded,
 }
 
@@ -114,9 +116,8 @@ impl fmt::Display for AttachError {
             AttachError::BoxHostRowEnded => write!(
                 f,
                 "this session's shell has ended, and with it the session's host-side \
-                 network registration; the daemon cannot register it again; destroy \
-                 the session with `min session destroy` and start a new one with \
-                 `min session activate`"
+                 network registration, which could not be resumed; destroy the session \
+                 with `min session destroy` and start a new one with `min session activate`"
             ),
         }
     }
@@ -4087,7 +4088,7 @@ impl Session {
         // gone must not be handed a rowless host, whichever way the slot came
         // to be without its binding launch — the shell exited, a hook run
         // relaunched over a dead host, or the daemon restarted.
-        if self.host_row_lost(&record) {
+        if self.host_row_lost(&record).await {
             return Err(AttachError::BoxHostRowEnded);
         }
         let holds_host_row = record.box_addresses.is_some();
@@ -4163,7 +4164,7 @@ impl Session {
                         // The check at the top of this attach normally
                         // refuses first, but the loop can end between that
                         // check and this send, so ask again.
-                        if self.host_row_lost(&record) {
+                        if self.host_row_lost(&record).await {
                             return Err(AttachError::BoxHostRowEnded);
                         }
                         // The host's loop has ended; mint a fresh one from the
@@ -4350,14 +4351,29 @@ impl Session {
     /// be rowless, and the host gate silently drops a rowless box's frames.
     /// False for a box that carries no host-handed addresses, and for a
     /// registered box no launch has bound yet: its first launch binds it.
-    fn host_row_lost(&self, record: &Record) -> bool {
+    ///
+    /// When the binding launch's host is gone, the VM host daemon is asked
+    /// whether its row still stands ([`crate::net::listeners::host_row_standing`]):
+    /// the host detaches a row at the end of its box's attachment and
+    /// withdraws it only after a grace, and the box's creator may resume a
+    /// withdrawn one, so a row that stands is the host's own word that a
+    /// relaunch rejoins the switch under it. The answer is the host's
+    /// table, never a fact this daemon asserts; a host that cannot be asked
+    /// — a native host, or a door that does not answer — reads as no row.
+    async fn host_row_lost(&self, record: &Record) -> bool {
         let slot_alive = matches!(
             &self.inner,
             SessionInner::Active { host: Some((h, _)), .. } if h.is_alive()
         );
-        record.box_addresses.is_some()
-            && record.host_row_bound
-            && !(self.slot_holds_row && slot_alive)
+        let Some(addresses) = record.box_addresses else {
+            return false;
+        };
+        if !record.host_row_bound || (self.slot_holds_row && slot_alive) {
+            return false;
+        }
+        let control = self.switch_control().await;
+        crate::net::listeners::host_row_standing(&control, addresses.switch_address).await
+            != Some(true)
     }
 
     /// Records the launch's own placement outcome on this session's record
@@ -4494,7 +4510,7 @@ impl Session {
             // Attach's refusal, for the same reason: neither the host a
             // later launch left in the slot nor a fresh one would hold the
             // registered box's host-side row.
-            if self.host_row_lost(&record) {
+            if self.host_row_lost(&record).await {
                 return Err(AttachError::BoxHostRowEnded);
             }
         }

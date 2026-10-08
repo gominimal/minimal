@@ -710,6 +710,49 @@ pub struct WithdrawBoxRequest {
     pub box_id: Option<BoxId>,
 }
 
+/// A creator's request for its box's row back
+/// ([`BoxControlRequest::ResumeBox`], NET-138): the session that registered
+/// the box presenting the pair — and the id, when it holds one — the
+/// registration handed back, before it attaches to or runs in a box whose
+/// row may have been withdrawn while nothing carried its frames: the box's
+/// host ended and stayed down past the host's detach grace, or the VM host
+/// daemon restarted under it.
+///
+/// The pair is the proof and the lookup key, as for a withdrawal
+/// ([`WithdrawBoxRequest`]); every fact the reinstated row holds comes from
+/// the host's own record of the registration, never from this request.
+/// Answered with [`BoxControlReply::Registered`] — the row's addresses and
+/// box id — whether the row stood or was reinstated, or with
+/// [`BoxControlReply::Error`] when the host holds no registration of the
+/// box the pair proves.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResumeBoxRequest {
+    /// The name the box was registered under.
+    pub name: String,
+    /// The switch address the registration handed back.
+    pub switch_address: std::net::Ipv4Addr,
+    /// The loopback address the registration handed back.
+    pub loopback_address: std::net::Ipv4Addr,
+    /// The box id the registration handed back, when the resuming client
+    /// holds it: a registration of the name under another id is a newer
+    /// box, and the resume is refused. `None` when the client holds no id
+    /// (the session record carries none): the pair proof alone decides.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub box_id: Option<BoxId>,
+}
+
+/// The in-VM daemon's read of whether the host still holds a row at its
+/// box's switch address ([`BoxControlRequest::RowStanding`], NET-138):
+/// asked before the daemon relaunches a box's host after the host it ran
+/// ended, so the box rejoins the switch only while the host's row stands
+/// for it. A read, never a report: the answer is the host's own table,
+/// and the request changes nothing in it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RowStandingRequest {
+    /// The switch address the host-side registration handed the box.
+    pub switch_address: std::net::Ipv4Addr,
+}
+
 /// A name to hold in the host's zone without a row behind it
 /// ([`BoxControlRequest::HoldBoxName`]): the interim a `host_ip` box's
 /// name answers NODATA — the box exists, no address to tell — instead
@@ -1207,6 +1250,14 @@ pub enum BoxControlRequest {
     /// Cancel a release: the daemon re-binds its interim answerer at once.
     /// A daemon with no release pending answers a no-op.
     ReleaseAnswererCancel,
+    /// A creator's request for its box's row back ([`ResumeBoxRequest`],
+    /// NET-138): served on the host's control socket only, answered with
+    /// [`BoxControlReply::Registered`].
+    ResumeBox(ResumeBoxRequest),
+    /// The in-VM daemon's read of whether its box's row stands
+    /// ([`RowStandingRequest`]): carried on the daemon's own control
+    /// channel, answered with [`BoxControlReply::RowStanding`].
+    RowStanding(RowStandingRequest),
 }
 
 /// The VM host daemon's answerer status: the state of the machine's
@@ -1564,6 +1615,15 @@ pub enum BoxControlReply {
         acted: bool,
         /// What the daemon did, as its log line said it.
         detail: String,
+    },
+    /// The row-standing read's answer: whether the host holds a row at the
+    /// switch address asked about. `row_standing` is required — the marker
+    /// that keeps this document from decoding as any other reply.
+    RowStanding {
+        /// The switch address that was asked about.
+        switch_address: std::net::Ipv4Addr,
+        /// Whether a row stands at it.
+        row_standing: bool,
     },
 }
 

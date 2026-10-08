@@ -1399,6 +1399,10 @@ async fn relay_frames(
     // the vector is bounded by the rows, never by what a guest could push
     // through it.
     let mut attributed: Vec<[u8; 4]> = Vec::new();
+    // The rows those sources were attributed to, by box id: what the relay
+    // reports at its end, so the registry detaches the boxes this
+    // connection carried and no newer box handed one of their addresses.
+    let mut carried: Vec<([u8; 4], crate::bep_attach::BoxId)> = Vec::new();
     {
         let egress = relay_frames_to_switch(
             &mut guest,
@@ -1410,6 +1414,7 @@ async fn relay_frames(
             &limiter,
             &forwards,
             &mut attributed,
+            &mut carried,
         );
         tokio::pin!(egress);
         // The two legs race, because neither can see the other's end. The
@@ -1454,13 +1459,14 @@ async fn relay_frames(
     // error on either end, a frame claim the gate refused, or the switch
     // closing its side while the guest was still on it. What it relayed is
     // what it attributes: the rows whose traffic this connection carried are
-    // withdrawn now that nothing is left carrying it. The guest relay never
-    // reconnects a closed shuttle connection (`attach_to_switch_vsock` in the
-    // guest's relay), so egress at those addresses is already down; the
-    // withdrawal is what makes that true of the table too, so a re-attachment
-    // starts from a registration and not from a row whose connection is gone
-    // (NET-133: a box's row goes with its shuttle connection). The same event
-    // retires the pins: the admission entries those boxes' own lookups filled
+    // detached now that nothing is left carrying it, and withdrawn once their
+    // grace passes unless a relay carries them again (NET-138). The guest
+    // relay never reconnects a closed shuttle connection
+    // (`attach_to_switch_vsock` in the guest's relay) — a box's host
+    // relaunched inside the grace opens a new one — so egress at those
+    // addresses is already down; the withdrawal at the grace's end is what
+    // makes that true of the table too (NET-133: a box's row goes with its
+    // shuttle connection). The same event retires the pins at once: the admission entries those boxes' own lookups filled
     // go with the rows that declared the names, so nothing inside the VM can
     // hand a box its old grants back — a re-attachment starts fail-closed,
     // until its own lookups pin again. A control connection files no report
@@ -1487,7 +1493,7 @@ async fn relay_frames(
     }
     pins.retire(&attributed);
     replies.retire(&attributed);
-    table.report_withdrawals(std::mem::take(&mut attributed));
+    table.report_withdrawals(std::mem::take(&mut carried));
 }
 
 /// One control request on a connection, decided before any of it is written
@@ -3301,6 +3307,7 @@ async fn relay_frames_to_switch(
     limiter: &DropLimiter,
     forwards: &PublishedForwards,
     attributed: &mut Vec<[u8; 4]>,
+    carried: &mut Vec<([u8; 4], crate::bep_attach::BoxId)>,
 ) -> io::Result<()> {
     let mut len_buf = [0u8; 2];
     let mut frame = vec![0u8; max_frame()];
@@ -3419,7 +3426,9 @@ async fn relay_frames_to_switch(
         {
             // The row's switch address is quarantined at its withdrawal
             // from here on: this connection may now key state by it.
-            table.mark_attributed(src);
+            if let Some(box_id) = table.mark_attributed(src) {
+                carried.push((src, box_id));
+            }
             attributed.push(src);
         }
         // The box's DNS datagram, read once for both checks below: only for
@@ -6657,7 +6666,7 @@ mod tests {
             }
         };
         assert_eq!(
-            report,
+            report.iter().map(|&(addr, _)| addr).collect::<Vec<_>>(),
             vec![LEASE],
             "the closed relay's report names the box whose traffic it carried"
         );
@@ -13970,6 +13979,21 @@ mod tests {
         );
     }
 
+    /// Waits for the row at [`LEASE`] to detach at its relay's end, then
+    /// moves `clock`'s registry past the detach grace: the drainer's next
+    /// sweep withdraws the row.
+    async fn detach_then_pass_the_grace(table: &BoxTable, clock: &BoxRegistry) {
+        let deadline = tokio::time::Instant::now() + DEADLINE;
+        while !table.by_source(LEASE).is_some_and(|row| row.is_detached()) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the row did not detach at its shuttle connection's end within {DEADLINE:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        clock.advance_clock(crate::box_registry::DETACH_GRACE);
+    }
+
     /// NET-133, at the table: a box's row is withdrawn within the
     /// requirement's bound of its end. The bound's name is the box's end; the
     /// event the table keys the withdrawal to is the box's own shuttle
@@ -13977,18 +14001,20 @@ mod tests {
     /// reopens — ending, and creator-driven withdrawal at destroy is T66's
     /// (#1711), landing with it. The gate attributes every admitted frame's
     /// source to the connection that carried it and files the report at the
-    /// relay's end — whatever ended it — and the registry's drainer withdraws
-    /// a row per reported address, so the namespace whose connection closed
-    /// holds no row after. Here that is immediate: the report rides the same
-    /// close that ended the traffic, far inside the bound the requirement
-    /// names. A re-attachment starts from a registration, not from a row
-    /// whose connection is gone; and the guest relay never reconnects a
-    /// closed shuttle connection, so the traffic was already down.
+    /// relay's end — whatever ended it — and the registry's drainer detaches
+    /// a row per reported address and withdraws it once the detach grace
+    /// passes with no relay carrying it again (NET-138), so the namespace
+    /// whose connection closed holds no row after. The grace
+    /// ([`DETACH_GRACE`]) plus the drainer's sweep is inside the bound the
+    /// requirement names; the test clock stands in for it here. The guest
+    /// relay never reconnects a closed shuttle connection, so the traffic
+    /// was already down.
     #[tokio::test]
     async fn host_table_row_withdrawn_within_60s_of_box_end() {
         let registry = BoxRegistry::new(SUBNET);
         tcp_lan_box(&registry, LEASE);
         registry.spawn_withdrawal_drainer(|_| {});
+        let clock = registry.clone();
         let mut h = gate_over(registry).await;
 
         // The box's declared frame, admitted by its row: the traffic the
@@ -14001,10 +14027,11 @@ mod tests {
         // The box's connection ends: the guest closes its side.
         h.guest.shutdown().await.expect("closing the guest's side");
 
-        // The row goes with it. The withdrawal is polled rather than
-        // asserted once: the report rides a close the relay has to notice
-        // first, and the honest path is immediate — the poll bounds it at
-        // the harness's deadline, nowhere near the requirement's own.
+        // The row detaches with it, then goes once the grace passes. Both
+        // are polled rather than asserted once: the report rides a close
+        // the relay has to notice first — the poll bounds it at the
+        // harness's deadline, nowhere near the requirement's own.
+        detach_then_pass_the_grace(&h.table, &clock).await;
         let deadline = tokio::time::Instant::now() + DEADLINE;
         while h.table.by_source(LEASE).is_some() {
             assert!(
@@ -14027,6 +14054,7 @@ mod tests {
         let registry = BoxRegistry::new(SUBNET);
         tcp_lan_box(&registry, LEASE);
         registry.spawn_withdrawal_drainer(|_| {});
+        let clock = registry.clone();
         let mut h = gate_over(registry).await;
 
         // The box's declared frame, admitted by its row and forwarded: the
@@ -14045,6 +14073,7 @@ mod tests {
 
         // The row goes with the connection regardless of which side closed
         // it. The withdrawal is polled, as in the guest-close path.
+        detach_then_pass_the_grace(&h.table, &clock).await;
         let deadline = tokio::time::Instant::now() + DEADLINE;
         while h.table.by_source(LEASE).is_some() {
             assert!(
@@ -14140,7 +14169,11 @@ mod tests {
                 }
             }
         };
-        assert_eq!(report, vec![LEASE], "the report names the box");
+        assert_eq!(
+            report.iter().map(|&(addr, _)| addr).collect::<Vec<_>>(),
+            vec![LEASE],
+            "the report names the box"
+        );
         assert!(
             !h.pins
                 .admits_frame(&record, answer.octets(), None, Instant::now()),
@@ -14165,6 +14198,7 @@ mod tests {
         tcp_lan_box(&registry, LEASE);
         let node = registry.register_node_namespace(7654);
         registry.spawn_withdrawal_drainer(|_| {});
+        let clock = registry.clone();
         let mut h = gate_over(registry).await;
 
         // Node-plane traffic on the relay — the in-VM daemon's own frames,
@@ -14188,9 +14222,10 @@ mod tests {
         // The relay ends, whichever way a shuttle connection does.
         h.guest.shutdown().await.expect("closing the guest's side");
 
-        // The box's row goes with its connection — the drainer withdrew it —
-        // and the node's row stands: its frames attributed nothing, so no
-        // report ever named its address.
+        // The box's row goes with its connection — the drainer withdrew it
+        // once its grace passed — and the node's row stands: its frames
+        // attributed nothing, so no report ever named its address.
+        detach_then_pass_the_grace(&h.table, &clock).await;
         let deadline = tokio::time::Instant::now() + DEADLINE;
         while h.table.by_source(LEASE).is_some() {
             assert!(
@@ -14280,7 +14315,7 @@ mod tests {
             }
         };
         assert_eq!(
-            report,
+            report.iter().map(|&(addr, _)| addr).collect::<Vec<_>>(),
             vec![LEASE],
             "the withdrawal report names only the lease-run address"
         );

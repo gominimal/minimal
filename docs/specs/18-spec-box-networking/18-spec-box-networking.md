@@ -643,7 +643,7 @@ included, with every refusal logged (NET-001 to NET-004).
   - WHEN a box's attachment to the switch ends or its creator destroys it THE SYSTEM SHALL withdraw its row within 60 seconds.
     tier:   T0
     verify: cargo nextest run -p minvmd host_table_row_withdrawn_within_60s_of_box_end
-    <!-- S10a/AC1; prose 51; event-driven; liveness is read at the host's end of the box's attachment, never from a daemon report; NET-133's withdrawal reads this row -->
+    <!-- S10a/AC1; prose 51; event-driven; liveness is read at the host's end of the box's attachment, never from a daemon report; NET-133's withdrawal reads this row; the attachment's end detaches the row and the row is withdrawn after a grace (`DETACH_GRACE`, 45 s, swept every second) unless the box's shuttle carries a frame from its address again first — while detached the row decides frames as before and keeps its addresses; the creator's registrations persist host-side in the VM host daemon's state dir (`box-registry.json`, mode 0600, written by rename, versioned) and reload detached at start; a creator resumes a row withdrawn after its grace from that host-side record, never from a guest report -->
   - WHILE a host-address box is published THE SYSTEM SHALL admit the node's mirrored binds for it at the node's address at any port.
     tier:   T0
     verify: cargo nextest run -p minvmd host_address_mirrored_binds_admitted_unfiltered

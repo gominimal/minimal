@@ -569,6 +569,62 @@ pub fn withdraw_box_row_beside(
     withdraw_box_row_at(&control_sock, box_name, addresses, box_id);
 }
 
+/// Asks the VM host daemon whose control socket is `control_sock` for box
+/// `box_name`'s host row back (NET-138), before an attach or an exec runs
+/// in a box whose row may have been withdrawn while nothing carried its
+/// frames — its host ended and stayed down past the daemon's detach grace,
+/// or the daemon restarted under it. The creator presents the name and the
+/// pair its registration handed back, the proof a withdrawal presents; the
+/// daemon reinstates the row from its own record of the registration, or
+/// keeps the one that stands. `box_id` narrows the proof to one creation,
+/// where the caller holds it.
+///
+/// Best-effort and blocking: a resume that cannot be made — the socket
+/// unreachable, a daemon that predates the verb or holds no registration
+/// of the box — is a warn line, and the attach goes ahead: the in-VM
+/// daemon still refuses to relaunch a box whose row is gone. Returns
+/// whether the daemon answered with the row.
+pub fn resume_box_row_at(
+    control_sock: &Path,
+    box_name: &str,
+    addresses: sessions::BoxAddresses,
+    box_id: Option<minimald_rpc::BoxId>,
+) -> bool {
+    let request = minimald_rpc::BoxControlRequest::ResumeBox(minimald_rpc::ResumeBoxRequest {
+        name: box_name.to_string(),
+        switch_address: addresses.switch_address,
+        loopback_address: addresses.loopback_address,
+        box_id,
+    });
+    let failure = match host_control(control_sock, &request) {
+        Ok((minimald_rpc::BoxControlReply::Registered(row), _))
+            if row.switch_address == addresses.switch_address
+                && row.loopback_address == addresses.loopback_address =>
+        {
+            tracing::debug!(
+                box = %box_name,
+                switch_address = %row.switch_address,
+                "the box's host row stands"
+            );
+            return true;
+        }
+        Ok((minimald_rpc::BoxControlReply::Registered(row), _)) => format!(
+            "the daemon answered with a different address pair, switch address {}",
+            row.switch_address
+        ),
+        Ok((minimald_rpc::BoxControlReply::Error { error }, _)) => {
+            format!("the daemon refused it: {error}")
+        }
+        Ok((other, _)) => format!("another verb's reply: {other:?}"),
+        Err(error) => format!("{error:#}"),
+    };
+    tracing::warn!(
+        box = %box_name,
+        "the box's host row could not be resumed ({failure})"
+    );
+    false
+}
+
 impl HostAsks {
     /// Subscribe to the pending asks of the box whose row is named
     /// `box_name` on the VM host daemon at `control_sock`: the row read

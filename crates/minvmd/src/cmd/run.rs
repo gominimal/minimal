@@ -512,9 +512,14 @@ fn run_foreground() -> Result<()> {
         egress_deny_all_opt_out,
         "host-side egress default opt-out for undeclared boxes"
     );
+    // The client boxes' registrations persist in this VM's state dir
+    // (NET-138): a supervisor restarted under a session's live box reloads
+    // its row detached, for the box to attach again or its creator to
+    // resume inside the grace — never from anything the guest reports.
     let boxes = crate::box_registry::BoxRegistry::new(switch::DEFAULT_SUBNET)
         .feeding_proxy_attachments(proxy_attachments.clone())
-        .with_egress_deny_all_opt_out(egress_deny_all_opt_out);
+        .with_egress_deny_all_opt_out(egress_deny_all_opt_out)
+        .persisting_to(state_dir.dir().join(crate::box_registry::REGISTRY_FILE));
     // The node's own proxy port is resolved once before the VM boots — the
     // operator's override (`MINVMD_NODE_PROXY_PORT` in this supervisor's env)
     // or the default-first probe, so a VM sharing a host with a native daemon
@@ -552,7 +557,9 @@ fn run_foreground() -> Result<()> {
     let answerer_status = crate::net::answerer::AnswererStatus::starting();
     // A box's row goes with its shuttle connection: the gate reports which
     // addresses each relay carried at the relay's end, and this drainer thread
-    // applies the reports for the life of the process (NET-133). Each
+    // detaches those rows and withdraws them once their grace passes with no
+    // relay carrying them again, for the life of the process (NET-133,
+    // NET-138). Each
     // withdrawal hands the box's published address back to the machine's
     // answerer, as the creator's withdrawal does, unless a live row or a
     // registration in flight under the name owns it — so a session ended
