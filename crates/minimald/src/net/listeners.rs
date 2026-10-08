@@ -2324,6 +2324,25 @@ mod tests {
             .port()
     }
 
+    /// A loopback-bound and an any-bound listener on adjacent ports, so a
+    /// range spanning the two names exactly the ports this test holds:
+    /// nothing another process bound elsewhere in the ephemeral range falls
+    /// inside it, so no such listener can race this test's publication.
+    /// Port `p + 1` is skipped when something else holds it and the loop
+    /// tries the next ephemeral pair.
+    fn adjacent_listeners() -> (TcpListener, TcpListener) {
+        loop {
+            let loopback = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+                .expect("an ephemeral port binds on the loopback alone");
+            let Some(next) = port_of(&loopback).checked_add(1) else {
+                continue;
+            };
+            if let Ok(any) = TcpListener::bind((Ipv4Addr::UNSPECIFIED, next)) {
+                return (loopback, any);
+            }
+        }
+    }
+
     /// The box's lease on the test switch.
     const LEASE: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 9);
     /// The box's published address (NET-010).
@@ -3181,10 +3200,8 @@ mod tests {
     /// sockets and chose between them.
     #[tokio::test]
     async fn a_loopback_bound_listener_is_not_published() {
-        let loopback = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-            .expect("an ephemeral port binds on the loopback alone");
+        let (loopback, any) = adjacent_listeners();
         let loop_port = port_of(&loopback);
-        let any = listening_socket();
         let any_port = port_of(&any);
         let dir = tempfile::tempdir().unwrap();
         // The rules permit both ports: only the binds differ.
