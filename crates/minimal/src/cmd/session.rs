@@ -304,6 +304,49 @@ pub(crate) fn control_sock_beside(ssh_sock: &std::path::Path) -> Option<std::pat
         .map(|dir| dir.join(minvmd::control::CONTROL_SOCK_FILE))
 }
 
+/// The host reads `min net setup` decides its script from (NET-122): this
+/// host's resolver detection and its answerer service step, read together,
+/// with the control sockets the step asks to release the hook port recorded
+/// for the render.
+pub(crate) async fn advisory_host_reads(
+    global: &GlobalArgs,
+) -> (
+    (
+        crate::resolver::Hook,
+        Option<String>,
+        crate::resolver::RangeStep,
+    ),
+    crate::resolver::AnswererStep,
+) {
+    let (detection, answerer_step) = tokio::join!(
+        crate::resolver::session_detection(),
+        crate::resolver::read_answerer_step()
+    );
+    // The daemons the step asks to release the hook port: this CLI's
+    // own state dir's — its VM host daemons, default VM and named VMs
+    // alike, or its native daemon — never another state dir's.
+    let controls = match daemon_provider_kind(global) {
+        paths::ProviderKind::Minvmd => {
+            client::enumerate_vm_sockets(global.minimal_dir.as_deref(), true)
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|vm| control_sock_beside(&vm.sock))
+                .map(|sock| sock.display().to_string())
+                .collect()
+        }
+        paths::ProviderKind::Minimald => {
+            client::resolve_socket_path(global.minimal_dir.as_deref(), false)
+                .ok()
+                .and_then(|sock| control_sock_beside(&sock))
+                .into_iter()
+                .map(|sock| sock.display().to_string())
+                .collect()
+        }
+    };
+    crate::resolver::set_handover_controls(controls);
+    (detection, answerer_step)
+}
+
 /// The machine's zone-answerer state, read from the VM host daemon's
 /// control socket (NET-138) — the read-only status verb, over the same
 /// socket the box rows ride, so the posture (a 0600 socket in the provider
@@ -1305,83 +1348,30 @@ pub(crate) async fn activate_session(
             crate::resolver::name_surface_line(surface, created.hostname_proxy_port)
         );
     } else if let Some(answerer_port) = answerer_port {
-        // The answerer service's step (NET-122's host service) is read
-        // beside the detection on every hooked host, VM-backed and native
-        // alike: whether the zone is manager-held or held only while a
-        // session holds it, and whether the installed copy speaks this
-        // daemon's channel protocol — the native daemon publishes into the
-        // same machine-global channel a VM host daemon does, so the same
-        // service is the one to hand its zone to.
-        let (detection, answerer_step) = tokio::join!(
-            crate::resolver::session_detection(),
-            crate::resolver::read_answerer_step()
-        );
-        // The daemons the step asks to release the hook port: this CLI's
-        // own state dir's — its VM host daemons, default VM and named VMs
-        // alike, or its native daemon — never another state dir's.
-        let controls = match daemon_provider_kind(global) {
-            paths::ProviderKind::Minvmd => {
-                client::enumerate_vm_sockets(global.minimal_dir.as_deref(), true)
-                    .unwrap_or_default()
-                    .iter()
-                    .filter_map(|vm| control_sock_beside(&vm.sock))
-                    .map(|sock| sock.display().to_string())
-                    .collect()
-            }
-            paths::ProviderKind::Minimald => {
-                client::resolve_socket_path(global.minimal_dir.as_deref(), false)
-                    .ok()
-                    .and_then(|sock| control_sock_beside(&sock))
-                    .into_iter()
-                    .map(|sock| sock.display().to_string())
-                    .collect()
-            }
-        };
-        crate::resolver::set_handover_controls(controls);
         // NET-018: name the live surface at the moment the user is about to
         // rely on the names — decided in the one function both verbs share
-        // (`resolver`), from the same detection the advisory reads: this
-        // host's hook (and the stub-bypass blocker that says whether its
-        // lookups consult what the hook configures), the answerer-bound
-        // proof this start holds — the daemon's report on a native host,
-        // this CLI's own query on a VM-backed one — and the reserved range
-        // on this host's own loopback. Decided before the advisory prints
-        // only so the range its read holds can be the advisory's too — one
-        // probe, one host — while the printed order stays the advisory's
-        // and then the surface's. `None` — the answerer not bound — prints
-        // nothing: no native surface to name, and the ports and the
-        // advisory have told the proxy's story. The proxy's half is said
+        // (`resolver`), from this host's detection: its hook (and the
+        // stub-bypass blocker that says whether its lookups consult what the
+        // hook configures), the answerer-bound proof this start holds — the
+        // daemon's report on a native host, this CLI's own query on a
+        // VM-backed one — and the reserved range on this host's own
+        // loopback. `None` — the answerer not bound — prints the proxy's
+        // line: there is no native surface to name. The proxy's half is said
         // with the native arm either way (NET-019): the `HTTP(S)_PROXY`
-        // recipes this activation prints keep working beside native DNS,
-        // so nothing already captured goes stale.
+        // recipes this activation prints keep working beside native DNS, so
+        // nothing already captured goes stale.
+        //
+        // Host DNS is opt-in (NET-122): the start never prints the
+        // privileged step. While the host is not set up the proxy is the
+        // live surface, and its line names `min net setup`, which prints or
+        // runs the step from its own reads of the host.
+        let detection = crate::resolver::session_detection().await;
         let surface_verdict = crate::resolver::live_name_surface_with_range_at(
             &detection,
             Some(answerer_port),
             answerer_bound,
         )
         .await;
-        // The advisory shares that verdict's range read: the daemon's
-        // interim flag is not this host's range fact — on a VM-backed host
-        // it reads the guest's loopback, which always carries the range —
-        // so a hook that routes over a loopback that lacks the range is
-        // told the range is what is missing, not left with a silent
-        // advisory beside a verdict that names the proxy for exactly that.
-        let name_advisory = crate::resolver::session_advisory_at(
-            &detection,
-            Some(answerer_port),
-            created.interim_loopback,
-            surface_verdict
-                .as_ref()
-                .and_then(|verdict| verdict.range_present),
-            &answerer_step,
-        );
-        if let Some(advisory) = &name_advisory {
-            // Printed whole on every start, interactive or not (NET-122:
-            // the start names the exact command, and a scripted start's log
-            // is its only record), after a blank line so the note and its
-            // command block stand apart from the lines above them.
-            eprintln!("\n{advisory}");
-        }
         if let Some(verdict) = surface_verdict {
             // The host-side record of that verdict, the half the daemon's own
             // log cannot make: a daemon can name only the answerer *it* binds
@@ -1402,14 +1392,30 @@ pub(crate) async fn activate_session(
                 range_present = ?verdict.range_present,
                 range_unit_state = ?detection.2.state,
                 range_unit_check = ?detection.2.failed_check,
-                answerer_manager_held = answerer_step.holds(),
-                answerer_step = ?answerer_step,
                 "session start decided the live name surface for this host, \
                  with the range unit's state beside it"
             );
             eprintln!(
                 "{}",
-                crate::resolver::name_surface_line(verdict.surface, created.hostname_proxy_port)
+                crate::resolver::start_name_surface_line(
+                    Some(verdict.surface),
+                    created.hostname_proxy_port
+                )
+            );
+        } else {
+            // The answerer is reported but not bound yet: no native surface
+            // to name, so the proxy is the live one, and its line carries the
+            // `min net setup` pointer NET-122 owes every start on a host not
+            // set up.
+            tracing::info!(
+                surface = ?crate::resolver::LiveSurface::Proxy,
+                answerer_bound = false,
+                answerer_port = answerer_port,
+                "session start decided the live name surface for this host"
+            );
+            eprintln!(
+                "{}",
+                crate::resolver::start_name_surface_line(None, created.hostname_proxy_port)
             );
         }
     }

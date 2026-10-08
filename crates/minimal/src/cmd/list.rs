@@ -330,6 +330,29 @@ pub struct VmListing {
 /// selected provider's daemon, exactly the listing `min ls` has always
 /// printed.
 pub(crate) async fn ls_listings(global: &GlobalArgs) -> Result<Vec<VmListing>, anyhow::Error> {
+    listings_across_vms(global, true).await
+}
+
+/// [`ls_listings`] for a reader that needs any one listing, not the
+/// selected VM's: `min net setup` looks for a VM that reports an answerer
+/// port, so a selected VM that fails is skipped with a debug line instead
+/// of discarding the listings already read and the VMs not yet reached.
+pub(crate) async fn ls_listings_best_effort(global: &GlobalArgs) -> Vec<VmListing> {
+    listings_across_vms(global, false)
+        .await
+        .unwrap_or_else(|err| {
+            tracing::debug!("no daemon listing: {err:#}");
+            Vec::new()
+        })
+}
+
+/// The listing behind [`ls_listings`] and [`ls_listings_best_effort`].
+/// `strict` keeps `min ls`'s rule that a failure on the selected VM is the
+/// failure to report; without it that VM is skipped like any other.
+async fn listings_across_vms(
+    global: &GlobalArgs,
+    strict: bool,
+) -> Result<Vec<VmListing>, anyhow::Error> {
     let mut vms = client::enumerate_vm_sockets(global.minimal_dir.as_deref(), global.use_minvmd())?;
     if let Some(pinned) = global.vm.as_deref() {
         vms.retain(|vm| vm.vm == pinned);
@@ -359,11 +382,15 @@ pub(crate) async fn ls_listings(global: &GlobalArgs) -> Result<Vec<VmListing>, a
         // same dir the registration and the withdrawal find it in.
         let control_sock = crate::cmd::session::control_sock_beside(&vm.sock);
         if gate {
-            listings.push(VmListing {
-                vm: vm.vm,
-                resp: list_selected_vm(&vm.sock).await?,
-                control_sock,
-            });
+            match list_selected_vm(&vm.sock).await {
+                Ok(resp) => listings.push(VmListing {
+                    vm: vm.vm,
+                    resp,
+                    control_sock,
+                }),
+                Err(e) if strict => return Err(e),
+                Err(e) => tracing::debug!("skipping the selected VM {}: {e:#}", vm.vm),
+            }
         } else {
             match list_other_vm(&vm.sock).await {
                 Ok(Some(resp)) => listings.push(VmListing {

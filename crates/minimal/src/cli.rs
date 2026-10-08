@@ -981,6 +981,8 @@ pub enum NetCommand {
     /// installed or configured on the remote side. Stays in the foreground
     /// and closes with the session.
     Forward(NetForwardArgs),
+    /// Set this host up to resolve and reach boxes by name (runs one privileged script; `--print` only prints it, `--undo` removes it)
+    Setup(NetSetupArgs),
 }
 
 #[derive(Debug, Args)]
@@ -993,6 +995,16 @@ pub struct NetForwardArgs {
     /// `localhost:8080` from port 3000 in the box)
     #[arg(value_name = "LOCAL:PORT")]
     pub spec: String,
+}
+
+#[derive(Debug, Args)]
+pub struct NetSetupArgs {
+    /// Print the setup script instead of running it
+    #[arg(long)]
+    pub print: bool,
+    /// Remove everything the setup step installs on this host (with --print, print the removal script)
+    #[arg(long)]
+    pub undo: bool,
 }
 
 #[derive(Debug, Args)]

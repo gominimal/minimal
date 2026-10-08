@@ -7084,11 +7084,11 @@ fi
 # Native host-OS resolution of a box name, with no proxy settings anywhere
 # (NET-009, with the client halves of NET-122 and NET-123).
 #
-# The session-start advisory (NET-122) must print on a host whose resolver is
-# not configured for the zone, and name the EXACT command that points it at
-# the daemon's zone answerer — this case runs the text it printed, verbatim,
-# not a reconstruction of it, so what the user would have copied is what is
-# proved. And session start must never prompt: this case drives `min session
+# `min net setup --print` (NET-122) must print, on a host whose resolver is
+# not configured for the zone, the EXACT script that points it at the
+# daemon's zone answerer — this case runs the file it printed, under one
+# `sudo sh`, not a reconstruction of it, so what `min net setup` would run is
+# what is proved. And session start must never prompt: this case drives `min session
 # activate` from a script with no answers to give, so the activate completing
 # at all is half the proof. The other half, where this host can run it: after
 # the command, a plain `getent hosts` — any process, through the host's
@@ -7128,15 +7128,15 @@ fi
 #     the quiet was right.
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
-# NET-123's macOS half: the advisory's one privileged command installs the
-# boot-time unit that reserves the local range (design §7.1) — the same
-# `sudo sh -c` that writes the resolver file, so both halves of the host's
-# configuration land in one elevation, never two commands the user runs
-# separately.
+# NET-123's macOS half: the one privileged script `min net setup` runs
+# installs the boot-time unit that reserves the local range (design §7.1) —
+# the same script that writes the resolver file, so both halves of the
+# host's configuration land in one elevation, never two commands the user
+# runs separately.
 #
-# The proof runs the exact command the advisory printed — the bytes a user
-# would have copied off the terminal, including the two files' bodies riding
-# inside it as quoted heredocs — and then asserts what the spec promises:
+# The proof runs the exact script `min net setup --print` printed — the
+# bytes `min net setup` runs under `sudo sh`, including the two files'
+# bodies riding inside it as quoted heredocs — and then asserts what the spec promises:
 # both files root-owned at their exact modes, the plist's ProgramArguments
 # naming the root-owned program, the whole reserved range present on this
 # host's lo0, a session started afterwards with no advisory and no interim
@@ -7231,26 +7231,31 @@ proof_local_range_reserved_by_privileged_step() {
     fail
   }
   echo "activated $RANGE_NAME ($(printf '%s' "$range_sid" | tail -n1 | tr -d '\r')); answerer on 127.0.0.1:$range_port"
+  # A session start prints no advisory (host DNS is opt-in, NET-122); the
+  # setup script is what `min net setup --print` prints on stdout, from the
+  # same host reads, with its note on stderr.
+  range_setup="$WORK/range-net-setup.out"
+  mnl net setup --print >"$range_setup" 2>"$range_setup.note" || true
 
-  # The command the advisory named, exactly as a user would have copied it:
-  # on macOS it spans several lines, because the two files' bytes ride
-  # inside it as quoted heredocs, so the extraction runs from the
-  # de-indented `sudo` line to the closing quote.
-  range_cmd="$(awk -v lead="Configure the host's resolver, reserve the local range, and install the Minimal box-name service (DNS and addresses for boxes) with:" -v q="'" '
-    index($0, lead) > 0 { started = 1; next }
-    started && !first { sub(/^  /, ""); first = 1 }
-    started { print; if (substr($0, length($0), 1) == q) exit }
-  ' "$range_err")"
+  # The script `min net setup` runs, exactly as `--print` wrote it: the two
+  # files' bytes ride inside it as quoted heredocs, and its header says
+  # what it configures — on macOS the resolver and the local range together.
+  range_cmd="$(setup_script_from "$range_setup")"
   case "$range_cmd" in
-    "sudo sh -c '"*) ;;
+    '#!/bin/sh'*) ;;
     *)
-      echo "::error::no range-reserving advisory on the activate's stderr (got: '$range_cmd')"
-      echo "  (the lead-in must say the command configures the resolver and reserves the range)"
+      echo "::error::no setup script from 'min net setup --print' (got: '$range_cmd')"
       echo "--- activate stderr ---"; cat "$range_err" 2>/dev/null || true
+      echo "--- min net setup --print ---"; cat "$range_setup" "$range_setup.note" 2>/dev/null || true
       fail
       ;;
   esac
-  # The command the lead-in promised: one elevation for the resolver and the
+  if ! printf '%s\n' "$range_cmd" | sed -n 2p | grep -qF -- "# Configure the host's resolver, reserve the local range"; then
+    echo "::error::the setup script's header does not say it configures the resolver and reserves the range"
+    echo "--- script (first lines) ---"; printf '%s\n' "$range_cmd" | sed -n '1,4p'
+    fail
+  fi
+  # The script the header promised: one elevation for the resolver and the
   # range together, carrying both files' bytes and the boot step.
   case "$range_cmd" in
     *"$RANGE_PROGRAM_PATH"*) ;;
@@ -7284,10 +7289,11 @@ proof_local_range_reserved_by_privileged_step() {
       fail
       ;;
   esac
-  range_sudos="$(printf '%s\n' "$range_cmd" | grep -c -- sudo)"
-  if [ "$range_sudos" != 1 ]; then
-    echo "::error::the command is not one privilege elevation ($range_sudos 'sudo's) — the user must never run two commands"
-    echo "--- command ---"; printf '%s\n' "$range_cmd"
+  # One elevation: the user runs the script under one sudo, so no statement
+  # in it elevates again (the header's comment names the sudo it runs under).
+  if printf '%s\n' "$range_cmd" | grep -v '^[[:space:]]*#' | grep -q -- sudo; then
+    echo "::error::the setup script elevates on its own — the user must never be asked twice"
+    echo "--- script ---"; printf '%s\n' "$range_cmd"
     fail
   fi
 
@@ -7307,7 +7313,8 @@ proof_local_range_reserved_by_privileged_step() {
     echo "--- command (first and last lines) ---"; printf '%s\n' "$range_cmd" | sed -n '1p;$p'
     fail
   fi
-  if ! sh -c "$range_cmd" >"$WORK/range-cmd.out" 2>"$WORK/range-cmd.err"; then
+  # shellcheck disable=SC2024 # the output files are this user's, not root's
+  if ! sudo -n sh "$range_setup" >"$WORK/range-cmd.out" 2>"$WORK/range-cmd.err"; then
     echo "::error::the advisory's command did not run"
     echo "--- command (first and last lines) ---"
     printf '%s\n' "$range_cmd" | sed -n '1p;$p'
@@ -7429,7 +7436,8 @@ proof_local_range_reserved_by_privileged_step() {
   # addresses lo0 already carries rather than re-adding them: a re-run adds
   # only the missing aliases and removes nothing. (The command boots out
   # the prior load first, its guarded half, then bootstraps the unit again.)
-  if ! sh -c "$range_cmd" >"$WORK/range-cmd2.out" 2>"$WORK/range-cmd2.err"; then
+  # shellcheck disable=SC2024 # the output files are this user's, not root's
+  if ! sudo -n sh "$range_setup" >"$WORK/range-cmd2.out" 2>"$WORK/range-cmd2.err"; then
     echo "::error::the advisory's command failed on its re-run over the aliases it had already applied"
     echo "--- command (first and last lines) ---"
     printf '%s\n' "$range_cmd" | sed -n '1p;$p'
@@ -7570,24 +7578,15 @@ answerer_channel_of() {
     -e 's/^[[:space:]]*<string>\(\/.*\/answerer\.sock\)<\/string>$/\1/p' | head -n1
 }
 
-# The command the advisory named, whole, as a user would copy it: from the
-# line after the lead-in (de-indented) to the line that closes the quote the
-# command opened (`sudo sh -c "` on Linux, `sudo sh -c '` on macOS). The
-# command spans several lines on both platforms, because the unit files'
-# bytes ride inside it as quoted heredocs, so the first line alone is a
-# command with an unterminated quote. $1: the stderr file. $2: the lead-in.
-advisory_command_from() {
-  awk -v lead="$2" '
-    !started && index($0, lead) > 0 { started = 1; next }
-    started && !first {
-      sub(/^  /, ""); first = 1
-      q = substr($0, length("sudo sh -c ") + 1, 1)
-      print
-      if (length($0) > length("sudo sh -c ") + 1 && substr($0, length($0), 1) == q) exit
-      next
-    }
-    started { print; if (substr($0, length($0), 1) == q) exit }
-  ' "$1" 2>/dev/null
+# The setup script `min net setup --print` wrote to $1 (its stdout), whole,
+# when that is a script — its first line `#!/bin/sh` — and nothing otherwise
+# (a host with nothing to run, or a blocker, prints only its note on
+# stderr). The proof runs this file with one `sudo -n sh`, the way
+# `min net setup` itself runs it.
+setup_script_from() {
+  if [ "$(head -n1 "$1" 2>/dev/null)" = '#!/bin/sh' ]; then
+    cat "$1"
+  fi
 }
 
 # Wait for the range unit to finish the run its `bootstrap` started, before
@@ -7699,16 +7698,15 @@ proof_native_resolution_without_proxy_env() {
   }
   native_sid="$(printf '%s\n' "$native_sid" | tail -n1 | tr -d '\r')"
   echo "activated $NATIVE_NAME ($native_sid); answerer on 127.0.0.1:$native_port"
+  # A session start prints no advisory (host DNS is opt-in, NET-122); the
+  # setup script is what `min net setup --print` prints on stdout, from the
+  # same host reads, with its note on stderr.
+  native_setup="$WORK/native-net-setup.out"
+  mnl net setup --print >"$native_setup" 2>"$native_setup.note" || true
 
-  # The command the advisory named: the line after its lead-in, de-indented —
-  # exactly what a user would have copied off the terminal. The lead-in's
-  # shared prefix matches both platforms' wording ("…and install the Minimal
-  # box-name service (DNS and addresses for boxes) with:" on Linux, "…reserve the
-  # local range, and install the Minimal box-name service (DNS and addresses
-  # for boxes) with:" on macOS, whose command
-  # carries the range step NET-123 folds into it); the range-reserving case
-  # below extracts the multi-line command whole.
-  native_cmd="$(advisory_command_from "$native_err" "Configure the host's resolver")"
+  # The script `min net setup` runs, whole, exactly as `--print` wrote it.
+  # On macOS it carries the range step NET-123 folds into it too.
+  native_cmd="$(setup_script_from "$native_setup")"
 
   if [ -n "$native_cmd" ]; then
     # The command must name this platform's mechanism and THIS daemon's
@@ -7745,23 +7743,24 @@ proof_native_resolution_without_proxy_env() {
           ;;
       esac
     fi
-    case "$native_cmd" in
-      sudo*) ;;
-      *) echo "::error::the advisory's command is not one the user runs (got: '$native_cmd')"; fail ;;
-    esac
-    echo "advisory named the exact command: $native_cmd"
+    if printf '%s\n' "$native_cmd" | grep -v '^[[:space:]]*#' | grep -q -- sudo; then
+      echo "::error::the setup script elevates on its own; it must run whole under the one sudo the user gives it"
+      echo "--- script ---"; printf '%s\n' "$native_cmd"
+      fail
+    fi
+    echo "min net setup --print named the setup script ($(printf '%s\n' "$native_cmd" | wc -l | tr -d ' ') lines)"
     native_proved="advised"
 
     # NET-123's present arm, client side: a probe that found the reserved
     # range adds no interim sentence to the advisory. On the lanes that run
     # Linux daemons (native guest, or the Linux host of a VM lane) the
     # probe always succeeds, so the word must be absent.
-    if [ "$(uname -s)" = Linux ] && grep -q -- interim "$native_err"; then
+    if [ "$(uname -s)" = Linux ] && grep -q -- interim "$native_setup.note"; then
       echo "::error::the advisory names the 127.0.0.1 interim where the probe found the reserved range"
       echo "--- activate stderr ---"; cat "$native_err" 2>/dev/null || true
       fail
     fi
-  elif grep -q -- 'bypass systemd-resolved' "$native_err" 2>/dev/null; then
+  elif grep -q -- 'bypass systemd-resolved' "$native_setup.note" 2>/dev/null; then
     # An advisory that names no command: this host's lookups never reach
     # systemd-resolved's stub, so the routing-domain command would
     # configure nothing a host process consults — NET-122's detection says
@@ -7770,7 +7769,7 @@ proof_native_resolution_without_proxy_env() {
     # command above.
     native_bypassed=yes
     echo "advisory said this host's lookups bypass systemd-resolved's stub (NET-122 detection):"
-    echo "  $(grep -F -- 'bypass systemd-resolved' "$native_err" 2>/dev/null | head -n1)"
+    echo "  $(grep -F -- 'bypass systemd-resolved' "$native_setup.note" 2>/dev/null | head -n1)"
     if [ -n "${CI:-}" ]; then
       echo "::error::this lane's host bypasses systemd-resolved's stub, so NET-009 cannot be proved on it"
       echo "--- activate stderr ---"; cat "$native_err" 2>/dev/null || true
@@ -7786,8 +7785,8 @@ proof_native_resolution_without_proxy_env() {
     # daemon before. CI's fresh runners never see it, which is why it is an
     # error there.
     if [ -n "${CI:-}" ]; then
-      echo "::error::no advisory on the activate's stderr, and this lane's resolver is not configured for the zone (NET-122)"
-      echo "--- activate stderr ---"; cat "$native_err" 2>/dev/null || true
+      echo "::error::'min net setup --print' printed no script, and this lane's resolver is not configured for the zone (NET-122)"
+      echo "--- min net setup --print ---"; cat "$native_setup" "$native_setup.note" 2>/dev/null || true
       fail
     fi
     echo "::warning::no advisory printed — this host's resolver already routes the zone to this answerer (NET-122's quiet state)"
@@ -7870,7 +7869,8 @@ proof_native_resolution_without_proxy_env() {
       esac
       # Run the exact command the advisory printed — verbatim, as the user
       # would have. Passwordless sudo is the gate above, so it cannot prompt.
-      if ! sh -c "$native_cmd" >"$WORK/native-cmd.out" 2>"$WORK/native-cmd.err"; then
+      # shellcheck disable=SC2024 # the output files are this user's, not root's
+      if ! sudo -n sh "$native_setup" >"$WORK/native-cmd.out" 2>"$WORK/native-cmd.err"; then
         echo "::error::the advisory's command did not run (are resolvectl and ip usable here?)"
         echo "--- command ---"; echo "$native_cmd"
         echo "--- output ---"; cat "$WORK/native-cmd.out" "$WORK/native-cmd.err" 2>/dev/null || true
@@ -8500,6 +8500,11 @@ proof_box_name_resolves_natively_without_proxy() {
   }
   bn_sid="$(printf '%s\n' "$bn_sid" | tail -n1 | tr -d '\r')"
   echo "activated $BN_WEB_NAME ($bn_sid); answerer on 127.0.0.1:$bn_port"
+  # A session start prints no advisory (host DNS is opt-in, NET-122); the
+  # setup script is what `min net setup --print` prints on stdout, from the
+  # same host reads, with its note on stderr.
+  bn_setup="$WORK/bn-net-setup.out"
+  mnl net setup --print >"$bn_setup" 2>"$bn_setup.note" || true
   # The surface the activation reports — printed, not asserted: before the
   # advisory's command runs it is the proxy's surface, and the verdict the
   # command is about to move is the second box's to report (NET-018).
@@ -8551,10 +8556,10 @@ proof_box_name_resolves_natively_without_proxy() {
   echo "$BN_WEB_NAME's address: $bn_web_ip, leased at finalize (NET-010) — registered for its name there (NET-011)"
   echo "daemon log: $bn_box_reg"
 
-  # NET-122: the advisory, on the activate's stderr — the exact command, no
-  # prompt anywhere in the path. The command must name this platform's
-  # mechanism and THIS daemon's answerer, and be one the user runs.
-  bn_cmd="$(advisory_command_from "$bn_err" "Configure the host's resolver")"
+  # NET-122: the setup script `min net setup --print` prints — the exact
+  # script, no prompt anywhere in the path. It must name this platform's
+  # mechanism and THIS daemon's answerer, and run whole under one sudo.
+  bn_cmd="$(setup_script_from "$bn_setup")"
   if [ -n "$bn_cmd" ]; then
     case "$bn_cmd" in
       *resolvectl*) ;;
@@ -8572,19 +8577,20 @@ proof_box_name_resolves_natively_without_proxy() {
         fail
         ;;
     esac
-    case "$bn_cmd" in
-      sudo*) ;;
-      *) echo "::error::the advisory's command is not one the user runs (got: '$bn_cmd')"; fail ;;
-    esac
-    echo "advisory named the exact command: $bn_cmd"
-  elif grep -q -- 'bypass systemd-resolved' "$bn_err" 2>/dev/null; then
+    if printf '%s\n' "$bn_cmd" | grep -v '^[[:space:]]*#' | grep -q -- sudo; then
+      echo "::error::the setup script elevates on its own; it must run whole under the one sudo the user gives it"
+      echo "--- script ---"; printf '%s\n' "$bn_cmd"
+      fail
+    fi
+    echo "min net setup --print named the setup script ($(printf '%s\n' "$bn_cmd" | wc -l | tr -d ' ') lines)"
+  elif grep -q -- 'bypass systemd-resolved' "$bn_setup.note" 2>/dev/null; then
     # An advisory that names no command: this host's lookups never reach
     # systemd-resolved's stub, so the routing-domain command would configure
     # nothing a host process consults — NET-122's detection says so instead.
     # Only a dev host can see this; a lane's lookups go through the stub.
     bn_bypassed=yes
     echo "advisory said this host's lookups bypass systemd-resolved's stub (NET-122 detection):"
-    echo "  $(grep -F -- 'bypass systemd-resolved' "$bn_err" 2>/dev/null | head -n1)"
+    echo "  $(grep -F -- 'bypass systemd-resolved' "$bn_setup.note" 2>/dev/null | head -n1)"
     if [ -n "${CI:-}" ]; then
       echo "::error::this lane's host bypasses systemd-resolved's stub, so NET-009 cannot be proved on it"
       echo "--- activate stderr ---"; cat "$bn_err" 2>/dev/null || true
@@ -8598,8 +8604,8 @@ proof_box_name_resolves_natively_without_proxy() {
     # right. CI's fresh runners never see it, which is why it is an error
     # there.
     if [ -n "${CI:-}" ]; then
-      echo "::error::no advisory on the activate's stderr, and this lane's resolver is not configured for the zone (NET-122)"
-      echo "--- activate stderr ---"; cat "$bn_err" 2>/dev/null || true
+      echo "::error::'min net setup --print' printed no script, and this lane's resolver is not configured for the zone (NET-122)"
+      echo "--- min net setup --print ---"; cat "$bn_setup" "$bn_setup.note" 2>/dev/null || true
       fail
     fi
     echo "::warning::no advisory printed — this host's resolver already routes the zone to this answerer (NET-122's quiet state)"
@@ -8774,13 +8780,14 @@ proof_box_name_resolves_natively_without_proxy() {
         fi
         ;;
     esac
-    if ! sh -c "$bn_cmd" >"$WORK/bn-cmd.out" 2>"$WORK/bn-cmd.err"; then
+    # shellcheck disable=SC2024 # the output files are this user's, not root's
+    if ! sudo -n sh "$bn_setup" >"$WORK/bn-cmd.out" 2>"$WORK/bn-cmd.err"; then
       echo "::error::the advisory's command did not run (are resolvectl and ip usable here?)"
       echo "--- command ---"; echo "$bn_cmd"
       echo "--- output ---"; cat "$WORK/bn-cmd.out" "$WORK/bn-cmd.err" 2>/dev/null || true
       fail
     fi
-    echo "ran the advisory's command: $bn_cmd"
+    echo "ran the setup script under one sudo"
   fi
 
   # ---- NET-018: the second box's activate reports the verdict -------------
@@ -9106,7 +9113,7 @@ proof_box_name_resolves_natively_without_proxy() {
 #
 #   1. Node A (this lane's state dir) starts with no service installed and
 #      hosts the interim on the hook port.
-#   2. A's session start prints the advisory; its command, run verbatim,
+#   2. `min net setup --print` prints the setup script; run as root, it
 #      asks A to release the port, installs the service, and starts it. A
 #      becomes a channel client of the manager-held service, and its box
 #      name still answers on the host.
@@ -9382,6 +9389,11 @@ for row in json.load(open(sys.argv[1])):
 
   local asr_a_sid asr_a_err="$WORK/asr-a-activate.err"
   asr_a_sid="$(asr_activate mnl e2e-asr-a "$asr_a_err")" || fail
+  # A session start prints no advisory (host DNS is opt-in, NET-122); the
+  # setup script is what `min net setup --print` prints on stdout, from the
+  # same host reads, with its note on stderr.
+  local asr_a_setup="$WORK/asr-a-net-setup.out"
+  mnl net setup --print >"$asr_a_setup" 2>"$asr_a_setup.note" || true
   local asr_a_ip
   asr_a_ip="$(asr_zone_address "$asr_base_a" e2e-asr-a.min.internal)"
   if [ -z "$asr_a_ip" ]; then
@@ -9434,12 +9446,13 @@ for row in json.load(open(sys.argv[1])):
 
   # ---- 2. the advisory hands the port to the service -----------------------
   local asr_cmd
-  asr_cmd="$(advisory_command_from "$asr_a_err" "Configure the host's resolver")"
+  asr_cmd="$(setup_script_from "$asr_a_setup")"
   case "$asr_cmd" in
     *minzoned*) ;;
     *)
       echo "::error::node A's session start printed no advisory carrying the answerer service step"
       echo "--- activate stderr ---"; cat "$asr_a_err" 2>/dev/null || true
+      echo "--- min net setup --print ---"; cat "$asr_a_setup" 2>/dev/null || true
       fail
       ;;
   esac
@@ -9476,7 +9489,8 @@ for row in json.load(open(sys.argv[1])):
   local asr_released_before asr_service_before
   asr_released_before="$(asr_count "$asr_base_a" 'released the interim answerer')"
   asr_service_before="$(asr_count "$asr_base_a" 'the manager-held answerer service')"
-  if ! sh -c "$asr_cmd" >"$WORK/asr-cmd.out" 2>"$WORK/asr-cmd.err"; then
+  # shellcheck disable=SC2024 # the output files are this user's, not root's
+  if ! sudo -n sh "$asr_a_setup" >"$WORK/asr-cmd.out" 2>"$WORK/asr-cmd.err"; then
     echo "::error::the advisory's command did not run"
     echo "--- command ---"; printf '%s\n' "$asr_cmd"
     echo "--- output ---"; cat "$WORK/asr-cmd.out" "$WORK/asr-cmd.err" 2>/dev/null || true
@@ -9724,8 +9738,8 @@ for row in json.load(open(sys.argv[1])):
 #
 #   1. Node A (this lane's state dir) starts with no service installed and
 #      hosts the interim on the hook port; its box name answers there.
-#   2. A's session start prints the advisory; its command, run verbatim as
-#      root, asks A's own control socket to release the port, installs the
+#   2. `min net setup --print` prints the setup script; run as root, it
+#      asks A's own control socket to release the port, installs the
 #      service and starts it. A becomes a client of the manager-held
 #      answerer, no minimald holds the port, and A's name keeps answering
 #      the same address — now from the service.
@@ -9899,6 +9913,11 @@ proof_native_answerer_survives_session_stop() {
 
   local nasr_a_sid nasr_a_err="$WORK/nasr-a-activate.err" nasr_a_ip
   nasr_a_sid="$(nasr_activate mnl e2e-nasr-a "$nasr_a_err")" || fail
+  # A session start prints no advisory (host DNS is opt-in, NET-122); the
+  # setup script is what `min net setup --print` prints on stdout, from the
+  # same host reads, with its note on stderr.
+  local nasr_a_setup="$WORK/nasr-a-net-setup.out"
+  mnl net setup --print >"$nasr_a_setup" 2>"$nasr_a_setup.note" || true
   nasr_a_ip="$(nasr_address e2e-nasr-a.min.internal)"
   if [ -z "$nasr_a_ip" ]; then
     echo "::error::e2e-nasr-a.min.internal does not answer from node A's interim on 127.0.0.1:$nasr_port"
@@ -9909,12 +9928,13 @@ proof_native_answerer_survives_session_stop() {
 
   # ---- 2. the advisory hands the port to the service -----------------------
   local nasr_cmd
-  nasr_cmd="$(advisory_command_from "$nasr_a_err" "Configure the host's resolver")"
+  nasr_cmd="$(setup_script_from "$nasr_a_setup")"
   case "$nasr_cmd" in
     *minzoned*) ;;
     *)
       echo "::error::node A's native session start printed no advisory carrying the answerer service step"
       echo "--- activate stderr ---"; cat "$nasr_a_err" 2>/dev/null || true
+      echo "--- min net setup --print ---"; cat "$nasr_a_setup" 2>/dev/null || true
       fail
       ;;
   esac
@@ -9943,7 +9963,8 @@ proof_native_answerer_survives_session_stop() {
   local nasr_released_before nasr_service_before
   nasr_released_before="$(nasr_count "$nasr_base_a" 'released the interim answerer')"
   nasr_service_before="$(nasr_count "$nasr_base_a" 'the manager-held answerer service')"
-  if ! sh -c "$nasr_cmd" >"$WORK/nasr-cmd.out" 2>"$WORK/nasr-cmd.err"; then
+  # shellcheck disable=SC2024 # the output files are this user's, not root's
+  if ! sudo -n sh "$nasr_a_setup" >"$WORK/nasr-cmd.out" 2>"$WORK/nasr-cmd.err"; then
     echo "::error::the advisory's command did not run"
     echo "--- command ---"; printf '%s\n' "$nasr_cmd"
     echo "--- output ---"; cat "$WORK/nasr-cmd.out" "$WORK/nasr-cmd.err" 2>/dev/null || true
