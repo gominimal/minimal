@@ -388,8 +388,8 @@ pub(crate) struct DnsGate {
     /// same reason as [`Self::window`]: the release of an idle flow cannot
     /// be observed in a test that would have to wait a day for it.
     flow_idle_cap: Duration,
-    /// The box's switch IP, the `session_id` of every log line and the
-    /// limiter's key.
+    /// The box's switch IP: the `switch_addr` of this gate's debug lines,
+    /// the R2.7 refusal warning's `session_id`, and the limiter's key.
     label: String,
     /// The session's rate limiter, the same instance the frame-drop
     /// warnings emit through: one limiter and one warn log per session
@@ -520,7 +520,7 @@ impl DnsGate {
         if datagram.len() > MAX_DATAGRAM {
             tracing::debug!(
                 component = COMPONENT,
-                session_id = %self.label,
+                switch_addr = %self.label,
                 n = datagram.len(),
                 "ignoring an oversized DNS query at the relay"
             );
@@ -531,7 +531,7 @@ impl DnsGate {
             Err(error) => {
                 tracing::debug!(
                     component = COMPONENT,
-                    session_id = %self.label,
+                    switch_addr = %self.label,
                     %error,
                     "forwarding an unparseable DNS query"
                 );
@@ -601,7 +601,7 @@ impl DnsGate {
         reply.add_queries(query.queries);
         tracing::debug!(
             component = COMPONENT,
-            session_id = %self.label,
+            switch_addr = %self.label,
             name,
             query_type = ?rtype,
             answer = ?rcode,
@@ -630,7 +630,7 @@ impl DnsGate {
         if datagram.len() > MAX_DATAGRAM {
             tracing::debug!(
                 component = COMPONENT,
-                session_id = %self.label,
+                switch_addr = %self.label,
                 n = datagram.len(),
                 "ignoring an oversized DNS reply at the relay"
             );
@@ -641,7 +641,7 @@ impl DnsGate {
             Err(error) => {
                 tracing::debug!(
                     component = COMPONENT,
-                    session_id = %self.label,
+                    switch_addr = %self.label,
                     %error,
                     "passing an unparseable DNS reply through unpinned"
                 );
@@ -711,7 +711,7 @@ impl DnsGate {
                     split.admitted.iter().copied().map(Ipv4Addr::from).collect();
                 tracing::debug!(
                     component = COMPONENT,
-                    session_id = %self.label,
+                    switch_addr = %self.label,
                     name = %asked,
                     ?addresses,
                     "validated a box-zone answer; it pins nothing, reach is decided at connect"
@@ -800,7 +800,7 @@ impl DnsGate {
         if !over_cap.is_empty() {
             tracing::debug!(
                 component = COMPONENT,
-                session_id = %self.label,
+                switch_addr = %self.label,
                 name,
                 ?over_cap,
                 cap = MAX_ADDRESSES_PER_NAME,
@@ -810,7 +810,7 @@ impl DnsGate {
         let addresses: Vec<Ipv4Addr> = admitted_now.iter().copied().map(Ipv4Addr::from).collect();
         tracing::debug!(
             component = COMPONENT,
-            session_id = %self.label,
+            switch_addr = %self.label,
             name,
             ?addresses,
             window_secs = self.window.as_secs(),

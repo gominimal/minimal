@@ -773,7 +773,10 @@ fn hand_out_run(subnet: SwitchSubnet) -> (u32, u32) {
 /// box address comes from — the plan's switch lease run and the published
 /// loopback slice — are finite; exhausting one is an answer to hand back
 /// over the control socket, not a panic.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+///
+/// Not `Copy`: every variant that names a box carries its [`String`] name,
+/// and the refusal is built once, answered with, and dropped.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum AllocationError {
     /// Every switch address in the plan's lease run is published.
     #[error("the switch's address plan is exhausted; no box address remains")]
@@ -818,6 +821,23 @@ pub enum AllocationError {
     /// the registration was read, so the registration writes no row.
     #[error("the box was withdrawn while its address was being allocated")]
     WithdrawnWhileAllocating,
+    /// The name folds to one a live row already holds: the answerer keys
+    /// an address by the name's canonical form
+    /// ([`crate::net::answerer::canonical_box_name`]), so two rows under
+    /// folded-equal names would share one published address — one box, one
+    /// address, one row. The registration is refused before any address is
+    /// spent, and names the spelling the live row holds.
+    ///
+    /// Box names are DNS labels under `min.internal`, and DNS compares
+    /// names case-insensitively (RFC 4343); the answerer already keys this
+    /// way and session names are unique under the same fold, so one row per
+    /// name (NET-138) means one row per folded name.
+    #[error("a box named {held} already exists")]
+    NameAlreadyHeld {
+        /// The name the live row holds, in its registered spelling: the
+        /// one the refusal reports back to the asking client.
+        held: String,
+    },
 }
 
 /// One box name's registration bookkeeping: how many registrations of it
@@ -1226,17 +1246,21 @@ impl ConnectionGauge {
     }
 }
 
-/// The ask verbs' gauges (NET-045), shared by every clone of a registry:
-/// the guest-door ask connections and the host subscriptions, each capped
-/// by the door, and the asks whose end is not yet audited, which a graceful
-/// stop waits on.
+/// The held connections' gauges, shared by every clone of a registry: the
+/// ask verbs' (NET-045) guest-door ask connections and host subscriptions,
+/// and the held registrations' lease connections
+/// ([`minimald_rpc::RegisterBoxRequest::hold`]), each capped by the door,
+/// and the asks whose end is not yet audited, which a graceful stop waits
+/// on.
 #[derive(Debug)]
 pub(crate) struct AskGauges {
     pub(crate) guest_asks: Arc<ConnectionGauge>,
     pub(crate) subscriptions: Arc<ConnectionGauge>,
+    pub(crate) leases: Arc<ConnectionGauge>,
     pub(crate) unaudited: Arc<ConnectionGauge>,
     guest_ask_cap: std::sync::atomic::AtomicUsize,
     subscription_cap: std::sync::atomic::AtomicUsize,
+    lease_cap: std::sync::atomic::AtomicUsize,
 }
 
 impl Default for AskGauges {
@@ -1244,9 +1268,11 @@ impl Default for AskGauges {
         Self {
             guest_asks: Arc::default(),
             subscriptions: Arc::default(),
+            leases: Arc::default(),
             unaudited: Arc::default(),
             guest_ask_cap: crate::control::MAX_GUEST_ASK_CONNECTIONS.into(),
             subscription_cap: crate::control::MAX_ASK_SUBSCRIPTIONS.into(),
+            lease_cap: crate::control::MAX_REGISTRATION_LEASES.into(),
         }
     }
 }
@@ -1268,6 +1294,17 @@ impl AskGauges {
         self.guest_ask_cap.store(guest_asks, Ordering::Relaxed);
         self.subscription_cap
             .store(subscriptions, Ordering::Relaxed);
+    }
+
+    /// The held registrations' lease connection cap.
+    pub(crate) fn lease_cap(&self) -> usize {
+        self.lease_cap.load(Ordering::Relaxed)
+    }
+
+    /// Lower the lease cap, so a test can fill it.
+    #[cfg(test)]
+    pub(crate) fn set_lease_cap(&self, leases: usize) {
+        self.lease_cap.store(leases, Ordering::Relaxed);
     }
 }
 
@@ -1971,7 +2008,7 @@ impl BoxRegistry {
             next_switch_addr: Arc::new(AtomicU32::new(hand_out_run(subnet).0)),
             #[cfg(test)]
             next_loopback_addr: Arc::new(AtomicU32::new(
-                loopback_slice.map_or(0, |slice| u32::from(slice.first())),
+                loopback_slice.map_or(0, |slice| box_loopback_run(slice).0),
             )),
             loopback_slice,
             attachments: None,
@@ -2054,6 +2091,22 @@ impl BoxRegistry {
     /// registration of the name can start between the decision and the
     /// release. Returns whether `release` ran.
     pub fn release_unless_owned(&self, claim: &RegistrationClaim, release: impl FnOnce()) -> bool {
+        self.release_unless_owned_past(&claim.key, 1, release)
+    }
+
+    /// Hand a withdrawn box's address back to the answerer, by running
+    /// `release`, unless something else owns it: [`Self::release_unless_owned`]
+    /// for a withdrawal, which holds no registration of its own, so every
+    /// registration of the name in flight counts as another owner. Returns
+    /// whether `release` ran.
+    pub fn release_withdrawn_unless_owned(&self, name: &str, release: impl FnOnce()) -> bool {
+        self.release_unless_owned_past(&canonical_box_name(name), 0, release)
+    }
+
+    /// The one locked decision both releases take: under the row lock and
+    /// then the generations' lock, `release` runs unless a live row holds
+    /// `key` or more than `own` registrations of it are in flight.
+    fn release_unless_owned_past(&self, key: &str, own: u32, release: impl FnOnce()) -> bool {
         let rows = self
             .rows
             .read()
@@ -2061,10 +2114,10 @@ impl BoxRegistry {
         let generations = self.generations();
         let row_holds = rows
             .values()
-            .any(|record| canonical_box_name(record.name()) == claim.key);
+            .any(|record| canonical_box_name(record.name()) == key);
         let others_in_flight = generations
-            .get(&claim.key)
-            .map_or(0, |entry| entry.in_flight.saturating_sub(1));
+            .get(key)
+            .map_or(0, |entry| entry.in_flight.saturating_sub(own));
         if row_holds || others_in_flight > 0 {
             return false;
         }
@@ -2416,7 +2469,10 @@ impl BoxRegistry {
     /// A mint that collides with an id a live row or attachment already
     /// holds is refused ([`AllocationError::CollidingBoxId`], BEP-070) —
     /// never re-minted — before any address is spent, and said as one warn
-    /// line naming the id.
+    /// line naming the id. A name that folds to one a live row already
+    /// holds is refused the same way ([`AllocationError::NameAlreadyHeld`]):
+    /// the answerer keys a published address by the name's canonical form,
+    /// so two rows under folded-equal names would share one address.
     pub fn register_client_box_at(
         &self,
         spec: ClientBoxSpec,
@@ -2448,7 +2504,7 @@ impl BoxRegistry {
     }
 
     /// [`Self::register_client_box_at`] with the freshly minted `id` it
-    /// creates the box as: the one door the collision check guards, split
+    /// creates the box as: the one door the collision checks guard, split
     /// out so a test can drive a colliding mint.
     fn register_client_box_as(
         &self,
@@ -2478,6 +2534,22 @@ impl BoxRegistry {
         // that decides.
         if generation.is_some_and(|read| read != self.withdrawal_generation(&spec.name)) {
             return Err(AllocationError::WithdrawnWhileAllocating);
+        }
+        // The answerer keys a published address by the name's canonical
+        // form, so a registration whose name folds to a live row's would
+        // share that row's address: one box, one address, one row. The
+        // check runs after the withdrawal-generation one — a registration
+        // raced by a withdrawal answers as withdrawn while allocating —
+        // and before any address is spent. The collision is decided in
+        // the answerer's fold, and the refusal reports the held row's own
+        // spelling, so the asking client learns which box holds the name.
+        if let Some(held) = self.held_name_for(&spec.name) {
+            tracing::warn!(
+                asked = %spec.name,
+                held = %held,
+                "refused a box registration whose name a live row already holds"
+            );
+            return Err(AllocationError::NameAlreadyHeld { held });
         }
         // A withdrawn box's revocation may still hold the published address
         // the answerer handed back: the answerer releases a box's address at
@@ -2545,12 +2617,9 @@ impl BoxRegistry {
         let slice = self
             .loopback_slice
             .ok_or(AllocationError::UnplannedSubnet(self.subnet))?;
-        let loopback_addr = take_next(
-            &self.next_loopback_addr,
-            u32::from(slice.first()),
-            u32::from(slice.last()),
-        )
-        .ok_or(AllocationError::LoopbackExhausted)?;
+        let (first, last) = box_loopback_run(slice);
+        let loopback_addr = take_next(&self.next_loopback_addr, first, last)
+            .ok_or(AllocationError::LoopbackExhausted)?;
         self.register_client_box_at(spec, loopback_addr)
     }
 
@@ -2576,6 +2645,23 @@ impl BoxRegistry {
             .is_some_and(|attachments| attachments.holds_id(id))
     }
 
+    /// The name a live row holds that `name` folds to, in the row's own
+    /// spelling, or `None` when no live row's name folds to it. The
+    /// answerer allocates a published address by the name's canonical form
+    /// ([`crate::net::answerer::canonical_box_name`]), so two live rows
+    /// under folded-equal names would share one address; this is the check
+    /// that keeps the live set one row per folded name.
+    fn held_name_for(&self, name: &str) -> Option<String> {
+        let asked = canonical_box_name(name);
+        let rows = self
+            .rows
+            .read()
+            .expect("the row lock is never held across a panic, so it cannot be poisoned");
+        rows.values()
+            .find(|record| canonical_box_name(record.name()) == asked)
+            .map(|record| record.name().to_string())
+    }
+
     /// Withdraws the client box's row when the pair `(name, switch_addr,
     /// loopback_addr)` proves its client is the row's creator, returning the
     /// row removed — `Ok(None)` when no row is published at `switch_addr` at
@@ -2589,7 +2675,10 @@ impl BoxRegistry {
     /// ([`ClientBoxSpec`]'s allocation), which only the registering session's
     /// record carries; a row published under another name or another
     /// loopback is not the requesting client's to remove and is refused with
-    /// [`WithdrawError`]. The withdrawn addresses are not returned to the
+    /// [`WithdrawError`]. The name in the proof is compared in its
+    /// canonical form, the answerer's fold: a box registered under "Web"
+    /// is withdrawn by its own name in any spelling that folds to it.
+    /// The withdrawn addresses are not returned to the
     /// allocation cursors — spent for good, as [`Self::register_client_box`]
     /// documents — and what their frames do next is the gate phase's to say
     /// ([`Self::withdraw`]). The box's proxy attachment goes with the row
@@ -2622,7 +2711,7 @@ impl BoxRegistry {
             self.bump_withdrawal_generation(name);
             return Ok(None);
         };
-        if record.name() != name {
+        if canonical_box_name(record.name()) != canonical_box_name(name) {
             return Err(WithdrawError::NotTheCreatorsRow {
                 switch_addr,
                 held_name: record.name().to_string(),
@@ -2889,22 +2978,27 @@ impl BoxRegistry {
     /// destroyed box's last row. `None` when no live row carries the name.
     ///
     /// Exact match alone is not the rule: the table does not hold names
-    /// unique. Rows are keyed by switch address, and a box recreated under
-    /// its name gets a new row beside the old one, which stays until its
-    /// withdrawal lands (up to NET-138's 60 s for an attachment's end).
+    /// unique. Rows are keyed by switch address; a client registration is
+    /// refused while a live row holds its folded name
+    /// ([`AllocationError::NameAlreadyHeld`]), but a row registered in
+    /// process ([`Self::try_register`]) can sit beside an older one under
+    /// the same name until the older one's withdrawal lands.
     /// While both are held, the alias resolves to the newest creation —
     /// the row with the greatest id, because every id is a UUIDv7 this
     /// process minted ([`crate::bep_attach::mint_box_id`]), and the crate
-    /// orders those by creation within a process. The name carries no
-    /// other alias form: it is matched in its registered spelling.
+    /// orders those by creation within a process. The name is matched in
+    /// its canonical form ([`crate::net::answerer::canonical_box_name`]):
+    /// the answerer keys the box's published address by that form, so the
+    /// row table and the address hold one box to a folded-equal name.
     #[must_use]
     pub fn row_by_name(&self, name: &str) -> Option<Arc<BoxRecord>> {
+        let asked = canonical_box_name(name);
         let rows = self
             .rows
             .read()
             .expect("the row lock is never held across a panic, so it cannot be poisoned");
         rows.values()
-            .filter(|record| record.name() == name)
+            .filter(|record| canonical_box_name(record.name()) == asked)
             .max_by_key(|record| record.box_id())
             .cloned()
     }
@@ -3217,6 +3311,24 @@ impl BoxRegistry {
             revoking: Arc::clone(&self.revoking),
         }
     }
+}
+
+/// The run of published loopback addresses a box may take inside `slice`:
+/// the slice clamped to the reserved local range's interior. The range's
+/// network address, `.1` and its broadcast address are never a box's — a
+/// slice that starts at or ends on one of them keeps it out of a box's
+/// hands too.
+///
+/// That interior is the answerer's own hand-out run, read from its one
+/// definition ([`switch::box_loopback_interior`]) rather than restated;
+/// this run is the tests' single-node cursor clamped to it, so a test box
+/// never holds an address the answerer would refuse.
+#[cfg(test)]
+fn box_loopback_run(slice: switch::LoopbackSlice) -> (u32, u32) {
+    let (box_first, box_last) = switch::box_loopback_interior();
+    let first = u32::from(slice.first()).max(u32::from(box_first));
+    let last = u32::from(slice.last()).min(u32::from(box_last));
+    (first, last)
 }
 
 /// Takes the next unspent address from `cursor`, when `first..=last` still
@@ -3893,6 +4005,103 @@ mod tests {
                 "exhaustion is explicit and never wraps"
             );
         }
+    }
+
+    /// Design §7.1, the loopback run a box may take: the reserved local
+    /// range's `.2` to its last-but-one address, never its network
+    /// address, `.1` or its broadcast — the answerer's own hand-out run
+    /// ([`switch::box_loopback_interior`]), clamped to the single-node
+    /// cursor's slice. Pinned on both ends: the reserved local range's
+    /// default slice and its last.
+    #[test]
+    fn client_boxes_take_only_the_range_s_interior() {
+        // The default plan's slice starts at the range's network address,
+        // and a box takes none of it: its first loopback is the run's.
+        let registry = BoxRegistry::new(SUBNET);
+        let first = registry
+            .register_client_box(ClientBoxSpec {
+                name: "web".to_string(),
+                ingress_ports: Vec::new(),
+                egress: None,
+                credentialed_upstream: None,
+                dynamic_ingress: None,
+                dynamic_allowed_range: None,
+            })
+            .expect("the default plan has published addresses");
+        assert_eq!(
+            first.loopback_addr(),
+            Ipv4Addr::new(127, 0, 64, 2),
+            "the first box takes the run's first address, never the range's \
+             network address nor .1"
+        );
+
+        // The last slice ends on the range's broadcast address, and a box
+        // takes none of that either: its last address is the run's, and a
+        // further box is refused as before.
+        let last = SwitchSubnet::new(Ipv4Addr::new(100, 64, 7, 0), 24).expect("valid");
+        assert!(
+            switch::AddressPlan::default()
+                .loopback_slice_for_switch(last)
+                .is_some(),
+            "the last slice's subnet is planned, so the refusal below is a \
+             run's exhaustion, not the plan's absence"
+        );
+        let registry = BoxRegistry::new(last);
+        for index in 0..30 {
+            registry
+                .register_client_box(ClientBoxSpec {
+                    name: format!("box{index}"),
+                    ingress_ports: Vec::new(),
+                    egress: None,
+                    credentialed_upstream: None,
+                    dynamic_ingress: None,
+                    dynamic_allowed_range: None,
+                })
+                .expect("the last slice hands out 30 addresses below its last");
+        }
+        assert_eq!(
+            registry
+                .register_client_box(ClientBoxSpec {
+                    name: "last".to_string(),
+                    ingress_ports: Vec::new(),
+                    egress: None,
+                    credentialed_upstream: None,
+                    dynamic_ingress: None,
+                    dynamic_allowed_range: None,
+                })
+                .expect("the last slice holds one more published address")
+                .loopback_addr(),
+            Ipv4Addr::new(127, 0, 64, 254),
+            "the last box takes the run's last address, never the range's \
+             broadcast"
+        );
+        assert!(
+            matches!(
+                registry.register_client_box(ClientBoxSpec {
+                    name: "late".to_string(),
+                    ingress_ports: Vec::new(),
+                    egress: None,
+                    credentialed_upstream: None,
+                    dynamic_ingress: None,
+                    dynamic_allowed_range: None,
+                }),
+                Err(AllocationError::LoopbackExhausted)
+            ),
+            "exhaustion stays explicit and never wraps"
+        );
+
+        // A slice inside the range touches none of its reserved ends, so
+        // the clamp keeps every one of its addresses.
+        let middle = switch::AddressPlan::default()
+            .loopback_slice_for_switch(
+                SwitchSubnet::new(Ipv4Addr::new(100, 64, 3, 0), 24).expect("valid"),
+            )
+            .expect("a middle slice is planned");
+        assert_eq!(
+            box_loopback_run(middle),
+            (u32::from(middle.first()), u32::from(middle.last())),
+            "a middle slice loses no address to the clamp"
+        );
     }
 
     /// BEP-070, one id names one box, so a registration whose minted id a
@@ -4896,7 +5105,133 @@ mod tests {
         assert!(registry.row_by_name("web").is_none());
         assert!(
             registry.row_by_name("Web").is_none(),
-            "no alias form but the name"
+            "a withdrawn name answers no row in any folded spelling"
+        );
+    }
+
+    /// The answerer keys a published address by the name's canonical
+    /// form, so a client registration whose name folds to a live row's
+    /// is refused — one box, one address, one row — before any address
+    /// is spent, naming the spelling the live row holds; the row's own
+    /// spelling is what everyone reads back.
+    #[test]
+    fn folded_equal_name_refused_and_the_live_row_keeps_its_spelling() {
+        let (log, _guard) = crate::net::egress_gate::test_support::capture_log();
+        let registry = BoxRegistry::new(SUBNET);
+        let web = registry
+            .register_client_box(ClientBoxSpec {
+                name: "Web".to_string(),
+                ingress_ports: Vec::new(),
+                egress: None,
+                credentialed_upstream: None,
+                dynamic_ingress: None,
+                dynamic_allowed_range: None,
+            })
+            .expect("the plan has an address for the first box");
+
+        // A second client asks under a spelling that folds to the live
+        // row's name: refused, naming the spelling the row holds.
+        let refused = registry
+            .register_client_box(ClientBoxSpec {
+                name: "web".to_string(),
+                ingress_ports: Vec::new(),
+                egress: None,
+                credentialed_upstream: None,
+                dynamic_ingress: None,
+                dynamic_allowed_range: None,
+            })
+            .expect_err("one published address is one box's");
+        assert_eq!(
+            refused,
+            AllocationError::NameAlreadyHeld {
+                held: "Web".to_string()
+            },
+            "the refusal names the held spelling, not the asking one"
+        );
+        assert!(
+            refused
+                .to_string()
+                .contains("a box named Web already exists"),
+            "the refusal's sentence names the held spelling: {refused}"
+        );
+
+        // The refusal spent nothing: the live row stands untouched, in
+        // its own spelling, and resolves under every folded spelling.
+        let rows = registry.table().rows();
+        assert_eq!(rows.len(), 1, "a refused registration publishes no row");
+        assert_eq!(
+            row_identity(&rows[0]),
+            row_identity(&web),
+            "the live row is the live box's, untouched by the refusal"
+        );
+        assert_eq!(
+            registry
+                .row_by_name("WEB")
+                .expect("the name resolves in every folded spelling")
+                .name(),
+            "Web",
+            "the row keeps its holder's spelling, the one its holder reads"
+        );
+        let next = registry
+            .register_client_box(ClientBoxSpec {
+                name: "db".to_string(),
+                ingress_ports: Vec::new(),
+                egress: None,
+                credentialed_upstream: None,
+                dynamic_ingress: None,
+                dynamic_allowed_range: None,
+            })
+            .expect("the plan has a second hand-out address");
+        assert_eq!(
+            next.switch_addr(),
+            Ipv4Addr::from(u32::from(web.switch_addr()) + 1),
+            "the refusal spent no address: the next registration takes the \
+             hand-out run's next, the address the refused one would have spent"
+        );
+
+        // One warn line names the refusal and both spellings — the line a
+        // bundle's daemon log tail reads a refused registration by.
+        let logged = log.contents();
+        assert_eq!(
+            logged
+                .matches("refused a box registration whose name a live row already holds")
+                .count(),
+            1,
+            "one warn line per refused registration, got: {logged}"
+        );
+        assert!(
+            logged.contains("asked=web") && logged.contains("held=Web"),
+            "the warn line names the asking and the held spelling, got: {logged}"
+        );
+    }
+
+    /// A withdrawal presents the same name-folding proof the registration
+    /// answers under: a box registered as "web" is withdrawn by its own
+    /// creator under "WEB", and the row the matching address pair points
+    /// at is removed — never refused as another box's row.
+    #[test]
+    fn withdraw_folds_the_asking_name() {
+        let registry = BoxRegistry::new(SUBNET);
+        let web = registry
+            .register_client_box(ClientBoxSpec {
+                name: "web".to_string(),
+                ingress_ports: Vec::new(),
+                egress: None,
+                credentialed_upstream: None,
+                dynamic_ingress: None,
+                dynamic_allowed_range: None,
+            })
+            .expect("the plan has an address for the first box");
+        assert!(
+            registry
+                .withdraw_client_box("WEB", web.switch_addr(), web.loopback_addr())
+                .expect("the asking name folds to the row's, so the proof stands")
+                .is_some(),
+            "the folded-equal name withdraws the row its pair proves"
+        );
+        assert!(
+            registry.row_by_name("web").is_none(),
+            "the row is withdrawn, not held against a folded-equal ask"
         );
     }
 

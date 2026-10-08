@@ -469,6 +469,9 @@ pub async fn activate(
         match client
             .oneshot_rpc::<minimald_rpc::FinalizeSession>(minimald_rpc::FinalizeSessionRequest {
                 session_id: id,
+                // The dashboard's status line does not render the yielded
+                // ports, so it does not ask for them.
+                report_shared_port_collisions: false,
             })
             .await
             .context("FinalizeSession RPC failed")?

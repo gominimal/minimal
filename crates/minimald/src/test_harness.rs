@@ -626,7 +626,10 @@ pub async fn create_configured_session(
     // circuits the marker check in that case (there's nothing to
     // upload), so calling it directly is fine.
     match client
-        .call::<FinalizeSession>(&FinalizeSessionRequest { session_id: id })
+        .call::<FinalizeSession>(&FinalizeSessionRequest {
+            session_id: id,
+            report_shared_port_collisions: false,
+        })
         .await
     {
         minimald_rpc::Errorable::Ok(_) => {}

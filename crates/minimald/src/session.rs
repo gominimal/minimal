@@ -1173,17 +1173,60 @@ impl Session {
     /// manager's message handling, a rename — publishes such a hand at the
     /// `127.0.0.1` interim at once, and the present landing moves it.
     #[cfg(target_os = "linux")]
-    async fn register_hostname(&self, record: &Record, wait_for_verdict: bool) {
+    async fn register_hostname(
+        &self,
+        record: &Record,
+        wait_for_verdict: bool,
+    ) -> Vec<crate::net::dns::SharedPortCollision> {
         if !self.owns_hostname_route(record) {
-            return;
+            return Vec::new();
         }
         let name = registry_name(record);
+        // The hostname proxy's port for the box's own-address set (design
+        // §7.1): resolved through the serving transition (see
+        // [`crate::net::hostname_proxy_serving_port`]) so a registration
+        // racing the proxy's detached startup cannot compile the seeded —
+        // possibly relocated (NET-025) — port into the node's opening. Only a
+        // registration that may wait (`wait_for_verdict`) waits for it: the
+        // others run inside the manager's own message handling, where a
+        // wait would park every other session's operation, so they read the
+        // port only if it is already settled and fail closed otherwise. What
+        // that withholds is the caller check's reach to the node address at
+        // the proxy's own port — a proxied request back at the proxy — never
+        // the box's relay opening, which the attach path resolves itself.
         // Scoped: the switch lock is dropped before the registry is taken, so
         // no path holds both.
-        let (subnet, hostname_proxy_port) = {
+        let (subnet, settled_port, unsettled) = {
             let switch = self.net_switch.lock().await;
-            (switch.subnet(), switch.hostname_proxy_port())
+            (
+                switch.subnet(),
+                switch.serving_hostname_proxy_port(),
+                switch.hostname_proxy_unsettled(),
+            )
         };
+        // Only an `OwnIp` box carries the opening: a `HostNet` one never
+        // waits for it. The wait does not count the box as stranded: this
+        // is the caller check's copy, not the box's relay opening, which
+        // the attach path resolves (and counts) itself.
+        let hostname_proxy_port = match record.network {
+            sessions::NetworkMode::OwnIp if wait_for_verdict => {
+                crate::net::hostname_proxy_serving_port(&self.net_switch, None).await
+            }
+            sessions::NetworkMode::OwnIp if unsettled => {
+                // Said, not silent: this registration keeps no opening at
+                // the node address for the caller check until the session
+                // re-registers (a rename, a re-finalize, a restart).
+                tracing::info!(
+                    session = %record.id,
+                    "the hostname proxy is not serving yet; this session's \
+                     caller check is registered with no node-address opening \
+                     (design §7.1)"
+                );
+                settled_port
+            }
+            _ => settled_port,
+        };
+        let mut shared_port_collisions = Vec::new();
         match record.network {
             sessions::NetworkMode::OwnIp => {
                 // NET-010/NET-011: finalize publishes the box's declaration
@@ -1392,8 +1435,12 @@ impl Session {
                     // collisions on this box, the one that yields, so its
                     // attach skips those forwards instead of failing on a bind
                     // the forwarder refuses. The box activates and stays
-                    // usable; its other forwards bind as usual.
-                    reg.publish_own_address(record.id, &name, address, declared.clone());
+                    // usable; its other forwards bind as usual. The list rides
+                    // the finalize reply so the activating client can warn —
+                    // the daemon log line is the only other trace, and a user
+                    // reading exit 0 never sees it.
+                    shared_port_collisions =
+                        reg.publish_own_address(record.id, &name, address, declared.clone());
                 }
                 // A box whose grant was withheld registers no name: the
                 // registry's own route is built only from a published
@@ -1423,6 +1470,7 @@ impl Session {
         if matches!(record.network, sessions::NetworkMode::OwnIp) {
             self.report_unrecorded_publishes();
         }
+        shared_port_collisions
     }
 
     /// Resolves a hand to the address the box publishes at (NET-123 §7.1):
@@ -2442,7 +2490,17 @@ impl Session {
                 // ([`Self::deregister_hostname`]). A retried finalize
                 // registers again, which is idempotent for one session id.
                 #[cfg(target_os = "linux")]
-                self.register_hostname(&record, true).await;
+                let shared_port_collisions: Vec<minimald_rpc::SharedPortCollision> = self
+                    .register_hostname(&record, true)
+                    .await
+                    .into_iter()
+                    .map(|c| minimald_rpc::SharedPortCollision {
+                        port: c.port,
+                        held_by: c.other,
+                    })
+                    .collect();
+                #[cfg(not(target_os = "linux"))]
+                let shared_port_collisions: Vec<minimald_rpc::SharedPortCollision> = Vec::new();
 
                 let mut ran: Vec<minimald_rpc::RanHook> = Vec::new();
                 if self.has_hooks_for(crate::hooks::HookEvent::Activate) {
@@ -2495,6 +2553,7 @@ impl Session {
                 Ok(minimald_rpc::FinalizeSessionResponse {
                     activate_hooks: ran,
                     package_check_skipped,
+                    shared_port_collisions,
                 })
             }
             SessionStatus::Pending => Err(std::io::Error::new(

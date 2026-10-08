@@ -596,7 +596,37 @@ pub async fn cmd_ls(global: &GlobalArgs, args: LsArgs) -> Result<(), anyhow::Err
         &surfaces,
         &vm_answerers,
     )?;
+    // NET-129: after the table, one stderr line per port a box yields at a
+    // shared address. `--json` carries the same rows on each entry, so it
+    // prints none and stdout stays the parser's.
+    if !args.json {
+        for line in shared_port_collision_lines(&listings) {
+            eprintln!("{line}");
+        }
+    }
     Ok(())
+}
+
+/// The lines `min ls` prints on stderr after the table for each declared
+/// port a box yields because another box at the same shared loopback
+/// address holds it (NET-129, first-come): the box, by name or by id when it
+/// has none, the port, and the box that holds it. Pure, so tests can assert
+/// the wording without capturing stderr.
+#[must_use]
+pub fn shared_port_collision_lines(listings: &[VmListing]) -> Vec<String> {
+    listings
+        .iter()
+        .flat_map(|listing| &listing.resp.sessions)
+        .flat_map(|entry| {
+            let session = entry.name.clone().unwrap_or_else(|| entry.id.to_string());
+            entry.shared_port_collisions.iter().map(move |collision| {
+                format!(
+                    "warning: {session}: port {} is held by {}; not forwarded",
+                    collision.port, collision.held_by
+                )
+            })
+        })
+        .collect()
 }
 
 /// The warning `min ls` and `min session activate` print when the daemon

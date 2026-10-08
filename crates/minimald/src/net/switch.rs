@@ -968,8 +968,8 @@ fn is_legacy_host_literal(frame: &[u8], alias: Ipv4Addr) -> bool {
 /// rate-limited, naming the box and [`HOST_MIN_INTERNAL`] — instead of letting
 /// the verdict drop them silently.
 struct LegacyHostNotice {
-    /// The box's switch IP — the relay gate's `session_id` label, the same
-    /// identity the policy warnings name.
+    /// The box's switch IP — the relay gate's label, the same identity the
+    /// policy warnings name; logged here as `switch_addr`.
     label: String,
     /// The literal address the notice watches for.
     alias: Ipv4Addr,
@@ -1002,7 +1002,7 @@ impl LegacyHostNotice {
             return false;
         }
         tracing::info!(
-            session = %self.label,
+            switch_addr = %self.label,
             deprecated = %self.alias,
             replacement = HOST_MIN_INTERNAL,
             "connection to the deprecated literal host address; \
@@ -1242,7 +1242,8 @@ pub struct SessionGate {
     /// undeclared datagram, or one the relay answered itself (NET-136), cannot
     /// open a window.
     conntrack: Arc<UdpConntrack>,
-    /// The target PTask's switch IP, carried as the R2.7 log's `session_id`.
+    /// The target PTask's switch IP, carried as the R2.7 warning's
+    /// `session_id` and as `switch_addr` on the relay's other log lines.
     label: String,
     /// Rate-limited emitter for dropped-frame warnings (R2.7), keyed by box and
     /// rule, shared by both legs and the NET-004 notice.
@@ -1960,7 +1961,7 @@ impl SessionGate {
                 // admitted reads so in a bundle).
                 if self.flows.claim_first_record() {
                     tracing::info!(
-                        session_id = %self.label,
+                        switch_addr = %self.label,
                         port = pkt.dst.port(),
                         client = %pkt.src,
                         "recorded the box's first inbound flow at its published port"
@@ -1971,7 +1972,7 @@ impl SessionGate {
                 // reclaims one, which a bundle's tail should be able to say.
                 if filled && self.flows.claim_table_filled() {
                     tracing::info!(
-                        session_id = %self.label,
+                        switch_addr = %self.label,
                         cap = self.flows.cap(),
                         "the box's inbound-flow table has filled; new inbound flows are refused at the cap"
                     );
@@ -5947,7 +5948,7 @@ pub(crate) mod tests {
             "a dropped frame to the literal still notices: {logged}"
         );
         for expected in [
-            "session=100.64.0.77",
+            "switch_addr=100.64.0.77",
             "deprecated=100.64.255.254",
             "replacement=\"host.min.internal\"",
         ] {
@@ -5956,6 +5957,10 @@ pub(crate) mod tests {
                 "missing {expected:?} in: {logged}"
             );
         }
+        assert!(
+            !logged.contains("session=100.64.0.77"),
+            "the box's address is not named as a session: {logged}"
+        );
     }
 
     /// NET-084: a frame whose source is not the relay's lease never reaches
@@ -6262,8 +6267,12 @@ pub(crate) mod tests {
             "the first-record line: {logged}"
         );
         assert!(
-            logged.contains("session_id=100.64.0.9") && logged.contains("port=8080"),
+            logged.contains("switch_addr=100.64.0.9") && logged.contains("port=8080"),
             "the line names the box and the published port: {logged}"
+        );
+        assert!(
+            !logged.contains("session_id=100.64."),
+            "the box's address is not named as a session id: {logged}"
         );
     }
 
