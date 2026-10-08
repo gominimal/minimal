@@ -1131,12 +1131,18 @@ pub(crate) fn live_gate(addr: Ipv4Addr) -> Option<Arc<SessionGate>> {
 
 /// Whether anything this daemon's relays hold still names `addr`: a live
 /// gate published under it, or a flow some live gate tracks with it as the
-/// peer (an outbound UDP flow, an inbound TCP flow's tail, or a terminated
-/// flow's tail) inside that record's TTL. The allocator hands a released
-/// draw again only when this is false, so no state left from the address's
-/// last holder can admit traffic for its next one. DNS admission windows
-/// are not consulted: the infrastructure deny set refuses the switch plane
-/// (`100.64.0.0/10`), so a pin never holds a switch address.
+/// peer — an outbound UDP flow, an inbound TCP flow's tail or a terminated
+/// flow's tail inside that record's TTL, or a reply-flow record (NET-040)
+/// the address opened toward the gate's box that neither side's FIN or
+/// RST has ended and the record's idle cap has not expired. The allocator
+/// hands a released draw again only when this is false, so no state left
+/// from the address's last holder can admit traffic for its next one, and
+/// a conversation a live box is still in with the address holds it. DNS
+/// admission windows are not consulted: a box-zone answer pins nothing
+/// (the DNS gate validates it and leaves reach to connect time), and an
+/// ordinary name's answer inside the switch plane is refused as
+/// infrastructure by the rebinding check (NET-072), so a pin never holds a
+/// switch address.
 pub(super) fn address_referenced(addr: Ipv4Addr) -> bool {
     let gates: Vec<Arc<SessionGate>> = {
         let table = LIVE_GATES.lock().expect("live gate table poisoned");
@@ -1462,15 +1468,20 @@ impl SessionGate {
     }
 
     /// Whether any flow this gate tracks names `peer` as its remote end and
-    /// is still inside its TTL at `now` (see [`address_referenced`]).
+    /// is still inside its TTL at `now`, or a reply-flow record the peer
+    /// opened is still live — a TCP conversation the box is in, which the
+    /// box's own replies keep refreshing and only a FIN, an RST or the idle
+    /// cap ends (see [`address_referenced`]).
     fn references_peer(&self, peer: Ipv4Addr, now: Instant) -> bool {
         let live = |seen: &Instant, ttl: Duration| now.duration_since(*seen) < ttl;
-        self.conntrack
-            .flows
-            .lock()
-            .expect("UdpConntrack mutex poisoned")
-            .iter()
-            .any(|(key, seen)| key.0 == peer && live(seen, UDP_FLOW_TTL))
+        self.flows.names_peer(peer.octets(), now)
+            || self
+                .conntrack
+                .flows
+                .lock()
+                .expect("UdpConntrack mutex poisoned")
+                .iter()
+                .any(|(key, seen)| key.0 == peer && live(seen, UDP_FLOW_TTL))
             || self
                 .inbound_flows
                 .lock()
@@ -2152,6 +2163,15 @@ impl ReplyFlowGate {
             .lock()
             .expect("the reply-flow lock is held only across one decision")
             .observe_inbound(tuple, flags, now)
+    }
+
+    /// The address-reuse question ([`SessionGate::references_peer`]): whether
+    /// a record live at `now` names `peer` as its client.
+    fn names_peer(&self, peer: [u8; 4], now: Instant) -> bool {
+        self.flows
+            .lock()
+            .expect("the reply-flow lock is held only across one decision")
+            .names_peer(peer, now)
     }
 
     /// Ends every recorded flow ([`SessionGate::end_inbound_flows`]).
@@ -6181,6 +6201,7 @@ pub(crate) mod tests {
             holder,
             &policy,
             SwitchSubnet::default(),
+            None,
         ));
         register_live_gate(holder, &gate);
         assert!(address_referenced(holder), "a live row names its address");
@@ -6195,6 +6216,7 @@ pub(crate) mod tests {
             peer,
             &policy,
             SwitchSubnet::default(),
+            None,
         ));
         register_live_gate(peer, &peer_gate);
         let datagram = udp_frame(peer, 40000, holder, 53);
@@ -6207,6 +6229,93 @@ pub(crate) mod tests {
         );
         drop(peer_gate);
         assert!(!address_referenced(holder), "nothing names it any more");
+    }
+
+    /// A TCP conversation a live box is still in with the address holds it
+    /// past any tail's TTL: the reply-flow record the address opened toward
+    /// the box's published port names it while the record is live — the
+    /// box's own replies refresh it — and the record's end, a FIN or RST
+    /// from either side, is what lets the address go.
+    #[test]
+    fn address_referenced_follows_live_tcp_conversations() {
+        // Addresses no other test publishes in the process-wide table.
+        let holder = Ipv4Addr::new(100, 64, 78, 2);
+        let peer = Ipv4Addr::new(100, 64, 78, 3);
+        let policy = sessions::SessionPolicy::default();
+        let peer_gate = Arc::new(SessionGate::for_session(
+            peer.to_string(),
+            peer,
+            &policy,
+            SwitchSubnet::default(),
+            None,
+        ));
+        register_live_gate(peer, &peer_gate);
+        assert!(!address_referenced(holder), "no conversation yet");
+
+        // The holder opens a connection to a port the peer published: the
+        // record the ingress leg opens (driven at the record here, the
+        // admission already decided) names the holder.
+        let open = parse_ipv4_l4(&egress_tcp_segment(holder, 40000, peer, 8080, SYN))
+            .expect("the SYN parses");
+        let now = Instant::now();
+        assert_eq!(
+            peer_gate
+                .flows
+                .observe_inbound(reply_tuple(&open), SYN, now),
+            egress::InboundFlow::Recorded { filled: false }
+        );
+        assert!(
+            address_referenced(holder),
+            "a live record of the holder's connection names it"
+        );
+        // The peer's reply keeps the record live, and the reference with it.
+        let answer = parse_ipv4_l4(&egress_tcp_segment(peer, 8080, holder, 40000, ACK))
+            .expect("the reply parses");
+        assert!(peer_gate.flows.reply_admits(reply_tuple(&answer), ACK, now));
+        assert!(address_referenced(holder), "the box's reply refreshes it");
+        // The peer's FIN ends the conversation, and with it the reference.
+        assert!(
+            peer_gate
+                .flows
+                .reply_admits(reply_tuple(&answer), FIN | ACK, now)
+        );
+        assert!(
+            !address_referenced(holder),
+            "the record the box's FIN ended holds nothing"
+        );
+
+        // The same from the holder's side: a connection it resets is over.
+        assert_eq!(
+            peer_gate
+                .flows
+                .observe_inbound(reply_tuple(&open), SYN, now),
+            egress::InboundFlow::Recorded { filled: false }
+        );
+        assert!(address_referenced(holder));
+        assert_eq!(
+            peer_gate
+                .flows
+                .observe_inbound(reply_tuple(&open), RST | ACK, now),
+            egress::InboundFlow::Ended
+        );
+        assert!(
+            !address_referenced(holder),
+            "the record the holder's RST ended holds nothing"
+        );
+
+        // And a record the idle cap expired names nothing either, the
+        // bound the allocator's quarantine is the floor of.
+        assert_eq!(
+            peer_gate
+                .flows
+                .observe_inbound(reply_tuple(&open), SYN, now),
+            egress::InboundFlow::Recorded { filled: false }
+        );
+        assert!(peer_gate.references_peer(holder, now));
+        assert!(
+            !peer_gate.references_peer(holder, now + egress::REPLY_TCP_IDLE_CAP),
+            "an expired record holds nothing"
+        );
     }
 
     /// TCP FIN, one of the flags the reply-flow record's end reads (`RST`
