@@ -513,47 +513,34 @@ fn policy_lines(model: &Model, key: &SessionKey) -> Vec<Line<'static>> {
                     "egress",
                     Style::default().add_modifier(Modifier::BOLD),
                 ));
-                match &policy.egress {
-                    sessions::EffectiveEgress::DenyAll => {
-                        lines.push(Line::raw("  deny-all (default)"));
+                // The verdict by name, from the same `sessions` helper
+                // `min session policy` prints: a default marked as one, a
+                // declared deny-all unmarked (the box chose it), never rows
+                // of blankness.
+                if let Some(label) = policy.egress.summary_label() {
+                    lines.push(Line::raw(format!("  {label}")));
+                } else if let sessions::EffectiveEgress::Declared(egress) = &policy.egress {
+                    policy_list(&mut lines, "subnets", &egress.allow_subnets);
+                    policy_list(&mut lines, "dns hosts", &egress.allow_dns_hosts);
+                    match &egress.allow_protocols {
+                        None => lines.push(Line::raw("  protocols  allow-all")),
+                        Some(protos) => lines.push(Line::raw(format!(
+                            "  protocols  {}",
+                            protos
+                                .iter()
+                                .map(|p| p.to_string())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ))),
                     }
-                    sessions::EffectiveEgress::AllowAll => {
-                        lines.push(Line::raw("  allow-all (default)"));
-                    }
-                    // A declared deny-all — every allow list present and
-                    // empty — prints by name, as `min session policy` does,
-                    // never as rows of blankness. Unmarked: this deny-all is
-                    // the box's own declaration, not the rollout's default
-                    // forced on an absent one.
-                    sessions::EffectiveEgress::Declared(egress)
-                        if egress.allow_subnets.as_ref().is_some_and(Vec::is_empty)
-                            && egress.allow_dns_hosts.as_ref().is_some_and(Vec::is_empty)
-                            && egress.allow_protocols.as_ref().is_some_and(Vec::is_empty) =>
-                    {
-                        lines.push(Line::raw("  deny-all"));
-                    }
-                    sessions::EffectiveEgress::Declared(egress) => {
-                        policy_list(&mut lines, "subnets", &egress.allow_subnets);
-                        policy_list(&mut lines, "dns hosts", &egress.allow_dns_hosts);
-                        match &egress.allow_protocols {
-                            None => lines.push(Line::raw("  protocols  allow-all")),
-                            Some(protos) => lines.push(Line::raw(format!(
-                                "  protocols  {}",
-                                protos
-                                    .iter()
-                                    .map(|p| p.to_string())
-                                    .collect::<Vec<_>>()
-                                    .join(", ")
-                            ))),
-                        }
-                        // The denied ranges are subtractive — carved out of
-                        // what the allow fields admit — so unlike the allow
-                        // fields an unset row means "nothing denied", not
-                        // "allow-all".
-                        match &egress.deny_subnets {
-                            None => lines.push(Line::raw("  deny subnets  (none)")),
-                            Some(subnets) => lines
-                                .push(Line::raw(format!("  deny subnets  {}", subnets.join(", ")))),
+                    // The denied ranges are subtractive — carved out of
+                    // what the allow fields admit — so unlike the allow
+                    // fields an unset row means "nothing denied", not
+                    // "allow-all".
+                    match &egress.deny_subnets {
+                        None => lines.push(Line::raw("  deny subnets  (none)")),
+                        Some(subnets) => {
+                            lines.push(Line::raw(format!("  deny subnets  {}", subnets.join(", "))))
                         }
                     }
                 }
