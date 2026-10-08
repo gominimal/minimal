@@ -2482,6 +2482,11 @@ pub fn format_policy(
     // real (the same case the TUI's detail pane replaces with this note).
     if network == sessions::NetworkMode::NoNet {
         writeln!(out, "No network policy (NoNet)")?;
+        // A lane the box declared is still shown, marked as not in effect:
+        // the view states what was declared (NET-134).
+        if effective.credentialed_upstream.is_some() {
+            writeln!(out, "  {}", sessions::CredentialedUpstream::policy_row(network))?;
+        }
         return Ok(());
     }
     writeln!(out, "egress")?;
@@ -2547,12 +2552,13 @@ pub fn format_policy(
     // stays refused. Printed only when the policy carries the lane;
     // `None`, the declaration every policy without one holds, is no lane,
     // and a row for it would claim one — silence says the box runs without
-    // the credential, under its egress rules alone. A switch-fabric
-    // surface, like the baseline block below: the lane is admitted at the
-    // switch's gate, which only own-address boxes sit behind, so a
-    // host-address box prints no row for a lane nothing enforces there.
-    if network == sessions::NetworkMode::OwnIp && effective.credentialed_upstream.is_some() {
-        writeln!(out, "  credentialed upstream  box egress proxy listener")?;
+    // the credential, under its egress rules alone. The lane is admitted at
+    // the switch's gate, which only own-address boxes sit behind, but a
+    // declaration in another mode is still shown: the row carries a
+    // `(not in effect: <mode> box)` mark there rather than hiding what the
+    // box declared. The text is shared with the `min dash` detail pane.
+    if effective.credentialed_upstream.is_some() {
+        writeln!(out, "  {}", sessions::CredentialedUpstream::policy_row(network))?;
     }
     // The node-plane baseline set, beside the box's rules (NET-130): the
     // helper's built-in enumeration of the categories the in-VM daemon's own
@@ -2864,11 +2870,30 @@ struct PolicyJson<'a> {
     /// restated for a machine: a box without the lane has no key, so a
     /// client cannot mistake an absent lane for a null one.
     #[serde(skip_serializing_if = "Option::is_none")]
-    credentialed_upstream: Option<&'a sessions::CredentialedUpstream>,
+    credentialed_upstream: Option<PolicyCredentialedUpstreamJson>,
     #[serde(skip_serializing_if = "Option::is_none")]
     node_plane_baseline: Option<PolicyBaselineJson>,
     #[serde(skip_serializing_if = "Option::is_none")]
     live_ingress: Option<LiveIngressJson>,
+}
+
+/// A declared credentialed-upstream lane as the document carries it:
+/// `effective` is whether the box's network mode admits the lane (own-address
+/// only), the machine form of the text row's `(not in effect: …)` mark.
+#[derive(serde::Serialize)]
+struct PolicyCredentialedUpstreamJson {
+    effective: bool,
+}
+
+impl PolicyCredentialedUpstreamJson {
+    fn from_effective(
+        effective: &sessions::EffectiveSessionPolicy,
+        network: sessions::NetworkMode,
+    ) -> Option<Self> {
+        effective.credentialed_upstream.as_ref().map(|_| Self {
+            effective: sessions::CredentialedUpstream::in_effect(network),
+        })
+    }
 }
 
 /// The live rows as the document carries them — the two states a client
@@ -2913,7 +2938,10 @@ pub fn write_policy_json(
             network,
             egress: None,
             ingress: None,
-            credentialed_upstream: None,
+            // A declared lane is still carried, marked not in effect.
+            credentialed_upstream: PolicyCredentialedUpstreamJson::from_effective(
+                effective, network,
+            ),
             node_plane_baseline: None,
             live_ingress: None,
         }
@@ -2950,11 +2978,11 @@ pub fn write_policy_json(
                 .then(|| PolicyIngressJson::from_effective(effective.ingress.as_ref())),
             // The lane rides the document the way the text rendering prints
             // it: only when declared, so the key's absence is the no-lane
-            // claim. Held to the same own-address gate: the switch is the
-            // only place the lane is admitted.
-            credentialed_upstream: (network == sessions::NetworkMode::OwnIp)
-                .then_some(effective.credentialed_upstream.as_ref())
-                .flatten(),
+            // claim. Carried in every mode; `effective` says whether this
+            // mode admits it, since the switch is the only place it is.
+            credentialed_upstream: PolicyCredentialedUpstreamJson::from_effective(
+                effective, network,
+            ),
             node_plane_baseline,
             // The wire's own rows, `pending` included — an empty list is a
             // claim about the box (it published nothing), which is what the
@@ -4746,7 +4774,8 @@ mod tests {
     /// a box that declared none prints nothing, the same silence a
     /// lane-less box always read, so the render cannot claim a lane the
     /// box does not run. The document carries the same distinction for a
-    /// machine: the key only when the lane exists, never nulled.
+    /// machine: the key only when the lane exists, never nulled. A mode
+    /// the lane has no effect in still shows the declaration, marked.
     #[test]
     fn policy_render_carries_the_credentialed_upstream_row_when_declared() {
         let laned = EffectiveSessionPolicy {
@@ -4790,7 +4819,7 @@ mod tests {
         let laned_json = json_of(&laned);
         assert_eq!(
             laned_json["credentialed_upstream"],
-            serde_json_lenient::json!({}),
+            serde_json_lenient::json!({ "effective": true }),
             "the document carries the lane as a key when it is declared: {laned_json}"
         );
         let unlaned_json = json_of(&unlaned);
@@ -4800,20 +4829,42 @@ mod tests {
         );
 
         // A host-address box sits behind no switch gate, so a declared
-        // lane there is admitted nowhere: neither surface claims it.
+        // lane there is admitted nowhere — but the view still shows what
+        // the box declared, marked as not in effect on both surfaces.
         let mut out = Vec::new();
         format_policy(&mut out, &laned, NetworkMode::HostNet, None, None).unwrap();
         let rendered = String::from_utf8(out).unwrap();
         assert!(
-            !rendered.contains("credentialed upstream"),
-            "a host-address box must print no lane row, got: {rendered}"
+            rendered.contains(
+                "  credentialed upstream  box egress proxy listener \
+                 (not in effect: host_ip box)\n"
+            ),
+            "a host-address box must show its declared lane, marked, got: {rendered}"
         );
         let mut out = Vec::new();
         write_policy_json(&mut out, &laned, NetworkMode::HostNet, None, Ok(Vec::new())).unwrap();
         let host_json: serde_json_lenient::Value = serde_json_lenient::from_slice(&out).unwrap();
+        assert_eq!(
+            host_json["credentialed_upstream"],
+            serde_json_lenient::json!({ "effective": false }),
+            "a host-address box carries its declared lane as not in effect, got: {host_json}"
+        );
+
+        // A none box keeps the declaration visible the same way.
+        let mut out = Vec::new();
+        format_policy(&mut out, &laned, NetworkMode::NoNet, None, None).unwrap();
+        let rendered = String::from_utf8(out).unwrap();
         assert!(
-            host_json.get("credentialed_upstream").is_none(),
-            "a host-address box carries no lane key, got: {host_json}"
+            rendered.contains("(not in effect: none box)"),
+            "a none box must show its declared lane, marked, got: {rendered}"
+        );
+        let mut out = Vec::new();
+        write_policy_json(&mut out, &laned, NetworkMode::NoNet, None, Ok(Vec::new())).unwrap();
+        let none_json: serde_json_lenient::Value = serde_json_lenient::from_slice(&out).unwrap();
+        assert_eq!(
+            none_json["credentialed_upstream"],
+            serde_json_lenient::json!({ "effective": false }),
+            "a none box carries its declared lane as not in effect, got: {none_json}"
         );
     }
 

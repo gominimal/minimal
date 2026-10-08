@@ -3076,9 +3076,10 @@ mod tests {
     /// the policy's `egress` is. NET-134's lane is the one deliberate
     /// exception, and this test pins both of its halves: a lane-less reply
     /// serializes without the lane's key and so still decodes in the old
-    /// client's strict shape, while a laned reply — a fact that rides
-    /// nowhere else — is refused by that client, the visible error the
-    /// lane's issue took over a lane the report is silent about.
+    /// client's strict shape, while a laned reply — a fact `min session
+    /// policy` reads from no other reply — is refused by that client, the
+    /// visible error the lane's issue took over a lane the report is
+    /// silent about.
     #[test]
     fn effective_policy_reply_decodes_in_the_old_clients_strict_shape() {
         // The reply this build serves for a lane-less box: no enforcement
@@ -3134,9 +3135,9 @@ mod tests {
                 r#"{"egress":"deny_all","ingress":null,"credentialed_upstream":{}}"#
             )
             .is_err(),
-            "the old client refuses a laned reply too — the lane rides nowhere \
-             else, so the refusal is the visible error the lane's issue chose \
-             over a silent omission",
+            "the old client refuses a laned reply too — `min session policy` \
+             reads no other reply that carries the lane, so the refusal is the \
+             visible error the lane's issue chose over a silent omission",
         );
 
         // The runtime-facts reply keeps the property the strict shapes

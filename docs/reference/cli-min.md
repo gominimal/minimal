@@ -291,8 +291,8 @@ marks an own-address box once the deny-all default is in force.
 its host's network namespace. The `(default)` mark distinguishes a verdict
 the box declared from the same verdict the default gave it.
 
-An own-address box activated with `--credentialed-upstream` prints one
-more row in the egress block:
+A box activated with `--credentialed-upstream` prints one more row in
+the egress block:
 
 ```
 egress
@@ -305,13 +305,15 @@ frames to the box egress proxy's listener, and the proxy checks their
 credential. The rows above never decide that destination. The listener is
 the lane's whole reach. The gate still refuses everything else the box
 sends to the proxy's address. A box without the lane omits the row, so
-the missing row means the box runs without a lane. A host-address box
-omits it too: the gate that admits the lane sits only in front of
-own-address boxes.
+the missing row means the box runs without a lane. The gate that admits
+the lane sits only in front of own-address boxes. A box in another mode
+that declared a lane still prints the row, marked with its mode, for
+example `(not in effect: host_ip box)`.
 
-The ingress block lists the published port mappings the session's `--ingress` flags
-declared (or `deny-all` when the box leaves ingress undeclared). The
-`dynamic ports` row joins them when the box declared a `--dynamic-range`.
+The ingress block lists the published port mappings the session's
+`--ingress` flags declared (or `deny-all` when the box leaves ingress
+undeclared). The `dynamic ports` row joins them when the box declared a
+`--dynamic-range`.
 The `dynamic ingress` row always prints, with the stance that decides the
 box's own publish requests. A box that set no `--dynamic-ingress`
 reads `deny (default)`, the deny the absence evaluates to, marked the way
@@ -360,7 +362,7 @@ Each `live_ingress` row is the daemon's mapping object, with its `pending`
 state (`true`, `false`, or `null` for a daemon older than the field). The
 document leaves out the blocks the text output leaves out. A host-address
 session has no `ingress` key, and a `--network none` box has only `schema`
-and `network`. The `ingress` block has a `kind` tag, `deny_all` or
+and `network`, plus `credentialed_upstream` when it declared a lane. The `ingress` block has a `kind` tag, `deny_all` or
 `declared`, so a client reads one field to branch. Both kinds carry
 `dynamic_ingress`, the resolved stance: `allow`, `ask`, or `deny`, never
 `null`. Both also carry `dynamic_ingress_source`. It reads `declared` when
@@ -368,10 +370,11 @@ the box set `--dynamic-ingress`, and `default` when the stance is the deny
 an absent setting gives. Both keys are new in the `min/v1/session-policy`
 shape. A client written against the earlier document ignores them. A
 client that reads them finds a value in every `ingress` object. The
-document also carries `credentialed_upstream`, an object, when an
-own-address box declared a lane. It leaves the key out when the box declared none. The
-text row follows the same rule, so a missing key means the box runs
-without a lane.
+document also carries `credentialed_upstream`, an object, when the box
+declared a lane, in any network mode. Its `effective` field is `true`
+for an own-address box and `false` for any other, the text row's
+`(not in effect: …)` mark. The document leaves the key out when the box
+declared no lane, so a missing key means the box runs without one.
 
 With `-o json`, a failed run writes one `min/v1/error` object on stderr and
 exits non-zero, with no plain-text error line. The `code` field names the
