@@ -70,8 +70,9 @@ pub enum AttachError {
     /// The session host's loop ended, but this box carries host-handed
     /// addresses (T66) whose host-side row the ended loop already withdrew
     /// (NET-138); the host gate drops re-attached frames from an unregistered
-    /// source, so re-minting here would re-attach "rowless". The client must
-    /// detach and re-attach against a fresh registration.
+    /// source, so re-minting here would re-attach "rowless". Only the box's
+    /// creator registers a row, and today only a session activation does, so
+    /// the message names that as the way forward.
     BoxHostRowEnded,
 }
 
@@ -111,8 +112,10 @@ impl fmt::Display for AttachError {
             }
             AttachError::BoxHostRowEnded => write!(
                 f,
-                "session host ended and this box holds a host-side row; detach \
-                 and re-attach against a fresh registration"
+                "this session's shell exited, which ended its host-side network \
+                 registration, and the daemon cannot register it again; destroy \
+                 the session with `min session destroy` and start a new one with \
+                 `min session activate`"
             ),
         }
     }
@@ -4044,16 +4047,10 @@ impl Session {
                         // and the host gate drops re-attached frames from an
                         // unregistered source — re-minting here would
                         // re-attach "rowless" and silently drop the box's
-                        // frames. Refuse instead of re-minting: the box must
-                        // be detached and re-attached against a fresh
-                        // registration.
-                        let holds_host_row = self
-                            .record
-                            .record()
-                            .await
-                            .map_err(AttachError::LoadoutFailed)?
-                            .box_addresses
-                            .is_some();
+                        // frames. Refuse instead of re-minting: only the
+                        // box's creator registers a row (NET-138).
+                        // `holds_host_row` is the Active-gated record read at
+                        // the top of this attach.
                         if holds_host_row {
                             return Err(AttachError::BoxHostRowEnded);
                         }

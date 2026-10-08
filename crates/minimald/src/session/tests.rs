@@ -3455,8 +3455,12 @@ async fn a_box_holding_a_host_row_refuses_remint_after_its_host_loop_ends() {
         "the refusal must be surfaced as an attach error; got: {refusal:?}"
     );
     assert!(
-        refusal.contains("host-side row"),
+        refusal.contains("host-side network registration"),
         "the refusal must name the host-row cause; got: {refusal:?}"
+    );
+    assert!(
+        refusal.contains("min session activate"),
+        "the refusal must name the step that registers a box again; got: {refusal:?}"
     );
     assert_eq!(
         super::launch_publish_seam::observed(id).len(),
