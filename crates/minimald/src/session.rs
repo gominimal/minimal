@@ -67,6 +67,12 @@ pub enum AttachError {
     /// The session host is alive but busy (its mailbox stayed full past the
     /// attach deadline). The client should retry.
     SessionBusy,
+    /// The session host's loop ended, but this box carries host-handed
+    /// addresses (T66) whose host-side row the ended loop already withdrew
+    /// (NET-138); the host gate drops re-attached frames from an unregistered
+    /// source, so re-minting here would re-attach "rowless". The client must
+    /// detach and re-attach against a fresh registration.
+    BoxHostRowEnded,
 }
 
 impl std::error::Error for AttachError {
@@ -103,6 +109,11 @@ impl fmt::Display for AttachError {
             AttachError::SessionBusy => {
                 write!(f, "session host is busy; retry the attach once it drains")
             }
+            AttachError::BoxHostRowEnded => write!(
+                f,
+                "session host ended and this box holds a host-side row; detach \
+                 and re-attach against a fresh registration"
+            ),
         }
     }
 }
@@ -4027,6 +4038,25 @@ impl Session {
                 {
                     Ok(()) => Ok(()),
                     Err(session_host::HostAttachError::Closed(channel, sz)) => {
+                        // A box whose record carries host-handed addresses
+                        // (T66) has a host-side row keyed on that address.
+                        // The ended loop already withdrew the row (NET-138),
+                        // and the host gate drops re-attached frames from an
+                        // unregistered source — re-minting here would
+                        // re-attach "rowless" and silently drop the box's
+                        // frames. Refuse instead of re-minting: the box must
+                        // be detached and re-attached against a fresh
+                        // registration.
+                        let holds_host_row = self
+                            .record
+                            .record()
+                            .await
+                            .map_err(AttachError::LoadoutFailed)?
+                            .box_addresses
+                            .is_some();
+                        if holds_host_row {
+                            return Err(AttachError::BoxHostRowEnded);
+                        }
                         // The host's loop has ended; mint a fresh one from the
                         // channel it handed back.
                         self.mint_session_host(

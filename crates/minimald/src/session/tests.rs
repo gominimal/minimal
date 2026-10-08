@@ -3411,6 +3411,60 @@ async fn an_activate_hook_launch_finds_the_box_s_address_already_published() {
     assert_eq!(address, handed, "the name answers at the hand, exactly");
 }
 
+/// A box whose record carries host-handed addresses (T66) has a host-side
+/// row keyed on that address. When its host loop ends — the shell exited —
+/// the ended loop already withdrew the row (NET-138), so re-minting a fresh
+/// host here would re-attach "rowless": the host gate silently drops the
+/// box's frames from an unregistered source. The attach must refuse with the
+/// typed `BoxHostRowEnded` refusal (surfaced to the client on the channel)
+/// instead of re-minting, and no second host may launch — the hands are the
+/// host-side creator's, and re-registering a row is exactly what a daemon
+/// must never do.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_box_holding_a_host_row_refuses_remint_after_its_host_loop_ends() {
+    let handed = std::net::Ipv4Addr::new(127, 0, 64, 23);
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = finalize_handed_own_ip_session(
+        &mut client,
+        "web",
+        std::net::Ipv4Addr::new(100, 64, 128, 23),
+        handed,
+    )
+    .await;
+
+    // The first attach mints the host and arms the mock shell.
+    let mut channel = client.open_shell(id).await;
+    await_echo(&mut channel).await;
+    assert_eq!(
+        super::launch_publish_seam::observed(id).len(),
+        1,
+        "the first attach is the box's one and only launch so far"
+    );
+
+    // Exit the shell: the host loop ends, withdrawing the host-side row.
+    keep_exit(&mut channel).await;
+
+    // Re-attaching must refuse rather than re-mint a rowless host. The
+    // refusal rides the channel as an attach error, then the channel closes.
+    let mut second = client.open_shell(id).await;
+    let refusal = collect_to_close(&mut second).await;
+    assert!(
+        refusal.contains("Error attaching to session:"),
+        "the refusal must be surfaced as an attach error; got: {refusal:?}"
+    );
+    assert!(
+        refusal.contains("host-side row"),
+        "the refusal must name the host-row cause; got: {refusal:?}"
+    );
+    assert_eq!(
+        super::launch_publish_seam::observed(id).len(),
+        1,
+        "no second host may be minted for a box whose host row was withdrawn"
+    );
+}
+
 /// #2070's error path: the publish now precedes the activate hooks, so a
 /// hook that fails leaves it standing on the unpromoted record — and the
 /// destroy the client's activate cleanup sends withdraws it with the name,
