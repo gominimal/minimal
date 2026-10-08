@@ -78,7 +78,10 @@ where
         match tokio::io::copy(&mut stdin, &mut tx).await {
             // The daemon closed its end, so there is no write half left to
             // shut down: macOS fails that shutdown with ENOTCONN.
-            Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => {
+                tracing::debug!(error = %err, "stdin→daemon copy ended: daemon stopped reading");
+                Ok(())
+            }
             res => {
                 res?;
                 tx.shutdown().await
@@ -110,7 +113,10 @@ where
 /// pipe (os error 32)`.
 fn ignore_broken_pipe(result: std::io::Result<u64>) -> std::io::Result<u64> {
     match result {
-        Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => Ok(0),
+        Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => {
+            tracing::debug!(error = %err, "daemon→stdout copy ended: downstream reader closed");
+            Ok(0)
+        }
         other => other,
     }
 }
@@ -497,18 +503,88 @@ mod tests {
         });
     }
 
+    /// A minimal DEBUG-and-up subscriber for the tests that assert on the
+    /// bridge's swallowed-pipe lines. `enabled` filters to DEBUG so only the
+    /// lines under test reach the log, and `event` records each line's
+    /// message.
+    #[derive(Clone, Default)]
+    struct DebugLog(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    /// Records an event's `message` field — the swallowed-pipe line's text.
+    struct MessageField<'a>(&'a mut String);
+
+    impl tracing::field::Visit for MessageField<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                use std::fmt::Write as _;
+                let _ = write!(self.0, "{value:?}");
+            }
+        }
+    }
+
+    impl DebugLog {
+        /// The lines said so far, in order.
+        fn lines(&self) -> Vec<String> {
+            self.0.lock().expect("the test owns the log").clone()
+        }
+    }
+
+    impl tracing::Subscriber for DebugLog {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            *metadata.level() <= tracing::Level::DEBUG
+        }
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut line = String::new();
+            event.record(&mut MessageField(&mut line));
+            self.0.lock().expect("the test owns the log").push(line);
+        }
+
+        // The bridge emits no span, so the span half of the trait is inert: a
+        // single id that nothing records into and nothing enters.
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    /// Capture every DEBUG line the current thread emits while the guard
+    /// lives. The current-thread test runtime drives the bridge on the test's
+    /// own thread, so the thread-local default subscriber sees its lines.
+    fn capture_debug_lines() -> (DebugLog, tracing::subscriber::DefaultGuard) {
+        let log = DebugLog::default();
+        let guard = tracing::subscriber::set_default(log.clone());
+        (log, guard)
+    }
+
     /// When the downstream reader closes early (BrokenPipe), the bridge treats
     /// it as normal termination rather than surfacing `error: proxy: Broken
-    /// pipe (os error 32)`.
+    /// pipe (os error 32)`. The swallow is still visible as a DEBUG line
+    /// naming the side whose pipe broke.
     #[tokio::test]
     async fn proxy_bridge_exits_quietly_on_broken_pipe() {
         let (bridge, daemon) = tokio::net::UnixStream::pair().expect("socket pair");
         writing_daemon(daemon);
         let stdout = FailingWriter(std::io::ErrorKind::BrokenPipe);
 
+        let (log, _guard) = capture_debug_lines();
         proxy_bridge(bridge, &[][..], stdout)
             .await
             .expect("a broken pipe downstream is not a proxy failure");
+        assert!(
+            log.lines()
+                .iter()
+                .any(|line| line.contains("daemon→stdout")),
+            "the swallowed pipe must be logged naming its side, got {:?}",
+            log.lines()
+        );
     }
 
     /// Any error other than BrokenPipe is still surfaced with the `proxy`
@@ -529,10 +605,11 @@ mod tests {
     }
 
     /// When the daemon stops reading first, the stdin-to-socket copy hits
-    /// `BrokenPipe`. The bridge treats that as normal termination and still
-    /// drains the daemon's remaining output to stdout instead of failing or
-    /// truncating it. Linux only: there a write to a peer that shut down its
-    /// read side fails with `EPIPE` at once.
+    /// `BrokenPipe`. The bridge treats that as normal termination — logged as
+    /// a DEBUG line naming the stdin→daemon side — and still drains the
+    /// daemon's remaining output to stdout instead of failing or truncating
+    /// it. Linux only: there a write to a peer that shut down its read side
+    /// fails with `EPIPE` at once.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn proxy_bridge_drains_daemon_output_after_stdin_broken_pipe() {
@@ -558,6 +635,7 @@ mod tests {
         });
 
         let mut stdout = Vec::new();
+        let (log, _guard) = capture_debug_lines();
         tokio::time::timeout(
             std::time::Duration::from_secs(10),
             proxy_bridge(bridge, tokio::io::repeat(b'x'), &mut stdout),
@@ -566,5 +644,10 @@ mod tests {
         .expect("the bridge must not hang after a broken pipe")
         .expect("a broken pipe towards the daemon is not a proxy failure");
         assert_eq!(stdout, b"hello", "the daemon's output must be drained");
+        assert!(
+            log.lines().iter().any(|line| line.contains("stdin→daemon")),
+            "the swallowed pipe must be logged naming its side, got {:?}",
+            log.lines()
+        );
     }
 }
