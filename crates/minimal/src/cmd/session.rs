@@ -2485,7 +2485,11 @@ pub fn format_policy(
         // A lane the box declared is still shown, marked as not in effect:
         // the view states what was declared (NET-134).
         if effective.credentialed_upstream.is_some() {
-            writeln!(out, "  {}", sessions::CredentialedUpstream::policy_row(network))?;
+            writeln!(
+                out,
+                "  {}",
+                sessions::CredentialedUpstream::policy_row(network)
+            )?;
         }
         return Ok(());
     }
@@ -2558,7 +2562,11 @@ pub fn format_policy(
     // `(not in effect: <mode> box)` mark there rather than hiding what the
     // box declared. The text is shared with the `min dash` detail pane.
     if effective.credentialed_upstream.is_some() {
-        writeln!(out, "  {}", sessions::CredentialedUpstream::policy_row(network))?;
+        writeln!(
+            out,
+            "  {}",
+            sessions::CredentialedUpstream::policy_row(network)
+        )?;
     }
     // The node-plane baseline set, beside the box's rules (NET-130): the
     // helper's built-in enumeration of the categories the in-VM daemon's own

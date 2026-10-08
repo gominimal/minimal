@@ -374,7 +374,7 @@ document also carries `credentialed_upstream`, an object, when the box
 declared a lane, in any network mode. Its `effective` field is `true`
 for an own-address box and `false` for any other, the text row's
 `(not in effect: …)` mark. The document leaves the key out when the box
-declared no lane, so a missing key means the box runs without one.
+did not declare a lane, so a missing key means the box runs without one.
 
 With `-o json`, a failed run writes one `min/v1/error` object on stderr and
 exits non-zero, with no plain-text error line. The `code` field names the

@@ -1035,6 +1035,7 @@ mod tests {
             hooks_enabled: true,
             box_addresses: None,
             host_ip_enforcement: None,
+            host_row_bound: false,
             attrs: std::collections::BTreeMap::new(),
         };
         let mut model = Model::new(Utc::now());
