@@ -799,7 +799,6 @@ fn deny_all_default_binds(created: &minimald_rpc::CreateSessionResponse) -> bool
     }
 }
 
-
 /// Strip hooks whose scripts are files rather than inline bodies.
 ///
 /// The daemon gates `FinalizeSession` on a marker the hook-script upload

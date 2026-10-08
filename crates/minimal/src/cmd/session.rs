@@ -623,14 +623,6 @@ pub(crate) async fn activate_session(
         SyncMode::Tarball => Some(resolve_upload_root(&utf8_path)?),
     };
 
-    // Skip the upload without prompting when the resolved root is an
-    // empty directory or `$HOME` — unless the user asked for it with an
-    // explicit `--sync tarball`, the escape hatch.
-    let skip_empty_or_home = !sync_explicit
-        && upload_root.as_ref().is_some_and(|root| {
-            file_upload::is_empty_or_home(root.as_std_path(), std::env::home_dir().as_deref())
-        });
-
     // Deliberately not `connect_daemon`: this path's version gate travels on
     // the `CreateSession` below rather than on a `GetVersion` sent ahead of it.
     // Activation is the hot path #1251's gate landed on, and it must not pay a
@@ -1191,99 +1183,41 @@ pub(crate) async fn activate_session(
                 eprintln!("{notice}");
             }
         }
-        SyncMode::Tarball if skip_empty_or_home => {
-            // An empty directory has nothing to sync, and `$HOME` is far
-            // too much to ship on a stray confirmation keypress — and if
-            // `$HOME` is itself a VCS root the old gate uploaded it with
-            // no prompt at all. Skip both silently by default; a
-            // deliberate `--sync tarball` (via `sync_explicit`) is the
-            // escape hatch that still uploads them.
-            eprintln!("Starting with an empty box (nothing here to sync)");
-        }
         SyncMode::Tarball => {
-            // Upload from the project root — the directory the mfile
-            // lives in — rather than wherever the user invoked us. This
-            // matches the CLI's config-discovery walk: a user running
-            // `minimal activate ./subdir` still uploads the whole
-            // project. Falls back to `utf8_path` when no mfile is found
-            // anywhere up the tree (#770).
             let upload_root = upload_root.expect("upload_root is set for SyncMode::Tarball above");
-            if upload_root != utf8_path {
-                eprintln!("Uploading from project root {upload_root} (resolved from {utf8_path})");
-            }
-            // Guard against accidentally uploading a non-VCS directory
-            // (e.g. `~`). A VCS root, or a directory carrying a
-            // `minimal.toml` (a declared project), uploads unconditionally.
-            // For an undeclared non-VCS root an interactive caller gets the
-            // confirm (default No); a headless caller (CI, pipes, agents,
-            // `--no-prompt`, `--no-input`) can't be asked, so it skips the
-            // upload with a warning rather than silently shipping a directory
-            // nobody confirmed — `--sync tarball` (via `sync_explicit`) is the
-            // escape hatch that force-uploads it anyway (#770).
             let headless = args.no_prompt || global.no_input || !can_prompt_interactively();
-            let should_upload = match file_upload::upload_gate(
-                file_upload::is_vcs_root(upload_root.as_std_path()),
-                sync_explicit,
-                project_has_mfile(&upload_root),
-                headless,
-            ) {
-                file_upload::UploadGate::Upload => true,
-                file_upload::UploadGate::SkipHeadless => {
-                    // Skipping the upload means the project's minimal.toml
-                    // never reaches the daemon, so any lifecycle hooks it
-                    // declares are discarded and never run. Refuse loudly
-                    // instead of exiting 0 on a session silently missing
-                    // them; the caller can force the upload or opt out on
-                    // purpose.
-                    let dropped_hooks = project_lifecycle_hook_count(&upload_root);
-                    if dropped_hooks > 0 {
-                        bail!(
-                            "{upload_root} is not a version control repository root, so its \
-                             file upload is being skipped — but its {name} declares \
-                             {dropped_hooks} lifecycle hook(s) that reach the session only \
-                             through that upload. They would be silently dropped and never \
-                             run. Pass `--sync tarball` to upload the project (hooks \
-                             included), or `--sync none` to start without them deliberately.",
-                            name = mfile::MFILE_NAME,
-                        );
-                    }
-                    eprintln!(
-                        "{}",
-                        file_upload::skipped_upload_warning(upload_root.as_std_path())
-                    );
-                    false
-                }
-                file_upload::UploadGate::Prompt => confirm(
-                    &format!(
-                        "{upload_root} is not a version control repository root. \
-                         Upload all files from this directory?"
-                    ),
-                    false,
-                )?,
-            };
-            if should_upload {
-                let uploaded = client
-                    .upload_workspace_files(id, upload_root.as_std_path())
-                    .await;
-                if let Err(error) = uploaded {
-                    // The upload failed: the activation is abandoned, and the
-                    // row its registration bought goes with it (T66).
-                    withdraw_box_row(
-                        control_sock.clone(),
-                        config.name.as_deref(),
-                        config.box_addresses,
-                        registered
-                            .as_ref()
-                            .and_then(|registration| registration.box_id),
+            let decision = decide_workspace_upload(&upload_root, sync_explicit, headless);
+            let uploaded = run_workspace_upload(
+                &mut client,
+                id,
+                &utf8_path,
+                &upload_root,
+                decision,
+                || {
+                    confirm(
+                        &format!(
+                            "{upload_root} is not a version control repository root. \
+                             Upload all files from this directory?"
+                        ),
+                        false,
                     )
-                    .await;
-                    return Err(error.context("Failed to upload project files"));
-                }
-            } else if !headless {
-                eprintln!(
-                    "Skipping file upload; the session will start with an \
-                     empty workspace."
-                );
+                },
+                true,
+            )
+            .await;
+            if let Err(error) = uploaded {
+                // The upload failed: the activation is abandoned, and the
+                // row its registration bought goes with it (T66).
+                withdraw_box_row(
+                    control_sock.clone(),
+                    config.name.as_deref(),
+                    config.box_addresses,
+                    registered
+                        .as_ref()
+                        .and_then(|registration| registration.box_id),
+                )
+                .await;
+                return Err(error);
             }
         }
     };

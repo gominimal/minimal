@@ -692,10 +692,6 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     } else {
         String::new()
     };
-    let skip_empty_or_home = crate::file_upload::is_empty_or_home(
-        upload_root.as_std_path(),
-        std::env::home_dir().as_deref(),
-    );
 
     // Not `connect_daemon`: like `min session activate`, this creates a session
     // and the version gate rides on that `CreateSession` rather than on a
@@ -745,44 +741,26 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     // session exactly as during an activate.
     let interrupt_guard = crate::arm_activation_interrupt(global, id);
 
-    if skip_empty_or_home {
-        eprintln!("Starting with an empty box (nothing here to sync)");
-    } else {
-        if upload_root != utf8_path {
-            eprintln!("Uploading from project root {upload_root} (resolved from {utf8_path})");
-        }
-        let headless = global.no_input || !crate::can_prompt_interactively();
-        let should_upload = match crate::file_upload::upload_gate(
-            crate::file_upload::is_vcs_root(upload_root.as_std_path()),
-            false,
-            crate::project_has_mfile(&upload_root),
-            headless,
-        ) {
-            crate::file_upload::UploadGate::Upload => true,
-            crate::file_upload::UploadGate::SkipHeadless => {
-                eprintln!(
-                    "{}",
-                    crate::file_upload::skipped_upload_warning(upload_root.as_std_path())
-                );
-                false
-            }
-            crate::file_upload::UploadGate::Prompt => crate::confirm(
+    let headless = global.no_input || !crate::can_prompt_interactively();
+    let decision = crate::decide_workspace_upload(&upload_root, false, headless);
+    crate::run_workspace_upload(
+        &mut client,
+        id,
+        &utf8_path,
+        &upload_root,
+        decision,
+        || {
+            crate::confirm(
                 &format!(
                     "{upload_root} is not a version control repository root. \
                      Upload all files from this directory?"
                 ),
                 false,
-            )?,
-        };
-        if should_upload {
-            client
-                .upload_workspace_files(id, upload_root.as_std_path())
-                .await
-                .context("Failed to upload project files")?;
-        } else if !headless {
-            eprintln!("Skipping file upload; the session will start with an empty workspace.");
-        }
-    }
+            )
+        },
+        false,
+    )
+    .await?;
 
     // Client-side loadout patches land in the composition whether the
     // configure response is Materialized or Pending; daemon-side patches
