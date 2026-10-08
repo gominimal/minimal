@@ -1168,15 +1168,33 @@ impl Session {
         // the box's relay opening, which the attach path resolves itself.
         // Scoped: the switch lock is dropped before the registry is taken, so
         // no path holds both.
-        let (subnet, settled_port) = {
+        let (subnet, settled_port, unsettled) = {
             let switch = self.net_switch.lock().await;
-            (switch.subnet(), switch.serving_hostname_proxy_port())
+            (
+                switch.subnet(),
+                switch.serving_hostname_proxy_port(),
+                switch.hostname_proxy_unsettled(),
+            )
         };
         // Only an `OwnIp` box carries the opening: a `HostNet` one never
-        // waits for it.
+        // waits for it. The wait does not count the box as stranded: this
+        // is the caller check's copy, not the box's relay opening, which
+        // the attach path resolves (and counts) itself.
         let hostname_proxy_port = match record.network {
             sessions::NetworkMode::OwnIp if wait_for_verdict => {
-                crate::net::hostname_proxy_serving_port(&self.net_switch).await
+                crate::net::hostname_proxy_serving_port(&self.net_switch, None).await
+            }
+            sessions::NetworkMode::OwnIp if unsettled => {
+                // Said, not silent: this registration keeps no opening at
+                // the node address for the caller check until the session
+                // re-registers (a rename, a re-finalize, a restart).
+                tracing::info!(
+                    session = %record.id,
+                    "the hostname proxy is not serving yet; this session's \
+                     caller check is registered with no node-address opening \
+                     (design §7.1)"
+                );
+                settled_port
             }
             _ => settled_port,
         };
