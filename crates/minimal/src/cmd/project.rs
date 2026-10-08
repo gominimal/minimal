@@ -218,7 +218,7 @@ pub(crate) enum WorkspaceUpload {
 #[allow(clippy::too_many_arguments)] // one home for a sequence three callers share; splitting the args would hide the flow
 pub(crate) async fn run_workspace_upload(
     client: &mut client::Client,
-    id: sessions::SessionId,
+    id: boxes::SessionId,
     invoked_from: &camino::Utf8Path,
     root: &camino::Utf8Path,
     decision: UploadDecision,
@@ -286,7 +286,7 @@ pub(crate) async fn run_workspace_upload(
 /// failure context.
 async fn upload_workspace(
     client: &mut client::Client,
-    id: sessions::SessionId,
+    id: boxes::SessionId,
     root: &camino::Utf8Path,
     progress: UploadProgress,
 ) -> Result<WorkspaceUpload, anyhow::Error> {

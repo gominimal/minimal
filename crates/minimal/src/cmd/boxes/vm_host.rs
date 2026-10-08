@@ -402,6 +402,14 @@ fn rehold_undo(
     Some(taken_over_by.map_or((id, false), |other| (other.id, true)))
 }
 
+/// Whether a session holds its name in the VM host's zone in place of a
+/// row: a `host_ip` box shares the node's own row, so `min session
+/// activate` and `min dash` hold its name (NODATA) instead of registering
+/// one. `box_addresses` is `None` exactly when no row was registered.
+pub(crate) fn holds_name(record: &boxes::Record) -> bool {
+    record.network == boxes::NetworkMode::HostNet && record.box_addresses.is_none()
+}
+
 /// Holds or releases a `host_ip` box's name on the VM host daemon, by
 /// `hold`, best-effort: the hold is the interim that answers the name
 /// NODATA where an unheld name answers NXDOMAIN — the \[proposed\] pre-alias
