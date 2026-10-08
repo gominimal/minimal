@@ -49,6 +49,18 @@ async fn control_request_with_vm_host(
     sock_path: &std::path::Path,
     request: minimald_rpc::BoxControlRequest,
 ) -> anyhow::Result<minimald_rpc::BoxControlReply> {
+    control_exchange_with_vm_host(sock_path, request)
+        .await
+        .map(|(reply, _stream)| reply)
+}
+
+/// [`control_request_with_vm_host`] that hands the connection back beside
+/// the reply, for a verb whose connection outlives its one exchange — the
+/// held registration's lease ([`BoxLease`]).
+async fn control_exchange_with_vm_host(
+    sock_path: &std::path::Path,
+    request: minimald_rpc::BoxControlRequest,
+) -> anyhow::Result<(minimald_rpc::BoxControlReply, tokio::net::UnixStream)> {
     use tokio::io::AsyncBufReadExt as _;
     use tokio::io::AsyncWriteExt as _;
 
@@ -68,7 +80,9 @@ async fn control_request_with_vm_host(
         .await
         .context("writing the box control request")?;
     let mut reply = String::new();
-    tokio::io::BufReader::new(stream)
+    // The daemon writes nothing past its one reply line until the client
+    // writes again, so the reader buffers nothing the connection still owes.
+    tokio::io::BufReader::new(&mut stream)
         .read_line(&mut reply)
         .await
         .context("reading the box control reply")?;
@@ -81,7 +95,59 @@ async fn control_request_with_vm_host(
         .with_context(|| {
             format!("the VM host daemon's box control reply did not parse: {reply}")
         })?;
-    Ok(reply)
+    Ok((reply, stream))
+}
+
+/// A held registration's lease ([`minimald_rpc::RegisterBoxRequest::hold`]):
+/// the connection the registration was answered on, kept open while the
+/// activation runs. Dropping it uncommitted — an activation that fails, is
+/// interrupted, or dies — closes the connection, and the VM host daemon
+/// withdraws the row on that close, so a row whose activation never went
+/// active does not hold its name until the daemon restarts. [`Self::commit`]
+/// keeps the row once the session is active.
+#[derive(Debug)]
+struct BoxLease {
+    stream: tokio::net::UnixStream,
+}
+
+impl BoxLease {
+    /// Commit the lease: write the one commit line and close, so the row
+    /// stays when the connection does. A commit that cannot be written is
+    /// a daemon that already closed the lease — one that predates leases
+    /// and answered one-shot, or one that went away — and is logged, not
+    /// fatal: the session is already active.
+    async fn commit(mut self) {
+        use tokio::io::AsyncWriteExt as _;
+        let line = format!("{}\n", minimald_rpc::REGISTRATION_COMMIT_LINE);
+        match tokio::time::timeout(BOX_CONTROL_TIMEOUT, self.stream.write_all(line.as_bytes()))
+            .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::debug!(%error, "could not commit the box's registration lease");
+            }
+            Err(_) => tracing::debug!(
+                "the box's registration lease commit did not complete in {BOX_CONTROL_TIMEOUT:?}"
+            ),
+        }
+    }
+}
+
+/// Run `finalize` — the step that makes the session active — with the
+/// registration's lease held across it, and commit the lease only when it
+/// succeeds. A failure drops the lease uncommitted, so the VM host daemon
+/// withdraws the row with the activation.
+async fn finalize_holding_lease<T>(
+    lease: Option<BoxLease>,
+    finalize: impl std::future::Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    let finalized = finalize.await;
+    if finalized.is_ok()
+        && let Some(lease) = lease
+    {
+        lease.commit().await;
+    }
+    finalized
 }
 
 /// What a successful registration with the VM host daemon hands the
@@ -102,6 +168,10 @@ struct RegisteredWithVmHost {
     /// the one spelling the row, the attachment and a diagnostic all name
     /// it by — or `None` when the answering daemon predates ids.
     box_id: Option<minimald_rpc::BoxId>,
+    /// The registration's lease, held until the session is active and
+    /// committed then; `None` from a daemon that predates ids, which
+    /// predates leases too and answered one-shot.
+    lease: Option<BoxLease>,
 }
 
 /// Registers an own-address box with the VM host daemon over its control
@@ -110,26 +180,29 @@ async fn register_box_with_vm_host(
     sock_path: &std::path::Path,
     request: minimald_rpc::RegisterBoxRequest,
 ) -> anyhow::Result<RegisteredWithVmHost> {
-    match control_request_with_vm_host(
+    let (reply, stream) = control_exchange_with_vm_host(
         sock_path,
         minimald_rpc::BoxControlRequest::Register(request),
     )
-    .await?
-    {
+    .await?;
+    match reply {
         // The answer a daemon this build boots beside sends: the addresses
-        // beside the id the published row holds.
+        // beside the id the published row holds, on the connection a held
+        // registration keeps as its lease.
         minimald_rpc::BoxControlReply::Registered(web) => Ok(RegisteredWithVmHost {
             addresses: sessions::BoxAddresses {
                 switch_address: web.switch_address,
                 loopback_address: web.loopback_address,
             },
             box_id: Some(web.box_id),
+            lease: Some(BoxLease { stream }),
         }),
         // A daemon that predates ids answers with the bare pair the
         // registration has always been answered with.
         minimald_rpc::BoxControlReply::Addresses(addresses) => Ok(RegisteredWithVmHost {
             addresses,
             box_id: None,
+            lease: None,
         }),
         minimald_rpc::BoxControlReply::Error { error } => {
             anyhow::bail!("the VM host daemon refused the box registration: {error}")
@@ -543,6 +616,10 @@ async fn register_box_for_activation(
             .ingress
             .as_ref()
             .and_then(|ingress| ingress.dynamic_allowed_range),
+        // The row is held as a lease until the session is active: an
+        // activation that dies before then — an interrupt, a crash, a
+        // withdrawal that never lands — leaves no row holding its name.
+        hold: true,
     };
     let registration = tokio::time::timeout(
         BOX_CONTROL_TIMEOUT,
@@ -573,6 +650,38 @@ async fn register_box_for_activation(
              {BOX_CONTROL_TIMEOUT:?}; the session does not start with the box \
              unregistered"
         )),
+    }
+}
+
+/// [`register_box_for_activation`] for an activation whose session name may
+/// be autogen. The VM host daemon refuses a registration whose name folds
+/// to one a live row already holds; for an autogen `name` that refusal is a
+/// name collision like the create's, so the name is re-minted with `remint`
+/// and registered again, within the bounded budget ([`should_retry_autogen`])
+/// the `CreateSession` collision retry spends — `attempts` is shared with
+/// it. A refused registration publishes no row, so nothing is withdrawn
+/// between attempts. A user-supplied name, any other failure, and a spent
+/// budget surface the error unchanged. The refusal is matched across the
+/// whole error chain: the daemon's reason is its innermost cause.
+#[allow(clippy::too_many_arguments)]
+async fn register_box_reminting_autogen(
+    kind: paths::ProviderKind,
+    minimal_dir: Option<&std::path::Path>,
+    network: sessions::NetworkMode,
+    name: &mut String,
+    policy: &sessions::SessionPolicy,
+    autogen: bool,
+    attempts: &mut u32,
+    mut remint: impl FnMut() -> String,
+) -> anyhow::Result<Option<RegisteredWithVmHost>> {
+    loop {
+        match register_box_for_activation(kind, minimal_dir, network, name, policy).await {
+            Err(error) if should_retry_autogen(autogen, *attempts, &format!("{error:#}")) => {
+                *attempts += 1;
+                *name = remint();
+            }
+            registered => return registered,
+        }
     }
 }
 
@@ -917,15 +1026,23 @@ pub(crate) async fn activate_session(
     // resolved once, here, and the withdrawals ride on it.
     let kind = daemon_provider_kind(global);
     let control_sock = vm_host_control_sock(kind, global.minimal_dir.as_deref());
-    let mut registered = register_box_for_activation(
+    // An autogen name can collide with a live box's row the same way it
+    // can with a session (the row stays live until its session's destroy):
+    // the registration's refusal re-mints it within the same budget the
+    // create's collision retry below spends.
+    let mut attempts = 0u32;
+    let mut registered = register_box_reminting_autogen(
         kind,
         global.minimal_dir.as_deref(),
         config.network,
         config
             .name
-            .as_deref()
+            .as_mut()
             .expect("the session name is minted before the create"),
         &config.policy,
+        autogen,
+        &mut attempts,
+        || autogen_session_name(&utf8_path, &random_hex4()),
     )
     .await?;
     // The registration is the client's record of the box: the addresses
@@ -942,7 +1059,7 @@ pub(crate) async fn activate_session(
     // re-mint the hex suffix and retry a bounded number of times. A
     // user-supplied name never retries — its collision, and any other failure
     // (e.g. a policy/network-mode validation error), surfaces unchanged.
-    let mut attempts = 0u32;
+    // `attempts` carries over from the registration's own collision retry.
     let created = loop {
         let resp = client
             .oneshot_rpc::<CreateSession>(CreateSessionRequest {
@@ -984,6 +1101,8 @@ pub(crate) async fn activate_session(
                         config.box_addresses,
                     )
                     .await;
+                    // The abandoned row's lease goes with it, uncommitted.
+                    drop(registered.take());
                     config.name = Some(autogen_session_name(&utf8_path, &random_hex4()));
                     // A registered box's row carries the name it was
                     // registered under (T66), so the re-mint re-registers;
@@ -998,12 +1117,15 @@ pub(crate) async fn activate_session(
                     // reused, so the re-registration is a new creation, and
                     // the host mints it a new id, which replaces the record
                     // (NET-133).
-                    registered = register_box_for_activation(
+                    registered = register_box_reminting_autogen(
                         kind,
                         global.minimal_dir.as_deref(),
                         config.network,
-                        config.name.as_deref().expect("just re-minted"),
+                        config.name.as_mut().expect("just re-minted"),
                         &config.policy,
+                        autogen,
+                        &mut attempts,
+                        || autogen_session_name(&utf8_path, &random_hex4()),
                     )
                     .await?;
                     config.box_addresses = registered
@@ -1662,12 +1784,21 @@ pub(crate) async fn activate_session(
     // are exact matches (same source), so collapsing is safe.
     collected_patches.sort_by(|a, b| a.1.as_str().cmp(b.1.as_str()));
     collected_patches.dedup_by(|a, b| a.1.as_str() == b.1.as_str());
-    if let Err(e) = upload_and_finalize(
-        &mut client,
-        id,
-        &collected_patches,
-        &hook_scripts,
-        finalize_hook_budget,
+    // The registration's lease is held across the finalize and committed
+    // only once the session is active: until then an activation that dies
+    // leaves the VM host daemon to withdraw the row on the lease's close.
+    let lease = registered
+        .as_mut()
+        .and_then(|registration| registration.lease.take());
+    if let Err(e) = finalize_holding_lease(
+        lease,
+        upload_and_finalize(
+            &mut client,
+            id,
+            &collected_patches,
+            &hook_scripts,
+            finalize_hook_budget,
+        ),
     )
     .await
     {
@@ -4153,7 +4284,7 @@ mod tests {
             ("allower", DynamicIngress::Allow),
             ("denier", DynamicIngress::Deny),
         ] {
-            stand.register(name, stance).await;
+            let _held = stand.register(name, stance).await;
             let row = stand
                 .registry
                 .row_by_name(name)
@@ -5407,6 +5538,10 @@ mod tests {
                 panic!("a registration is carried by the register verb");
             };
             assert_eq!(request.name, "web");
+            assert!(
+                request.hold,
+                "the activation holds its registration as a lease"
+            );
             assert_eq!(request.ingress_ports, vec![8080, 5432]);
             assert_eq!(request.egress.as_ref(), policy.egress.as_ref());
             assert!(
@@ -5466,6 +5601,7 @@ mod tests {
                 credentialed_upstream: None,
                 dynamic_ingress: None,
                 dynamic_allowed_range: None,
+                hold: false,
             },
         )
         .await
@@ -5685,6 +5821,253 @@ mod tests {
         assert!(
             !attachments.holds_id(id.to_bytes()),
             "the withdrawn box's id is held by no attachment"
+        );
+    }
+
+    /// The VM host daemon refuses a registration whose name folds to a
+    /// live row's, and that refusal reads as a name collision: an autogen
+    /// name re-mints and registers again under the fresh name, within the
+    /// shared budget, while a user-supplied name surfaces the refusal —
+    /// naming the held spelling — unchanged. Driven against the real
+    /// control server so a rewording of the daemon's refusal cannot
+    /// silently break the retry.
+    #[tokio::test]
+    async fn autogen_registration_reminted_on_a_held_name() {
+        let policy = sessions::SessionPolicy {
+            egress: None,
+            ingress: None,
+            credentialed_upstream: None,
+        };
+        let dir = tempfile::TempDir::new().unwrap();
+        let provider_dir = dir.path().join("providers").join("local-minvmd0");
+        std::fs::create_dir_all(&provider_dir).unwrap();
+        let sock_path = provider_dir.join("control.sock");
+        let registry = minvmd::box_registry::BoxRegistry::new(switch::SwitchSubnet::default());
+        let _server = minvmd::control::spawn(
+            sock_path,
+            registry.clone(),
+            minvmd::net::answerer::AnswererStatus::allocating_for_tests("session-test-node"),
+            minvmd::control::ProxyPublishStatus::default(),
+        )
+        .expect("the control server binds its socket");
+        let minimal_dir = Some(dir.path());
+
+        let mut held = "Proj-9c1e".to_string();
+        let mut attempts = 0u32;
+        // Bound for the test's life: the registration's lease holds the
+        // row, and dropping it would withdraw the row.
+        let _held_box = register_box_reminting_autogen(
+            paths::ProviderKind::Minvmd,
+            minimal_dir,
+            NetworkMode::OwnIp,
+            &mut held,
+            &policy,
+            true,
+            &mut attempts,
+            || unreachable!("a free name registers on the first try"),
+        )
+        .await
+        .expect("the first box registers")
+        .expect("an own-address box on a VM-backed host registers");
+        assert_eq!(attempts, 0);
+
+        // An autogen name folding to the live row's re-mints and registers.
+        let mut name = "proj-9c1e".to_string();
+        let registered = register_box_reminting_autogen(
+            paths::ProviderKind::Minvmd,
+            minimal_dir,
+            NetworkMode::OwnIp,
+            &mut name,
+            &policy,
+            true,
+            &mut attempts,
+            || "proj-77aa".to_string(),
+        )
+        .await
+        .expect("the held autogen name is re-minted, not fatal")
+        .expect("the re-minted name registers");
+        assert_eq!(
+            name, "proj-77aa",
+            "the activation carries the re-minted name"
+        );
+        assert_eq!(attempts, 1, "the re-mint spent one attempt of the budget");
+        assert_eq!(
+            registry
+                .row_by_name("proj-77aa")
+                .expect("the re-minted name holds a row")
+                .switch_addr(),
+            registered.addresses.switch_address,
+        );
+
+        // A user-supplied name never re-mints: the refusal surfaces, naming
+        // the spelling the live row holds.
+        let mut user = "PROJ-9C1E".to_string();
+        let refused = register_box_reminting_autogen(
+            paths::ProviderKind::Minvmd,
+            minimal_dir,
+            NetworkMode::OwnIp,
+            &mut user,
+            &policy,
+            false,
+            &mut 0,
+            || unreachable!("a user-supplied name is never re-minted"),
+        )
+        .await
+        .expect_err("a user-supplied held name is refused");
+        let refused = format!("{refused:#}");
+        assert!(
+            refused.contains("a box named Proj-9c1e already exists"),
+            "the refusal names the held spelling: {refused}"
+        );
+        assert_eq!(user, "PROJ-9C1E", "the user's name is left as given");
+    }
+
+    /// The registration's lease is held across the finalize — the daemon
+    /// sees neither a byte nor a close while it runs — and committed only
+    /// when it succeeds: one commit line, then the close. A failed finalize
+    /// closes the lease with no commit, the close the daemon withdraws on.
+    #[tokio::test]
+    async fn finalize_holding_lease_commits_only_on_success() {
+        use tokio::io::AsyncReadExt as _;
+
+        async fn lease_pair(
+            listener: &tokio::net::UnixListener,
+            sock_path: &std::path::Path,
+        ) -> (BoxLease, tokio::net::UnixStream) {
+            let (client, accepted) = tokio::join!(
+                tokio::net::UnixStream::connect(sock_path),
+                listener.accept()
+            );
+            (
+                BoxLease {
+                    stream: client.expect("the lease connects"),
+                },
+                accepted.expect("the daemon side accepts").0,
+            )
+        }
+
+        /// Whether the daemon side has seen nothing — no byte, no close —
+        /// within a short wait.
+        async fn untouched(daemon: &mut tokio::net::UnixStream) -> bool {
+            let mut buf = [0u8; 16];
+            tokio::time::timeout(std::time::Duration::from_millis(50), daemon.read(&mut buf))
+                .await
+                .is_err()
+        }
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let sock_path = dir.path().join("control.sock");
+        let listener = tokio::net::UnixListener::bind(&sock_path).unwrap();
+
+        let (lease, mut daemon) = lease_pair(&listener, &sock_path).await;
+        let finalized = finalize_holding_lease(Some(lease), async {
+            assert!(
+                untouched(&mut daemon).await,
+                "the lease is held, uncommitted, while the finalize runs"
+            );
+            Ok(7)
+        })
+        .await
+        .expect("the finalize succeeds");
+        assert_eq!(finalized, 7);
+        let mut seen = String::new();
+        daemon.read_to_string(&mut seen).await.unwrap();
+        assert_eq!(
+            seen,
+            format!("{}\n", minimald_rpc::REGISTRATION_COMMIT_LINE),
+            "a finalized session commits its lease, then closes it"
+        );
+
+        let (lease, mut daemon) = lease_pair(&listener, &sock_path).await;
+        let failed = finalize_holding_lease(Some(lease), async {
+            assert!(
+                untouched(&mut daemon).await,
+                "the lease is held, uncommitted, while the finalize runs"
+            );
+            Err::<(), _>(anyhow::anyhow!("finalize failed"))
+        })
+        .await;
+        assert!(failed.is_err(), "the finalize's failure surfaces unchanged");
+        let mut seen = String::new();
+        daemon.read_to_string(&mut seen).await.unwrap();
+        assert!(
+            seen.is_empty(),
+            "a failed finalize closes the lease uncommitted, got {seen:?}"
+        );
+
+        finalize_holding_lease(None, async { Ok(()) })
+            .await
+            .expect("a registration with no lease finalizes as ever");
+    }
+
+    /// Against the real control server: a registration the activation
+    /// holds and drops uncommitted is withdrawn by the VM host daemon, so
+    /// its name registers again at once; one committed after its session
+    /// went active keeps its row past the lease's close.
+    #[tokio::test]
+    async fn activation_lease_withdraws_uncommitted_and_keeps_committed() {
+        let policy = sessions::SessionPolicy {
+            egress: None,
+            ingress: None,
+            credentialed_upstream: None,
+        };
+        let dir = tempfile::TempDir::new().unwrap();
+        let provider_dir = dir.path().join("providers").join("local-minvmd0");
+        std::fs::create_dir_all(&provider_dir).unwrap();
+        let sock_path = provider_dir.join("control.sock");
+        let registry = minvmd::box_registry::BoxRegistry::new(switch::SwitchSubnet::default());
+        let _server = minvmd::control::spawn(
+            sock_path,
+            registry.clone(),
+            minvmd::net::answerer::AnswererStatus::allocating_for_tests("session-test-node"),
+            minvmd::control::ProxyPublishStatus::default(),
+        )
+        .expect("the control server binds its socket");
+        let minimal_dir = Some(dir.path());
+        let policy = &policy;
+        let register = move || {
+            register_box_for_activation(
+                paths::ProviderKind::Minvmd,
+                minimal_dir,
+                NetworkMode::OwnIp,
+                "web",
+                policy,
+            )
+        };
+
+        let dropped = register()
+            .await
+            .expect("the box registers")
+            .expect("an own-address box on a VM-backed host registers");
+        assert!(
+            dropped.lease.is_some(),
+            "the registration is held as a lease"
+        );
+        assert!(registry.row_by_name("web").is_some());
+        drop(dropped);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while registry.row_by_name("web").is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "an uncommitted lease's close withdraws its row"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let mut kept = register()
+            .await
+            .expect("the withdrawn name registers again at once")
+            .expect("an own-address box on a VM-backed host registers");
+        kept.lease
+            .take()
+            .expect("the registration is held as a lease")
+            .commit()
+            .await;
+        drop(kept);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            registry.row_by_name("web").is_some(),
+            "a committed lease keeps its row past the close"
         );
     }
 

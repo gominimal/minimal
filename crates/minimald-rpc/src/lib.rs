@@ -649,7 +649,23 @@ pub struct RegisterBoxRequest {
     /// carries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dynamic_allowed_range: Option<(u16, u16)>,
+    /// Whether the registration is held as a lease until its client
+    /// commits it. With `hold`, the daemon writes the reply and keeps the
+    /// connection open: the client writes one `commit` line once its
+    /// session is active, and a close or an error before that line
+    /// withdraws the row, so an activation that dies between registering
+    /// and committing leaves no row holding its name. A client that omits
+    /// the field, or a daemon that predates it, keeps the one-shot
+    /// registration: one line each way, and the row lives until its
+    /// creator withdraws it.
+    #[serde(default)]
+    pub hold: bool,
 }
+
+/// The one line a held registration's client writes on the lease
+/// connection once its session is active ([`RegisterBoxRequest::hold`]):
+/// from then on the row stays when the connection closes.
+pub const REGISTRATION_COMMIT_LINE: &str = "commit";
 
 /// The withdrawal a destroyed session's client sends for the row its
 /// activation registered: the name the row went by and the pair the

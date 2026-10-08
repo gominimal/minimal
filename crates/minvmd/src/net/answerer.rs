@@ -757,11 +757,15 @@ fn box_zone_name(name: &str) -> String {
 
 /// The one form a box's registry name is compared in wherever it keys the
 /// box's published address: the answerer's allocations and releases
-/// ([`box_zone_name`]) and the box registry's in-flight registrations
-/// ([`crate::box_registry::BoxRegistry::begin_registration`]). Names are
-/// DNS labels, so the fold is ASCII lower-case: "Web" and "web" are one
-/// box to the answerer, and must be one to everything its hold is checked
-/// against.
+/// ([`box_zone_name`]), the box registry's in-flight registrations
+/// ([`crate::box_registry::BoxRegistry::begin_registration`]), and its
+/// live rows — the row table's name lookups
+/// ([`crate::box_registry::BoxRegistry::row_by_name`]), a client
+/// registration's name-collision refusal
+/// ([`crate::box_registry::AllocationError::NameAlreadyHeld`]), and a
+/// client withdrawal's name proof. Names are DNS labels, so the fold is
+/// ASCII lower-case: "Web" and "web" are one box to the answerer, and must
+/// be one to everything its hold is checked against.
 pub(crate) fn canonical_box_name(name: &str) -> String {
     name.to_ascii_lowercase()
 }
