@@ -2377,6 +2377,10 @@ pub(crate) fn ensure_interactive_attach_tty(stdin_is_tty: bool) -> Result<(), an
 /// host daemon's control socket beside `sock` and renders each ask's dialog
 /// while the relay is suspended. `None` on a native host, where the
 /// session's own binding asks, and for every exec channel.
+///
+/// Neither path returns normally: on success the error is a [`Handoff`]
+/// (exec ssh, or exit with the attach's status) that [`run`] finishes once
+/// the command's `cmd` span has ended, so callers return it untouched.
 pub(crate) async fn session_via_ssh(
     sock: &std::path::Path,
     id: sessions::SessionId,
@@ -2419,8 +2423,9 @@ pub(crate) async fn session_via_ssh(
         }
         // Terminate with ssh's own status, exactly as the `exec()` this
         // replaced did: `min` has nothing of its own left to say after an
-        // attach, and the unwind guard has already run.
-        std::process::exit(code);
+        // attach, and the unwind guard has already run. `run` exits once the
+        // command's `cmd` span has ended and been flushed.
+        return Err(Handoff::Exit(code).into());
     }
 
     // The exec path spawns ssh with stdout piped so this process can relay
@@ -2437,6 +2442,11 @@ pub(crate) async fn session_via_ssh(
     let mut sigterm = signal(SignalKind::terminate()).context("installing SIGTERM handler")?;
     let mut sighup = signal(SignalKind::hangup()).context("installing SIGHUP handler")?;
     let mut sigint = signal(SignalKind::interrupt()).context("installing SIGINT handler")?;
+    // `min` stays ssh's parent, so the `cmd` span covers the command: every
+    // way out below is a [`Handoff::Exit`], which `run` finishes once the
+    // span has ended and been flushed. The ssh command carries this
+    // process's TRACEPARENT (`attach_command`), which the daemon's `exec`
+    // span parents to.
     ssh.stdout(std::process::Stdio::piped());
     let mut child = tokio::process::Command::from(ssh)
         .spawn()
@@ -2449,12 +2459,12 @@ pub(crate) async fn session_via_ssh(
                 // ssh stdout closed cleanly; wait for the child and propagate
                 // its exit status.
                 let status = child.wait().await.context("ssh exited")?;
-                std::process::exit(exit_code_of(status));
+                return Err(Handoff::Exit(exit_code_of(status)).into());
             }
             Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
                 // Local reader closed; kill ssh and exit 141.
                 kill_ssh(&mut child).await;
-                std::process::exit(141);
+                return Err(Handoff::Exit(141).into());
             }
             Err(e) => {
                 // Any other relay failure leaves ssh with nobody reading its
@@ -2468,7 +2478,7 @@ pub(crate) async fn session_via_ssh(
         _ = sigint.recv() => SignalKind::interrupt().as_raw_value(),
     };
     kill_ssh(&mut child).await;
-    std::process::exit(128 + signo);
+    Err(Handoff::Exit(128 + signo).into())
 }
 
 /// Subscribe an interactive attach to its box's pending asks on the VM host

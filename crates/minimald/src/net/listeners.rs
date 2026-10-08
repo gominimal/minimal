@@ -1135,7 +1135,18 @@ impl ListenWatcher {
             leader = ?leader,
             "listen watcher started"
         );
-        let task = tokio::spawn(async move {
+        // Detached: the watcher lives as long as the box, so spawned in the
+        // caller's span (the host-launch message's) it would hold that span
+        // open for the box's whole life and parent every poll to a one-shot
+        // message. Its own root links back to the launch instead
+        // (`traced::spawn_detached`).
+        let root = tracing::info_span!(
+            parent: None,
+            "net.listen_watcher",
+            session = %plan.box_name,
+            lease = %plan.lease,
+        );
+        let task = crate::traced::spawn_detached(root, async move {
             let mut state = WatchState::new(plan, leader);
             loop {
                 state.poll().await;
@@ -2552,7 +2563,7 @@ mod tests {
         let listener = UnixListener::bind(&path).expect("the control socket binds");
         let (tx, rx) = mpsc::channel(64);
         let decide = std::sync::Arc::new(decide);
-        let handle = tokio::spawn(async move {
+        let handle = crate::traced::spawn(async move {
             // Sequential on purpose: the watcher publishes and withdraws one
             // port at a time, awaited, so one connection served at a time is
             // its shape.
@@ -2957,6 +2968,61 @@ mod tests {
                 .all(|served| served.local != format!("{PUBLISHED}:{other}")),
             "no request ever names the port the rules do not permit: {records:?}"
         );
+        server.abort();
+    }
+
+    /// The watcher lives as long as the box, so it runs in a root span of
+    /// its own and the span it was started in (the host launch's message)
+    /// closes when the launch is done, while the watcher runs on (code
+    /// review, CodeRabbit).
+    #[tokio::test]
+    async fn a_watcher_does_not_hold_its_launch_span_open() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        use tracing_subscriber::registry::LookupSpan as _;
+        // Layered: a bare `Registry` never frees a closed span's slot (the
+        // close is `Layered::try_close`'s), so every span would read open.
+        let _g = tracing::subscriber::set_default(
+            tracing_subscriber::registry().with(tracing_subscriber::layer::Identity::new()),
+        );
+        let is_open = |id: &tracing::Id| {
+            tracing::dispatcher::get_default(|d| {
+                d.downcast_ref::<tracing_subscriber::Registry>()
+                    .unwrap()
+                    .span(id)
+                    .is_some()
+            })
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("gvproxy.sock");
+        let (server, _served) = spawn_forwarder(sock.clone());
+        let gate = Arc::new(SessionGate::for_session(
+            "listen-box".into(),
+            LEASE,
+            &permit_policy(1),
+            SwitchSubnet::default(),
+            None,
+        ));
+        let state_dir = state_dir_beside(&sock);
+        let plan = ListenPlan::new(
+            "listen-box".into(),
+            LEASE,
+            PUBLISHED,
+            ControlChannel::Unix(sock),
+            gate,
+            BoxPublications::default(),
+            state_dir,
+        );
+        let launch = tracing::info_span!("session.host.message");
+        let launch_id = launch.id().unwrap();
+        let watcher =
+            launch.in_scope(|| ListenWatcher::start(plan, Leader::Resolved(std::process::id())));
+        drop(launch);
+        tokio::task::yield_now().await;
+        assert!(
+            !is_open(&launch_id),
+            "the launch's span closed while the watcher runs"
+        );
+        watcher.stop().await;
         server.abort();
     }
 
@@ -3406,7 +3472,7 @@ mod tests {
             let gate = Arc::clone(&gate);
             let ever_admitted = Arc::clone(&ever_admitted);
             let sampling = Arc::clone(&sampling);
-            tokio::spawn(async move {
+            crate::traced::spawn(async move {
                 while sampling.load(Ordering::SeqCst) {
                     if gate.admits_tcp(port) {
                         ever_admitted.store(true, Ordering::SeqCst);
@@ -4896,7 +4962,7 @@ mod tests {
         use tokio::io::AsyncBufReadExt as _;
         let listener = UnixListener::bind(&door).expect("bind the report door stand-in");
         let (seen_tx, seen) = mpsc::unbounded_channel();
-        let task = tokio::spawn(async move {
+        let task = crate::traced::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
                 let (read, mut write) = stream.into_split();
                 let mut line = String::new();
@@ -4958,7 +5024,7 @@ mod tests {
         let door = dir.path().join("report-door.sock");
         let listener = UnixListener::bind(&door).expect("bind the report door stand-in");
         let (seen_tx, mut seen) = mpsc::unbounded_channel();
-        let task = tokio::spawn(async move {
+        let task = crate::traced::spawn(async move {
             let mut held = Vec::new();
             while let Ok((stream, _)) = listener.accept().await {
                 let (read, mut write) = stream.into_split();

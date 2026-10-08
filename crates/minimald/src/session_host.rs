@@ -22,7 +22,6 @@ use tokio::sync::mpsc::error::{SendError, SendTimeoutError};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::Instrument as _;
 
 use crate::RequestedPty;
 use crate::session::SessionPaths;
@@ -631,12 +630,17 @@ impl Binding {
         // The session name rides the span too: the channel id correlates these
         // lines with the connection's `accepted connection`/`closed` pair, but
         // only the name says *which* session an operator's report is about.
+        //
+        // A root of its own, linked to whatever spawned it (the host loop, or
+        // the request that launched the host): a binding lives as long as
+        // its channel, past the attach that asked for it.
         let span = tracing::info_span!(
+            parent: None,
             "binding",
             channel = %binding.channel.id(),
             session = %binding.name,
         );
-        (tx, tokio::spawn(binding.run().instrument(span)), shed)
+        (tx, crate::traced::spawn_detached(span, binding.run()), shed)
     }
 
     /// Hands `kind` to the host, giving up if the binding is shed first.
@@ -3453,7 +3457,7 @@ pub(crate) async fn re_read_classifier_fact(
     mountinfo_knob: Option<String>,
     guest: bool,
 ) -> std::io::Result<(Option<String>, crate::net::classifier::Decision)> {
-    tokio::task::spawn_blocking(move || {
+    crate::traced::spawn_blocking(move || {
         let mountinfo = launch_mountinfo(mountinfo_knob);
         let decision = crate::net::classifier::decide(&root, mountinfo.as_deref(), guest, || {
             classifier_reading(&root, guest)
@@ -3521,7 +3525,7 @@ async fn create_session_leaf(
     // do not belong on an executor thread. The probe makes its leaf in the
     // subtree this box's verdict picked, the same one its own leaf will
     // live in.
-    let placement = match tokio::task::spawn_blocking({
+    let placement = match crate::traced::spawn_blocking({
         let root = root.to_path_buf();
         move || sandbox2::classifier::probe_child_placement(&root, verdict)
     })
@@ -4108,7 +4112,7 @@ impl SessionLauncher for SandboxLauncher {
         // `graph_from_all_packages` is CPU-heavy (nickel evaluation,
         // graph construction) — run it on the blocking pool so it
         // doesn't stall the async executor.
-        let (ctx, graph_result) = tokio::task::spawn_blocking(move || {
+        let (ctx, graph_result) = crate::traced::spawn_blocking(move || {
             let mut ctx = ctx;
             let r = ctx.graph_from_all_packages().map_err(|e| e.to_string());
             (ctx, r)
@@ -4445,6 +4449,7 @@ impl SessionLauncher for SandboxLauncher {
             // the launch future's layout overruns rustc's query depth (128).
             let mut env_args =
                 crate::env::EnvArgs::new(name, paths.working, paths.home, paths.cache, session)
+                    .with_session_id(session_id)
                     .with_packages(packages)
                     .with_resolved_env_vars(env_vars)
                     // Session envs source package attrs (env_state_wiring,
@@ -4595,9 +4600,9 @@ impl SessionLauncher for SandboxLauncher {
         if let Some(leaf) = leaf.as_ref() {
             let report = env.closure_report_path(leaf);
             let session = session_label.clone();
-            tokio::spawn(
-                async move { report_box_closure(report, session, CLOSURE_REPORT_WATCH).await },
-            );
+            crate::traced::spawn(async move {
+                report_box_closure(report, session, CLOSURE_REPORT_WATCH).await
+            });
         }
 
         // NET-079: the box's supervisor is moved into its leaf right after the
@@ -5247,7 +5252,16 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
         // launch's own, set once by `build` and never updated, and the
         // host's attrs stay what `get_attrs` serves for the session's life.
         let host_ip_enforcement = host.attrs.host_ip_enforcement;
-        let task = tokio::spawn(host.mainloop());
+        // The host loop outlives the exec or attach that launched it: its own
+        // root, linked to that request. Without it, `session host killed on
+        // request` minutes later still named the first exec's command.
+        let root = tracing::info_span!(
+            parent: None,
+            "session.host",
+            session_id = %host.session_id,
+            session = %host.session_name,
+        );
+        let task = crate::traced::spawn_detached(root, host.mainloop());
         Ok((handle, task, host_ip_enforcement))
     }
 
@@ -5826,7 +5840,7 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
                                 // decide `is_alive` would report a live host
                                 // dead.
                                 Ok(()) => {
-                                    tokio::spawn(async move {
+                                    crate::traced::spawn(async move {
                                         // The binding dropping mid-prompt — a
                                         // detach, a shed, a daemon shutdown —
                                         // is the nobody-attached case again.
@@ -5872,7 +5886,7 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
                         // they run.
                         let root = self.workspace_root.clone();
                         let delta = self.delta.clone();
-                        tokio::spawn(async move {
+                        crate::traced::spawn(async move {
                             let _ = s.send(crate::session_delta::assess(root, delta).await);
                         });
                     }

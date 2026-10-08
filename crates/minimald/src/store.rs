@@ -90,7 +90,8 @@ impl Store {
             store: l,
         };
 
-        tokio::spawn(store.mainloop());
+        // Lives for the daemon: a root of its own (see `traced::spawn_detached`).
+        crate::traced::spawn_detached(tracing::info_span!(parent: None, "store"), store.mainloop());
         Ok(handle)
     }
 }

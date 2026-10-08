@@ -386,16 +386,24 @@ impl russh::server::Handler for ConnectionHandler {
             return Ok(());
         };
 
+        // The lookup and the attach run in the `attach` span, a child of the
+        // client's `TRACEPARENT`, so the session's `Attach` message joins the
+        // CLI's trace as an exec's messages do. russh runs this handler on a
+        // task of its own, outside the connection's span.
+        let span = attach_span(&config, session_id);
         let mngr = serv.sessions_manager().await;
-        let session_handle = match mngr.get_session(SessionKeyPredicate::Id(session_id)).await {
+        let lookup = mngr.get_session(SessionKeyPredicate::Id(session_id));
+        let session_handle = match tracing::Instrument::instrument(lookup, span.clone()).await {
             Ok(Some(h)) => h,
             Ok(None) => {
-                tracing::warn!(%session_id, "shell request rejected: unknown session");
+                span.in_scope(|| tracing::warn!("shell request rejected: unknown session"));
                 session.channel_failure(id)?;
                 return Ok(());
             }
             Err(e) => {
-                tracing::warn!(%session_id, error = %e, "shell request rejected: lookup failed");
+                span.in_scope(|| {
+                    tracing::warn!(error = %e, "shell request rejected: lookup failed");
+                });
                 session.channel_failure(id)?;
                 return Ok(());
             }
@@ -403,14 +411,15 @@ impl russh::server::Handler for ConnectionHandler {
 
         session.channel_success(id)?;
         let hnd = session.handle();
-        tokio::spawn(async move {
+        let attach = async move {
             if let Err(e) = session_handle.attach(conn_username, channel, config).await {
                 let _ = hnd
                     .data(id, format!("Error attaching to session: {e}\r\n"))
                     .await;
                 let _ = hnd.close(id).await;
             }
-        });
+        };
+        span.in_scope(|| crate::traced::spawn(attach));
         Ok(())
     }
 
@@ -468,6 +477,43 @@ impl russh::server::Handler for ConnectionHandler {
         reply: ChannelOpenHandle,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
+        // The native client puts its W3C traceparent in the open request's
+        // originator address: a direct-tcpip open is decided before any
+        // channel request could carry an env, and the daemon dials the target
+        // itself, so the field has no other use here (see
+        // `minimal_client::Client::open_direct_tcpip`). The forward's span
+        // adopts it, so the relay and the session's `TrackForward` join the
+        // CLI's trace (TEL-028). Any other
+        // originator — OpenSSH sends an address — mints a fresh context, as
+        // every forward did before.
+        let span = forward_span(host_to_connect, port_to_connect, originator_address);
+        tracing::Instrument::instrument(
+            self.relay_direct_tcpip(
+                channel,
+                host_to_connect,
+                port_to_connect,
+                originator_address,
+                originator_port,
+                reply,
+            ),
+            span,
+        )
+        .await
+    }
+}
+
+impl ConnectionHandler {
+    /// The `direct-tcpip` handler's body, run under the forward's span (see
+    /// [`russh::server::Handler::channel_open_direct_tcpip`] above).
+    async fn relay_direct_tcpip(
+        &mut self,
+        channel: RuChannel<Msg>,
+        host_to_connect: &str,
+        port_to_connect: u32,
+        originator_address: &str,
+        originator_port: u32,
+        reply: ChannelOpenHandle,
+    ) -> Result<(), ConnectionError> {
         protocol_trace!(
             "Got channel_open_direct_tcpip: {host_to_connect}:{port_to_connect} \
              from {originator_address}:{originator_port}"
@@ -631,13 +677,65 @@ impl russh::server::Handler for ConnectionHandler {
         // the session's to abort at teardown, so a session that goes away
         // takes its forwards down with it.
         let relay = match upstream {
-            Upstream::Shared(socket) => tokio::spawn(relay_streams(channel.into_stream(), socket)),
-            Upstream::InBox(child) => tokio::spawn(relay_streams(channel.into_stream(), child)),
+            Upstream::Shared(socket) => {
+                crate::traced::spawn(relay_streams(channel.into_stream(), socket))
+            }
+            Upstream::InBox(child) => {
+                crate::traced::spawn(relay_streams(channel.into_stream(), child))
+            }
         };
         session.track_forward(relay.abort_handle()).await;
 
         Ok(())
     }
+}
+
+/// The client's trace context a direct-tcpip open carries, when its
+/// originator address is a W3C `traceparent` (the native client's), else
+/// `None` (an address, as OpenSSH sends).
+fn forward_parent(originator_address: &str) -> Option<minimald_rpc::trace::TraceContext> {
+    minimald_rpc::trace::TraceContext::parse_traceparent(originator_address)
+}
+
+/// The span one forwarded connection is served under: `forward`, a child of
+/// the client's context when the open carried one (so the relay tasks and the
+/// session's `TrackForward` message are in the CLI's trace), with its ids
+/// recorded as the `rpc` and `exec` spans record theirs.
+fn forward_span(host: &str, port: u32, originator_address: &str) -> tracing::Span {
+    let span = tracing::info_span!(
+        "forward",
+        host = %host,
+        port,
+        telemetry = tracing::field::Empty,
+        trace_id = tracing::field::Empty,
+        span_id = tracing::field::Empty,
+        parent_span_id = tracing::field::Empty,
+    );
+    // The native client's opt-out rides in the same field as its context
+    // would: `MINIMAL_OTEL=off` instead of a traceparent.
+    if originator_address == minimald_rpc::trace::OTEL_OFF_ORIGINATOR {
+        crate::exec::adopt_opt_out(&span);
+    } else {
+        crate::exec::adopt_trace(&span, forward_parent(originator_address));
+    }
+    span
+}
+
+/// The span an interactive attach is served under: `attach`, a child of the
+/// client's `TRACEPARENT` (channel env) when it sent one, with its ids
+/// recorded as the `rpc` and `exec` spans record theirs. Adopted with the
+/// exec path's helper ([`crate::exec::adopt_client_trace`]).
+fn attach_span(config: &ChannelConfig, session_id: SessionId) -> tracing::Span {
+    let span = tracing::info_span!(
+        "attach",
+        %session_id,
+        telemetry = tracing::field::Empty,
+        trace_id = tracing::field::Empty,
+        span_id = tracing::field::Empty,
+        parent_span_id = tracing::field::Empty,
+    );
+    crate::exec::adopt_client_trace(&span, config);
+    span
 }
 
 /// Where a direct-tcpip dial must run, decided by the session's network mode.
@@ -853,6 +951,96 @@ where
 
 #[cfg(test)]
 mod tests {
+    /// A direct-tcpip open from the native client carries the CLI's
+    /// traceparent as its originator address; an OpenSSH client's address
+    /// there is not a context, so the forward starts a fresh trace as before.
+    #[test]
+    fn a_forward_adopts_a_traceparent_originator_and_ignores_an_address() {
+        let tp = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+        let parent = super::forward_parent(tp).expect("a traceparent originator parses");
+        assert_eq!(parent.trace_id_hex(), "0af7651916cd43dd8448eb211c80319c");
+        assert!(super::forward_parent("127.0.0.1").is_none());
+        assert!(super::forward_parent("").is_none());
+    }
+
+    /// A forward opened by a client that opted out (`MINIMAL_OTEL=off` as
+    /// the originator) is served in a span marked `telemetry=opt-out` with
+    /// no parent, whose ids are unsampled; an attach with the marker in its
+    /// channel env likewise. The file log still joins the messages they
+    /// send (flags 00).
+    #[test]
+    fn an_opted_out_forward_or_attach_is_marked_and_unsampled() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let log = crate::test_harness::SpanLog::default();
+        let _g = tracing::subscriber::set_default(tracing_subscriber::registry().with(log.clone()));
+        let span = super::forward_span("127.0.0.1", 8080, minimald_rpc::trace::OTEL_OFF_ORIGINATOR);
+        let sent = span
+            .in_scope(crate::traced::caller_context)
+            .expect("a TrackForward sent in the span carries its ids");
+        assert!(
+            sent.traceparent().ends_with("-00"),
+            "{}",
+            sent.traceparent()
+        );
+        let forward = log.one("forward", "telemetry", crate::exec::OPT_OUT);
+        assert_eq!(forward.field("parent_span_id"), None, "{forward:?}");
+        assert_eq!(
+            forward.field("trace_id"),
+            Some(sent.trace_id_hex().as_str())
+        );
+
+        let mut config = ChannelConfig {
+            env_vars: BTreeMap::new(),
+            pty: None,
+        };
+        config.env_vars.insert(
+            minimald_rpc::trace::OTEL_ENV.to_owned(),
+            minimald_rpc::trace::OTEL_OFF.to_owned(),
+        );
+        let span = super::attach_span(&config, SessionId::nil());
+        let sent = span
+            .in_scope(crate::traced::caller_context)
+            .expect("an Attach sent in the span carries its ids");
+        assert!(sent.traceparent().ends_with("-00"));
+        let attach = log.one("attach", "telemetry", crate::exec::OPT_OUT);
+        assert_eq!(attach.field("parent_span_id"), None, "{attach:?}");
+    }
+
+    /// An interactive attach adopts the `TRACEPARENT` the CLI sends in the
+    /// channel env (TEL-029): the `attach` span is in the CLI's
+    /// trace, and the session's `Attach` message, sent from inside it,
+    /// carries the attach span's ids. Without one, the attach mints a trace.
+    #[test]
+    fn an_attach_joins_the_callers_trace() {
+        let _g = tracing::subscriber::set_default(tracing_subscriber::registry());
+        let tp = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+        let session_id = SessionId::nil();
+        let mut config = ChannelConfig {
+            env_vars: BTreeMap::new(),
+            pty: None,
+        };
+        config.env_vars.insert(
+            minimald_rpc::trace::TRACEPARENT_ENV.to_owned(),
+            tp.to_owned(),
+        );
+        let span = super::attach_span(&config, session_id);
+        let sent = span
+            .in_scope(crate::traced::caller_context)
+            .expect("an Attach message sent in the span carries its ids");
+        assert_eq!(sent.trace_id_hex(), "0af7651916cd43dd8448eb211c80319c");
+        assert_ne!(
+            sent.span_id_hex(),
+            "b7ad6b7169203331",
+            "a child, not the CLI's span"
+        );
+
+        config.env_vars.clear();
+        let fresh = super::attach_span(&config, session_id)
+            .in_scope(crate::traced::caller_context)
+            .expect("a minted context");
+        assert_ne!(fresh.trace_id_hex(), sent.trace_id_hex());
+    }
+
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -861,7 +1049,7 @@ mod tests {
         let (mut client, relay_client) = tokio::io::duplex(4096);
         let (mut server, relay_server) = tokio::io::duplex(4096);
 
-        tokio::spawn(relay_streams(relay_client, relay_server));
+        crate::traced::spawn(relay_streams(relay_client, relay_server));
 
         client.write_all(b"hello").await.unwrap();
         let mut buf = [0u8; 5];
@@ -874,6 +1062,140 @@ mod tests {
         assert_eq!(&buf2, b"world");
     }
 
+    /// Accepts any host key: the test server's is ephemeral.
+    struct ForwardHandler;
+
+    impl russh::client::Handler for ForwardHandler {
+        type Error = russh::Error;
+        async fn check_server_key(
+            &mut self,
+            _key: &russh::keys::PublicKeyOrCertificate,
+        ) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+    }
+
+    /// A client connection to `server`, authenticated for `session_id`
+    /// (the SSH username carries its UUID, as `ssh -l <uuid> -L ...` does).
+    /// `TestClient` keeps its russh handle private and the forward tests
+    /// need the raw `channel_open_direct_tcpip`, so this drives both halves
+    /// of the connection the way `TestServer::connect` does.
+    async fn forward_client(
+        server: &crate::test_harness::TestServer,
+        session_id: SessionId,
+    ) -> russh::client::Handle<ForwardHandler> {
+        let host_key = server.state.host_key().await.unwrap();
+        let russh_config = Arc::new(russh::server::Config {
+            keys: vec![host_key],
+            auth_rejection_time_initial: Some(Duration::ZERO),
+            nodelay: true,
+            ..Default::default()
+        });
+        let (server_side, client_side) = tokio::net::UnixStream::pair().unwrap();
+        let server_setup = {
+            let state = server.state.clone();
+            async move {
+                let (_conn, session_fut) =
+                    Connection::from_stream(server_side, russh_config, state, true)
+                        .await
+                        .expect("handshake over the in-memory pair");
+                crate::traced::spawn(session_fut);
+            }
+        };
+        let client_setup = russh::client::connect_stream(
+            Arc::new(russh::client::Config::default()),
+            client_side,
+            ForwardHandler,
+        );
+        let (_, handle) = tokio::join!(server_setup, client_setup);
+        let mut handle = handle.unwrap();
+        let auth = handle
+            .authenticate_none(&session_id.to_string())
+            .await
+            .unwrap();
+        assert!(auth.success(), "auth_none should succeed on local UDS");
+        handle
+    }
+
+    /// A loopback listener echoing what its one connection sends: the box
+    /// port a forward reaches. Returns its port.
+    async fn echo_port() -> u16 {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        crate::traced::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 64];
+            loop {
+                match sock.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => sock.write_all(&buf[..n]).await.unwrap(),
+                }
+            }
+        });
+        port
+    }
+
+    /// TEL-028: a `min net forward` connection
+    /// opened with the CLI's traceparent as its originator is served in a
+    /// `forward` span in the CLI's trace, and the session's `TrackForward`
+    /// message, sent from inside it, is that span's child.
+    #[tokio::test]
+    async fn a_forwarded_connections_track_forward_is_a_child_of_the_forward_span() {
+        use crate::test_harness::{SpanLog, TestServer, create_session_req};
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let log = SpanLog::default();
+        let _g = tracing::subscriber::set_default(tracing_subscriber::registry().with(log.clone()));
+        let port = echo_port().await;
+        let server = TestServer::new().await;
+        let req = create_session_req("forward", "/tmp");
+        let session_id = server
+            .state
+            .sessions_manager()
+            .await
+            .create_session(req.config, None)
+            .await
+            .unwrap();
+        let handle = forward_client(&server, session_id).await;
+        let tp = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+        let mut channel = handle
+            .channel_open_direct_tcpip("127.0.0.1", port.into(), tp, 0)
+            .await
+            .expect("the forward opens")
+            .into_stream();
+        channel.write_all(b"ping").await.unwrap();
+        let mut echoed = [0u8; 4];
+        channel.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(&echoed, b"ping");
+
+        // The relay is answering; the TrackForward send follows the accept.
+        let tracked = || {
+            !log.find("session.message", "kind", "TrackForward")
+                .is_empty()
+        };
+        for _ in 0..100 {
+            if tracked() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let forward = log.one("forward", "trace_id", "0af7651916cd43dd8448eb211c80319c");
+        assert_eq!(forward.field("parent_span_id"), Some("b7ad6b7169203331"));
+        let track = log.one("session.message", "kind", "TrackForward");
+        assert_eq!(
+            track.field("trace_id"),
+            Some("0af7651916cd43dd8448eb211c80319c"),
+            "{track:?}"
+        );
+        assert_eq!(
+            track.field("parent_span_id"),
+            forward.field("span_id"),
+            "TrackForward is a child of the forward span: {track:?}"
+        );
+    }
+
     /// A `direct-tcpip` channel to a box port relays bytes in the default,
     /// featureless build — the configuration a release build ships — because
     /// nothing about the handler is behind a feature anymore (NET-110). The
@@ -881,8 +1203,7 @@ mod tests {
     /// port it reached.
     #[tokio::test]
     async fn direct_tcpip_served_in_release() {
-        use russh::keys::PublicKeyOrCertificate;
-        use tokio::net::{TcpListener, UnixStream};
+        use tokio::net::TcpListener;
 
         use crate::test_harness::{TestServer, captured_log, create_session_req};
 
@@ -893,7 +1214,7 @@ mod tests {
         // The box port: a loopback listener echoing whatever it receives.
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        tokio::spawn(async move {
+        crate::traced::spawn(async move {
             let (mut sock, _) = listener.accept().await.unwrap();
             let mut buf = [0u8; 64];
             loop {
@@ -916,51 +1237,7 @@ mod tests {
             .await
             .unwrap();
 
-        // `TestClient` keeps its russh handle private and this test needs the
-        // raw `channel_open_direct_tcpip`, so drive both halves of the
-        // connection the way `TestServer::connect` does.
-        struct ForwardHandler;
-        impl russh::client::Handler for ForwardHandler {
-            type Error = russh::Error;
-            async fn check_server_key(
-                &mut self,
-                _key: &PublicKeyOrCertificate,
-            ) -> Result<bool, Self::Error> {
-                Ok(true)
-            }
-        }
-
-        let host_key = server.state.host_key().await.unwrap();
-        let russh_config = Arc::new(russh::server::Config {
-            keys: vec![host_key],
-            auth_rejection_time_initial: Some(Duration::ZERO),
-            nodelay: true,
-            ..Default::default()
-        });
-        let (server_side, client_side) = UnixStream::pair().unwrap();
-        let server_setup = {
-            let state = server.state.clone();
-            let russh_config = russh_config.clone();
-            async move {
-                let (_conn, session_fut) =
-                    Connection::from_stream(server_side, russh_config, state, true)
-                        .await
-                        .expect("handshake over the in-memory pair");
-                tokio::spawn(session_fut);
-            }
-        };
-        let client_setup = russh::client::connect_stream(
-            Arc::new(russh::client::Config::default()),
-            client_side,
-            ForwardHandler,
-        );
-        let (_, handle) = tokio::join!(server_setup, client_setup);
-        let mut handle = handle.unwrap();
-        let auth = handle
-            .authenticate_none(&session_id.to_string())
-            .await
-            .unwrap();
-        assert!(auth.success(), "auth_none should succeed on local UDS");
+        let handle = forward_client(&server, session_id).await;
 
         // The point of the test: the channel opens in a build with no
         // features, and bytes relay through it to the box port and back.
@@ -1117,7 +1394,7 @@ kill "$peer" 2>/dev/null
         // The box port: a loopback listener echoing whatever it receives.
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        tokio::spawn(async move {
+        crate::traced::spawn(async move {
             let (mut sock, _) = listener.accept().await.unwrap();
             let mut buf = [0u8; 64];
             loop {
@@ -1194,7 +1471,7 @@ kill "$peer" 2>/dev/null
                     Connection::from_stream(server_side, russh_config, state, true)
                         .await
                         .expect("handshake over the in-memory pair");
-                tokio::spawn(session_fut);
+                crate::traced::spawn(session_fut);
             }
         };
         let client_setup = russh::client::connect_stream(

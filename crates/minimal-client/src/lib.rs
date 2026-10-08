@@ -19,11 +19,47 @@ use minimald_rpc::OneshotSshRpc;
 /// The process-wide trace context, minted once at command dispatch. The
 /// root span carries its ids into every log line, and the SSH client sends
 /// the same context to the daemon as a `TRACEPARENT` channel env request —
-/// one grep joins host and guest records.
+/// one grep joins host and guest records — unless telemetry is off
+/// ([`set_telemetry_opted_out`]), when the channel says so instead.
 pub fn trace_context() -> &'static minimald_rpc::trace::TraceContext {
-    static CONTEXT: std::sync::OnceLock<minimald_rpc::trace::TraceContext> =
-        std::sync::OnceLock::new();
-    CONTEXT.get_or_init(minimald_rpc::trace::TraceContext::mint)
+    TRACE_CONTEXT.get_or_init(minimald_rpc::trace::TraceContext::mint)
+}
+
+static TRACE_CONTEXT: std::sync::OnceLock<minimald_rpc::trace::TraceContext> =
+    std::sync::OnceLock::new();
+
+/// Whether this process's telemetry decision is off, whatever the cause
+/// (not opted in, `DO_NOT_TRACK`, `OTEL_SDK_DISABLED`). Set by the CLI at
+/// dispatch ([`set_telemetry_opted_out`]); off by default, so a caller that
+/// never says sends its `TRACEPARENT` as before.
+static TELEMETRY_OPTED_OUT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Record that this process's telemetry decision is off. From then on every
+/// channel to the daemon carries the opt-out marker (`MINIMAL_OTEL=off`)
+/// and no `TRACEPARENT`, so the daemon records nothing of this process's
+/// requests either (its request spans are unsampled, and it keeps their
+/// command lines out of its own records). The process's trace context is
+/// still minted: the CLI's own file log keeps joining its lines by it.
+pub fn set_telemetry_opted_out(off: bool) {
+    TELEMETRY_OPTED_OUT.store(off, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether [`set_telemetry_opted_out`] was last given `true`.
+#[must_use]
+pub fn telemetry_opted_out() -> bool {
+    TELEMETRY_OPTED_OUT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Set the process-wide trace context before its first use (the CLI's root
+/// span decides it, so exported spans, log fields and the propagated
+/// `TRACEPARENT` agree). Ignored once the context exists.
+pub fn init_trace_context(ctx: minimald_rpc::trace::TraceContext) {
+    #[expect(
+        clippy::let_underscore_must_use,
+        reason = "a second init keeps the first value, which is the intent"
+    )]
+    let _ = TRACE_CONTEXT.set(ctx);
 }
 
 // ── VM name ─────────────────────────────────────────────────────────────────
@@ -263,6 +299,7 @@ impl Client {
     /// ensured and is about to drive. A VM it did not select gets
     /// [`Client::probe`] instead: waiting out the retry on a daemon nobody
     /// promised would charge every stopped VM on the host to the caller.
+    #[tracing::instrument(level = "info", name = "client.connect", skip_all)]
     pub async fn connect(sock_path: &Path) -> Result<Self, anyhow::Error> {
         Self::connect_as(sock_path, "minimal-cli").await
     }
@@ -402,8 +439,21 @@ impl Client {
         host: &str,
         port: u16,
     ) -> Result<russh::Channel<russh::client::Msg>, anyhow::Error> {
+        // The open request carries no channel env, and the daemon dials the
+        // target itself, so the originator address has no meaning for it:
+        // this process's trace context rides there instead (the daemon's
+        // `forward` span adopts it, so the relay and the session's
+        // TrackForward join this command's trace; TEL-028). An OpenSSH
+        // client's real address in that field parses as nothing there. With
+        // telemetry off the field carries the opt-out instead
+        // (`MINIMAL_OTEL=off`), as `send_trace_context` does on a channel.
+        let originator = if telemetry_opted_out() {
+            minimald_rpc::trace::OTEL_OFF_ORIGINATOR.to_owned()
+        } else {
+            trace_context().traceparent()
+        };
         self.handle
-            .channel_open_direct_tcpip(host, u32::from(port), "127.0.0.1", 0)
+            .channel_open_direct_tcpip(host, u32::from(port), &originator, 0)
             .await
             .with_context(|| format!("open direct-tcpip channel to {host}:{port}"))
     }
@@ -451,6 +501,7 @@ impl Client {
             .await
     }
 
+    #[tracing::instrument(level = "info", name = "client.rpc", skip_all, fields(rpc = R::NAME, timeout_s = timeout.as_secs()))]
     async fn oneshot_rpc_within<R: OneshotSshRpc>(
         &mut self,
         request: R::Request<'_>,
@@ -466,7 +517,7 @@ impl Client {
                 .await
                 .with_context(|| format!("open channel for {}", R::NAME))?;
 
-            send_traceparent(&channel).await;
+            send_trace_context(&channel).await;
             // want_reply = true so an unknown subsystem (CLI/daemon version
             // skew) surfaces as a Failure instead of the client writing into a
             // channel nobody serves (#901).
@@ -562,7 +613,7 @@ impl Client {
             .channel_open_session()
             .await
             .context("open exec channel")?;
-        send_traceparent(&channel).await;
+        send_trace_context(&channel).await;
         if let Some(id) = session_id {
             channel
                 .set_env(true, "MINIMAL_SESSION_ID", id.to_string())
@@ -877,7 +928,7 @@ impl Client {
             .await
             .with_context(|| format!("open channel for {what} upload"))?;
 
-        send_traceparent(&channel).await;
+        send_trace_context(&channel).await;
         channel
             .set_env(true, "MINIMAL_SESSION_ID", session_id.to_string())
             .await
@@ -968,7 +1019,7 @@ impl Client {
             .await
             .context("open channel for diagnostic bundle")?;
 
-        send_traceparent(&channel).await;
+        send_trace_context(&channel).await;
         channel
             .request_subsystem(true, minimald_rpc::DIAG_BUNDLE_SUBSYSTEM)
             .await
@@ -1394,14 +1445,23 @@ pub fn enumerate_vm_sockets(
     Ok(vms)
 }
 
-/// Sends the process trace context as a `TRACEPARENT` channel env request.
-/// Best-effort and reply-less: trace propagation is a diagnostic aid, and a
-/// daemon predating the variable ignores unknown env names anyway.
-async fn send_traceparent(channel: &russh::Channel<russh::client::Msg>) {
-    use minimald_rpc::trace::TRACEPARENT_ENV;
-    let _ = channel
-        .set_env(false, TRACEPARENT_ENV, trace_context().traceparent())
-        .await;
+/// Sends the process trace context as a `TRACEPARENT` channel env request,
+/// or, when this process's telemetry is off ([`telemetry_opted_out`]), the
+/// opt-out marker (`MINIMAL_OTEL=off`) and no `TRACEPARENT`. Best-effort
+/// and reply-less: trace propagation is a diagnostic aid, and a daemon
+/// predating either variable ignores unknown env names anyway.
+async fn send_trace_context(channel: &russh::Channel<russh::client::Msg>) {
+    use minimald_rpc::trace::{OTEL_ENV, OTEL_OFF, TRACEPARENT_ENV};
+    let sent = if telemetry_opted_out() {
+        channel.set_env(false, OTEL_ENV, OTEL_OFF).await
+    } else {
+        channel
+            .set_env(false, TRACEPARENT_ENV, trace_context().traceparent())
+            .await
+    };
+    if let Err(error) = sent {
+        tracing::debug!(%error, "trace context not sent on the channel");
+    }
 }
 
 /// Per-probe deadline for the `git` calls [`fill_git_info`] runs: a list
@@ -1991,5 +2051,198 @@ mod tests {
             std::fs::canonicalize(&info.repo_root).unwrap(),
             std::fs::canonicalize(repo.path()).unwrap()
         );
+    }
+}
+
+#[cfg(test)]
+mod opt_out_tests {
+    use std::sync::{Arc, Mutex};
+
+    /// A stand-in daemon that records what each channel open and request
+    /// carries, accepts everything, and ends every subsystem channel at
+    /// once (the client's RPC then fails to decode, which is not the point).
+    #[derive(Clone, Default)]
+    struct Recorder {
+        env: Arc<Mutex<Vec<(String, String)>>>,
+        originators: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl russh::server::Handler for Recorder {
+        type Error = russh::Error;
+
+        async fn auth_none(&mut self, _: &str) -> Result<russh::server::Auth, Self::Error> {
+            Ok(russh::server::Auth::Accept)
+        }
+
+        async fn channel_open_session(
+            &mut self,
+            _: russh::Channel<russh::server::Msg>,
+            reply: russh::server::ChannelOpenHandle,
+            _: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            reply.accept().await;
+            Ok(())
+        }
+
+        async fn env_request(
+            &mut self,
+            id: russh::ChannelId,
+            name: &str,
+            value: &str,
+            session: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            self.env
+                .lock()
+                .unwrap()
+                .push((name.to_owned(), value.to_owned()));
+            session.channel_success(id)?;
+            Ok(())
+        }
+
+        async fn subsystem_request(
+            &mut self,
+            id: russh::ChannelId,
+            _: &str,
+            session: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            session.channel_success(id)?;
+            session.eof(id)?;
+            session.close(id)?;
+            Ok(())
+        }
+
+        async fn channel_open_direct_tcpip(
+            &mut self,
+            _: russh::Channel<russh::server::Msg>,
+            _: &str,
+            _: u32,
+            originator_address: &str,
+            _: u32,
+            reply: russh::server::ChannelOpenHandle,
+            _: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            self.originators
+                .lock()
+                .unwrap()
+                .push(originator_address.to_owned());
+            reply.accept().await;
+            Ok(())
+        }
+    }
+
+    /// One RPC and one direct-tcpip open against the recorder, through the
+    /// real client; returns the channel env requests and the originator
+    /// addresses it sent.
+    async fn drive(sock: &std::path::Path) {
+        let mut client = super::Client::connect(sock).await.unwrap();
+        // The recorder ends the RPC channel unanswered and accepts the
+        // forward: neither outcome is the point, what was sent is.
+        drop(client.oneshot_rpc::<minimald_rpc::GetVersion>(()).await);
+        drop(client.open_direct_tcpip("127.0.0.1", 8080).await);
+        drop(client);
+    }
+
+    /// With the process's telemetry off (`DO_NOT_TRACK`, no opt-in, or
+    /// `OTEL_SDK_DISABLED`: the CLI's one decision), every channel to the
+    /// daemon carries `MINIMAL_OTEL=off` and no `TRACEPARENT`, and a
+    /// forward's open carries the same marker as its originator. With it
+    /// on, the `TRACEPARENT` goes and no marker. Both run here in order on
+    /// the process-wide flag, so this is the one test that sets it.
+    #[tokio::test]
+    async fn do_not_track_sends_the_opt_out_and_no_traceparent() {
+        let key = russh::keys::PrivateKey::random(
+            &mut russh::keys::key::safe_rng(),
+            russh::keys::Algorithm::Ed25519,
+        )
+        .unwrap();
+        let config = Arc::new(russh::server::Config {
+            keys: vec![key],
+            auth_rejection_time_initial: Some(std::time::Duration::ZERO),
+            ..Default::default()
+        });
+        let dir = tempfile::Builder::new()
+            .prefix("mcot")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let sock = dir.path().join("ssh.sock");
+        let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+        let recorder = Recorder::default();
+        let server = {
+            let (config, recorder) = (config.clone(), recorder.clone());
+            tokio::spawn(async move {
+                loop {
+                    let Ok((stream, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let (config, recorder) = (config.clone(), recorder.clone());
+                    tokio::spawn(async move {
+                        if let Ok(session) =
+                            russh::server::run_stream(config, stream, recorder).await
+                        {
+                            drop(session.await);
+                        }
+                    });
+                }
+            })
+        };
+        let env = |r: &Recorder| r.env.lock().unwrap().clone();
+        let originators = |r: &Recorder| r.originators.lock().unwrap().clone();
+
+        super::set_telemetry_opted_out(true);
+        drive(&sock).await;
+        let sent = env(&recorder);
+        assert!(
+            sent.iter()
+                .any(|(k, v)| k == minimald_rpc::trace::OTEL_ENV
+                    && v == minimald_rpc::trace::OTEL_OFF),
+            "the opt-out marker was sent: {sent:?}"
+        );
+        assert!(
+            !sent
+                .iter()
+                .any(|(k, _)| k == minimald_rpc::trace::TRACEPARENT_ENV),
+            "and no TRACEPARENT: {sent:?}"
+        );
+        assert_eq!(
+            originators(&recorder),
+            [minimald_rpc::trace::OTEL_OFF_ORIGINATOR.to_owned()],
+            "the forward's originator is the marker"
+        );
+
+        recorder.env.lock().unwrap().clear();
+        recorder.originators.lock().unwrap().clear();
+        super::set_telemetry_opted_out(false);
+        drive(&sock).await;
+        let sent = env(&recorder);
+        let tp = super::trace_context().traceparent();
+        assert!(
+            sent.iter()
+                .any(|(k, v)| k == minimald_rpc::trace::TRACEPARENT_ENV && *v == tp),
+            "with telemetry on the TRACEPARENT is sent: {sent:?}"
+        );
+        assert!(
+            !sent.iter().any(|(k, _)| k == minimald_rpc::trace::OTEL_ENV),
+            "and no marker: {sent:?}"
+        );
+        assert_eq!(originators(&recorder), [tp]);
+
+        // The OpenSSH attach path picks the same one variable.
+        super::set_telemetry_opted_out(true);
+        assert_eq!(
+            super::attach::trace_env(),
+            (
+                minimald_rpc::trace::OTEL_ENV,
+                minimald_rpc::trace::OTEL_OFF.to_owned()
+            )
+        );
+        super::set_telemetry_opted_out(false);
+        assert_eq!(
+            super::attach::trace_env(),
+            (
+                minimald_rpc::trace::TRACEPARENT_ENV,
+                super::trace_context().traceparent()
+            )
+        );
+        server.abort();
     }
 }

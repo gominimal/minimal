@@ -465,7 +465,7 @@ impl SideOp {
         sinks: Vec<BuildSink>,
     ) -> Result<Self, std::io::Error> {
         // `graph_from_all_packages` is CPU-heavy, run on blocking pool.
-        let (ctx, graph_result) = tokio::task::spawn_blocking(move || {
+        let (ctx, graph_result) = crate::traced::spawn_blocking(move || {
             let mut ctx = ctx;
             let r = ctx.graph_from_all_packages().map_err(|e| e.to_string());
 
@@ -486,13 +486,13 @@ impl SideOp {
             let cancel_flag = cancel.clone();
             let pump_inner = inner.clone();
             let build_inner = inner.clone();
-            tokio::task::spawn(async move {
+            crate::traced::spawn(async move {
                 let mut ctx = ctx;
                 let (log_tx, mut log_rx) = futures::channel::mpsc::unbounded::<BuildEvent>();
 
                 // Pump task: drain the log channel until the build drops its
                 // sender (on completion or cancellation).
-                let pump = tokio::task::spawn(async move {
+                let pump = crate::traced::spawn(async move {
                     while let Some(event) = log_rx.next().await {
                         let inner = pump_inner.lock().await;
                         for sink in &inner.sinks {
@@ -579,7 +579,7 @@ impl SideOp {
             .to_path_buf();
 
         // `graph_from_all_packages` is CPU-heavy, run on blocking pool.
-        let (ctx, graph_result) = tokio::task::spawn_blocking(move || {
+        let (ctx, graph_result) = crate::traced::spawn_blocking(move || {
             let mut ctx = ctx;
             let r = ctx.graph_from_all_packages().map_err(|e| e.to_string());
 
@@ -597,7 +597,7 @@ impl SideOp {
             let cancel_flag = cancel.clone();
             let check_opts = opts.clone();
             let check_inner = inner.clone();
-            tokio::task::spawn(async move {
+            crate::traced::spawn(async move {
                 let stream = check::run_checks(
                     (check_opts.packages).then(|| dir.join("packages")),
                     (check_opts.stacks).then(|| dir.join("stacks")),
@@ -739,7 +739,7 @@ impl SideOp {
         let top_levels = output.top_levels();
 
         // Graph construction is CPU-heavy, run on blocking pool.
-        let (ctx, graph_result) = tokio::task::spawn_blocking(move || {
+        let (ctx, graph_result) = crate::traced::spawn_blocking(move || {
             let mut ctx = ctx;
             let r = ctx
                 .graph_from_package_names_with_target(top_levels, target)
@@ -760,7 +760,7 @@ impl SideOp {
             let cancel_flag = cancel.clone();
             let pump_inner = inner.clone();
             let op_inner = inner.clone();
-            tokio::task::spawn(async move {
+            crate::traced::spawn(async move {
                 let mut ctx = ctx;
 
                 let build_err = match ctx
@@ -797,7 +797,7 @@ impl SideOp {
                 // than growing a whole image in memory.
                 let (byte_tx, byte_rx) = mpsc::channel::<Vec<u8>>(3);
 
-                let pump = tokio::task::spawn(pump_materialize(pump_inner, byte_rx, event_rx));
+                let pump = crate::traced::spawn(pump_materialize(pump_inner, byte_rx, event_rx));
 
                 // Assembly blocks its thread, so keep it off the async
                 // workers; its internal `rayon` scope needs a runtime entered.
@@ -805,7 +805,7 @@ impl SideOp {
                 let ot = ctx.op_tracker();
                 let daemon_id = ctx.daemon_id();
                 let runtime = tokio::runtime::Handle::current();
-                let result = tokio::task::spawn_blocking(move || {
+                let result = crate::traced::spawn_blocking(move || {
                     let _rt = runtime.enter();
                     let opts = op::Options {
                         cache,
@@ -965,7 +965,7 @@ mod tests {
 
         drop(sub_rx);
 
-        let pump = tokio::task::spawn(pump_materialize(inner, byte_rx, event_rx));
+        let pump = crate::traced::spawn(pump_materialize(inner, byte_rx, event_rx));
         byte_tx.send(vec![1, 2, 3]).await.expect("pump is alive");
 
         // Bounded: the point is that it terminates rather than parking on a

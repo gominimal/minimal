@@ -636,7 +636,13 @@ where
     // egress leg's forwarded frames and the gate's synthesized resets both
     // leave by it, one brief lock per write.
     let sock_tx = Arc::new(tokio::sync::Mutex::new(sock_tx));
-    let tap_to_switch = tokio::spawn(relay_tap_to_switch(
+    // The relay lives as long as the box, past the request that brought the
+    // box up: its tasks run under a root of their own, linked to that
+    // request (see `traced::spawn_detached`), so the request's span ends
+    // with the request.
+    let root = crate::traced::detach(tracing::info_span!(parent: None, "net.relay", %lease));
+    let _in_root = root.enter();
+    let tap_to_switch = crate::traced::spawn(relay_tap_to_switch(
         Arc::clone(&tap),
         Arc::clone(&sock_tx),
         gate.clone(),
@@ -648,17 +654,18 @@ where
     // revocation's terminations (NET-121) — are written to the switch as they
     // arrive. The task ends when the gate's last holder drops, and the relay
     // aborts it on the way out.
-    let reset_writer =
-        resets_rx.map(|resets_rx| tokio::spawn(write_resets(resets_rx, Arc::clone(&sock_tx))));
+    let reset_writer = resets_rx
+        .map(|resets_rx| crate::traced::spawn(write_resets(resets_rx, Arc::clone(&sock_tx))));
     // The gate's box-directed resets — a revocation ending the box's own half
     // of a held connection (NET-121) — are written into the tap instead, raw
     // the way the ingress leg delivers frames to the box (only the switch side
     // is framed). The tap is written through the same `AsyncFd` readiness
     // guard; a frame-sized `write` is what both legs already issue, so this
     // writer needs no lock of its own against them.
-    let box_reset_writer = box_resets_rx
-        .map(|box_resets_rx| tokio::spawn(write_box_resets(box_resets_rx, Arc::clone(&tap))));
-    let switch_to_tap = tokio::spawn(relay_switch_to_tap(sock_rx, tap, gate.clone()));
+    let box_reset_writer = box_resets_rx.map(|box_resets_rx| {
+        crate::traced::spawn(write_box_resets(box_resets_rx, Arc::clone(&tap)))
+    });
+    let switch_to_tap = crate::traced::spawn(relay_switch_to_tap(sock_rx, tap, gate.clone()));
     Ok(SwitchRelay {
         tap_to_switch,
         switch_to_tap,

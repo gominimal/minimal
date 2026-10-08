@@ -2,6 +2,9 @@
 
 use std::sync::Arc;
 
+use nix::sys::signal::Signal;
+use tokio::signal::unix::SignalKind;
+
 use super::*;
 
 /// How often the forward re-checks that its session is still there.
@@ -186,6 +189,14 @@ fn advisory_command(advisory: &str) -> Option<(&str, &str)> {
 /// destroyed, or the daemon it lives behind goes away (the transport is the
 /// daemon's, so a `min stop` that succeeds ends the forward with it) — or a
 /// Ctrl-C, and the listener and every open relay close with it (NET-105).
+///
+/// A SIGTERM (a supervisor, a `timeout`, a script's cleanup `kill`) or a
+/// SIGHUP (the terminal it runs in closed) closes the forward the same way,
+/// then returns a [`Handoff::Raise`]: [`run`] ends the `cmd` span, flushes,
+/// and dies of the signal as an uncaught one would have, with no closing
+/// line. Without it the process died inside the span, which never ended, so
+/// the `cmd` root of every forward stopped this way reached no collector and
+/// its spans were orphans.
 pub async fn cmd_net_forward(
     global: &GlobalArgs,
     args: NetForwardArgs,
@@ -222,6 +233,11 @@ pub async fn cmd_net_forward(
             .context("Failed to open the session-scoped connection")?,
     ));
 
+    // Before the announcement, so a caller that waits for it and then sends
+    // SIGTERM or SIGHUP always reaches the handler.
+    let mut sigterm = signal_stream(SignalKind::terminate());
+    let mut sighup = signal_stream(SignalKind::hangup());
+
     let label = session_announce_label(&record.id, record.name.as_deref());
     eprintln!(
         "Forwarding localhost:{local_port} → 127.0.0.1:{box_port} in session {label}. \
@@ -242,10 +258,15 @@ pub async fn cmd_net_forward(
     // SIGINT landing there is dropped.
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
-    loop {
+    let end = loop {
         tokio::select! {
             // Ctrl-C is the manual half of the forward's lifecycle.
-            _ = &mut ctrl_c => break,
+            _ = &mut ctrl_c => break ForwardEnd::Closed,
+
+            // SIGTERM and SIGHUP are the other manual endings; see
+            // `ForwardEnd::Terminated`.
+            () = next_signal(&mut sigterm) => break ForwardEnd::Terminated(Signal::SIGTERM),
+            () = next_signal(&mut sighup) => break ForwardEnd::Terminated(Signal::SIGHUP),
 
             // The other half: a session that is gone — destroyed, or lost
             // with its daemon — ends the forward rather than leaving a
@@ -257,7 +278,7 @@ pub async fn cmd_net_forward(
                     Ok(resp) if resp.sessions.iter().any(|s| s.id == session_id) => {}
                     Ok(_) => {
                         eprintln!("Session {label} is gone; closing the forward.");
-                        break;
+                        break ForwardEnd::Closed;
                     }
                     // The list itself failed, which means the daemon is no
                     // longer there to answer it. A different ending than the
@@ -271,7 +292,7 @@ pub async fn cmd_net_forward(
                         eprintln!(
                             "The daemon is no longer reachable; closing the forward."
                         );
-                        break;
+                        break ForwardEnd::Closed;
                     }
                 }
             }
@@ -288,7 +309,7 @@ pub async fn cmd_net_forward(
                             local_port, box_port, error = %e,
                             "forward listener failed; closing the forward"
                         );
-                        break;
+                        break ForwardEnd::Closed;
                     }
                 };
                 // Live handles only: a long-lived forward serves many
@@ -301,16 +322,65 @@ pub async fn cmd_net_forward(
                 )));
             }
         }
-    }
+    };
 
     // The forward is over: take the open relays down with the listener
     // rather than leaving them orphaned against a session that is closing.
     for relay in std::mem::take(&mut relays) {
         relay.abort();
     }
-    tracing::info!(session_id = %session_id, local_port, box_port, "net forward closed");
-    eprintln!("Forward localhost:{local_port} → 127.0.0.1:{box_port} closed.");
-    Ok(())
+    tracing::info!(
+        session_id = %session_id,
+        local_port,
+        box_port,
+        terminated = matches!(end, ForwardEnd::Terminated(_)),
+        "net forward closed"
+    );
+    finish_forward(end, local_port, box_port)
+}
+
+/// How the forward's loop ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForwardEnd {
+    /// Ctrl-C, the session gone, the daemon lost, or the listener failed:
+    /// the forward says it closed and the command succeeds.
+    Closed,
+    /// SIGTERM or SIGHUP. The process dies of it once the `cmd` span has
+    /// ended and been flushed ([`Handoff::Raise`]), exactly as it did when
+    /// nothing caught the signal: same status, nothing more on the console.
+    Terminated(Signal),
+}
+
+/// The command's outcome once the forward has closed: a closing line and
+/// success, or, after a SIGTERM or SIGHUP, the [`Handoff`] that has [`run`]
+/// die of it.
+fn finish_forward(end: ForwardEnd, local_port: u16, box_port: u16) -> Result<(), anyhow::Error> {
+    match end {
+        ForwardEnd::Closed => {
+            eprintln!("Forward localhost:{local_port} → 127.0.0.1:{box_port} closed.");
+            Ok(())
+        }
+        ForwardEnd::Terminated(signal) => Err(Handoff::Raise(signal).into()),
+    }
+}
+
+/// A listener for `kind` in the forward's loop, or `None` when the handler
+/// cannot be installed: the signal then keeps its default action and kills
+/// the forward where it stands, as before.
+fn signal_stream(kind: SignalKind) -> Option<tokio::signal::unix::Signal> {
+    tokio::signal::unix::signal(kind).ok()
+}
+
+/// Resolve on the next signal `stream` listens for; never, without a
+/// listener or once the listener has shut down (`recv` returning `None`), so
+/// a select arm on it cannot spin.
+async fn next_signal(stream: &mut Option<tokio::signal::unix::Signal>) {
+    if let Some(signal) = stream.as_mut()
+        && signal.recv().await.is_some()
+    {
+        return;
+    }
+    std::future::pending::<()>().await;
 }
 
 /// Open one accepted connection's `direct-tcpip` channel, then relay it.
@@ -395,5 +465,28 @@ mod tests {
             None
         );
         assert_eq!(advisory_command("note: one.\nnot a script"), None);
+    }
+
+    /// A forward closed by Ctrl-C or by its session succeeds, as before.
+    #[test]
+    fn a_closed_forward_succeeds() {
+        finish_forward(ForwardEnd::Closed, 18769, 8769).unwrap();
+    }
+
+    /// A forward stopped by SIGTERM or SIGHUP hands `run` that signal to
+    /// die of, so the `cmd` span ends and is flushed first (a forward that died
+    /// of the signal uncaught left its spans unexported; a closed terminal is
+    /// the everyday SIGHUP).
+    #[test]
+    fn a_terminated_forward_hands_off_its_signal() {
+        for signal in [Signal::SIGTERM, Signal::SIGHUP] {
+            let Err(err) = finish_forward(ForwardEnd::Terminated(signal), 18769, 8769) else {
+                panic!("a forward ended by {signal} must not succeed");
+            };
+            assert!(
+                matches!(err.downcast_ref::<Handoff>(), Some(Handoff::Raise(s)) if *s == signal),
+                "{signal}: {err:?}"
+            );
+        }
     }
 }

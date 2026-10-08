@@ -30,7 +30,6 @@ use std::ops::ControlFlow;
 use std::sync::Arc;
 #[cfg(target_os = "linux")]
 use std::sync::RwLock;
-use tokio::sync::mpsc::WeakSender;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
@@ -751,6 +750,51 @@ struct PendingAsk {
     host_ask: Option<tokio::task::AbortHandle>,
 }
 
+impl SessionMessage {
+    /// The variant's name, for the actor's per-message span.
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::GetPaths { .. } => "GetPaths",
+            Self::MakeContext { .. } => "MakeContext",
+            Self::Attach { .. } => "Attach",
+            Self::GetHostAttrs { .. } => "GetHostAttrs",
+            Self::EnsureHost { .. } => "EnsureHost",
+            Self::GetWorkspaceDelta { .. } => "GetWorkspaceDelta",
+            Self::GetHostScreen { .. } => "GetHostScreen",
+            Self::ConfigureLoadout { .. } => "ConfigureLoadout",
+            Self::SubmitVerdict { .. } => "SubmitVerdict",
+            Self::Finalize { .. } => "Finalize",
+            Self::RunDetachHooks { .. } => "RunDetachHooks",
+            Self::Abort { .. } => "Abort",
+            Self::Rename { .. } => "Rename",
+            Self::IsBusy { .. } => "IsBusy",
+            Self::Stop { .. } => "Stop",
+            Self::Destroy { .. } => "Destroy",
+            Self::GetRecord { .. } => "GetRecord",
+            Self::GetNetSwitch { .. } => "GetNetSwitch",
+            Self::GetDenyAllOptOut(_) => "GetDenyAllOptOut",
+            Self::GetComposition { .. } => "GetComposition",
+            Self::GetPatchesUploadLock { .. } => "GetPatchesUploadLock",
+            Self::GetHookScriptsUploadLock { .. } => "GetHookScriptsUploadLock",
+            Self::TrackForward { .. } => "TrackForward",
+            Self::StartBuild { .. } => "StartBuild",
+            Self::StartCheck { .. } => "StartCheck",
+            Self::StartMaterialize { .. } => "StartMaterialize",
+            Self::ExposeDynamic { .. } => "ExposeDynamic",
+            Self::LiveIngress { .. } => "LiveIngress",
+            Self::AskAnswered { .. } => "AskAnswered",
+            #[cfg(test)]
+            Self::PeekPendingAsks(_) => "PeekPendingAsks",
+            #[cfg(test)]
+            Self::PeekComposition { .. } => "PeekComposition",
+            #[cfg(test)]
+            Self::PeekIngressCells(_) => "PeekIngressCells",
+            #[cfg(test)]
+            Self::CheckPackagesAtFinalize(..) => "CheckPackagesAtFinalize",
+        }
+    }
+}
+
 /// Manages one session, from the moment its record is allocated: the create
 /// flow (compose → `Draft` → verdict → `Active`) runs as the
 /// [`SessionInner`] state machine, and the actor owns its record's writes
@@ -759,7 +803,7 @@ struct PendingAsk {
 /// Follows the actor pattern.
 #[derive(Debug)]
 pub struct Session {
-    receiver: mpsc::Receiver<SessionMessage>,
+    receiver: crate::traced::Receiver<SessionMessage>,
     minimal_state_dir: DaemonAbsPath,
     minimal_cache_dir: DaemonAbsPath,
     daemon_ctx: Arc<mctx::DaemonContext>,
@@ -951,7 +995,7 @@ impl Session {
     /// caller decides when to enter [`Self::mainloop`].
     fn assemble(
         seed: SessionConfig,
-        receiver: mpsc::Receiver<SessionMessage>,
+        receiver: crate::traced::Receiver<SessionMessage>,
         inner: SessionInner,
         weak_self: WeakSessionHandle,
     ) -> Self {
@@ -1080,7 +1124,7 @@ impl Session {
             }
         };
 
-        let (sender, receiver) = mpsc::channel(8);
+        let (sender, receiver) = crate::traced::channel(8);
         // One line per session start (NET-074/NET-076/NET-077): the rollout
         // phase this build ships, the daemon's opt-out state, and the
         // effective egress they leave this box with. The declaration
@@ -1141,7 +1185,15 @@ impl Session {
         #[cfg(target_os = "linux")]
         actor.register_hostname(obj.record(), false).await;
 
-        tokio::spawn(actor.mainloop());
+        // The actor outlives the message that brought it up (a create, the
+        // resume an RPC naming the box makes): its own root, linked to that
+        // request, so the request's span ends with the request.
+        let root = tracing::info_span!(
+            parent: None,
+            "session.actor",
+            session_id = %actor.record.id(),
+        );
+        crate::traced::spawn_detached(root, actor.mainloop());
         Ok(SessionHandle(sender))
     }
 
@@ -1761,8 +1813,22 @@ impl Session {
     /// instead of deadlocking against a full manager mailbox.
     async fn mainloop(mut self) {
         let mut teardown = Teardown::ManagerInitiated;
-        while let Some(msg) = self.receiver.recv().await {
-            if let ControlFlow::Break(t) = self.handle_message(msg).await {
+        while let Some((msg, caller)) = self.receiver.recv().await {
+            // Opened now, a child of the sender's ids (see
+            // `traced::Receiver::recv`), so compose, graph resolution and
+            // checkouts nest under the RPC that asked for them.
+            let span = tracing::info_span!(
+                parent: None,
+                "session.message",
+                kind = msg.kind(),
+                trace_id = tracing::field::Empty,
+                span_id = tracing::field::Empty,
+                parent_span_id = tracing::field::Empty,
+            );
+            crate::exec::adopt_trace(&span, caller);
+            if let ControlFlow::Break(t) =
+                tracing::Instrument::instrument(self.handle_message(msg), span).await
+            {
                 teardown = t;
                 break;
             }
@@ -1814,7 +1880,7 @@ impl Session {
                     // unbounded probe would strand one task per poll against
                     // a host that never answers.
                     let h = h.clone();
-                    tokio::spawn(async move {
+                    crate::traced::spawn(async move {
                         let _ = r.send(probe_host(h.get_attrs()).await);
                     });
                 }
@@ -1830,7 +1896,7 @@ impl Session {
                     // commands / a workspace re-walk that can take seconds,
                     // and this actor must stay responsive while they run.
                     let h = h.clone();
-                    tokio::spawn(async move {
+                    crate::traced::spawn(async move {
                         let _ = r.send(h.at_risk().await);
                     });
                 }
@@ -1845,7 +1911,7 @@ impl Session {
                     // Off-actor and bounded for the same reasons as
                     // `GetHostAttrs`.
                     let h = h.clone();
-                    tokio::spawn(async move {
+                    crate::traced::spawn(async move {
                         let _ = r.send(probe_host(h.get_screen()).await);
                     });
                 }
@@ -2862,7 +2928,7 @@ impl Session {
         let weak = self.weak_self.clone();
         let host_ask = match host_switch_address {
             Some(switch_address) => {
-                let task = tokio::spawn(async move {
+                let task = crate::traced::spawn(async move {
                     let end =
                         match crate::net::listeners::report_ask(&control, switch_address, port)
                             .await
@@ -2884,7 +2950,7 @@ impl Session {
                 Some(task.abort_handle())
             }
             None => {
-                tokio::spawn(async move {
+                crate::traced::spawn(async move {
                     let answer = host.ask_expose(port).await;
                     // A session that already went away has already answered
                     // its pending asks fail-closed (`stop_running`), so a
@@ -5156,7 +5222,7 @@ impl Session {
                 };
                 // CPU-heavy (nickel evaluation), so on the blocking pool, as the
                 // launch runs it.
-                let graph = tokio::task::spawn_blocking(move || {
+                let graph = crate::traced::spawn_blocking(move || {
                     let mut ctx = ctx;
                     ctx.graph_from_all_packages().map_err(|e| e.to_string())
                 })
@@ -5229,7 +5295,7 @@ impl Session {
 
 /// The handle to the session.
 #[derive(Debug, Clone)]
-pub struct SessionHandle(mpsc::Sender<SessionMessage>);
+pub struct SessionHandle(crate::traced::Sender<SessionMessage>);
 
 impl SessionHandle {
     /// Returns a non-owning handle to this session.
@@ -5421,7 +5487,7 @@ impl SessionHandle {
         let mut ctx = self.context().await?;
         // `mctx::Error` isn't `Send` (it carries nickel-language types), so it
         // is rendered to a string inside the task.
-        tokio::task::spawn_blocking(move || ctx.needed_packages().map_err(|e| e.to_string()))
+        crate::traced::spawn_blocking(move || ctx.needed_packages().map_err(|e| e.to_string()))
             .await
             .map_err(|e| format!("resolving needed packages: {e}"))?
     }
@@ -5814,7 +5880,7 @@ impl SessionHandle {
 
 /// A non-owning handle to the [`Session`] actor.
 #[derive(Debug, Clone)]
-pub struct WeakSessionHandle(WeakSender<SessionMessage>);
+pub struct WeakSessionHandle(crate::traced::WeakSender<SessionMessage>);
 
 impl WeakSessionHandle {
     /// Promotes to a strong [`SessionHandle`], or `None` if the session actor
@@ -5830,7 +5896,7 @@ impl WeakSessionHandle {
     /// handle, without standing up a live actor.
     #[cfg(test)]
     pub(crate) fn dangling() -> Self {
-        let (tx, _rx) = mpsc::channel::<SessionMessage>(1);
+        let (tx, _rx) = crate::traced::channel::<SessionMessage>(1);
         let weak = tx.downgrade();
         // Drop the only strong sender so `upgrade()` returns `None`.
         drop(tx);
@@ -5849,15 +5915,15 @@ impl WeakSessionHandle {
     pub(crate) fn answering(
         answers: Vec<Result<minimald_rpc::LiveMapping, crate::net::policy::ExposeFailure>>,
     ) -> Self {
-        let (tx, mut rx) = mpsc::channel::<SessionMessage>(1);
+        let (tx, mut rx) = crate::traced::channel::<SessionMessage>(1);
         let weak = tx.downgrade();
-        tokio::spawn(async move {
+        crate::traced::spawn(async move {
             // Hold the strong sender for the runtime the test lives in:
             // without a live sender the channel closes and the asker's
             // `upgrade()` fails before any answer is reached.
             let _hold = tx;
             let mut answers = answers.into_iter();
-            while let Some(message) = rx.recv().await {
+            while let Some((message, _span)) = rx.recv().await {
                 // Past the script, no answer is sent: `reply` drops
                 // unanswered, which the asker types as the actor being gone.
                 if let SessionMessage::ExposeDynamic { reply, .. } = message

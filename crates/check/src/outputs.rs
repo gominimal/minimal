@@ -161,8 +161,10 @@ impl crate::GraphBasedChecker for MissingRuntimeDeps {
         // Clone the graph and release the read lock so other checkers can proceed.
         let graph = std::ops::Deref::deref(&graph).clone();
         let cancel = ctx.cancel.clone();
+        let span = tracing::Span::current();
 
         tokio::task::spawn_blocking(move || {
+            let _enter = span.enter();
             (move || -> Result<CheckResult, Error> {
             crate::bail_if_cancelled(&cancel)?;
             let build = graph.get(&bsr).unwrap();

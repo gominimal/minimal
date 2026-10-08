@@ -81,6 +81,13 @@
 //! neither captured nor indented — reaching the parser as an annotation on
 //! the check run that every reader of the pull request can see.
 #![cfg(target_os = "linux")]
+// An integration test has no `crate::traced` to route its spawns through,
+// and nothing it spawns is in a daemon request's trace; the crate's clippy
+// `disallowed-methods` (see clippy.toml) is for the daemon's own sources.
+#![expect(
+    clippy::disallowed_methods,
+    reason = "an integration test cannot reach crate::traced, and traces nothing"
+)]
 
 use sandbox2::NetPlan;
 use sandbox2::Network as _;

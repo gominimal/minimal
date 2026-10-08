@@ -5,6 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::{
+    borrow::Cow,
     collections::HashMap,
     fs::{self, File, OpenOptions, TryLockError},
     path::{Path, PathBuf},
@@ -391,6 +392,7 @@ impl Manager {
     /// In offline mode, returns [Error::OfflineCacheMiss] — `update` is fundamentally
     /// a network operation, and silently lameducking it would mask hard-to-debug bugs
     /// for callers like `minimal update` that explicitly want fresh state.
+    #[tracing::instrument(level = "info", name = "checkouts.update", skip_all)]
     pub fn update(&mut self) -> Result<(), Error> {
         // Serialize against every other manager over the same cache dir. Git
         // itself is only per-repository; a second `min session activate`
@@ -408,7 +410,7 @@ impl Manager {
                 .git_remotes
                 .keys()
                 .next()
-                .cloned()
+                .map(|remote| scrubbed_remote(remote).into_owned())
                 .unwrap_or_else(|| "<no remotes>".to_string());
             return Err(Error::OfflineCacheMiss { remote });
         }
@@ -417,7 +419,7 @@ impl Manager {
         let checkouts_dir = self.git_checkouts_dir();
         for id in self.state.git_remotes.values_mut() {
             let repo = self.repos.get_mut(id).unwrap();
-            trace!("updating repo {}", repo.url());
+            trace!("updating repo {}", scrubbed_remote(repo.url()));
             repo.fetch()?;
             for (dir, checkout) in self.state.repos.get_mut(id).unwrap().checkouts.iter_mut() {
                 checkout.rev =
@@ -435,6 +437,12 @@ impl Manager {
     /// untouched, so one unreachable remote cannot gate an operation that only
     /// needs `remote` fresh. A remote not yet registered is a no-op: a
     /// subsequent [`Self::checkout_of`] clones it on first use.
+    #[tracing::instrument(
+        level = "info",
+        name = "checkouts.update_remote",
+        skip_all,
+        fields(remote = %scrubbed_remote(remote))
+    )]
     pub fn update_remote(&mut self, remote: &str) -> Result<(), Error> {
         if self.offline {
             // As in `update`: offline touches nothing, so it never waits on
@@ -444,7 +452,7 @@ impl Manager {
                 return Ok(());
             }
             return Err(Error::OfflineCacheMiss {
-                remote: remote.to_string(),
+                remote: scrubbed_remote(remote).into_owned(),
             });
         }
         let _lock = lock_cache(&self.base_dir, lock_timeout())?;
@@ -454,7 +462,7 @@ impl Manager {
         };
         let checkouts_dir = self.git_checkouts_dir();
         let repo = self.repos.get_mut(&id).unwrap();
-        trace!("updating repo {}", repo.url());
+        trace!("updating repo {}", scrubbed_remote(repo.url()));
         repo.fetch()?;
         for (dir, checkout) in self.state.repos.get_mut(&id).unwrap().checkouts.iter_mut() {
             checkout.rev = repo.worktree_checkout(&checkouts_dir.join(dir), &checkout.version)?;
@@ -465,8 +473,14 @@ impl Manager {
 
     /// Returns the path to a checkout described by the given parameters, as well as the
     /// commit hash at the given ref.
+    #[tracing::instrument(
+        level = "info",
+        name = "checkouts.checkout_of",
+        skip_all,
+        fields(remote = %scrubbed_remote(remote))
+    )]
     pub fn checkout_of(&mut self, remote: &str, at: GitRef) -> Result<(PathBuf, String), Error> {
-        trace!("checkout_of {} at {:?}", remote, at);
+        trace!("checkout_of {} at {:?}", scrubbed_remote(remote), at);
 
         // A ref already checked out, and an offline miss on an unknown
         // remote, are answered from an unlocked read (`state.json` is
@@ -478,7 +492,7 @@ impl Manager {
         }
         if self.offline && !fresh.git_remotes.contains_key(remote) {
             return Err(Error::OfflineCacheMiss {
-                remote: remote.to_string(),
+                remote: scrubbed_remote(remote).into_owned(),
             });
         }
 
@@ -523,7 +537,7 @@ impl Manager {
                     // Offline: cannot clone an unknown remote. Surface as cache miss
                     // so the caller sees a clean error (not a git "could not connect").
                     return Err(Error::OfflineCacheMiss {
-                        remote: remote.to_string(),
+                        remote: scrubbed_remote(remote).into_owned(),
                     });
                 }
                 // Make id/directory for bare repository
@@ -575,6 +589,30 @@ impl Manager {
     }
 }
 
+/// `remote` as the `checkouts.*` spans record it: without userinfo, query or
+/// fragment, so a credential in a remote URL (`https://user:token@host/…`,
+/// `?private_token=…`) never reaches a log or an exported span. The host and
+/// path are kept; they are what makes the span useful. scp-like remotes
+/// (`git@host:org/repo.git`) lose their user the same way; a local path is
+/// returned as given.
+pub(crate) fn scrubbed_remote(remote: &str) -> Cow<'_, str> {
+    let base = remote
+        .find(['?', '#'])
+        .map_or(remote, |at| remote.split_at(at).0);
+    if let Some((scheme, rest)) = base.split_once("://") {
+        let (authority, path) = rest.find('/').map_or((rest, ""), |at| rest.split_at(at));
+        if let Some((_, host)) = authority.rsplit_once('@') {
+            return Cow::Owned(format!("{scheme}://{host}{path}"));
+        }
+    } else if let Some((authority, path)) = base.split_once(':')
+        && !authority.contains('/')
+        && let Some((_, host)) = authority.rsplit_once('@')
+    {
+        return Cow::Owned(format!("{host}:{path}"));
+    }
+    Cow::Borrowed(base)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -585,6 +623,171 @@ mod tests {
         assert_eq!(GitRef::Branch("main".to_string()).as_str(), "main");
         assert_eq!(GitRef::Tag("v1.0.0".to_string()).as_str(), "v1.0.0");
         assert_eq!(GitRef::Commit("abc123".to_string()).as_str(), "abc123");
+    }
+
+    #[test]
+    fn spans_record_a_remote_without_credentials() {
+        for (remote, recorded) in [
+            (
+                "https://github.com/octocat/Spoon-Knife",
+                "https://github.com/octocat/Spoon-Knife",
+            ),
+            (
+                "https://user:ghp_token@github.com/org/private.git",
+                "https://github.com/org/private.git",
+            ),
+            (
+                "https://oauth2:glpat-x@gitlab.internal:8443/team/repo",
+                "https://gitlab.internal:8443/team/repo",
+            ),
+            (
+                "https://git.example/repo.git?private_token=abc#frag",
+                "https://git.example/repo.git",
+            ),
+            ("https://tok@git.example", "https://git.example"),
+            (
+                "ssh://git@git.example:2222/org/repo",
+                "ssh://git.example:2222/org/repo",
+            ),
+            ("git@github.com:org/repo.git", "github.com:org/repo.git"),
+            ("github.com:org/repo.git", "github.com:org/repo.git"),
+            ("/srv/git/repo@v1", "/srv/git/repo@v1"),
+            ("./a@b:c/repo", "./a@b:c/repo"),
+        ] {
+            assert_eq!(scrubbed_remote(remote), recorded, "{remote}");
+        }
+    }
+
+    /// A subscriber that keeps the `remote` field of every span it is
+    /// given, and every event rendered as `name=value` fields.
+    struct Remotes(std::sync::Mutex<Vec<String>>, std::sync::Mutex<Vec<String>>);
+
+    impl tracing::Subscriber for Remotes {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            struct Remote<'a>(&'a std::sync::Mutex<Vec<String>>);
+            impl tracing::field::Visit for Remote<'_> {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "remote" {
+                        self.0.lock().unwrap().push(format!("{value:?}"));
+                    }
+                }
+            }
+            span.record(&mut Remote(&self.0));
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Fields(String);
+            impl tracing::field::Visit for Fields {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    self.0.push_str(&format!("{}={value:?} ", field.name()));
+                }
+            }
+            let mut fields = Fields(String::new());
+            event.record(&mut fields);
+            self.1.lock().unwrap().push(fields.0);
+        }
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// Spec 25 TEL-041: the `checkouts.*` spans carry the remote
+    /// without its userinfo or query, and so do the trace-level events
+    /// inside them, so a token in a remote URL never reaches the log, the
+    /// spool or a collector. Offline, so nothing is
+    /// fetched: the spans open, record and fail fast.
+    #[test]
+    fn a_checkout_span_never_carries_userinfo() {
+        let remote = "https://u:ghp_t0ken@git.example/org/repo.git?private_token=q";
+        let base_dir = tempdir().unwrap();
+        let handle = Manager::new_in_dir_with_offline(base_dir.path(), true).unwrap();
+        let seen = std::sync::Arc::new(Remotes(
+            std::sync::Mutex::default(),
+            std::sync::Mutex::default(),
+        ));
+        tracing::subscriber::with_default(seen.clone(), || {
+            let mut manager = handle.0.lock().unwrap();
+            manager.update_remote(remote).unwrap();
+            assert!(
+                manager
+                    .checkout_of(remote, GitRef::Branch("main".to_string()))
+                    .is_err(),
+                "offline: no fetch"
+            );
+        });
+        let events = seen.1.lock().unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| e.contains("checkout_of https://git.example/org/repo.git")),
+            "checkout_of's trace event names the scrubbed remote: {events:?}"
+        );
+        for event in events.iter() {
+            for secret in ["ghp_t0ken", "private_token", "//u:"] {
+                assert!(!event.contains(secret), "{secret} in an event: {event}");
+            }
+        }
+        let seen = seen.0.lock().unwrap();
+        assert_eq!(
+            *seen,
+            [
+                "https://git.example/org/repo.git",
+                "https://git.example/org/repo.git"
+            ],
+            "update_remote's and checkout_of's spans"
+        );
+    }
+
+    /// Spec 25 TEL-041: an error names the remote without its userinfo or
+    /// query, so a token in a remote URL never reaches an error message: the
+    /// offline miss, and a failed clone whose git stderr echoes the URL.
+    #[test]
+    fn an_error_never_carries_userinfo() {
+        let remote = "https://u:ghp_t0ken@127.0.0.1:1/org/repo.git?private_token=q";
+        let base_dir = tempdir().unwrap();
+        let handle = Manager::new_in_dir_with_offline(base_dir.path(), true).unwrap();
+        let err = handle
+            .0
+            .lock()
+            .unwrap()
+            .checkout_of(remote, GitRef::Branch("main".to_string()))
+            .expect_err("offline: no fetch");
+        assert!(matches!(err, Error::OfflineCacheMiss { .. }), "{err:?}");
+        let Err(clone) = repo::Repo::new(remote, base_dir.path().join("bare")) else {
+            panic!("nothing listens on port 1");
+        };
+        for text in [
+            err.to_string(),
+            format!("{err:?}"),
+            clone.to_string(),
+            format!("{clone:?}"),
+        ] {
+            for secret in ["ghp_t0ken", "private_token", "//u:"] {
+                assert!(!text.contains(secret), "{secret} in an error: {text}");
+            }
+        }
+        assert!(
+            err.to_string().contains("https://127.0.0.1:1/org/repo.git"),
+            "the miss names the scrubbed remote: {err}"
+        );
     }
 
     #[test]
