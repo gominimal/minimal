@@ -704,16 +704,15 @@ impl SwitchClient {
     /// box's PTask stops) or when its creator withdraws it, so a re-attach
     /// here after the previous PTask ended finds no row unless the creator
     /// registers again. What this daemon cannot yet check is that the
-    /// address it is handed is still the
-    /// row's for this box: the host-row check by box id — the same address
-    /// for the same box, a refusal on mismatch — lands with the box id in
-    /// the registration (T44, #1660, NET-133), which names it as the gap;
-    /// until then this daemon attaches with whatever the create request
-    /// carries. A drawn lease, by contrast, is reused only under a new
-    /// epoch and after the reuse quarantine ([`IpAllocator::allocate`]).
-    /// Everything else
-    /// matches [`Self::attach`], including the DM2 config/spawn steps
-    /// and the attach count.
+    /// address it is handed is still the row's for this box: the host-row
+    /// check by box id — the same address for the same box, a refusal on
+    /// mismatch — lands with the box id in the registration (T44, #1660,
+    /// NET-133), which names it as the gap; until then this daemon attaches
+    /// with whatever the create request carries. A drawn lease, by
+    /// contrast, is reused only under a new epoch and after the reuse
+    /// quarantine ([`IpAllocator::allocate`]). Everything else matches
+    /// [`Self::attach`], including the DM2 config/spawn steps and the
+    /// attach count.
     ///
     /// # Errors
     ///

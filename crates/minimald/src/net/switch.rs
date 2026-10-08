@@ -1089,8 +1089,9 @@ impl ForeignSourceReject {
 /// relay's entry answers nothing and needs no deregistration. A drawn lease is
 /// handed again only once no live entry here, and no flow any live gate
 /// records, names it ([`address_referenced`]), so a dead entry is all a reused
-/// address can meet, and the new holder's relay overwrites it. The table still sweeps its dead entries past a threshold, the
-/// [`UdpConntrack`] pattern, so it never grows without bound. Per-process:
+/// address can meet, and the new holder's relay overwrites it. The table
+/// still sweeps its dead entries past a threshold, the [`UdpConntrack`]
+/// pattern, so it never grows without bound. Per-process:
 /// boxes behind a *different* daemon are not seen from here, and their
 /// connections decide on the target's ingress alone.
 static LIVE_GATES: LazyLock<Mutex<HashMap<Ipv4Addr, Weak<SessionGate>>>> =
