@@ -5902,7 +5902,7 @@ fi
 proof_task_network_inherits_session() {
 if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
   if [ -z "${MINVMD_GVPROXY_BIN:-}" ] && [ -z "$E2E_NATIVE_SWITCH" ]; then
-    echo "task network proof SKIPPED (no switch: neither MINVMD_GVPROXY_BIN (VM) nor E2E_NATIVE_SWITCH (native) is set)"
+    not_run task_network_inherits_session "no switch staged: neither MINVMD_GVPROXY_BIN (VM) nor E2E_NATIVE_SWITCH (native) is set"
   else
   echo "::group::task network proof (a task inherits its session's network mode)"
   native_switch_daemon
@@ -6054,7 +6054,7 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
   mnl session destroy --force "$tn_host_sid" >/dev/null 2>&1 || true
   tn_own_proven=1
   else
-    echo "own-IP and host_ip task legs: known_gap on this VM lane (a task self-allocates a switch address the host-side table holds no row for, so the egress gate drops its traffic as unregistered, NET-085/NET-138; and the listener is on the CI host while every task runs in the guest, so no loopback leg can tell own_ip from host_ip)"
+    known_gap task_network_inherits_session "own-IP/host_ip task legs on a VM lane: a task self-allocates a switch address the host-side table holds no row for, so the egress gate drops its traffic (NET-085, closed by NET-138); the host listener is also unreachable from the guest"
   fi
 
   # -- none: the task has no network at all ----------------------------------

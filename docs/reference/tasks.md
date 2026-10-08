@@ -358,10 +358,16 @@ session that runs it, which the session's
 
 `host_ip` (the default) shares the host's network namespace. The task
 reaches everything the host reaches. This includes the host-side hostname
-proxy, the port clients point `HTTP(S)_PROXY` at. It listens on
-`127.0.0.1:7654` by default, and picks a free port when 7654 is busy. `min
-ls` prints the port in use, and [`minimald run
---hostname-proxy-port`](./cli-minimald.md#run) pins it.
+proxy, the port clients point `HTTP(S)_PROXY` at. `min ls` prints the port
+in use. On a native Linux host the proxy listens on `127.0.0.1:7654` by
+default, and picks a free port when 7654 is busy. On a native host only,
+[`minimald run --hostname-proxy-port`](./cli-minimald.md#run) pins it.
+
+On a host where Minimal runs in a VM (macOS), the task shares the VM's
+network, not your computer's. `127.0.0.1` inside the task is the VM's
+loopback. A service listening on your computer's loopback is not reachable
+at that address. The VM helper assigns the proxy port there, so read it from
+`min ls` rather than assuming 7654.
 
 `own_ip` gives the task its own address on the host's switch, in its own
 network namespace. This namespace is a second box beside the session's box,
