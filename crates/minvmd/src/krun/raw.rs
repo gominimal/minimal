@@ -69,6 +69,10 @@ pub const LOG_STYLE_AUTO: u32 = 0;
 /// `KRUN_LOG_OPTION_NO_ENV`).
 pub const LOG_OPTIONS_DEFAULT: u32 = 0;
 
+/// `KRUN_LOG_OPTION_NO_ENV`: ignore `RUST_LOG` and `RUST_LOG_STYLE`, so the
+/// level passed to `krun_init_log` is the level libkrun logs at.
+pub const LOG_OPTION_NO_ENV: u32 = 1;
+
 /// Flush/sync behaviour for `krun_add_disk3`'s `sync_mode` argument.
 ///
 /// Mirrors `KRUN_SYNC_{NONE,RELAXED,FULL}` in libkrun.h. **Note:** the header
