@@ -649,6 +649,14 @@ fn cli_reference_has_no_retired_commands() {
         rendered.contains("Usage:"),
         "the refusal must carry the usage, got: {rendered}"
     );
+
+    // The refusal `min` prints names the verb that replaced the retired one.
+    let rendered = with_retired_command_hint(err).to_string();
+    assert!(
+        rendered.contains("unrecognized subcommand 'ssh-forward'")
+            && rendered.contains("min net forward <SESSION> <LOCAL>:<PORT>"),
+        "the refusal must name the replacement, got: {rendered}"
+    );
 }
 
 /// Entry constructor for the bare-`min` state-report tests.
