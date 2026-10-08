@@ -3069,6 +3069,10 @@ fn build_socket_family_filter(seal: network::SocketSeal) -> SocketFamilyFilter {
         tail.push(ret(refuse_action));
         // The default allow for every syscall that creates no socket.
         tail.push(ret(allow_action));
+        // The jump offsets above assume AF_NETLINK appears at most once in
+        // `admitted` and is the only protocol-gated family; a miscounted tail
+        // fails here instead of misjudging sockets at runtime.
+        debug_assert_eq!(tail.len(), total, "seccomp verdict tail length");
         tail
     };
 
