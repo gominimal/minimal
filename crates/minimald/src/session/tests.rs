@@ -3467,6 +3467,27 @@ async fn a_box_holding_a_host_row_refuses_remint_after_its_host_loop_ends() {
         1,
         "no second host may be minted for a box whose host row was withdrawn"
     );
+
+    // The exec path's relaunch refuses the same way: an exec against the
+    // box must not mint the rowless host the attach just refused.
+    let handle = server
+        .state
+        .sessions_manager()
+        .await
+        .get_session(crate::sessions::SessionKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the box resolves");
+    match handle.ensure_host("tester".to_string()).await {
+        Err(crate::session::AttachError::BoxHostRowEnded) => {}
+        Err(other) => panic!("the exec relaunch failed for another reason: {other}"),
+        Ok(_) => panic!("an exec relaunched a rowless host for a box whose row was withdrawn"),
+    }
+    assert_eq!(
+        super::launch_publish_seam::observed(id).len(),
+        1,
+        "the exec path may not mint a second host either"
+    );
 }
 
 /// #2070's error path: the publish now precedes the activate hooks, so a
