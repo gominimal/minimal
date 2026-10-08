@@ -1104,10 +1104,17 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
                         );
                         // The attach may have ended in the shell-exit
                         // prompt's Delete: withdraw the box's row, or
-                        // release a `host_ip` box's hold.
+                        // release a `host_ip` box's hold, through the CLI's
+                        // helper (it carries the lookup timeout the dashboard's
+                        // old copy lacked).
                         if let Some(name) = box_name.as_deref() {
-                            rpc::release_held_name_after_attach(p, key.id, name, box_addresses)
-                                .await;
+                            crate::release_held_name_after_attach(
+                                &sock,
+                                key.id,
+                                name,
+                                box_addresses,
+                            )
+                            .await;
                         }
                         inbox.push_back(Msg::Tick);
                     }

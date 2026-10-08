@@ -280,25 +280,12 @@ pub async fn fetch_screen(
     Ok(resp.ok())
 }
 
-/// Whether a session holds its name in the VM host's zone in place of a
-/// row: a `host_ip` box shares the node's own row, so `min session
-/// activate` and [`activate`] hold its name (NODATA) instead of
-/// registering one.
-fn holds_name(record: &sessions::Record) -> bool {
-    record.network == NetworkMode::HostNet && record.box_addresses.is_none()
-}
-
-/// Holds or releases a name on the VM host daemon beside `sock`, off the
-/// async workers: the control exchange is a blocking socket call.
+/// Holds or releases a name on the VM host daemon beside `sock`, via the
+/// CLI's own control exchange: the shared helper derives the control socket,
+/// applies [`crate::cmd::session`]'s `BOX_CONTROL_TIMEOUT`, and warns on
+/// failure just as `min session activate` does.
 async fn hold_box_name(sock: &Path, name: &str, id: SessionId, hold: bool) {
-    let (sock, name) = (sock.to_path_buf(), name.to_string());
-    if let Err(error) = tokio::task::spawn_blocking(move || {
-        minimal_client::attach::hold_box_name_beside(&sock, &name, Some(id), hold);
-    })
-    .await
-    {
-        tracing::warn!(%error, "the box name hold's thread failed");
-    }
+    crate::hold_box_name_with_vm_host(crate::control_sock_beside(sock), name, Some(id), hold).await;
 }
 
 /// Withdraws a box's host row (T66) on the VM host daemon beside `sock`,
@@ -331,7 +318,7 @@ pub async fn record_of(provider: &mut Provider, id: SessionId) -> Option<session
 /// the daemon's detach grace, and the in-VM daemon relaunches it only while
 /// its row stands. Returns the pair the row was registered with: an attach
 /// that ends in the shell-exit prompt's Delete leaves no record to read it
-/// from, and [`release_held_name_after_attach`] still owes the row's
+/// from, and [`crate::release_held_name_after_attach`] still owes the row's
 /// withdrawal. `None` when the record cannot be read or holds no row.
 ///
 /// # Errors
@@ -358,7 +345,7 @@ async fn settle_destroyed_box(sock: &Path, id: SessionId, record: &sessions::Rec
     };
     if let Some(addresses) = record.box_addresses {
         withdraw_box_row(sock, name, addresses).await;
-    } else if holds_name(record) {
+    } else if crate::holds_name(record) {
         hold_box_name(sock, name, id, false).await;
     }
 }
@@ -401,7 +388,7 @@ pub async fn rename(
     .context("RenameSession RPC failed")?
     {
         Errorable::Ok(_) => {
-            if let Some(record) = record.filter(holds_name) {
+            if let Some(record) = record.filter(crate::holds_name) {
                 if let Some(old_name) = record.name.as_deref() {
                     hold_box_name(&provider.sock, old_name, id, false).await;
                 }
@@ -410,32 +397,6 @@ pub async fn rename(
             Ok(())
         }
         Errorable::Err { error } => Err(anyhow::anyhow!(error)),
-    }
-}
-
-/// Settles what session `id` held once an attach from the dashboard has
-/// ended with the session gone: the shell-exit prompt's Delete destroys the
-/// session daemon-side, past [`destroy`]. The row its box registered is
-/// withdrawn with `box_addresses`, the pair [`prepare_attach`] read
-/// before the attach; with none, the name's zone hold is released. A lookup
-/// that fails settles nothing; a session still there keeps its row and its
-/// hold, and the release names the session, so a newer session under
-/// `name` keeps its own.
-pub async fn release_held_name_after_attach(
-    provider: &mut Provider,
-    id: SessionId,
-    name: &str,
-    box_addresses: Option<sessions::BoxAddresses>,
-) {
-    let lookup =
-        timed::<GetSessionRecord>(&mut provider.client, GetSessionRecordRequest::Id(id)).await;
-    if let Ok(resp) = lookup
-        && resp.record.is_none()
-    {
-        match box_addresses {
-            Some(addresses) => withdraw_box_row(&provider.sock, name, addresses).await,
-            None => hold_box_name(&provider.sock, name, id, false).await,
-        }
     }
 }
 
@@ -612,7 +573,7 @@ pub(crate) async fn activate(
             if let Ok(resp) = client
                 .oneshot_rpc::<GetSessionRecord>(GetSessionRecordRequest::Id(id))
                 .await
-                && let Some(record) = resp.record.filter(holds_name)
+                && let Some(record) = resp.record.filter(crate::holds_name)
                 && let Some(name) = record.name.as_deref()
             {
                 hold_box_name(sock, name, id, true).await;
