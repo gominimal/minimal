@@ -1248,7 +1248,7 @@ async fn guest_deny_all_resolver_reachable() {
         guest
             .boot_log_lines(&["answered a lookup at the relay"])
             .iter()
-            .any(|line| line.contains("session_id=node")
+            .any(|line| line.contains("switch_addr=node")
                 && line.contains("example.com")
                 && line.contains("answer=NoError")),
         "the node's DNS layer on the daemon's relay never answered the box's AAAA lookup; \
