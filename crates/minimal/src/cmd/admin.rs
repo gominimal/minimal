@@ -17,11 +17,43 @@ pub async fn cmd_proxy(global: &GlobalArgs, args: ProxyArgs) -> Result<(), anyho
         }
     };
 
-    let stream = tokio::net::UnixStream::connect(&socket_path)
-        .await
-        .with_context(|| format!("connect to {}", socket_path))?;
+    let stream = connect_with_retry(&socket_path).await?;
 
     proxy_bridge(stream, tokio::io::stdin(), tokio::io::stdout()).await
+}
+
+/// Connect to the daemon UDS, retrying a bounded number of times when the
+/// connect is refused.
+///
+/// A burst of concurrent connects to the daemon socket can overflow the
+/// daemon's accept backlog, so a single refused connect must not fail the
+/// proxy outright. A full backlog surfaces as `ConnectionRefused` on macOS
+/// and as `WouldBlock` (`EAGAIN` from the non-blocking connect) on Linux, so
+/// both are retried. A `NotFound` (no socket file) fails immediately: it
+/// usually means the daemon is not running, but it also covers the short
+/// unlink-then-bind window of a daemon re-binding its socket, which this
+/// helper does not retry.
+async fn connect_with_retry(socket_path: &str) -> Result<tokio::net::UnixStream, anyhow::Error> {
+    let mut last_err = None;
+    for _ in 0..client::CONNECT_RETRIES {
+        match tokio::net::UnixStream::connect(socket_path).await {
+            Ok(stream) => return Ok(stream),
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                last_err = Some(err);
+                tokio::time::sleep(client::CONNECT_RETRY_DELAY).await;
+            }
+            Err(err) => {
+                return Err(err).with_context(|| format!("connect to {}", socket_path));
+            }
+        }
+    }
+    Err(last_err.expect("CONNECT_RETRIES > 0, so at least one attempt ran and failed"))
+        .with_context(|| format!("connect to {}", socket_path))
 }
 
 /// Bridge proxy stdio to the daemon socket until either side closes.
@@ -43,10 +75,17 @@ where
     let (mut rx, mut tx) = stream.into_split();
 
     let to_sock = async {
-        tokio::io::copy(&mut stdin, &mut tx).await?;
-        tx.shutdown().await
+        match tokio::io::copy(&mut stdin, &mut tx).await {
+            // The daemon closed its end, so there is no write half left to
+            // shut down: macOS fails that shutdown with ENOTCONN.
+            Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+            res => {
+                res?;
+                tx.shutdown().await
+            }
+        }
     };
-    let from_sock = tokio::io::copy(&mut rx, &mut stdout);
+    let from_sock = async { ignore_broken_pipe(tokio::io::copy(&mut rx, &mut stdout).await) };
     tokio::pin!(from_sock);
 
     tokio::select! {
@@ -59,6 +98,21 @@ where
         }
     }
     Ok(())
+}
+
+/// Treat a `BrokenPipe` from the socket-to-stdout copy as normal termination.
+///
+/// The reader on the downstream side may close the pipe before the copy
+/// finishes (for example `yes | ssh host 'cmd'`, where `cmd` never reads
+/// stdin): the peer tears the stream down and `tokio::io::copy` reports
+/// `BrokenPipe`. That is not a proxy failure, so it is mapped to a
+/// successful zero-byte copy instead of surfacing `error: proxy: Broken
+/// pipe (os error 32)`.
+fn ignore_broken_pipe(result: std::io::Result<u64>) -> std::io::Result<u64> {
+    match result {
+        Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => Ok(0),
+        other => other,
+    }
 }
 
 /// The local mesh-enrolment record path. `--minimal-dir` still wins for
@@ -228,9 +282,13 @@ pub async fn cmd_spin(_global: &GlobalArgs, args: SpinArgs) -> Result<(), anyhow
     // window smoothing so the reported `{bytes_per_sec}` stays
     // legible instead of dancing every tick.
     let mut fake_throughput = tokio::time::interval(Duration::from_millis(50));
+    // Registered once, outside the loop, for the same reason as `net forward`:
+    // a fresh `ctrl_c()` per iteration can drop a SIGINT between arms.
+    let ctrl_c = tokio::signal::ctrl_c();
+    tokio::pin!(ctrl_c);
     loop {
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => break,
+            _ = &mut ctrl_c => break,
             _ = &mut deadline => break,
             _ = fake_throughput.tick() => bar.inc(4096),
         }
@@ -245,8 +303,15 @@ pub async fn cmd_spin(_global: &GlobalArgs, args: SpinArgs) -> Result<(), anyhow
 /// the daemon version and stdlib version. Unlike other commands, this does
 /// not autospawn the daemon — it is a lightweight diagnostic that should
 /// report versions without starting a VM.
-pub async fn cmd_version(global: &GlobalArgs) -> Result<(), anyhow::Error> {
-    println!("Client: minimal {}", version::LONG_VERSION);
+///
+/// The output goes to the caller's writer rather than to stdout directly,
+/// so a reader that has gone away (e.g. `min version | head -1`) surfaces
+/// as a broken-pipe error instead of a `println!` panic.
+pub async fn cmd_version<W: std::io::Write>(
+    global: &GlobalArgs,
+    out: &mut W,
+) -> Result<(), anyhow::Error> {
+    writeln!(out, "Client: minimal {}", version::LONG_VERSION)?;
 
     let sock = match client::resolve_socket_path(global.minimal_dir.as_deref(), global.use_minvmd())
     {
@@ -277,8 +342,229 @@ pub async fn cmd_version(global: &GlobalArgs) -> Result<(), anyhow::Error> {
         }
     };
 
-    println!("Server: minimald {}", resp.long_version);
-    println!("Stdlib: {}", resp.stdlib_version);
+    writeln!(out, "Server: minimald {}", resp.long_version)?;
+    writeln!(out, "Stdlib: {}", resp.stdlib_version)?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A refused connect is retried: a listener that comes up after the first
+    /// attempt is still reached, so a burst of concurrent proxies that
+    /// overflows the daemon's accept backlog does not fail spuriously.
+    #[tokio::test]
+    async fn connect_with_retry_reaches_a_late_listener() {
+        let dir = tempfile::tempdir().expect("a temp dir for the socket");
+        let sock = dir.path().join("daemon.sock");
+        let sock_path = sock.to_str().unwrap().to_string();
+
+        // A stale socket file: the listener died and left its path behind, so
+        // connects are refused until a new listener takes the path.
+        let stale = std::os::unix::net::UnixListener::bind(&sock).expect("stale bind");
+        drop(stale);
+
+        // A listener comes up after the first refused attempt, exercising the
+        // retry path.
+        let bind_sock = sock.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            std::fs::remove_file(&bind_sock).expect("remove the stale socket");
+            let _listener = tokio::net::UnixListener::bind(&bind_sock).expect("late bind");
+            // Hold the listener open until the connect lands.
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        });
+
+        let stream = connect_with_retry(&sock_path)
+            .await
+            .expect("a late-bound listener must be reached by retry");
+        drop(stream);
+    }
+
+    /// A missing socket path fails immediately: `NotFound` is not retried, so
+    /// a proxy against a daemon that is not running does not hang for the
+    /// full retry window.
+    #[tokio::test]
+    async fn connect_with_retry_fails_fast_on_missing_socket() {
+        let dir = tempfile::tempdir().expect("a temp dir for the socket");
+        let sock_path = dir.path().join("no-daemon.sock");
+        let sock_path = sock_path.to_str().unwrap().to_string();
+
+        let started = std::time::Instant::now();
+        let err = connect_with_retry(&sock_path)
+            .await
+            .expect_err("a missing socket must fail");
+        let elapsed = started.elapsed();
+
+        assert!(
+            err.to_string().contains(&sock_path),
+            "the error must name the socket path: {err}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "a missing socket must not be retried ({elapsed:?})"
+        );
+    }
+
+    /// A would-block connect is retried: on Linux a full accept backlog makes
+    /// the non-blocking connect fail with `EAGAIN` (`WouldBlock`), and a
+    /// listener that drains its backlog after the first attempt is still
+    /// reached.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn connect_with_retry_retries_a_would_block_on_a_full_backlog() {
+        let dir = tempfile::tempdir().expect("a temp dir for the socket");
+        let sock = dir.path().join("daemon.sock");
+        let sock_path = sock.to_str().unwrap().to_string();
+
+        let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
+        // Shrink the accept backlog so a couple of connects fill it.
+        nix::sys::socket::listen(
+            &listener,
+            nix::sys::socket::Backlog::new(0).expect("a zero backlog"),
+        )
+        .expect("shrink the backlog");
+
+        // Fill the backlog until a connect would block.
+        let mut held = Vec::new();
+        loop {
+            match tokio::net::UnixStream::connect(&sock).await {
+                Ok(stream) => {
+                    held.push(stream);
+                    assert!(held.len() < 64, "the backlog never filled");
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(err) => panic!("unexpected connect error filling the backlog: {err}"),
+            }
+        }
+
+        // Drain the backlog after the first retried attempt, then accept the
+        // retried connect too.
+        let pending = held.len() + 1;
+        let acceptor = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            (0..pending)
+                .map(|_| listener.accept().expect("accept").0)
+                .collect::<Vec<_>>()
+        });
+
+        let stream = connect_with_retry(&sock_path)
+            .await
+            .expect("a would-block connect must be reached by retry");
+        drop(stream);
+        drop(held);
+        acceptor.join().expect("the acceptor thread");
+    }
+
+    /// A downstream writer that fails every write with the given error kind.
+    struct FailingWriter(std::io::ErrorKind);
+
+    impl tokio::io::AsyncWrite for FailingWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Err(std::io::Error::from(self.0)))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Write a couple of bytes down the daemon side and then shut it down, so
+    /// the bridge's socket-to-stdout copy has something to deliver.
+    fn writing_daemon(mut stream: tokio::net::UnixStream) {
+        tokio::spawn(async move {
+            stream
+                .write_all(b"hello")
+                .await
+                .expect("daemon writes its greeting");
+            stream.shutdown().await.expect("daemon shuts down");
+        });
+    }
+
+    /// When the downstream reader closes early (BrokenPipe), the bridge treats
+    /// it as normal termination rather than surfacing `error: proxy: Broken
+    /// pipe (os error 32)`.
+    #[tokio::test]
+    async fn proxy_bridge_exits_quietly_on_broken_pipe() {
+        let (bridge, daemon) = tokio::net::UnixStream::pair().expect("socket pair");
+        writing_daemon(daemon);
+        let stdout = FailingWriter(std::io::ErrorKind::BrokenPipe);
+
+        proxy_bridge(bridge, &[][..], stdout)
+            .await
+            .expect("a broken pipe downstream is not a proxy failure");
+    }
+
+    /// Any error other than BrokenPipe is still surfaced with the `proxy`
+    /// context intact.
+    #[tokio::test]
+    async fn proxy_bridge_reports_non_broken_pipe_errors() {
+        let (bridge, daemon) = tokio::net::UnixStream::pair().expect("socket pair");
+        writing_daemon(daemon);
+        let stdout = FailingWriter(std::io::ErrorKind::Other);
+
+        let err = proxy_bridge(bridge, &[][..], stdout)
+            .await
+            .expect_err("a non-broken-pipe write failure must surface");
+        assert!(
+            format!("{err:#}").contains("proxy"),
+            "the error must carry the proxy context: {err:#}"
+        );
+    }
+
+    /// When the daemon stops reading first, the stdin-to-socket copy hits
+    /// `BrokenPipe`. The bridge treats that as normal termination and still
+    /// drains the daemon's remaining output to stdout instead of failing or
+    /// truncating it. Linux only: there a write to a peer that shut down its
+    /// read side fails with `EPIPE` at once.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn proxy_bridge_drains_daemon_output_after_stdin_broken_pipe() {
+        let (bridge, daemon) = std::os::unix::net::UnixStream::pair().expect("socket pair");
+        daemon
+            .shutdown(std::net::Shutdown::Read)
+            .expect("daemon stops reading");
+        for s in [&bridge, &daemon] {
+            s.set_nonblocking(true).expect("non-blocking");
+        }
+        let bridge = tokio::net::UnixStream::from_std(bridge).expect("bridge stream");
+        let mut daemon = tokio::net::UnixStream::from_std(daemon).expect("daemon stream");
+
+        // Hold the daemon's write side open until well after the bridge's
+        // first write has failed, so the socket-to-stdout copy cannot finish
+        // first and the BrokenPipe arm is the one that runs.
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            daemon
+                .write_all(b"hello")
+                .await
+                .expect("daemon writes its reply");
+        });
+
+        let mut stdout = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            proxy_bridge(bridge, tokio::io::repeat(b'x'), &mut stdout),
+        )
+        .await
+        .expect("the bridge must not hang after a broken pipe")
+        .expect("a broken pipe towards the daemon is not a proxy failure");
+        assert_eq!(stdout, b"hello", "the daemon's output must be drained");
+    }
 }

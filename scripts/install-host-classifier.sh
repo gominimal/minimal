@@ -17,9 +17,9 @@
 # point of the barrier.
 #
 # Usage:
-#   sudo scripts/install-host-classifier.sh [--user NAME] [--root DIR]
+#   sudo scripts/install-host-classifier.sh [--user NAME|UID] [--root DIR]
 #         [--answerer-address ADDR] [--answerer-port PORT]
-#         [--ct-mark-mask 0x30000000]
+#         [--gateway-resolver ADDR] [--ct-mark-mask 0x30000000]
 #         --cohort-address ADDR --node-plane-address ADDR
 #   sudo scripts/install-host-classifier.sh --pid PID
 #   sudo scripts/install-host-classifier.sh --uninstall
@@ -100,10 +100,32 @@ readonly TABLE_NAME=minimal_class
 # way, so the two read one fact — and an uninstall and a check read it
 # back by prefix, never by the default value.
 readonly MASK_RECORD_PREFIX=ct-mark-mask-
+# The resolver carve-out the loaded table admits, recorded beside the
+# marker as "$CARVE_OUT_RECORD_PREFIX<address>-<port>" so the daemon can
+# refuse a deny-all box whose carve-out no longer names its live answerer.
+# A table rendered with --gateway-resolver carves out the node's DNS layer
+# at the gateway, not an answerer, and records none.
+readonly CARVE_OUT_RECORD_PREFIX=carve-out-
 readonly DEFAULT_CT_MARK_MASK=0x30000000
 
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 note() { printf '%s\n' "$*"; }
+
+# sha256_of <text> — the digest of exactly the bytes handed to it: the hex
+# field alone, because sha256sum spells its output "<hex>  -" and shasum
+# "<hex> -". shasum is the macOS spelling of the same sum, so a rehearsal
+# on a Mac digests like an install on a Linux host; neither being there is
+# this step's own failure to name, before anything loads.
+sha256_of() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sum="$(printf '%s' "$1" | sha256sum)"
+    elif command -v shasum >/dev/null 2>&1; then
+        sum="$(printf '%s' "$1" | shasum -a 256)"
+    else
+        die "cannot digest the ruleset: this step needs sha256sum (or shasum) to name the sha256 of the bytes it loads"
+    fi
+    printf '%s' "${sum%% *}"
+}
 
 # Rehearsal posture (set iff the stand-in mountinfo below is in play): the
 # caller created the stand-in tree, so the one fact it cannot represent is
@@ -122,6 +144,16 @@ tree_root=$DEFAULT_TREE_ROOT
 # carve-out is by address and port, never loopback-wide).
 answerer_address=127.0.0.1
 answerer_port=7656
+# --gateway-resolver ADDR renders the carve-out a VM-backed guest needs
+# instead of the answerer's: the resolver Minimal owns for a box there is
+# the node's DNS layer at the switch gateway (NET-003), which every box's
+# lookups reach on DNS's own port, so deny_out admits ADDR on port 53 over
+# UDP and TCP (a truncated answer retries over TCP) and nothing is
+# retargeted, because the box already asks the address the rule admits.
+# The address and port, never the address alone: the gateway is also the
+# switch's control surface, and the carve-out is the resolver, not it.
+gateway_resolver=
+answerer_given=
 # The cohort's and the node plane's source identities (NET-078). They are
 # this host's to know, not the script's to guess: each SNAT rule is rendered
 # only when its address was given, and the two go together — half a
@@ -151,6 +183,7 @@ while [ $# -gt 0 ]; do
         --answerer-address)
             [ $# -ge 2 ] || die "--answerer-address needs an address"
             answerer_address=$2
+            answerer_given=1
             shift 2
             ;;
         --answerer-port)
@@ -159,6 +192,7 @@ while [ $# -gt 0 ]; do
                 die "--answerer-port needs a numeric port, got: $2" ;;
             esac
             answerer_port=$2
+            answerer_given=1
             shift 2
             ;;
         --cohort-address)
@@ -174,6 +208,11 @@ while [ $# -gt 0 ]; do
         --ct-mark-mask)
             [ $# -ge 2 ] || die "--ct-mark-mask needs a mask"
             ct_mark_mask=$2
+            shift 2
+            ;;
+        --gateway-resolver)
+            [ $# -ge 2 ] || die "--gateway-resolver needs an address"
+            gateway_resolver=$2
             shift 2
             ;;
         --uninstall) mode=uninstall; shift ;;
@@ -196,13 +235,34 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+# A render whose carve-out is the gateway's resolver has no answerer to
+# name, so a call that names one asked for two carve-outs at once.
+if [ -n "$gateway_resolver" ] && [ -n "$answerer_given" ]; then
+    die "--gateway-resolver carves out the gateway's resolver, not an answerer: drop --answerer-address and --answerer-port"
+fi
+
 # The account the tree is delegated to, and the one whose boxes it is:
 # --user wins, else the account that ran sudo, else there is no default worth
 # guessing — delegating to root would hand every box a way to write the tree.
 resolve_owner() {
     if [ -n "$user" ]; then
-        owner_uid="$(id -u "$user")" || die "no such account: $user"
-        owner_gid="$(id -g "$user")" || die "no such account: $user"
+        case "$user" in ''|*[!0-9]*)
+            owner_uid="$(id -u "$user")" || die "no such account: $user"
+            owner_gid="$(id -g "$user")" || die "no such account: $user"
+            ;;
+        *)
+            # A numeric uid needs no passwd entry for its uid, but its group
+            # is the account's own: take it from the account when there is
+            # one, and from the caller only when the caller is that uid (an
+            # unprivileged rehearsal under a uid with no passwd entry).
+            owner_uid=$user
+            if ! owner_gid="$(id -g "$user" 2>/dev/null)"; then
+                [ "$user" = "$(id -u)" ] ||
+                    die "no account with uid $user to take a group from: pass --user NAME"
+                owner_gid="$(id -g)"
+            fi
+            ;;
+        esac
     elif [ -n "${SUDO_UID:-}" ] && [ -n "${SUDO_GID:-}" ]; then
         owner_uid=$SUDO_UID
         owner_gid=$SUDO_GID
@@ -436,7 +496,9 @@ cgroup_level() {
 # retargets the deny subtree's DNS-port lookups on the answerer's address
 # onto the answerer's own port: a deny-all box resolves through the
 # answerer (NET-079) by asking DNS's port like any resolver would, and the
-# one destination its deny rule admits is the one its lookups reach.
+# one destination its deny rule admits is the one its lookups reach. A
+# render with --gateway-resolver has no dstnat chain: the box's lookups
+# already go to the gateway's port 53, the destination deny_out admits.
 #
 # The filter output chain runs before the postrouting chain (priority
 # srcnat), so a connection refused on the box's own cgroup is refused
@@ -472,6 +534,21 @@ cgroup_level() {
 # so translating its source would rewrite the reply the conntrack entry
 # already knows.
 render_ruleset() {
+    carve_out_rule=
+    dstnat_chain=
+    if [ -n "$gateway_resolver" ]; then
+        carve_out_rule="
+        ip daddr $gateway_resolver udp dport 53 accept
+        ip daddr $gateway_resolver tcp dport 53 accept"
+    else
+        carve_out_rule="
+        ip daddr $answerer_address udp dport $answerer_port accept"
+        dstnat_chain="
+    chain dstnat {
+        type nat hook output priority dstnat; policy accept;
+        socket cgroupv2 level $(cgroup_level "$deny_path") \"$deny_path\" ip daddr $answerer_address udp dport 53 dnat ip to $answerer_address:$answerer_port
+    }"
+    fi
     cat <<RULES
 add table inet $TABLE_NAME
 delete table inet $TABLE_NAME
@@ -482,15 +559,10 @@ table inet $TABLE_NAME {
         socket cgroupv2 level $(cgroup_level "$deny_path") "$deny_path" jump deny_out
     }
     chain deny_out {
-        ct state established,related ct direction reply accept
-        ip daddr $answerer_address udp dport $answerer_port accept
+        ct state established,related ct direction reply accept$carve_out_rule
         limit rate 1/second burst 4 packets log prefix "minimal-classifier: refused " level warn
         reject with icmpx admin-prohibited
-    }
-    chain dstnat {
-        type nat hook output priority dstnat; policy accept;
-        socket cgroupv2 level $(cgroup_level "$deny_path") "$deny_path" ip daddr $answerer_address udp dport 53 dnat ip to $answerer_address:$answerer_port
-    }
+    }$dstnat_chain
     chain classify {
         type filter hook output priority mangle; policy accept;
         ct state new socket cgroupv2 level $(cgroup_level "$boxes_path") "$boxes_path" ct mark set ct mark and $clear_hex or $cohort_hex
@@ -711,7 +783,7 @@ if [ "$mode" = uninstall ]; then
     # The mask records go with the marker they were written beside, read
     # back by prefix so whatever mask an install chose comes away with its
     # install, never a record left vouching for a table that is gone.
-    for record in "$tree_root"/"$MASK_RECORD_PREFIX"*; do
+    for record in "$tree_root"/"$MASK_RECORD_PREFIX"* "$tree_root"/"$CARVE_OUT_RECORD_PREFIX"*; do
         [ -d "$record" ] || continue
         rmdir "$record" 2>/dev/null || true
     done
@@ -800,18 +872,20 @@ fi
 # loaded table classifies with reads the step as not installed — so a
 # re-install that cannot remove the records it is about to replace dies
 # before touching the table, exactly as it does for the marker.
-for stale_record in "$tree_root"/"$MASK_RECORD_PREFIX"*; do
+for stale_record in "$tree_root"/"$MASK_RECORD_PREFIX"* "$tree_root"/"$CARVE_OUT_RECORD_PREFIX"*; do
     [ -d "$stale_record" ] || continue
     rmdir "$stale_record" 2>/dev/null ||
-        die "cannot remove the previous ct-mark mask record at $stale_record: a re-install must leave no record beside a table it did not load"
+        die "cannot remove the previous record at $stale_record: a re-install must leave no record beside a table it did not load"
 done
-ruleset="$(mktemp)"
-render_ruleset >"$ruleset"
-if ! nft -f "$ruleset"; then
-    rm -f "$ruleset"
-    die "nft refused the classifier table: the previous table, if any, is untouched and neither the marker nor its ct-mark mask record was written, so minimald reports no per-box verdict until this step succeeds (nft's own error is above)"
-fi
-rm -f "$ruleset"
+# Render into a variable first, so nothing that touches a disk can sit between
+# rendering and loading. The captured text is byte for byte what render_ruleset
+# wrote: `read -d ''` with an empty delimiter reads without a terminator, so
+# every trailing newline survives (a command substitution would strip them and
+# the digest below would then cover different bytes than nft received).
+IFS= read -r -d '' ruleset < <(render_ruleset) || true
+ruleset_sha256="$(sha256_of "$ruleset")"
+printf '%s' "$ruleset" | nft -f - || die "nft refused the classifier table: the previous table, if any, is untouched and neither the marker nor its ct-mark mask record was written, so minimald reports no per-box verdict until this step succeeds (nft's own error is above)"
+note "loaded the classifier table inet $TABLE_NAME: sha256 $ruleset_sha256, over exactly the bytes piped to nft"
 
 # The presence marker the daemon probes at start, and the ct-mark mask
 # recorded beside it: on real cgroupfs a plain file cannot exist, so each
@@ -824,6 +898,12 @@ rm -f "$ruleset"
 # at. The record is written first and the marker last, so the marker is
 # the commit point: it is never there without the mask beside it, and a
 # daemon that reads it also reads the one value the table classifies by.
+if [ -z "$gateway_resolver" ]; then
+    carve_out_record="$tree_root/$CARVE_OUT_RECORD_PREFIX$answerer_address-$answerer_port"
+    mkdir "$carve_out_record" 2>/dev/null ||
+        [ -d "$carve_out_record" ] ||
+        die "cannot record the table's resolver carve-out at $carve_out_record"
+fi
 mask_record="$tree_root/$MASK_RECORD_PREFIX$mask_hex"
 mkdir "$mask_record" 2>/dev/null ||
     [ -d "$mask_record" ] ||
@@ -834,10 +914,18 @@ mkdir "$tree_root/$TABLE_MARKER" 2>/dev/null ||
 
 note "installed the classifier tree at $tree_root"
 note "  $DAEMON_LEAF/            the daemon itself, entered at startup or placed with --pid"
-note "  $BOXES_DIR/$DENY_DIR/    the boxes that admit no destination, resolved through the answerer"
+if [ -n "$gateway_resolver" ]; then
+    note "  $BOXES_DIR/$DENY_DIR/    the boxes that admit no destination, resolved through the node's DNS layer at $gateway_resolver:53"
+else
+    note "  $BOXES_DIR/$DENY_DIR/    the boxes that admit no destination, resolved through the answerer"
+fi
 note "  $BOXES_DIR/$ALLOW_DIR/   every other box"
 note "delegated to $owner_uid:$owner_gid per the v2 contract: each directory plus its cgroup.procs, cgroup.threads and cgroup.subtree_control"
-note "loaded the classifier table inet $TABLE_NAME: $deny_path is refused everything but the answerer at $answerer_address:$answerer_port (its DNS-port lookups retargeted there), and the refusal is active, never a silent drop"
+if [ -n "$gateway_resolver" ]; then
+    note "loaded the classifier table inet $TABLE_NAME: $deny_path is refused everything but the gateway's resolver at $gateway_resolver:53 over udp and tcp, and the refusal is active, never a silent drop"
+else
+    note "loaded the classifier table inet $TABLE_NAME: $deny_path is refused everything but the answerer at $answerer_address:$answerer_port (its DNS-port lookups retargeted there), and the refusal is active, never a silent drop"
+fi
 note "the boxes cohort leaves as $cohort_address; everything else in the slice as $node_plane_address"
 note "classified the cohort and the node plane on the ct-mark bits $mask_hex: the ruleset this host carried used neither, and a re-install rescans before it loads"
 note "wrote the table's presence marker at $tree_root/$TABLE_MARKER with the ct-mark mask $mask_hex recorded beside it: minimald records a per-box verdict only while both are there"

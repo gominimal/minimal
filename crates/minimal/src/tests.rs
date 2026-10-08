@@ -15,6 +15,163 @@ fn interactive_attach_requires_a_tty_on_stdin() {
     ensure_interactive_attach_tty(true).expect("a real terminal must pass the guard");
 }
 
+/// The #953 refusal still comes first: a non-terminal stdin is turned away
+/// before the unwind guard arms or the relay opens a pty or touches the
+/// terminal.
+#[test]
+fn non_terminal_stdin_still_refused_before_relay() {
+    let armed = std::cell::Cell::new(false);
+    let relayed = std::cell::Cell::new(false);
+    let err = interactive_attach(
+        std::process::Command::new("ssh"),
+        false,
+        || {
+            armed.set(true);
+            attach::TerminalUnwind::arm_on(Vec::new(), true)
+        },
+        |_| {
+            relayed.set(true);
+            unreachable!("the relay must not run over a non-terminal stdin")
+        },
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("not a TTY"), "{err}");
+    assert!(!armed.get(), "the unwind guard armed before the refusal");
+    assert!(!relayed.get(), "the relay ran before the refusal");
+}
+
+/// The termios the relay put back must be in force before the blind unwind
+/// writes a byte, and the unwind goes to the real terminal (what the user
+/// sees), not to the session's pty. Driven over a pty that stands in for
+/// the user's terminal, through the real relay, with a session that ends
+/// the way a dropped transport does (255) so the guard fires.
+#[test]
+fn relay_restores_termios_before_unwind_codes() {
+    use nix::sys::termios::{LocalFlags, Termios, tcgetattr};
+    use std::io::Read as _;
+    use std::os::fd::OwnedFd;
+    use std::sync::{Arc, Mutex};
+
+    fn mode(t: &Termios) -> String {
+        // PENDIN is kernel bookkeeping on macOS, not a mode anyone set; and
+        // only the named control characters count (Linux's kernel keeps
+        // fewer than libc's `NCCS`, so the array's tail is stack garbage).
+        use nix::sys::termios::SpecialCharacterIndices as C;
+        let cc: Vec<u8> = [
+            C::VEOF,
+            C::VEOL,
+            C::VERASE,
+            C::VINTR,
+            C::VKILL,
+            C::VMIN,
+            C::VQUIT,
+            C::VSTART,
+            C::VSTOP,
+            C::VSUSP,
+            C::VTIME,
+        ]
+        .iter()
+        .map(|&i| t.control_chars[i as usize])
+        .collect();
+        format!(
+            "{:?} {:?} {:?} {:?} {cc:?}",
+            t.input_flags,
+            t.output_flags,
+            t.control_flags,
+            t.local_flags - LocalFlags::PENDIN,
+        )
+    }
+
+    /// Writes to the user's terminal, noting the termios it found there
+    /// at the moment of the first write.
+    struct RealTerminal {
+        tty: std::fs::File,
+        termios_at_write: Arc<Mutex<Option<String>>>,
+    }
+    impl std::io::Write for RealTerminal {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let mut seen = self.termios_at_write.lock().unwrap();
+            if seen.is_none() {
+                *seen = Some(mode(&tcgetattr(&self.tty).unwrap()));
+            }
+            self.tty.write(buf)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.tty.flush()
+        }
+    }
+
+    let pty = nix::pty::openpty(None, None).unwrap();
+    let start = mode(&tcgetattr(&pty.slave).unwrap());
+    let mut master = std::fs::File::from(pty.master);
+    let screen = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&screen);
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match master.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => sink.lock().unwrap().extend_from_slice(&buf[..n]),
+                // A signal can interrupt the read on some targets.
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
+    });
+    let dup = |fd: &OwnedFd| fd.try_clone().unwrap();
+    let termios_at_write = Arc::new(Mutex::new(None));
+
+    let mut session = std::process::Command::new("/bin/sh");
+    session
+        .arg("-c")
+        .arg("stty raw -echo -iexten; printf R; exit 255");
+    let code = interactive_attach(
+        session,
+        true,
+        || {
+            attach::TerminalUnwind::arm_on(
+                RealTerminal {
+                    tty: std::fs::File::from(dup(&pty.slave)),
+                    termios_at_write: Arc::clone(&termios_at_write),
+                },
+                true,
+            )
+        },
+        |ssh| {
+            let real = client::tty_relay::RealTty::from_fds(dup(&pty.slave), dup(&pty.slave));
+            client::attach::run_interactive_attach_on(ssh, real, None)
+        },
+    )
+    .unwrap();
+    assert_eq!(code, 255);
+
+    let at_write = termios_at_write
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("a transport drop arms the blind unwind");
+    assert_eq!(
+        at_write, start,
+        "the unwind wrote before the termios was restored"
+    );
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let seen = screen.lock().unwrap().clone();
+        // The session's output, then the unwind's codes, on the user's
+        // terminal.
+        if seen.starts_with(b"R") && seen.ends_with(b"\x1b[?1004l") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < until,
+            "the unwind codes never reached the terminal: {:?}",
+            String::from_utf8_lossy(&seen)
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
 /// The interactive attach no longer `exec()`s ssh — it waits on it so the
 /// terminal can be put back afterwards (#1210) — so the status ssh reports
 /// has to become this process's own, signalled children included.
@@ -28,6 +185,38 @@ fn ssh_status_becomes_the_clients_exit_code() {
     // A signalled child reports no code of its own; the shell's 128 + n.
     // 9 is SIGKILL, in the low bits where wait(2) puts the signal.
     assert_eq!(exit_code_of(std::process::ExitStatus::from_raw(9)), 137);
+}
+
+/// The exec-path stdout relay copies data from a reader to a writer and
+/// returns `BrokenPipe` when the writer's far end closes (#815).
+#[tokio::test]
+async fn exec_stdout_relay_copies_and_detects_broken_pipe() {
+    use tokio::io::AsyncWriteExt as _;
+
+    // Clean EOF: write "hello\n" then drop the write half, so the read half
+    // yields the bytes and then EOF. The relay should copy and return Ok.
+    let (mut src, mut rx) = tokio::io::duplex(64);
+    src.write_all(b"hello\n").await.unwrap();
+    drop(src);
+    let mut sink = tokio::io::sink();
+    relay_exec_stdout(&mut rx, &mut sink)
+        .await
+        .expect("relay should succeed on clean EOF");
+
+    // BrokenPipe: the writer's far end is closed, so the first write fails.
+    let (mut src, mut rx) = tokio::io::duplex(64);
+    src.write_all(b"world\n").await.unwrap();
+    drop(src);
+    let (mut writer, reader) = tokio::io::duplex(64);
+    drop(reader); // close the read half of the duplex
+    let err = relay_exec_stdout(&mut rx, &mut writer)
+        .await
+        .expect_err("relay should fail when the writer's far end is closed");
+    assert_eq!(
+        err.kind(),
+        std::io::ErrorKind::BrokenPipe,
+        "relay should return BrokenPipe when writer's far end closes"
+    );
 }
 
 /// A CLI upgraded past its daemon must be refused up front, naming both
@@ -475,6 +664,7 @@ fn twin_entry(
         project_path: path.map(|p| paths::HostAbsPath::try_new(p).unwrap()),
         status,
         git: None,
+        host_ip_enforcement: None,
         attrs: None,
     }
 }
@@ -767,6 +957,15 @@ fn sanitize_name_component_trims_and_falls_back() {
     assert_eq!(sanitize_name_component("café"), "caf");
     assert_eq!(sanitize_name_component("...."), "session");
     assert_eq!(sanitize_name_component("a\tb"), "ab");
+    // `_` and `.` map to `-`, so the minted name stays a single DNS label.
+    assert_eq!(sanitize_name_component("my_app.dev"), "my-app-dev");
+    assert_eq!(sanitize_name_component("mnlh.Ab12_"), "mnlh-ab12");
+    // An over-long basename is capped and re-trimmed.
+    assert_eq!(sanitize_name_component(&"a".repeat(100)).len(), 48);
+    assert_eq!(
+        sanitize_name_component(&format!("{}-tail", "b".repeat(47))),
+        "b".repeat(47)
+    );
 }
 
 /// The minted suffix is exactly four lowercase hex digits.
@@ -1101,6 +1300,8 @@ fn session_run_encodes_a_task_form_not_a_command() {
     let request = minimald_rpc::exec::ExecRequest::TaskRun {
         task: "check".to_string(),
         owns_box: false,
+        args: vec![],
+        cwd: String::new(),
     };
     let wire = request.encode();
     assert_eq!(
@@ -1108,12 +1309,15 @@ fn session_run_encodes_a_task_form_not_a_command() {
         Ok(minimald_rpc::exec::ExecRequest::TaskRun {
             task: "check".to_string(),
             owns_box: false,
+            args: vec![],
+            cwd: String::new(),
         })
     );
 }
 
-/// `min task run <task>` parses with `--keep` off by default; the flag
-/// and the optional path positional are accepted in any order.
+/// `min task run <task>` parses with `--keep` off by default; the `--path`
+/// option and the `--keep` flag are accepted in any order, and every
+/// positional after the task name is a task argument, never a project path.
 #[test]
 fn task_run_parses_task_keep_and_path() {
     use clap::Parser as _;
@@ -1130,14 +1334,38 @@ fn task_run_parses_task_keep_and_path() {
     assert_eq!(a.task, "build");
     assert!(!a.keep);
     assert!(a.path.is_none());
+    assert!(a.args.is_empty());
 
     let a = run_args(&["min", "task", "run", "build", "--keep"]);
     assert!(a.keep);
 
-    let a = run_args(&["min", "task", "run", "--keep", "build", "sub/dir"]);
+    let a = run_args(&["min", "task", "run", "--keep", "build", "--path", "sub/dir"]);
     assert_eq!(a.task, "build");
     assert_eq!(a.path.as_deref(), Some("sub/dir"));
     assert!(a.keep);
+
+    // A positional after the task name is a task argument, not a path.
+    let a = run_args(&["min", "task", "run", "greet", "Alice"]);
+    assert_eq!(a.task, "greet");
+    assert!(a.path.is_none());
+    assert_eq!(a.args, ["Alice"]);
+
+    // `--path` may precede the task name.
+    let a = run_args(&["min", "task", "run", "--path", "sub/dir", "build"]);
+    assert_eq!(a.task, "build");
+    assert_eq!(a.path.as_deref(), Some("sub/dir"));
+
+    // A declared task arg is a `--<name>` flag; it passes through as-is.
+    let a = run_args(&["min", "task", "run", "greet", "--name", "Alice"]);
+    assert_eq!(a.task, "greet");
+    assert_eq!(a.args, ["--name", "Alice"]);
+
+    // A task arg whose name collides with a `min task run` option (`path`,
+    // `keep`) goes after `--`, which ends `min`'s own options.
+    let a = run_args(&["min", "task", "run", "deploy", "--", "--path", "prod"]);
+    assert_eq!(a.task, "deploy");
+    assert!(a.path.is_none());
+    assert_eq!(a.args, ["--path", "prod"]);
 
     // The task name is required.
     assert!(Cli::try_parse_from(["min", "task", "run"]).is_err());
@@ -1195,6 +1423,42 @@ fn ingress_spec_rejects_malformed_and_bad_proto() {
     assert!(parse_ingress_mapping("18080:80/icmp").is_err());
 }
 
+#[test]
+fn forward_spec_accepts_ephemeral_local_port() {
+    let (local, box_port) = parse_forward_spec("0:80").unwrap();
+    assert_eq!(local, 0);
+    assert_eq!(box_port, 80);
+}
+
+#[test]
+fn forward_spec_rejects_zero_box_port() {
+    let err = parse_forward_spec("8080:0").unwrap_err().to_string();
+    assert!(
+        err.contains("box port must be 1-65535"),
+        "expected the box-port message, got: {err}"
+    );
+}
+
+#[test]
+fn forward_spec_rejects_out_of_range_and_malformed() {
+    assert!(parse_forward_spec("8080:99999").is_err());
+    let err = parse_forward_spec("x:80").unwrap_err().to_string();
+    assert!(
+        err.contains("invalid local port"),
+        "expected the local-port message, got: {err}"
+    );
+}
+
+#[test]
+fn ingress_spec_rejects_box_port_zero() {
+    let err = parse_ingress_mapping("8080:0").unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("port 0 is reserved"),
+        "box port 0 must be rejected: {msg}"
+    );
+}
+
 /// Regression: a config in the `.minimal/` layout must be detected so
 /// `activate` returns without prompting and never scaffolds over it.
 /// The old naive `join(MFILE_NAME)` check missed this path.
@@ -1224,6 +1488,44 @@ fn project_has_mfile_false_when_absent() {
     let dir = tempfile::tempdir().unwrap();
     let path = camino::Utf8Path::from_path(dir.path()).expect("temp path is UTF-8");
     assert!(!project_has_mfile(path));
+}
+
+/// `--sync none` drops a config only when one exists up the tree: a
+/// `minimal.toml` at the project root is detected from a nested subdir,
+/// so the notice fires for the case that would otherwise silently lose
+/// the project's packages, vars, patches and hooks.
+#[test]
+fn sync_none_drops_project_config_true_when_mfile_up_tree() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join(mfile::MFILE_NAME),
+        "[upstream]\nrepo = \"https://github.com/gominimal/pkgs\"\n",
+    )
+    .unwrap();
+    let root = camino::Utf8Path::from_path(dir.path()).expect("temp path is UTF-8");
+    let subdir = root.join("nested/deep");
+    std::fs::create_dir_all(&subdir).unwrap();
+
+    assert!(sync_none_drops_project_config(&subdir));
+    let notice = sync_none_notice(&subdir).expect("a config to drop gets a notice");
+    assert!(notice.contains("minimal.toml is not sent"), "{notice}");
+}
+
+/// With no mfile anywhere up the tree, `--sync none` has nothing to
+/// drop, so the notice stays silent. Anchored in `$HOME` for the same
+/// reason as [`resolve_upload_root_returns_input_when_no_mfile`]: the
+/// upward walk stops there, so "no mfile up the tree" is guaranteed.
+#[test]
+fn sync_none_drops_project_config_false_when_no_mfile() {
+    let Some(home) = std::env::home_dir() else {
+        return; // no HOME: no walk boundary to anchor the test to
+    };
+    let Ok(dir) = tempfile::tempdir_in(&home) else {
+        return; // can't create temp dir in HOME, such as on a read only file system
+    };
+    let path = camino::Utf8Path::from_path(dir.path()).expect("temp path is UTF-8");
+    assert!(!sync_none_drops_project_config(path));
+    assert_eq!(sync_none_notice(path), None);
 }
 
 /// With no mfile anywhere up the tree, `resolve_upload_root` returns the
@@ -1319,6 +1621,33 @@ fn composition_failure_leads_with_the_directory_not_the_daemon_step() {
     assert!(
         msg.contains(daemon_error),
         "the daemon's error is the only diagnostic and must survive: {msg}"
+    );
+}
+
+/// A transient git failure — the concurrent `min session activate`
+/// `index.lock` race — is not the user's configuration, so the message must
+/// not instruct them to fix "the configuration there". The remedy is to
+/// re-run, and the directory still leads.
+#[test]
+fn composition_failure_does_not_blame_config_for_git_lock() {
+    let daemon_error = "init of minimal context: other: git command 'checkout' failed \
+                            (exit status: 128): fatal: Unable to create \
+                            '.../.git/index.lock': File exists.";
+    let msg =
+        composition_failure_message(camino::Utf8Path::new("/home/dev/myproject"), daemon_error);
+
+    let headline = msg.lines().next().expect("a first line");
+    assert!(
+        headline.contains("/home/dev/myproject"),
+        "the headline must name the directory: {msg}"
+    );
+    assert!(
+        !msg.contains("Fix the configuration there"),
+        "a git lock is transient, not a config fault: {msg}"
+    );
+    assert!(
+        msg.contains(daemon_error),
+        "the daemon's error must survive: {msg}"
     );
 }
 
@@ -1694,6 +2023,155 @@ fn legacy_network_spellings_parse_with_hint() {
     );
 }
 
+/// The `--network` parser accepts every [`sessions::NetworkMode::word`] and
+/// maps it back to the same mode, so the word the daemon logs and the
+/// refusals print is always one a person can type.
+#[test]
+fn network_parser_round_trips_every_mode_word() {
+    for mode in [
+        sessions::NetworkMode::NoNet,
+        sessions::NetworkMode::HostNet,
+        sessions::NetworkMode::OwnIp,
+    ] {
+        let parsed = parse_network_mode(mode.word()).expect("a mode word must parse");
+        assert_eq!(sessions::NetworkMode::from(parsed), mode, "{}", mode.word());
+    }
+}
+
+/// `--deny-all-egress` conflicts with every egress rule flag at parse
+/// (NET-075's CLI half): a deny-all declaration admits no exceptions, so
+/// combining it with any `--allow-*`/`--deny-*` rule is refused before the
+/// activation runs, naming both flags — and the refusal is the parser's
+/// conflict, not a later validation, so nothing is half-declared. The one
+/// egress-shaped flag it must combine with is `--credentialed-upstream`
+/// (NET-134): the proxy listener is infrastructure, the machine-internal
+/// analogue of the fabric pin's infrastructure set, so a deny-all box may
+/// still declare the lane — the proxy's own checks govern what the lane
+/// grants, and this flag's conflict is with rules, never with
+/// infrastructure.
+#[test]
+fn deny_all_egress_conflicts_with_every_egress_flag() {
+    use clap::Parser as _;
+
+    for (rule, value) in [
+        ("--allow-subnets", "10.0.0.0/8"),
+        ("--allow-dns-hosts", "github.com"),
+        ("--allow-protocols", "tcp"),
+        ("--deny-subnets", "0.0.0.0/0"),
+    ] {
+        let err = Cli::try_parse_from([
+            "min",
+            "session",
+            "activate",
+            "--deny-all-egress",
+            rule,
+            value,
+        ])
+        .map(|_| ())
+        .expect_err("--deny-all-egress must conflict with every egress rule flag");
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::ArgumentConflict,
+            "the combination must be refused as a parse conflict, not a later \
+             validation: {err}"
+        );
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("--deny-all-egress"),
+            "the refusal must name the deny-all flag: {rendered}"
+        );
+        assert!(
+            rendered.contains(rule),
+            "the refusal must name the rule flag it conflicts with: {rendered}"
+        );
+    }
+
+    // The flag on its own parses, and it carries one meaning wherever the
+    // egress flags appear: a boolean declaration with no value to validate.
+    let args = Cli::try_parse_from(["min", "session", "activate", "--deny-all-egress"])
+        .expect("--deny-all-egress alone must parse");
+    match args.command {
+        Some(Command::Session(SessionArgs {
+            command: SessionCommand::Activate(a),
+        })) => assert!(a.deny_all_egress, "the flag must land on the args"),
+        _ => panic!("expected an activate command"),
+    }
+
+    // The proxy lane is not a rule (NET-134): the two combine.
+    Cli::try_parse_from([
+        "min",
+        "session",
+        "activate",
+        "--deny-all-egress",
+        "--credentialed-upstream",
+    ])
+    .expect("--deny-all-egress must combine with --credentialed-upstream");
+}
+
+/// The dynamic ingress flags parse at the flag (NET-043): a mode with a
+/// range lands as both, a mode alone lands with no range, an unknown mode
+/// is refused by the mode's parser, and a privileged range is refused by
+/// the range's parser in the launch check's own words.
+#[test]
+fn dynamic_ingress_flags_parse() {
+    use clap::Parser as _;
+
+    let activate = |argv: &[&str]| -> ActivateArgs {
+        let args = Cli::try_parse_from(argv)
+            .unwrap_or_else(|error| panic!("{argv:?} must parse: {error}"));
+        match args.command {
+            Some(Command::Session(SessionArgs {
+                command: SessionCommand::Activate(a),
+            })) => a,
+            _ => panic!("expected an activate command"),
+        }
+    };
+
+    let a = activate(&[
+        "min",
+        "session",
+        "activate",
+        "--dynamic-ingress",
+        "allow",
+        "--dynamic-range",
+        "8000-8443",
+    ]);
+    assert_eq!(a.dynamic_ingress, Some(sessions::DynamicIngress::Allow));
+    assert_eq!(a.dynamic_range, Some((8000, 8443)));
+
+    let a = activate(&["min", "session", "activate", "--dynamic-ingress", "ask"]);
+    assert_eq!(a.dynamic_ingress, Some(sessions::DynamicIngress::Ask));
+    assert_eq!(a.dynamic_range, None, "a mode alone carries no range");
+
+    let Err(err) =
+        Cli::try_parse_from(["min", "session", "activate", "--dynamic-ingress", "maybe"])
+    else {
+        panic!("an unknown dynamic ingress mode must not parse");
+    };
+    let rendered = err.to_string();
+    assert!(
+        rendered.contains("unknown mode 'maybe'"),
+        "the refusal must name the mode, got: {rendered}"
+    );
+
+    let Err(err) = Cli::try_parse_from([
+        "min",
+        "session",
+        "activate",
+        "--dynamic-ingress",
+        "allow",
+        "--dynamic-range",
+        "80-90",
+    ]) else {
+        panic!("a privileged dynamic range must not parse");
+    };
+    let rendered = err.to_string();
+    assert!(
+        rendered.contains(&sessions::PolicyError::PrivilegedDynamicRange { lo: 80 }.to_string()),
+        "the refusal must use the launch check's words, got: {rendered}"
+    );
+}
+
 /// The CLI reference documents the network flags on `session activate`
 /// (NET-036), read from the real file so a docs edit cannot silently drop
 /// either row.
@@ -1714,6 +2192,8 @@ fn cli_reference_documents_network_flags() {
     for row in [
         "--network <none|host_ip|own_ip>",
         "--ingress <EXT:INT[/PROTO]>",
+        "--dynamic-ingress <allow|ask|deny>",
+        "--dynamic-range <LO-HI>",
     ] {
         assert!(
             section.contains(row),
@@ -1857,10 +2337,19 @@ async fn ls_shows_vm_per_box() {
     // line says which surface its own names answer through — here fed
     // straight to the formatter, the way the verdict a configured host's
     // reads decide arrives at it, with the host daemon answering through
-    // its proxy and the named VM through native DNS.
+    // its proxy and the named VM through native DNS. NET-138's answerer row
+    // is per VM for the same reason's host half: each VM's own control
+    // socket read decides its own row, so a VM whose minvmd holds the
+    // machine's port says so while a sibling registered with another
+    // daemon names that holder instead — one `Holder` and one `Registered`
+    // here, fed the same way.
     let surfaces = vec![
         Some(crate::resolver::LiveSurface::Proxy),
         Some(crate::resolver::LiveSurface::Native),
+    ];
+    let answerers = vec![
+        Some(minimald_rpc::ZoneAnswererStatus::Holder { port: 7_656 }),
+        Some(minimald_rpc::ZoneAnswererStatus::Registered { port: 7_656 }),
     ];
     let mut out = Vec::new();
     format_ls_across_vms(
@@ -1871,6 +2360,7 @@ async fn ls_shows_vm_per_box() {
         },
         &listings,
         &surfaces,
+        &answerers,
     )
     .expect("rendering the two-VM listing");
     let table = String::from_utf8(out).expect("the listing is UTF-8");
@@ -1902,10 +2392,35 @@ async fn ls_shows_vm_per_box() {
         surface_line_of("alpha").contains("native DNS is the live name surface"),
         "the VM the hook routes to is named native:\n{table}"
     );
+    let answerer_row_of = |vm: &str| {
+        table
+            .lines()
+            .find(|l| l.starts_with("ZONE ANSWERER:") && l.contains(vm))
+            .unwrap_or_else(|| panic!("a ZONE ANSWERER line for {vm} in:\n{table}"))
+            .to_string()
+    };
+    assert!(
+        answerer_row_of("default").contains("this VM's minvmd holds it on 127.0.0.1:7656"),
+        "the VM whose minvmd holds the port says so, in its own row:\n{table}"
+    );
+    assert!(
+        answerer_row_of("alpha").contains("another VM host daemon holds it on 127.0.0.1:7656"),
+        "the registered VM names the holder, in its own row:\n{table}"
+    );
+    assert!(
+        !answerer_row_of("alpha").contains("this VM's minvmd holds it"),
+        "a VM registered with another daemon must not claim its own minvmd \
+         holds the port:\n{table}"
+    );
+    assert!(
+        !answerer_row_of("default").contains("another VM host daemon"),
+        "a holder must not be named as a sibling's registration:\n{table}"
+    );
 
     // One VM listed renders exactly the single-VM listing `min ls` has always
-    // printed — the surface line included, verdict and all: the column is a
-    // fact about a multi-VM host, not a new format.
+    // printed — the surface line included, verdict and all, and the VM's own
+    // answerer row with it: the column is a fact about a multi-VM host, not a
+    // new format.
     let single = &listings[1..];
     let mut delegated = Vec::new();
     format_ls_across_vms(
@@ -1916,6 +2431,7 @@ async fn ls_shows_vm_per_box() {
         },
         single,
         &surfaces[1..],
+        &answerers[1..],
     )
     .expect("rendering the single-VM listing");
     let mut direct = Vec::new();
@@ -1926,7 +2442,8 @@ async fn ls_shows_vm_per_box() {
             json: false,
         },
         &single[0].resp,
-        surfaces[1],
+        surfaces[1].clone(),
+        answerers[1].clone(),
     )
     .expect("format_ls on the same listing");
     assert_eq!(
@@ -1948,6 +2465,7 @@ async fn ls_shows_vm_per_box() {
             json: true,
         },
         &listings,
+        &[],
         &[],
     )
     .expect("rendering the two-VM listing as JSON");
@@ -2157,6 +2675,50 @@ async fn a_stopped_vm_does_not_hold_a_listing() {
         elapsed < std::time::Duration::from_secs(1),
         "a stopped VM's stale socket must not charge the listing its \
          connect-retry window ({elapsed:?})"
+    );
+}
+
+/// The fallback listing's control-sock gate keys on the backend the daemon
+/// connection resolves through, never on `use_minvmd()` — the same rule every
+/// other VM-backed gate keys on: the flag is how Linux asks for the VM host,
+/// while macOS reaches it with no flag at all, so a gate keyed on the flag
+/// would find no control socket for exactly the host whose every invocation
+/// is VM-backed, and the one entry `min ls` falls back to there would carry
+/// no answerer state to read.
+#[test]
+fn fallback_listing_control_sock_keys_on_provider_kind() {
+    let state = tempfile::tempdir().expect("a temp minimal state dir");
+    let sock = state.path().join("ssh.sock");
+    // The unflagged invocation resolves through the platform's default
+    // backend, so the expectation is that backend's — `client_provider_kind`'s
+    // own reading, whatever host this runs on: on Linux the native backend
+    // hosts no VM host daemon, while macOS has no native backend at all and
+    // every invocation is minvmd-backed, flag or no flag.
+    let unflagged = GlobalArgs {
+        repo_dir: None,
+        minimal_dir: Some(state.path().to_path_buf()),
+        config_dir: None,
+        provider: None,
+        no_input: true,
+        vm: None,
+    };
+    assert_eq!(
+        fallback_control_sock(&unflagged, &sock).is_some(),
+        client::client_provider_kind(false) == paths::ProviderKind::Minvmd,
+        "an unflagged fallback carries a control socket exactly when the \
+         backend it resolves through is minvmd"
+    );
+    // `--provider local-minvmd` asks for the VM host whatever the platform's
+    // default backend is, so the fallback always resolves the control socket
+    // beside the daemon socket it just listed through.
+    let control = fallback_control_sock(&vm_globals(state.path(), None), &sock)
+        .expect("`--provider local-minvmd` always resolves a control socket");
+    assert_eq!(
+        control,
+        sock.parent()
+            .unwrap()
+            .join(minvmd::control::CONTROL_SOCK_FILE),
+        "the control socket sits beside the daemon socket the listing resolved"
     );
 }
 
@@ -2428,6 +2990,10 @@ async fn walked_proxy_port_reported_at_start_and_in_ls() {
         VmListing {
             vm: vm.to_owned(),
             resp,
+            // A synthetic listing: no VM host daemon sits behind it, so
+            // there is no control socket to read a state from — the shape
+            // this render is fed, same as a listing that read none.
+            control_sock: None,
         }
     };
 
@@ -2452,6 +3018,7 @@ async fn walked_proxy_port_reported_at_start_and_in_ls() {
             json: false,
         },
         &listings,
+        &[],
         &[],
     )
     .expect("rendering the two-VM listing");
@@ -2512,36 +3079,240 @@ async fn walked_proxy_port_reported_at_start_and_in_ls() {
         no_input: true,
         vm: None,
     };
+    // Which backend `--provider local-minimald` selects is the platform's
+    // call: on Linux it is the native one, while macOS has no native backend
+    // at all, so `client_provider_kind` folds the flag's reading onto minvmd
+    // there — the same rule every VM-backed gate keys on, flag or no flag.
+    // The expectation is therefore the kind's, not a constant.
+    let native_names_a_vm = cfg!(target_os = "macos");
     assert_eq!(
         hostname_proxy_start_vm(&native),
-        None,
-        "the native backend hosts no VM to name"
+        native_names_a_vm.then_some(paths::DEFAULT_VM_NAME),
+        "the backend the flag selects names a VM exactly where that backend \
+         is the VM one"
     );
 
     // The native line is the single-VM routing line word for word — the same
-    // address in the same words, so the two surfaces read as one.
-    let native_start = hostname_proxy_start_line(hostname_proxy_start_vm(&native), NEXT_RUNG);
-    let mut single = Vec::new();
-    let mut native_resp = reply.clone();
-    native_resp.hostname_proxy_port = Some(NEXT_RUNG);
-    format_ls(
-        &mut single,
-        &LsArgs {
-            raw: false,
-            json: false,
-        },
-        &native_resp,
-        None,
-    )
-    .expect("rendering the single-VM listing");
-    let single = String::from_utf8(single).expect("the listing is UTF-8");
+    // address in the same words, so the two surfaces read as one. A fact
+    // about the native backend, so it is asserted only where that backend
+    // exists: a host whose every backend is minvmd renders its routing lines
+    // through the VM listing, which names the VM the start line names above.
+    if !native_names_a_vm {
+        let native_start = hostname_proxy_start_line(hostname_proxy_start_vm(&native), NEXT_RUNG);
+        let mut single = Vec::new();
+        let mut native_resp = reply.clone();
+        native_resp.hostname_proxy_port = Some(NEXT_RUNG);
+        format_ls(
+            &mut single,
+            &LsArgs {
+                raw: false,
+                json: false,
+            },
+            &native_resp,
+            None,
+            None,
+        )
+        .expect("rendering the single-VM listing");
+        let single = String::from_utf8(single).expect("the listing is UTF-8");
+        assert_eq!(
+            single
+                .lines()
+                .find(|l| l.starts_with("HOSTNAME PROXY:"))
+                .expect("the single-VM listing prints a routing line"),
+            native_start.as_str(),
+            "the native start line and `min ls`'s routing line must be the same \
+             line"
+        );
+    }
+}
+
+/// Two listed sessions for the id-prefix tests: an unnamed `01a0fe9d…` and
+/// `a1b2c3d4…` named `web`.
+fn prefix_entries() -> Vec<minimald_rpc::ListSessionsEntry> {
+    use sessions::SessionStatus::Active;
+    vec![
+        twin_entry("01a0fe9d-0a99-78b1-9165-0809440f0052", None, None, Active),
+        twin_entry(
+            "a1b2c3d4-0a99-78b1-9165-0809440f0052",
+            Some("web"),
+            None,
+            Active,
+        ),
+    ]
+}
+
+/// The short id `min ls` prints resolves as a unique id prefix, with or
+/// without dashes and in either case; a prefix nothing matches resolves to
+/// nothing, leaving the caller's "no session found".
+#[test]
+fn a_unique_id_prefix_resolves_to_its_session() {
+    let entries = prefix_entries();
+    for prefix in ["01a0fe9d", "01A0", "01a0fe9d-0a", "01a0fe9d0a99"] {
+        assert_eq!(
+            match_id_prefix(&entries, prefix).unwrap(),
+            Some(entries[0].id),
+            "`{prefix}` resolves"
+        );
+    }
+    assert_eq!(match_id_prefix(&entries, "ffff").unwrap(), None);
+}
+
+/// A prefix several sessions share is refused, naming each candidate by its
+/// short id and its session name; one more character that tells them apart
+/// resolves.
+#[test]
+fn an_ambiguous_id_prefix_names_the_candidates() {
+    use sessions::SessionStatus::Active;
+    let entries = vec![
+        twin_entry(
+            "a1b2c3d4-0a99-78b1-9165-0809440f0052",
+            Some("web"),
+            None,
+            Active,
+        ),
+        twin_entry(
+            "a1b29e8f-0a99-78b1-9165-0809440f0052",
+            Some("db"),
+            None,
+            Active,
+        ),
+    ];
+    let err = match_id_prefix(&entries, "a1b2").unwrap_err();
+    assert!(err.downcast_ref::<AmbiguousIdPrefix>().is_some());
     assert_eq!(
-        single
-            .lines()
-            .find(|l| l.starts_with("HOSTNAME PROXY:"))
-            .expect("the single-VM listing prints a routing line"),
-        native_start.as_str(),
-        "the native start line and `min ls`'s routing line must be the same \
-         line"
+        err.to_string(),
+        "'a1b2' matches sessions a1b2c3d4… (web), a1b29e8f… (db); use more characters"
+    );
+    assert_eq!(
+        match_id_prefix(&entries, "a1b29").unwrap(),
+        Some(entries[1].id)
+    );
+}
+
+/// Candidates that share more than eight hex digits are cut only as far as
+/// needed to be told apart: each rendered id is distinct and exactly as long
+/// as the first differing digit.
+#[test]
+fn an_ambiguous_id_prefix_cuts_at_the_first_differing_digit() {
+    use sessions::SessionStatus::Active;
+    let entries = vec![
+        twin_entry("a1b2c3d4-e50f-78b1-9165-0809440f0052", None, None, Active),
+        twin_entry("a1b2c3d4-e51f-78b1-9165-0809440f0052", None, None, Active),
+    ];
+    // The two ids share their first ten hex digits; the eleventh diverges.
+    let err = match_id_prefix(&entries, "a1b2c3d4e5").unwrap_err();
+    assert!(err.downcast_ref::<AmbiguousIdPrefix>().is_some());
+    assert_eq!(
+        err.to_string(),
+        "'a1b2c3d4e5' matches sessions a1b2c3d4e50…, a1b2c3d4e51…; use more characters"
+    );
+    // Each rendered candidate resolves back to exactly its own session.
+    assert_eq!(
+        match_id_prefix(&entries, "a1b2c3d4e50").unwrap(),
+        Some(entries[0].id)
+    );
+    assert_eq!(
+        match_id_prefix(&entries, "a1b2c3d4e51").unwrap(),
+        Some(entries[1].id)
+    );
+}
+
+/// Only 4 to 32 hex digits (dashes allowed) are tried as a prefix: anything
+/// else stays a plain name, so a miss is the usual "no session found".
+#[test]
+fn a_non_hex_or_short_input_is_not_an_id_prefix() {
+    let (max, over) = ("0".repeat(32), "0".repeat(33));
+    for not_prefix in ["01a", "01a0fe9z", "web-01a0", "", "----", over.as_str()] {
+        assert!(!is_id_prefix(not_prefix), "`{not_prefix}` is not a prefix");
+    }
+    for prefix in ["01a0", "01A0FE9D", "01a0fe9d-0a99", max.as_str()] {
+        assert!(is_id_prefix(prefix), "`{prefix}` is a prefix");
+    }
+    // `01a0fe9z` would match the first session's id were it read as hex.
+    assert_eq!(
+        match_id_prefix(&prefix_entries(), "01a0fe9z").unwrap(),
+        None
+    );
+}
+
+/// A session named with a string that is also another session's id prefix
+/// resolves by its name: an exact name wins over a prefix.
+#[test]
+fn an_exact_name_wins_over_an_id_prefix() {
+    use sessions::SessionStatus::Active;
+    let mut entries = prefix_entries();
+    entries.push(twin_entry(
+        "ffffffff-0a99-78b1-9165-0809440f0052",
+        Some("01a0fe9d"),
+        None,
+        Active,
+    ));
+    assert_eq!(
+        match_id_prefix(&entries, "01a0fe9d").unwrap(),
+        Some(entries[2].id)
+    );
+}
+
+/// A name resolves in any casing, matching how names are made unique: a
+/// session named `Beef-Cafe` is found by `beef-cafe` (and vice versa). The
+/// names are hex-shaped, because only those reach this match on a name miss,
+/// and a folded name wins over a session whose id starts with the same hex.
+#[test]
+fn a_name_resolves_case_insensitively() {
+    use sessions::SessionStatus::Active;
+    let entries = vec![
+        twin_entry(
+            "ffffffff-0a99-78b1-9165-0809440f0052",
+            Some("Beef-Cafe"),
+            None,
+            Active,
+        ),
+        twin_entry("beefcafe-0a99-78b1-9165-0809440f0054", None, None, Active),
+    ];
+    assert_eq!(
+        match_id_prefix(&entries, "beef-cafe").unwrap(),
+        Some(entries[0].id)
+    );
+    assert_eq!(
+        match_id_prefix(&entries, "BEEF-CAFE").unwrap(),
+        Some(entries[0].id)
+    );
+}
+
+/// An exact name wins over a case-folded one, and a casing that folds to two
+/// sessions (case-only duplicates written before names were made unique
+/// under case folding) resolves to neither rather than picking one, nor
+/// falls through to a session whose id starts with that prefix.
+#[test]
+fn an_exact_name_wins_and_an_ambiguous_fold_resolves_to_none() {
+    use sessions::SessionStatus::Active;
+    let entries = vec![
+        twin_entry(
+            "ffffffff-0a99-78b1-9165-0809440f0052",
+            Some("Beef-Cafe"),
+            None,
+            Active,
+        ),
+        twin_entry(
+            "eeeeeeee-0a99-78b1-9165-0809440f0053",
+            Some("beef-cafe"),
+            None,
+            Active,
+        ),
+        twin_entry("beefcafe-0a99-78b1-9165-0809440f0054", None, None, Active),
+    ];
+    assert_eq!(
+        match_id_prefix(&entries, "beef-cafe").unwrap(),
+        Some(entries[1].id)
+    );
+    assert_eq!(
+        match_id_prefix(&entries, "Beef-Cafe").unwrap(),
+        Some(entries[0].id)
+    );
+    assert_eq!(match_id_prefix(&entries, "BEEF-CAFE").unwrap(), None);
+    // The id prefix alone, with no name folding to it, still resolves.
+    assert_eq!(
+        match_id_prefix(&entries, "beefcafe").unwrap(),
+        Some(entries[2].id)
     );
 }

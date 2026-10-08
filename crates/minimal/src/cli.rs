@@ -1,6 +1,6 @@
 //! `clap` argument definitions for the `min` CLI.
 
-use clap::{ArgGroup, Args, Subcommand};
+use clap::{ArgGroup, Args, Subcommand, ValueEnum};
 // Re-exported so the crate-root glob (`pub use cli::*`) keeps `Parser` in scope
 // for tests that call `Cli::try_parse_from`, exactly as the old single-module
 // layout did.
@@ -124,6 +124,15 @@ pub enum Command {
     /// on Ctrl-C, whichever comes first.
     #[command(hide = true)]
     Spin(SpinArgs),
+    /// Print the privileged command that installs this host's resolver,
+    /// local range and box-name service (development aid).
+    ///
+    /// The command a session start's advisory prints, rendered without a
+    /// daemon, so the service install can be tested on a host that cannot
+    /// boot a VM. Debug builds only.
+    #[cfg(debug_assertions)]
+    #[command(name = "debug-answerer-command", hide = true)]
+    DebugAnswererCommand,
     /// Print session-identifier completion candidates (used by the shell).
     ///
     /// The completion path a shell actually takes runs in-process (see
@@ -176,7 +185,8 @@ pub enum SessionCommand {
     Destroy(DestroyArgs),
     /// Rename an existing session
     Rename(RenameArgs),
-    /// Print the effective networking policy for a session as JSON
+    /// Print the effective networking policy for a session, as text or as
+    /// one JSON document (`-o json`)
     Policy(PolicyArgs),
     /// Register a session as an SSH remote in Zed's settings
     ///
@@ -206,7 +216,7 @@ pub enum SessionCommand {
 
 #[derive(Debug, Args)]
 pub struct SetupZedArgs {
-    /// Session identifier (UUID or session name)
+    /// Session identifier (UUID, unique id prefix, or session name)
     #[arg(add = completion::session_completer())]
     pub session: String,
     /// Zed settings file to edit (default: `~/.config/zed/settings.json`)
@@ -220,7 +230,7 @@ pub struct SetupZedArgs {
 /// Args for `min session hooks`.
 #[derive(Debug, Args)]
 pub struct HooksArgs {
-    /// Session identifier (UUID or session name)
+    /// Session identifier (UUID, unique id prefix, or session name)
     #[arg(add = completion::session_completer())]
     pub session: String,
     /// Emit the raw JSON the daemon returned instead of a table
@@ -230,7 +240,7 @@ pub struct HooksArgs {
 
 #[derive(Debug, Args)]
 pub struct ExecArgs {
-    /// Session identifier (UUID or session name).
+    /// Session identifier (UUID, unique id prefix, or session name).
     #[arg(add = completion::session_completer())]
     pub session: String,
     /// Command to execute in the session context
@@ -245,7 +255,7 @@ pub struct ExecArgs {
 
 #[derive(Debug, Args)]
 pub struct SessionRunArgs {
-    /// Session identifier (UUID or session name).
+    /// Session identifier (UUID, unique id prefix, or session name).
     #[arg(add = completion::session_completer())]
     pub session: String,
     /// Name of a task declared in the session project's minimal.toml
@@ -254,9 +264,103 @@ pub struct SessionRunArgs {
 
 #[derive(Debug, Args)]
 pub struct PolicyArgs {
-    /// Session identifier (UUID or session name)
+    /// Session identifier (UUID, unique id prefix, or session name)
     #[arg(add = completion::session_completer())]
     pub session: String,
+    /// Write one JSON document instead of text (the default)
+    #[arg(short = 'o', long = "output", value_enum)]
+    pub output: Option<PolicyOutputFormat>,
+}
+
+/// The rendering `min session policy` writes. One value today — `json`, the
+/// machine-readable shape — beside the text default; an `output` enum rather
+/// than a bare `--json` flag so a second format lands beside the first
+/// instead of accreting flags.
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub enum PolicyOutputFormat {
+    /// One JSON document, `min/v1/session-policy`, with each live mapping's
+    /// `pending` state carried
+    Json,
+}
+
+/// The typed failure a machine-output run fails its walk into: the
+/// `code`, `message` and `hint` of the one `min/v1/error` object the CLI's
+/// `main` writes on stderr when the run ends non-zero. Keyed on the output
+/// mode rather than on any one command — every command that takes `-o json`
+/// fails into this, and `main`'s single machine-mode error emitter (keyed
+/// the same way, in `main.rs`, shared by all of them) is the only thing
+/// that turns one into bytes — so the next command that takes `-o json`
+/// calls the mechanism directly: its walk names the failure kinds it can
+/// tell apart and fails into this payload, with no sentinel of its own.
+///
+/// [`std::error::Error`] so the failure can ride the `anyhow` chain across
+/// the library boundary to `main`, the way the task-status type does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MachineModeFailure {
+    /// The failure's kind: a name a script branches on — the
+    /// architecture's codes, `not_found` for a missing thing (with the
+    /// kind of thing that was missing in the message and the hint),
+    /// `daemon_unreachable`, `policy_unavailable` — never a single
+    /// command's own spelling.
+    code: &'static str,
+    message: String,
+    hint: String,
+}
+
+impl MachineModeFailure {
+    /// One failure, from the three parts the error object carries.
+    #[must_use]
+    pub fn new(code: &'static str, message: String, hint: String) -> Self {
+        Self {
+            code,
+            message,
+            hint,
+        }
+    }
+
+    /// The failure's kind — the `code` of the error object.
+    #[must_use]
+    pub fn code(&self) -> &'static str {
+        self.code
+    }
+
+    /// The message beside it: the same chain the text mode's error line
+    /// carries.
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    /// The hint beside them: one line naming what to do about the failure,
+    /// or the kind of thing that was missing.
+    #[must_use]
+    pub fn hint(&self) -> &str {
+        &self.hint
+    }
+}
+
+impl std::fmt::Display for MachineModeFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the machine-mode error object on stderr says why: {} ({})",
+            self.message, self.code
+        )
+    }
+}
+
+impl std::error::Error for MachineModeFailure {}
+
+/// The context a machine-output command puts on a failure to write its own
+/// document to stdout, so the machine-mode error path can tell that failure
+/// (`output_failed`) from any other I/O error the run met on the way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutputWriteError;
+
+impl std::fmt::Display for OutputWriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("failed to write the document to stdout")
+    }
 }
 
 #[derive(Debug, Args)]
@@ -307,11 +411,17 @@ pub struct TaskRunArgs {
     /// Name of a task declared in the project's minimal.toml
     pub task: String,
     /// Project path. Defaults to the directory set by `-C`/`--repo-dir`,
-    /// or the current working directory when neither is given.
+    /// or the current working directory when neither is given. A named
+    /// option rather than a positional so that every positional after the
+    /// task name is a task argument, never a project path.
+    #[arg(long)]
     pub path: Option<String>,
     /// Keep the session after the task exits instead of destroying it
     #[arg(long)]
     pub keep: bool,
+    /// Arguments to the task, passed through to its declared `args`.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
+    pub args: Vec<String>,
 }
 
 /// Arguments for the hidden top-level `run` catch. Everything after `run` is
@@ -464,6 +574,22 @@ impl GlobalArgs {
 }
 
 #[derive(Debug, Args)]
+#[command(
+    // The egress rule flags as one named set, so a declaration that admits
+    // no exceptions can conflict with them as a family: `--deny-all-egress`
+    // names this group in `conflicts_with`, which is how it comes to
+    // conflict with every `--allow-*`/`--deny-*` rule flag at parse without
+    // the four rules becoming mutually exclusive with each other — they
+    // still combine freely (`multiple`), the way the section they build
+    // combines its dimensions. The one place the egress flags appear is
+    // `ActivateArgs`, so this is the one shared definition.
+    group(
+        ArgGroup::new("egress-rules")
+            .args(["allow_subnets", "allow_dns_hosts", "allow_protocols", "deny_subnets"])
+            .required(false)
+            .multiple(true)
+    )
+)]
 pub struct ActivateArgs {
     /// Optional session name
     #[arg(long, short)]
@@ -498,6 +624,30 @@ pub struct ActivateArgs {
     /// tcp). Repeatable. Requires `--network own_ip`.
     #[arg(long = "ingress", value_name = "EXT:INT[/PROTO]")]
     pub ingress: Vec<String>,
+    /// How dynamic ingress requests from inside this box are decided
+    /// (NET-043): `allow` publishes a port the box asks to expose (or
+    /// listens on inside `--dynamic-range`), `ask` routes the request to
+    /// the attached human, `deny` — like an unset flag — refuses every
+    /// one. Requires `--network own_ip`; the flags are the interim source
+    /// of the Box Spec `[network]` block's `dynamic_ingress` setting.
+    #[arg(
+        long = "dynamic-ingress",
+        value_name = "allow|ask|deny",
+        value_parser = parse_dynamic_ingress_mode
+    )]
+    pub dynamic_ingress: Option<sessions::DynamicIngress>,
+    /// Inclusive port range `lo-hi` (both ends included) within which
+    /// `--dynamic-ingress allow` accepts dynamic ingress requests; outside
+    /// it a request is refused with the out-of-range error. Only meaningful
+    /// beside `--dynamic-ingress`, so the range-without-mode spelling is
+    /// rejected rather than read as a deliberate allow.
+    #[arg(
+        long = "dynamic-range",
+        value_name = "LO-HI",
+        value_parser = parse_dynamic_range,
+        requires = "dynamic_ingress"
+    )]
+    pub dynamic_range: Option<(u16, u16)>,
     /// Allowed destination subnets in CIDR form (`egress.allow_subnets`),
     /// e.g. `10.0.0.0/8`. Repeatable; unset means allow-all subnets. Valid on
     /// an own-address (`--network own_ip`) or host-address
@@ -518,6 +668,26 @@ pub struct ActivateArgs {
     /// denied.
     #[arg(long = "deny-subnets", value_name = "CIDR")]
     pub deny_subnets: Vec<String>,
+    /// Declare deny-all egress: the box reaches no external address. The
+    /// section this writes is the deny-all shape — every allow list present
+    /// and empty, nothing denied on top (`sessions::EgressPolicy::deny_all()`)
+    /// — a declaration, not the default: on a host-address box the host's
+    /// classifier decides it per box (NET-079), while a box that declares no
+    /// egress at all keeps the default the rollout phase resolves
+    /// (NET-074). Valid wherever the egress rule flags are; conflicts with
+    /// every one of them, because deny-all admits no exceptions.
+    #[arg(long = "deny-all-egress", conflicts_with = "egress-rules")]
+    pub deny_all_egress: bool,
+    /// Declare a credentialed upstream for this box (NET-134): the Box
+    /// Egress Proxy's listener becomes the box's infrastructure, reachable
+    /// whatever its `--allow-*`/`--deny-*` rules say. Without the flag every
+    /// frame this box sends to the proxy's address is dropped — by the VM
+    /// host's egress gate on a VM-backed host, by the relay's own
+    /// `egress-uncredentialed-proxy-destination` drop on a native one. The
+    /// steering the proxy applies and the credentials it redeems are the
+    /// proxy document's; this declares the lane, nothing more.
+    #[arg(long)]
+    pub credentialed_upstream: bool,
     /// Apply the named loadout from `<config>/minimal/loadouts/<NAME>.toml`.
     /// Repeatable. If any `--loadout` is specified, defaults from
     /// `[loadouts].default_loadouts` in the client config are ignored.
@@ -649,6 +819,11 @@ pub(crate) fn parse_ingress_mapping(spec: &str) -> Result<sessions::PortMapping,
     let internal_port = int
         .parse::<u16>()
         .map_err(|_| anyhow::anyhow!("ingress '{spec}': invalid internal port '{int}'"))?;
+    if internal_port == 0 {
+        anyhow::bail!(
+            "ingress '{spec}': internal port 0 is reserved — choose an internal port >= 1"
+        );
+    }
     Ok(sessions::PortMapping {
         external_port,
         internal_port,
@@ -664,6 +839,62 @@ pub(crate) fn parse_ingress_proto(proto: &str) -> Result<sessions::IpProto, anyh
             "ingress: unsupported protocol '{other}' (use tcp or udp)"
         )),
     }
+}
+
+/// Parse a `--dynamic-ingress <allow|ask|deny>` value (NET-043) into the
+/// [`sessions::DynamicIngress`] stance the create request carries. The
+/// snake_case spellings are the record's own — the same words
+/// `min session policy` prints back — so what a person types to create the
+/// box is what they read from it later. `deny` parses the same as an unset
+/// flag reads: both are the deny-all default the policy module evaluates
+/// them as, but spelling it is still meaningful — it makes the ingress
+/// declaration, so `min session policy` shows the resolved row rather than
+/// no ingress block at all.
+pub(crate) fn parse_dynamic_ingress_mode(raw: &str) -> Result<sessions::DynamicIngress, String> {
+    match raw {
+        "allow" => Ok(sessions::DynamicIngress::Allow),
+        "deny" => Ok(sessions::DynamicIngress::Deny),
+        "ask" => Ok(sessions::DynamicIngress::Ask),
+        other => Err(format!(
+            "dynamic ingress: unknown mode '{other}' (expected allow, ask, or deny)"
+        )),
+    }
+}
+
+/// Parse a `--dynamic-range <lo>-<hi>` value (NET-043) into the inclusive
+/// `(lo, hi)` pair the create request's `dynamic_allowed_range` carries.
+/// A malformed value (no `-`, a non-numeric end, a port outside u16), an
+/// inverted one (`hi` below `lo`), or a privileged one (`lo` below
+/// [`sessions::MIN_DYNAMIC_INGRESS_PORT`]) is a create-time error here, at the flag,
+/// rather than a daemon-side refusal after the box's directory exists: the
+/// user sees what they typed named in the error, with no half-created
+/// session behind it.
+pub(crate) fn parse_dynamic_range(raw: &str) -> Result<(u16, u16), String> {
+    let (lo, hi) = raw
+        .split_once('-')
+        .ok_or_else(|| format!("dynamic range '{raw}': expected LO-HI (e.g. 8000-8443)"))?;
+    let lo = lo
+        .trim()
+        .parse::<u16>()
+        .map_err(|_| format!("dynamic range '{raw}': '{lo}' is not a valid port number"))?;
+    let hi = hi
+        .trim()
+        .parse::<u16>()
+        .map_err(|_| format!("dynamic range '{raw}': '{hi}' is not a valid port number"))?;
+    if hi < lo {
+        return Err(format!(
+            "dynamic range '{raw}': the upper end must not be below the lower end"
+        ));
+    }
+    // The launch check's own bound and wording (`validate_policy`), so a
+    // privileged range is refused here, at the flag, in the same words.
+    if lo < sessions::MIN_DYNAMIC_INGRESS_PORT {
+        return Err(format!(
+            "dynamic range '{raw}': {}",
+            sessions::PolicyError::PrivilegedDynamicRange { lo }
+        ));
+    }
+    Ok((lo, hi))
 }
 
 /// Parse an `--allow-protocols <PROTO>` spec into an [`sessions::IpProto`].
@@ -693,14 +924,17 @@ pub(crate) fn parse_forward_spec(spec: &str) -> Result<(u16, u16), anyhow::Error
     let box_port = port
         .parse::<u16>()
         .map_err(|_| anyhow::anyhow!("forward '{spec}': invalid box port '{port}'"))?;
+    if box_port == 0 {
+        anyhow::bail!("forward '{spec}': box port must be 1-65535");
+    }
     Ok((local_port, box_port))
 }
 
 #[derive(Debug, Args)]
 pub struct AttachArgs {
-    /// Session identifier (UUID or session name). When omitted, `min session attach`
-    /// resolves a session from the current working directory (or the only
-    /// existing session), and opens an interactive picker if the choice is
+    /// Session identifier (UUID, unique id prefix, or session name). When
+    /// omitted, `min session attach` resolves a session from the current
+    /// working directory (or the only existing session), and opens an interactive picker if the choice is
     /// ambiguous. See `--no-input` to skip the picker in scripts.
     #[arg(add = completion::session_completer())]
     pub session: Option<String>,
@@ -720,7 +954,7 @@ pub struct LsArgs {
 #[derive(Debug, Args)]
 #[command(group(ArgGroup::new("target").args(["session", "all"]).required(true).multiple(false)))]
 pub struct DestroyArgs {
-    /// Session identifier (UUID or session name)
+    /// Session identifier (UUID, unique id prefix, or session name)
     #[arg(add = completion::session_completer())]
     pub session: Option<String>,
     /// Destroy all sessions
@@ -751,7 +985,7 @@ pub enum NetCommand {
 
 #[derive(Debug, Args)]
 pub struct NetForwardArgs {
-    /// Session identifier (UUID or session name)
+    /// Session identifier (UUID, unique id prefix, or session name)
     #[arg(add = completion::session_completer())]
     pub session: String,
     /// Ports to relay, as `<LOCAL>:<PORT>` — the laptop-side listener and
@@ -770,7 +1004,7 @@ pub struct StopArgs {
 
 #[derive(Debug, Args)]
 pub struct RenameArgs {
-    /// Session identifier (UUID or session name)
+    /// Session identifier (UUID, unique id prefix, or session name)
     #[arg(add = completion::session_completer())]
     pub session: String,
     /// New name for the session

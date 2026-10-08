@@ -291,6 +291,13 @@ async fn build_bundle(
         state_listing(&mut w, &state_dir, req.include_state_listing)
     );
     collect_step!(w, "sessions", sessions(&mut w, &state_dir));
+    // The local decision log's tail (NET-046): every dynamic ingress
+    // decision this daemon made — allowed, denied, asked and answered — one
+    // line each, with the box, the port, and who decided. Beside the session
+    // records because it is the other half of "what did this daemon do to
+    // whom": the records say what was configured, the audit says what was
+    // decided.
+    collect_step!(w, "audit", audit(&mut w, &state_dir, log_tail_cap(req)));
     collect_step!(w, "env", env(&mut w));
     // Incident captures: pure `/proc`, since the microVM rootfs has no `ps`,
     // `lsof`, `ss` or `ip`. The mechanics are the ones the host bundle uses.
@@ -669,6 +676,50 @@ async fn sessions<W: BundleSink>(
                 format!("sessions/{short}/record.json"),
                 format!("does not parse as JSON, cannot redact safely: {e}"),
             ),
+        }
+    }
+    Ok(())
+}
+
+/// The local decision log's tail (NET-046), beside the session records: one
+/// line per dynamic ingress decision this daemon made, naming the box, the
+/// port, the decision the box's setting made, who decided it, and the
+/// outcome. Its absence is a fresh daemon that has decided nothing — the same
+/// answer `logs` gives a daemon that has never run detached — and any other
+/// failure is a skipped entry, not a broken bundle: `add_file_tail` opens
+/// `O_NOFOLLOW`, so on the guest-writable state volume a `decisions.log`
+/// swapped for a link is refused at open exactly the way a swapped log file
+/// is.
+///
+/// The log rotates to one kept generation past its bound, so that generation
+/// travels too, under the same cap: right after a rotation the live file
+/// holds only the newest record, and the rotated one holds the history
+/// before it.
+async fn audit<W: BundleSink>(
+    w: &mut BundleWriter<W>,
+    state_dir: &Path,
+    cap: u64,
+) -> Result<(), anyhow::Error> {
+    for (relative, path, absent) in [
+        (
+            crate::audit::LOG_RELATIVE,
+            crate::audit::log_path(state_dir),
+            "not present — this daemon has recorded no decisions yet",
+        ),
+        (
+            crate::audit::ROTATED_RELATIVE,
+            crate::audit::rotated_path(state_dir),
+            "not present — the decision log has not rotated yet",
+        ),
+    ] {
+        match w.add_file_tail(relative, &path, cap).await {
+            Ok(()) => {}
+            Err(e) if io_kind(&e) == Some(std::io::ErrorKind::NotFound) => {
+                w.skip(relative, absent);
+            }
+            Err(e) => {
+                w.skip(relative, format!("unreadable: {e:#}"));
+            }
         }
     }
     Ok(())
@@ -1441,6 +1492,76 @@ mod tests {
         assert!(
             listing.contains("sessions/sess-x"),
             "the walk still reaches sessions/: {listing}"
+        );
+    }
+
+    /// A credential planted in a `minimald.log` is absent from the bundle:
+    /// `add_file_tail` scrubs log tails line-wise.
+    #[tokio::test]
+    async fn diag_bundle_scrubs_credentials_from_log_tails() {
+        let server = TestServer::new().await;
+        let state_dir = server.state.minimal_state_dir().await;
+        let log_dir = state_dir.as_utf8_path().as_std_path().join("logs");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        std::fs::write(
+            log_dir.join("minimald.log.2026-07-14"),
+            "2024-01-01T00:00:00Z  INFO exec request command=min://argv [\"sh\",\"-c\",\"curl -H 'Authorization: Bearer ghp_FAKETOKEN' https://x/\"]\n",
+        )
+        .unwrap();
+
+        let files = fetch_bundle(&server).await;
+        let contents = String::from_utf8_lossy(&files["logs/minimald.log.2026-07-14"]);
+        assert!(
+            !contents.contains("ghp_FAKETOKEN"),
+            "token must be scrubbed from the log tail, got: {contents}"
+        );
+        assert!(
+            contents.contains("<redacted:len=13>"),
+            "token must be replaced with placeholder, got: {contents}"
+        );
+        // The rest of the line is intact.
+        assert!(
+            contents.contains("curl -H 'Authorization: Bearer"),
+            "non-credential parts must survive, got: {contents}"
+        );
+    }
+
+    /// NET-046's log keeps reading across a rotation: once the decision log
+    /// has rotated, the bundle carries the live file — whose last line is the
+    /// newest decision — and the rotated generation that holds the records
+    /// before it, each at the path it holds under the state directory.
+    #[tokio::test]
+    async fn diag_bundle_reads_the_decision_log_across_a_rotation() {
+        let server = TestServer::new().await;
+        let state_dir = server.state.minimal_state_dir().await;
+        let state_dir = state_dir.as_utf8_path().as_std_path();
+        let record = |port: u16| crate::audit::DecisionRecord {
+            ts: chrono::Utc::now().to_rfc3339(),
+            box_name: "web".to_string(),
+            port,
+            decision: sessions::DynamicIngress::Allow,
+            decided_by: crate::audit::DecidedBy::BoxPolicy,
+            outcome: crate::audit::DecisionOutcome::Published,
+            reason: None,
+        };
+        // A cap of one line per file: every append past the first rotates.
+        let cap = serde_json_lenient::to_string(&record(3000)).unwrap().len() as u64 + 1;
+        for port in [3000, 3001, 3002] {
+            crate::audit::try_append_capped(state_dir, &record(port), cap)
+                .await
+                .unwrap();
+        }
+
+        let files = fetch_bundle(&server).await;
+        let live = String::from_utf8_lossy(&files[crate::audit::LOG_RELATIVE]);
+        assert!(
+            live.contains("\"port\":3002"),
+            "the live log's tail carries the newest decision: {live}"
+        );
+        let rotated = String::from_utf8_lossy(&files[crate::audit::ROTATED_RELATIVE]);
+        assert!(
+            rotated.contains("\"port\":3001"),
+            "the rotated generation carries the decision before it: {rotated}"
         );
     }
 }

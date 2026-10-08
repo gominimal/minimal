@@ -505,12 +505,22 @@ fn policy_lines(model: &Model, key: &SessionKey) -> Vec<Line<'static>> {
                     Style::default().add_modifier(Modifier::BOLD),
                 ));
                 match &policy.egress {
-                    None => lines.push(Line::raw("  allow all")),
+                    None => lines.push(Line::raw("  allow-all")),
+                    // A declared deny-all — every allow list present and
+                    // empty — prints by name, as `min session policy` does,
+                    // never as rows of blankness.
+                    Some(egress)
+                        if egress.allow_subnets.as_ref().is_some_and(Vec::is_empty)
+                            && egress.allow_dns_hosts.as_ref().is_some_and(Vec::is_empty)
+                            && egress.allow_protocols.as_ref().is_some_and(Vec::is_empty) =>
+                    {
+                        lines.push(Line::raw("  deny-all"));
+                    }
                     Some(egress) => {
                         policy_list(&mut lines, "subnets", &egress.allow_subnets);
                         policy_list(&mut lines, "dns hosts", &egress.allow_dns_hosts);
                         match &egress.allow_protocols {
-                            None => lines.push(Line::raw("  protocols  allow all")),
+                            None => lines.push(Line::raw("  protocols  allow-all")),
                             Some(protos) => lines.push(Line::raw(format!(
                                 "  protocols  {}",
                                 protos
@@ -523,7 +533,7 @@ fn policy_lines(model: &Model, key: &SessionKey) -> Vec<Line<'static>> {
                         // The denied ranges are subtractive — carved out of
                         // what the allow fields admit — so unlike the allow
                         // fields an unset row means "nothing denied", not
-                        // "allow all".
+                        // "allow-all".
                         match &egress.deny_subnets {
                             None => lines.push(Line::raw("  deny subnets  (none)")),
                             Some(subnets) => lines
@@ -541,13 +551,13 @@ fn policy_lines(model: &Model, key: &SessionKey) -> Vec<Line<'static>> {
                         Style::default().add_modifier(Modifier::BOLD),
                     ));
                     match &policy.ingress {
-                        None => lines.push(Line::raw("  deny all")),
+                        None => lines.push(Line::raw("  deny-all")),
                         Some(ingress) => {
                             if ingress.port_mappings.is_empty()
                                 && ingress.dynamic_allowed_range.is_none()
                                 && ingress.dynamic_ingress.is_none()
                             {
-                                lines.push(Line::raw("  deny all"));
+                                lines.push(Line::raw("  deny-all"));
                             }
                             for mapping in &ingress.port_mappings {
                                 lines.push(Line::raw(format!(
@@ -573,7 +583,7 @@ fn policy_lines(model: &Model, key: &SessionKey) -> Vec<Line<'static>> {
 
 fn policy_list(lines: &mut Vec<Line>, label: &str, values: &Option<Vec<String>>) {
     match values {
-        None => lines.push(Line::raw(format!("  {label}  allow all"))),
+        None => lines.push(Line::raw(format!("  {label}  allow-all"))),
         Some(values) => lines.push(Line::raw(format!("  {label}  {}", values.join(", ")))),
     }
 }
@@ -886,6 +896,7 @@ mod tests {
             project_path: Some(paths::HostAbsPath::try_new("/src/x").unwrap()),
             status: sessions::SessionStatus::Active,
             git: None,
+            host_ip_enforcement: None,
             attrs: None,
         }
     }
