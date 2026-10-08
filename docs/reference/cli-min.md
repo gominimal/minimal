@@ -350,6 +350,14 @@ an absent setting gives. Both keys are new in the `min/v1/session-policy`
 shape. A client written against the earlier document ignores them. A
 client that reads them finds a value in every `ingress` object.
 
+Boxes handed one shared loopback address can declare the same port. The
+box that published it first holds it, and a later box does not forward it.
+Activation prints a `warning:` line on stderr for each such port, naming
+the box that holds it. The text output marks the declared row
+`(held by <box>)`, and the document lists the rows under
+`shared_port_collisions`, each with `port` and the holding box as `other`.
+The key is absent when another box holds none of the box's ports.
+
 With `-o json`, a failed run writes one `min/v1/error` object on stderr and
 exits non-zero, with no plain-text error line. The `code` field names the
 failure: `not_found` for a missing session, `daemon_unreachable`, or

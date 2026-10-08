@@ -2869,6 +2869,18 @@ struct PolicyJson<'a> {
     node_plane_baseline: Option<PolicyBaselineJson>,
     #[serde(skip_serializing_if = "Option::is_none")]
     live_ingress: Option<LiveIngressJson>,
+    /// NET-129: the declared ports this box yields because another box at
+    /// the same shared loopback address holds them, as the wire's own rows
+    /// (`port`, and the holding box as `other`) — the text rendering's
+    /// "(held by …)" marks. Omitted when empty, the reading a daemon that
+    /// predates the fact, or a facts fetch that failed, also leaves.
+    #[serde(skip_serializing_if = "no_shared_port_collisions")]
+    shared_port_collisions: &'a [minimald_rpc::SharedPortCollision],
+}
+
+/// Serde helper: leave [`PolicyJson::shared_port_collisions`] out when empty.
+fn no_shared_port_collisions(rows: &&[minimald_rpc::SharedPortCollision]) -> bool {
+    rows.is_empty()
 }
 
 /// The live rows as the document carries them — the two states a client
@@ -2903,6 +2915,7 @@ pub fn write_policy_json(
     network: sessions::NetworkMode,
     fabric: Option<switch::SwitchSubnet>,
     live: Result<Vec<minimald_rpc::LiveMapping>, String>,
+    shared_port_collisions: &[minimald_rpc::SharedPortCollision],
 ) -> Result<(), anyhow::Error> {
     // A none box has no policy to describe; the text rendering's one-line
     // note is prose for a person, so the document carries the schema and
@@ -2915,6 +2928,7 @@ pub fn write_policy_json(
             ingress: None,
             node_plane_baseline: None,
             live_ingress: None,
+            shared_port_collisions: &[],
         }
     } else {
         // The baseline set is a switch-fabric surface, held to the same
@@ -2961,6 +2975,13 @@ pub fn write_policy_json(
                 Ok(rows) => LiveIngressJson::Rows(rows),
                 Err(_) => LiveIngressJson::Unavailable,
             }),
+            // Ingress's own gate: a host-address box has no per-session
+            // ingress, so it yields nothing a key could claim.
+            shared_port_collisions: if network == sessions::NetworkMode::HostNet {
+                &[]
+            } else {
+                shared_port_collisions
+            },
         }
     };
     let encoded =
@@ -3087,6 +3108,7 @@ async fn session_policy_json_inputs(
         sessions::Record,
         sessions::EffectiveSessionPolicy,
         Result<Vec<minimald_rpc::LiveMapping>, String>,
+        Vec<minimald_rpc::SharedPortCollision>,
     ),
     PolicyJsonFailure,
 > {
@@ -3122,9 +3144,24 @@ async fn session_policy_json_inputs(
         .map_err(|error| PolicyJsonFailure::PolicyUnavailable(format!("{error:#}")))?;
 
     let live = fetch_live_ingress(&mut client, session).await;
+    // The yielded shared-address ports (NET-129), from the runtime facts the
+    // text walk reads them from, degrading the same way: a daemon that
+    // cannot answer — an older build, a session mid-teardown — leaves the
+    // key out, as a box that yields nothing does.
+    let facts_lookup = match SessionLookup::parse(session) {
+        SessionLookup::Id(id) => minimald_rpc::GetSessionRuntimeFactsRequest::Id(id),
+        SessionLookup::Name(n) => minimald_rpc::GetSessionRuntimeFactsRequest::Name(n),
+    };
+    let shared_port_collisions = match client
+        .oneshot_rpc::<minimald_rpc::GetSessionRuntimeFacts>(facts_lookup)
+        .await
+    {
+        Ok(minimald_rpc::Errorable::Ok(facts)) => facts.shared_port_collisions,
+        Ok(minimald_rpc::Errorable::Err { .. }) | Err(_) => Vec::new(),
+    };
 
     match resp {
-        minimald_rpc::Errorable::Ok(policy) => Ok((record, policy, live)),
+        minimald_rpc::Errorable::Ok(policy) => Ok((record, policy, live, shared_port_collisions)),
         minimald_rpc::Errorable::Err { error } => {
             Err(PolicyJsonFailure::PolicyUnavailable(error.to_string()))
         }
@@ -3140,10 +3177,11 @@ async fn session_policy_json_inputs(
 /// by every command that takes `-o json` — writes, so the error path is
 /// one mechanism rather than a per-command one.
 async fn session_policy_as_json(global: &GlobalArgs, session: &str) -> Result<(), anyhow::Error> {
-    let (record, policy, live) = match session_policy_json_inputs(global, session).await {
-        Ok(inputs) => inputs,
-        Err(failure) => return Err(failure.machine_failure().into()),
-    };
+    let (record, policy, live, shared_port_collisions) =
+        match session_policy_json_inputs(global, session).await {
+            Ok(inputs) => inputs,
+            Err(failure) => return Err(failure.machine_failure().into()),
+        };
     // The fabric the baseline set builds from — keyed the same way the text
     // rendering keys it (see the comment in [`cmd_session_policy`]): the
     // backend this command actually talks to, with no fabric named for the
@@ -3151,7 +3189,15 @@ async fn session_policy_as_json(global: &GlobalArgs, session: &str) -> Result<()
     let fabric = (daemon_provider_kind(global) == paths::ProviderKind::Minvmd)
         .then_some(switch::SwitchSubnet::default());
     let mut out = std::io::stdout();
-    write_policy_json(&mut out, &policy, record.network, fabric, live).context(OutputWriteError)?;
+    write_policy_json(
+        &mut out,
+        &policy,
+        record.network,
+        fabric,
+        live,
+        &shared_port_collisions,
+    )
+    .context(OutputWriteError)?;
     out.flush().context(OutputWriteError)?;
     Ok(())
 }
@@ -4525,7 +4571,15 @@ mod tests {
         // the box declared nothing to carry.
         let egress_of = |policy: &EffectiveSessionPolicy| {
             let mut out = Vec::new();
-            write_policy_json(&mut out, policy, NetworkMode::OwnIp, None, Ok(Vec::new())).unwrap();
+            write_policy_json(
+                &mut out,
+                policy,
+                NetworkMode::OwnIp,
+                None,
+                Ok(Vec::new()),
+                &[],
+            )
+            .unwrap();
             serde_json_lenient::from_slice::<serde_json_lenient::Value>(&out).unwrap()["egress"]
                 .clone()
         };
@@ -5042,6 +5096,42 @@ mod tests {
         assert!(
             rendered.contains("  udp  :5353 → :5353\n"),
             "a port no other box holds prints unmarked: {rendered}"
+        );
+
+        // The `-o json` document carries the same rows, so a parser can tell
+        // the yielded mapping from one this box serves; with none, the key
+        // is absent.
+        let mut out = Vec::new();
+        write_policy_json(
+            &mut out,
+            &policy,
+            NetworkMode::OwnIp,
+            None,
+            Ok(Vec::new()),
+            &collisions,
+        )
+        .unwrap();
+        let document = String::from_utf8(out).unwrap();
+        assert!(
+            document.contains(
+                r#""shared_port_collisions":[{"port":8080,"other":"first.min.internal"}]"#
+            ),
+            "the document names the yielded port and its holder: {document}"
+        );
+        let mut out = Vec::new();
+        write_policy_json(
+            &mut out,
+            &policy,
+            NetworkMode::OwnIp,
+            None,
+            Ok(Vec::new()),
+            &[],
+        )
+        .unwrap();
+        let document = String::from_utf8(out).unwrap();
+        assert!(
+            !document.contains("shared_port_collisions"),
+            "no yields, no key: {document}"
         );
 
         // No collisions, no marks: the same declaration renders as before.

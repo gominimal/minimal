@@ -928,6 +928,7 @@ async fn policy_shows_resolved_dynamic_ingress() {
             sessions::NetworkMode::OwnIp,
             None,
             Ok(vec![]),
+            &[],
         )
         .unwrap();
         let document: Value = serde_json_lenient::from_slice(&out).unwrap();
@@ -1484,6 +1485,7 @@ async fn policy_json_carries_schema_and_pending() {
         sessions::NetworkMode::OwnIp,
         None,
         Ok(live),
+        &[],
     )
     .unwrap();
     let document: Value = serde_json_lenient::from_slice(&out).unwrap();
@@ -1546,6 +1548,7 @@ async fn policy_json_carries_schema_and_pending() {
         sessions::NetworkMode::OwnIp,
         None,
         Ok(vec![pre_field]),
+        &[],
     )
     .unwrap();
     let document: Value = serde_json_lenient::from_slice(&out).unwrap();
@@ -1584,6 +1587,7 @@ fn policy_json_distinguishes_unavailable_live_rows_from_none_published() {
         sessions::NetworkMode::OwnIp,
         None,
         Ok(Vec::new()),
+        &[],
     )
     .unwrap();
     let document: Value = serde_json_lenient::from_slice(&out).unwrap();
@@ -1602,6 +1606,7 @@ fn policy_json_distinguishes_unavailable_live_rows_from_none_published() {
         sessions::NetworkMode::OwnIp,
         None,
         Err("live port mappings are unavailable: no session found".to_string()),
+        &[],
     )
     .unwrap();
     let document: Value = serde_json_lenient::from_slice(&out).unwrap();
@@ -1619,6 +1624,7 @@ fn policy_json_distinguishes_unavailable_live_rows_from_none_published() {
         sessions::NetworkMode::NoNet,
         None,
         Ok(Vec::new()),
+        &[],
     )
     .unwrap();
     let document: Value = serde_json_lenient::from_slice(&out).unwrap();
@@ -2306,6 +2312,7 @@ async fn policy_shows_unset_egress_as_named_default() {
         sessions::NetworkMode::OwnIp,
         None,
         Ok(Vec::new()),
+        &[],
     )
     .unwrap();
     let own_document: Value = serde_json_lenient::from_slice(&out).unwrap();
@@ -2442,6 +2449,7 @@ async fn policy_shows_unset_egress_as_named_default() {
         sessions::NetworkMode::OwnIp,
         None,
         Ok(Vec::new()),
+        &[],
     )
     .unwrap();
     let declared_document: Value = serde_json_lenient::from_slice(&out).unwrap();
