@@ -950,11 +950,14 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
                     Some(p) => {
                         let sock = p.sock.clone();
                         let box_name = model.entry(&key).and_then(|entry| entry.name.clone());
-                        // The pair the box's row was registered with, read
-                        // before the attach: a Delete at the shell-exit
-                        // prompt leaves no record to read it from after.
+                        // The box's row is asked back before the attach
+                        // (NET-138), and the pair it was registered with is
+                        // read: a Delete at the shell-exit prompt leaves no
+                        // record to read it from after.
                         let box_addresses = match box_name {
-                            Some(_) => rpc::box_addresses_of(p, key.id).await,
+                            Some(_) => {
+                                rpc::prepare_attach(&sock, rpc::record_of(p, key.id).await).await
+                            }
                             None => None,
                         };
                         attach_and_resume(
