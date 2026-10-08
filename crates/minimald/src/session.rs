@@ -4171,6 +4171,9 @@ impl Session {
                 control: Some(SessionControl::new(self.manager.clone(), record.id)),
                 delta,
                 archives_dir,
+                // A registered box: its shell-exit prompt says a kept session
+                // can only be destroyed (NET-138).
+                holds_host_row: record.box_addresses.is_some(),
                 session_id: record.id,
                 // The host runs attach and detach itself: it owns the terminal
                 // they write to and the process whose namespaces they join.
