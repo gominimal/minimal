@@ -1945,7 +1945,7 @@ impl<C: Channel> Sandbox<C> {
         // IP/UNIX flows, but AF_VSOCK is not subject to the network namespace,
         // so a process in any box could still reach the host over vsock.  The
         // seal is an allowlist: the `none` plan's seal admits the families its
-        // own network namespace confines (unix, inet, inet6, netlink), so the
+        // own network namespace confines (unix, inet, inet6, netlink route), so the
         // box can use its own loopback — but only when `isolate` says this
         // launch unshares that namespace (hakoniwa fails the spawn if the
         // unshare fails), and AF_UNIX alone otherwise, so a none box never
@@ -4479,6 +4479,40 @@ ff02::2\tip6-allrouters
             ),
             libc::SECCOMP_RET_ALLOW,
             "the compat ABI must keep NETLINK_ROUTE allowed"
+        );
+        // socketpair(2) carries its protocol in the same argument, so it is
+        // judged by the same netlink rule as socket(2).
+        assert_eq!(
+            run_proto(
+                libc::SYS_socketpair,
+                AUDIT_ARCH,
+                libc::AF_NETLINK,
+                libc::NETLINK_AUDIT
+            ),
+            refuse,
+            "socketpair(AF_NETLINK, NETLINK_AUDIT) must fail with EAFNOSUPPORT"
+        );
+        assert_eq!(
+            run_proto(
+                libc::SYS_socketpair,
+                AUDIT_ARCH,
+                libc::AF_NETLINK,
+                libc::NETLINK_ROUTE
+            ),
+            libc::SECCOMP_RET_ALLOW,
+            "socketpair(AF_NETLINK, NETLINK_ROUTE) must reach the kernel"
+        );
+        // Only the netlink entry reads the protocol: an inet socket with an
+        // explicit protocol stays allowed.
+        assert_eq!(
+            run_proto(
+                libc::SYS_socket,
+                AUDIT_ARCH,
+                libc::AF_INET,
+                libc::IPPROTO_TCP
+            ),
+            libc::SECCOMP_RET_ALLOW,
+            "socket(AF_INET, IPPROTO_TCP) must stay allowed"
         );
         assert_eq!(
             run(libc::SYS_read, AUDIT_ARCH, 0),
