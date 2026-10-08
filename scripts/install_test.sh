@@ -381,6 +381,11 @@ TEST_SHELL=
 USERNS_SYSCTL=
 APPARMOR_DIR=
 
+# Root the installer looks under for the host paths `min net setup` installs.
+# Empty points it at a nonexistent directory, so this host's own setup never
+# leaks into a scenario; scenarios seed a fake root to drive the offer.
+NET_SETUP_ROOT=
+
 # Bin prefix the installer sees. Empty means the harness default ($hp/bin — a
 # custom MINIMAL_BIN, NOT one of the AppArmor tunable's stock attachment
 # paths); scenarios set it to $hp/.local/bin to exercise the default-prefix
@@ -416,6 +421,7 @@ run() {
         STUB_UNAME_M="$PLAT_M" \
         MINIMAL_OVERRIDE_USERNS_SYSCTL="${USERNS_SYSCTL:-$root/no-such-sysctl}" \
         MINIMAL_OVERRIDE_APPARMOR_DIR="${APPARMOR_DIR:-$root/no-such-apparmor.d}" \
+        MINIMAL_OVERRIDE_NET_SETUP_ROOT="${NET_SETUP_ROOT:-$root/no-such-net-setup-root}" \
         MINIMAL_OVERRIDE_TTY="${TTY_FILE:-$root/no-such-tty}" \
         MINIMAL_INSTALL_FORCE_STOP="${FORCE_STOP:-}" \
         "$SH" "$installer" "$@" </dev/null >"$OUT" 2>&1
@@ -574,6 +580,41 @@ case_apparmor_uninstall() {
         test -f "$fake_aa/minimald"
     want_err "uninstall removed the shipped apparmor loader" \
         test -e "$HAA_U/xdg-data/minimal/apparmor/install-apparmor-profile.sh"
+}
+
+case_net_setup_uninstall() {
+    # --- Uninstall: advise removing the host DNS setup (min net setup) ----------
+    # A non-interactive uninstall on a host where `min net setup` ran advises
+    # `min net setup --undo` and the root commands that stay valid once `min` is
+    # gone, and never elevates: the seeded host files survive. A host that never
+    # ran the step sees nothing.
+    HNS="$root/hns"; mkdir -p "$HNS"
+    run ns_seed "$HNS"
+    check 0 "$rc" "uninstall-net-setup seed install exits 0"
+    fake_ns="$root/fake-net-setup-root"
+    case "$PLAT_S" in
+        Darwin) ns_file="$fake_ns/etc/resolver/min.internal" ;;
+        *)      ns_file="$fake_ns/etc/systemd/system/minzoned.service" ;;
+    esac
+    mkdir -p "$(dirname "$ns_file")"
+    printf 'unit\n' >"$ns_file"
+    NET_SETUP_ROOT="$fake_ns"
+    run ns_run "$HNS" --uninstall
+    NET_SETUP_ROOT=
+    check 0 "$rc" "uninstall with the host DNS setup present exits 0"
+    want_ok "uninstall advises the host DNS setup is still installed" \
+        grep -q "host DNS setup from min net setup is still installed" "$OUT"
+    want_ok "advisory names min net setup --undo" grep -q "min net setup --undo" "$OUT"
+    want_ok "advisory gives the root removal commands" grep -q "sudo " "$OUT"
+    want_ok "non-interactive uninstall never elevates (host file survives)" \
+        test -f "$ns_file"
+
+    HNS2="$root/hns2"; mkdir -p "$HNS2"
+    run ns2_seed "$HNS2"
+    run ns2_run "$HNS2" --uninstall
+    check 0 "$rc" "uninstall on a host without the setup exits 0"
+    want_err "a host that never ran min net setup sees no advisory" \
+        grep -q "min net setup" "$OUT"
 }
 
 case_checksum_mismatch() {
@@ -2143,6 +2184,7 @@ case_for() {
         install)                            case_install ;;
         apparmor)                           case_apparmor ;;
         apparmor_uninstall)                 case_apparmor_uninstall ;;
+        net_setup_uninstall)                case_net_setup_uninstall ;;
         checksum_mismatch)                  case_checksum_mismatch ;;
         target_validation)                  case_target_validation ;;
         prefix_resolution)                  case_prefix_resolution ;;
@@ -2165,7 +2207,7 @@ case_for() {
 }
 case "${1:-}" in
     "")
-        for _c in install apparmor apparmor_uninstall checksum_mismatch \
+        for _c in install apparmor apparmor_uninstall net_setup_uninstall checksum_mismatch \
             target_validation prefix_resolution install_record daemon_stop \
             shell_integration darwin_dequarantine uninstall \
             gvproxy_rename_migration installer_switch_binary_executable \
