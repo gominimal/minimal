@@ -4992,7 +4992,7 @@ mod tests {
             credentialed_upstream: Some(CredentialedUpstream::default()),
         };
         let mut out = Vec::new();
-        format_policy(&mut out, &laned, NetworkMode::OwnIp, None, None).unwrap();
+        format_policy(&mut out, &laned, NetworkMode::OwnIp, None, &[], None).unwrap();
         let rendered = String::from_utf8(out).unwrap();
         assert!(
             rendered.contains(
@@ -5009,7 +5009,7 @@ mod tests {
             credentialed_upstream: None,
         };
         let mut out = Vec::new();
-        format_policy(&mut out, &unlaned, NetworkMode::OwnIp, None, None).unwrap();
+        format_policy(&mut out, &unlaned, NetworkMode::OwnIp, None, &[], None).unwrap();
         let rendered = String::from_utf8(out).unwrap();
         assert!(
             !rendered.contains("credentialed upstream"),
@@ -5021,7 +5021,15 @@ mod tests {
         // not tell from a lane it failed to read.
         let json_of = |policy: &EffectiveSessionPolicy| {
             let mut out = Vec::new();
-            write_policy_json(&mut out, policy, NetworkMode::OwnIp, None, Ok(Vec::new())).unwrap();
+            write_policy_json(
+                &mut out,
+                policy,
+                NetworkMode::OwnIp,
+                None,
+                Ok(Vec::new()),
+                &[],
+            )
+            .unwrap();
             serde_json_lenient::from_slice::<serde_json_lenient::Value>(&out).unwrap()
         };
         let laned_json = json_of(&laned);
@@ -5040,7 +5048,7 @@ mod tests {
         // lane there is admitted nowhere — but the view still shows what
         // the box declared, marked as not in effect on both surfaces.
         let mut out = Vec::new();
-        format_policy(&mut out, &laned, NetworkMode::HostNet, None, None).unwrap();
+        format_policy(&mut out, &laned, NetworkMode::HostNet, None, &[], None).unwrap();
         let rendered = String::from_utf8(out).unwrap();
         assert!(
             rendered.contains(
@@ -5050,7 +5058,15 @@ mod tests {
             "a host-address box must show its declared lane, marked, got: {rendered}"
         );
         let mut out = Vec::new();
-        write_policy_json(&mut out, &laned, NetworkMode::HostNet, None, Ok(Vec::new())).unwrap();
+        write_policy_json(
+            &mut out,
+            &laned,
+            NetworkMode::HostNet,
+            None,
+            Ok(Vec::new()),
+            &[],
+        )
+        .unwrap();
         let host_json: serde_json_lenient::Value = serde_json_lenient::from_slice(&out).unwrap();
         assert_eq!(
             host_json["credentialed_upstream"],
@@ -5060,14 +5076,22 @@ mod tests {
 
         // A none box keeps the declaration visible the same way.
         let mut out = Vec::new();
-        format_policy(&mut out, &laned, NetworkMode::NoNet, None, None).unwrap();
+        format_policy(&mut out, &laned, NetworkMode::NoNet, None, &[], None).unwrap();
         let rendered = String::from_utf8(out).unwrap();
         assert!(
             rendered.contains("(not in effect: none box)"),
             "a none box must show its declared lane, marked, got: {rendered}"
         );
         let mut out = Vec::new();
-        write_policy_json(&mut out, &laned, NetworkMode::NoNet, None, Ok(Vec::new())).unwrap();
+        write_policy_json(
+            &mut out,
+            &laned,
+            NetworkMode::NoNet,
+            None,
+            Ok(Vec::new()),
+            &[],
+        )
+        .unwrap();
         let none_json: serde_json_lenient::Value = serde_json_lenient::from_slice(&out).unwrap();
         assert_eq!(
             none_json["credentialed_upstream"],
