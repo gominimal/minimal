@@ -1960,7 +1960,7 @@ impl SessionGate {
                 // admitted reads so in a bundle).
                 if self.flows.claim_first_record() {
                     tracing::info!(
-                        session_id = %self.label,
+                        switch_addr = %self.label,
                         port = pkt.dst.port(),
                         client = %pkt.src,
                         "recorded the box's first inbound flow at its published port"
@@ -1971,7 +1971,7 @@ impl SessionGate {
                 // reclaims one, which a bundle's tail should be able to say.
                 if filled && self.flows.claim_table_filled() {
                     tracing::info!(
-                        session_id = %self.label,
+                        switch_addr = %self.label,
                         cap = self.flows.cap(),
                         "the box's inbound-flow table has filled; new inbound flows are refused at the cap"
                     );
@@ -6262,8 +6262,12 @@ pub(crate) mod tests {
             "the first-record line: {logged}"
         );
         assert!(
-            logged.contains("session_id=100.64.0.9") && logged.contains("port=8080"),
+            logged.contains("switch_addr=100.64.0.9") && logged.contains("port=8080"),
             "the line names the box and the published port: {logged}"
+        );
+        assert!(
+            !logged.contains("session_id=100.64."),
+            "the box's address is not named as a session id: {logged}"
         );
     }
 
