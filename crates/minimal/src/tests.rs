@@ -694,7 +694,7 @@ fn bare_status_renders_a_cwd_session_verbatim() {
              \x20 sessions: 1 (web, active)\n\
              \x20 blueprint: minimal.toml present\n\
              Next:\n\
-             \x20 min session attach --command 'min task run <task>' web\n\
+             \x20 min session run web <task>\n\
              \x20 min ls --json\n"
     );
 }
@@ -856,14 +856,15 @@ fn bare_status_counts_elsewhere_sessions() {
         "no cwd session must suggest activate: {out}"
     );
     assert!(
-        !out.contains("session attach --command"),
-        "must not suggest attaching elsewhere: {out}"
+        !out.contains("min session run"),
+        "must not suggest running in a session elsewhere: {out}"
     );
 }
 
 /// More than two cwd matches: the count is the full total, the listing
-/// stops at two, and an unnamed session shows its short id — which is
-/// also what the attach suggestion substitutes for the first match.
+/// stops at two and counts the rest, sessions elsewhere are counted too,
+/// and an unnamed session shows its short id — which is also what the run
+/// suggestion substitutes for the first match.
 #[test]
 fn bare_status_lists_at_most_two_cwd_sessions() {
     let entries = vec![
@@ -885,20 +886,29 @@ fn bare_status_lists_at_most_two_cwd_sessions() {
             Some("/w"),
             sessions::SessionStatus::Active,
         ),
+        twin_entry(
+            "019f5d0f-0a99-78b1-9165-0809440f0088",
+            Some("api"),
+            Some("/other"),
+            sessions::SessionStatus::Active,
+        ),
     ];
     let cwd = paths::HostAbsPath::try_new("/w").unwrap();
     let out = render_bare_status("/w", &entries, &cwd, true);
     assert!(
-        out.contains("  sessions: 3 (019f5d0f, pending), (web, materializing)\n"),
-        "count-then-two listing: {out}"
+        out.contains(
+            "  sessions: 3 (019f5d0f, pending), (web, materializing) and 1 more \
+             (1 elsewhere)\n"
+        ),
+        "count-then-two listing, the rest counted: {out}"
     );
     assert!(
         !out.contains("spare"),
         "third session must not be listed: {out}"
     );
     assert!(
-        out.contains("  min session attach --command 'min task run <task>' 019f5d0f\n"),
-        "attach suggestion uses the first match's handle: {out}"
+        out.contains("  min session run 019f5d0f <task>\n"),
+        "run suggestion uses the first match's handle: {out}"
     );
 }
 

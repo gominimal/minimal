@@ -153,12 +153,22 @@ pub(crate) fn render_bare_status(
     } else if cwd_matches.is_empty() {
         format!("0 here ({} elsewhere)", entries.len())
     } else {
+        /// Cap on the cwd sessions listed by name; the rest are counted.
+        const LISTED: usize = 2;
         let listed: Vec<String> = cwd_matches
             .iter()
-            .take(2)
+            .take(LISTED)
             .map(|e| format!("({}, {})", entry_handle(e), status_label(e.status)))
             .collect();
-        format!("{} {}", cwd_matches.len(), listed.join(", "))
+        let mut line = format!("{} {}", cwd_matches.len(), listed.join(", "));
+        if cwd_matches.len() > LISTED {
+            line.push_str(&format!(" and {} more", cwd_matches.len() - LISTED));
+        }
+        let elsewhere = entries.len() - cwd_matches.len();
+        if elsewhere > 0 {
+            line.push_str(&format!(" ({elsewhere} elsewhere)"));
+        }
+        line
     };
 
     let blueprint = if has_mfile {
@@ -175,10 +185,7 @@ pub(crate) fn render_bare_status(
     out.push_str("Next:\n");
     match cwd_matches.first() {
         Some(e) => {
-            out.push_str(&format!(
-                "  min session attach --command 'min task run <task>' {}\n",
-                entry_handle(e)
-            ));
+            out.push_str(&format!("  min session run {} <task>\n", entry_handle(e)));
         }
         None => out.push_str("  min session activate --attach .\n"),
     }
