@@ -4320,7 +4320,7 @@ impl Session {
         session_hnd: SessionHandle,
         conn_username: String,
     ) -> Result<session_host::HostHandle, AttachError> {
-        {
+        let holds_host_row = {
             let record = self
                 .record
                 .record()
@@ -4329,13 +4329,20 @@ impl Session {
             if record.status != SessionStatus::Active {
                 return Err(AttachError::SessionPending);
             }
-        }
+            record.box_addresses.is_some()
+        };
 
         let running = match &self.inner {
             SessionInner::Draft { .. } => return Err(AttachError::SessionPending),
             SessionInner::Active {
                 host: Some((h, _)), ..
             } if h.is_alive() => Some(h.clone()),
+            // The host's loop ended, and with it the box's host-side row
+            // (NET-138). Relaunching would run the exec in a rowless box,
+            // so refuse the same way the attach's `Closed` arm does.
+            SessionInner::Active { host: Some(_), .. } if holds_host_row => {
+                return Err(AttachError::BoxHostRowEnded);
+            }
             SessionInner::Active { .. } => None,
         };
         if let Some(host) = running {
