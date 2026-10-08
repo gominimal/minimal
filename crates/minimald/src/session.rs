@@ -4200,6 +4200,20 @@ impl Session {
         // holds the launch that bound the box's host-side row; only the
         // binding launch itself, below, sets this again.
         self.slot_holds_row = false;
+        // The first launch of a registered box binds its host-side row
+        // (NET-138). Recorded on the record, so a restarted daemon knows the
+        // row is gone, before anything else can fail the launch: the kill
+        // below ends the switch attachment, and with it the row, so a
+        // binding not yet recorded by then would let a later launch run
+        // rowless. A binding that cannot be recorded fails the launch the
+        // same way.
+        if record.box_addresses.is_some()
+            && !record.host_row_bound
+            && let Err(e) = self.record_host_row_bound().await
+        {
+            let _ = host.kill(false).await;
+            return Err(AttachError::LaunchRecordUnwritable(e));
+        }
         // NET-079: the launch that just ran records its own outcome for
         // this session's box on the box's record here — the one path every
         // launch takes, so an attach, an exec, an activation and a hook run
@@ -4210,18 +4224,6 @@ impl Session {
         // attach fails — and a record with no outcome keeps meaning "never
         // launched", the state a created session's reads answer.
         if let Err(e) = self.record_launch_outcome(host_ip_enforcement).await {
-            let _ = host.kill(false).await;
-            return Err(AttachError::LaunchRecordUnwritable(e));
-        }
-        // The first launch of a registered box binds its host-side row
-        // (NET-138). Recorded on the record, so a restarted daemon knows the
-        // row is gone, before the box is handed back: a binding that cannot
-        // be recorded would let a later launch past the restart run
-        // rowless, so it fails the launch like the outcome write above.
-        if record.box_addresses.is_some()
-            && !record.host_row_bound
-            && let Err(e) = self.record_host_row_bound().await
-        {
             let _ = host.kill(false).await;
             return Err(AttachError::LaunchRecordUnwritable(e));
         }

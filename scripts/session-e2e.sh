@@ -18001,9 +18001,10 @@ eib_vm_ask_legs() {
   vm_ask_answered() { # $1 sid, $2 allow|deny, $3 label
     local a_pid="" a_live="" a_rc=0
     # shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
-    E2E_PTY_COMMANDS="> /home/eib-$3-live
-sleep 20
-exit" E2E_PTY_ASK="$2" E2E_PTY_ANSWER=keep \
+    # Leaves by the detach chord once the ask is answered, never by `exit`:
+    # the box's first host holds its host-side row (NET-138), and a later
+    # exec must reach that same live host rather than be refused a new one.
+    E2E_PTY_COMMANDS="> /home/eib-$3-live" E2E_PTY_ASK="$2" E2E_PTY_DETACH=1 \
       python3 "$ROOT/scripts/e2e-attach-pty.py" - min ${E2E_MINIMAL_ARGS:-} session attach "$1" \
       >"$WORK/eib-vm-$3-attach.out" 2>"$WORK/eib-vm-$3-attach.err" &
     a_pid=$!
