@@ -1286,6 +1286,33 @@ mod tests {
         );
     }
 
+    /// Runs `f` with git's global config replaced by `gitconfig` and the
+    /// system config disabled, so the developer's real config never leaks
+    /// into the test. nextest runs each test in its own process, so the env
+    /// change is not seen by other tests.
+    fn with_git_config<T>(gitconfig: &str, f: impl FnOnce() -> T) -> T {
+        let config = tempfile::tempdir().unwrap();
+        let config_path = config.path().join("gitconfig");
+        std::fs::write(&config_path, gitconfig).unwrap();
+
+        let vars = ["GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM"];
+        let previous: Vec<_> = vars.iter().map(std::env::var_os).collect();
+        unsafe {
+            std::env::set_var("GIT_CONFIG_GLOBAL", &config_path);
+            std::env::set_var("GIT_CONFIG_NOSYSTEM", "1");
+        }
+
+        let result = f();
+
+        for (var, previous) in vars.iter().zip(previous) {
+            match previous {
+                Some(previous) => unsafe { std::env::set_var(var, previous) },
+                None => unsafe { std::env::remove_var(var) },
+            }
+        }
+        result
+    }
+
     /// A global `url.<base>.insteadOf` rewrite used to break the cache
     /// validation in `Repo::new`: `git remote get-url` applies rewrites, the
     /// clone stores the un-rewritten `remote.origin.url`, so the second open
@@ -1294,37 +1321,43 @@ mod tests {
     fn accepts_a_cached_clone_whose_origin_is_rewritten_by_insteadof() {
         let (src, _) = make_local_repo("main");
         let src = src.path().to_string_lossy().into_owned();
+        let cache = tempfile::tempdir().unwrap();
 
         // Rewrite the plain path to a `file://` URL, as a user's global
-        // config might. Scoped to this tempdir's unique path so parallel
-        // tests that spawn git are unaffected.
-        let config = tempfile::tempdir().unwrap();
-        let config_path = config.path().join("gitconfig");
-        std::fs::write(
-            &config_path,
-            format!("[url \"file://{src}\"]\n\tinsteadOf = {src}\n"),
-        )
-        .unwrap();
-
-        let previous = std::env::var("GIT_CONFIG_GLOBAL").ok();
-        unsafe {
-            std::env::set_var("GIT_CONFIG_GLOBAL", &config_path);
-        }
-
-        let cache = tempfile::tempdir().unwrap();
-        let result = (|| {
+        // config might.
+        let gitconfig = format!("[url \"file://{src}\"]\n\tinsteadOf = {src}\n");
+        let result = with_git_config(&gitconfig, || {
             let mut repo = Repo::new(&src, cache.path())?;
             repo.fetch()?;
             // Second open revalidates the cached clone instead of cloning.
             Repo::new(&src, cache.path())?;
             Ok::<_, crate::Error>(())
-        })();
-
-        match previous {
-            Some(previous) => unsafe { std::env::set_var("GIT_CONFIG_GLOBAL", previous) },
-            None => unsafe { std::env::remove_var("GIT_CONFIG_GLOBAL") },
-        }
+        });
 
         result.expect("both opens of the rewritten cache dir succeed");
+    }
+
+    /// The cache identity check compares the url the caller asked for with
+    /// the url the cache was cloned from, both un-rewritten: an `insteadOf`
+    /// mapping the requested url onto the cached one does not make a cache
+    /// of another remote pass.
+    #[test]
+    fn refuses_a_cached_clone_of_another_remote_even_under_insteadof() {
+        let (cached, _) = make_local_repo("main");
+        let cached = cached.path().to_string_lossy().into_owned();
+        let (requested, _) = make_local_repo("main");
+        let requested = requested.path().to_string_lossy().into_owned();
+        let cache = tempfile::tempdir().unwrap();
+
+        let gitconfig = format!("[url \"{cached}\"]\n\tinsteadOf = {requested}\n");
+        let result = with_git_config(&gitconfig, || {
+            Repo::new(&cached, cache.path()).expect("first open clones");
+            Repo::new(&requested, cache.path()).map(|_| ())
+        });
+
+        assert!(
+            matches!(result, Err(crate::Error::InvalidPath)),
+            "a cache of another remote is refused"
+        );
     }
 }

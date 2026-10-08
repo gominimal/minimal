@@ -28,8 +28,10 @@ impl Repo {
             // not `git remote get-url`: the latter applies `url.<base>.insteadOf`
             // rewrites from the user's global config, so a rewritten clone would
             // never match and every cache open would fail with InvalidPath.
+            // `--local` so a `remote.origin.url` in global or system config
+            // cannot stand in for a cache whose own config lacks one.
             let output = Command::new("git")
-                .args(["config", "--get", "remote.origin.url"])
+                .args(["config", "--local", "--get", "remote.origin.url"])
                 .current_dir(&base)
                 // Explicit GIT_DIR so git recognises the bare repo as
                 // intentional even when `safe.bareRepository = explicit` is
