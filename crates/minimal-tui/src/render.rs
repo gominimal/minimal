@@ -493,6 +493,18 @@ fn policy_lines(model: &Model, key: &SessionKey) -> Vec<Line<'static>> {
             "No network policy (NoNet)",
             Style::default().fg(Color::Gray),
         ));
+        // A lane the box declared is still shown, marked as not in effect,
+        // as `min session policy` shows it (NET-134).
+        if let Some(network) = network
+            && detail
+                .and_then(|d| d.policy.as_ref())
+                .is_some_and(|p| p.credentialed_upstream.is_some())
+        {
+            lines.push(Line::raw(format!(
+                "  {}",
+                sessions::CredentialedUpstream::policy_row(network)
+            )));
+        }
     } else {
         match detail.and_then(|d| d.policy.as_ref()) {
             None => match detail.and_then(|d| d.policy_error.as_deref()) {
@@ -543,6 +555,17 @@ fn policy_lines(model: &Model, key: &SessionKey) -> Vec<Line<'static>> {
                             lines.push(Line::raw(format!("  deny subnets  {}", subnets.join(", "))))
                         }
                     }
+                }
+                // The credentialed-upstream lane (NET-134), in the row text
+                // `min session policy` prints: shown whenever the box
+                // declared it, marked where its mode leaves it without
+                // effect. A mode not yet loaded prints the unmarked row.
+                if policy.credentialed_upstream.is_some() {
+                    let row = network.map_or_else(
+                        || sessions::CredentialedUpstream::POLICY_ROW.to_string(),
+                        sessions::CredentialedUpstream::policy_row,
+                    );
+                    lines.push(Line::raw(format!("  {row}")));
                 }
                 // Ingress is an own-address surface: the switch's static
                 // forwarder is the only per-session ingress minimald applies,
@@ -996,6 +1019,90 @@ mod tests {
         assert!(
             !out.contains("hidden-sess"),
             "collapsed session leaked:\n{out}"
+        );
+    }
+
+    /// The Policy pane's text for one session with this mode and policy.
+    fn policy_text(network: sessions::NetworkMode, policy: sessions::SessionPolicy) -> String {
+        let key = SessionKey {
+            provider: "host".to_string(),
+            id: sid(1),
+        };
+        let record = sessions::Record {
+            id: sid(1),
+            name: None,
+            username: None,
+            project_path: paths::HostAbsPath::try_new("/src/x").unwrap(),
+            network,
+            policy: policy.clone(),
+            status: sessions::SessionStatus::Active,
+            hooks_enabled: true,
+            box_addresses: None,
+            host_ip_enforcement: None,
+            host_row_bound: false,
+            attrs: std::collections::BTreeMap::new(),
+        };
+        let mut model = Model::new(Utc::now());
+        model.details.insert(
+            key.clone(),
+            crate::app::Detail {
+                record: Some(record),
+                policy: Some(sessions::EffectiveSessionPolicy {
+                    egress: policy
+                        .egress
+                        .clone()
+                        .map_or(sessions::EffectiveEgress::DenyAll, |egress| {
+                            sessions::EffectiveEgress::Declared(egress)
+                        }),
+                    ingress: policy.ingress.clone(),
+                    credentialed_upstream: policy.credentialed_upstream.clone(),
+                }),
+                policy_error: None,
+            },
+        );
+        policy_lines(&model, &key)
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// NET-134: the pane shows a declared credentialed-upstream lane in the
+    /// same row text `min session policy` prints — unmarked on an
+    /// own-address box, marked as not in effect on a host-address one —
+    /// and prints no row for a box that declared no lane.
+    #[test]
+    fn policy_pane_shows_the_credentialed_upstream_lane_when_declared() {
+        let laned = sessions::SessionPolicy {
+            egress: Some(sessions::EgressPolicy::deny_all()),
+            ingress: None,
+            credentialed_upstream: Some(sessions::CredentialedUpstream::default()),
+        };
+        let unlaned = sessions::SessionPolicy {
+            credentialed_upstream: None,
+            ..laned.clone()
+        };
+
+        let own = policy_text(sessions::NetworkMode::OwnIp, laned.clone());
+        assert!(
+            own.contains(
+                "egress\n  deny-all\n  credentialed upstream  box egress proxy listener\n"
+            ),
+            "a laned own-address box must show the lane row, got:\n{own}"
+        );
+
+        let bare = policy_text(sessions::NetworkMode::OwnIp, unlaned);
+        assert!(
+            !bare.contains("credentialed upstream"),
+            "a box without a lane must show no lane row, got:\n{bare}"
+        );
+
+        let host = policy_text(sessions::NetworkMode::HostNet, laned);
+        assert!(
+            host.contains(
+                "  credentialed upstream  box egress proxy listener (not in effect: host_ip box)"
+            ),
+            "a laned host-address box must show the lane, marked, got:\n{host}"
         );
     }
 }

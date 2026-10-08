@@ -324,6 +324,40 @@ impl IngressPolicy {
 #[serde(deny_unknown_fields)]
 pub struct CredentialedUpstream {}
 
+impl CredentialedUpstream {
+    /// Whether a declared lane takes effect in a box of this network mode:
+    /// the lane is admitted at the switch's gate, which only own-address
+    /// boxes sit behind. A declaration in any other mode stays on the
+    /// record and is still shown, marked as not in effect.
+    #[must_use]
+    pub fn in_effect(network: NetworkMode) -> bool {
+        network == NetworkMode::OwnIp
+    }
+
+    /// The policy row that states a declared lane, without indentation:
+    /// the one text `min session policy` and the `min dash` detail pane
+    /// both print, so the two surfaces cannot disagree. A box whose mode
+    /// leaves the lane without effect gets a `(not in effect: <mode> box)`
+    /// mark, the mode named by its CLI word.
+    #[must_use]
+    pub fn policy_row(network: NetworkMode) -> String {
+        if Self::in_effect(network) {
+            Self::POLICY_ROW.to_string()
+        } else {
+            format!(
+                "{} (not in effect: {} box)",
+                Self::POLICY_ROW,
+                network.word()
+            )
+        }
+    }
+
+    /// The lane's row text with no mode mark: what [`Self::policy_row`]
+    /// prints for an own-address box, and what a view prints when it does
+    /// not know the box's mode.
+    pub const POLICY_ROW: &'static str = "credentialed upstream  box egress proxy listener";
+}
+
 /// The networking policy for a session: its egress and ingress configuration.
 ///
 /// `None` for a dimension means it was not configured (allow-all egress; the
@@ -467,7 +501,11 @@ impl EffectiveEgress {
 // The strictness is also the wire contract with an older `min`: an old client
 // rejects a key it has no field for, so a fact that did not exist when it was
 // built must ride its own reply (`GetSessionRuntimeFacts`, the way live
-// ingress rides `GetLiveIngress`) rather than a new field here.
+// ingress rides `GetLiveIngress`) rather than a new field here. The
+// credentialed-upstream lane (NET-134) breaks that rule deliberately: a
+// policy reply a client cannot read is a visible error, while a lane it
+// cannot see is a security fact this command exists to state, and
+// `min session policy` reads no other reply that carries it.
 #[serde(deny_unknown_fields)]
 pub struct EffectiveSessionPolicy {
     /// The effective egress: the declaration, or the default the rollout
@@ -475,6 +513,14 @@ pub struct EffectiveSessionPolicy {
     pub egress: EffectiveEgress,
     /// Ingress policy; `None` when no explicit ingress config is present.
     pub ingress: Option<IngressPolicy>,
+    /// The box's credentialed-upstream lane (NET-134), carried verbatim
+    /// from the declaration: `Some` marks the Box Egress Proxy's listener
+    /// as the box's infrastructure — the one destination its egress rules
+    /// never decide — and `None` is no lane. Skipped when `None`, so a
+    /// lane-less box serializes exactly as it did before this field
+    /// existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credentialed_upstream: Option<CredentialedUpstream>,
 }
 
 /// Resolves the effective egress of a box (NET-074/NET-077): a declared
@@ -1233,6 +1279,28 @@ mod tests {
             let serde = serde_json_lenient::to_string(&mode).unwrap();
             assert_ne!(mode.word(), serde.trim_matches('"'), "{mode:?}");
         }
+    }
+
+    /// NET-134: the lane's row is unmarked only where the switch gate
+    /// admits it; every other mode still shows the declaration, marked
+    /// with the mode that leaves it without effect.
+    #[test]
+    fn credentialed_upstream_row_marks_modes_without_effect() {
+        assert!(CredentialedUpstream::in_effect(NetworkMode::OwnIp));
+        assert_eq!(
+            CredentialedUpstream::policy_row(NetworkMode::OwnIp),
+            "credentialed upstream  box egress proxy listener"
+        );
+        assert!(!CredentialedUpstream::in_effect(NetworkMode::HostNet));
+        assert_eq!(
+            CredentialedUpstream::policy_row(NetworkMode::HostNet),
+            "credentialed upstream  box egress proxy listener (not in effect: host_ip box)"
+        );
+        assert!(!CredentialedUpstream::in_effect(NetworkMode::NoNet));
+        assert_eq!(
+            CredentialedUpstream::policy_row(NetworkMode::NoNet),
+            "credentialed upstream  box egress proxy listener (not in effect: none box)"
+        );
     }
 
     fn record_with(network: NetworkMode, policy: SessionPolicy) -> Record {

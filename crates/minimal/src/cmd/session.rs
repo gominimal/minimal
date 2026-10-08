@@ -2857,6 +2857,15 @@ pub fn format_policy(
     // real (the same case the TUI's detail pane replaces with this note).
     if network == sessions::NetworkMode::NoNet {
         writeln!(out, "No network policy (NoNet)")?;
+        // A lane the box declared is still shown, marked as not in effect:
+        // the view states what was declared (NET-134).
+        if effective.credentialed_upstream.is_some() {
+            writeln!(
+                out,
+                "  {}",
+                sessions::CredentialedUpstream::policy_row(network)
+            )?;
+        }
         return Ok(());
     }
     writeln!(out, "egress")?;
@@ -2907,6 +2916,27 @@ pub fn format_policy(
     // rather than a row silence never carried.
     if let Some(enforcement) = host_ip_enforcement {
         writeln!(out, "  per-box enforcement  {}", enforcement.machine_str())?;
+    }
+    // The credentialed-upstream lane (NET-134), as the egress block's last
+    // declared row: a laned box's frames to the box egress proxy's
+    // listener are admitted on the credential the proxy itself checks —
+    // the one destination the rows above never decide — so the row states
+    // the lane beside rules that do not bound it, and names the listener
+    // as the lane's whole reach: everything else to the proxy's address
+    // stays refused. Printed only when the policy carries the lane;
+    // `None`, the declaration every policy without one holds, is no lane,
+    // and a row for it would claim one — silence says the box runs without
+    // the credential, under its egress rules alone. The lane is admitted at
+    // the switch's gate, which only own-address boxes sit behind, but a
+    // declaration in another mode is still shown: the row carries a
+    // `(not in effect: <mode> box)` mark there rather than hiding what the
+    // box declared. The text is shared with the `min dash` detail pane.
+    if effective.credentialed_upstream.is_some() {
+        writeln!(
+            out,
+            "  {}",
+            sessions::CredentialedUpstream::policy_row(network)
+        )?;
     }
     // The node-plane baseline set, beside the box's rules (NET-130): the
     // helper's built-in enumeration of the categories the in-VM daemon's own
@@ -3255,6 +3285,12 @@ struct PolicyJson<'a> {
     egress: Option<PolicyEgressJson<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     ingress: Option<PolicyIngressJson<'a>>,
+    /// The credentialed-upstream lane (NET-134), carried only when the
+    /// policy declares one — the same gate as the text rendering's row,
+    /// restated for a machine: a box without the lane has no key, so a
+    /// client cannot mistake an absent lane for a null one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    credentialed_upstream: Option<PolicyCredentialedUpstreamJson<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     node_plane_baseline: Option<PolicyBaselineJson>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3276,6 +3312,29 @@ struct PolicyJson<'a> {
 /// Serde helper: leave [`PolicyJson::shared_port_collisions`] out when empty.
 fn no_shared_port_collisions(rows: &&[minimald_rpc::SharedPortCollision]) -> bool {
     rows.is_empty()
+}
+
+/// A declared credentialed-upstream lane as the document carries it: the
+/// declaration as declared, plus `effective`, whether the box's network
+/// mode admits the lane (own-address only) — the machine form of the text
+/// row's `(not in effect: …)` mark.
+#[derive(serde::Serialize)]
+struct PolicyCredentialedUpstreamJson<'a> {
+    #[serde(flatten)]
+    lane: &'a sessions::CredentialedUpstream,
+    effective: bool,
+}
+
+impl<'a> PolicyCredentialedUpstreamJson<'a> {
+    fn from_effective(
+        effective: &'a sessions::EffectiveSessionPolicy,
+        network: sessions::NetworkMode,
+    ) -> Option<Self> {
+        effective.credentialed_upstream.as_ref().map(|lane| Self {
+            lane,
+            effective: sessions::CredentialedUpstream::in_effect(network),
+        })
+    }
 }
 
 /// The live rows as the document carries them — the two states a client
@@ -3338,14 +3397,19 @@ pub fn write_policy_json_noting(
     unaudited_listen_ports: &[u16],
 ) -> Result<(), anyhow::Error> {
     // A none box has no policy to describe; the text rendering's one-line
-    // note is prose for a person, so the document carries the schema and
-    // the mode alone, and every other key's absence says why.
+    // note is prose for a person, so the document carries the schema, the
+    // mode, and a declared lane (marked not in effect) alone, and every
+    // other key's absence says why.
     let document = if network == sessions::NetworkMode::NoNet {
         PolicyJson {
             schema: POLICY_JSON_SCHEMA,
             network,
             egress: None,
             ingress: None,
+            // A declared lane is still carried, marked not in effect.
+            credentialed_upstream: PolicyCredentialedUpstreamJson::from_effective(
+                effective, network,
+            ),
             node_plane_baseline: None,
             live_ingress: None,
             unaudited_listen_ports: &[],
@@ -3382,6 +3446,13 @@ pub fn write_policy_json_noting(
             // would claim a per-session policy that does not exist.
             ingress: (network != sessions::NetworkMode::HostNet)
                 .then(|| PolicyIngressJson::from_effective(effective.ingress.as_ref())),
+            // The lane rides the document the way the text rendering prints
+            // it: only when declared, so the key's absence is the no-lane
+            // claim. Carried in every mode; `effective` says whether this
+            // mode admits it, since the switch is the only place it is.
+            credentialed_upstream: PolicyCredentialedUpstreamJson::from_effective(
+                effective, network,
+            ),
             node_plane_baseline,
             // The wire's own rows, `pending` included — an empty list is a
             // claim about the box (it published nothing), which is what the
@@ -4376,8 +4447,8 @@ pub async fn cmd_rename(global: &GlobalArgs, args: RenameArgs) -> Result<(), any
 mod tests {
     use super::*;
     use sessions::{
-        DynamicIngress, EffectiveEgress, EffectiveSessionPolicy, IngressPolicy, IpProto,
-        NetworkMode, PortMapping,
+        CredentialedUpstream, DynamicIngress, EffectiveEgress, EffectiveSessionPolicy,
+        IngressPolicy, IpProto, NetworkMode, PortMapping,
     };
 
     #[test]
@@ -4875,6 +4946,7 @@ mod tests {
                 dynamic_allowed_range: None,
                 dynamic_ingress: Some(DynamicIngress::Allow),
             }),
+            credentialed_upstream: None,
         };
         let mut out = Vec::new();
         format_policy(&mut out, &policy, NetworkMode::OwnIp, None, &[], None).unwrap();
@@ -4902,6 +4974,7 @@ mod tests {
                 dynamic_allowed_range: None,
                 dynamic_ingress: Some(DynamicIngress::Ask),
             }),
+            credentialed_upstream: None,
         };
         let mut out = Vec::new();
         format_policy(&mut out, &policy, NetworkMode::OwnIp, None, &[], None).unwrap();
@@ -4925,6 +4998,7 @@ mod tests {
         let policy = EffectiveSessionPolicy {
             egress: EffectiveEgress::Declared(sessions::EgressPolicy::default()),
             ingress: None,
+            credentialed_upstream: None,
         };
         let mut out = Vec::new();
         format_policy(&mut out, &policy, NetworkMode::OwnIp, None, &[], None).unwrap();
@@ -4954,6 +5028,7 @@ mod tests {
         let declared = EffectiveSessionPolicy {
             egress: EffectiveEgress::Declared(sessions::EgressPolicy::deny_all()),
             ingress: None,
+            credentialed_upstream: None,
         };
 
         // Own-address: the name, and no dimension rows — never blankness.
@@ -4984,6 +5059,7 @@ mod tests {
         let defaulted = EffectiveSessionPolicy {
             egress: EffectiveEgress::DenyAll,
             ingress: None,
+            credentialed_upstream: None,
         };
         let mut out = Vec::new();
         format_policy(&mut out, &defaulted, NetworkMode::OwnIp, None, &[], None).unwrap();
@@ -5082,6 +5158,7 @@ mod tests {
                 deny_subnets: None,
             }),
             ingress: None,
+            credentialed_upstream: None,
         };
         let mut out = Vec::new();
         format_policy(&mut out, &not_deny_all, NetworkMode::OwnIp, None, &[], None).unwrap();
@@ -5117,6 +5194,7 @@ mod tests {
         let deny_all = EffectiveSessionPolicy {
             egress: EffectiveEgress::DenyAll,
             ingress: None,
+            credentialed_upstream: None,
         };
         let mut out = Vec::new();
         format_policy(&mut out, &deny_all, NetworkMode::OwnIp, None, &[], None).unwrap();
@@ -5135,6 +5213,7 @@ mod tests {
         let allow_all = EffectiveSessionPolicy {
             egress: EffectiveEgress::AllowAll,
             ingress: None,
+            credentialed_upstream: None,
         };
         let mut out = Vec::new();
         format_policy(&mut out, &allow_all, NetworkMode::OwnIp, None, &[], None).unwrap();
@@ -5159,6 +5238,7 @@ mod tests {
         let unenforced = EffectiveSessionPolicy {
             egress: EffectiveEgress::Declared(sessions::EgressPolicy::deny_all()),
             ingress: None,
+            credentialed_upstream: None,
         };
         let mut out = Vec::new();
         format_policy(
@@ -5181,6 +5261,7 @@ mod tests {
         let enforced = EffectiveSessionPolicy {
             egress: EffectiveEgress::AllowAll,
             ingress: None,
+            credentialed_upstream: None,
         };
         let mut out = Vec::new();
         format_policy(
@@ -5205,6 +5286,7 @@ mod tests {
         let silent = EffectiveSessionPolicy {
             egress: EffectiveEgress::DenyAll,
             ingress: None,
+            credentialed_upstream: None,
         };
         let mut out = Vec::new();
         format_policy(&mut out, &silent, NetworkMode::HostNet, None, &[], None).unwrap();
@@ -5212,6 +5294,130 @@ mod tests {
         assert!(
             !rendered.contains("per-box enforcement"),
             "no state reported means no row, got: {rendered}"
+        );
+    }
+
+    /// NET-134's lane in the policy render: a box that declared a
+    /// credentialed upstream prints the row — the one destination its
+    /// egress rules never decide, named as the lane's whole reach — while
+    /// a box that declared none prints nothing, the same silence a
+    /// lane-less box always read, so the render cannot claim a lane the
+    /// box does not run. The document carries the same distinction for a
+    /// machine: the key only when the lane exists, never nulled. A mode
+    /// the lane has no effect in still shows the declaration, marked.
+    #[test]
+    fn policy_render_carries_the_credentialed_upstream_row_when_declared() {
+        let laned = EffectiveSessionPolicy {
+            egress: EffectiveEgress::Declared(sessions::EgressPolicy::deny_all()),
+            ingress: None,
+            credentialed_upstream: Some(CredentialedUpstream::default()),
+        };
+        let mut out = Vec::new();
+        format_policy(&mut out, &laned, NetworkMode::OwnIp, None, &[], None).unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(
+            rendered.contains(
+                "egress\n  deny-all\n  credentialed upstream  box egress proxy listener\n"
+            ),
+            "a laned box must print the lane beside its rules, got: {rendered}"
+        );
+
+        // The same policy without the lane prints no row: silence is the
+        // no-lane claim, not a lane that reads as undeclared.
+        let unlaned = EffectiveSessionPolicy {
+            egress: EffectiveEgress::Declared(sessions::EgressPolicy::deny_all()),
+            ingress: None,
+            credentialed_upstream: None,
+        };
+        let mut out = Vec::new();
+        format_policy(&mut out, &unlaned, NetworkMode::OwnIp, None, &[], None).unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(
+            !rendered.contains("credentialed upstream"),
+            "a box that declared no lane must print no lane row, got: {rendered}"
+        );
+
+        // The document carries the lane the same way: a key only when
+        // declared, absent otherwise — never `null`, which a client could
+        // not tell from a lane it failed to read.
+        let json_of = |policy: &EffectiveSessionPolicy| {
+            let mut out = Vec::new();
+            write_policy_json(
+                &mut out,
+                policy,
+                NetworkMode::OwnIp,
+                None,
+                Ok(Vec::new()),
+                &[],
+            )
+            .unwrap();
+            serde_json_lenient::from_slice::<serde_json_lenient::Value>(&out).unwrap()
+        };
+        let laned_json = json_of(&laned);
+        assert_eq!(
+            laned_json["credentialed_upstream"],
+            serde_json_lenient::json!({ "effective": true }),
+            "the document carries the lane as a key when it is declared: {laned_json}"
+        );
+        let unlaned_json = json_of(&unlaned);
+        assert!(
+            unlaned_json.get("credentialed_upstream").is_none(),
+            "a box without a lane carries no key, got: {unlaned_json}"
+        );
+
+        // A host-address box sits behind no switch gate, so a declared
+        // lane there is admitted nowhere — but the view still shows what
+        // the box declared, marked as not in effect on both surfaces.
+        let mut out = Vec::new();
+        format_policy(&mut out, &laned, NetworkMode::HostNet, None, &[], None).unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(
+            rendered.contains(
+                "  credentialed upstream  box egress proxy listener \
+                 (not in effect: host_ip box)\n"
+            ),
+            "a host-address box must show its declared lane, marked, got: {rendered}"
+        );
+        let mut out = Vec::new();
+        write_policy_json(
+            &mut out,
+            &laned,
+            NetworkMode::HostNet,
+            None,
+            Ok(Vec::new()),
+            &[],
+        )
+        .unwrap();
+        let host_json: serde_json_lenient::Value = serde_json_lenient::from_slice(&out).unwrap();
+        assert_eq!(
+            host_json["credentialed_upstream"],
+            serde_json_lenient::json!({ "effective": false }),
+            "a host-address box carries its declared lane as not in effect, got: {host_json}"
+        );
+
+        // A none box keeps the declaration visible the same way.
+        let mut out = Vec::new();
+        format_policy(&mut out, &laned, NetworkMode::NoNet, None, &[], None).unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(
+            rendered.contains("(not in effect: none box)"),
+            "a none box must show its declared lane, marked, got: {rendered}"
+        );
+        let mut out = Vec::new();
+        write_policy_json(
+            &mut out,
+            &laned,
+            NetworkMode::NoNet,
+            None,
+            Ok(Vec::new()),
+            &[],
+        )
+        .unwrap();
+        let none_json: serde_json_lenient::Value = serde_json_lenient::from_slice(&out).unwrap();
+        assert_eq!(
+            none_json["credentialed_upstream"],
+            serde_json_lenient::json!({ "effective": false }),
+            "a none box carries its declared lane as not in effect, got: {none_json}"
         );
     }
 
@@ -5430,6 +5636,7 @@ mod tests {
                 dynamic_allowed_range: Some((3000, 3999)),
                 dynamic_ingress: Some(DynamicIngress::Allow),
             }),
+            credentialed_upstream: None,
         };
         let mut out = Vec::new();
         format_policy(&mut out, &policy, NetworkMode::OwnIp, None, &[], None).unwrap();
@@ -5513,6 +5720,7 @@ mod tests {
         let policy = EffectiveSessionPolicy {
             egress: EffectiveEgress::AllowAll,
             ingress: None,
+            credentialed_upstream: None,
         };
         let document = |ports: &[u16]| {
             let mut out = Vec::new();
@@ -5563,6 +5771,7 @@ mod tests {
                 dynamic_allowed_range: None,
                 dynamic_ingress: None,
             }),
+            credentialed_upstream: None,
         };
         let collisions = vec![minimald_rpc::SharedPortCollision {
             port: 8080,

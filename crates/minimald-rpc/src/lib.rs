@@ -3368,29 +3368,43 @@ mod tests {
     /// the untagged [`Errorable`] — rejects a key it has no field for, so a
     /// policy reply that grew the state would make every old client fail
     /// `min session policy` outright. Pinned here as the contract that keeps
-    /// that from regressing: the reply this build serves decodes in the old
-    /// client's own strict shape, and the state answers over
-    /// [`GetSessionRuntimeFacts`] instead — a reply an old client simply
-    /// never asks for, and this build's own answer to it stays anchored the
-    /// same way the policy's `egress` is.
+    /// that from regressing: the state answers over
+    /// [`GetSessionRuntimeFacts`] — a reply an old client simply never asks
+    /// for, and this build's own answer to it stays anchored the same way
+    /// the policy's `egress` is. NET-134's lane is the one deliberate
+    /// exception, and this test pins both of its halves: a lane-less reply
+    /// serializes without the lane's key and so still decodes in the old
+    /// client's strict shape, while a laned reply — a fact `min session
+    /// policy` reads from no other reply — is refused by that client, the
+    /// visible error the lane's issue took over a lane the report is
+    /// silent about.
     #[test]
     fn effective_policy_reply_decodes_in_the_old_clients_strict_shape() {
-        // The reply this build serves: two fields, no enforcement key.
+        // The reply this build serves for a lane-less box: no enforcement
+        // key, and no lane key either — the shape every earlier client
+        // reads.
         let reply = Errorable::Ok(EffectiveSessionPolicy {
             egress: EffectiveEgress::DenyAll,
             ingress: None,
+            credentialed_upstream: None,
         });
         let json = serde_json_lenient::to_string(&reply).expect("the policy reply serializes");
         assert!(
             !json.contains("host_ip_enforcement"),
             "the strict policy reply must carry no enforcement key, got: {json}",
         );
+        assert!(
+            !json.contains("credentialed_upstream"),
+            "a lane-less reply must carry no lane key, so the old shape still \
+             reads it, got: {json}",
+        );
 
         // The old client: the strict two-field shape it was built against,
         // spelled as its own derive would spell it. It decodes the reply
-        // above because the reply never grew a field — and it refuses a
-        // reply that did, which is exactly why the state must ride its own
-        // RPC rather than a new field here.
+        // above because a lane-less reply never grew a key — and it refuses
+        // a reply that did, which is why the enforcement state must ride its
+        // own RPC, and why a laned box's reply is a visible error to this
+        // client rather than a silently missing lane.
         #[derive(serde::Deserialize, Debug, PartialEq)]
         #[serde(deny_unknown_fields)]
         struct OldClientPolicy {
@@ -3413,6 +3427,15 @@ mod tests {
             .is_err(),
             "the old client refuses a policy reply that grew the key — the \
              reason the state answers over its own runtime-facts reply",
+        );
+        assert!(
+            serde_json_lenient::from_str::<Errorable<OldClientPolicy>>(
+                r#"{"egress":"deny_all","ingress":null,"credentialed_upstream":{}}"#
+            )
+            .is_err(),
+            "the old client refuses a laned reply too — `min session policy` \
+             reads no other reply that carries the lane, so the refusal is the \
+             visible error the lane's issue chose over a silent omission",
         );
 
         // The runtime-facts reply keeps the property the strict shapes

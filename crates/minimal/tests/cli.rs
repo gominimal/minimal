@@ -1658,6 +1658,7 @@ fn policy_json_distinguishes_unavailable_live_rows_from_none_published() {
     let policy = sessions::EffectiveSessionPolicy {
         egress: sessions::EffectiveEgress::AllowAll,
         ingress: None,
+        credentialed_upstream: None,
     };
 
     // A box that published nothing: the empty list is an authoritative
@@ -2008,6 +2009,7 @@ async fn policy_shows_deny_all_default() {
             false,
         ),
         ingress: None,
+        credentialed_upstream: None,
     };
     assert_eq!(
         in_force.egress,
@@ -2597,6 +2599,7 @@ fn policy_shows_baseline_set() {
             false,
         ),
         ingress: None,
+        credentialed_upstream: None,
     };
     let fabric = switch::SwitchSubnet::default();
     let mut out = Vec::new();
