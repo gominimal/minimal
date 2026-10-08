@@ -1673,6 +1673,25 @@ pub struct FinalizeSessionResponse {
     /// client.
     #[serde(default, skip_serializing_if = "package_check_skipped_is_false")]
     pub package_check_skipped: bool,
+    /// One entry per declared ingress port another box at the same shared
+    /// address already holds, so this box's attach yields it (first-come):
+    /// the port, and the box that holds it. The box still activates and
+    /// serves its other ports; the client warns so the operator knows the
+    /// declared mapping is served by the holding box, not this one.
+    /// Serde-defaulted and omitted when empty so a daemon that predates
+    /// the field still answers to an older client.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shared_port_collisions: Vec<SharedPortCollision>,
+}
+
+/// A declared ingress port the box yields because another box at the same
+/// shared loopback address holds it, as the finalize reply reports it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SharedPortCollision {
+    /// The port both boxes declared and the holding box serves.
+    pub port: u16,
+    /// The holding box's name, as the warning names it.
+    pub other: String,
 }
 
 /// Serde helper: omit [`FinalizeSessionResponse::package_check_skipped`]
@@ -2116,6 +2135,14 @@ pub struct SessionRuntimeFacts {
     /// be read back — the same states
     /// [`ListSessionsEntry::host_ip_enforcement`] names.
     pub host_ip_enforcement: Option<HostIpEnforcement>,
+    /// The declared ingress ports this box's attach yields because another
+    /// box at the same shared loopback address holds them (first-come):
+    /// one entry per port, naming the holding box. Serde-defaulted and
+    /// omitted when empty, so a daemon that predates the field still
+    /// answers to an older client; a client that cannot ask reads the
+    /// same silence an empty list reads as.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shared_port_collisions: Vec<SharedPortCollision>,
 }
 
 impl OneshotSshRpc for GetSessionRuntimeFacts {
@@ -2504,6 +2531,43 @@ mod tests {
         let back: FinalizeSessionResponse =
             serde_json_lenient::from_str(&wire).expect("must decode");
         assert!(back.package_check_skipped);
+    }
+
+    /// `shared_port_collisions` is omitted from the wire when empty, so a
+    /// client that predates the field still decodes the common success
+    /// payload; when a port was yielded it is present, naming the port and
+    /// the box that holds it so the client can warn.
+    #[test]
+    fn shared_port_collisions_are_omitted_when_empty() {
+        let wire = serde_json_lenient::to_string(&FinalizeSessionResponse::default())
+            .expect("must serialize");
+        assert!(
+            !wire.contains("shared_port_collisions"),
+            "an empty collision list must not be serialized, got {wire:?}"
+        );
+
+        let yielded = FinalizeSessionResponse {
+            shared_port_collisions: vec![SharedPortCollision {
+                port: 8080,
+                other: "first.min.internal".to_string(),
+            }],
+            ..Default::default()
+        };
+        let wire = serde_json_lenient::to_string(&yielded).expect("must serialize");
+        assert!(
+            wire.contains("shared_port_collisions"),
+            "a yielded port must be serialized, got {wire:?}"
+        );
+        let back: FinalizeSessionResponse =
+            serde_json_lenient::from_str(&wire).expect("must decode");
+        assert_eq!(
+            back.shared_port_collisions,
+            vec![SharedPortCollision {
+                port: 8080,
+                other: "first.min.internal".to_string(),
+            }],
+            "the collision list must round-trip"
+        );
     }
 
     /// An empty request body must decode with the documented defaults so a
@@ -3127,6 +3191,7 @@ mod tests {
         let facts = SessionRuntimeFacts {
             id: SessionId::nil(),
             host_ip_enforcement: Some(HostIpEnforcement::None),
+            shared_port_collisions: Vec::new(),
         };
         assert_eq!(round_trip(&facts), facts);
         match serde_json_lenient::from_str::<Errorable<SessionRuntimeFacts>>(
@@ -3149,6 +3214,7 @@ mod tests {
                 SessionRuntimeFacts {
                     id: SessionId::nil(),
                     host_ip_enforcement: Some(HostIpEnforcement::PerBox),
+                    shared_port_collisions: Vec::new(),
                 },
                 "the facts this client knows decode beside a key it does not"
             ),

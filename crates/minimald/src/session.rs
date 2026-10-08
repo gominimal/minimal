@@ -1149,9 +1149,13 @@ impl Session {
     /// manager's message handling, a rename — publishes such a hand at the
     /// `127.0.0.1` interim at once, and the present landing moves it.
     #[cfg(target_os = "linux")]
-    async fn register_hostname(&self, record: &Record, wait_for_verdict: bool) {
+    async fn register_hostname(
+        &self,
+        record: &Record,
+        wait_for_verdict: bool,
+    ) -> Vec<crate::net::dns::SharedPortCollision> {
         if !self.owns_hostname_route(record) {
-            return;
+            return Vec::new();
         }
         let name = registry_name(record);
         // Scoped: the switch lock is dropped before the registry is taken, so
@@ -1160,6 +1164,7 @@ impl Session {
             let switch = self.net_switch.lock().await;
             (switch.subnet(), switch.hostname_proxy_port())
         };
+        let mut shared_port_collisions = Vec::new();
         match record.network {
             sessions::NetworkMode::OwnIp => {
                 // NET-010/NET-011: finalize publishes the box's declaration
@@ -1368,8 +1373,12 @@ impl Session {
                     // collisions on this box, the one that yields, so its
                     // attach skips those forwards instead of failing on a bind
                     // the forwarder refuses. The box activates and stays
-                    // usable; its other forwards bind as usual.
-                    reg.publish_own_address(record.id, &name, address, declared.clone());
+                    // usable; its other forwards bind as usual. The list rides
+                    // the finalize reply so the activating client can warn —
+                    // the daemon log line is the only other trace, and a user
+                    // reading exit 0 never sees it.
+                    shared_port_collisions =
+                        reg.publish_own_address(record.id, &name, address, declared.clone());
                 }
                 // A box whose grant was withheld registers no name: the
                 // registry's own route is built only from a published
@@ -1399,6 +1408,7 @@ impl Session {
         if matches!(record.network, sessions::NetworkMode::OwnIp) {
             self.report_unrecorded_publishes();
         }
+        shared_port_collisions
     }
 
     /// Resolves a hand to the address the box publishes at (NET-123 §7.1):
@@ -2418,7 +2428,9 @@ impl Session {
                 // ([`Self::deregister_hostname`]). A retried finalize
                 // registers again, which is idempotent for one session id.
                 #[cfg(target_os = "linux")]
-                self.register_hostname(&record, true).await;
+                let shared_port_collisions = self.register_hostname(&record, true).await;
+                #[cfg(not(target_os = "linux"))]
+                let shared_port_collisions = Vec::new();
 
                 let mut ran: Vec<minimald_rpc::RanHook> = Vec::new();
                 if self.has_hooks_for(crate::hooks::HookEvent::Activate) {
@@ -2467,6 +2479,13 @@ impl Session {
                 Ok(minimald_rpc::FinalizeSessionResponse {
                     activate_hooks: ran,
                     package_check_skipped,
+                    shared_port_collisions: shared_port_collisions
+                        .into_iter()
+                        .map(|c| minimald_rpc::SharedPortCollision {
+                            port: c.port,
+                            other: c.other,
+                        })
+                        .collect(),
                 })
             }
             SessionStatus::Pending => Err(std::io::Error::new(

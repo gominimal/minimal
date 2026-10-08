@@ -768,6 +768,18 @@ pub(crate) async fn upload_and_finalize(
                      log); unknown package names will surface at first exec"
                 );
             }
+            // First-come on a shared loopback address: another box at the
+            // same address holds this port, so this box's attach yields the
+            // forward. The box activates and serves its other ports, but
+            // without this line the only trace of the yield is the daemon
+            // log — a user reading a green activate would never know.
+            for collision in &ok.shared_port_collisions {
+                eprintln!(
+                    "warning: port {} is already held by {}; this session \
+                     will not forward it (first-come on the shared address)",
+                    collision.port, collision.other
+                );
+            }
             Ok(())
         }
         minimald_rpc::Errorable::Err { error } => {

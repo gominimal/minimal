@@ -2280,12 +2280,14 @@ pub async fn cmd_session_policy(
         SessionLookup::Id(id) => minimald_rpc::GetSessionRuntimeFactsRequest::Id(id),
         SessionLookup::Name(n) => minimald_rpc::GetSessionRuntimeFactsRequest::Name(n),
     };
-    let host_ip_enforcement = match client
+    let (host_ip_enforcement, shared_port_collisions) = match client
         .oneshot_rpc::<minimald_rpc::GetSessionRuntimeFacts>(facts_lookup)
         .await
     {
-        Ok(minimald_rpc::Errorable::Ok(facts)) => facts.host_ip_enforcement,
-        Ok(minimald_rpc::Errorable::Err { .. }) | Err(_) => None,
+        Ok(minimald_rpc::Errorable::Ok(facts)) => {
+            (facts.host_ip_enforcement, facts.shared_port_collisions)
+        }
+        Ok(minimald_rpc::Errorable::Err { .. }) | Err(_) => (None, Vec::new()),
     };
     // (NET-044) — the rows that make a `min net expose` visible rather than
     // only permitted. Fetched through the text walk's own degrade of the
@@ -2317,6 +2319,7 @@ pub async fn cmd_session_policy(
                 &policy,
                 record.network,
                 host_ip_enforcement,
+                &shared_port_collisions,
                 fabric,
             )?;
             write_live_ingress(&mut out, &live)?;
@@ -2475,6 +2478,7 @@ pub fn format_policy(
     effective: &sessions::EffectiveSessionPolicy,
     network: sessions::NetworkMode,
     host_ip_enforcement: Option<sessions::HostIpEnforcement>,
+    shared_port_collisions: &[minimald_rpc::SharedPortCollision],
     fabric: Option<switch::SwitchSubnet>,
 ) -> Result<(), anyhow::Error> {
     // A none box has no network, so it can carry no egress or ingress
@@ -2604,11 +2608,29 @@ pub fn format_policy(
                     writeln!(out, "  deny-all")?;
                 }
                 for mapping in &ingress.port_mappings {
-                    writeln!(
-                        out,
-                        "  {}  :{} → :{}",
-                        mapping.proto, mapping.external_port, mapping.internal_port
-                    )?;
+                    // NET-129: a declared port another box at the same shared
+                    // loopback address holds is served by that box — this
+                    // box's attach yielded the forward (first-come) — so the
+                    // row says whose it is rather than reading as this box's
+                    // own. Every other declared row prints as before; an
+                    // empty list, or one a client too old to fetch could not
+                    // pass, marks nothing.
+                    let held_by = shared_port_collisions
+                        .iter()
+                        .find(|c| c.port == mapping.external_port)
+                        .map(|c| format!(" (held by {})", c.other));
+                    match held_by {
+                        Some(mark) => writeln!(
+                            out,
+                            "  {}  :{} → :{}{}",
+                            mapping.proto, mapping.external_port, mapping.internal_port, mark
+                        )?,
+                        None => writeln!(
+                            out,
+                            "  {}  :{} → :{}",
+                            mapping.proto, mapping.external_port, mapping.internal_port
+                        )?,
+                    }
                 }
             }
         }
@@ -4372,7 +4394,7 @@ mod tests {
             }),
         };
         let mut out = Vec::new();
-        format_policy(&mut out, &policy, NetworkMode::OwnIp, None, None).unwrap();
+        format_policy(&mut out, &policy, NetworkMode::OwnIp, None, &[], None).unwrap();
         let rendered = String::from_utf8(out).unwrap();
         assert!(
             rendered.contains("  dynamic ingress  allow"),
@@ -4399,7 +4421,7 @@ mod tests {
             }),
         };
         let mut out = Vec::new();
-        format_policy(&mut out, &policy, NetworkMode::OwnIp, None, None).unwrap();
+        format_policy(&mut out, &policy, NetworkMode::OwnIp, None, &[], None).unwrap();
         let rendered = String::from_utf8(out).unwrap();
         assert!(
             rendered.contains("  tcp  :8080 → :80"),
@@ -4422,7 +4444,7 @@ mod tests {
             ingress: None,
         };
         let mut out = Vec::new();
-        format_policy(&mut out, &policy, NetworkMode::OwnIp, None, None).unwrap();
+        format_policy(&mut out, &policy, NetworkMode::OwnIp, None, &[], None).unwrap();
         let rendered = String::from_utf8(out).unwrap();
         assert!(rendered.contains("egress\n"), "{rendered}");
         assert!(rendered.contains("  allow-all\n"), "{rendered}");
@@ -4453,7 +4475,7 @@ mod tests {
 
         // Own-address: the name, and no dimension rows — never blankness.
         let mut out = Vec::new();
-        format_policy(&mut out, &declared, NetworkMode::OwnIp, None, None).unwrap();
+        format_policy(&mut out, &declared, NetworkMode::OwnIp, None, &[], None).unwrap();
         let rendered = String::from_utf8(out).unwrap();
         assert!(
             rendered.contains("egress\n  deny-all\n"),
@@ -4481,7 +4503,7 @@ mod tests {
             ingress: None,
         };
         let mut out = Vec::new();
-        format_policy(&mut out, &defaulted, NetworkMode::OwnIp, None, None).unwrap();
+        format_policy(&mut out, &defaulted, NetworkMode::OwnIp, None, &[], None).unwrap();
         let default_rendered = String::from_utf8(out).unwrap();
         assert!(
             default_rendered.contains("egress\n  deny-all (default)\n"),
@@ -4548,6 +4570,7 @@ mod tests {
             &declared,
             NetworkMode::HostNet,
             Some(sessions::HostIpEnforcement::PerBox),
+            &[],
             None,
         )
         .unwrap();
@@ -4570,7 +4593,7 @@ mod tests {
             ingress: None,
         };
         let mut out = Vec::new();
-        format_policy(&mut out, &not_deny_all, NetworkMode::OwnIp, None, None).unwrap();
+        format_policy(&mut out, &not_deny_all, NetworkMode::OwnIp, None, &[], None).unwrap();
         let rendered = String::from_utf8(out).unwrap();
         assert!(
             rendered.contains("  subnets  10.0.0.0/8"),
@@ -4605,7 +4628,7 @@ mod tests {
             ingress: None,
         };
         let mut out = Vec::new();
-        format_policy(&mut out, &deny_all, NetworkMode::OwnIp, None, None).unwrap();
+        format_policy(&mut out, &deny_all, NetworkMode::OwnIp, None, &[], None).unwrap();
         let rendered = String::from_utf8(out).unwrap();
         assert!(
             rendered.contains("egress\n  deny-all (default)\n"),
@@ -4623,7 +4646,7 @@ mod tests {
             ingress: None,
         };
         let mut out = Vec::new();
-        format_policy(&mut out, &allow_all, NetworkMode::OwnIp, None, None).unwrap();
+        format_policy(&mut out, &allow_all, NetworkMode::OwnIp, None, &[], None).unwrap();
         let rendered = String::from_utf8(out).unwrap();
         assert!(
             rendered.contains("egress\n  allow-all (default)\n"),
@@ -4652,6 +4675,7 @@ mod tests {
             &unenforced,
             NetworkMode::HostNet,
             Some(sessions::HostIpEnforcement::None),
+            &[],
             None,
         )
         .unwrap();
@@ -4673,6 +4697,7 @@ mod tests {
             &enforced,
             NetworkMode::HostNet,
             Some(sessions::HostIpEnforcement::PerBox),
+            &[],
             None,
         )
         .unwrap();
@@ -4691,7 +4716,7 @@ mod tests {
             ingress: None,
         };
         let mut out = Vec::new();
-        format_policy(&mut out, &silent, NetworkMode::HostNet, None, None).unwrap();
+        format_policy(&mut out, &silent, NetworkMode::HostNet, None, &[], None).unwrap();
         let rendered = String::from_utf8(out).unwrap();
         assert!(
             !rendered.contains("per-box enforcement"),
@@ -4916,7 +4941,7 @@ mod tests {
             }),
         };
         let mut out = Vec::new();
-        format_policy(&mut out, &policy, NetworkMode::OwnIp, None, None).unwrap();
+        format_policy(&mut out, &policy, NetworkMode::OwnIp, None, &[], None).unwrap();
         write_live_ingress(&mut out, &live).unwrap();
         let rendered = String::from_utf8(out).unwrap();
         let (declared, live_rows) = rendered
@@ -4965,6 +4990,67 @@ mod tests {
             String::from_utf8(out).unwrap(),
             "",
             "a box that published nothing prints no live section"
+        );
+    }
+
+    /// NET-129: a declared port another box at the same shared loopback
+    /// address holds is served by that box, so the declared row says whose
+    /// it is rather than reading as this box's own. The mark names the
+    /// holding box; a row whose port nobody else holds prints as before;
+    /// an empty list marks nothing.
+    #[test]
+    fn policy_marks_a_yielded_shared_address_port() {
+        let policy = EffectiveSessionPolicy {
+            egress: EffectiveEgress::AllowAll,
+            ingress: Some(IngressPolicy {
+                port_mappings: vec![
+                    PortMapping {
+                        proto: IpProto::Tcp,
+                        external_port: 8080,
+                        internal_port: 8080,
+                    },
+                    PortMapping {
+                        proto: IpProto::Udp,
+                        external_port: 5353,
+                        internal_port: 5353,
+                    },
+                ],
+                dynamic_allowed_range: None,
+                dynamic_ingress: None,
+            }),
+        };
+        let collisions = vec![minimald_rpc::SharedPortCollision {
+            port: 8080,
+            other: "first.min.internal".to_string(),
+        }];
+
+        let mut out = Vec::new();
+        format_policy(
+            &mut out,
+            &policy,
+            NetworkMode::OwnIp,
+            None,
+            &collisions,
+            None,
+        )
+        .unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(
+            rendered.contains("  tcp  :8080 → :8080 (held by first.min.internal)\n"),
+            "the yielded port's row names the box that holds it: {rendered}"
+        );
+        assert!(
+            rendered.contains("  udp  :5353 → :5353\n"),
+            "a port no other box holds prints unmarked: {rendered}"
+        );
+
+        // No collisions, no marks: the same declaration renders as before.
+        let mut out = Vec::new();
+        format_policy(&mut out, &policy, NetworkMode::OwnIp, None, &[], None).unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(
+            rendered.contains("  tcp  :8080 → :8080\n"),
+            "an empty collision list marks nothing: {rendered}"
         );
     }
 

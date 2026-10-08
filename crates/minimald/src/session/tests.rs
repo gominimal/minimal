@@ -2870,14 +2870,19 @@ async fn finalize_handed_own_ip_session(
 /// The FinalizeSession step of the helpers above, on its own — for the
 /// tests that send it from a second connection while the daemon's
 /// registration waits on the range verdict, so the walk can land inside
-/// that bounded wait (NET-123 §7.1).
-async fn finalize_session(client: &mut TestClient, id: SessionId) {
+/// that bounded wait (NET-123 §7.1). Returns the reply, so a test can
+/// read what the finalize reported — the collisions a shared-address box
+/// yielded among them.
+async fn finalize_session(
+    client: &mut TestClient,
+    id: SessionId,
+) -> minimald_rpc::FinalizeSessionResponse {
     use minimald_rpc::{Errorable, FinalizeSession, FinalizeSessionRequest};
     match client
         .call::<FinalizeSession>(&FinalizeSessionRequest { session_id: id })
         .await
     {
-        Errorable::Ok(_) => {}
+        Errorable::Ok(ok) => ok,
         Errorable::Err { error } => panic!("FinalizeSession failed: {error}"),
     }
 }
@@ -5325,20 +5330,26 @@ async fn shared_address_port_collision_reported_at_finalize_without_attached_cli
     let capture = crate::test_harness::captured_log();
     let mut client = server.connect().await;
 
-    let first = finalize_handed_own_ip_session(
+    // Each box's finalize runs directly, not through the combined helper,
+    // because the reply is half of what this test pins: the collision list
+    // the daemon hands the activating client, so it can warn without
+    // reading the daemon log.
+    let first = create_handed_own_ip_session(
         &mut client,
         "first",
         std::net::Ipv4Addr::new(100, 64, 128, 9),
         shared,
     )
     .await;
-    let second = finalize_handed_own_ip_session(
+    let first_finalize_reply = finalize_session(&mut client, first).await;
+    let second = create_handed_own_ip_session(
         &mut client,
         "second",
         std::net::Ipv4Addr::new(100, 64, 128, 10),
         shared,
     )
     .await;
+    let second_reply = finalize_session(&mut client, second).await;
 
     // Both names answer at the one shared address while no client is attached.
     let (_, first_address) = zone_answer_for(&server, "first.min.internal")
@@ -5412,6 +5423,24 @@ async fn shared_address_port_collision_reported_at_finalize_without_attached_cli
         "the box that published first holds its port and yields nothing"
     );
     drop(routes);
+
+    // The finalize reply carries the same list to the activating client —
+    // the reply half of the report, so the client can warn at the activate
+    // the user reads instead of the daemon log the user does not. The box
+    // that holds the port answered a reply with no list, the client-side
+    // silence of the registry record asserted above.
+    assert_eq!(
+        second_reply.shared_port_collisions,
+        vec![minimald_rpc::SharedPortCollision {
+            port: 18080,
+            other: "first.min.internal".to_string(),
+        }],
+        "the finalize reply names the yielded port and the box that holds it"
+    );
+    assert!(
+        first_finalize_reply.shared_port_collisions.is_empty(),
+        "the box that holds its port yields nothing, and its reply says so"
+    );
 
     // The collision reached the log and named both boxes and the port.
     let logged = capture.contents();

@@ -1468,9 +1468,30 @@ async fn serve_get_session_runtime_facts(
                         &crate::session_host::host_ip_enforcement_fact(),
                         record.host_ip_enforcement,
                     );
+                    // The ports this box's attach yields because a sibling at
+                    // the same shared loopback address holds them (first-come):
+                    // the same registry record the attach path reads to skip
+                    // those forwards, surfaced so the policy view can mark the
+                    // declared rows that are served elsewhere. Empty for every
+                    // mode but a shared-address own-ip box — and read behind
+                    // the registry's lock, a plain map lookup, so it never
+                    // holds up the reply.
+                    let shared_port_collisions = {
+                        let registry = mngr.hostnames();
+                        let routes = registry.read().expect("hostname registry lock poisoned");
+                        routes
+                            .shared_port_collisions(record.id)
+                            .into_iter()
+                            .map(|c| minimald_rpc::SharedPortCollision {
+                                port: c.port,
+                                other: c.other,
+                            })
+                            .collect()
+                    };
                     Ok(Errorable::Ok(minimald_rpc::SessionRuntimeFacts {
                         id: record.id,
                         host_ip_enforcement,
+                        shared_port_collisions,
                     }))
                 }
             }

@@ -894,7 +894,15 @@ async fn policy_shows_resolved_dynamic_ingress() {
         };
 
         let mut out = Vec::new();
-        format_policy(&mut out, &policy, sessions::NetworkMode::OwnIp, None, None).unwrap();
+        format_policy(
+            &mut out,
+            &policy,
+            sessions::NetworkMode::OwnIp,
+            None,
+            &[],
+            None,
+        )
+        .unwrap();
         let text = String::from_utf8(out).unwrap();
         let row = if declared {
             format!("  dynamic ingress  {mode}\n")
@@ -1706,7 +1714,15 @@ async fn policy_shows_effective_egress() {
     );
 
     let mut out = Vec::new();
-    format_policy(&mut out, &policy, sessions::NetworkMode::OwnIp, None, None).unwrap();
+    format_policy(
+        &mut out,
+        &policy,
+        sessions::NetworkMode::OwnIp,
+        None,
+        &[],
+        None,
+    )
+    .unwrap();
     let text = String::from_utf8(out).unwrap();
     assert!(
         text.contains("subnets  10.0.0.0/8"),
@@ -1753,6 +1769,7 @@ async fn policy_shows_effective_egress() {
         &policy,
         sessions::NetworkMode::HostNet,
         None,
+        &[],
         None,
     )
     .unwrap();
@@ -1793,6 +1810,7 @@ async fn policy_shows_effective_egress() {
         &policy,
         sessions::NetworkMode::HostNet,
         Some(host_ip_enforcement),
+        &[],
         None,
     )
     .unwrap();
@@ -1828,7 +1846,15 @@ async fn policy_shows_effective_egress() {
         }
     };
     let mut out = Vec::new();
-    format_policy(&mut out, &policy, sessions::NetworkMode::NoNet, None, None).unwrap();
+    format_policy(
+        &mut out,
+        &policy,
+        sessions::NetworkMode::NoNet,
+        None,
+        &[],
+        None,
+    )
+    .unwrap();
     let text = String::from_utf8(out).unwrap();
     assert_eq!(
         text, "No network policy (NoNet)\n",
@@ -1906,6 +1932,7 @@ async fn policy_shows_deny_all_default() {
         &in_force,
         sessions::NetworkMode::OwnIp,
         None,
+        &[],
         None,
     )
     .unwrap();
@@ -1964,6 +1991,7 @@ async fn policy_shows_deny_all_default() {
         &policy,
         sessions::NetworkMode::HostNet,
         None,
+        &[],
         None,
     )
     .unwrap();
@@ -2244,6 +2272,7 @@ async fn policy_shows_unset_egress_as_named_default() {
         &own_policy,
         sessions::NetworkMode::OwnIp,
         None,
+        &[],
         None,
     )
     .unwrap();
@@ -2342,6 +2371,7 @@ async fn policy_shows_unset_egress_as_named_default() {
         &host_policy,
         sessions::NetworkMode::HostNet,
         Some(enforcement),
+        &[],
         None,
     )
     .unwrap();
@@ -2387,6 +2417,7 @@ async fn policy_shows_unset_egress_as_named_default() {
         &declared_policy,
         sessions::NetworkMode::OwnIp,
         None,
+        &[],
         None,
     )
     .unwrap();
@@ -2484,6 +2515,7 @@ fn policy_shows_baseline_set() {
         &deny_all,
         sessions::NetworkMode::OwnIp,
         None,
+        &[],
         Some(fabric),
     )
     .unwrap();
@@ -2546,6 +2578,7 @@ fn policy_shows_baseline_set() {
         &deny_all,
         sessions::NetworkMode::HostNet,
         None,
+        &[],
         Some(fabric),
     )
     .unwrap();
@@ -2565,6 +2598,7 @@ fn policy_shows_baseline_set() {
         &deny_all,
         sessions::NetworkMode::OwnIp,
         None,
+        &[],
         None,
     )
     .unwrap();
