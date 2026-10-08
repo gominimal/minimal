@@ -983,6 +983,14 @@ pub(crate) async fn hostname_proxy_serving_port(
 ) -> Option<u16> {
     let deadline = tokio::time::Instant::now() + HOSTNAME_PROXY_SERVE_WAIT;
     loop {
+        // Untimed on purpose: the deadline bounds the serving transition, not
+        // contention on the switch mutex. Both callers take this same lock
+        // unbounded immediately before (the `subnet()` read), so timing this
+        // acquisition would not bound the attach, and the fail-closed path
+        // below must hold the lock to record the box stranded. The lock is
+        // dropped before every poll, so a waiter cannot starve the transition
+        // writer (`set_hostname_proxy_port`, from `record_bound`) — the review
+        // thread on the serving wait settled this.
         let mut switch = switch.lock().await;
         let port = switch.hostname_proxy_port();
         if !switch.hostname_proxy_unsettled() {
