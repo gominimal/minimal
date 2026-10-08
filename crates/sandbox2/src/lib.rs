@@ -2903,6 +2903,17 @@ const COMPAT_SYS_SOCKETPAIR: u32 = 360; // __NR_socketpair, i386
 const COMPAT_SYS_SOCKET: u32 = 281; // __NR_socket, arm EABI
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 const COMPAT_SYS_SOCKETPAIR: u32 = 288; // __NR_socketpair, arm EABI
+/// `io_uring_setup(2)`: since Linux 5.19 an `IORING_OP_SOCKET` on a ring
+/// creates a socket without passing through `socket(2)`, so seccomp never
+/// sees its family.  The filter refuses the ring itself with `ENOSYS` (the
+/// answer of a kernel built without io_uring, which libuv, tokio, and glibc
+/// users already fall back on), so no box can open a socket the seal would
+/// refuse through it (NET-137).  425 on every architecture's table,
+/// the compat ones included (the unified numbering new syscalls share).
+#[cfg(target_os = "linux")]
+const SYS_IO_URING_SETUP: i64 = libc::SYS_io_uring_setup;
+#[cfg(target_os = "linux")]
+const COMPAT_SYS_IO_URING_SETUP: u32 = 425; // __NR_io_uring_setup, i386 and arm EABI
 /// The 32-bit multiplexed socket entry point.  The filter returns `ENOSYS`
 /// for its socket-creating sub-calls on the compat ABI because seccomp cannot
 /// read their address-family argument (it sits behind a pointer), so a compat
@@ -2930,8 +2941,12 @@ const SOCKETCALL_SOCKETPAIR: u32 = 8;
 /// NET-083, not by this filter).  Within the netlink family only the
 /// `NETLINK_ROUTE` protocol is admitted — the protocols a box needs to
 /// configure its own namespace's interfaces — and every other netlink
-/// protocol is refused with the seal's `EAFNOSUPPORT`.  No family that
-/// reaches past the namespace survives either seal.
+/// protocol is refused with `EPROTONOSUPPORT`, the kernel's own answer for
+/// a netlink protocol it does not provide, so a caller never reads the
+/// refusal as netlink itself missing.  `io_uring_setup(2)`, the one path
+/// that creates sockets without `socket(2)`, is refused with `ENOSYS` on
+/// both ABIs.  No family that reaches past the namespace survives either
+/// seal.
 ///
 /// This program is the first instalment of the seccomp profile applied
 /// inside boxes (architecture.md AT9, open gap 2): the family list is
@@ -2940,6 +2955,11 @@ const SOCKETCALL_SOCKETPAIR: u32 = 8;
 fn build_socket_family_filter(seal: network::SocketSeal) -> SocketFamilyFilter {
     // Return EAFNOSUPPORT for a socket() or socketpair() the seal refuses.
     let refuse_action = libc::SECCOMP_RET_ERRNO | (libc::EAFNOSUPPORT as u32);
+    // Return EPROTONOSUPPORT for an admitted family's refused protocol: the
+    // netlink protocols other than NETLINK_ROUTE.  The kernel answers the
+    // same for a netlink protocol it does not provide, whereas EAFNOSUPPORT
+    // would tell the caller netlink as a whole is missing.
+    let proto_refuse_action = libc::SECCOMP_RET_ERRNO | (libc::EPROTONOSUPPORT as u32);
     // Return the default allow action when the syscall is not one we restrict
     // or when the address family is allowed.
     let allow_action = libc::SECCOMP_RET_ALLOW;
@@ -3017,21 +3037,22 @@ fn build_socket_family_filter(seal: network::SocketSeal) -> SocketFamilyFilter {
     let socket_verdict = |socket_nr: u32, socketpair_nr: u32| {
         // Plain families cost one comparison and one allow return; the
         // netlink entry costs four — family match, protocol load, protocol
-        // comparison, allow return.  The refuse return ends the tail, so its
-        // index tells every refusal jump where to land.
+        // comparison, allow return.  The family refuse return follows the
+        // entries and the protocol refuse return follows it, so its index
+        // tells every refusal jump where to land.
         let netlink_entry_extra = if admitted.contains(&(libc::AF_NETLINK as u32)) {
             2
         } else {
             0
         };
         let refuse_index = 3 + 2 * admitted.len() + netlink_entry_extra;
-        let total = refuse_index + 2;
+        let total = refuse_index + 3;
         let mut tail = vec![
             // socket() -> load arg0; else -> check socketpair.
             jeq(socket_nr, 1, 0),
             // socketpair() -> load arg0; anything else jumps past the whole
             // verdict tail to the default allow — one skip per verdict pair,
-            // four for the netlink entry, plus the refuse and allow returns.
+            // four for the netlink entry, plus the two refuse returns.
             jeq(
                 socketpair_nr,
                 0,
@@ -3054,9 +3075,10 @@ fn build_socket_family_filter(seal: network::SocketSeal) -> SocketFamilyFilter {
                 tail.push(jeq(*family, 0, 3));
                 // Load arg2 (the netlink protocol).
                 tail.push(load(OFFSET_ARG2));
-                // route -> the allow return; other protocols -> the refuse
-                // return that ends the tail.
-                let jf = u8::try_from(refuse_index - pos - 3).expect("seccomp jump offset fits u8");
+                // route -> the allow return; other protocols -> the protocol
+                // refuse return, one past the family refuse return.
+                let jf =
+                    u8::try_from(refuse_index + 1 - pos - 3).expect("seccomp jump offset fits u8");
                 tail.push(jeq(libc::NETLINK_ROUTE as u32, 0, jf));
             } else {
                 // family matches -> the allow return; anything else falls
@@ -3067,6 +3089,9 @@ fn build_socket_family_filter(seal: network::SocketSeal) -> SocketFamilyFilter {
         }
         // The seal's verdict for every family it does not admit, EAFNOSUPPORT.
         tail.push(ret(refuse_action));
+        // The verdict for a netlink protocol other than the route protocol,
+        // EPROTONOSUPPORT.
+        tail.push(ret(proto_refuse_action));
         // The default allow for every syscall that creates no socket.
         tail.push(ret(allow_action));
         // The jump offsets above assume AF_NETLINK appears at most once in
@@ -3084,8 +3109,10 @@ fn build_socket_family_filter(seal: network::SocketSeal) -> SocketFamilyFilter {
     //   1: native ABI -> native block
     //   2: compat ABI -> compat block
     //   3: kill (a truly foreign ABI: its numbers would mean other syscalls)
-    //   native block: load nr, x32 guard (x86_64), native socket verdict
-    //   compat block: load nr, socketcall(SOCKET|SOCKETPAIR) -> ENOSYS,
+    //   native block: load nr, x32 guard (x86_64), io_uring_setup -> ENOSYS,
+    //                 native socket verdict
+    //   compat block: load nr, io_uring_setup -> ENOSYS,
+    //                 socketcall(SOCKET|SOCKETPAIR) -> ENOSYS,
     //                 compat socket verdict
     //
     // Each ABI is judged against its own syscall table: the compat ABI's
@@ -3103,10 +3130,16 @@ fn build_socket_family_filter(seal: network::SocketSeal) -> SocketFamilyFilter {
         });
         native.push(ret(kill_action));
     }
+    // io_uring_setup() -> ENOSYS; else -> the socket verdict.
+    native.push(jeq(SYS_IO_URING_SETUP as u32, 0, 1));
+    native.push(ret(enosys_action));
     native.extend(socket_verdict(SYS_SOCKET as u32, SYS_SOCKETPAIR as u32));
 
     let mut compat: Vec<libc::sock_filter> = vec![
         load(OFFSET_NR),
+        // io_uring_setup() -> ENOSYS; else -> the socketcall dispatch.
+        jeq(COMPAT_SYS_IO_URING_SETUP, 0, 1),
+        ret(enosys_action),
         // socketcall(2) -> load its call number; else -> the compat socket
         // verdict past the sub-call dispatch.
         jeq(COMPAT_SYS_SOCKETCALL, 0, 5),
@@ -3205,11 +3238,11 @@ pub fn socket_family_filter_for_none_box() -> &'static SocketFamilyFilter {
 /// Returns a pointer to the built-in confined-families socket-family filter:
 /// it admits the families the box's own network namespace confines — unix,
 /// inet, inet6, netlink (the `NETLINK_ROUTE` protocol only), packet — and
-/// refuses everything else, other netlink protocols included, with
-/// `EAFNOSUPPORT`, `AF_VSOCK` (the family that reaches the host whatever
-/// network namespace the caller sits in) included, so an own-address or
-/// host-address box keeps its inet sockets and cannot reach past its
-/// namespace.
+/// refuses the other netlink protocols with `EPROTONOSUPPORT` and every
+/// other family with `EAFNOSUPPORT`, `AF_VSOCK` (the family that reaches the
+/// host whatever network namespace the caller sits in) included, so an
+/// own-address or host-address box keeps its inet sockets and cannot reach
+/// past its namespace.
 #[cfg(target_os = "linux")]
 #[must_use]
 pub fn socket_family_filter_for_confined_families() -> &'static SocketFamilyFilter {
@@ -4088,38 +4121,43 @@ ff02::2\tip6-allrouters
 
     /// The sockets the filter's live-kernel behaviour is probed for, in the
     /// order the probe child reports them: one `socket()` per entry, with the
-    /// family, type, and protocol the probe passes.  The netlink probes cover
-    /// the seal's protocol split — `NETLINK_ROUTE` is admitted, the host-global
-    /// audit, connector, and uevent protocols are not.
+    /// family, type, and protocol the probe passes, and whether the seals
+    /// under test admit it.  The netlink probes cover the seal's protocol
+    /// split — `NETLINK_ROUTE` is admitted, the host-global audit, connector,
+    /// and uevent protocols are not.
     #[cfg(target_os = "linux")]
-    const PROBED_SOCKETS: [(&str, i32, i32, i32); 8] = [
-        ("AF_UNIX", libc::AF_UNIX, libc::SOCK_STREAM, 0),
-        ("AF_INET", libc::AF_INET, libc::SOCK_STREAM, 0),
-        ("AF_INET6", libc::AF_INET6, libc::SOCK_STREAM, 0),
-        ("AF_VSOCK", libc::AF_VSOCK, libc::SOCK_STREAM, 0),
+    const PROBED_SOCKETS: [(&str, i32, i32, i32, bool); 8] = [
+        ("AF_UNIX", libc::AF_UNIX, libc::SOCK_STREAM, 0, true),
+        ("AF_INET", libc::AF_INET, libc::SOCK_STREAM, 0, true),
+        ("AF_INET6", libc::AF_INET6, libc::SOCK_STREAM, 0, true),
+        ("AF_VSOCK", libc::AF_VSOCK, libc::SOCK_STREAM, 0, false),
         (
             "NETLINK_ROUTE",
             libc::AF_NETLINK,
             libc::SOCK_RAW,
             libc::NETLINK_ROUTE,
+            true,
         ),
         (
             "NETLINK_AUDIT",
             libc::AF_NETLINK,
             libc::SOCK_RAW,
             libc::NETLINK_AUDIT,
+            false,
         ),
         (
             "NETLINK_CONNECTOR",
             libc::AF_NETLINK,
             libc::SOCK_RAW,
             libc::NETLINK_CONNECTOR,
+            false,
         ),
         (
             "NETLINK_KOBJECT_UEVENT",
             libc::AF_NETLINK,
             libc::SOCK_RAW,
             libc::NETLINK_KOBJECT_UEVENT,
+            false,
         ),
     ];
 
@@ -4127,6 +4165,30 @@ ff02::2\tip6-allrouters
     /// production filter first when one is supplied, and returns one errno
     /// byte per probe: `0` when the child created that socket, the raw errno
     /// otherwise.
+    #[cfg(target_os = "linux")]
+    fn probe_socket_families_in_child(
+        filter: Option<&'static SocketFamilyFilter>,
+    ) -> std::io::Result<[u8; 8]> {
+        probe_in_child(filter, || {
+            let mut report = [0u8; 8];
+            for (i, &(_, family, ty, protocol, _)) in PROBED_SOCKETS.iter().enumerate() {
+                // SAFETY: `socket(2)` reads only its arguments.
+                let fd = unsafe { libc::socket(family, ty, protocol) };
+                report[i] = if fd >= 0 {
+                    // SAFETY: `close(2)` consumes the descriptor just created.
+                    unsafe { libc::close(fd) };
+                    0
+                } else {
+                    std::io::Error::last_os_error().raw_os_error().unwrap_or(1) as u8
+                };
+            }
+            report
+        })
+    }
+
+    /// Runs `probe` in a forked child, installing the given production
+    /// filter first when one is supplied, and returns the report the child
+    /// wrote back.
     ///
     /// The child runs only async-signal-safe calls between the fork and its
     /// `_exit` (`prctl`, the raw `seccomp` syscall, `socket`, `close`, `write`,
@@ -4134,10 +4196,11 @@ ff02::2\tip6-allrouters
     /// installed in; the parent owns every assertion, so a failure is reported
     /// with the test's own messages rather than a bare child exit code.
     #[cfg(target_os = "linux")]
-    fn probe_socket_families_in_child(
+    fn probe_in_child<const N: usize>(
         filter: Option<&'static SocketFamilyFilter>,
-    ) -> std::io::Result<[u8; 8]> {
-        let mut report = [0u8; 8];
+        probe: fn() -> [u8; N],
+    ) -> std::io::Result<[u8; N]> {
+        let mut report = [0u8; N];
         let mut fds = [0; 2];
         // SAFETY: `pipe(2)` writes two descriptors into `fds` and reads no
         // memory of ours beyond it; the result is checked.
@@ -4152,7 +4215,7 @@ ff02::2\tip6-allrouters
             return Err(std::io::Error::last_os_error());
         }
         if pid == 0 {
-            // Child: the production filter, then one errno byte per family.
+            // Child: the production filter, then the probe's report.
             // SAFETY: the descriptors are the pipe's own ends.
             unsafe { libc::close(fds[0]) };
             if let Some(filter) = filter {
@@ -4164,17 +4227,7 @@ ff02::2\tip6-allrouters
                     unsafe { libc::_exit(127) };
                 }
             }
-            for (i, &(_, family, ty, protocol)) in PROBED_SOCKETS.iter().enumerate() {
-                // SAFETY: `socket(2)` reads only its arguments.
-                let fd = unsafe { libc::socket(family, ty, protocol) };
-                report[i] = if fd >= 0 {
-                    // SAFETY: `close(2)` consumes the descriptor just created.
-                    unsafe { libc::close(fd) };
-                    0
-                } else {
-                    std::io::Error::last_os_error().raw_os_error().unwrap_or(1) as u8
-                };
-            }
+            report = probe();
             // SAFETY: `write(2)` reads `report`, which outlives the call, and
             // `_exit(2)` never returns, so the child ends here.
             unsafe {
@@ -4208,14 +4261,14 @@ ff02::2\tip6-allrouters
         }
         if !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != 0 {
             return Err(std::io::Error::other(format!(
-                "the socket-family probe child exited with status {status} \
+                "the seccomp probe child exited with status {status} \
                  (127 means installing the filter failed, so this host cannot \
                  install the seal at all)"
             )));
         }
         if filled != report.len() {
             return Err(std::io::Error::other(format!(
-                "the socket-family probe child reported {filled} of {} bytes",
+                "the seccomp probe child reported {filled} of {} bytes",
                 report.len()
             )));
         }
@@ -4420,6 +4473,7 @@ ff02::2\tip6-allrouters
             )
         };
         let refuse = libc::SECCOMP_RET_ERRNO | (libc::EAFNOSUPPORT as u32);
+        let proto_refuse = libc::SECCOMP_RET_ERRNO | (libc::EPROTONOSUPPORT as u32);
         let enosys = libc::SECCOMP_RET_ERRNO | (libc::ENOSYS as u32);
         // AUDIT_ARCH_S390: a truly foreign arch the filter must still kill.
         const FOREIGN_ARCH: u32 = 0x8000_0016;
@@ -4440,8 +4494,8 @@ ff02::2\tip6-allrouters
             "socket(AF_UNIX) must stay allowed"
         );
         // Netlink is admitted for the route protocol alone; the host-global
-        // audit, connector, and uevent protocols must meet the same refusal
-        // as a refused family.
+        // audit, connector, and uevent protocols get the kernel's answer for
+        // a protocol it does not provide, not the refused-family errno.
         for protocol in [
             libc::NETLINK_AUDIT,
             libc::NETLINK_CONNECTOR,
@@ -4449,8 +4503,8 @@ ff02::2\tip6-allrouters
         ] {
             assert_eq!(
                 run_proto(libc::SYS_socket, AUDIT_ARCH, libc::AF_NETLINK, protocol),
-                refuse,
-                "socket(AF_NETLINK, {protocol}) must fail with EAFNOSUPPORT"
+                proto_refuse,
+                "socket(AF_NETLINK, {protocol}) must fail with EPROTONOSUPPORT"
             );
         }
         assert_eq!(
@@ -4472,8 +4526,8 @@ ff02::2\tip6-allrouters
                 libc::AF_NETLINK,
                 libc::NETLINK_AUDIT
             ),
-            refuse,
-            "the compat ABI must refuse NETLINK_AUDIT with EAFNOSUPPORT"
+            proto_refuse,
+            "the compat ABI must refuse NETLINK_AUDIT with EPROTONOSUPPORT"
         );
         assert_eq!(
             run_proto(
@@ -4494,8 +4548,8 @@ ff02::2\tip6-allrouters
                 libc::AF_NETLINK,
                 libc::NETLINK_AUDIT
             ),
-            refuse,
-            "socketpair(AF_NETLINK, NETLINK_AUDIT) must fail with EAFNOSUPPORT"
+            proto_refuse,
+            "socketpair(AF_NETLINK, NETLINK_AUDIT) must fail with EPROTONOSUPPORT"
         );
         assert_eq!(
             run_proto(
@@ -4631,16 +4685,16 @@ ff02::2\tip6-allrouters
         ] {
             assert_eq!(
                 errno,
-                libc::EAFNOSUPPORT as u8,
-                "the filter must refuse {name} with EAFNOSUPPORT"
+                libc::EPROTONOSUPPORT as u8,
+                "the filter must refuse {name} with EPROTONOSUPPORT"
             );
         }
         // Where the control child could create the socket at all, the filter
         // is what refused it; where the kernel never could, the refusal above
         // matches what the kernel already answers and says so, so a missing
         // driver on the host is never mistaken for the seal working.
-        for (i, (name, ..)) in PROBED_SOCKETS.iter().enumerate().skip(1) {
-            if unfiltered[i] != 0 {
+        for (i, &(name, .., admitted)) in PROBED_SOCKETS.iter().enumerate() {
+            if !admitted && unfiltered[i] != 0 {
                 eprintln!(
                     "note: this kernel creates no {name} sockets (errno {}), \
                      so the filtered refusal matches what it already answers",
@@ -4698,6 +4752,7 @@ ff02::2\tip6-allrouters
             ("none", network::NetPlan::none(), network::SocketSeal::Full),
         ];
         let refuse = libc::SECCOMP_RET_ERRNO | (libc::EAFNOSUPPORT as u32);
+        let proto_refuse = libc::SECCOMP_RET_ERRNO | (libc::EPROTONOSUPPORT as u32);
         for (name, plan, seal) in plans {
             assert_eq!(plan.to_string(), name, "the plan under test");
             assert_eq!(plan.seal(), seal, "plan {name} must run under its seal");
@@ -4809,9 +4864,9 @@ ff02::2\tip6-allrouters
             ] {
                 assert_eq!(
                     run_proto(libc::SYS_socket, AUDIT_ARCH, libc::AF_NETLINK, protocol),
-                    refuse,
+                    proto_refuse,
                     "{name}: socket(AF_NETLINK, {protocol}) must fail with \
-                     EAFNOSUPPORT — the host-global protocols reach past \
+                     EPROTONOSUPPORT — the host-global protocols reach past \
                      the namespace"
                 );
             }
@@ -4833,8 +4888,8 @@ ff02::2\tip6-allrouters
                     libc::AF_NETLINK,
                     libc::NETLINK_AUDIT
                 ),
-                refuse,
-                "{name}: the compat ABI must refuse NETLINK_AUDIT with EAFNOSUPPORT"
+                proto_refuse,
+                "{name}: the compat ABI must refuse NETLINK_AUDIT with EPROTONOSUPPORT"
             );
             if seal == network::SocketSeal::ConfinedFamilies {
                 assert_eq!(
@@ -4894,18 +4949,97 @@ ff02::2\tip6-allrouters
         ] {
             assert_eq!(
                 errno,
-                libc::EAFNOSUPPORT as u8,
-                "the confined-families seal must refuse {name} with EAFNOSUPPORT"
+                libc::EPROTONOSUPPORT as u8,
+                "the confined-families seal must refuse {name} with EPROTONOSUPPORT"
             );
         }
-        for (i, (name, ..)) in PROBED_SOCKETS.iter().enumerate().skip(1) {
-            if unfiltered[i] != 0 {
+        for (i, &(name, .., admitted)) in PROBED_SOCKETS.iter().enumerate() {
+            if !admitted && unfiltered[i] != 0 {
                 eprintln!(
                     "note: this kernel creates no {name} sockets (errno {}), \
                      so the filtered refusal matches what it already answers",
                     unfiltered[i]
                 );
             }
+        }
+    }
+
+    /// NET-137's io_uring clause.  Since Linux 5.19 an `IORING_OP_SOCKET`
+    /// creates a socket without passing through `socket(2)`, so the family
+    /// rule above never sees it; every seal therefore refuses the ring
+    /// itself — `io_uring_setup(2)` answers `ENOSYS`, as a kernel without
+    /// io_uring would — on the native and the compat ABI alike, while the
+    /// syscalls around it stay untouched.  The shipped filters are then
+    /// installed against the live kernel, with an unfiltered control child
+    /// as the witness for what the kernel answers on its own.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn box_io_uring_socket_refused() {
+        let enosys = libc::SECCOMP_RET_ERRNO | (libc::ENOSYS as u32);
+        for seal in [
+            network::SocketSeal::Full,
+            network::SocketSeal::UnixOnly,
+            network::SocketSeal::ConfinedFamilies,
+        ] {
+            let filter = socket_family_filter_for_seal(seal);
+            let run =
+                |nr: i64, arch: u32| run_seccomp_program(&filter.program, nr as u32, arch, 0, 0);
+            assert_eq!(
+                run(SYS_IO_URING_SETUP, AUDIT_ARCH),
+                enosys,
+                "{seal}: io_uring_setup must fail with ENOSYS — a ring creates \
+                 sockets the family rule never judges"
+            );
+            assert_eq!(
+                run(i64::from(COMPAT_SYS_IO_URING_SETUP), COMPAT_AUDIT_ARCH),
+                enosys,
+                "{seal}: compat io_uring_setup must fail with ENOSYS"
+            );
+            assert_eq!(
+                run(libc::SYS_read, AUDIT_ARCH),
+                libc::SECCOMP_RET_ALLOW,
+                "{seal}: a syscall that creates no socket must stay allowed"
+            );
+        }
+
+        // One io_uring_setup(2) per child, a single-entry ring with zeroed
+        // parameters: `0` when the kernel built the ring, the errno
+        // otherwise.  The parameter block is `struct io_uring_params`, 120
+        // bytes, which the kernel reads and writes back.
+        fn probe_io_uring() -> [u8; 1] {
+            let mut params = [0u64; 15];
+            // SAFETY: `io_uring_setup(2)` reads and writes the 120-byte
+            // parameter block `params` owns, which outlives the call.
+            let fd = unsafe { libc::syscall(SYS_IO_URING_SETUP, 1u32, params.as_mut_ptr()) };
+            if fd >= 0 {
+                // SAFETY: `close(2)` consumes the ring descriptor just created.
+                unsafe { libc::close(fd as i32) };
+                [0]
+            } else {
+                [std::io::Error::last_os_error().raw_os_error().unwrap_or(1) as u8]
+            }
+        }
+        let [unfiltered] =
+            probe_in_child(None, probe_io_uring).expect("running the unfiltered io_uring probe");
+        if unfiltered != 0 {
+            eprintln!(
+                "note: this kernel builds no io_uring ring unfiltered (errno {unfiltered}), \
+                 so the filtered refusal below is checked against a kernel that \
+                 already refuses it"
+            );
+        }
+        for filter in [
+            socket_family_filter_for_none_box(),
+            socket_family_filter_for_confined_families(),
+        ] {
+            let [filtered] = probe_in_child(Some(filter), probe_io_uring)
+                .expect("running the filtered io_uring probe");
+            assert_eq!(
+                filtered,
+                libc::ENOSYS as u8,
+                "{}: the filter must refuse io_uring_setup with ENOSYS",
+                filter.seal
+            );
         }
     }
 
