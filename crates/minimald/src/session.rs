@@ -1172,10 +1172,13 @@ impl Session {
             let switch = self.net_switch.lock().await;
             (switch.subnet(), switch.serving_hostname_proxy_port())
         };
-        let hostname_proxy_port = if wait_for_verdict {
-            crate::net::hostname_proxy_serving_port(&self.net_switch).await
-        } else {
-            settled_port
+        // Only an `OwnIp` box carries the opening: a `HostNet` one never
+        // waits for it.
+        let hostname_proxy_port = match record.network {
+            sessions::NetworkMode::OwnIp if wait_for_verdict => {
+                crate::net::hostname_proxy_serving_port(&self.net_switch).await
+            }
+            _ => settled_port,
         };
         match record.network {
             sessions::NetworkMode::OwnIp => {
