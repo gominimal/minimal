@@ -1962,7 +1962,7 @@ impl BoxRegistry {
             next_switch_addr: Arc::new(AtomicU32::new(hand_out_run(subnet).0)),
             #[cfg(test)]
             next_loopback_addr: Arc::new(AtomicU32::new(
-                loopback_slice.map_or(0, |slice| u32::from(slice.first())),
+                loopback_slice.map_or(0, |slice| box_loopback_run(slice).0),
             )),
             loopback_slice,
             attachments: None,
@@ -2536,12 +2536,9 @@ impl BoxRegistry {
         let slice = self
             .loopback_slice
             .ok_or(AllocationError::UnplannedSubnet(self.subnet))?;
-        let loopback_addr = take_next(
-            &self.next_loopback_addr,
-            u32::from(slice.first()),
-            u32::from(slice.last()),
-        )
-        .ok_or(AllocationError::LoopbackExhausted)?;
+        let (first, last) = box_loopback_run(slice);
+        let loopback_addr = take_next(&self.next_loopback_addr, first, last)
+            .ok_or(AllocationError::LoopbackExhausted)?;
         self.register_client_box_at(spec, loopback_addr)
     }
 
@@ -3140,6 +3137,27 @@ impl BoxRegistry {
             revoking: Arc::clone(&self.revoking),
         }
     }
+}
+
+/// The run of published loopback addresses a box may take inside `slice`:
+/// the slice clamped to the reserved local range's interior. The range's
+/// network address, `.1` and its broadcast address are never a box's — a
+/// slice that starts at or ends on one of them keeps it out of a box's
+/// hands too.
+///
+/// That interior is the answerer's own hand-out run
+/// (`minimald::net::answerer`'s `box_address_range`, restated against the
+/// range's one definition in the switch crate so the two cannot drift);
+/// this run is the tests' single-node cursor clamped to it, so a test box
+/// never holds an address the answerer would refuse.
+#[cfg(test)]
+fn box_loopback_run(slice: switch::LoopbackSlice) -> (u32, u32) {
+    let (network, prefix) = switch::RESERVED_LOCAL_RANGE;
+    let size = 1u32 << (32 - u32::from(prefix));
+    let range_first = u32::from(network);
+    let first = u32::from(slice.first()).max(range_first + 2);
+    let last = u32::from(slice.last()).min(range_first + size - 2);
+    (first, last)
 }
 
 /// Takes the next unspent address from `cursor`, when `first..=last` still
@@ -3816,6 +3834,89 @@ mod tests {
                 "exhaustion is explicit and never wraps"
             );
         }
+    }
+
+    /// Design §7.1, the loopback run a box may take: the reserved local
+    /// range's `.2` to its last-but-one address, never its network
+    /// address, `.1` or its broadcast — the answerer's own hand-out run,
+    /// restated for the single-node cursor. Pinned on both ends: the
+    /// reserved local range's default slice and its last.
+    #[test]
+    fn client_boxes_take_only_the_range_s_interior() {
+        // The default plan's slice starts at the range's network address,
+        // and a box takes none of it: its first loopback is the run's.
+        let registry = BoxRegistry::new(SUBNET);
+        let first = registry
+            .register_client_box(ClientBoxSpec {
+                name: "web".to_string(),
+                ingress_ports: Vec::new(),
+                egress: None,
+                credentialed_upstream: None,
+                dynamic_ingress: None,
+                dynamic_allowed_range: None,
+            })
+            .expect("the default plan has published addresses");
+        assert_eq!(
+            first.loopback_addr(),
+            Ipv4Addr::new(127, 0, 64, 2),
+            "the first box takes the run's first address, never the range's \
+             network address nor .1"
+        );
+
+        // The last slice ends on the range's broadcast address, and a box
+        // takes none of that either: its last address is the run's, and a
+        // further box is refused as before.
+        let last = SwitchSubnet::new(Ipv4Addr::new(100, 64, 7, 0), 24).expect("valid");
+        assert!(
+            switch::AddressPlan::default()
+                .loopback_slice_for_switch(last)
+                .is_some(),
+            "the last slice's subnet is planned, so the refusal below is a \
+             run's exhaustion, not the plan's absence"
+        );
+        let registry = BoxRegistry::new(last);
+        for index in 0..30 {
+            registry
+                .register_client_box(ClientBoxSpec {
+                    name: format!("box{index}"),
+                    ingress_ports: Vec::new(),
+                    egress: None,
+                    credentialed_upstream: None,
+                    dynamic_ingress: None,
+                    dynamic_allowed_range: None,
+                })
+                .expect("the last slice hands out 30 addresses below its last");
+        }
+        assert_eq!(
+            registry
+                .register_client_box(ClientBoxSpec {
+                    name: "last".to_string(),
+                    ingress_ports: Vec::new(),
+                    egress: None,
+                    credentialed_upstream: None,
+                    dynamic_ingress: None,
+                    dynamic_allowed_range: None,
+                })
+                .expect("the last slice holds one more published address")
+                .loopback_addr(),
+            Ipv4Addr::new(127, 0, 64, 254),
+            "the last box takes the run's last address, never the range's \
+             broadcast"
+        );
+        assert!(
+            matches!(
+                registry.register_client_box(ClientBoxSpec {
+                    name: "late".to_string(),
+                    ingress_ports: Vec::new(),
+                    egress: None,
+                    credentialed_upstream: None,
+                    dynamic_ingress: None,
+                    dynamic_allowed_range: None,
+                }),
+                Err(AllocationError::LoopbackExhausted)
+            ),
+            "exhaustion stays explicit and never wraps"
+        );
     }
 
     /// BEP-070, one id names one box, so a registration whose minted id a
