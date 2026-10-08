@@ -1158,14 +1158,25 @@ impl Session {
         // §7.1): resolved through the serving transition (see
         // [`crate::net::hostname_proxy_serving_port`]) so a registration
         // racing the proxy's detached startup cannot compile the seeded —
-        // possibly relocated (NET-025) — port into the node's opening.
+        // possibly relocated (NET-025) — port into the node's opening. Only a
+        // registration that may wait (`wait_for_verdict`) waits for it: the
+        // others run inside the manager's own message handling, where a
+        // wait would park every other session's operation, so they read the
+        // port only if it is already settled and fail closed otherwise. What
+        // that withholds is the caller check's reach to the node address at
+        // the proxy's own port — a proxied request back at the proxy — never
+        // the box's relay opening, which the attach path resolves itself.
         // Scoped: the switch lock is dropped before the registry is taken, so
         // no path holds both.
-        let subnet = {
+        let (subnet, settled_port) = {
             let switch = self.net_switch.lock().await;
-            switch.subnet()
+            (switch.subnet(), switch.serving_hostname_proxy_port())
         };
-        let hostname_proxy_port = crate::net::hostname_proxy_serving_port(&self.net_switch).await;
+        let hostname_proxy_port = if wait_for_verdict {
+            crate::net::hostname_proxy_serving_port(&self.net_switch).await
+        } else {
+            settled_port
+        };
         match record.network {
             sessions::NetworkMode::OwnIp => {
                 // NET-010/NET-011: finalize publishes the box's declaration

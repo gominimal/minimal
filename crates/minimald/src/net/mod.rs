@@ -450,12 +450,20 @@ pub struct SwitchClient {
     /// Whether that port is safe to compile a box's opening from: `false`
     /// from construction until [`Self::set_hostname_proxy_port`] records
     /// the port the proxy actually bound — the transition
-    /// [`hostname_proxy_serving_port`] waits for — because the seeded port
+    /// [`hostname_proxy_serving_port`] waits for — because a seeded default
     /// is only the bind's *request*, which the OS may relocate when busy
     /// (NET-025), and a box compiled against it would point its node
     /// address's opening at whatever unrelated host process holds the
-    /// reselected port (design §7.1).
+    /// reselected port (design §7.1). A seed that cannot relocate (a pinned
+    /// port, NET-024) is final from construction
+    /// ([`Self::with_hostname_proxy_port_final`]).
     hostname_proxy_serving: bool,
+    /// How many boxes [`hostname_proxy_serving_port`] compiled with no
+    /// opening because the proxy was still not serving past its settle:
+    /// said again, with the remedy, when the serving transition lands
+    /// ([`Self::set_hostname_proxy_port`] hands the count back and clears
+    /// it), since those boxes keep their openingless rules until they restart.
+    hostname_proxy_stranded: usize,
 }
 
 impl SwitchClient {
@@ -487,6 +495,7 @@ impl SwitchClient {
             host_id: crate::net::dns::DEFAULT_HOST_ID.to_owned(),
             hostname_proxy_port: None,
             hostname_proxy_serving: false,
+            hostname_proxy_stranded: 0,
         }
     }
 
@@ -515,6 +524,16 @@ impl SwitchClient {
         self
     }
 
+    /// Marks the seeded port as final: one the proxy's bind can never
+    /// relocate (a pinned port, NET-024 — the startup retries it rather than
+    /// moving), so a box may compile its opening from it at once instead of
+    /// waiting for the bind.
+    #[must_use]
+    pub fn with_hostname_proxy_port_final(mut self, is_final: bool) -> Self {
+        self.hostname_proxy_serving |= is_final;
+        self
+    }
+
     /// The hostname proxy's port this switch's boxes are compiled with, or
     /// `None` when none is known.
     #[must_use]
@@ -522,15 +541,27 @@ impl SwitchClient {
         self.hostname_proxy_port
     }
 
+    /// The port a box may compile its opening from right now, without
+    /// waiting: the port once it is final or the proxy serves on it, `None`
+    /// before then (fail closed, design §7.1).
+    #[must_use]
+    pub fn serving_hostname_proxy_port(&self) -> Option<u16> {
+        self.hostname_proxy_port
+            .filter(|_| self.hostname_proxy_serving)
+    }
+
     /// Re-points the port this switch's boxes are compiled with to the port
-    /// the proxy actually bound, called once its startup retry has it serving
-    /// (see [`crate::net::switch::compiled_egress`]): an OS-selected port
-    /// replaces the configured/default opening the switch was built with.
-    /// This call is also the serving transition: from it on, the port is
-    /// one a box may compile its node address's opening from.
-    pub fn set_hostname_proxy_port(&mut self, port: Option<u16>) {
+    /// the proxy actually bound, called once its startup has bound it and
+    /// spawned its serve loop (see [`crate::net::switch::compiled_egress`]):
+    /// an OS-selected port replaces the configured/default opening the
+    /// switch was built with. This call is also the serving transition: from
+    /// it on, the port is one a box may compile its node address's opening
+    /// from. Returns how many boxes attached openingless before it (see
+    /// [`hostname_proxy_serving_port`]), clearing the count.
+    pub fn set_hostname_proxy_port(&mut self, port: Option<u16>) -> usize {
         self.hostname_proxy_port = port;
         self.hostname_proxy_serving = true;
+        std::mem::take(&mut self.hostname_proxy_stranded)
     }
 
     /// Sets how PTask taps reach the switch. The DM2 default is
@@ -897,22 +928,24 @@ const HOSTNAME_PROXY_SERVE_POLL: std::time::Duration = std::time::Duration::from
 pub(crate) async fn hostname_proxy_serving_port(switch: &Arc<Mutex<SwitchClient>>) -> Option<u16> {
     let deadline = tokio::time::Instant::now() + HOSTNAME_PROXY_SERVE_WAIT;
     loop {
-        let switch = switch.lock().await;
+        let mut switch = switch.lock().await;
         let port = switch.hostname_proxy_port();
-        let serving = switch.hostname_proxy_serving;
-        drop(switch);
-        if serving || port.is_none() {
+        if switch.hostname_proxy_serving || port.is_none() {
             return port;
         }
         if tokio::time::Instant::now() >= deadline {
+            switch.hostname_proxy_stranded += 1;
+            drop(switch);
             tracing::warn!(
                 ?port,
                 "the hostname proxy is not serving yet; a box attaching now is \
                  compiled with no node-address opening rather than against \
-                 the port it was seeded with (design §7.1)"
+                 the port it was seeded with (design §7.1), and cannot reach \
+                 the hostname proxy until it restarts once the proxy serves"
             );
             return None;
         }
+        drop(switch);
         tokio::time::sleep(HOSTNAME_PROXY_SERVE_POLL).await;
     }
 }
@@ -1327,5 +1360,42 @@ mod tests {
         ));
         serving.lock().await.set_hostname_proxy_port(Some(41913));
         assert_eq!(hostname_proxy_serving_port(&serving).await, Some(41913));
+
+        // The box that failed closed above is counted, and the serving
+        // transition hands the count back once (for its remedy line).
+        assert_eq!(seeded.lock().await.set_hostname_proxy_port(Some(41914)), 1);
+        assert_eq!(seeded.lock().await.set_hostname_proxy_port(Some(41914)), 0);
+
+        // A final seed (a pinned port, which never relocates) answers at
+        // once, with no settle wait.
+        let pinned = Arc::new(tokio::sync::Mutex::new(
+            SwitchClient::new("/nonexistent/gvproxy-binary", "/run/minimal/gvproxy")
+                .with_hostname_proxy_port(Some(7654))
+                .with_hostname_proxy_port_final(true),
+        ));
+        let start = tokio::time::Instant::now();
+        assert_eq!(hostname_proxy_serving_port(&pinned).await, Some(7654));
+        assert_eq!(start.elapsed(), std::time::Duration::ZERO);
+    }
+
+    /// The race itself: a box that starts attaching while the proxy is
+    /// still unbound waits, and the bind landing mid-wait — relocated off
+    /// the seed — hands it the bound port, never the seed.
+    #[tokio::test(start_paused = true)]
+    async fn a_waiting_attach_takes_the_port_bound_mid_wait() {
+        use std::sync::Arc;
+
+        let switch = Arc::new(tokio::sync::Mutex::new(
+            SwitchClient::new("/nonexistent/gvproxy-binary", "/run/minimal/gvproxy")
+                .with_hostname_proxy_port(Some(7654)),
+        ));
+        let waiter = tokio::spawn({
+            let switch = Arc::clone(&switch);
+            async move { hostname_proxy_serving_port(&switch).await }
+        });
+        tokio::time::sleep(HOSTNAME_PROXY_SERVE_POLL * 3).await;
+        assert!(!waiter.is_finished(), "the attach waits for the bind");
+        assert_eq!(switch.lock().await.set_hostname_proxy_port(Some(41913)), 0);
+        assert_eq!(waiter.await.expect("waiter"), Some(41913));
     }
 }
