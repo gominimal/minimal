@@ -4,5 +4,5 @@
 # (trimmed: --no-default-features --features blk,net).
 # `commit` is the resolved commit of `version` at pin time; the build fetches
 # the commit, so a moved/deleted tag cannot change what we build.
-version=v1.19.4
-commit=728df8125077d0db44265f6e997c72b81b65c015
+version=v1.19.6
+commit=227b2de6ed323fe180e02f871c5f325a90c13cc2

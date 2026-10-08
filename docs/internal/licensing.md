@@ -66,7 +66,7 @@ decoupled from it in #721.
 The macOS (darwin/arm64) release artifacts redistribute two prebuilt
 Apache-2.0 components, pinned in `vendor/`:
 
-- libkrun v1.19.4 (`vendor/libkrun/libkrun.lock`), shipped as
+- libkrun v1.19.6 (`vendor/libkrun/libkrun.lock`), distributed as
   `libkrun.1.dylib`, https://github.com/containers/libkrun
 - gvproxy v0.8.9 from gvisor-tap-vsock
   (`vendor/gvproxy/gvproxy.lock`),

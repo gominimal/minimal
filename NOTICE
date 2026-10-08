@@ -9,7 +9,7 @@ Third-party attributions
 The macOS (darwin/arm64) release artifacts redistribute the following
 third-party components:
 
-  * libkrun (v1.19.4), shipped as libkrun.1.dylib
+  * libkrun (v1.19.6), shipped as libkrun.1.dylib
     Licensed under the Apache License, Version 2.0
     https://github.com/containers/libkrun
 
