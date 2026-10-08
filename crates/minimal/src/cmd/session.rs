@@ -1233,9 +1233,8 @@ pub(crate) async fn activate_session(
         // hook configures), the answerer-bound proof this start holds — the
         // daemon's report on a native host, this CLI's own query on a
         // VM-backed one — and the reserved range on this host's own
-        // loopback. `None` — the answerer not bound — prints nothing: no
-        // native surface to name, and the ports have told the proxy's
-        // story. The proxy's half is said with the native arm either way
+        // loopback. `None` — the answerer not bound — prints the proxy's
+        // line: there is no native surface to name. The proxy's half is said with the native arm either way
         // (NET-019): the `HTTP(S)_PROXY` recipes this activation prints keep
         // working beside native DNS, so nothing already captured goes stale.
         //
@@ -1276,6 +1275,24 @@ pub(crate) async fn activate_session(
             eprintln!(
                 "{}",
                 crate::resolver::name_surface_line(verdict.surface, created.hostname_proxy_port)
+            );
+        } else {
+            // The answerer is reported but not bound yet: no native surface
+            // to name, so the proxy is the live one, and its line carries the
+            // `min net setup` pointer NET-122 owes every start on a host not
+            // set up.
+            tracing::info!(
+                surface = ?crate::resolver::LiveSurface::Proxy,
+                answerer_bound = false,
+                answerer_port = answerer_port,
+                "session start decided the live name surface for this host"
+            );
+            eprintln!(
+                "{}",
+                crate::resolver::name_surface_line(
+                    crate::resolver::LiveSurface::Proxy,
+                    created.hostname_proxy_port,
+                )
             );
         }
     }

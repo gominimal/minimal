@@ -37,13 +37,7 @@ pub async fn cmd_net_setup(global: &GlobalArgs, args: NetSetupArgs) -> Result<()
     if args.undo {
         return cmd_net_setup_undo(args.print);
     }
-    let listings = match ls_listings(global).await {
-        Ok(listings) => listings,
-        Err(err) => {
-            tracing::debug!("min net setup: no daemon listing: {err:#}");
-            Vec::new()
-        }
-    };
+    let listings = ls_listings_best_effort(global).await;
     let mut answerer = None;
     let mut held_no_channel = None;
     for listing in &listings {
