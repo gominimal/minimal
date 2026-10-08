@@ -4134,6 +4134,274 @@ async fn a_restarted_daemon_re_derives_the_box_s_address_from_the_answerer() {
     );
 }
 
+/// The session that owns `name`'s route in `server`'s registry, if any.
+#[cfg(target_os = "linux")]
+async fn route_owner(server: &TestServer, name: &str) -> Option<String> {
+    server
+        .state
+        .sessions_manager()
+        .await
+        .hostnames()
+        .read()
+        .expect("registry lock")
+        .resolve(name)
+        .map(|route| route.session().to_owned())
+}
+
+/// Stops every session the way a daemon going down does (records kept),
+/// then boots a second server on the same state root. The harness never
+/// runs `Server::run`, so nothing on the new server is resumed yet.
+#[cfg(target_os = "linux")]
+async fn restart(server: TestServer, client: TestClient) -> TestServer {
+    server
+        .state
+        .sessions_manager()
+        .await
+        .shutdown(true)
+        .await
+        .expect("a forced shutdown has nothing left to refuse it");
+    drop(client);
+    TestServer::new_in(server.into_state_dir()).await
+}
+
+/// A restarted daemon routes the names of the active sessions it restored
+/// as soon as it resumes them, with no RPC naming either session first.
+/// Resuming is idempotent: a second resume starts nothing, and an RPC that
+/// names a resumed session finds its actor instead of registering again.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restarted_daemon_routes_restored_sessions_names_without_an_rpc() {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let alpha = create_configured_session(&mut client, "restored-alpha", "/uwu").await;
+    create_configured_session(&mut client, "restored-beta", "/uwu").await;
+    assert_eq!(
+        route_owner(&server, "restored-alpha.min.internal").await,
+        Some("restored-alpha".to_owned()),
+        "the name routes at the first daemon"
+    );
+
+    let server = restart(server, client).await;
+    let manager = server.state.sessions_manager().await;
+    assert_eq!(
+        route_owner(&server, "restored-alpha.min.internal").await,
+        None,
+        "before the resume the restored session's name is unregistered"
+    );
+
+    let resumed = manager.enqueue_resume_active_sessions().await;
+    assert_eq!(
+        manager.running_count().await,
+        2,
+        "a message sent after the enqueue returns is served after the resume"
+    );
+    assert_eq!(
+        resumed.await.unwrap(),
+        2,
+        "both active sessions are resumed"
+    );
+    for name in ["restored-alpha", "restored-beta"] {
+        assert_eq!(
+            route_owner(&server, &format!("{name}.min.internal")).await,
+            Some(name.to_owned()),
+            "{name}'s name routes after the resume, with no RPC naming it"
+        );
+    }
+
+    assert_eq!(
+        manager.resume_active_sessions().await.unwrap(),
+        0,
+        "a second resume starts nothing"
+    );
+    manager
+        .get_session(crate::sessions::SessionKeyPredicate::Id(alpha))
+        .await
+        .unwrap()
+        .expect("the resumed session resolves");
+    assert_eq!(
+        manager.running_count().await,
+        2,
+        "an RPC naming a resumed session reuses its actor"
+    );
+    assert_eq!(
+        route_owner(&server, "restored-alpha.min.internal").await,
+        Some("restored-alpha".to_owned()),
+        "the name still routes to its own session"
+    );
+}
+
+/// One restored session whose actor cannot start costs only its own name:
+/// the resume logs it and goes on, and the other session still routes.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restored_session_that_fails_to_resume_does_not_stop_the_others() {
+    let capture = crate::test_harness::captured_log();
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let broken = create_configured_session(&mut client, "resume-broken", "/uwu").await;
+    create_configured_session(&mut client, "resume-healthy", "/uwu").await;
+    let home = session_paths(&server, broken).await.home;
+
+    let server = restart(server, client).await;
+    // A file where the session's home directory belongs: the actor's
+    // bring-up cannot create its directories, so it fails to start.
+    std::fs::remove_dir_all(home.as_utf8_path()).unwrap();
+    std::fs::write(home.as_utf8_path(), b"not a directory").unwrap();
+
+    let manager = server.state.sessions_manager().await;
+    assert_eq!(
+        manager.resume_active_sessions().await.unwrap(),
+        1,
+        "only the healthy session is resumed"
+    );
+    assert_eq!(
+        route_owner(&server, "resume-healthy.min.internal").await,
+        Some("resume-healthy".to_owned()),
+        "the healthy session's name routes"
+    );
+    assert_eq!(
+        route_owner(&server, "resume-broken.min.internal").await,
+        None,
+        "the broken session's name stays unregistered"
+    );
+    let logged = capture.contents();
+    assert!(
+        logged
+            .lines()
+            .any(|line| line.contains("could not start the session's actor")
+                && line.contains("session_name=\"resume-broken\"")),
+        "the failed resume is logged naming the session, got: {logged}"
+    );
+}
+
+/// Two restored sessions whose box names fold to one hostname (two unnamed
+/// sessions whose project directories' basenames differ only in case): the
+/// resume routes the name for one of them and skips the other with a
+/// collision warning, rather than letting the second registration take the
+/// route over.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restored_hostname_collision_is_logged_and_skipped() {
+    use minimald_rpc::{CreateSession, Errorable, FinalizeSession, FinalizeSessionRequest};
+
+    let capture = crate::test_harness::captured_log();
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    for project in ["/x/FoldApp", "/y/foldapp"] {
+        let mut request = crate::test_harness::create_session_req("unused", project);
+        request.config.name = None;
+        let id = client.call::<CreateSession>(&request).await.unwrap().id;
+        crate::test_harness::unwrap_ready(
+            client
+                .call::<minimald_rpc::ConfigureLoadout>(&minimald_rpc::ConfigureLoadoutRequest {
+                    session_id: id,
+                    contribution: Default::default(),
+                })
+                .await
+                .unwrap(),
+        );
+        match client
+            .call::<FinalizeSession>(&FinalizeSessionRequest { session_id: id })
+            .await
+        {
+            Errorable::Ok(_) => {}
+            Errorable::Err { error } => panic!("FinalizeSession failed: {error}"),
+        }
+    }
+
+    let server = restart(server, client).await;
+    let manager = server.state.sessions_manager().await;
+    assert_eq!(
+        manager.resume_active_sessions().await.unwrap(),
+        1,
+        "only one of the colliding sessions is resumed"
+    );
+    let owner = route_owner(&server, "foldapp.min.internal")
+        .await
+        .expect("the folded name routes for one of the sessions");
+    assert!(
+        owner == "FoldApp" || owner == "foldapp",
+        "the name routes to one of the colliding sessions, got {owner}"
+    );
+    let logged = capture.contents();
+    assert!(
+        logged
+            .lines()
+            .any(|line| line.contains("hostname-collision")
+                && line.contains("resume:")
+                && line.contains(&format!("owner=\"{owner}\""))),
+        "the skipped session is logged as a collision, got: {logged}"
+    );
+}
+
+/// Two restored sessions that share one registry name *outright* — two
+/// unnamed sessions whose project directories share a basename, the pair
+/// the store's name-uniqueness check never sees, since it only runs for
+/// assigned names. The check keys on the session id, not the name: an
+/// owner carrying the same name string is not this session, so the resume
+/// routes the name for one of them, skips the other with a collision
+/// warning, and never lets the second registration take the first's
+/// route over — which would move the name with no warning at all, both
+/// registrations being under the same name.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restored_session_sharing_another_sessions_registry_name_is_skipped() {
+    use minimald_rpc::{CreateSession, Errorable, FinalizeSession, FinalizeSessionRequest};
+
+    let capture = crate::test_harness::captured_log();
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    for project in ["/a/twins", "/b/twins"] {
+        let mut request = crate::test_harness::create_session_req("unused", project);
+        request.config.name = None;
+        let id = client.call::<CreateSession>(&request).await.unwrap().id;
+        crate::test_harness::unwrap_ready(
+            client
+                .call::<minimald_rpc::ConfigureLoadout>(&minimald_rpc::ConfigureLoadoutRequest {
+                    session_id: id,
+                    contribution: Default::default(),
+                })
+                .await
+                .unwrap(),
+        );
+        match client
+            .call::<FinalizeSession>(&FinalizeSessionRequest { session_id: id })
+            .await
+        {
+            Errorable::Ok(_) => {}
+            Errorable::Err { error } => panic!("FinalizeSession failed: {error}"),
+        }
+    }
+
+    let server = restart(server, client).await;
+    let manager = server.state.sessions_manager().await;
+    assert_eq!(
+        manager.resume_active_sessions().await.unwrap(),
+        1,
+        "only one of the name-sharing sessions is resumed"
+    );
+    assert_eq!(
+        manager.running_count().await,
+        1,
+        "the skipped session never starts an actor, so its registration \
+         cannot take the resumed one's route over"
+    );
+    assert_eq!(
+        route_owner(&server, "twins.min.internal").await,
+        Some("twins".to_owned()),
+        "the shared name routes for the one resumed session"
+    );
+    let logged = capture.contents();
+    assert!(
+        logged
+            .lines()
+            .any(|line| line.contains("hostname-collision")
+                && line.contains("resume:")
+                && line.contains("owner=\"twins\"")),
+        "the skipped session is logged as a collision, got: {logged}"
+    );
+}
+
 /// NET-013 inside the deferred probe's window, without the wait §7.1 keeps
 /// for a first finalize. A microVM daemon cannot measure the range its
 /// publishes bind on — the host's loopback, a machine the guest cannot see —
