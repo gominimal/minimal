@@ -202,6 +202,7 @@ async fn a_shell_exit_reaches_the_binding_with_the_reaped_exit_reason() {
             control: None,
             delta: None,
             archives_dir: std::env::temp_dir(),
+            holds_host_row: false,
             session_id: sessions::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
@@ -261,6 +262,7 @@ async fn a_stalled_binding_does_not_wedge_the_host_loop() {
             control: None,
             delta: None,
             archives_dir: std::env::temp_dir(),
+            holds_host_row: false,
             session_id: sessions::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
@@ -410,6 +412,7 @@ impl FloodedAttach {
                 control: None,
                 delta: None,
                 archives_dir: std::env::temp_dir(),
+                holds_host_row: false,
                 session_id: sessions::SessionId::nil(),
                 composition: None,
                 connection_env: ConnectionEnv::new(),
@@ -664,6 +667,7 @@ async fn a_shell_exit_hands_the_binding_the_codes_that_leave_mouse_mode() {
             control: None,
             delta: None,
             archives_dir: std::env::temp_dir(),
+            holds_host_row: false,
             session_id: sessions::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
@@ -726,6 +730,7 @@ async fn unwind_codes_narrow_to_what_the_screen_actually_set() {
             control: None,
             delta: None,
             archives_dir: std::env::temp_dir(),
+            holds_host_row: false,
             session_id: sessions::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
@@ -776,6 +781,7 @@ async fn a_kill_tells_the_binding_nothing() {
             control: None,
             delta: None,
             archives_dir: std::env::temp_dir(),
+            holds_host_row: false,
             session_id: sessions::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
@@ -818,6 +824,7 @@ async fn reap_log_host(name: &str) -> (Host<MockProcess, ()>, HostHandle) {
             control: None,
             delta: None,
             archives_dir: std::env::temp_dir(),
+            holds_host_row: false,
             session_id: sessions::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
@@ -1292,6 +1299,7 @@ async fn get_attrs_tracks_title_and_io_times() {
             control: None,
             delta: None,
             archives_dir: std::env::temp_dir(),
+            holds_host_row: false,
             session_id: sessions::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
@@ -1369,6 +1377,7 @@ async fn kill_tears_down_host_and_reaps_process() {
             control: None,
             delta: None,
             archives_dir: std::env::temp_dir(),
+            holds_host_row: false,
             session_id: sessions::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
@@ -1474,6 +1483,7 @@ async fn exit_releases_the_network() {
             control: None,
             delta: None,
             archives_dir: std::env::temp_dir(),
+            holds_host_row: false,
             session_id: sessions::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
@@ -1529,6 +1539,7 @@ async fn detach_keystroke_holds_the_session_and_network() {
             control: None,
             delta: None,
             archives_dir: std::env::temp_dir(),
+            holds_host_row: false,
             session_id: sessions::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
@@ -1631,6 +1642,7 @@ async fn stale_binding_generation_input_is_discarded() {
             control: None,
             delta: None,
             archives_dir: std::env::temp_dir(),
+            holds_host_row: false,
             session_id: sessions::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
@@ -1762,6 +1774,7 @@ async fn hook_injections_carry_the_session_s_none_box_seal() {
                 control: None,
                 delta: None,
                 archives_dir: std::env::temp_dir(),
+                holds_host_row: false,
                 session_id: sessions::SessionId::nil(),
                 composition: Some(bare_composition()),
                 connection_env: ConnectionEnv::new(),
@@ -3336,7 +3349,7 @@ async fn launch_refuses_unenforceable_host_ip_declaration_after_host_gains_per_b
     );
 
     let capture = crate::test_harness::captured_log();
-    const REFUSAL: &str = "cannot enforce the rules this box's declaration names";
+    const REFUSAL: &str = "host_ip boxes on this host enforce only deny-all egress";
     // The box's declaration: the narrowing a per-box host has no verdict for,
     // in the CLI's own spelling of `--deny-subnets`.
     let narrowing = sessions::SessionPolicy::new(
@@ -3420,12 +3433,12 @@ async fn launch_refuses_unenforceable_host_ip_declaration_after_host_gains_per_b
         "the launch's refusal names the rule it refused over: {refusal}"
     );
     assert!(
-        refusal.contains("own-address boxes enforce them"),
+        refusal.contains("which enforces them"),
         "the launch's refusal says own-address boxes enforce these rules, \
          the same words the create's would have said: {refusal}"
     );
     assert!(
-        refusal.contains("remove these rules"),
+        refusal.contains("Remove them"),
         "the launch's refusal ends with what to do, the same remedy the \
          create's would have named: {refusal}"
     );
@@ -6237,6 +6250,7 @@ async fn ask_expose_without_a_binding_answers_no_one() {
             control: None,
             delta: None,
             archives_dir: std::env::temp_dir(),
+            holds_host_row: false,
             session_id: sessions::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
@@ -6797,4 +6811,61 @@ async fn ask_yes_publish_withdraws_on_unexpose() {
         .expect("the stop finishes")
         .expect("the stop task should not panic");
     forwarder.abort();
+}
+
+/// Renders the shell-exit prompt with Enter answering it (the Keep item,
+/// listed first) and returns what reached the terminal.
+async fn rendered_shell_exit_prompt(holds_host_row: bool) -> String {
+    let mut out: Vec<u8> = Vec::new();
+    let disposition = Binding::shell_exit_prompt(
+        None,
+        None,
+        &std::env::temp_dir(),
+        "box",
+        holds_host_row,
+        &b"\r"[..],
+        &mut out,
+    )
+    .await;
+    assert_eq!(
+        disposition,
+        ExitDisposition::Kept,
+        "Enter takes the Keep item"
+    );
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// A registered box's Keep item says what keeping it leaves (NET-138): the
+/// files, and only a destroy, because its network registration ended with
+/// the shell. An unregistered box's prompt is unchanged.
+#[tokio::test]
+async fn shell_exit_keep_item_names_the_ended_registration_for_a_registered_box() {
+    let registered = rendered_shell_exit_prompt(true).await;
+    assert!(
+        registered.contains(
+            "Exit, keeping the session's files. Its network registration ended with the \
+             shell, so you can only destroy this session, not attach to it or run commands \
+             in it."
+        ),
+        "the registered box's Keep item; got: {registered:?}"
+    );
+    assert!(
+        !registered.contains(SHELL_EXIT_KEEP),
+        "the recoverable wording is not offered to a registered box; got: {registered:?}"
+    );
+
+    let unregistered = rendered_shell_exit_prompt(false).await;
+    assert!(
+        unregistered.contains("Exit, leaving the session filesystem in place and recoverable"),
+        "an unregistered box keeps its Keep item; got: {unregistered:?}"
+    );
+    assert!(
+        !unregistered.contains("network registration ended"),
+        "an unregistered box's prompt is unchanged; got: {unregistered:?}"
+    );
+    let delete = "Delete, all in-session files permanently deleted";
+    assert!(
+        registered.contains(delete) && unregistered.contains(delete),
+        "both prompts keep the Delete item"
+    );
 }

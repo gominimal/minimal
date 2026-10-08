@@ -231,6 +231,18 @@ pub struct ListSessionsEntry {
     /// other surfaces read as "not a host-address session".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_ip_enforcement: Option<HostIpEnforcement>,
+    /// The declared ingress ports this box yields because another box at the
+    /// same shared loopback address holds them (NET-129, first-come), one
+    /// entry per port naming the holding box: the same registry read
+    /// [`SessionRuntimeFacts::shared_port_collisions`] answers from, so a
+    /// listing and the policy view cannot disagree. Serde-defaulted, so an
+    /// entry from a daemon that predates the field decodes as empty, and
+    /// omitted when empty, so the common entry is unchanged on the wire.
+    /// Neither this entry nor [`ListSessionsResponse`] is
+    /// `deny_unknown_fields`, so a client that predates the field ignores a
+    /// populated list rather than refusing the listing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shared_port_collisions: Vec<SharedPortCollision>,
 }
 
 /// The git state of a session's project path, probed by the client on the
@@ -637,7 +649,23 @@ pub struct RegisterBoxRequest {
     /// carries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dynamic_allowed_range: Option<(u16, u16)>,
+    /// Whether the registration is held as a lease until its client
+    /// commits it. With `hold`, the daemon writes the reply and keeps the
+    /// connection open: the client writes one `commit` line once its
+    /// session is active, and a close or an error before that line
+    /// withdraws the row, so an activation that dies between registering
+    /// and committing leaves no row holding its name. A client that omits
+    /// the field, or a daemon that predates it, keeps the one-shot
+    /// registration: one line each way, and the row lives until its
+    /// creator withdraws it.
+    #[serde(default)]
+    pub hold: bool,
 }
+
+/// The one line a held registration's client writes on the lease
+/// connection once its session is active ([`RegisterBoxRequest::hold`]):
+/// from then on the row stays when the connection closes.
+pub const REGISTRATION_COMMIT_LINE: &str = "commit";
 
 /// The withdrawal a destroyed session's client sends for the row its
 /// activation registered: the name the row went by and the pair the
@@ -1643,6 +1671,21 @@ pub struct FinalizeSession;
 pub struct FinalizeSessionRequest {
     /// The session to finalize.
     pub session_id: SessionId,
+    /// The client decodes [`FinalizeSessionResponse::shared_port_collisions`],
+    /// so the daemon may fill it. [`FinalizeSessionResponse`] is
+    /// `deny_unknown_fields`: a client built before that field would refuse a
+    /// reply carrying it and abort the activation, so the daemon reports the
+    /// list only to a client that asks. Serde-defaulted, so an older client's
+    /// request reads as `false`, and omitted when `false`, so the request an
+    /// older daemon reads is unchanged — it ignores the key either way.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub report_shared_port_collisions: bool,
+}
+
+/// Serde helper: omit a `false` request flag, so the request matches the one
+/// a client that predates the flag sends.
+fn is_false(v: &bool) -> bool {
+    !*v
 }
 
 /// The response for a [`FinalizeSession`] RPC.
@@ -1673,6 +1716,28 @@ pub struct FinalizeSessionResponse {
     /// client.
     #[serde(default, skip_serializing_if = "package_check_skipped_is_false")]
     pub package_check_skipped: bool,
+    /// One entry per declared ingress port another box at the same shared
+    /// address already holds, so this box's attach yields it (first-come):
+    /// the port, and the box that holds it. The box still activates and
+    /// serves its other ports; the client warns so the operator knows the
+    /// declared mapping is served by the holding box, not this one.
+    /// Serde-defaulted, so a reply from a daemon that predates the field
+    /// decodes as empty; filled only when the request set
+    /// [`FinalizeSessionRequest::report_shared_port_collisions`], because
+    /// this struct is `deny_unknown_fields` and a client that predates the
+    /// field would refuse the reply.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shared_port_collisions: Vec<SharedPortCollision>,
+}
+
+/// A declared ingress port the box yields because another box at the same
+/// shared loopback address holds it, as the finalize reply reports it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SharedPortCollision {
+    /// The port both boxes declared and the holding box serves.
+    pub port: u16,
+    /// The holding box's name, as the warning names it.
+    pub held_by: String,
 }
 
 /// Serde helper: omit [`FinalizeSessionResponse::package_check_skipped`]
@@ -2116,6 +2181,14 @@ pub struct SessionRuntimeFacts {
     /// be read back — the same states
     /// [`ListSessionsEntry::host_ip_enforcement`] names.
     pub host_ip_enforcement: Option<HostIpEnforcement>,
+    /// The declared ingress ports this box's attach yields because another
+    /// box at the same shared loopback address holds them (first-come):
+    /// one entry per port, naming the holding box. Serde-defaulted and
+    /// omitted when empty, so a daemon that predates the field still
+    /// answers to an older client; a client that cannot ask reads the
+    /// same silence an empty list reads as.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shared_port_collisions: Vec<SharedPortCollision>,
 }
 
 impl OneshotSshRpc for GetSessionRuntimeFacts {
@@ -2504,6 +2577,91 @@ mod tests {
         let back: FinalizeSessionResponse =
             serde_json_lenient::from_str(&wire).expect("must decode");
         assert!(back.package_check_skipped);
+    }
+
+    /// `shared_port_collisions` is omitted from the wire when empty, so a
+    /// client that predates the field still decodes the common success
+    /// payload; when a port was yielded it is present, naming the port and
+    /// the box that holds it so the client can warn.
+    #[test]
+    fn shared_port_collisions_are_omitted_when_empty() {
+        let wire = serde_json_lenient::to_string(&FinalizeSessionResponse::default())
+            .expect("must serialize");
+        assert!(
+            !wire.contains("shared_port_collisions"),
+            "an empty collision list must not be serialized, got {wire:?}"
+        );
+
+        let yielded = FinalizeSessionResponse {
+            shared_port_collisions: vec![SharedPortCollision {
+                port: 8080,
+                held_by: "first.min.internal".to_string(),
+            }],
+            ..Default::default()
+        };
+        let wire = serde_json_lenient::to_string(&yielded).expect("must serialize");
+        assert!(
+            wire.contains("shared_port_collisions"),
+            "a yielded port must be serialized, got {wire:?}"
+        );
+        let back: FinalizeSessionResponse =
+            serde_json_lenient::from_str(&wire).expect("must decode");
+        assert_eq!(
+            back.shared_port_collisions,
+            vec![SharedPortCollision {
+                port: 8080,
+                held_by: "first.min.internal".to_string(),
+            }],
+            "the collision list must round-trip"
+        );
+    }
+
+    /// A client and a daemon on either side of the
+    /// `report_shared_port_collisions` flag still finalize. An older
+    /// client's request (no flag) reads as not asking, so a newer daemon
+    /// leaves the collision list off a reply that client's
+    /// `deny_unknown_fields` type would refuse; a newer client's request
+    /// that does not ask is byte-for-byte the older one; and a newer
+    /// client that asks still decodes an older daemon's reply, which has
+    /// no list, as empty.
+    #[test]
+    fn finalize_collision_report_survives_version_skew_both_ways() {
+        let id = SessionId::nil();
+        let older_request = format!(r#"{{"session_id":"{}"}}"#, id.as_ref());
+        let decoded: FinalizeSessionRequest =
+            serde_json_lenient::from_str(&older_request).expect("an older request must decode");
+        assert!(
+            !decoded.report_shared_port_collisions,
+            "an older client never asked for the list"
+        );
+
+        let not_asking = FinalizeSessionRequest {
+            session_id: id,
+            report_shared_port_collisions: false,
+        };
+        assert_eq!(
+            serde_json_lenient::to_string(&not_asking).expect("must serialize"),
+            older_request,
+            "a request that does not ask is the one an older client sends"
+        );
+
+        let asking = FinalizeSessionRequest {
+            session_id: id,
+            report_shared_port_collisions: true,
+        };
+        let wire = serde_json_lenient::to_string(&asking).expect("must serialize");
+        assert!(
+            wire.contains("report_shared_port_collisions"),
+            "a request that asks says so: {wire}"
+        );
+
+        let older_reply: Errorable<FinalizeSessionResponse> =
+            serde_json_lenient::from_str("{}").expect("an older daemon's reply must decode");
+        assert_eq!(
+            older_reply,
+            Errorable::Ok(FinalizeSessionResponse::default()),
+            "an older daemon's reply reads as no collisions"
+        );
     }
 
     /// An empty request body must decode with the documented defaults so a
@@ -3127,6 +3285,7 @@ mod tests {
         let facts = SessionRuntimeFacts {
             id: SessionId::nil(),
             host_ip_enforcement: Some(HostIpEnforcement::None),
+            shared_port_collisions: Vec::new(),
         };
         assert_eq!(round_trip(&facts), facts);
         match serde_json_lenient::from_str::<Errorable<SessionRuntimeFacts>>(
@@ -3149,6 +3308,7 @@ mod tests {
                 SessionRuntimeFacts {
                     id: SessionId::nil(),
                     host_ip_enforcement: Some(HostIpEnforcement::PerBox),
+                    shared_port_collisions: Vec::new(),
                 },
                 "the facts this client knows decode beside a key it does not"
             ),
@@ -3399,6 +3559,71 @@ mod tests {
             }))
         );
         assert_eq!(round_trip(&with), with);
+    }
+
+    /// NET-129's listing half survives version skew both ways without a
+    /// request flag, because neither [`ListSessionsResponse`] nor
+    /// [`ListSessionsEntry`] is `deny_unknown_fields`. A newer daemon's
+    /// populated entry carries one key more than an older client knows, and
+    /// these types skip a key they do not know — shown here with a key this
+    /// build does not know either, the position an older client is in. An
+    /// older daemon's entry carries no list and decodes as empty, and an
+    /// empty list stays off the wire.
+    #[test]
+    fn list_sessions_shared_port_collisions_survive_version_skew_both_ways() {
+        let entry = |collisions: Vec<SharedPortCollision>| ListSessionsEntry {
+            id: SessionId::nil(),
+            name: Some("second".to_string()),
+            project_path: None,
+            status: sessions::SessionStatus::Active,
+            git: None,
+            attrs: None,
+            host_ip_enforcement: None,
+            shared_port_collisions: collisions,
+        };
+        let response = |sessions| ListSessionsResponse {
+            resource_pool: None,
+            sessions,
+            daemon_version: None,
+            hostname_routing_unavailable: None,
+            hostname_proxy_port: None,
+            zone_answerer_port: None,
+            answerer_bound: false,
+        };
+
+        let quiet = serde_json_lenient::to_string(&response(vec![entry(Vec::new())]))
+            .expect("must serialize");
+        assert!(
+            !quiet.contains("shared_port_collisions"),
+            "an empty list must not be serialized, got {quiet}"
+        );
+
+        let yielded = entry(vec![SharedPortCollision {
+            port: 8080,
+            held_by: "first.min.internal".to_string(),
+        }]);
+        let mut wire =
+            serde_json_lenient::to_value(response(vec![yielded.clone()])).expect("serializes");
+        assert_eq!(
+            wire["sessions"][0]["shared_port_collisions"],
+            serde_json_lenient::json!([{"port": 8080, "held_by": "first.min.internal"}]),
+            "a yielded port is listed under its wire key: {wire}"
+        );
+
+        // A newer daemon's reply, one key past what this build knows: still
+        // decodes, so an older client's listing survives a populated list.
+        wire["sessions"][0]["a_later_field"] = serde_json_lenient::json!([1]);
+        wire["a_later_field"] = serde_json_lenient::json!(true);
+        let newer: ListSessionsResponse =
+            serde_json_lenient::from_value(wire).expect("unknown keys are ignored");
+        assert_eq!(newer.sessions, vec![yielded]);
+
+        // An older daemon's entry: no list, decoded as empty.
+        let older: ListSessionsResponse = serde_json_lenient::from_str(
+            r#"{"sessions":[{"id":"00000000-0000-0000-0000-000000000000","name":"second","attrs":null}]}"#,
+        )
+        .expect("a pre-field entry must decode");
+        assert!(older.sessions[0].shared_port_collisions.is_empty());
     }
 
     /// The port-report verbs (NET-138) round-trip as the fixed, size-bounded
