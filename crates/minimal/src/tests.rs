@@ -1021,14 +1021,30 @@ fn net_setup_parses_to_the_setup_command() {
     assert!(matches!(
         cli.command,
         Some(Command::Net(NetArgs {
-            command: NetCommand::Setup(NetSetupArgs { print: false })
+            command: NetCommand::Setup(NetSetupArgs {
+                print: false,
+                undo: false
+            })
         }))
     ));
     let cli = Cli::try_parse_from(["min", "net", "setup", "--print"]).unwrap();
     assert!(matches!(
         cli.command,
         Some(Command::Net(NetArgs {
-            command: NetCommand::Setup(NetSetupArgs { print: true })
+            command: NetCommand::Setup(NetSetupArgs {
+                print: true,
+                undo: false
+            })
+        }))
+    ));
+    let cli = Cli::try_parse_from(["min", "net", "setup", "--undo", "--print"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Some(Command::Net(NetArgs {
+            command: NetCommand::Setup(NetSetupArgs {
+                print: true,
+                undo: true
+            })
         }))
     ));
 }

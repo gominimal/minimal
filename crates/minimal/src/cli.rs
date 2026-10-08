@@ -981,7 +981,7 @@ pub enum NetCommand {
     /// installed or configured on the remote side. Stays in the foreground
     /// and closes with the session.
     Forward(NetForwardArgs),
-    /// Set this host up to resolve and reach boxes by name (runs one privileged command; `--print` only prints it)
+    /// Set this host up to resolve and reach boxes by name (runs one privileged script; `--print` only prints it, `--undo` removes it)
     Setup(NetSetupArgs),
 }
 
@@ -999,9 +999,12 @@ pub struct NetForwardArgs {
 
 #[derive(Debug, Args)]
 pub struct NetSetupArgs {
-    /// Print the command instead of running it
+    /// Print the setup script instead of running it
     #[arg(long)]
     pub print: bool,
+    /// Remove everything the setup step installs on this host (with --print, print the removal script)
+    #[arg(long)]
+    pub undo: bool,
 }
 
 #[derive(Debug, Args)]

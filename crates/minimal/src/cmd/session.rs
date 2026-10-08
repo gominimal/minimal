@@ -231,12 +231,10 @@ pub(crate) fn control_sock_beside(ssh_sock: &std::path::Path) -> Option<std::pat
         .map(|dir| dir.join(minvmd::control::CONTROL_SOCK_FILE))
 }
 
-/// The host reads the resolver advisory is decided from (NET-122): this
+/// The host reads `min net setup` decides its script from (NET-122): this
 /// host's resolver detection and its answerer service step, read together,
 /// with the control sockets the step asks to release the hook port recorded
-/// for the render. Shared by the session start and `min net setup`, so the
-/// command a start points at and the command it runs come from the same
-/// reads.
+/// for the render.
 pub(crate) async fn advisory_host_reads(
     global: &GlobalArgs,
 ) -> (
@@ -274,43 +272,6 @@ pub(crate) async fn advisory_host_reads(
     };
     crate::resolver::set_handover_controls(controls);
     (detection, answerer_step)
-}
-
-/// The hint a one-line advisory ends with: the command that runs the full
-/// one's command.
-const NET_SETUP_HINT: &str = "Run `min net setup` to configure it.";
-
-/// The advisory text a session start prints (NET-122): the advisory whole
-/// when the start is interactive, [`short_advisory`] otherwise. Pure, so
-/// the tests assert both forms without capturing stderr.
-pub(crate) fn start_advisory_text(advisory: &str, interactive: bool) -> String {
-    if interactive {
-        advisory.to_string()
-    } else {
-        short_advisory(advisory)
-    }
-}
-
-/// The one-line form of an advisory: its first line, the `note: <facts>.`
-/// a full advisory starts with, without the trailing "… with:" lead-in
-/// sentence that introduces the command block, followed by
-/// [`NET_SETUP_HINT`]. An advisory with no command block (a blocker names
-/// no command) is already one line and is kept as it is: there is no
-/// command for `min net setup` to run.
-pub(crate) fn short_advisory(advisory: &str) -> String {
-    let mut lines = advisory.lines();
-    let first = lines.next().unwrap_or_default().trim_end();
-    if lines.next().is_none() {
-        return first.to_string();
-    }
-    let facts = if first.ends_with(" with:") {
-        // The lead-in is the last sentence; the facts end at the period
-        // before it.
-        first.rfind(". ").map_or(first, |end| &first[..=end])
-    } else {
-        first
-    };
-    format!("{facts} {NET_SETUP_HINT}")
 }
 
 /// The machine's zone-answerer state, read from the VM host daemon's
@@ -1265,66 +1226,30 @@ pub(crate) async fn activate_session(
             crate::resolver::name_surface_line(surface, created.hostname_proxy_port)
         );
     } else if let Some(answerer_port) = answerer_port {
-        // The answerer service's step (NET-122's host service) is read
-        // beside the detection on every hooked host, VM-backed and native
-        // alike: whether the zone is manager-held or held only while a
-        // session holds it, and whether the installed copy speaks this
-        // daemon's channel protocol — the native daemon publishes into the
-        // same machine-global channel a VM host daemon does, so the same
-        // service is the one to hand its zone to.
-        let (detection, answerer_step) = advisory_host_reads(global).await;
         // NET-018: name the live surface at the moment the user is about to
         // rely on the names — decided in the one function both verbs share
-        // (`resolver`), from the same detection the advisory reads: this
-        // host's hook (and the stub-bypass blocker that says whether its
-        // lookups consult what the hook configures), the answerer-bound
-        // proof this start holds — the daemon's report on a native host,
-        // this CLI's own query on a VM-backed one — and the reserved range
-        // on this host's own loopback. Decided before the advisory prints
-        // only so the range its read holds can be the advisory's too — one
-        // probe, one host — while the printed order stays the advisory's
-        // and then the surface's. `None` — the answerer not bound — prints
-        // nothing: no native surface to name, and the ports and the
-        // advisory have told the proxy's story. The proxy's half is said
-        // with the native arm either way (NET-019): the `HTTP(S)_PROXY`
-        // recipes this activation prints keep working beside native DNS,
-        // so nothing already captured goes stale.
+        // (`resolver`), from this host's detection: its hook (and the
+        // stub-bypass blocker that says whether its lookups consult what the
+        // hook configures), the answerer-bound proof this start holds — the
+        // daemon's report on a native host, this CLI's own query on a
+        // VM-backed one — and the reserved range on this host's own
+        // loopback. `None` — the answerer not bound — prints nothing: no
+        // native surface to name, and the ports have told the proxy's
+        // story. The proxy's half is said with the native arm either way
+        // (NET-019): the `HTTP(S)_PROXY` recipes this activation prints keep
+        // working beside native DNS, so nothing already captured goes stale.
+        //
+        // Host DNS is opt-in (NET-122): the start never prints the
+        // privileged step. While the host is not set up the proxy is the
+        // live surface, and its line names `min net setup`, which prints or
+        // runs the step from its own reads of the host.
+        let detection = crate::resolver::session_detection().await;
         let surface_verdict = crate::resolver::live_name_surface_with_range_at(
             &detection,
             Some(answerer_port),
             answerer_bound,
         )
         .await;
-        // The advisory shares that verdict's range read: the daemon's
-        // interim flag is not this host's range fact — on a VM-backed host
-        // it reads the guest's loopback, which always carries the range —
-        // so a hook that routes over a loopback that lacks the range is
-        // told the range is what is missing, not left with a silent
-        // advisory beside a verdict that names the proxy for exactly that.
-        let name_advisory = crate::resolver::session_advisory_at(
-            &detection,
-            Some(answerer_port),
-            created.interim_loopback,
-            surface_verdict
-                .as_ref()
-                .and_then(|verdict| verdict.range_present),
-            &answerer_step,
-        );
-        if let Some(advisory) = &name_advisory {
-            // NET-122: whole, with the exact command, on an interactive
-            // start, after a blank line so the note and its command block
-            // stand apart from the lines above them. Any other start gets
-            // one line: it repeats on every activation, and the command
-            // block would bury the session's own errors. The one line keeps
-            // the facts and names `min net setup`, which runs the same
-            // command from the same host reads.
-            let interactive = !args.no_prompt && should_announce_session(global);
-            if interactive {
-                eprintln!("\n{}", start_advisory_text(advisory, true));
-            } else {
-                eprintln!("{}", start_advisory_text(advisory, false));
-            }
-        }
         if let Some(verdict) = surface_verdict {
             // The host-side record of that verdict, the half the daemon's own
             // log cannot make: a daemon can name only the answerer *it* binds
@@ -1345,8 +1270,6 @@ pub(crate) async fn activate_session(
                 range_present = ?verdict.range_present,
                 range_unit_state = ?detection.2.state,
                 range_unit_check = ?detection.2.failed_check,
-                answerer_manager_held = answerer_step.holds(),
-                answerer_step = ?answerer_step,
                 "session start decided the live name surface for this host, \
                  with the range unit's state beside it"
             );
@@ -3939,40 +3862,6 @@ mod tests {
         DynamicIngress, EffectiveEgress, EffectiveSessionPolicy, IngressPolicy, IpProto,
         NetworkMode, PortMapping,
     };
-
-    const FULL_ADVISORY: &str = "note: the resolver file is missing. Configure the \
-                                 host's resolver with:\n  sudo sh -c '…'";
-
-    /// NET-122: an interactive start prints the advisory whole, with the
-    /// exact command.
-    #[test]
-    fn interactive_start_prints_full_advisory() {
-        assert_eq!(start_advisory_text(FULL_ADVISORY, true), FULL_ADVISORY);
-    }
-
-    /// NET-122: any other start prints one line that keeps the facts, drops
-    /// the command and its lead-in, and names `min net setup`.
-    #[test]
-    fn non_interactive_start_prints_short_advisory() {
-        let short = start_advisory_text(FULL_ADVISORY, false);
-        assert_eq!(short, short_advisory(FULL_ADVISORY));
-        assert_eq!(short.lines().count(), 1, "{short}");
-        assert!(
-            short.starts_with("note: the resolver file is missing."),
-            "{short}"
-        );
-        assert!(!short.contains("sudo"), "{short}");
-        assert!(!short.contains("with:"), "{short}");
-        assert!(short.ends_with(NET_SETUP_HINT), "{short}");
-    }
-
-    /// A one-line advisory (a blocker, no command block) is kept as it is:
-    /// there is no command for `min net setup` to run, so no hint.
-    #[test]
-    fn short_advisory_keeps_a_one_line_advisory() {
-        let advisory = "note: host lookups bypass the resolver.";
-        assert_eq!(short_advisory(advisory), advisory);
-    }
 
     #[test]
     fn normalize_subnets_masks_host_bits_and_keeps_the_rest() {

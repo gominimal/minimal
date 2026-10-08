@@ -433,30 +433,46 @@ that leg (`just test-root-integration`) is still owed to the root lane.
 ### `net setup`
 
 ```
-min net setup [--print]
+min net setup [--print] [--undo]
 ```
 
-Sets this host up to resolve and reach boxes by name, for this host's
-current state. It prints what is missing, then runs one privileged command,
-so `sudo` asks for your password once. The exit status is the command's.
-On a host that is already set up, it runs nothing and says so.
+Host DNS is opt-in. Until you run this command, the hostname proxy serves box
+names. The name-surface line that `min session activate` and `min ls` print
+ends with a pointer here. A session start never prints or runs the
+privileged step.
+
+`min net setup` sets this host up to resolve and reach boxes by name, for
+this host's current state. It prints what is missing to stderr. It then
+writes a setup script to a private temporary file and runs it with
+`sudo sh`, so `sudo` asks for your password once. It removes the file
+afterwards and exits with the script's status. On a host that is already set
+up, it runs nothing and says so.
+
+The script is plain POSIX `sh` and stops at the first statement that fails.
+Its header says what it configures and that it must run as root. A comment
+introduces each step. The steps install the resolver hook and the Minimal
+box-name service, plus the local range on macOS.
 
 | Flag | Description |
 |---|---|
-| `--print` | Print the command instead of running it, with no privilege prompt. |
+| `--print` | Print the script to stdout instead of running it, with no privilege prompt. Run it later with `sudo sh <file>`. |
+| `--undo` | Remove everything the setup step installs on this host. With `--print`, print the removal script instead. |
 
-A session start also checks the host's resolver for the box zone. If the
-resolver is not configured and the start is interactive, it prints the same
-command in full.
-Under `--no-prompt` or `--no-input`, or with stderr not a terminal, the start
-prints one line instead. That line names what is missing and points here, so
-the command does not bury a scripted start's log on every activation.
+Setup points at the port the daemon's zone answerer listens on, so it needs a
+running daemon that has bound its answerer. It does not start one. With no
+daemon reachable, it prints an error and exits 1. Start a session first to
+bring the daemon up. On a host where no script can make box names
+resolve, it prints why and exits 1.
 
-The command points at the port the daemon's zone answerer listens on, so it
-needs a running daemon that has bound its answerer. It does not start one:
-with no daemon reachable, it prints an error and exits 1, and starting a
-session first brings the daemon up. On a host where no command can make box
-names resolve, it prints why and exits 1.
+The box-name service runs as one user for the whole machine. If another user
+already installed it, setup refuses before running anything, names that user,
+and exits 1. `--print` still prints the script.
+
+`--undo` works without a daemon, and it succeeds on a host that holds none of
+the setup. It removes the box-name service and its program copy, the resolver
+hook, and on macOS the local range unit. The local range addresses on macOS
+stay on the loopback until the next boot. `install.sh --uninstall` points at
+`min net setup --undo` while any of these host files remain.
 
 ### `stop`
 
