@@ -533,10 +533,6 @@ fn run_foreground() -> Result<()> {
     boxes
         .try_register_node_namespace(node_port.port)
         .context("publishing the node namespace's row")?;
-    // A box's row goes with its shuttle connection: the gate reports which
-    // addresses each relay carried at the relay's end, and this drainer thread
-    // applies the reports for the life of the process (NET-133).
-    boxes.spawn_withdrawal_drainer();
     // SIGTERM (a service manager's stop) and SIGINT cancel and audit every
     // pending ask before the process ends by the signal as it always did
     // (NET-045). A handler that cannot be installed leaves the default.
@@ -554,6 +550,16 @@ fn run_foreground() -> Result<()> {
     // is its pre-acquisition value, and the CLI treats it as "nothing to
     // say yet" rather than a verdict.
     let answerer_status = crate::net::answerer::AnswererStatus::starting();
+    // A box's row goes with its shuttle connection: the gate reports which
+    // addresses each relay carried at the relay's end, and this drainer thread
+    // applies the reports for the life of the process (NET-133). Each
+    // withdrawal hands the box's published address back to the machine's
+    // answerer, as the creator's withdrawal does, unless a live row or a
+    // registration in flight under the name owns it — so a session ended
+    // daemon-side frees its address rather than holding it until this
+    // process exits.
+    let drainer_answerer = answerer_status.clone();
+    boxes.spawn_withdrawal_drainer(move |name| drainer_answerer.release_address(name));
     // The hostname proxy's publish state (T93): the cell the supervisor
     // writes a failed start's cause into and the control socket below
     // serves, so the CLI's surfaces read *why* the proxy is not serving

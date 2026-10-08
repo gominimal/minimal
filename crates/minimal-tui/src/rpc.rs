@@ -301,6 +301,21 @@ async fn hold_box_name(sock: &Path, name: &str, id: SessionId, hold: bool) {
     }
 }
 
+/// Withdraws a box's host row (T66) on the VM host daemon beside `sock`,
+/// off the async workers: the control exchange is a blocking socket call.
+/// The pair comes off the session record, which carries no box id, so the
+/// pair is the withdrawal's proof.
+async fn withdraw_box_row(sock: &Path, name: &str, addresses: sessions::BoxAddresses) {
+    let (sock, name) = (sock.to_path_buf(), name.to_string());
+    if let Err(error) = tokio::task::spawn_blocking(move || {
+        minimal_client::attach::withdraw_box_row_beside(&sock, &name, addresses, None);
+    })
+    .await
+    {
+        tracing::warn!(%error, "the box row withdrawal's thread failed");
+    }
+}
+
 /// The session's record, best-effort: `None` when it cannot be read.
 async fn record_of(provider: &mut Provider, id: SessionId) -> Option<sessions::Record> {
     timed::<GetSessionRecord>(&mut provider.client, GetSessionRecordRequest::Id(id))
@@ -309,8 +324,37 @@ async fn record_of(provider: &mut Provider, id: SessionId) -> Option<sessions::R
         .and_then(|resp| resp.record)
 }
 
-/// Destroys the session, then releases the zone hold its name kept when it
-/// is a `host_ip` box, the release `min session destroy` makes too.
+/// The pair session `id`'s box was registered with (T66), read before an
+/// attach: an attach that ends in the shell-exit prompt's Delete leaves no
+/// record to read it from, and [`release_held_name_after_attach`] still
+/// owes the row's withdrawal. `None` when the record cannot be read.
+pub async fn box_addresses_of(
+    provider: &mut Provider,
+    id: SessionId,
+) -> Option<sessions::BoxAddresses> {
+    record_of(provider, id)
+        .await
+        .and_then(|record| record.box_addresses)
+}
+
+/// Settles what destroyed session `id` held on the VM host daemon beside
+/// `sock`, as `min session destroy` settles it: the row an own-address box
+/// registered is withdrawn with the pair off its record, and a `host_ip`
+/// box's zone hold is released. A session that held neither owes nothing.
+async fn settle_destroyed_box(sock: &Path, id: SessionId, record: &sessions::Record) {
+    let Some(name) = record.name.as_deref() else {
+        return;
+    };
+    if let Some(addresses) = record.box_addresses {
+        withdraw_box_row(sock, name, addresses).await;
+    } else if holds_name(record) {
+        hold_box_name(sock, name, id, false).await;
+    }
+}
+
+/// Destroys the session, then withdraws the row its box registered or
+/// releases the zone hold a `host_ip` box's name kept, as `min session
+/// destroy` does.
 pub async fn destroy(provider: &mut Provider, id: SessionId) -> Result<(), anyhow::Error> {
     let record = record_of(provider, id).await;
     match timed::<DestroySession>(&mut provider.client, DestroySessionRequest { id })
@@ -318,8 +362,8 @@ pub async fn destroy(provider: &mut Provider, id: SessionId) -> Result<(), anyho
         .context("DestroySession RPC failed")?
     {
         Errorable::Ok(_) => {
-            if let Some(name) = record.filter(holds_name).and_then(|record| record.name) {
-                hold_box_name(&provider.sock, &name, id, false).await;
+            if let Some(record) = record {
+                settle_destroyed_box(&provider.sock, id, &record).await;
             }
             Ok(())
         }
@@ -358,18 +402,29 @@ pub async fn rename(
     }
 }
 
-/// Releases session `id`'s zone hold once an attach from the dashboard has
+/// Settles what session `id` held once an attach from the dashboard has
 /// ended with the session gone: the shell-exit prompt's Delete destroys the
-/// session daemon-side, past [`destroy`]. A lookup that fails releases
-/// nothing; a session still there keeps its hold, and the release names
-/// the session, so a newer session under `name` keeps its own.
-pub async fn release_held_name_after_attach(provider: &mut Provider, id: SessionId, name: &str) {
+/// session daemon-side, past [`destroy`]. The row its box registered is
+/// withdrawn with `box_addresses`, the pair [`box_addresses_of`] read
+/// before the attach; with none, the name's zone hold is released. A lookup
+/// that fails settles nothing; a session still there keeps its row and its
+/// hold, and the release names the session, so a newer session under
+/// `name` keeps its own.
+pub async fn release_held_name_after_attach(
+    provider: &mut Provider,
+    id: SessionId,
+    name: &str,
+    box_addresses: Option<sessions::BoxAddresses>,
+) {
     let lookup =
         timed::<GetSessionRecord>(&mut provider.client, GetSessionRecordRequest::Id(id)).await;
     if let Ok(resp) = lookup
         && resp.record.is_none()
     {
-        hold_box_name(&provider.sock, name, id, false).await;
+        match box_addresses {
+            Some(addresses) => withdraw_box_row(&provider.sock, name, addresses).await,
+            None => hold_box_name(&provider.sock, name, id, false).await,
+        }
     }
 }
 
@@ -606,6 +661,68 @@ fn without_external_hook_scripts(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// T66's dashboard destroy: a destroyed own-address box's row is
+    /// withdrawn on the control socket beside the daemon's ssh socket — one
+    /// withdraw line naming the box and the pair off its record, with no
+    /// box id, which the record does not carry.
+    #[tokio::test]
+    async fn tui_destroy_withdraws_box_row() {
+        use std::io::{BufRead as _, Write as _};
+        let dir = tempfile::TempDir::new().unwrap();
+        let ssh_sock = dir.path().join("ssh.sock");
+        let listener = std::os::unix::net::UnixListener::bind(
+            dir.path()
+                .join(minimal_client::attach::VM_HOST_CONTROL_SOCK_FILE),
+        )
+        .unwrap();
+        let handed = sessions::BoxAddresses {
+            switch_address: std::net::Ipv4Addr::new(100, 64, 0, 2),
+            loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 0),
+        };
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            reader
+                .get_mut()
+                .write_all(
+                    b"{\"switch_address\":\"100.64.0.2\",\"loopback_address\":\"127.0.64.0\"}\n",
+                )
+                .unwrap();
+            line
+        });
+        let record = sessions::Record {
+            id: SessionId::nil(),
+            name: Some("web".to_string()),
+            username: None,
+            project_path: paths::HostAbsPath::try_new("/p").unwrap(),
+            network: NetworkMode::OwnIp,
+            policy: SessionPolicy {
+                egress: None,
+                ingress: None,
+                credentialed_upstream: None,
+            },
+            status: sessions::SessionStatus::default(),
+            hooks_enabled: true,
+            box_addresses: Some(handed),
+            host_ip_enforcement: None,
+            host_row_bound: false,
+            attrs: Default::default(),
+        };
+        settle_destroyed_box(&ssh_sock, record.id, &record).await;
+        let line = server.join().unwrap();
+        let request: minimald_rpc::BoxControlRequest =
+            serde_json_lenient::from_str(line.trim()).expect("the request is the wire type");
+        let minimald_rpc::BoxControlRequest::Withdraw(request) = request else {
+            panic!("a destroyed box's row goes by the withdraw verb");
+        };
+        assert_eq!(request.name, "web");
+        assert_eq!(request.switch_address, handed.switch_address);
+        assert_eq!(request.loopback_address, handed.loopback_address);
+        assert_eq!(request.box_id, None, "the record carries no box id");
+    }
 
     /// With no mfile anywhere up the tree, `resolve_upload_root` returns the
     /// input unchanged.

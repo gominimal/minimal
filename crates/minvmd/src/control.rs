@@ -107,7 +107,7 @@ use minimald_rpc::{
     WithdrawBoxRequest, WithdrawPortRequest,
 };
 
-use crate::box_registry::{BoxRegistry, ClientBoxSpec};
+use crate::box_registry::{AllocationError, BoxRegistry, ClientBoxSpec};
 use crate::net::answerer::AnswererStatus;
 
 /// The control socket's file name inside the provider-instance dir, beside
@@ -1049,10 +1049,13 @@ fn serve_held_registration(
     let BoxControlReply::Registered(registered) = &reply else {
         return write_reply(&mut stream, &reply);
     };
+    // The lease's withdrawal names the id the registration minted, so a
+    // lease that ends late never removes a newer row under the same pair.
     let withdrawal = WithdrawBoxRequest {
         name,
         switch_address: registered.switch_address,
         loopback_address: registered.loopback_address,
+        box_id: Some(registered.box_id),
     };
     let not_held = |stream: &mut UnixStream, error: std::io::Error| {
         order.apply(|| withdraw_box(boxes, answerer, withdrawal.clone()));
@@ -1400,12 +1403,25 @@ fn register_box(
             let released = boxes.release_unless_owned(&claim, || {
                 answerer.release_address(&request.name);
             });
-            tracing::debug!(
-                address_released = released,
-                box = %request.name,
-                error = %error,
-                "box registration refused"
-            );
+            // An exhausted hand-out run is a capacity refusal an operator
+            // has to see — the activation fails on it — so it is a warn
+            // line naming the counts; every other refusal is the asking
+            // client's own to read from the reply.
+            if matches!(error, AllocationError::SwitchExhausted(_)) {
+                tracing::warn!(
+                    address_released = released,
+                    box = %request.name,
+                    error = %error,
+                    "box registration refused: the switch's address plan is exhausted"
+                );
+            } else {
+                tracing::debug!(
+                    address_released = released,
+                    box = %request.name,
+                    error = %error,
+                    "box registration refused"
+                );
+            }
             BoxControlReply::Error {
                 error: error.to_string(),
             }
@@ -1448,6 +1464,7 @@ fn withdraw_box(
         &request.name,
         request.switch_address,
         request.loopback_address,
+        request.box_id.map(minimald_rpc::BoxId::to_bytes),
     ) {
         Ok(withdrawn) => {
             // The box is gone, so its published address returns to the
@@ -2586,7 +2603,7 @@ mod tests {
     };
     use switch::SwitchSubnet;
 
-    use crate::box_registry::{AllocationError, PENDING_ASKS_PER_ROW};
+    use crate::box_registry::PENDING_ASKS_PER_ROW;
     use crate::net::egress_gate::test_support::CaptureWriter;
 
     use super::*;
@@ -2997,6 +3014,67 @@ mod tests {
         );
     }
 
+    /// The withdrawal's box id reaches the registry: one naming another
+    /// id than the row's — a stale creator's, after a newer box was handed
+    /// the same name and addresses — is refused over the socket and the
+    /// row stays; the row's own id withdraws it.
+    #[tokio::test]
+    async fn a_withdrawal_naming_another_box_id_leaves_the_row() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (sock_path, _server, registry, _answerer, _proxy_publish) =
+            spawn_server(dir.path()).expect("server binds");
+        let web = handed(
+            register(
+                &sock_path,
+                &RegisterBoxRequest {
+                    name: "web".to_string(),
+                    ingress_ports: Vec::new(),
+                    egress: None,
+                    credentialed_upstream: None,
+                    dynamic_ingress: None,
+                    dynamic_allowed_range: None,
+                    hold: false,
+                },
+            )
+            .expect("the registration is answered"),
+        );
+        let withdrawal = |box_id| {
+            BoxControlRequest::Withdraw(WithdrawBoxRequest {
+                name: "web".to_string(),
+                switch_address: web.switch_address,
+                loopback_address: web.loopback_address,
+                box_id: Some(box_id),
+            })
+        };
+
+        let stale = minimald_rpc::BoxId::from_bytes([7; 16]);
+        let refused = control(&sock_path, &withdrawal(stale)).expect("the withdrawal is answered");
+        assert!(
+            matches!(&refused, BoxControlReply::Error { error } if error.contains("newer box")),
+            "a withdrawal naming another id is refused, got {refused:?}"
+        );
+        assert!(
+            registry
+                .table()
+                .by_source(web.switch_address.octets())
+                .is_some(),
+            "the refused withdrawal left the row"
+        );
+
+        let withdrawn =
+            control(&sock_path, &withdrawal(web.box_id)).expect("the withdrawal is answered");
+        assert!(
+            matches!(withdrawn, BoxControlReply::Addresses(_)),
+            "the row's own id withdraws it, got {withdrawn:?}"
+        );
+        assert!(
+            registry
+                .table()
+                .by_source(web.switch_address.octets())
+                .is_none()
+        );
+    }
+
     /// The withdrawal round-trip the destroyed session's client drives
     /// (T66): it registers the box, presents the pair the registration
     /// handed back to prove it is the row's creator, and the daemon removes
@@ -3049,6 +3127,7 @@ mod tests {
                 name: "web".to_string(),
                 switch_address: web.switch_address,
                 loopback_address: web.loopback_address,
+                box_id: None,
             }),
         )
         .expect("the withdrawal is answered");
@@ -3154,6 +3233,7 @@ mod tests {
                     name: name.to_string(),
                     switch_address: db.switch_address,
                     loopback_address: loopback,
+                    box_id: None,
                 }),
             )
             .expect("the withdrawal is answered");
@@ -3217,6 +3297,7 @@ mod tests {
                 name: "web".to_string(),
                 switch_address: web.switch_address,
                 loopback_address: web.loopback_address,
+                box_id: None,
             }),
         )
         .expect("the repeat withdrawal is answered");
@@ -4090,6 +4171,7 @@ mod tests {
                 name: "web".to_string(),
                 switch_address: web.switch_address,
                 loopback_address: web.loopback_address,
+                box_id: None,
             }),
         )
         .expect("the withdrawal is answered");
@@ -4623,6 +4705,7 @@ mod tests {
                 name: "web".to_string(),
                 switch_address: web.switch_address,
                 loopback_address: web.loopback_address,
+                box_id: None,
             }),
         )
         .expect("the withdrawal is answered");
@@ -5337,6 +5420,7 @@ mod tests {
                     name: name.to_string(),
                     switch_address,
                     loopback_address,
+                    box_id: None,
                 }),
             )
             .expect("the withdrawal is answered without waiting on the allocation");

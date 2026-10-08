@@ -494,6 +494,81 @@ pub fn hold_box_name_beside(
     );
 }
 
+/// Withdraws a box's host row (T66) on the VM host daemon whose control
+/// socket is `control_sock`, once the session that registered it is gone:
+/// the creator presents the name and the pair the registration handed back,
+/// and the daemon stops the pair's addresses admitting anything and returns
+/// them to its hand-out books. `box_id` is the id the registration handed
+/// back beside the pair, where the caller still holds it: the daemon then
+/// withdraws only that box, never a newer one handed the same name and pair
+/// after the quarantine. `None` — a session record carries no id — is the
+/// pair proof alone.
+///
+/// Best-effort and blocking: a withdrawal that cannot be made — the socket
+/// unreachable, a daemon that refuses the line, no answer in time — leaves
+/// the row published and warns rather than failing the destroy or the
+/// activation error it rides on. A daemon answering with a pair that is not
+/// the pair asked is answering something else, and says the row stays too.
+pub fn withdraw_box_row_at(
+    control_sock: &Path,
+    box_name: &str,
+    addresses: sessions::BoxAddresses,
+    box_id: Option<minimald_rpc::BoxId>,
+) {
+    let request = minimald_rpc::BoxControlRequest::Withdraw(minimald_rpc::WithdrawBoxRequest {
+        name: box_name.to_string(),
+        switch_address: addresses.switch_address,
+        loopback_address: addresses.loopback_address,
+        box_id,
+    });
+    let failure = match host_control(control_sock, &request) {
+        Ok((minimald_rpc::BoxControlReply::Addresses(handed), _)) if handed == addresses => {
+            tracing::info!(
+                box = %box_name,
+                switch_address = %handed.switch_address,
+                loopback_address = %handed.loopback_address,
+                "withdrew the box's host row; its addresses admit nothing"
+            );
+            return;
+        }
+        Ok((minimald_rpc::BoxControlReply::Addresses(handed), _)) => format!(
+            "the daemon answered with a different address pair, switch address {}",
+            handed.switch_address
+        ),
+        Ok((minimald_rpc::BoxControlReply::Error { error }, _)) => {
+            format!("the daemon refused it: {error}")
+        }
+        Ok((other, _)) => format!("another verb's reply: {other:?}"),
+        Err(error) => format!("{error:#}"),
+    };
+    tracing::warn!(
+        box = %box_name,
+        "the box row withdrawal could not be made ({failure}); the row stays published"
+    );
+}
+
+/// [`withdraw_box_row_at`] on the control socket beside the daemon's ssh
+/// socket `ssh_sock`, for a caller that does not know whether the daemon is
+/// VM-backed: no control socket beside it is a native host, which holds no
+/// rows, and nothing to do.
+pub fn withdraw_box_row_beside(
+    ssh_sock: &Path,
+    box_name: &str,
+    addresses: sessions::BoxAddresses,
+    box_id: Option<minimald_rpc::BoxId>,
+) {
+    let Some(control_sock) = ssh_sock
+        .parent()
+        .map(|dir| dir.join(VM_HOST_CONTROL_SOCK_FILE))
+    else {
+        return;
+    };
+    if !control_sock.exists() {
+        return;
+    }
+    withdraw_box_row_at(&control_sock, box_name, addresses, box_id);
+}
+
 impl HostAsks {
     /// Subscribe to the pending asks of the box whose row is named
     /// `box_name` on the VM host daemon at `control_sock`: the row read

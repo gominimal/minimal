@@ -646,17 +646,26 @@ impl AddressBook {
                 .values()
                 .map(|(_, at)| REUSE_QUARANTINE.saturating_sub(now.saturating_duration_since(*at)))
                 .min();
+            // The counts the refusal names: live, quarantined, and the
+            // range's capacity, so the line tells a full machine from one
+            // that frees an address in seconds.
+            let capacity = u32::from(last)
+                .saturating_sub(u32::from(first))
+                .saturating_add(1);
+            let (held, quarantined) = (self.held.len(), self.released.len());
             return Err(match next {
                 Some(wait) => format!(
                     "every box address in {first}-{last} is held or was released less than \
-                     {} s ago (the answer TTL a host resolver may still serve it under); the \
-                     next one frees in {} s",
+                     {} s ago (the answer TTL a host resolver may still serve it under): \
+                     {held} of {capacity} are held by live boxes and {quarantined} are \
+                     quarantined; the next one frees in {} s",
                     REUSE_QUARANTINE.as_secs(),
                     wait.as_secs().max(1)
                 ),
-                None => {
-                    format!("every box address in {first}-{last} is held; none remains to hand out")
-                }
+                None => format!(
+                    "every box address in {first}-{last} is held ({held} of {capacity} by \
+                     live boxes); none remains to hand out"
+                ),
             });
         };
         self.released.remove(&free);

@@ -1216,7 +1216,7 @@ mod tests {
         // box's own id from its own address, is refused now.
         assert!(
             registry
-                .withdraw_client_box("web", box_row.switch_addr(), box_row.loopback_addr())
+                .withdraw_client_box("web", box_row.switch_addr(), box_row.loopback_addr(), None)
                 .expect("the withdrawing client is the row's creator")
                 .is_some(),
             "the row was published"

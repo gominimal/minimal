@@ -236,7 +236,12 @@ pub fn self_allocation_run(subnet: SwitchSubnet) -> (u32, u32) {
 /// holder's entry. Both are asserted below at compile time. Waiting out the
 /// quarantine is necessary but not sufficient: [`IpAllocator`] also skips an
 /// address any live gate row or flow still names.
-pub const REUSE_QUARANTINE: Duration = Duration::from_secs(300);
+///
+/// The value is the switch crate's one quarantine
+/// ([`::switch::SWITCH_ADDRESS_REUSE_QUARANTINE`]), shared with the VM host
+/// daemon's hand-out run, so the two allocators that hand addresses on one
+/// switch never wait out different spans.
+pub const REUSE_QUARANTINE: Duration = ::switch::SWITCH_ADDRESS_REUSE_QUARANTINE;
 
 const _: () = assert!(
     REUSE_QUARANTINE.as_millis() > ::switch::BEP_NEIGHBOUR_CACHE_LIFETIME.as_millis(),

@@ -3417,6 +3417,9 @@ async fn relay_frames_to_switch(
             && src != baseline.node_addr()
             && !attributed.contains(&src)
         {
+            // The row's switch address is quarantined at its withdrawal
+            // from here on: this connection may now key state by it.
+            table.mark_attributed(src);
             attributed.push(src);
         }
         // The box's DNS datagram, read once for both checks below: only for
@@ -13985,7 +13988,7 @@ mod tests {
     async fn host_table_row_withdrawn_within_60s_of_box_end() {
         let registry = BoxRegistry::new(SUBNET);
         tcp_lan_box(&registry, LEASE);
-        registry.spawn_withdrawal_drainer();
+        registry.spawn_withdrawal_drainer(|_| {});
         let mut h = gate_over(registry).await;
 
         // The box's declared frame, admitted by its row: the traffic the
@@ -14023,7 +14026,7 @@ mod tests {
     async fn host_table_row_withdrawn_when_the_switch_closes_first() {
         let registry = BoxRegistry::new(SUBNET);
         tcp_lan_box(&registry, LEASE);
-        registry.spawn_withdrawal_drainer();
+        registry.spawn_withdrawal_drainer(|_| {});
         let mut h = gate_over(registry).await;
 
         // The box's declared frame, admitted by its row and forwarded: the
@@ -14161,7 +14164,7 @@ mod tests {
         let registry = BoxRegistry::new(SUBNET);
         tcp_lan_box(&registry, LEASE);
         let node = registry.register_node_namespace(7654);
-        registry.spawn_withdrawal_drainer();
+        registry.spawn_withdrawal_drainer(|_| {});
         let mut h = gate_over(registry).await;
 
         // Node-plane traffic on the relay — the in-VM daemon's own frames,

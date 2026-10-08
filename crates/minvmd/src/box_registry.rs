@@ -45,7 +45,9 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::net::Ipv4Addr;
-use std::sync::atomic::{AtomicU32, Ordering};
+#[cfg(test)]
+use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock};
 use std::time::{Duration, Instant};
 
@@ -319,6 +321,13 @@ pub struct BoxRecord {
     /// policy as it was declared, not the compiled form only the gate
     /// reads.
     egress_allow_list: Vec<String>,
+    /// Whether a frame of the box ever crossed the gate under this row
+    /// ([`BoxTable::mark_attributed`]): set once by the relay that first
+    /// attributes the row's source, never cleared. A row withdrawn before
+    /// it was ever attributed returns its switch address with no
+    /// quarantine ([`SwitchAddressBook`]), since nothing on the host keyed
+    /// state by it. Bookkeeping, like the rate window: not compared.
+    attributed: AtomicBool,
 }
 
 /// Manual because the row's runtime half is interior ([`RowRuntime`]): the
@@ -397,6 +406,13 @@ impl BoxRecord {
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Whether a frame of the box ever crossed the gate under this row
+    /// ([`BoxTable::mark_attributed`]).
+    #[must_use]
+    pub fn was_attributed(&self) -> bool {
+        self.attributed.load(Ordering::Relaxed)
     }
 
     /// The box's own id (BEP-070): minted once for this creation — by
@@ -771,6 +787,182 @@ fn hand_out_run(subnet: SwitchSubnet) -> (u32, u32) {
     (first + reserve_len, last)
 }
 
+/// How long a released hand-out address waits before it is handed again:
+/// the switch crate's one quarantine, shared with the daemon's
+/// self-allocation reserve ([`switch::SWITCH_ADDRESS_REUSE_QUARANTINE`]).
+/// Asserted below to outlast every timer on this host that keys state by a
+/// box's switch address past its row: the gate's reply-flow records (both
+/// windows a replied flow lives under) and the DNS admission window a pin
+/// lives under. Pins and reply flows are also retired when the relay that
+/// carried them ends ([`crate::net::dns_pins`]) — the only end an
+/// established pinned flow's day-long idle cap gets short of a FIN — so the
+/// quarantine is the bound for a row withdrawn while its relay lives on.
+const SWITCH_REUSE_QUARANTINE: Duration = switch::SWITCH_ADDRESS_REUSE_QUARANTINE;
+
+const _: () = assert!(
+    SWITCH_REUSE_QUARANTINE.as_millis()
+        >= sessions::core::egress::REPLY_UDP_REPLIED_WINDOW.as_millis(),
+    "the switch address quarantine must outlast a replied UDP flow's record"
+);
+const _: () = assert!(
+    SWITCH_REUSE_QUARANTINE.as_millis() >= sessions::core::egress::REPLY_TCP_IDLE_CAP.as_millis(),
+    "the switch address quarantine must outlast an idle TCP flow's record"
+);
+const _: () = assert!(
+    SWITCH_REUSE_QUARANTINE.as_millis() >= sessions::core::egress::DNS_ADMISSION_WINDOW.as_millis(),
+    "the switch address quarantine must outlast a DNS pin's admission window"
+);
+
+/// The hand-out run's book (NET-138, design §7.1): which of the run's
+/// switch addresses are out — drawn for a row that stands or a
+/// registration in flight — and which came back, when. Modeled on the
+/// daemon's own self-allocation book (`minimald::net::IpAllocator`): an
+/// address is reused, never shared, and never wraps.
+///
+/// Addresses are handed longest-free first: the run's never-drawn
+/// addresses in plan order, then returned ones in return order, so the
+/// quarantine is the normal case rather than the edge. A returned address
+/// is handed again only once its quarantine ([`SWITCH_REUSE_QUARANTINE`])
+/// has passed **and** no row and no withdrawn box's revocation still holds
+/// it — the registry checks both at the draw. A row withdrawn before it
+/// was ever attributed — no frame of its box ever crossed the gate — comes
+/// back with no quarantine: nothing on the host keyed state by it, so an
+/// activation that withdraws and re-registers (an autogen name's retry)
+/// spends nothing.
+///
+/// A row's box id is the epoch its address carries between two hands: a
+/// re-handed address is a new box with a new id (BEP-070), and a
+/// withdrawal that names the old id removes nothing of the new row
+/// ([`BoxRegistry::withdraw_client_box`]).
+#[derive(Debug)]
+struct SwitchAddressBook {
+    /// The hand-out run, inclusive at both ends (`hand_out_run`).
+    first: u32,
+    last: u32,
+    /// The next never-drawn address; `None` once the run is drawn through.
+    /// Only ever advances, by a checked add, so it can never wrap.
+    next: Option<u32>,
+    /// The addresses drawn and not yet returned.
+    out: BTreeSet<u32>,
+    /// Returned addresses, oldest return first, each with the instant it
+    /// becomes eligible again: its return plus the quarantine, or its
+    /// return alone for a row that was never attributed.
+    free: VecDeque<(u32, Instant)>,
+}
+
+/// Where the hand-out run stands when a draw hands nothing: the counts an
+/// [`AllocationError::SwitchExhausted`] names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HandOutCounts {
+    /// Addresses out: drawn for a row that stands or a registration in
+    /// flight.
+    pub live: usize,
+    /// Addresses returned but not yet eligible — inside their quarantine,
+    /// or still held by a row or a withdrawn box's revocation.
+    pub quarantined: usize,
+    /// Every address the hand-out run holds.
+    pub capacity: u64,
+    /// How long until the soonest returned address's quarantine passes,
+    /// when one was returned at all.
+    pub next_free_in: Option<Duration>,
+}
+
+impl std::fmt::Display for HandOutCounts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} of {} box addresses are held by live boxes and {} are in their {} s reuse \
+             quarantine",
+            self.live,
+            self.capacity,
+            self.quarantined,
+            SWITCH_REUSE_QUARANTINE.as_secs()
+        )?;
+        if let Some(wait) = self.next_free_in {
+            // Rounded up: an address that frees in 0.4 s is not free now.
+            let secs = wait
+                .as_secs()
+                .saturating_add(u64::from(wait.subsec_nanos() > 0));
+            write!(f, "; the next one frees in {} s", secs.max(1))?;
+        }
+        Ok(())
+    }
+}
+
+impl SwitchAddressBook {
+    fn new(subnet: SwitchSubnet) -> Self {
+        let (first, last) = hand_out_run(subnet);
+        Self {
+            first,
+            last,
+            next: (first <= last).then_some(first),
+            out: BTreeSet::new(),
+            free: VecDeque::new(),
+        }
+    }
+
+    /// Draws an address at `now`: a never-drawn one first, then the
+    /// returned address free longest whose eligibility has passed and that
+    /// `held` does not name. Hands nothing, and says where the run stands,
+    /// when no address qualifies.
+    fn draw(
+        &mut self,
+        now: Instant,
+        held: impl Fn(Ipv4Addr) -> bool,
+    ) -> Result<Ipv4Addr, HandOutCounts> {
+        if let Some(next) = self.next {
+            self.next = next.checked_add(1).filter(|after| *after <= self.last);
+            self.out.insert(next);
+            return Ok(Ipv4Addr::from(next));
+        }
+        let reusable = self
+            .free
+            .iter()
+            .position(|&(addr, eligible)| now >= eligible && !held(Ipv4Addr::from(addr)));
+        if let Some((addr, _)) = reusable.and_then(|at| self.free.remove(at)) {
+            self.out.insert(addr);
+            return Ok(Ipv4Addr::from(addr));
+        }
+        Err(HandOutCounts {
+            live: self.out.len(),
+            quarantined: self.free.len(),
+            capacity: u64::from(self.last)
+                .saturating_sub(u64::from(self.first))
+                .saturating_add(1),
+            next_free_in: self
+                .free
+                .iter()
+                .map(|&(_, eligible)| eligible.saturating_duration_since(now))
+                .filter(|wait| !wait.is_zero())
+                .min(),
+        })
+    }
+
+    /// Returns `addr` at `now`, quarantined unless `quarantine` is false.
+    /// Only an address this book drew and has not had back is returned:
+    /// one an explicit registration brought ([`BoxRegistry::try_register`])
+    /// is not the run's to hand, and a second return is a no-op. An
+    /// eligibility past the clock's range keeps the address out for good —
+    /// the fail-closed reading of an overflow, never a wrap to an early
+    /// one. Returns whether the address came back.
+    fn give_back(&mut self, addr: Ipv4Addr, now: Instant, quarantine: bool) -> bool {
+        let addr = u32::from(addr);
+        let eligible = if quarantine {
+            now.checked_add(SWITCH_REUSE_QUARANTINE)
+        } else {
+            Some(now)
+        };
+        let Some(eligible) = eligible else {
+            return false;
+        };
+        if !self.out.remove(&addr) {
+            return false;
+        }
+        self.free.push_back((addr, eligible));
+        true
+    }
+}
+
 /// Why a client-driven registration could not be allocated. Both runs a
 /// box address comes from — the plan's switch lease run and the published
 /// loopback slice — are finite; exhausting one is an answer to hand back
@@ -780,9 +972,13 @@ fn hand_out_run(subnet: SwitchSubnet) -> (u32, u32) {
 /// and the refusal is built once, answered with, and dropped.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum AllocationError {
-    /// Every switch address in the plan's lease run is published.
-    #[error("the switch's address plan is exhausted; no box address remains")]
-    SwitchExhausted,
+    /// Every switch address in the hand-out run is out or not yet eligible
+    /// again: held by a live row or a registration in flight, or returned
+    /// and still inside its reuse quarantine ([`SwitchAddressBook`]). The
+    /// counts say which, so the refusal tells an exhausted plan from one
+    /// that frees an address shortly.
+    #[error("the switch's address plan is exhausted: {0}")]
+    SwitchExhausted(HandOutCounts),
     /// Every address in the loopback slice this subnet's switch publishes
     /// at is handed out.
     #[error("the host's loopback slice is exhausted; no published address remains")]
@@ -928,6 +1124,24 @@ pub enum WithdrawError {
         held_loopback: Ipv4Addr,
         /// The loopback address the withdrawal presented.
         asked_loopback: Ipv4Addr,
+    },
+    /// The row at the switch address carries the requested name and pair
+    /// but another box id than the withdrawal named: a newer creation was
+    /// handed the same name and addresses since, and the withdrawing client
+    /// is the creator of the row before it, not of this one.
+    #[error(
+        "the row at switch address {switch_addr} is box id {}, not the {} the withdrawal \
+         named; it is a newer box under the same name and addresses",
+        crate::bep_attach::BoxIdText(held_box_id),
+        crate::bep_attach::BoxIdText(asked_box_id)
+    )]
+    NotTheBoxId {
+        /// The switch address the withdrawal named.
+        switch_addr: Ipv4Addr,
+        /// The id the published row holds.
+        held_box_id: BoxId,
+        /// The id the withdrawal named.
+        asked_box_id: BoxId,
     },
 }
 
@@ -1856,7 +2070,7 @@ fn record_ask_yes(
 /// client-driven path — and the source of the read-only [`BoxTable`] the
 /// gate reads.
 ///
-/// Cheap to clone, and every clone shares the rows, the allocation cursors,
+/// Cheap to clone, and every clone shares the rows, the hand-out book,
 /// and the withdrawal channel: the table the gate holds is the same one every
 /// later registration lands in, which is how a box published after the gate
 /// started is decided by its rules from that moment on, an address a
@@ -1906,11 +2120,19 @@ pub struct BoxRegistry {
     /// The addresses withdrawn boxes' revocations still hold against reuse
     /// ([`Revoking`]), shared by every clone and every [`BoxTable`].
     revoking: Arc<Revoking>,
-    /// The next switch address the client-driven allocation hands out,
-    /// shared by every clone of this registry. Draws from the hand-out run
-    /// — the plan run's upper half, above the daemon's self-allocation
-    /// reserve (`hand_out_run`) — never from the reserve itself.
-    next_switch_addr: Arc<AtomicU32>,
+    /// The book the client-driven allocation hands switch addresses from
+    /// and returns them to ([`SwitchAddressBook`]), shared by every clone of
+    /// this registry. Draws from the hand-out run — the plan run's upper
+    /// half, above the daemon's self-allocation reserve (`hand_out_run`) —
+    /// never from the reserve itself. A draw reads the rows while it holds
+    /// the book, so the book is never taken while a row lock is held: every
+    /// return lands after the row lock that removed the row is dropped.
+    switch_book: Arc<Mutex<SwitchAddressBook>>,
+    /// How far the tests have moved this registry's clock past the real
+    /// one ([`Self::now`]), shared by every clone, so a quarantine is
+    /// driven without waiting it out.
+    #[cfg(test)]
+    clock_skew: Arc<Mutex<Duration>>,
     /// The next published loopback address the tests' single-node
     /// allocation hands out, shared the same way. The daemon's addresses
     /// are the answerer's ([`Self::register_client_box_at`]).
@@ -1960,7 +2182,7 @@ pub struct BoxRegistry {
     egress_deny_all_opt_out: bool,
 }
 
-/// A clone shares the live rows, the allocation cursors, and the withdrawal
+/// A clone shares the live rows, the hand-out book, and the withdrawal
 /// channel but not the receiver: only the registry that created the channel —
 /// the one [`Self::spawn_withdrawal_drainer`] (or a test) drains — holds the
 /// receiving end, so a clone can register, allocate, and file reports like
@@ -1977,7 +2199,9 @@ impl Clone for BoxRegistry {
             withdrawal_reports_rx: Mutex::new(None),
             row_withdrawals: Arc::clone(&self.row_withdrawals),
             revoking: Arc::clone(&self.revoking),
-            next_switch_addr: Arc::clone(&self.next_switch_addr),
+            switch_book: Arc::clone(&self.switch_book),
+            #[cfg(test)]
+            clock_skew: Arc::clone(&self.clock_skew),
             #[cfg(test)]
             next_loopback_addr: Arc::clone(&self.next_loopback_addr),
             loopback_slice: self.loopback_slice,
@@ -2010,7 +2234,9 @@ impl BoxRegistry {
             withdrawal_reports_rx: Mutex::new(Some(reports_rx)),
             row_withdrawals: Arc::new(Mutex::new(Vec::new())),
             revoking: Arc::new(Revoking::default()),
-            next_switch_addr: Arc::new(AtomicU32::new(hand_out_run(subnet).0)),
+            switch_book: Arc::new(Mutex::new(SwitchAddressBook::new(subnet))),
+            #[cfg(test)]
+            clock_skew: Arc::new(Mutex::new(Duration::ZERO)),
             #[cfg(test)]
             next_loopback_addr: Arc::new(AtomicU32::new(
                 loopback_slice.map_or(0, |slice| box_loopback_run(slice).0),
@@ -2167,6 +2393,88 @@ impl BoxRegistry {
         self.subnet
     }
 
+    /// The instant the hand-out book draws and returns at: the real clock,
+    /// moved by [`Self::advance_clock`] in tests.
+    fn now(&self) -> Instant {
+        #[cfg(test)]
+        {
+            let skew = *self
+                .clock_skew
+                .lock()
+                .expect("the test clock's lock is held only across a read or an add");
+            Instant::now()
+                .checked_add(skew)
+                .expect("a test moves the clock by minutes, never past the clock's range")
+        }
+        #[cfg(not(test))]
+        {
+            Instant::now()
+        }
+    }
+
+    /// Moves this registry's clock, and every clone's, `by` past the real
+    /// one: the seam that drives the hand-out quarantine in tests.
+    #[cfg(test)]
+    pub(crate) fn advance_clock(&self, by: Duration) {
+        let mut skew = self
+            .clock_skew
+            .lock()
+            .expect("the test clock's lock is held only across a read or an add");
+        *skew = skew.saturating_add(by);
+    }
+
+    fn switch_book(&self) -> MutexGuard<'_, SwitchAddressBook> {
+        self.switch_book
+            .lock()
+            .expect("the hand-out book's lock is never held across a panic")
+    }
+
+    /// Draws a switch address from the hand-out book ([`SwitchAddressBook`]):
+    /// a returned address only once it is eligible and no row and no
+    /// withdrawn box's revocation holds it.
+    fn draw_switch_addr(&self) -> Result<Ipv4Addr, AllocationError> {
+        let now = self.now();
+        let mut book = self.switch_book();
+        let rows = self
+            .rows
+            .read()
+            .expect("the row lock is never held across a panic, so it cannot be poisoned");
+        book.draw(now, |addr| {
+            rows.contains_key(&addr.octets())
+                || self.revoking.first_held(&[addr.octets()]).is_some()
+        })
+        .map_err(AllocationError::SwitchExhausted)
+    }
+
+    /// Returns a removed row's switch address to the hand-out book:
+    /// quarantined when the row was ever attributed
+    /// ([`BoxRecord::was_attributed`]), at once when no frame of its box
+    /// ever crossed the gate. Called after the row lock that removed it is
+    /// dropped. An address the book did not draw is not returned.
+    fn give_back_switch_addr(&self, addr: Ipv4Addr, quarantine: bool) {
+        let now = self.now();
+        self.switch_book().give_back(addr, now, quarantine);
+    }
+
+    /// How many hand-out addresses are out: drawn for a row that stands or
+    /// a registration in flight.
+    #[cfg(test)]
+    pub(crate) fn live_switch_addrs(&self) -> usize {
+        self.switch_book().out.len()
+    }
+
+    /// The returned hand-out addresses, oldest return first, each with
+    /// whether it is eligible to be handed again now.
+    #[cfg(test)]
+    pub(crate) fn returned_switch_addrs(&self) -> Vec<(Ipv4Addr, bool)> {
+        let now = self.now();
+        self.switch_book()
+            .free
+            .iter()
+            .map(|&(addr, eligible)| (Ipv4Addr::from(addr), now >= eligible))
+            .collect()
+    }
+
     /// Publishes one namespace: compiles the declaration into a row keyed by
     /// its switch address — the lease the shared verdict checks every
     /// frame's source against (NET-084) — and returns it. Registering an
@@ -2287,6 +2595,7 @@ impl BoxRegistry {
             // box it replaced's runtime facts.
             runtime_ports: Mutex::new(RowRuntime::default()),
             egress_allow_list,
+            attributed: AtomicBool::new(false),
             switch_addr: registration.switch_addr,
             loopback_addr: registration.loopback_addr,
             admitted_ports: registration.admitted_ports,
@@ -2407,6 +2716,9 @@ impl BoxRegistry {
             .and_then(|record| self.begin_revocation(record));
         drop(rows);
         self.retired(&removed, withdrawal);
+        if let Some(record) = &removed {
+            self.give_back_switch_addr(record.switch_addr, record.was_attributed());
+        }
         removed
     }
 
@@ -2435,23 +2747,26 @@ impl BoxRegistry {
     /// returns the row, whose addresses are the ones to hand back over the
     /// control socket.
     ///
-    /// Addresses are handed out in plan order from shared cursors: each
-    /// registration takes the next address the plan has not spent, and no
-    /// address is ever handed to two rows (clones of this registry share the
-    /// cursors, so that holds across every clone). The switch cursor draws
-    /// only from the hand-out run — the plan run's upper half, above the
-    /// daemon's self-allocation reserve (`hand_out_run`) — so the two
-    /// allocators cannot meet. The runs are finite — the hand-out run ends
-    /// at the plan's last PTask address, the slice ends where the plan's
-    /// next switch begins — and exhausting one is the [`AllocationError`]
-    /// the control socket hands back as the registration's failure.
+    /// The switch address comes from the hand-out book
+    /// ([`SwitchAddressBook`]), shared by every clone of this registry, so
+    /// no address is ever out to two rows at once. The book draws only from
+    /// the hand-out run — the plan run's upper half, above the daemon's
+    /// self-allocation reserve (`hand_out_run`) — so the two allocators
+    /// cannot meet. The run is finite, and exhausting it is the
+    /// [`AllocationError::SwitchExhausted`] the control socket hands back as
+    /// the registration's failure, naming the live, quarantined and total
+    /// counts.
     ///
-    /// An address is spent for good: withdrawing its row does not return it
-    /// to the cursor, and neither does an allocation whose other run is
-    /// exhausted. A spent address's host-side state — the gate's
-    /// rate-limit slots, the switch's static lease table — is keyed by it,
-    /// and re-issuing it to a new box would inherit all of that; a fresh
-    /// address starts clean.
+    /// Every path that removes a row returns its switch address — the
+    /// drainer's [`Self::withdraw`], the creator's
+    /// [`Self::withdraw_client_box`], and a refusal after the draw — and a
+    /// returned address is handed again only after its quarantine and once
+    /// nothing holds it. A withdrawn address's host-side state — the gate's
+    /// reply flows and DNS pins, the BEP leg's neighbour entry — is keyed
+    /// by it, and the quarantine outlasts every one of those timers
+    /// ([`SWITCH_REUSE_QUARANTINE`]), so a re-handed address starts clean.
+    /// A row never attributed keyed nothing, and its address comes back at
+    /// once.
     ///
     /// While a row this registration filled stands, the box's frames are
     /// decided by its rules; a box with **no** row — one whose registration
@@ -2560,9 +2875,9 @@ impl BoxRegistry {
         // the answerer handed back: the answerer releases a box's address at
         // its withdrawal, and the next box can draw it at once. The wait is
         // bounded, and normally the revocation is long done. It runs before a
-        // switch address is spent: the cursor never hands one out twice, so a
-        // registration refused here must not have drawn one. The switch
-        // address drawn next is fresh, and `try_register` still checks both.
+        // switch address is drawn, so a registration refused here holds none.
+        // The book never draws an address a row or a revocation holds, and
+        // `try_register` still checks both.
         if let Some(addr) = self.wait_for_revocations(&[loopback_addr.octets()], REVOCATION_WAIT) {
             tracing::warn!(
                 box = %spec.name,
@@ -2572,9 +2887,7 @@ impl BoxRegistry {
             );
             return Err(AllocationError::RevocationPending { addr });
         }
-        let (hand_out_first, hand_out_last) = hand_out_run(self.subnet);
-        let switch_addr = take_next(&self.next_switch_addr, hand_out_first, hand_out_last)
-            .ok_or(AllocationError::SwitchExhausted)?;
+        let switch_addr = self.draw_switch_addr()?;
         let mut registration = BoxRegistration::new(spec.name, switch_addr, loopback_addr)
             .with_admitted_ports(spec.ingress_ports);
         // A client box is an own-address box (only those register), so an
@@ -2607,7 +2920,11 @@ impl BoxRegistry {
             registration = registration.with_dynamic_ingress(stance, spec.dynamic_allowed_range);
         }
         registration.box_id = Some(id);
+        // A refusal after the draw publishes no row, so no frame of the box
+        // was ever attributed: the address goes straight back, with no
+        // quarantine, and the refusal spends nothing.
         self.try_register_since(registration, generation)
+            .inspect_err(|_| self.give_back_switch_addr(switch_addr, false))
     }
 
     /// [`Self::register_client_box_at`] with the published loopback address
@@ -2683,11 +3000,24 @@ impl BoxRegistry {
     /// [`WithdrawError`]. The name in the proof is compared in its
     /// canonical form, the answerer's fold: a box registered under "Web"
     /// is withdrawn by its own name in any spelling that folds to it.
-    /// The withdrawn addresses are not returned to the
-    /// allocation cursors — spent for good, as [`Self::register_client_box`]
-    /// documents — and what their frames do next is the gate phase's to say
-    /// ([`Self::withdraw`]). The box's proxy attachment goes with the row
-    /// (NET-133), retired under the same row lock that removes it.
+    ///
+    /// `box_id`, when the withdrawing client knows it, is the epoch the
+    /// proof is held to: the id the registration minted for the row it
+    /// handed the pair with. A row at the pair under another id is a newer
+    /// creation that was handed the same name and addresses — the switch
+    /// address re-handed after its quarantine, or at once when the old row
+    /// was never attributed, and the loopback one handed back to the same
+    /// name by the answerer — so a stale creator's withdrawal is refused
+    /// with [`WithdrawError::NotTheBoxId`] and removes nothing of it.
+    /// `None`, from a client that predates the field, keeps the pair proof
+    /// alone.
+    ///
+    /// The withdrawn switch address returns to the hand-out book
+    /// ([`SwitchAddressBook`]): quarantined when the row was ever
+    /// attributed, at once when it never was. What the address's frames do
+    /// next is the gate phase's to say ([`Self::withdraw`]). The box's
+    /// proxy attachment goes with the row (NET-133), retired under the same
+    /// row lock that removes it.
     ///
     /// This is the host-side half of the withdrawal a destroyed or failed
     /// activation sends over the control socket
@@ -2698,6 +3028,7 @@ impl BoxRegistry {
         name: &str,
         switch_addr: Ipv4Addr,
         loopback_addr: Ipv4Addr,
+        box_id: Option<BoxId>,
     ) -> Result<Option<Arc<BoxRecord>>, WithdrawError> {
         #[expect(
             clippy::unwrap_in_result,
@@ -2730,6 +3061,15 @@ impl BoxRegistry {
                 asked_loopback: loopback_addr,
             });
         }
+        if let Some(asked) = box_id
+            && asked != record.box_id
+        {
+            return Err(WithdrawError::NotTheBoxId {
+                switch_addr,
+                held_box_id: record.box_id,
+                asked_box_id: asked,
+            });
+        }
         // The attachment goes with the row (NET-133), retired inside the
         // same critical section that removes the row: a registration
         // landing after cannot retire the new box's attachment, and one
@@ -2745,6 +3085,9 @@ impl BoxRegistry {
             .and_then(|record| self.begin_revocation(record));
         drop(rows);
         self.retired(&removed, withdrawal);
+        if let Some(record) = &removed {
+            self.give_back_switch_addr(record.switch_addr, record.was_attributed());
+        }
         Ok(removed)
     }
 
@@ -3278,8 +3621,18 @@ impl BoxRegistry {
     /// row goes with its connection. The bound the withdrawal keeps is
     /// NET-133's, keyed to the relay's end: the box's own shuttle
     /// connection, the one its frames travel by, is what the report rides
-    /// (and a row whose traffic never ends is never withdrawn). The
-    /// thread holds a clone of this registry, so it withdraws the same
+    /// (and a row whose traffic never ends is never withdrawn).
+    ///
+    /// Each withdrawal also hands the box's published loopback address back
+    /// to the machine's answerer, by running `release_address` with the
+    /// row's name, unless something else owns it
+    /// ([`Self::release_withdrawn_unless_owned`]: a live row under the
+    /// name, or a registration of it in flight) — the same release the
+    /// creator's withdrawal makes, so a box whose session ends daemon-side
+    /// does not hold its address until this process exits. Its switch
+    /// address goes back to the hand-out book inside [`Self::withdraw`].
+    ///
+    /// The thread holds a clone of this registry, so it withdraws the same
     /// rows every other handle sees. That clone carries one of the
     /// reports' senders — the very channel the thread drains — so the
     /// senders are never all gone while the thread runs and `recv()`
@@ -3289,7 +3642,7 @@ impl BoxRegistry {
     ///
     /// Idempotent by the take underneath: a second call finds no receiver
     /// and spawns nothing.
-    pub fn spawn_withdrawal_drainer(&self) {
+    pub fn spawn_withdrawal_drainer(&self, release_address: impl Fn(&str) + Send + 'static) {
         // Taken from this registry, never a clone: the receiver lives only
         // on the registry that created the channel, and a clone carries
         // `None` for it, so a clone's take would return `None` and spawn
@@ -3303,7 +3656,11 @@ impl BoxRegistry {
             .spawn(move || {
                 while let Ok(report) = reports.recv() {
                     for addr in report {
-                        registry.withdraw(Ipv4Addr::from(addr));
+                        if let Some(record) = registry.withdraw(Ipv4Addr::from(addr)) {
+                            registry.release_withdrawn_unless_owned(record.name(), || {
+                                release_address(record.name());
+                            });
+                        }
                     }
                 }
             });
@@ -3357,10 +3714,14 @@ fn box_loopback_run(slice: switch::LoopbackSlice) -> (u32, u32) {
 }
 
 /// Takes the next unspent address from `cursor`, when `first..=last` still
-/// holds one. Relaxed ordering: a cursor's only invariant is that no two
-/// takes return the same address, which an atomic add gives on every
-/// ordering; the run's bounds are checked on the taken value, so even a
-/// cursor advanced past its run's end (or wrapped) hands out nothing.
+/// holds one: the tests' single-node loopback cursor
+/// ([`BoxRegistry::register_client_box`]); the daemon's switch addresses
+/// come from the hand-out book ([`SwitchAddressBook`]). Relaxed ordering: a
+/// cursor's only invariant is that no two takes return the same address,
+/// which an atomic add gives on every ordering; the run's bounds are
+/// checked on the taken value, so even a cursor advanced past its run's
+/// end (or wrapped) hands out nothing.
+#[cfg(test)]
 fn take_next(cursor: &AtomicU32, first: u32, last: u32) -> Option<Ipv4Addr> {
     let next = cursor.fetch_add(1, Ordering::Relaxed);
     (first <= next && next <= last).then(|| Ipv4Addr::from(next))
@@ -3458,6 +3819,26 @@ impl BoxTable {
     #[must_use]
     pub fn revocation_pending(&self, addr: [u8; 4]) -> bool {
         self.revoking.first_held(&[addr]).is_some()
+    }
+
+    /// Marks the row at `src` attributed, when one is held: a frame of its
+    /// box crossed the gate on a relay that will retire the address at its
+    /// end. The relay marks each source once per connection, when it first
+    /// attributes it, so the cost is one row lookup per box per connection.
+    /// Like the withdrawal report, it is a fact the host observed, not a
+    /// row operation: it changes nothing the gate decides by, only whether
+    /// the row's switch address is quarantined when the row goes
+    /// ([`BoxRecord::was_attributed`]). The mark is stored under the row
+    /// lock's read half, and a withdrawal reads it after taking the write
+    /// half, so a mark made while the row stood is always seen.
+    pub fn mark_attributed(&self, src: [u8; 4]) {
+        let rows = self
+            .rows
+            .read()
+            .expect("the row lock is never held across a panic, so it cannot be poisoned");
+        if let Some(record) = rows.get(&src) {
+            record.attributed.store(true, Ordering::Relaxed);
+        }
     }
 
     /// The published namespace holding the switch address `src`, when one
@@ -4256,7 +4637,7 @@ mod tests {
         assert!(registry.withdraw(web.switch_addr()).is_none());
         assert!(
             registry
-                .withdraw_client_box("db", db.switch_addr(), db.loopback_addr())
+                .withdraw_client_box("db", db.switch_addr(), db.loopback_addr(), None)
                 .expect("the withdrawing client is the row's creator")
                 .is_some()
         );
@@ -4437,6 +4818,386 @@ mod tests {
         );
     }
 
+    /// A planned carved /24 — its hand-out run is 100.64.1.127 through
+    /// 100.64.1.251, 125 addresses — small enough to draw through, with the
+    /// one loopback address every box below registers at: the answerer's
+    /// half is not under test, and with no withdrawal subscriber nothing
+    /// holds it.
+    fn carved() -> SwitchSubnet {
+        SwitchSubnet::new(Ipv4Addr::new(100, 64, 1, 0), 24).expect("a /24 is a valid plan")
+    }
+    const CARVED_RUN: usize = 125;
+    const CARVED_LOOPBACK: Ipv4Addr = Ipv4Addr::new(127, 0, 64, 40);
+
+    fn client_spec(name: &str) -> ClientBoxSpec {
+        ClientBoxSpec {
+            name: name.to_string(),
+            ingress_ports: Vec::new(),
+            egress: None,
+            credentialed_upstream: None,
+            dynamic_ingress: None,
+            dynamic_allowed_range: None,
+        }
+    }
+
+    fn register_carved(
+        registry: &BoxRegistry,
+        name: &str,
+    ) -> Result<Arc<BoxRecord>, AllocationError> {
+        registry.register_client_box_at(client_spec(name), CARVED_LOOPBACK)
+    }
+
+    /// Draws the carved run through: one row per address, each attributed
+    /// as a relay that carried its frames would mark it.
+    fn fill_carved_run(registry: &BoxRegistry) -> Vec<Arc<BoxRecord>> {
+        (0..CARVED_RUN)
+            .map(|index| {
+                let row = register_carved(registry, &format!("box{index}"))
+                    .expect("the carved run holds an address for every box");
+                registry.table().mark_attributed(row.switch_addr().octets());
+                row
+            })
+            .collect()
+    }
+
+    /// NET-138, design §7.1: a withdrawn row's switch address goes back to
+    /// the hand-out book, but is handed again only once the shared reuse
+    /// quarantine has passed — not a second before — and then to a new box
+    /// with a new id.
+    #[test]
+    fn withdrawn_switch_address_rehanded_only_after_quarantine() {
+        let registry = BoxRegistry::new(carved());
+        let rows = fill_carved_run(&registry);
+        let gone = &rows[7];
+        assert!(registry.withdraw(gone.switch_addr()).is_some());
+
+        assert!(
+            matches!(
+                register_carved(&registry, "late"),
+                Err(AllocationError::SwitchExhausted(_))
+            ),
+            "a returned address is not handed inside its quarantine"
+        );
+        registry.advance_clock(SWITCH_REUSE_QUARANTINE.saturating_sub(Duration::from_secs(1)));
+        assert!(
+            matches!(
+                register_carved(&registry, "late"),
+                Err(AllocationError::SwitchExhausted(_))
+            ),
+            "nor a second before the quarantine ends"
+        );
+        registry.advance_clock(Duration::from_secs(1));
+        let again = register_carved(&registry, "late").expect("the quarantine has passed");
+        assert_eq!(again.switch_addr(), gone.switch_addr());
+        assert_ne!(
+            again.box_id(),
+            gone.box_id(),
+            "a re-handed address is a new box"
+        );
+        assert_eq!(registry.live_switch_addrs(), CARVED_RUN);
+    }
+
+    /// The book hands never-drawn addresses first, then returned ones in
+    /// return order: the address free longest goes first.
+    #[test]
+    fn hand_out_reuses_longest_free_first() {
+        let registry = BoxRegistry::new(carved());
+        let rows = fill_carved_run(&registry);
+        let (first_back, second_back) = (&rows[40], &rows[3]);
+        assert!(registry.withdraw(first_back.switch_addr()).is_some());
+        registry.advance_clock(Duration::from_secs(10));
+        assert!(registry.withdraw(second_back.switch_addr()).is_some());
+        registry.advance_clock(SWITCH_REUSE_QUARANTINE);
+
+        let next = register_carved(&registry, "next").expect("both quarantines have passed");
+        assert_eq!(
+            next.switch_addr(),
+            first_back.switch_addr(),
+            "the longest free goes first"
+        );
+        let after = register_carved(&registry, "after").expect("one more address is free");
+        assert_eq!(after.switch_addr(), second_back.switch_addr());
+    }
+
+    /// A registration refused after its switch address was drawn — here a
+    /// withdrawal under its name that landed while it waited — returns the
+    /// address at once, unquarantined: no row was published, so no frame
+    /// was ever attributed to it, and the refusal spends nothing.
+    #[test]
+    fn refused_registration_returns_its_switch_address() {
+        let registry = BoxRegistry::new(SUBNET);
+        let mut withdrawn = registry.table().subscribe_row_withdrawals();
+        let old = registry
+            .register_client_box(client_spec("old"))
+            .expect("the plan has an address for the box");
+        registry.table().mark_attributed(old.switch_addr().octets());
+        assert!(registry.withdraw(old.switch_addr()).is_some());
+        // The old box's revocation holds its loopback address, so the next
+        // registration at it waits — past its early checks, before its draw.
+        let hold = withdrawn.try_recv().expect("the subscriber is told");
+        let claim = registry.begin_registration("web");
+        let generation = claim.generation();
+        let loopback = old.loopback_addr();
+        let waiting = registry.clone();
+        let registering = std::thread::spawn(move || {
+            waiting.register_client_box_since(client_spec("web"), loopback, generation)
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        // A withdrawal under the name lands while the registration waits,
+        // then the revocation ends and the registration draws and is
+        // refused in its turn.
+        assert_eq!(
+            registry.withdraw_client_box("web", Ipv4Addr::new(100, 64, 200, 1), loopback, None),
+            Ok(None)
+        );
+        let live_before = registry.live_switch_addrs();
+        drop(hold);
+        assert_eq!(
+            registering
+                .join()
+                .expect("the registering thread")
+                .map(|row| row.name().to_string()),
+            Err(AllocationError::WithdrawnWhileAllocating)
+        );
+        drop(claim);
+        assert_eq!(
+            registry.live_switch_addrs(),
+            live_before,
+            "the refusal holds no address"
+        );
+        let next_never_drawn = Ipv4Addr::from(u32::from(old.switch_addr()) + 1);
+        assert_eq!(
+            registry.returned_switch_addrs(),
+            vec![(old.switch_addr(), false), (next_never_drawn, true)],
+            "the refused registration's draw came back at once, unquarantined, behind the \
+             attributed old row's quarantined one"
+        );
+    }
+
+    /// A row withdrawn before any frame of its box crossed the gate keyed
+    /// no state by its switch address, so the address comes back with no
+    /// quarantine and is handed at once; an attributed row's is not.
+    #[test]
+    fn unattached_withdrawal_skips_quarantine() {
+        let registry = BoxRegistry::new(carved());
+        let attributed = register_carved(&registry, "attributed").expect("the run is empty");
+        registry
+            .table()
+            .mark_attributed(attributed.switch_addr().octets());
+        // A row no relay ever carried a frame for.
+        let never = register_carved(&registry, "never").expect("the run has room");
+        for index in 2..CARVED_RUN {
+            register_carved(&registry, &format!("box{index}")).expect("the run has room");
+        }
+        assert!(matches!(
+            register_carved(&registry, "late"),
+            Err(AllocationError::SwitchExhausted(_))
+        ));
+        assert!(registry.withdraw(attributed.switch_addr()).is_some());
+        assert!(registry.withdraw(never.switch_addr()).is_some());
+
+        let quiet = register_carved(&registry, "quiet")
+            .expect("nothing was attributed to the row, so its address is free at once");
+        assert_eq!(quiet.switch_addr(), never.switch_addr());
+        // The creator's withdrawal of a row never attributed skips the
+        // quarantine too.
+        assert_eq!(
+            registry.withdraw_client_box(
+                "quiet",
+                quiet.switch_addr(),
+                quiet.loopback_addr(),
+                Some(quiet.box_id())
+            ),
+            Ok(Some(Arc::clone(&quiet)))
+        );
+        let again = register_carved(&registry, "again").expect("free at once again");
+        assert_eq!(again.switch_addr(), never.switch_addr());
+        assert!(
+            matches!(
+                register_carved(&registry, "late"),
+                Err(AllocationError::SwitchExhausted(_))
+            ),
+            "the attributed row's address is still in its quarantine"
+        );
+    }
+
+    /// An exhausted hand-out run names where it stands: the live and
+    /// quarantined counts, the capacity, and when the next address frees.
+    #[test]
+    fn switch_exhaustion_names_live_and_quarantined() {
+        let registry = BoxRegistry::new(carved());
+        let rows = fill_carved_run(&registry);
+        assert!(registry.withdraw(rows[0].switch_addr()).is_some());
+        registry.advance_clock(Duration::from_secs(100));
+        let error = register_carved(&registry, "late").expect_err("the run is exhausted");
+        let AllocationError::SwitchExhausted(counts) = &error else {
+            panic!("the refusal is the run's exhaustion, got: {error}");
+        };
+        assert_eq!(
+            (counts.live, counts.quarantined, counts.capacity),
+            (CARVED_RUN - 1, 1, CARVED_RUN as u64)
+        );
+        // The real clock moves under the test's skew, so the wait is a
+        // hair under the 200 s left.
+        let wait = counts.next_free_in.expect("one address is quarantined");
+        assert!(
+            Duration::from_secs(199) < wait && wait <= Duration::from_secs(200),
+            "the next address frees when its quarantine ends, got {wait:?}"
+        );
+        let said = error.to_string();
+        assert!(
+            said.contains(
+                "124 of 125 box addresses are held by live boxes and 1 are in their 300 s \
+                 reuse quarantine; the next one frees in 200 s"
+            ),
+            "the refusal names the counts, got: {said}"
+        );
+        assert_eq!(
+            registry.live_switch_addrs(),
+            CARVED_RUN - 1,
+            "the refusal holds nothing"
+        );
+    }
+
+    /// The box id is the epoch a withdrawal is held to: once a newer box
+    /// was handed the same name and both addresses, a stale creator naming
+    /// the old id removes nothing; the new row's own creator, or a client
+    /// predating the field, still withdraws it.
+    #[test]
+    fn stale_withdrawal_with_old_box_id_leaves_new_row() {
+        let registry = BoxRegistry::new(carved());
+        let mut rows = fill_carved_run(&registry);
+        let filler = rows.pop().expect("the run is full");
+        assert!(registry.withdraw(filler.switch_addr()).is_some());
+        registry.advance_clock(SWITCH_REUSE_QUARANTINE);
+        let old = register_carved(&registry, "web").expect("the address is free again");
+        // The old box ends daemon-side; its creator's withdrawal is late.
+        assert!(registry.withdraw(old.switch_addr()).is_some());
+        let new = register_carved(&registry, "web").expect("never attributed, so free at once");
+        assert_eq!(
+            (new.switch_addr(), new.loopback_addr()),
+            (old.switch_addr(), old.loopback_addr())
+        );
+
+        assert_eq!(
+            registry.withdraw_client_box(
+                "web",
+                old.switch_addr(),
+                old.loopback_addr(),
+                Some(old.box_id())
+            ),
+            Err(WithdrawError::NotTheBoxId {
+                switch_addr: old.switch_addr(),
+                held_box_id: new.box_id(),
+                asked_box_id: old.box_id(),
+            })
+        );
+        assert_eq!(
+            registry.row_by_name("web").map(|row| row.box_id()),
+            Some(new.box_id()),
+            "the stale withdrawal left the newer row"
+        );
+        assert_eq!(
+            registry.withdraw_client_box("web", new.switch_addr(), new.loopback_addr(), None),
+            Ok(Some(Arc::clone(&new))),
+            "a client predating the field keeps the pair proof alone"
+        );
+    }
+
+    /// NET-133, design §7.1: the drainer's withdrawal — a box whose shuttle
+    /// closed, whatever ended its session — hands the box's published
+    /// address back to the answerer by name, unless something else owns
+    /// the name: here, a registration of it still in flight.
+    #[test]
+    fn drainer_withdrawal_releases_answerer_address() {
+        let registry = BoxRegistry::new(SUBNET);
+        let (released, releases) = std::sync::mpsc::channel();
+        registry.spawn_withdrawal_drainer(move |name| {
+            let _ = released.send(name.to_string());
+        });
+        let web = registry
+            .register_client_box(client_spec("web"))
+            .expect("the plan has an address for the box");
+        let api = registry
+            .register_client_box(client_spec("api"))
+            .expect("the plan has an address for the box");
+        let in_flight = registry.begin_registration("api");
+
+        registry
+            .table()
+            .report_withdrawals(vec![api.switch_addr().octets(), web.switch_addr().octets()]);
+        assert_eq!(
+            releases.recv_timeout(Duration::from_secs(5)).as_deref(),
+            Ok("web"),
+            "the withdrawn box's address goes back to the answerer"
+        );
+        assert!(
+            registry.row_by_name("api").is_none(),
+            "both rows were withdrawn"
+        );
+        assert!(
+            releases.recv_timeout(Duration::from_millis(200)).is_err(),
+            "a registration of the name in flight owns the address, so it is not released"
+        );
+        drop(in_flight);
+    }
+
+    /// Activate-and-destroy cycles past the run's size never exhaust it: a
+    /// destroyed box's switch address comes back and, once its quarantine
+    /// has passed, is handed again — the leak the count-up cursor had.
+    #[test]
+    fn hundreds_of_activate_destroy_cycles_never_exhaust() {
+        let registry = BoxRegistry::new(carved());
+        for cycle in 0..CARVED_RUN * 3 {
+            let row = register_carved(&registry, &format!("cycle{cycle}"))
+                .unwrap_or_else(|error| panic!("cycle {cycle} found the run exhausted: {error}"));
+            registry.table().mark_attributed(row.switch_addr().octets());
+            assert!(registry.withdraw(row.switch_addr()).is_some());
+            registry.advance_clock(SWITCH_REUSE_QUARANTINE);
+        }
+        assert_eq!(
+            registry.live_switch_addrs(),
+            0,
+            "every destroyed box's address came back"
+        );
+    }
+
+    /// An autogen name's retry — register, withdraw the unused row, re-mint
+    /// and register again — leaves the live count where one activation
+    /// leaves it, and the abandoned row's address free at once.
+    #[test]
+    fn autogen_retry_leaves_live_counts_unchanged() {
+        let registry = BoxRegistry::new(SUBNET);
+        let first = registry
+            .register_client_box(client_spec("proj-ab12"))
+            .expect("the plan has an address for the box");
+        assert_eq!(registry.live_switch_addrs(), 1);
+        assert!(
+            registry
+                .withdraw_client_box(
+                    "proj-ab12",
+                    first.switch_addr(),
+                    first.loopback_addr(),
+                    Some(first.box_id())
+                )
+                .expect("the creator's pair and id")
+                .is_some()
+        );
+        registry
+            .register_client_box(client_spec("proj-cd34"))
+            .expect("the plan has an address for the retry");
+        assert_eq!(
+            registry.live_switch_addrs(),
+            1,
+            "the retry holds one address, not two"
+        );
+        assert_eq!(
+            registry.returned_switch_addrs(),
+            vec![(first.switch_addr(), true)],
+            "the abandoned row's address is free to hand at once"
+        );
+    }
+
     /// With nothing subscribed to withdrawals, nothing would ever release a
     /// hold, so a withdrawal takes none.
     #[test]
@@ -4478,7 +5239,7 @@ mod tests {
             .expect("the plan has an address for the first box");
         assert!(
             registry
-                .withdraw_client_box("web", first.switch_addr(), first.loopback_addr())
+                .withdraw_client_box("web", first.switch_addr(), first.loopback_addr(), None)
                 .expect("the withdrawing client is the row's creator")
                 .is_some(),
             "the first box's row was published"
@@ -4942,7 +5703,7 @@ mod tests {
             Ipv4Addr::from(lease),
             Ipv4Addr::LOCALHOST,
         ));
-        registry.spawn_withdrawal_drainer();
+        registry.spawn_withdrawal_drainer(|_| {});
         let mut harness = gate_over(registry).await;
 
         // The box's attachment is held before its traffic: issued by the
@@ -4971,6 +5732,11 @@ mod tests {
             expect_frame(&mut harness.switch).await,
             frame,
             "the box's declared frame reaches the switch"
+        );
+        assert!(
+            row.was_attributed(),
+            "the relay that carried the box's frame marked its row attributed, so its \
+             switch address is quarantined at the row's withdrawal"
         );
 
         // The box's connection ends: the guest closes its side.
@@ -5286,7 +6052,7 @@ mod tests {
             .expect("the plan has an address for the first box");
         assert!(
             registry
-                .withdraw_client_box("WEB", web.switch_addr(), web.loopback_addr())
+                .withdraw_client_box("WEB", web.switch_addr(), web.loopback_addr(), None)
                 .expect("the asking name folds to the row's, so the proof stands")
                 .is_some(),
             "the folded-equal name withdraws the row its pair proves"

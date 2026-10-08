@@ -682,9 +682,13 @@ pub const REGISTRATION_COMMIT_LINE: &str = "commit";
 /// is refused with [`BoxControlReply::Error`]: the requesting client is not
 /// its creator, and no client may remove another box's row.
 ///
-/// The addresses themselves are spent for good by design — the host's
-/// allocation cursors never regress — so a withdrawal ends a row's
-/// admissions without ever returning its addresses to the plan.
+/// A withdrawal ends the row's admissions and returns its addresses: the
+/// switch address to the host's hand-out run, handed again only after its
+/// reuse quarantine (or at once for a row no frame ever crossed the gate
+/// under), and the published loopback address to the machine's answerer.
+/// Because an address can be handed again, the withdrawal may name the
+/// row's [`BoxId`] — the epoch the pair was handed under — so a stale
+/// creator never removes a newer row holding the same name and addresses.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WithdrawBoxRequest {
     /// The name the row to withdraw was registered under.
@@ -695,6 +699,15 @@ pub struct WithdrawBoxRequest {
     /// The loopback address the registration handed back, which the pair
     /// proof checks against the row's own.
     pub loopback_address: std::net::Ipv4Addr,
+    /// The box id the registration handed back with the pair, when the
+    /// withdrawing client holds it: a row at the pair under another id is
+    /// a newer box, and the withdrawal is refused with
+    /// [`BoxControlReply::Error`] rather than removing it. `None` from a
+    /// client that predates the field, or one that no longer holds the id
+    /// (a destroy reads the pair from the session record, which carries
+    /// none): the pair proof alone decides, as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub box_id: Option<BoxId>,
 }
 
 /// A name to hold in the host's zone without a row behind it
@@ -3811,6 +3824,35 @@ mod tests {
     /// reply shape — the discrimination the untagged reply depends on, since
     /// a report the grant refused is answered as `Error` and a publish that
     /// unwinds must be able to tell which it got.
+    /// A withdrawal's box id is optional on the wire: a client that
+    /// predates it sends none and decodes as `None`, and `None` is not
+    /// written, so a daemon that predates it reads the line it always did.
+    #[test]
+    fn withdraw_box_id_is_optional_on_the_wire() {
+        let old_client: WithdrawBoxRequest = serde_json_lenient::from_str(
+            r#"{"name":"web","switch_address":"100.64.127.255","loopback_address":"127.0.64.2"}"#,
+        )
+        .expect("a pre-epoch withdrawal decodes");
+        assert_eq!(old_client.box_id, None);
+        let wire = serde_json_lenient::to_string(&old_client).expect("serialize");
+        assert!(
+            !wire.contains("box_id"),
+            "an absent id is not written: {wire}"
+        );
+
+        let with_id = WithdrawBoxRequest {
+            box_id: Some(BoxId::from_bytes([7; 16])),
+            ..old_client
+        };
+        let wire = serde_json_lenient::to_string(&with_id).expect("serialize");
+        assert!(
+            wire.contains(r#""box_id":"07070707070707070707070707070707""#),
+            "the id crosses as its hex spelling: {wire}"
+        );
+        let decoded: WithdrawBoxRequest = serde_json_lenient::from_str(&wire).expect("decode");
+        assert_eq!(decoded, with_id);
+    }
+
     #[test]
     fn box_control_admit_and_withdraw_round_trip() {
         let admit = BoxControlRequest::AdmitPort(AdmitPortRequest {

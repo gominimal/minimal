@@ -945,10 +945,18 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
                 Effect::SaveState => save_state(&model, opts.minimal_dir.as_deref()),
                 // Attach suspends the TUI around a blocking ssh child; it
                 // needs the terminal guard, so it can't live in exec_effect.
-                Effect::Attach(key) => match providers.iter().find(|p| p.label == key.provider) {
+                Effect::Attach(key) => match providers.iter_mut().find(|p| p.label == key.provider)
+                {
                     Some(p) => {
                         let sock = p.sock.clone();
                         let box_name = model.entry(&key).and_then(|entry| entry.name.clone());
+                        // The pair the box's row was registered with, read
+                        // before the attach: a Delete at the shell-exit
+                        // prompt leaves no record to read it from after.
+                        let box_addresses = match box_name {
+                            Some(_) => rpc::box_addresses_of(p, key.id).await,
+                            None => None,
+                        };
                         attach_and_resume(
                             &mut terminal,
                             &sock,
@@ -958,11 +966,11 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
                             &mut model,
                         );
                         // The attach may have ended in the shell-exit
-                        // prompt's Delete: release a `host_ip` box's hold.
-                        if let Some(name) = box_name.as_deref()
-                            && let Some(p) = providers.iter_mut().find(|p| p.label == key.provider)
-                        {
-                            rpc::release_held_name_after_attach(p, key.id, name).await;
+                        // prompt's Delete: withdraw the box's row, or
+                        // release a `host_ip` box's hold.
+                        if let Some(name) = box_name.as_deref() {
+                            rpc::release_held_name_after_attach(p, key.id, name, box_addresses)
+                                .await;
                         }
                         inbox.push_back(Msg::Tick);
                     }

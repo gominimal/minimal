@@ -441,11 +441,16 @@ pub(crate) fn vm_host_answerer_start_line(
 /// the deadline — leaves the row published and warns rather than failing
 /// the destroy or the activation error it rides on; the daemon restarting
 /// between registration and withdrawal answers the withdrawal as already
-/// gone, which is the goal state either way.
+/// gone, which is the goal state either way. `box_id` is the id the
+/// registration handed back beside the pair, where the caller still holds
+/// it — an activation failing after it registered — so the withdrawal
+/// removes only that box; a destroy, reading the pair from the session
+/// record, has none and passes `None`.
 pub(crate) async fn withdraw_box_row(
     control_sock: Option<std::path::PathBuf>,
     name: Option<&str>,
     box_addresses: Option<sessions::BoxAddresses>,
+    box_id: Option<minimald_rpc::BoxId>,
 ) {
     let Some(name) = name else { return };
     let Some(addresses) = box_addresses else {
@@ -459,142 +464,24 @@ pub(crate) async fn withdraw_box_row(
         );
         return;
     };
-    let request = minimald_rpc::WithdrawBoxRequest {
-        name: name.to_string(),
-        switch_address: addresses.switch_address,
-        loopback_address: addresses.loopback_address,
-    };
+    // The exchange itself is the client library's, shared with the
+    // dashboard's destroy and the after-attach release; it blocks, so it
+    // runs off the runtime under this side's own deadline.
+    let box_name = name.to_string();
     let withdrawn = tokio::time::timeout(
         BOX_CONTROL_TIMEOUT,
-        control_request_with_vm_host(
-            &sock_path,
-            minimald_rpc::BoxControlRequest::Withdraw(request),
-        ),
+        tokio::task::spawn_blocking(move || {
+            minimal_client::attach::withdraw_box_row_at(&sock_path, &box_name, addresses, box_id)
+        }),
     )
     .await;
-    match withdrawn {
-        Ok(Ok(reply)) => match reply {
-            // The daemon answers the withdrawal with the pair it went by; a
-            // pair back that is not the pair asked is a daemon speaking
-            // another protocol's answer — the row asked for is not
-            // withdrawn, so say so.
-            minimald_rpc::BoxControlReply::Addresses(handed) if handed == addresses => {
-                tracing::info!(
-                    box = %name,
-                    switch_address = %handed.switch_address,
-                    loopback_address = %handed.loopback_address,
-                    "withdrew the box's host row; its addresses admit nothing"
-                );
-            }
-            minimald_rpc::BoxControlReply::Addresses(handed) => {
-                tracing::warn!(
-                    box = %name,
-                    switch_address = %handed.switch_address,
-                    "the VM host daemon answered the withdrawal with a different \
-                     address pair; the row asked for stays published"
-                );
-            }
-            minimald_rpc::BoxControlReply::Error { error } => {
-                tracing::warn!(
-                    box = %name,
-                    %error,
-                    "the VM host daemon refused the box row withdrawal; the row \
-                     stays published"
-                );
-            }
-            // A status reply is another verb's answer on a wire whose
-            // reply shapes are disjoint: the row asked for was not
-            // withdrawn, so say so and leave it published.
-            minimald_rpc::BoxControlReply::Status(status) => {
-                tracing::warn!(
-                    box = %name,
-                    status = ?status,
-                    "the VM host daemon answered the box row withdrawal with its \
-                     answerer status; the row stays published"
-                );
-            }
-            minimald_rpc::BoxControlReply::AnswererRelease { .. } => {
-                tracing::warn!(
-                    box = %name,
-                    "the VM host daemon answered the box row withdrawal with an \
-                     answerer release reply; the row stays published"
-                );
-            }
-            // A withdrawal is never answered with a registered box — but a
-            // daemon that speaks another shape here is still not answering
-            // the withdrawal, so the row stays published and the line says
-            // so.
-            minimald_rpc::BoxControlReply::Registered(_) => {
-                tracing::warn!(
-                    box = %name,
-                    "the VM host daemon answered the box row withdrawal with a \
-                     registration; the row stays published"
-                );
-            }
-            // The read-only and report replies are other verbs' answers on
-            // a wire whose shapes are disjoint: none of them says the row
-            // went, so the row stays published and the line says so.
-            minimald_rpc::BoxControlReply::Row(_) => {
-                tracing::warn!(
-                    box = %name,
-                    "the VM host daemon answered the box row withdrawal with a \
-                     row read; the row stays published"
-                );
-            }
-            minimald_rpc::BoxControlReply::NoRow { .. } => {
-                tracing::warn!(
-                    box = %name,
-                    "the VM host daemon answered the box row withdrawal with a \
-                     no-row marker; the row stays published"
-                );
-            }
-            minimald_rpc::BoxControlReply::NameHeld {
-                name: held_name, ..
-            } => {
-                tracing::warn!(
-                    box = %name,
-                    held_name = %held_name,
-                    "the VM host daemon answered the box row withdrawal with a \
-                     name-hold reply; the row stays published"
-                );
-            }
-            minimald_rpc::BoxControlReply::PortRecorded { port, .. } => {
-                tracing::warn!(
-                    box = %name,
-                    port,
-                    "the VM host daemon answered the box row withdrawal with a \
-                     port report; the row stays published"
-                );
-            }
-            other @ (minimald_rpc::BoxControlReply::AsksSubscribed { .. }
-            | minimald_rpc::BoxControlReply::PendingAskOffer(_)
-            | minimald_rpc::BoxControlReply::PendingAskDismissed { .. }
-            | minimald_rpc::BoxControlReply::AskAnswerRecorded { .. }
-            | minimald_rpc::BoxControlReply::AskAdmit(_)
-            | minimald_rpc::BoxControlReply::AskAlreadyEnded { .. }) => {
-                tracing::warn!(
-                    box = %name,
-                    reply = ?other,
-                    "the VM host daemon answered the box row withdrawal with an \
-                     ask verb's reply; the row stays published"
-                );
-            }
-        },
-        Ok(Err(error)) => {
-            tracing::warn!(
-                box = %name,
-                %error,
-                "the box row withdrawal failed; the row stays published"
-            );
-        }
-        Err(_) => {
-            tracing::warn!(
-                after = ?BOX_CONTROL_TIMEOUT,
-                box = %name,
-                "the VM host daemon did not answer the box row withdrawal in \
-                 time; the row stays published"
-            );
-        }
+    if withdrawn.is_err() {
+        tracing::warn!(
+            after = ?BOX_CONTROL_TIMEOUT,
+            box = %name,
+            "the VM host daemon did not answer the box row withdrawal in \
+             time; the row stays published"
+        );
     }
 }
 
@@ -619,17 +506,42 @@ pub(crate) async fn release_held_box_name(
     hold_box_name_with_vm_host(control_sock, name, Some(id), false).await;
 }
 
-/// Releases a session's held name once an interactive attach on a
-/// VM-backed host has ended with the session gone: the shell-exit prompt's
-/// Delete destroys the session daemon-side, so neither `min session attach`
-/// nor `activate --attach` passes through [`destroy_session`], and this is
-/// the release that destroy would have made. The lookup and the release are
-/// both by the session's `id`: a session still there — a detach, a Keep —
-/// keeps its hold, a newer session that took the name keeps its own, and a
-/// hold a rename moved to another name is freed with its session.
-/// Best-effort: a lookup that fails or times out releases nothing, and a
-/// session that held nothing (an own-address box, a `none` box) is the
-/// goal state already holding.
+/// A session's record by its `id`, bounded by [`BOX_CONTROL_TIMEOUT`]:
+/// `None` once the session is gone. An interactive attach on a VM-backed
+/// host reads it twice — before the attach, for the pair the box's row was
+/// registered with, and after, to tell whether the attach ended in a
+/// daemon-side destroy ([`release_held_name_after_attach`]).
+async fn attached_session_record(
+    sock: &std::path::Path,
+    id: sessions::SessionId,
+) -> anyhow::Result<Option<sessions::Record>> {
+    use minimald_rpc::{GetSessionRecord, GetSessionRecordRequest};
+    tokio::time::timeout(BOX_CONTROL_TIMEOUT, async {
+        let mut client = client::Client::connect(sock).await?;
+        let resp = client
+            .oneshot_rpc::<GetSessionRecord>(GetSessionRecordRequest::Id(id))
+            .await
+            .context("GetSessionRecord RPC failed")?;
+        anyhow::Ok(resp.record)
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("no session lookup answer within {BOX_CONTROL_TIMEOUT:?}"))?
+}
+
+/// Releases what a session held on the VM host daemon once an interactive
+/// attach on a VM-backed host has ended with the session gone: the
+/// shell-exit prompt's Delete destroys the session daemon-side, so neither
+/// `min session attach` nor `activate --attach` passes through
+/// [`destroy_session`], and this is the release that destroy would have
+/// made — the row's withdrawal (T66) for a box that registered one, whose
+/// pair `box_addresses` was read off the record before the attach, and the
+/// name hold's release for one that did not. The lookup and the release
+/// are both by the session's `id`: a session still there — a detach, a
+/// Keep — keeps its row and its hold, a newer session that took the name
+/// keeps its own, and a hold a rename moved to another name is freed with
+/// its session. Best-effort: a lookup that fails or times out releases
+/// nothing, and a session that held nothing (a `none` box) is the goal
+/// state already holding.
 ///
 /// A destroy no client of this host issues — the daemon's own reap — still
 /// leaves the hold until the VM host daemon restarts: holds carry no
@@ -638,30 +550,29 @@ pub(crate) async fn release_held_name_after_attach(
     sock: &std::path::Path,
     id: sessions::SessionId,
     name: &str,
+    box_addresses: Option<sessions::BoxAddresses>,
 ) {
-    use minimald_rpc::{GetSessionRecord, GetSessionRecordRequest};
-    let lookup = tokio::time::timeout(BOX_CONTROL_TIMEOUT, async {
-        let mut client = client::Client::connect(sock).await?;
-        let resp = client
-            .oneshot_rpc::<GetSessionRecord>(GetSessionRecordRequest::Id(id))
-            .await
-            .context("GetSessionRecord RPC failed")?;
-        anyhow::Ok(resp.record)
-    })
-    .await;
-    match lookup {
-        Ok(Ok(None)) => {
-            hold_box_name_with_vm_host(control_sock_beside(sock), name, Some(id), false).await;
-        }
-        Ok(Ok(Some(_))) => {}
-        Ok(Err(error)) => tracing::debug!(
+    match attached_session_record(sock, id).await {
+        Ok(None) => match box_addresses {
+            // The record carries no box id, so the pair is the proof.
+            Some(addresses) => {
+                let (ssh_sock, box_name) = (sock.to_path_buf(), name.to_string());
+                let _ = tokio::task::spawn_blocking(move || {
+                    minimal_client::attach::withdraw_box_row_beside(
+                        &ssh_sock, &box_name, addresses, None,
+                    )
+                })
+                .await;
+            }
+            None => {
+                hold_box_name_with_vm_host(control_sock_beside(sock), name, Some(id), false).await;
+            }
+        },
+        Ok(Some(_)) => {}
+        Err(error) => tracing::debug!(
             box = %name,
             error = %format!("{error:#}"),
-            "could not tell whether the attached session is gone; its name hold stays"
-        ),
-        Err(_) => tracing::debug!(
-            box = %name,
-            "no session lookup answer within {BOX_CONTROL_TIMEOUT:?}; the name hold stays"
+            "could not tell whether the attached session is gone; its row and name hold stay"
         ),
     }
 }
@@ -1271,6 +1182,9 @@ pub(crate) async fn activate_session(
                     control_sock.clone(),
                     config.name.as_deref(),
                     config.box_addresses,
+                    registered
+                        .as_ref()
+                        .and_then(|registration| registration.box_id),
                 )
                 .await;
                 return Err(error.context("CreateSession RPC failed"));
@@ -1289,6 +1203,9 @@ pub(crate) async fn activate_session(
                         control_sock.clone(),
                         config.name.as_deref(),
                         config.box_addresses,
+                        registered
+                            .as_ref()
+                            .and_then(|registration| registration.box_id),
                     )
                     .await;
                     // The abandoned row's lease goes with it, uncommitted.
@@ -1296,10 +1213,9 @@ pub(crate) async fn activate_session(
                     config.name = Some(autogen_session_name(&utf8_path, &random_hex4()));
                     // A registered box's row carries the name it was
                     // registered under (T66), so the re-mint re-registers;
-                    // the abandoned row's addresses stay spent by design
-                    // (the host's cursors never regress), but its
-                    // admissions are withdrawn above, and the retry leaves
-                    // no row behind. The re-registration can itself fail —
+                    // the abandoned row is withdrawn above, by its id, which
+                    // returns its addresses to the host's hand-out books,
+                    // and the retry leaves no row behind. The re-registration can itself fail —
                     // the plan can be exhausted by then — and that failure
                     // ends the retry loop the same way the first one would
                     // have, with its cause. The first registration's id is
@@ -1329,6 +1245,9 @@ pub(crate) async fn activate_session(
                     control_sock.clone(),
                     config.name.as_deref(),
                     config.box_addresses,
+                    registered
+                        .as_ref()
+                        .and_then(|registration| registration.box_id),
                 )
                 .await;
                 bail!("CreateSession failed: {error}");
@@ -1348,6 +1267,9 @@ pub(crate) async fn activate_session(
             control_sock.clone(),
             config.name.as_deref(),
             config.box_addresses,
+            registered
+                .as_ref()
+                .and_then(|registration| registration.box_id),
         )
         .await;
         return Err(error);
@@ -1776,6 +1698,9 @@ pub(crate) async fn activate_session(
                         control_sock.clone(),
                         config.name.as_deref(),
                         config.box_addresses,
+                        registered
+                            .as_ref()
+                            .and_then(|registration| registration.box_id),
                     )
                     .await;
                     return Err(error.context("Failed to upload project files"));
@@ -1824,6 +1749,9 @@ pub(crate) async fn activate_session(
                 control_sock.clone(),
                 config.name.as_deref(),
                 config.box_addresses,
+                registered
+                    .as_ref()
+                    .and_then(|registration| registration.box_id),
             )
             .await;
             return Err(error.context("ConfigureLoadout RPC failed"));
@@ -1840,6 +1768,9 @@ pub(crate) async fn activate_session(
                 control_sock.clone(),
                 config.name.as_deref(),
                 config.box_addresses,
+                registered
+                    .as_ref()
+                    .and_then(|registration| registration.box_id),
             )
             .await;
             bail!(composition_failure_message(&utf8_path, &error));
@@ -1879,6 +1810,9 @@ pub(crate) async fn activate_session(
                         control_sock.clone(),
                         config.name.as_deref(),
                         config.box_addresses,
+                        registered
+                            .as_ref()
+                            .and_then(|registration| registration.box_id),
                     )
                     .await;
                     // The route an activation actually reaches today: the
@@ -1897,6 +1831,9 @@ pub(crate) async fn activate_session(
                     control_sock.clone(),
                     config.name.as_deref(),
                     config.box_addresses,
+                    registered
+                        .as_ref()
+                        .and_then(|registration| registration.box_id),
                 )
                 .await;
                 let count = summary.count();
@@ -1919,6 +1856,9 @@ pub(crate) async fn activate_session(
                     control_sock.clone(),
                     config.name.as_deref(),
                     config.box_addresses,
+                    registered
+                        .as_ref()
+                        .and_then(|registration| registration.box_id),
                 )
                 .await;
                 return Err(error);
@@ -1967,6 +1907,9 @@ pub(crate) async fn activate_session(
                     control_sock.clone(),
                     config.name.as_deref(),
                     config.box_addresses,
+                    registered
+                        .as_ref()
+                        .and_then(|registration| registration.box_id),
                 )
                 .await;
             }
@@ -2015,6 +1958,9 @@ pub(crate) async fn activate_session(
             control_sock.clone(),
             config.name.as_deref(),
             config.box_addresses,
+            registered
+                .as_ref()
+                .and_then(|registration| registration.box_id),
         )
         .await;
         return Err(e);
@@ -2400,6 +2346,18 @@ pub(crate) async fn session_via_ssh(
         let stdin_is_tty = std::io::stdin().is_terminal();
         let host_asks = host_asks_for
             .and_then(|name| control_sock_beside(sock).map(|control| (control, name.to_string())));
+        // The pair the box's row was registered with, read before the
+        // attach: an attach that ends in a daemon-side destroy leaves no
+        // record to read it from, and the row is still this client's to
+        // withdraw. A lookup that fails reads as no row.
+        let box_addresses = match host_asks_for {
+            Some(_) => attached_session_record(sock, id)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|record| record.box_addresses),
+            None => None,
+        };
         // The relay blocks its thread until ssh exits, so it runs off the
         // runtime's workers.
         let code = tokio::task::spawn_blocking(move || {
@@ -2413,9 +2371,10 @@ pub(crate) async fn session_via_ssh(
         .await
         .context("the interactive attach's thread failed")??;
         // The attach may have ended in the shell-exit prompt's Delete, a
-        // destroy made daemon-side: release the name a `host_ip` box held.
+        // destroy made daemon-side: withdraw the row an own-address box
+        // registered, or release the name a `host_ip` box held.
         if let Some(name) = host_asks_for {
-            release_held_name_after_attach(sock, id, name).await;
+            release_held_name_after_attach(sock, id, name, box_addresses).await;
         }
         // Terminate with ssh's own status, exactly as the `exec()` this
         // replaced did: `min` has nothing of its own left to say after an
@@ -4237,7 +4196,7 @@ pub(crate) async fn destroy_session(
         // way.
         let control_sock =
             vm_host_control_sock(daemon_provider_kind(global), global.minimal_dir.as_deref());
-        withdraw_box_row(control_sock.clone(), name, box_addresses).await;
+        withdraw_box_row(control_sock.clone(), name, box_addresses, None).await;
         release_held_box_name(control_sock, id, name, box_addresses).await;
     } else {
         bail!("DestroySession returned an error from the daemon");
@@ -6342,9 +6301,16 @@ mod tests {
         );
 
         // The autospawn retry's shape: the row is withdrawn — its creator
-        // presents the pair it was handed — and the re-registration under
-        // the re-minted name is a new creation the host mints a new id for.
-        withdraw_box_row(Some(sock_path.clone()), Some("web"), Some(first.addresses)).await;
+        // presents the pair and the id it was handed — and the
+        // re-registration under the re-minted name is a new creation the
+        // host mints a new id for.
+        withdraw_box_row(
+            Some(sock_path.clone()),
+            Some("web"),
+            Some(first.addresses),
+            Some(id),
+        )
+        .await;
         let again = register_box_for_activation(
             paths::ProviderKind::Minvmd,
             global.minimal_dir.as_deref(),
@@ -6364,7 +6330,7 @@ mod tests {
         );
         assert_ne!(
             again.addresses.switch_address, first.addresses.switch_address,
-            "the recreation spent the run's next address, never a spent one again"
+            "the recreation draws a never-drawn address before any returned one"
         );
 
         // The CLI's record, the new row and the new attachment agree on the
@@ -6792,6 +6758,7 @@ mod tests {
             minimal_dir: Some(dir.path().to_path_buf()),
             ..Default::default()
         };
+        let box_id = minimald_rpc::BoxId::from_bytes([7; 16]);
         let handed = sessions::BoxAddresses {
             switch_address: std::net::Ipv4Addr::new(100, 64, 0, 2),
             loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 0),
@@ -6804,6 +6771,7 @@ mod tests {
             vm_host_control_sock(paths::ProviderKind::Minvmd, global.minimal_dir.as_deref()),
             Some("web"),
             Some(handed),
+            Some(box_id),
         )
         .await;
         {
@@ -6817,6 +6785,11 @@ mod tests {
             assert_eq!(request.name, "web");
             assert_eq!(request.switch_address, handed.switch_address);
             assert_eq!(request.loopback_address, handed.loopback_address);
+            assert_eq!(
+                request.box_id,
+                Some(box_id),
+                "a withdrawal that holds the id names it"
+            );
         }
 
         // And a session that registered nothing owes nothing: no pair, no
@@ -6824,6 +6797,7 @@ mod tests {
         withdraw_box_row(
             vm_host_control_sock(paths::ProviderKind::Minvmd, global.minimal_dir.as_deref()),
             Some("web"),
+            None,
             None,
         )
         .await;
@@ -6836,6 +6810,7 @@ mod tests {
             vm_host_control_sock(paths::ProviderKind::Minvmd, global.minimal_dir.as_deref()),
             None,
             Some(handed),
+            None,
         )
         .await;
         assert_eq!(
@@ -6847,6 +6822,7 @@ mod tests {
             vm_host_control_sock(paths::ProviderKind::Minimald, None),
             Some("web"),
             Some(handed),
+            None,
         )
         .await;
         assert_eq!(
@@ -6881,7 +6857,7 @@ mod tests {
         };
 
         // A failed activation's withdrawal of a row-less box: nothing sent.
-        withdraw_box_row(control_sock(), Some("web"), None).await;
+        withdraw_box_row(control_sock(), Some("web"), None, None).await;
         assert!(
             requests.lock().unwrap().is_empty(),
             "a row-less withdrawal never releases a name a live session may hold"
@@ -6959,7 +6935,7 @@ mod tests {
         .await;
 
         // The attach ended with the session still there: nothing released.
-        release_held_name_after_attach(&ssh_sock, id, "web").await;
+        release_held_name_after_attach(&ssh_sock, id, "web", None).await;
         assert!(
             requests.lock().unwrap().is_empty(),
             "a session still holding the name keeps its hold"
@@ -6973,7 +6949,7 @@ mod tests {
             minimald_rpc::Errorable::Ok(_) => {}
             minimald_rpc::Errorable::Err { error } => panic!("the destroy failed: {error}"),
         }
-        release_held_name_after_attach(&ssh_sock, id, "web").await;
+        release_held_name_after_attach(&ssh_sock, id, "web", None).await;
         let seen = requests.lock().unwrap();
         assert_eq!(seen.len(), 1, "one release, one request");
         let minimald_rpc::BoxControlRequest::ReleaseBoxName(request) =
@@ -6987,6 +6963,63 @@ mod tests {
             Some(id),
             "the release names the session, so it frees only that session's hold"
         );
+    }
+
+    /// T66's attach-exit side: an own-address box whose attach ended in the
+    /// shell-exit prompt's Delete has its row withdrawn by the attach's own
+    /// exit, with the pair read off the record before the attach — one
+    /// withdraw request naming the box and the pair, with no box id, which
+    /// the record does not carry — and nothing while the session is still
+    /// there.
+    #[tokio::test]
+    async fn an_attach_that_ends_with_the_session_gone_withdraws_its_row() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ssh_sock = dir.path().join("ssh.sock");
+        let requests = fake_vm_host(
+            dir.path().join(minvmd::control::CONTROL_SOCK_FILE),
+            r#"{"switch_address":"100.64.0.2","loopback_address":"127.0.64.0"}"#.to_string(),
+        )
+        .await;
+        let server = minimald::test_harness::TestServer::new().await;
+        server.listen_on_uds(&ssh_sock).await;
+        let project = tempfile::TempDir::new().unwrap();
+        let mut daemon = server.connect().await;
+        let id = minimald::test_harness::create_configured_session(
+            &mut daemon,
+            "web",
+            project.path().to_str().unwrap(),
+        )
+        .await;
+        let handed = sessions::BoxAddresses {
+            switch_address: std::net::Ipv4Addr::new(100, 64, 0, 2),
+            loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 0),
+        };
+
+        release_held_name_after_attach(&ssh_sock, id, "web", Some(handed)).await;
+        assert!(
+            requests.lock().unwrap().is_empty(),
+            "a session still there keeps its row"
+        );
+
+        match daemon
+            .call::<minimald_rpc::DestroySession>(&minimald_rpc::DestroySessionRequest { id })
+            .await
+        {
+            minimald_rpc::Errorable::Ok(_) => {}
+            minimald_rpc::Errorable::Err { error } => panic!("the destroy failed: {error}"),
+        }
+        release_held_name_after_attach(&ssh_sock, id, "web", Some(handed)).await;
+        let seen = requests.lock().unwrap();
+        assert_eq!(seen.len(), 1, "one withdrawal, one request");
+        let minimald_rpc::BoxControlRequest::Withdraw(request) =
+            serde_json_lenient::from_str(&seen[0]).expect("the request is the wire type")
+        else {
+            panic!("a gone session's row is withdrawn by the withdraw verb");
+        };
+        assert_eq!(request.name, "web");
+        assert_eq!(request.switch_address, handed.switch_address);
+        assert_eq!(request.loopback_address, handed.loopback_address);
+        assert_eq!(request.box_id, None, "the record carries no box id");
     }
 
     /// The macOS shape of every VM-backed gate (NET-081's other half): the
