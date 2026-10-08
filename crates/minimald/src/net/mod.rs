@@ -454,9 +454,9 @@ pub struct SwitchClient {
     /// is only the bind's *request*, which the OS may relocate when busy
     /// (NET-025), and a box compiled against it would point its node
     /// address's opening at whatever unrelated host process holds the
-    /// reselected port (design §7.1). A seed that cannot relocate (a pinned
-    /// port, NET-024) is final from construction
-    /// ([`Self::with_hostname_proxy_port_final`]).
+    /// reselected port (design §7.1). A pinned seed is no exception: it
+    /// never relocates (NET-024), but a busy one is retried while another
+    /// host process holds it, so it too waits for the recorded bind.
     hostname_proxy_serving: bool,
     /// Whether a proxy bind is still to come on this host: set by a seeded
     /// port, and by [`Self::with_hostname_proxy_pending`] for the OS-picks
@@ -547,16 +547,6 @@ impl SwitchClient {
         self
     }
 
-    /// Marks the seeded port as final: one the proxy's bind can never
-    /// relocate (a pinned port, NET-024 — the startup retries it rather than
-    /// moving), so a box may compile its opening from it at once instead of
-    /// waiting for the bind.
-    #[must_use]
-    pub fn with_hostname_proxy_port_final(mut self, is_final: bool) -> Self {
-        self.hostname_proxy_serving |= is_final;
-        self
-    }
-
     /// The hostname proxy's port this switch's boxes are compiled with, or
     /// `None` when none is known.
     #[must_use]
@@ -565,7 +555,7 @@ impl SwitchClient {
     }
 
     /// The port a box may compile its opening from right now, without
-    /// waiting: the port once it is final or the proxy serves on it, `None`
+    /// waiting: the port once the proxy serves on it, `None`
     /// before then (fail closed, design §7.1).
     #[must_use]
     pub fn serving_hostname_proxy_port(&self) -> Option<u16> {
@@ -1458,20 +1448,37 @@ mod tests {
         assert_eq!(seeded.lock().await.set_hostname_proxy_port(Some(41914)), 1);
         assert!(seeded.lock().await.hostname_proxy_stranded(lease));
         assert_eq!(seeded.lock().await.set_hostname_proxy_port(Some(41914)), 0);
+    }
 
-        // A final seed (a pinned port, which never relocates) answers at
-        // once, with no settle wait.
+    /// A pinned seed (NET-024) is pending like any other until the bind is
+    /// recorded: it never relocates, but a busy one is retried while another
+    /// host process holds it, so compiling a box's opening from it would let
+    /// the box reach that foreign process (design §7.1). Not yet bound, it
+    /// fails closed past the settle and records the box as stranded; once
+    /// the bind is recorded, it is the answer.
+    #[tokio::test(start_paused = true)]
+    async fn a_pinned_seed_waits_for_the_bind_like_any_other() {
+        use std::sync::Arc;
+
+        let lease = Ipv4Addr::new(10, 88, 0, 9);
         let pinned = Arc::new(tokio::sync::Mutex::new(
             SwitchClient::new("/nonexistent/gvproxy-binary", "/run/minimal/gvproxy")
-                .with_hostname_proxy_port(Some(7654))
-                .with_hostname_proxy_port_final(true),
+                .with_hostname_proxy_port(Some(7654)),
         ));
         let start = tokio::time::Instant::now();
         assert_eq!(
             hostname_proxy_serving_port(&pinned, Some(lease)).await,
+            None,
+            "a pinned seed not yet bound must not become a box's opening"
+        );
+        assert!(start.elapsed() >= HOSTNAME_PROXY_SERVE_WAIT);
+        assert!(pinned.lock().await.hostname_proxy_stranded(lease));
+
+        assert_eq!(pinned.lock().await.set_hostname_proxy_port(Some(7654)), 1);
+        assert_eq!(
+            hostname_proxy_serving_port(&pinned, Some(lease)).await,
             Some(7654)
         );
-        assert_eq!(start.elapsed(), std::time::Duration::ZERO);
     }
 
     /// The race itself: a box that starts attaching while the proxy is

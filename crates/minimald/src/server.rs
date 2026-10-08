@@ -478,29 +478,27 @@ impl ServerState {
         // set (design §7.1). The OS-picks `0` names no port, so no opening.
         // When the bind lands elsewhere (an OS-chosen port, NET-025), the
         // opening is re-pointed to the port actually bound once the proxy is
-        // bound (see `record_bound`). A pinned port never relocates (NET-024:
-        // a busy one is retried, not moved), so its seed is final and a box
-        // compiles its opening from it without waiting for the bind — except
-        // the pinned OS-picks `0`, which names no port until bound: its bind
-        // is pending like a relocatable one's, so a box waits for it rather
-        // than reading "no port known" as "no proxy on this host". On Linux
-        // a proxy bind is always pending (the daemon always starts one).
+        // bound (see `record_bound`). Every seed — a pinned port included —
+        // is pending until that bind is recorded, and a box waits for it: a
+        // pinned port never relocates (NET-024: a busy one is retried, not
+        // moved), but while it retries another host process holds it, so an
+        // opening compiled from the seed would let a box reach that foreign
+        // process (design §7.1's parity rule). The pinned OS-picks `0` names
+        // no port until bound, so it is marked pending without a seed, and a
+        // box waits rather than reading "no port known" as "no proxy on this
+        // host". On Linux a proxy bind is always pending (the daemon always
+        // starts one).
         #[cfg(target_os = "linux")]
-        let (hostname_proxy_port, hostname_proxy_port_final, hostname_proxy_pending) = {
-            let choice = ProxyPort::from_config(
+        let (hostname_proxy_port, hostname_proxy_pending) = (
+            ProxyPort::from_config(
                 config.hostname_proxy_port,
                 crate::net::proxy::DEFAULT_EGRESS_PROXY_PORT,
-            );
-            let opening = choice.opening_port();
-            (
-                opening,
-                !choice.reselects_when_busy() && opening.is_some(),
-                true,
             )
-        };
+            .opening_port(),
+            true,
+        );
         #[cfg(not(target_os = "linux"))]
-        let (hostname_proxy_port, hostname_proxy_port_final, hostname_proxy_pending) =
-            (None, false, false);
+        let (hostname_proxy_port, hostname_proxy_pending) = (None, false);
         let net_switch = Arc::new(Mutex::new(
             crate::net::SwitchClient::with_subnet(
                 config.gvproxy_bin_path(),
@@ -517,7 +515,6 @@ impl ServerState {
             // instead of overwriting the first's records (NET-027).
             .with_host_id(daemon_id.clone())
             .with_hostname_proxy_port(hostname_proxy_port)
-            .with_hostname_proxy_port_final(hostname_proxy_port_final)
             .with_hostname_proxy_pending(hostname_proxy_pending),
         ));
         // One line at daemon start naming the switch subnet this instance's
@@ -3974,32 +3971,39 @@ mod tests {
         drop(held);
     }
 
-    /// A pinned port never relocates (NET-024), so its seed is final: a box
-    /// attaching before the bind compiles its opening from it at once,
-    /// rather than waiting out the settle and attaching openingless — which
-    /// would strand it for good behind a pinned port some other process
-    /// holds for a while.
+    /// A pinned port never relocates (NET-024), but a busy one is retried
+    /// while another host process holds it, so its seed is pending like any
+    /// other until the bind is recorded (design §7.1): a box attaching
+    /// before the bind fails closed past the settle and is recorded as
+    /// stranded, and once the bind is recorded the port is the answer.
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn a_pinned_seed_is_final_before_the_bind() {
+    async fn a_pinned_seed_is_not_an_opening_until_the_bind() {
         let dir = TempDir::new().unwrap();
         let mut config = test_config(&dir);
         config.hostname_proxy_port = Some(47123);
         let state = ServerStateHandle::new(config, None).await.unwrap();
         let switch = state.test_switch().await;
-        let start = tokio::time::Instant::now();
+        assert!(
+            switch.lock().await.hostname_proxy_unsettled(),
+            "a pinned port's bind is pending until recorded"
+        );
+        assert_eq!(
+            crate::net::hostname_proxy_serving_port(&switch, Some(BOX_LEASE)).await,
+            None,
+            "a pinned seed not yet bound hands a box no opening"
+        );
+        assert!(switch.lock().await.hostname_proxy_stranded(BOX_LEASE));
+
+        state.set_switch_hostname_proxy_port(47123).await;
         assert_eq!(
             crate::net::hostname_proxy_serving_port(&switch, Some(BOX_LEASE)).await,
             Some(47123),
         );
-        assert!(
-            start.elapsed() < Duration::from_secs(1),
-            "no settle wait on a final seed"
-        );
     }
 
-    /// The pinned OS-picks `0` names no port before the bind, so its seed
-    /// is not final: a box attaching before the bind is not handed "no
+    /// The pinned OS-picks `0` names no port before the bind, yet its bind
+    /// is pending all the same: a box attaching before the bind is not handed "no
     /// proxy here" at once (which would leave it openingless for good), it
     /// waits, and takes the port the OS picked once the proxy binds it.
     #[cfg(target_os = "linux")]
