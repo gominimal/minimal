@@ -2428,9 +2428,17 @@ impl Session {
                 // ([`Self::deregister_hostname`]). A retried finalize
                 // registers again, which is idempotent for one session id.
                 #[cfg(target_os = "linux")]
-                let shared_port_collisions = self.register_hostname(&record, true).await;
+                let shared_port_collisions: Vec<minimald_rpc::SharedPortCollision> = self
+                    .register_hostname(&record, true)
+                    .await
+                    .into_iter()
+                    .map(|c| minimald_rpc::SharedPortCollision {
+                        port: c.port,
+                        other: c.other,
+                    })
+                    .collect();
                 #[cfg(not(target_os = "linux"))]
-                let shared_port_collisions = Vec::new();
+                let shared_port_collisions: Vec<minimald_rpc::SharedPortCollision> = Vec::new();
 
                 let mut ran: Vec<minimald_rpc::RanHook> = Vec::new();
                 if self.has_hooks_for(crate::hooks::HookEvent::Activate) {
@@ -2479,13 +2487,7 @@ impl Session {
                 Ok(minimald_rpc::FinalizeSessionResponse {
                     activate_hooks: ran,
                     package_check_skipped,
-                    shared_port_collisions: shared_port_collisions
-                        .into_iter()
-                        .map(|c| minimald_rpc::SharedPortCollision {
-                            port: c.port,
-                            other: c.other,
-                        })
-                        .collect(),
+                    shared_port_collisions,
                 })
             }
             SessionStatus::Pending => Err(std::io::Error::new(
