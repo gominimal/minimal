@@ -3508,6 +3508,53 @@ fn ls_keeps_the_answerer_row_beside_a_down_proxy() {
         !plain_ls.contains("HOSTNAME PROXY:"),
         "a reply without a cause prints no proxy row: {plain_ls}"
     );
+
+    // A daemon that reports a proxy port beside a down-proxy sibling: the
+    // cause row is the one HOSTNAME PROXY row, and neither it nor the NAME
+    // SURFACE row names the reported port as serving.
+    let reported = ListSessionsResponse {
+        hostname_proxy_port: Some(7_654),
+        ..resp.clone()
+    };
+    let down_reply = minimald_rpc::AnswererStatusReply {
+        answerer: minimald_rpc::ZoneAnswererStatus::Holder { port: 7_656 },
+        proxy_down: Some(minimald_rpc::ProxyDown {
+            port: 19_911,
+            cause: minimald_rpc::ProxyDownCause::PortHeld,
+        }),
+    };
+    for surface in [resolver::LiveSurface::Native, resolver::LiveSurface::Proxy] {
+        let mut out = Vec::new();
+        format_ls(
+            &mut out,
+            &LsArgs {
+                raw: false,
+                json: false,
+            },
+            &reported,
+            Some(surface.clone()),
+            Some(down_reply.clone()),
+        )
+        .unwrap();
+        let ls = String::from_utf8(out).unwrap();
+        assert_eq!(
+            ls.matches("HOSTNAME PROXY:").count(),
+            1,
+            "the cause row is the VM's one proxy row: {ls}"
+        );
+        assert!(
+            !ls.contains("listening on 127.0.0.1:7654"),
+            "a down proxy is not listed as listening: {ls}"
+        );
+        assert!(
+            !ls.contains("still serves") && !ls.contains("routes through it on"),
+            "the surface row does not name a down proxy as serving: {ls}"
+        );
+        assert!(
+            ls.contains("NAME SURFACE:") && ls.contains("not serving"),
+            "the surface row agrees the proxy is not serving: {ls}"
+        );
+    }
 }
 
 // --- retired surfaces (NET-109 / NET-110) ---

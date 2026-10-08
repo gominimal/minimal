@@ -1145,6 +1145,16 @@ pub(crate) async fn activate_session(
     {
         eprintln!("{}", crate::resolver::proxy_down_line(down));
     }
+    // The surface lines below never name the reported port as serving
+    // while the reply carries a proxy-down sibling: the cause line above
+    // is the host-side verdict on the proxy, and a "still serves" or
+    // "routes through it" beside it would contradict it.
+    let serving_proxy_port = crate::resolver::serving_proxy_port(
+        created.hostname_proxy_port,
+        vm_answerer
+            .as_ref()
+            .and_then(|reply| reply.proxy_down.as_ref()),
+    );
     if held_no_channel && let Some(answerer_port) = answerer_port {
         // NET-138's warning, at every session start — TTY and non-TTY: it
         // rides stderr unconditionally, because the first lookup that
@@ -1171,7 +1181,7 @@ pub(crate) async fn activate_session(
             "{}",
             crate::resolver::name_surface_line(
                 crate::resolver::LiveSurface::Proxy,
-                created.hostname_proxy_port,
+                serving_proxy_port,
             )
         );
     } else if answerer_port.is_none()
@@ -1307,7 +1317,7 @@ pub(crate) async fn activate_session(
             );
             eprintln!(
                 "{}",
-                crate::resolver::name_surface_line(verdict.surface, created.hostname_proxy_port)
+                crate::resolver::name_surface_line(verdict.surface, serving_proxy_port)
             );
         }
     }

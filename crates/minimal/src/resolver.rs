@@ -3383,6 +3383,17 @@ pub(crate) async fn vm_host_name_surface(reply: AnswererStatusReply) -> Option<L
     }
 }
 
+/// The hostname-proxy port a surface line may name as serving (T93): the
+/// port the daemon reported, unless the VM host daemon's reply carries a
+/// proxy-down sibling — then `None`, because the host-side verdict is that
+/// the proxy is not seen serving, and a NAME SURFACE line or a `listening
+/// on` row naming the reported port as live would contradict the cause
+/// line printed beside it.
+#[must_use]
+pub fn serving_proxy_port(reported: Option<u16>, proxy_down: Option<&ProxyDown>) -> Option<u16> {
+    if proxy_down.is_some() { None } else { reported }
+}
+
 /// The proxy's publish outcome as its own printed line (T93): the same
 /// named cause — the port the failure is about, the thing to free — said
 /// beside the answerer's own facts instead of in place of them, and

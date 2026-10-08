@@ -755,7 +755,15 @@ pub fn format_ls(
     // field: nothing to print for it then. `--raw` and `--json` stay
     // machine-readable-only, so a port line never lands in a pipeline.
     if !args.raw {
-        if let Some(port) = resp.hostname_proxy_port {
+        // A proxy-down sibling (T93) is the host-side verdict on the proxy:
+        // the reported port is not named as serving beside it, and the
+        // cause row below is this VM's one HOSTNAME PROXY row.
+        let proxy_down = vm_answerer
+            .as_ref()
+            .and_then(|reply| reply.proxy_down.as_ref());
+        let serving_proxy_port =
+            crate::resolver::serving_proxy_port(resp.hostname_proxy_port, proxy_down);
+        if let Some(port) = serving_proxy_port {
             writeln!(
                 out,
                 "HOSTNAME PROXY:  listening on 127.0.0.1:{port} · <name>.min.internal routes through it"
@@ -769,12 +777,7 @@ pub fn format_ls(
         let vm_answerer_line = vm_answerer
             .as_ref()
             .and_then(|reply| crate::resolver::vm_host_answerer_line(reply.answerer.clone()));
-        let proxy_down_line = vm_answerer.as_ref().and_then(|reply| {
-            reply
-                .proxy_down
-                .as_ref()
-                .map(crate::resolver::proxy_down_line)
-        });
+        let proxy_down_line = proxy_down.map(crate::resolver::proxy_down_line);
         if let Some(answerer) = resp.zone_answerer_port {
             writeln!(
                 out,
@@ -803,7 +806,7 @@ pub fn format_ls(
             writeln!(
                 out,
                 "NAME SURFACE:    {}",
-                crate::resolver::name_surface_line(surface, resp.hostname_proxy_port)
+                crate::resolver::name_surface_line(surface, serving_proxy_port)
             )?;
         }
         if resp.hostname_proxy_port.is_some()
@@ -1030,7 +1033,16 @@ pub fn format_ls_across_vms(
                 )?;
                 facts += 1;
             }
-            if let Some(port) = listing.resp.hostname_proxy_port {
+            // A proxy-down sibling (T93) is this VM's host-side verdict on
+            // its proxy: the reported port is not named as serving beside
+            // it, and the cause row below is the VM's one HOSTNAME PROXY row.
+            let answerer = answerer_at(index);
+            let proxy_down = answerer
+                .as_ref()
+                .and_then(|reply| reply.proxy_down.as_ref());
+            let serving_proxy_port =
+                crate::resolver::serving_proxy_port(listing.resp.hostname_proxy_port, proxy_down);
+            if let Some(port) = serving_proxy_port {
                 writeln!(
                     out,
                     "HOSTNAME PROXY:  {vm:<width$} listening on 127.0.0.1:{port} · <name>.min.internal routes through it",
@@ -1064,12 +1076,7 @@ pub fn format_ls_across_vms(
             // VM's answerer line — the same words the single-VM listing
             // prints — because each VM's proxy publishes on a host port of
             // its own and fails on its own.
-            if let Some(line) = answerer_at(index).as_ref().and_then(|reply| {
-                reply
-                    .proxy_down
-                    .as_ref()
-                    .map(crate::resolver::proxy_down_line)
-            }) {
+            if let Some(line) = proxy_down.map(crate::resolver::proxy_down_line) {
                 writeln!(
                     out,
                     "HOSTNAME PROXY:  {vm:<width$} {line}",
@@ -1090,7 +1097,7 @@ pub fn format_ls_across_vms(
                 writeln!(
                     out,
                     "NAME SURFACE:    {vm:<width$} {}",
-                    crate::resolver::name_surface_line(surface, listing.resp.hostname_proxy_port),
+                    crate::resolver::name_surface_line(surface, serving_proxy_port),
                     vm = listing.vm,
                     width = VM_COLUMN_WIDTH,
                 )?;

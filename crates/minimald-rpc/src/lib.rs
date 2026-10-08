@@ -3951,6 +3951,12 @@ mod tests {
             assert!(wire.contains(field), "the reply spells {field}: {wire}");
         }
         assert_eq!(round_trip(&with_cause), with_cause);
+        // An older client decodes the status payload as the bare
+        // `ZoneAnswererStatus` its `Status` variant held: the sibling key is
+        // an unknown field it ignores, never a decode failure.
+        let older_client: ZoneAnswererStatus =
+            serde_json_lenient::from_str(&wire).expect("an older client still decodes the reply");
+        assert_eq!(older_client, ZoneAnswererStatus::Holder { port: 7_656 });
 
         // The unconfirmed publish rides the sibling the same way, beside
         // whatever state the answerer itself is in.
