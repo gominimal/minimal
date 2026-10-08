@@ -827,6 +827,11 @@ pub enum AllocationError {
     /// folded-equal names would share one published address — one box, one
     /// address, one row. The registration is refused before any address is
     /// spent, and names the spelling the live row holds.
+    ///
+    /// Box names are DNS labels under `min.internal`, and DNS compares
+    /// names case-insensitively (RFC 4343); the answerer already keys this
+    /// way and session names are unique under the same fold, so one row per
+    /// name (NET-138) means one row per folded name.
     #[error("a box named {held} already exists")]
     NameAlreadyHeld {
         /// The name the live row holds, in its registered spelling: the
@@ -1241,17 +1246,21 @@ impl ConnectionGauge {
     }
 }
 
-/// The ask verbs' gauges (NET-045), shared by every clone of a registry:
-/// the guest-door ask connections and the host subscriptions, each capped
-/// by the door, and the asks whose end is not yet audited, which a graceful
-/// stop waits on.
+/// The held connections' gauges, shared by every clone of a registry: the
+/// ask verbs' (NET-045) guest-door ask connections and host subscriptions,
+/// and the held registrations' lease connections
+/// ([`minimald_rpc::RegisterBoxRequest::hold`]), each capped by the door,
+/// and the asks whose end is not yet audited, which a graceful stop waits
+/// on.
 #[derive(Debug)]
 pub(crate) struct AskGauges {
     pub(crate) guest_asks: Arc<ConnectionGauge>,
     pub(crate) subscriptions: Arc<ConnectionGauge>,
+    pub(crate) leases: Arc<ConnectionGauge>,
     pub(crate) unaudited: Arc<ConnectionGauge>,
     guest_ask_cap: std::sync::atomic::AtomicUsize,
     subscription_cap: std::sync::atomic::AtomicUsize,
+    lease_cap: std::sync::atomic::AtomicUsize,
 }
 
 impl Default for AskGauges {
@@ -1259,9 +1268,11 @@ impl Default for AskGauges {
         Self {
             guest_asks: Arc::default(),
             subscriptions: Arc::default(),
+            leases: Arc::default(),
             unaudited: Arc::default(),
             guest_ask_cap: crate::control::MAX_GUEST_ASK_CONNECTIONS.into(),
             subscription_cap: crate::control::MAX_ASK_SUBSCRIPTIONS.into(),
+            lease_cap: crate::control::MAX_REGISTRATION_LEASES.into(),
         }
     }
 }
@@ -1283,6 +1294,17 @@ impl AskGauges {
         self.guest_ask_cap.store(guest_asks, Ordering::Relaxed);
         self.subscription_cap
             .store(subscriptions, Ordering::Relaxed);
+    }
+
+    /// The held registrations' lease connection cap.
+    pub(crate) fn lease_cap(&self) -> usize {
+        self.lease_cap.load(Ordering::Relaxed)
+    }
+
+    /// Lower the lease cap, so a test can fill it.
+    #[cfg(test)]
+    pub(crate) fn set_lease_cap(&self, leases: usize) {
+        self.lease_cap.store(leases, Ordering::Relaxed);
     }
 }
 
@@ -2060,6 +2082,22 @@ impl BoxRegistry {
     /// registration of the name can start between the decision and the
     /// release. Returns whether `release` ran.
     pub fn release_unless_owned(&self, claim: &RegistrationClaim, release: impl FnOnce()) -> bool {
+        self.release_unless_owned_past(&claim.key, 1, release)
+    }
+
+    /// Hand a withdrawn box's address back to the answerer, by running
+    /// `release`, unless something else owns it: [`Self::release_unless_owned`]
+    /// for a withdrawal, which holds no registration of its own, so every
+    /// registration of the name in flight counts as another owner. Returns
+    /// whether `release` ran.
+    pub fn release_withdrawn_unless_owned(&self, name: &str, release: impl FnOnce()) -> bool {
+        self.release_unless_owned_past(&canonical_box_name(name), 0, release)
+    }
+
+    /// The one locked decision both releases take: under the row lock and
+    /// then the generations' lock, `release` runs unless a live row holds
+    /// `key` or more than `own` registrations of it are in flight.
+    fn release_unless_owned_past(&self, key: &str, own: u32, release: impl FnOnce()) -> bool {
         let rows = self
             .rows
             .read()
@@ -2067,10 +2105,10 @@ impl BoxRegistry {
         let generations = self.generations();
         let row_holds = rows
             .values()
-            .any(|record| canonical_box_name(record.name()) == claim.key);
+            .any(|record| canonical_box_name(record.name()) == key);
         let others_in_flight = generations
-            .get(&claim.key)
-            .map_or(0, |entry| entry.in_flight.saturating_sub(1));
+            .get(key)
+            .map_or(0, |entry| entry.in_flight.saturating_sub(own));
         if row_holds || others_in_flight > 0 {
             return false;
         }

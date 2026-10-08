@@ -735,6 +735,32 @@ fn serve_connection(
     // only that thread, never the accept loop.
     let gauges = boxes.ask_gauges();
     let served = match (&request, door) {
+        // A held registration keeps its connection as the row's lease until
+        // its client commits it, so it too runs on a thread of its own under
+        // its kind's cap ([`MAX_REGISTRATION_LEASES`]), freeing this door's
+        // slot once the reply is written; past the cap the registration is
+        // refused before anything is allocated.
+        (BoxControlRequest::Register(register), ControlDoor::Host) if register.hold => {
+            match gauges.leases.try_acquire(gauges.lease_cap()) {
+                Some(slot) => {
+                    return serve_held_registration(
+                        stream,
+                        boxes,
+                        answerer,
+                        order,
+                        register.clone(),
+                        slot,
+                    );
+                }
+                None => refuse_past_cap(
+                    &mut stream,
+                    "registration lease",
+                    door.name(),
+                    gauges.lease_cap(),
+                    &LEASE_CAP_WARNED,
+                ),
+            }
+        }
         (BoxControlRequest::AdmitAsk(ask), ControlDoor::GuestReports) => {
             let ask = *ask;
             match gauges.guest_asks.try_acquire(gauges.guest_ask_cap()) {
@@ -888,19 +914,7 @@ fn serve_request(
     // ended. The read-only verbs and the answerer handover take no ticket.
     match (request, door) {
         (BoxControlRequest::Register(request), ControlDoor::Host) => {
-            // The published address is asked of the answerer before the
-            // ticket: the allocation can wait out a handover, and no turn
-            // is held across it.
-            // The registration is counted in flight and reads its name's
-            // withdrawal generation before the allocation: a withdrawal
-            // that lands while the address is being allocated refuses the
-            // registration in its turn. The claim ends with the turn.
-            let claim = boxes.begin_registration(&request.name);
-            let reply = match allocate_box_address(answerer, &request.name) {
-                Ok(loopback_addr) => order
-                    .apply(move || register_box(boxes, answerer, request, loopback_addr, claim)),
-                Err(reply) => reply,
-            };
+            let reply = registration_reply(boxes, answerer, order, request);
             write_reply(stream, &reply)
         }
         (BoxControlRequest::Withdraw(request), ControlDoor::Host) => {
@@ -972,6 +986,159 @@ fn serve_request(
         // frame to drop silently.
         (request, door) => refused_wrong_door(stream, &request, door),
     }
+}
+
+/// Register a box in its door's apply order and build the reply: the one
+/// registration path the one-shot and the held verb share.
+fn registration_reply(
+    boxes: &BoxRegistry,
+    answerer: &AnswererStatus,
+    order: &Arc<ApplyOrder>,
+    request: RegisterBoxRequest,
+) -> BoxControlReply {
+    // The published address is asked of the answerer before the
+    // ticket: the allocation can wait out a handover, and no turn
+    // is held across it.
+    // The registration is counted in flight and reads its name's
+    // withdrawal generation before the allocation: a withdrawal
+    // that lands while the address is being allocated refuses the
+    // registration in its turn. The claim ends with the turn.
+    let claim = boxes.begin_registration(&request.name);
+    match allocate_box_address(answerer, &request.name) {
+        Ok(loopback_addr) => {
+            order.apply(move || register_box(boxes, answerer, request, loopback_addr, claim))
+        }
+        Err(reply) => reply,
+    }
+}
+
+/// Serve a held registration ([`RegisterBoxRequest::hold`]): register the
+/// box, then hand the connection to a thread of its own that writes the
+/// reply and holds the connection as the row's lease until its client
+/// commits it ([`hold_registration_lease`]). `slot` is the lease's place
+/// under [`MAX_REGISTRATION_LEASES`], held for the lease's life. A refused
+/// registration holds nothing: its reply is written here and the
+/// connection closes. A thread that cannot be spawned withdraws the row it
+/// would have held and answers the reason, so no row outlives a lease that
+/// never started.
+fn serve_held_registration(
+    mut stream: UnixStream,
+    boxes: &BoxRegistry,
+    answerer: &AnswererStatus,
+    order: &Arc<ApplyOrder>,
+    request: RegisterBoxRequest,
+    slot: crate::box_registry::GaugeGuard,
+) -> std::io::Result<()> {
+    let name = request.name.clone();
+    let reply = registration_reply(boxes, answerer, order, request);
+    let BoxControlReply::Registered(registered) = &reply else {
+        return write_reply(&mut stream, &reply);
+    };
+    let withdrawal = WithdrawBoxRequest {
+        name,
+        switch_address: registered.switch_address,
+        loopback_address: registered.loopback_address,
+    };
+    let not_held = |stream: &mut UnixStream, error: std::io::Error| {
+        order.apply(|| withdraw_box(boxes, answerer, withdrawal.clone()));
+        write_reply(
+            stream,
+            &BoxControlReply::Error {
+                error: format!("the VM host daemon could not hold the registration: {error}"),
+            },
+        )
+    };
+    let lease_stream = match stream.try_clone() {
+        Ok(lease_stream) => lease_stream,
+        Err(error) => return not_held(&mut stream, error),
+    };
+    let thread_boxes = boxes.clone();
+    let thread_answerer = answerer.clone();
+    let thread_order = Arc::clone(order);
+    let thread_withdrawal = withdrawal.clone();
+    let spawned = std::thread::Builder::new()
+        .name("minvmd-box-lease".to_string())
+        .spawn(move || {
+            let _slot = slot;
+            hold_registration_lease(
+                lease_stream,
+                &thread_boxes,
+                &thread_answerer,
+                &thread_order,
+                thread_withdrawal,
+                &reply,
+            );
+        });
+    match spawned {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            tracing::warn!(%error, "could not start a registration lease's thread");
+            not_held(&mut stream, error)
+        }
+    }
+}
+
+/// Hold a registered box's lease connection: write the registration's
+/// `reply`, then wait, with no read bound, for the client's one
+/// [`minimald_rpc::REGISTRATION_COMMIT_LINE`]. The commit keeps the row:
+/// from then on its liveness is its switch attachment (NET-138) and its
+/// creator's withdrawal. Anything else first — the connection's close, a
+/// read error, any other line — is the activation ending before its
+/// session went active, so the row is withdrawn on the lease's word: the
+/// connection that registered the row is its creator's proof, and the
+/// withdrawal runs in the door's apply order through the same path a
+/// client's withdrawal takes ([`withdraw_box`]). The commit is explicit,
+/// never read from a clean close, so a client that closes just after its
+/// session went active cannot withdraw a live box's row before the row's
+/// first attachment.
+fn hold_registration_lease(
+    mut stream: UnixStream,
+    boxes: &BoxRegistry,
+    answerer: &AnswererStatus,
+    order: &Arc<ApplyOrder>,
+    withdrawal: WithdrawBoxRequest,
+    reply: &BoxControlReply,
+) {
+    // The lease lasts as long as the activation takes, so the request
+    // line's read bound is lifted before the reply is written: a lease
+    // that cannot lift it would end at the bound under a live session.
+    let ended = match stream.set_read_timeout(None) {
+        Err(error) => {
+            if let Err(write_error) = write_reply(
+                &mut stream,
+                &BoxControlReply::Error {
+                    error: format!("the VM host daemon could not hold the registration: {error}"),
+                },
+            ) {
+                tracing::debug!(error = %write_error, "could not write the lease refusal");
+            }
+            format!("its read bound could not be lifted: {error}")
+        }
+        Ok(()) => match write_reply(&mut stream, reply) {
+            Err(error) => format!("its reply could not be written: {error}"),
+            Ok(()) => match read_request_line(&mut stream) {
+                Ok(Some(line)) if line.trim() == minimald_rpc::REGISTRATION_COMMIT_LINE => {
+                    tracing::info!(
+                        box = %withdrawal.name,
+                        switch_address = %withdrawal.switch_address,
+                        "committed the box's registration lease; the row stays until its \
+                         creator withdraws it"
+                    );
+                    return;
+                }
+                Ok(Some(_)) => "its client sent a line that is not the commit".to_string(),
+                Ok(None) => "its client closed the connection before the commit".to_string(),
+                Err(error) => format!("its connection failed before the commit: {error}"),
+            },
+        },
+    };
+    tracing::info!(
+        box = %withdrawal.name,
+        switch_address = %withdrawal.switch_address,
+        cause = %ended,
+        "the box's registration lease ended uncommitted; withdrawing its row"
+    );
+    order.apply(|| withdraw_box(boxes, answerer, withdrawal));
 }
 
 /// Refuse a verb that arrived on a door that does not serve it (NET-138):
@@ -1267,8 +1434,12 @@ fn withdraw_box(
     ) {
         Ok(withdrawn) => {
             // The box is gone, so its published address returns to the
-            // machine's range — the answerer's release is idempotent.
-            answerer.release_address(&request.name);
+            // machine's range — unless a live row or a registration in
+            // flight under the name owns it: the answerer allocates per
+            // name, so a release by name would free theirs.
+            boxes.release_withdrawn_unless_owned(&request.name, || {
+                answerer.release_address(&request.name);
+            });
             if withdrawn.is_some() {
                 tracing::info!(
                     box = %request.name,
@@ -1724,6 +1895,11 @@ pub(crate) const MAX_GUEST_ASK_CONNECTIONS: usize = crate::box_registry::PENDING
 /// one per interactive attach, bounded the same way.
 pub(crate) const MAX_ASK_SUBSCRIPTIONS: usize = MAX_GUEST_ASK_CONNECTIONS;
 
+/// How many held registrations' lease connections are served at once
+/// ([`RegisterBoxRequest::hold`]): one per activation between its
+/// registration and its commit, bounded like a door's connections.
+pub(crate) const MAX_REGISTRATION_LEASES: usize = MAX_CONTROL_CONNECTIONS;
+
 /// How many connection threads each control door runs at once. A request
 /// connection's thread lives for one request line (at most
 /// [`REGISTER_READ_TIMEOUT`]) plus, on the guest door, the drain bound; an
@@ -1734,6 +1910,9 @@ pub(crate) const MAX_CONTROL_CONNECTIONS: usize = 64;
 /// When the last ask connection-cap warn line was written: rate-limited
 /// like the queue-full line.
 static ASK_CAP_WARNED: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
+/// When the last registration-lease cap warn line was written.
+static LEASE_CAP_WARNED: Mutex<Option<std::time::Instant>> = Mutex::new(None);
 
 /// When the host control socket's last connection-cap warn line was
 /// written, rate-limited the same way. Each door keeps its own stamp, so a
@@ -2553,6 +2732,7 @@ mod tests {
                     credentialed_upstream: None,
                     dynamic_ingress: None,
                     dynamic_allowed_range: None,
+                    hold: false,
                 },
             )
             .expect("first registration is answered"),
@@ -2622,6 +2802,7 @@ mod tests {
                     credentialed_upstream: None,
                     dynamic_ingress: None,
                     dynamic_allowed_range: None,
+                    hold: false,
                 },
             )
             .expect("second registration is answered"),
@@ -2665,6 +2846,7 @@ mod tests {
                     credentialed_upstream: None,
                     dynamic_ingress: None,
                     dynamic_allowed_range: None,
+                    hold: false,
                 },
             )
             .expect("server still serves after a refused request"),
@@ -2793,6 +2975,7 @@ mod tests {
                     credentialed_upstream: None,
                     dynamic_ingress: None,
                     dynamic_allowed_range: None,
+                    hold: false,
                 },
             )
             .expect("the registration is answered"),
@@ -2895,6 +3078,7 @@ mod tests {
                     credentialed_upstream: None,
                     dynamic_ingress: None,
                     dynamic_allowed_range: None,
+                    hold: false,
                 },
             )
             .expect("the marker box is registered"),
@@ -3119,6 +3303,7 @@ mod tests {
                     credentialed_upstream: None,
                     dynamic_ingress: None,
                     dynamic_allowed_range: None,
+                    hold: false,
                 },
             )
             .expect("a registration still answers around the read"),
@@ -3484,6 +3669,7 @@ mod tests {
                     credentialed_upstream: None,
                     dynamic_ingress: Some(sessions::DynamicIngress::Allow),
                     dynamic_allowed_range: Some((3000, 3999)),
+                    hold: false,
                 },
             )
             .expect("the registration is answered"),
@@ -3626,6 +3812,7 @@ mod tests {
                     credentialed_upstream: None,
                     dynamic_ingress: Some(sessions::DynamicIngress::Allow),
                     dynamic_allowed_range: Some((3000, 3999)),
+                    hold: false,
                 },
             )
             .expect("the registration is answered"),
@@ -3715,6 +3902,7 @@ mod tests {
                     credentialed_upstream: None,
                     dynamic_ingress: None,
                     dynamic_allowed_range: None,
+                    hold: false,
                 },
             )
             .expect("the registration is answered"),
@@ -3835,6 +4023,7 @@ mod tests {
                         credentialed_upstream: None,
                         dynamic_ingress: Some(sessions::DynamicIngress::Ask),
                         dynamic_allowed_range: Some((ASK_PORT, ASK_PORT + 999)),
+                        hold: false,
                     },
                 )
                 .expect("the registration is answered"),
@@ -4625,6 +4814,7 @@ mod tests {
                 credentialed_upstream: None,
                 dynamic_ingress: None,
                 dynamic_allowed_range: None,
+                hold: false,
             },
         )
         .expect("the second connection is served");
@@ -4742,6 +4932,7 @@ mod tests {
                     credentialed_upstream: None,
                     dynamic_ingress: Some(sessions::DynamicIngress::Allow),
                     dynamic_allowed_range: Some((3000, 3999)),
+                    hold: false,
                 },
             )
             .expect("the registration is answered"),
@@ -5038,6 +5229,7 @@ mod tests {
             credentialed_upstream: None,
             dynamic_ingress: None,
             dynamic_allowed_range: None,
+            hold: false,
         }
     }
 
@@ -5077,14 +5269,11 @@ mod tests {
         );
         assert!(!host.boxes.tracks_registrations_of("web"));
 
-        // The withdrawal's release and the refusal's both reach the
-        // answerer; the address the registration drew is free again.
+        // The withdrawal leaves the address to the registration in flight,
+        // and that registration's refusal releases it: the address the
+        // registration drew is free again.
         let releases = host.releases_of("web");
-        assert_eq!(
-            releases.len(),
-            2,
-            "the withdrawal and the refusal each release: {releases:?}"
-        );
+        assert_eq!(releases.len(), 1, "only the refusal releases: {releases:?}");
         let freed = releases
             .iter()
             .find_map(|freed| *freed)
@@ -5115,22 +5304,20 @@ mod tests {
         let row = host.boxes.row_by_name("web").expect("the live row stands");
         assert_eq!(row.loopback_addr(), live.loopback_address);
 
-        // Only the withdrawal released; the refusal left the live row's
-        // address held.
+        // Nothing released: the withdrawal left the address to the
+        // registration in flight, and the refusal left it to the live row.
         let releases = host.releases_of("web");
-        assert_eq!(
-            releases.len(),
-            1,
-            "the refusal released nothing: {releases:?}"
+        assert!(
+            releases.is_empty(),
+            "neither the withdrawal nor the refusal released: {releases:?}"
         );
         assert_eq!(
             host.answerer.allocate("web"),
             Ok(live.loopback_address),
             "the answerer still holds the live row's address for its box"
         );
-        assert_eq!(
-            host.releases_of("web").len(),
-            1,
+        assert!(
+            host.releases_of("web").is_empty(),
             "the address was held, not released and redrawn"
         );
         assert!(
@@ -5152,12 +5339,10 @@ mod tests {
         assert!(host.boxes.row_by_name("Web").is_none());
         assert!(host.boxes.row_by_name("web").is_none());
         assert!(!host.boxes.tracks_registrations_of("Web"));
+        // The withdrawal leaves the address to the registration in flight,
+        // and that registration's refusal releases it.
         let releases = host.releases_of("web");
-        assert_eq!(
-            releases.len(),
-            2,
-            "the withdrawal and the refusal each release: {releases:?}"
-        );
+        assert_eq!(releases.len(), 1, "only the refusal releases: {releases:?}");
         assert!(releases.iter().any(Option::is_some));
     }
 
@@ -5176,10 +5361,10 @@ mod tests {
         let row = host.boxes.row_by_name("WEB").expect("the live row stands");
         assert_eq!(row.loopback_addr(), live.loopback_address);
         let releases = host.releases_of("web");
-        assert_eq!(
-            releases.len(),
-            1,
-            "only the withdrawal released: {releases:?}"
+        assert!(
+            releases.is_empty(),
+            "neither the withdrawal, raced by a registration in flight, nor the \
+             refusal released: {releases:?}"
         );
         assert_eq!(
             host.answerer.allocate("web"),
@@ -5254,10 +5439,135 @@ mod tests {
             host.releases_of("web").is_empty(),
             "the refusal released nothing: the live row's address stays held"
         );
+
+        // A withdrawal under a folded-equal name that finds no row of its
+        // own releases nothing either: the live row owns the name's address.
+        host.withdraw_unregistered("web");
+        assert!(
+            host.releases_of("web").is_empty(),
+            "a withdrawal releases no address a live row under the folded name holds"
+        );
         assert_eq!(
             host.answerer.allocate("web"),
             Ok(live.loopback_address),
             "the answerer still holds the live row's address for its box"
         );
+    }
+
+    /// Open a held registration of `name` ([`RegisterBoxRequest::hold`]):
+    /// the lease connection, kept open, and the reply read off it.
+    fn register_holding(sock_path: &Path, name: &str) -> (TestStream, BoxControlReply) {
+        let mut stream = TestStream::connect(sock_path).expect("the door accepts");
+        let request = BoxControlRequest::Register(RegisterBoxRequest {
+            hold: true,
+            ..box_request(name)
+        });
+        let mut line = serde_json_lenient::to_string(&request).expect("the request serializes");
+        line.push('\n');
+        stream
+            .write_all(line.as_bytes())
+            .expect("the request is written");
+        let mut reply = String::new();
+        BufReader::new(stream.try_clone().expect("the lease clones"))
+            .read_line(&mut reply)
+            .expect("the reply is read");
+        let reply = serde_json_lenient::from_str(reply.trim()).expect("the reply parses");
+        (stream, reply)
+    }
+
+    /// Wait until no registration lease is held: each lease's thread has
+    /// decided its row — kept on the commit, withdrawn otherwise.
+    fn leases_settled(host: &SlowAllocation) {
+        assert!(
+            host.boxes.ask_gauges().leases.wait_idle(ASK_WAIT),
+            "every registration lease ends once its connection does"
+        );
+    }
+
+    /// A held registration whose lease connection closes before its commit
+    /// — an activation that died between registering and going active —
+    /// withdraws its row and releases its address, so the name registers
+    /// again at once, in any spelling, with no daemon restart.
+    #[test]
+    fn registration_lease_closed_before_commit_withdraws_the_row() {
+        let host = SlowAllocation::start();
+        let (lease, reply) = register_holding(&host.sock_path, "Web");
+        let web = handed(reply);
+        let row = host
+            .boxes
+            .row_by_name("web")
+            .expect("the held registration publishes its row");
+        assert_eq!(row.switch_addr(), web.switch_address);
+
+        drop(lease);
+        leases_settled(&host);
+        assert!(
+            host.boxes.row_by_name("web").is_none(),
+            "a lease closed before its commit withdraws its row"
+        );
+        assert_eq!(
+            host.releases_of("web"),
+            vec![Some(web.loopback_address)],
+            "the withdrawn row's address goes back to the answerer"
+        );
+        let again = host.register_live("WEB");
+        assert_eq!(
+            host.boxes
+                .row_by_name("web")
+                .expect("the name registers again at once")
+                .switch_addr(),
+            again.switch_address,
+        );
+    }
+
+    /// A held registration whose client commits keeps its row when the
+    /// lease connection closes after the commit: the commit, never the
+    /// close, is what keeps a live box's row.
+    #[test]
+    fn committed_registration_lease_keeps_the_row() {
+        let host = SlowAllocation::start();
+        let (mut lease, reply) = register_holding(&host.sock_path, "web");
+        let web = handed(reply);
+        lease
+            .write_all(format!("{}\n", minimald_rpc::REGISTRATION_COMMIT_LINE).as_bytes())
+            .expect("the commit is written");
+        drop(lease);
+        leases_settled(&host);
+        assert_eq!(
+            host.boxes
+                .row_by_name("web")
+                .expect("a committed lease keeps its row")
+                .switch_addr(),
+            web.switch_address,
+        );
+        assert!(
+            host.releases_of("web").is_empty(),
+            "a committed lease releases nothing"
+        );
+    }
+
+    /// Past the lease cap a held registration is refused naming the cap,
+    /// before any row is published; a one-shot registration is not a lease
+    /// and is served past it.
+    #[test]
+    fn registration_lease_refused_past_its_cap() {
+        let host = SlowAllocation::start();
+        host.boxes.ask_gauges().set_lease_cap(1);
+        let (_first, reply) = register_holding(&host.sock_path, "web");
+        handed(reply);
+
+        let (_second, refused) = register_holding(&host.sock_path, "db");
+        match &refused {
+            BoxControlReply::Error { error } => assert!(
+                error.contains("already serving 1 registration lease connections"),
+                "the refusal names the cap, got {error}"
+            ),
+            other => panic!("a lease past the cap is refused, got {other:?}"),
+        }
+        assert!(
+            host.boxes.row_by_name("db").is_none(),
+            "a refused lease publishes no row"
+        );
+        host.register_live("api");
     }
 }
