@@ -226,18 +226,11 @@ pub(crate) fn unenforceable_declaration_words(rules: &[UnenforceableRule]) -> St
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "this host decides a host-address box's egress verdict per box, and \
-         its classifier cannot enforce the rules this box's declaration \
-         names: {named} — the host-address classifier enforces only \
-         deny-all until declared address rules are supported, and the \
-         per-box verdict the loaded table decides is deny-all alone \
-         (every allow_* list present and empty) or nothing, so the box \
-         was refused rather than run with these rules unenforced; remove \
-         these rules, or declare deny-all egress instead — `min session \
-         activate --deny-all-egress`, or the box's `egress` section, all \
-         three allow lists present and empty, and no deny entries — or \
-         run the box with `--network own_ip` \
-         (own-address boxes enforce them)"
+        "host_ip boxes on this host enforce only deny-all egress, so these \
+         rules would go unenforced: {named}. Remove them, use \
+         --deny-all-egress (or an egress section with all three allow \
+         lists empty and no deny entries), or use --network own_ip, which \
+         enforces them."
     )
 }
 
@@ -3124,7 +3117,7 @@ mod tests {
             "the refusal names every rule: {words}"
         );
         assert!(
-            words.contains("--network own_ip") && words.contains("own-address boxes enforce them"),
+            words.contains("--network own_ip") && words.contains("which enforces them"),
             "the refusal says own-address boxes enforce these rules: {words}"
         );
         // The words end with what to do: a refusal that names the rules it
@@ -3136,19 +3129,17 @@ mod tests {
         // the why ahead of it is the classifier's own limit, the thing a
         // person cannot fix from the declaration.
         assert!(
-            words.contains("remove these rules")
-                && words.contains("declare deny-all egress")
-                && words.contains("`egress` section")
-                && words.contains("all three allow lists present and empty")
+            words.contains("Remove them")
+                && words.contains("--deny-all-egress")
+                && words.contains("egress section")
+                && words.contains("all three allow lists empty")
                 && words.contains("no deny entries")
-                && words.contains(
-                    "the host-address classifier enforces only deny-all \
-                     until declared address rules are supported"
-                ),
+                && words.contains("host_ip boxes on this host enforce only deny-all egress")
+                && words.contains("these rules would go unenforced"),
             "the refusal says what to do about the rules it named: {words}"
         );
         assert!(
-            words.ends_with("(own-address boxes enforce them)"),
+            words.ends_with("which enforces them."),
             "the words end with the remedy, so what a person reads last is \
              what they can do: {words}"
         );
@@ -3245,20 +3236,24 @@ mod tests {
         let rules = unenforceable_rules(Some(&declaration));
         let words = unenforceable_declaration_words(&rules);
         let (_, remedy) = words
-            .split_once("remove these rules")
+            .split_once("Remove them")
             .expect("the refusal ends with its remedy");
         assert!(
             remedy.contains("--deny-all-egress"),
             "the remedy names the flag that declares deny-all: {words}"
         );
         assert!(
-            remedy.contains("`egress` section"),
+            remedy.contains("egress section"),
             "the flag names the section form beside it, never in place of \
              it: {words}"
         );
         assert!(
             remedy.contains("--network own_ip"),
             "the mode remedy stays beside the declaration's: {words}"
+        );
+        assert!(
+            words.chars().count() < 300,
+            "a one-rule refusal stays a sentence, not a wall: {words}"
         );
     }
 
