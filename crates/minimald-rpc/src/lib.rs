@@ -231,6 +231,18 @@ pub struct ListSessionsEntry {
     /// other surfaces read as "not a host-address session".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_ip_enforcement: Option<HostIpEnforcement>,
+    /// The declared ingress ports this box yields because another box at the
+    /// same shared loopback address holds them (NET-129, first-come), one
+    /// entry per port naming the holding box: the same registry read
+    /// [`SessionRuntimeFacts::shared_port_collisions`] answers from, so a
+    /// listing and the policy view cannot disagree. Serde-defaulted, so an
+    /// entry from a daemon that predates the field decodes as empty, and
+    /// omitted when empty, so the common entry is unchanged on the wire.
+    /// Neither this entry nor [`ListSessionsResponse`] is
+    /// `deny_unknown_fields`, so a client that predates the field ignores a
+    /// populated list rather than refusing the listing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shared_port_collisions: Vec<SharedPortCollision>,
 }
 
 /// The git state of a session's project path, probed by the client on the
@@ -637,7 +649,23 @@ pub struct RegisterBoxRequest {
     /// carries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dynamic_allowed_range: Option<(u16, u16)>,
+    /// Whether the registration is held as a lease until its client
+    /// commits it. With `hold`, the daemon writes the reply and keeps the
+    /// connection open: the client writes one `commit` line once its
+    /// session is active, and a close or an error before that line
+    /// withdraws the row, so an activation that dies between registering
+    /// and committing leaves no row holding its name. A client that omits
+    /// the field, or a daemon that predates it, keeps the one-shot
+    /// registration: one line each way, and the row lives until its
+    /// creator withdraws it.
+    #[serde(default)]
+    pub hold: bool,
 }
+
+/// The one line a held registration's client writes on the lease
+/// connection once its session is active ([`RegisterBoxRequest::hold`]):
+/// from then on the row stays when the connection closes.
+pub const REGISTRATION_COMMIT_LINE: &str = "commit";
 
 /// The withdrawal a destroyed session's client sends for the row its
 /// activation registered: the name the row went by and the pair the
@@ -667,6 +695,23 @@ pub struct WithdrawBoxRequest {
     /// The loopback address the registration handed back, which the pair
     /// proof checks against the row's own.
     pub loopback_address: std::net::Ipv4Addr,
+}
+
+/// A name to hold in the host's zone without a row behind it
+/// ([`BoxControlRequest::HoldBoxName`]): the interim a `host_ip` box's
+/// name answers NODATA — the box exists, no address to tell — instead
+/// of NXDOMAIN. Answered with [`BoxControlReply::NameHeld`]; idempotent.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HoldBoxNameRequest {
+    /// The box's name, as the session's create names it: the label the
+    /// zone holds under the apex, normalized there.
+    pub name: String,
+    /// The session the hold is for. A hold records it, and a release that
+    /// carries it frees only that session's holds, wherever a rename moved
+    /// them, never a newer session's under the same name. `None` from a
+    /// client that predates the field: the release is by name alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<sessions::SessionId>,
 }
 
 /// What side of the in-VM daemon reported a runtime-admitted port (NET-045,
@@ -1094,6 +1139,16 @@ pub enum BoxControlRequest {
     /// — the read-only verb: no row is touched, no state changes, the reply
     /// is the status the answerer's acquisition last left.
     AnswererStatus,
+    /// Hold a `host_ip` box's name in the host's zone with no row behind
+    /// it ([`HoldBoxNameRequest`]): the interim that answers NODATA until
+    /// the node's bind mirror lands. Served on the host's control socket
+    /// only, answered with [`BoxControlReply::NameHeld`].
+    HoldBoxName(HoldBoxNameRequest),
+    /// Release a name [`BoxControlRequest::HoldBoxName`] holds: the box's
+    /// session is gone, so the name answers nothing again. Answered with
+    /// [`BoxControlReply::NameHeld`]; a name no hold kept is the goal
+    /// state already holding.
+    ReleaseBoxName(HoldBoxNameRequest),
     /// The in-VM daemon's report that one of its boxes published a port at
     /// runtime (NET-138), carried on the daemon's own control channel: the
     /// host records it in the row only within the grant the host-side
@@ -1246,6 +1301,90 @@ pub enum ProxyDownCause {
     },
 }
 
+/// The hostname proxy's terminal publish outcome the status reply carries
+/// beside the answerer's state (T93): the port the failure is about, and
+/// its named cause. A sibling of [`ZoneAnswererStatus`] on
+/// [`AnswererStatusReply`], never a replacement for it — the answerer's
+/// state is a fact about the machine's zone answerer and the proxy's
+/// publish outcome a fact about the proxy, and one reply can carry both
+/// without either substituting for the other.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProxyDown {
+    /// The port the supervisor reserved and the guest could not publish.
+    pub port: u16,
+    /// What kept the proxy from serving on that port.
+    pub cause: ProxyDownCause,
+}
+
+/// The answerer-status verb's answer (T93): the machine's zone-answerer
+/// state as the daemon holds it ([`ZoneAnswererStatus`]), with the
+/// hostname proxy's publish outcome — when the supervisor reached a cause
+/// that names one — riding beside it as [`Self::proxy_down`] rather than
+/// in place of it. The proxy-down cause is a fact about the proxy, never
+/// a state of the answerer: substituting it for the answerer's state
+/// dropped the zone-answerer facts entirely, leaving the CLI unable to
+/// name who answers the zone or to probe for native DNS while the proxy
+/// was down or its publish unconfirmed.
+///
+/// The wire shape is the status's own flat document — `state` at the top
+/// level — with `proxy_down` an optional sibling key: a client that
+/// predates the field ignores it (unknown fields are not refused), and a
+/// client that knows it reads `None` from a daemon that predates it. The
+/// older substituting shape — `state: "proxy_not_serving"` naming no
+/// answerer fact — stays a variant a new client still parses, for the
+/// daemons that still send it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AnswererStatusReply {
+    /// The machine's zone-answerer state, flattened so `state` stays at
+    /// the document's top level, exactly where every reader of the
+    /// status verb looks for it.
+    #[serde(flatten)]
+    pub answerer: ZoneAnswererStatus,
+    /// Why this VM's hostname proxy is not serving, when the supervisor
+    /// reached a cause that names it: the port the failure is about and
+    /// its cause. `None` in every state where the status says nothing
+    /// about the proxy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_down: Option<ProxyDown>,
+}
+
+impl<'de> Deserialize<'de> for AnswererStatusReply {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Manual on purpose: `flatten` inside an untagged variant's
+        // payload is a shape serde cannot deserialize (it buffers into a
+        // private format the untagged machinery rejects), so the reply
+        // splits instead — the document whole, the sibling key out, the
+        // rest through the status's own tagged shape, and the sibling
+        // parsed as the fact it names.
+        let whole = serde_json_lenient::Value::deserialize(deserializer)?;
+        let mut object = match whole {
+            serde_json_lenient::Value::Object(map) => map,
+            other => {
+                return Err(serde::de::Error::custom(format!(
+                    "the answerer status is a JSON object; got {other}"
+                )));
+            }
+        };
+        // The sibling is read leniently: a cause this client does not know
+        // (a newer daemon's variant) reads as no proxy fact, never as a
+        // decode failure that would drop the answerer's state with it —
+        // the displacement the sibling exists to remove.
+        let proxy_down = object
+            .remove("proxy_down")
+            .and_then(|value| serde_json_lenient::from_value::<Option<ProxyDown>>(value).ok())
+            .flatten();
+        let answerer = serde_json_lenient::from_value(serde_json_lenient::Value::Object(object))
+            .map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            answerer,
+            proxy_down,
+        })
+    }
+}
+
 /// The addresses a successful registration hands back
 /// ([`sessions::BoxAddresses`]): the box's switch address and its published
 /// loopback address, both allocated on the host from the address plan the
@@ -1274,7 +1413,8 @@ pub enum ProxyDownCause {
 /// offered ask cannot decode as a recorded port. The older newer shapes
 /// stay disjoint the same way — [`Row`](Self::Row) its
 /// `egress_allow_list`, [`NoRow`](Self::NoRow) its `no_row`,
-/// [`PortRecorded`](Self::PortRecorded) its `proto` — so no document of
+/// [`PortRecorded`](Self::PortRecorded) its `proto`,
+/// [`NameHeld`](Self::NameHeld) its `held` — so no document of
 /// one can decode as another's, and the order among them is free.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
@@ -1357,12 +1497,26 @@ pub enum BoxControlReply {
     /// The verb succeeded: a withdrawal's echo of the pair the row went by,
     /// and a registration's answer on a daemon that predates box ids.
     Addresses(BoxAddresses),
+    /// A hold or a release was answered: the name back, `held` saying
+    /// which — `true` a hold the table now keeps, `false` a release that
+    /// freed one (or found none).
+    NameHeld {
+        /// The name the hold or the release was about.
+        name: String,
+        /// The marker: whether the table holds the name now.
+        held: bool,
+    },
     /// The verb failed: `error` is a sentence naming why, for the client to
     /// warn with.
     Error { error: String },
     /// The answerer-status read succeeded: the state of the machine's
-    /// zone answerer as the daemon holds it ([`ZoneAnswererStatus`]).
-    Status(ZoneAnswererStatus),
+    /// zone answerer as the daemon holds it, with the hostname proxy's
+    /// publish outcome riding beside it as a sibling rather than in
+    /// place of it ([`AnswererStatusReply`] — T93). The flat `state` key
+    /// stays where every reader of the status verb looks for it, so an
+    /// older client still parses the answerer state and merely misses
+    /// the sibling.
+    Status(AnswererStatusReply),
     /// The read-only row verb's answer for a live box: the row's switch
     /// address, its derived egress allow-list, and its declared and
     /// runtime-admitted ports ([`BoxRow`]).
@@ -1643,6 +1797,21 @@ pub struct FinalizeSession;
 pub struct FinalizeSessionRequest {
     /// The session to finalize.
     pub session_id: SessionId,
+    /// The client decodes [`FinalizeSessionResponse::shared_port_collisions`],
+    /// so the daemon may fill it. [`FinalizeSessionResponse`] is
+    /// `deny_unknown_fields`: a client built before that field would refuse a
+    /// reply carrying it and abort the activation, so the daemon reports the
+    /// list only to a client that asks. Serde-defaulted, so an older client's
+    /// request reads as `false`, and omitted when `false`, so the request an
+    /// older daemon reads is unchanged — it ignores the key either way.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub report_shared_port_collisions: bool,
+}
+
+/// Serde helper: omit a `false` request flag, so the request matches the one
+/// a client that predates the flag sends.
+fn is_false(v: &bool) -> bool {
+    !*v
 }
 
 /// The response for a [`FinalizeSession`] RPC.
@@ -1664,6 +1833,44 @@ pub struct FinalizeSessionResponse {
     /// Serde-defaulted so a daemon that predates the field still answers.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub activate_hooks: Vec<RanHook>,
+    /// True when the finalize's package check stepped aside — its deadline
+    /// expired, or the session context or package graph could not be
+    /// evaluated — rather than refusing an unknown package. The session
+    /// still activates; the client warns so the operator knows unknown
+    /// names will surface at first exec. Serde-defaulted and omitted when
+    /// false so a daemon that predates the field still answers to an older
+    /// client.
+    #[serde(default, skip_serializing_if = "package_check_skipped_is_false")]
+    pub package_check_skipped: bool,
+    /// One entry per declared ingress port another box at the same shared
+    /// address already holds, so this box's attach yields it (first-come):
+    /// the port, and the box that holds it. The box still activates and
+    /// serves its other ports; the client warns so the operator knows the
+    /// declared mapping is served by the holding box, not this one.
+    /// Serde-defaulted, so a reply from a daemon that predates the field
+    /// decodes as empty; filled only when the request set
+    /// [`FinalizeSessionRequest::report_shared_port_collisions`], because
+    /// this struct is `deny_unknown_fields` and a client that predates the
+    /// field would refuse the reply.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shared_port_collisions: Vec<SharedPortCollision>,
+}
+
+/// A declared ingress port the box yields because another box at the same
+/// shared loopback address holds it, as the finalize reply reports it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SharedPortCollision {
+    /// The port both boxes declared and the holding box serves.
+    pub port: u16,
+    /// The holding box's name, as the warning names it.
+    pub held_by: String,
+}
+
+/// Serde helper: omit [`FinalizeSessionResponse::package_check_skipped`]
+/// when it is `false`, so the common success payload is unchanged for
+/// clients that predate the field.
+fn package_check_skipped_is_false(v: &bool) -> bool {
+    !*v
 }
 
 /// One hook that ran, as reported back to the client.
@@ -1987,17 +2194,12 @@ pub struct LiveMapping {
     pub internal_port: u16,
     /// The transport the forward carries.
     pub proto: IpProto,
-    /// Whether the box's own relay gate has admitted the port yet. A runtime
-    /// publish binds on the host at once, but the frame only reaches the box
-    /// through the relay gate its attach installed — and that gate admits the
-    /// ports the *declaration* named, so a port published at runtime is
-    /// refused at the relay until the gate's admitted set grows to include
-    /// runtime-published ports. A mapping that reads `pending` is bound, and
-    /// a connection to its `local` is answered by the relay, not by the box.
-    ///
-    /// Filled by the daemon at read time (the serving handler compares the
-    /// mapping against the gate's compile set), never stored with the
-    /// forwarder — the state is a fact about the box, not about the bind.
+    /// Whether the box's own relay gate has not admitted the port. A current
+    /// daemon admits a runtime publish at the gate in the same step it binds
+    /// the forward (NET-044), so it always answers `Some(false)`. Only a
+    /// daemon from before that change answers `Some(true)`: its gate admitted
+    /// only the declared ports, so a connection to such a row's `local` was
+    /// answered by the relay, not by the box.
     ///
     /// An `Option`, defaulted on the wire, so a reply from a daemon older
     /// than the field — one that carries no `pending` key — still decodes,
@@ -2006,6 +2208,11 @@ pub struct LiveMapping {
     /// renderings `min session policy` writes spell that (`unknown` in the
     /// text row, `null` in the JSON document); a daemon that does carry the
     /// field answers `Some(true)` or `Some(false)`, and only those.
+    ///
+    /// Deprecated: daemons from the gate-admits-exposed-ports change onward
+    /// always send `Some(false)`, so the field carries information only from
+    /// an older daemon. Remove it, and the client's `pending` rendering, when
+    /// the support window for those older daemons ends.
     #[serde(default)]
     pub pending: Option<bool>,
 }
@@ -2100,6 +2307,28 @@ pub struct SessionRuntimeFacts {
     /// be read back — the same states
     /// [`ListSessionsEntry::host_ip_enforcement`] names.
     pub host_ip_enforcement: Option<HostIpEnforcement>,
+    /// The permitted listening ports the box's listen watcher left
+    /// unpublished because their allow's audit record could not be written
+    /// (NET-046 fails closed), in port order. A watcher-driven publish has
+    /// no caller to answer, so this is where its failure reaches the user:
+    /// `min session policy` prints a warning per port. Absent when empty,
+    /// and absent from a daemon that predates the field — both read as
+    /// nothing to warn about.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unaudited_listen_ports: Vec<u16>,
+    /// The daemon's audit log path the warnings for
+    /// [`Self::unaudited_listen_ports`] name. Set only beside a non-empty
+    /// list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit_log: Option<String>,
+    /// The declared ingress ports this box's attach yields because another
+    /// box at the same shared loopback address holds them (first-come):
+    /// one entry per port, naming the holding box. Serde-defaulted and
+    /// omitted when empty, so a daemon that predates the field still
+    /// answers to an older client; a client that cannot ask reads the
+    /// same silence an empty list reads as.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shared_port_collisions: Vec<SharedPortCollision>,
 }
 
 impl OneshotSshRpc for GetSessionRuntimeFacts {
@@ -2442,6 +2671,7 @@ mod tests {
                 description: Some("emit to stdout and stderr".to_string()),
                 output: "HOOK_STDOUT_VISIBLE\nHOOK_STDERR_VISIBLE\n".to_string(),
             }],
+            ..Default::default()
         };
         let wire = serde_json_lenient::to_string(&resp).expect("must serialize");
         let back: FinalizeSessionResponse =
@@ -2461,6 +2691,117 @@ mod tests {
             Errorable::Ok(ok) => assert!(ok.activate_hooks[0].output.is_empty()),
             Errorable::Err { error } => panic!("a success decoded as an error: {error}"),
         }
+    }
+
+    /// `package_check_skipped` is omitted from the wire when false, so a
+    /// client that predates the field still decodes the common success
+    /// payload; when true it is present so the client can warn.
+    #[test]
+    fn package_check_skipped_is_omitted_when_false() {
+        let wire = serde_json_lenient::to_string(&FinalizeSessionResponse::default())
+            .expect("must serialize");
+        assert!(
+            !wire.contains("package_check_skipped"),
+            "a false skip must not be serialized, got {wire:?}"
+        );
+
+        let skipped = FinalizeSessionResponse {
+            package_check_skipped: true,
+            ..Default::default()
+        };
+        let wire = serde_json_lenient::to_string(&skipped).expect("must serialize");
+        assert!(
+            wire.contains("package_check_skipped"),
+            "a true skip must be serialized, got {wire:?}"
+        );
+        let back: FinalizeSessionResponse =
+            serde_json_lenient::from_str(&wire).expect("must decode");
+        assert!(back.package_check_skipped);
+    }
+
+    /// `shared_port_collisions` is omitted from the wire when empty, so a
+    /// client that predates the field still decodes the common success
+    /// payload; when a port was yielded it is present, naming the port and
+    /// the box that holds it so the client can warn.
+    #[test]
+    fn shared_port_collisions_are_omitted_when_empty() {
+        let wire = serde_json_lenient::to_string(&FinalizeSessionResponse::default())
+            .expect("must serialize");
+        assert!(
+            !wire.contains("shared_port_collisions"),
+            "an empty collision list must not be serialized, got {wire:?}"
+        );
+
+        let yielded = FinalizeSessionResponse {
+            shared_port_collisions: vec![SharedPortCollision {
+                port: 8080,
+                held_by: "first.min.internal".to_string(),
+            }],
+            ..Default::default()
+        };
+        let wire = serde_json_lenient::to_string(&yielded).expect("must serialize");
+        assert!(
+            wire.contains("shared_port_collisions"),
+            "a yielded port must be serialized, got {wire:?}"
+        );
+        let back: FinalizeSessionResponse =
+            serde_json_lenient::from_str(&wire).expect("must decode");
+        assert_eq!(
+            back.shared_port_collisions,
+            vec![SharedPortCollision {
+                port: 8080,
+                held_by: "first.min.internal".to_string(),
+            }],
+            "the collision list must round-trip"
+        );
+    }
+
+    /// A client and a daemon on either side of the
+    /// `report_shared_port_collisions` flag still finalize. An older
+    /// client's request (no flag) reads as not asking, so a newer daemon
+    /// leaves the collision list off a reply that client's
+    /// `deny_unknown_fields` type would refuse; a newer client's request
+    /// that does not ask is byte-for-byte the older one; and a newer
+    /// client that asks still decodes an older daemon's reply, which has
+    /// no list, as empty.
+    #[test]
+    fn finalize_collision_report_survives_version_skew_both_ways() {
+        let id = SessionId::nil();
+        let older_request = format!(r#"{{"session_id":"{}"}}"#, id.as_ref());
+        let decoded: FinalizeSessionRequest =
+            serde_json_lenient::from_str(&older_request).expect("an older request must decode");
+        assert!(
+            !decoded.report_shared_port_collisions,
+            "an older client never asked for the list"
+        );
+
+        let not_asking = FinalizeSessionRequest {
+            session_id: id,
+            report_shared_port_collisions: false,
+        };
+        assert_eq!(
+            serde_json_lenient::to_string(&not_asking).expect("must serialize"),
+            older_request,
+            "a request that does not ask is the one an older client sends"
+        );
+
+        let asking = FinalizeSessionRequest {
+            session_id: id,
+            report_shared_port_collisions: true,
+        };
+        let wire = serde_json_lenient::to_string(&asking).expect("must serialize");
+        assert!(
+            wire.contains("report_shared_port_collisions"),
+            "a request that asks says so: {wire}"
+        );
+
+        let older_reply: Errorable<FinalizeSessionResponse> =
+            serde_json_lenient::from_str("{}").expect("an older daemon's reply must decode");
+        assert_eq!(
+            older_reply,
+            Errorable::Ok(FinalizeSessionResponse::default()),
+            "an older daemon's reply reads as no collisions"
+        );
     }
 
     /// An empty request body must decode with the documented defaults so a
@@ -3027,29 +3368,43 @@ mod tests {
     /// the untagged [`Errorable`] — rejects a key it has no field for, so a
     /// policy reply that grew the state would make every old client fail
     /// `min session policy` outright. Pinned here as the contract that keeps
-    /// that from regressing: the reply this build serves decodes in the old
-    /// client's own strict shape, and the state answers over
-    /// [`GetSessionRuntimeFacts`] instead — a reply an old client simply
-    /// never asks for, and this build's own answer to it stays anchored the
-    /// same way the policy's `egress` is.
+    /// that from regressing: the state answers over
+    /// [`GetSessionRuntimeFacts`] — a reply an old client simply never asks
+    /// for, and this build's own answer to it stays anchored the same way
+    /// the policy's `egress` is. NET-134's lane is the one deliberate
+    /// exception, and this test pins both of its halves: a lane-less reply
+    /// serializes without the lane's key and so still decodes in the old
+    /// client's strict shape, while a laned reply — a fact `min session
+    /// policy` reads from no other reply — is refused by that client, the
+    /// visible error the lane's issue took over a lane the report is
+    /// silent about.
     #[test]
     fn effective_policy_reply_decodes_in_the_old_clients_strict_shape() {
-        // The reply this build serves: two fields, no enforcement key.
+        // The reply this build serves for a lane-less box: no enforcement
+        // key, and no lane key either — the shape every earlier client
+        // reads.
         let reply = Errorable::Ok(EffectiveSessionPolicy {
             egress: EffectiveEgress::DenyAll,
             ingress: None,
+            credentialed_upstream: None,
         });
         let json = serde_json_lenient::to_string(&reply).expect("the policy reply serializes");
         assert!(
             !json.contains("host_ip_enforcement"),
             "the strict policy reply must carry no enforcement key, got: {json}",
         );
+        assert!(
+            !json.contains("credentialed_upstream"),
+            "a lane-less reply must carry no lane key, so the old shape still \
+             reads it, got: {json}",
+        );
 
         // The old client: the strict two-field shape it was built against,
         // spelled as its own derive would spell it. It decodes the reply
-        // above because the reply never grew a field — and it refuses a
-        // reply that did, which is exactly why the state must ride its own
-        // RPC rather than a new field here.
+        // above because a lane-less reply never grew a key — and it refuses
+        // a reply that did, which is why the enforcement state must ride its
+        // own RPC, and why a laned box's reply is a visible error to this
+        // client rather than a silently missing lane.
         #[derive(serde::Deserialize, Debug, PartialEq)]
         #[serde(deny_unknown_fields)]
         struct OldClientPolicy {
@@ -3073,6 +3428,15 @@ mod tests {
             "the old client refuses a policy reply that grew the key — the \
              reason the state answers over its own runtime-facts reply",
         );
+        assert!(
+            serde_json_lenient::from_str::<Errorable<OldClientPolicy>>(
+                r#"{"egress":"deny_all","ingress":null,"credentialed_upstream":{}}"#
+            )
+            .is_err(),
+            "the old client refuses a laned reply too — `min session policy` \
+             reads no other reply that carries the lane, so the refusal is the \
+             visible error the lane's issue chose over a silent omission",
+        );
 
         // The runtime-facts reply keeps the property the strict shapes
         // exist for without being strict: its required `id` is a field the
@@ -3084,8 +3448,22 @@ mod tests {
         let facts = SessionRuntimeFacts {
             id: SessionId::nil(),
             host_ip_enforcement: Some(HostIpEnforcement::None),
+            unaudited_listen_ports: Vec::new(),
+            audit_log: None,
+            shared_port_collisions: Vec::new(),
         };
         assert_eq!(round_trip(&facts), facts);
+        let unaudited = SessionRuntimeFacts {
+            unaudited_listen_ports: vec![3000, 3001],
+            audit_log: Some("/state/audit/decisions.log".to_string()),
+            ..facts.clone()
+        };
+        assert_eq!(round_trip(&unaudited), unaudited);
+        let empty = serde_json_lenient::to_string(&facts).expect("facts serialize");
+        assert!(
+            !empty.contains("unaudited_listen_ports") && !empty.contains("audit_log"),
+            "an empty unaudited list is omitted from the wire: {empty}"
+        );
         match serde_json_lenient::from_str::<Errorable<SessionRuntimeFacts>>(
             r#"{"error":"no session found"}"#,
         )
@@ -3106,6 +3484,9 @@ mod tests {
                 SessionRuntimeFacts {
                     id: SessionId::nil(),
                     host_ip_enforcement: Some(HostIpEnforcement::PerBox),
+                    unaudited_listen_ports: Vec::new(),
+                    audit_log: None,
+                    shared_port_collisions: Vec::new(),
                 },
                 "the facts this client knows decode beside a key it does not"
             ),
@@ -3356,6 +3737,71 @@ mod tests {
             }))
         );
         assert_eq!(round_trip(&with), with);
+    }
+
+    /// NET-129's listing half survives version skew both ways without a
+    /// request flag, because neither [`ListSessionsResponse`] nor
+    /// [`ListSessionsEntry`] is `deny_unknown_fields`. A newer daemon's
+    /// populated entry carries one key more than an older client knows, and
+    /// these types skip a key they do not know — shown here with a key this
+    /// build does not know either, the position an older client is in. An
+    /// older daemon's entry carries no list and decodes as empty, and an
+    /// empty list stays off the wire.
+    #[test]
+    fn list_sessions_shared_port_collisions_survive_version_skew_both_ways() {
+        let entry = |collisions: Vec<SharedPortCollision>| ListSessionsEntry {
+            id: SessionId::nil(),
+            name: Some("second".to_string()),
+            project_path: None,
+            status: sessions::SessionStatus::Active,
+            git: None,
+            attrs: None,
+            host_ip_enforcement: None,
+            shared_port_collisions: collisions,
+        };
+        let response = |sessions| ListSessionsResponse {
+            resource_pool: None,
+            sessions,
+            daemon_version: None,
+            hostname_routing_unavailable: None,
+            hostname_proxy_port: None,
+            zone_answerer_port: None,
+            answerer_bound: false,
+        };
+
+        let quiet = serde_json_lenient::to_string(&response(vec![entry(Vec::new())]))
+            .expect("must serialize");
+        assert!(
+            !quiet.contains("shared_port_collisions"),
+            "an empty list must not be serialized, got {quiet}"
+        );
+
+        let yielded = entry(vec![SharedPortCollision {
+            port: 8080,
+            held_by: "first.min.internal".to_string(),
+        }]);
+        let mut wire =
+            serde_json_lenient::to_value(response(vec![yielded.clone()])).expect("serializes");
+        assert_eq!(
+            wire["sessions"][0]["shared_port_collisions"],
+            serde_json_lenient::json!([{"port": 8080, "held_by": "first.min.internal"}]),
+            "a yielded port is listed under its wire key: {wire}"
+        );
+
+        // A newer daemon's reply, one key past what this build knows: still
+        // decodes, so an older client's listing survives a populated list.
+        wire["sessions"][0]["a_later_field"] = serde_json_lenient::json!([1]);
+        wire["a_later_field"] = serde_json_lenient::json!(true);
+        let newer: ListSessionsResponse =
+            serde_json_lenient::from_value(wire).expect("unknown keys are ignored");
+        assert_eq!(newer.sessions, vec![yielded]);
+
+        // An older daemon's entry: no list, decoded as empty.
+        let older: ListSessionsResponse = serde_json_lenient::from_str(
+            r#"{"sessions":[{"id":"00000000-0000-0000-0000-000000000000","name":"second","attrs":null}]}"#,
+        )
+        .expect("a pre-field entry must decode");
+        assert!(older.sessions[0].shared_port_collisions.is_empty());
     }
 
     /// The port-report verbs (NET-138) round-trip as the fixed, size-bounded
@@ -3778,5 +4224,120 @@ mod tests {
         )
         .expect("an error reply still decodes");
         assert!(matches!(error, BoxControlReply::Error { .. }));
+    }
+
+    /// The answerer-status reply's shape (T93): the answerer's state
+    /// rides flat — `state` at the document's top level, exactly where
+    /// every reader of the status verb looks for it — with the hostname
+    /// proxy's publish outcome a sibling key beside it, never in place of
+    /// it. The sibling is optional in both directions: a client that
+    /// predates it ignores it, and a client that knows it reads `None`
+    /// from a daemon that predates it.
+    #[test]
+    fn box_control_answerer_status_reply_round_trip() {
+        // Without a proxy-down cause the wire is the status's own document,
+        // byte for byte the shape it always was.
+        let plain = BoxControlReply::Status(AnswererStatusReply {
+            answerer: ZoneAnswererStatus::Holder { port: 7_656 },
+            proxy_down: None,
+        });
+        let wire = serde_json_lenient::to_string(&plain).expect("serialize");
+        assert_eq!(
+            wire, r#"{"state":"holder","port":7656}"#,
+            "no cause to name means no sibling key: the wire is the old shape"
+        );
+        assert_eq!(round_trip(&plain), plain);
+
+        // With the proxy down the reply carries both facts: the answerer's
+        // state in its own place, the cause named beside it — not in place
+        // of it.
+        let with_cause = BoxControlReply::Status(AnswererStatusReply {
+            answerer: ZoneAnswererStatus::Holder { port: 7_656 },
+            proxy_down: Some(ProxyDown {
+                port: 19_911,
+                cause: ProxyDownCause::PortHeld,
+            }),
+        });
+        let wire = serde_json_lenient::to_string(&with_cause).expect("serialize");
+        for field in [
+            r#""state":"holder""#,
+            r#""port":7656"#,
+            r#""proxy_down":{"port":19911,"cause":"port_held"}"#,
+        ] {
+            assert!(wire.contains(field), "the reply spells {field}: {wire}");
+        }
+        assert_eq!(round_trip(&with_cause), with_cause);
+        // An older client decodes the status payload as the bare
+        // `ZoneAnswererStatus` its `Status` variant held: the sibling key is
+        // an unknown field it ignores, never a decode failure.
+        let older_client: ZoneAnswererStatus =
+            serde_json_lenient::from_str(&wire).expect("an older client still decodes the reply");
+        assert_eq!(older_client, ZoneAnswererStatus::Holder { port: 7_656 });
+
+        // The unconfirmed publish rides the sibling the same way, beside
+        // whatever state the answerer itself is in.
+        let unconfirmed = BoxControlReply::Status(AnswererStatusReply {
+            answerer: ZoneAnswererStatus::Starting,
+            proxy_down: Some(ProxyDown {
+                port: 19_916,
+                cause: ProxyDownCause::PublishUnconfirmed,
+            }),
+        });
+        let wire = serde_json_lenient::to_string(&unconfirmed).expect("serialize");
+        assert!(
+            wire.contains(r#""state":"starting""#)
+                && wire.contains(r#""cause":"publish_unconfirmed""#),
+            "the unconfirmed publish is a sibling of the answerer's state: {wire}"
+        );
+        assert_eq!(round_trip(&unconfirmed), unconfirmed);
+
+        // A daemon that predates the sibling — its reply names only the
+        // state — decodes with the cause `None` an absent fact is.
+        let older: BoxControlReply =
+            serde_json_lenient::from_str(r#"{"state":"manager_held","port":7656}"#)
+                .expect("an older daemon's status still decodes");
+        assert_eq!(
+            older,
+            BoxControlReply::Status(AnswererStatusReply {
+                answerer: ZoneAnswererStatus::ManagerHeld { port: 7_656 },
+                proxy_down: None,
+            }),
+            "a reply that says nothing about the proxy reads as no proxy fact"
+        );
+
+        // The old substituting shape still parses: a daemon that answers
+        // the proxy failure in the state's own place is read as exactly
+        // that, claiming no answerer facts the reply does not carry.
+        let substituting: BoxControlReply = serde_json_lenient::from_str(
+            r#"{"state":"proxy_not_serving","port":19911,"cause":"redraws_ran_out"}"#,
+        )
+        .expect("the substituting shape still decodes");
+        assert_eq!(
+            substituting,
+            BoxControlReply::Status(AnswererStatusReply {
+                answerer: ZoneAnswererStatus::ProxyNotServing {
+                    port: 19_911,
+                    cause: ProxyDownCause::RedrawsRanOut,
+                },
+                proxy_down: None,
+            }),
+            "the state the older daemon answered is the state the read returns"
+        );
+
+        // A newer daemon's cause this client does not know still yields
+        // the answerer's state: the unparseable sibling reads as no proxy
+        // fact instead of failing the whole Status decode.
+        let future: BoxControlReply = serde_json_lenient::from_str(
+            r#"{"state":"holder","port":7656,"proxy_down":{"port":1,"cause":"future"}}"#,
+        )
+        .expect("an unknown proxy-down cause still decodes the status");
+        assert_eq!(
+            future,
+            BoxControlReply::Status(AnswererStatusReply {
+                answerer: ZoneAnswererStatus::Holder { port: 7_656 },
+                proxy_down: None,
+            }),
+            "an unknown cause drops the sibling, never the answerer's state"
+        );
     }
 }

@@ -275,6 +275,10 @@ fn every_daemon_connection_is_classified() {
             "cmd/session.rs::cmd_exec = gated",
             "cmd/session.rs::cmd_session_run = gated",
             "cmd/session.rs::cmd_session_setup_zed = gated",
+            // A read-only lookup after an attach the gated `cmd_attach` already
+            // made: it only asks whether the session is gone, to release a
+            // `host_ip` name hold, and builds nothing a skew could half-make.
+            "cmd/session.rs::release_held_name_after_attach = ungated",
             "diag/net.rs::probe_socket = ungated",
             "task.rs::arm_task_run_interrupt = ungated",
             // Not a product path: the fall-through tests' own connections to
@@ -649,6 +653,14 @@ fn cli_reference_has_no_retired_commands() {
         rendered.contains("Usage:"),
         "the refusal must carry the usage, got: {rendered}"
     );
+
+    // The refusal `min` prints names the verb that replaced the retired one.
+    let rendered = with_retired_command_hint(err).to_string();
+    assert!(
+        rendered.contains("unrecognized subcommand 'ssh-forward'")
+            && rendered.contains("min net forward <SESSION> <LOCAL>:<PORT>"),
+        "the refusal must name the replacement, got: {rendered}"
+    );
 }
 
 /// Entry constructor for the bare-`min` state-report tests.
@@ -665,6 +677,7 @@ fn twin_entry(
         status,
         git: None,
         host_ip_enforcement: None,
+        shared_port_collisions: Vec::new(),
         attrs: None,
     }
 }
@@ -686,7 +699,7 @@ fn bare_status_renders_a_cwd_session_verbatim() {
              \x20 sessions: 1 (web, active)\n\
              \x20 blueprint: minimal.toml present\n\
              Next:\n\
-             \x20 min session attach --command 'min task run <task>' web\n\
+             \x20 min session run web <task>\n\
              \x20 min ls --json\n"
     );
 }
@@ -848,14 +861,15 @@ fn bare_status_counts_elsewhere_sessions() {
         "no cwd session must suggest activate: {out}"
     );
     assert!(
-        !out.contains("session attach --command"),
-        "must not suggest attaching elsewhere: {out}"
+        !out.contains("min session run"),
+        "must not suggest running in a session elsewhere: {out}"
     );
 }
 
 /// More than two cwd matches: the count is the full total, the listing
-/// stops at two, and an unnamed session shows its short id — which is
-/// also what the attach suggestion substitutes for the first match.
+/// stops at two and counts the rest, sessions elsewhere are counted too,
+/// and an unnamed session shows its short id — which is also what the run
+/// suggestion substitutes for the first match.
 #[test]
 fn bare_status_lists_at_most_two_cwd_sessions() {
     let entries = vec![
@@ -877,20 +891,29 @@ fn bare_status_lists_at_most_two_cwd_sessions() {
             Some("/w"),
             sessions::SessionStatus::Active,
         ),
+        twin_entry(
+            "019f5d0f-0a99-78b1-9165-0809440f0088",
+            Some("api"),
+            Some("/other"),
+            sessions::SessionStatus::Active,
+        ),
     ];
     let cwd = paths::HostAbsPath::try_new("/w").unwrap();
     let out = render_bare_status("/w", &entries, &cwd, true);
     assert!(
-        out.contains("  sessions: 3 (019f5d0f, pending), (web, materializing)\n"),
-        "count-then-two listing: {out}"
+        out.contains(
+            "  sessions: 3 (019f5d0f, pending), (web, materializing) and 1 more \
+             (1 elsewhere)\n"
+        ),
+        "count-then-two listing, the rest counted: {out}"
     );
     assert!(
         !out.contains("spare"),
         "third session must not be listed: {out}"
     );
     assert!(
-        out.contains("  min session attach --command 'min task run <task>' 019f5d0f\n"),
-        "attach suggestion uses the first match's handle: {out}"
+        out.contains("  min session run 019f5d0f <task>\n"),
+        "run suggestion uses the first match's handle: {out}"
     );
 }
 
@@ -1012,6 +1035,41 @@ fn provider_local_minimald_is_the_host_backend() {
     use clap::Parser as _;
     let cli = Cli::try_parse_from(["min", "--provider", "local-minimald", "ls"]).unwrap();
     assert!(!cli.global_args.use_minvmd());
+}
+
+#[test]
+fn net_setup_parses_to_the_setup_command() {
+    use clap::Parser as _;
+    let cli = Cli::try_parse_from(["min", "net", "setup"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Some(Command::Net(NetArgs {
+            command: NetCommand::Setup(NetSetupArgs {
+                print: false,
+                undo: false
+            })
+        }))
+    ));
+    let cli = Cli::try_parse_from(["min", "net", "setup", "--print"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Some(Command::Net(NetArgs {
+            command: NetCommand::Setup(NetSetupArgs {
+                print: true,
+                undo: false
+            })
+        }))
+    ));
+    let cli = Cli::try_parse_from(["min", "net", "setup", "--undo", "--print"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Some(Command::Net(NetArgs {
+            command: NetCommand::Setup(NetSetupArgs {
+                print: true,
+                undo: true
+            })
+        }))
+    ));
 }
 
 #[test]
@@ -1624,6 +1682,33 @@ fn composition_failure_leads_with_the_directory_not_the_daemon_step() {
     );
 }
 
+/// A transient git failure — the concurrent `min session activate`
+/// `index.lock` race — is not the user's configuration, so the message must
+/// not instruct them to fix "the configuration there". The remedy is to
+/// re-run, and the directory still leads.
+#[test]
+fn composition_failure_does_not_blame_config_for_git_lock() {
+    let daemon_error = "init of minimal context: other: git command 'checkout' failed \
+                            (exit status: 128): fatal: Unable to create \
+                            '.../.git/index.lock': File exists.";
+    let msg =
+        composition_failure_message(camino::Utf8Path::new("/home/dev/myproject"), daemon_error);
+
+    let headline = msg.lines().next().expect("a first line");
+    assert!(
+        headline.contains("/home/dev/myproject"),
+        "the headline must name the directory: {msg}"
+    );
+    assert!(
+        !msg.contains("Fix the configuration there"),
+        "a git lock is transient, not a config fault: {msg}"
+    );
+    assert!(
+        msg.contains(daemon_error),
+        "the daemon's error must survive: {msg}"
+    );
+}
+
 /// Every site that reports an uncomposable session goes through the one
 /// helper: the refused `ConfigureLoadout` and the headless gating bail in
 /// each creator, plus the interactive gating bail they share via
@@ -1996,6 +2081,21 @@ fn legacy_network_spellings_parse_with_hint() {
     );
 }
 
+/// The `--network` parser accepts every [`sessions::NetworkMode::word`] and
+/// maps it back to the same mode, so the word the daemon logs and the
+/// refusals print is always one a person can type.
+#[test]
+fn network_parser_round_trips_every_mode_word() {
+    for mode in [
+        sessions::NetworkMode::NoNet,
+        sessions::NetworkMode::HostNet,
+        sessions::NetworkMode::OwnIp,
+    ] {
+        let parsed = parse_network_mode(mode.word()).expect("a mode word must parse");
+        assert_eq!(sessions::NetworkMode::from(parsed), mode, "{}", mode.word());
+    }
+}
+
 /// `--deny-all-egress` conflicts with every egress rule flag at parse
 /// (NET-075's CLI half): a deny-all declaration admits no exceptions, so
 /// combining it with any `--allow-*`/`--deny-*` rule is refused before the
@@ -2238,7 +2338,10 @@ async fn create_box_on(
         Errorable::Err { error } => panic!("ConfigureLoadout failed: {error}"),
     }
     match client
-        .call::<FinalizeSession>(&FinalizeSessionRequest { session_id: id })
+        .call::<FinalizeSession>(&FinalizeSessionRequest {
+            session_id: id,
+            report_shared_port_collisions: false,
+        })
         .await
     {
         Errorable::Ok(_) => id,
@@ -2306,8 +2409,14 @@ async fn ls_shows_vm_per_box() {
         Some(crate::resolver::LiveSurface::Native),
     ];
     let answerers = vec![
-        Some(minimald_rpc::ZoneAnswererStatus::Holder { port: 7_656 }),
-        Some(minimald_rpc::ZoneAnswererStatus::Registered { port: 7_656 }),
+        Some(minimald_rpc::AnswererStatusReply {
+            answerer: minimald_rpc::ZoneAnswererStatus::Holder { port: 7_656 },
+            proxy_down: None,
+        }),
+        Some(minimald_rpc::AnswererStatusReply {
+            answerer: minimald_rpc::ZoneAnswererStatus::Registered { port: 7_656 },
+            proxy_down: None,
+        }),
     ];
     let mut out = Vec::new();
     format_ls_across_vms(
@@ -3116,22 +3225,61 @@ fn a_unique_id_prefix_resolves_to_its_session() {
 }
 
 /// A prefix several sessions share is refused, naming each candidate by its
-/// short id; one more character that tells them apart resolves.
+/// short id and its session name; one more character that tells them apart
+/// resolves.
 #[test]
 fn an_ambiguous_id_prefix_names_the_candidates() {
     use sessions::SessionStatus::Active;
     let entries = vec![
-        twin_entry("a1b2c3d4-0a99-78b1-9165-0809440f0052", None, None, Active),
-        twin_entry("a1b29e8f-0a99-78b1-9165-0809440f0052", None, None, Active),
+        twin_entry(
+            "a1b2c3d4-0a99-78b1-9165-0809440f0052",
+            Some("web"),
+            None,
+            Active,
+        ),
+        twin_entry(
+            "a1b29e8f-0a99-78b1-9165-0809440f0052",
+            Some("db"),
+            None,
+            Active,
+        ),
     ];
     let err = match_id_prefix(&entries, "a1b2").unwrap_err();
     assert!(err.downcast_ref::<AmbiguousIdPrefix>().is_some());
     assert_eq!(
         err.to_string(),
-        "'a1b2' matches sessions a1b2c3d4…, a1b29e8f…; use more characters"
+        "'a1b2' matches sessions a1b2c3d4… (web), a1b29e8f… (db); use more characters"
     );
     assert_eq!(
         match_id_prefix(&entries, "a1b29").unwrap(),
+        Some(entries[1].id)
+    );
+}
+
+/// Candidates that share more than eight hex digits are cut only as far as
+/// needed to be told apart: each rendered id is distinct and exactly as long
+/// as the first differing digit.
+#[test]
+fn an_ambiguous_id_prefix_cuts_at_the_first_differing_digit() {
+    use sessions::SessionStatus::Active;
+    let entries = vec![
+        twin_entry("a1b2c3d4-e50f-78b1-9165-0809440f0052", None, None, Active),
+        twin_entry("a1b2c3d4-e51f-78b1-9165-0809440f0052", None, None, Active),
+    ];
+    // The two ids share their first ten hex digits; the eleventh diverges.
+    let err = match_id_prefix(&entries, "a1b2c3d4e5").unwrap_err();
+    assert!(err.downcast_ref::<AmbiguousIdPrefix>().is_some());
+    assert_eq!(
+        err.to_string(),
+        "'a1b2c3d4e5' matches sessions a1b2c3d4e50…, a1b2c3d4e51…; use more characters"
+    );
+    // Each rendered candidate resolves back to exactly its own session.
+    assert_eq!(
+        match_id_prefix(&entries, "a1b2c3d4e50").unwrap(),
+        Some(entries[0].id)
+    );
+    assert_eq!(
+        match_id_prefix(&entries, "a1b2c3d4e51").unwrap(),
         Some(entries[1].id)
     );
 }
@@ -3168,6 +3316,70 @@ fn an_exact_name_wins_over_an_id_prefix() {
     ));
     assert_eq!(
         match_id_prefix(&entries, "01a0fe9d").unwrap(),
+        Some(entries[2].id)
+    );
+}
+
+/// A name resolves in any casing, matching how names are made unique: a
+/// session named `Beef-Cafe` is found by `beef-cafe` (and vice versa). The
+/// names are hex-shaped, because only those reach this match on a name miss,
+/// and a folded name wins over a session whose id starts with the same hex.
+#[test]
+fn a_name_resolves_case_insensitively() {
+    use sessions::SessionStatus::Active;
+    let entries = vec![
+        twin_entry(
+            "ffffffff-0a99-78b1-9165-0809440f0052",
+            Some("Beef-Cafe"),
+            None,
+            Active,
+        ),
+        twin_entry("beefcafe-0a99-78b1-9165-0809440f0054", None, None, Active),
+    ];
+    assert_eq!(
+        match_id_prefix(&entries, "beef-cafe").unwrap(),
+        Some(entries[0].id)
+    );
+    assert_eq!(
+        match_id_prefix(&entries, "BEEF-CAFE").unwrap(),
+        Some(entries[0].id)
+    );
+}
+
+/// An exact name wins over a case-folded one, and a casing that folds to two
+/// sessions (case-only duplicates written before names were made unique
+/// under case folding) resolves to neither rather than picking one, nor
+/// falls through to a session whose id starts with that prefix.
+#[test]
+fn an_exact_name_wins_and_an_ambiguous_fold_resolves_to_none() {
+    use sessions::SessionStatus::Active;
+    let entries = vec![
+        twin_entry(
+            "ffffffff-0a99-78b1-9165-0809440f0052",
+            Some("Beef-Cafe"),
+            None,
+            Active,
+        ),
+        twin_entry(
+            "eeeeeeee-0a99-78b1-9165-0809440f0053",
+            Some("beef-cafe"),
+            None,
+            Active,
+        ),
+        twin_entry("beefcafe-0a99-78b1-9165-0809440f0054", None, None, Active),
+    ];
+    assert_eq!(
+        match_id_prefix(&entries, "beef-cafe").unwrap(),
+        Some(entries[1].id)
+    );
+    assert_eq!(
+        match_id_prefix(&entries, "Beef-Cafe").unwrap(),
+        Some(entries[0].id)
+    );
+    assert_eq!(match_id_prefix(&entries, "BEEF-CAFE").unwrap(), None);
+    // The id prefix alone, with no name folding to it, still resolves.
+    assert_eq!(
+        match_id_prefix(&entries, "beefcafe").unwrap(),
         Some(entries[2].id)
     );
 }

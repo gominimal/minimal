@@ -59,6 +59,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
+use hickory_proto::rr::Name;
 use serde::Serialize;
 use sessions::core::egress::EgressRules;
 #[cfg(target_os = "linux")]
@@ -69,19 +70,23 @@ use std::time::Duration;
 
 use super::SwitchSubnet;
 
-/// The DNS suffix every PTask box name carries (see the module docs).
-pub const HOSTNAME_SUFFIX: &str = "min.internal";
+/// The DNS suffix every PTask box name carries (see the module docs). Read
+/// from the sessions zone's apex, the one spelling every registry shares.
+pub const HOSTNAME_SUFFIX: &str = sessions::core::zone_answer::ZONE_APEX;
 
 /// Whether `name` is a box-zone name — the zone apex itself or any name under
-/// it (NET-072). `name` is an already-normalized qname: lowercased, no root
-/// dot, exactly what [`super::dns_gate`]'s gate asks about. Mirrors the
-/// answerer's zone-suffix match so both layers cannot drift.
+/// it (NET-072). `name` is an already-normalized qname in presentation form:
+/// lowercased, no root dot, exactly what [`super::dns_gate`]'s gate asks
+/// about. The match is by labels, not by string suffix: a single label
+/// holding an escaped dot, `evil\.min` under `internal`, renders as
+/// `evil\.min.internal` but sits under `internal`, not under the zone. A
+/// name that does not parse is not the zone.
 #[must_use]
 pub fn is_zone_name(name: &str) -> bool {
-    name == HOSTNAME_SUFFIX
-        || name
-            .strip_suffix(HOSTNAME_SUFFIX)
-            .is_some_and(|stem| stem.ends_with('.'))
+    match (Name::from_ascii(name), Name::from_ascii(HOSTNAME_SUFFIX)) {
+        (Ok(name), Ok(zone)) => zone.zone_of(&name),
+        _ => false,
+    }
 }
 
 /// Default `<host-id>` of the deprecated three-label zone: a stable short name
@@ -915,6 +920,33 @@ impl HostnameRegistry {
         self.by_session
             .get(session_name)
             .is_some_and(|registration| registration.id != session_id)
+    }
+
+    /// The session name whose route the box name `session_name` answers with
+    /// now, when that route belongs to a session **other than `session_id`**
+    /// — the collision a restart's resume must not overwrite. The lookup
+    /// goes through the name's hostname, which is case-folded, so it also
+    /// finds a route registered under a name that differs from
+    /// `session_name` only in ASCII case; and whether that route is this
+    /// session's own is decided by the `SessionId` it was registered
+    /// under, never by the name — two sessions can share one registry
+    /// name outright (two unnamed sessions whose project directories
+    /// share a basename), so a same-named owner is not necessarily self.
+    #[must_use]
+    pub fn hostname_held_by_another(
+        &self,
+        session_id: SessionId,
+        session_name: &str,
+    ) -> Option<String> {
+        let owner = self
+            .by_host
+            .get(&Hostname::for_ptask(session_name))?
+            .session()
+            .to_owned();
+        self.by_session
+            .get(&owner)
+            .filter(|registration| registration.id != session_id)
+            .map(|_| owner)
     }
 
     /// Reports the lease an `OwnIp` box attached with (from the attach path)
@@ -2455,6 +2487,28 @@ mod tests {
         BTreeMap::from([(18080, 8080)])
     }
 
+    /// The daemon's zone spellings are the sessions zone's, byte for byte:
+    /// the box suffix is the apex, the switch's host name and the host-net
+    /// `/etc/hosts` entry are the host row, and the gvproxy config renders
+    /// the zone and the host row's label. A spelling that drifts from the
+    /// zone fails here.
+    #[test]
+    fn zone_spellings_are_the_sessions_zone() {
+        use sessions::core::zone_answer::{HOST_ROW_LABEL, HOST_ROW_NAME, ZONE_APEX};
+
+        assert_eq!(HOSTNAME_SUFFIX, "min.internal");
+        assert_eq!(HOSTNAME_SUFFIX, ZONE_APEX);
+        assert_eq!(crate::net::switch::HOST_MIN_INTERNAL, "host.min.internal");
+        assert_eq!(sandbox2::HOST_MIN_INTERNAL, HOST_ROW_NAME);
+        let yaml = ::switch::render_gvproxy_config(::switch::SwitchSubnet::default(), &[]);
+        assert!(
+            yaml.contains(&format!(
+                "    - name: \"{ZONE_APEX}.\"\n      records:\n        - name: \"{HOST_ROW_LABEL}\"\n"
+            )),
+            "the gvproxy zone record spells the zone's host row; config was:\n{yaml}"
+        );
+    }
+
     /// NET-072's name boundary: the zone the gate carves out of the
     /// infrastructure deny set is the zone's own apex and the names under it —
     /// never a name that merely carries the zone's words. The matcher mirrors
@@ -2479,6 +2533,13 @@ mod tests {
         assert!(!is_zone_name("webmin.internal"));
         assert!(!is_zone_name("example.com"));
         assert!(!is_zone_name(""), "no name is no zone");
+        // One label holding an escaped dot sits under `internal`, not under
+        // the zone, though its presentation form ends in `.min.internal`.
+        assert!(!is_zone_name("evil\\.min.internal"));
+        assert!(
+            is_zone_name("a\\.b.min.internal"),
+            "the escape is below the zone"
+        );
     }
 
     /// Proof artifact 1 (registry/proxy contract): registering a `HostNet`

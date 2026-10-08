@@ -12,6 +12,8 @@ use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::time::Duration;
 
 use nix::sched::CloneFlags;
 
@@ -20,6 +22,67 @@ pub const SUBCOMMAND: &str = "__nsenter";
 
 /// Where this daemon can re-exec itself from. Registered by [`set_shim_exe`].
 static SHIM_EXE: OnceLock<PathBuf> = OnceLock::new();
+
+/// How long the shim gives the injected process group between the SIGTERM it
+/// forwards and the SIGKILL that ends the group. Ending an exec is SIGTERM, a
+/// grace period, then SIGKILL, so a member that traps SIGTERM can clean up.
+///
+/// This and [`SHIM_ESCALATION`] are two halves of one timeline and are defined
+/// together on purpose: the daemon's SIGKILL of the shim must come after the
+/// shim's own group SIGKILL plus [`ESCALATION_MARGIN`]. A shim SIGKILLed first
+/// cannot kill the group (`PR_SET_PDEATHSIG` takes the group leader only), so
+/// the daemon's SIGKILL is a fallback for a wedged shim, never the normal way
+/// an exec ends. Whole seconds, because `alarm(2)` arms whole seconds.
+pub const GROUP_GRACE: Duration = Duration::from_secs(2);
+
+/// How long the daemon waits for a SIGTERMed shim to exit before it SIGKILLs
+/// it. Longer than [`GROUP_GRACE`] plus [`ESCALATION_MARGIN`], which the const
+/// assertion below enforces; [`GROUP_GRACE`] says why.
+pub const SHIM_ESCALATION: Duration = Duration::from_secs(5);
+
+/// The slack between the shim's group SIGKILL and the daemon's SIGKILL of the
+/// shim: time for the shim to finish its last group scan, reap, and exit.
+const ESCALATION_MARGIN: Duration = Duration::from_secs(2);
+
+const _: () = {
+    assert!(
+        SHIM_ESCALATION.as_secs() > GROUP_GRACE.as_secs() + ESCALATION_MARGIN.as_secs(),
+        "the daemon must SIGKILL the shim only after the shim's own group SIGKILL"
+    );
+    assert!(
+        GROUP_GRACE.subsec_nanos() == 0 && GROUP_GRACE.as_secs() > 0,
+        "alarm(2) arms whole seconds"
+    );
+};
+
+/// [`GROUP_GRACE`] as the `alarm(2)` argument the SIGTERM handler arms.
+#[allow(clippy::cast_possible_truncation)]
+const GROUP_GRACE_ALARM: libc::c_uint = GROUP_GRACE.as_secs() as libc::c_uint;
+
+/// How often the shim's main flow checks, during the grace period, whether the
+/// group still has a live member.
+const GROUP_POLL: Duration = Duration::from_millis(25);
+
+/// The process-group id (== pid, see `setpgid(0, 0)` in [`shim_main`]) of the
+/// process this shim injected into the session, published after spawn so the
+/// signal handlers can reach the whole group — the injected program and every
+/// descendant it forked — rather than leaving grandchildren reparented to
+/// PID 1. `0` before the spawn and again just before the leader is reaped, so
+/// a handler can never target a recycled pid.
+static CHILD_PGID: AtomicI32 = AtomicI32::new(0);
+
+/// The first SIGTERM or SIGHUP the shim received, `0` until one arrives. The
+/// handler claims it with a compare-exchange, so a second signal neither
+/// re-sends the group SIGTERM nor re-arms or extends the grace period.
+static TERM_SIGNAL: AtomicI32 = AtomicI32::new(0);
+
+/// Whether the group has been sent its SIGTERM. Claimed with a swap by
+/// whichever of the handler and the main flow first sees both a termination
+/// request and a published [`CHILD_PGID`], so the group gets exactly one.
+static GROUP_TERMED: AtomicBool = AtomicBool::new(false);
+
+/// Set by the SIGALRM handler once [`GROUP_GRACE`] has run out.
+static GRACE_EXPIRED: AtomicBool = AtomicBool::new(false);
 
 /// Registers `path` as the [`SUBCOMMAND`] shim, overriding `current_exe()` for
 /// every later [`Injection`].
@@ -426,9 +489,10 @@ impl Injection {
     /// Mark this injection as entering a none box, so the shim reinstalls the
     /// none plan's full socket-family seal — every family but the ones the
     /// box's own network namespace confines (`AF_UNIX`, `AF_INET`,
-    /// `AF_INET6`, `AF_NETLINK`) — after joining the namespaces.  That seal
-    /// applies only when the injection joins the box's own network namespace;
-    /// one that does not falls back to `AF_UNIX` alone
+    /// `AF_INET6`, `AF_NETLINK` with `NETLINK_ROUTE` only) — after joining
+    /// the namespaces.  That seal applies only when the injection joins the
+    /// box's own network namespace; one that does not falls back to `AF_UNIX`
+    /// alone
     /// ([`injection_socket_filter`]).
     ///
     /// Every injection is sealed: without this marker the shim reinstalls the
@@ -585,7 +649,7 @@ pub struct ShimArgs {
 
     /// When present, the target session is a none box and the shim must
     /// re-install its full socket-family seal after joining the namespaces —
-    /// unix, inet, inet6 and netlink admitted when the join enters the box's
+    /// unix, inet, inet6 and netlink route admitted when the join enters the box's
     /// own network namespace, `AF_UNIX` alone when it does not. When absent the shim re-installs the
     /// confined-families seal, the one every other box launches under, which
     /// admits the families the box's namespace confines and refuses the
@@ -677,6 +741,14 @@ pub fn shim_main(args: ShimArgs) -> Result<i32, NsenterError> {
         }
     }
 
+    // The daemon's procfs, opened before the join: the grace period below scans
+    // it for live members of the injected group, by the pids and group ids this
+    // shim sees. After `setns(CLONE_NEWNS)` the path `/proc` names the box's
+    // procfs, whose pids belong to the box's PID namespace rather than this
+    // shim's. `None` (no procfs) only costs the early exit: the grace period
+    // then always runs to its end.
+    let proc_dir = std::fs::File::open("/proc").ok();
+
     if !args.join.is_empty() {
         // One call for the whole set: the kernel installs the user namespace
         // first and validates the rest against the credentials that gives us,
@@ -720,11 +792,31 @@ pub fn shim_main(args: ShimArgs) -> Result<i32, NsenterError> {
     let socket_family_filter = injection_socket_filter(args.seal_none_box, &args.join);
 
     // SAFETY: the closures run in the forked child between `fork` and `exec`,
-    // where only async-signal-safe calls are legal. `prctl` and the raw
-    // `seccomp` syscall are on that list, and the closures allocate nothing
+    // where only async-signal-safe calls are legal. `signal`, `alarm`,
+    // `setpgid`, `prctl` and the raw `seccomp` syscall are on that list, and
+    // the closures allocate nothing
     // and capture only a static reference.
     unsafe {
         cmd.pre_exec(|| {
+            // Undo what the shim's own termination handling (installed before
+            // the spawn) left in this forked copy: the handlers, and an alarm
+            // a handler running here before this point could have armed, which
+            // `exec` would otherwise carry into the program. Dispositions first,
+            // so a signal from here on takes its default action.
+            for signum in [libc::SIGTERM, libc::SIGHUP, libc::SIGALRM] {
+                if libc::signal(signum, libc::SIG_DFL) == libc::SIG_ERR {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            libc::alarm(0);
+            // Make the injected process the leader of a new process group
+            // (pid == pgid). Nothing else does: the shim sits outside the
+            // session's PID namespace, so the group ids the session's shell
+            // already assigned do not help it name "the shim's child and its
+            // descendants" for a later group kill.
+            if libc::setpgid(0, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
             // Tie the injected process's lifetime to this shim's. Nothing else
             // does: the shim is its parent but sits outside the session's PID
             // namespace, and killing the shim is exactly how the daemon cancels
@@ -774,6 +866,18 @@ pub fn shim_main(args: ShimArgs) -> Result<i32, NsenterError> {
         });
     }
 
+    // The handlers go in before the spawn, so a SIGTERM or SIGHUP that arrives
+    // before the child exists is recorded (and its grace period armed) rather
+    // than taking the default action, which would leave the child to
+    // `PR_SET_PDEATHSIG` and its descendants to run on. The forked copy resets
+    // them in its first pre-exec closure.
+    // SAFETY: shim_main runs before any runtime is built (see its doc), so this
+    // process is single-threaded and no handler can interrupt half-initialised
+    // state.
+    unsafe {
+        install_termination_handlers();
+    }
+
     let program = PathBuf::from(program);
     let mut child = match cmd.spawn() {
         Ok(child) => child,
@@ -793,17 +897,312 @@ pub fn shim_main(args: ShimArgs) -> Result<i32, NsenterError> {
             return Ok(code);
         }
     };
+
+    // Publish the child's group lead (its own pid, from `setpgid(0, 0)` above)
+    // for the handlers. A termination that arrived before this store found no
+    // group to signal, so it is forwarded here; `GROUP_TERMED` makes sure the
+    // group gets one SIGTERM whichever side gets there first.
+    let pgid = libc::pid_t::try_from(child.id()).expect("a pid fits a pid_t");
+    CHILD_PGID.store(pgid, Ordering::SeqCst);
+    if TERM_SIGNAL.load(Ordering::SeqCst) != 0 {
+        term_group_once();
+    }
+
+    // Wait for the leader to exit without reaping it: until it is reaped its
+    // pid stays allocated and still names the group, so neither a handler nor
+    // the grace period below can target a recycled group. The handlers return
+    // (they only record and signal), so an interrupted wait is resumed.
+    loop {
+        // SAFETY: `waitid` writes only into `info`, a zeroed `siginfo_t` we own.
+        let observed = unsafe {
+            let mut info: libc::siginfo_t = std::mem::zeroed();
+            libc::waitid(
+                libc::P_PID,
+                child.id(),
+                &raw mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        if observed == 0 {
+            break;
+        }
+        let source = std::io::Error::last_os_error();
+        if source.kind() != std::io::ErrorKind::Interrupted {
+            return Err(NsenterError::Wait { program, source });
+        }
+    }
+
+    // The leader has exited. Decide once whether the exec was ended or ended
+    // by itself, after blocking SIGTERM and SIGHUP so the answer cannot change
+    // once read. One that arrived before the block started the grace period;
+    // one that arrives after it is never delivered, and the exec ends as the
+    // leader did, killing nothing: a normal exit leaves the group's other
+    // members (a `nohup`'d job) alone.
+    block_termination_signals();
+    let terminated_by = TERM_SIGNAL.load(Ordering::SeqCst);
+    if terminated_by != 0 {
+        // The usual shape: the leader died of the SIGTERM while a member it
+        // forked traps or ignores it. Hold the leader as a zombie, so the pgid
+        // stays allocated, until the grace period runs out (the SIGALRM
+        // handler sets the flag and has already SIGKILLed the group) or the
+        // group has no live member left. Then SIGKILL whatever remains.
+        while !GRACE_EXPIRED.load(Ordering::SeqCst)
+            && proc_dir
+                .as_ref()
+                .is_none_or(|proc_dir| group_has_live_member(proc_dir, pgid))
+        {
+            std::thread::sleep(GROUP_POLL);
+        }
+        // SAFETY: `pgid` names the group this shim spawned, which its unreaped
+        // leader keeps from being recycled.
+        unsafe { kill_group(pgid) };
+    }
+
+    // Disarm: no alarm left to fire, and from here the handlers are no-ops so
+    // a straggler signal cannot target the pid the reap below frees for reuse.
+    // SAFETY: `alarm(0)` only cancels this process's pending alarm.
+    unsafe { libc::alarm(0) };
+    CHILD_PGID.store(0, Ordering::SeqCst);
+
     let status = child.wait().map_err(|source| NsenterError::Wait {
         program: program.clone(),
         source,
     })?;
 
+    // An exec that was ended reports the signal that ended it, the way the
+    // shell reports a command it killed, whatever the leader's own status.
+    if terminated_by != 0 {
+        return Ok(128 + terminated_by);
+    }
     // Mirror the shell's convention for a signalled child so the daemon sees
     // the same code it would from a direct spawn.
     Ok(status
         .code()
         .or_else(|| status.signal().map(|sig| 128 + sig))
         .unwrap_or(1))
+}
+
+/// Kill every process in the process group led by `pgid` — the injected program
+/// and every descendant that has not left the group.
+///
+/// The daemon cancels a `min session exec` by signalling the shim, which
+/// SIGTERMs this group and, once [`GROUP_GRACE`] is over, calls this with the
+/// group lead captured at spawn. Without the group kill, only the shim's direct
+/// child dies and its grandchildren are reparented to PID 1 to run on
+/// indefinitely (#948).
+///
+/// A descendant that calls `setsid(2)` leaves the group and escapes this kill
+/// (and the shim's `wait`); it is bounded by the sandbox's PID namespace dying
+/// with its session shell, the same bound the pre-fix race already relied on.
+///
+/// # Safety
+///
+/// The caller must pass the group-lead of a live group it is entitled to
+/// signal, or `0` (a no-op, so a handler that fires after the child was reaped
+/// cannot hit a recycled pid). Any `pgid <= 1` is a no-op: `kill(0, …)` would
+/// signal the shim's own group and `kill(-1, …)` every process it may signal,
+/// so neither can ever be the target.
+unsafe fn kill_group(pgid: i32) {
+    if pgid <= 1 {
+        return;
+    }
+    // SAFETY: only async-signal-safe calls follow, so this is legal from a
+    // signal handler. SIGKILL is uncatchable, so nothing in the group can
+    // survive it; ESRCH means the group is already gone.
+    unsafe {
+        libc::kill(-pgid, libc::SIGKILL);
+    }
+}
+
+/// Send the injected group its one SIGTERM, if the group is published and no
+/// one has sent it yet. Async-signal-safe (atomics and `kill` only), so both
+/// the SIGTERM/SIGHUP handler and the main flow call it.
+fn term_group_once() {
+    let pgid = CHILD_PGID.load(Ordering::SeqCst);
+    // The same guard as `kill_group`: `0` is "no group yet" (or "already
+    // reaped"), and nothing at or below 1 names a child group.
+    if pgid > 1 && !GROUP_TERMED.swap(true, Ordering::SeqCst) {
+        // SAFETY: `pgid` is the group lead this shim spawned, unreaped while
+        // published; `kill(2)` is async-signal-safe.
+        unsafe { libc::kill(-pgid, libc::SIGTERM) };
+    }
+}
+
+/// SIGTERM and SIGHUP: the daemon ending an exec whose client went away. The
+/// first one records itself, arms [`GROUP_GRACE`] and forwards SIGTERM to the
+/// group; any later one does nothing, so the grace period is never re-armed or
+/// extended. The waiting happens in [`shim_main`]'s main flow, not here.
+extern "C" fn on_term_or_hup(signum: libc::c_int) {
+    // The main flow reads errno after the `waitid` this may have interrupted.
+    // SAFETY: `__errno_location` is this thread's errno slot, live for the call.
+    let saved = unsafe { *libc::__errno_location() };
+    if TERM_SIGNAL
+        .compare_exchange(0, signum, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+    {
+        // SAFETY: `alarm(2)` is async-signal-safe and arms only this process's
+        // timer.
+        unsafe { libc::alarm(GROUP_GRACE_ALARM) };
+        term_group_once();
+    }
+    // SAFETY: as above.
+    unsafe { *libc::__errno_location() = saved };
+}
+
+/// SIGALRM: [`GROUP_GRACE`] has run out. SIGKILL the group and tell the main
+/// flow. Once the shim is about to reap its child, [`CHILD_PGID`] is `0` and the
+/// kill is a no-op, so an alarm that fires late does nothing.
+extern "C" fn on_grace_expired(_signum: libc::c_int) {
+    // SAFETY: `__errno_location` is this thread's errno slot, live for the call.
+    let saved = unsafe { *libc::__errno_location() };
+    GRACE_EXPIRED.store(true, Ordering::SeqCst);
+    // SAFETY: the published pgid is the group this shim spawned, or `0`.
+    unsafe { kill_group(CHILD_PGID.load(Ordering::SeqCst)) };
+    // SAFETY: as above.
+    unsafe { *libc::__errno_location() = saved };
+}
+
+/// Install [`on_term_or_hup`] for SIGTERM and SIGHUP — the two the daemon uses
+/// to cancel a shim whose client died — and [`on_grace_expired`] for SIGALRM.
+///
+/// # Safety
+///
+/// Must run while the process is single-threaded (before the tokio runtime is
+/// built, which [`shim_main`] guarantees) so a handler cannot interrupt a
+/// half-initialised data structure.
+unsafe fn install_termination_handlers() {
+    let handlers: [(libc::c_int, extern "C" fn(libc::c_int)); 3] = [
+        (libc::SIGTERM, on_term_or_hup),
+        (libc::SIGHUP, on_term_or_hup),
+        (libc::SIGALRM, on_grace_expired),
+    ];
+    for (signum, handler) in handlers {
+        // SAFETY: an all-zero `sigaction` is a valid disposition (empty mask,
+        // SIG_DFL); `sigemptyset` writes only the mask; `sigaction` installs a
+        // handler whose body is limited to atomics, `kill`, `alarm` and errno.
+        // No SA_RESTART: the main flow's waits retry on EINTR themselves.
+        let installed = unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = handler as usize;
+            libc::sigemptyset(&raw mut action.sa_mask);
+            libc::sigaction(signum, &raw const action, std::ptr::null_mut())
+        };
+        debug_assert_eq!(
+            installed, 0,
+            "installing the termination handler for signal {signum}"
+        );
+    }
+}
+
+/// Block SIGTERM and SIGHUP for the rest of the shim's life: once the shim has
+/// decided whether the exec was ended, a later request must not change that.
+fn block_termination_signals() {
+    // SAFETY: an all-zero `sigset_t` is valid storage for `sigemptyset` to
+    // initialise; `sigprocmask` only changes this single-threaded process's
+    // mask.
+    let blocked = unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&raw mut set);
+        libc::sigaddset(&raw mut set, libc::SIGTERM);
+        libc::sigaddset(&raw mut set, libc::SIGHUP);
+        libc::sigprocmask(libc::SIG_BLOCK, &raw const set, std::ptr::null_mut())
+    };
+    debug_assert_eq!(blocked, 0, "blocking SIGTERM and SIGHUP");
+}
+
+/// Whether the process group `pgid` has a member that is still running: any
+/// member that is not a zombie (the shim's own unreaped leader is one). Read
+/// from the `pgrp` and state fields of every `<pid>/stat` under `proc_dir`,
+/// the shim's own procfs. `kill(-pgid, 0)` cannot answer this: the zombie
+/// leader the shim holds is still a member, so it never reports `ESRCH`. A
+/// scan that cannot be made answers `true`, which only costs the early exit:
+/// the grace period then runs to its end.
+fn group_has_live_member(proc_dir: &std::fs::File, pgid: libc::pid_t) -> bool {
+    // A fresh open file description for every scan: a `dup` would share the
+    // directory offset the previous scan left at the end.
+    // SAFETY: `openat` on a directory fd this function borrows, with a static
+    // NUL-terminated path; the result is checked before use.
+    let fd = unsafe {
+        libc::openat(
+            proc_dir.as_raw_fd(),
+            c".".as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return true;
+    }
+    // SAFETY: `fd` is an open directory this function owns; on success
+    // `fdopendir` takes it over and `closedir` below closes it.
+    let dir = unsafe { libc::fdopendir(fd) };
+    if dir.is_null() {
+        // SAFETY: `fdopendir` failed, so `fd` is still ours to close.
+        unsafe { libc::close(fd) };
+        return true;
+    }
+    let mut live = false;
+    loop {
+        // SAFETY: `dir` is the open stream above, used by this thread only.
+        let entry = unsafe { libc::readdir(dir) };
+        if entry.is_null() {
+            break;
+        }
+        // SAFETY: `readdir` returned a valid entry whose `d_name` is
+        // NUL-terminated and live until the next `readdir` on `dir`.
+        let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
+        let Some(pid) = name.to_str().ok().and_then(|n| n.parse::<u32>().ok()) else {
+            continue;
+        };
+        if is_live_member(proc_dir, pid, pgid) {
+            live = true;
+            break;
+        }
+    }
+    // SAFETY: `dir` came from `fdopendir` above and is closed exactly once.
+    unsafe { libc::closedir(dir) };
+    live
+}
+
+/// Whether `pid` (under `proc_dir`) is in group `pgid` and not a zombie. A
+/// process that is gone, or whose `stat` cannot be read, is not.
+fn is_live_member(proc_dir: &std::fs::File, pid: u32, pgid: libc::pid_t) -> bool {
+    let Ok(path) = std::ffi::CString::new(format!("{pid}/stat")) else {
+        return false;
+    };
+    // SAFETY: `openat` on a directory fd this function borrows and a
+    // NUL-terminated path it owns; the result is checked before use.
+    let fd = unsafe {
+        libc::openat(
+            proc_dir.as_raw_fd(),
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return false;
+    }
+    // SAFETY: `fd` was just opened and nothing else owns it.
+    let mut file = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+    let mut stat = String::new();
+    if std::io::Read::read_to_string(&mut file, &mut stat).is_err() {
+        return false;
+    }
+    stat_is_live_member(&stat, pgid)
+}
+
+/// Whether a `/proc/<pid>/stat` line names a process in group `pgid` that is
+/// not a zombie. The fields after the parenthesised comm, which may itself
+/// contain `)`, start: state ppid pgrp.
+fn stat_is_live_member(stat: &str, pgid: libc::pid_t) -> bool {
+    let Some((_, after_comm)) = stat.rsplit_once(')') else {
+        return false;
+    };
+    let mut fields = after_comm.split_whitespace();
+    let (Some(state), Some(_ppid), Some(pgrp)) = (fields.next(), fields.next(), fields.next())
+    else {
+        return false;
+    };
+    pgrp.parse::<libc::pid_t>() == Ok(pgid) && !matches!(state, "Z" | "X")
 }
 
 /// Maps a failed `spawn` to the shell's exit-code and message conventions:
@@ -836,7 +1235,7 @@ fn spawn_failed_on_missing_chdir(source: &std::io::Error, chdir: Option<&Path>) 
 }
 
 /// The socket-family filter an injected process installs after joining a
-/// box.  A none box's relaxed seal admits inet and netlink only because the
+/// box.  A none box's relaxed seal admits inet and netlink route only because the
 /// box's own network namespace confines them, so it applies only when the
 /// join enters that namespace (`join` names `Net`); an injection that stays
 /// in the daemon's namespace gets the unix-only seal instead, fail closed
@@ -974,6 +1373,156 @@ mod tests {
         let _ = sh.kill();
         let _ = sh.wait();
         assert_eq!(resolved.expect("resolving the sole child"), expected);
+    }
+
+    /// The group kill reaches a descendant, not just the direct child: `sh`
+    /// puts its background `sleep` in the group, and after [`kill_group`] on the
+    /// group lead, `kill(grandchild, 0)` reports `ESRCH` — the descendant is
+    /// gone, not reparented and left running.
+    #[test]
+    fn kill_group_reaches_the_grandchild() {
+        use std::io::BufRead as _;
+        use std::os::unix::process::CommandExt as _;
+        use std::time::Instant;
+
+        let mut sh = Command::new("/bin/sh");
+        sh.arg("-c")
+            .arg("sleep 600 & echo $!; wait")
+            .stdout(std::process::Stdio::piped());
+        // SAFETY: the closure only calls `setpgid(2)`, which is
+        // async-signal-safe, in the forked pre-exec child.
+        unsafe {
+            sh.pre_exec(|| {
+                if libc::setpgid(0, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut sh = sh.spawn().expect("spawning /bin/sh");
+
+        let mut out = String::new();
+        std::io::BufReader::new(sh.stdout.as_mut().expect("piped stdout"))
+            .read_line(&mut out)
+            .expect("reading the grandchild pid");
+        let grandchild: i32 = out.trim().parse().expect("sh printed a pid");
+
+        // SAFETY: `sh.id()` is the group lead the pre_exec created; it is the
+        // group this test spawned and owns.
+        unsafe { kill_group(sh.id() as i32) };
+        let _ = sh.wait();
+
+        // The descendant must disappear quickly rather than linger under PID 1.
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            // SAFETY: `kill(pid, 0)` only probes existence; `grandchild` names a
+            // process this test forked.
+            let exists = unsafe { libc::kill(grandchild, 0) } == 0;
+            if !exists {
+                assert_eq!(
+                    std::io::Error::last_os_error().raw_os_error(),
+                    Some(libc::ESRCH),
+                    "the grandchild must be gone, not just invisible"
+                );
+                break;
+            }
+            // Killed but not yet reaped: a container's PID 1 need not reap
+            // the orphans reparented to it, so a zombie counts as dead.
+            if is_zombie(grandchild) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "grandchild {grandchild} survived the group kill"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// Whether `pid` is a zombie, per the state field of `/proc/<pid>/stat`
+    /// (the first field after the parenthesised comm).
+    fn is_zombie(pid: i32) -> bool {
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| {
+                let (_, after_comm) = stat.rsplit_once(')')?;
+                after_comm
+                    .split_whitespace()
+                    .next()
+                    .map(|state| state == "Z")
+            })
+            .unwrap_or(false)
+    }
+
+    /// The handler's guard: `kill_group` never signals the shim's own group
+    /// (`0`) or every process it may signal (`-1`, from a `pgid` of `1`), nor
+    /// a negative id. Reaching any `kill` here would take the test runner down.
+    #[test]
+    fn kill_group_ignores_pgids_that_name_no_child_group() {
+        for pgid in [i32::MIN, -1, 0, 1] {
+            // SAFETY: every value is below the guard, so no signal is sent.
+            unsafe { kill_group(pgid) };
+        }
+    }
+
+    /// The grace period's group probe reads state and pgrp past the last `)`,
+    /// so a comm holding `) ` cannot shift the fields, and a zombie member is
+    /// not a live one.
+    #[test]
+    fn stat_is_live_member_reads_state_and_pgrp() {
+        assert!(stat_is_live_member("42 (sh) S 1 42 42 0 -1", 42));
+        assert!(stat_is_live_member("43 (a) b) R 42 42 42 0 -1", 42));
+        assert!(!stat_is_live_member("42 (sh) Z 1 42 42 0 -1", 42));
+        assert!(!stat_is_live_member("44 (sh) S 1 44 44 0 -1", 42));
+        assert!(!stat_is_live_member("garbage", 42));
+    }
+
+    /// The probe the grace period polls: a running group has a live member,
+    /// and a group whose only member is its unreaped zombie leader — the
+    /// state the shim holds the group in — has none, so the shim stops
+    /// waiting as soon as the last real member is gone.
+    #[test]
+    fn group_has_live_member_ignores_the_zombie_leader() {
+        use std::os::unix::process::CommandExt as _;
+
+        let proc_dir = std::fs::File::open("/proc").expect("opening /proc");
+        let mut sleep = Command::new("sleep");
+        sleep.arg("600");
+        // SAFETY: the closure only calls `setpgid(2)`, which is
+        // async-signal-safe, in the forked pre-exec child.
+        unsafe {
+            sleep.pre_exec(|| {
+                if libc::setpgid(0, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut sleep = sleep.spawn().expect("spawning sleep");
+        let pgid = libc::pid_t::try_from(sleep.id()).expect("a pid fits a pid_t");
+        assert!(
+            group_has_live_member(&proc_dir, pgid),
+            "the running leader is a live member"
+        );
+
+        // SAFETY: `pgid` is the group this test spawned and owns.
+        unsafe { kill_group(pgid) };
+        // SAFETY: `waitid` writes only into `info`, a zeroed `siginfo_t`.
+        let observed = unsafe {
+            let mut info: libc::siginfo_t = std::mem::zeroed();
+            libc::waitid(
+                libc::P_PID,
+                sleep.id(),
+                &raw mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        assert_eq!(observed, 0, "waiting for the leader to die");
+        assert!(
+            !group_has_live_member(&proc_dir, pgid),
+            "a zombie leader alone is not a live member"
+        );
+        let _ = sleep.wait();
     }
 
     /// The production path: no shim is named per injection (only tests do

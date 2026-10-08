@@ -786,7 +786,7 @@ impl Exec for TokioExec {
             for name in &self.drop_env {
                 cmd.env_remove(name);
             }
-            cmd.spawn().map(TokioProcess)
+            cmd.spawn().map(TokioProcess::new)
         })
         .boxed()
     }
@@ -884,7 +884,7 @@ impl Exec for SessionExec {
             // This spawns the shim — us, re-exec'd — not the user's command, so
             // a bare ENOENT reads as a missing shell. Name the path (#1175).
             let shim = command.as_std().get_program().to_owned();
-            command.spawn().map(TokioProcess).map_err(|e| {
+            command.spawn().map(TokioProcess::shim).map_err(|e| {
                 io::Error::new(
                     e.kind(),
                     format!(
@@ -900,7 +900,37 @@ impl Exec for SessionExec {
 
 /// `Process` implementation backed by [`tokio::process::Child`].
 #[derive(Debug)]
-pub struct TokioProcess(Child);
+pub struct TokioProcess {
+    child: Child,
+    /// Whether [`Process::start_kill`] sends SIGTERM, with a SIGKILL
+    /// escalation in [`Process::wait`], rather than an immediate SIGKILL.
+    /// Only the injection shim handles SIGTERM by killing its whole process
+    /// group; any other child gets the immediate SIGKILL.
+    graceful: bool,
+    /// Whether a graceful [`Process::start_kill`] has asked the child to
+    /// exit, which arms the escalation in [`Process::wait`].
+    terminating: bool,
+}
+
+impl TokioProcess {
+    /// A child that [`Process::start_kill`] SIGKILLs at once.
+    fn new(child: Child) -> Self {
+        Self {
+            child,
+            graceful: false,
+            terminating: false,
+        }
+    }
+
+    /// The injection shim, which [`Process::start_kill`] SIGTERMs so its
+    /// handler can kill the injected process's whole group.
+    fn shim(child: Child) -> Self {
+        Self {
+            graceful: true,
+            ..Self::new(child)
+        }
+    }
+}
 
 impl Process for TokioProcess {
     type Stdin = ChildStdin;
@@ -909,18 +939,53 @@ impl Process for TokioProcess {
 
     fn take_stdio(&mut self) -> Option<(Self::Stdin, Self::Stdout, Self::Stderr)> {
         Some((
-            self.0.stdin.take()?,
-            self.0.stdout.take()?,
-            self.0.stderr.take()?,
+            self.child.stdin.take()?,
+            self.child.stdout.take()?,
+            self.child.stderr.take()?,
         ))
     }
 
     async fn wait(&mut self) -> io::Result<Option<i32>> {
-        self.0.wait().await.map(|s| s.code())
+        // Never asked to die: a plain wait, as before.
+        if !self.terminating {
+            return self.child.wait().await.map(|s| s.code());
+        }
+        // Longer than the shim's own grace period for the group, so the shim
+        // always delivers the group's SIGKILL itself; this one is the fallback
+        // for a wedged shim (see `nsenter::GROUP_GRACE`).
+        match tokio::time::timeout(crate::nsenter::SHIM_ESCALATION, self.child.wait()).await {
+            Ok(status) => status.map(|s| s.code()),
+            // The shim did not exit: escalate to SIGKILL and wait it out.
+            Err(_elapsed) => {
+                self.child.start_kill()?;
+                self.child.wait().await.map(|s| s.code())
+            }
+        }
     }
 
     fn start_kill(&mut self) -> io::Result<()> {
-        self.0.start_kill()
+        if !self.graceful {
+            return self.child.start_kill();
+        }
+        // The shim is the direct child; SIGTERM reaches it and, through the
+        // handler it installs, its whole process group, which the shim SIGKILLs
+        // after its grace period. If the shim itself does not exit within
+        // `SHIM_ESCALATION`, `wait` escalates to SIGKILL (above).
+        // `id()` is `None` once the child has been reaped; nothing to signal.
+        if let Some(pid) = self.child.id() {
+            // SAFETY: `pid` is the live shim pid `Child` holds; `kill(2)` is
+            // async-signal-safe and has no Rust-side invariants.
+            if unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) } == -1 {
+                let err = io::Error::last_os_error();
+                // ESRCH means it already exited between `id()` and `kill`; that
+                // is success, not an error the caller must handle.
+                if err.raw_os_error() != Some(libc::ESRCH) {
+                    return Err(err);
+                }
+            }
+        }
+        self.terminating = true;
+        Ok(())
     }
 }
 
@@ -1170,7 +1235,10 @@ where
 ///
 /// The trade is that a grandchild's output after we return is silently
 /// discarded; `nohup cmd >/dev/null 2>&1 &` is the way to detach
-/// cleanly (documented in `docs/reference/cli-min.md`).
+/// cleanly (documented in `docs/reference/cli-min.md`). A `nohup`'d job
+/// stays in the exec's process group, which a client lost mid-exec ends
+/// (see `nsenter::GROUP_GRACE`), so a job that must survive the client
+/// going away is started with `setsid`: `setsid nohup cmd >/dev/null 2>&1 &`.
 ///
 /// Polling the I/O sources in a single `select!` lets a slow consumer
 /// on one side apply backpressure without starving the others, which is
@@ -1377,6 +1445,7 @@ where
     // on a full pipe and never be reapable. Kill, then fall through to
     // the `wait` below.
     if ssh_write_failed {
+        // A `--detach` exec, if one is ever added, must not reach this client-loss kill.
         let _ = process.start_kill();
     }
 
@@ -1439,6 +1508,8 @@ where
                             %channel_id,
                             "exec: ssh client disconnected; killing child",
                         );
+                        // A `--detach` exec, if one is ever added, must not reach this
+                        // client-loss kill.
                         let _ = process.start_kill();
                     }
                     process.wait().await
@@ -2492,6 +2563,78 @@ mod tests {
         tokio::sync::watch::channel(false).1
     }
 
+    /// `start_kill` asks the shim to exit with SIGTERM, not SIGKILL: SIGTERM
+    /// is what runs the shim's handler, which kills the injected process's
+    /// whole group. A SIGKILL here would leave the grandchildren running.
+    #[tokio::test]
+    async fn start_kill_sends_sigterm() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        use super::{Process as _, TokioProcess};
+
+        let child = tokio::process::Command::new("sleep")
+            .arg("600")
+            .spawn()
+            .expect("spawning sleep");
+        let mut process = TokioProcess::shim(child);
+        process.start_kill().expect("signalling the child");
+        let status = tokio::time::timeout(std::time::Duration::from_secs(10), process.child.wait())
+            .await
+            .expect("the child exits on SIGTERM")
+            .expect("reaping the child");
+        assert_eq!(status.signal(), Some(libc::SIGTERM), "{status:?}");
+    }
+
+    /// Any child other than the shim (the git service path's `/bin/sh -c`)
+    /// has no group-kill handler, so `start_kill` SIGKILLs it at once.
+    #[tokio::test]
+    async fn start_kill_sigkills_a_plain_child() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        use super::{Process as _, TokioProcess};
+
+        let child = tokio::process::Command::new("sleep")
+            .arg("600")
+            .spawn()
+            .expect("spawning sleep");
+        let mut process = TokioProcess::new(child);
+        process.start_kill().expect("signalling the child");
+        let status = tokio::time::timeout(std::time::Duration::from_secs(10), process.child.wait())
+            .await
+            .expect("the child exits on SIGKILL")
+            .expect("reaping the child");
+        assert_eq!(status.signal(), Some(libc::SIGKILL), "{status:?}");
+    }
+
+    /// A child that ignores SIGTERM is not waited on forever: after the grace
+    /// period, `wait` escalates to SIGKILL.
+    #[tokio::test]
+    async fn wait_escalates_to_sigkill_when_sigterm_is_ignored() {
+        use super::{Process as _, TokioProcess};
+
+        // The ignored disposition survives the `exec`, so `sleep` itself
+        // ignores SIGTERM. The marker line says the trap is installed.
+        let child = tokio::process::Command::new("/bin/sh")
+            .args(["-c", "trap '' TERM; echo ready; exec sleep 600"])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawning sh");
+        let mut process = TokioProcess::shim(child);
+        let mut stdout = process.child.stdout.take().expect("piped stdout");
+        let mut ready = [0u8; 6];
+        stdout
+            .read_exact(&mut ready)
+            .await
+            .expect("reading the ready marker");
+
+        process.start_kill().expect("signalling the child");
+        let code = tokio::time::timeout(std::time::Duration::from_secs(10), process.wait())
+            .await
+            .expect("the escalation to SIGKILL ends the wait")
+            .expect("reaping the child");
+        assert_eq!(code, None, "a signalled child has no exit code");
+    }
+
     /// `inherit_cwd` on the daemon side: a task that declares it starts at
     /// `/workbench/<cwd>` when that directory is in the uploaded tree, and
     /// falls back to `/workbench` with a stderr notice when it is not. A task
@@ -2532,6 +2675,7 @@ mod tests {
             // No launch ever minted these records, so none has recorded its
             // outcome on one.
             host_ip_enforcement: None,
+            host_row_bound: false,
             attrs: Default::default(),
         }
     }
@@ -3792,7 +3936,10 @@ mod tests {
             );
 
             match client
-                .call::<FinalizeSession>(&FinalizeSessionRequest { session_id })
+                .call::<FinalizeSession>(&FinalizeSessionRequest {
+                    session_id,
+                    report_shared_port_collisions: false,
+                })
                 .await
             {
                 minimald_rpc::Errorable::Ok(_) => {}

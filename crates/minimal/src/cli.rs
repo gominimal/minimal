@@ -30,6 +30,36 @@ pub struct Cli {
     pub global_args: GlobalArgs,
 }
 
+/// Retired top-level verbs, each with the tip naming what replaced it.
+const RETIRED_COMMANDS: &[(&str, &str)] = &[(
+    "ssh-forward",
+    "`min ssh-forward` was removed: forward a box port with \
+     `min net forward <SESSION> <LOCAL>:<PORT>`",
+)];
+
+/// Adds a tip naming the replacement when `err` refuses a retired verb. The
+/// parser still refuses the verb, with its usage; the tip says where it went.
+pub fn with_retired_command_hint(mut err: clap::Error) -> clap::Error {
+    use clap::error::{ContextKind, ContextValue, ErrorKind};
+    if err.kind() != ErrorKind::InvalidSubcommand {
+        return err;
+    }
+    let tip = match err.get(ContextKind::InvalidSubcommand) {
+        Some(ContextValue::String(verb)) => RETIRED_COMMANDS
+            .iter()
+            .find(|(retired, _)| *retired == verb.as_str())
+            .map(|(_, tip)| tip),
+        _ => None,
+    };
+    if let Some(tip) = tip {
+        err.insert(
+            ContextKind::Suggested,
+            ContextValue::StyledStrs(vec![(*tip).to_owned().into()]),
+        );
+    }
+    err
+}
+
 #[derive(Subcommand)]
 pub enum Command {
     /// List sessions
@@ -124,6 +154,15 @@ pub enum Command {
     /// on Ctrl-C, whichever comes first.
     #[command(hide = true)]
     Spin(SpinArgs),
+    /// Print the privileged command that installs this host's resolver,
+    /// local range and box-name service (development aid).
+    ///
+    /// The command a session start's advisory prints, rendered without a
+    /// daemon, so the service install can be tested on a host that cannot
+    /// boot a VM. Debug builds only.
+    #[cfg(debug_assertions)]
+    #[command(name = "debug-answerer-command", hide = true)]
+    DebugAnswererCommand,
     /// Print session-identifier completion candidates (used by the shell).
     ///
     /// The completion path a shell actually takes runs in-process (see
@@ -972,6 +1011,8 @@ pub enum NetCommand {
     /// installed or configured on the remote side. Stays in the foreground
     /// and closes with the session.
     Forward(NetForwardArgs),
+    /// Set this host up to resolve and reach boxes by name (runs one privileged script; `--print` only prints it, `--undo` removes it)
+    Setup(NetSetupArgs),
 }
 
 #[derive(Debug, Args)]
@@ -984,6 +1025,16 @@ pub struct NetForwardArgs {
     /// `localhost:8080` from port 3000 in the box)
     #[arg(value_name = "LOCAL:PORT")]
     pub spec: String,
+}
+
+#[derive(Debug, Args)]
+pub struct NetSetupArgs {
+    /// Print the setup script instead of running it
+    #[arg(long)]
+    pub print: bool,
+    /// Remove everything the setup step installs on this host (with --print, print the removal script)
+    #[arg(long)]
+    pub undo: bool,
 }
 
 #[derive(Debug, Args)]

@@ -57,6 +57,21 @@
 //! same rules — so the decision is exact at the relay for the path the box
 //! actually rides, and what the box may reach is decided outside the VM.
 //!
+//! ## A deny-all box's queries (NET-141)
+//!
+//! A row the host registered as deny-all ([`BoxRecord::is_deny_all`]) pins
+//! nothing — it declared no names — but the resolver carve-out still
+//! admits its UDP queries, and a forwarded query carries data out in the
+//! name it asks. So for an own-address deny-all row this module also holds
+//! the host-side decision of what that carve-out may carry
+//! ([`deny_all_refusal`]): a standard query whose every question is an A
+//! lookup of a box-zone name, the one thing the switch's resolver answers
+//! without asking upstream. Anything else is dropped by the relay before it
+//! reaches the switch, silently toward the guest and with a rate-limited
+//! line naming the box and the name. The in-VM gate answers the same
+//! queries REFUSED first, as the precision copy honest clients meet; this
+//! is the deciding copy, outside the VM.
+//!
 //! ## Lifetime
 //!
 //! An entry is born from its row, keyed by the row's switch address, and
@@ -88,8 +103,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use hickory_proto::op::{Message, MessageType};
-use hickory_proto::rr::RData;
+use hickory_proto::op::{Message, MessageType, OpCode};
+use hickory_proto::rr::{Name, RData, RecordType};
 use sessions::core::egress::{
     self, DNS_ADMISSION_WINDOW, DNS_FLOW_IDLE_CAP, DNS_MAX_ADDRESSES_PER_NAME,
     DNS_MAX_FLOWS_PER_BOX, DNS_OUTSTANDING_QUERY_CAP, DNS_QUERY_EXPIRY, InfrastructureDenySet,
@@ -1222,6 +1237,107 @@ impl DnsPins {
     }
 }
 
+/// One DNS datagram from a deny-all box that the host-side gate drops
+/// rather than write on to the switch ([`deny_all_refusal`]): the row it
+/// came from and what the warn line names.
+pub(crate) struct DenyAllRefusal {
+    /// The deny-all row the datagram's source resolved to.
+    pub(crate) record: Arc<BoxRecord>,
+    /// The first question that failed the check, normalized the way names
+    /// are matched here — or a placeholder in angle brackets when the
+    /// datagram carried no question to name (unparseable, not a standard
+    /// query, or no question at all).
+    pub(crate) name: String,
+    /// That question's record type, when it had one.
+    pub(crate) query_type: Option<RecordType>,
+}
+
+/// Whether `name` is a zone name the switch's resolver answers locally for
+/// a deny-all row: at least one label strictly below the apex, whose last
+/// two wire labels are exactly the lowercase bytes of `min.internal`.
+///
+/// This is gvproxy's own test, not the zone's: it treats a name as local
+/// only on a case-sensitive `.min.internal.` suffix, so a name that spells
+/// the apex in any other case (`x.MIN.INTERNAL`), and the apex itself, are
+/// forwarded to the host's upstream resolvers and must be dropped here.
+/// The labels below the apex may carry any case. Comparing raw label bytes
+/// also keeps a label that carries an escaped dot (`evil\.min` under
+/// `internal`) from passing the way a string-suffix match would.
+fn is_zone_name(name: &Name) -> bool {
+    let mut labels = name.iter();
+    sessions::core::zone_answer::ZONE_APEX
+        .rsplit('.')
+        .all(|apex_label| labels.next_back() == Some(apex_label.as_bytes()))
+        && labels.next_back().is_some()
+}
+
+/// The host-side deny-all DNS gate (NET-141's deny-all case, decided
+/// outside the VM for own-address rows): whether the UDP datagram one box
+/// sent to DNS's port must be dropped instead of written on to the switch.
+/// `Some` is the drop and what its warn line names; `None` is "not this
+/// gate's; forward as the verdict decided".
+///
+/// Only a row the host registered as deny-all ([`BoxRecord::is_deny_all`])
+/// is decided here. For such a row the resolver carve-out (NET-079, UDP
+/// only) is the one thing the frame verdict admits, so the carve-out is
+/// narrowed to what the switch's resolver answers on its own: a standard
+/// query whose every question is an A lookup of a box-zone name strictly
+/// below the apex, the apex spelled in lowercase ([`is_zone_name`]).
+/// gvproxy's resolver answers those names locally for A alone and hands
+/// every other type, and every name outside the zone, to the host's
+/// upstream resolvers — a forwarded question carries data out in its name
+/// even when no connection follows. So the datagram is dropped when:
+///
+/// * it does not parse as a DNS message, is not a query, is not a standard
+///   query, or carries no question (fail closed: nothing proves it names
+///   only the zone);
+/// * any question names a name outside the zone — every question is read,
+///   so a zone name in front cannot carry a second name past the check;
+/// * any question asks a zone name for a type other than A.
+///
+/// Silent toward the guest by construction: this only decides; the caller
+/// drops the frame by not writing it, and nothing is written back.
+/// Host-address boxes ride the node row, which is never deny-all, and an
+/// allow-list row is not decided here either.
+pub(crate) fn deny_all_refusal(
+    table: &BoxTable,
+    pkt: &L4Packet,
+    datagram: &[u8],
+) -> Option<DenyAllRefusal> {
+    if pkt.proto != IPPROTO_UDP || pkt.dst.port() != DNS_PORT {
+        return None;
+    }
+    let record = table
+        .by_source(pkt.src.ip().octets())
+        .filter(|record| record.is_deny_all())?;
+    let refused = |name: &str, query_type: Option<RecordType>| DenyAllRefusal {
+        record: Arc::clone(&record),
+        name: name.to_string(),
+        query_type,
+    };
+    let Ok(message) = Message::from_vec(datagram) else {
+        return Some(refused("<unparseable>", None));
+    };
+    if message.metadata.message_type != MessageType::Query
+        || message.metadata.op_code != OpCode::Query
+    {
+        return Some(refused("<not a standard query>", None));
+    }
+    if message.queries.is_empty() {
+        return Some(refused("<no question>", None));
+    }
+    message
+        .queries
+        .iter()
+        .find(|question| !(question.query_type() == RecordType::A && is_zone_name(question.name())))
+        .map(|question| {
+            refused(
+                &normalized(&question.name().to_lowercase().to_string()),
+                Some(question.query_type()),
+            )
+        })
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     //! The host-side table's own proofs (NET-081 deciding NET-066/067), plus
@@ -1243,7 +1359,7 @@ pub(crate) mod tests {
     use sessions::core::egress::{DNS_ADMISSION_WINDOW, DNS_FLOW_IDLE_CAP, DNS_MAX_FLOWS_PER_BOX};
     use switch::SwitchSubnet;
 
-    use super::{DnsPins, IPPROTO_TCP, TCP_FIN, udp_datagram};
+    use super::{DnsPins, IPPROTO_TCP, TCP_FIN, deny_all_refusal, udp_datagram};
     use crate::box_registry::{BoxRegistration, BoxRegistry, BoxTable};
     use crate::net::egress_gate::DropLimiter;
 
@@ -1340,6 +1456,22 @@ pub(crate) mod tests {
         let mut msg = Message::new(0x522a, MessageType::Query, OpCode::Query);
         msg.add_query(Query::query(qname, RecordType::A));
         msg.to_vec().expect("query encodes")
+    }
+
+    /// A DNS query datagram asking every one of `questions` in one message,
+    /// in order — the multi-question shape a zone name in front could try
+    /// to carry a second name past a first-question check in.
+    pub(crate) fn dns_query_of(questions: &[(Name, RecordType)]) -> Vec<u8> {
+        let mut msg = Message::new(0x522a, MessageType::Query, OpCode::Query);
+        for (name, rtype) in questions {
+            msg.add_query(Query::query(name.clone(), *rtype));
+        }
+        msg.to_vec().expect("query encodes")
+    }
+
+    /// `name` parsed as a query name.
+    pub(crate) fn qname(name: &str) -> Name {
+        Name::from_utf8(name).expect("query name parses")
     }
 
     /// A DNS reply datagram from the resolver: the id of a real exchange, the
@@ -2837,6 +2969,247 @@ pub(crate) mod tests {
                 "the {name} answer inside the completed infrastructure set \
                  never became a pin"
             );
+        }
+    }
+
+    /// The deny-all box: every `allow_*` dimension present and empty, the
+    /// section `sessions::EgressPolicy::deny_all` materializes.
+    fn deny_all_box(registry: &BoxRegistry, namespace: &str, lease: [u8; 4]) {
+        registry.register(
+            BoxRegistration::new(namespace, Ipv4Addr::from(lease), Ipv4Addr::LOCALHOST)
+                .with_egress_policy(EgressPolicy::deny_all()),
+        );
+    }
+
+    /// What the host-side deny-all gate decides for `payload` sent from
+    /// `lease` to the plan's resolver at DNS's port: `Some((name, type))`
+    /// for a drop, `None` for a pass.
+    #[expect(
+        clippy::unwrap_in_result,
+        reason = "a test helper: a frame the test built that does not parse is the test's bug"
+    )]
+    fn deny_all_decision(
+        table: &BoxTable,
+        lease: [u8; 4],
+        payload: &[u8],
+    ) -> Option<(String, Option<RecordType>)> {
+        let frame = udp_payload_frame(
+            Ipv4Addr::from(lease),
+            40000,
+            SUBNET.dns_server(),
+            53,
+            payload,
+        );
+        let (pkt, datagram) = udp_datagram(&frame).expect("the query frame parses");
+        deny_all_refusal(table, &pkt, datagram).map(|refusal| (refusal.name, refusal.query_type))
+    }
+
+    /// NET-141's deny-all case, decided host-side for an own-address row: a
+    /// deny-all box's query passes only when every question is an A lookup
+    /// of a box-zone name — the one thing the switch's resolver answers on
+    /// its own — and is dropped otherwise: a name outside the zone in any
+    /// record type, a zone name asked for any type but A (which the switch's
+    /// resolver forwards upstream), a datagram that is not a standard
+    /// query, and a multi-question query hiding either behind a zone A in
+    /// front.
+    #[test]
+    fn deny_all_row_passes_only_zone_a_lookups() {
+        let registry = BoxRegistry::new(SUBNET);
+        deny_all_box(&registry, "sealed", LEASE);
+        let table = registry.table();
+        let decide = |payload: &[u8]| deny_all_decision(&table, LEASE, payload);
+
+        for rtype in [
+            RecordType::A,
+            RecordType::AAAA,
+            RecordType::TXT,
+            RecordType::MX,
+        ] {
+            assert_eq!(
+                decide(&dns_query_of(&[(qname("example.com."), rtype)])),
+                Some(("example.com".to_string(), Some(rtype))),
+                "a {rtype:?} lookup outside the zone is dropped, naming the name"
+            );
+        }
+        // A lookalike of the zone is outside it, and so is a name whose
+        // labels only spell the zone through an escaped dot: the match is
+        // label by label, not by string suffix.
+        assert!(
+            decide(&dns_query_of(&[(
+                qname("web.min.internal.example.com."),
+                RecordType::A
+            )]))
+            .is_some(),
+            "a lookalike of the zone is outside it"
+        );
+        let escaped = Name::from_labels(vec![b"evil.min" as &[u8], b"internal"])
+            .expect("a label may carry a dot");
+        assert!(
+            decide(&dns_query_of(&[(escaped, RecordType::A)])).is_some(),
+            "a label holding an escaped dot is not a zone name"
+        );
+
+        // The case-bearing names below are built with `from_ascii`, which
+        // keeps the case as the guest would put it on the wire; `qname`
+        // (`from_utf8`) folds it to lowercase.
+        let cased = |name: &str| Name::from_ascii(name).expect("query name parses");
+
+        // Zone A lookups pass: a sibling and the host row (NET-003), the
+        // root dot and the case of the labels below the apex notwithstanding.
+        for name in [
+            "web.min.internal.",
+            "host.min.internal.",
+            "host.min.internal",
+            "X.min.internal.",
+            "HOST.min.internal",
+        ] {
+            assert_eq!(
+                decide(&dns_query_of(&[(cased(name), RecordType::A)])),
+                None,
+                "an A lookup of {name} passes"
+            );
+        }
+        // The switch's resolver matches the zone by a case-sensitive
+        // `.min.internal.` suffix, so it forwards upstream an A lookup that
+        // spells the apex in any other case, and the apex itself: both drop.
+        for name in [
+            "x.MIN.INTERNAL.",
+            "x.Min.Internal.",
+            "x.min.INTERNAL.",
+            "HOST.Min.Internal",
+            "min.internal.",
+            "MIN.INTERNAL.",
+        ] {
+            assert!(
+                decide(&dns_query_of(&[(cased(name), RecordType::A)])).is_some(),
+                "an A lookup of {name} is dropped"
+            );
+        }
+        // Two zone A questions pass together.
+        assert_eq!(
+            decide(&dns_query_of(&[
+                (qname("web.min.internal."), RecordType::A),
+                (qname("db.min.internal."), RecordType::A),
+            ])),
+            None,
+            "every question a zone A lookup passes"
+        );
+
+        // A zone name asked for any type but A is dropped: the switch's
+        // resolver answers the zone locally for A alone and forwards the rest
+        // upstream.
+        for name in ["x.min.internal.", "host.min.internal."] {
+            for rtype in [
+                RecordType::TXT,
+                RecordType::MX,
+                RecordType::SRV,
+                RecordType::AAAA,
+            ] {
+                assert!(
+                    decide(&dns_query_of(&[(qname(name), rtype)])).is_some(),
+                    "{rtype:?} for {name} is dropped"
+                );
+            }
+        }
+
+        // Every question is read: a zone A in front carries neither an
+        // outside name nor a zone name of another type past the check.
+        assert_eq!(
+            decide(&dns_query_of(&[
+                (qname("web.min.internal."), RecordType::A),
+                (qname("leak.example.com."), RecordType::A),
+            ])),
+            Some(("leak.example.com".to_string(), Some(RecordType::A))),
+            "an outside name behind a zone A is dropped"
+        );
+        assert_eq!(
+            decide(&dns_query_of(&[
+                (qname("x.min.internal."), RecordType::A),
+                (qname("x.min.internal."), RecordType::TXT),
+            ])),
+            Some(("x.min.internal".to_string(), Some(RecordType::TXT))),
+            "a zone TXT behind a zone A is dropped"
+        );
+
+        // Nothing that is not a standard query with a question passes: an
+        // unparseable datagram, a reply-shaped one, and a query with no
+        // question all fail closed.
+        assert_eq!(
+            decide(&[0xde, 0xad, 0xbe, 0xef, 0x00]),
+            Some(("<unparseable>".to_string(), None)),
+            "an unparseable datagram is dropped"
+        );
+        assert_eq!(
+            decide(&dns_response(
+                "example.com",
+                &[Ipv4Addr::new(93, 184, 216, 34)]
+            )),
+            Some(("<not a standard query>".to_string(), None)),
+            "a reply-shaped datagram is dropped"
+        );
+        assert_eq!(
+            decide(&dns_query_of(&[])),
+            Some(("<no question>".to_string(), None)),
+            "a query with no question is dropped"
+        );
+    }
+
+    /// The deny-all gate decides deny-all rows and nothing else: an
+    /// allow-list row, a row with no egress declaration, a row whose names
+    /// are closed but whose subnets are not, the node namespace (which every
+    /// host-address box's frames ride) and an unregistered source are all
+    /// left to the verdict and the pins, whatever their queries name.
+    #[test]
+    fn non_deny_all_rows_are_not_decided() {
+        let registry = BoxRegistry::new(SUBNET);
+        dns_box(
+            &registry,
+            "weather",
+            LEASE,
+            vec!["example.com".to_string()],
+            Vec::new(),
+        );
+        let open = [100, 64, 0, 10];
+        registry.register(BoxRegistration::new(
+            "open",
+            Ipv4Addr::from(open),
+            Ipv4Addr::LOCALHOST,
+        ));
+        let closed_names = [100, 64, 0, 11];
+        registry.register(
+            BoxRegistration::new(
+                "closed-names",
+                Ipv4Addr::from(closed_names),
+                Ipv4Addr::LOCALHOST,
+            )
+            .with_egress_policy(EgressPolicy {
+                allow_protocols: Some(Vec::new()),
+                allow_subnets: Some(vec!["203.0.113.0/24".to_string()]),
+                allow_dns_hosts: Some(Vec::new()),
+                deny_subnets: None,
+            }),
+        );
+        let node = registry.register_node_namespace(7655);
+        let table = registry.table();
+
+        for (lease, row) in [
+            (LEASE, "an allow-list row"),
+            (open, "a row with no egress declaration"),
+            (closed_names, "a row with closed names but open subnets"),
+            (node.switch_addr().octets(), "the node namespace"),
+            ([100, 64, 0, 12], "an unregistered source"),
+        ] {
+            for payload in [
+                dns_query_of(&[(qname("example.com."), RecordType::A)]),
+                dns_query_of(&[(qname("x.min.internal."), RecordType::TXT)]),
+                vec![0xde, 0xad],
+            ] {
+                assert_eq!(
+                    deny_all_decision(&table, lease, &payload),
+                    None,
+                    "{row} is not decided by the deny-all gate"
+                );
+            }
         }
     }
 

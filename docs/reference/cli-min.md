@@ -53,6 +53,13 @@ JSON. When the daemon reports a shared resource pool, the table is headed
 by a `RESOURCE POOL:` line (CPU cores, memory, and the number of sessions
 sharing them); `--raw` omits it.
 
+Another box at the same shared loopback address can hold a port this box
+declares, and this box does not forward it. The list prints one stderr line
+per such port after the table:
+`warning: <session>: port <p> is held by <box>; not forwarded`.
+With `--json` the entry lists those ports under `shared_port_collisions`,
+each with `port` and `held_by`, and the key is absent when there are none.
+
 `min ls` is the same command kept bare at the top level — a deliberate
 exception to the `min <noun> <verb>` convention, since it is the
 highest-traffic command in the CLI; `min session ls` is the noun-level alias.
@@ -212,6 +219,17 @@ its own stdout and stderr and drops the ones it inherited, so nothing about it
 depends on the exec channel at all. The same applies to `session run` and
 `task run`, which relay over the same channel.
 
+If the client goes away while the command is still running, the exec ends its
+whole process group: SIGTERM, a grace period, then SIGKILL. A `nohup`'d job
+stays in that group, so it ends too. Start a job that must outlive the client
+with `setsid`, which puts it in a session and group of its own:
+
+```
+min session exec web 'setsid nohup ./server >/dev/null 2>&1 &'
+```
+
+A command that exits by itself ends nothing: its background jobs keep running.
+
 ### `session run`
 
 ```
@@ -236,8 +254,15 @@ session's `PATH`.
 min session destroy [--all] [-f|--force] [SESSION]
 ```
 
-Destroys (terminates) a session. `--all` destroys all sessions;
-`-f/--force` skips the confirmation when destroying all sessions.
+Destroys a session and ends its processes. `--all` destroys all sessions.
+`-f/--force` skips the confirmation.
+
+Before it destroys one session, the command asks for confirmation if the
+session holds uncommitted changes or commits that no remote has. It also asks
+if the daemon cannot report that state. The command destroys a clean session without
+a prompt. Without a terminal, or under `--no-input`, nobody can answer, so the
+command refuses unless you pass `-f`. `--all` without a terminal also refuses
+unless you pass `-f`.
 
 ### `session rename`
 
@@ -278,10 +303,38 @@ the absence to, by name and marked as what it is. `deny-all (default)`
 marks an own-address box once the deny-all default is in force.
 `allow-all (default)` marks a box behind the opt-out or one that shares
 its host's network namespace. The `(default)` mark distinguishes a verdict
-the box declared from the same verdict the default gave it. The ingress
-block lists the published port mappings the session's `--ingress` flags
-declared (or `deny-all` when the box leaves ingress undeclared). The
-`dynamic ports` row joins them when the box declared a `--dynamic-range`.
+the box declared from the same verdict the default gave it.
+
+A box activated with `--credentialed-upstream` prints one more row in
+the egress block:
+
+```
+egress
+  deny-all (default)
+  credentialed upstream  box egress proxy listener
+```
+
+The row names the lane the declaration opened. The gate admits the box's
+frames to the box egress proxy's listener, and the proxy checks their
+credential. The rows above never decide that destination. The listener is
+the lane's whole reach. The gate still refuses everything else the box
+sends to the proxy's address. A box without the lane omits the row, so
+the missing row means the box runs without a lane.
+
+The gate that admits the lane sits only in front of own-address boxes. A
+box in any other mode still prints the row it declared, marked as not in
+effect, with the box's mode named:
+
+```
+egress
+  allow-all (default)
+  credentialed upstream  box egress proxy listener (not in effect: host_ip box)
+```
+
+The ingress block lists the published port mappings the session's
+`--ingress` flags declared (or `deny-all` when the box leaves ingress
+undeclared). The `dynamic ports` row joins them when the box declared a
+`--dynamic-range`.
 The `dynamic ingress` row always prints, with the stance that decides the
 box's own publish requests. A box that set no `--dynamic-ingress`
 reads `deny (default)`, the deny the absence evaluates to, marked the way
@@ -308,12 +361,26 @@ live ingress (published at runtime)
   tcp  127.0.64.21:3000 → :3000
 ```
 
-The host binds a runtime publish at once. A frame reaches the box only
-through the relay gate its attach installed, and that gate admits only the
-ports the declaration named. So a port the box published at runtime reads
-`(pending; not yet reachable)` until the gate admits it. A row from a daemon
-older than the `pending` field reads `(unknown; daemon predates this field)`.
-The CLI never shows such a row as reachable.
+A listed runtime publish is reachable. The daemon admits the port at the
+box's relay gate when it binds the forward. If nothing in the box listens on
+the port yet, the box itself refuses a connection to it.
+A row from an older daemon whose gate did not admit runtime publishes reads
+`(pending; not yet reachable)`. A row from a daemon older than the `pending`
+field reads `(unknown; daemon predates this field)`. The CLI never shows
+either row as reachable.
+
+The daemon publishes a port the box listens on only after it writes the
+decision to its audit log. When the daemon cannot write the log, the port
+stays unpublished, and the command prints one line per port after the live
+rows:
+
+```
+warning: port 3000 is permitted but not published: the audit log /path/to/audit/decisions.log cannot be written
+```
+
+The line clears once the log takes records again and the port publishes.
+In `-o json` output the same ports appear as `unaudited_listen_ports`, a
+list the document leaves out when it is empty.
 
 `-o json` (`--output json`) prints one `min/v1/session-policy` document on
 stdout instead of text. Each block the text output prints becomes a key:
@@ -329,14 +396,27 @@ Each `live_ingress` row is the daemon's mapping object, with its `pending`
 state (`true`, `false`, or `null` for a daemon older than the field). The
 document leaves out the blocks the text output leaves out. A host-address
 session has no `ingress` key, and a `--network none` box has only `schema`
-and `network`. The `ingress` block has a `kind` tag, `deny_all` or
+and `network`, plus `credentialed_upstream` when it declared a lane. The `ingress` block has a `kind` tag, `deny_all` or
 `declared`, so a client reads one field to branch. Both kinds carry
 `dynamic_ingress`, the resolved stance: `allow`, `ask`, or `deny`, never
 `null`. Both also carry `dynamic_ingress_source`. It reads `declared` when
 the box set `--dynamic-ingress`, and `default` when the stance is the deny
 an absent setting gives. Both keys are new in the `min/v1/session-policy`
 shape. A client written against the earlier document ignores them. A
-client that reads them finds a value in every `ingress` object.
+client that reads them finds a value in every `ingress` object. The
+document also carries `credentialed_upstream`, an object, when the box
+declared a lane, in any network mode. Its `effective` field is `true`
+for an own-address box and `false` for any other, the text row's
+`(not in effect: …)` mark. The document leaves the key out when the box
+did not declare a lane, so a missing key means the box runs without one.
+
+Boxes handed one shared loopback address can declare the same port. The
+box that published it first holds it, and a later box does not forward it.
+Activation prints a `warning:` line on stderr for each such port, naming
+the box that holds it. The text output marks the declared row
+`(held by <box>)`, and the document lists the rows under
+`shared_port_collisions`, each with `port` and the holding box as `held_by`.
+The key is absent when another box holds none of the box's ports.
 
 With `-o json`, a failed run writes one `min/v1/error` object on stderr and
 exits non-zero, with no plain-text error line. The `code` field names the
@@ -417,6 +497,50 @@ through a live laptop-side listener. The in-box dial that the isolated modes
 the box's namespaces — is exercised by the daemon's harness test with a
 host-side stand-in relay rather than a real box; a root-integration proof of
 that leg (`just test-root-integration`) is still owed to the root lane.
+
+### `net setup`
+
+```
+min net setup [--print] [--undo]
+```
+
+Host DNS is opt-in. Until you run this command, the hostname proxy serves box
+names. The name-surface line that `min session activate` and `min ls` print
+ends with a pointer here. A session start never prints or runs the
+privileged step.
+
+`min net setup` sets this host up to resolve and reach boxes by name, for
+this host's current state. It prints what is missing to stderr. It then
+writes a setup script to a private temporary file and runs it with
+`sudo sh`, so `sudo` asks for your password once. It removes the file
+afterwards and exits with the script's status. On a host that is already set
+up, it runs nothing and says so.
+
+The script is plain POSIX `sh` and stops at the first statement that fails.
+Its header says what it configures and that it must run as root. A comment
+introduces each step. The steps install the resolver hook and the Minimal
+box-name service, plus the local range on macOS.
+
+| Flag | Description |
+|---|---|
+| `--print` | Print the script to stdout instead of running it, with no privilege prompt. Run it later with `sudo sh <file>`. |
+| `--undo` | Remove everything the setup step installs on this host. With `--print`, print the removal script instead. |
+
+Setup points at the port the daemon's zone answerer listens on, so it needs a
+running daemon that has bound its answerer. It does not start one. With no
+daemon reachable, it prints an error and exits 1. Start a session first to
+bring the daemon up. On a host where no script can make box names
+resolve, it prints why and exits 1.
+
+The box-name service runs as one user for the whole machine. If another user
+already installed it, setup refuses before running anything, names that user,
+and exits 1. `--print` still prints the script.
+
+`--undo` works without a daemon, and it succeeds on a host that holds none of
+the setup. It removes the box-name service and its program copy, the resolver
+hook, and on macOS the local range unit. The local range addresses on macOS
+stay on the loopback until the next boot. `install.sh --uninstall` points at
+`min net setup --undo` while any of these host files remain.
 
 ### `stop`
 

@@ -82,6 +82,9 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
         Some(Command::Net(NetArgs {
             command: NetCommand::Forward(args),
         })) => cmd_net_forward(&cli.global_args, args).await,
+        Some(Command::Net(NetArgs {
+            command: NetCommand::Setup(args),
+        })) => cmd_net_setup(&cli.global_args, args).await,
         Some(Command::Dirs) => dirs::cmd_dirs(&cli.global_args),
         Some(Command::Bug(args)) => diag::cmd_bug(&cli.global_args, args).await,
         Some(Command::Diag(diag::DiagArgs { command })) => match command {
@@ -103,6 +106,14 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
         // logging may need stdout too.
         Some(Command::Version) => cmd_version(&cli.global_args, &mut std::io::stdout()).await,
         Some(Command::Spin(args)) => cmd_spin(&cli.global_args, args).await,
+        #[cfg(debug_assertions)]
+        Some(Command::DebugAnswererCommand) => {
+            println!(
+                "{}",
+                crate::resolver::answerer_command_for_this_host().await?
+            );
+            Ok(())
+        }
         Some(Command::Init(args)) => cmd_init(&cli.global_args, args)
             .await
             .map_err(|e| anyhow::anyhow!("{e}")),
@@ -350,9 +361,12 @@ pub(crate) fn is_id_prefix(s: &str) -> bool {
 }
 
 /// Match `session` against the listed sessions: an exact name first, then a
-/// unique id prefix (compared without dashes, ignoring case). `None` when
-/// nothing matches or `session` is not prefix-shaped; an error naming the
-/// candidates when the prefix matches more than one session.
+/// name that matches ignoring ASCII case (the fold names are made unique
+/// under), then a unique id prefix (compared without dashes, ignoring case).
+/// A case-folded name that matches several sessions (written before names
+/// were made unique that way) resolves to none of them, not to an id prefix
+/// either. `None` when nothing matches or `session` is not prefix-shaped; an
+/// error naming the candidates when the prefix matches more than one session.
 pub(crate) fn match_id_prefix(
     entries: &[minimald_rpc::ListSessionsEntry],
     session: &str,
@@ -360,22 +374,54 @@ pub(crate) fn match_id_prefix(
     if let Some(entry) = entries.iter().find(|e| e.name.as_deref() == Some(session)) {
         return Ok(Some(entry.id));
     }
+    let mut folded = entries.iter().filter(|e| {
+        e.name
+            .as_deref()
+            .is_some_and(|n| n.eq_ignore_ascii_case(session))
+    });
+    match (folded.next(), folded.next()) {
+        (Some(entry), None) => return Ok(Some(entry.id)),
+        (Some(_), Some(_)) => return Ok(None),
+        _ => {}
+    }
     if !is_id_prefix(session) {
         return Ok(None);
     }
     let prefix = session.replace('-', "").to_ascii_lowercase();
-    let matches: Vec<sessions::SessionId> = entries
+    let matches: Vec<&minimald_rpc::ListSessionsEntry> = entries
         .iter()
-        .map(|e| e.id)
-        .filter(|id| id.as_ref().simple().to_string().starts_with(&prefix))
+        .filter(|e| e.id.as_ref().simple().to_string().starts_with(&prefix))
         .collect();
     match matches.as_slice() {
         [] => Ok(None),
-        [id] => Ok(Some(*id)),
+        [entry] => Ok(Some(entry.id)),
         several => {
+            // `min ls` shows sessions cut to eight digits, but sessions made
+            // close together share a long UUIDv7 prefix, so the refusal names
+            // each candidate at the shortest length that keeps them distinct.
+            let simples: Vec<String> = several
+                .iter()
+                .map(|e| e.id.as_ref().simple().to_string())
+                .collect();
+            let cut = (8..=32)
+                .find(|&n| {
+                    let prefixes: Vec<&str> = simples.iter().map(|s| &s[..n]).collect();
+                    let mut seen = std::collections::HashSet::new();
+                    prefixes.iter().all(|p| seen.insert(*p))
+                })
+                .unwrap_or(32);
+            // Only a shortened id gets an ellipsis; a full id is not cut.
+            let ellipsis = if cut < 32 { "…" } else { "" };
             let candidates: Vec<String> = several
                 .iter()
-                .map(|id| format!("{}…", &id.as_ref().simple().to_string()[..8]))
+                .zip(&simples)
+                .map(|(entry, simple)| {
+                    let mut candidate = format!("{}{ellipsis}", &simple[..cut]);
+                    if let Some(name) = entry.name.as_deref() {
+                        candidate.push_str(&format!(" ({name})"));
+                    }
+                    candidate
+                })
                 .collect();
             Err(AmbiguousIdPrefix(format!(
                 "'{session}' matches sessions {}; use more characters",
@@ -658,6 +704,16 @@ pub(crate) async fn best_effort_destroy(
     }
 }
 
+/// The stderr line activation prints for a declared port the box yields
+/// because another box at the same shared loopback address holds it.
+fn shared_port_collision_warning(collision: &minimald_rpc::SharedPortCollision) -> String {
+    format!(
+        "warning: port {} is already held by {}; this session will not \
+         forward it (first-come on the shared address)",
+        collision.port, collision.held_by
+    )
+}
+
 /// Upload the composition's patches and external hook scripts (if
 /// any) and finalize the session. The session is `Materializing` at
 /// entry; `Active` on success. On upload/finalize failure the session
@@ -693,7 +749,10 @@ pub(crate) async fn upload_and_finalize(
     use minimald_rpc::{FinalizeSession, FinalizeSessionRequest};
     let resp = client
         .oneshot_rpc_with_hook_budget::<FinalizeSession>(
-            FinalizeSessionRequest { session_id },
+            FinalizeSessionRequest {
+                session_id,
+                report_shared_port_collisions: true,
+            },
             hook_budget,
         )
         .await
@@ -717,6 +776,21 @@ pub(crate) async fn upload_and_finalize(
                         eprintln!();
                     }
                 }
+            }
+            if ok.package_check_skipped {
+                eprintln!(
+                    "warning: the session package check was skipped (the package graph \
+                     did not resolve in time or could not be evaluated; see the daemon \
+                     log); unknown package names will surface at first exec"
+                );
+            }
+            // First-come on a shared loopback address: another box at the
+            // same address holds this port, so this box's attach yields the
+            // forward. The box activates and serves its other ports, but
+            // without this line the only trace of the yield is the daemon
+            // log — a user reading a green activate would never know.
+            for collision in &ok.shared_port_collisions {
+                eprintln!("{}", shared_port_collision_warning(collision));
             }
             Ok(())
         }
@@ -806,14 +880,36 @@ pub(crate) fn arm_activation_interrupt(
 
 /// The user-facing text for a session that could not be composed, by
 /// either route: a refused `ConfigureLoadout` or failed gating of what it
-/// sent back. The underlying error names an internal step the caller never
-/// asked for, so the directory leads and that text follows as the only
-/// diagnostic there is. Shared with `min task run` (`crate::task`), which
-/// creates a session through the same two steps.
+/// sent back. The underlying error often names an internal step the caller
+/// never asked for (a package server, a git lock), so the directory leads
+/// and that text follows as the only diagnostic there is. The cause may or
+/// may not implicate the project configuration, so the remedy is phrased
+/// conditionally rather than assuming the config is at fault. Shared with
+/// `min task run` (`crate::task`), which creates a session through the same
+/// two steps.
 pub(crate) fn composition_failure_message(project_dir: &camino::Utf8Path, error: &str) -> String {
     format!(
         "Cannot start a session for {project_dir}: composing a session environment from \
-         that directory's project configuration failed, so no session was activated. Fix \
-         the configuration there, then re-run.\n\ncause: {error}"
+         that directory's project configuration failed, so no session was activated. If \
+         the cause below names the project configuration, fix it there; otherwise re-run.\
+         \n\ncause: {error}"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    /// NET-129: the activate warning for a yielded shared-address port is a
+    /// `warning:` line naming the port and the box that holds it.
+    #[test]
+    fn shared_port_collision_warning_names_the_port_and_its_holder() {
+        let line = super::shared_port_collision_warning(&minimald_rpc::SharedPortCollision {
+            port: 18080,
+            held_by: "first.min.internal".to_string(),
+        });
+        assert_eq!(
+            line,
+            "warning: port 18080 is already held by first.min.internal; this session \
+             will not forward it (first-come on the shared address)"
+        );
+    }
 }

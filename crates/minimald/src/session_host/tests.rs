@@ -202,6 +202,7 @@ async fn a_shell_exit_reaches_the_binding_with_the_reaped_exit_reason() {
             control: None,
             delta: None,
             archives_dir: std::env::temp_dir(),
+            holds_host_row: false,
             session_id: sessions::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
@@ -261,6 +262,7 @@ async fn a_stalled_binding_does_not_wedge_the_host_loop() {
             control: None,
             delta: None,
             archives_dir: std::env::temp_dir(),
+            holds_host_row: false,
             session_id: sessions::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
@@ -410,6 +412,7 @@ impl FloodedAttach {
                 control: None,
                 delta: None,
                 archives_dir: std::env::temp_dir(),
+                holds_host_row: false,
                 session_id: sessions::SessionId::nil(),
                 composition: None,
                 connection_env: ConnectionEnv::new(),
@@ -664,6 +667,7 @@ async fn a_shell_exit_hands_the_binding_the_codes_that_leave_mouse_mode() {
             control: None,
             delta: None,
             archives_dir: std::env::temp_dir(),
+            holds_host_row: false,
             session_id: sessions::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
@@ -726,6 +730,7 @@ async fn unwind_codes_narrow_to_what_the_screen_actually_set() {
             control: None,
             delta: None,
             archives_dir: std::env::temp_dir(),
+            holds_host_row: false,
             session_id: sessions::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
@@ -776,6 +781,7 @@ async fn a_kill_tells_the_binding_nothing() {
             control: None,
             delta: None,
             archives_dir: std::env::temp_dir(),
+            holds_host_row: false,
             session_id: sessions::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
@@ -818,6 +824,7 @@ async fn reap_log_host(name: &str) -> (Host<MockProcess, ()>, HostHandle) {
             control: None,
             delta: None,
             archives_dir: std::env::temp_dir(),
+            holds_host_row: false,
             session_id: sessions::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
@@ -1292,6 +1299,7 @@ async fn get_attrs_tracks_title_and_io_times() {
             control: None,
             delta: None,
             archives_dir: std::env::temp_dir(),
+            holds_host_row: false,
             session_id: sessions::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
@@ -1369,6 +1377,7 @@ async fn kill_tears_down_host_and_reaps_process() {
             control: None,
             delta: None,
             archives_dir: std::env::temp_dir(),
+            holds_host_row: false,
             session_id: sessions::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
@@ -1474,6 +1483,7 @@ async fn exit_releases_the_network() {
             control: None,
             delta: None,
             archives_dir: std::env::temp_dir(),
+            holds_host_row: false,
             session_id: sessions::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
@@ -1529,6 +1539,7 @@ async fn detach_keystroke_holds_the_session_and_network() {
             control: None,
             delta: None,
             archives_dir: std::env::temp_dir(),
+            holds_host_row: false,
             session_id: sessions::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
@@ -1631,6 +1642,7 @@ async fn stale_binding_generation_input_is_discarded() {
             control: None,
             delta: None,
             archives_dir: std::env::temp_dir(),
+            holds_host_row: false,
             session_id: sessions::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
@@ -1762,6 +1774,7 @@ async fn hook_injections_carry_the_session_s_none_box_seal() {
                 control: None,
                 delta: None,
                 archives_dir: std::env::temp_dir(),
+                holds_host_row: false,
                 session_id: sessions::SessionId::nil(),
                 composition: Some(bare_composition()),
                 connection_env: ConnectionEnv::new(),
@@ -3336,7 +3349,7 @@ async fn launch_refuses_unenforceable_host_ip_declaration_after_host_gains_per_b
     );
 
     let capture = crate::test_harness::captured_log();
-    const REFUSAL: &str = "cannot enforce the rules this box's declaration names";
+    const REFUSAL: &str = "host_ip boxes on this host enforce only deny-all egress";
     // The box's declaration: the narrowing a per-box host has no verdict for,
     // in the CLI's own spelling of `--deny-subnets`.
     let narrowing = sessions::SessionPolicy::new(
@@ -3420,12 +3433,12 @@ async fn launch_refuses_unenforceable_host_ip_declaration_after_host_gains_per_b
         "the launch's refusal names the rule it refused over: {refusal}"
     );
     assert!(
-        refusal.contains("own-address boxes enforce them"),
+        refusal.contains("which enforces them"),
         "the launch's refusal says own-address boxes enforce these rules, \
          the same words the create's would have said: {refusal}"
     );
     assert!(
-        refusal.contains("remove these rules"),
+        refusal.contains("Remove them"),
         "the launch's refusal ends with what to do, the same remedy the \
          create's would have named: {refusal}"
     );
@@ -3456,6 +3469,7 @@ async fn launch_refuses_unenforceable_host_ip_declaration_after_host_gains_per_b
         logged.lines().any(|line| {
             line.contains("refusing a host-address box whose declaration names rules")
                 && line.contains("session=race-proof-after")
+                && line.contains("network_mode=host_ip")
                 && line.contains("host_ip_enforcement=per_box")
                 && line.contains("deny_subnets 0.0.0.0/0")
         }),
@@ -5499,6 +5513,92 @@ async fn expose_ask_prompts_attached_human() {
     assert!(records[0].get("reason").is_none());
 }
 
+/// NET-044/NET-045: an `ask` answered yes admits the port at the box's relay
+/// gate the way an `allow` does — the publish the human allowed is reachable
+/// — while a port nobody published stays refused. The gate is registered
+/// under the box's switch address the way its relay's spawn registers it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expose_ask_yes_admits_the_port_at_the_box_gate() {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let manager = server.state.sessions_manager().await;
+    manager.land_range_verdict(crate::net::dns::RangeVerdict::Present);
+    // An address no other test's box uses: the live-gate table is
+    // process-wide.
+    let switch = std::net::Ipv4Addr::new(100, 64, 128, 92);
+    let web = finalize_dynamic_ingress_session(
+        &mut client,
+        "askgate",
+        switch,
+        std::net::Ipv4Addr::new(127, 0, 64, 92),
+        Some(sessions::DynamicIngress::Ask),
+        Some((3000, 3999)),
+    )
+    .await;
+    let handle = manager
+        .get_session(crate::sessions::SessionKeyPredicate::Id(web))
+        .await
+        .unwrap()
+        .expect("the asking box resolves");
+    let gate = std::sync::Arc::new(crate::net::switch::SessionGate::for_session(
+        "askgate".to_string(),
+        switch,
+        &sessions::SessionPolicy::default(),
+        crate::net::SwitchSubnet::default(),
+        None,
+    ));
+    crate::net::switch::register_live_gate_for_test(switch, &gate);
+    let sock = handle
+        .net_switch()
+        .await
+        .unwrap()
+        .lock()
+        .await
+        .control_socket();
+    let (forwarder, _served) = fake_forwarder(sock, 200).await;
+
+    // Attach the human the ask will be routed to, and prove the binding is
+    // live before asking.
+    let mut channel = client.open_shell(web).await;
+    channel.data_bytes(b"hello\n".to_vec()).await.unwrap();
+    let mut live = Vec::new();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            match channel.wait().await {
+                Some(russh::ChannelMsg::Data { data }) => {
+                    live.extend_from_slice(&data);
+                    if String::from_utf8_lossy(&live).contains("got:hello") {
+                        return;
+                    }
+                }
+                Some(_) => {}
+                None => panic!("the channel closed before the shell came up"),
+            }
+        }
+    })
+    .await
+    .expect("the attached shell should echo within the bound");
+
+    assert!(!gate.admits_tcp(3000), "nothing is published yet");
+    let asked = tokio::spawn(async move { handle.expose_dynamic(3000).await });
+    answer_ask_on(&mut channel, true).await;
+    tokio::time::timeout(Duration::from_secs(30), asked)
+        .await
+        .expect("the ask should be answered once the human answers")
+        .expect("the spawned request should not panic")
+        .expect("the human's allow publishes the port");
+    forwarder.abort();
+
+    assert!(
+        gate.admits_tcp(3000),
+        "the port the human allowed is admitted at the box's relay gate"
+    );
+    assert!(
+        !gate.admits_tcp(3001),
+        "a port nobody published stays refused"
+    );
+}
+
 /// NET-045's unwanted branch: a box decided `ask` with nobody attached — no
 /// client ever bound, so no human to render the dialog to — is refused with
 /// the typed error that says nobody is attached to answer, the switch is
@@ -5647,6 +5747,558 @@ async fn expose_unenrolled_decision_audited() {
     );
 }
 
+/// NET-046 fails closed on an unrecordable allow: with a link planted where
+/// the audit directory should be, every append is refused, so the allowing
+/// box's publish is withdrawn — the switch asked to unbind what it bound, no
+/// live mapping left — and the caller hears a failed publish naming the
+/// audit log, with the refusal in the daemon's log. A deny under the same
+/// refusal still refuses: an unrecordable deny is never turned into a
+/// publish. The link's target is untouched either way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expose_unrecordable_allow_is_refused_and_deny_still_refuses() {
+    let capture = captured_log();
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let manager = server.state.sessions_manager().await;
+    manager.land_range_verdict(crate::net::dns::RangeVerdict::Present);
+    // An address no other test's box uses: the live-gate table is
+    // process-wide, and this test's point is the gate's own state.
+    let switch = std::net::Ipv4Addr::new(100, 64, 128, 93);
+    let web = finalize_dynamic_ingress_session(
+        &mut client,
+        "web",
+        switch,
+        std::net::Ipv4Addr::new(127, 0, 64, 93),
+        Some(sessions::DynamicIngress::Allow),
+        Some((3000, 3999)),
+    )
+    .await;
+    let web_handle = manager
+        .get_session(crate::sessions::SessionKeyPredicate::Id(web))
+        .await
+        .unwrap()
+        .expect("the allowing box resolves");
+    let (_db, db_handle) = dynamic_ingress_box(&server, &mut client, "db", None, None).await;
+    let gate = std::sync::Arc::new(crate::net::switch::SessionGate::for_session(
+        "web".to_string(),
+        switch,
+        &sessions::SessionPolicy::default(),
+        crate::net::SwitchSubnet::default(),
+        None,
+    ));
+    crate::net::switch::register_live_gate_for_test(switch, &gate);
+    web_handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("the allowing box launches its host");
+    let sock = web_handle
+        .net_switch()
+        .await
+        .unwrap()
+        .lock()
+        .await
+        .control_socket();
+    let (forwarder, served) = fake_forwarder(sock, 200).await;
+
+    let state_dir = server.state.minimal_state_dir().await;
+    let state_dir = state_dir.as_utf8_path().as_std_path();
+    let planted = state_dir.join("planted");
+    std::fs::create_dir_all(&planted).unwrap();
+    std::os::unix::fs::symlink(&planted, state_dir.join("audit")).unwrap();
+
+    // A sampler that reads the gate the whole time the refused publish
+    // runs: the admission waits on the record (NET-046), so an allow the
+    // log refuses is never admitted, not even for the length of the audit
+    // write and the unwind after it.
+    let ever_admitted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sampling = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let sampler = {
+        let gate = std::sync::Arc::clone(&gate);
+        let ever_admitted = std::sync::Arc::clone(&ever_admitted);
+        let sampling = std::sync::Arc::clone(&sampling);
+        tokio::spawn(async move {
+            while sampling.load(std::sync::atomic::Ordering::SeqCst) {
+                if gate.admits_tcp(3000) {
+                    ever_admitted.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+    };
+    match web_handle.expose_dynamic(3000).await {
+        Err(crate::net::policy::ExposeFailure::Publish { port: 3000, source }) => assert!(
+            source.to_string().contains("audit log"),
+            "the failure says the decision could not be recorded: {source}"
+        ),
+        other => panic!("an allow that cannot be audited is refused: {other:?}"),
+    }
+    sampling.store(false, std::sync::atomic::Ordering::SeqCst);
+    sampler.await.unwrap();
+    assert!(
+        !ever_admitted.load(std::sync::atomic::Ordering::SeqCst),
+        "an allow whose record the log refused is never admitted at the relay gate"
+    );
+    assert!(
+        !gate.admits_tcp(3000),
+        "the unaudited allow is not admitted at the relay gate"
+    );
+    assert!(
+        web_handle
+            .live_ingress()
+            .await
+            .expect("the actor answers")
+            .exposed
+            .is_empty(),
+        "the withdrawn publish leaves no live mapping"
+    );
+    assert!(
+        served
+            .lock()
+            .expect("served lock")
+            .iter()
+            .any(|line| line.starts_with("POST /services/forwarder/unexpose ")),
+        "the forward the publish bound is unbound again"
+    );
+    match db_handle.expose_dynamic(3000).await {
+        Err(crate::net::policy::ExposeFailure::Refused(
+            crate::net::policy::ExposeRefusal::DeniedByPolicy,
+        )) => {}
+        other => panic!("an unrecordable deny still refuses: {other:?}"),
+    }
+
+    // Once the audit log takes records again the same publish stands: the
+    // gate holds no residue of the refused attempt, and the allow is
+    // admitted afresh — a refusal withdrawn leaves the box none the
+    // worse for having been refused.
+    std::fs::remove_file(state_dir.join("audit")).unwrap();
+    web_handle
+        .expose_dynamic(3000)
+        .await
+        .expect("an auditable allow publishes again");
+    assert!(
+        gate.admits_tcp(3000),
+        "the republished allow is admitted at the box's relay gate"
+    );
+    forwarder.abort();
+
+    let log = capture.contents();
+    assert!(
+        log.contains("the dynamic ingress allow could not be audited"),
+        "the refused allow is said in the daemon's log: {log}"
+    );
+    assert!(
+        log.contains("the dynamic ingress decision could not be audited"),
+        "the unrecordable refusals are warned about, not silent: {log}"
+    );
+    assert!(
+        !planted.join("decisions.log").exists(),
+        "the planted link's target is untouched"
+    );
+}
+
+/// Drives one VM-backed publish under `mode` whose allow cannot be audited
+/// and returns the withdrawal the VM host daemon's door read. The door holds
+/// the withdrawal's reply while the switch's requests are checked, so the
+/// unexpose is proved to come first, the order every unwind holds.
+async fn unaudited_vm_withdrawal(
+    mode: sessions::DynamicIngress,
+) -> minimald_rpc::BoxControlRequest {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let (_web, handle) =
+        dynamic_ingress_box(&server, &mut client, "web", Some(mode), Some((3000, 3999))).await;
+    handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("the box launches its host");
+    let sock = handle
+        .net_switch()
+        .await
+        .unwrap()
+        .lock()
+        .await
+        .control_socket();
+    let (forwarder, served, door, mut requests, replies) = vm_backed_ask_box(&handle).await;
+
+    let state_dir = server.state.minimal_state_dir().await;
+    let state_dir = state_dir.as_utf8_path().as_std_path();
+    let planted = state_dir.join("planted");
+    std::fs::create_dir_all(&planted).unwrap();
+    std::os::unix::fs::symlink(&planted, state_dir.join("audit")).unwrap();
+
+    let exposing = handle.clone();
+    let expose = tokio::spawn(async move { exposing.expose_dynamic(3000).await });
+    let admit = tokio::time::timeout(Duration::from_secs(10), requests.recv())
+        .await
+        .expect("the publish reaches the VM host daemon's door")
+        .expect("the report door stand-in lives");
+    let admitted = if mode == sessions::DynamicIngress::Ask {
+        assert!(
+            matches!(admit, minimald_rpc::BoxControlRequest::AdmitAsk(_)),
+            "an ask is raised with the host first: {admit:?}"
+        );
+        host_end(minimald_rpc::AskAdmitOutcome::Admitted {
+            ask_id: host_ask_id(),
+            port: 3000,
+            proto: sessions::IpProto::Tcp,
+        })
+    } else {
+        assert!(
+            matches!(admit, minimald_rpc::BoxControlRequest::AdmitPort(_)),
+            "an allow reports the port before it binds: {admit:?}"
+        );
+        minimald_rpc::BoxControlReply::PortRecorded {
+            port: 3000,
+            proto: sessions::IpProto::Tcp,
+        }
+    };
+    replies
+        .send(admitted)
+        .expect("the report door stand-in lives");
+    let withdrawal = tokio::time::timeout(Duration::from_secs(10), requests.recv())
+        .await
+        .expect("the unaudited publish withdraws its row entry")
+        .expect("the report door stand-in lives");
+    {
+        let served = served.lock().expect("served lock");
+        assert!(
+            served
+                .iter()
+                .any(|line| line.starts_with("POST /services/forwarder/unexpose ")),
+            "the forward is unbound before the row entry is withdrawn: {served:?}"
+        );
+    }
+    replies
+        .send(minimald_rpc::BoxControlReply::PortRecorded {
+            port: 3000,
+            proto: sessions::IpProto::Tcp,
+        })
+        .expect("the report door stand-in lives");
+    assert!(
+        matches!(
+            expose.await.expect("the expose task should not panic"),
+            Err(crate::net::policy::ExposeFailure::Publish { port: 3000, .. })
+        ),
+        "an allow that cannot be audited is refused"
+    );
+    forwarder.abort();
+    door.abort();
+    crate::net::listeners::clear_vm_report_door_for_tests(&sock);
+    withdrawal
+}
+
+/// NET-046's fail-closed withdrawal on a VM-backed host gives the VM host
+/// daemon's row entry back under the surface the publish used: the box's
+/// own expose for an `allow`, the answered ask for an `ask` (NET-045).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unaudited_allow_withdraws_the_vm_row_under_its_source() {
+    for (mode, source) in [
+        (
+            sessions::DynamicIngress::Allow,
+            minimald_rpc::PortReportSource::Expose,
+        ),
+        (
+            sessions::DynamicIngress::Ask,
+            minimald_rpc::PortReportSource::Ask,
+        ),
+    ] {
+        assert_eq!(
+            unaudited_vm_withdrawal(mode).await,
+            minimald_rpc::BoxControlRequest::WithdrawPort(minimald_rpc::WithdrawPortRequest {
+                switch_address: ASK_SWITCH,
+                port: 3000,
+                proto: sessions::IpProto::Tcp,
+                source,
+            }),
+            "the {mode} publish's row entry is withdrawn under its own source"
+        );
+    }
+}
+
+/// The unaudited withdrawal keeps what it cannot take down: a forward whose
+/// unexpose the switch refuses — the very failure the fail-closed path can
+/// meet on a switch that is wedged or gone — stays recorded in the box's
+/// live set, `unrevoked`, so the box's stop sweep can ask for it again, and
+/// the VM host daemon's row entry stays beside it, because the host's gate
+/// retracts a runtime port only while the row still holds it. What the
+/// caller hears does not change: the publish is refused either way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unaudited_allow_keeps_a_forward_the_switch_would_not_unbind() {
+    let capture = captured_log();
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let (_web, handle) = dynamic_ingress_box(
+        &server,
+        &mut client,
+        "web",
+        Some(sessions::DynamicIngress::Allow),
+        Some((3000, 3999)),
+    )
+    .await;
+    handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("the allowing box launches its host");
+    let sock = handle
+        .net_switch()
+        .await
+        .unwrap()
+        .lock()
+        .await
+        .control_socket();
+    // VM-backed, so the publish is admitted at a report door the test owns
+    // and the withdrawal would report back to it.
+    let door_sock = sock.with_file_name("report-door.sock");
+    let (door, mut requests, replies) = fake_report_door(&door_sock).await;
+    crate::net::listeners::seed_vm_report_door_for_tests(&sock, &door_sock);
+    // The switch accepts the publish's bind and then refuses the
+    // withdrawal's unexpose — the failure the retention is for.
+    let (forwarder, served) =
+        crate::session::tests::scripted_forwarder(sock.clone(), vec![200, 500]).await;
+
+    // Every append is refused: the audit directory is a planted link.
+    let state_dir = server.state.minimal_state_dir().await;
+    let state_dir = state_dir.as_utf8_path().as_std_path();
+    let planted = state_dir.join("planted");
+    std::fs::create_dir_all(&planted).unwrap();
+    std::os::unix::fs::symlink(&planted, state_dir.join("audit")).unwrap();
+
+    let exposing = handle.clone();
+    let expose = tokio::spawn(async move { exposing.expose_dynamic(3000).await });
+    // The publish reports its port first; the door admits it.
+    let admit = tokio::time::timeout(Duration::from_secs(10), requests.recv())
+        .await
+        .expect("the publish reaches the VM host daemon's door")
+        .expect("the report door stand-in lives");
+    assert!(
+        matches!(admit, minimald_rpc::BoxControlRequest::AdmitPort(_)),
+        "an allow reports the port before it binds: {admit:?}"
+    );
+    replies
+        .send(minimald_rpc::BoxControlReply::PortRecorded {
+            port: 3000,
+            proto: sessions::IpProto::Tcp,
+        })
+        .expect("the report door stand-in lives");
+    // The caller hears the failed publish the fail-closed path owes, naming
+    // the audit log.
+    match expose.await.expect("the expose task should not panic") {
+        Err(crate::net::policy::ExposeFailure::Publish { port: 3000, source }) => assert!(
+            source.to_string().contains("audit log"),
+            "the failure says the decision could not be recorded: {source}"
+        ),
+        other => panic!("an allow that cannot be audited is refused: {other:?}"),
+    }
+
+    let live = handle
+        .live_ingress()
+        .await
+        .expect("the actor answers")
+        .exposed;
+    assert_eq!(
+        live.len(),
+        1,
+        "the forward the switch would not unbind stays recorded for the \
+         box's stop to ask for again: {live:?}"
+    );
+    assert_eq!(
+        live[0].internal_port, 3000,
+        "the recorded forward is the unaudited publish's own"
+    );
+    assert_eq!(
+        live[0].pending,
+        Some(true),
+        "the gate refuses the retained forward, so its row reads pending, \
+         never reachable"
+    );
+    let served = served.lock().expect("served lock").clone();
+    assert_eq!(
+        served.len(),
+        2,
+        "the publish's bind and the withdrawal's refused unexpose: {served:?}"
+    );
+    assert!(
+        served[1].starts_with("POST /services/forwarder/unexpose "),
+        "the withdrawal did ask the switch to unbind: {served:?}"
+    );
+    // No withdrawal report reached the door: the row entry stays with the
+    // forward, so the host's gate can still retract the port.
+    match tokio::time::timeout(Duration::from_millis(200), requests.recv()).await {
+        Err(_) => {}
+        Ok(received) => {
+            panic!("the row entry is held back with the forward it names: {received:?}")
+        }
+    }
+    let log = capture.contents();
+    assert!(
+        log.contains("the unaudited publish's forward could not be unbound"),
+        "the refused unexpose is said, not silent: {log}"
+    );
+    forwarder.abort();
+    door.abort();
+    crate::net::listeners::clear_vm_report_door_for_tests(&sock);
+}
+
+/// The retention above has one case it cannot keep: the box's spawn ends
+/// while the refused unexpose is in flight, so the guard that would unbind
+/// the forward has already swept the cell, and the cell refuses it back. The
+/// withdrawal then unbinds it once more, best-effort, and gives the port back
+/// the way every detached publish does — the publication-set entry released
+/// and the VM host daemon's row entry withdrawn, after the unexposes — since
+/// no sweep is left that would ever retry them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unaudited_allow_whose_spawn_ends_mid_unbind_gives_the_port_back() {
+    use tokio::io::AsyncWriteExt;
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let (_web, handle) = dynamic_ingress_box(
+        &server,
+        &mut client,
+        "web",
+        Some(sessions::DynamicIngress::Allow),
+        Some((3000, 3999)),
+    )
+    .await;
+    handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("the allowing box launches its host");
+    let sock = handle
+        .net_switch()
+        .await
+        .unwrap()
+        .lock()
+        .await
+        .control_socket();
+    let door_sock = sock.with_file_name("report-door.sock");
+    let (door, mut requests, replies) = fake_report_door(&door_sock).await;
+    crate::net::listeners::seed_vm_report_door_for_tests(&sock, &door_sock);
+    let (runtime_ingress, publications) = handle.ingress_cells().await.expect("the actor answers");
+
+    // The switch accepts the bind and refuses every unexpose, and the box's
+    // spawn ends while the first of them is in flight: the stand-in empties
+    // the cell the way the spawn's guard does before it answers.
+    if let Some(parent) = sock.parent() {
+        std::fs::create_dir_all(parent).expect("create the switch state dir");
+    }
+    let listener = tokio::net::UnixListener::bind(&sock).expect("bind the control socket");
+    let served = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let forwarder = {
+        let served = served.clone();
+        let runtime_ingress = runtime_ingress.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let Some(request) = crate::session::tests::read_control_request(&mut stream).await
+                else {
+                    continue;
+                };
+                let status = if request.starts_with("POST /services/forwarder/unexpose ") {
+                    // The guard's sweep is what is simulated; what it took
+                    // is not this test's concern.
+                    drop(runtime_ingress.detach());
+                    "500 Internal Server Error"
+                } else {
+                    "200 OK"
+                };
+                served.lock().expect("served lock").push(request);
+                #[expect(
+                    clippy::let_underscore_must_use,
+                    reason = "the answer's fate is not what the stand-in records; the request is"
+                )]
+                let _ = stream
+                    .write_all(format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\n\r\n").as_bytes())
+                    .await;
+            }
+        })
+    };
+
+    // Every append is refused: the audit directory is a planted link.
+    let state_dir = server.state.minimal_state_dir().await;
+    let state_dir = state_dir.as_utf8_path().as_std_path();
+    let planted = state_dir.join("planted");
+    std::fs::create_dir_all(&planted).unwrap();
+    std::os::unix::fs::symlink(&planted, state_dir.join("audit")).unwrap();
+
+    let exposing = handle.clone();
+    let expose = tokio::spawn(async move { exposing.expose_dynamic(3000).await });
+    let admit = tokio::time::timeout(Duration::from_secs(10), requests.recv())
+        .await
+        .expect("the publish reaches the VM host daemon's door")
+        .expect("the report door stand-in lives");
+    assert!(
+        matches!(admit, minimald_rpc::BoxControlRequest::AdmitPort(_)),
+        "an allow reports the port before it binds: {admit:?}"
+    );
+    replies
+        .send(minimald_rpc::BoxControlReply::PortRecorded {
+            port: 3000,
+            proto: sessions::IpProto::Tcp,
+        })
+        .expect("the report door stand-in lives");
+
+    // The row entry is withdrawn, under the expose's own source, and only
+    // after the switch was asked to unbind: the refused unexpose, then the
+    // best-effort one the detached forward gets.
+    let withdrawal = tokio::time::timeout(Duration::from_secs(10), requests.recv())
+        .await
+        .expect("the detached publish withdraws its row entry")
+        .expect("the report door stand-in lives");
+    assert_eq!(
+        withdrawal,
+        minimald_rpc::BoxControlRequest::WithdrawPort(minimald_rpc::WithdrawPortRequest {
+            switch_address: ASK_SWITCH,
+            port: 3000,
+            proto: sessions::IpProto::Tcp,
+            source: minimald_rpc::PortReportSource::Expose,
+        }),
+        "the row entry is withdrawn once no sweep is left to retry it"
+    );
+    {
+        let served = served.lock().expect("served lock");
+        let unexposes = served
+            .iter()
+            .filter(|line| line.starts_with("POST /services/forwarder/unexpose "))
+            .count();
+        assert_eq!(
+            unexposes, 2,
+            "the refused unexpose and the detached forward's best-effort one both \
+             precede the withdrawal: {served:?}"
+        );
+    }
+    replies
+        .send(minimald_rpc::BoxControlReply::PortRecorded {
+            port: 3000,
+            proto: sessions::IpProto::Tcp,
+        })
+        .expect("the report door stand-in lives");
+    assert!(
+        matches!(
+            expose.await.expect("the expose task should not panic"),
+            Err(crate::net::policy::ExposeFailure::Publish { port: 3000, .. })
+        ),
+        "an allow that cannot be audited is refused"
+    );
+    assert!(
+        publications.held_by(3000).is_none(),
+        "the publication-set entry is given back with the row entry"
+    );
+    assert!(
+        handle
+            .live_ingress()
+            .await
+            .expect("the actor answers")
+            .exposed
+            .is_empty(),
+        "the cell the spawn's end emptied does not take the forward back"
+    );
+    forwarder.abort();
+    door.abort();
+    crate::net::listeners::clear_vm_report_door_for_tests(&sock);
+}
+
 /// The host-level half of NET-045's no-client case: an ask reaching a host
 /// nobody is bound to answers no-one rather than parking — the dialog has no
 /// terminal to render on — which is the fail-closed answer the session turns
@@ -5666,6 +6318,7 @@ async fn ask_expose_without_a_binding_answers_no_one() {
             control: None,
             delta: None,
             archives_dir: std::env::temp_dir(),
+            holds_host_row: false,
             session_id: sessions::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
@@ -6226,4 +6879,61 @@ async fn ask_yes_publish_withdraws_on_unexpose() {
         .expect("the stop finishes")
         .expect("the stop task should not panic");
     forwarder.abort();
+}
+
+/// Renders the shell-exit prompt with Enter answering it (the Keep item,
+/// listed first) and returns what reached the terminal.
+async fn rendered_shell_exit_prompt(holds_host_row: bool) -> String {
+    let mut out: Vec<u8> = Vec::new();
+    let disposition = Binding::shell_exit_prompt(
+        None,
+        None,
+        &std::env::temp_dir(),
+        "box",
+        holds_host_row,
+        &b"\r"[..],
+        &mut out,
+    )
+    .await;
+    assert_eq!(
+        disposition,
+        ExitDisposition::Kept,
+        "Enter takes the Keep item"
+    );
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// A registered box's Keep item says what keeping it leaves (NET-138): the
+/// files, and only a destroy, because its network registration ended with
+/// the shell. An unregistered box's prompt is unchanged.
+#[tokio::test]
+async fn shell_exit_keep_item_names_the_ended_registration_for_a_registered_box() {
+    let registered = rendered_shell_exit_prompt(true).await;
+    assert!(
+        registered.contains(
+            "Exit, keeping the session's files. Its network registration ended with the \
+             shell, so you can only destroy this session, not attach to it or run commands \
+             in it."
+        ),
+        "the registered box's Keep item; got: {registered:?}"
+    );
+    assert!(
+        !registered.contains(SHELL_EXIT_KEEP),
+        "the recoverable wording is not offered to a registered box; got: {registered:?}"
+    );
+
+    let unregistered = rendered_shell_exit_prompt(false).await;
+    assert!(
+        unregistered.contains("Exit, leaving the session filesystem in place and recoverable"),
+        "an unregistered box keeps its Keep item; got: {unregistered:?}"
+    );
+    assert!(
+        !unregistered.contains("network registration ended"),
+        "an unregistered box's prompt is unchanged; got: {unregistered:?}"
+    );
+    let delete = "Delete, all in-session files permanently deleted";
+    assert!(
+        registered.contains(delete) && unregistered.contains(delete),
+        "both prompts keep the Delete item"
+    );
 }

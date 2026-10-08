@@ -53,13 +53,15 @@ pub(crate) const PUBLISH_GENERATION_ENV: &str = "MINVMD_PUBLISH_GENERATION";
 /// step.
 const PUBLISH_GENERATION_TOKEN: &str = "MINIMALD_PUBLISH_GENERATION";
 
-/// The environment variable the operator sets to opt the guest daemon out of
-/// the deny-all egress default (NET-077). Read by the VMM child, which writes
-/// it onto the kernel command line for the guest to read (see
-/// `EGRESS_DENY_ALL_OPT_OUT_TOKEN`). Inherited through the process tree like
-/// [`OWN_IP_ENV`]: the operator sets it in the environment that starts
-/// `minvmd run`/`boot`, and the supervisor hands it to the VMM child by
-/// inheritance.
+/// The environment variable the operator sets to opt the VM out of the
+/// deny-all egress default (NET-077). Read twice: by the supervisor, whose
+/// host-side registry compiles an undeclared box's row by it, and by the VMM
+/// child, which writes it onto the kernel command line for the guest daemon
+/// to read (see `EGRESS_DENY_ALL_OPT_OUT_TOKEN`), so the gate on each side of
+/// the escape boundary keeps the same default. Inherited through the process
+/// tree like [`OWN_IP_ENV`]: the operator sets it in the environment that
+/// starts `minvmd run`/`boot`, and the supervisor hands it to the VMM child
+/// by inheritance.
 pub(crate) const EGRESS_DENY_ALL_OPT_OUT_ENV: &str = "MINVMD_EGRESS_DENY_ALL_OPT_OUT";
 
 /// The boot token the egress opt-out rides to the guest on, beside the port's
@@ -344,7 +346,7 @@ impl VmConfig {
         // device wiring (tap fd handed to gvproxy over the per-PTask vsock
         // shuttle) is driven by the switch handle, not configured here; record
         // the selected mode so a stuck boot can be diagnosed.
-        tracing::debug!(network_mode = ?self.network_mode, "VM network mode selected");
+        tracing::debug!(network_mode = %self.network_mode.word(), "VM network mode selected");
 
         // R3.1: register the host UDS bridge (listen=true). libkrun listens on
         // the host UDS and bridges each accepted connection to the guest process
@@ -569,29 +571,20 @@ fn publish_generation_from_raw(raw: Option<&str>) -> Result<Option<u64>, crate::
     }
 }
 
-/// Whether the operator opted the guest daemon out of the deny-all egress
-/// default (NET-077), read from [`EGRESS_DENY_ALL_OPT_OUT_ENV`]. Truthy like
-/// [`crate::cmd::own_ip_requested`] (`1`/`true`/`yes`/`on`, case-insensitive);
-/// unset or any other value is `false` — the guest runs the egress default its
-/// host's build ships. The VMM child inherits the operator's environment, so
-/// no explicit handoff is needed: the value set on the process that starts
-/// `minvmd run`/`boot` reaches the child that composes the boot line.
+/// Whether the operator opted the VM out of the deny-all egress default
+/// (NET-077), read from [`EGRESS_DENY_ALL_OPT_OUT_ENV`] through the parse the
+/// guest shares ([`sessions::egress_deny_all_opt_out_from_raw`]):
+/// `1`/`true`/`yes`/`on`, case-insensitive; unset or any other value is
+/// `false` — the build's egress default. Read by both processes that need it,
+/// as [`OWN_IP_ENV`] is: the supervisor, for the host-side registry's
+/// undeclared-row default, and the VMM child, which writes it onto the boot
+/// line. Both inherit the operator's environment, so the value set on the
+/// process that starts `minvmd run`/`boot` reaches each.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
-fn egress_deny_all_opt_out_from_env() -> bool {
-    egress_deny_all_opt_out_from_raw(std::env::var(EGRESS_DENY_ALL_OPT_OUT_ENV).ok().as_deref())
-}
-
-/// The parse half of [`egress_deny_all_opt_out_from_env`], split out so the
-/// fail-closed rule is testable without touching the process environment:
-/// only the truthy set opts out; absent or anything else keeps the default.
-#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
-fn egress_deny_all_opt_out_from_raw(raw: Option<&str>) -> bool {
-    raw.is_some_and(|v| {
-        matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    })
+pub(crate) fn egress_deny_all_opt_out_from_env() -> bool {
+    sessions::egress_deny_all_opt_out_from_raw(
+        std::env::var(EGRESS_DENY_ALL_OPT_OUT_ENV).ok().as_deref(),
+    )
 }
 
 /// Resolve the data-volume `(direct_io, sync_mode)` from the R1.9 environment
@@ -825,19 +818,6 @@ mod tests {
             "console=hvc0 ipv6.disable=1 MINIMALD_HOSTNAME_PROXY_PORT=7654 \
              MINIMALD_PUBLISH_GENERATION=42 MINIMALD_EGRESS_DENY_ALL_OPT_OUT=1 RUST_LOG=debug"
         );
-    }
-
-    #[test]
-    fn the_egress_opt_out_fails_closed() {
-        // NET-077: unset keeps the deny-all default; only the truthy set that
-        // `MINVMD_VM_OWN_IP` accepts opts out, and anything else fails closed.
-        assert!(!egress_deny_all_opt_out_from_raw(None));
-        for value in ["1", "true", "TRUE", "yes", "on", " On "] {
-            assert!(egress_deny_all_opt_out_from_raw(Some(value)), "{value:?}");
-        }
-        for value in ["", "0", "no", "off", "false", "garbage", "1x", "enabled"] {
-            assert!(!egress_deny_all_opt_out_from_raw(Some(value)), "{value:?}");
-        }
     }
 
     #[test]

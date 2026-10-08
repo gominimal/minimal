@@ -100,15 +100,16 @@ pub const HANDED_EGRESS_DENY_ALL_OPT_OUT_TOKEN: &str = "MINIMALD_EGRESS_DENY_ALL
 /// Whether the VM host handed this boot an egress opt-out (NET-077): the
 /// operator set the opt-out on the host, and the guest daemon runs the egress
 /// default its host was started with. Truthy like the host's reader
-/// (`1`/`true`/`yes`/`on`, case-insensitive); an absent token — an older
-/// minvmd, a native run — or any other value is `false`, the egress default.
+/// (`1`/`true`/`yes`/`on`, case-insensitive) through the one parse both
+/// sides share ([`sessions::egress_deny_all_opt_out_from_raw`]); an absent
+/// token — an older minvmd, a native run — or any other value is `false`,
+/// the egress default.
 pub fn handed_egress_deny_all_opt_out() -> bool {
-    std::env::var(HANDED_EGRESS_DENY_ALL_OPT_OUT_TOKEN).is_ok_and(|v| {
-        matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    })
+    sessions::egress_deny_all_opt_out_from_raw(
+        std::env::var(HANDED_EGRESS_DENY_ALL_OPT_OUT_TOKEN)
+            .ok()
+            .as_deref(),
+    )
 }
 
 /// A boot token the host put a port on that does not carry one (NET-025):
@@ -1401,12 +1402,14 @@ pub async fn bring_up_root_egress() -> std::io::Result<crate::net::switch::Switc
     // daemon relay carries no gate, so it emits no deprecation notice; its
     // lease is the daemon's own address (NET-084: a frame out of this tap
     // whose source is anything else is rejected at the relay), and the
-    // subnet passed is the one the guest is configured on above.
-    let relay = switch::attach_to_switch_vsock(
+    // subnet passed is the one the guest is configured on above. It carries
+    // the node's DNS layer: every host-address box shares this namespace, so
+    // its lookups to the gateway leave through here and reach upstream only
+    // through that layer (NET-003).
+    let relay = switch::attach_node_to_switch_vsock(
         tap_fd,
         VSOCK_HOST_CID,
         VSOCK_GVPROXY_SHUTTLE_PORT,
-        None,
         ip,
         DEFAULT_SUBNET,
     )

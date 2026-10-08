@@ -49,7 +49,7 @@ unset GCLOUD_STUB_EXISTS GCLOUD_STUB_SMOKED GCLOUD_STUB_RM_ERROR RESTAGE VERSION
 mkdir -p "$root/artifacts" "$root/pkg"
 printf 'fake min\n' >"$root/artifacts/minimal-linux-amd64"
 printf 'fake mip\n' >"$root/artifacts/mip-linux-amd64"
-printf 'fake answerer\n' >"$root/artifacts/min-answerer-linux-amd64"
+printf 'fake answerer\n' >"$root/artifacts/minzoned-linux-amd64"
 printf 'fake deb\n' >"$root/pkg/minimal_0.6.0_amd64.deb"
 
 pass=0 fail=0
@@ -242,25 +242,25 @@ fi
 expect 1 "--extra needs an existing file" "--extra with a missing file fails before anything runs" -- \
     with GCLOUD_STUB_EXISTS=0 -- stage --version 0.6.0 --extra "$root/absent"
 
-# --- min-answerer stages beside min; optional until release.yml ships it -----
+# --- minzoned stages beside min; optional until release.yml ships it -----
 
-# The answerer row: bin/min-answerer beside bin/min on every platform the
+# The answerer row: bin/minzoned beside bin/min on every platform the
 # manifest ships min for, hashed and uploaded with the rest — it is the copy
 # source NET-122's session advisory finds, so a release without it is a
 # release whose advisory cannot offer the host service.
 answerer_out="$(with GCLOUD_STUB_EXISTS=0 -- stage --version 0.6.0 2>&1)"
 answerer_rows="$(printf '%s\n' "$answerer_out" | awk '
-    $1 == "min-answerer" && $2 == "linux" && $3 == "amd64" && $6 == "file" \
-    && $7 == "bin/min-answerer" && $8 == "versions/0.6.0/min-answerer-linux-amd64"')"
+    $1 == "minzoned" && $2 == "linux" && $3 == "amd64" && $6 == "file" \
+    && $7 == "bin/minzoned" && $8 == "versions/0.6.0/minzoned-linux-amd64"')"
 if [ -n "$answerer_rows" ]; then
-    ok "the manifest carries min-answerer as bin/min-answerer beside min, hashed from the artifact"
+    ok "the manifest carries minzoned as bin/minzoned beside min, hashed from the artifact"
 else
-    bad "no min-answerer row in the manifest (out: $answerer_out)"
+    bad "no minzoned row in the manifest (out: $answerer_out)"
 fi
-expect_calls 1 "min-answerer-linux-amd64 .*gs://test-bucket/versions/0.6.0/$" \
+expect_calls 1 "minzoned-linux-amd64 .*gs://test-bucket/versions/0.6.0/$" \
     "the answerer artifact uploads with the others in the one artifact cp"
-if [ -n "$(printf '%s\n' "$answerer_out" | awk '$1 == "min-answerer" && $7 ~ /^lib\//')" ]; then
-    bad "min-answerer must carry no lib/ component on any platform"
+if [ -n "$(printf '%s\n' "$answerer_out" | awk '$1 == "minzoned" && $7 ~ /^lib\//')" ]; then
+    bad "minzoned must carry no lib/ component on any platform"
 else
     ok "the answerer row stages no lib/ component"
 fi
@@ -279,7 +279,7 @@ mkdir -p "$root/artifacts-no-answerer"
 awk -F'|' '/^    "[a-z-]+\|(linux|darwin)\|/ && $4 == "file" {
         sub(/".*$/, "", $6); print $6
     }' "$script" | sort -u | while read -r base; do
-    case "$base" in min-answerer-*) continue ;; esac
+    case "$base" in minzoned-*) continue ;; esac
     printf 'fake %s\n' "$base" >"$root/artifacts-no-answerer/$base"
 done
 : >"$GCLOUD_STUB_ARGS"
@@ -292,10 +292,10 @@ else
     bad "a missing answerer artifact failed the stage (rc=$no_answerer_rc, out: $no_answerer_out)"
 fi
 for plat in linux/amd64 linux/arm64 darwin/arm64; do
-    if [[ "$no_answerer_out" == *"warning: optional artifact missing, omitting min-answerer/$plat:"* ]]; then
-        ok "the stage warns that min-answerer/$plat is omitted"
+    if [[ "$no_answerer_out" == *"warning: optional artifact missing, omitting minzoned/$plat:"* ]]; then
+        ok "the stage warns that minzoned/$plat is omitted"
     else
-        bad "no omission warning for min-answerer/$plat (out: $no_answerer_out)"
+        bad "no omission warning for minzoned/$plat (out: $no_answerer_out)"
     fi
 done
 if [[ "$no_answerer_out" == *"gominimal/inbox#899"* ]]; then
@@ -303,10 +303,10 @@ if [[ "$no_answerer_out" == *"gominimal/inbox#899"* ]]; then
 else
     bad "the warning does not name gominimal/inbox#899 (out: $no_answerer_out)"
 fi
-if [ -z "$(printf '%s\n' "$no_answerer_out" | awk '$1 == "min-answerer" && $6 == "file"')" ]; then
-    ok "the manifest carries no min-answerer row when the artifact is missing"
+if [ -z "$(printf '%s\n' "$no_answerer_out" | awk '$1 == "minzoned" && $6 == "file"')" ]; then
+    ok "the manifest carries no minzoned row when the artifact is missing"
 else
-    bad "the manifest carries a min-answerer row with no artifact behind it (out: $no_answerer_out)"
+    bad "the manifest carries a minzoned row with no artifact behind it (out: $no_answerer_out)"
 fi
 if [ -n "$(printf '%s\n' "$no_answerer_out" | awk '$1 == "minimal" && $2 == "darwin" && $7 == "bin/min"')" ] \
     && [ -n "$(printf '%s\n' "$no_answerer_out" | awk '$1 == "minvmd" && $2 == "linux" && $3 == "arm64"')" ]; then
@@ -316,7 +316,7 @@ else
 fi
 expect_calls 1 "/components gs://test-bucket/versions/0.6.0/components$" \
     "the manifest still uploads when only the answerer is missing"
-expect_calls 0 "min-answerer" "no answerer artifact is uploaded when it is missing"
+expect_calls 0 "minzoned" "no answerer artifact is uploaded when it is missing"
 
 # Every other binary stays required: the same fixture without minvmd's arm64
 # artifact fails the stage naming it.

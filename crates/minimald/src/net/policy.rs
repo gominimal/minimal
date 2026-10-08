@@ -430,6 +430,20 @@ pub async fn remove_ingress(control: &ControlChannel, bound: &[PortForwarder]) {
     }
 }
 
+/// Unbinds one forward and says whether the switch let it go: the fallible
+/// twin of [`remove_ingress`], for a caller that keeps tracking a forward the
+/// switch still holds so a later teardown can retry it. A forward already
+/// revoked is already down.
+pub async fn unexpose_forwarder(
+    control: &ControlChannel,
+    forwarder: &PortForwarder,
+) -> io::Result<()> {
+    if forwarder.is_revoked() {
+        return Ok(());
+    }
+    unexpose_mapping(control, &forwarder.mapping).await
+}
+
 /// Ends the declared ports' forwards in `bound` when their box stops (NET-121)
 /// or when a partial apply rolls back. Who unbinds them depends on the host
 /// ([`ControlChannel::host_unbinds_declared_forwards`]):

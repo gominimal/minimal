@@ -11,6 +11,159 @@ use super::*;
 /// is what makes the forward end with the session instead of outliving it.
 const SESSION_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// What `min net setup` prints when the daemon has no answerer port to point
+/// a command at.
+const NET_SETUP_NO_PORT: &str =
+    "the daemon is not running or has not bound its answerer yet; start a session first";
+
+/// What `min net setup` prints on a host that needs no step.
+const NET_SETUP_NOTHING_TO_RUN: &str =
+    "This host is already set up to resolve boxes by name; there is nothing to run.";
+
+/// `min net setup`: set this host up to resolve and reach boxes by name
+/// (NET-122), an opt-in step a session start only points at. It builds the
+/// privileged script from this host's reads, prints the note saying what
+/// is missing, and runs the script as root with `sudo sh <file>` — the
+/// script's one privilege prompt. With `--print` it prints the script and
+/// runs nothing. With `--undo` the script removes everything the step
+/// installs instead (see [`cmd_net_setup_undo`]).
+///
+/// The answerer port is the one `min ls` reads: each listed VM's own state
+/// from its VM host daemon's control socket (NET-138), else the daemon's
+/// listing. It never starts a daemon: with none reachable, or none that
+/// reports a port, there is no port to point a script at, so it says so
+/// and exits 1.
+pub async fn cmd_net_setup(global: &GlobalArgs, args: NetSetupArgs) -> Result<(), anyhow::Error> {
+    if args.undo {
+        return cmd_net_setup_undo(args.print);
+    }
+    let listings = ls_listings_best_effort(global).await;
+    let mut answerer = None;
+    let mut held_no_channel = None;
+    for listing in &listings {
+        let (port, bound, held) =
+            match crate::cmd::session::vm_host_answerer_status_at(listing.control_sock.clone())
+                .await
+            {
+                Some(status) => {
+                    let read = crate::resolver::host_answerer_read(status).await;
+                    (read.port, read.answerer_bound, read.held_no_channel)
+                }
+                None => (
+                    listing.resp.zone_answerer_port,
+                    listing.resp.answerer_bound,
+                    false,
+                ),
+            };
+        match port {
+            // A port no channel reaches is no daemon's answerer: say that
+            // fact instead of a script, unless another listing reports a
+            // port that answers.
+            Some(port) if held => held_no_channel = held_no_channel.or(Some(port)),
+            Some(port) => {
+                answerer = Some((port, bound));
+                break;
+            }
+            None => {}
+        }
+    }
+    let Some((port, bound)) = answerer else {
+        match held_no_channel {
+            Some(port) => eprintln!("{}", crate::resolver::port_held_no_channel_warning(port)),
+            None => eprintln!("{NET_SETUP_NO_PORT}"),
+        }
+        std::process::exit(1);
+    };
+    let (detection, answerer_step) = crate::cmd::session::advisory_host_reads(global).await;
+    // The range read the live-surface verdict makes, so the note names the
+    // same missing facts the surface line reports.
+    let range_present =
+        crate::resolver::live_name_surface_with_range_at(&detection, Some(port), bound)
+            .await
+            .and_then(|verdict| verdict.range_present);
+    let advisory = crate::resolver::session_advisory_at(
+        &detection,
+        Some(port),
+        false,
+        range_present,
+        &answerer_step,
+    );
+    let Some(advisory) = advisory else {
+        eprintln!("{NET_SETUP_NOTHING_TO_RUN}");
+        return Ok(());
+    };
+    let Some((note, script)) = advisory_command(&advisory) else {
+        // A blocker: the advisory names what stops every script from
+        // reaching host lookups, and there is no script to print or run.
+        eprintln!("{advisory}");
+        std::process::exit(1);
+    };
+    eprintln!("{note}");
+    if args.print {
+        print!("{script}");
+        return Ok(());
+    }
+    // The installed service runs as one operator; replacing another user's
+    // is not this user's call (spec 18's open question on several users).
+    if let Some(refusal) = crate::resolver::other_operator_refusal_on_this_host() {
+        eprintln!("min net setup: {refusal}");
+        std::process::exit(1);
+    }
+    run_as_root(script)
+}
+
+/// `min net setup --undo`: remove everything the setup step installs on
+/// this host (NET-122's removal). The script reads no daemon and needs no
+/// answerer port, so it works with nothing running, and every step of it
+/// tolerates what is already gone, so it succeeds on a clean host. With
+/// `print` it prints the script and runs nothing.
+fn cmd_net_setup_undo(print: bool) -> Result<(), anyhow::Error> {
+    let script = crate::resolver::undo_command();
+    if print {
+        print!("{script}");
+        return Ok(());
+    }
+    run_as_root(&script)
+}
+
+/// Runs a host-setup script as root: written to a private temp file —
+/// created exclusively, mode 0600, so no other user can read or swap it —
+/// and run with `sudo sh <file>`, whose prompt is the one privilege prompt.
+/// The file is removed once the script exits, and the process exits with
+/// the script's status. The script is the one `--print` prints, byte for
+/// byte, so the printed and the run steps cannot diverge.
+fn run_as_root(script: &str) -> Result<(), anyhow::Error> {
+    use std::io::Write as _;
+    let mut file = tempfile::Builder::new()
+        .prefix("min-net-setup-")
+        .suffix(".sh")
+        .tempfile()
+        .context("min net setup: could not create a private file for the setup script")?;
+    file.write_all(script.as_bytes())
+        .and_then(|()| file.flush())
+        .context("min net setup: could not write the setup script")?;
+    let status = std::process::Command::new("sudo")
+        .arg("sh")
+        .arg(file.path())
+        .status()
+        .context("min net setup: could not start sudo to run the setup script")?;
+    // Removed before the exit below, which runs no destructor.
+    file.close()
+        .context("min net setup: could not remove the setup script")?;
+    if !status.success() {
+        std::process::exit(status.code().unwrap_or(1));
+    }
+    Ok(())
+}
+
+/// An advisory split into its note line and the script it names: the note
+/// is the first line, the script the rest, starting at its `#!/bin/sh`.
+/// `None` for an advisory with no script, a blocker.
+fn advisory_command(advisory: &str) -> Option<(&str, &str)> {
+    let (note, script) = advisory.split_once('\n')?;
+    script.starts_with("#!/bin/sh").then_some((note, script))
+}
+
 /// `min net forward <SESSION> <LOCAL>:<PORT>`: bind `localhost:<LOCAL>` and
 /// relay every accepted connection over the session's SSH channel to
 /// `127.0.0.1:<PORT>` inside the box.
@@ -84,10 +237,15 @@ pub async fn cmd_net_forward(
     let session_id = record.id;
     let mut relays: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     let mut poll = tokio::time::interval(SESSION_POLL_INTERVAL);
+    // Registered once, outside the loop: a fresh `ctrl_c()` per iteration
+    // leaves a window between arms where no listener is installed, so a
+    // SIGINT landing there is dropped.
+    let ctrl_c = tokio::signal::ctrl_c();
+    tokio::pin!(ctrl_c);
     loop {
         tokio::select! {
             // Ctrl-C is the manual half of the forward's lifecycle.
-            _ = tokio::signal::ctrl_c() => break,
+            _ = &mut ctrl_c => break,
 
             // The other half: a session that is gone — destroyed, or lost
             // with its daemon — ends the forward rather than leaving a
@@ -213,4 +371,29 @@ async fn relay(
         tracing::warn!(local_port, box_port, %peer, error = %e, "forward connection failed");
     }
     tracing::info!(local_port, box_port, %peer, "forward connection closed");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// NET-122: `min net setup` runs, and `--print` prints, exactly the
+    /// script the advisory names: everything after the note line, from its
+    /// `#!/bin/sh`, byte for byte, so a script's heredoc bodies reach the
+    /// root shell as rendered. A blocker names no script, so there is
+    /// nothing to print or run.
+    #[test]
+    fn net_setup_runs_the_advisory_script() {
+        let script = "#!/bin/sh\n# Configure the host's resolver.\nset -eu\n\
+                      cat > /x <<\\EOF\nbody line\nEOF\nchmod 0755 /x\n";
+        let advisory = format!("note: the range is missing.\n{script}");
+        let (note, split) = advisory_command(&advisory).unwrap();
+        assert_eq!(note, "note: the range is missing.");
+        assert_eq!(split, script);
+        assert_eq!(
+            advisory_command("note: host lookups bypass the resolver."),
+            None
+        );
+        assert_eq!(advisory_command("note: one.\nnot a script"), None);
+    }
 }

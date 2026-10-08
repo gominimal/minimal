@@ -160,7 +160,7 @@ MOCKEOF
 printf 'linux-amd64-minimald-body\n'     >"$mock/versions/v1/minimald-linux-amd64"
 write_min_stub "$mock/versions/v1/minimal-linux-amd64"  linux-amd64
 # The answerer NET-122's advisory copies from beside min (NET-122).
-printf 'linux-amd64-answerer-body\n'    >"$mock/versions/v1/min-answerer-linux-amd64"
+printf 'linux-amd64-answerer-body\n'    >"$mock/versions/v1/minzoned-linux-amd64"
 printf 'linux-amd64-minvmd-body\n'       >"$mock/versions/v1/minvmd-linux-amd64"
 printf 'linux-amd64-initramfs-body\n'   >"$mock/versions/v1/initramfs-amd64.cpio"
 printf 'linux-amd64-rootfs-body\n'      >"$mock/versions/v1/rootfs-amd64.img"
@@ -172,7 +172,7 @@ printf 'mock-gvproxy-switch-body\n'      >"$mock/versions/v1/gvproxy-min-linux-a
 # Linux arm64 release artifacts, including the VM stack (NET-050).
 printf 'linux-arm64-minimald-body\n'    >"$mock/versions/v1/minimald-linux-arm64"
 write_min_stub "$mock/versions/v1/minimal-linux-arm64" linux-arm64
-printf 'linux-arm64-answerer-body\n'    >"$mock/versions/v1/min-answerer-linux-arm64"
+printf 'linux-arm64-answerer-body\n'    >"$mock/versions/v1/minzoned-linux-arm64"
 printf 'linux-arm64-minvmd-body\n'      >"$mock/versions/v1/minvmd-linux-arm64"
 printf 'linux-arm64-initramfs-body\n'    >"$mock/versions/v1/initramfs-arm64.cpio"
 printf 'linux-arm64-rootfs-body\n'       >"$mock/versions/v1/rootfs-arm64.img"
@@ -182,7 +182,7 @@ printf 'mock-gvproxy-switch-arm64-body\n' >"$mock/versions/v1/gvproxy-min-linux-
 # macOS arm64 guest payload (kept distinct from the linux arm64 rootfs so each
 # architecture is exercised with its own artifact and hash).
 write_min_stub "$mock/versions/v1/minimal-darwin-arm64" darwin-arm64
-printf 'darwin-arm64-answerer-body\n'    >"$mock/versions/v1/min-answerer-macos-arm64"
+printf 'darwin-arm64-answerer-body\n'    >"$mock/versions/v1/minzoned-macos-arm64"
 printf 'darwin-arm64-rootfs-body\n'      >"$mock/versions/v1/rootfs-darwin-arm64.img"
 
 # AppArmor components: noarch text (the loader is a runnable stub here), shipped
@@ -194,7 +194,7 @@ printf '#!/bin/sh\n# mock apparmor loader\n' >"$mock/versions/v1/install-apparmo
 # Hashes for every artifact referenced by the component table below.
 h_minimald="$(hash_file "$mock/versions/v1/minimald-linux-amd64")"
 h_minimal="$(hash_file "$mock/versions/v1/minimal-linux-amd64")"
-h_answerer="$(hash_file "$mock/versions/v1/min-answerer-linux-amd64")"
+h_answerer="$(hash_file "$mock/versions/v1/minzoned-linux-amd64")"
 h_minvmd="$(hash_file "$mock/versions/v1/minvmd-linux-amd64")"
 h_initramfs="$(hash_file "$mock/versions/v1/initramfs-amd64.cpio")"
 h_rootfs="$(hash_file "$mock/versions/v1/rootfs-amd64.img")"
@@ -203,7 +203,7 @@ h_gvmin="$(hash_file "$mock/versions/v1/gvproxy-min-linux-amd64")"
 
 h_minimald_arm="$(hash_file "$mock/versions/v1/minimald-linux-arm64")"
 h_minimal_arm="$(hash_file "$mock/versions/v1/minimal-linux-arm64")"
-h_answerer_arm="$(hash_file "$mock/versions/v1/min-answerer-linux-arm64")"
+h_answerer_arm="$(hash_file "$mock/versions/v1/minzoned-linux-arm64")"
 h_minvmd_arm="$(hash_file "$mock/versions/v1/minvmd-linux-arm64")"
 h_initramfs_arm="$(hash_file "$mock/versions/v1/initramfs-arm64.cpio")"
 h_rootfs_arm="$(hash_file "$mock/versions/v1/rootfs-arm64.img")"
@@ -211,7 +211,7 @@ h_vmlinuz_arm="$(hash_file "$mock/versions/v1/vmlinuz-arm64")"
 h_gvmin_arm="$(hash_file "$mock/versions/v1/gvproxy-min-linux-arm64")"
 
 h_dmin="$(hash_file "$mock/versions/v1/minimal-darwin-arm64")"
-h_danswerer="$(hash_file "$mock/versions/v1/min-answerer-macos-arm64")"
+h_danswerer="$(hash_file "$mock/versions/v1/minzoned-macos-arm64")"
 h_drootfs="$(hash_file "$mock/versions/v1/rootfs-darwin-arm64.img")"
 
 h_aaprof="$(hash_file "$mock/versions/v1/minimald.apparmor")"
@@ -234,7 +234,7 @@ write_manifest() {
         # The answerer installs beside min on every platform min ships for
         # (NET-122); the installed copy is only the advisory's copy source.
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
-            min-answerer linux amd64 v1 "$h_answerer" file bin/min-answerer versions/v1/min-answerer-linux-amd64
+            minzoned linux amd64 v1 "$h_answerer" file bin/minzoned versions/v1/minzoned-linux-amd64
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
             gvproxy-min linux amd64 v1 "$h_gvmin" file bin/gvproxy-min versions/v1/gvproxy-min-linux-amd64
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
@@ -251,7 +251,7 @@ write_manifest() {
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
             minimal linux arm64 v1 "$h_minimal_arm" file bin/min versions/v1/minimal-linux-arm64
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
-            min-answerer linux arm64 v1 "$h_answerer_arm" file bin/min-answerer versions/v1/min-answerer-linux-arm64
+            minzoned linux arm64 v1 "$h_answerer_arm" file bin/minzoned versions/v1/minzoned-linux-arm64
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
             gvproxy-min linux arm64 v1 "$h_gvmin_arm" file bin/gvproxy-min versions/v1/gvproxy-min-linux-arm64
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
@@ -266,7 +266,7 @@ write_manifest() {
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
             minimal darwin arm64 v1 "$h_dmin" file bin/min versions/v1/minimal-darwin-arm64
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
-            min-answerer darwin arm64 v1 "$h_danswerer" file bin/min-answerer versions/v1/min-answerer-macos-arm64
+            minzoned darwin arm64 v1 "$h_danswerer" file bin/minzoned versions/v1/minzoned-macos-arm64
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
             rootfs darwin arm64 v1 "$h_drootfs" file data/rootfs.img versions/v1/rootfs-darwin-arm64.img
         # AppArmor support files ship to every Linux arch.
@@ -381,6 +381,11 @@ TEST_SHELL=
 USERNS_SYSCTL=
 APPARMOR_DIR=
 
+# Root the installer looks under for the host paths `min net setup` installs.
+# Empty points it at a nonexistent directory, so this host's own setup never
+# leaks into a scenario; scenarios seed a fake root to drive the offer.
+NET_SETUP_ROOT=
+
 # Bin prefix the installer sees. Empty means the harness default ($hp/bin — a
 # custom MINIMAL_BIN, NOT one of the AppArmor tunable's stock attachment
 # paths); scenarios set it to $hp/.local/bin to exercise the default-prefix
@@ -416,6 +421,7 @@ run() {
         STUB_UNAME_M="$PLAT_M" \
         MINIMAL_OVERRIDE_USERNS_SYSCTL="${USERNS_SYSCTL:-$root/no-such-sysctl}" \
         MINIMAL_OVERRIDE_APPARMOR_DIR="${APPARMOR_DIR:-$root/no-such-apparmor.d}" \
+        MINIMAL_OVERRIDE_NET_SETUP_ROOT="${NET_SETUP_ROOT:-$root/no-such-net-setup-root}" \
         MINIMAL_OVERRIDE_TTY="${TTY_FILE:-$root/no-such-tty}" \
         MINIMAL_INSTALL_FORCE_STOP="${FORCE_STOP:-}" \
         "$SH" "$installer" "$@" </dev/null >"$OUT" 2>&1
@@ -574,6 +580,41 @@ case_apparmor_uninstall() {
         test -f "$fake_aa/minimald"
     want_err "uninstall removed the shipped apparmor loader" \
         test -e "$HAA_U/xdg-data/minimal/apparmor/install-apparmor-profile.sh"
+}
+
+case_net_setup_uninstall() {
+    # --- Uninstall: advise removing the host DNS setup (min net setup) ----------
+    # A non-interactive uninstall on a host where `min net setup` ran advises
+    # `min net setup --undo` and the root commands that stay valid once `min` is
+    # gone, and never elevates: the seeded host files survive. A host that never
+    # ran the step sees nothing.
+    HNS="$root/hns"; mkdir -p "$HNS"
+    run ns_seed "$HNS"
+    check 0 "$rc" "uninstall-net-setup seed install exits 0"
+    fake_ns="$root/fake-net-setup-root"
+    case "$PLAT_S" in
+        Darwin) ns_file="$fake_ns/etc/resolver/min.internal" ;;
+        *)      ns_file="$fake_ns/etc/systemd/system/minzoned.service" ;;
+    esac
+    mkdir -p "$(dirname "$ns_file")"
+    printf 'unit\n' >"$ns_file"
+    NET_SETUP_ROOT="$fake_ns"
+    run ns_run "$HNS" --uninstall
+    NET_SETUP_ROOT=
+    check 0 "$rc" "uninstall with the host DNS setup present exits 0"
+    want_ok "uninstall advises the host DNS setup is still installed" \
+        grep -q "host DNS setup from min net setup is still installed" "$OUT"
+    want_ok "advisory names min net setup --undo" grep -q "min net setup --undo" "$OUT"
+    want_ok "advisory gives the root removal commands" grep -q "sudo " "$OUT"
+    want_ok "non-interactive uninstall never elevates (host file survives)" \
+        test -f "$ns_file"
+
+    HNS2="$root/hns2"; mkdir -p "$HNS2"
+    run ns2_seed "$HNS2"
+    run ns2_run "$HNS2" --uninstall
+    check 0 "$rc" "uninstall on a host without the setup exits 0"
+    want_err "a host that never ran min net setup sees no advisory" \
+        grep -q "min net setup" "$OUT"
 }
 
 case_checksum_mismatch() {
@@ -2073,16 +2114,16 @@ case_answerer_source_installed() {
     H_A1="$root/h_ans_amd64"; mkdir -p "$H_A1"
     run ans_amd64_install "$H_A1"
     check 0 "$rc" "amd64 install with the answerer row exits 0"
-    want_ok "amd64: the answerer installs beside min" test -f "$H_A1/bin/min-answerer"
+    want_ok "amd64: the answerer installs beside min" test -f "$H_A1/bin/minzoned"
     want_ok "amd64: beside the installed min itself" test -f "$H_A1/bin/min"
-    want_ok "amd64: the answerer is executable like every bin row" test -x "$H_A1/bin/min-answerer"
-    check "$h_answerer" "$(hash_file "$H_A1/bin/min-answerer")" \
+    want_ok "amd64: the answerer is executable like every bin row" test -x "$H_A1/bin/minzoned"
+    check "$h_answerer" "$(hash_file "$H_A1/bin/minzoned")" \
         "amd64: installed answerer matches the manifest hash"
     want_ok "amd64: the installer printed the answerer status" \
-        grep -qE "^  min-answerer +(installed|current)" "$OUT"
+        grep -qE "^  minzoned +(installed|current)" "$OUT"
     _rec="$H_A1/xdg-state/minimal/installed"
     want_ok "amd64: the answerer is recorded at its user-prefix path" \
-        record_has min-answerer "$H_A1/bin/min-answerer" "$_rec"
+        record_has minzoned "$H_A1/bin/minzoned" "$_rec"
     # The installed copy is only the copy source: no unit or plist was
     # written, and no record row names a service-manager path or the
     # root-owned program path.
@@ -2091,20 +2132,20 @@ case_answerer_source_installed() {
         sh -c 'find "$1" \( -name "*.plist" -o -name "*.service" -o -name "*.socket" \) -print | grep -q .' sh "$H_A1"
     # shellcheck disable=SC2016  # $2 is awk's second field, not a shell parameter
     want_ok "no record row names a unit, plist, or root-owned answerer path" \
-        awk '$2 ~ /(systemd|launchd|PrivilegedHelperTools|zone-answerer)/ {bad=1} END{exit bad ? 1 : 0}' "$_rec"
+        awk '$2 ~ /(systemd|launchd|PrivilegedHelperTools|lib\/minimal\/minzoned|dev\.gominimal\.zone)/ {bad=1} END{exit bad ? 1 : 0}' "$_rec"
 
     # An upgrade replaces it like the other binaries: a new release's answerer
     # bytes alone re-download and land.
-    printf 'linux-amd64-answerer-body-v2\n' >"$mock/versions/v1/min-answerer-linux-amd64-v2"
-    h_answerer2="$(hash_file "$mock/versions/v1/min-answerer-linux-amd64-v2")"
+    printf 'linux-amd64-answerer-body-v2\n' >"$mock/versions/v1/minzoned-linux-amd64-v2"
+    h_answerer2="$(hash_file "$mock/versions/v1/minzoned-linux-amd64-v2")"
     awk -v h="$h_answerer2" \
-        '$1=="min-answerer" && $2=="linux" && $3=="amd64" {$5=h; $8="versions/v1/min-answerer-linux-amd64-v2"} {print}' \
+        '$1=="minzoned" && $2=="linux" && $3=="amd64" {$5=h; $8="versions/v1/minzoned-linux-amd64-v2"} {print}' \
         "$root/good-components" >"$mock/versions/v1/components"
     reset_dl
     run ans_amd64_upgrade "$H_A1"
     check 0 "$rc" "answerer upgrade install exits 0"
     check 1 "$(downloads)" "a new manifest hash re-downloads the answerer alone"
-    check "$h_answerer2" "$(hash_file "$H_A1/bin/min-answerer")" \
+    check "$h_answerer2" "$(hash_file "$H_A1/bin/minzoned")" \
         "the upgraded answerer replaced the installed copy"
     cp "$root/good-components" "$mock/versions/v1/components"   # restore
 
@@ -2113,7 +2154,7 @@ case_answerer_source_installed() {
     H_A2="$root/h_ans_arm64"; mkdir -p "$H_A2"
     run ans_arm64_install "$H_A2"
     check 0 "$rc" "arm64 install with the answerer row exits 0"
-    check "$h_answerer_arm" "$(hash_file "$H_A2/bin/min-answerer")" \
+    check "$h_answerer_arm" "$(hash_file "$H_A2/bin/minzoned")" \
         "arm64: the answerer installs beside min"
     PLAT_M=x86_64
 
@@ -2124,11 +2165,11 @@ case_answerer_source_installed() {
     H_A3="$root/h_ans_darwin"; mkdir -p "$H_A3"
     run ans_darwin_install "$H_A3"
     check 0 "$rc" "darwin install with the answerer row exits 0"
-    want_ok "darwin: the answerer installs beside min" test -f "$H_A3/bin/min-answerer"
+    want_ok "darwin: the answerer installs beside min" test -f "$H_A3/bin/minzoned"
     want_ok "darwin: quarantine stripped from the answerer bin (xattr)" \
-        grep -q "/bin/min-answerer\.tmp" "$root/xattr.calls"
+        grep -q "/bin/minzoned\.tmp" "$root/xattr.calls"
     want_ok "darwin: the answerer is recorded at its user-prefix path" \
-        record_has min-answerer "$H_A3/bin/min-answerer" "$H_A3/xdg-state/minimal/installed"
+        record_has minzoned "$H_A3/bin/minzoned" "$H_A3/xdg-state/minimal/installed"
     PLAT_S=Linux; PLAT_M=x86_64
 }
 
@@ -2143,6 +2184,7 @@ case_for() {
         install)                            case_install ;;
         apparmor)                           case_apparmor ;;
         apparmor_uninstall)                 case_apparmor_uninstall ;;
+        net_setup_uninstall)                case_net_setup_uninstall ;;
         checksum_mismatch)                  case_checksum_mismatch ;;
         target_validation)                  case_target_validation ;;
         prefix_resolution)                  case_prefix_resolution ;;
@@ -2165,7 +2207,7 @@ case_for() {
 }
 case "${1:-}" in
     "")
-        for _c in install apparmor apparmor_uninstall checksum_mismatch \
+        for _c in install apparmor apparmor_uninstall net_setup_uninstall checksum_mismatch \
             target_validation prefix_resolution install_record daemon_stop \
             shell_integration darwin_dequarantine uninstall \
             gvproxy_rename_migration installer_switch_binary_executable \

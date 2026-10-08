@@ -79,9 +79,12 @@
 //! check cannot tell the activating client's registrations apart from
 //! another process running as the same user. If box rows ever have to
 //! come only from the host-side creator, a per-boot token minted by that
-//! creator is the pattern to use; this socket does not build one. Requests
-//! are served serially, one connection at a time, each read bounded by a
-//! 30-second timeout. That is what v1 ships, not a design endpoint.
+//! creator is the pattern to use; this socket does not build one. Each
+//! connection is served on a thread of its own, so the accept loop never
+//! blocks on a read: a connection that opens and never sends a line holds
+//! only its own thread, bounded by a 30-second read timeout, while every
+//! other request is accepted and served behind it. That is what v1 ships,
+//! not a design endpoint.
 //!
 //! A box whose row is gone — never registered, or withdrawn at destroy —
 //! is dropped by the gate's unregistered rule unconditionally (NET-085);
@@ -101,7 +104,7 @@ use std::time::Duration;
 use minimald_rpc::{
     AdmitPortRequest, BoxAddresses, BoxControlReply, BoxControlRequest, BoxRow, IpProto,
     PortReportSource, ProxyDownCause, ReadRowRequest, RegisterBoxRequest, RegisteredBox,
-    WithdrawBoxRequest, WithdrawPortRequest, ZoneAnswererStatus,
+    WithdrawBoxRequest, WithdrawPortRequest,
 };
 
 use crate::box_registry::{BoxRegistry, ClientBoxSpec};
@@ -168,17 +171,35 @@ enum ControlDoor {
     GuestReports,
 }
 
+impl ControlDoor {
+    /// The door's name as a log line names it.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Host => "host control",
+            Self::GuestReports => "guest reports",
+        }
+    }
+
+    /// The door's own connection-cap warn stamp.
+    fn cap_warned(self) -> &'static Mutex<Option<std::time::Instant>> {
+        match self {
+            Self::Host => &HOST_CONTROL_CAP_WARNED,
+            Self::GuestReports => &GUEST_REPORTS_CAP_WARNED,
+        }
+    }
+}
+
 /// How long the server waits for a registration's one request line before
 /// dropping the connection. Generous against a slow starter; a hung client
-/// must not pin the serving thread — connections are served one at a
-/// time — forever.
+/// must not pin its connection's thread, and the door slot it holds,
+/// forever.
 const REGISTER_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long the guest door waits for the in-VM daemon to close its end
 /// after its reply is written. The wait is the G-N8 workaround's other
 /// half, so the bound only ends a client that read its reply and never
-/// closed: a wedged reporter cannot pin the door's serial accept loop the
-/// way an honest one never does.
+/// closed: a wedged reporter cannot pin its connection's thread, and the
+/// door slot it holds, the way an honest one never does.
 const GUEST_REPORT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The largest request line the server will read. A registration carries a
@@ -427,15 +448,15 @@ impl ProxyPublishStatus {
         }
     }
 
-    /// The status to serve the read-only verb with: the proxy-down cause
-    /// when the supervisor wrote one, or `None` to let the answerer's state
-    /// answer as it always did.
-    pub(crate) fn down(&self) -> Option<ZoneAnswererStatus> {
+    /// The proxy-down fact to serve beside the read-only verb's answer
+    /// (T93): the port and the cause the supervisor wrote, for the reply
+    /// to carry next to the answerer's own state — or `None`, to let the
+    /// answerer's state answer alone as it always did.
+    pub(crate) fn down(&self) -> Option<(u16, ProxyDownCause)> {
         self.0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
-            .map(|(port, cause)| ZoneAnswererStatus::ProxyNotServing { port, cause })
     }
 }
 
@@ -493,6 +514,7 @@ pub fn spawn(
                 proxy_publish,
                 ControlDoor::Host,
                 &audit_path,
+                MAX_CONTROL_CONNECTIONS,
             )
         })
 }
@@ -507,8 +529,9 @@ pub fn spawn(
 /// The door is the port reports' alone: the admit-port and withdraw-port
 /// verbs answer on it and nothing else does, so the grant a row's
 /// registration holds — never the peer, whose uid the socket posture
-/// already gates — decides what a report records. It serves one connection
-/// at a time on its own thread beside the host socket's thread, and never
+/// already gates — decides what a report records. Its accept loop runs on
+/// its own thread beside the host socket's, each connection on a thread of
+/// its own, and it never
 /// closes a connection first: after its reply is written it waits for the
 /// reporter's close, because the KVM shuttle drops a server-initiated
 /// close's still-buffered reply bytes on the way to the guest (G-N8).
@@ -552,6 +575,7 @@ pub fn spawn_guest_reports_door(
                 proxy_publish,
                 ControlDoor::GuestReports,
                 &audit_path,
+                MAX_CONTROL_CONNECTIONS,
             )
         })
         // The door's bound path is the handle the caller pairs with the
@@ -559,12 +583,24 @@ pub fn spawn_guest_reports_door(
         .map(|_| sock_path)
 }
 
-/// Accept and serve box control requests until the daemon exits. One
-/// connection at a time per door: a request is a row's map write or
-/// removal, served serially so the table sees its requests in arrival
-/// order — and the status and row reads ride the same serial turn. The
-/// two doors are served on two threads, so a report the grant refuses
-/// never waits behind a registration.
+/// Accept and serve box control requests until the daemon exits. The
+/// accept loop never blocks on a read: each connection is handed to a
+/// thread of its own, so a connection that opens and never sends a line
+/// holds only that thread, while every other request is accepted and
+/// served behind it. The two doors are served on two threads, so a report
+/// the grant refuses never waits behind a registration.
+///
+/// At most `cap` connection threads live at once per door: past it a
+/// connection is refused on the accept loop's own turn, before any thread
+/// is spawned, so a peer that opens connections in a loop cannot grow
+/// threads without limit. A slot is freed when its connection's thread
+/// ends. Each door has its own gauge and its own [`ApplyOrder`]: a guest
+/// flooding its report door fills the guest door's slots, never the host's.
+///
+/// The connections are served concurrently, but each door's mutations
+/// apply one at a time, in the order their requests were read and
+/// validated ([`ApplyOrder`]): the read, the ask hand-off and the guest
+/// door's drain stay concurrent, and only the registry write takes turns.
 fn accept_loop(
     listener: UnixListener,
     boxes: BoxRegistry,
@@ -572,14 +608,53 @@ fn accept_loop(
     proxy_publish: ProxyPublishStatus,
     door: ControlDoor,
     audit_path: &Path,
+    cap: usize,
 ) {
+    let connections = Arc::new(crate::box_registry::ConnectionGauge::default());
+    let order = Arc::new(ApplyOrder::default());
     for stream in listener.incoming() {
         match stream {
-            Ok(stream) => {
-                if let Err(error) =
-                    serve_connection(stream, &boxes, &answerer, &proxy_publish, door, audit_path)
+            Ok(mut stream) => {
+                let Some(slot) = connections.try_acquire(cap) else {
+                    // The refusal is written and the connection closed on
+                    // the accept loop's own turn, without reading the
+                    // request line or draining: either would block the
+                    // loop. The reply is best-effort: a client whose write
+                    // lands after the close sees a broken pipe, and on the
+                    // guest door the KVM shuttle can drop the buffered
+                    // reply of a server-initiated close (G-N8), so the
+                    // in-VM daemon may read a bare EOF. The connection is
+                    // refused either way.
+                    if let Err(error) =
+                        refuse_past_cap(&mut stream, "control", door.name(), cap, door.cap_warned())
+                    {
+                        tracing::debug!(%error, "could not write the control-cap refusal");
+                    }
+                    continue;
+                };
+                let boxes = boxes.clone();
+                let answerer = answerer.clone();
+                let proxy_publish = proxy_publish.clone();
+                let audit_path = audit_path.to_path_buf();
+                let order = Arc::clone(&order);
+                if let Err(error) = std::thread::Builder::new()
+                    .name("minvmd-control-conn".to_string())
+                    .spawn(move || {
+                        let _slot = slot;
+                        if let Err(error) = serve_connection(
+                            stream,
+                            &boxes,
+                            &answerer,
+                            &proxy_publish,
+                            door,
+                            &audit_path,
+                            &order,
+                        ) {
+                            tracing::debug!(error = %error, "box control connection failed");
+                        }
+                    })
                 {
-                    tracing::debug!(error = %error, "box control connection failed");
+                    tracing::debug!(error = %error, "could not start a box control connection thread");
                 }
             }
             Err(error) => tracing::debug!(error = %error, "control socket accept failed"),
@@ -595,6 +670,7 @@ fn serve_connection(
     proxy_publish: &ProxyPublishStatus,
     door: ControlDoor,
     audit_path: &Path,
+    order: &Arc<ApplyOrder>,
 ) -> std::io::Result<()> {
     let mut stream = stream;
     stream.set_read_timeout(Some(REGISTER_READ_TIMEOUT))?;
@@ -646,18 +722,45 @@ fn serve_connection(
     }
     // The ask verbs hold their connection open for as long as the ask or
     // the subscription lives (NET-045), so each runs on a thread of its
-    // own: a door serves its other connections one at a time, and an ask
-    // waiting on a human must not hold a report or a registration behind
-    // it.
+    // own under its kind's cap, freeing this connection's door slot at
+    // once: an ask waiting on a human must not hold a slot a report or a
+    // registration needs.
     //
     // Each kind is capped ([`MAX_GUEST_ASK_CONNECTIONS`],
     // [`MAX_ASK_SUBSCRIPTIONS`]): past the cap the connection is refused on
     // this door's own turn, before any thread is spawned, so a guest that
     // opens asks in a loop cannot grow threads without limit. The first
-    // request line is read under [`REGISTER_READ_TIMEOUT`] before any of
-    // this, so a connection that never sends one costs no thread at all.
+    // request line is read under [`REGISTER_READ_TIMEOUT`] on this
+    // connection's own thread, so a connection that never sends one holds
+    // only that thread, never the accept loop.
     let gauges = boxes.ask_gauges();
     let served = match (&request, door) {
+        // A held registration keeps its connection as the row's lease until
+        // its client commits it, so it too runs on a thread of its own under
+        // its kind's cap ([`MAX_REGISTRATION_LEASES`]), freeing this door's
+        // slot once the reply is written; past the cap the registration is
+        // refused before anything is allocated.
+        (BoxControlRequest::Register(register), ControlDoor::Host) if register.hold => {
+            match gauges.leases.try_acquire(gauges.lease_cap()) {
+                Some(slot) => {
+                    return serve_held_registration(
+                        stream,
+                        boxes,
+                        answerer,
+                        order,
+                        register.clone(),
+                        slot,
+                    );
+                }
+                None => refuse_past_cap(
+                    &mut stream,
+                    "registration lease",
+                    door.name(),
+                    gauges.lease_cap(),
+                    &LEASE_CAP_WARNED,
+                ),
+            }
+        }
         (BoxControlRequest::AdmitAsk(ask), ControlDoor::GuestReports) => {
             let ask = *ask;
             match gauges.guest_asks.try_acquire(gauges.guest_ask_cap()) {
@@ -673,7 +776,13 @@ fn serve_connection(
                         },
                     );
                 }
-                None => refuse_past_ask_cap(&mut stream, "guest ask", gauges.guest_ask_cap()),
+                None => refuse_past_cap(
+                    &mut stream,
+                    "guest ask",
+                    door.name(),
+                    gauges.guest_ask_cap(),
+                    &ASK_CAP_WARNED,
+                ),
             }
         }
         (BoxControlRequest::SubscribeAsks(subscribe), ControlDoor::Host) => {
@@ -691,9 +800,13 @@ fn serve_connection(
                         },
                     );
                 }
-                None => {
-                    refuse_past_ask_cap(&mut stream, "ask subscription", gauges.subscription_cap())
-                }
+                None => refuse_past_cap(
+                    &mut stream,
+                    "ask subscription",
+                    door.name(),
+                    gauges.subscription_cap(),
+                    &ASK_CAP_WARNED,
+                ),
             }
         }
         _ => serve_request(
@@ -703,6 +816,7 @@ fn serve_connection(
             proxy_publish,
             door,
             audit_path,
+            order,
             request,
         ),
     };
@@ -723,13 +837,13 @@ fn serve_connection(
 /// Wait for the peer's close on a guest-door connection whose reply was
 /// already written: read until EOF — the reporter closing its end, which
 /// it does once it has the reply — or until the drain bound ends a client
-/// that never closes, so a wedged reporter cannot pin the door's serial
-/// accept loop. Bytes past the request line, if any, are discarded: the
+/// that never closes, so a wedged reporter cannot pin its connection's
+/// thread and door slot. Bytes past the request line, if any, are discarded: the
 /// door's protocol is one line each way.
 fn drain_until_peer_closes(stream: &mut UnixStream) {
     if let Err(error) = stream.set_read_timeout(Some(GUEST_REPORT_DRAIN_TIMEOUT)) {
-        // Without the bound a reporter that never closes would pin the
-        // door's serial accept loop, so a timeout that cannot be set ends
+        // Without the bound a reporter that never closes would pin its
+        // connection's thread and door slot, so a timeout that cannot be set ends
         // the drain here: the reply is already written, and the peer's
         // close ends the connection all the same.
         tracing::debug!(error = %error, "the guest report drain could not arm its bound");
@@ -780,6 +894,10 @@ fn root_may_ask(request: &BoxControlRequest) -> bool {
 /// registration holds decides. A verb on the wrong door is refused with
 /// its reason — never parsed into the other door's posture, because the
 /// peer a door serves is exactly what the verb decides what it may do.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the door's shared state, passed through as serve_connection holds it"
+)]
 fn serve_request(
     stream: &mut UnixStream,
     boxes: &BoxRegistry,
@@ -787,38 +905,63 @@ fn serve_request(
     proxy_publish: &ProxyPublishStatus,
     door: ControlDoor,
     audit_path: &Path,
+    order: &Arc<ApplyOrder>,
     request: BoxControlRequest,
 ) -> std::io::Result<()> {
+    // The mutating verbs apply in their door's order ([`ApplyOrder`]): each
+    // takes its ticket here, after its line was read, parsed and its door
+    // checked, applies in its turn, and writes its reply once the turn has
+    // ended. The read-only verbs and the answerer handover take no ticket.
     match (request, door) {
         (BoxControlRequest::Register(request), ControlDoor::Host) => {
-            register_and_reply(stream, boxes, answerer, request)
+            let reply = registration_reply(boxes, answerer, order, request);
+            write_reply(stream, &reply)
         }
         (BoxControlRequest::Withdraw(request), ControlDoor::Host) => {
-            withdraw_and_reply(stream, boxes, answerer, request)
+            let reply = order.apply(|| withdraw_box(boxes, answerer, request));
+            write_reply(stream, &reply)
+        }
+        // The hold and its release take a ticket like the verbs they
+        // bracket: each changes the table the answerer answers from, so
+        // each publishes in its own turn, never mid-fold.
+        (BoxControlRequest::HoldBoxName(request), ControlDoor::Host) => {
+            let reply = order.apply(|| hold_box_name(boxes, &request.name, request.session_id));
+            write_reply(stream, &reply)
+        }
+        (BoxControlRequest::ReleaseBoxName(request), ControlDoor::Host) => {
+            let reply = order.apply(|| release_box_name(boxes, &request.name, request.session_id));
+            write_reply(stream, &reply)
         }
         (BoxControlRequest::AnswererStatus, ControlDoor::Host) => {
-            // The read-only status answers the host facts the CLI's
-            // surfaces read (T93): why the hostname proxy is not serving
-            // when the supervisor reached a cause that names it, and
-            // otherwise the answerer's state as it always did — the
-            // proxy-down cause is the exception, not a new shape.
-            let reply = match proxy_publish.down() {
-                Some(status) => BoxControlReply::Status(status),
-                None => BoxControlReply::Status(answerer.get()),
-            };
+            // The read-only status answers both host facts the CLI's
+            // surfaces read (T93): the answerer's own state, always —
+            // never substituted away — and beside it, when the supervisor
+            // reached one, the cause that names why the hostname proxy
+            // is not serving. Two facts, one reply: the answerer's state
+            // decides the zone-answerer row and the native-DNS probe,
+            // the sibling cause the proxy's own line.
+            let reply = BoxControlReply::Status(minimald_rpc::AnswererStatusReply {
+                answerer: answerer.get(),
+                proxy_down: proxy_publish
+                    .down()
+                    .map(|(port, cause)| minimald_rpc::ProxyDown { port, cause }),
+            });
             write_reply(stream, &reply)
         }
         (BoxControlRequest::ReadRow(request), ControlDoor::Host) => {
             read_row_and_reply(stream, boxes, request)
         }
         (BoxControlRequest::RecordAskAnswer(request), ControlDoor::Host) => {
-            record_ask_answer_and_reply(stream, boxes, audit_path, request)
+            let reply = order.apply(|| record_ask_answer(boxes, audit_path, request));
+            write_reply(stream, &reply)
         }
         (BoxControlRequest::AdmitPort(request), ControlDoor::GuestReports) => {
-            admit_report_and_reply(stream, boxes, audit_path, request)
+            let reply = order.apply(|| admit_report(boxes, audit_path, &request));
+            write_reply(stream, &reply)
         }
         (BoxControlRequest::WithdrawPort(request), ControlDoor::GuestReports) => {
-            withdraw_report_and_reply(stream, boxes, request)
+            let reply = order.apply(|| withdraw_report(boxes, &request));
+            write_reply(stream, &reply)
         }
         (BoxControlRequest::ReleaseAnswerer, ControlDoor::Host) => {
             let reply = answerer.release();
@@ -858,6 +1001,159 @@ fn serve_request(
         // frame to drop silently.
         (request, door) => refused_wrong_door(stream, &request, door),
     }
+}
+
+/// Register a box in its door's apply order and build the reply: the one
+/// registration path the one-shot and the held verb share.
+fn registration_reply(
+    boxes: &BoxRegistry,
+    answerer: &AnswererStatus,
+    order: &Arc<ApplyOrder>,
+    request: RegisterBoxRequest,
+) -> BoxControlReply {
+    // The published address is asked of the answerer before the
+    // ticket: the allocation can wait out a handover, and no turn
+    // is held across it.
+    // The registration is counted in flight and reads its name's
+    // withdrawal generation before the allocation: a withdrawal
+    // that lands while the address is being allocated refuses the
+    // registration in its turn. The claim ends with the turn.
+    let claim = boxes.begin_registration(&request.name);
+    match allocate_box_address(answerer, &request.name) {
+        Ok(loopback_addr) => {
+            order.apply(move || register_box(boxes, answerer, request, loopback_addr, claim))
+        }
+        Err(reply) => reply,
+    }
+}
+
+/// Serve a held registration ([`RegisterBoxRequest::hold`]): register the
+/// box, then hand the connection to a thread of its own that writes the
+/// reply and holds the connection as the row's lease until its client
+/// commits it ([`hold_registration_lease`]). `slot` is the lease's place
+/// under [`MAX_REGISTRATION_LEASES`], held for the lease's life. A refused
+/// registration holds nothing: its reply is written here and the
+/// connection closes. A thread that cannot be spawned withdraws the row it
+/// would have held and answers the reason, so no row outlives a lease that
+/// never started.
+fn serve_held_registration(
+    mut stream: UnixStream,
+    boxes: &BoxRegistry,
+    answerer: &AnswererStatus,
+    order: &Arc<ApplyOrder>,
+    request: RegisterBoxRequest,
+    slot: crate::box_registry::GaugeGuard,
+) -> std::io::Result<()> {
+    let name = request.name.clone();
+    let reply = registration_reply(boxes, answerer, order, request);
+    let BoxControlReply::Registered(registered) = &reply else {
+        return write_reply(&mut stream, &reply);
+    };
+    let withdrawal = WithdrawBoxRequest {
+        name,
+        switch_address: registered.switch_address,
+        loopback_address: registered.loopback_address,
+    };
+    let not_held = |stream: &mut UnixStream, error: std::io::Error| {
+        order.apply(|| withdraw_box(boxes, answerer, withdrawal.clone()));
+        write_reply(
+            stream,
+            &BoxControlReply::Error {
+                error: format!("the VM host daemon could not hold the registration: {error}"),
+            },
+        )
+    };
+    let lease_stream = match stream.try_clone() {
+        Ok(lease_stream) => lease_stream,
+        Err(error) => return not_held(&mut stream, error),
+    };
+    let thread_boxes = boxes.clone();
+    let thread_answerer = answerer.clone();
+    let thread_order = Arc::clone(order);
+    let thread_withdrawal = withdrawal.clone();
+    let spawned = std::thread::Builder::new()
+        .name("minvmd-box-lease".to_string())
+        .spawn(move || {
+            let _slot = slot;
+            hold_registration_lease(
+                lease_stream,
+                &thread_boxes,
+                &thread_answerer,
+                &thread_order,
+                thread_withdrawal,
+                &reply,
+            );
+        });
+    match spawned {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            tracing::warn!(%error, "could not start a registration lease's thread");
+            not_held(&mut stream, error)
+        }
+    }
+}
+
+/// Hold a registered box's lease connection: write the registration's
+/// `reply`, then wait, with no read bound, for the client's one
+/// [`minimald_rpc::REGISTRATION_COMMIT_LINE`]. The commit keeps the row:
+/// from then on its liveness is its switch attachment (NET-138) and its
+/// creator's withdrawal. Anything else first — the connection's close, a
+/// read error, any other line — is the activation ending before its
+/// session went active, so the row is withdrawn on the lease's word: the
+/// connection that registered the row is its creator's proof, and the
+/// withdrawal runs in the door's apply order through the same path a
+/// client's withdrawal takes ([`withdraw_box`]). The commit is explicit,
+/// never read from a clean close, so a client that closes just after its
+/// session went active cannot withdraw a live box's row before the row's
+/// first attachment.
+fn hold_registration_lease(
+    mut stream: UnixStream,
+    boxes: &BoxRegistry,
+    answerer: &AnswererStatus,
+    order: &Arc<ApplyOrder>,
+    withdrawal: WithdrawBoxRequest,
+    reply: &BoxControlReply,
+) {
+    // The lease lasts as long as the activation takes, so the request
+    // line's read bound is lifted before the reply is written: a lease
+    // that cannot lift it would end at the bound under a live session.
+    let ended = match stream.set_read_timeout(None) {
+        Err(error) => {
+            if let Err(write_error) = write_reply(
+                &mut stream,
+                &BoxControlReply::Error {
+                    error: format!("the VM host daemon could not hold the registration: {error}"),
+                },
+            ) {
+                tracing::debug!(error = %write_error, "could not write the lease refusal");
+            }
+            format!("its read bound could not be lifted: {error}")
+        }
+        Ok(()) => match write_reply(&mut stream, reply) {
+            Err(error) => format!("its reply could not be written: {error}"),
+            Ok(()) => match read_request_line(&mut stream) {
+                Ok(Some(line)) if line.trim() == minimald_rpc::REGISTRATION_COMMIT_LINE => {
+                    tracing::info!(
+                        box = %withdrawal.name,
+                        switch_address = %withdrawal.switch_address,
+                        "committed the box's registration lease; the row stays until its \
+                         creator withdraws it"
+                    );
+                    return;
+                }
+                Ok(Some(_)) => "its client sent a line that is not the commit".to_string(),
+                Ok(None) => "its client closed the connection before the commit".to_string(),
+                Err(error) => format!("its connection failed before the commit: {error}"),
+            },
+        },
+    };
+    tracing::info!(
+        box = %withdrawal.name,
+        switch_address = %withdrawal.switch_address,
+        cause = %ended,
+        "the box's registration lease ended uncommitted; withdrawing its row"
+    );
+    order.apply(|| withdraw_box(boxes, answerer, withdrawal));
 }
 
 /// Refuse a verb that arrived on a door that does not serve it (NET-138):
@@ -900,6 +1196,8 @@ fn request_verb(request: &BoxControlRequest) -> &'static str {
     match request {
         BoxControlRequest::Register(_) => "register",
         BoxControlRequest::Withdraw(_) => "withdraw",
+        BoxControlRequest::HoldBoxName(_) => "hold_box_name",
+        BoxControlRequest::ReleaseBoxName(_) => "release_box_name",
         BoxControlRequest::AnswererStatus => "answerer_status",
         BoxControlRequest::AdmitPort(_) => "admit_port",
         BoxControlRequest::WithdrawPort(_) => "withdraw_port",
@@ -1043,7 +1341,7 @@ fn parse_request(line: &str) -> Result<BoxControlRequest, serde_json_lenient::Er
     serde_json_lenient::from_str(line)
 }
 
-/// Allocate the box into the table and write the reply — the addresses and
+/// Allocate the box into the table and build the reply — the addresses and
 /// the box id on success, the reason on a refusal. One info line per
 /// registration names the box, its id, both addresses and the declared
 /// egress the row carries: the diagnostic a bundle's VM host daemon log is
@@ -1052,12 +1350,16 @@ fn parse_request(line: &str) -> Result<BoxControlRequest, serde_json_lenient::Er
 /// The box's published address is the machine answerer's to hand out
 /// (design §7.1), asked for before the row is filled: a node never
 /// self-assigns one, so two state dirs' boxes never share an address.
-fn register_and_reply(
-    stream: &mut UnixStream,
+///
+/// The address is asked for first ([`allocate_box_address`]), outside the
+/// door's apply order; the row is filled here, in the registration's turn.
+fn register_box(
     boxes: &BoxRegistry,
     answerer: &AnswererStatus,
     request: RegisterBoxRequest,
-) -> std::io::Result<()> {
+    loopback_addr: std::net::Ipv4Addr,
+    claim: crate::box_registry::RegistrationClaim,
+) -> BoxControlReply {
     // The declaration as the row received it; `null` for a box with no
     // egress section. A plain struct of strings serialises infallibly.
     let declared_egress = serde_json_lenient::to_string(&request.egress).unwrap_or_default();
@@ -1075,23 +1377,7 @@ fn register_and_reply(
         dynamic_ingress: request.dynamic_ingress,
         dynamic_allowed_range: request.dynamic_allowed_range,
     };
-    let loopback_addr = match answerer.allocate(&request.name) {
-        Ok(address) => address,
-        Err(reason) => {
-            tracing::warn!(
-                box = %request.name,
-                %reason,
-                "box registration refused: the zone answerer handed out no address"
-            );
-            return write_reply(
-                stream,
-                &BoxControlReply::Error {
-                    error: format!("the zone answerer could not allocate a box address: {reason}"),
-                },
-            );
-        }
-    };
-    let reply = match boxes.register_client_box_at(spec, loopback_addr) {
+    match boxes.register_client_box_since(spec, loopback_addr, claim.generation()) {
         Ok(record) => {
             tracing::info!(
                 box = %record.name(),
@@ -1108,9 +1394,14 @@ fn register_and_reply(
             })
         }
         Err(error) => {
-            // The address goes back: no row holds it.
-            answerer.release_address(&request.name);
+            // The address goes back unless a live row or another
+            // registration of the name in flight owns it: the answerer
+            // allocates per name, so a release by name would free theirs.
+            let released = boxes.release_unless_owned(&claim, || {
+                answerer.release_address(&request.name);
+            });
             tracing::debug!(
+                address_released = released,
                 box = %request.name,
                 error = %error,
                 "box registration refused"
@@ -1119,31 +1410,53 @@ fn register_and_reply(
                 error: error.to_string(),
             }
         }
-    };
-    write_reply(stream, &reply)
+    }
 }
 
-/// Remove the row the request's pair proves its client created, and write
+/// Ask the machine's answerer for box `name`'s published address, or the
+/// refusal to answer with when it hands none out. The wait can run as long
+/// as an answerer handover, so it runs before the registration takes its
+/// place in the door's apply order, never inside its turn.
+fn allocate_box_address(
+    answerer: &AnswererStatus,
+    name: &str,
+) -> Result<std::net::Ipv4Addr, BoxControlReply> {
+    answerer.allocate(name).map_err(|reason| {
+        tracing::warn!(
+            box = %name,
+            %reason,
+            "box registration refused: the zone answerer handed out no address"
+        );
+        BoxControlReply::Error {
+            error: format!("the zone answerer could not allocate a box address: {reason}"),
+        }
+    })
+}
+
+/// Remove the row the request's pair proves its client created, and build
 /// the reply — the pair echoed back on success, the reason on a refusal.
 /// One info line per withdrawal names the box and both addresses, mirroring
 /// the registration's; a withdrawal that finds no row is the goal state
 /// already holding (already withdrawn, or the daemon restarted since) and
 /// is a debug line, not an error.
-fn withdraw_and_reply(
-    stream: &mut UnixStream,
+fn withdraw_box(
     boxes: &BoxRegistry,
     answerer: &AnswererStatus,
     request: WithdrawBoxRequest,
-) -> std::io::Result<()> {
-    let reply = match boxes.withdraw_client_box(
+) -> BoxControlReply {
+    match boxes.withdraw_client_box(
         &request.name,
         request.switch_address,
         request.loopback_address,
     ) {
         Ok(withdrawn) => {
             // The box is gone, so its published address returns to the
-            // machine's range — the answerer's release is idempotent.
-            answerer.release_address(&request.name);
+            // machine's range — unless a live row or a registration in
+            // flight under the name owns it: the answerer allocates per
+            // name, so a release by name would free theirs.
+            boxes.release_withdrawn_unless_owned(&request.name, || {
+                answerer.release_address(&request.name);
+            });
             if withdrawn.is_some() {
                 tracing::info!(
                     box = %request.name,
@@ -1174,8 +1487,39 @@ fn withdraw_and_reply(
                 error: error.to_string(),
             }
         }
-    };
-    write_reply(stream, &reply)
+    }
+}
+
+/// Hold a `host_ip` box's name in the host's zone with no row behind it:
+/// the interim that answers the name NODATA until the node's bind mirror
+/// lands. `held` true either way — a name the table already holds is the
+/// goal state, not a refusal.
+fn hold_box_name(
+    boxes: &BoxRegistry,
+    name: &str,
+    session_id: Option<sessions::SessionId>,
+) -> BoxControlReply {
+    boxes.hold_box_name(name, session_id);
+    BoxControlReply::NameHeld {
+        name: name.to_string(),
+        held: true,
+    }
+}
+
+/// Release a name a hold kept: the name answers nothing again. `held`
+/// false either way — a name no hold kept is the goal state already
+/// holding — and a release that names its session frees only that
+/// session's holds (see [`BoxRegistry::release_held_name`]).
+fn release_box_name(
+    boxes: &BoxRegistry,
+    name: &str,
+    session_id: Option<sessions::SessionId>,
+) -> BoxControlReply {
+    boxes.release_held_name(name, session_id);
+    BoxControlReply::NameHeld {
+        name: name.to_string(),
+        held: false,
+    }
 }
 
 fn write_reply(stream: &mut UnixStream, reply: &BoxControlReply) -> std::io::Result<()> {
@@ -1199,14 +1543,13 @@ fn write_reply(stream: &mut UnixStream, reply: &BoxControlReply) -> std::io::Res
 /// The refusal answers `Error` with the grant's own sentence, so the
 /// guest's publish unwinds on the check that refused it: nothing was
 /// recorded, and the in-VM mapping is the caller's to take down.
-fn admit_report_and_reply(
-    stream: &mut UnixStream,
+fn admit_report(
     boxes: &BoxRegistry,
     audit_path: &Path,
-    request: AdmitPortRequest,
-) -> std::io::Result<()> {
+    request: &AdmitPortRequest,
+) -> BoxControlReply {
     let source = source_text(request.source);
-    let reply = match boxes.admit_runtime_port(
+    match boxes.admit_runtime_port(
         request.switch_address,
         request.port,
         request.proto,
@@ -1221,7 +1564,7 @@ fn admit_report_and_reply(
                 source = %source,
                 "recorded the box's runtime-admitted port in the host-held grant"
             );
-            append_audit_copy(audit_path, &record, &request);
+            append_audit_copy(audit_path, &record, request);
             BoxControlReply::PortRecorded {
                 port: request.port,
                 proto: request.proto,
@@ -1243,8 +1586,7 @@ fn admit_report_and_reply(
                 error: refusal.to_string(),
             }
         }
-    };
-    write_reply(stream, &reply)
+    }
 }
 
 /// Serve the in-VM daemon's withdrawal report (NET-138): remove the
@@ -1254,11 +1596,7 @@ fn admit_report_and_reply(
 /// that holds nothing the report names is already the report's goal
 /// state. One info line per report, the same shape the admit path's
 /// answers with.
-fn withdraw_report_and_reply(
-    stream: &mut UnixStream,
-    boxes: &BoxRegistry,
-    request: WithdrawPortRequest,
-) -> std::io::Result<()> {
+fn withdraw_report(boxes: &BoxRegistry, request: &WithdrawPortRequest) -> BoxControlReply {
     let source = source_text(request.source);
     let row = boxes.withdraw_runtime_port(request.switch_address, request.port, request.proto);
     match &row {
@@ -1278,18 +1616,16 @@ fn withdraw_report_and_reply(
             "no live row holds the withdrawn port; the grant's goal state already holds"
         ),
     }
-    write_reply(
-        stream,
-        &BoxControlReply::PortRecorded {
-            port: request.port,
-            proto: request.proto,
-        },
-    )
+    BoxControlReply::PortRecorded {
+        port: request.port,
+        proto: request.proto,
+    }
 }
 
 /// Serve the read-only row verb (NET-138): the live row the asked-for name
-/// resolves to under the identity rule — a box's id on the host is its
-/// name, exact, and liveness is the table's own fact — answered with its
+/// resolves to under the alias rule — the name is matched in its canonical
+/// form ([`crate::net::answerer::canonical_box_name`]), and liveness is
+/// the table's own fact ([`BoxRegistry::row_by_name`]) — answered with its
 /// switch address, its derived egress allow-list, and its declared and
 /// runtime-admitted ports. A name no live box holds answers the no-row
 /// marker: a withdrawn row is gone, not archived, so a destroyed box's
@@ -1422,7 +1758,7 @@ fn append_audit_line(path: &Path, line: &impl serde::Serialize) {
 
 /// Run one ask verb's connection on a thread of its own (NET-045): the ask
 /// or the subscription holds the connection open, so it must not hold the
-/// door's serial accept loop with it. A thread that cannot be spawned is
+/// door's connection slot with it. A thread that cannot be spawned is
 /// answered on the spot with the reason, and the connection closes.
 fn spawn_ask_thread(
     mut stream: UnixStream,
@@ -1480,6 +1816,125 @@ fn watch_peer_close(
     Ok(closed_rx)
 }
 
+/// The order one door's mutations apply in: one turn at a time, in the
+/// order their requests finished being read, parsed and validated.
+///
+/// Each door serves its connections on threads of their own, so without an
+/// order two requests for the same box could apply in either order: the
+/// in-VM daemon's report exchange gives up on an attempt whose reply is
+/// late, abandons that connection, and sends the unwinding withdrawal on a
+/// new one — and the abandoned admit, still on its way to the registry,
+/// could then apply after the withdrawal and re-open the port it withdrew
+/// (NET-012, NET-128). A registration racing its box's destroy has the same
+/// shape.
+///
+/// For the verbs that take their ticket right after the read — withdraw,
+/// admit_port, withdraw_port and record_ask_answer — the order is the
+/// order the requests were read: a client writes its
+/// request line before it starts waiting for the reply, and the door's
+/// thread reads that line as soon as it runs, so what a client times out
+/// on is the apply step, not the read. A request whose client gave up was
+/// therefore read before the client's next connection opened — and so
+/// holds the earlier ticket — or its read never completes and it applies
+/// nothing: the read is bounded by [`REGISTER_READ_TIMEOUT`].
+///
+/// Reading the line and applying it are separate steps on separate
+/// threads, so ordering by "whoever takes a lock first after its read"
+/// would leave a window: a thread that finished its read and was then
+/// preempted could still lose the lock to a later request. Instead each
+/// request takes a monotonic [`Ticket`] in a short critical section right
+/// after its read and validation, and waits on the condvar until every
+/// earlier ticket has had its turn. Only mutating verbs take one, and
+/// nothing unbounded runs in a turn: no read, no answerer allocation, no
+/// ask hand-off, no drain. The one bounded wait is the address-reuse
+/// revocation wait, up to [`crate::box_registry::REVOCATION_WAIT`] (5 s),
+/// which must run after every earlier withdrawal, so it stays inside the
+/// registration's turn.
+///
+/// A registration takes its ticket only after its answerer allocation, so
+/// it is not ordered by its read, and a withdrawal can land while its
+/// address is being allocated. That race is closed by the withdrawal
+/// generation, not by ticket order: the registration reads its name's
+/// generation before it asks for the address
+/// ([`BoxRegistry::begin_registration`]), and the registry refuses it in
+/// its turn when the generation moved
+/// ([`BoxRegistry::register_client_box_since`]).
+#[derive(Debug, Default)]
+pub(crate) struct ApplyOrder {
+    state: Mutex<ApplyState>,
+    turn: std::sync::Condvar,
+}
+
+#[derive(Debug, Default)]
+struct ApplyState {
+    /// The next ticket to hand out.
+    issued: u64,
+    /// The ticket whose turn it is.
+    serving: u64,
+}
+
+/// One request's place in its door's [`ApplyOrder`]. Its turn ends when the
+/// ticket drops — on the apply path, on an early return, and on a panic's
+/// unwind alike — so a request that never applies still hands the turn on
+/// and the tickets behind it never wedge.
+#[derive(Debug)]
+pub(crate) struct Ticket {
+    order: Arc<ApplyOrder>,
+    number: u64,
+}
+
+impl ApplyOrder {
+    fn state(&self) -> std::sync::MutexGuard<'_, ApplyState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Take the next ticket: the request's place in the apply order.
+    pub(crate) fn take(self: &Arc<Self>) -> Ticket {
+        let mut state = self.state();
+        let number = state.issued;
+        state.issued = state.issued.wrapping_add(1);
+        Ticket {
+            order: Arc::clone(self),
+            number,
+        }
+    }
+
+    /// Run `apply` in a fresh ticket's turn and hand back what it answers.
+    /// The turn ends before the caller writes the reply.
+    fn apply<R>(self: &Arc<Self>, apply: impl FnOnce() -> R) -> R {
+        let ticket = self.take();
+        ticket.wait_turn();
+        apply()
+    }
+}
+
+impl Ticket {
+    /// Block until every earlier ticket's turn has ended.
+    pub(crate) fn wait_turn(&self) {
+        let mut state = self.order.state();
+        while state.serving != self.number {
+            state = self
+                .order
+                .turn
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+}
+
+impl Drop for Ticket {
+    fn drop(&mut self) {
+        // A ticket that never waited for its turn still takes it before
+        // handing it on, so the order holds for every ticket behind it.
+        self.wait_turn();
+        let mut state = self.order.state();
+        state.serving = state.serving.wrapping_add(1);
+        self.order.turn.notify_all();
+    }
+}
+
 /// How many guest-door ask connections are served at once (NET-045): the
 /// per-row queue bound across a generous number of rows. Each holds a
 /// serving thread and a watcher thread for the ask's life.
@@ -1489,9 +1944,32 @@ pub(crate) const MAX_GUEST_ASK_CONNECTIONS: usize = crate::box_registry::PENDING
 /// one per interactive attach, bounded the same way.
 pub(crate) const MAX_ASK_SUBSCRIPTIONS: usize = MAX_GUEST_ASK_CONNECTIONS;
 
-/// When the last connection-cap warn line was written: rate-limited like
-/// the queue-full line.
+/// How many held registrations' lease connections are served at once
+/// ([`RegisterBoxRequest::hold`]): one per activation between its
+/// registration and its commit, bounded like a door's connections.
+pub(crate) const MAX_REGISTRATION_LEASES: usize = MAX_CONTROL_CONNECTIONS;
+
+/// How many connection threads each control door runs at once. A request
+/// connection's thread lives for one request line (at most
+/// [`REGISTER_READ_TIMEOUT`]) plus, on the guest door, the drain bound; an
+/// ask verb's connection hands off to its own capped thread and frees its
+/// slot at once.
+pub(crate) const MAX_CONTROL_CONNECTIONS: usize = 64;
+
+/// When the last ask connection-cap warn line was written: rate-limited
+/// like the queue-full line.
 static ASK_CAP_WARNED: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
+/// When the last registration-lease cap warn line was written.
+static LEASE_CAP_WARNED: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
+/// When the host control socket's last connection-cap warn line was
+/// written, rate-limited the same way. Each door keeps its own stamp, so a
+/// guest flooding its door never silences the host door's line.
+static HOST_CONTROL_CAP_WARNED: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
+/// When the guest report door's last connection-cap warn line was written.
+static GUEST_REPORTS_CAP_WARNED: Mutex<Option<std::time::Instant>> = Mutex::new(None);
 
 /// Whether a rate-limited warn line is due, stamping it when it is.
 fn warn_due(last: &Mutex<Option<std::time::Instant>>) -> bool {
@@ -1506,20 +1984,30 @@ fn warn_due(last: &Mutex<Option<std::time::Instant>>) -> bool {
     due
 }
 
-/// Refuse an ask verb's connection past its cap, before any thread is
-/// spawned: an error reply naming the cap, and a rate-limited warn line.
-fn refuse_past_ask_cap(stream: &mut UnixStream, kind: &str, cap: usize) -> std::io::Result<()> {
-    if warn_due(&ASK_CAP_WARNED) {
+/// Refuse a connection past its kind's cap, before any thread is spawned:
+/// an error reply naming the cap, and a warn line rate-limited by `warned`.
+/// The line names the `door` the connection arrived on, so a guest flooding
+/// its report door reads apart from the host's own clients.
+fn refuse_past_cap(
+    stream: &mut UnixStream,
+    kind: &str,
+    door: &str,
+    cap: usize,
+    warned: &Mutex<Option<std::time::Instant>>,
+) -> std::io::Result<()> {
+    if warn_due(warned) {
         tracing::warn!(
             kind,
+            door,
             cap,
-            "refused an ask connection past the VM host daemon's cap"
+            "refused a connection past the VM host daemon's cap"
         );
     } else {
         tracing::debug!(
             kind,
+            door,
             cap,
-            "refused an ask connection past the VM host daemon's cap"
+            "refused a connection past the VM host daemon's cap"
         );
     }
     write_reply(
@@ -1864,14 +2352,13 @@ fn unsubscribe_and_log(boxes: &BoxRegistry, box_id: crate::bep_attach::BoxId, su
 /// takes the answered ask's place. An answer for an id the book does not
 /// hold — unknown, cancelled, or already answered — records nothing, is
 /// audited as refused, and answers an error.
-fn record_ask_answer_and_reply(
-    stream: &mut UnixStream,
+fn record_ask_answer(
     boxes: &BoxRegistry,
     audit_path: &Path,
     request: minimald_rpc::RecordAskAnswerRequest,
-) -> std::io::Result<()> {
+) -> BoxControlReply {
     let ask_id = request.ask_id;
-    let reply = match boxes.record_ask_answer(ask_id, request.answer) {
+    match boxes.record_ask_answer(ask_id, request.answer) {
         Ok(ended) => {
             tracing::info!(
                 %ask_id,
@@ -1921,8 +2408,7 @@ fn record_ask_answer_and_reply(
                 error: format!("no pending or recently ended ask holds id {ask_id}"),
             }
         }
-    };
-    write_reply(stream, &reply)
+    }
 }
 
 /// Log an offer — how many attached clients it reached — and audit it.
@@ -2095,8 +2581,8 @@ mod tests {
     use std::time::Duration;
 
     use minimald_rpc::{
-        BoxControlReply, BoxControlRequest, RegisterBoxRequest, WithdrawBoxRequest,
-        ZoneAnswererStatus,
+        BoxControlReply, BoxControlRequest, HoldBoxNameRequest, RegisterBoxRequest,
+        WithdrawBoxRequest, ZoneAnswererStatus,
     };
     use switch::SwitchSubnet;
 
@@ -2259,6 +2745,12 @@ mod tests {
             BoxControlReply::AnswererRelease { detail, .. } => {
                 panic!("a box verb is never answered with a release reply, got {detail}")
             }
+            BoxControlReply::NameHeld { name, held } => {
+                panic!(
+                    "a registration is answered with the registered box, got a name-hold \
+                     reply for {name:?} (held: {held})"
+                )
+            }
         }
     }
 
@@ -2295,6 +2787,7 @@ mod tests {
                     credentialed_upstream: None,
                     dynamic_ingress: None,
                     dynamic_allowed_range: None,
+                    hold: false,
                 },
             )
             .expect("first registration is answered"),
@@ -2364,6 +2857,7 @@ mod tests {
                     credentialed_upstream: None,
                     dynamic_ingress: None,
                     dynamic_allowed_range: None,
+                    hold: false,
                 },
             )
             .expect("second registration is answered"),
@@ -2407,6 +2901,7 @@ mod tests {
                     credentialed_upstream: None,
                     dynamic_ingress: None,
                     dynamic_allowed_range: None,
+                    hold: false,
                 },
             )
             .expect("server still serves after a refused request"),
@@ -2535,6 +3030,7 @@ mod tests {
                     credentialed_upstream: None,
                     dynamic_ingress: None,
                     dynamic_allowed_range: None,
+                    hold: false,
                 },
             )
             .expect("the registration is answered"),
@@ -2593,6 +3089,12 @@ mod tests {
             BoxControlReply::AnswererRelease { detail, .. } => {
                 panic!("a box verb is never answered with a release reply, got {detail}")
             }
+            BoxControlReply::NameHeld { name, held } => {
+                panic!(
+                    "a withdrawal echoes the pair it went by, got a name-hold reply for \
+                     {name:?} (held: {held})"
+                )
+            }
         }
         assert!(
             registry
@@ -2637,6 +3139,7 @@ mod tests {
                     credentialed_upstream: None,
                     dynamic_ingress: None,
                     dynamic_allowed_range: None,
+                    hold: false,
                 },
             )
             .expect("the marker box is registered"),
@@ -2689,6 +3192,12 @@ mod tests {
                 }
                 BoxControlReply::AnswererRelease { detail, .. } => {
                     panic!("a box verb is never answered with a release reply, got {detail}")
+                }
+                BoxControlReply::NameHeld { name, held } => {
+                    panic!(
+                        "a foreign pair's withdrawal must be refused, got a name-hold reply \
+                         for {name:?} (held: {held})"
+                    )
                 }
             }
         }
@@ -2747,6 +3256,12 @@ mod tests {
             }
             BoxControlReply::AnswererRelease { detail, .. } => {
                 panic!("a box verb is never answered with a release reply, got {detail}")
+            }
+            BoxControlReply::NameHeld { name, held } => {
+                panic!(
+                    "a repeat withdrawal echoes the pair, got a name-hold reply for {name:?} \
+                     (held: {held})"
+                )
             }
         }
 
@@ -2824,7 +3339,10 @@ mod tests {
             .expect("the status read is answered");
         assert_eq!(
             reply,
-            BoxControlReply::Status(ZoneAnswererStatus::Starting),
+            BoxControlReply::Status(minimald_rpc::AnswererStatusReply {
+                answerer: ZoneAnswererStatus::Starting,
+                proxy_down: None,
+            }),
             "the read answers the cell the daemon starts with"
         );
 
@@ -2843,7 +3361,10 @@ mod tests {
                 .expect("the status read is answered");
             assert_eq!(
                 reply,
-                BoxControlReply::Status(state),
+                BoxControlReply::Status(minimald_rpc::AnswererStatusReply {
+                    answerer: state,
+                    proxy_down: None,
+                }),
                 "the read answers the state the loop last wrote"
             );
         }
@@ -2861,6 +3382,7 @@ mod tests {
                     credentialed_upstream: None,
                     dynamic_ingress: None,
                     dynamic_allowed_range: None,
+                    hold: false,
                 },
             )
             .expect("a registration still answers around the read"),
@@ -2872,6 +3394,73 @@ mod tests {
                 .is_some(),
             "the read-only verb leaves the row the registration published"
         );
+    }
+
+    /// The `host_ip` interim over the host door: a hold answers the
+    /// name-hold marker and leaves the name in the zone view with no
+    /// address (NODATA), whatever case it was asked in; the release
+    /// answers the marker with `held: false` and takes the name out of the
+    /// view (NXDOMAIN again), and a repeat release is the goal state
+    /// already holding.
+    #[test]
+    fn a_held_name_is_held_and_released_over_the_control_socket() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (sock_path, _server, registry, _answerer, _proxy_publish) =
+            spawn_server(dir.path()).expect("server binds");
+        let held_row = |registry: &BoxRegistry| {
+            registry
+                .zone_view()
+                .rows()
+                .find(|(name, _)| *name == "web.min.internal")
+                .map(|(_, row)| *row)
+        };
+
+        let reply = control(
+            &sock_path,
+            &BoxControlRequest::HoldBoxName(HoldBoxNameRequest {
+                name: "Web".to_string(),
+                session_id: None,
+            }),
+        )
+        .expect("the hold is answered");
+        assert_eq!(
+            reply,
+            BoxControlReply::NameHeld {
+                name: "Web".to_string(),
+                held: true,
+            }
+        );
+        assert_eq!(
+            held_row(&registry),
+            Some(sessions::core::zone_answer::ZoneRow {
+                address: None,
+                live: true,
+            }),
+            "the held name is in the zone with no address behind it"
+        );
+
+        for _ in 0..2 {
+            let reply = control(
+                &sock_path,
+                &BoxControlRequest::ReleaseBoxName(HoldBoxNameRequest {
+                    name: "web".to_string(),
+                    session_id: None,
+                }),
+            )
+            .expect("the release is answered");
+            assert_eq!(
+                reply,
+                BoxControlReply::NameHeld {
+                    name: "web".to_string(),
+                    held: false,
+                }
+            );
+            assert_eq!(
+                held_row(&registry),
+                None,
+                "a released name is out of the zone"
+            );
+        }
     }
 
     /// The drawn port's story (T93): a guest that reports its publish was
@@ -3019,9 +3608,9 @@ mod tests {
         }
     }
 
-    /// The unconfirmed state rides the status read until the guest's late
-    /// report confirms the port, and a confirm never clears a terminal
-    /// cause or another port's state.
+    /// The unconfirmed state rides the status read beside the answerer's
+    /// own state until the guest's late report confirms the port, and a
+    /// confirm never clears a terminal cause or another port's state.
     #[test]
     fn unconfirmed_publish_rides_the_read_until_confirmed() {
         let port = 19_916;
@@ -3032,35 +3621,36 @@ mod tests {
         proxy_publish.set_unconfirmed(port);
         assert_eq!(
             control(&sock_path, &BoxControlRequest::AnswererStatus).expect("the read is answered"),
-            BoxControlReply::Status(ZoneAnswererStatus::ProxyNotServing {
-                port,
-                cause: ProxyDownCause::PublishUnconfirmed,
+            BoxControlReply::Status(minimald_rpc::AnswererStatusReply {
+                answerer: ZoneAnswererStatus::Holder { port: 7_656 },
+                proxy_down: Some(minimald_rpc::ProxyDown {
+                    port,
+                    cause: ProxyDownCause::PublishUnconfirmed,
+                }),
             }),
-            "an unconfirmed publish is what the read answers"
+            "the read answers the answerer's own state with the unconfirmed \
+             publish beside it — the cause never takes the state's place"
         );
         proxy_publish.confirm(port + 1);
         assert_eq!(
             proxy_publish.down(),
-            Some(ZoneAnswererStatus::ProxyNotServing {
-                port,
-                cause: ProxyDownCause::PublishUnconfirmed,
-            }),
+            Some((port, ProxyDownCause::PublishUnconfirmed)),
             "another port's report confirms nothing"
         );
         proxy_publish.confirm(port);
         assert_eq!(
             control(&sock_path, &BoxControlRequest::AnswererStatus).expect("the read is answered"),
-            BoxControlReply::Status(ZoneAnswererStatus::Holder { port: 7_656 }),
-            "the late report clears it; the answerer's state answers again"
+            BoxControlReply::Status(minimald_rpc::AnswererStatusReply {
+                answerer: ZoneAnswererStatus::Holder { port: 7_656 },
+                proxy_down: None,
+            }),
+            "the late report clears it; the answerer's state answers alone again"
         );
         proxy_publish.set_down(port, ProxyDownCause::PortHeld);
         proxy_publish.confirm(port);
         assert_eq!(
             proxy_publish.down(),
-            Some(ZoneAnswererStatus::ProxyNotServing {
-                port,
-                cause: ProxyDownCause::PortHeld,
-            }),
+            Some((port, ProxyDownCause::PortHeld)),
             "a confirm never clears a terminal cause"
         );
         // A late refusal after an unconfirmed start: the VM stays up, and the
@@ -3073,8 +3663,12 @@ mod tests {
         proxy_publish.confirm(port);
         assert_eq!(
             control(&sock_path, &BoxControlRequest::AnswererStatus).expect("the read is answered"),
-            BoxControlReply::Status(ZoneAnswererStatus::ProxyNotServing { port, cause: late }),
-            "a late refusal rides the read with its holder, and a confirm never clears it"
+            BoxControlReply::Status(minimald_rpc::AnswererStatusReply {
+                answerer: ZoneAnswererStatus::Holder { port: 7_656 },
+                proxy_down: Some(minimald_rpc::ProxyDown { port, cause: late }),
+            }),
+            "a late refusal rides beside the answerer's state with its \
+             holder, and a confirm never clears it"
         );
     }
 
@@ -3109,33 +3703,45 @@ mod tests {
         }
 
         // And the failure's cause rides the read-only verb the CLI's
-        // surfaces read: once the supervisor writes it, the status read
-        // answers the port and the cause, not the answerer's state.
+        // surfaces read — beside the answerer's own state, never in its
+        // place: once the supervisor writes it, the status read answers
+        // the port and the cause as a sibling of the answerer's state.
         let dir = tempfile::TempDir::new().expect("temp dir");
         let (sock_path, _server, _boxes, answerer, proxy_publish) =
             spawn_server(dir.path()).expect("server binds");
         assert_eq!(
             control(&sock_path, &BoxControlRequest::AnswererStatus).expect("the read is answered"),
-            BoxControlReply::Status(ZoneAnswererStatus::Starting),
-            "before any cause, the read answers the answerer's state as it always did"
+            BoxControlReply::Status(minimald_rpc::AnswererStatusReply {
+                answerer: ZoneAnswererStatus::Starting,
+                proxy_down: None,
+            }),
+            "before any cause, the read answers the answerer's state alone"
         );
         proxy_publish.set_down(port, ProxyDownCause::PortHeld);
         assert_eq!(
             control(&sock_path, &BoxControlRequest::AnswererStatus).expect("the read is answered"),
-            BoxControlReply::Status(ZoneAnswererStatus::ProxyNotServing {
-                port,
-                cause: ProxyDownCause::PortHeld,
+            BoxControlReply::Status(minimald_rpc::AnswererStatusReply {
+                answerer: ZoneAnswererStatus::Starting,
+                proxy_down: Some(minimald_rpc::ProxyDown {
+                    port,
+                    cause: ProxyDownCause::PortHeld,
+                }),
             }),
-            "the read answers the cause the supervisor reached, naming the port"
+            "the read answers the cause the supervisor reached as a sibling, \
+             naming the port"
         );
         answerer.set(ZoneAnswererStatus::Holder { port: 7_656 });
         assert_eq!(
             control(&sock_path, &BoxControlRequest::AnswererStatus).expect("the read is answered"),
-            BoxControlReply::Status(ZoneAnswererStatus::ProxyNotServing {
-                port,
-                cause: ProxyDownCause::PortHeld,
+            BoxControlReply::Status(minimald_rpc::AnswererStatusReply {
+                answerer: ZoneAnswererStatus::Holder { port: 7_656 },
+                proxy_down: Some(minimald_rpc::ProxyDown {
+                    port,
+                    cause: ProxyDownCause::PortHeld,
+                }),
             }),
-            "the cause outranks the answerer's state while the supervisor holds it"
+            "the cause rides beside the answerer's own state while the \
+             supervisor holds it — the answerer's state is never dropped"
         );
     }
 
@@ -3226,6 +3832,7 @@ mod tests {
                     credentialed_upstream: None,
                     dynamic_ingress: Some(sessions::DynamicIngress::Allow),
                     dynamic_allowed_range: Some((3000, 3999)),
+                    hold: false,
                 },
             )
             .expect("the registration is answered"),
@@ -3368,6 +3975,7 @@ mod tests {
                     credentialed_upstream: None,
                     dynamic_ingress: Some(sessions::DynamicIngress::Allow),
                     dynamic_allowed_range: Some((3000, 3999)),
+                    hold: false,
                 },
             )
             .expect("the registration is answered"),
@@ -3457,6 +4065,7 @@ mod tests {
                     credentialed_upstream: None,
                     dynamic_ingress: None,
                     dynamic_allowed_range: None,
+                    hold: false,
                 },
             )
             .expect("the registration is answered"),
@@ -3577,6 +4186,7 @@ mod tests {
                         credentialed_upstream: None,
                         dynamic_ingress: Some(sessions::DynamicIngress::Ask),
                         dynamic_allowed_range: Some((ASK_PORT, ASK_PORT + 999)),
+                        hold: false,
                     },
                 )
                 .expect("the registration is answered"),
@@ -4340,5 +4950,787 @@ mod tests {
             "the second subscription is refused at the cap: {refused_sub:?}"
         );
         held.clear();
+    }
+
+    /// A connection that opens and never sends a request line must not pin
+    /// the accept loop: a second connection is still served promptly while
+    /// the silent one holds only its own thread.
+    #[test]
+    fn silent_connection_does_not_pin_the_accept_loop() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (sock_path, _server, _registry, _answerer, _proxy_publish) =
+            spawn_server(dir.path()).expect("server binds");
+
+        // Open a connection and send nothing: it holds its own thread,
+        // waiting on the read timeout, while the accept loop moves on.
+        let _silent = TestStream::connect(&sock_path).expect("socket accepts");
+
+        // A second connection is accepted and served without waiting out
+        // the silent connection's 30-second read bound.
+        let started = std::time::Instant::now();
+        let reply = register(
+            &sock_path,
+            &RegisterBoxRequest {
+                name: "web".to_string(),
+                ingress_ports: vec![8080],
+                egress: None,
+                credentialed_upstream: None,
+                dynamic_ingress: None,
+                dynamic_allowed_range: None,
+                hold: false,
+            },
+        )
+        .expect("the second connection is served");
+        assert!(
+            matches!(reply, BoxControlReply::Registered(_)),
+            "the second connection is answered, got {reply:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the second connection is served without waiting out the silent \
+             connection's read bound"
+        );
+    }
+
+    /// Past the door's connection cap a connection is refused on the
+    /// accept loop's own turn, before any thread is spawned; a slot freed
+    /// by a connection's end admits the next.
+    #[test]
+    fn control_connections_refused_past_the_cap() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let sock_path = dir.path().join(CONTROL_SOCK_FILE);
+        let listener = UnixListener::bind(&sock_path).expect("socket binds");
+        let boxes = BoxRegistry::new(SUBNET);
+        let answerer = AnswererStatus::allocating_for_tests("control-test-node");
+        let proxy_publish = ProxyPublishStatus::new();
+        let audit_path = audit_log_path(&sock_path);
+        std::thread::spawn(move || {
+            accept_loop(
+                listener,
+                boxes,
+                answerer,
+                proxy_publish,
+                ControlDoor::Host,
+                &audit_path,
+                1,
+            )
+        });
+
+        // The refusal closes without reading the request line, so a
+        // client's write can lose the race to the close (a broken pipe):
+        // the reply already written is still read. `None` is a connection
+        // whose reply could not be read at all.
+        let control_past_cap = |request: &BoxControlRequest| -> Option<BoxControlReply> {
+            let mut stream = TestStream::connect(&sock_path).expect("socket accepts");
+            let mut line = serde_json_lenient::to_string(request).expect("request serializes");
+            line.push('\n');
+            if let Err(error) = stream.write_all(line.as_bytes()) {
+                assert_eq!(
+                    error.kind(),
+                    std::io::ErrorKind::BrokenPipe,
+                    "write: {error}"
+                );
+            }
+            let mut reply = String::new();
+            BufReader::new(stream).read_line(&mut reply).ok()?;
+            serde_json_lenient::from_str(reply.trim()).ok()
+        };
+
+        // The silent connection takes the one slot.
+        let silent = TestStream::connect(&sock_path).expect("socket accepts");
+        let refused =
+            control_past_cap(&BoxControlRequest::AnswererStatus).expect("the refusal is answered");
+        assert!(
+            matches!(&refused, BoxControlReply::Error { error } if error.contains("1 control")),
+            "a connection past the cap is refused: {refused:?}"
+        );
+
+        // Its close frees the slot for the next connection.
+        drop(silent);
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let reply = control_past_cap(&BoxControlRequest::AnswererStatus);
+            if reply
+                .as_ref()
+                .is_some_and(|reply| !matches!(reply, BoxControlReply::Error { .. }))
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < until,
+                "the freed slot never admitted a connection: {reply:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// The admit an abandoned connection carries and the withdrawal the
+    /// reporter's unwind sends on a new one, for port 3000 on `web`.
+    fn admit_then_withdraw(web: &RegisteredBox) -> (AdmitPortRequest, WithdrawPortRequest) {
+        (
+            AdmitPortRequest {
+                switch_address: web.switch_address,
+                port: 3000,
+                proto: sessions::IpProto::Tcp,
+                source: PortReportSource::Expose,
+            },
+            WithdrawPortRequest {
+                switch_address: web.switch_address,
+                port: 3000,
+                proto: sessions::IpProto::Tcp,
+                source: PortReportSource::Expose,
+            },
+        )
+    }
+
+    /// A row named `web` whose grant admits runtime ports 3000-3999.
+    fn allow_box(sock_path: &std::path::Path) -> RegisteredBox {
+        handed(
+            register(
+                sock_path,
+                &RegisterBoxRequest {
+                    name: "web".to_string(),
+                    ingress_ports: Vec::new(),
+                    egress: None,
+                    credentialed_upstream: None,
+                    dynamic_ingress: Some(sessions::DynamicIngress::Allow),
+                    dynamic_allowed_range: Some((3000, 3999)),
+                    hold: false,
+                },
+            )
+            .expect("the registration is answered"),
+        )
+    }
+
+    /// A mutation whose request was read first applies first, even when its
+    /// thread is held between taking its ticket and applying: the
+    /// withdrawal read after it waits its turn, so the stale admit can
+    /// never re-open the port the withdrawal closed (NET-012, NET-128).
+    #[test]
+    fn earlier_ticket_applies_first_though_delayed_before_its_turn() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (sock_path, _server, boxes, _answerer, _proxy_publish) =
+            spawn_server(dir.path()).expect("server binds");
+        let web = allow_box(&sock_path);
+        let (admit, withdraw) = admit_then_withdraw(&web);
+        let audit_path = audit_log_path(&sock_path);
+        let order = Arc::new(ApplyOrder::default());
+        let applied = Arc::new(Mutex::new(Vec::new()));
+
+        // The admit's read finished first, the withdrawal's second.
+        let admit_ticket = order.take();
+        let withdraw_ticket = order.take();
+
+        // The admit's thread is held between its ticket and its turn until
+        // the test lets it go: the preempted thread of the race.
+        let (release_admit, admit_held) = std::sync::mpsc::channel::<()>();
+        let admit_thread = {
+            let boxes = boxes.clone();
+            let applied = Arc::clone(&applied);
+            std::thread::spawn(move || {
+                admit_held.recv().expect("the test releases the admit");
+                admit_ticket.wait_turn();
+                let reply = admit_report(&boxes, &audit_path, &admit);
+                applied.lock().expect("log").push("admit");
+                drop(admit_ticket);
+                reply
+            })
+        };
+        let (withdrawn, withdraw_done) = std::sync::mpsc::channel();
+        let withdraw_thread = {
+            let boxes = boxes.clone();
+            let applied = Arc::clone(&applied);
+            std::thread::spawn(move || {
+                withdraw_ticket.wait_turn();
+                let reply = withdraw_report(&boxes, &withdraw);
+                applied.lock().expect("log").push("withdraw");
+                drop(withdraw_ticket);
+                let _ = withdrawn.send(());
+                reply
+            })
+        };
+
+        // While the admit is held, the later withdrawal does not apply.
+        assert!(
+            withdraw_done
+                .recv_timeout(Duration::from_millis(300))
+                .is_err(),
+            "the later withdrawal applied ahead of the earlier admit"
+        );
+        assert!(applied.lock().expect("log").is_empty());
+
+        release_admit.send(()).expect("the admit thread waits");
+        let admit_reply = admit_thread.join().expect("the admit thread ends");
+        let withdraw_reply = withdraw_thread.join().expect("the withdraw thread ends");
+        assert!(
+            matches!(
+                admit_reply,
+                BoxControlReply::PortRecorded { port: 3000, .. }
+            ),
+            "the admit is recorded in its turn, got {admit_reply:?}"
+        );
+        assert!(
+            matches!(
+                withdraw_reply,
+                BoxControlReply::PortRecorded { port: 3000, .. }
+            ),
+            "the withdrawal is answered in its turn, got {withdraw_reply:?}"
+        );
+        assert_eq!(*applied.lock().expect("log"), ["admit", "withdraw"]);
+        let row = boxes.row_by_name("web").expect("the row is live");
+        assert!(
+            row.runtime_port_numbers().is_empty(),
+            "the withdrawal, read last, is the state that holds: {:?}",
+            row.runtime_port_numbers()
+        );
+    }
+
+    /// A ticket whose thread panics before its turn still hands the turn
+    /// on through its drop: the tickets behind it apply, and the door's
+    /// order never wedges.
+    #[test]
+    fn ticket_whose_thread_panics_hands_the_turn_on() {
+        let order = Arc::new(ApplyOrder::default());
+        let doomed = order.take();
+        let next = order.take();
+
+        let panicked = std::thread::spawn(move || {
+            let _ticket = doomed;
+            panic!("the request's thread dies between its ticket and its turn");
+        })
+        .join();
+        assert!(panicked.is_err(), "the doomed thread panicked");
+
+        let (applied, applied_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            next.wait_turn();
+            let _ = applied.send(());
+        });
+        applied_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the ticket behind the dead one gets its turn");
+
+        // The order keeps serving after both.
+        let (later, later_rx) = std::sync::mpsc::channel();
+        let order_after = Arc::clone(&order);
+        std::thread::spawn(move || {
+            let answer = order_after.apply(|| 7);
+            let _ = later.send(answer);
+        });
+        assert_eq!(
+            later_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("a fresh ticket gets its turn"),
+            7
+        );
+    }
+
+    /// The releases a test answerer served: each box name with the address
+    /// it freed, if it held one.
+    type Releases = Arc<Mutex<Vec<(String, Option<Ipv4Addr>)>>>;
+
+    /// The gate the next allocation's reply is held behind: a channel the
+    /// answerer signals when it holds a reply, and the receiver it waits on.
+    type AllocationGate =
+        Arc<Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>>;
+
+    /// A host door over a test answerer that holds an armed allocation's
+    /// reply until the test lets it go, with every release recorded.
+    struct SlowAllocation {
+        _dir: tempfile::TempDir,
+        sock_path: PathBuf,
+        boxes: BoxRegistry,
+        answerer: AnswererStatus,
+        gate: AllocationGate,
+        releases: Releases,
+    }
+
+    /// A registration whose allocation reply is held.
+    struct HeldRegistration {
+        registering: JoinHandle<std::io::Result<BoxControlReply>>,
+        release: std::sync::mpsc::Sender<()>,
+    }
+
+    impl SlowAllocation {
+        fn start() -> Self {
+            let dir = tempfile::TempDir::new().expect("temp dir");
+            let sock_path = dir.path().join(CONTROL_SOCK_FILE);
+            let boxes = BoxRegistry::new(SUBNET);
+            let gate: AllocationGate = Arc::new(Mutex::new(None));
+            let releases: Releases = Arc::new(Mutex::new(Vec::new()));
+            let answerer = {
+                let gate = Arc::clone(&gate);
+                let releases = Arc::clone(&releases);
+                AnswererStatus::allocating_for_tests_with(
+                    "control-test-node",
+                    move || {
+                        let held = gate.lock().expect("gate").take();
+                        held.map(|(entered, held)| {
+                            let _ = entered.send(());
+                            held
+                        })
+                    },
+                    move |name, freed| {
+                        releases
+                            .lock()
+                            .expect("releases")
+                            .push((name.to_string(), freed));
+                    },
+                )
+            };
+            spawn(
+                sock_path.clone(),
+                boxes.clone(),
+                answerer.clone(),
+                ProxyPublishStatus::new(),
+            )
+            .expect("server binds");
+            for _ in 0..500 {
+                if TestStream::connect(&sock_path).is_ok() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            Self {
+                _dir: dir,
+                sock_path,
+                boxes,
+                answerer,
+                gate,
+                releases,
+            }
+        }
+
+        /// Register `name` on a thread of its own, returning once the
+        /// answerer holds its allocation's reply.
+        fn register_held(&self, name: &str) -> HeldRegistration {
+            let (entered, allocation_entered) = std::sync::mpsc::channel();
+            let (release, held) = std::sync::mpsc::channel();
+            *self.gate.lock().expect("gate") = Some((entered, held));
+            let registering = {
+                let sock_path = self.sock_path.clone();
+                let request = box_request(name);
+                std::thread::spawn(move || register(&sock_path, &request))
+            };
+            allocation_entered
+                .recv_timeout(ASK_WAIT)
+                .expect("the registration reaches the allocation");
+            HeldRegistration {
+                registering,
+                release,
+            }
+        }
+
+        /// Register `name` and expect its row.
+        fn register_live(&self, name: &str) -> RegisteredBox {
+            handed(
+                register(&self.sock_path, &box_request(name))
+                    .expect("the registration is answered"),
+            )
+        }
+
+        /// Withdraw `name` at `switch_address` and `loopback_address`.
+        fn withdraw(&self, name: &str, switch_address: Ipv4Addr, loopback_address: Ipv4Addr) {
+            let withdrawn = control(
+                &self.sock_path,
+                &BoxControlRequest::Withdraw(WithdrawBoxRequest {
+                    name: name.to_string(),
+                    switch_address,
+                    loopback_address,
+                }),
+            )
+            .expect("the withdrawal is answered without waiting on the allocation");
+            assert!(
+                matches!(withdrawn, BoxControlReply::Addresses(_)),
+                "the withdrawal is answered, got {withdrawn:?}"
+            );
+        }
+
+        /// Withdraw `name` while no row is held for it yet: the goal state
+        /// already holding.
+        fn withdraw_unregistered(&self, name: &str) {
+            self.withdraw(
+                name,
+                Ipv4Addr::new(100, 64, 0, 200),
+                Ipv4Addr::new(127, 64, 0, 2),
+            );
+        }
+
+        /// Let the held allocation's reply go and answer the registration,
+        /// with how long the answer took from the reply's release.
+        fn finish(&self, held: HeldRegistration) -> (BoxControlReply, Duration) {
+            let released_at = std::time::Instant::now();
+            held.release.send(()).expect("the reply waits");
+            let reply = held
+                .registering
+                .join()
+                .expect("the registering client ends")
+                .expect("the registration is answered");
+            (reply, released_at.elapsed())
+        }
+
+        /// The releases of names that fold to `name` the answerer has served
+        /// so far. A probe allocation first drains every command queued
+        /// ahead of it: the book serves them in order.
+        fn releases_of(&self, name: &str) -> Vec<Option<Ipv4Addr>> {
+            let _ = self.answerer.allocate("release-probe");
+            self.releases
+                .lock()
+                .expect("releases")
+                .iter()
+                .filter(|(released, _)| released.eq_ignore_ascii_case(name))
+                .map(|(_, freed)| *freed)
+                .collect()
+        }
+    }
+
+    fn box_request(name: &str) -> RegisterBoxRequest {
+        RegisterBoxRequest {
+            name: name.to_string(),
+            ingress_ports: Vec::new(),
+            egress: None,
+            credentialed_upstream: None,
+            dynamic_ingress: None,
+            dynamic_allowed_range: None,
+            hold: false,
+        }
+    }
+
+    /// The registration was refused as withdrawn while allocating — not as
+    /// a revocation still pending — and without waiting out the revocation
+    /// bound.
+    fn assert_withdrawn_while_allocating(reply: &BoxControlReply, took: Duration) {
+        assert!(
+            matches!(
+                reply,
+                BoxControlReply::Error { error }
+                    if *error == AllocationError::WithdrawnWhileAllocating.to_string()
+            ),
+            "the registration the withdrawal raced is refused as withdrawn while allocating, \
+             got {reply:?}"
+        );
+        assert!(
+            took < crate::box_registry::REVOCATION_WAIT / 5,
+            "the refusal waited {took:?}, near the revocation bound"
+        );
+    }
+
+    /// A registration whose address is still being allocated when a
+    /// withdrawal for its name applies is refused in its turn: it writes no
+    /// row, and with nothing else holding the name the address goes back,
+    /// so the box created again takes it.
+    #[test]
+    fn registration_withdrawn_while_allocating_is_refused() {
+        let host = SlowAllocation::start();
+        let held = host.register_held("web");
+        host.withdraw_unregistered("web");
+        let (refused, took) = host.finish(held);
+        assert_withdrawn_while_allocating(&refused, took);
+        assert!(
+            host.boxes.row_by_name("web").is_none(),
+            "a refused registration writes no row"
+        );
+        assert!(!host.boxes.tracks_registrations_of("web"));
+
+        // The withdrawal leaves the address to the registration in flight,
+        // and that registration's refusal releases it: the address the
+        // registration drew is free again.
+        let releases = host.releases_of("web");
+        assert_eq!(releases.len(), 1, "only the refusal releases: {releases:?}");
+        let freed = releases
+            .iter()
+            .find_map(|freed| *freed)
+            .expect("the address the registration drew was released");
+
+        // The box created again takes the freed address and fills its row.
+        let again = host.register_live("web");
+        assert_eq!(again.loopback_address, freed);
+        assert!(host.boxes.row_by_name("web").is_some());
+    }
+
+    /// A refused registration never releases an address a live row of its
+    /// name holds: the answerer allocates per name, so the stale
+    /// registration and the one that replaced it drew the same address,
+    /// and a release by name would free the live row's.
+    #[test]
+    fn refused_registration_keeps_the_live_rows_address() {
+        let host = SlowAllocation::start();
+        let stale = host.register_held("web");
+        host.withdraw_unregistered("web");
+
+        // The box is created again while the stale registration's reply is
+        // still held, and its row lands.
+        let live = host.register_live("web");
+
+        let (refused, took) = host.finish(stale);
+        assert_withdrawn_while_allocating(&refused, took);
+        let row = host.boxes.row_by_name("web").expect("the live row stands");
+        assert_eq!(row.loopback_addr(), live.loopback_address);
+
+        // Nothing released: the withdrawal left the address to the
+        // registration in flight, and the refusal left it to the live row.
+        let releases = host.releases_of("web");
+        assert!(
+            releases.is_empty(),
+            "neither the withdrawal nor the refusal released: {releases:?}"
+        );
+        assert_eq!(
+            host.answerer.allocate("web"),
+            Ok(live.loopback_address),
+            "the answerer still holds the live row's address for its box"
+        );
+        assert!(
+            host.releases_of("web").is_empty(),
+            "the address was held, not released and redrawn"
+        );
+        assert!(
+            !host.boxes.tracks_registrations_of("web"),
+            "the name's entry goes once both registrations ended"
+        );
+    }
+
+    /// The answerer allocates per canonical name, so a withdrawal of "web"
+    /// refuses a registration of "Web" still allocating: one box to the
+    /// answerer is one box to the withdrawal generation.
+    #[test]
+    fn mixed_case_registration_withdrawn_while_allocating_is_refused() {
+        let host = SlowAllocation::start();
+        let held = host.register_held("Web");
+        host.withdraw_unregistered("web");
+        let (refused, took) = host.finish(held);
+        assert_withdrawn_while_allocating(&refused, took);
+        assert!(host.boxes.row_by_name("Web").is_none());
+        assert!(host.boxes.row_by_name("web").is_none());
+        assert!(!host.boxes.tracks_registrations_of("Web"));
+        // The withdrawal leaves the address to the registration in flight,
+        // and that registration's refusal releases it.
+        let releases = host.releases_of("web");
+        assert_eq!(releases.len(), 1, "only the refusal releases: {releases:?}");
+        assert!(releases.iter().any(Option::is_some));
+    }
+
+    /// A live row named "WEB" holds its address against a refused
+    /// registration of "Web": the ownership check compares names in the
+    /// answerer's canonical form.
+    #[test]
+    fn mixed_case_live_row_keeps_the_address() {
+        let host = SlowAllocation::start();
+        let stale = host.register_held("Web");
+        host.withdraw_unregistered("web");
+        let live = host.register_live("WEB");
+
+        let (refused, took) = host.finish(stale);
+        assert_withdrawn_while_allocating(&refused, took);
+        let row = host.boxes.row_by_name("WEB").expect("the live row stands");
+        assert_eq!(row.loopback_addr(), live.loopback_address);
+        let releases = host.releases_of("web");
+        assert!(
+            releases.is_empty(),
+            "neither the withdrawal, raced by a registration in flight, nor the \
+             refusal released: {releases:?}"
+        );
+        assert_eq!(
+            host.answerer.allocate("web"),
+            Ok(live.loopback_address),
+            "the answerer still holds the live row's address"
+        );
+        assert!(!host.boxes.tracks_registrations_of("web"));
+        assert!(!host.boxes.tracks_registrations_of("WEB"));
+    }
+
+    /// A registration raced by its box's withdrawal is refused at once as
+    /// withdrawn while allocating, even when the withdrawal's revocation
+    /// still holds the address: the generation check runs before the
+    /// revocation wait, which would otherwise run out its bound and answer
+    /// a pending revocation instead.
+    #[test]
+    fn raced_registration_is_refused_without_waiting_out_the_revocation() {
+        let host = SlowAllocation::start();
+        // A subscriber that never acts holds every withdrawn row's
+        // revocation, the way a gate still unbinding forwards does.
+        let table = host.boxes.table();
+        let _revocations = table.subscribe_row_withdrawals();
+        let old = host.register_live("web");
+
+        // The box's next registration draws the same address (the
+        // answerer's hold is per name) and is held in the allocation.
+        let held = host.register_held("web");
+        host.withdraw("web", old.switch_address, old.loopback_address);
+        assert!(
+            table.revocation_pending(old.loopback_address.octets()),
+            "the withdrawn row's revocation holds the address"
+        );
+
+        let (refused, took) = host.finish(held);
+        assert_withdrawn_while_allocating(&refused, took);
+        assert!(host.boxes.row_by_name("web").is_none());
+        assert!(!host.boxes.tracks_registrations_of("web"));
+    }
+
+    /// A registration whose name folds to a live row's is refused through
+    /// the door, the refusal names the held spelling, and the held
+    /// loopback is not released: the answerer allocates by the name's
+    /// canonical form, so a release by the refused name would free the
+    /// live row's address.
+    #[test]
+    fn folded_equal_name_refused_and_does_not_release_the_held_loopback() {
+        let host = SlowAllocation::start();
+        let live = host.register_live("Web");
+
+        let refused = control(
+            &host.sock_path,
+            &BoxControlRequest::Register(box_request("web")),
+        )
+        .expect("the registration is answered");
+        match &refused {
+            BoxControlReply::Error { error } => assert_eq!(
+                error,
+                &AllocationError::NameAlreadyHeld {
+                    held: "Web".to_string()
+                }
+                .to_string(),
+                "the refusal names the held spelling, got {refused:?}"
+            ),
+            other => panic!("a folded-equal name is refused, got {other:?}"),
+        }
+
+        // The live row stands in its own spelling and still holds its
+        // address — the refusal released nothing.
+        let row = host.boxes.row_by_name("WEB").expect("the live row stands");
+        assert_eq!(row.loopback_addr(), live.loopback_address);
+        assert!(
+            host.releases_of("web").is_empty(),
+            "the refusal released nothing: the live row's address stays held"
+        );
+
+        // A withdrawal under a folded-equal name that finds no row of its
+        // own releases nothing either: the live row owns the name's address.
+        host.withdraw_unregistered("web");
+        assert!(
+            host.releases_of("web").is_empty(),
+            "a withdrawal releases no address a live row under the folded name holds"
+        );
+        assert_eq!(
+            host.answerer.allocate("web"),
+            Ok(live.loopback_address),
+            "the answerer still holds the live row's address for its box"
+        );
+    }
+
+    /// Open a held registration of `name` ([`RegisterBoxRequest::hold`]):
+    /// the lease connection, kept open, and the reply read off it.
+    fn register_holding(sock_path: &Path, name: &str) -> (TestStream, BoxControlReply) {
+        let mut stream = TestStream::connect(sock_path).expect("the door accepts");
+        let request = BoxControlRequest::Register(RegisterBoxRequest {
+            hold: true,
+            ..box_request(name)
+        });
+        let mut line = serde_json_lenient::to_string(&request).expect("the request serializes");
+        line.push('\n');
+        stream
+            .write_all(line.as_bytes())
+            .expect("the request is written");
+        let mut reply = String::new();
+        BufReader::new(stream.try_clone().expect("the lease clones"))
+            .read_line(&mut reply)
+            .expect("the reply is read");
+        let reply = serde_json_lenient::from_str(reply.trim()).expect("the reply parses");
+        (stream, reply)
+    }
+
+    /// Wait until no registration lease is held: each lease's thread has
+    /// decided its row — kept on the commit, withdrawn otherwise.
+    fn leases_settled(host: &SlowAllocation) {
+        assert!(
+            host.boxes.ask_gauges().leases.wait_idle(ASK_WAIT),
+            "every registration lease ends once its connection does"
+        );
+    }
+
+    /// A held registration whose lease connection closes before its commit
+    /// — an activation that died between registering and going active —
+    /// withdraws its row and releases its address, so the name registers
+    /// again at once, in any spelling, with no daemon restart.
+    #[test]
+    fn registration_lease_closed_before_commit_withdraws_the_row() {
+        let host = SlowAllocation::start();
+        let (lease, reply) = register_holding(&host.sock_path, "Web");
+        let web = handed(reply);
+        let row = host
+            .boxes
+            .row_by_name("web")
+            .expect("the held registration publishes its row");
+        assert_eq!(row.switch_addr(), web.switch_address);
+
+        drop(lease);
+        leases_settled(&host);
+        assert!(
+            host.boxes.row_by_name("web").is_none(),
+            "a lease closed before its commit withdraws its row"
+        );
+        assert_eq!(
+            host.releases_of("web"),
+            vec![Some(web.loopback_address)],
+            "the withdrawn row's address goes back to the answerer"
+        );
+        let again = host.register_live("WEB");
+        assert_eq!(
+            host.boxes
+                .row_by_name("web")
+                .expect("the name registers again at once")
+                .switch_addr(),
+            again.switch_address,
+        );
+    }
+
+    /// A held registration whose client commits keeps its row when the
+    /// lease connection closes after the commit: the commit, never the
+    /// close, is what keeps a live box's row.
+    #[test]
+    fn committed_registration_lease_keeps_the_row() {
+        let host = SlowAllocation::start();
+        let (mut lease, reply) = register_holding(&host.sock_path, "web");
+        let web = handed(reply);
+        lease
+            .write_all(format!("{}\n", minimald_rpc::REGISTRATION_COMMIT_LINE).as_bytes())
+            .expect("the commit is written");
+        drop(lease);
+        leases_settled(&host);
+        assert_eq!(
+            host.boxes
+                .row_by_name("web")
+                .expect("a committed lease keeps its row")
+                .switch_addr(),
+            web.switch_address,
+        );
+        assert!(
+            host.releases_of("web").is_empty(),
+            "a committed lease releases nothing"
+        );
+    }
+
+    /// Past the lease cap a held registration is refused naming the cap,
+    /// before any row is published; a one-shot registration is not a lease
+    /// and is served past it.
+    #[test]
+    fn registration_lease_refused_past_its_cap() {
+        let host = SlowAllocation::start();
+        host.boxes.ask_gauges().set_lease_cap(1);
+        let (_first, reply) = register_holding(&host.sock_path, "web");
+        handed(reply);
+
+        let (_second, refused) = register_holding(&host.sock_path, "db");
+        match &refused {
+            BoxControlReply::Error { error } => assert!(
+                error.contains("already serving 1 registration lease connections"),
+                "the refusal names the cap, got {error}"
+            ),
+            other => panic!("a lease past the cap is refused, got {other:?}"),
+        }
+        assert!(
+            host.boxes.row_by_name("db").is_none(),
+            "a refused lease publishes no row"
+        );
+        host.register_live("api");
     }
 }

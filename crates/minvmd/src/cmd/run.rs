@@ -503,8 +503,18 @@ fn run_foreground() -> Result<()> {
     // table and its one line per attachment are the host's own state, ready
     // for the acceptor that reads them.
     let proxy_attachments = crate::bep_attach::Attachments::new();
+    // The operator's deny-all opt-out (NET-077), read once here as the VMM
+    // child reads it for the boot line: the registry compiles a client box
+    // with no `egress` section by it, so the host gate keeps the default the
+    // guest daemon was handed.
+    let egress_deny_all_opt_out = crate::vm::egress_deny_all_opt_out_from_env();
+    tracing::info!(
+        egress_deny_all_opt_out,
+        "host-side egress default opt-out for undeclared boxes"
+    );
     let boxes = crate::box_registry::BoxRegistry::new(switch::DEFAULT_SUBNET)
-        .feeding_proxy_attachments(proxy_attachments.clone());
+        .feeding_proxy_attachments(proxy_attachments.clone())
+        .with_egress_deny_all_opt_out(egress_deny_all_opt_out);
     // The node's own proxy port is resolved once before the VM boots — the
     // operator's override (`MINVMD_NODE_PROXY_PORT` in this supervisor's env)
     // or the default-first probe, so a VM sharing a host with a native daemon
@@ -661,6 +671,19 @@ fn run_foreground() -> Result<()> {
             let switch_sock =
                 crate::net::resolve_switch_sock().context("resolving switch socket")?;
             crate::sock::prepare_socket_dir(&switch_sock).context("preparing switch socket dir")?;
+            // A crashed supervisor (SIGKILL, abort) leaves its gvproxy alive:
+            // the pidfd stop paths are clean-stop-only and gvproxy holds no
+            // alive lock, so nothing reaps it. Unlinking the stale socket
+            // below would let the fresh gvproxy bind while the leftover still
+            // holds the host-side forwards. Kill it first — matched on exact
+            // argv tokens: argv[0] is the gvproxy binary and `-listen` names
+            // this VM's switch socket. This supervisor's alive lock rules out
+            // a live same-instance supervisor, so a match owned by a live
+            // minvmd fails the start rather than spawning a duplicate switch.
+            // This thread is the synchronous supervisor thread, not a tokio
+            // worker, so the reap's bounded wait may block it.
+            crate::net::reap_stale_gvproxy(&binary, &switch_sock)
+                .context("reaping a stale gvproxy")?;
             crate::sock::remove_stale_socket(&switch_sock)
                 .context("removing stale switch socket")?;
             // The gate binds the socket beside the switch socket, so a stale

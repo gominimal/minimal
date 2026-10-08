@@ -3984,17 +3984,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "min-answerer"
-version = "0.7.0"
-dependencies = [
- "anyhow",
- "clap",
- "minvmd",
- "tracing-subscriber",
- "version",
-]
-
-[[package]]
 name = "minimal"
 version = "0.7.0"
 dependencies = [
@@ -4230,6 +4219,17 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "uuid",
+ "version",
+]
+
+[[package]]
+name = "minzoned"
+version = "0.7.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "minvmd",
+ "tracing-subscriber",
  "version",
 ]
 
@@ -4770,6 +4770,7 @@ dependencies = [
  "oci-spec",
  "ot",
  "rayon",
+ "rcache",
  "sandbox2",
  "serde",
  "serde_json_lenient",

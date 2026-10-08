@@ -12,10 +12,11 @@ use anyhow::Context as _;
 use minimal_client::Client;
 use minimald_rpc::{
     CreateSession, CreateSessionRequest, DestroySession, DestroySessionRequest, Errorable,
-    GetSessionPolicy, GetSessionPolicyRequest, GetSessionRecord, GetSessionRecordRequest,
-    GetVersion, ListSessions, OneshotSshRpc, RenameSession, RenameSessionRequest, SessionConfig,
+    GetEffectiveSessionPolicy, GetEffectiveSessionPolicyRequest, GetSessionRecord,
+    GetSessionRecordRequest, GetVersion, ListSessions, OneshotSshRpc, RenameSession,
+    RenameSessionRequest, SessionConfig,
 };
-use sessions::{NetworkMode, SessionId, SessionPolicy};
+use sessions::{EffectiveSessionPolicy, NetworkMode, SessionId, SessionPolicy};
 
 /// Deadline for the UI-loop RPCs. The draw loop awaits these inline, so a
 /// wedged-but-connected daemon (a suspended microVM behind libkrun's
@@ -229,19 +230,41 @@ pub async fn refresh(provider: &mut Provider) -> Result<ProviderData, anyhow::Er
 }
 
 /// The record + networking policy behind the detail pane, fetched with one
-/// RPC each per focus change.
+/// RPC each per focus change. The policy is the *effective* one — the same
+/// answer `GetSessionPolicy` serves, with the egress half resolved to what
+/// the gate enforces — so the pane's `(default)` mark can show when the
+/// deny-all a session is held to is the rollout's default, not its own
+/// declaration (what `min session policy` renders).
+///
+/// A failed policy lookup does not cost the pane its record: it comes back
+/// as the policy's `Err`, for the pane to name. A daemon that predates
+/// `GetEffectiveSessionPolicy` refuses the subsystem, and that is the case
+/// this keeps visible.
 pub async fn fetch_detail(
     provider: &mut Provider,
     id: SessionId,
-) -> Result<(Option<sessions::Record>, Option<SessionPolicy>), anyhow::Error> {
+) -> Result<
+    (
+        Option<sessions::Record>,
+        Result<EffectiveSessionPolicy, String>,
+    ),
+    anyhow::Error,
+> {
     let record = timed::<GetSessionRecord>(&mut provider.client, GetSessionRecordRequest::Id(id))
         .await
         .context("GetSessionRecord RPC failed")?
         .record;
-    let policy = timed::<GetSessionPolicy>(&mut provider.client, GetSessionPolicyRequest::Id(id))
-        .await
-        .context("GetSessionPolicy RPC failed")?
-        .ok();
+    let policy = match timed::<GetEffectiveSessionPolicy>(
+        &mut provider.client,
+        GetEffectiveSessionPolicyRequest::Id(id),
+    )
+    .await
+    .context("GetEffectiveSessionPolicy RPC failed")
+    {
+        Ok(Errorable::Ok(policy)) => Ok(policy),
+        Ok(Errorable::Err { error }) => Err(error),
+        Err(e) => Err(format!("{e:#}")),
+    };
     Ok((record, policy))
 }
 
@@ -257,21 +280,61 @@ pub async fn fetch_screen(
     Ok(resp.ok())
 }
 
+/// Whether a session holds its name in the VM host's zone in place of a
+/// row: a `host_ip` box shares the node's own row, so `min session
+/// activate` and [`activate`] hold its name (NODATA) instead of
+/// registering one.
+fn holds_name(record: &sessions::Record) -> bool {
+    record.network == NetworkMode::HostNet && record.box_addresses.is_none()
+}
+
+/// Holds or releases a name on the VM host daemon beside `sock`, off the
+/// async workers: the control exchange is a blocking socket call.
+async fn hold_box_name(sock: &Path, name: &str, id: SessionId, hold: bool) {
+    let (sock, name) = (sock.to_path_buf(), name.to_string());
+    if let Err(error) = tokio::task::spawn_blocking(move || {
+        minimal_client::attach::hold_box_name_beside(&sock, &name, Some(id), hold);
+    })
+    .await
+    {
+        tracing::warn!(%error, "the box name hold's thread failed");
+    }
+}
+
+/// The session's record, best-effort: `None` when it cannot be read.
+async fn record_of(provider: &mut Provider, id: SessionId) -> Option<sessions::Record> {
+    timed::<GetSessionRecord>(&mut provider.client, GetSessionRecordRequest::Id(id))
+        .await
+        .ok()
+        .and_then(|resp| resp.record)
+}
+
+/// Destroys the session, then releases the zone hold its name kept when it
+/// is a `host_ip` box, the release `min session destroy` makes too.
 pub async fn destroy(provider: &mut Provider, id: SessionId) -> Result<(), anyhow::Error> {
+    let record = record_of(provider, id).await;
     match timed::<DestroySession>(&mut provider.client, DestroySessionRequest { id })
         .await
         .context("DestroySession RPC failed")?
     {
-        Errorable::Ok(_) => Ok(()),
+        Errorable::Ok(_) => {
+            if let Some(name) = record.filter(holds_name).and_then(|record| record.name) {
+                hold_box_name(&provider.sock, &name, id, false).await;
+            }
+            Ok(())
+        }
         Errorable::Err { error } => Err(anyhow::anyhow!(error)),
     }
 }
 
+/// Renames the session; a `host_ip` box's zone hold moves with the name, as
+/// `min session rename` moves it.
 pub async fn rename(
     provider: &mut Provider,
     id: SessionId,
     new_name: &str,
 ) -> Result<(), anyhow::Error> {
+    let record = record_of(provider, id).await;
     match timed::<RenameSession>(
         &mut provider.client,
         RenameSessionRequest {
@@ -282,8 +345,31 @@ pub async fn rename(
     .await
     .context("RenameSession RPC failed")?
     {
-        Errorable::Ok(_) => Ok(()),
+        Errorable::Ok(_) => {
+            if let Some(record) = record.filter(holds_name) {
+                if let Some(old_name) = record.name.as_deref() {
+                    hold_box_name(&provider.sock, old_name, id, false).await;
+                }
+                hold_box_name(&provider.sock, new_name, id, true).await;
+            }
+            Ok(())
+        }
         Errorable::Err { error } => Err(anyhow::anyhow!(error)),
+    }
+}
+
+/// Releases session `id`'s zone hold once an attach from the dashboard has
+/// ended with the session gone: the shell-exit prompt's Delete destroys the
+/// session daemon-side, past [`destroy`]. A lookup that fails releases
+/// nothing; a session still there keeps its hold, and the release names
+/// the session, so a newer session under `name` keeps its own.
+pub async fn release_held_name_after_attach(provider: &mut Provider, id: SessionId, name: &str) {
+    let lookup =
+        timed::<GetSessionRecord>(&mut provider.client, GetSessionRecordRequest::Id(id)).await;
+    if let Ok(resp) = lookup
+        && resp.record.is_none()
+    {
+        hold_box_name(&provider.sock, name, id, false).await;
     }
 }
 
@@ -313,7 +399,7 @@ pub async fn activate(
     project_path: paths::HostAbsPath,
     network: NetworkMode,
     contribution: sessions::wire::request::WireContribution,
-) -> Result<SessionId, anyhow::Error> {
+) -> Result<Activated, anyhow::Error> {
     let mut client = Client::connect(sock).await?;
     // The dashboard's own copy of the create/upload/configure/finalize
     // sequence, so it needs the same gate `min session activate` gets: on a
@@ -405,11 +491,14 @@ pub async fn activate(
         match client
             .oneshot_rpc::<minimald_rpc::FinalizeSession>(minimald_rpc::FinalizeSessionRequest {
                 session_id: id,
+                // The dashboard's status line does not render the yielded
+                // ports, so it does not ask for them.
+                report_shared_port_collisions: false,
             })
             .await
             .context("FinalizeSession RPC failed")?
         {
-            Errorable::Ok(_) => Ok(()),
+            Errorable::Ok(ok) => Ok(ok.package_check_skipped),
             Errorable::Err { error } => anyhow::bail!("{error}"),
         }
     }
@@ -417,13 +506,40 @@ pub async fn activate(
 
     // A failed flow must not orphan the record: a `Pending` stub would hold
     // its name and be reaped at the next daemon restart anyway.
-    if let Err(e) = flow {
-        let _ = client
-            .oneshot_rpc::<minimald_rpc::AbortSession>(minimald_rpc::AbortSessionRequest { id })
-            .await;
-        return Err(e);
+    match flow {
+        Ok(package_check_skipped) => {
+            // The session is active: a `host_ip` box holds its name in the
+            // zone (NODATA) the way `min session activate` holds it, read
+            // off the record so an autogen name is the one held.
+            if let Ok(resp) = client
+                .oneshot_rpc::<GetSessionRecord>(GetSessionRecordRequest::Id(id))
+                .await
+                && let Some(record) = resp.record.filter(holds_name)
+                && let Some(name) = record.name.as_deref()
+            {
+                hold_box_name(sock, name, id, true).await;
+            }
+            Ok(Activated {
+                id,
+                package_check_skipped,
+            })
+        }
+        Err(e) => {
+            let _ = client
+                .oneshot_rpc::<minimald_rpc::AbortSession>(minimald_rpc::AbortSessionRequest { id })
+                .await;
+            Err(e)
+        }
     }
-    Ok(id)
+}
+
+/// A session the dashboard created and activated.
+#[derive(Debug)]
+pub struct Activated {
+    pub id: SessionId,
+    /// The daemon's package check stepped aside at finalize, so unknown
+    /// package names surface at first exec; the status line says so.
+    pub package_check_skipped: bool,
 }
 
 /// Resolves the directory whose tree should be uploaded as the session

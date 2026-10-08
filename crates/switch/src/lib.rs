@@ -30,6 +30,15 @@ pub const GATEWAY_MAC: MacAddr = MacAddr([0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xdd]);
 /// [`SwitchSubnet::box_egress_proxy_address`] on that subnet.
 pub const BEP_MAC: MacAddr = MacAddr([0x52, 0x54, 0x00, 0x40, 0xff, 0xfc]);
 
+/// How long the Box Egress Proxy leg's smoltcp neighbour cache keeps an
+/// entry: smoltcp 0.14's `iface::neighbor::Cache::ENTRY_LIFETIME`, which the
+/// crate keeps `pub(crate)`, so it is restated here. A switch address handed
+/// again wears the same derived MAC ([`MacAddr::for_switch_ip`]), so an
+/// allocator that reuses addresses must quarantine a released one for longer
+/// than this, or the leg could still answer the new holder from the old
+/// holder's entry. Change it with the smoltcp version.
+pub const BEP_NEIGHBOUR_CACHE_LIFETIME: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// AF_VSOCK CID of the host as seen from inside a libkrun guest. Well-known:
 /// `VMADDR_CID_HOST == 2`. The per-PTask shuttle dials this CID to reach the
 /// host gvproxy switch (DM1/3/4).
@@ -60,6 +69,22 @@ pub const DEFAULT_SUBNET: SwitchSubnet = SwitchSubnet {
 /// addresses live: the range the plan publishes from is, by construction,
 /// the range the zone answers.
 pub const RESERVED_LOCAL_RANGE: (Ipv4Addr, u8) = (Ipv4Addr::new(127, 0, 64, 0), 24);
+
+/// The run of [`RESERVED_LOCAL_RANGE`] a box's published address may come
+/// from (design §7.1): the range's `.2` to its last-but-one address (`.254`
+/// of the /24). The network address, `.1` and the broadcast address are
+/// never a box's.
+///
+/// The one definition of that run: the answerer's address book hands boxes
+/// out of it, and the box registry's single-node test cursor clamps its
+/// slice to it, so the two cannot drift.
+#[must_use]
+pub fn box_loopback_interior() -> (Ipv4Addr, Ipv4Addr) {
+    let (network, prefix) = RESERVED_LOCAL_RANGE;
+    let size = 1u32 << (32 - u32::from(prefix));
+    let first = u32::from(network);
+    (Ipv4Addr::from(first + 2), Ipv4Addr::from(first + size - 2))
+}
 
 /// Prefix of the reserved local range slice each switch (one gvproxy) publishes
 /// its boxes at. A /27 is 32 addresses — 32 published boxes per switch — and a
@@ -624,6 +649,17 @@ mod tests {
         assert_eq!(BEP_MAC.to_string(), "52:54:00:40:ff:fc");
         assert_eq!(net.daemon_ip(), Ipv4Addr::new(100, 64, 255, 253));
         assert_eq!(net.host_alias(), Ipv4Addr::new(100, 64, 255, 254));
+    }
+
+    /// Design §7.1: a box's published address is the reserved local range's
+    /// interior, `.2` to `.254`, never its network address, `.1` or its
+    /// broadcast.
+    #[test]
+    fn box_loopback_interior_is_the_range_s_dot2_to_dot254() {
+        assert_eq!(
+            box_loopback_interior(),
+            (Ipv4Addr::new(127, 0, 64, 2), Ipv4Addr::new(127, 0, 64, 254))
+        );
     }
 
     /// The lease run's end has one source: the run the lease book hands from

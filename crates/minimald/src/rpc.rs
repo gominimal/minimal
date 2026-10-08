@@ -2,13 +2,12 @@ use futures::StreamExt as _;
 use minimald_rpc::{
     AbortSession, AbortSessionResponse, BoxControlReply, BoxControlRequest, CleanCacheRequest,
     CleanCacheUpdate, CreateSession, DestroySession, DestroySessionResponse, Errorable,
-    FinalizeSession, FinalizeSessionResponse, GetEffectiveSessionPolicy,
-    GetEffectiveSessionPolicyRequest, GetMeshStatus, GetSessionPolicy, GetSessionPolicyRequest,
-    GetSessionRecord, GetSessionRecordRequest, GetSessionRecordResponse, GetSessionScreen,
-    GetVersion, GetVersionResponse, ListSessions, ListSessionsEntry, ListSessionsResponse,
-    OneshotSshRpc, RPC_SUBSYSTEM_PREFIX, RenameSession, RenameSessionResponse, ResourcePool,
-    SessionDelta, SessionDeltaRequest, SessionDeltaResponse, Shutdown, ShutdownRequest,
-    ShutdownResponse, SubmitVerdict,
+    FinalizeSession, GetEffectiveSessionPolicy, GetEffectiveSessionPolicyRequest, GetMeshStatus,
+    GetSessionPolicy, GetSessionPolicyRequest, GetSessionRecord, GetSessionRecordRequest,
+    GetSessionRecordResponse, GetSessionScreen, GetVersion, GetVersionResponse, ListSessions,
+    ListSessionsEntry, ListSessionsResponse, OneshotSshRpc, RPC_SUBSYSTEM_PREFIX, RenameSession,
+    RenameSessionResponse, ResourcePool, SessionDelta, SessionDeltaRequest, SessionDeltaResponse,
+    Shutdown, ShutdownRequest, ShutdownResponse, SubmitVerdict,
 };
 use russh::{
     Channel as RuChannel, ChannelId,
@@ -180,6 +179,9 @@ async fn serve_list_sessions(
                     .into_iter()
                     .zip(enforcement)
                     .map(|(i, host_ip_enforcement)| ListSessionsEntry {
+                        // NET-129: the listing names the ports this box
+                        // yields, from the same read the runtime facts use.
+                        shared_port_collisions: shared_port_collisions_of(&mngr, i.id),
                         id: i.id,
                         name: i.name,
                         project_path: Some(i.project_path),
@@ -207,6 +209,28 @@ async fn serve_list_sessions(
             })
         })
         .await
+}
+
+/// The ports a box's attach yields because a sibling at the same shared
+/// loopback address holds them (NET-129, first-come), as the wire names
+/// them: the one registry read both the runtime facts and the listing answer
+/// from, so `min session policy` and `min session list` cannot disagree.
+/// Empty for every mode but a shared-address own-ip box; a plain map lookup
+/// behind the registry's lock, so it never holds up a reply.
+fn shared_port_collisions_of(
+    mngr: &crate::sessions::ManagerHandle,
+    id: SessionId,
+) -> Vec<minimald_rpc::SharedPortCollision> {
+    let registry = mngr.hostnames();
+    let routes = registry.read().expect("hostname registry lock poisoned");
+    routes
+        .shared_port_collisions(id)
+        .into_iter()
+        .map(|c| minimald_rpc::SharedPortCollision {
+            port: c.port,
+            held_by: c.other,
+        })
+        .collect()
 }
 
 fn detect_resource_pool() -> Option<ResourcePool> {
@@ -312,6 +336,10 @@ async fn serve_create_session(
             // manager: the success record below needs it, and the reply
             // carries only the assigned id.
             let session_name = req.config.name.clone();
+            // Read the network mode off the config for the same reason: the
+            // manager consumes it, and the mode the session activated with is
+            // what the field below reports beside the "session created" line.
+            let network = req.config.network;
             // Read the egress rule counts off the config for the same reason:
             // the manager consumes it, and the stored record's egress is what
             // the counts below report beside the "session created" line.
@@ -378,6 +406,7 @@ async fn serve_create_session(
                     tracing::info!(
                         session_id = %id,
                         session_name = session_name.as_deref().unwrap_or(ANONYMOUS_SESSION),
+                        network_mode = %network.word(),
                         egress_allow_subnets = egress_counts.allow_subnets,
                         egress_allow_protocols = egress_counts.allow_protocols,
                         egress_allow_dns_hosts = egress_counts.allow_dns_hosts,
@@ -851,7 +880,12 @@ async fn serve_answerer_control(
                 return;
             }
             match request {
-                BoxControlRequest::AnswererStatus => BoxControlReply::Status(status.get()),
+                BoxControlRequest::AnswererStatus => {
+                    BoxControlReply::Status(minimald_rpc::AnswererStatusReply {
+                        answerer: status.get(),
+                        proxy_down: None,
+                    })
+                }
                 BoxControlRequest::ReleaseAnswerer => {
                     let reply = status.release().await;
                     tracing::info!(
@@ -880,6 +914,8 @@ async fn serve_answerer_control(
                 }
                 BoxControlRequest::Register(_)
                 | BoxControlRequest::Withdraw(_)
+                | BoxControlRequest::HoldBoxName(_)
+                | BoxControlRequest::ReleaseBoxName(_)
                 | BoxControlRequest::AdmitPort(_)
                 | BoxControlRequest::WithdrawPort(_)
                 | BoxControlRequest::ReadRow(_)
@@ -1083,7 +1119,16 @@ async fn serve_finalize_session(
                 });
             };
             Ok(match h.finalize().await {
-                Ok(activate_hooks) => Errorable::Ok(FinalizeSessionResponse { activate_hooks }),
+                Ok(mut response) => {
+                    // The reply is `deny_unknown_fields`, so a client that
+                    // did not ask for the yielded ports would refuse a reply
+                    // naming them and abort its activation: only a client
+                    // that asked gets the list (the yield itself stands).
+                    if !req.report_shared_port_collisions {
+                        response.shared_port_collisions.clear();
+                    }
+                    Errorable::Ok(response)
+                }
                 Err(e) => Errorable::Err {
                     error: e.to_string(),
                 },
@@ -1292,11 +1337,17 @@ async fn serve_get_session_policy(
 
 /// The `GetEffectiveSessionPolicy` reply for one record's policy and network
 /// mode: the egress half resolved to what the gate enforces, the ingress half
-/// verbatim. NET-079's enforcement state answers beside this reply, over
-/// `GetSessionRuntimeFacts` — never as a field here, because the policy
-/// struct is `deny_unknown_fields`: an older `min` rejects a key it has no
-/// field for, so a fact that did not exist when that client was built must
-/// ride its own reply or the rules stop reading at all.
+/// verbatim, and the credentialed-upstream lane (NET-134) verbatim.
+///
+/// The reply rule: the policy struct is `deny_unknown_fields`, so an older
+/// `min` rejects a key it has no field for. A field that changes what the
+/// box can reach goes in this strict reply, so an older `min` fails visibly
+/// instead of under-reporting the box's reach — the lane is such a field,
+/// and `min session policy` reads no other reply that carries it.
+/// Descriptive state — NET-079's enforcement state among it — never rides
+/// here: it answers beside this reply, over `GetSessionRuntimeFacts`, so an
+/// older client keeps reading the rules.
+///
 /// `phase` is the rollout
 /// phase to resolve under — the handler serves
 /// [`sessions::EGRESS_DEFAULT_PHASE`], the phase this build ships, while the
@@ -1312,6 +1363,7 @@ pub(crate) fn effective_policy_reply(
     minimald_rpc::EffectiveSessionPolicy {
         egress: sessions::effective_egress(policy.egress.as_ref(), network, phase, opt_out),
         ingress: policy.ingress.clone(),
+        credentialed_upstream: policy.credentialed_upstream.clone(),
     }
 }
 
@@ -1378,20 +1430,13 @@ async fn serve_get_effective_session_policy(
 /// empty list — the honest answer for a box that is not running, since a
 /// publish lives only while its box does.
 ///
-/// Each row's reachability state is filled here, at read time, from the same
-/// set the box's relay gate was compiled from — the declared ports
-/// [`declared_ingress_ports`] — because it is a fact about the box, not about
-/// the bind: a runtime-published port is bound on the host at once, but the
-/// frame only reaches the box through the relay gate its attach installed,
-/// and that gate admits the ports the *declaration* named. So a runtime
-/// publish reads `pending` until the gate's admitted set grows to include
-/// runtime-published ports, and a publish of a port the declaration already
-/// names — the one overlap — is not pending, because the declared forward is
-/// what answers at that address. The listen watcher's rows — the in-range
-/// listens the box's `allow` stance published — are the exception that
-/// growth already made: the watcher admits each port at the gate as its
-/// publish's last step, so they are served as they stand, reachable, after
-/// the exposes' rows.
+/// Every row reads not pending: a runtime publish admits its port at the
+/// box's relay gate in the same turn it records the mapping (NET-044), so a
+/// listed publish is reachable. The `pending` field stays on the wire so a
+/// client can still tell this daemon's rows from an older daemon's. The
+/// listen watcher's rows — the in-range listens the box's `allow` stance
+/// published — follow the exposes' rows, reachable too: the watcher admits
+/// each port at the gate as its publish's last step.
 async fn serve_get_live_ingress(
     s: ServerStateHandle,
     c: RuChannel<Msg>,
@@ -1411,42 +1456,19 @@ async fn serve_get_live_ingress(
                 None => Ok(Errorable::Err {
                     error: "no session found".to_string(),
                 }),
-                Some(session) => {
-                    // The admitted set the gate is compiled from, per
-                    // mapping's transport — an unreadable record reads as
-                    // "nothing admitted", so its mappings all read pending: a
-                    // row is reachable only when the gate is known to admit
-                    // it.
-                    let record = session.record().await.ok();
-                    let policy = record.as_ref().map(|record| &record.policy);
-                    match session.live_ingress().await {
-                        // The listen watcher's rows follow the exposes' as
-                        // they stand: the gate admitted each one as its
-                        // publish's last step, so they read reachable.
-                        Ok(live) => Ok(Errorable::Ok(
-                            live.exposed
-                                .into_iter()
-                                .map(|mut mapping| {
-                                    let admitted = crate::net::switch::declared_ingress_ports(
-                                        policy,
-                                        mapping.proto,
-                                    );
-                                    // The daemon knows the state, so it says
-                                    // it: `Some`, never the unknown a reply
-                                    // from a daemon older than the field
-                                    // decodes as.
-                                    mapping.pending =
-                                        Some(!admitted.contains(&mapping.internal_port));
-                                    mapping
-                                })
-                                .chain(live.listened)
-                                .collect(),
-                        )),
-                        Err(e) => Ok(Errorable::Err {
-                            error: e.to_string(),
-                        }),
-                    }
-                }
+                Some(session) => match session.live_ingress().await {
+                    // The actor's own rows, `pending: Some(false)` each: the
+                    // publish admitted the port when it recorded the row. The
+                    // listen watcher's rows follow the exposes' as they
+                    // stand: the gate admitted each one as its publish's
+                    // last step.
+                    Ok(live) => Ok(Errorable::Ok(
+                        live.exposed.into_iter().chain(live.listened).collect(),
+                    )),
+                    Err(e) => Ok(Errorable::Err {
+                        error: e.to_string(),
+                    }),
+                },
             }
         })
         .await
@@ -1494,9 +1516,46 @@ async fn serve_get_session_runtime_facts(
                         &crate::session_host::host_ip_enforcement_fact(),
                         record.host_ip_enforcement,
                     );
+                    // The listen publishes the audit log refused (NET-046):
+                    // a watcher-driven publish has no caller to answer, so
+                    // the live actor's set is read here and `min session
+                    // policy` warns per port. A session whose actor cannot
+                    // answer has no watcher running, and nothing to warn
+                    // about.
+                    let unaudited_listen_ports =
+                        match mngr.get_session(SessionKeyPredicate::Id(record.id)).await {
+                            Ok(Some(session)) => session
+                                .live_ingress()
+                                .await
+                                .map(|live| live.unaudited_listen_ports)
+                                .unwrap_or_default(),
+                            Ok(None) | Err(_) => Vec::new(),
+                        };
+                    let audit_log = if unaudited_listen_ports.is_empty() {
+                        None
+                    } else {
+                        let state_dir = s.minimal_state_dir().await;
+                        Some(
+                            crate::audit::log_path(state_dir.as_utf8_path().as_std_path())
+                                .display()
+                                .to_string(),
+                        )
+                    };
+                    // The ports this box's attach yields because a sibling at
+                    // the same shared loopback address holds them (first-come):
+                    // the same registry record the attach path reads to skip
+                    // those forwards, surfaced so the policy view can mark the
+                    // declared rows that are served elsewhere. Empty for every
+                    // mode but a shared-address own-ip box — and read behind
+                    // the registry's lock, a plain map lookup, so it never
+                    // holds up the reply.
+                    let shared_port_collisions = shared_port_collisions_of(&mngr, record.id);
                     Ok(Errorable::Ok(minimald_rpc::SessionRuntimeFacts {
                         id: record.id,
                         host_ip_enforcement,
+                        unaudited_listen_ports,
+                        audit_log,
+                        shared_port_collisions,
                     }))
                 }
             }
@@ -2574,8 +2633,9 @@ mod tests {
     use minimald_rpc::{
         CreateSession, CreateSessionRequest, DestroySessionRequest, EffectiveEgress,
         EffectiveSessionPolicy, EgressPolicy, GetEffectiveSessionPolicy,
-        GetEffectiveSessionPolicyRequest, GetSessionPolicy, GetSessionPolicyRequest,
-        RenameSessionRequest, SessionPolicy, Shutdown, ShutdownRequest, ShutdownResponse,
+        GetEffectiveSessionPolicyRequest, GetSessionPolicy, GetSessionPolicyRequest, IngressPolicy,
+        IpProto, PortMapping, RenameSessionRequest, SessionPolicy, Shutdown, ShutdownRequest,
+        ShutdownResponse,
     };
     use paths::HostAbsPath;
     use sessions::{NetworkMode, SessionId};
@@ -3510,6 +3570,7 @@ mod tests {
                 // verdict, so no host's gate refuses it and the fact is what
                 // shows, on any host this test runs on.
                 host_ip_enforcement: Some(fact.enforcement),
+                shared_port_collisions: Vec::new(),
                 attrs: None,
             }]
         );
@@ -4299,11 +4360,11 @@ mod tests {
             "the refusal names the rule it refused over, by field and entry: {error}"
         );
         assert!(
-            error.contains("this host decides a host-address box's egress verdict per box"),
+            error.contains("host_ip boxes on this host enforce only deny-all egress"),
             "the refusal says whose verdict it is that cannot enforce the rule: {error}"
         );
         assert!(
-            error.contains("own-address boxes enforce them"),
+            error.contains("which enforces them"),
             "the refusal says own-address boxes enforce these rules, so the \
              person who typed the declaration is told where they do work: {error}"
         );
@@ -4312,8 +4373,8 @@ mod tests {
         // enforces them — the words a person reads last are the ones they
         // can act on.
         assert!(
-            error.contains("remove these rules")
-                && error.contains("declare deny-all egress")
+            error.contains("Remove them")
+                && error.contains("--deny-all-egress")
                 && error.contains("all three allow lists present and empty"),
             "the refusal names the remedy for the rules it refused: {error}"
         );
@@ -4362,6 +4423,7 @@ mod tests {
                 logged.lines().any(|line| {
                     line.contains("refused a create whose host-address declaration names rules")
                         && line.contains(&format!("session_name=Some(\"{name}\")"))
+                        && line.contains("network_mode=host_ip")
                         && line.contains("host_ip_enforcement=per_box")
                         && line.contains(rule)
                 }),
@@ -5676,6 +5738,10 @@ mod tests {
     /// the absent section as `None`: the default reaches the client without
     /// rewriting the record. A box that declared its own egress answers it
     /// verbatim, survived the JSON round trip, with its ingress beside it.
+    /// NET-134: a box that declared a credentialed upstream answers the lane
+    /// over the same reply — `Some` over the wire, spelled in the JSON —
+    /// while a box that declared none answers `None` and serializes without
+    /// the key, byte-identical to the reply this field did not exist for.
     #[tokio::test]
     async fn effective_policy_response_round_trips() {
         let server = TestServer::new().await;
@@ -5694,6 +5760,12 @@ mod tests {
         )
         .await;
         let bare_id = own_ip_session(&mut client, "bare-egress", SessionPolicy::default()).await;
+        let laned_policy = SessionPolicy {
+            egress: None,
+            ingress: None,
+            credentialed_upstream: Some(sessions::CredentialedUpstream::default()),
+        };
+        let laned_id = own_ip_session(&mut client, "laned-egress", laned_policy.clone()).await;
 
         // The default's own case, with the phase passed explicitly
         // (NET-074): an own-address box that declared nothing is deny-all
@@ -5708,6 +5780,7 @@ mod tests {
             EffectiveSessionPolicy {
                 egress: EffectiveEgress::DenyAll,
                 ingress: None,
+                credentialed_upstream: None,
             },
             "an own-address box with no egress section must answer deny-all in force",
         );
@@ -5715,16 +5788,22 @@ mod tests {
         // The response carries that posture across the wire codec it
         // travels as — the strict shape untouched beside it: the effective
         // reply spells the default, `deny_all`, and decodes back to the
-        // same value.
+        // same value. A lane-less reply serializes without the lane's key:
+        // the shape an older client reads.
         let deny_all = EffectiveSessionPolicy {
             egress: EffectiveEgress::DenyAll,
             ingress: None,
+            credentialed_upstream: None,
         };
         let wire = serde_json_lenient::to_string(&minimald_rpc::Errorable::Ok(deny_all.clone()))
             .expect("the deny-all reply must serialize");
         assert!(
             wire.contains(r#""egress":"deny_all""#),
             "the wire must carry the deny-all posture, got: {wire}",
+        );
+        assert!(
+            !wire.contains("credentialed_upstream"),
+            "a reply without a lane must serialize without the lane's key, got: {wire}",
         );
         assert_eq!(
             serde_json_lenient::from_str::<minimald_rpc::Errorable<EffectiveSessionPolicy>>(&wire)
@@ -5769,6 +5848,40 @@ mod tests {
             .unwrap();
         assert_eq!(declared.egress, EffectiveEgress::Declared(egress));
         assert_eq!(declared.ingress, None);
+
+        // A declared lane round-trips too: the reply answers it as `Some`
+        // over the real wire, spelled in the JSON the codec travels as,
+        // while the strict declaration keeps it beside the record.
+        let laned = client
+            .call::<GetEffectiveSessionPolicy>(&GetEffectiveSessionPolicyRequest::Id(laned_id))
+            .await
+            .unwrap();
+        assert_eq!(
+            laned.credentialed_upstream,
+            Some(sessions::CredentialedUpstream::default()),
+            "the wire must answer the lane a declared box carries",
+        );
+        let lane_wire = serde_json_lenient::to_string(&minimald_rpc::Errorable::Ok(laned.clone()))
+            .expect("the laned reply must serialize");
+        assert!(
+            lane_wire.contains(r#""credentialed_upstream":{}"#),
+            "the wire must spell the lane, got: {lane_wire}",
+        );
+        let strict_laned = client
+            .call::<GetSessionPolicy>(&GetSessionPolicyRequest::Id(laned_id))
+            .await
+            .unwrap();
+        assert_eq!(
+            strict_laned, laned_policy,
+            "the strict policy reply must keep the lane as declared",
+        );
+
+        // The bare box answers no lane: `None` on the reply, and absent
+        // from the wire — the reply that predates the lane.
+        assert_eq!(
+            bare.credentialed_upstream, None,
+            "a box that declared no lane must answer none",
+        );
     }
 
     /// NET-077: a daemon started with the deny-all opt-out keeps the shipped
@@ -5804,6 +5917,7 @@ mod tests {
             EffectiveSessionPolicy {
                 egress: EffectiveEgress::AllowAll,
                 ingress: None,
+                credentialed_upstream: None,
             },
             "behind the opt-out, an absent egress section keeps the shipped allow-all",
         );
@@ -5938,6 +6052,52 @@ mod tests {
         );
     }
 
+    /// The `session created` log line names the session's network mode beside
+    /// its id and name, in the CLI's `--network` spellings (`none` / `host_ip`
+    /// / `own_ip`) so the bundle's tail reads like the command a person typed.
+    /// Attributed by session id, because under libtest the capture buffer is
+    /// shared by every test in the binary — assertions on it say `contains`,
+    /// never `equals`.
+    #[tokio::test]
+    async fn session_created_line_names_the_network_mode() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let capture = crate::test_harness::captured_log();
+
+        // One box per mode: the default (host-address), a NoNet box, and an
+        // own-address box. Each create succeeds because none declares egress
+        // (so the unenforceable-declaration gate never fires) and the native
+        // test host is not a microVM (so an own-address box needs no handed
+        // addresses).
+        let host_ip = req("host-address", "/uwu");
+        let host_id = client.call::<CreateSession>(&host_ip).await.unwrap().id;
+
+        let mut no_net = req("no-network", "/uwu");
+        no_net.config.network = NetworkMode::NoNet;
+        let none_id = client.call::<CreateSession>(&no_net).await.unwrap().id;
+
+        let mut own_ip = req("own-address", "/uwu");
+        own_ip.config.network = NetworkMode::OwnIp;
+        let own_id = client.call::<CreateSession>(&own_ip).await.unwrap().id;
+
+        let log = capture.contents();
+        for (id, spelling) in [
+            (&host_id, "host_ip"),
+            (&none_id, "none"),
+            (&own_id, "own_ip"),
+        ] {
+            assert!(
+                log.lines().any(|line| {
+                    line.contains("session created")
+                        && line.contains(&format!("session_id={id}"))
+                        && line.contains(&format!("network_mode={spelling} "))
+                }),
+                "the session created line for {id} must name its network mode \
+                 {spelling}, got: {log}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn create_session_rejects_policy_incompatible_with_network_mode() {
         let server = TestServer::new().await;
@@ -5970,7 +6130,56 @@ mod tests {
         assert_eq!(
             resp,
             Errorable::Err {
-                error: "egress policy is only valid for an own-IP or host-address PTask, not NoNet"
+                error: "egress rules need network mode own_ip or host_ip (this box is none): \
+                        a none box has no network to apply them to"
+                    .to_string()
+            }
+        );
+
+        // The rejected session left nothing behind in the store.
+        let mngr = server.state.sessions_manager().await;
+        assert!(mngr.list().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_session_rejects_static_ingress_on_host_net() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+
+        // A static ingress mapping on a host-address box is a configuration the
+        // daemon refuses at create time, naming the policy field and the box's
+        // mode (not a CLI flag: any client may send this): an own-IP box is the
+        // only mode with a published address to apply the mapping to. Built by
+        // hand to bypass the CLI-side refusal so the daemon path itself is what
+        // is exercised.
+        let ingress = IngressPolicy {
+            port_mappings: vec![PortMapping {
+                external_port: 18080,
+                internal_port: 80,
+                proto: IpProto::Tcp,
+            }],
+            dynamic_allowed_range: None,
+            dynamic_ingress: None,
+        };
+        let resp = client
+            .call::<CreateSession>(&CreateSessionRequest {
+                config: minimald_rpc::SessionConfig {
+                    name: Some("bad-ingress".to_string()),
+                    project_path: HostAbsPath::try_new("/uwu").unwrap(),
+                    network: NetworkMode::HostNet,
+                    policy: SessionPolicy::new(None, Some(ingress)),
+                    box_addresses: None,
+                    hooks_enabled: true,
+                    attrs: Default::default(),
+                },
+                must_match_version: None,
+            })
+            .await;
+        assert_eq!(
+            resp,
+            Errorable::Err {
+                error: "ingress port mappings need network mode own_ip (this box is host_ip): \
+                        only an own-IP box has a published address to apply them to"
                     .to_string()
             }
         );

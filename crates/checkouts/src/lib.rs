@@ -6,12 +6,13 @@
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
-    fs,
+    fs::{self, File, OpenOptions, TryLockError},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 use tempfile::tempdir_in;
-use tracing::trace;
+use tracing::{trace, warn};
 
 mod error;
 pub use error::Error;
@@ -121,24 +122,110 @@ impl ManagerState {
         }
     }
 
-    /// serializes the state to the statefile in the given base directory.
-    fn write_to(&self, dir: &Path) -> Result<(), Error> {
-        let path = dir.join("state.json");
-        let f = fs::File::create(path)?;
-        match serde_json_lenient::to_writer(f, self) {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                if e.is_io() {
-                    Err(std::io::Error::new(
-                        e.io_error_kind().unwrap(),
-                        format!("writing state: {}", dir.join("state.json").display()),
-                    )
-                    .into())
-                } else {
-                    todo!("serde error: {:?}", e)
-                }
+    /// The recorded checkout of `remote` that already serves `at`, as its dir
+    /// under the checkouts root and its commit.
+    fn existing_checkout(&self, remote: &str, at: &GitRef) -> Option<(String, String)> {
+        let id = self.git_remotes.get(remote)?;
+        for (dir, checkout) in self.repos.get(id)?.checkouts.iter() {
+            if &checkout.version == at {
+                return Some((dir.clone(), checkout.rev.clone()));
+            }
+            // Its possible to have a checkout thats tracking a branch, but right now it points
+            // to a commit which was requested. We can just use that checkout rather than making
+            // one that points to just a commit in this case.
+            if let GitRef::Commit(rev) = at
+                && &checkout.rev == rev
+            {
+                return Some((dir.clone(), rev.clone()));
             }
         }
+        None
+    }
+
+    /// serializes the state to the statefile in the given base directory.
+    ///
+    /// The file is written beside `state.json` and renamed over it, so a
+    /// reader that does not hold the cache lock (the [`Manager`] constructor)
+    /// sees either the old registry or the new one, never a torn write.
+    fn write_to(&self, dir: &Path) -> Result<(), Error> {
+        let path = dir.join("state.json");
+        let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+        if let Err(e) = serde_json_lenient::to_writer(&mut tmp, self) {
+            if e.is_io() {
+                return Err(std::io::Error::new(
+                    e.io_error_kind().unwrap(),
+                    format!("writing state: {}", path.display()),
+                )
+                .into());
+            } else {
+                todo!("serde error: {:?}", e)
+            }
+        }
+        tmp.as_file().sync_all()?;
+        tmp.persist(&path).map_err(|e| e.error)?;
+        Ok(())
+    }
+}
+
+/// How long [`lock_cache`] waits for another holder before giving up. A
+/// holder keeps the lock for a whole clone or fetch; a stuck one (a hung
+/// `git fetch`) must fail the waiter with a diagnostic, not hang it forever.
+/// `MINIMAL_VCS_LOCK_TIMEOUT_SECS` overrides the default for slow remotes.
+fn lock_timeout() -> Duration {
+    std::env::var("MINIMAL_VCS_LOCK_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(600))
+}
+
+/// Takes `<base_dir>/.lock` exclusively, the lock serializing every manager
+/// over one cache dir, and returns the open file holding it; dropping the
+/// file releases the lock. The file is opened fresh on every call so two
+/// managers in a single process also exclude each other: `flock` is per open
+/// file description, not per inode.
+///
+/// A holder can sit on the lock for a whole network fetch, so a contended
+/// lock is reported before the wait starts, and a wait that outlasts
+/// `timeout` fails naming the lock file rather than hanging behind a stuck
+/// holder.
+fn lock_cache(base_dir: &Path, timeout: Duration) -> Result<File, Error> {
+    let lock_path = base_dir.join(".lock");
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)?;
+    let deadline = Instant::now() + timeout;
+    let mut backoff = Duration::from_millis(10);
+    let mut warned = false;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(TryLockError::WouldBlock) => {}
+            Err(TryLockError::Error(e)) => return Err(e.into()),
+        }
+        if !warned {
+            warn!(
+                "waiting for the checkouts cache lock at {} (held by another process or manager)",
+                lock_path.display()
+            );
+            warned = true;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(Error::Other(format!(
+                "timed out after {}s waiting for the checkouts cache lock at {}; another \
+                 process or manager still holds it. If that holder is stuck (for example on \
+                 a hung git fetch), stop it and re-run; if it is only slow, set \
+                 MINIMAL_VCS_LOCK_TIMEOUT_SECS to wait longer",
+                timeout.as_secs(),
+                lock_path.display()
+            )));
+        }
+        std::thread::sleep(backoff.min(deadline - now));
+        backoff = (backoff * 2).min(Duration::from_secs(1));
     }
 }
 
@@ -248,6 +335,11 @@ impl Manager {
         fs::create_dir_all(&db_path)?;
         fs::create_dir_all(base_dir.join("git").join("checkouts"))?;
 
+        // Read without the cache lock: a holder can keep it for a whole
+        // network fetch, and this constructor runs on async workers in the
+        // daemon. `write_to` replaces `state.json` atomically, so this read
+        // never sees it half written, and every mutating path re-reads the
+        // registry under the lock before writing it back.
         let state = ManagerState::in_dir_or_default(&base_dir)?;
         let mut repos = HashMap::new();
         for (remote, id) in state.git_remotes.iter() {
@@ -279,17 +371,40 @@ impl Manager {
         self.base_dir.join("git").join("db")
     }
 
+    /// Re-reads the registry, keeping every repo already opened. Called with
+    /// the cache lock held: the snapshot taken at construction goes stale as
+    /// soon as another manager over the same dir records a remote or a
+    /// checkout, and writing it back would drop that manager's entries.
+    fn reload_state(&mut self) -> Result<(), Error> {
+        self.state = ManagerState::in_dir_or_default(&self.base_dir)?;
+        let db_path = self.git_bares_dir();
+        for (remote, id) in self.state.git_remotes.iter() {
+            if !self.repos.contains_key(id) {
+                self.repos
+                    .insert(id.clone(), Repo::new(remote, db_path.join(id))?);
+            }
+        }
+        Ok(())
+    }
+
     /// Updates all repos to latest - does nothing for refs which arent symbolic (i.e. commits).
     /// In offline mode, returns [Error::OfflineCacheMiss] — `update` is fundamentally
     /// a network operation, and silently lameducking it would mask hard-to-debug bugs
     /// for callers like `minimal update` that explicitly want fresh state.
     pub fn update(&mut self) -> Result<(), Error> {
+        // Serialize against every other manager over the same cache dir. Git
+        // itself is only per-repository; a second `min session activate`
+        // against the same bare repo would otherwise race this fetch/checkout
+        // inside the shared worktree (`index.lock: File exists`).
         if self.offline {
-            // Pick the first known remote for the error message; if there are
-            // no known remotes there's nothing to update, so a synthetic
-            // placeholder is clearer than a misleading Ok.
-            let remote = self
-                .state
+            // Offline touches nothing, so answer from an unlocked read
+            // (`state.json` is replaced atomically) rather than wait behind
+            // another manager's fetch. Pick the first known remote for the
+            // error message; if there are no known remotes there's nothing to
+            // update, so a synthetic placeholder is clearer than a misleading
+            // Ok.
+            let state = ManagerState::in_dir_or_default(&self.base_dir)?;
+            let remote = state
                 .git_remotes
                 .keys()
                 .next()
@@ -297,6 +412,8 @@ impl Manager {
                 .unwrap_or_else(|| "<no remotes>".to_string());
             return Err(Error::OfflineCacheMiss { remote });
         }
+        let _lock = lock_cache(&self.base_dir, lock_timeout())?;
+        self.reload_state()?;
         let checkouts_dir = self.git_checkouts_dir();
         for id in self.state.git_remotes.values_mut() {
             let repo = self.repos.get_mut(id).unwrap();
@@ -319,14 +436,22 @@ impl Manager {
     /// needs `remote` fresh. A remote not yet registered is a no-op: a
     /// subsequent [`Self::checkout_of`] clones it on first use.
     pub fn update_remote(&mut self, remote: &str) -> Result<(), Error> {
-        let Some(id) = self.state.git_remotes.get(remote).cloned() else {
-            return Ok(());
-        };
         if self.offline {
+            // As in `update`: offline touches nothing, so it never waits on
+            // the lock. An unregistered remote is still a no-op.
+            let state = ManagerState::in_dir_or_default(&self.base_dir)?;
+            if !state.git_remotes.contains_key(remote) {
+                return Ok(());
+            }
             return Err(Error::OfflineCacheMiss {
                 remote: remote.to_string(),
             });
         }
+        let _lock = lock_cache(&self.base_dir, lock_timeout())?;
+        self.reload_state()?;
+        let Some(id) = self.state.git_remotes.get(remote).cloned() else {
+            return Ok(());
+        };
         let checkouts_dir = self.git_checkouts_dir();
         let repo = self.repos.get_mut(&id).unwrap();
         trace!("updating repo {}", repo.url());
@@ -343,22 +468,32 @@ impl Manager {
     pub fn checkout_of(&mut self, remote: &str, at: GitRef) -> Result<(PathBuf, String), Error> {
         trace!("checkout_of {} at {:?}", remote, at);
 
+        // A ref already checked out, and an offline miss on an unknown
+        // remote, are answered from an unlocked read (`state.json` is
+        // replaced atomically): neither touches the cache, so neither waits
+        // behind another manager's fetch.
+        let fresh = ManagerState::in_dir_or_default(&self.base_dir)?;
+        if let Some((dir, rev)) = fresh.existing_checkout(remote, &at) {
+            return Ok((self.git_checkouts_dir().join(dir), rev));
+        }
+        if self.offline && !fresh.git_remotes.contains_key(remote) {
+            return Err(Error::OfflineCacheMiss {
+                remote: remote.to_string(),
+            });
+        }
+
+        // Same serialization rationale as `update`: the fetch and worktree
+        // checkout below mutate shared git state across managers.
+        let _lock = lock_cache(&self.base_dir, lock_timeout())?;
+        self.reload_state()?;
+
         let out = match self.state.git_remotes.get(remote) {
             // This remote is already managed
             Some(id) => {
-                // See if theres already a checkout of this ref
-                for (dir, checkout) in self.state.repos[id].checkouts.iter() {
-                    if checkout.version == at {
-                        return Ok((self.git_checkouts_dir().join(dir), checkout.rev.clone()));
-                    }
-                    // Its possible to have a checkout thats tracking a branch, but right now it points
-                    // to a commit which was requested. We can just use that checkout rather than making
-                    // one that points to just a commit in this case.
-                    if let GitRef::Commit(ref rev) = at
-                        && &checkout.rev == rev
-                    {
-                        return Ok((self.git_checkouts_dir().join(dir), rev.clone()));
-                    }
+                // See if theres already a checkout of this ref (another
+                // manager may have made it while this one waited).
+                if let Some((dir, rev)) = self.state.existing_checkout(remote, &at) {
+                    return Ok((self.git_checkouts_dir().join(dir), rev));
                 }
                 // There's not a checkout of this ref, lets create it.
                 let checkout_dir = tempdir_in(self.git_checkouts_dir())?.keep();
@@ -715,9 +850,9 @@ mod tests {
 
         assert_eq!(rev1, hash);
         assert_eq!(rev2, hash);
-        assert_ne!(
+        assert_eq!(
             path1, path2,
-            "the stale manager cannot know the first's checkout"
+            "the stale manager re-reads the registry under the lock and reuses the first's checkout"
         );
         assert!(path2.join("hello.txt").exists());
     }
@@ -828,6 +963,10 @@ mod tests {
         let out = Command::new("git")
             .args(["update-ref", "-d", "refs/remotes/origin/main"])
             .current_dir(&bare)
+            // Match Repo::run_git_bare: explicit GIT_DIR keeps git operating
+            // on the bare repo even when `safe.bareRepository = explicit` is
+            // configured (planned as the default in Git 3.0).
+            .env("GIT_DIR", &bare)
             .output()
             .unwrap();
         assert!(out.status.success());
@@ -922,6 +1061,199 @@ mod tests {
         assert!(!manager.0.lock().unwrap().offline);
     }
 
+    /// Many managers converging on one cache dir — the exact shape of
+    /// concurrent `min session activate` invocations, each building its own
+    /// manager against the shared vcs cache — must not race each other's
+    /// git operations into `index.lock` and must all land a usable checkout.
+    #[test]
+    fn concurrent_checkout_of_managers_share_one_cache_dir() {
+        let (src, hash) = make_local_repo("main");
+        let remote = src.path().to_str().unwrap().to_string();
+        let base = tempfile::tempdir().unwrap();
+
+        // The intended failure mode: every manager holds its own directory
+        // snapshot at construction. Two managers constructed together see the
+        // same (empty) state, so each tries an independent clone + worktree
+        // add for the same ref unless the lock serializes them.
+        let n_threads = 8;
+        let results: Vec<_> = (0..n_threads)
+            .map(|_| {
+                let (remote, base) = (remote.clone(), base.path().to_path_buf());
+                std::thread::spawn(move || {
+                    let mut mgr = Manager::new_in_dir(base).unwrap();
+                    let (path, rev) = mgr
+                        .checkout_of(&remote, GitRef::Branch("main".to_string()))
+                        .map_err(|e| e.to_string())?;
+                    assert!(path.join("hello.txt").exists());
+                    Ok::<_, String>(rev)
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .collect::<Vec<_>>();
+
+        // Every thread must succeed rather than trip over `index.lock`.
+        for result in results {
+            assert_eq!(result.unwrap(), hash, "manager checkout failed");
+        }
+
+        // Each manager re-reads the registry under the lock, so the first
+        // clone is reused rather than duplicated under a suffixed id.
+        let state = ManagerState::in_dir_or_default(base.path()).unwrap();
+        assert_eq!(state.git_remotes.len(), 1, "one remote: {state:?}");
+        let id = &state.git_remotes[&remote];
+        assert_eq!(
+            state.repos[id].checkouts.len(),
+            1,
+            "one checkout: {state:?}"
+        );
+
+        // No `index.lock` may be left stranded in any worktree. A linked
+        // worktree's `.git` is a file pointing at its gitdir under the bare
+        // repo, which is where the index (and its lock) lives.
+        let checkouts = base.path().join("git").join("checkouts");
+        for entry in std::fs::read_dir(checkouts).unwrap().flatten() {
+            let pointer = std::fs::read_to_string(entry.path().join(".git")).unwrap();
+            let gitdir = PathBuf::from(pointer.trim().strip_prefix("gitdir: ").unwrap());
+            assert!(gitdir.is_dir(), "worktree gitdir {}", gitdir.display());
+            assert!(
+                !gitdir.join("index.lock").exists(),
+                "stranded index.lock for {}",
+                entry.path().display()
+            );
+        }
+    }
+
+    /// Concurrency over the same remote through separate `update_remote`
+    /// managers: one manager's worktree refresh must not see another's git
+    /// state mid-flux (the other half of the reported `index.lock` race).
+    #[test]
+    fn concurrent_update_remote_does_not_race() {
+        let (src, _) = make_local_repo("main");
+        let remote = src.path().to_str().unwrap().to_string();
+        let base = tempfile::tempdir().unwrap();
+
+        // One manager registers the remote, so the others see it in state.json.
+        let mut first = Manager::new_in_dir(base.path()).unwrap();
+        first
+            .checkout_of(&remote, GitRef::Branch("main".to_string()))
+            .unwrap();
+
+        let n_threads = 8;
+        let handles: Vec<_> = (0..n_threads)
+            .map(|_| {
+                let base = base.path().to_path_buf();
+                let remote = remote.clone();
+                std::thread::spawn(move || {
+                    let mut mgr = Manager::new_in_dir(base).unwrap();
+                    mgr.update_remote(&remote).map_err(|e| e.to_string())
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap().unwrap();
+        }
+    }
+
+    /// Two managers built before either records anything both register
+    /// their remote: the second re-reads `state.json` under the lock instead
+    /// of writing back its empty construction-time snapshot over the first.
+    #[test]
+    fn stale_manager_keeps_another_managers_remote() {
+        let (src_a, _) = make_local_repo("main");
+        let (src_b, _) = make_local_repo("main");
+        let remote_a = src_a.path().to_str().unwrap().to_string();
+        let remote_b = src_b.path().to_str().unwrap().to_string();
+        let base = tempfile::tempdir().unwrap();
+
+        let mut first = Manager::new_in_dir(base.path()).unwrap();
+        let mut second = Manager::new_in_dir(base.path()).unwrap();
+        first
+            .checkout_of(&remote_a, GitRef::Branch("main".to_string()))
+            .unwrap();
+        second
+            .checkout_of(&remote_b, GitRef::Branch("main".to_string()))
+            .unwrap();
+
+        let state = ManagerState::in_dir_or_default(base.path()).unwrap();
+        assert!(state.git_remotes.contains_key(&remote_a), "{state:?}");
+        assert!(state.git_remotes.contains_key(&remote_b), "{state:?}");
+    }
+
+    /// A holder of `<base>/.lock` outside any manager (another process, in
+    /// the field) keeps `checkout_of` waiting until it lets go, and the
+    /// waiter then completes rather than failing.
+    #[test]
+    fn checkout_of_waits_for_an_external_lock_holder() {
+        let (src, hash) = make_local_repo("main");
+        let remote = src.path().to_str().unwrap().to_string();
+        let base = tempfile::tempdir().unwrap();
+        let mut mgr = Manager::new_in_dir(base.path()).unwrap();
+
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(base.path().join(".lock"))
+            .unwrap();
+        file.lock().unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let out = mgr.checkout_of(&remote, GitRef::Branch("main".to_string()));
+            tx.send(out.map(|(_, rev)| rev).map_err(|e| e.to_string()))
+                .unwrap();
+        });
+
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(500))
+                .is_err(),
+            "checkout_of must not proceed while another holder has the lock"
+        );
+        drop(file);
+        let rev = rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("checkout_of completes once the lock is released")
+            .unwrap();
+        assert_eq!(rev, hash);
+        waiter.join().unwrap();
+    }
+
+    /// A holder that never lets go fails the waiter once the bound passes,
+    /// naming the lock file, instead of hanging it forever.
+    #[test]
+    fn lock_cache_times_out_on_a_stuck_holder() {
+        let base = tempfile::tempdir().unwrap();
+        let held = lock_cache(base.path(), Duration::from_secs(1)).unwrap();
+        let err = lock_cache(base.path(), Duration::from_millis(200)).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("timed out"), "{msg}");
+        assert!(
+            msg.contains(&base.path().join(".lock").display().to_string()),
+            "the error names the lock file: {msg}"
+        );
+        drop(held);
+        lock_cache(base.path(), Duration::from_millis(200)).expect("free once released");
+    }
+
+    /// The constructor reads `state.json` without the cache lock, so it
+    /// must not wait behind a holder.
+    #[test]
+    fn constructor_does_not_wait_for_the_cache_lock() {
+        let base = tempfile::tempdir().unwrap();
+        let _held = lock_cache(base.path(), Duration::from_secs(1)).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let dir = base.path().to_path_buf();
+        std::thread::spawn(move || tx.send(Manager::new_in_dir(dir).is_ok()).unwrap());
+        assert!(
+            rx.recv_timeout(Duration::from_secs(30))
+                .expect("constructor returns while the lock is held")
+        );
+    }
+
     #[test]
     #[ignore]
     fn repo_integration_smoketest() {
@@ -951,6 +1283,66 @@ mod tests {
             "d0dd1f61b33d64e29d8bc1372a94ef6a2fee76a9".to_string(),
             repo.worktree_checkout(checkout_dir.path(), &GitRef::Branch("main".to_string()))
                 .unwrap()
+        );
+    }
+
+    /// Writes `url.<base>.insteadOf = <instead_of>` into the bare clone's own
+    /// config. The rewrite can come from any config level; the clone's own
+    /// config is used so the test never touches the process environment.
+    fn add_insteadof(cache: &std::path::Path, base: &str, instead_of: &str) {
+        let output = std::process::Command::new("git")
+            .arg("config")
+            .arg("--file")
+            .arg(cache.join("config"))
+            .arg(format!("url.{base}.insteadOf"))
+            .arg(instead_of)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git config insteadOf failed");
+    }
+
+    /// A `url.<base>.insteadOf` rewrite, at any config level, used to break
+    /// the cache validation in `Repo::new`: `git remote get-url` applies
+    /// rewrites, the clone stores the un-rewritten `remote.origin.url`, so
+    /// the second open of the same cache dir failed with
+    /// `Error::InvalidPath`.
+    #[test]
+    fn accepts_a_cached_clone_whose_origin_is_rewritten_by_insteadof() {
+        let (src, _) = make_local_repo("main");
+        let src = src.path().to_string_lossy().into_owned();
+        let cache = tempfile::tempdir().unwrap();
+
+        Repo::new(&src, cache.path()).expect("first open clones");
+        // Rewrite the plain path to a `file://` URL, as a user's config might.
+        add_insteadof(cache.path(), &format!("file://{src}"), &src);
+
+        // Second open revalidates the cached clone instead of cloning, and
+        // fetches still go through the rewrite.
+        let mut repo = Repo::new(&src, cache.path()).expect("rewritten cache reopens");
+        repo.fetch().expect("fetch through the rewrite succeeds");
+    }
+
+    /// The cache identity check compares the url the caller asked for with
+    /// the url the cache was cloned from, both un-rewritten: an `insteadOf`
+    /// mapping the requested url onto the cached one does not make a cache
+    /// of another remote pass. The pre-fix code refused this too; the test
+    /// pins that refusal so a later loosening (for example comparing
+    /// rewritten urls on both sides) cannot slip through.
+    #[test]
+    fn refuses_a_cached_clone_of_another_remote_even_under_insteadof() {
+        let (cached, _) = make_local_repo("main");
+        let cached = cached.path().to_string_lossy().into_owned();
+        let (requested, _) = make_local_repo("main");
+        let requested = requested.path().to_string_lossy().into_owned();
+        let cache = tempfile::tempdir().unwrap();
+
+        Repo::new(&cached, cache.path()).expect("first open clones");
+        add_insteadof(cache.path(), &cached, &requested);
+        let result = Repo::new(&requested, cache.path()).map(|_| ());
+
+        assert!(
+            matches!(result, Err(crate::Error::InvalidPath)),
+            "a cache of another remote is refused"
         );
     }
 }
