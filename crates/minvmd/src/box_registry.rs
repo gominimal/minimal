@@ -232,8 +232,10 @@ impl Drop for RevocationHold {
 }
 
 /// The guest node namespace's name in the table: the in-VM daemon, whose own
-/// root-netns tap [`BoxRegistry::register_node_namespace`] publishes.
-const NODE_NAMESPACE: &str = "minimald";
+/// root-netns tap [`BoxRegistry::register_node_namespace`] publishes. Read
+/// from the sessions zone so the registry and the store's reserved names
+/// spell the one label the zone defines.
+const NODE_NAMESPACE: &str = zone_answer::NODE_ROW_LABEL;
 
 /// The node namespace's row's name under the zone, as
 /// [`BoxRegistry::zone_view`] holds it: `minimald.min.internal`, the same
