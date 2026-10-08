@@ -55,7 +55,7 @@ sign-in (no Gatehouse-brokered grants; Gatehouse §6.10's un-enrolled bullet,
 ruled 2026-09-17), is the next thing built and is a separate document,
 [BEP](https://github.com/gominimal/minimal/pull/1426), that cites this one. It
 depends on these behaviours bound here: box-zone resolution (NET-072, NET-073)
-and the resolver advisory that makes its default `dns` steering buildable
+and the opt-in host setup that makes its default `dns` steering buildable
 (NET-122), `egress.allow_dns_hosts` with DNS-pinned admission (NET-066,
 NET-067), the hostname-proxy parity rule (NET-069 to NET-071), the relay's
 source-address check (NET-084), which on a VM-backed host makes a box's switch
@@ -769,43 +769,48 @@ included, with every refusal logged (NET-001 to NET-004).
     verify: cargo nextest run -p minimald failed_forwarder_bind_is_reported_not_substituted
     <!-- design §7.1: a failed bind is "a surfaced error, never a silent fallback or a standing-capability grant"; unwanted; NET-020 covers the hostname listener -->
 
-- **NET-122** WHILE the host's native resolver is not configured for the box zone, WHEN a session starts THE SYSTEM SHALL print an advisory naming what is missing and the exact command that configures it, or the command that runs it, with no privilege prompt.
+- **NET-122** WHILE the host's native resolver is not configured for the box zone, WHEN the operator runs host setup THE SYSTEM SHALL name what is missing and run the exact script that configures it, with the script's one privilege elevation as the only prompt.
   tier:     T0
-  verify:   cargo nextest run -p minimal session_start_advises_resolver_command_without_prompt
-  <!-- S1b-1; design §7.1 (host-OS resolution per OS); state+event; `/etc/resolver/min.internal` with its `port` directive on macOS, the systemd-resolved routing-domain link on Linux; NET-009's WHERE presupposes it and the Box Egress Proxy document's default `dns` steering needs it -->
-  - WHERE the session start is interactive THE SYSTEM SHALL print the advisory in full, with the exact command.
+  verify:   cargo nextest run -p minimal net_setup_names_resolver_script_without_prompt
+  <!-- S1b-1; design §7.1 (host-OS resolution per OS); state+event; `min net setup`; host DNS is opt-in: the proxy is the name surface until the operator takes the step; `/etc/resolver/min.internal` with its `port` directive on macOS, the systemd-resolved routing-domain link on Linux; NET-009's WHERE presupposes it and the Box Egress Proxy document's default `dns` steering needs it -->
+  - WHILE the host is not configured for host DNS and the daemon reports an answerer port, WHEN a session starts THE SYSTEM SHALL point at host setup on the name-surface line without printing the privileged script or prompting for privilege.
     tier:   T0
-    verify: cargo nextest run -p minimal interactive_start_prints_full_advisory
-    <!-- state-driven; interactive means stderr is a terminal and neither `--no-prompt` nor `--no-input` is set; the full command embeds the range program and the service definitions and runs to tens of lines, which is what a person at a terminal copies -->
-  - WHERE the session start is not interactive THE SYSTEM SHALL print the advisory as one line that names what is missing and the command that runs the exact command.
+    verify: cargo nextest run -p minimal session_start_points_at_net_setup_without_the_advisory
+    <!-- state+event; the CLI test `activate_and_ls_report_native_surface` checks both verbs' output; the pointer is part of NET-018's proxy surface line, so `min session activate` and `min ls` print the same words; a native surface has no pointer; a scripted or agent start that repeats on every activation carries one clause, never a script block that buries the session's own errors -->
+  - WHEN the operator runs host setup THE SYSTEM SHALL write the script for this host's current state to a file only the operator can read, run it as root with one privilege elevation, remove the file, and exit with the script's status.
     tier:   T0
-    verify: cargo nextest run -p minimal non_interactive_start_prints_short_advisory
-    <!-- state-driven; a scripted or agent start repeats on every activation, and a full command block on each buries the session's own errors; the one line keeps the facts in the log and points at the command that runs the rest -->
-  - WHEN the operator runs host setup THE SYSTEM SHALL run the exact command for this host's current state, with the command's own privilege elevation as the only prompt, and exit with the command's status.
+    verify: cargo nextest run -p minimal net_setup_runs_the_advisory_script
+    <!-- event-driven; `min net setup` runs `sudo sh <file>`; the operator's request is the consent, so that `sudo` is the only prompt; the note says what is missing, on stderr; on a host that needs no step it runs nothing and says so, and a host fact that makes the step dead (a blocker) runs nothing and exits non-zero -->
+  - WHEN the operator asks to print the host setup script THE SYSTEM SHALL print, without running it and with no privilege prompt, the same script that host setup runs. The script is POSIX shell that stops at its first failed statement. Its header says what it configures and that it runs as root, and a comment introduces each step.
     tier:   T0
-    verify: cargo nextest run -p minimal net_setup_runs_the_advisory_command
-    <!-- event-driven; `min net setup`; the operator's request is the consent, so the one elevation is the command's own `sudo`, never a second prompt; the same command a full advisory names, from the same host reads, so a non-interactive start's pointer and this command never disagree; on a host that needs no step it runs nothing and says so, and an advisory that names no command (a blocker) runs nothing and exits non-zero -->
-  - WHEN the operator asks to print the host setup command THE SYSTEM SHALL print the exact command for this host's current state without running it, with no privilege prompt.
+    verify: cargo nextest run -p minimal setup_script_is_an_annotated_posix_script
+    <!-- event-driven; `min net setup --print`; one renderer is the script's only source, so the printed script and the run script never disagree; the script on stdout and the note on stderr, for an operator who reviews or adapts it and for the session e2e, which runs the printed file; no statement elevates on its own and no outer quoting layer wraps it -->
+  - IF a box-name service installed for another user is present THEN THE SYSTEM SHALL refuse host setup before running anything, name that user, and exit non-zero.
     tier:   T0
-    verify: cargo nextest run -p minimal net_setup_prints_the_advisory_command
-    <!-- event-driven; `min net setup --print`; the advisory whole, command block included, for an operator who reviews or adapts the command before running it, and for the session e2e, which reads the command from it; it prints nothing to run on a host that needs no step, and says so -->
+    verify: cargo nextest run -p minimal net_setup_refuses_another_users_service
+    <!-- unwanted; the operator is the `UserName` of the installed launchd plist on macOS, the `User=` of the installed systemd service on Linux; replacing it would hand the one machine-wide service to a different user and cut the first user's daemons off; printing the script is not refused, and neither is removal -->
   - WHERE the host is hooked THE SYSTEM SHALL install, by the privileged step, the box-zone answerer as a host service whose listener and channel sockets the service manager holds, running as the operator, from a root-owned non-user-writable program.
     tier:   T0
     verify: cargo nextest run -p minimal advisory_installs_manager_held_answerer
-    <!-- design §7.1 (one always-on answerer per host, its sockets held by the service manager, the answerer running as the operator and never root); state-driven; a launchd plist with socket activation on macOS, a systemd system socket and service pair on Linux, never a user-session unit; the step copies the answerer program to a root-owned path and the unit names that copy, never a user-writable binary; the copy carries the channel protocol version, and the hook probe re-surfaces the advisory when it differs from the daemon's, so an upgrade re-runs the step -->
+    <!-- design §7.1 (one always-on answerer per host, its sockets held by the service manager, the answerer running as the operator and never root); state-driven; a launchd plist with socket activation on macOS, a systemd system socket and service pair on Linux, never a user-session unit; the step copies the answerer program to a root-owned path and the unit names that copy, never a user-writable binary; the copy carries the channel protocol version, and host setup reinstalls it when it differs from the daemon's, so an upgrade re-runs the step -->
+  - WHEN the operator asks to remove host setup THE SYSTEM SHALL remove everything the privileged step installs on this host without a daemon, and exit zero on a host that holds none of it.
+    tier:   T0
+    verify: cargo nextest run -p minimal net_setup_undo_removes_what_setup_installs
+    verify: cargo nextest run -p minimal net_setup_undo_succeeds_on_a_clean_host
+    <!-- event-driven; `min net setup --undo` runs the removal script as root, `--undo --print` prints it; on macOS the answerer unit, its program copy and channel, the range unit and its program, and the resolver file; on Linux the answerer socket and service units, the program copy and channel, and the routing-domain link; the range aliases on macOS stay on the loopback until the next boot, since no unit re-applies them; the installer's uninstall names this step while any of those paths exist -->
 
 - **NET-123** WHEN a session starts THE SYSTEM SHALL verify by a bind probe that the reserved local range is present before publishing.
   tier:     T0
   verify:   cargo nextest run -p minimald session_start_probes_reserved_range
   <!-- S1b-2a; design §7.1 (macOS per-box addresses, the privileged step); event-driven; on Linux the range is always present on `lo` and the probe is a macOS concern; the routing-domain link carries the §4.2 hook carve-out address, not the range -->
-  - IF the reserved range is absent THEN THE SYSTEM SHALL publish the box at `127.0.0.1`, re-surface the advisory of NET-122, and neither prompt nor hang.
+  - IF the reserved range is absent THEN THE SYSTEM SHALL publish the box at `127.0.0.1`, point at NET-122's host setup on the name-surface line, and neither prompt nor hang.
     tier:   T0
     verify: cargo nextest run -p minimald absent_range_publishes_interim_and_readvises
     <!-- design §7.1; unwanted; the interim is a per-host state that the privileged step supersedes -->
-  - WHERE the host is macOS THE SYSTEM SHALL name, in NET-122's advisory command, a privileged step that installs a boot-time service, from root-owned non-user-writable paths and reading no configuration, which applies exactly the reserved local range to the host loopback at install and at every boot.
+  - WHERE the host is macOS THE SYSTEM SHALL carry, in NET-122's host setup script, a privileged step that installs a boot-time service, from root-owned non-user-writable paths and reading no configuration, which applies exactly the reserved local range to the host loopback at install and at every boot.
     tier:   T0
     verify: cargo nextest run -p minimal advisory_command_reserves_the_range_on_macos
-    <!-- design §7.1 (the privileged step, one command with one privilege elevation shared with the answerer unit); state+event; Linux takes no range step — the whole 127/8 binds on `lo` — and its command keeps the routing-domain link's routable-scope address, without which resolved never consults the routing domain -->
+    <!-- design §7.1 (the privileged step, one script with one privilege elevation shared with the answerer unit); state+event; Linux takes no range step — the whole 127/8 binds on `lo` — and its script keeps the routing-domain link's routable-scope address, without which resolved never consults the routing domain -->
 
 - **NET-124** WHEN a lookup asks for a record type other than A for a name a box or node holds in the box zone THE SYSTEM SHALL answer NODATA.
   tier:     T0
@@ -945,12 +950,14 @@ loopback answerer held by the host's service manager, published addresses come
 from a reserved local range (`127.0.64.0/24`), Linux uses a systemd-resolved
 routing domain on a dedicated link of routable scope, and macOS uses
 `/etc/resolver/min.internal` with a `port` directive, written once by the
-advisory command NET-122 names at session start, or runs or prints on request. On macOS the same command
+host setup script NET-122 runs, or prints, on the operator's request. Host DNS
+is opt-in, and a session start only points at it. On macOS the same script
 reserves the local range: it installs a root-held boot step that re-applies
 exactly the reserved range at each start, at root-owned paths no user can
 write, so the range is present before any session starts and no daemon
 re-applies it. NET-123's bind probe with its `127.0.0.1` interim is what holds
 on a host until that step is installed, so session start never prompts. The
+same command removes the step again, on both platforms. The
 answerer's negatives are cacheable by the host resolver (NET-124): an
 uncacheable negative stalls every lookup on a macOS host, not only the zone's.
 NET-018 and NET-019 take their WHERE from the same ruling: the proxy
@@ -1215,6 +1222,16 @@ daemon does, and the attribute that makes that gap visible to policy is EHE's.
   covered by: NET-006, NET-007, NET-127
 
 ## Open questions
+- [NEEDS CLARIFICATION (MEDIUM): can one machine-wide box-name service serve
+  several users of the same host? The service runs as one operator. Its
+  channel's peer check admits that operator's daemons only (NET-122). A
+  second user's host setup replaces the first user's service. Until this
+  question closes, host setup refuses on a host whose installed service names
+  another user. One option is a service per user on distinct hook ports, but
+  the resolver hook routes a zone to one port. A second is one service that
+  admits a set of users, which needs a name space per user or box-address
+  arbitration across users. The third is one host DNS user per machine, the
+  current behaviour.]
 - [NEEDS CLARIFICATION (MEDIUM): on a native host, which component forwards a
   non-deny-all host-address box's upstream name queries under the box's rules
   (NET-066, NET-079), or are native host-address allow lists CIDR-only until one
