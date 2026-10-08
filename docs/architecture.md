@@ -206,7 +206,7 @@ execution:
 **session** covers the CLIs and daemons behind a running session, on the host
 and inside the microVM:
 
-`async-dialog`, `minimal`, `minimal-client`, `minimal-tui`, `minimald`,
+`async-dialog`, `minimal`, `minimal-client`, `minimald`,
 `minimald-rpc`, `minvmd`, `sessions`, `switch`
 
 **shared** covers the utilities the other planes draw on:

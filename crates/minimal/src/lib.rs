@@ -9,6 +9,7 @@ pub use minimal_client as client;
 pub mod completion;
 pub mod completions;
 pub mod config;
+pub mod dash;
 pub mod diag;
 pub mod dirs;
 pub mod git_remote;

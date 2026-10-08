@@ -1,6 +1,5 @@
 ---
-source: crates/minimal-tui/tests/snapshots.rs
-assertion_line: 230
+source: crates/minimal/tests/dash_snapshots.rs
 expression: render(&mut model)
 ---
 "┌──────────────────────────────┐┌ api-staging · 00000000 ──────────────────────────────────────────┐"
@@ -10,14 +9,14 @@ expression: render(&mut model)
 "│ ──────────────────────────── ││ bells   -                                                        │"
 "│ ▼ host  v0.1              ●  ││ ─ Policy ─────────────────────────────────────────────────────── │"
 "│   ▸ api-staging     OwnIp    ││ egress                                                           │"
-"│                              ││   subnets  10.0.0.0/8                                            │"
-"│                              ││   dns hosts  allow-all                                           │"
-"│                              ││   protocols  allow-all                                           │"
-"│                              ││   deny subnets  192.168.0.0/16                                   │"
+"│                              ││   allow-all (default)                                            │"
 "│                              ││ ingress                                                          │"
-"│                              ││   tcp  :8080 → :80                                               │"
+"│                              ││   deny-all                                                       │"
 "│                              ││ ─ Preview (live screen snapshot) ─────────────────────────────── │"
 "│                              ││ loading preview…                                                 │"
+"│                              ││                                                                  │"
+"│                              ││                                                                  │"
+"│                              ││                                                                  │"
 "│                              ││                                                                  │"
 "│                              ││                                                                  │"
 "│                              ││                                                                  │"

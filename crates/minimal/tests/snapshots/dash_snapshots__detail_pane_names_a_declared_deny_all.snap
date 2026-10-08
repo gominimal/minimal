@@ -1,6 +1,6 @@
 ---
-source: crates/minimal-tui/tests/snapshots.rs
-expression: render(&mut model)
+source: crates/minimal/tests/dash_snapshots.rs
+expression: rendered
 ---
 "┌──────────────────────────────┐┌ api-staging · 00000000 ──────────────────────────────────────────┐"
 "│      ▃🭕🭏🭕🭏 M I N I M A L     ││ project /src/api                  net     OwnIp                  │"
@@ -9,7 +9,7 @@ expression: render(&mut model)
 "│ ──────────────────────────── ││ bells   -                                                        │"
 "│ ▼ host  v0.1              ●  ││ ─ Policy ─────────────────────────────────────────────────────── │"
 "│   ▸ api-staging     OwnIp    ││ egress                                                           │"
-"│                              ││   allow-all (default)                                            │"
+"│                              ││   deny-all                                                       │"
 "│                              ││ ingress                                                          │"
 "│                              ││   deny-all                                                       │"
 "│                              ││ ─ Preview (live screen snapshot) ─────────────────────────────── │"

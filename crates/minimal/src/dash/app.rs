@@ -17,9 +17,9 @@ use chrono::{DateTime, Utc};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use sessions::{NetworkMode, SessionId};
 
-use crate::filter;
-use crate::rpc::{self, ProviderData};
-use crate::state::{self, DashState};
+use crate::dash::filter;
+use crate::dash::rpc::{self, ProviderData};
+use crate::dash::state::{self, DashState};
 
 /// How often the session list refreshes.
 const REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
@@ -938,7 +938,7 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
     let mut inbox: VecDeque<Msg> = VecDeque::from([Msg::Tick]);
     loop {
         terminal
-            .draw(|frame| crate::render::view(&mut model, frame))
+            .draw(|frame| crate::dash::render::view(&mut model, frame))
             .context("draw frame")?;
 
         let msg = match inbox.pop_front() {
@@ -947,7 +947,7 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
                 use futures::StreamExt as _;
                 tokio::select! {
                     maybe_event = events.next() => match maybe_event {
-                        Some(Ok(event)) => match crate::event::into_msg(event) {
+                        Some(Ok(event)) => match crate::dash::event::into_msg(event) {
                             Some(msg) => msg,
                             // Resizes and friends just trigger a redraw.
                             None => continue,
@@ -1330,7 +1330,7 @@ impl Drop for TerminalGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rpc::ProviderData;
+    use crate::dash::rpc::ProviderData;
 
     fn id(n: u128) -> SessionId {
         SessionId::parse_str(&format!("00000000-0000-0000-0000-{n:012x}")).unwrap()

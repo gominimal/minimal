@@ -751,7 +751,7 @@ async fn dashboard_activate_uploads_loadout_patches() {
         .as_ref()
         .unwrap()
         .join("providers/local-minimald0/ssh.sock");
-    let activated = minimal_tui::rpc::activate(
+    let activated = minimal::dash::rpc::activate(
         &sock,
         Some("dash-patched".to_string()),
         paths::HostAbsPath::try_new(project.path().to_str().unwrap()).unwrap(),

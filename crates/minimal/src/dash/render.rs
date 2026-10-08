@@ -9,7 +9,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::{
+use crate::dash::app::{
     Action, CreateField, Model, Row, SessionKey, display_name_of, network_mode_label,
 };
 
@@ -784,7 +784,7 @@ fn render_footer(model: &Model, frame: &mut Frame, area: Rect) {
                     field("path", &form.path, form.field == CreateField::Path),
                     field(
                         "net",
-                        network_mode_label(crate::app::NETWORK_MODES[form.net_idx]),
+                        network_mode_label(crate::dash::app::NETWORK_MODES[form.net_idx]),
                         form.field == CreateField::Network,
                     ),
                     Span::styled(
@@ -932,8 +932,8 @@ mod tests {
         label: &str,
         collapsed: bool,
         sessions: Vec<minimald_rpc::ListSessionsEntry>,
-    ) -> crate::app::ProviderView {
-        crate::app::ProviderView {
+    ) -> crate::dash::app::ProviderView {
+        crate::dash::app::ProviderView {
             label: label.to_string(),
             version: "0.1".to_string(),
             collapsed,
@@ -942,7 +942,7 @@ mod tests {
         }
     }
 
-    fn sidebar_model(providers: Vec<crate::app::ProviderView>) -> Model {
+    fn sidebar_model(providers: Vec<crate::dash::app::ProviderView>) -> Model {
         let now = chrono::DateTime::parse_from_rfc3339("2026-07-29T12:00:00Z")
             .unwrap()
             .to_utc();
@@ -1047,7 +1047,7 @@ mod tests {
         let mut model = Model::new(Utc::now());
         model.details.insert(
             key.clone(),
-            crate::app::Detail {
+            crate::dash::app::Detail {
                 record: Some(record),
                 policy: Some(sessions::EffectiveSessionPolicy {
                     egress: policy

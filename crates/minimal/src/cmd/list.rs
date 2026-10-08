@@ -286,10 +286,10 @@ pub async fn cmd_dash(global: &GlobalArgs) -> Result<(), anyhow::Error> {
         ensure_daemon(global)?;
     }
     // Compose the default loadout contribution up front, mirroring
-    // cmd_activate: the TUI can't reach this crate's config/loadout
-    // plumbing (it sits below), and an empty contribution would silently
-    // skip `default_loadouts` and the user policy for sessions created
-    // from the dashboard.
+    // cmd_activate: the dash module takes a pre-composed contribution so its
+    // `run` stays free of this crate's config/loadout plumbing, and an empty
+    // contribution would silently skip `default_loadouts` and the user policy
+    // for sessions created from the dashboard.
     let cfg = config::read_client_config(global)?;
     let user_policy = config::read_user_policy(global)?;
     let compose_options = loadouts::compose_options_from_config(&cfg);
@@ -299,7 +299,7 @@ pub async fn cmd_dash(global: &GlobalArgs) -> Result<(), anyhow::Error> {
     // the TUI sends on `CreateSession`.
     let (contribution, _user_policy) =
         loadouts::compose_user_contribution(active, user_policy, compose_options, true)?;
-    minimal_tui::run(minimal_tui::DashOptions {
+    crate::dash::run(crate::dash::DashOptions {
         minimal_dir: global.minimal_dir.clone(),
         config_dir: global.config_dir.clone(),
         contribution,

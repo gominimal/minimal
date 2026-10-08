@@ -57,7 +57,6 @@ nix.workspace = true
 mctx.workspace = true
 mfile.workspace = true
 minimal-client.workspace = true
-minimal-tui.workspace = true
 minimald-rpc.workspace = true
 op.workspace = true
 paths.workspace = true
@@ -99,9 +98,20 @@ minvmd = { path = "../minvmd", default-features = false }
 ot.workspace = true
 inquire.workspace = true
 
+# ── `min dash` dashboard (`minimal::dash`) ─────────────────────────────────
+# Only the interactive dashboard links a terminal UI, so these sit apart from
+# the CLI's own dependencies. `common` (fuzzy filter) and `futures` (driving
+# crossterm's EventStream) are used nowhere outside the dash module.
+common.workspace = true
+crossterm.workspace = true
+futures.workspace = true
+ratatui.workspace = true
+unicode-width.workspace = true
+
 [dev-dependencies]
-# `term` for the pty that stands in for the user's terminal in the attach
-# tests.
+# `insta` for the `dash_snapshots` render snapshots; `term` for the pty that
+# stands in for the user's terminal in the attach tests.
+insta.workspace = true
 nix = { workspace = true, features = ["term"] }
 minimald = { path = "../minimald", features = ["test-support"] }
 minvmd = { path = "../minvmd", default-features = false, features = ["test-support"] }

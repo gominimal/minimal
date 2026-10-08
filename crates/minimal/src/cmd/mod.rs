@@ -8,8 +8,8 @@ use tokio::io::AsyncReadExt as _;
 use tokio::io::AsyncWriteExt as _;
 
 // The version gate lives in `minimal-client`, next to the transport it guards,
-// so the dashboard's activation path (`minimal-tui`, which cannot depend on
-// this crate) gates on the same wording and the same override.
+// so the dashboard's activation path (`minimal::dash`) gates on the same wording
+// and the same override.
 // `ensure_version_reported` asserts a build a reply already carried;
 // `ensure_version_match` is the round-trip form, for paths with no first RPC
 // of their own to carry it.

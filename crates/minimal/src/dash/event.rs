@@ -2,7 +2,7 @@
 
 use crossterm::event::Event;
 
-use crate::app::Msg;
+use crate::dash::app::Msg;
 
 /// Map a crossterm event to a model message. Key presses become
 /// [`Msg::Key`]; resizes and other events return `None` (they only warrant
