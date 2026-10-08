@@ -79,6 +79,7 @@ fn record(name: Option<&str>, network: NetworkMode) -> sessions::Record {
         // A record that predates a launch of its box: the TUI's rows render
         // over whatever the record carries, and these carry no launch yet.
         host_ip_enforcement: None,
+        host_row_bound: false,
         attrs: Default::default(),
     }
 }
