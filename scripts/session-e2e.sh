@@ -16684,18 +16684,18 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
       # A close the egress gate made leaves its record behind: the box's
       # row withdrawal takes every tracked flow at the box's address and
       # resets each at the switch, writing one terminate record that names
-      # the switch address — and a FIN the box's own stack sent removes
-      # no tracked flow, so the held connection IS in the table a real
-      # revocation terminates. So on the lane that can read the gate's
-      # records, a close without a NEW terminate record (one absent from
-      # the snapshot this half took before the destroy — an earlier box's
-      # records can share the address) was not revocation
-      # at all: the box itself closed it (its FIN as its socat holder is
-      # torn down, or a RST, which untracks the flow), and that close
-      # reaches the host the same way — the two were this leg's flake. The
-      # record proves revocation ran and reset the tracked flow; it does
-      # not say which segment ended curl. Absent the record, say so, so
-      # the next failure is not read as a pass.
+      # the switch address. A FIN removes no tracked flow, so a connection
+      # the box already FIN-closed is still taken and counted, and the
+      # earlier forwards' flows keep the count non-zero: the record proves
+      # revocation ran at this box's address and reset the connections its
+      # forwards carried, not that the gate's reset is what ended curl. So
+      # on the lane that can read the gate's records, a close without a
+      # NEW terminate record (one absent from the snapshot this half took
+      # before the destroy — an earlier box's records can share the
+      # address) means the gate did not reset the box's connections: either
+      # revocation never reached the gate, or its inject failed (a WARN at
+      # the same address, which the dump below shows). Absent the record,
+      # say so, so the next failure is not read as a pass.
       if [ -n "$po_switch_addr" ]; then
         po_term_rec=""
         for _ in $(seq 1 60); do
@@ -16709,9 +16709,9 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
         done
         if [ -n "$po_term_rec" ]; then
           echo "egress gate: $po_term_rec"
-          echo "revocation ran when its box ended, and the egress gate reset the connection the declared forward carried (design §7.1)"
+          echo "the egress gate ran revocation at the box's switch address $po_switch_addr when its box ended and reset the connections its forwards carried (design §7.1)"
         else
-          echo "::error::the held connection to $po_addr:$PO_HOLD ended, but the egress gate wrote no terminate record for the box's switch address $po_switch_addr after its box was destroyed — so the gate never reset it; the close came from the box itself (its FIN, or a RST that untracked the flow), not from revocation (design §7.1)"
+          echo "::error::the held connection to $po_addr:$PO_HOLD ended, but the egress gate wrote no terminate record for the box's switch address $po_switch_addr after its box was destroyed, so the gate did not reset it (design §7.1)"
           echo "--- egress gate records for this box (bind, unbind, terminate) ---"
           po_gate_recs="$(minvmd_log_lines "$po_term_key" 2>/dev/null || true)"
           if [ -n "$po_gate_recs" ]; then
