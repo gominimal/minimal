@@ -3939,12 +3939,17 @@ async fn a_restarted_daemon_routes_restored_sessions_names_without_an_rpc() {
         "before the resume the restored session's name is unregistered"
     );
 
+    let resumed = manager.enqueue_resume_active_sessions().await;
     assert_eq!(
-        manager.resume_active_sessions().await.unwrap(),
+        manager.running_count().await,
+        2,
+        "a message sent after the enqueue returns is served after the resume"
+    );
+    assert_eq!(
+        resumed.await.unwrap(),
         2,
         "both active sessions are resumed"
     );
-    assert_eq!(manager.running_count().await, 2);
     for name in ["restored-alpha", "restored-beta"] {
         assert_eq!(
             route_owner(&server, &format!("{name}.min.internal")).await,

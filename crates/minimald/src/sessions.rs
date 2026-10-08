@@ -1650,26 +1650,39 @@ impl ManagerHandle {
         self.loopback.verdict_waiters()
     }
 
-    /// Starts the actor of every active session restored from the store, so
-    /// each one's box name is registered without waiting for an RPC to name
-    /// the session (see [`Manager::resume_active_sessions`]). Returns how
-    /// many actors were started.
+    /// Enqueues the resume of every active session restored from the store
+    /// (see [`Manager::resume_active_sessions`]) and returns the future that
+    /// answers with how many actors it started. The message is in the
+    /// manager's mailbox when this returns, so any message sent after it —
+    /// an RPC's lookup of a restored session, say — is served once the
+    /// resume has registered the restored names; the answer can be awaited
+    /// later, or not at all.
     ///
-    /// [`crate::server::Server::run`] calls this once, off its accept path,
-    /// right after the manager is built. It is a message rather than part of
-    /// [`Manager::init`] so the test harness, which builds the manager
-    /// without `Server::run`, can open a window (a pending range verdict,
-    /// say) before the resume.
+    /// [`crate::server::Server::run`] enqueues this once, before its accept
+    /// loop opens, and awaits the answer off that path. It is a message
+    /// rather than part of [`Manager::init`] so the test harness, which
+    /// builds the manager without `Server::run`, can open a window (a
+    /// pending range verdict, say) before the resume.
     #[cfg(target_os = "linux")]
-    pub async fn resume_active_sessions(&self) -> Result<usize, SessionsError> {
+    pub async fn enqueue_resume_active_sessions(
+        &self,
+    ) -> impl Future<Output = Result<usize, SessionsError>> + Send + 'static {
         let (send, recv) = Responder::channel();
         #[expect(
             clippy::let_underscore_must_use,
             reason = "a closed manager is the one way the send can fail, and the recv \
-                      below reports it — the send's own receipt has nothing to add"
+                      reports it — the send's own receipt has nothing to add"
         )]
         let _ = self.sender.send(ManagerMessage::ResumeActive(send)).await;
-        recv.await.expect("corresponding sessions manager is dead")
+        async move { recv.await.expect("corresponding sessions manager is dead") }
+    }
+
+    /// [`Self::enqueue_resume_active_sessions`], awaited: starts the actor
+    /// of every active session restored from the store and returns how many
+    /// it started.
+    #[cfg(target_os = "linux")]
+    pub async fn resume_active_sessions(&self) -> Result<usize, SessionsError> {
+        self.enqueue_resume_active_sessions().await.await
     }
 
     /// Lists the sessions known to this (minimald) instance.

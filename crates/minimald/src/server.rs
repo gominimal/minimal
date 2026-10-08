@@ -1000,14 +1000,19 @@ impl Server {
 
         // Bring up the actor of every active session restored from the
         // store, so each one's box name routes from daemon start rather than
-        // from the first RPC that names the session. Spawned, so the accept
-        // loop does not wait on it; the manager's mailbox orders it ahead of
-        // any RPC that arrives meanwhile.
+        // from the first RPC that names the session. Enqueued here, before
+        // the accept loop opens, so the manager's mailbox orders it ahead of
+        // every RPC the loop admits; only the answer is awaited off the
+        // accept path.
         #[cfg(target_os = "linux")]
         {
-            let manager = state.sessions_manager().await;
+            let resumed = state
+                .sessions_manager()
+                .await
+                .enqueue_resume_active_sessions()
+                .await;
             tokio::spawn(async move {
-                if let Err(error) = manager.resume_active_sessions().await {
+                if let Err(error) = resumed.await {
                     tracing::warn!(
                         %error,
                         "could not resume active sessions at daemon start; their names \
