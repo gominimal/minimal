@@ -5669,6 +5669,7 @@ mod tests {
         let policy = EffectiveSessionPolicy {
             egress: EffectiveEgress::AllowAll,
             ingress: None,
+            credentialed_upstream: None,
         };
         let document = |ports: &[u16]| {
             let mut out = Vec::new();
