@@ -275,6 +275,10 @@ fn every_daemon_connection_is_classified() {
             "cmd/session.rs::cmd_exec = gated",
             "cmd/session.rs::cmd_session_run = gated",
             "cmd/session.rs::cmd_session_setup_zed = gated",
+            // A read-only lookup after an attach the gated `cmd_attach` already
+            // made: it only asks whether the session is gone, to release a
+            // `host_ip` name hold, and builds nothing a skew could half-make.
+            "cmd/session.rs::release_held_name_after_attach = ungated",
             "diag/net.rs::probe_socket = ungated",
             "task.rs::arm_task_run_interrupt = ungated",
             // Not a product path: the fall-through tests' own connections to
