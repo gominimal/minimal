@@ -13,7 +13,6 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::io;
-use std::net::Ipv4Addr;
 use std::os::fd::OwnedFd;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -21,10 +20,10 @@ use std::sync::Arc;
 use sandbox2::NetGuard;
 use tokio::sync::Mutex;
 
-use crate::net::SwitchClient;
 use crate::net::dns;
 use crate::net::policy::{ControlChannel, PortForwarder};
 use crate::net::switch::{SessionGate, SwitchRelay};
+use crate::net::{PtaskLease, SwitchClient};
 
 /// The own-IP attachment guard. Returned by [`complete_own_ip_attach`] and torn
 /// down explicitly via [`NetGuard::teardown`] at the end of the sandbox's life.
@@ -50,16 +49,16 @@ pub(crate) struct OwnIpGuard {
     /// stops, each able to unbind its port and end its connections. Removed
     /// on teardown. Empty when no ingress was configured.
     exposed: Vec<PortForwarder>,
+    /// The lease this guard's attach holds — its address at its epoch —
+    /// passed to `detach` so the lease is released with the count (T66),
+    /// handed or drawn alike: a lease's life is its attachment's.
+    lease: PtaskLease,
     /// The box's runtime publishes (NET-044), shared with its session actor.
     /// They deliver to this spawn's lease, so they come down with it, beside
     /// `exposed`: the next spawn takes a new lease and starts with none,
     /// never with a forward aimed at the stale one. `None` for a task, which
     /// publishes nothing at runtime.
     runtime_ingress: Option<crate::net::provider::RuntimeIngress>,
-    /// The lease ip this guard's attach holds, passed to `detach` so the
-    /// lease is released with the count (T66) — handed or drawn alike, a
-    /// lease's life is its attachment's.
-    lease_ip: Ipv4Addr,
 }
 
 impl OwnIpGuard {
@@ -139,22 +138,35 @@ impl NetGuard for OwnIpGuard {
             // reach a still-running switch first. On a VM-backed host the
             // declared forwards are the host's to unbind at box end, so this
             // asks the switch for nothing there.
-            if !self.exposed.is_empty() {
-                crate::net::policy::release_declared_ingress(&self.control, &self.exposed).await;
+            let Self {
+                _relay: relay,
+                switch,
+                control,
+                exposed,
+                runtime_ingress,
+                lease,
+            } = *self;
+            if !exposed.is_empty() {
+                crate::net::policy::release_declared_ingress(&control, &exposed).await;
             }
             // The runtime publishes deliver to the same lease, so they take
             // the same path down — and the box refuses new ones until its
             // next spawn attaches.
-            if let Some(runtime_ingress) = &self.runtime_ingress {
+            if let Some(runtime_ingress) = &runtime_ingress {
                 let runtime = runtime_ingress.detach();
                 if !runtime.is_empty() {
-                    crate::net::policy::remove_ingress(&self.control, &runtime).await;
+                    crate::net::policy::remove_ingress(&control, &runtime).await;
                 }
             }
-            if let Err(e) = self.switch.lock().await.detach(self.lease_ip).await {
+            // Release before reuse: the relay and the forwarders hold the
+            // box's gate, so dropping them first ends its gate row, its flows
+            // and its admission windows before the lease goes back to the
+            // allocator.
+            drop(relay);
+            drop(exposed);
+            if let Err(e) = switch.lock().await.detach(lease).await {
                 tracing::warn!(error = %e, "detaching OwnIp PTask from switch on session end");
             }
-            // `_relay` drops here, aborting the relay tasks.
         })
     }
 }
@@ -183,7 +195,7 @@ impl NetGuard for OwnIpGuard {
 /// (`sandbox2::PlannedLaunch`), and detaching as well would double-decrement
 /// gvproxy's attach count.
 ///
-/// `handed_from_host` says whether `lease_ip` is the address the VM host
+/// `handed_from_host` says whether `lease`'s address is the address the VM host
 /// daemon allocated for this box's registration and handed back (T66), or
 /// one this daemon drew itself — the one debug line per attach names the
 /// address and that distinction, so a log tail can tell an attach that
@@ -198,12 +210,13 @@ pub(crate) async fn complete_own_ip_attach(
     switch: &Arc<Mutex<SwitchClient>>,
     tap_fd: OwnedFd,
     control: ControlChannel,
-    lease_ip: Ipv4Addr,
+    lease: PtaskLease,
     session_name: &str,
     policy: Option<&sessions::SessionPolicy>,
     own_address: Option<&crate::net::provider::OwnAddressReporter>,
     handed_from_host: bool,
 ) -> io::Result<OwnIpGuard> {
+    let lease_ip = lease.ip;
     tracing::debug!(
         session = session_name,
         switch_address = %lease_ip,
@@ -279,7 +292,7 @@ pub(crate) async fn complete_own_ip_attach(
         switch,
         relay,
         control,
-        lease_ip,
+        lease,
         session_name,
         policy.and_then(|p| p.ingress.as_ref()),
         gate.as_ref(),
@@ -310,12 +323,13 @@ async fn finish_own_ip_attach(
     switch: &Arc<Mutex<SwitchClient>>,
     relay: SwitchRelay,
     control: ControlChannel,
-    lease_ip: Ipv4Addr,
+    lease: PtaskLease,
     session_name: &str,
     ingress: Option<&sessions::IngressPolicy>,
     gate: Option<&Arc<SessionGate>>,
     own_address: Option<&crate::net::provider::OwnAddressReporter>,
 ) -> io::Result<OwnIpGuard> {
+    let lease_ip = lease.ip;
     // The host loopback address this box's declaration publishes on (NET-010):
     // the address a creator handed it, read back from the registry rather than
     // re-derived, so the forwards bind where the box's name answers. The
@@ -465,8 +479,8 @@ async fn finish_own_ip_attach(
         switch: Arc::clone(switch),
         control,
         exposed,
+        lease,
         runtime_ingress: own_address.map(crate::net::provider::OwnAddressReporter::runtime_ingress),
-        lease_ip,
     })
 }
 
@@ -493,6 +507,16 @@ mod tests {
     use crate::net::provider::network_for;
     use crate::test_harness::CaptureWriter;
     use sessions::BoxAddresses;
+
+    /// A lease at `ip` for an attach whose switch never handed it: epoch 0,
+    /// which no allocator hands, so its teardown releases nothing.
+    fn lease_at(ip: Ipv4Addr) -> PtaskLease {
+        PtaskLease {
+            ip,
+            mac: MacAddr::for_switch_ip(ip),
+            epoch: 0,
+        }
+    }
 
     /// The fake gvproxy's answer for a request it serves happily.
     fn ok() -> (u16, String) {
@@ -755,12 +779,13 @@ mod tests {
             1,
             "the handed attach counts like any other"
         );
+        let handed_lease = switch.lock().await.leases().to_vec();
         assert_eq!(
-            switch.lock().await.leases(),
-            &[PtaskLease {
-                ip: handed_switch,
-                mac: MacAddr::for_switch_ip(handed_switch),
-            }],
+            handed_lease
+                .iter()
+                .map(|lease| (lease.ip, lease.mac))
+                .collect::<Vec<_>>(),
+            [(handed_switch, MacAddr::for_switch_ip(handed_switch))],
             "the handed attach records the handed lease and selects nothing else"
         );
         let _ = plan; // the plan's resolver/tap carry the same lease; asserted above
@@ -878,12 +903,11 @@ mod tests {
              {leases:?}"
         );
         assert!(
-            leases.contains(&PtaskLease {
-                ip: handed_switch,
-                mac: MacAddr::for_switch_ip(handed_switch),
-            }),
-            "the re-hand carries the same lease the first attach recorded: \
-             {leases:?}"
+            leases.iter().any(|lease| lease.ip == handed_switch
+                && lease.mac == MacAddr::for_switch_ip(handed_switch)
+                && lease.epoch > handed_lease[0].epoch),
+            "the re-hand carries the same address and MAC the first attach \
+             recorded, under a new epoch: {leases:?}"
         );
         assert_eq!(
             switch.lock().await.attached(),
@@ -956,7 +980,7 @@ mod tests {
             &switch,
             tap_fd,
             ControlChannel::Unix(control_path),
-            handed_switch,
+            lease_at(handed_switch),
             "web",
             None,
             None,
@@ -1385,7 +1409,7 @@ mod tests {
             &switch,
             tap_fd,
             ControlChannel::Unix(control_path),
-            Ipv4Addr::new(100, 64, 0, 9),
+            lease_at(Ipv4Addr::new(100, 64, 0, 9)),
             "web",
             Some(&policy),
             Some(&reporter),
@@ -1538,7 +1562,7 @@ mod tests {
             &refused_switch,
             refused.tap_fd,
             ControlChannel::Unix(refused.control_path.clone()),
-            LEASE,
+            lease_at(LEASE),
             "web",
             Some(&refused_policy),
             Some(&refused.reporter),
@@ -1652,7 +1676,7 @@ mod tests {
             &failed_switch,
             failed.tap_fd,
             ControlChannel::Unix(failed.control_path.clone()),
-            LEASE,
+            lease_at(LEASE),
             "web",
             Some(&failed_policy),
             Some(&failed.reporter),
@@ -1731,7 +1755,7 @@ mod tests {
             &switch,
             bare.tap_fd,
             ControlChannel::Unix(bare.control_path.clone()),
-            LEASE,
+            lease_at(LEASE),
             "web",
             Some(&policy),
             None,
@@ -1799,7 +1823,7 @@ mod tests {
             &switch,
             unhand.tap_fd,
             ControlChannel::Unix(unhand.control_path.clone()),
-            LEASE,
+            lease_at(LEASE),
             "web",
             Some(&policy),
             Some(&unhand.reporter),
@@ -1876,7 +1900,7 @@ mod tests {
             &switch,
             scenario.tap_fd,
             ControlChannel::Unix(scenario.control_path.clone()),
-            LEASE,
+            lease_at(LEASE),
             "web",
             Some(&policy),
             Some(&scenario.reporter),
@@ -1976,7 +2000,7 @@ mod tests {
             &switch,
             scenario.tap_fd,
             ControlChannel::Unix(scenario.control_path.clone()),
-            LEASE,
+            lease_at(LEASE),
             "web",
             Some(&policy),
             Some(&scenario.reporter),
@@ -2068,7 +2092,7 @@ mod tests {
             &switch,
             scenario.tap_fd,
             control.clone(),
-            FIRST_LEASE,
+            lease_at(FIRST_LEASE),
             "web",
             Some(&policy),
             Some(&reporter),
@@ -2132,7 +2156,7 @@ mod tests {
             &switch,
             second_tap,
             control.clone(),
-            SECOND_LEASE,
+            lease_at(SECOND_LEASE),
             "web",
             Some(&policy),
             Some(&reporter),
@@ -2555,7 +2579,7 @@ mod tests {
             &switch,
             tap_fd,
             ControlChannel::Unix(control_path),
-            LEASE,
+            lease_at(LEASE),
             "web",
             Some(&policy),
             Some(&reporter),
@@ -2832,7 +2856,7 @@ mod tests {
             &switch,
             tap_fd,
             ControlChannel::Unix(control_path),
-            LEASE,
+            lease_at(LEASE),
             "web",
             Some(&policy),
             Some(&reporter),
@@ -3159,7 +3183,7 @@ mod tests {
             &switch,
             scenario.tap_fd,
             ControlChannel::Unix(scenario.control_path.clone()),
-            LEASE,
+            lease_at(LEASE),
             "web",
             Some(&policy),
             Some(&scenario.reporter),
