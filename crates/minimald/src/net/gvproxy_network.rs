@@ -215,11 +215,16 @@ pub(crate) async fn complete_own_ip_attach(
     // a custom-subnet switch is keyed to its own resolver and watched at its
     // own host alias.
     // The hostname proxy's port rides with it: the node address's interim
-    // opening in the box's own-address set (design §7.1).
-    let (subnet, hostname_proxy_port) = {
+    // opening in the box's own-address set (design §7.1) — resolved through
+    // the serving transition, so a box attaching while the proxy's detached
+    // startup driver is still retrying cannot compile its opening against
+    // the port the switch was seeded with (which the OS may have relocated
+    // when busy, NET-025).
+    let subnet = {
         let switch = switch.lock().await;
-        (switch.subnet(), switch.hostname_proxy_port())
+        switch.subnet()
     };
+    let hostname_proxy_port = crate::net::hostname_proxy_serving_port(switch).await;
     // The gate is held in an `Arc` so the relay's legs and the ingress
     // forwarders this attach goes on to build (NET-121) share one gate: a
     // revoked port's refusal on the legs is the same gate state the

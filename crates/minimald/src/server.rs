@@ -781,6 +781,13 @@ impl ServerStateHandle {
         switch.lock().await.hostname_proxy_port()
     }
 
+    /// The daemon's shared gvproxy switch, for tests that drive the
+    /// attach path's serving transition against it.
+    #[cfg(test)]
+    async fn test_switch(&self) -> Arc<Mutex<crate::net::SwitchClient>> {
+        Arc::clone(&self.0.lock().await.net_switch)
+    }
+
     /// Records the port the box-zone answerer actually listens on (UDP),
     /// once its startup has bound (and, in a microVM, published) it.
     pub(crate) async fn set_zone_answerer_port(&self, port: u16) {
@@ -3824,6 +3831,60 @@ mod tests {
         assert!(
             logged.contains(r#"port_source="selected""#),
             "the startup line must say the port was selected, got: {logged}"
+        );
+        drop(held);
+    }
+
+    /// Design §7.1's attach-race edge, in the daemon's own terms: the
+    /// switch's node-address opening is seeded with the *requested* port,
+    /// and a box attaching before the proxy's detached startup driver has
+    /// bound must not compile that request into its own-address set — the
+    /// OS relocates a busy request (NET-025), and the stale seed would point
+    /// the opening at whatever unrelated host process holds the reselected
+    /// port. The attach path resolves the port through the serving
+    /// transition instead: it follows the bind to the port actually taken,
+    /// and fails closed — no opening, once said out loud — while the proxy
+    /// is still coming up.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_box_attaching_before_the_proxy_serves_never_takes_the_seeded_port() {
+        // Hold the documented default so the relocation is real: the seeded
+        // port names a listener this test owns, not the daemon's proxy.
+        let held = tokio::net::TcpListener::bind((
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            crate::net::proxy::DEFAULT_EGRESS_PROXY_PORT,
+        ))
+        .await
+        .ok();
+
+        let dir = TempDir::new().unwrap();
+        let state = ServerStateHandle::new(test_config(&dir), None)
+            .await
+            .unwrap();
+        let switch = state.test_switch().await;
+
+        // Seeded with the default before the proxy serves: the attach path
+        // must fail closed on it rather than hand it to a box.
+        assert_eq!(
+            state.switch_hostname_proxy_port().await,
+            Some(crate::net::proxy::DEFAULT_EGRESS_PROXY_PORT),
+            "the switch is seeded with the requested port before the proxy serves"
+        );
+        assert_eq!(
+            crate::net::hostname_proxy_serving_port(&switch).await,
+            None,
+            "a not-yet-serving proxy hands a box no opening, not the seeded port"
+        );
+
+        // The default was busy, so the bind relocates; once the proxy is
+        // serving, the attach path follows it there.
+        start_host_proxies(&state, false, None, None).await;
+        let bound = wait_for_proxy_port(&state).await;
+        assert_ne!(bound, crate::net::proxy::DEFAULT_EGRESS_PROXY_PORT);
+        assert_eq!(
+            crate::net::hostname_proxy_serving_port(&switch).await,
+            Some(bound),
+            "the attach path must hand a box the port the proxy bound, not the seed"
         );
         drop(held);
     }

@@ -1154,12 +1154,18 @@ impl Session {
             return;
         }
         let name = registry_name(record);
+        // The hostname proxy's port for the box's own-address set (design
+        // §7.1): resolved through the serving transition (see
+        // [`crate::net::hostname_proxy_serving_port`]) so a registration
+        // racing the proxy's detached startup cannot compile the seeded —
+        // possibly relocated (NET-025) — port into the node's opening.
         // Scoped: the switch lock is dropped before the registry is taken, so
         // no path holds both.
-        let (subnet, hostname_proxy_port) = {
+        let subnet = {
             let switch = self.net_switch.lock().await;
-            (switch.subnet(), switch.hostname_proxy_port())
+            switch.subnet()
         };
+        let hostname_proxy_port = crate::net::hostname_proxy_serving_port(&self.net_switch).await;
         match record.network {
             sessions::NetworkMode::OwnIp => {
                 // NET-010/NET-011: finalize publishes the box's declaration
