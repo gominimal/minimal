@@ -1047,7 +1047,17 @@ mod tests {
             key.clone(),
             crate::app::Detail {
                 record: Some(record),
-                policy: Some(policy),
+                policy: Some(sessions::EffectiveSessionPolicy {
+                    egress: policy
+                        .egress
+                        .clone()
+                        .map_or(sessions::EffectiveEgress::DenyAll, |egress| {
+                            sessions::EffectiveEgress::Declared(egress)
+                        }),
+                    ingress: policy.ingress.clone(),
+                    credentialed_upstream: policy.credentialed_upstream.clone(),
+                }),
+                policy_error: None,
             },
         );
         policy_lines(&model, &key)

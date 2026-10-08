@@ -5371,6 +5371,7 @@ mod tests {
                 dynamic_allowed_range: None,
                 dynamic_ingress: None,
             }),
+            credentialed_upstream: None,
         };
         let collisions = vec![minimald_rpc::SharedPortCollision {
             port: 8080,

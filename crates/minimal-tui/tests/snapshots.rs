@@ -230,6 +230,7 @@ fn detail_pane_with_policy() {
                     dynamic_allowed_range: None,
                     dynamic_ingress: None,
                 }),
+                credentialed_upstream: None,
             }),
             policy_error: None,
         },
@@ -264,6 +265,7 @@ fn detail_pane_names_a_declared_deny_all() {
                     deny_subnets: None,
                 }),
                 ingress: None,
+                credentialed_upstream: None,
             }),
             policy_error: None,
         },
@@ -298,6 +300,36 @@ fn detail_pane_marks_the_allow_all_default() {
             policy: Some(sessions::EffectiveSessionPolicy {
                 egress: sessions::EffectiveEgress::AllowAll,
                 ingress: None,
+                credentialed_upstream: None,
+            }),
+            policy_error: None,
+        },
+    );
+    model.cursor = 1;
+    insta::assert_snapshot!(render(&mut model));
+}
+
+/// NET-134: a host-address box that declared a credentialed upstream shows
+/// the lane in the pane, marked `(not in effect: host_ip box)`, in the row
+/// text `min session policy` prints (one shared sessions function).
+#[test]
+fn detail_pane_marks_a_credentialed_upstream_lane_not_in_effect() {
+    let mut model = fixed_model(vec![provider(
+        "host",
+        vec![entry(1, Some("api-staging"), "/src/api")],
+    )]);
+    let key = SessionKey {
+        provider: "host".to_string(),
+        id: id(1),
+    };
+    model.details.insert(
+        key,
+        Detail {
+            record: Some(record(Some("api-staging"), NetworkMode::HostNet)),
+            policy: Some(sessions::EffectiveSessionPolicy {
+                egress: sessions::EffectiveEgress::AllowAll,
+                ingress: None,
+                credentialed_upstream: Some(sessions::CredentialedUpstream::default()),
             }),
             policy_error: None,
         },
@@ -354,6 +386,7 @@ fn detail_pane_marks_the_deny_all_default() {
             policy: Some(sessions::EffectiveSessionPolicy {
                 egress: sessions::EffectiveEgress::DenyAll,
                 ingress: None,
+                credentialed_upstream: None,
             }),
             policy_error: None,
         },
@@ -393,6 +426,7 @@ fn detail_pane_shows_dynamic_ingress() {
                     dynamic_allowed_range: None,
                     dynamic_ingress: Some(sessions::DynamicIngress::Ask),
                 }),
+                credentialed_upstream: None,
             }),
             policy_error: None,
         },
