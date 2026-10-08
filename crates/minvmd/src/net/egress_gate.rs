@@ -3213,6 +3213,22 @@ async fn relay_switch_frames_to_guest(
             && let Some(record) = table.by_source(pkt.dst.ip().octets())
             && forwards.inside_published(record.switch_addr().octets(), pkt.dst.port())
         {
+            // NET-134's ingress arm: the box egress proxy answers and never
+            // opens toward a box, so a bare SYN from its address to a
+            // published inside port has no legitimate origin. Dropping the
+            // opening packet here — before any observation or delivery —
+            // keeps the proxy's address from planting an inbound flow toward
+            // a box at all. Only opening packets are dropped: SYN-ACKs and
+            // ACKs the proxy sends back to the box on a credentialed dial
+            // still reach it untouched.
+            let proxy = table.subnet().box_egress_proxy_address().octets();
+            if pkt.src.ip().octets() == proxy
+                && pkt.proto == egress::IPPROTO_TCP
+                && pkt.tcp_flags & egress::TCP_SYN != 0
+                && pkt.tcp_flags & egress::TCP_ACK == 0
+            {
+                continue;
+            }
             let now = Instant::now();
             if matches!(
                 replies.observe_delivered(&record, &pkt, &limiter, table.subnet(), now),
@@ -8907,6 +8923,77 @@ mod tests {
             "the frame behind the FIN never arrived; the marker did"
         );
         expect_silence(&mut switch).await;
+    }
+
+    /// NET-134's ingress arm: a bare-SYN TCP frame from the Box Egress
+    /// Proxy's address toward a box's published inside port has no
+    /// legitimate origin — the proxy only answers (NET-134) and never opens
+    /// toward a box — so the ingress relay drops it before it can open a
+    /// reply-flow record or reach the box. The proxy's answers to a
+    /// credentialed box's dial (SYN-ACK, ACK) are not opening packets and
+    /// still pass, and a proxy-sourced bare SYN toward a port no publish
+    /// names is out of the recording bound's reach, so it is not this rule's
+    /// and continues to its normal decision.
+    #[tokio::test]
+    async fn box_egress_proxy_syn_to_published_port_dropped() {
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register_node_namespace(7654);
+        let node_addr = SUBNET.daemon_ip().octets();
+        let publish = expose_request(
+            "127.0.0.1:7654",
+            &format!("{}:7654", SUBNET.daemon_ip()),
+            "tcp",
+        );
+        let h = gate_over_control(registry, publish).await;
+        let (mut guest, mut switch) = connect_over(&h).await;
+        let proxy = SUBNET.box_egress_proxy_address().octets();
+
+        // The proxy's bare SYN toward the published inside port — the
+        // opening packet no one legitimately sends — never reaches the
+        // guest, and never opens a reply-flow record for the node.
+        let opening = dns_pins::tests::tcp_frame(
+            Ipv4Addr::from(proxy),
+            40000,
+            Ipv4Addr::from(node_addr),
+            7654,
+            sessions::core::egress::TCP_SYN,
+        );
+        send_frame(&mut switch, &opening).await;
+        assert_eq!(
+            h.replies.record_count_of(node_addr),
+            None,
+            "the dropped opening packet opened no reply-flow record for the node"
+        );
+
+        // The proxy's answer to a credentialed box's dial — a SYN-ACK from
+        // the proxy's address toward the published inside port — is not an
+        // opening packet, so it is not dropped by this rule. Delivered
+        // toward the guest, it is the exact frame this hardening must never
+        // withhold.
+        let answer = dns_pins::tests::tcp_frame(
+            Ipv4Addr::from(proxy),
+            40000,
+            Ipv4Addr::from(node_addr),
+            7654,
+            sessions::core::egress::TCP_SYN | sessions::core::egress::TCP_ACK,
+        );
+        send_frame(&mut switch, &answer).await;
+        assert_eq!(
+            expect_frame(&mut guest).await,
+            answer,
+            "the proxy's SYN-ACK answer reaches the guest"
+        );
+
+        // The marker after them proves the dropped bare SYN was decided, and
+        // nothing but the answer reached the guest.
+        let marker = arp_frame(node_addr);
+        send_frame(&mut switch, &marker).await;
+        assert_eq!(
+            expect_frame(&mut guest).await,
+            marker,
+            "the bare SYN never arrived; only the answer and the marker did"
+        );
+        expect_silence(&mut guest).await;
     }
 
     /// The §5.3 infrastructure deny set as a host frame rule
