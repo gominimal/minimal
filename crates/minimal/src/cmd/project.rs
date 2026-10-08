@@ -185,6 +185,16 @@ pub(crate) fn decide_workspace_upload(
     }
 }
 
+/// Which upload progress presentation the caller wants: the CLI's spinner bar,
+/// or the quiet path the `min dash` TUI owns its screen with. Under `Quiet`
+/// the shared notices are suppressed too, so a background create never writes
+/// over the TUI frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UploadProgress {
+    Bar,
+    Quiet,
+}
+
 /// What [`run_workspace_upload`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WorkspaceUpload {
@@ -200,11 +210,12 @@ pub(crate) enum WorkspaceUpload {
 /// Runs [`UploadDecision`] against the daemon: prints the shared notices,
 /// prompts through `ask` only for [`UploadDecision::Confirm`], refuses when
 /// `refuse_on_dropped_hooks` and a skip would drop project hooks, and uploads
-/// via `client` with the CLI's spinner bar.
+/// via `client`. `progress` picks the bar or the quiet path.
 ///
 /// The upload's failure is returned to the caller, which owns the teardown
 /// (`withdraw_box_row` for the CLI, `AbortSession` for the dashboard) — the
 /// session exists on the daemon by the time this runs.
+#[allow(clippy::too_many_arguments)] // one home for a sequence three callers share; splitting the args would hide the flow
 pub(crate) async fn run_workspace_upload(
     client: &mut client::Client,
     id: sessions::SessionId,
@@ -213,16 +224,26 @@ pub(crate) async fn run_workspace_upload(
     decision: UploadDecision,
     ask: impl FnOnce() -> Result<bool, anyhow::Error>,
     refuse_on_dropped_hooks: bool,
+    progress: UploadProgress,
 ) -> Result<WorkspaceUpload, anyhow::Error> {
+    // The TUI owns its own screen, so only the CLI's bar mode prints the
+    // notices; the wording still has one home here.
+    let say = |line: &str| {
+        if progress == UploadProgress::Bar {
+            eprintln!("{line}");
+        }
+    };
     if decision == UploadDecision::SkipEmptyOrHome {
-        eprintln!("Starting with an empty box (nothing here to sync)");
+        say("Starting with an empty box (nothing here to sync)");
         return Ok(WorkspaceUpload::Skipped);
     }
     // Upload from the project root — the directory the mfile lives in — rather
     // than wherever the user invoked us, so `min activate ./subdir` still
     // uploads the whole project.
     if root != invoked_from {
-        eprintln!("Uploading from project root {root} (resolved from {invoked_from})");
+        say(&format!(
+            "Uploading from project root {root} (resolved from {invoked_from})"
+        ));
     }
     match decision {
         UploadDecision::SkipUndeclared => {
@@ -244,24 +265,19 @@ pub(crate) async fn run_workspace_upload(
                     );
                 }
             }
-            eprintln!(
-                "{}",
-                file_upload::skipped_upload_warning(root.as_std_path())
-            );
+            say(&file_upload::skipped_upload_warning(root.as_std_path()));
             Ok(WorkspaceUpload::Skipped)
         }
         UploadDecision::Confirm => {
             if ask()? {
-                upload_workspace(client, id, root).await
+                upload_workspace(client, id, root, progress).await
             } else {
-                eprintln!(
-                    "Skipping file upload; the session will start with an \
-                     empty workspace."
-                );
+                say("Skipping file upload; the session will start with an \
+                     empty workspace.");
                 Ok(WorkspaceUpload::Declined)
             }
         }
-        UploadDecision::Upload => upload_workspace(client, id, root).await,
+        UploadDecision::Upload => upload_workspace(client, id, root, progress).await,
         UploadDecision::SkipEmptyOrHome => unreachable!("handled above"),
     }
 }
@@ -272,10 +288,17 @@ async fn upload_workspace(
     client: &mut client::Client,
     id: sessions::SessionId,
     root: &camino::Utf8Path,
+    progress: UploadProgress,
 ) -> Result<WorkspaceUpload, anyhow::Error> {
-    client
-        .upload_workspace_files(id, root.as_std_path())
-        .await
+    let result = match progress {
+        UploadProgress::Bar => client.upload_workspace_files(id, root.as_std_path()).await,
+        UploadProgress::Quiet => {
+            client
+                .upload_workspace_files_quiet(id, root.as_std_path())
+                .await
+        }
+    };
+    result
         .map(|()| WorkspaceUpload::Uploaded)
         .context("Failed to upload project files")
 }
