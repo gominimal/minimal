@@ -909,6 +909,8 @@ async fn serve_answerer_control(
                 }
                 BoxControlRequest::Register(_)
                 | BoxControlRequest::Withdraw(_)
+                | BoxControlRequest::HoldBoxName(_)
+                | BoxControlRequest::ReleaseBoxName(_)
                 | BoxControlRequest::AdmitPort(_)
                 | BoxControlRequest::WithdrawPort(_)
                 | BoxControlRequest::ReadRow(_)
@@ -1509,6 +1511,31 @@ async fn serve_get_session_runtime_facts(
                         &crate::session_host::host_ip_enforcement_fact(),
                         record.host_ip_enforcement,
                     );
+                    // The listen publishes the audit log refused (NET-046):
+                    // a watcher-driven publish has no caller to answer, so
+                    // the live actor's set is read here and `min session
+                    // policy` warns per port. A session whose actor cannot
+                    // answer has no watcher running, and nothing to warn
+                    // about.
+                    let unaudited_listen_ports =
+                        match mngr.get_session(SessionKeyPredicate::Id(record.id)).await {
+                            Ok(Some(session)) => session
+                                .live_ingress()
+                                .await
+                                .map(|live| live.unaudited_listen_ports)
+                                .unwrap_or_default(),
+                            Ok(None) | Err(_) => Vec::new(),
+                        };
+                    let audit_log = if unaudited_listen_ports.is_empty() {
+                        None
+                    } else {
+                        let state_dir = s.minimal_state_dir().await;
+                        Some(
+                            crate::audit::log_path(state_dir.as_utf8_path().as_std_path())
+                                .display()
+                                .to_string(),
+                        )
+                    };
                     // The ports this box's attach yields because a sibling at
                     // the same shared loopback address holds them (first-come):
                     // the same registry record the attach path reads to skip
@@ -1521,6 +1548,8 @@ async fn serve_get_session_runtime_facts(
                     Ok(Errorable::Ok(minimald_rpc::SessionRuntimeFacts {
                         id: record.id,
                         host_ip_enforcement,
+                        unaudited_listen_ports,
+                        audit_log,
                         shared_port_collisions,
                     }))
                 }

@@ -369,6 +369,19 @@ A row from an older daemon whose gate did not admit runtime publishes reads
 field reads `(unknown; daemon predates this field)`. The CLI never shows
 either row as reachable.
 
+The daemon publishes a port the box listens on only after it writes the
+decision to its audit log. When the daemon cannot write the log, the port
+stays unpublished, and the command prints one line per port after the live
+rows:
+
+```
+warning: port 3000 is permitted but not published: the audit log /path/to/audit/decisions.log cannot be written
+```
+
+The line clears once the log takes records again and the port publishes.
+In `-o json` output the same ports appear as `unaudited_listen_ports`, a
+list the document leaves out when it is empty.
+
 `-o json` (`--output json`) prints one `min/v1/session-policy` document on
 stdout instead of text. Each block the text output prints becomes a key:
 `network`, `egress`, `ingress`, and `live_ingress`. The `egress` object

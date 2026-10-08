@@ -443,6 +443,57 @@ fn host_control(
     Ok((reply, reader))
 }
 
+/// Holds (`hold`) or releases a `host_ip` box's name in the zone of the VM
+/// host daemon beside the daemon's ssh socket `ssh_sock`: the \[proposed\]
+/// pre-alias interim (deployment-and-egress-gateway ruling §7.1) that
+/// answers a held name NODATA where an unheld one answers NXDOMAIN.
+/// Best-effort for a caller that does not know whether the daemon is
+/// VM-backed: no control socket beside it is nothing to do, and a refusal
+/// or a failed exchange warns and leaves the name answering as it did.
+/// `session_id` is the session the hold is for: a release that names it
+/// frees only that session's hold.
+pub fn hold_box_name_beside(
+    ssh_sock: &Path,
+    box_name: &str,
+    session_id: Option<sessions::SessionId>,
+    hold: bool,
+) {
+    let Some(control_sock) = ssh_sock
+        .parent()
+        .map(|dir| dir.join(VM_HOST_CONTROL_SOCK_FILE))
+    else {
+        return;
+    };
+    if !control_sock.exists() {
+        return;
+    }
+    let request = minimald_rpc::HoldBoxNameRequest {
+        name: box_name.to_string(),
+        session_id,
+    };
+    let (verb, operation) = if hold {
+        (
+            minimald_rpc::BoxControlRequest::HoldBoxName(request),
+            "hold",
+        )
+    } else {
+        (
+            minimald_rpc::BoxControlRequest::ReleaseBoxName(request),
+            "release",
+        )
+    };
+    let failure = match host_control(&control_sock, &verb) {
+        Ok((minimald_rpc::BoxControlReply::NameHeld { .. }, _)) => return,
+        Ok((other, _)) => format!("another verb's reply: {other:?}"),
+        Err(error) => format!("{error:#}"),
+    };
+    tracing::warn!(
+        box = %box_name,
+        operation,
+        "the box name {operation} could not be made ({failure}); the name answers as it did before"
+    );
+}
+
 impl HostAsks {
     /// Subscribe to the pending asks of the box whose row is named
     /// `box_name` on the VM host daemon at `control_sock`: the row read
@@ -724,6 +775,55 @@ pub fn checked_remote_command(command: &[String]) -> anyhow::Result<Option<Strin
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    /// The dashboard's hold verbs: a release is one release line naming the
+    /// box on the control socket beside the ssh socket, a hold one hold
+    /// line, and a daemon with no control socket beside it (a native host)
+    /// is sent nothing.
+    #[test]
+    fn hold_box_name_beside_speaks_the_hold_verbs_on_the_control_socket() {
+        use std::io::{BufRead as _, Write as _};
+        let dir = tempfile::TempDir::new().unwrap();
+        let ssh_sock = dir.path().join("ssh.sock");
+
+        // No control socket: nothing to connect to, nothing happens.
+        hold_box_name_beside(&ssh_sock, "web", None, false);
+
+        let listener =
+            std::os::unix::net::UnixListener::bind(dir.path().join(VM_HOST_CONTROL_SOCK_FILE))
+                .unwrap();
+        let server = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().unwrap();
+                let mut reader = std::io::BufReader::new(stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                reader
+                    .get_mut()
+                    .write_all(b"{\"name\":\"web\",\"held\":false}\n")
+                    .unwrap();
+                seen.push(line);
+            }
+            seen
+        });
+        let id = sessions::SessionId::nil();
+        hold_box_name_beside(&ssh_sock, "web", Some(id), false);
+        hold_box_name_beside(&ssh_sock, "api", Some(id), true);
+        let seen = server.join().unwrap();
+        let decode = |line: &str| -> minimald_rpc::BoxControlRequest {
+            serde_json_lenient::from_str(line.trim()).expect("the request is the wire type")
+        };
+        let minimald_rpc::BoxControlRequest::ReleaseBoxName(release) = decode(&seen[0]) else {
+            panic!("a release is carried by the release verb");
+        };
+        assert_eq!(release.name, "web");
+        assert_eq!(release.session_id, Some(id));
+        let minimald_rpc::BoxControlRequest::HoldBoxName(hold) = decode(&seen[1]) else {
+            panic!("a hold is carried by the hold verb");
+        };
+        assert_eq!(hold.name, "api");
+    }
 
     /// A late answer prints exactly how the ask had already ended.
     #[test]

@@ -428,8 +428,8 @@ impl ServerState {
         let minimal_cache_dir = config.minimal_cache_dir.clone();
         let daemon_id = common::random_alphanumeric(5);
         // Construct the per-host switch once, here at daemon scope, so a single
-        // gvproxy runs for the host and a single allocator never reuses an
-        // address for the daemon's lifetime (R1.4/R1.6). Its config/socket/pid
+        // gvproxy runs for the host and a single allocator hands each address
+        // to one live attach at a time (R1.4/R1.6). Its config/socket/pid
         // live under `<state>/gvproxy/<daemon_id>/`, keyed per daemon instance
         // so two native daemons sharing a state root never unlink each
         // other's control socket or overwrite each other's config or pid

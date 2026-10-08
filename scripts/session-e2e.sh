@@ -16377,14 +16377,26 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
     # modules the lane's `warn` filter drops, so a readable-log lane restarts
     # the daemon with them at info — the same restart the deny-all answer
     # proof runs — and puts the lane's filter back afterwards. A VM lane
-    # keeps its records (they are the guest's) and its filter. The run half
-    # below reads its own record off this same daemon but pins its own module
-    # (it restarts for it): this half's pin is skipped along with this half
-    # on a lane with no switch, so nothing below may lean on it.
+    # keeps its guest's minimald records, but its host gate (minvmd) writes
+    # the records this half ends on too — the box's registration, and the
+    # egress gate's unbind and terminate records for the revocation leg
+    # below — and the daemon an earlier case left up was spawned under the
+    # quiet filter, so it drops them (the host answerer case's mechanism).
+    # Same recipe as there: take the daemon down — sessions survive it, the
+    # restart proof pins that — and let the ONE call that autospawns carry
+    # minvmd at info, command-local, before this half's box registers into
+    # the fresh daemon.
     if hook_log_readable; then
       mnl stop >/dev/null 2>&1 || true # a standalone run has no daemon yet
       PO_SAVED_RUST_LOG="${RUST_LOG:-}"
       export RUST_LOG="warn,minimald::exec=info,minimald::net::gvproxy_network=info,minimald::net::listeners=info"
+    elif [ -n "${E2E_VM:-}" ]; then
+      mnl stop --force >/dev/null 2>&1 || true # a standalone run has no daemon yet
+      PO_SAVED_RUST_LOG="${RUST_LOG:-}" # the filter is command-local; restore exactly
+      if ! RUST_LOG="warn,minvmd=info" mnl ls >/dev/null 2>&1; then
+        echo "::error::'min ls' could not bring this VM lane's daemon up (this half reads the egress gate's revocation records off it)"
+        fail
+      fi
     fi
     po_restore_log() {
       if [ -n "$PO_SAVED_RUST_LOG" ]; then export RUST_LOG="$PO_SAVED_RUST_LOG"; else unset RUST_LOG; fi
@@ -16401,6 +16413,39 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
       fail
     }
     po_sid="$(printf '%s\n' "$po_sid" | tail -n1 | tr -d '\r')"
+
+    # The box's switch address, on a VM lane: the egress gate's revocation
+    # records name the box only by it, so the leg below cannot ask for its
+    # records without it. It comes from the registration record — the
+    # daemon's own word for the address pair it allocated — not from the
+    # host-side listener address the address legs read (that is the
+    # published loopback, a different address). Read the way the box
+    # registration case reads its own: polled, because the record lands
+    # after activate returns.
+    po_switch_addr=""
+    if [ -n "${E2E_VM:-}" ]; then
+      po_reg=""
+      for _ in $(seq 1 40); do
+        po_reg="$(minvmd_log_lines \
+          'registered box with the VM host daemon; addresses allocated' \
+          | grep -F -- "\"box\":\"$PO_BOX_NAME\"" | tail -n1)"
+        [ -n "$po_reg" ] && break
+        sleep 0.25
+      done
+      if [ -z "$po_reg" ]; then
+        echo "::error::the VM host daemon's log carries no registration record for box '$PO_BOX_NAME' after activate — the revocation leg below has no switch address to ask its records by"
+        echo "--- minvmd log (tail) ---"
+        find "$XDG_STATE_HOME/minimal/logs" -name 'minvmd.log.*' -type f \
+          -exec tail -n 40 {} + 2>/dev/null || true
+        fail
+      fi
+      po_switch_addr="$(printf '%s\n' "$po_reg" \
+        | sed -n 's/.*"switch_address":"\([0-9.]*\)".*/\1/p')"
+      if [ -z "$po_switch_addr" ]; then
+        echo "::error::the VM host daemon's registration record for box '$PO_BOX_NAME' does not name the switch address it allocated: $po_reg"
+        fail
+      fi
+    fi
 
     # Capability gates, the two the deny-all answer proof runs: this half
     # needs a session sandbox AND this run's daemon owning the proxy, and a
@@ -16789,6 +16834,24 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
       echo "held: a host connection to $po_addr:$PO_HOLD is established through its declared forward, and the box holds it open"
     fi
 
+    # Snapshot the terminate records at this box's switch address BEFORE
+    # the destroy: the log dir carries every earlier case's records too (a
+    # daemon's file outlives it), and address allocation starts over on a
+    # fresh daemon, so an earlier box's records can sit at this box's
+    # address. The leg below requires a record NOT in this snapshot, so a
+    # stale record can never pass it. A set of lines, not a count: each
+    # line carries its own timestamp, so retention pruning a rotated
+    # day-file between here and the check cannot hide a new one. Keyed by
+    # the whole field — `"switch_addr":"<addr>"` — so 10.0.0.1 never
+    # matches a record for 10.0.0.12.
+    po_term_key="\"switch_addr\":\"$po_switch_addr\""
+    po_term_msg="terminated the connections the box's forwarders carried"
+    po_term_before_file="$WORK/po-term-before.log"
+    : >"$po_term_before_file"
+    if [ -n "$po_switch_addr" ]; then
+      minvmd_log_lines "$po_term_msg" | grep -F -- "$po_term_key" \
+        >"$po_term_before_file" || true
+    fi
     mnl session destroy --force "$po_sid" >/dev/null 2>&1 || true
     po_destroyed_ms=$(now_ms)
 
@@ -16834,10 +16897,28 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
         sleep 0.25
       done
       po_hold_ms=$(($(now_ms) - po_destroyed_ms))
+      # What the egress gate said about this box's forwards, for either
+      # failure below: the unbind record at every forward's row-withdrawal
+      # and the terminate record for the connections they carried are the
+      # gate's own account of the revocation (the record sites live at
+      # info), so their presence or absence tells the two failure modes
+      # apart — but only on a lane whose gate records reach a log, which
+      # is the VM lane (the gate is minvmd's; on a native lane it is
+      # minimald's, behind the same filter story the readable-log restart
+      # above handles, and the revocation records carry no module pin this
+      # half can lean on there — `po_switch_addr` marks the lane).
+      po_gate_recs=""
+      if [ -n "$po_switch_addr" ]; then
+        po_gate_recs="$(minvmd_log_lines "$po_term_key" 2>/dev/null || true)"
+      fi
       if kill -0 "$po_hold_pid" 2>/dev/null; then
         kill "$po_hold_pid" 2>/dev/null || true
         wait "$po_hold_pid" 2>/dev/null || true
         echo "::error::the connection held through the declared forward $po_addr:$PO_HOLD was still open ${po_hold_ms}ms after its box was destroyed, so revocation did not terminate it (design §7.1)"
+        if [ -n "$po_gate_recs" ]; then
+          echo "--- egress gate records for this box ---"
+          printf '%s\n' "$po_gate_recs" | tail -n 20
+        fi
         fail
       fi
       po_hold_rc=0
@@ -16847,7 +16928,52 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
         echo "::error::the held connection to $po_addr:$PO_HOLD did not end closed or reset (curl exit $po_hold_rc) after its box was destroyed (design §7.1)"
         fail
       fi
-      echo "the connection the declared forward carried was closed when its box ended: revocation terminated it"
+      # A close the egress gate made leaves its record behind: the box's
+      # row withdrawal takes every tracked flow at the box's address and
+      # resets each at the switch, writing one terminate record that names
+      # the switch address. A FIN removes no tracked flow, so a connection
+      # the box already FIN-closed is still taken and counted, and the
+      # earlier forwards' flows keep the count non-zero: the record proves
+      # revocation ran at this box's address and reset the connections its
+      # forwards carried, not that the gate's reset is what ended curl. So
+      # on the lane that can read the gate's records, a close without a
+      # NEW terminate record (one absent from the snapshot this half took
+      # before the destroy — an earlier box's records can share the
+      # address) means the gate did not reset the box's connections: either
+      # revocation never reached the gate, or its inject failed (a WARN at
+      # the same address, which the dump below shows). Absent the record,
+      # say so, so the next failure is not read as a pass.
+      if [ -n "$po_switch_addr" ]; then
+        po_term_rec=""
+        for _ in $(seq 1 60); do
+          # grep -vxFf with an empty snapshot keeps every line: no record
+          # before the destroy, so any record now is new.
+          po_term_rec="$(minvmd_log_lines "$po_term_msg" 2>/dev/null \
+            | grep -F -- "$po_term_key" \
+            | grep -vxFf "$po_term_before_file" | tail -n1)"
+          [ -n "$po_term_rec" ] && break
+          sleep 0.25
+        done
+        if [ -n "$po_term_rec" ]; then
+          echo "egress gate: $po_term_rec"
+          echo "the egress gate ran revocation at the box's switch address $po_switch_addr when its box ended and reset the connections its forwards carried (design §7.1)"
+        else
+          echo "::error::the held connection to $po_addr:$PO_HOLD ended, but the egress gate wrote no terminate record for the box's switch address $po_switch_addr after its box was destroyed, so the gate did not reset it (design §7.1)"
+          echo "--- egress gate records for this box (bind, unbind, terminate) ---"
+          po_gate_recs="$(minvmd_log_lines "$po_term_key" 2>/dev/null || true)"
+          if [ -n "$po_gate_recs" ]; then
+            printf '%s\n' "$po_gate_recs" | tail -n 20
+          else
+            echo "(none — the gate wrote no record naming this box's address)"
+          fi
+          echo "--- minvmd log (tail) ---"
+          find "$XDG_STATE_HOME/minimal/logs" -name 'minvmd.log.*' -type f \
+            -exec tail -n 40 {} + 2>/dev/null || true
+          fail
+        fi
+      else
+        echo "the connection the declared forward carried was closed when its box ended: revocation terminated it"
+      fi
     fi
 
     rm -rf "$PO_OWNIP_SEED_DIR"; PO_OWNIP_SEED_DIR=""
