@@ -1087,7 +1087,16 @@ async fn serve_finalize_session(
                 });
             };
             Ok(match h.finalize().await {
-                Ok(response) => Errorable::Ok(response),
+                Ok(mut response) => {
+                    // The reply is `deny_unknown_fields`, so a client that
+                    // did not ask for the yielded ports would refuse a reply
+                    // naming them and abort its activation: only a client
+                    // that asked gets the list (the yield itself stands).
+                    if !req.report_shared_port_collisions {
+                        response.shared_port_collisions.clear();
+                    }
+                    Errorable::Ok(response)
+                }
                 Err(e) => Errorable::Err {
                     error: e.to_string(),
                 },

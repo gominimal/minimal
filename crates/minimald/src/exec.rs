@@ -3935,7 +3935,10 @@ mod tests {
             );
 
             match client
-                .call::<FinalizeSession>(&FinalizeSessionRequest { session_id })
+                .call::<FinalizeSession>(&FinalizeSessionRequest {
+                    session_id,
+                    report_shared_port_collisions: false,
+                })
                 .await
             {
                 minimald_rpc::Errorable::Ok(_) => {}

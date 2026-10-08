@@ -1643,6 +1643,21 @@ pub struct FinalizeSession;
 pub struct FinalizeSessionRequest {
     /// The session to finalize.
     pub session_id: SessionId,
+    /// The client decodes [`FinalizeSessionResponse::shared_port_collisions`],
+    /// so the daemon may fill it. [`FinalizeSessionResponse`] is
+    /// `deny_unknown_fields`: a client built before that field would refuse a
+    /// reply carrying it and abort the activation, so the daemon reports the
+    /// list only to a client that asks. Serde-defaulted, so an older client's
+    /// request reads as `false`, and omitted when `false`, so the request an
+    /// older daemon reads is unchanged — it ignores the key either way.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub report_shared_port_collisions: bool,
+}
+
+/// Serde helper: omit a `false` request flag, so the request matches the one
+/// a client that predates the flag sends.
+fn is_false(v: &bool) -> bool {
+    !*v
 }
 
 /// The response for a [`FinalizeSession`] RPC.
@@ -1678,8 +1693,11 @@ pub struct FinalizeSessionResponse {
     /// the port, and the box that holds it. The box still activates and
     /// serves its other ports; the client warns so the operator knows the
     /// declared mapping is served by the holding box, not this one.
-    /// Serde-defaulted and omitted when empty so a daemon that predates
-    /// the field still answers to an older client.
+    /// Serde-defaulted, so a reply from a daemon that predates the field
+    /// decodes as empty; filled only when the request set
+    /// [`FinalizeSessionRequest::report_shared_port_collisions`], because
+    /// this struct is `deny_unknown_fields` and a client that predates the
+    /// field would refuse the reply.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub shared_port_collisions: Vec<SharedPortCollision>,
 }
@@ -2567,6 +2585,54 @@ mod tests {
                 other: "first.min.internal".to_string(),
             }],
             "the collision list must round-trip"
+        );
+    }
+
+    /// A client and a daemon on either side of the
+    /// `report_shared_port_collisions` flag still finalize. An older
+    /// client's request (no flag) reads as not asking, so a newer daemon
+    /// leaves the collision list off a reply that client's
+    /// `deny_unknown_fields` type would refuse; a newer client's request
+    /// that does not ask is byte-for-byte the older one; and a newer
+    /// client that asks still decodes an older daemon's reply, which has
+    /// no list, as empty.
+    #[test]
+    fn finalize_collision_report_survives_version_skew_both_ways() {
+        let id = SessionId::nil();
+        let older_request = format!(r#"{{"session_id":"{}"}}"#, id.as_ref());
+        let decoded: FinalizeSessionRequest =
+            serde_json_lenient::from_str(&older_request).expect("an older request must decode");
+        assert!(
+            !decoded.report_shared_port_collisions,
+            "an older client never asked for the list"
+        );
+
+        let not_asking = FinalizeSessionRequest {
+            session_id: id,
+            report_shared_port_collisions: false,
+        };
+        assert_eq!(
+            serde_json_lenient::to_string(&not_asking).expect("must serialize"),
+            older_request,
+            "a request that does not ask is the one an older client sends"
+        );
+
+        let asking = FinalizeSessionRequest {
+            session_id: id,
+            report_shared_port_collisions: true,
+        };
+        let wire = serde_json_lenient::to_string(&asking).expect("must serialize");
+        assert!(
+            wire.contains("report_shared_port_collisions"),
+            "a request that asks says so: {wire}"
+        );
+
+        let older_reply: Errorable<FinalizeSessionResponse> =
+            serde_json_lenient::from_str("{}").expect("an older daemon's reply must decode");
+        assert_eq!(
+            older_reply,
+            Errorable::Ok(FinalizeSessionResponse::default()),
+            "an older daemon's reply reads as no collisions"
         );
     }
 

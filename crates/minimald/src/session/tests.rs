@@ -1583,7 +1583,10 @@ async fn session_with_hook(
             .unwrap(),
     );
     match client
-        .call::<FinalizeSession>(&FinalizeSessionRequest { session_id: id })
+        .call::<FinalizeSession>(&FinalizeSessionRequest {
+            session_id: id,
+            report_shared_port_collisions: false,
+        })
         .await
     {
         Errorable::Ok(_) => id,
@@ -1742,7 +1745,10 @@ async fn activate_hook_output_reaches_the_client() {
     );
 
     let ran = match client
-        .call::<FinalizeSession>(&FinalizeSessionRequest { session_id: id })
+        .call::<FinalizeSession>(&FinalizeSessionRequest {
+            session_id: id,
+            report_shared_port_collisions: false,
+        })
         .await
     {
         Errorable::Ok(ok) => ok.activate_hooks,
@@ -2000,7 +2006,10 @@ async fn a_failing_activate_hook_blocks_the_session() {
     );
 
     let error = match client
-        .call::<FinalizeSession>(&FinalizeSessionRequest { session_id: id })
+        .call::<FinalizeSession>(&FinalizeSessionRequest {
+            session_id: id,
+            report_shared_port_collisions: false,
+        })
         .await
     {
         Errorable::Err { error } => error,
@@ -2872,14 +2881,28 @@ async fn finalize_handed_own_ip_session(
 /// registration waits on the range verdict, so the walk can land inside
 /// that bounded wait (NET-123 §7.1). Returns the reply, so a test can
 /// read what the finalize reported — the collisions a shared-address box
-/// yielded among them.
+/// yielded among them. Asks for that list, as the current `min` does.
 async fn finalize_session(
     client: &mut TestClient,
     id: SessionId,
 ) -> minimald_rpc::FinalizeSessionResponse {
+    finalize_session_asking(client, id, true).await
+}
+
+/// [`finalize_session`] with the request's
+/// `report_shared_port_collisions` flag chosen by the caller — `false` is
+/// the request a client that predates the flag sends.
+async fn finalize_session_asking(
+    client: &mut TestClient,
+    id: SessionId,
+    report_shared_port_collisions: bool,
+) -> minimald_rpc::FinalizeSessionResponse {
     use minimald_rpc::{Errorable, FinalizeSession, FinalizeSessionRequest};
     match client
-        .call::<FinalizeSession>(&FinalizeSessionRequest { session_id: id })
+        .call::<FinalizeSession>(&FinalizeSessionRequest {
+            session_id: id,
+            report_shared_port_collisions,
+        })
         .await
     {
         Errorable::Ok(ok) => ok,
@@ -3441,7 +3464,10 @@ async fn a_failed_activate_hook_s_publish_is_withdrawn_by_the_destroy() {
     )
     .await;
     match client
-        .call::<FinalizeSession>(&FinalizeSessionRequest { session_id: id })
+        .call::<FinalizeSession>(&FinalizeSessionRequest {
+            session_id: id,
+            report_shared_port_collisions: false,
+        })
         .await
     {
         Errorable::Err { .. } => {}
@@ -4056,7 +4082,10 @@ async fn a_restored_hostname_collision_is_logged_and_skipped() {
                 .unwrap(),
         );
         match client
-            .call::<FinalizeSession>(&FinalizeSessionRequest { session_id: id })
+            .call::<FinalizeSession>(&FinalizeSessionRequest {
+                session_id: id,
+                report_shared_port_collisions: false,
+            })
             .await
         {
             Errorable::Ok(_) => {}
@@ -4120,7 +4149,10 @@ async fn a_restored_session_sharing_another_sessions_registry_name_is_skipped() 
                 .unwrap(),
         );
         match client
-            .call::<FinalizeSession>(&FinalizeSessionRequest { session_id: id })
+            .call::<FinalizeSession>(&FinalizeSessionRequest {
+                session_id: id,
+                report_shared_port_collisions: false,
+            })
             .await
         {
             Errorable::Ok(_) => {}
@@ -5440,6 +5472,35 @@ async fn shared_address_port_collision_reported_at_finalize_without_attached_cli
     assert!(
         first_finalize_reply.shared_port_collisions.is_empty(),
         "the box that holds its port yields nothing, and its reply says so"
+    );
+
+    // A client that predates the field did not ask for the list, and its
+    // reply type refuses a key it does not know — so the daemon leaves the
+    // list off that reply even though the box yields, instead of failing
+    // the older client's activation over a report it cannot read.
+    let third = create_handed_own_ip_session(
+        &mut client,
+        "third",
+        std::net::Ipv4Addr::new(100, 64, 128, 11),
+        shared,
+    )
+    .await;
+    let older_client_reply = finalize_session_asking(&mut client, third, false).await;
+    assert!(
+        older_client_reply.shared_port_collisions.is_empty(),
+        "a client that did not ask gets no collision list: {older_client_reply:?}"
+    );
+    assert!(
+        !server
+            .state
+            .sessions_manager()
+            .await
+            .hostnames()
+            .read()
+            .expect("registry lock")
+            .shared_port_collisions(third)
+            .is_empty(),
+        "the third box still yields the port; only the report is withheld"
     );
 
     // The collision reached the log and named both boxes and the port.
