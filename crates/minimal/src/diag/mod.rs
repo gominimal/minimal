@@ -242,6 +242,12 @@ pub async fn cmd_bug(global: &GlobalArgs, args: BugArgs) -> Result<(), anyhow::E
             &mut absent_log_prefixes
         )
     );
+    collect_step!(
+        w,
+        "telemetry-spool",
+        collect::spool(&mut w, &paths, args.log_tail_bytes)
+    );
+    collect_step!(w, "telemetry-state", collect::telemetry(&mut w, &paths));
 
     // ── Per-provider: files and liveness, then the staged socket probe, then
     // (when the probe handshook and --no-guest wasn't given) the daemon's own

@@ -27,7 +27,9 @@ const ENV_VALUE_ALLOWLIST_PREFIXES: &[&str] = &["XDG_", "MINIMAL_", "MINVMD_", "
 
 /// Returns true when the named env var's value may be captured verbatim.
 /// A sensitive-shaped name always loses to the allowlist — `MINIMAL_AUTH_TOKEN`
-/// matches the project prefix but must never leave the machine.
+/// matches the project prefix but must never leave the machine — and so does
+/// a telemetry exporter setting, through the deny list the daemon shares
+/// ([`diagnostics::redact::is_env_value_denylisted`]).
 pub fn is_env_value_allowlisted(name: &str) -> bool {
     diagnostics::redact::is_env_value_allowlisted(
         name,
@@ -77,6 +79,33 @@ mod tests {
     fn terminal_identity_is_allowlisted_by_name_not_by_prefix() {
         for name in ["TERMINAL_EMULATOR", "TERM_SESSION_ID", "TERM_TOKEN"] {
             assert!(!is_env_value_allowlisted(name), "{name} must not be");
+        }
+    }
+
+    /// The telemetry exporter settings match the project prefix, but their
+    /// values (an endpoint URL, a headers list) can carry a collector's
+    /// credentials, so a bundle reports them by name only.
+    #[test]
+    fn telemetry_exporter_settings_are_reported_by_name_only() {
+        for name in [
+            "MINIMAL_OTEL_EXPORTER_OTLP_ENDPOINT",
+            "MINIMAL_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+            "MINIMAL_OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+            "MINIMAL_OTEL_EXPORTER_OTLP_HEADERS",
+            "MINIMAL_OTEL_EXPORTER_OTLP_TRACES_HEADERS",
+            "OTEL_EXPORTER_OTLP_HEADERS",
+            "OTEL_EXPORTER_OTLP_ENDPOINT",
+            "MINIMALD_SOMETHING_HEADERS",
+        ] {
+            assert!(!is_env_value_allowlisted(name), "{name} must not be");
+        }
+        // The on/off switches say which mode ran and stay verbatim.
+        for name in [
+            "MINIMAL_TELEMETRY",
+            "MINIMAL_OTEL_SPOOL",
+            "MINIMAL_OTEL_FILTER",
+        ] {
+            assert!(is_env_value_allowlisted(name), "{name} should be allowed");
         }
     }
 }
