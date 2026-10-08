@@ -143,7 +143,7 @@ pub(crate) fn project_lifecycle_hook_count(root: &camino::Utf8Path) -> usize {
 
 /// What [`decide_workspace_upload`] decided to do about the workspace upload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum UploadDecision {
+pub enum UploadDecision {
     /// Upload from the resolved root.
     Upload,
     /// Empty dir or `$HOME`: skip silently.
