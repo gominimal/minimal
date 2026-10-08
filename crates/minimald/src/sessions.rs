@@ -181,6 +181,12 @@ enum ManagerMessage {
     CreateSession(Box<CreateSessionMsg>),
     DeleteSession(SessionId, Responder<Vec<String>>),
     Shutdown(bool, Responder<Result<(), ()>>),
+    /// Bring up the actor of every `Active` record whose box owns a name,
+    /// so a restarted daemon routes the names of the sessions it restored
+    /// (see [`ManagerHandle::resume_active_sessions`]). Answers with how many
+    /// actors it started.
+    #[cfg(target_os = "linux")]
+    ResumeActive(Responder<usize>),
     /// Fire-and-forget: drop the `running` entry for a session whose actor
     /// terminated on its own (abort, failed verdict resume, create failure).
     /// A no-op for an id already removed; ids are never reused, so a stale
@@ -977,6 +983,97 @@ impl Manager {
         Ok(Some(h))
     }
 
+    /// Starts the actor of every `Active` record whose box owns a name
+    /// (`HostNet`, `OwnIp`) and has no actor yet. A session's name is
+    /// registered when its actor starts ([`Session::run`]), and a restarted
+    /// daemon otherwise starts an actor only when an RPC first names the
+    /// session, so until then the name of a session `min ls` lists as active
+    /// answers NXDOMAIN and the proxy has no route for it.
+    ///
+    /// Resuming through [`Session::run`] keeps one registration path, with
+    /// its collision rules and its rule never to wait on the range verdict.
+    /// It is idempotent: a session already in `running` is skipped, and a
+    /// later RPC that names a resumed session finds its actor there rather
+    /// than registering it again.
+    ///
+    /// A record whose box name is already routed for another session is not
+    /// resumed: [`crate::net::dns::HostnameRegistry`] lets the later
+    /// registration take the route over, and a restart must not move a name
+    /// from one session to another. The check keys on the session id, not
+    /// the name — two restored sessions can share one registry name
+    /// outright (two unnamed sessions whose project directories share a
+    /// basename), the pair the store's name-uniqueness check never sees, as
+    /// well as fold to one hostname. That record keeps the lazy path.
+    /// A record that cannot be read, or whose actor fails to start, is
+    /// logged and skipped, so one bad record costs only its own name.
+    #[cfg(target_os = "linux")]
+    async fn resume_active_sessions(&mut self) -> Result<usize, SessionsError> {
+        if self.in_shutdown.is_cancelled() {
+            return Ok(0);
+        }
+        let mut resumed = 0;
+        for handle in self.store.handles().await? {
+            let session_id = *handle.id();
+            if self.running.contains_key(&session_id) {
+                continue;
+            }
+            let record = match handle.record().await {
+                Ok(record) => record,
+                Err(error) => {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        %error,
+                        "resume: could not read the session record; its name stays \
+                         unregistered until an RPC names the session",
+                    );
+                    continue;
+                }
+            };
+            if !matches!(record.status, sessions::SessionStatus::Active)
+                || !matches!(
+                    record.network,
+                    sessions::NetworkMode::HostNet | sessions::NetworkMode::OwnIp
+                )
+            {
+                continue;
+            }
+            let name = crate::session::registry_name(&record);
+            if let Some(owner) = self
+                .hostnames
+                .read()
+                .expect("hostname registry lock poisoned")
+                .hostname_held_by_another(session_id, &name)
+            {
+                tracing::warn!(
+                    session_id = %session_id,
+                    session_name = &name,
+                    owner,
+                    action = "hostname-collision",
+                    "resume: the box name is already routed for another session; \
+                     not resuming this one, so the restart does not move the name",
+                );
+                continue;
+            }
+            match Session::run(self.session_config(handle)).await {
+                Ok(session) => {
+                    self.running.insert(session_id, session);
+                    resumed += 1;
+                }
+                Err(error) => tracing::warn!(
+                    session_id = %session_id,
+                    session_name = &name,
+                    %error,
+                    "resume: could not start the session's actor; its name stays \
+                     unregistered until an RPC names the session",
+                ),
+            }
+        }
+        if resumed > 0 {
+            tracing::info!(resumed, "resumed active sessions so their names route");
+        }
+        Ok(resumed)
+    }
+
     /// The spawn-time config for a session actor backing `record`. The one
     /// place the daemon-scoped dependencies are gathered, so the create and
     /// bring-up-from-disk paths can't hand their actors different worlds.
@@ -1131,6 +1228,10 @@ impl Manager {
                     })
                 })
                 .await;
+            }
+            #[cfg(target_os = "linux")]
+            ManagerMessage::ResumeActive(r) => {
+                r.handle(self.resume_active_sessions()).await;
             }
             #[cfg(test)]
             ManagerMessage::RunningCount(r) => {
@@ -1547,6 +1648,41 @@ impl ManagerHandle {
     #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn verdict_waiters(&self) -> usize {
         self.loopback.verdict_waiters()
+    }
+
+    /// Enqueues the resume of every active session restored from the store
+    /// (see [`Manager::resume_active_sessions`]) and returns the future that
+    /// answers with how many actors it started. The message is in the
+    /// manager's mailbox when this returns, so any message sent after it —
+    /// an RPC's lookup of a restored session, say — is served once the
+    /// resume has registered the restored names; the answer can be awaited
+    /// later, or not at all.
+    ///
+    /// [`crate::server::Server::run`] enqueues this once, before its accept
+    /// loop opens, and awaits the answer off that path. It is a message
+    /// rather than part of [`Manager::init`] so the test harness, which
+    /// builds the manager without `Server::run`, can open a window (a
+    /// pending range verdict, say) before the resume.
+    #[cfg(target_os = "linux")]
+    pub async fn enqueue_resume_active_sessions(
+        &self,
+    ) -> impl Future<Output = Result<usize, SessionsError>> + Send + 'static {
+        let (send, recv) = Responder::channel();
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "a closed manager is the one way the send can fail, and the recv \
+                      reports it — the send's own receipt has nothing to add"
+        )]
+        let _ = self.sender.send(ManagerMessage::ResumeActive(send)).await;
+        async move { recv.await.expect("corresponding sessions manager is dead") }
+    }
+
+    /// [`Self::enqueue_resume_active_sessions`], awaited: starts the actor
+    /// of every active session restored from the store and returns how many
+    /// it started.
+    #[cfg(target_os = "linux")]
+    pub async fn resume_active_sessions(&self) -> Result<usize, SessionsError> {
+        self.enqueue_resume_active_sessions().await.await
     }
 
     /// Lists the sessions known to this (minimald) instance.
