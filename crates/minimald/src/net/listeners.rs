@@ -1896,6 +1896,21 @@ impl WatchState {
                                         minimald_rpc::PortReportSource::Listen,
                                     )
                                     .await;
+                                    // The allow's `Published` record is
+                                    // already written, but the publish never
+                                    // stood: the log says so, so it never
+                                    // claims a publication that did not
+                                    // happen (NET-046). Best-effort, like
+                                    // every refusal's record.
+                                    self.audit_listen(
+                                        port,
+                                        crate::audit::DecisionOutcome::PublishFailed,
+                                        Some(
+                                            "the publication was revoked before it stood"
+                                                .to_string(),
+                                        ),
+                                    )
+                                    .await;
                                     return Appearance::Settled;
                                 }
                                 self.forwards.insert(port, mapping);
