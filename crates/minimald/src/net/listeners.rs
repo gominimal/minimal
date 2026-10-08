@@ -2344,7 +2344,9 @@ mod tests {
                 Err(error) => panic!("binding the adjacent any-address listener failed: {error}"),
             }
         }
-        panic!("no free adjacent port pair found in {ATTEMPTS} ephemeral binds");
+        panic!(
+            "no adjacent loopback/any port pair after {ATTEMPTS} tries; the ephemeral range is crowded"
+        );
     }
 
     /// The box's lease on the test switch.
