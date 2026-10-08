@@ -853,7 +853,6 @@ fn set_project_root(
     Ok(())
 }
 
-
 /// Strip hooks whose scripts are files rather than inline bodies.
 ///
 /// The daemon gates `FinalizeSession` on a marker the hook-script upload
