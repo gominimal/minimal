@@ -372,6 +372,12 @@ network does not need the proxy. The task also follows the session's egress
 policy: when the session cannot reach a destination, the task cannot reach it
 either.
 
+On a VM-backed host, which includes every macOS host, a task in an `own_ip`
+session has no outbound reach yet. The task takes a switch address that the
+host's table of boxes does not hold. The switch drops traffic from such an
+address. Run a task that needs the network in a `host_ip`
+session there.
+
 `none` gives the task no network. Every connection to a destination outside
 the task fails. When a task needs the network, give its session a mode that
 has one.

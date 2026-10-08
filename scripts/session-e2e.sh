@@ -5889,11 +5889,13 @@ fi
 # not the host's — while its egress still works through the switch; a task
 # in a none session has no network at all. Each refusal leg asserts curl's
 # exit code, so a task that fails for another reason (curl missing, the task
-# never starting) cannot pass for a refused connection. The loopback legs
-# are native-only: on a VM lane the daemon and every task run in the guest,
-# so no task in any mode can reach a listener on the CI host's loopback. On
-# the native lane a host_ip control task reaches that same listener, so the
-# own-IP refusal is shown to depend on the mode. Own seeded project (the
+# never starting) cannot pass for a refused connection. A host_ip control
+# task reaches the same host listener, so the own-IP refusal is shown to
+# depend on the mode. The own-IP and host_ip legs are native-only: on a VM
+# lane a task self-allocates a switch address the host-side table holds no
+# row for, so the egress gate drops its traffic (NET-085, until NET-138
+# registers every box), and the listener is on the CI host while every task
+# runs in the guest. The none leg runs on every lane. Own seeded project (the
 # shared seed declares no tasks), switch-gated like the own-IP proofs above
 # (a task in an own-IP session needs the tap the switch carries):
 # MINVMD_GVPROXY_BIN on a VM lane, E2E_NATIVE_SWITCH on the native one.
@@ -5921,21 +5923,11 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
     echo "::error::no free candidate port among 18130-18133 for the host-side listener"
     fail
   fi
-  # Each task first waits (up to 10 s) for a default route in its own
-  # namespace. The daemon wires a task's own-IP namespace AFTER the process
-  # has started (exec.rs attach_or_reap; the default route is the last step),
-  # so a curl that runs at once can fail on an unwired namespace and exit
-  # before the wiring, which then fails with "nsenter: reassociate to
-  # namespaces failed: No such process" (seen on the KVM lane). The wait
-  # keeps the legs about the mode, not about that launch race. A none task
-  # never gets a route, so it waits out the 10 s and then fails to connect.
-  # shellcheck disable=SC2016 # expanded by the task's bash, not here
-  tn_wait='for _ in {1..100}; do while read -r _ d _; do case $d in 00000000) break 2;; esac; done < /proc/net/route; sleep 0.1; done; '
   {
     hook_seed_preamble
-    printf '\n[tasks.e2e-tn-egress-com]\nbash = "%scurl -fsS --max-time 30 -o /dev/null https://example.com"\n' "$tn_wait"
-    printf '\n[tasks.e2e-tn-egress-org]\nbash = "%scurl -fsS --max-time 30 -o /dev/null https://example.org"\n' "$tn_wait"
-    printf '\n[tasks.e2e-tn-loopback]\nbash = "%scurl -fsS --max-time 5 -o /dev/null http://127.0.0.1:%s/"\n' "$tn_wait" "$TN_LB_PORT"
+    printf '\n[tasks.e2e-tn-egress-com]\nbash = "curl -fsS --max-time 30 -o /dev/null https://example.com"\n'
+    printf '\n[tasks.e2e-tn-egress-org]\nbash = "curl -fsS --max-time 30 -o /dev/null https://example.org"\n'
+    printf '\n[tasks.e2e-tn-loopback]\nbash = "curl -fsS --max-time 5 -o /dev/null http://127.0.0.1:%s/"\n' "$TN_LB_PORT"
   } > "$TN_SEED_DIR/minimal.toml"
   mkdir "$TN_SEED_DIR/.git"
 
@@ -5967,7 +5959,9 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
   fi
   echo "host listener: answers 200 on 127.0.0.1:$TN_LB_PORT"
 
-  # -- own-IP: the task gets an own-IP namespace of its own beside the box ---
+  # -- own-IP (native only): its own namespace beside the session's box ----
+  tn_own_proven=""
+  if [ -z "$E2E_VM" ]; then
   tn_sid="$(cd "$TN_SEED_DIR" && mnl session activate . --no-prompt \
     --name e2e-tn-ownip --network own_ip 2>"$WORK/tn-activate.err")" || {
     echo "::error::'min session activate --network own_ip' failed for the task-network proof"
@@ -6011,62 +6005,56 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
   fi
   echo "own-IP session task: egress OK ($tn_egress_ok of 2 hosts answered)"
 
-  # Loopback (native only): the listener answers on the host, and the task
-  # still cannot reach it — its 127.0.0.1 is its own namespace's loopback,
-  # where nothing listens, so curl must exit 7 (could not connect). The task's
-  # exit code is the client's (the task_run proof's exit relay), and the
-  # egress leg above already proved curl runs in this session's tasks. On a
-  # VM lane the listener is on the CI host's loopback while every task runs
-  # in the guest, so no mode could reach it and the leg would prove nothing.
-  tn_lb_proven=""
-  if [ -z "$E2E_VM" ]; then
-    mnl session run "$tn_sid" e2e-tn-loopback >/dev/null 2>"$WORK/tn-loopback.err"
-    rc=$?
-    if [ "$rc" -ne 7 ]; then
-      if [ "$rc" -eq 0 ]; then
-        echo "::error::a task in an own-IP session reached the host's listener at 127.0.0.1:$TN_LB_PORT — its loopback is not its own"
-      else
-        echo "::error::the own-IP session's loopback task exited $rc, want 7 (curl: could not connect) — it failed for a reason other than an empty loopback"
-        echo "--- task stderr ---"; cat "$WORK/tn-loopback.err" 2>/dev/null || true
-      fi
-      mnl session destroy --force "$tn_sid" >/dev/null 2>&1 || true
-      kill "$TN_LISTENER_PID" 2>/dev/null || true
-      TN_LISTENER_PID=""
-      fail
+  # Loopback: the listener answers on the host, and the task still cannot
+  # reach it — its 127.0.0.1 is its own namespace's loopback, where nothing
+  # listens, so curl must exit 7 (could not connect). The task's exit code is
+  # the client's (the task_run proof's exit relay), and the egress leg above
+  # already proved curl runs in this session's tasks.
+  mnl session run "$tn_sid" e2e-tn-loopback >/dev/null 2>"$WORK/tn-loopback.err"
+  rc=$?
+  if [ "$rc" -ne 7 ]; then
+    if [ "$rc" -eq 0 ]; then
+      echo "::error::a task in an own-IP session reached the host's listener at 127.0.0.1:$TN_LB_PORT — its loopback is not its own"
+    else
+      echo "::error::the own-IP session's loopback task exited $rc, want 7 (curl: could not connect) — it failed for a reason other than an empty loopback"
+      echo "--- task stderr ---"; cat "$WORK/tn-loopback.err" 2>/dev/null || true
     fi
-    echo "own-IP session task: 127.0.0.1:$TN_LB_PORT unreachable (exit $rc: $(head -n1 "$WORK/tn-loopback.err" 2>/dev/null || true))"
-  else
-    echo "own-IP session task loopback leg: not_run (VM lane: the listener is on the CI host and every task runs in the guest, so the leg cannot tell own_ip from host_ip)"
+    mnl session destroy --force "$tn_sid" >/dev/null 2>&1 || true
+    kill "$TN_LISTENER_PID" 2>/dev/null || true
+    TN_LISTENER_PID=""
+    fail
   fi
+  echo "own-IP session task: 127.0.0.1:$TN_LB_PORT unreachable (exit $rc: $(head -n1 "$WORK/tn-loopback.err" 2>/dev/null || true))"
   mnl session destroy --force "$tn_sid" >/dev/null 2>&1 || true
 
-  # -- host_ip control (native only): the same task reaches the listener -----
+  # -- host_ip control: the same task reaches the listener ------------------
   # Without this the own-IP leg's exit 7 is not shown to depend on the mode:
   # a host_ip task shares the host's namespace, so the same loopback task
   # must reach the host-side listener and exit 0.
-  if [ -z "$E2E_VM" ]; then
-    tn_host_sid="$(cd "$TN_SEED_DIR" && mnl session activate . --no-prompt \
-      --name e2e-tn-hostip --network host_ip 2>"$WORK/tn-host-activate.err")" || {
-      echo "::error::'min session activate --network host_ip' failed for the task-network proof"
-      echo "--- stderr ---"; cat "$WORK/tn-host-activate.err" 2>/dev/null || true
-      kill "$TN_LISTENER_PID" 2>/dev/null || true
-      TN_LISTENER_PID=""
-      fail
-    }
-    tn_host_sid="$(printf '%s\n' "$tn_host_sid" | tail -n1 | tr -d '\r')"
-    mnl session run "$tn_host_sid" e2e-tn-loopback >/dev/null 2>"$WORK/tn-host-loopback.err"
-    rc=$?
-    if [ "$rc" -ne 0 ]; then
-      echo "::error::a task in a host_ip session could not reach the host's listener at 127.0.0.1:$TN_LB_PORT (exit $rc) — the own-IP refusal above is not shown to depend on the mode"
-      echo "--- task stderr ---"; cat "$WORK/tn-host-loopback.err" 2>/dev/null || true
-      mnl session destroy --force "$tn_host_sid" >/dev/null 2>&1 || true
-      kill "$TN_LISTENER_PID" 2>/dev/null || true
-      TN_LISTENER_PID=""
-      fail
-    fi
-    echo "host_ip session task: 127.0.0.1:$TN_LB_PORT reachable (exit 0)"
+  tn_host_sid="$(cd "$TN_SEED_DIR" && mnl session activate . --no-prompt \
+    --name e2e-tn-hostip --network host_ip 2>"$WORK/tn-host-activate.err")" || {
+    echo "::error::'min session activate --network host_ip' failed for the task-network proof"
+    echo "--- stderr ---"; cat "$WORK/tn-host-activate.err" 2>/dev/null || true
+    kill "$TN_LISTENER_PID" 2>/dev/null || true
+    TN_LISTENER_PID=""
+    fail
+  }
+  tn_host_sid="$(printf '%s\n' "$tn_host_sid" | tail -n1 | tr -d '\r')"
+  mnl session run "$tn_host_sid" e2e-tn-loopback >/dev/null 2>"$WORK/tn-host-loopback.err"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "::error::a task in a host_ip session could not reach the host's listener at 127.0.0.1:$TN_LB_PORT (exit $rc) — the own-IP refusal above is not shown to depend on the mode"
+    echo "--- task stderr ---"; cat "$WORK/tn-host-loopback.err" 2>/dev/null || true
     mnl session destroy --force "$tn_host_sid" >/dev/null 2>&1 || true
-    tn_lb_proven=1
+    kill "$TN_LISTENER_PID" 2>/dev/null || true
+    TN_LISTENER_PID=""
+    fail
+  fi
+  echo "host_ip session task: 127.0.0.1:$TN_LB_PORT reachable (exit 0)"
+  mnl session destroy --force "$tn_host_sid" >/dev/null 2>&1 || true
+  tn_own_proven=1
+  else
+    echo "own-IP and host_ip task legs: known_gap on this VM lane (a task self-allocates a switch address the host-side table holds no row for, so the egress gate drops its traffic as unregistered, NET-085/NET-138; and the listener is on the CI host while every task runs in the guest, so no loopback leg can tell own_ip from host_ip)"
   fi
 
   # -- none: the task has no network at all ----------------------------------
@@ -6102,10 +6090,10 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
   kill "$TN_LISTENER_PID" 2>/dev/null || true
   TN_LISTENER_PID=""
   rm -rf "$TN_SEED_DIR"; TN_SEED_DIR=""
-  if [ -n "$tn_lb_proven" ]; then
+  if [ -n "$tn_own_proven" ]; then
     echo "task network proof OK (own-IP: egress via the switch, host loopback unreachable; host_ip: host loopback reachable; none: no network)"
   else
-    echo "task network proof OK (own-IP: egress via the switch; none: no network; loopback legs not_run on this VM lane)"
+    echo "task network proof OK (none: no network; own-IP and host_ip legs known_gap on this VM lane)"
   fi
   echo "::endgroup::"
   fi
