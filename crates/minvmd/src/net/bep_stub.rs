@@ -444,9 +444,11 @@ mod tests {
     /// first, then the fixed header — and return whatever it answered before
     /// closing. A close with no answer reads as empty however the kernel
     /// reports it: a refusal that stops reading mid-presentation closes on
-    /// unread bytes, which the kernel reports to the peer as a reset, and
-    /// the refusal's meaning — nothing was answered — is the same either
-    /// way.
+    /// unread bytes, which the kernel reports to the peer as a reset, and a
+    /// refusal decided on the credentials closes at accept, before a byte
+    /// is read — which can land before this side has written, so the
+    /// write itself fails with a broken pipe. The refusal's meaning —
+    /// nothing was answered — is the same every way.
     fn present(
         sock: &Path,
         token: &[u8],
@@ -467,7 +469,14 @@ mod tests {
         assert_eq!(head.len(), DELIVERY_HEADER_LEN);
         let mut bytes = token.to_vec();
         bytes.extend_from_slice(&head);
-        stream.write_all(&bytes).expect("token then header");
+        match stream.write_all(&bytes) {
+            Ok(()) => {}
+            // Closed before the presentation arrived: a refusal that was
+            // decided at accept. Nothing was answered, and the reason is
+            // in the audit the caller checks next.
+            Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => return Vec::new(),
+            Err(error) => panic!("the stand-in refused the presentation's bytes: {error}"),
+        }
         let mut answer = Vec::new();
         match stream.read_to_end(&mut answer) {
             Ok(_) => answer,
