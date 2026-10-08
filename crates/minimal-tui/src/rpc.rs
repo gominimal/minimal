@@ -259,7 +259,8 @@ pub async fn fetch_screen(
 
 /// Whether a session holds its name in the VM host's zone in place of a
 /// row: a `host_ip` box shares the node's own row, so `min session
-/// activate` holds its name (NODATA) instead of registering one.
+/// activate` and [`activate`] hold its name (NODATA) instead of
+/// registering one.
 fn holds_name(record: &sessions::Record) -> bool {
     record.network == NetworkMode::HostNet && record.box_addresses.is_none()
 }
@@ -483,10 +484,23 @@ pub async fn activate(
     // A failed flow must not orphan the record: a `Pending` stub would hold
     // its name and be reaped at the next daemon restart anyway.
     match flow {
-        Ok(package_check_skipped) => Ok(Activated {
-            id,
-            package_check_skipped,
-        }),
+        Ok(package_check_skipped) => {
+            // The session is active: a `host_ip` box holds its name in the
+            // zone (NODATA) the way `min session activate` holds it, read
+            // off the record so an autogen name is the one held.
+            if let Ok(resp) = client
+                .oneshot_rpc::<GetSessionRecord>(GetSessionRecordRequest::Id(id))
+                .await
+                && let Some(record) = resp.record.filter(holds_name)
+                && let Some(name) = record.name.as_deref()
+            {
+                hold_box_name(sock, name, id, true).await;
+            }
+            Ok(Activated {
+                id,
+                package_check_skipped,
+            })
+        }
         Err(e) => {
             let _ = client
                 .oneshot_rpc::<minimald_rpc::AbortSession>(minimald_rpc::AbortSessionRequest { id })
