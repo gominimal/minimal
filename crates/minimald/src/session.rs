@@ -75,7 +75,8 @@ pub enum AttachError {
     /// from an unregistered source, so any host handed out now would be
     /// "rowless". Only the box's creator registers or resumes a row, and the
     /// client resumes it before every attach and exec, so the message names
-    /// a new session as the way forward.
+    /// a re-run as the way forward, and a new activation once the host no
+    /// longer holds the creator's record to resume from.
     BoxHostRowEnded,
 }
 
@@ -115,9 +116,10 @@ impl fmt::Display for AttachError {
             }
             AttachError::BoxHostRowEnded => write!(
                 f,
-                "this session's shell has ended, and with it the session's host-side \
-                 network registration, which could not be resumed; destroy the session \
-                 with `min session destroy` and start a new one with `min session activate`"
+                "this box's host-side network registration has ended; run the attach or \
+                 exec again to resume it, and if that is refused too (the host no longer \
+                 holds the box's record), destroy the session with `min session destroy` \
+                 and activate it again with `min session activate`"
             ),
         }
     }

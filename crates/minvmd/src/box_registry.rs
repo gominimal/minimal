@@ -114,6 +114,22 @@ const ALLOW_ALL_SUBNET: &str = "0.0.0.0/0";
 /// row, its addresses and its proxy attachment going and coming back.
 pub const DETACH_GRACE: Duration = Duration::from_secs(45);
 
+/// How long a row its creator resumed ([`BoxRegistry::resume_client_box`])
+/// awaits its box's first frame before it is withdrawn as a detached row
+/// is at its grace's end: its switch address back to the book, its
+/// loopback address back to the answerer, its creation kept dormant so a
+/// later resume still works.
+///
+/// The creator resumes before it attaches or execs, and the first frame
+/// comes once the box's host is launched in the guest and its shuttle
+/// carries one. After a minvmd restart that is a VM cold boot (40 to 70
+/// seconds), the guest daemon's start, and the box host's launch; five
+/// minutes covers several times that, so a slow boot does not lose the
+/// row it was resumed for, while a resume nobody follows with an attach
+/// holds its addresses no longer than this. NET-138's 60 s runs from the
+/// end of an attachment, and a resumed row has none yet.
+pub const RESUME_ATTACH_BOUND: Duration = Duration::from_secs(300);
+
 /// How often the drainer looks for detached rows whose grace has passed.
 pub const DETACH_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -386,9 +402,11 @@ pub struct BoxRecord {
 /// been **detached**. A row is in one of three states:
 ///
 /// - **awaiting** — no relay has carried it yet, and no grace runs: a
-///   fresh registration, or one its creator resumed
-///   ([`BoxRegistry::resume_client_box`]), stands until its box's first
-///   frame or its creator's withdrawal;
+///   fresh registration stands until its box's first frame or its
+///   creator's withdrawal; one its creator resumed
+///   ([`BoxRegistry::resume_client_box`]) stands until its box's first
+///   frame, or until [`RESUME_ATTACH_BOUND`] passes and it is withdrawn as
+///   at a grace's end;
 /// - **attached** — at least one relay carries it;
 /// - **detached** — its last relay ended, or it was reloaded from the
 ///   persisted registry at start ([`BoxRegistry::persisting_to`]); it is
@@ -402,6 +420,9 @@ pub struct BoxRecord {
 struct RowLiveness {
     carriers: usize,
     detached_since: Option<Instant>,
+    /// When its creator resumed the row, while no relay has carried it
+    /// since ([`RESUME_ATTACH_BOUND`]).
+    resumed_since: Option<Instant>,
 }
 
 /// Manual because the row's runtime half is interior ([`RowRuntime`]): the
@@ -496,12 +517,20 @@ impl BoxRecord {
         self.liveness().detached_since.is_some()
     }
 
-    /// The instant the row detached, when it has stood detached for
-    /// [`DETACH_GRACE`] at `now`.
-    fn detached_past_grace(&self, now: Instant) -> Option<Instant> {
-        self.liveness()
-            .detached_since
-            .filter(|since| now.saturating_duration_since(*since) >= DETACH_GRACE)
+    /// When the row's attachment ended, if it is due its withdrawal at
+    /// `now`: the instant it detached, once it has stood detached for
+    /// [`DETACH_GRACE`]; or `now`, once its creator resumed it
+    /// [`RESUME_ATTACH_BOUND`] ago and no relay has carried it since.
+    fn past_its_bound(&self, now: Instant) -> Option<Instant> {
+        let liveness = self.liveness();
+        let past = |since: Option<Instant>, bound| {
+            since.filter(|since| now.saturating_duration_since(*since) >= bound)
+        };
+        past(liveness.detached_since, DETACH_GRACE).or_else(|| {
+            (liveness.carriers == 0)
+                .then(|| past(liveness.resumed_since, RESUME_ATTACH_BOUND).map(|_| now))
+                .flatten()
+        })
     }
 
     fn liveness(&self) -> MutexGuard<'_, RowLiveness> {
@@ -866,7 +895,8 @@ pub struct ClientBoxSpec {
 /// new registration takes its name; a row withdrawn at the end of its
 /// detach grace leaves the creation **dormant** (`standing: false`),
 /// holding no address, for its creator to resume
-/// ([`BoxRegistry::resume_client_box`]).
+/// ([`BoxRegistry::resume_client_box`]). Dormant creations are not capped:
+/// they hold neither address, and there is at most one per box name.
 ///
 /// The file format: one JSON object per creation in
 /// [`RegistryFile::boxes`], its fields named as here.
@@ -1096,8 +1126,9 @@ struct SwitchAddressBook {
     /// the box that returned it, the one box that may take it back inside
     /// its quarantine ([`Self::take`]).
     ///
-    /// Not persisted: every host-side state the quarantine outlasts — the
-    /// gate's reply flows and DNS pins, the proxy's attachments, gvproxy's
+    /// Not persisted: a minvmd restart is a VM restart, and every
+    /// switch-keyed host-side state the quarantine outlasts — the gate's
+    /// reply flows and DNS pins, the proxy's attachments, gvproxy's
     /// neighbour entries — lives in this process and the VM it supervises,
     /// and ends with them, so a book reloaded at start
     /// ([`BoxRegistry::persisting_to`]) holds only what reloaded rows hold.
@@ -3713,7 +3744,9 @@ impl BoxRegistry {
     /// egress default — never from the request, and never from the guest.
     ///
     /// A row that stands is set **awaiting** ([`RowLiveness`]): no grace
-    /// runs until a relay that carried it ends. A dormant creation's row is
+    /// runs until a relay that carried it ends, and a row no relay carries
+    /// within [`RESUME_ATTACH_BOUND`] is withdrawn as at a grace's end, its
+    /// creation kept for a later resume. A dormant creation's row is
     /// published at its own switch address — taken from the hand-out book,
     /// which hands it back inside its quarantine only to the box that
     /// returned it ([`SwitchAddressBook::take`]) — and at the published
@@ -3770,10 +3803,17 @@ impl BoxRegistry {
         if let Some(record) = rows.get(&switch_addr.octets())
             && record.box_id == creation.id()
         {
-            record.liveness().detached_since = None;
+            let now = self.now();
+            let mut liveness = record.liveness();
+            liveness.detached_since = None;
+            if liveness.carriers == 0 {
+                liveness.resumed_since = Some(now);
+            }
+            drop(liveness);
             tracing::info!(
                 box = %record.name(),
                 switch_addr = %record.switch_addr(),
+                bound = ?RESUME_ATTACH_BOUND,
                 "its creator resumed a box whose row stands; the row awaits its box's frames"
             );
             return Ok(Arc::clone(record));
@@ -3814,6 +3854,7 @@ impl BoxRegistry {
         let record = self
             .try_register_since(registration, Some(generation), Some(standing))
             .inspect_err(|_| self.give_back_switch_addr(switch_addr, false, id))?;
+        record.liveness().resumed_since = Some(now);
         tracing::info!(
             box = %record.name(),
             switch_addr = %record.switch_addr(),
@@ -3855,11 +3896,12 @@ impl BoxRegistry {
         }
     }
 
-    /// Withdraws every row detached for [`DETACH_GRACE`] or longer, and
+    /// Withdraws every row detached for [`DETACH_GRACE`] or longer, or
+    /// resumed [`RESUME_ATTACH_BOUND`] ago and not carried since, and
     /// returns them: the same withdrawal the drainer always made, at the
-    /// grace's end rather than at the relay's ([`Self::withdraw_where`]).
-    /// Each row's grace is decided again under the write of the row lock it
-    /// leaves under, so a row a relay carried again since the scan stays.
+    /// bound's end rather than at the relay's ([`Self::withdraw_where`]).
+    /// Each row's bound is decided again under the write of the row lock it
+    /// leaves under, so a row a relay carried since the scan stays.
     fn withdraw_expired_detached(&self) -> Vec<Arc<BoxRecord>> {
         let now = self.now();
         let expired: Vec<Ipv4Addr> = self
@@ -3867,12 +3909,12 @@ impl BoxRegistry {
             .read()
             .expect("the row lock is never held across a panic, so it cannot be poisoned")
             .values()
-            .filter(|record| record.detached_past_grace(now).is_some())
+            .filter(|record| record.past_its_bound(now).is_some())
             .map(|record| record.switch_addr)
             .collect();
         expired
             .into_iter()
-            .filter_map(|addr| self.withdraw_where(addr, |record| record.detached_past_grace(now)))
+            .filter_map(|addr| self.withdraw_where(addr, |record| record.past_its_bound(now)))
             .collect()
     }
 
@@ -4642,6 +4684,7 @@ impl BoxTable {
         record.attributed.store(true, Ordering::Relaxed);
         let mut liveness = record.liveness();
         liveness.carriers = liveness.carriers.saturating_add(1);
+        liveness.resumed_since = None;
         if liveness.detached_since.take().is_some() {
             tracing::info!(
                 box = %record.name(),
@@ -6017,6 +6060,68 @@ mod tests {
 
         let again = resume(web.switch_addr(), None).expect("a standing row resumes as it is");
         assert!(Arc::ptr_eq(&again, &resumed), "the standing row itself");
+    }
+
+    /// NET-138: a resumed row no relay carries within its bound is
+    /// withdrawn as a detached row is at its grace's end — both addresses
+    /// returned, so the dormant creation left behind holds neither — and
+    /// the creation is kept, so a later resume still works.
+    #[test]
+    fn an_unattributed_resume_is_withdrawn_after_its_bound() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let registry = persisted_registry(&dir);
+        let released = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = Arc::clone(&released);
+        registry.spawn_withdrawal_drainer(move |name| {
+            sink.lock().expect("the test's lock").push(name.to_string());
+        });
+        let web = registry
+            .register_client_box(client_spec("web"))
+            .expect("the plan has an address for the box");
+        let resume = || {
+            let claim = registry.begin_registration("web");
+            registry.resume_client_box(
+                "web",
+                web.switch_addr(),
+                web.loopback_addr(),
+                Some(web.box_id()),
+                web.loopback_addr(),
+                claim.generation(),
+            )
+        };
+        resume().expect("the creator resumes its standing row");
+        registry.advance_clock(RESUME_ATTACH_BOUND.saturating_sub(Duration::from_secs(10)));
+        let_the_drainer_sweep();
+        assert!(
+            registry.row_by_name("web").is_some(),
+            "the row stands inside its bound"
+        );
+
+        registry.advance_clock(Duration::from_secs(10));
+        wait_until(
+            || registry.row_by_name("web").is_none(),
+            "the row is withdrawn at its bound",
+        );
+        assert_eq!(
+            registry.live_switch_addrs(),
+            0,
+            "the dormant creation holds no switch address"
+        );
+        wait_until(
+            || released.lock().expect("the test's lock").as_slice() == ["web"],
+            "the loopback address goes back to the answerer",
+        );
+
+        let again = resume().expect("the kept creation resumes again");
+        assert_eq!(again.box_id(), web.box_id(), "under its own box id");
+        let table = registry.table();
+        table.mark_attributed(web.switch_addr().octets());
+        registry.advance_clock(RESUME_ATTACH_BOUND);
+        let_the_drainer_sweep();
+        assert!(
+            registry.row_by_name("web").is_some(),
+            "a resumed row its box attached to is no longer bound"
+        );
     }
 
     /// NET-138: a box whose creator withdrew it cannot be resumed — the

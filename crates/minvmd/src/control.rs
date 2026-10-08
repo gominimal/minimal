@@ -926,6 +926,10 @@ fn serve_request(
             write_reply(stream, &reply)
         }
         // A read of the host's own table, like the row read: no ticket.
+        // The table is this supervisor's, and a supervisor runs one VM and
+        // binds this door for that VM's vsock bridge alone, so the answer
+        // is only ever about the asking VM's own rows. A map lookup: it
+        // changes no row, no liveness and no attribution.
         (BoxControlRequest::RowStanding(request), ControlDoor::GuestReports) => {
             let reply = BoxControlReply::RowStanding {
                 switch_address: request.switch_address,
@@ -4110,6 +4114,60 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600, "the audit copy is owner-only, got {mode:o}");
+    }
+
+    /// NET-138: the guest door's row-standing read answers from the asking
+    /// VM's own supervisor's table only — a second supervisor, another
+    /// VM's, does not know the box — and reading changes nothing: the row
+    /// stays awaiting, unattributed, its address still out.
+    #[test]
+    fn row_standing_answers_only_for_the_asking_node() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (sock_path, _server, registry, _answerer, _proxy_publish) =
+            spawn_server(dir.path()).expect("server binds");
+        let other_dir = tempfile::TempDir::new().expect("temp dir");
+        let (other_sock_path, _other_server, _other_registry, _, _) =
+            spawn_server(other_dir.path()).expect("the other VM's server binds");
+        let web = handed(
+            register(
+                &sock_path,
+                &RegisterBoxRequest {
+                    name: "web".to_string(),
+                    ingress_ports: Vec::new(),
+                    egress: None,
+                    credentialed_upstream: None,
+                    dynamic_ingress: None,
+                    dynamic_allowed_range: None,
+                    hold: false,
+                },
+            )
+            .expect("the registration is answered"),
+        );
+        let standing = |sock: &std::path::Path, switch_address| match control(
+            &sock.with_file_name(GUEST_CONTROL_SOCK_FILE),
+            &BoxControlRequest::RowStanding(minimald_rpc::RowStandingRequest { switch_address }),
+        )
+        .expect("the read is answered")
+        {
+            BoxControlReply::RowStanding { row_standing, .. } => row_standing,
+            other => panic!("expected a row-standing answer, got {other:?}"),
+        };
+        assert!(
+            standing(&sock_path, web.switch_address),
+            "its own VM's row stands"
+        );
+        assert!(
+            !standing(&other_sock_path, web.switch_address),
+            "another VM's door knows nothing of the box"
+        );
+        assert!(
+            !standing(&sock_path, Ipv4Addr::new(100, 64, 0, 200)),
+            "an address no row holds does not stand"
+        );
+        let row = registry.row_by_name("web").expect("the row stands");
+        assert!(!row.was_attributed(), "the read attributes nothing");
+        assert!(!row.is_detached(), "the read detaches nothing");
+        assert_eq!(registry.live_switch_addrs(), 1, "the read frees nothing");
     }
 
     /// The doors are the verb's access control (NET-138): the read-only row

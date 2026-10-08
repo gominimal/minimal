@@ -3490,6 +3490,10 @@ async fn a_box_holding_a_host_row_refuses_remint_after_its_host_loop_ends() {
         refusal.contains("min session activate"),
         "the refusal must name the step that registers a box again; got: {refusal:?}"
     );
+    assert!(
+        refusal.contains("run the attach or exec again"),
+        "the refusal must name the re-run that resumes the row; got: {refusal:?}"
+    );
     assert_eq!(
         super::launch_publish_seam::observed(id).len(),
         1,
