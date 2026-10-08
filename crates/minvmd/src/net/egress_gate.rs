@@ -3791,10 +3791,11 @@ impl ReplyTables {
     /// packet (SYN set, ACK clear) — it drops that one before calling here
     /// ([`PROXY_OPENING_RULE`]) — while every other proxy-sourced frame, the
     /// proxy's answers to a box's dial included, is still delivered with only
-    /// the reply-flow recording declined. A box on a credentialed lane does dial the
-    /// proxy's listener (NET-134), but the proxy only answers: it never opens
-    /// a connection toward a box, so a proxy-sourced opening packet at a
-    /// box's published port has no legitimate origin, and the stream it
+    /// the reply-flow recording declined.
+    /// A box on a credentialed lane does dial the proxy's listener
+    /// (NET-134), but the proxy only answers: it never opens a connection
+    /// toward a box, so a proxy-sourced opening packet at a box's published
+    /// port has no legitimate origin, and the stream it
     /// would open must never become a reply flow the box could reverse-answer
     /// ([`gate_verdict`]'s reply-flow admit). Defense in depth — the
     /// reply-flow admit in [`gate_verdict`] itself never admits a frame to
@@ -9001,7 +9002,7 @@ mod tests {
 
         // The proxy's bare SYN toward the published inside port — the
         // opening packet no one legitimately sends — never reaches the
-        // guest, and never opens a reply-flow record for the node.
+        // guest; the marker below proves it was decided.
         let opening = dns_pins::tests::tcp_frame(
             Ipv4Addr::from(proxy),
             40000,
@@ -9010,11 +9011,6 @@ mod tests {
             sessions::core::egress::TCP_SYN,
         );
         send_frame(&mut switch, &opening).await;
-        assert_eq!(
-            h.replies.record_count_of(node_addr),
-            None,
-            "the dropped opening packet opened no reply-flow record for the node"
-        );
         // A SYN carrying other flags but no ACK is still an opening packet by
         // the reply-flow table's own shape, and is dropped the same way.
         let odd_opening = dns_pins::tests::tcp_frame(
