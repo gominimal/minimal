@@ -8471,6 +8471,7 @@ async fn runtime_facts_name_a_listen_the_audit_log_refused() {
         &mut client,
         &manager,
         "unaudited",
+        true,
         switch,
         loopback,
         (port, port),
