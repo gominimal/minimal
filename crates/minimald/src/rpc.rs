@@ -4289,7 +4289,7 @@ mod tests {
         assert!(
             error.contains("Remove them")
                 && error.contains("--deny-all-egress")
-                && error.contains("all three allow lists empty"),
+                && error.contains("all three allow lists present and empty"),
             "the refusal names the remedy for the rules it refused: {error}"
         );
 

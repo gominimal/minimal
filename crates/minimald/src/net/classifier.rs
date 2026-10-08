@@ -229,8 +229,8 @@ pub(crate) fn unenforceable_declaration_words(rules: &[UnenforceableRule]) -> St
         "host_ip boxes on this host enforce only deny-all egress, so these \
          rules would go unenforced: {named}. Remove them, use \
          --deny-all-egress (or an egress section with all three allow \
-         lists empty and no deny entries), or use --network own_ip, which \
-         enforces them."
+         lists present and empty and no deny entries), or use --network \
+         own_ip, which enforces them."
     )
 }
 
@@ -3132,7 +3132,7 @@ mod tests {
             words.contains("Remove them")
                 && words.contains("--deny-all-egress")
                 && words.contains("egress section")
-                && words.contains("all three allow lists empty")
+                && words.contains("all three allow lists present and empty")
                 && words.contains("no deny entries")
                 && words.contains("host_ip boxes on this host enforce only deny-all egress")
                 && words.contains("these rules would go unenforced"),
