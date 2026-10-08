@@ -981,8 +981,8 @@ pub enum NetCommand {
     /// installed or configured on the remote side. Stays in the foreground
     /// and closes with the session.
     Forward(NetForwardArgs),
-    /// Print the command that sets this host up to resolve and reach boxes by name (does not run it)
-    Setup,
+    /// Set this host up to resolve and reach boxes by name (runs one privileged command; `--print` only prints it)
+    Setup(NetSetupArgs),
 }
 
 #[derive(Debug, Args)]
@@ -995,6 +995,13 @@ pub struct NetForwardArgs {
     /// `localhost:8080` from port 3000 in the box)
     #[arg(value_name = "LOCAL:PORT")]
     pub spec: String,
+}
+
+#[derive(Debug, Args)]
+pub struct NetSetupArgs {
+    /// Print the command instead of running it
+    #[arg(long)]
+    pub print: bool,
 }
 
 #[derive(Debug, Args)]

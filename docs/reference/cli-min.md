@@ -433,13 +433,17 @@ that leg (`just test-root-integration`) is still owed to the root lane.
 ### `net setup`
 
 ```
-min net setup
+min net setup [--print]
 ```
 
-Prints the command that sets this host up to resolve and reach boxes by
-name, for this host's current state. It never runs the command and never
-asks for privilege: you copy it and run it yourself. On a host that needs no
-step, it prints that there is nothing to run.
+Sets this host up to resolve and reach boxes by name, for this host's
+current state. It prints what is missing, then runs one privileged command,
+so `sudo` asks for your password once. The exit status is the command's.
+On a host that is already set up, it runs nothing and says so.
+
+| Flag | Description |
+|---|---|
+| `--print` | Print the command instead of running it, with no privilege prompt. |
 
 A session start also checks the host's resolver for the box zone. If the
 resolver is not configured and the start is interactive, it prints the same
@@ -451,7 +455,8 @@ the command does not bury a scripted start's log on every activation.
 The command points at the port the daemon's zone answerer listens on, so it
 needs a running daemon that has bound its answerer. It does not start one:
 with no daemon reachable, it prints an error and exits 1, and starting a
-session first brings the daemon up.
+session first brings the daemon up. On a host where no command can make box
+names resolve, it prints why and exits 1.
 
 ### `stop`
 

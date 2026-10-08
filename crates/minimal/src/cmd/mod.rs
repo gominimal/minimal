@@ -83,8 +83,8 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
             command: NetCommand::Forward(args),
         })) => cmd_net_forward(&cli.global_args, args).await,
         Some(Command::Net(NetArgs {
-            command: NetCommand::Setup,
-        })) => cmd_net_setup(&cli.global_args).await,
+            command: NetCommand::Setup(args),
+        })) => cmd_net_setup(&cli.global_args, args).await,
         Some(Command::Dirs) => dirs::cmd_dirs(&cli.global_args),
         Some(Command::Bug(args)) => diag::cmd_bug(&cli.global_args, args).await,
         Some(Command::Diag(diag::DiagArgs { command })) => match command {

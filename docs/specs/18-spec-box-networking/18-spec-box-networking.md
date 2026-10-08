@@ -752,7 +752,7 @@ included, with every refusal logged (NET-001 to NET-004).
     verify: cargo nextest run -p minimald failed_forwarder_bind_is_reported_not_substituted
     <!-- design §7.1: a failed bind is "a surfaced error, never a silent fallback or a standing-capability grant"; unwanted; NET-020 covers the hostname listener -->
 
-- **NET-122** WHILE the host's native resolver is not configured for the box zone, WHEN a session starts THE SYSTEM SHALL print an advisory naming what is missing and the exact command that configures it, or the command that prints it, with no privilege prompt.
+- **NET-122** WHILE the host's native resolver is not configured for the box zone, WHEN a session starts THE SYSTEM SHALL print an advisory naming what is missing and the exact command that configures it, or the command that runs it, with no privilege prompt.
   tier:     T0
   verify:   cargo nextest run -p minimal session_start_advises_resolver_command_without_prompt
   <!-- S1b-1; design §7.1 (host-OS resolution per OS); state+event; `/etc/resolver/min.internal` with its `port` directive on macOS, the systemd-resolved routing-domain link on Linux; NET-009's WHERE presupposes it and the Box Egress Proxy document's default `dns` steering needs it -->
@@ -760,14 +760,18 @@ included, with every refusal logged (NET-001 to NET-004).
     tier:   T0
     verify: cargo nextest run -p minimal interactive_start_prints_full_advisory
     <!-- state-driven; interactive means stderr is a terminal and neither `--no-prompt` nor `--no-input` is set; the full command embeds the range program and the service definitions and runs to tens of lines, which is what a person at a terminal copies -->
-  - WHERE the session start is not interactive THE SYSTEM SHALL print the advisory as one line that names what is missing and the command that prints the exact command.
+  - WHERE the session start is not interactive THE SYSTEM SHALL print the advisory as one line that names what is missing and the command that runs the exact command.
     tier:   T0
     verify: cargo nextest run -p minimal non_interactive_start_prints_short_advisory
-    <!-- state-driven; a scripted or agent start repeats on every activation, and a full command block on each buries the session's own errors; the one line keeps the facts in the log and points at the command that prints the rest -->
-  - WHEN the operator asks for the host setup command THE SYSTEM SHALL print the exact command for this host's current state without running it, with no privilege prompt.
+    <!-- state-driven; a scripted or agent start repeats on every activation, and a full command block on each buries the session's own errors; the one line keeps the facts in the log and points at the command that runs the rest -->
+  - WHEN the operator runs host setup THE SYSTEM SHALL run the exact command for this host's current state, with the command's own privilege elevation as the only prompt, and exit with the command's status.
+    tier:   T0
+    verify: cargo nextest run -p minimal net_setup_runs_the_advisory_command
+    <!-- event-driven; `min net setup`; the operator's request is the consent, so the one elevation is the command's own `sudo`, never a second prompt; the same command a full advisory names, from the same host reads, so a non-interactive start's pointer and this command never disagree; on a host that needs no step it runs nothing and says so, and an advisory that names no command (a blocker) runs nothing and exits non-zero -->
+  - WHEN the operator asks to print the host setup command THE SYSTEM SHALL print the exact command for this host's current state without running it, with no privilege prompt.
     tier:   T0
     verify: cargo nextest run -p minimal net_setup_prints_the_advisory_command
-    <!-- event-driven; `min net setup`; the same command a full advisory names, from the same host reads, so a non-interactive start and this command never disagree; it prints nothing to run on a host that needs no step, and says so -->
+    <!-- event-driven; `min net setup --print`; the advisory whole, command block included, for an operator who reviews or adapts the command before running it, and for the session e2e, which reads the command from it; it prints nothing to run on a host that needs no step, and says so -->
   - WHERE the host is hooked THE SYSTEM SHALL install, by the privileged step, the box-zone answerer as a host service whose listener and channel sockets the service manager holds, running as the operator, from a root-owned non-user-writable program.
     tier:   T0
     verify: cargo nextest run -p minimal advisory_installs_manager_held_answerer
@@ -924,7 +928,7 @@ loopback answerer held by the host's service manager, published addresses come
 from a reserved local range (`127.0.64.0/24`), Linux uses a systemd-resolved
 routing domain on a dedicated link of routable scope, and macOS uses
 `/etc/resolver/min.internal` with a `port` directive, written once by the
-advisory command NET-122 names at session start, or prints on request. On macOS the same command
+advisory command NET-122 names at session start, or runs or prints on request. On macOS the same command
 reserves the local range: it installs a root-held boot step that re-applies
 exactly the reserved range at each start, at root-owned paths no user can
 write, so the range is present before any session starts and no daemon

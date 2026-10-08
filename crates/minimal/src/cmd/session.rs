@@ -235,7 +235,7 @@ pub(crate) fn control_sock_beside(ssh_sock: &std::path::Path) -> Option<std::pat
 /// host's resolver detection and its answerer service step, read together,
 /// with the control sockets the step asks to release the hook port recorded
 /// for the render. Shared by the session start and `min net setup`, so the
-/// command a start points at and the command it prints come from the same
+/// command a start points at and the command it runs come from the same
 /// reads.
 pub(crate) async fn advisory_host_reads(
     global: &GlobalArgs,
@@ -276,9 +276,9 @@ pub(crate) async fn advisory_host_reads(
     (detection, answerer_step)
 }
 
-/// The hint a one-line advisory ends with: the command that prints the
-/// full one.
-const NET_SETUP_HINT: &str = "Run `min net setup` to print the command that configures it.";
+/// The hint a one-line advisory ends with: the command that runs the full
+/// one's command.
+const NET_SETUP_HINT: &str = "Run `min net setup` to configure it.";
 
 /// The advisory text a session start prints (NET-122): the advisory whole
 /// when the start is interactive, [`short_advisory`] otherwise. Pure, so
@@ -296,7 +296,7 @@ pub(crate) fn start_advisory_text(advisory: &str, interactive: bool) -> String {
 /// sentence that introduces the command block, followed by
 /// [`NET_SETUP_HINT`]. An advisory with no command block (a blocker names
 /// no command) is already one line and is kept as it is: there is no
-/// command for `min net setup` to print.
+/// command for `min net setup` to run.
 pub(crate) fn short_advisory(advisory: &str) -> String {
     let mut lines = advisory.lines();
     let first = lines.next().unwrap_or_default().trim_end();
@@ -1316,7 +1316,7 @@ pub(crate) async fn activate_session(
             // stand apart from the lines above them. Any other start gets
             // one line: it repeats on every activation, and the command
             // block would bury the session's own errors. The one line keeps
-            // the facts and names `min net setup`, which prints the same
+            // the facts and names `min net setup`, which runs the same
             // command from the same host reads.
             let interactive = !args.no_prompt && should_announce_session(global);
             if interactive {
@@ -3967,7 +3967,7 @@ mod tests {
     }
 
     /// A one-line advisory (a blocker, no command block) is kept as it is:
-    /// there is no command for `min net setup` to print, so no hint.
+    /// there is no command for `min net setup` to run, so no hint.
     #[test]
     fn short_advisory_keeps_a_one_line_advisory() {
         let advisory = "note: host lookups bypass the resolver.";

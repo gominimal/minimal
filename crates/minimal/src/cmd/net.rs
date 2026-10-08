@@ -20,17 +20,18 @@ const NET_SETUP_NO_PORT: &str =
 const NET_SETUP_NOTHING_TO_RUN: &str =
     "This host is already set up to resolve boxes by name; there is nothing to run.";
 
-/// `min net setup`: print the command that sets this host up to resolve and
-/// reach boxes by name (NET-122), the same command an interactive session
-/// start prints, from the same host reads. It never runs the command and
-/// never prompts.
+/// `min net setup`: set this host up to resolve and reach boxes by name
+/// (NET-122) by running the command an interactive session start prints,
+/// built from the same host reads. The command's own `sudo` is the one
+/// privilege prompt. With `--print` it prints the advisory, command block
+/// included, and runs nothing.
 ///
 /// The answerer port is the one `min ls` reads: each listed VM's own state
 /// from its VM host daemon's control socket (NET-138), else the daemon's
 /// listing. It never starts a daemon: with none reachable, or none that
 /// reports a port, there is no port to point a command at, so it says so
 /// and exits 1.
-pub async fn cmd_net_setup(global: &GlobalArgs) -> Result<(), anyhow::Error> {
+pub async fn cmd_net_setup(global: &GlobalArgs, args: NetSetupArgs) -> Result<(), anyhow::Error> {
     let listings = match ls_listings(global).await {
         Ok(listings) => listings,
         Err(err) => {
@@ -88,15 +89,46 @@ pub async fn cmd_net_setup(global: &GlobalArgs) -> Result<(), anyhow::Error> {
         range_present,
         &answerer_step,
     );
-    println!("{}", net_setup_output(advisory.as_deref()));
+    if args.print {
+        println!("{}", net_setup_output(advisory.as_deref()));
+        return Ok(());
+    }
+    let Some(advisory) = advisory else {
+        println!("{NET_SETUP_NOTHING_TO_RUN}");
+        return Ok(());
+    };
+    let Some((note, command)) = advisory_command(&advisory) else {
+        // A blocker: the advisory names what stops every command from
+        // reaching host lookups, and there is no command to run.
+        eprintln!("{advisory}");
+        std::process::exit(1);
+    };
+    eprintln!("{note}");
+    let status = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(command)
+        .status()
+        .context("min net setup: could not start /bin/sh to run the setup command")?;
+    if !status.success() {
+        std::process::exit(status.code().unwrap_or(1));
+    }
     Ok(())
 }
 
-/// What `min net setup` prints for an advisory: the advisory whole, or the
-/// sentence that says this host needs no step. Pure, so the test asserts it
-/// without capturing stdout.
+/// What `min net setup --print` prints for an advisory: the advisory whole,
+/// or the sentence that says this host needs no step. Pure, so the test
+/// asserts it without capturing stdout.
 fn net_setup_output(advisory: Option<&str>) -> String {
     advisory.map_or_else(|| NET_SETUP_NOTHING_TO_RUN.to_string(), str::to_string)
+}
+
+/// An advisory split into its note line and the command it names: the
+/// command starts on the second line, indented two spaces, and runs to the
+/// end (the macOS command's heredoc bodies are not indented). `None` for an
+/// advisory with no command block, a blocker.
+fn advisory_command(advisory: &str) -> Option<(&str, &str)> {
+    let (note, rest) = advisory.split_once('\n')?;
+    Some((note, rest.strip_prefix("  ").unwrap_or(rest)))
 }
 
 /// `min net forward <SESSION> <LOCAL>:<PORT>`: bind `localhost:<LOCAL>` and
@@ -312,14 +344,35 @@ async fn relay(
 mod tests {
     use super::*;
 
-    /// NET-122: `min net setup` prints the advisory whole, command block
-    /// included, and on a host that needs no step says there is nothing to
-    /// run.
+    /// NET-122: `min net setup --print` prints the advisory whole, command
+    /// block included, and on a host that needs no step says there is
+    /// nothing to run.
     #[test]
     fn net_setup_prints_the_advisory_command() {
         let advisory = "note: the resolver file is missing. Configure the host's \
                         resolver with:\n  sudo sh -c 'true'";
         assert_eq!(net_setup_output(Some(advisory)), advisory);
         assert_eq!(net_setup_output(None), NET_SETUP_NOTHING_TO_RUN);
+    }
+
+    /// NET-122: `min net setup` runs exactly the command the advisory names:
+    /// the block after the note, de-indented on its first line only, so a
+    /// multi-line command's heredoc bodies run byte for byte. A blocker
+    /// names no command, so there is nothing to run.
+    #[test]
+    fn net_setup_runs_the_advisory_command() {
+        let advisory = "note: the range is missing. Configure the host's resolver and \
+                        reserve the local range with:\n  sudo sh -c 'set -e; cat > /x <<\\EOF\n\
+                        body line\nEOF\nchmod 0755 /x'";
+        let (note, command) = advisory_command(advisory).unwrap();
+        assert!(note.starts_with("note: the range is missing."), "{note}");
+        assert_eq!(
+            command,
+            "sudo sh -c 'set -e; cat > /x <<\\EOF\nbody line\nEOF\nchmod 0755 /x'"
+        );
+        assert_eq!(
+            advisory_command("note: host lookups bypass the resolver."),
+            None
+        );
     }
 }
