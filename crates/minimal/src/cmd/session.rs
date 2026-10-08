@@ -229,6 +229,14 @@ pub(crate) fn vm_host_answerer_start_line(
     crate::resolver::vm_host_answerer_line(status).map(|line| format!("DNS service: {line}"))
 }
 
+/// Whether a session holds its name in the VM host's zone in place of a
+/// row: a `host_ip` box shares the node's own row, so `min session
+/// activate` and `min dash` hold its name (NODATA) instead of registering
+/// one. `box_addresses` is `None` exactly when no row was registered.
+pub(crate) fn holds_name(record: &boxes::Record) -> bool {
+    record.network == boxes::NetworkMode::HostNet && record.box_addresses.is_none()
+}
+
 /// Releases the zone hold a destroyed session's activation made, when the
 /// session registered no row (`box_addresses` is `None` — a `host_ip` box
 /// holds its name in place of a row): the destroy-side twin of the hold
@@ -431,7 +439,7 @@ fn rehold_undo(
 /// frees only that session's hold. Returns whether the VM host daemon
 /// answered the verb: `false` for no VM host daemon to ask, a refusal, or
 /// no answer.
-async fn hold_box_name_with_vm_host(
+pub(crate) async fn hold_box_name_with_vm_host(
     control_sock: Option<std::path::PathBuf>,
     name: &str,
     id: Option<boxes::SessionId>,
@@ -4463,7 +4471,7 @@ pub async fn cmd_rename(global: &GlobalArgs, args: RenameArgs) -> Result<(), any
             // of a row: the hold moves with the name, so the old name no box
             // owns answers NXDOMAIN again and the new one is the one the
             // destroy releases.
-            if record.network == boxes::NetworkMode::HostNet && record.box_addresses.is_none() {
+            if holds_name(&record) {
                 let control_sock = vm_host_control_sock(
                     daemon_provider_kind(global),
                     global.minimal_dir.as_deref(),
