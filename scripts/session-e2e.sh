@@ -3499,10 +3499,10 @@ proof_daemon_fetch_under_deny_all_host_address_box() {
   fi
   grep -q "deny_subnets 0.0.0.0/0" "$WORK/net080-refused-range.err" \
     || { echo "::error::the refused create does not name the rule it refused over (deny_subnets 0.0.0.0/0)"; cat "$WORK/net080-refused-range.err" 2>/dev/null || true; fail; }
-  grep -q "own-address boxes enforce them" "$WORK/net080-refused-range.err" \
+  grep -qF -- "--network own_ip, which enforces them" "$WORK/net080-refused-range.err" \
     || { echo "::error::the refused create does not say own-address boxes enforce these rules"; cat "$WORK/net080-refused-range.err" 2>/dev/null || true; fail; }
-  grep -q "remove these rules" "$WORK/net080-refused-range.err" \
-    || { echo "::error::the refused create does not end with what to do (remove these rules)"; cat "$WORK/net080-refused-range.err" 2>/dev/null || true; fail; }
+  grep -q "Remove them" "$WORK/net080-refused-range.err" \
+    || { echo "::error::the refused create does not end with what to do (Remove them)"; cat "$WORK/net080-refused-range.err" 2>/dev/null || true; fail; }
   if (cd "$NET080_SEED_DIR" && mnl session activate . --no-prompt \
       --name e2e-net080-refused-list --network host_ip \
       --allow-subnets 10.0.0.0/8) >/dev/null 2>"$WORK/net080-refused-list.err"; then

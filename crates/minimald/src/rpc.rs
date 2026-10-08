@@ -4279,11 +4279,11 @@ mod tests {
             "the refusal names the rule it refused over, by field and entry: {error}"
         );
         assert!(
-            error.contains("this host decides a host-address box's egress verdict per box"),
+            error.contains("host_ip boxes on this host enforce only deny-all egress"),
             "the refusal says whose verdict it is that cannot enforce the rule: {error}"
         );
         assert!(
-            error.contains("own-address boxes enforce them"),
+            error.contains("which enforces them"),
             "the refusal says own-address boxes enforce these rules, so the \
              person who typed the declaration is told where they do work: {error}"
         );
@@ -4292,8 +4292,8 @@ mod tests {
         // enforces them — the words a person reads last are the ones they
         // can act on.
         assert!(
-            error.contains("remove these rules")
-                && error.contains("declare deny-all egress")
+            error.contains("Remove them")
+                && error.contains("--deny-all-egress")
                 && error.contains("all three allow lists present and empty"),
             "the refusal names the remedy for the rules it refused: {error}"
         );
