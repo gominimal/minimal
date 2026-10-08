@@ -535,7 +535,7 @@ pub async fn activate(
         // can't stall the runtime.
         let dir = project_path.as_utf8_path().to_path_buf();
         let (upload_root, is_repo) = tokio::task::spawn_blocking(move || {
-            let root = resolve_upload_root(&dir)?;
+            let root = crate::resolve_upload_root(&dir)?;
             let repo = minimal_client::file_upload::is_vcs_root(root.as_std_path());
             Ok::<_, anyhow::Error>((root, repo))
         })
@@ -799,26 +799,6 @@ fn deny_all_default_binds(created: &minimald_rpc::CreateSessionResponse) -> bool
     }
 }
 
-/// Resolves the directory whose tree should be uploaded as the session
-/// workspace, walking up from `dir` to the nearest `minimal.toml` and using
-/// its repo root. Falls back to `dir` itself when no mfile is found. Any
-/// other mfile error (malformed TOML, I/O) propagates: a broken config in
-/// an ancestor should fail loudly rather than silently uploading a subdir
-/// with no config. Mirrors the CLI's `resolve_upload_root`.
-fn resolve_upload_root(dir: &camino::Utf8Path) -> Result<camino::Utf8PathBuf, anyhow::Error> {
-    match mfile::File::from_dir_recursive(dir.as_std_path()) {
-        Ok(f) => match f.repo_path() {
-            Some(root) => Ok(camino::Utf8PathBuf::from_path_buf(root.to_path_buf())
-                .unwrap_or_else(|_| dir.to_path_buf())),
-            None => Ok(dir.to_path_buf()),
-        },
-        Err(mfile::Error::NotFound) => Ok(dir.to_path_buf()),
-        Err(e) => Err(anyhow::anyhow!(
-            "found a broken {name} while walking up from {dir}: {e}",
-            name = mfile::MFILE_NAME,
-        )),
-    }
-}
 
 /// Strip hooks whose scripts are files rather than inline bodies.
 ///
@@ -1326,58 +1306,6 @@ mod tests {
         assert_eq!(request.switch_address, handed.switch_address);
         assert_eq!(request.loopback_address, handed.loopback_address);
         assert_eq!(request.box_id, None, "the record carries no box id");
-    }
-
-    /// With no mfile anywhere up the tree, `resolve_upload_root` returns the
-    /// input unchanged.
-    #[test]
-    fn resolve_upload_root_returns_input_when_no_mfile() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = camino::Utf8PathBuf::from_path_buf(dir.path().join("sub")).unwrap();
-        assert_eq!(resolve_upload_root(&path).unwrap(), path);
-    }
-
-    /// `resolve_upload_root` walks up to the nearest mfile and returns its
-    /// repo root (root layout: `minimal.toml` at the repo root).
-    #[test]
-    fn resolve_upload_root_walks_up_to_mfile_root_layout() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join(mfile::MFILE_NAME),
-            "[upstream]\nrepo = \"https://github.com/gominimal/pkgs\"\n",
-        )
-        .unwrap();
-        let root = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
-        let subdir = root.join("crates").join("foo");
-        std::fs::create_dir_all(&subdir).unwrap();
-        assert_eq!(resolve_upload_root(&subdir).unwrap(), root);
-    }
-
-    /// Dot-minimal layout: `minimal.toml` lives in `.minimal/`, and the repo
-    /// root is its parent.
-    #[test]
-    fn resolve_upload_root_walks_up_to_mfile_dot_minimal_layout() {
-        let dir = tempfile::tempdir().unwrap();
-        let mfile_dir = dir.path().join(".minimal");
-        std::fs::create_dir(&mfile_dir).unwrap();
-        std::fs::write(
-            mfile_dir.join(mfile::MFILE_NAME),
-            "[upstream]\nrepo = \"https://github.com/gominimal/pkgs\"\n",
-        )
-        .unwrap();
-        let root = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
-        let subdir = root.join("crates").join("foo");
-        std::fs::create_dir_all(&subdir).unwrap();
-        assert_eq!(resolve_upload_root(&subdir).unwrap(), root);
-    }
-
-    /// A malformed mfile up the tree fails loudly instead of falling back.
-    #[test]
-    fn resolve_upload_root_errors_on_malformed_mfile() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join(mfile::MFILE_NAME), "not valid toml = =").unwrap();
-        let path = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
-        assert!(resolve_upload_root(&path).is_err());
     }
 
     /// NET-057's TUI half: the probe list covers every VM — the default one
