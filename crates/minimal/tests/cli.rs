@@ -3155,8 +3155,9 @@ async fn activate_and_ls_report_native_surface() {
     // names — and before the upload and the loadout, so the line is not lost
     // above a failed activate's output. The advisory rides beside the line
     // (NET-122): this host cannot resolve the zone natively, so the session
-    // start must say what is missing — the exact command to run, or the
-    // host fact that makes one dead — and never a prompt.
+    // start must say what is missing — on this scripted start, one line
+    // pointing at `min net setup`, or the host fact that makes the step
+    // dead — and never a prompt.
     let project = tempfile::TempDir::new().unwrap();
     std::fs::create_dir(project.path().join(".git")).unwrap();
     std::fs::write(
@@ -3195,10 +3196,10 @@ async fn activate_and_ls_report_native_surface() {
         "activate must print the naming advisory beside the surface line, got: {activate_stderr}"
     );
     assert!(
-        activate_stderr.contains("Configure the host's resolver")
+        activate_stderr.contains("Run `min net setup` to configure it.")
             || activate_stderr.contains("bypass systemd-resolved"),
-        "the advisory names what is missing — the command to run, or the host fact that \
-         makes one dead: {activate_stderr}"
+        "the advisory names what is missing — the pointer to `min net setup`, or the host \
+         fact that makes the step dead: {activate_stderr}"
     );
 
     // The positive arm, in process (see the test's doc): the native verdict
