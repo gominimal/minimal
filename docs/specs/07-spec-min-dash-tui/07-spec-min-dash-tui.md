@@ -403,9 +403,10 @@ the nearest `minimal.toml` repo root) and follows the CLI's upload gate: a
 VCS checkout or a root carrying `minimal.toml` uploads; an empty directory or
 `$HOME` is skipped; an undeclared non-VCS root prompts through a footer
 confirmation ("<root> is not a repository root; upload it? y/n") before
-anything reaches the daemon. The create sends the loadout contribution the
-CLI composed at `min dash` startup, so `default_loadouts` and the user
-policy apply to dashboard-created sessions too.
+anything reaches the daemon. The create composes its activation inputs
+through the CLI's own helper against the session's project path, so
+`default_loadouts`, the user policy, and loadout hook scripts apply to
+dashboard-created sessions too.
 
 ### Unit 7 — Last-session memory
 

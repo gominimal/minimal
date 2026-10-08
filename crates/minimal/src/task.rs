@@ -587,7 +587,11 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
         path: paths::HostPath::try_new(utf8_path.clone()).context("Invalid project path")?,
     };
     let non_interactive = global.no_input || !crate::can_prompt_interactively();
-    let (task_env, user_policy) = if non_interactive {
+    // The policy amended by the task-env gating above is persisted to disk on
+    // the interactive path, and unchanged on the refuse path, so
+    // `prepare_activation_inputs` (which re-reads it) composes under the same
+    // rules.
+    let (task_env, _) = if non_interactive {
         let hooks = RefuseAndRecord::default();
         let task_env = resolve_task_env(
             &declared,
@@ -658,29 +662,19 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
 
     // Loadouts and user policy: the same defaults as an activate with no
     // loadout flags — the config's `default_loadouts` apply. Resolved before
-    // the daemon connection so a broken loadout fails loudly client-side.
-    let cfg = crate::config::read_client_config(global)?;
-    let initial_policy = user_policy.clone();
-    let compose_options = crate::loadouts::compose_options_from_config(&cfg);
+    // the daemon connection so a broken loadout fails loudly client-side, and
+    // through the same shared helper an activate uses so the staged hook
+    // scripts and the finalize budget match.
     let selection = crate::loadouts::LoadoutSelection::from_flags(&[], false);
-    let active = crate::loadouts::resolve_active_loadouts(selection, &cfg, global)?;
-    if !active.loadouts.is_empty() {
-        let names: Vec<&str> = active.loadouts.iter().map(|l| l.name().as_ref()).collect();
-        eprintln!("Applying loadouts: {}", names.join(", "));
-    }
-    // Same pre-daemon staging as an activate, so a broken hook script
-    // path fails here rather than after the ephemeral session exists.
-    let hook_scripts = crate::loadouts::stage_loadout_hook_scripts(&active, &abs_path, true)?;
+    let inputs = crate::loadouts::prepare_activation_inputs(global, &abs_path, selection, true)?;
+    inputs.announce_loadouts();
 
-    // Same first-class orientation field as an activate: a `--keep`
-    // task session is attachable later, and its banner should orient
-    // too.
-    // Size the later `FinalizeSession` deadline to the composition's
-    // `on_activate` hook timeouts, read while the loadouts are still in hand.
-    let finalize_hook_budget = crate::loadouts::activate_hook_budget(&active, &utf8_path, true);
-
-    let (contribution, user_policy) =
-        crate::loadouts::compose_user_contribution(active, user_policy, compose_options, true)?;
+    let initial_policy = inputs.initial_policy;
+    let compose_options = inputs.compose_options;
+    let hook_scripts = inputs.hook_scripts;
+    let finalize_hook_budget = inputs.hook_budget;
+    let contribution = inputs.contribution;
+    let user_policy = inputs.user_policy;
 
     // Upload per the normal activate rules: tarball sync (the default), the
     // same empty/`$HOME` and non-VCS-root gates, no `--sync` escape hatch.

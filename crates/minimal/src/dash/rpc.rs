@@ -401,10 +401,11 @@ pub async fn rename(
 }
 
 /// The full activate flow behind the create form: create the record, upload
-/// the project tree, compose the loadout contribution the CLI composed at
-/// startup, upload the composition's patch files, and finalize — so the new
-/// session comes up `Active`, attachable, and restart-persistent rather than
-/// dying as an unresumable `Pending` stub on the next daemon restart.
+/// the project tree and the loadouts' staged hook scripts, send the
+/// contribution the caller composed, upload the composition's patch files,
+/// and finalize — so the new session comes up `Active`, attachable, and
+/// restart-persistent rather than dying as an unresumable `Pending` stub on
+/// the next daemon restart.
 ///
 /// Connects its own client so it can run as a background task without
 /// borrowing the provider's connection. A `ConfigureLoadout` that comes back
@@ -422,18 +423,17 @@ pub async fn rename(
 /// caller — the create task — so the TUI could ask its own confirm before
 /// anything reached the daemon. Only [`crate::UploadDecision::Upload`] and the
 /// skip decisions arrive here; `Confirm` is resolved against the create form's
-/// modal first.
-///
-/// Loadout hooks that name an external script are dropped on the way — see
-/// [`without_external_hook_scripts`].
-pub(crate) async fn activate(
+/// modal first. The loadout composition, staged hook scripts, and hook budget
+/// arrive as [`crate::loadouts::ActivationInputs`], resolved against the same
+/// project path, so an external loadout hook works from the dashboard.
+pub async fn activate(
     sock: &Path,
     name: Option<String>,
     project_path: paths::HostAbsPath,
     upload_root: camino::Utf8PathBuf,
     network: NetworkMode,
     decision: crate::UploadDecision,
-    contribution: sessions::wire::request::WireContribution,
+    inputs: crate::loadouts::ActivationInputs,
 ) -> Result<Activated, anyhow::Error> {
     let mut client = Client::connect(sock).await?;
     // The dashboard's own copy of the create/upload/configure/finalize
@@ -506,25 +506,24 @@ pub(crate) async fn activate(
             crate::UploadProgress::Quiet,
         )
         .await?;
+        // Upload the loadouts' external hook scripts before the configure:
+        // the daemon gates `FinalizeSession` on the upload's ready-marker, and
+        // a composition naming a script that never arrived cannot finalize.
+        client
+            .upload_hook_scripts(id, &inputs.hook_scripts)
+            .await
+            .context("Failed to upload lifecycle hook scripts")?;
         // Collect the upload pairs before the contribution moves into the
         // ConfigureLoadout RPC, through the collection `min session
         // activate` uses: they land in the final composition of a
         // `Materialized` response (the only one the dashboard accepts), so
         // the client is authoritative for them.
-        let mut patches = minimal_client::contribution_patch_uploads(&contribution);
+        let mut patches = minimal_client::contribution_patch_uploads(&inputs.contribution);
         minimal_client::dedup_patch_uploads(&mut patches);
-        // Drop hooks whose scripts live in a file. The dashboard has no
-        // hook-script upload — that staging lives in the `minimal` crate,
-        // which sits above this one — and the daemon refuses to finalize a
-        // session whose composition names a staged script that never
-        // arrived. Sending them would fail every dashboard activation for a
-        // user whose loadout happens to use an external hook. Inline hooks
-        // carry their body in the composition and are kept.
-        let contribution = without_external_hook_scripts(contribution);
         let configured = client
             .oneshot_rpc::<minimald_rpc::ConfigureLoadout>(minimald_rpc::ConfigureLoadoutRequest {
                 session_id: id,
-                contribution,
+                contribution: inputs.contribution,
             })
             .await
             .context("ConfigureLoadout RPC failed")?;
@@ -548,12 +547,15 @@ pub(crate) async fn activate(
             .await
             .context("uploading composition patches")?;
         match client
-            .oneshot_rpc::<minimald_rpc::FinalizeSession>(minimald_rpc::FinalizeSessionRequest {
-                session_id: id,
-                // The dashboard's status line does not render the yielded
-                // ports, so it does not ask for them.
-                report_shared_port_collisions: false,
-            })
+            .oneshot_rpc_with_hook_budget::<minimald_rpc::FinalizeSession>(
+                minimald_rpc::FinalizeSessionRequest {
+                    session_id: id,
+                    // The dashboard's status line does not render the yielded
+                    // ports, so it does not ask for them.
+                    report_shared_port_collisions: false,
+                },
+                inputs.hook_budget,
+            )
             .await
             .context("FinalizeSession RPC failed")?
         {
@@ -754,46 +756,6 @@ fn deny_all_default_binds(created: &minimald_rpc::CreateSessionResponse) -> bool
     }
 }
 
-/// Strip hooks whose scripts are files rather than inline bodies.
-///
-/// The daemon gates `FinalizeSession` on a marker the hook-script upload
-/// writes, and the dashboard has no such upload — the staging that produces
-/// it lives in the `minimal` crate, above this one. A composition naming a
-/// script that never arrives cannot finalize, so a user whose loadout uses
-/// an external hook could not create a session from the dashboard at all.
-///
-/// Dropping is the conservative half of that trade: an inline hook still
-/// runs, and an external one silently does not rather than failing the
-/// activation. A hook left with no scripts at all is removed entirely,
-/// since an empty one is not constructible.
-fn without_external_hook_scripts(
-    mut contribution: sessions::wire::request::WireContribution,
-) -> sessions::wire::request::WireContribution {
-    use sessions::wire::primitives::WireHookScript;
-    let is_inline =
-        |s: &Option<WireHookScript>| !matches!(s, Some(WireHookScript::External { .. }));
-    for ph in &mut contribution.lifecycle_hooks {
-        let h = &mut ph.hook;
-        for slot in [
-            &mut h.on_activate,
-            &mut h.on_destroy,
-            &mut h.on_attach,
-            &mut h.on_detach,
-        ] {
-            if !is_inline(slot) {
-                *slot = None;
-            }
-        }
-    }
-    contribution.lifecycle_hooks.retain(|ph| {
-        let h = &ph.hook;
-        h.on_activate.is_some()
-            || h.on_destroy.is_some()
-            || h.on_attach.is_some()
-            || h.on_detach.is_some()
-    });
-    contribution
-}
 #[cfg(test)]
 mod tests {
     use super::*;

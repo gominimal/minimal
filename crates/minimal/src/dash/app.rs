@@ -928,7 +928,7 @@ fn fetch_focused(model: &Model) -> Vec<Effect> {
 }
 
 /// Options for [`run`].
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct DashOptions {
     /// `--minimal-dir` override; `None` uses the platform default state dir.
     pub minimal_dir: Option<PathBuf>,
@@ -936,11 +936,11 @@ pub struct DashOptions {
     /// Resolved into session keys at attach so a dash-attach honors the
     /// `[session-keys]` config just like `min session attach`.
     pub config_dir: Option<PathBuf>,
-    /// The loadout contribution the CLI composed at startup (default
-    /// loadouts + user policy), re-sent with every create so `n` in dash
-    /// matches `min session activate`. Composition needs the CLI crate's
-    /// config plumbing, which lives above this crate.
-    pub contribution: sessions::wire::request::WireContribution,
+    /// The loadout selection every dashboard create resolves its activation
+    /// inputs from — `LoadoutSelection::Defaults`, matching `min session
+    /// activate` with no flags, so `default_loadouts` and the user policy
+    /// apply to dashboard-created sessions.
+    pub(crate) loadouts: crate::loadouts::LoadoutSelection,
 }
 
 /// One create waiting on an upload confirm: the token keys it, `root` is
@@ -986,7 +986,15 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
     }
 
     let mut providers = rpc::discover(opts.minimal_dir.as_deref()).await;
-    let contribution = opts.contribution.clone();
+    // The create task resolves each session's activation inputs through the
+    // CLI's helper; it needs a `GlobalArgs` carrying the same directory
+    // overrides the dashboard was launched with (the other fields do not
+    // affect activation-inputs resolution).
+    let global = crate::GlobalArgs {
+        minimal_dir: opts.minimal_dir.clone(),
+        config_dir: opts.config_dir.clone(),
+        ..Default::default()
+    };
     let mut last_rediscovery = std::time::Instant::now();
     let saved = state::load(opts.minimal_dir.as_deref());
     let mut model = Model::new(Utc::now());
@@ -1135,7 +1143,8 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
                     Some(p) => {
                         let sock = p.sock.clone();
                         let tx = bg_tx.clone();
-                        let contribution = contribution.clone();
+                        let global = global.clone();
+                        let loadouts = opts.loadouts.clone();
                         model.status = Some(format!(
                             "creating {}…",
                             name.as_deref().unwrap_or("session")
@@ -1151,6 +1160,15 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
                                 )?;
                                 let abs = paths::HostAbsPath::try_new(utf8)
                                     .context("invalid project path")?;
+                                // Resolve the loadout contribution, stage its
+                                // hook scripts, and size the hook budget
+                                // against this project path, through the same
+                                // CLI helper `min session activate` uses — so
+                                // an external loadout hook works from the
+                                // dashboard too.
+                                let inputs = crate::loadouts::prepare_activation_inputs(
+                                    &global, &abs, loadouts, true,
+                                )?;
                                 // The resolve walk and the gate's stats are
                                 // blocking filesystem traversals; run them off
                                 // the async worker so a stalled mount can't
@@ -1199,7 +1217,7 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
                                     upload_root,
                                     network,
                                     decision,
-                                    contribution,
+                                    inputs,
                                 )
                                 .await
                             }

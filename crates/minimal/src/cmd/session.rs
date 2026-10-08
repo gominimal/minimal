@@ -557,18 +557,16 @@ pub(crate) async fn activate_session(
     // Resolve and compose the loadouts BEFORE opening the daemon
     // connection: a missing loadout file or a malformed one should
     // fail loudly on the client side without ever touching the
-    // daemon.
-    let cfg = config::read_client_config(global)?;
+    // daemon. The same sequence stages the loadout hook scripts and sizes
+    // the finalize hook budget, so `min session activate`, `min task run`,
+    // and the dashboard share it.
     let policy_path = config::user_policy_path(global);
-    let user_policy = config::read_user_policy(global)?;
-    let initial_policy = user_policy.clone();
-    let compose_options = loadouts::compose_options_from_config(&cfg);
     let selection = loadouts::LoadoutSelection::from_flags(&args.loadout, args.no_loadouts);
-    let active = loadouts::resolve_active_loadouts(selection, &cfg, global)?;
+    let inputs = loadouts::prepare_activation_inputs(global, &abs_path, selection, !args.no_hooks)?;
 
-    // Scaffold-offer a missing `minimal.toml` only after loadouts resolve:
-    // a bad `--loadout` must error before anything prints, so the user is
-    // never told the session is proceeding and then that it is not.
+    // Scaffold-offer a missing `minimal.toml` only after the loadouts resolve
+    // and compose: a bad `--loadout` must error before anything prints, so the
+    // user is never told the session is proceeding and then that it is not.
     // `--sync none` never sends a `minimal.toml`, so offering to create
     // one there would only write a file the session then ignores.
     if offer_scaffold && !matches!(args.sync, Some(SyncMode::None)) {
@@ -582,37 +580,21 @@ pub(crate) async fn activate_session(
         )?;
     }
 
-    if !active.loadouts.is_empty() {
-        let names: Vec<&str> = active.loadouts.iter().map(|l| l.name().as_ref()).collect();
-        eprintln!("Applying loadouts: {}", names.join(", "));
-    }
+    inputs.announce_loadouts();
+
     // The contribution carries the banner's loadout display list as a
     // first-class orientation field (the daemon seeds MINIMAL_LOADOUTS
     // from it in the launcher baseline). The banner's other dynamic
     // clause — blueprint presence — is a session-filesystem fact,
     // tested by the templates in-shell when they print.
-    // Resolve the loadouts' external hook scripts before anything
-    // touches the daemon: a mistyped path, a symlinked script, or a
-    // missing loadout script directory should fail here, on this
-    // machine, rather than after a session exists on the daemon.
-    let hook_scripts = loadouts::stage_loadout_hook_scripts(&active, &abs_path, !args.no_hooks)?;
-
-    // Same idea for the *project's* hooks, which the daemon composes from
-    // the uploaded mfile and which therefore never pass through the
-    // staging above. Nothing here is uploaded — the project tree carries
-    // its own scripts — but the checks a staging pass would have made are
-    // still worth making on this machine, before a session exists.
-    if !args.no_hooks {
-        loadouts::check_project_hooks(&abs_path)?;
-    }
-
+    let hook_scripts = inputs.hook_scripts;
     // The daemon runs the composition's `on_activate` hooks inside
-    // `FinalizeSession`; size that call's deadline to their summed declared
-    // timeouts, computed here while the loadouts are still in hand.
-    let finalize_hook_budget = loadouts::activate_hook_budget(&active, &utf8_path, !args.no_hooks);
-
-    let (contribution, user_policy) =
-        loadouts::compose_user_contribution(active, user_policy, compose_options, !args.no_hooks)?;
+    // `FinalizeSession`; this deadline is their summed declared timeouts.
+    let finalize_hook_budget = inputs.hook_budget;
+    let contribution = inputs.contribution;
+    let user_policy = inputs.user_policy;
+    let initial_policy = inputs.initial_policy;
+    let compose_options = inputs.compose_options;
 
     // `--sync` defaults to tarball; `sync_explicit` records whether the
     // user actually typed the flag, which distinguishes a deliberate
