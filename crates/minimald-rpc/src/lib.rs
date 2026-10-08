@@ -669,6 +669,17 @@ pub struct WithdrawBoxRequest {
     pub loopback_address: std::net::Ipv4Addr,
 }
 
+/// A name to hold in the host's zone without a row behind it
+/// ([`BoxControlRequest::HoldBoxName`]): the interim a `host_ip` box's
+/// name answers NODATA — the box exists, no address to tell — instead
+/// of NXDOMAIN. Answered with [`BoxControlReply::NameHeld`]; idempotent.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HoldBoxNameRequest {
+    /// The box's name, as the session's create names it: the label the
+    /// zone holds under the apex, normalized there.
+    pub name: String,
+}
+
 /// What side of the in-VM daemon reported a runtime-admitted port (NET-045,
 /// NET-138): the fixed fact the host's log line and audit copy name, so a
 /// tail can tell an expose decision from an answered ask from a listen
@@ -1094,6 +1105,16 @@ pub enum BoxControlRequest {
     /// — the read-only verb: no row is touched, no state changes, the reply
     /// is the status the answerer's acquisition last left.
     AnswererStatus,
+    /// Hold a `host_ip` box's name in the host's zone with no row behind
+    /// it ([`HoldBoxNameRequest`]): the interim that answers NODATA until
+    /// the node's bind mirror lands. Served on the host's control socket
+    /// only, answered with [`BoxControlReply::NameHeld`].
+    HoldBoxName(HoldBoxNameRequest),
+    /// Release a name [`BoxControlRequest::HoldBoxName`] holds: the box's
+    /// session is gone, so the name answers nothing again. Answered with
+    /// [`BoxControlReply::NameHeld`]; a name no hold kept is the goal
+    /// state already holding.
+    ReleaseBoxName(HoldBoxNameRequest),
     /// The in-VM daemon's report that one of its boxes published a port at
     /// runtime (NET-138), carried on the daemon's own control channel: the
     /// host records it in the row only within the grant the host-side
@@ -1274,7 +1295,8 @@ pub enum ProxyDownCause {
 /// offered ask cannot decode as a recorded port. The older newer shapes
 /// stay disjoint the same way — [`Row`](Self::Row) its
 /// `egress_allow_list`, [`NoRow`](Self::NoRow) its `no_row`,
-/// [`PortRecorded`](Self::PortRecorded) its `proto` — so no document of
+/// [`PortRecorded`](Self::PortRecorded) its `proto`,
+/// [`NameHeld`](Self::NameHeld) its `held` — so no document of
 /// one can decode as another's, and the order among them is free.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
@@ -1357,6 +1379,15 @@ pub enum BoxControlReply {
     /// The verb succeeded: a withdrawal's echo of the pair the row went by,
     /// and a registration's answer on a daemon that predates box ids.
     Addresses(BoxAddresses),
+    /// A hold or a release was answered: the name back, `held` saying
+    /// which — `true` a hold the table now keeps, `false` a release that
+    /// freed one (or found none).
+    NameHeld {
+        /// The name the hold or the release was about.
+        name: String,
+        /// The marker: whether the table holds the name now.
+        held: bool,
+    },
     /// The verb failed: `error` is a sentence naming why, for the client to
     /// warn with.
     Error { error: String },

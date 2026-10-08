@@ -1835,6 +1835,13 @@ pub struct BoxRegistry {
     /// namespaces whose declarations stay published while they are not
     /// running, keyed by the row's own key and shared by every clone.
     stopped: Arc<RwLock<BTreeSet<[u8; 4]>>>,
+    /// The box names this daemon holds in the zone with no row behind them
+    /// (the `host_ip` interim): a name held here answers NODATA under the
+    /// zone apex where an unheld name answers NXDOMAIN. Keyed by the
+    /// name's [`canonical_box_name`] form and shared by every clone; the
+    /// [`Self::zone_view`] fold keeps a row's entry for a name a row
+    /// publishes, so a hold never shadows a row.
+    held_names: Arc<RwLock<BTreeSet<String>>>,
     /// The table's change pings: one `()` to every live subscriber whenever
     /// a row lands, goes, or is marked stopped. The host answerer
     /// ([`crate::net::answerer`]) subscribes — a daemon that does not hold
@@ -1922,6 +1929,7 @@ impl Clone for BoxRegistry {
             subnet: self.subnet,
             rows: self.rows.clone(),
             stopped: Arc::clone(&self.stopped),
+            held_names: Arc::clone(&self.held_names),
             table_pings: Arc::clone(&self.table_pings),
             withdrawal_reports: self.withdrawal_reports.clone(),
             withdrawal_reports_rx: Mutex::new(None),
@@ -1954,6 +1962,7 @@ impl BoxRegistry {
             subnet,
             rows: Arc::new(RwLock::new(BTreeMap::new())),
             stopped: Arc::new(RwLock::new(BTreeSet::new())),
+            held_names: Arc::new(RwLock::new(BTreeSet::new())),
             table_pings: Arc::new(Mutex::new(Vec::new())),
             withdrawal_reports: reports,
             withdrawal_reports_rx: Mutex::new(Some(reports_rx)),
@@ -2934,6 +2943,48 @@ impl BoxRegistry {
         held
     }
 
+    /// Holds box `name`'s name in the zone with no row behind it (the
+    /// `host_ip` interim): from here a lookup of `<name>.min.internal`
+    /// answers NODATA where an unheld name answers NXDOMAIN. Idempotent;
+    /// a name a live row publishes is the row's — the fold in
+    /// [`Self::zone_view`] keeps the row's entry, so the two coexist.
+    /// Returns whether the table did not hold the name already.
+    pub fn hold_box_name(&self, name: &str) -> bool {
+        let inserted = self
+            .held_names
+            .write()
+            .expect("the held names' lock is never held across a panic, so it cannot be poisoned")
+            .insert(canonical_box_name(name));
+        if inserted {
+            tracing::info!(
+                box = %name,
+                "held a box name in the zone with no row behind it; it answers NODATA"
+            );
+            self.ping();
+        }
+        inserted
+    }
+
+    /// Releases a name [`Self::hold_box_name`] holds: the name answers
+    /// nothing again — NXDOMAIN, the pre-box state. A name no hold kept
+    /// is the goal state already holding. Returns whether a hold was
+    /// actually released.
+    pub fn release_held_name(&self, name: &str) -> bool {
+        let removed = self
+            .held_names
+            .write()
+            .expect("the held names' lock is never held across a panic, so it cannot be poisoned")
+            .remove(&canonical_box_name(name));
+        if removed {
+            tracing::info!(
+                box = %name,
+                "released a held box name; it answers nothing again"
+            );
+            self.ping();
+        }
+        removed
+    }
+
     /// Subscribes to the table's change pings: one `()` per registration,
     /// withdrawal, and stopped mark, for as long as the returned receiver
     /// lives. The host answerer subscribes — a daemon that does not hold
@@ -2984,6 +3035,11 @@ impl BoxRegistry {
     /// namespace it names is not running. The view is a snapshot, built
     /// fresh by whoever asks — a lookup, a dump, a registration — so it
     /// can never hold a row the table has already let go.
+    ///
+    /// The names held with no row behind them ([`Self::hold_box_name`],
+    /// the `host_ip` interim) fold in after the rows as address-less
+    /// entries: a name a row publishes is the row's, and a name only
+    /// held answers NODATA.
     #[must_use]
     pub fn zone_view(&self) -> zone_answer::ZoneView {
         // The rows lock first, the stopped set inside it — the order every
@@ -3007,6 +3063,27 @@ impl BoxRegistry {
                     live: !stopped.contains(&record.switch_addr.octets()),
                 },
             );
+        }
+        drop(stopped);
+        drop(rows);
+        // Held names fold in after the rows: a name a row publishes keeps
+        // the row's entry — replacing it would drop the address a live box
+        // answers with — and a name only held answers NODATA.
+        let held_names = self
+            .held_names
+            .read()
+            .expect("the held names' lock is never held across a panic, so it cannot be poisoned");
+        for name in held_names.iter() {
+            let zone_name = zone_name(name);
+            if view.rows().find(|(held, _)| *held == zone_name).is_none() {
+                view.hold(
+                    zone_name,
+                    zone_answer::ZoneRow {
+                        address: None,
+                        live: true,
+                    },
+                );
+            }
         }
         view
     }
@@ -4408,6 +4485,75 @@ mod tests {
             sessions::core::zone_answer::decide(&a, &registry.zone_view()),
             sessions::core::zone_answer::Verdict::Nxdomain,
             "a withdrawn namespace's name is held by nothing"
+        );
+    }
+
+    /// The `host_ip` interim: a box that shares the node's own row
+    /// publishes no row of its own, so its name is held with no row
+    /// behind it — NODATA, never NXDOMAIN for a box that exists — and the
+    /// release ends the interim with the session that bought it.
+    #[test]
+    fn the_zone_view_holds_a_host_ip_box_name_with_no_row_behind_it() {
+        let registry = BoxRegistry::new(SUBNET);
+        let a = sessions::core::zone_answer::Lookup {
+            name: "web.min.internal".to_string(),
+            record: sessions::core::zone_answer::RecordType::A,
+            origin: sessions::core::zone_answer::Origin::OnMachine,
+        };
+        assert_eq!(
+            sessions::core::zone_answer::decide(&a, &registry.zone_view()),
+            sessions::core::zone_answer::Verdict::Nxdomain,
+            "a name nothing holds is NXDOMAIN, the pre-box state"
+        );
+
+        // The hold: NODATA, idempotent whatever the case it was asked in.
+        assert!(registry.hold_box_name("web"));
+        assert!(!registry.hold_box_name("WEB"));
+        let view = registry.zone_view();
+        assert_eq!(
+            view.rows()
+                .find(|(name, _)| *name == "web.min.internal")
+                .map(|(_, row)| *row),
+            Some(zone_answer::ZoneRow {
+                address: None,
+                live: true,
+            }),
+            "a held name is held with no address and live"
+        );
+        assert_eq!(
+            sessions::core::zone_answer::decide(&a, &view),
+            sessions::core::zone_answer::Verdict::Nodata,
+            "a held name answers NODATA: the box exists, no address to tell"
+        );
+
+        // The release: back to the pre-box state; a repeat is the goal
+        // state already holding.
+        assert!(registry.release_held_name("web"));
+        assert!(!registry.release_held_name("web"));
+        assert_eq!(
+            sessions::core::zone_answer::decide(&a, &registry.zone_view()),
+            sessions::core::zone_answer::Verdict::Nxdomain,
+            "a released name answers nothing again"
+        );
+
+        // A row's name is the row's: the hold does not shadow the address
+        // the row answers with, and releasing it leaves the row standing.
+        let web = registry.register(BoxRegistration::new(
+            "web",
+            Ipv4Addr::new(100, 64, 0, 9),
+            Ipv4Addr::new(127, 0, 64, 9),
+        ));
+        assert!(registry.hold_box_name("web"));
+        assert_eq!(
+            sessions::core::zone_answer::decide(&a, &registry.zone_view()),
+            sessions::core::zone_answer::Verdict::Address(web.loopback_addr()),
+            "a name a row publishes answers the row's address, hold or no hold"
+        );
+        assert!(registry.release_held_name("web"));
+        assert_eq!(
+            sessions::core::zone_answer::decide(&a, &registry.zone_view()),
+            sessions::core::zone_answer::Verdict::Address(web.loopback_addr()),
+            "the row keeps answering its address once the hold is gone"
         );
     }
 

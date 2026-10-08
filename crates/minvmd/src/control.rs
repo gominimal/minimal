@@ -907,6 +907,17 @@ fn serve_request(
             let reply = order.apply(|| withdraw_box(boxes, answerer, request));
             write_reply(stream, &reply)
         }
+        // The hold and its release take a ticket like the verbs they
+        // bracket: each changes the table the answerer answers from, so
+        // each publishes in its own turn, never mid-fold.
+        (BoxControlRequest::HoldBoxName(request), ControlDoor::Host) => {
+            let reply = order.apply(|| hold_box_name(boxes, &request.name));
+            write_reply(stream, &reply)
+        }
+        (BoxControlRequest::ReleaseBoxName(request), ControlDoor::Host) => {
+            let reply = order.apply(|| release_box_name(boxes, &request.name));
+            write_reply(stream, &reply)
+        }
         (BoxControlRequest::AnswererStatus, ControlDoor::Host) => {
             // The read-only status answers the host facts the CLI's
             // surfaces read (T93): why the hostname proxy is not serving
@@ -1014,6 +1025,8 @@ fn request_verb(request: &BoxControlRequest) -> &'static str {
     match request {
         BoxControlRequest::Register(_) => "register",
         BoxControlRequest::Withdraw(_) => "withdraw",
+        BoxControlRequest::HoldBoxName(_) => "hold_box_name",
+        BoxControlRequest::ReleaseBoxName(_) => "release_box_name",
         BoxControlRequest::AnswererStatus => "answerer_status",
         BoxControlRequest::AdmitPort(_) => "admit_port",
         BoxControlRequest::WithdrawPort(_) => "withdraw_port",
@@ -1299,6 +1312,29 @@ fn withdraw_box(
                 error: error.to_string(),
             }
         }
+    }
+}
+
+/// Hold a `host_ip` box's name in the host's zone with no row behind it:
+/// the interim that answers the name NODATA until the node's bind mirror
+/// lands. `held` true either way — a name the table already holds is the
+/// goal state, not a refusal.
+fn hold_box_name(boxes: &BoxRegistry, name: &str) -> BoxControlReply {
+    boxes.hold_box_name(name);
+    BoxControlReply::NameHeld {
+        name: name.to_string(),
+        held: true,
+    }
+}
+
+/// Release a name a hold kept: the name answers nothing again. `held`
+/// false either way — a name no hold kept is the goal state already
+/// holding.
+fn release_box_name(boxes: &BoxRegistry, name: &str) -> BoxControlReply {
+    boxes.release_held_name(name);
+    BoxControlReply::NameHeld {
+        name: name.to_string(),
+        held: false,
     }
 }
 
@@ -2516,6 +2552,12 @@ mod tests {
             BoxControlReply::AnswererRelease { detail, .. } => {
                 panic!("a box verb is never answered with a release reply, got {detail}")
             }
+            BoxControlReply::NameHeld { name, held } => {
+                panic!(
+                    "a registration is answered with the registered box, got a name-hold \
+                     reply for {name:?} (held: {held})"
+                )
+            }
         }
     }
 
@@ -2850,6 +2892,12 @@ mod tests {
             BoxControlReply::AnswererRelease { detail, .. } => {
                 panic!("a box verb is never answered with a release reply, got {detail}")
             }
+            BoxControlReply::NameHeld { name, held } => {
+                panic!(
+                    "a withdrawal echoes the pair it went by, got a name-hold reply for \
+                     {name:?} (held: {held})"
+                )
+            }
         }
         assert!(
             registry
@@ -2947,6 +2995,12 @@ mod tests {
                 BoxControlReply::AnswererRelease { detail, .. } => {
                     panic!("a box verb is never answered with a release reply, got {detail}")
                 }
+                BoxControlReply::NameHeld { name, held } => {
+                    panic!(
+                        "a foreign pair's withdrawal must be refused, got a name-hold reply \
+                         for {name:?} (held: {held})"
+                    )
+                }
             }
         }
         assert!(
@@ -3004,6 +3058,12 @@ mod tests {
             }
             BoxControlReply::AnswererRelease { detail, .. } => {
                 panic!("a box verb is never answered with a release reply, got {detail}")
+            }
+            BoxControlReply::NameHeld { name, held } => {
+                panic!(
+                    "a repeat withdrawal echoes the pair, got a name-hold reply for {name:?} \
+                     (held: {held})"
+                )
             }
         }
 
