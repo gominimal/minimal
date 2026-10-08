@@ -1285,4 +1285,46 @@ mod tests {
                 .unwrap()
         );
     }
+
+    /// A global `url.<base>.insteadOf` rewrite used to break the cache
+    /// validation in `Repo::new`: `git remote get-url` applies rewrites, the
+    /// clone stores the un-rewritten `remote.origin.url`, so the second open
+    /// of the same cache dir failed with `Error::InvalidPath`.
+    #[test]
+    fn accepts_a_cached_clone_whose_origin_is_rewritten_by_insteadof() {
+        let (src, _) = make_local_repo("main");
+        let src = src.path().to_string_lossy().into_owned();
+
+        // Rewrite the plain path to a `file://` URL, as a user's global
+        // config might. Scoped to this tempdir's unique path so parallel
+        // tests that spawn git are unaffected.
+        let config = tempfile::tempdir().unwrap();
+        let config_path = config.path().join("gitconfig");
+        std::fs::write(
+            &config_path,
+            format!("[url \"file://{src}\"]\n\tinsteadOf = {src}\n"),
+        )
+        .unwrap();
+
+        let previous = std::env::var("GIT_CONFIG_GLOBAL").ok();
+        unsafe {
+            std::env::set_var("GIT_CONFIG_GLOBAL", &config_path);
+        }
+
+        let cache = tempfile::tempdir().unwrap();
+        let result = (|| {
+            let mut repo = Repo::new(&src, cache.path())?;
+            repo.fetch()?;
+            // Second open revalidates the cached clone instead of cloning.
+            Repo::new(&src, cache.path())?;
+            Ok::<_, crate::Error>(())
+        })();
+
+        match previous {
+            Some(previous) => unsafe { std::env::set_var("GIT_CONFIG_GLOBAL", previous) },
+            None => unsafe { std::env::remove_var("GIT_CONFIG_GLOBAL") },
+        }
+
+        result.expect("both opens of the rewritten cache dir succeed");
+    }
 }
