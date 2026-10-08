@@ -19,6 +19,7 @@ wakes on it in a tight loop until the reaper drops the proxy.
 Disarm the fd in the full-shutdown branch, as the other paths that close
 a proxy already do.
 
+Upstream: https://github.com/libkrun/libkrun/pull/916
 Signed-off-by: Karl Godard <karl@minimal.dev>
 Assisted-by: Claude Code: claude-opus-5-5
 ---
