@@ -113,6 +113,39 @@ pub struct TaskExec {
     /// daemon's own environment — the very indirection #585 removes. A
     /// dropped name has to be named.
     pub drop_env: BTreeSet<String>,
+    /// The client's invocation directory relative to the uploaded tree,
+    /// already refused by [`minimald_rpc::exec::ExecRequest::parse`] if it
+    /// is absolute or holds a `..`. A task that declares `inherit_cwd`
+    /// starts there (see [`task_start_dir`]); empty means the root.
+    pub cwd: String,
+}
+
+/// Where a task starts inside its session-layout sandbox, when not at the
+/// default `/workbench`.
+///
+/// `Ok(Some(dir))` is `/workbench/<cwd>` for a task that declares
+/// `inherit_cwd` when `<cwd>` is a directory of the uploaded tree at
+/// `working`. `Ok(None)` keeps the default: the task does not inherit, or
+/// the client ran from the root. `Err(notice)` also keeps the default, with
+/// the one-line notice to show on the task's stderr: the directory is not in
+/// the uploaded tree (an upload that was skipped, or a path the upload
+/// excluded).
+fn task_start_dir(
+    inherit_cwd: bool,
+    cwd: &str,
+    working: &std::path::Path,
+) -> Result<Option<String>, String> {
+    if !inherit_cwd || cwd.is_empty() {
+        return Ok(None);
+    }
+    if working.join(cwd).is_dir() {
+        Ok(Some(format!("/{}/{cwd}", sandbox2::SESSION_DEFAULT_WD)))
+    } else {
+        Err(format!(
+            "minimal: {cwd} is not in the uploaded tree; running the task at /{}\n",
+            sandbox2::SESSION_DEFAULT_WD
+        ))
+    }
 }
 
 impl Exec for TaskExec {
@@ -165,7 +198,9 @@ impl Exec for TaskExec {
 /// rollout ends at stays proven while the default is only announced
 /// (NET-076) — and `deny_all_opt_out` is the daemon's opt-out (NET-077),
 /// read through the session handle so a task resolves its egress exactly as
-/// the launcher did.
+/// the launcher did. It carries no classifier decision either (NET-079):
+/// a task places no leaf in the cohort's subtrees, so no per-box verdict
+/// is its plan's to follow.
 ///
 /// A gate is attached only where that egress has rules to enforce: the
 /// deny-all section the in-force default resolves an absent declaration to,
@@ -209,6 +244,11 @@ pub(crate) fn task_network(
         // the reserve, so the two allocators cannot meet; the daemon-side
         // refusals (`IpAllocator::hand`) stay the guard against a pair that
         // disagrees about the split.
+        None,
+        // Deliberately no classifier decision (NET-079): a task places no
+        // leaf in the cohort's subtrees, so there is no per-box verdict for
+        // a task's plan to follow — the session's own launch carries the
+        // decision its reader read, and this one has none to carry.
         None,
     )
 }
@@ -361,6 +401,16 @@ async fn task_producer(
         // `/workbench`), and a patch that expanded into either directory is
         // mounted at the matching path there, keeping its declared mode.
         let session_paths = session.paths().await?;
+        // `inherit_cwd`: start where the client was invoked, inside the
+        // uploaded tree, or fall back to the root with a notice.
+        let (start_dir, mut start_notice) = match task_start_dir(
+            task.inherit_cwd,
+            &exec.cwd,
+            session_paths.working.as_utf8_path().as_std_path(),
+        ) {
+            Ok(dir) => (dir, None),
+            Err(notice) => (None, Some(notice)),
+        };
         let mut env = ctx
             .make_env_with_network(
                 &exec.task,
@@ -402,6 +452,9 @@ async fn task_producer(
                 let mut cmd = env
                     .command(&container, &inv.executable, inv.args.iter())
                     .map_err(|e| io::Error::other(format!("building command failed: {}", e)))?;
+                if let Some(dir) = &start_dir {
+                    cmd.current_dir(dir);
+                }
                 cmd.stdin(hakoniwa::Stdio::piped())
                     .stdout(hakoniwa::Stdio::piped())
                     .stderr(hakoniwa::Stdio::piped());
@@ -410,7 +463,10 @@ async fn task_producer(
                     .map_err(|e| io::Error::other(format!("command launch failed: {}", e)))?;
                 let spawned = sandbox2::Spawned::from_child(&mut child);
                 let guard = attach_or_reap(planned, spawned, &mut child).await?;
-                Ok(TaskProcess::Sandbox(HakoniwaProcess::new(child, guard)))
+                let mut process = HakoniwaProcess::new(child, guard);
+                // The fallback notice leads the first invocation's stderr.
+                process.stderr_notice = start_notice.take();
+                Ok(TaskProcess::Sandbox(process))
             }
             .await;
             if let Err(send_err) = proc_tx.send(result).await {
@@ -464,6 +520,9 @@ pub struct HakoniwaProcess {
     /// The network wiring this task's namespace got, released at the end of
     /// [`wait`](Process::wait).
     net: NetRelease,
+    /// A line the daemon shows ahead of the child's own stderr, such as the
+    /// `inherit_cwd` fallback notice (see [`task_start_dir`]).
+    stderr_notice: Option<String>,
 }
 
 /// The release of a task's network, owed once its process is gone.
@@ -538,6 +597,7 @@ impl HakoniwaProcess {
             pid: child.id() as libc::pid_t,
             state: WaitState::Spawned(Box::new(child)),
             net: NetRelease::new(net_guard),
+            stderr_notice: None,
         }
     }
 }
@@ -628,6 +688,8 @@ impl Process for TaskProcess {
         match self {
             TaskProcess::Sandbox(p) => {
                 let (i, o, e) = p.take_stdio()?;
+                let notice = p.stderr_notice.take().unwrap_or_default();
+                let e = std::io::Cursor::new(notice.into_bytes()).chain(e);
                 Some((Box::pin(i), Box::pin(o), Box::pin(e)))
             }
             TaskProcess::Echo(p) => p.take_stdio(),
@@ -724,7 +786,7 @@ impl Exec for TokioExec {
             for name in &self.drop_env {
                 cmd.env_remove(name);
             }
-            cmd.spawn().map(TokioProcess)
+            cmd.spawn().map(TokioProcess::new)
         })
         .boxed()
     }
@@ -822,7 +884,7 @@ impl Exec for SessionExec {
             // This spawns the shim — us, re-exec'd — not the user's command, so
             // a bare ENOENT reads as a missing shell. Name the path (#1175).
             let shim = command.as_std().get_program().to_owned();
-            command.spawn().map(TokioProcess).map_err(|e| {
+            command.spawn().map(TokioProcess::shim).map_err(|e| {
                 io::Error::new(
                     e.kind(),
                     format!(
@@ -838,7 +900,37 @@ impl Exec for SessionExec {
 
 /// `Process` implementation backed by [`tokio::process::Child`].
 #[derive(Debug)]
-pub struct TokioProcess(Child);
+pub struct TokioProcess {
+    child: Child,
+    /// Whether [`Process::start_kill`] sends SIGTERM, with a SIGKILL
+    /// escalation in [`Process::wait`], rather than an immediate SIGKILL.
+    /// Only the injection shim handles SIGTERM by killing its whole process
+    /// group; any other child gets the immediate SIGKILL.
+    graceful: bool,
+    /// Whether a graceful [`Process::start_kill`] has asked the child to
+    /// exit, which arms the escalation in [`Process::wait`].
+    terminating: bool,
+}
+
+impl TokioProcess {
+    /// A child that [`Process::start_kill`] SIGKILLs at once.
+    fn new(child: Child) -> Self {
+        Self {
+            child,
+            graceful: false,
+            terminating: false,
+        }
+    }
+
+    /// The injection shim, which [`Process::start_kill`] SIGTERMs so its
+    /// handler can kill the injected process's whole group.
+    fn shim(child: Child) -> Self {
+        Self {
+            graceful: true,
+            ..Self::new(child)
+        }
+    }
+}
 
 impl Process for TokioProcess {
     type Stdin = ChildStdin;
@@ -847,18 +939,53 @@ impl Process for TokioProcess {
 
     fn take_stdio(&mut self) -> Option<(Self::Stdin, Self::Stdout, Self::Stderr)> {
         Some((
-            self.0.stdin.take()?,
-            self.0.stdout.take()?,
-            self.0.stderr.take()?,
+            self.child.stdin.take()?,
+            self.child.stdout.take()?,
+            self.child.stderr.take()?,
         ))
     }
 
     async fn wait(&mut self) -> io::Result<Option<i32>> {
-        self.0.wait().await.map(|s| s.code())
+        // Never asked to die: a plain wait, as before.
+        if !self.terminating {
+            return self.child.wait().await.map(|s| s.code());
+        }
+        // Longer than the shim's own grace period for the group, so the shim
+        // always delivers the group's SIGKILL itself; this one is the fallback
+        // for a wedged shim (see `nsenter::GROUP_GRACE`).
+        match tokio::time::timeout(crate::nsenter::SHIM_ESCALATION, self.child.wait()).await {
+            Ok(status) => status.map(|s| s.code()),
+            // The shim did not exit: escalate to SIGKILL and wait it out.
+            Err(_elapsed) => {
+                self.child.start_kill()?;
+                self.child.wait().await.map(|s| s.code())
+            }
+        }
     }
 
     fn start_kill(&mut self) -> io::Result<()> {
-        self.0.start_kill()
+        if !self.graceful {
+            return self.child.start_kill();
+        }
+        // The shim is the direct child; SIGTERM reaches it and, through the
+        // handler it installs, its whole process group, which the shim SIGKILLs
+        // after its grace period. If the shim itself does not exit within
+        // `SHIM_ESCALATION`, `wait` escalates to SIGKILL (above).
+        // `id()` is `None` once the child has been reaped; nothing to signal.
+        if let Some(pid) = self.child.id() {
+            // SAFETY: `pid` is the live shim pid `Child` holds; `kill(2)` is
+            // async-signal-safe and has no Rust-side invariants.
+            if unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) } == -1 {
+                let err = io::Error::last_os_error();
+                // ESRCH means it already exited between `id()` and `kill`; that
+                // is success, not an error the caller must handle.
+                if err.raw_os_error() != Some(libc::ESRCH) {
+                    return Err(err);
+                }
+            }
+        }
+        self.terminating = true;
+        Ok(())
     }
 }
 
@@ -908,13 +1035,15 @@ impl<S: Exec> ExecTask<S> {
         let pump = spawn(pump_channel_input(msgs, stdin_tx, client_lost_tx));
 
         let stream = self.exec.exec(self.session.clone());
-        let exit_status = bridge(
+        let mngr = self.serv.sessions_manager().await;
+        let exit_status = bridge_noting_shutdown(
             self.channel_id,
             stream,
             &mut stdin_rx,
             &mut w,
             &mut e,
             client_lost_rx,
+            || mngr.is_shutting_down(),
         )
         .await;
 
@@ -928,6 +1057,40 @@ impl<S: Exec> ExecTask<S> {
         let _ = ws.close().await; // needed to release the remote
         exit_status
     }
+}
+
+/// The line an exec the daemon's shutdown ended leaves on stderr, so the
+/// client is told why its command stopped rather than handed a bare 137.
+const SHUTDOWN_NOTICE: &[u8] = b"minimald is shutting down; the command was stopped\n";
+
+/// Runs [`bridge`] and, when the daemon's shutdown is what ended it, writes
+/// [`SHUTDOWN_NOTICE`] to `e` before returning the exit status.
+///
+/// `shutting_down` is asked once the bridge returns. It reads the sessions
+/// manager's shutdown state, which is set before the manager stops any box,
+/// rather than the server's shutdown token, which is cancelled only after the
+/// manager is done and so after the command is already gone.
+async fn bridge_noting_shutdown<S, P, R, W, E>(
+    channel_id: impl Display + Clone,
+    stream: S,
+    r: &mut R,
+    w: &mut W,
+    e: &mut E,
+    client_lost: watch::Receiver<bool>,
+    shutting_down: impl FnOnce() -> bool,
+) -> u32
+where
+    P: Process,
+    S: Stream<Item = io::Result<P>> + Unpin,
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+    E: AsyncWrite + Unpin,
+{
+    let exit_status = bridge(channel_id, stream, r, w, e, client_lost).await;
+    if shutting_down() {
+        let _ = e.write_all(SHUTDOWN_NOTICE).await;
+    }
+    exit_status
 }
 
 /// Forwards the SSH channel's read half into the exec's stdin pipe and
@@ -1072,7 +1235,10 @@ where
 ///
 /// The trade is that a grandchild's output after we return is silently
 /// discarded; `nohup cmd >/dev/null 2>&1 &` is the way to detach
-/// cleanly (documented in `docs/reference/cli-min.md`).
+/// cleanly (documented in `docs/reference/cli-min.md`). A `nohup`'d job
+/// stays in the exec's process group, which a client lost mid-exec ends
+/// (see `nsenter::GROUP_GRACE`), so a job that must survive the client
+/// going away is started with `setsid`: `setsid nohup cmd >/dev/null 2>&1 &`.
 ///
 /// Polling the I/O sources in a single `select!` lets a slow consumer
 /// on one side apply backpressure without starving the others, which is
@@ -1279,6 +1445,7 @@ where
     // on a full pipe and never be reapable. Kill, then fall through to
     // the `wait` below.
     if ssh_write_failed {
+        // A `--detach` exec, if one is ever added, must not reach this client-loss kill.
         let _ = process.start_kill();
     }
 
@@ -1341,6 +1508,8 @@ where
                             %channel_id,
                             "exec: ssh client disconnected; killing child",
                         );
+                        // A `--detach` exec, if one is ever added, must not reach this
+                        // client-loss kill.
                         let _ = process.start_kill();
                     }
                     process.wait().await
@@ -1626,6 +1795,7 @@ pub(crate) async fn handle_exec(
             task,
             owns_box,
             args,
+            cwd,
         } => {
             let task = task.trim().to_string();
             if task.is_empty() {
@@ -1655,6 +1825,7 @@ pub(crate) async fn handle_exec(
                         task: task.clone(),
                         env: task_env,
                         drop_env,
+                        cwd,
                     },
                 };
                 let exit_status = exec_task.run(channel).await;
@@ -1803,7 +1974,7 @@ async fn end_run_box(
         .flatten()
         .and_then(|record| record.name);
     match mngr.delete_session(session_id).await {
-        Ok(()) => tracing::info!(
+        Ok(_) => tracing::info!(
             session_id = %session_id,
             session_name = session_name.as_deref().unwrap_or("<anonymous>"),
             task = %task,
@@ -2383,13 +2554,109 @@ pub(crate) mod testing {
 mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
 
-    use super::bridge;
     use super::testing::{MockEndpoints, build_mock, build_mock_seq};
+    use super::{bridge, bridge_noting_shutdown};
 
     /// A never-firing client-loss signal for tests that exercise the
     /// bridge without modelling a disconnect.
     fn client_lost() -> tokio::sync::watch::Receiver<bool> {
         tokio::sync::watch::channel(false).1
+    }
+
+    /// `start_kill` asks the shim to exit with SIGTERM, not SIGKILL: SIGTERM
+    /// is what runs the shim's handler, which kills the injected process's
+    /// whole group. A SIGKILL here would leave the grandchildren running.
+    #[tokio::test]
+    async fn start_kill_sends_sigterm() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        use super::{Process as _, TokioProcess};
+
+        let child = tokio::process::Command::new("sleep")
+            .arg("600")
+            .spawn()
+            .expect("spawning sleep");
+        let mut process = TokioProcess::shim(child);
+        process.start_kill().expect("signalling the child");
+        let status = tokio::time::timeout(std::time::Duration::from_secs(10), process.child.wait())
+            .await
+            .expect("the child exits on SIGTERM")
+            .expect("reaping the child");
+        assert_eq!(status.signal(), Some(libc::SIGTERM), "{status:?}");
+    }
+
+    /// Any child other than the shim (the git service path's `/bin/sh -c`)
+    /// has no group-kill handler, so `start_kill` SIGKILLs it at once.
+    #[tokio::test]
+    async fn start_kill_sigkills_a_plain_child() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        use super::{Process as _, TokioProcess};
+
+        let child = tokio::process::Command::new("sleep")
+            .arg("600")
+            .spawn()
+            .expect("spawning sleep");
+        let mut process = TokioProcess::new(child);
+        process.start_kill().expect("signalling the child");
+        let status = tokio::time::timeout(std::time::Duration::from_secs(10), process.child.wait())
+            .await
+            .expect("the child exits on SIGKILL")
+            .expect("reaping the child");
+        assert_eq!(status.signal(), Some(libc::SIGKILL), "{status:?}");
+    }
+
+    /// A child that ignores SIGTERM is not waited on forever: after the grace
+    /// period, `wait` escalates to SIGKILL.
+    #[tokio::test]
+    async fn wait_escalates_to_sigkill_when_sigterm_is_ignored() {
+        use super::{Process as _, TokioProcess};
+
+        // The ignored disposition survives the `exec`, so `sleep` itself
+        // ignores SIGTERM. The marker line says the trap is installed.
+        let child = tokio::process::Command::new("/bin/sh")
+            .args(["-c", "trap '' TERM; echo ready; exec sleep 600"])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawning sh");
+        let mut process = TokioProcess::shim(child);
+        let mut stdout = process.child.stdout.take().expect("piped stdout");
+        let mut ready = [0u8; 6];
+        stdout
+            .read_exact(&mut ready)
+            .await
+            .expect("reading the ready marker");
+
+        process.start_kill().expect("signalling the child");
+        let code = tokio::time::timeout(std::time::Duration::from_secs(10), process.wait())
+            .await
+            .expect("the escalation to SIGKILL ends the wait")
+            .expect("reaping the child");
+        assert_eq!(code, None, "a signalled child has no exit code");
+    }
+
+    /// `inherit_cwd` on the daemon side: a task that declares it starts at
+    /// `/workbench/<cwd>` when that directory is in the uploaded tree, and
+    /// falls back to `/workbench` with a stderr notice when it is not. A task
+    /// without `inherit_cwd`, or a run from the root, keeps `/workbench`.
+    #[test]
+    fn task_start_dir_honours_inherit_cwd() {
+        use super::task_start_dir;
+
+        let tree = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tree.path().join("sub/inner")).unwrap();
+
+        assert_eq!(
+            task_start_dir(true, "sub/inner", tree.path()),
+            Ok(Some("/workbench/sub/inner".to_string()))
+        );
+        assert_eq!(task_start_dir(false, "sub/inner", tree.path()), Ok(None));
+        assert_eq!(task_start_dir(true, "", tree.path()), Ok(None));
+
+        let notice = task_start_dir(true, "sub/gone", tree.path()).unwrap_err();
+        assert!(notice.contains("sub/gone"), "{notice}");
+        assert!(notice.contains("/workbench"), "{notice}");
+        assert_eq!(notice.lines().count(), 1, "one line: {notice:?}");
     }
 
     /// A session record carrying `mode`, with everything else at its default.
@@ -2408,6 +2675,7 @@ mod tests {
             // No launch ever minted these records, so none has recorded its
             // outcome on one.
             host_ip_enforcement: None,
+            host_row_bound: false,
             attrs: Default::default(),
         }
     }
@@ -2777,6 +3045,67 @@ mod tests {
         assert_eq!(err, b"err!");
 
         assert!(!ctrl.was_killed());
+    }
+
+    /// An exec the daemon's shutdown ends tells the client why on stderr,
+    /// after whatever the command itself wrote there, and still reports the
+    /// command's own status. One that ends outside a shutdown gets no notice.
+    #[tokio::test]
+    async fn an_exec_ended_by_shutdown_writes_the_notice_to_stderr() {
+        for shutting_down in [true, false] {
+            let (
+                process,
+                MockEndpoints {
+                    stdin_reader: _stdin_reader,
+                    stdout_writer,
+                    mut stderr_writer,
+                    ctrl,
+                },
+            ) = build_mock();
+
+            let (closed_stdin_w, mut bridge_stdin) = duplex(64);
+            drop(closed_stdin_w);
+            let (mut bridge_stdout, _client_stdout) = duplex(64 * 1024);
+            let (mut bridge_stderr, mut client_stderr) = duplex(64 * 1024);
+
+            let bridge_task = tokio::spawn(async move {
+                let exit = bridge_noting_shutdown(
+                    "test",
+                    process,
+                    &mut bridge_stdin,
+                    &mut bridge_stdout,
+                    &mut bridge_stderr,
+                    client_lost(),
+                    || shutting_down,
+                )
+                .await;
+                (exit, bridge_stderr)
+            });
+
+            stderr_writer.write_all(b"err!").await.unwrap();
+            drop(stderr_writer);
+            drop(stdout_writer);
+            // What a box killed by the shutdown reports: 128 + SIGKILL.
+            ctrl.signal_exit(137).await;
+
+            let (exit, bridge_stderr) = bridge_task.await.unwrap();
+            assert_eq!(exit, 137, "the command's own status passes through");
+            drop(bridge_stderr);
+
+            let mut err = Vec::new();
+            client_stderr.read_to_end(&mut err).await.unwrap();
+            let expected: &[u8] = if shutting_down {
+                b"err!minimald is shutting down; the command was stopped\n"
+            } else {
+                b"err!"
+            };
+            assert_eq!(
+                err,
+                expected,
+                "shutting down: {shutting_down}; stderr was {:?}",
+                String::from_utf8_lossy(&err),
+            );
+        }
     }
 
     /// When the SSH-channel write side fails, the bridge must call
@@ -3607,7 +3936,10 @@ mod tests {
             );
 
             match client
-                .call::<FinalizeSession>(&FinalizeSessionRequest { session_id })
+                .call::<FinalizeSession>(&FinalizeSessionRequest {
+                    session_id,
+                    report_shared_port_collisions: false,
+                })
                 .await
             {
                 minimald_rpc::Errorable::Ok(_) => {}
@@ -3645,6 +3977,7 @@ mod tests {
                         task: "echo_ok".to_string(),
                         owns_box: false,
                         args: vec![],
+                        cwd: String::new(),
                     }
                     .encode(),
                     &[],
@@ -3677,6 +4010,7 @@ mod tests {
                     task: "greet".to_string(),
                     owns_box: false,
                     args,
+                    cwd: String::new(),
                 }
                 .encode()
             };
@@ -3752,6 +4086,7 @@ mod tests {
                         task: "echo_ok".to_string(),
                         owns_box: true,
                         args: vec![],
+                        cwd: String::new(),
                     }
                     .encode(),
                     &[],
@@ -3813,6 +4148,7 @@ mod tests {
                         task: "echo_ok".to_string(),
                         owns_box: false,
                         args: vec![],
+                        cwd: String::new(),
                     }
                     .encode(),
                     &[],
@@ -3855,6 +4191,7 @@ mod tests {
                         task: "some_task".to_string(),
                         owns_box: false,
                         args: vec![],
+                        cwd: String::new(),
                     }
                     .encode(),
                     &[],
@@ -3875,6 +4212,7 @@ mod tests {
                         task: String::new(),
                         owns_box: false,
                         args: vec![],
+                        cwd: String::new(),
                     }
                     .encode(),
                     &[],

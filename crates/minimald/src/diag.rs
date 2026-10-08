@@ -690,29 +690,39 @@ async fn sessions<W: BundleSink>(
 /// `O_NOFOLLOW`, so on the guest-writable state volume a `decisions.log`
 /// swapped for a link is refused at open exactly the way a swapped log file
 /// is.
+///
+/// The log rotates to one kept generation past its bound, so that generation
+/// travels too, under the same cap: right after a rotation the live file
+/// holds only the newest record, and the rotated one holds the history
+/// before it.
 async fn audit<W: BundleSink>(
     w: &mut BundleWriter<W>,
     state_dir: &Path,
     cap: u64,
 ) -> Result<(), anyhow::Error> {
-    let path = crate::audit::log_path(state_dir);
-    match w
-        .add_file_tail(crate::audit::LOG_RELATIVE, &path, cap)
-        .await
-    {
-        Ok(()) => Ok(()),
-        Err(e) if io_kind(&e) == Some(std::io::ErrorKind::NotFound) => {
-            w.skip(
-                crate::audit::LOG_RELATIVE,
-                "not present — this daemon has recorded no decisions yet",
-            );
-            Ok(())
-        }
-        Err(e) => {
-            w.skip(crate::audit::LOG_RELATIVE, format!("unreadable: {e:#}"));
-            Ok(())
+    for (relative, path, absent) in [
+        (
+            crate::audit::LOG_RELATIVE,
+            crate::audit::log_path(state_dir),
+            "not present — this daemon has recorded no decisions yet",
+        ),
+        (
+            crate::audit::ROTATED_RELATIVE,
+            crate::audit::rotated_path(state_dir),
+            "not present — the decision log has not rotated yet",
+        ),
+    ] {
+        match w.add_file_tail(relative, &path, cap).await {
+            Ok(()) => {}
+            Err(e) if io_kind(&e) == Some(std::io::ErrorKind::NotFound) => {
+                w.skip(relative, absent);
+            }
+            Err(e) => {
+                w.skip(relative, format!("unreadable: {e:#}"));
+            }
         }
     }
+    Ok(())
 }
 
 /// Reads one session JSON file whole, bounded by [`MAX_SESSION_FILE_BYTES`]
@@ -1513,6 +1523,45 @@ mod tests {
         assert!(
             contents.contains("curl -H 'Authorization: Bearer"),
             "non-credential parts must survive, got: {contents}"
+        );
+    }
+
+    /// NET-046's log keeps reading across a rotation: once the decision log
+    /// has rotated, the bundle carries the live file — whose last line is the
+    /// newest decision — and the rotated generation that holds the records
+    /// before it, each at the path it holds under the state directory.
+    #[tokio::test]
+    async fn diag_bundle_reads_the_decision_log_across_a_rotation() {
+        let server = TestServer::new().await;
+        let state_dir = server.state.minimal_state_dir().await;
+        let state_dir = state_dir.as_utf8_path().as_std_path();
+        let record = |port: u16| crate::audit::DecisionRecord {
+            ts: chrono::Utc::now().to_rfc3339(),
+            box_name: "web".to_string(),
+            port,
+            decision: sessions::DynamicIngress::Allow,
+            decided_by: crate::audit::DecidedBy::BoxPolicy,
+            outcome: crate::audit::DecisionOutcome::Published,
+            reason: None,
+        };
+        // A cap of one line per file: every append past the first rotates.
+        let cap = serde_json_lenient::to_string(&record(3000)).unwrap().len() as u64 + 1;
+        for port in [3000, 3001, 3002] {
+            crate::audit::try_append_capped(state_dir, &record(port), cap)
+                .await
+                .unwrap();
+        }
+
+        let files = fetch_bundle(&server).await;
+        let live = String::from_utf8_lossy(&files[crate::audit::LOG_RELATIVE]);
+        assert!(
+            live.contains("\"port\":3002"),
+            "the live log's tail carries the newest decision: {live}"
+        );
+        let rotated = String::from_utf8_lossy(&files[crate::audit::ROTATED_RELATIVE]);
+        assert!(
+            rotated.contains("\"port\":3001"),
+            "the rotated generation carries the decision before it: {rotated}"
         );
     }
 }

@@ -53,6 +53,13 @@ JSON. When the daemon reports a shared resource pool, the table is headed
 by a `RESOURCE POOL:` line (CPU cores, memory, and the number of sessions
 sharing them); `--raw` omits it.
 
+Another box at the same shared loopback address can hold a port this box
+declares, and this box does not forward it. The list prints one stderr line
+per such port after the table:
+`warning: <session>: port <p> is held by <box>; not forwarded`.
+With `--json` the entry lists those ports under `shared_port_collisions`,
+each with `port` and `held_by`, and the key is absent when there are none.
+
 `min ls` is the same command kept bare at the top level — a deliberate
 exception to the `min <noun> <verb>` convention, since it is the
 highest-traffic command in the CLI; `min session ls` is the noun-level alias.
@@ -136,10 +143,18 @@ of this, so an unknown loadout name errors even in a directory with no config.
 min session attach [SESSION]
 ```
 
-Attaches to an existing session, identified by UUID or session name. When
-`SESSION` is omitted, `min session attach` resolves a session from the current
-working directory (or the only existing session) and opens an interactive
-picker if the choice is ambiguous (`--no-input` errors instead).
+Attaches to an existing session, identified by UUID, unique id prefix, or
+session name. An exact session name wins over an id prefix. A prefix that
+matches more than one session fails with an error that names the candidates.
+When `SESSION` is omitted, `min session attach` resolves a session from the
+current working directory (or the only existing session) and opens an
+interactive picker if the choice is ambiguous (`--no-input` errors instead).
+
+`min session attach` exits 0 when you detach or the session's shell exits.
+It prints a one-line notice and exits 254 when the daemon ends the attach.
+That happens when someone destroys the session, another connection attaches
+to it, or the daemon shuts down. It exits 255 when the connection fails, or
+when the daemon disconnects a terminal that stopped keeping up with output.
 
 ### `session exec`
 
@@ -149,6 +164,9 @@ min session exec <SESSION> <COMMAND>...
 
 Runs a command in an existing session, non-interactively, relaying its
 stdout, stderr and exit code.
+When a daemon shutdown stops the command, `min` prints
+`minimald is shutting down; the command was stopped` on stderr and exits with
+the command's own status.
 
 How `COMMAND` is read depends on how many arguments you give it:
 
@@ -201,6 +219,17 @@ its own stdout and stderr and drops the ones it inherited, so nothing about it
 depends on the exec channel at all. The same applies to `session run` and
 `task run`, which relay over the same channel.
 
+If the client goes away while the command is still running, the exec ends its
+whole process group: SIGTERM, a grace period, then SIGKILL. A `nohup`'d job
+stays in that group, so it ends too. Start a job that must outlive the client
+with `setsid`, which puts it in a session and group of its own:
+
+```
+min session exec web 'setsid nohup ./server >/dev/null 2>&1 &'
+```
+
+A command that exits by itself ends nothing: its background jobs keep running.
+
 ### `session run`
 
 ```
@@ -225,8 +254,15 @@ session's `PATH`.
 min session destroy [--all] [-f|--force] [SESSION]
 ```
 
-Destroys (terminates) a session. `--all` destroys all sessions;
-`-f/--force` skips the confirmation when destroying all sessions.
+Destroys a session and ends its processes. `--all` destroys all sessions.
+`-f/--force` skips the confirmation.
+
+Before it destroys one session, the command asks for confirmation if the
+session holds uncommitted changes or commits that no remote has. It also asks
+if the daemon cannot report that state. The command destroys a clean session without
+a prompt. Without a terminal, or under `--no-input`, nobody can answer, so the
+command refuses unless you pass `-f`. `--all` without a terminal also refuses
+unless you pass `-f`.
 
 ### `session rename`
 
@@ -242,8 +278,8 @@ Renames an existing session.
 min session policy <SESSION> [-o json]
 ```
 
-Prints the effective networking rules for `SESSION` (a UUID or session
-name). Resolved from the daemon, which answers from the policy stored at
+Prints the effective networking rules for `SESSION` (a UUID, unique id
+prefix, or session name). Resolved from the daemon, which answers from the policy stored at
 activation; each rule line shows what the session ended up with, not just
 what was typed.
 
@@ -297,12 +333,13 @@ live ingress (published at runtime)
   tcp  127.0.64.21:3000 → :3000
 ```
 
-The host binds a runtime publish at once. A frame reaches the box only
-through the relay gate its attach installed, and that gate admits only the
-ports the declaration named. So a port the box published at runtime reads
-`(pending; not yet reachable)` until the gate admits it. A row from a daemon
-older than the `pending` field reads `(unknown; daemon predates this field)`.
-The CLI never shows such a row as reachable.
+A listed runtime publish is reachable. The daemon admits the port at the
+box's relay gate when it binds the forward. If nothing in the box listens on
+the port yet, the box itself refuses a connection to it.
+A row from an older daemon whose gate did not admit runtime publishes reads
+`(pending; not yet reachable)`. A row from a daemon older than the `pending`
+field reads `(unknown; daemon predates this field)`. The CLI never shows
+either row as reachable.
 
 `-o json` (`--output json`) prints one `min/v1/session-policy` document on
 stdout instead of text. Each block the text output prints becomes a key:
@@ -327,6 +364,14 @@ an absent setting gives. Both keys are new in the `min/v1/session-policy`
 shape. A client written against the earlier document ignores them. A
 client that reads them finds a value in every `ingress` object.
 
+Boxes handed one shared loopback address can declare the same port. The
+box that published it first holds it, and a later box does not forward it.
+Activation prints a `warning:` line on stderr for each such port, naming
+the box that holds it. The text output marks the declared row
+`(held by <box>)`, and the document lists the rows under
+`shared_port_collisions`, each with `port` and the holding box as `held_by`.
+The key is absent when another box holds none of the box's ports.
+
 With `-o json`, a failed run writes one `min/v1/error` object on stderr and
 exits non-zero, with no plain-text error line. The `code` field names the
 failure: `not_found` for a missing session, `daemon_unreachable`, or
@@ -345,7 +390,7 @@ min session hooks <SESSION> [--json]
 ```
 
 Lists the [lifecycle hooks](./loadouts.md#lifecycle_hooks---scripts-at-session-transition-points)
-composed into `SESSION` (a UUID or session name), one row per script, with
+composed into `SESSION` (a UUID, unique id prefix, or session name), one row per script, with
 the transition it runs on, whether it is inline or external, its timeout, and
 the loadout or project that declared it.
 
@@ -372,7 +417,8 @@ Forwards a port from a session's box to the laptop: binds
 SSH channel to `127.0.0.1:<PORT>` inside the box, so a service running in
 the session answers on the laptop with nothing else installed or configured
 on the remote side. `min net forward web 8080:3000` puts the box's port 3000
-on `localhost:8080`.
+on `localhost:8080`. A `<LOCAL>` of `0` binds a free port the OS picks, and
+the forward prints the port it bound. `<PORT>` must be 1-65535.
 
 Each accepted connection gets its own SSH channel, and the daemon dials
 `127.0.0.1:<PORT>` on the box's side of the session: inside the box's own
@@ -405,6 +451,50 @@ through a live laptop-side listener. The in-box dial that the isolated modes
 the box's namespaces — is exercised by the daemon's harness test with a
 host-side stand-in relay rather than a real box; a root-integration proof of
 that leg (`just test-root-integration`) is still owed to the root lane.
+
+### `net setup`
+
+```
+min net setup [--print] [--undo]
+```
+
+Host DNS is opt-in. Until you run this command, the hostname proxy serves box
+names. The name-surface line that `min session activate` and `min ls` print
+ends with a pointer here. A session start never prints or runs the
+privileged step.
+
+`min net setup` sets this host up to resolve and reach boxes by name, for
+this host's current state. It prints what is missing to stderr. It then
+writes a setup script to a private temporary file and runs it with
+`sudo sh`, so `sudo` asks for your password once. It removes the file
+afterwards and exits with the script's status. On a host that is already set
+up, it runs nothing and says so.
+
+The script is plain POSIX `sh` and stops at the first statement that fails.
+Its header says what it configures and that it must run as root. A comment
+introduces each step. The steps install the resolver hook and the Minimal
+box-name service, plus the local range on macOS.
+
+| Flag | Description |
+|---|---|
+| `--print` | Print the script to stdout instead of running it, with no privilege prompt. Run it later with `sudo sh <file>`. |
+| `--undo` | Remove everything the setup step installs on this host. With `--print`, print the removal script instead. |
+
+Setup points at the port the daemon's zone answerer listens on, so it needs a
+running daemon that has bound its answerer. It does not start one. With no
+daemon reachable, it prints an error and exits 1. Start a session first to
+bring the daemon up. On a host where no script can make box names
+resolve, it prints why and exits 1.
+
+The box-name service runs as one user for the whole machine. If another user
+already installed it, setup refuses before running anything, names that user,
+and exits 1. `--print` still prints the script.
+
+`--undo` works without a daemon, and it succeeds on a host that holds none of
+the setup. It removes the box-name service and its program copy, the resolver
+hook, and on macOS the local range unit. The local range addresses on macOS
+stay on the loopback until the next boot. `install.sh --uninstall` points at
+`min net setup --undo` while any of these host files remain.
 
 ### `stop`
 
@@ -573,7 +663,7 @@ the shell to ask `min` itself what to offer. That indirection is what makes
 session arguments completable — `min session attach <TAB>` lists live session
 names, and `min session attach 019<TAB>` lists session IDs, neither of which
 exists at the time a static script would be written. Every argument documented
-as "UUID or session name" completes this way: `session attach`,
+as "UUID, unique id prefix, or session name" completes this way: `session attach`,
 `session exec`, `session run`, `session destroy`, `session rename`, and
 `session policy`.
 

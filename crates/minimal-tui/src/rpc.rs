@@ -12,10 +12,11 @@ use anyhow::Context as _;
 use minimal_client::Client;
 use minimald_rpc::{
     CreateSession, CreateSessionRequest, DestroySession, DestroySessionRequest, Errorable,
-    GetSessionPolicy, GetSessionPolicyRequest, GetSessionRecord, GetSessionRecordRequest,
-    GetVersion, ListSessions, OneshotSshRpc, RenameSession, RenameSessionRequest, SessionConfig,
+    GetEffectiveSessionPolicy, GetEffectiveSessionPolicyRequest, GetSessionRecord,
+    GetSessionRecordRequest, GetVersion, ListSessions, OneshotSshRpc, RenameSession,
+    RenameSessionRequest, SessionConfig,
 };
-use sessions::{NetworkMode, SessionId, SessionPolicy};
+use sessions::{EffectiveSessionPolicy, NetworkMode, SessionId, SessionPolicy};
 
 /// Deadline for the UI-loop RPCs. The draw loop awaits these inline, so a
 /// wedged-but-connected daemon (a suspended microVM behind libkrun's
@@ -229,19 +230,41 @@ pub async fn refresh(provider: &mut Provider) -> Result<ProviderData, anyhow::Er
 }
 
 /// The record + networking policy behind the detail pane, fetched with one
-/// RPC each per focus change.
+/// RPC each per focus change. The policy is the *effective* one — the same
+/// answer `GetSessionPolicy` serves, with the egress half resolved to what
+/// the gate enforces — so the pane's `(default)` mark can show when the
+/// deny-all a session is held to is the rollout's default, not its own
+/// declaration (what `min session policy` renders).
+///
+/// A failed policy lookup does not cost the pane its record: it comes back
+/// as the policy's `Err`, for the pane to name. A daemon that predates
+/// `GetEffectiveSessionPolicy` refuses the subsystem, and that is the case
+/// this keeps visible.
 pub async fn fetch_detail(
     provider: &mut Provider,
     id: SessionId,
-) -> Result<(Option<sessions::Record>, Option<SessionPolicy>), anyhow::Error> {
+) -> Result<
+    (
+        Option<sessions::Record>,
+        Result<EffectiveSessionPolicy, String>,
+    ),
+    anyhow::Error,
+> {
     let record = timed::<GetSessionRecord>(&mut provider.client, GetSessionRecordRequest::Id(id))
         .await
         .context("GetSessionRecord RPC failed")?
         .record;
-    let policy = timed::<GetSessionPolicy>(&mut provider.client, GetSessionPolicyRequest::Id(id))
-        .await
-        .context("GetSessionPolicy RPC failed")?
-        .ok();
+    let policy = match timed::<GetEffectiveSessionPolicy>(
+        &mut provider.client,
+        GetEffectiveSessionPolicyRequest::Id(id),
+    )
+    .await
+    .context("GetEffectiveSessionPolicy RPC failed")
+    {
+        Ok(Errorable::Ok(policy)) => Ok(policy),
+        Ok(Errorable::Err { error }) => Err(error),
+        Err(e) => Err(format!("{e:#}")),
+    };
     Ok((record, policy))
 }
 
@@ -313,7 +336,7 @@ pub async fn activate(
     project_path: paths::HostAbsPath,
     network: NetworkMode,
     contribution: sessions::wire::request::WireContribution,
-) -> Result<SessionId, anyhow::Error> {
+) -> Result<Activated, anyhow::Error> {
     let mut client = Client::connect(sock).await?;
     // The dashboard's own copy of the create/upload/configure/finalize
     // sequence, so it needs the same gate `min session activate` gets: on a
@@ -405,11 +428,14 @@ pub async fn activate(
         match client
             .oneshot_rpc::<minimald_rpc::FinalizeSession>(minimald_rpc::FinalizeSessionRequest {
                 session_id: id,
+                // The dashboard's status line does not render the yielded
+                // ports, so it does not ask for them.
+                report_shared_port_collisions: false,
             })
             .await
             .context("FinalizeSession RPC failed")?
         {
-            Errorable::Ok(_) => Ok(()),
+            Errorable::Ok(ok) => Ok(ok.package_check_skipped),
             Errorable::Err { error } => anyhow::bail!("{error}"),
         }
     }
@@ -417,13 +443,27 @@ pub async fn activate(
 
     // A failed flow must not orphan the record: a `Pending` stub would hold
     // its name and be reaped at the next daemon restart anyway.
-    if let Err(e) = flow {
-        let _ = client
-            .oneshot_rpc::<minimald_rpc::AbortSession>(minimald_rpc::AbortSessionRequest { id })
-            .await;
-        return Err(e);
+    match flow {
+        Ok(package_check_skipped) => Ok(Activated {
+            id,
+            package_check_skipped,
+        }),
+        Err(e) => {
+            let _ = client
+                .oneshot_rpc::<minimald_rpc::AbortSession>(minimald_rpc::AbortSessionRequest { id })
+                .await;
+            Err(e)
+        }
     }
-    Ok(id)
+}
+
+/// A session the dashboard created and activated.
+#[derive(Debug)]
+pub struct Activated {
+    pub id: SessionId,
+    /// The daemon's package check stepped aside at finalize, so unknown
+    /// package names surface at first exec; the status line says so.
+    pub package_check_skipped: bool,
 }
 
 /// Resolves the directory whose tree should be uploaded as the session

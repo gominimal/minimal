@@ -19,6 +19,14 @@
 //!   execs with the box's credentials: the box uid and gid, `no_new_privs`,
 //!   and the same empty capability sets the box's own processes exec with,
 //!   so joining a running box cannot open a raw socket either.
+//! * `sigterm_to_the_shim_kills_the_injected_group` — a SIGTERM to the
+//!   injection shim ends the injected process's whole process group, the
+//!   grandchild it forked included, and exits as soon as the group is gone.
+//! * `a_group_member_that_traps_sigterm_runs_its_trap` — the group gets
+//!   SIGTERM before any SIGKILL, so a member's SIGTERM trap runs.
+//! * `a_group_member_that_ignores_sigterm_is_sigkilled_after_the_grace` — a
+//!   member that outlives the leader's SIGTERM is SIGKILLed when the shim's
+//!   grace period runs out.
 //!
 //! The sandbox-layer half of NET-083 is another crate's test binary,
 //! `crates/sandbox2/tests/caps_root_integration.rs`
@@ -86,6 +94,7 @@ use std::time::Duration;
 
 use minimald::net::switch::{SessionGate, attach_to_switch, open_tap, tap_netns_commands};
 use minimald::net::{PtaskLease, SwitchClient, SwitchSubnet};
+use minimald::nsenter::GROUP_GRACE;
 use sessions::SessionPolicy;
 
 /// Whether the gate env var is set; when absent both proofs early-return so the
@@ -195,7 +204,11 @@ fn sudo(args: &[&str]) -> Output {
 /// `SHELL` on stdout, then sleeps forever so the sandbox stays alive for
 /// attach tests; with argument `caps` it reports its identity and capability
 /// sets and the errno of a raw socket, an ordinary stream socket, and a vsock
-/// socket; with argument `attach` it checks that `AF_UNIX` is still
+/// socket; with argument `group` it forks a child that sleeps forever, prints
+/// `forked` and waits; with arguments `trap <marker>` it forks a child whose
+/// SIGTERM handler creates `<marker>` and exits, and with argument `ignore` a
+/// child that ignores SIGTERM, each child printing `forked` once its
+/// disposition is set; with argument `attach` it checks that `AF_UNIX` is still
 /// usable inside an injected process and reports the same two lines.
 const SOCKET_PROBE_C: &str = r#"
 #include <sys/socket.h>
@@ -206,6 +219,18 @@ const SOCKET_PROBE_C: &str = r#"
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <signal.h>
+#include <fcntl.h>
+
+/* The `trap` mode's SIGTERM handler: create the marker file, then exit.
+ * open, close and _exit are async-signal-safe. */
+static const char *marker_path;
+static void on_term_write_marker(int sig) {
+    (void)sig;
+    int fd = open(marker_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd >= 0) close(fd);
+    _exit(0);
+}
 
 /* Two lines on stdout: the cwd hakoniwa chdir'd to and the SHELL it exported,
  * both of which the seccomp closure must carry across its command swap. */
@@ -255,6 +280,49 @@ int main(int argc, char **argv) {
         if (fd >= 0) close(fd);
         fflush(stdout);
         return 0;
+    }
+
+    /* A process with a descendant in its own process group: fork a child
+     * that sleeps forever, say so, then wait forever. The group kill must
+     * take the child as well as this process. */
+    if (argc > 1 && strcmp(argv[1], "group") == 0) {
+        pid_t pid = fork();
+        if (pid < 0) { perror("fork"); return 40; }
+        if (pid == 0) { while (1) sleep(60); }
+        printf("forked\n");
+        fflush(stdout);
+        while (1) pause();
+    }
+
+    /* A group member that traps SIGTERM: fork a child whose handler writes
+     * the marker file named by argv[2] and exits, then let the child say it
+     * is ready. This process keeps SIGTERM's default action. */
+    if (argc > 2 && strcmp(argv[1], "trap") == 0) {
+        pid_t pid = fork();
+        if (pid < 0) { perror("fork"); return 41; }
+        if (pid == 0) {
+            marker_path = argv[2];
+            signal(SIGTERM, on_term_write_marker);
+            printf("forked\n");
+            fflush(stdout);
+            while (1) pause();
+        }
+        while (1) pause();
+    }
+
+    /* A group member that ignores SIGTERM: fork a child that ignores it and
+     * says it is ready. This process keeps SIGTERM's default action, so the
+     * group SIGTERM ends it and leaves the child running. */
+    if (argc > 1 && strcmp(argv[1], "ignore") == 0) {
+        pid_t pid = fork();
+        if (pid < 0) { perror("fork"); return 42; }
+        if (pid == 0) {
+            signal(SIGTERM, SIG_IGN);
+            printf("forked\n");
+            fflush(stdout);
+            while (1) pause();
+        }
+        while (1) pause();
     }
 
     if (argc > 1 && strcmp(argv[1], "attach") == 0) {
@@ -1192,6 +1260,284 @@ async fn injected_process_lacks_cap_net_raw() {
     );
 }
 
+/// Whether `pid` is gone or a zombie, per `/proc/<pid>/stat`. The grandchild
+/// is reparented to the box's PID 1, which need not reap it, so a zombie
+/// counts as dead.
+fn dead_or_zombie(pid: u32) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return true;
+    };
+    stat.rsplit_once(')')
+        .and_then(|(_, rest)| rest.split_whitespace().next())
+        .is_some_and(|state| state == "Z")
+}
+
+/// What a group-kill proof observed: the shim's exit status, how long the shim
+/// took to exit after its SIGTERM, whether the grandchild was still running
+/// half a second into the grace period, and whether the injected process and
+/// the grandchild are dead, plus whether the marker file exists in the box.
+struct GroupKillOutcome {
+    status: std::process::ExitStatus,
+    shim_exit_after: Duration,
+    grandchild_alive_mid_grace: bool,
+    injected: u32,
+    injected_dead: bool,
+    grandchild: u32,
+    grandchild_dead: bool,
+    marker_exists: bool,
+}
+
+/// The marker file the `trap` probe's SIGTERM handler creates, inside the box.
+const GROUP_KILL_MARKER: &str = "/tmp/group-kill-marker";
+
+/// Inject `/usr/bin/probe <probe_args>` into an open box, wait for it to fork
+/// its grandchild, SIGTERM the injection shim the way the daemon does when an
+/// exec's client is gone (`TokioProcess::start_kill`), and report what became
+/// of the shim and the injected process group.
+///
+/// `None` when the host denies the unprivileged user namespace every sandbox
+/// starts by unsharing; the caller skips.
+async fn group_kill_proof(name: &str, probe_args: &[&str]) -> Option<GroupKillOutcome> {
+    if let Some(reason) = sandbox2::user_namespaces_restriction() {
+        eprintln!(
+            "skipping {name}: this host denies the unprivileged user namespace \
+             every sandbox starts by unsharing: {reason}"
+        );
+        return None;
+    }
+    announce_to_the_runner(name);
+    use minimald::nsenter::{Injection, session_leader_pid};
+    use std::io::BufRead as _;
+
+    let proofs = proof_base_dir();
+    let no_base_dir = format!("base temp dir under {}", proofs.display());
+    let base = tempfile::tempdir_in(&proofs).expect(&no_base_dir);
+    let probe = compile_socket_probe(base.path());
+    let source = base.path().join("rootfs-src");
+    probe_rootfs(&source, &probe);
+
+    let config = Config::new("group-kill")
+        .with_rootfs(std::iter::once(SandboxMapped::Dir(source)))
+        .with_dns(false)
+        .with_plan(NetPlan::host());
+    let no_sandbox_dir = format!("sandbox temp dir under {}", proofs.display());
+    let sandbox_base = tempfile::tempdir_in(&proofs).expect(&no_sandbox_dir);
+    let mut sandbox = config
+        .build(sandbox_base.path().join("sandbox"), ())
+        .await
+        .expect("building the open-box sandbox");
+    let plan = sandbox.built_in_plan();
+    let container = sandbox
+        .new_container(&plan)
+        .expect("building the open-box container");
+
+    let mut hold = sandbox
+        .command(
+            &container,
+            "/usr/bin/probe",
+            ["hold"],
+            std::iter::empty::<(&str, &str)>(),
+        )
+        .expect("building hold command");
+    hold.stdout(hakoniwa::Stdio::MakePipe);
+    let mut child = hold.spawn().expect("spawning hold process in open box");
+    let hold_stdout = child.stdout.take().expect("hold process stdout pipe");
+    let mut guard = LiveBox::new(child);
+    let hold_report = tokio::task::spawn_blocking(move || {
+        let mut line = String::new();
+        let _read = std::io::BufReader::new(hold_stdout).read_line(&mut line);
+        line
+    })
+    .await
+    .expect("spawn_blocking join");
+    if !hold_report.starts_with("cwd=") {
+        let end = guard.stop();
+        panic!("the hold process did not report: {hold_report:?}\nstatus: {end:?}");
+    }
+    let leader =
+        session_leader_pid(guard.child_id()).expect("resolving the open box's program pid");
+    guard.holds(leader);
+
+    let injection = Injection::new(leader, "/usr/bin/probe", probe_args.iter().copied())
+        .with_shim(shim())
+        .with_cwd(sandbox.command_cwd().expect("resolving sandbox cwd"))
+        .with_env(sandbox.command_env());
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(30),
+        tokio::task::spawn_blocking(move || {
+            let mut shim = injection
+                .command()
+                .expect("building injection command")
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawning the injection shim");
+            let mut line = String::new();
+            std::io::BufReader::new(shim.stdout.take().expect("piped stdout"))
+                .read_line(&mut line)
+                .expect("reading the probe's fork report");
+            assert_eq!(line.trim(), "forked", "the probe did not fork");
+
+            // Host pids: the shim's sole child is the injected probe, whose
+            // sole child is the grandchild it forked.
+            let injected = session_leader_pid(shim.id()).expect("resolving the injected pid");
+            let grandchild = session_leader_pid(injected).expect("resolving the grandchild pid");
+
+            let shim_pid = i32::try_from(shim.id()).expect("the shim pid fits an i32");
+            let signalled = std::time::Instant::now();
+            // SAFETY: `kill` is a plain syscall on a pid this proof spawned.
+            assert_eq!(unsafe { libc::kill(shim_pid, libc::SIGTERM) }, 0);
+            std::thread::sleep(Duration::from_millis(500));
+            let grandchild_alive_mid_grace = !dead_or_zombie(grandchild);
+            let status = shim.wait().expect("reaping the shim");
+            let shim_exit_after = signalled.elapsed();
+
+            // From the SIGTERM: the grace period, then a margin for the
+            // SIGKILL to land.
+            let deadline = signalled + GROUP_GRACE + Duration::from_secs(2);
+            while !dead_or_zombie(grandchild) && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            (
+                status,
+                shim_exit_after,
+                grandchild_alive_mid_grace,
+                injected,
+                grandchild,
+            )
+        }),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("{name}: the group-kill proof timed out"))
+    .expect("spawn_blocking join");
+    let (status, shim_exit_after, grandchild_alive_mid_grace, injected, grandchild) = outcome;
+    let grandchild_dead = dead_or_zombie(grandchild);
+    let injected_dead = dead_or_zombie(injected);
+    // The box's mount namespace, through its still-running program.
+    let marker_exists = Path::new(&format!("/proc/{leader}/root{GROUP_KILL_MARKER}")).exists();
+
+    let _stopped = guard.stop();
+
+    Some(GroupKillOutcome {
+        status,
+        shim_exit_after,
+        grandchild_alive_mid_grace,
+        injected,
+        injected_dead,
+        grandchild,
+        grandchild_dead,
+        marker_exists,
+    })
+}
+
+/// The daemon cancels an exec whose client is gone with a SIGTERM to the
+/// injection shim (`TokioProcess::start_kill`). The shim forwards it to the
+/// injected process's whole process group, which `setpgid(0, 0)` in the
+/// shim's pre-exec made, so a grandchild the injected process forked dies with
+/// it rather than run on under the box's PID 1. Every member here keeps
+/// SIGTERM's default action, so the group is empty at once and the shim exits
+/// well inside its grace period rather than waiting it out. The shim's exit
+/// code, 128 + SIGTERM, proves the handler ran: the default disposition would
+/// have killed the shim by the signal, with no code.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sigterm_to_the_shim_kills_the_injected_group() {
+    let name = "sigterm_to_the_shim_kills_the_injected_group";
+    let Some(outcome) = group_kill_proof(name, &["group"]).await else {
+        return;
+    };
+    assert_eq!(
+        outcome.status.code(),
+        Some(128 + libc::SIGTERM),
+        "the shim must exit through its SIGTERM handler: {:?}",
+        outcome.status
+    );
+    assert!(
+        outcome.injected_dead,
+        "the injected process {} survived",
+        outcome.injected
+    );
+    assert!(
+        outcome.grandchild_dead,
+        "the grandchild {} survived the group kill",
+        outcome.grandchild
+    );
+    assert!(
+        outcome.shim_exit_after < GROUP_GRACE,
+        "a group that dies of its SIGTERM must not be held for the whole grace \
+         period: the shim took {:?}",
+        outcome.shim_exit_after
+    );
+}
+
+/// Ending an exec is SIGTERM, a grace period, then SIGKILL, so a member that
+/// traps SIGTERM gets to run its trap: the probe's grandchild creates a marker
+/// file in its SIGTERM handler. An immediate SIGKILL would leave no marker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_group_member_that_traps_sigterm_runs_its_trap() {
+    let name = "a_group_member_that_traps_sigterm_runs_its_trap";
+    let Some(outcome) = group_kill_proof(name, &["trap", GROUP_KILL_MARKER]).await else {
+        return;
+    };
+    assert_eq!(
+        outcome.status.code(),
+        Some(128 + libc::SIGTERM),
+        "the shim must exit through its SIGTERM handler: {:?}",
+        outcome.status
+    );
+    assert!(
+        outcome.marker_exists,
+        "the grandchild's SIGTERM trap did not run: no {GROUP_KILL_MARKER} in the box"
+    );
+    assert!(
+        outcome.grandchild_dead,
+        "the grandchild {} survived its own trap",
+        outcome.grandchild
+    );
+}
+
+/// The usual shape of a lost client: the group leader dies of the SIGTERM,
+/// while a grandchild ignores it. The shim must not give up when its child
+/// exits; it holds the group until the grace period runs out and then
+/// SIGKILLs it, so the grandchild is still running half a second in and dead
+/// (or a zombie) within the grace period plus a margin.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_group_member_that_ignores_sigterm_is_sigkilled_after_the_grace() {
+    let name = "a_group_member_that_ignores_sigterm_is_sigkilled_after_the_grace";
+    let Some(outcome) = group_kill_proof(name, &["ignore"]).await else {
+        return;
+    };
+    assert_eq!(
+        outcome.status.code(),
+        Some(128 + libc::SIGTERM),
+        "the shim must exit through its SIGTERM handler: {:?}",
+        outcome.status
+    );
+    assert!(
+        outcome.injected_dead,
+        "the injected process {} survived its SIGTERM",
+        outcome.injected
+    );
+    assert!(
+        outcome.grandchild_alive_mid_grace,
+        "the grandchild {} was killed before the grace period ran out",
+        outcome.grandchild
+    );
+    assert!(
+        outcome.grandchild_dead,
+        "the grandchild {} ignoring SIGTERM survived the grace period's SIGKILL",
+        outcome.grandchild
+    );
+    assert!(
+        outcome.shim_exit_after >= GROUP_GRACE.saturating_sub(Duration::from_millis(500)),
+        "the shim exited after {:?}, before the grace period ran out",
+        outcome.shim_exit_after
+    );
+    assert!(
+        outcome.shim_exit_after < GROUP_GRACE + Duration::from_secs(2),
+        "the shim took {:?}, past the grace period plus a margin",
+        outcome.shim_exit_after
+    );
+}
+
 /// NET-137, the joined-process half: a process the daemon injects into a
 /// running box carries the box's socket-family seal. The filter installed at
 /// launch is inherited by children of the filtered process only, so the
@@ -1581,6 +1927,7 @@ async fn netns_ingress_static_port_mapping_exposes_then_unexposes() {
         lease.ip,
         &ingress,
         None,
+        &[],
     )
     .await
     .expect("apply ingress");

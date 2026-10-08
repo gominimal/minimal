@@ -240,6 +240,19 @@ impl EnvChannel<'_> {
                 .remote_storage()
                 .await
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
+            let remote_cache = if build_ctx.use_remote_cache() {
+                // No flag to name: the in-sandbox `min` helper takes none, and
+                // only a sandbox started by `mip --no-fetch run` has no_fetch
+                // set (a daemon-launched task has no switch at all).
+                Some(
+                    build_ctx
+                        .remote_cache(false, false)
+                        .await
+                        .map_err(|e| crate::remote_cache_setup_error(e, None))?,
+                )
+            } else {
+                None
+            };
 
             let output_base = build_ctx.builds_base_dir();
             std::fs::create_dir_all(&output_base).ok();
@@ -251,6 +264,7 @@ impl EnvChannel<'_> {
                 remote_fetcher: &remote_storage,
                 stdout_writer: Some(Box::new(stdout_writer)),
                 stderr_writer: Some(Box::new(stderr_writer)),
+                remote_cache: remote_cache.as_ref(),
             }
             .run(&op::Options {
                 cache,
@@ -267,7 +281,7 @@ impl EnvChannel<'_> {
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
             Ok::<(), anyhow::Error>(())
         }) {
-            writeln!(stream, "error: {}", e).ok();
+            writeln!(stream, "error: {:#}", e).ok();
             return;
         };
         writeln!(
@@ -1398,6 +1412,33 @@ mod tests {
             cmd, "curl -s -o /dev/null -w \"%{http_code}\" https://example.com",
             "the `%{{\"%\"}}{{...}}` escape should resolve to a literal `%{{http_code}}`"
         );
+    }
+
+    /// A repo-wide `[params]` entry resolves in a task command: its default
+    /// applies when the task is invoked without arguments, and `--<name>`
+    /// overrides it.
+    #[test]
+    fn interpolate_resolves_hydrated_repo_param() {
+        let mf: mfile::File = toml::from_str(indoc::indoc! {
+            r#"
+            [params]
+            greeting = { type = "string", default = "hi" }
+
+            [tasks.useparam]
+            exec = "echo %{greeting}"
+            "#
+        })
+        .unwrap();
+        let task = mf.task("useparam").unwrap();
+
+        for (argv, want) in [("", "echo hi"), ("--greeting bye", "echo bye")] {
+            let parsed = task.args.parse(argv).unwrap();
+            let resolved = interpolate_task_strings(&task, Some(&parsed)).unwrap();
+            let mfile::TaskAction::Exec(mfile::StrOrList::Single(cmd)) = resolved.action else {
+                panic!("expected a single exec string");
+            };
+            assert_eq!(cmd, want, "argv `{argv}`");
+        }
     }
 
     /// Helper: build a Context and Graph from the fakerepo test data,

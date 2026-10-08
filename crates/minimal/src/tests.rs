@@ -15,6 +15,163 @@ fn interactive_attach_requires_a_tty_on_stdin() {
     ensure_interactive_attach_tty(true).expect("a real terminal must pass the guard");
 }
 
+/// The #953 refusal still comes first: a non-terminal stdin is turned away
+/// before the unwind guard arms or the relay opens a pty or touches the
+/// terminal.
+#[test]
+fn non_terminal_stdin_still_refused_before_relay() {
+    let armed = std::cell::Cell::new(false);
+    let relayed = std::cell::Cell::new(false);
+    let err = interactive_attach(
+        std::process::Command::new("ssh"),
+        false,
+        || {
+            armed.set(true);
+            attach::TerminalUnwind::arm_on(Vec::new(), true)
+        },
+        |_| {
+            relayed.set(true);
+            unreachable!("the relay must not run over a non-terminal stdin")
+        },
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("not a TTY"), "{err}");
+    assert!(!armed.get(), "the unwind guard armed before the refusal");
+    assert!(!relayed.get(), "the relay ran before the refusal");
+}
+
+/// The termios the relay put back must be in force before the blind unwind
+/// writes a byte, and the unwind goes to the real terminal (what the user
+/// sees), not to the session's pty. Driven over a pty that stands in for
+/// the user's terminal, through the real relay, with a session that ends
+/// the way a dropped transport does (255) so the guard fires.
+#[test]
+fn relay_restores_termios_before_unwind_codes() {
+    use nix::sys::termios::{LocalFlags, Termios, tcgetattr};
+    use std::io::Read as _;
+    use std::os::fd::OwnedFd;
+    use std::sync::{Arc, Mutex};
+
+    fn mode(t: &Termios) -> String {
+        // PENDIN is kernel bookkeeping on macOS, not a mode anyone set; and
+        // only the named control characters count (Linux's kernel keeps
+        // fewer than libc's `NCCS`, so the array's tail is stack garbage).
+        use nix::sys::termios::SpecialCharacterIndices as C;
+        let cc: Vec<u8> = [
+            C::VEOF,
+            C::VEOL,
+            C::VERASE,
+            C::VINTR,
+            C::VKILL,
+            C::VMIN,
+            C::VQUIT,
+            C::VSTART,
+            C::VSTOP,
+            C::VSUSP,
+            C::VTIME,
+        ]
+        .iter()
+        .map(|&i| t.control_chars[i as usize])
+        .collect();
+        format!(
+            "{:?} {:?} {:?} {:?} {cc:?}",
+            t.input_flags,
+            t.output_flags,
+            t.control_flags,
+            t.local_flags - LocalFlags::PENDIN,
+        )
+    }
+
+    /// Writes to the user's terminal, noting the termios it found there
+    /// at the moment of the first write.
+    struct RealTerminal {
+        tty: std::fs::File,
+        termios_at_write: Arc<Mutex<Option<String>>>,
+    }
+    impl std::io::Write for RealTerminal {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let mut seen = self.termios_at_write.lock().unwrap();
+            if seen.is_none() {
+                *seen = Some(mode(&tcgetattr(&self.tty).unwrap()));
+            }
+            self.tty.write(buf)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.tty.flush()
+        }
+    }
+
+    let pty = nix::pty::openpty(None, None).unwrap();
+    let start = mode(&tcgetattr(&pty.slave).unwrap());
+    let mut master = std::fs::File::from(pty.master);
+    let screen = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&screen);
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match master.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => sink.lock().unwrap().extend_from_slice(&buf[..n]),
+                // A signal can interrupt the read on some targets.
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
+    });
+    let dup = |fd: &OwnedFd| fd.try_clone().unwrap();
+    let termios_at_write = Arc::new(Mutex::new(None));
+
+    let mut session = std::process::Command::new("/bin/sh");
+    session
+        .arg("-c")
+        .arg("stty raw -echo -iexten; printf R; exit 255");
+    let code = interactive_attach(
+        session,
+        true,
+        || {
+            attach::TerminalUnwind::arm_on(
+                RealTerminal {
+                    tty: std::fs::File::from(dup(&pty.slave)),
+                    termios_at_write: Arc::clone(&termios_at_write),
+                },
+                true,
+            )
+        },
+        |ssh| {
+            let real = client::tty_relay::RealTty::from_fds(dup(&pty.slave), dup(&pty.slave));
+            client::attach::run_interactive_attach_on(ssh, real, None)
+        },
+    )
+    .unwrap();
+    assert_eq!(code, 255);
+
+    let at_write = termios_at_write
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("a transport drop arms the blind unwind");
+    assert_eq!(
+        at_write, start,
+        "the unwind wrote before the termios was restored"
+    );
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let seen = screen.lock().unwrap().clone();
+        // The session's output, then the unwind's codes, on the user's
+        // terminal.
+        if seen.starts_with(b"R") && seen.ends_with(b"\x1b[?1004l") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < until,
+            "the unwind codes never reached the terminal: {:?}",
+            String::from_utf8_lossy(&seen)
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
 /// The interactive attach no longer `exec()`s ssh — it waits on it so the
 /// terminal can be put back afterwards (#1210) — so the status ssh reports
 /// has to become this process's own, signalled children included.
@@ -28,6 +185,38 @@ fn ssh_status_becomes_the_clients_exit_code() {
     // A signalled child reports no code of its own; the shell's 128 + n.
     // 9 is SIGKILL, in the low bits where wait(2) puts the signal.
     assert_eq!(exit_code_of(std::process::ExitStatus::from_raw(9)), 137);
+}
+
+/// The exec-path stdout relay copies data from a reader to a writer and
+/// returns `BrokenPipe` when the writer's far end closes (#815).
+#[tokio::test]
+async fn exec_stdout_relay_copies_and_detects_broken_pipe() {
+    use tokio::io::AsyncWriteExt as _;
+
+    // Clean EOF: write "hello\n" then drop the write half, so the read half
+    // yields the bytes and then EOF. The relay should copy and return Ok.
+    let (mut src, mut rx) = tokio::io::duplex(64);
+    src.write_all(b"hello\n").await.unwrap();
+    drop(src);
+    let mut sink = tokio::io::sink();
+    relay_exec_stdout(&mut rx, &mut sink)
+        .await
+        .expect("relay should succeed on clean EOF");
+
+    // BrokenPipe: the writer's far end is closed, so the first write fails.
+    let (mut src, mut rx) = tokio::io::duplex(64);
+    src.write_all(b"world\n").await.unwrap();
+    drop(src);
+    let (mut writer, reader) = tokio::io::duplex(64);
+    drop(reader); // close the read half of the duplex
+    let err = relay_exec_stdout(&mut rx, &mut writer)
+        .await
+        .expect_err("relay should fail when the writer's far end is closed");
+    assert_eq!(
+        err.kind(),
+        std::io::ErrorKind::BrokenPipe,
+        "relay should return BrokenPipe when writer's far end closes"
+    );
 }
 
 /// A CLI upgraded past its daemon must be refused up front, naming both
@@ -460,6 +649,14 @@ fn cli_reference_has_no_retired_commands() {
         rendered.contains("Usage:"),
         "the refusal must carry the usage, got: {rendered}"
     );
+
+    // The refusal `min` prints names the verb that replaced the retired one.
+    let rendered = with_retired_command_hint(err).to_string();
+    assert!(
+        rendered.contains("unrecognized subcommand 'ssh-forward'")
+            && rendered.contains("min net forward <SESSION> <LOCAL>:<PORT>"),
+        "the refusal must name the replacement, got: {rendered}"
+    );
 }
 
 /// Entry constructor for the bare-`min` state-report tests.
@@ -476,6 +673,7 @@ fn twin_entry(
         status,
         git: None,
         host_ip_enforcement: None,
+        shared_port_collisions: Vec::new(),
         attrs: None,
     }
 }
@@ -497,7 +695,7 @@ fn bare_status_renders_a_cwd_session_verbatim() {
              \x20 sessions: 1 (web, active)\n\
              \x20 blueprint: minimal.toml present\n\
              Next:\n\
-             \x20 min session attach --command 'min task run <task>' web\n\
+             \x20 min session run web <task>\n\
              \x20 min ls --json\n"
     );
 }
@@ -659,14 +857,15 @@ fn bare_status_counts_elsewhere_sessions() {
         "no cwd session must suggest activate: {out}"
     );
     assert!(
-        !out.contains("session attach --command"),
-        "must not suggest attaching elsewhere: {out}"
+        !out.contains("min session run"),
+        "must not suggest running in a session elsewhere: {out}"
     );
 }
 
 /// More than two cwd matches: the count is the full total, the listing
-/// stops at two, and an unnamed session shows its short id — which is
-/// also what the attach suggestion substitutes for the first match.
+/// stops at two and counts the rest, sessions elsewhere are counted too,
+/// and an unnamed session shows its short id — which is also what the run
+/// suggestion substitutes for the first match.
 #[test]
 fn bare_status_lists_at_most_two_cwd_sessions() {
     let entries = vec![
@@ -688,20 +887,29 @@ fn bare_status_lists_at_most_two_cwd_sessions() {
             Some("/w"),
             sessions::SessionStatus::Active,
         ),
+        twin_entry(
+            "019f5d0f-0a99-78b1-9165-0809440f0088",
+            Some("api"),
+            Some("/other"),
+            sessions::SessionStatus::Active,
+        ),
     ];
     let cwd = paths::HostAbsPath::try_new("/w").unwrap();
     let out = render_bare_status("/w", &entries, &cwd, true);
     assert!(
-        out.contains("  sessions: 3 (019f5d0f, pending), (web, materializing)\n"),
-        "count-then-two listing: {out}"
+        out.contains(
+            "  sessions: 3 (019f5d0f, pending), (web, materializing) and 1 more \
+             (1 elsewhere)\n"
+        ),
+        "count-then-two listing, the rest counted: {out}"
     );
     assert!(
         !out.contains("spare"),
         "third session must not be listed: {out}"
     );
     assert!(
-        out.contains("  min session attach --command 'min task run <task>' 019f5d0f\n"),
-        "attach suggestion uses the first match's handle: {out}"
+        out.contains("  min session run 019f5d0f <task>\n"),
+        "run suggestion uses the first match's handle: {out}"
     );
 }
 
@@ -823,6 +1031,41 @@ fn provider_local_minimald_is_the_host_backend() {
     use clap::Parser as _;
     let cli = Cli::try_parse_from(["min", "--provider", "local-minimald", "ls"]).unwrap();
     assert!(!cli.global_args.use_minvmd());
+}
+
+#[test]
+fn net_setup_parses_to_the_setup_command() {
+    use clap::Parser as _;
+    let cli = Cli::try_parse_from(["min", "net", "setup"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Some(Command::Net(NetArgs {
+            command: NetCommand::Setup(NetSetupArgs {
+                print: false,
+                undo: false
+            })
+        }))
+    ));
+    let cli = Cli::try_parse_from(["min", "net", "setup", "--print"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Some(Command::Net(NetArgs {
+            command: NetCommand::Setup(NetSetupArgs {
+                print: true,
+                undo: false
+            })
+        }))
+    ));
+    let cli = Cli::try_parse_from(["min", "net", "setup", "--undo", "--print"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Some(Command::Net(NetArgs {
+            command: NetCommand::Setup(NetSetupArgs {
+                print: true,
+                undo: true
+            })
+        }))
+    ));
 }
 
 #[test]
@@ -1112,6 +1355,7 @@ fn session_run_encodes_a_task_form_not_a_command() {
         task: "check".to_string(),
         owns_box: false,
         args: vec![],
+        cwd: String::new(),
     };
     let wire = request.encode();
     assert_eq!(
@@ -1120,6 +1364,7 @@ fn session_run_encodes_a_task_form_not_a_command() {
             task: "check".to_string(),
             owns_box: false,
             args: vec![],
+            cwd: String::new(),
         })
     );
 }
@@ -1230,6 +1475,32 @@ fn ingress_spec_rejects_malformed_and_bad_proto() {
     assert!(parse_ingress_mapping("18080").is_err());
     assert!(parse_ingress_mapping("notaport:80").is_err());
     assert!(parse_ingress_mapping("18080:80/icmp").is_err());
+}
+
+#[test]
+fn forward_spec_accepts_ephemeral_local_port() {
+    let (local, box_port) = parse_forward_spec("0:80").unwrap();
+    assert_eq!(local, 0);
+    assert_eq!(box_port, 80);
+}
+
+#[test]
+fn forward_spec_rejects_zero_box_port() {
+    let err = parse_forward_spec("8080:0").unwrap_err().to_string();
+    assert!(
+        err.contains("box port must be 1-65535"),
+        "expected the box-port message, got: {err}"
+    );
+}
+
+#[test]
+fn forward_spec_rejects_out_of_range_and_malformed() {
+    assert!(parse_forward_spec("8080:99999").is_err());
+    let err = parse_forward_spec("x:80").unwrap_err().to_string();
+    assert!(
+        err.contains("invalid local port"),
+        "expected the local-port message, got: {err}"
+    );
 }
 
 #[test]
@@ -1404,6 +1675,33 @@ fn composition_failure_leads_with_the_directory_not_the_daemon_step() {
     assert!(
         msg.contains(daemon_error),
         "the daemon's error is the only diagnostic and must survive: {msg}"
+    );
+}
+
+/// A transient git failure — the concurrent `min session activate`
+/// `index.lock` race — is not the user's configuration, so the message must
+/// not instruct them to fix "the configuration there". The remedy is to
+/// re-run, and the directory still leads.
+#[test]
+fn composition_failure_does_not_blame_config_for_git_lock() {
+    let daemon_error = "init of minimal context: other: git command 'checkout' failed \
+                            (exit status: 128): fatal: Unable to create \
+                            '.../.git/index.lock': File exists.";
+    let msg =
+        composition_failure_message(camino::Utf8Path::new("/home/dev/myproject"), daemon_error);
+
+    let headline = msg.lines().next().expect("a first line");
+    assert!(
+        headline.contains("/home/dev/myproject"),
+        "the headline must name the directory: {msg}"
+    );
+    assert!(
+        !msg.contains("Fix the configuration there"),
+        "a git lock is transient, not a config fault: {msg}"
+    );
+    assert!(
+        msg.contains(daemon_error),
+        "the daemon's error must survive: {msg}"
     );
 }
 
@@ -1779,6 +2077,21 @@ fn legacy_network_spellings_parse_with_hint() {
     );
 }
 
+/// The `--network` parser accepts every [`sessions::NetworkMode::word`] and
+/// maps it back to the same mode, so the word the daemon logs and the
+/// refusals print is always one a person can type.
+#[test]
+fn network_parser_round_trips_every_mode_word() {
+    for mode in [
+        sessions::NetworkMode::NoNet,
+        sessions::NetworkMode::HostNet,
+        sessions::NetworkMode::OwnIp,
+    ] {
+        let parsed = parse_network_mode(mode.word()).expect("a mode word must parse");
+        assert_eq!(sessions::NetworkMode::from(parsed), mode, "{}", mode.word());
+    }
+}
+
 /// `--deny-all-egress` conflicts with every egress rule flag at parse
 /// (NET-075's CLI half): a deny-all declaration admits no exceptions, so
 /// combining it with any `--allow-*`/`--deny-*` rule is refused before the
@@ -2021,7 +2334,10 @@ async fn create_box_on(
         Errorable::Err { error } => panic!("ConfigureLoadout failed: {error}"),
     }
     match client
-        .call::<FinalizeSession>(&FinalizeSessionRequest { session_id: id })
+        .call::<FinalizeSession>(&FinalizeSessionRequest {
+            session_id: id,
+            report_shared_port_collisions: false,
+        })
         .await
     {
         Errorable::Ok(_) => id,
@@ -2865,4 +3181,195 @@ async fn walked_proxy_port_reported_at_start_and_in_ls() {
              line"
         );
     }
+}
+
+/// Two listed sessions for the id-prefix tests: an unnamed `01a0fe9d…` and
+/// `a1b2c3d4…` named `web`.
+fn prefix_entries() -> Vec<minimald_rpc::ListSessionsEntry> {
+    use sessions::SessionStatus::Active;
+    vec![
+        twin_entry("01a0fe9d-0a99-78b1-9165-0809440f0052", None, None, Active),
+        twin_entry(
+            "a1b2c3d4-0a99-78b1-9165-0809440f0052",
+            Some("web"),
+            None,
+            Active,
+        ),
+    ]
+}
+
+/// The short id `min ls` prints resolves as a unique id prefix, with or
+/// without dashes and in either case; a prefix nothing matches resolves to
+/// nothing, leaving the caller's "no session found".
+#[test]
+fn a_unique_id_prefix_resolves_to_its_session() {
+    let entries = prefix_entries();
+    for prefix in ["01a0fe9d", "01A0", "01a0fe9d-0a", "01a0fe9d0a99"] {
+        assert_eq!(
+            match_id_prefix(&entries, prefix).unwrap(),
+            Some(entries[0].id),
+            "`{prefix}` resolves"
+        );
+    }
+    assert_eq!(match_id_prefix(&entries, "ffff").unwrap(), None);
+}
+
+/// A prefix several sessions share is refused, naming each candidate by its
+/// short id and its session name; one more character that tells them apart
+/// resolves.
+#[test]
+fn an_ambiguous_id_prefix_names_the_candidates() {
+    use sessions::SessionStatus::Active;
+    let entries = vec![
+        twin_entry(
+            "a1b2c3d4-0a99-78b1-9165-0809440f0052",
+            Some("web"),
+            None,
+            Active,
+        ),
+        twin_entry(
+            "a1b29e8f-0a99-78b1-9165-0809440f0052",
+            Some("db"),
+            None,
+            Active,
+        ),
+    ];
+    let err = match_id_prefix(&entries, "a1b2").unwrap_err();
+    assert!(err.downcast_ref::<AmbiguousIdPrefix>().is_some());
+    assert_eq!(
+        err.to_string(),
+        "'a1b2' matches sessions a1b2c3d4… (web), a1b29e8f… (db); use more characters"
+    );
+    assert_eq!(
+        match_id_prefix(&entries, "a1b29").unwrap(),
+        Some(entries[1].id)
+    );
+}
+
+/// Candidates that share more than eight hex digits are cut only as far as
+/// needed to be told apart: each rendered id is distinct and exactly as long
+/// as the first differing digit.
+#[test]
+fn an_ambiguous_id_prefix_cuts_at_the_first_differing_digit() {
+    use sessions::SessionStatus::Active;
+    let entries = vec![
+        twin_entry("a1b2c3d4-e50f-78b1-9165-0809440f0052", None, None, Active),
+        twin_entry("a1b2c3d4-e51f-78b1-9165-0809440f0052", None, None, Active),
+    ];
+    // The two ids share their first ten hex digits; the eleventh diverges.
+    let err = match_id_prefix(&entries, "a1b2c3d4e5").unwrap_err();
+    assert!(err.downcast_ref::<AmbiguousIdPrefix>().is_some());
+    assert_eq!(
+        err.to_string(),
+        "'a1b2c3d4e5' matches sessions a1b2c3d4e50…, a1b2c3d4e51…; use more characters"
+    );
+    // Each rendered candidate resolves back to exactly its own session.
+    assert_eq!(
+        match_id_prefix(&entries, "a1b2c3d4e50").unwrap(),
+        Some(entries[0].id)
+    );
+    assert_eq!(
+        match_id_prefix(&entries, "a1b2c3d4e51").unwrap(),
+        Some(entries[1].id)
+    );
+}
+
+/// Only 4 to 32 hex digits (dashes allowed) are tried as a prefix: anything
+/// else stays a plain name, so a miss is the usual "no session found".
+#[test]
+fn a_non_hex_or_short_input_is_not_an_id_prefix() {
+    let (max, over) = ("0".repeat(32), "0".repeat(33));
+    for not_prefix in ["01a", "01a0fe9z", "web-01a0", "", "----", over.as_str()] {
+        assert!(!is_id_prefix(not_prefix), "`{not_prefix}` is not a prefix");
+    }
+    for prefix in ["01a0", "01A0FE9D", "01a0fe9d-0a99", max.as_str()] {
+        assert!(is_id_prefix(prefix), "`{prefix}` is a prefix");
+    }
+    // `01a0fe9z` would match the first session's id were it read as hex.
+    assert_eq!(
+        match_id_prefix(&prefix_entries(), "01a0fe9z").unwrap(),
+        None
+    );
+}
+
+/// A session named with a string that is also another session's id prefix
+/// resolves by its name: an exact name wins over a prefix.
+#[test]
+fn an_exact_name_wins_over_an_id_prefix() {
+    use sessions::SessionStatus::Active;
+    let mut entries = prefix_entries();
+    entries.push(twin_entry(
+        "ffffffff-0a99-78b1-9165-0809440f0052",
+        Some("01a0fe9d"),
+        None,
+        Active,
+    ));
+    assert_eq!(
+        match_id_prefix(&entries, "01a0fe9d").unwrap(),
+        Some(entries[2].id)
+    );
+}
+
+/// A name resolves in any casing, matching how names are made unique: a
+/// session named `Beef-Cafe` is found by `beef-cafe` (and vice versa). The
+/// names are hex-shaped, because only those reach this match on a name miss,
+/// and a folded name wins over a session whose id starts with the same hex.
+#[test]
+fn a_name_resolves_case_insensitively() {
+    use sessions::SessionStatus::Active;
+    let entries = vec![
+        twin_entry(
+            "ffffffff-0a99-78b1-9165-0809440f0052",
+            Some("Beef-Cafe"),
+            None,
+            Active,
+        ),
+        twin_entry("beefcafe-0a99-78b1-9165-0809440f0054", None, None, Active),
+    ];
+    assert_eq!(
+        match_id_prefix(&entries, "beef-cafe").unwrap(),
+        Some(entries[0].id)
+    );
+    assert_eq!(
+        match_id_prefix(&entries, "BEEF-CAFE").unwrap(),
+        Some(entries[0].id)
+    );
+}
+
+/// An exact name wins over a case-folded one, and a casing that folds to two
+/// sessions (case-only duplicates written before names were made unique
+/// under case folding) resolves to neither rather than picking one, nor
+/// falls through to a session whose id starts with that prefix.
+#[test]
+fn an_exact_name_wins_and_an_ambiguous_fold_resolves_to_none() {
+    use sessions::SessionStatus::Active;
+    let entries = vec![
+        twin_entry(
+            "ffffffff-0a99-78b1-9165-0809440f0052",
+            Some("Beef-Cafe"),
+            None,
+            Active,
+        ),
+        twin_entry(
+            "eeeeeeee-0a99-78b1-9165-0809440f0053",
+            Some("beef-cafe"),
+            None,
+            Active,
+        ),
+        twin_entry("beefcafe-0a99-78b1-9165-0809440f0054", None, None, Active),
+    ];
+    assert_eq!(
+        match_id_prefix(&entries, "beef-cafe").unwrap(),
+        Some(entries[1].id)
+    );
+    assert_eq!(
+        match_id_prefix(&entries, "Beef-Cafe").unwrap(),
+        Some(entries[0].id)
+    );
+    assert_eq!(match_id_prefix(&entries, "BEEF-CAFE").unwrap(), None);
+    // The id prefix alone, with no name folding to it, still resolves.
+    assert_eq!(
+        match_id_prefix(&entries, "beefcafe").unwrap(),
+        Some(entries[2].id)
+    );
 }

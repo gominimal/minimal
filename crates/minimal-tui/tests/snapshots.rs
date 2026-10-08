@@ -21,6 +21,7 @@ fn entry(n: u128, name: Option<&str>, project: &str) -> minimald_rpc::ListSessio
         status: sessions::SessionStatus::Active,
         git: None,
         host_ip_enforcement: None,
+        shared_port_collisions: Vec::new(),
         attrs: None,
     }
 }
@@ -79,6 +80,7 @@ fn record(name: Option<&str>, network: NetworkMode) -> sessions::Record {
         // A record that predates a launch of its box: the TUI's rows render
         // over whatever the record carries, and these carry no launch yet.
         host_ip_enforcement: None,
+        host_row_bound: false,
         attrs: Default::default(),
     }
 }
@@ -212,14 +214,14 @@ fn detail_pane_with_policy() {
         key,
         Detail {
             record: Some(record(Some("api-staging"), NetworkMode::OwnIp)),
-            policy: Some(sessions::SessionPolicy::new(
-                Some(sessions::EgressPolicy {
+            policy: Some(sessions::EffectiveSessionPolicy {
+                egress: sessions::EffectiveEgress::Declared(sessions::EgressPolicy {
                     allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
                     allow_dns_hosts: None,
                     allow_protocols: None,
                     deny_subnets: Some(vec!["192.168.0.0/16".to_string()]),
                 }),
-                Some(sessions::IngressPolicy {
+                ingress: Some(sessions::IngressPolicy {
                     port_mappings: vec![sessions::PortMapping {
                         external_port: 8080,
                         internal_port: 80,
@@ -228,7 +230,8 @@ fn detail_pane_with_policy() {
                     dynamic_allowed_range: None,
                     dynamic_ingress: None,
                 }),
-            )),
+            }),
+            policy_error: None,
         },
     );
     // Focus the session.
@@ -253,15 +256,16 @@ fn detail_pane_names_a_declared_deny_all() {
         key,
         Detail {
             record: Some(record(Some("api-staging"), NetworkMode::OwnIp)),
-            policy: Some(sessions::SessionPolicy::new(
-                Some(sessions::EgressPolicy {
+            policy: Some(sessions::EffectiveSessionPolicy {
+                egress: sessions::EffectiveEgress::Declared(sessions::EgressPolicy {
                     allow_subnets: Some(vec![]),
                     allow_dns_hosts: Some(vec![]),
                     allow_protocols: Some(vec![]),
                     deny_subnets: None,
                 }),
-                None,
-            )),
+                ingress: None,
+            }),
+            policy_error: None,
         },
     );
     model.cursor = 1;
@@ -269,6 +273,94 @@ fn detail_pane_names_a_declared_deny_all() {
     assert!(rendered.contains("  deny-all "), "{rendered}");
     assert!(!rendered.contains("  subnets "), "{rendered}");
     assert!(!rendered.contains("dns hosts"), "{rendered}");
+    // Unmarked: the box chose this deny-all, so it carries no `(default)`.
+    assert!(!rendered.contains("(default)"), "{rendered}");
+    insta::assert_snapshot!(rendered);
+}
+
+/// An undeclared box whose daemon resolves the allow-all default (before the
+/// deny-all default is in force, behind the opt-out, or off an own address):
+/// marked `allow-all (default)`, as `min session policy` prints it.
+#[test]
+fn detail_pane_marks_the_allow_all_default() {
+    let mut model = fixed_model(vec![provider(
+        "host",
+        vec![entry(1, Some("api-staging"), "/src/api")],
+    )]);
+    let key = SessionKey {
+        provider: "host".to_string(),
+        id: id(1),
+    };
+    model.details.insert(
+        key,
+        Detail {
+            record: Some(record(Some("api-staging"), NetworkMode::OwnIp)),
+            policy: Some(sessions::EffectiveSessionPolicy {
+                egress: sessions::EffectiveEgress::AllowAll,
+                ingress: None,
+            }),
+            policy_error: None,
+        },
+    );
+    model.cursor = 1;
+    insta::assert_snapshot!(render(&mut model));
+}
+
+/// A daemon that predates `GetEffectiveSessionPolicy` refuses the RPC: the
+/// pane keeps the record and names the failure rather than showing
+/// "loading policy…" for an answer that never comes.
+#[test]
+fn detail_pane_names_an_unavailable_policy() {
+    let mut model = fixed_model(vec![provider(
+        "host",
+        vec![entry(1, Some("api-staging"), "/src/api")],
+    )]);
+    let key = SessionKey {
+        provider: "host".to_string(),
+        id: id(1),
+    };
+    model.details.insert(
+        key,
+        Detail {
+            record: Some(record(Some("api-staging"), NetworkMode::OwnIp)),
+            policy: None,
+            policy_error: Some("request subsystem GetEffectiveSessionPolicy".to_string()),
+        },
+    );
+    model.cursor = 1;
+    let rendered = render(&mut model);
+    assert!(rendered.contains("policy unavailable:"), "{rendered}");
+    assert!(!rendered.contains("loading policy"), "{rendered}");
+    assert!(rendered.contains("/src/api"), "{rendered}");
+}
+
+/// An own-address box with no egress declaration, under the deny-all
+/// default: the pane shows what the gate enforces — `deny-all (default)` —
+/// as `min session policy` does, not the bare declaration's allow-all.
+#[test]
+fn detail_pane_marks_the_deny_all_default() {
+    let mut model = fixed_model(vec![provider(
+        "host",
+        vec![entry(1, Some("api-staging"), "/src/api")],
+    )]);
+    let key = SessionKey {
+        provider: "host".to_string(),
+        id: id(1),
+    };
+    model.details.insert(
+        key,
+        Detail {
+            record: Some(record(Some("api-staging"), NetworkMode::OwnIp)),
+            policy: Some(sessions::EffectiveSessionPolicy {
+                egress: sessions::EffectiveEgress::DenyAll,
+                ingress: None,
+            }),
+            policy_error: None,
+        },
+    );
+    // Focus the session.
+    model.cursor = 1;
+    insta::assert_snapshot!(render(&mut model));
 }
 
 #[test]
@@ -285,14 +377,14 @@ fn detail_pane_shows_dynamic_ingress() {
         key,
         Detail {
             record: Some(record(Some("api-staging"), NetworkMode::OwnIp)),
-            policy: Some(sessions::SessionPolicy::new(
-                Some(sessions::EgressPolicy {
+            policy: Some(sessions::EffectiveSessionPolicy {
+                egress: sessions::EffectiveEgress::Declared(sessions::EgressPolicy {
                     allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
                     allow_dns_hosts: None,
                     allow_protocols: None,
                     deny_subnets: Some(vec!["192.168.0.0/16".to_string()]),
                 }),
-                Some(sessions::IngressPolicy {
+                ingress: Some(sessions::IngressPolicy {
                     port_mappings: vec![sessions::PortMapping {
                         external_port: 8080,
                         internal_port: 80,
@@ -301,7 +393,8 @@ fn detail_pane_shows_dynamic_ingress() {
                     dynamic_allowed_range: None,
                     dynamic_ingress: Some(sessions::DynamicIngress::Ask),
                 }),
-            )),
+            }),
+            policy_error: None,
         },
     );
     // Focus the session.
@@ -401,6 +494,7 @@ fn sidebar_truncates_a_long_branch() {
         Detail {
             record: Some(record(Some("api"), NetworkMode::OwnIp)),
             policy: None,
+            policy_error: None,
         },
     );
     let rendered = render(&mut model);

@@ -664,7 +664,10 @@ impl BoxSession {
                 .request_subsystem(false, FinalizeSession::NAME)
                 .await
                 .map_err(|e| format!("request_subsystem: {e}"))?;
-            let req = FinalizeSessionRequest { session_id };
+            let req = FinalizeSessionRequest {
+                session_id,
+                report_shared_port_collisions: false,
+            };
             let body =
                 serde_json_lenient::to_vec(&req).map_err(|e| format!("serialize request: {e}"))?;
             let mut rpc = channel.into_stream();
@@ -1040,7 +1043,7 @@ fn tcp_checksum(src: Ipv4Addr, dst: Ipv4Addr, tcp: &[u8]) -> u16 {
 
 /// One length-framed frame to the gate: the shuttle's own framing, a
 /// little-endian `u16` length and the raw frame, the form the gate reads
-/// (`relay_guest_to_switch`) and the guest relay writes.
+/// (`relay_frames_to_switch`) and the guest relay writes.
 fn write_frame(sock: &mut UnixStream, frame: &[u8]) -> Result<(), String> {
     let mut framed = Vec::with_capacity(2 + frame.len());
     let len = u16::try_from(frame.len()).map_err(|_| "frame too long for the shuttle framing")?;

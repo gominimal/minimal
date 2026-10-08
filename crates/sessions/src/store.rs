@@ -10,7 +10,10 @@ use uuid::Uuid;
 
 use paths::{DaemonAbsPath, DaemonRelPath, sub_path};
 
-use crate::{Record, SessionId};
+use crate::{
+    Record, SessionId,
+    core::zone_answer::{HOST_ROW_LABEL, NODE_ROW_LABEL},
+};
 
 /// Describes the session object yielded by [`Loader`].
 pub trait SessionObject: Sized + Send + Clone + 'static + std::fmt::Debug {
@@ -314,6 +317,23 @@ impl Index {
             .iter()
             .find(|(existing, _)| existing.eq_ignore_ascii_case(name))
             .map(|(_, id)| id)
+    }
+
+    /// Returns the session ID whose name folds to `name`, only when exactly
+    /// one indexed name does. Sessions written before names were made unique
+    /// under case folding can still sit side by side on disk (`Case-R` and
+    /// `case-r`); a lookup that folds to both is ambiguous and resolves to
+    /// neither rather than picking one.
+    fn find_by_name_folded_unique(&self, name: &str) -> Option<&SessionId> {
+        let mut matches = self
+            .name_to_id
+            .iter()
+            .filter(|(existing, _)| existing.eq_ignore_ascii_case(name))
+            .map(|(_, id)| id);
+        match (matches.next(), matches.next()) {
+            (Some(id), None) => Some(id),
+            _ => None,
+        }
     }
 
     /// Returns the session ID corresponding to the given short name, if known.
@@ -772,9 +792,12 @@ impl DiskLoader {
 /// Session names that collide with infrastructure names once the daemon
 /// renders them into box names (`<name>.min.internal`): `host` is the zone's
 /// fixed host row, `local` is the legacy three-label form's host-id label,
-/// and `localhost` is the loopback name. Refused under ASCII case folding
-/// because box names are lower-cased.
-const RESERVED_SESSION_NAMES: [&str; 3] = ["host", "local", "localhost"];
+/// `localhost` is the loopback name, and `minimald` is the node namespace's
+/// row in the zone. Refused under ASCII case folding because box names are
+/// lower-cased. The two node-row labels are read from
+/// [`crate::core::zone_answer`] so this list cannot drift from the
+/// registries that key those rows.
+const RESERVED_SESSION_NAMES: [&str; 4] = [HOST_ROW_LABEL, "local", "localhost", NODE_ROW_LABEL];
 
 /// Reject a session name that would break a downstream output contract.
 ///
@@ -786,7 +809,8 @@ const RESERVED_SESSION_NAMES: [&str; 3] = ["host", "local", "localhost"];
 /// `activate --name`, `save` for `rename`) share one gate. The name must
 /// also be a single DNS label (ASCII letters, digits and `-`, 1 to 63
 /// octets, no `-` at either end) because the daemon renders it into
-/// `<name>.min.internal`.
+/// `<name>.min.internal`. A name that parses as a session UUID is refused,
+/// because the CLI resolves a UUID before a name.
 fn validate_session_name(name: &str) -> Result<(), std::io::Error> {
     let invalid = |msg: &str| {
         std::io::Error::new(
@@ -808,6 +832,11 @@ fn validate_session_name(name: &str) -> Result<(), std::io::Error> {
         .find(|reserved| name.eq_ignore_ascii_case(reserved))
     {
         return Err(invalid(&format!("`{reserved}` is reserved")));
+    }
+    // Lookups try a UUID before a name, so a UUID-shaped name would be
+    // shadowed by (or shadow) the session that id belongs to.
+    if SessionId::parse_str(name).is_ok() {
+        return Err(invalid("must not be a session id"));
     }
     // Session names are rendered into `<name>.min.internal` box names, so a
     // name must be a single DNS label: ASCII letters, digits and `-`, 1 to 63
@@ -885,7 +914,12 @@ impl Loader for DiskLoader {
         }))
     }
     fn find_by_name<S: AsRef<str>>(&self, name: S) -> Result<Option<Self::Key>, std::io::Error> {
-        match self.index.find_by_name(name) {
+        let name = name.as_ref();
+        let uuid = self
+            .index
+            .find_by_name(name)
+            .or_else(|| self.index.find_by_name_folded_unique(name));
+        match uuid {
             Some(uuid) => self.find_by_id(uuid),
             None => Ok(None),
         }
@@ -1184,6 +1218,8 @@ mod tests {
             // round-trip of a `Some` is proved at the daemon's own launch
             // record, which a client reads back through `GetSessionRecord`.
             host_ip_enforcement: None,
+            // Non-default too, for the same reason: `false` is its serde default.
+            host_row_bound: true,
             attrs: [("color".to_string(), "blue".to_string())]
                 .into_iter()
                 .collect(),
@@ -1268,6 +1304,54 @@ mod tests {
     }
 
     #[test]
+    fn find_by_name_resolves_case_insensitively() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        let mut record = sample_record();
+        record.name = Some("My-Session".to_string());
+        let key = loader.create(record).unwrap();
+
+        // The exact name resolves, and so does any casing of it: names are
+        // unique under ASCII case folding, so the fallback is unambiguous.
+        assert_eq!(
+            loader.find_by_name("My-Session").unwrap(),
+            Some(key.clone())
+        );
+        assert_eq!(
+            loader.find_by_name("my-session").unwrap(),
+            Some(key.clone())
+        );
+        assert_eq!(loader.find_by_name("MY-SESSION").unwrap(), Some(key));
+    }
+
+    /// Sessions written before names were unique under case folding can sit
+    /// side by side in the index. An exact name still resolves to its own
+    /// session, and a casing that folds to both resolves to neither.
+    #[test]
+    fn find_by_name_prefers_exact_and_refuses_an_ambiguous_fold() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        let mut upper = sample_record();
+        upper.name = Some("Case-R".to_string());
+        let upper_key = loader.create(upper).unwrap();
+        let mut lower = sample_record();
+        lower.name = Some("Case-X".to_string());
+        let lower_key = loader.create(lower).unwrap();
+        // Plant the legacy case-only duplicate the create path now refuses.
+        loader.index.name_to_id.remove("Case-X");
+        loader
+            .index
+            .name_to_id
+            .insert("case-r".to_string(), lower_key.session_id);
+
+        assert_eq!(loader.find_by_name("Case-R").unwrap(), Some(upper_key));
+        assert_eq!(loader.find_by_name("case-r").unwrap(), Some(lower_key));
+        assert_eq!(loader.find_by_name("CASE-R").unwrap(), None);
+    }
+
+    #[test]
     fn validate_session_name_accepts_ordinary_names() {
         assert!(validate_session_name("debug-qa").is_ok());
         assert!(validate_session_name("my-session").is_ok());
@@ -1305,7 +1389,15 @@ mod tests {
 
     #[test]
     fn validate_session_name_rejects_reserved_names() {
-        for bad in ["host", "local", "localhost", "HOST", "Localhost"] {
+        for bad in [
+            "host",
+            "local",
+            "localhost",
+            "minimald",
+            "HOST",
+            "Localhost",
+            "MINIMALD",
+        ] {
             assert_eq!(
                 validate_session_name(bad).err().map(|e| e.kind()),
                 Some(ErrorKind::InvalidInput),
@@ -1314,11 +1406,59 @@ mod tests {
         }
     }
 
+    /// Every node-row label the zone defines is reserved: a registry that
+    /// keys a new row under the apex must not let a session take its
+    /// label, so the reserved list has to carry the label too. This pins
+    /// the list to the zone's labels: a label added to
+    /// [`crate::core::zone_answer::NODE_ROW_LABELS`] without a matching
+    /// reserved entry fails here rather than in production.
+    #[test]
+    fn reserved_session_names_carry_every_node_row_label() {
+        for label in crate::core::zone_answer::NODE_ROW_LABELS {
+            assert!(
+                RESERVED_SESSION_NAMES
+                    .iter()
+                    .any(|reserved| reserved.eq_ignore_ascii_case(label)),
+                "node-row label `{label}` is missing from the reserved names"
+            );
+        }
+    }
+
+    #[test]
+    fn create_and_rename_refuse_a_uuid_shaped_name() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+        let uuid = "019f5d0f-0a99-78b1-9165-0809440f0052";
+
+        for name in [uuid, "019f5d0f0a9978b191650809440f0052"] {
+            let mut record = sample_record();
+            record.name = Some(name.to_string());
+            let err = loader.create(record).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput, "create `{name}`");
+            assert!(
+                err.to_string().contains("must not be a session id"),
+                "{err}"
+            );
+        }
+        assert!(loader.keys().next().is_none());
+
+        let key = loader.create(sample_record()).unwrap();
+        let err = loader.rename(&key, uuid.to_string()).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("must not be a session id"),
+            "{err}"
+        );
+        assert_eq!(loader.find_by_name("my-session").unwrap(), Some(key));
+    }
+
     #[test]
     fn validate_session_name_accepts_names_containing_reserved_words() {
         validate_session_name("host-a").unwrap();
         validate_session_name("my-localhost").unwrap();
         validate_session_name("localdev").unwrap();
+        validate_session_name("minimald-dev").unwrap();
+        validate_session_name("my-minimald").unwrap();
     }
 
     #[test]
@@ -2285,10 +2425,11 @@ mod tests {
 
         let loader = DiskLoader::new(root.clone()).unwrap();
         // The live session still resolves; the case-colliding orphan is not
-        // indexed.
-        assert_eq!(loader.find_by_id(&a_id).unwrap(), Some(a_key));
+        // indexed. Its name resolves to the live session under the
+        // case-insensitive lookup, not to the orphan.
+        assert_eq!(loader.find_by_id(&a_id).unwrap(), Some(a_key.clone()));
         assert_eq!(loader.find_by_id(&orphan_record.id).unwrap(), None);
-        assert_eq!(loader.find_by_name("MY-SESSION").unwrap(), None);
+        assert_eq!(loader.find_by_name("MY-SESSION").unwrap(), Some(a_key));
         // The orphan dir is left on disk for manual triage.
         assert!(
             session_dir_path(&root, orphan_short).exists(),

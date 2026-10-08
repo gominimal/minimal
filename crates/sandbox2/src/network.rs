@@ -72,17 +72,20 @@ pub enum Resolver {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SocketSeal {
     /// Admits the families the box's own network namespace confines — unix,
-    /// inet, inet6, netlink, packet — and refuses everything else with
-    /// `EAFNOSUPPORT`, the namespace-bypass families (`AF_VSOCK`) included,
-    /// so no socket reaches past the namespace. The seal every plan but
+    /// inet, inet6, netlink (the `NETLINK_ROUTE` protocol only), packet — and
+    /// refuses every other family with `EAFNOSUPPORT`, the namespace-bypass
+    /// families (`AF_VSOCK`) included, and every other netlink protocol with
+    /// `EPROTONOSUPPORT`, so no socket reaches past the namespace. The seal every plan but
     /// [`NetPlan::none`] runs under, so an own-address or host-address box
     /// keeps its inet sockets; `AF_PACKET` is admitted here and refused by
     /// the missing `CAP_NET_RAW` no box holds, as NET-083 binds.
     ConfinedFamilies,
     /// Admits the families the box's own network namespace confines — unix,
-    /// inet, inet6, netlink — so the box can use its own loopback, and
-    /// refuses every other family with `EAFNOSUPPORT`, the
-    /// namespace-bypass families (`AF_VSOCK`) included.  The `none` plan's
+    /// inet, inet6, netlink (the `NETLINK_ROUTE` protocol only) — so the box
+    /// can use its own loopback, and refuses every other family with
+    /// `EAFNOSUPPORT`, the namespace-bypass families (`AF_VSOCK`) included,
+    /// and every other netlink protocol with `EPROTONOSUPPORT`.  The `none`
+    /// plan's
     /// seal: the namespace already holds only `lo`, so admitting inet
     /// blocks nothing the namespace does not already block.  It applies
     /// only inside that namespace; see [`SocketSeal::in_netns`].
@@ -194,7 +197,8 @@ impl NetPlan {
 
     /// A none box: an unshared network namespace that will never get a tap,
     /// with every socket family but the ones its own namespace confines
-    /// (`AF_UNIX`, `AF_INET`, `AF_INET6`, `AF_NETLINK`) refused on top
+    /// (`AF_UNIX`, `AF_INET`, `AF_INET6`, `AF_NETLINK` with `NETLINK_ROUTE`
+    /// only) refused on top
     /// (`AF_VSOCK` reaches the host regardless of the namespace). Unlike
     /// [`NetPlan::isolated`], which an own-address box also starts from when
     /// its tap is moved in after spawn, this plan is the promise of no reach

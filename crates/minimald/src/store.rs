@@ -397,6 +397,7 @@ mod tests {
             // No launch has recorded anything: these records are built
             // straight from disk-side seeds, never launched.
             host_ip_enforcement: None,
+            host_row_bound: false,
             attrs: Default::default(),
         }
     }
@@ -477,6 +478,11 @@ mod tests {
             handle.record().await.unwrap().name.as_deref(),
             Some("named")
         );
+
+        // A different casing resolves to the same record: names are unique
+        // under ASCII case folding.
+        let folded = open(&store, RecordPredicate::Name("NAMED".to_string())).await;
+        assert_eq!(*folded.id(), ids[0]);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

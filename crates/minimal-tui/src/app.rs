@@ -55,7 +55,11 @@ pub struct ProviderView {
 #[derive(Debug, Clone, Default)]
 pub struct Detail {
     pub record: Option<sessions::Record>,
-    pub policy: Option<sessions::SessionPolicy>,
+    pub policy: Option<sessions::EffectiveSessionPolicy>,
+    /// Why the policy could not be fetched, when it could not: a daemon that
+    /// predates `GetEffectiveSessionPolicy` refuses the RPC, and the pane
+    /// says so instead of sitting on "loading policy…".
+    pub policy_error: Option<String>,
 }
 
 /// A modal prompt capturing footer input, if one is open.
@@ -128,6 +132,8 @@ pub enum Msg {
     Created {
         provider: String,
         id: SessionId,
+        /// The daemon's package check stepped aside at finalize.
+        package_check_skipped: bool,
     },
 }
 
@@ -172,6 +178,11 @@ pub struct Model {
     pub scroll: usize,
     pub filter: FilterState,
     pub details: HashMap<SessionKey, Detail>,
+    /// When each cached detail's policy fetch last failed, so the retry is
+    /// throttled to [`REDISCOVERY_INTERVAL`] instead of riding every 2s
+    /// refresh tick: a daemon that predates `GetEffectiveSessionPolicy`
+    /// refuses it every time.
+    pub policy_failed_at: HashMap<SessionKey, DateTime<Utc>>,
     pub screens: HashMap<SessionKey, ScreenFetch>,
     /// The most recent bell timestamp acknowledged for a session; a bell
     /// newer than this lights the `●` indicator.
@@ -210,6 +221,7 @@ impl Model {
             scroll: 0,
             filter: FilterState::default(),
             details: HashMap::new(),
+            policy_failed_at: HashMap::new(),
             screens: HashMap::new(),
             bells_seen: HashMap::new(),
             action: None,
@@ -484,6 +496,7 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
                 })
                 .collect();
             model.details.retain(|k, _| live.contains(k));
+            model.policy_failed_at.retain(|k, _| live.contains(k));
             model.screens.retain(|k, _| live.contains(k));
             model.bells_seen.retain(|k, _| live.contains(k));
             // The cursor may have (re)landed on a session — restore from the
@@ -494,6 +507,11 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
             fetch_focused(model)
         }
         Msg::DetailLoaded(key, detail) => {
+            if detail.policy_error.is_some() {
+                model.policy_failed_at.insert(key.clone(), model.now);
+            } else {
+                model.policy_failed_at.remove(&key);
+            }
             model.details.insert(key, *detail);
             Vec::new()
         }
@@ -508,8 +526,18 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
             }
             vec![Effect::Refresh]
         }
-        Msg::Created { provider, id } => {
-            model.status = Some("session created".to_string());
+        Msg::Created {
+            provider,
+            id,
+            package_check_skipped,
+        } => {
+            model.status = Some(if package_check_skipped {
+                "session created; warning: the package check was skipped, so unknown \
+                 package names will surface at first exec"
+                    .to_string()
+            } else {
+                "session created".to_string()
+            });
             model.pending_focus = Some((provider, id));
             vec![Effect::Refresh]
         }
@@ -811,8 +839,24 @@ fn fetch_focused(model: &Model) -> Vec<Effect> {
     let Some(key) = model.focused() else {
         return Vec::new();
     };
-    if model.details.contains_key(&key) {
-        return Vec::new();
+    // A detail whose policy fetch failed is not an answer: retry it rather
+    // than caching the failure for the session's lifetime, but no sooner
+    // than REDISCOVERY_INTERVAL after the failure — an older daemon refuses
+    // the RPC every time, and the 2s tick would otherwise re-ask forever.
+    if let Some(detail) = model.details.get(&key) {
+        if detail.policy_error.is_none() {
+            return Vec::new();
+        }
+        let retry_due = model.policy_failed_at.get(&key).is_none_or(|&t| {
+            model
+                .now
+                .signed_duration_since(t)
+                .to_std()
+                .is_ok_and(|d| d >= REDISCOVERY_INTERVAL)
+        });
+        if !retry_due {
+            return Vec::new();
+        }
     }
     vec![Effect::FetchDetail(key)]
 }
@@ -904,10 +948,12 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
                 Effect::Attach(key) => match providers.iter().find(|p| p.label == key.provider) {
                     Some(p) => {
                         let sock = p.sock.clone();
+                        let box_name = model.entry(&key).and_then(|entry| entry.name.clone());
                         attach_and_resume(
                             &mut terminal,
                             &sock,
                             key.id,
+                            box_name.as_deref(),
                             opts.config_dir.as_deref(),
                             &mut model,
                         );
@@ -950,7 +996,14 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
                             }
                             .await;
                             let msg = match result {
-                                Ok(id) => Msg::Created { provider, id },
+                                Ok(rpc::Activated {
+                                    id,
+                                    package_check_skipped,
+                                }) => Msg::Created {
+                                    provider,
+                                    id,
+                                    package_check_skipped,
+                                },
                                 Err(e) => Msg::ActionDone(Err(format!("{e:#}"))),
                             };
                             let _ = tx.send(msg).await;
@@ -1042,7 +1095,18 @@ async fn exec_effect(
             let provider = providers.iter_mut().find(|p| p.label == key.provider)?;
             match rpc::fetch_detail(provider, key.id).await {
                 Ok((record, policy)) => {
-                    Some(Msg::DetailLoaded(key, Box::new(Detail { record, policy })))
+                    let (policy, policy_error) = match policy {
+                        Ok(policy) => (Some(policy), None),
+                        Err(e) => (None, Some(e)),
+                    };
+                    Some(Msg::DetailLoaded(
+                        key,
+                        Box::new(Detail {
+                            record,
+                            policy,
+                            policy_error,
+                        }),
+                    ))
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "detail fetch failed");
@@ -1087,10 +1151,16 @@ async fn exec_effect(
 /// detaches), then resume. The session-key config is resolved from
 /// `config_dir` so the daemon adopts the user's detach/forward chord; a bad
 /// config is reported in the status bar rather than aborting the TUI.
+///
+/// On a VM-backed daemon the attach subscribes to `box_name`'s pending asks
+/// on the VM host daemon and answers them the way `min session attach`
+/// does (NET-045); the dash's list view never subscribes, so only an attach
+/// counts as an attached client.
 fn attach_and_resume(
     terminal: &mut TerminalGuard,
     sock: &std::path::Path,
     id: SessionId,
+    box_name: Option<&str>,
     config_dir: Option<&std::path::Path>,
     model: &mut Model,
 ) {
@@ -1102,15 +1172,16 @@ fn attach_and_resume(
         }
     };
     let result = minimal_client::attach::attach_command(sock, id, None, session_keys.as_ref())
-        .and_then(|mut cmd| {
-            terminal.suspend();
-            let status = cmd.status();
-            // A failed resume leaves the TUI unusable; report it over the
-            // attach outcome.
-            terminal
-                .resume()
-                .context("restoring terminal after detach")?;
-            status.context("running ssh attach")
+        .and_then(|cmd| {
+            attach_through_relay(terminal, cmd, |cmd| {
+                let host_asks = box_name.and_then(|name| {
+                    minimal_client::attach::HostAsks::subscribe_beside(sock, name)
+                });
+                minimal_client::attach::run_interactive_attach(
+                    cmd,
+                    host_asks.map(minimal_client::attach::HostAsks::into_hook),
+                )
+            })
         });
     match result {
         Ok(status) => {
@@ -1121,6 +1192,36 @@ fn attach_and_resume(
         }
         Err(e) => model.status = Some(format!("error: attach failed: {e:#}")),
     }
+}
+
+/// The terminal the dash hands over for an attach and takes back after.
+trait SuspendableTerminal {
+    /// Leave raw mode and the alternate screen, releasing the terminal.
+    fn suspend(&mut self);
+    /// Take the terminal back for the TUI.
+    fn resume(&mut self) -> std::io::Result<()>;
+}
+
+/// Run an attach with the TUI suspended around it. crossterm releases the
+/// terminal first (raw mode off, alternate screen left), and only then does
+/// `relay` start, so the termios the relay captures, and puts back when the
+/// attach ends, is the released terminal's, never crossterm's raw mode. The
+/// relay's [`minimal_client::tty_relay::RealTty::acquire`] picks the fd by
+/// crossterm's own rule (stdin when a tty, else `/dev/tty`), so both act on
+/// the same terminal.
+fn attach_through_relay(
+    terminal: &mut impl SuspendableTerminal,
+    cmd: std::process::Command,
+    relay: impl FnOnce(std::process::Command) -> Result<std::process::ExitStatus, anyhow::Error>,
+) -> Result<std::process::ExitStatus, anyhow::Error> {
+    terminal.suspend();
+    let status = relay(cmd);
+    // A failed resume leaves the TUI unusable; report it over the attach
+    // outcome.
+    terminal
+        .resume()
+        .context("restoring terminal after detach")?;
+    status.context("running ssh attach")
 }
 
 /// Enters the alternate screen on construction and restores the terminal
@@ -1146,16 +1247,18 @@ impl TerminalGuard {
             None => Err(std::io::Error::other("terminal suspended")),
         }
     }
+}
 
+impl SuspendableTerminal for TerminalGuard {
     /// Leave the alternate screen and drop the terminal, handing the TTY to
-    /// a child process.
+    /// the attach.
     fn suspend(&mut self) {
         if self.0.take().is_some() {
             ratatui::restore();
         }
     }
 
-    /// Re-enter the alternate screen after the child exits.
+    /// Re-enter the alternate screen after the attach ends.
     fn resume(&mut self) -> std::io::Result<()> {
         let mut terminal = ratatui::init();
         terminal.clear()?;
@@ -1200,6 +1303,7 @@ mod tests {
             status: sessions::SessionStatus::Active,
             git: None,
             host_ip_enforcement: None,
+            shared_port_collisions: Vec::new(),
             attrs: None,
         }
     }
@@ -1530,6 +1634,37 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_policy_fetch_is_retried() {
+        let mut model = two_providers();
+        update(&mut model, key(KeyCode::Down));
+        // The policy fetch failed (an older daemon, a transient error): the
+        // failure is shown but not cached as the session's answer.
+        update(
+            &mut model,
+            Msg::DetailLoaded(
+                skey("host", 1),
+                Box::new(Detail {
+                    policy_error: Some("request subsystem failed".to_string()),
+                    ..Detail::default()
+                }),
+            ),
+        );
+        // Not straight away: an older daemon refuses every time, so the
+        // retry waits out REDISCOVERY_INTERVAL rather than riding each tick.
+        update(&mut model, key(KeyCode::Down));
+        let effects = update(&mut model, key(KeyCode::Up));
+        assert!(!effects.iter().any(|e| matches!(e, Effect::FetchDetail(_))));
+        model.now += chrono::Duration::from_std(REDISCOVERY_INTERVAL).unwrap();
+        update(&mut model, key(KeyCode::Down));
+        let effects = update(&mut model, key(KeyCode::Up));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::FetchDetail(k) if k.id == id(1)))
+        );
+    }
+
+    #[test]
     fn indicator_shows_spinner_for_recent_stdout() {
         let now = DateTime::parse_from_rfc3339("2026-07-29T12:00:00Z")
             .unwrap()
@@ -1707,6 +1842,115 @@ mod tests {
         assert_eq!(
             model.status.as_deref(),
             Some("error: provider 'vm' is unreachable")
+        );
+    }
+
+    /// `min dash` hands the terminal to the attach the same way the CLI
+    /// does, through the relay, and crossterm lets go first: the relay
+    /// starts only after the release, so the termios it puts back when the
+    /// attach ends is the released terminal's, not crossterm's raw mode.
+    #[test]
+    fn dash_attach_goes_through_relay_after_crossterm_release() {
+        use nix::sys::termios::{LocalFlags, SetArg, Termios, cfmakeraw, tcgetattr, tcsetattr};
+        use std::io::Read as _;
+        use std::os::fd::OwnedFd;
+        use std::sync::{Arc, Mutex};
+
+        fn mode(t: &Termios) -> String {
+            // PENDIN is kernel bookkeeping on macOS, not a mode anyone set; and
+            // only the named control characters count (Linux's kernel keeps
+            // fewer than libc's `NCCS`, so the array's tail is stack garbage).
+            use nix::sys::termios::SpecialCharacterIndices as C;
+            let cc: Vec<u8> = [
+                C::VEOF,
+                C::VEOL,
+                C::VERASE,
+                C::VINTR,
+                C::VKILL,
+                C::VMIN,
+                C::VQUIT,
+                C::VSTART,
+                C::VSTOP,
+                C::VSUSP,
+                C::VTIME,
+            ]
+            .iter()
+            .map(|&i| t.control_chars[i as usize])
+            .collect();
+            format!(
+                "{:?} {:?} {:?} {:?} {cc:?}",
+                t.input_flags,
+                t.output_flags,
+                t.control_flags,
+                t.local_flags - LocalFlags::PENDIN,
+            )
+        }
+
+        /// The TUI's terminal on a pty: raw (crossterm's) until suspended,
+        /// the shell's own termios after.
+        struct Tui {
+            tty: OwnedFd,
+            released: Termios,
+            steps: Arc<Mutex<Vec<String>>>,
+        }
+        impl SuspendableTerminal for Tui {
+            fn suspend(&mut self) {
+                tcsetattr(&self.tty, SetArg::TCSANOW, &self.released).unwrap();
+                self.steps.lock().unwrap().push("release".into());
+            }
+            fn resume(&mut self) -> std::io::Result<()> {
+                let now = mode(&tcgetattr(&self.tty).unwrap());
+                self.steps.lock().unwrap().push(format!("resume in {now}"));
+                Ok(())
+            }
+        }
+
+        let pty = nix::pty::openpty(None, None).unwrap();
+        let released = tcgetattr(&pty.slave).unwrap();
+        let mut crossterm_raw = released.clone();
+        cfmakeraw(&mut crossterm_raw);
+        tcsetattr(&pty.slave, SetArg::TCSANOW, &crossterm_raw).unwrap();
+        let mut master = std::fs::File::from(pty.master);
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            loop {
+                match master.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    // A signal can interrupt the read on some targets.
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let steps = Arc::new(Mutex::new(Vec::new()));
+        let mut tui = Tui {
+            tty: pty.slave.try_clone().unwrap(),
+            released: released.clone(),
+            steps: Arc::clone(&steps),
+        };
+        let mut session = std::process::Command::new("/bin/sh");
+        session
+            .arg("-c")
+            .arg("stty raw -echo -iexten; printf R; exit 0");
+        let status = attach_through_relay(&mut tui, session, |cmd| {
+            steps.lock().unwrap().push("relay".into());
+            let real = minimal_client::tty_relay::RealTty::from_fds(
+                pty.slave.try_clone().unwrap(),
+                pty.slave.try_clone().unwrap(),
+            );
+            minimal_client::attach::run_interactive_attach_on(cmd, real, None)
+        })
+        .unwrap();
+        assert!(status.success());
+        assert_eq!(
+            *steps.lock().unwrap(),
+            vec![
+                "release".to_string(),
+                "relay".to_string(),
+                format!("resume in {}", mode(&released)),
+            ],
         );
     }
 }

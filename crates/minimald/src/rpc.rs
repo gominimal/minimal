@@ -1,11 +1,11 @@
 use futures::StreamExt as _;
 use minimald_rpc::{
-    AbortSession, AbortSessionResponse, CleanCacheRequest, CleanCacheUpdate, CreateSession,
-    DestroySession, DestroySessionResponse, Errorable, FinalizeSession, FinalizeSessionResponse,
-    GetEffectiveSessionPolicy, GetEffectiveSessionPolicyRequest, GetMeshStatus, GetSessionPolicy,
-    GetSessionPolicyRequest, GetSessionRecord, GetSessionRecordRequest, GetSessionRecordResponse,
-    GetSessionScreen, GetVersion, GetVersionResponse, ListSessions, ListSessionsEntry,
-    ListSessionsResponse, OneshotSshRpc, RPC_SUBSYSTEM_PREFIX, RenameSession,
+    AbortSession, AbortSessionResponse, BoxControlReply, BoxControlRequest, CleanCacheRequest,
+    CleanCacheUpdate, CreateSession, DestroySession, DestroySessionResponse, Errorable,
+    FinalizeSession, GetEffectiveSessionPolicy, GetEffectiveSessionPolicyRequest, GetMeshStatus,
+    GetSessionPolicy, GetSessionPolicyRequest, GetSessionRecord, GetSessionRecordRequest,
+    GetSessionRecordResponse, GetSessionScreen, GetVersion, GetVersionResponse, ListSessions,
+    ListSessionsEntry, ListSessionsResponse, OneshotSshRpc, RPC_SUBSYSTEM_PREFIX, RenameSession,
     RenameSessionResponse, ResourcePool, SessionDelta, SessionDeltaRequest, SessionDeltaResponse,
     Shutdown, ShutdownRequest, ShutdownResponse, SubmitVerdict,
 };
@@ -179,6 +179,9 @@ async fn serve_list_sessions(
                     .into_iter()
                     .zip(enforcement)
                     .map(|(i, host_ip_enforcement)| ListSessionsEntry {
+                        // NET-129: the listing names the ports this box
+                        // yields, from the same read the runtime facts use.
+                        shared_port_collisions: shared_port_collisions_of(&mngr, i.id),
                         id: i.id,
                         name: i.name,
                         project_path: Some(i.project_path),
@@ -206,6 +209,28 @@ async fn serve_list_sessions(
             })
         })
         .await
+}
+
+/// The ports a box's attach yields because a sibling at the same shared
+/// loopback address holds them (NET-129, first-come), as the wire names
+/// them: the one registry read both the runtime facts and the listing answer
+/// from, so `min session policy` and `min session list` cannot disagree.
+/// Empty for every mode but a shared-address own-ip box; a plain map lookup
+/// behind the registry's lock, so it never holds up a reply.
+fn shared_port_collisions_of(
+    mngr: &crate::sessions::ManagerHandle,
+    id: SessionId,
+) -> Vec<minimald_rpc::SharedPortCollision> {
+    let registry = mngr.hostnames();
+    let routes = registry.read().expect("hostname registry lock poisoned");
+    routes
+        .shared_port_collisions(id)
+        .into_iter()
+        .map(|c| minimald_rpc::SharedPortCollision {
+            port: c.port,
+            held_by: c.other,
+        })
+        .collect()
 }
 
 fn detect_resource_pool() -> Option<ResourcePool> {
@@ -311,6 +336,10 @@ async fn serve_create_session(
             // manager: the success record below needs it, and the reply
             // carries only the assigned id.
             let session_name = req.config.name.clone();
+            // Read the network mode off the config for the same reason: the
+            // manager consumes it, and the mode the session activated with is
+            // what the field below reports beside the "session created" line.
+            let network = req.config.network;
             // Read the egress rule counts off the config for the same reason:
             // the manager consumes it, and the stored record's egress is what
             // the counts below report beside the "session created" line.
@@ -377,6 +406,7 @@ async fn serve_create_session(
                     tracing::info!(
                         session_id = %id,
                         session_name = session_name.as_deref().unwrap_or(ANONYMOUS_SESSION),
+                        network_mode = %network.word(),
                         egress_allow_subnets = egress_counts.allow_subnets,
                         egress_allow_protocols = egress_counts.allow_protocols,
                         egress_allow_dns_hosts = egress_counts.allow_dns_hosts,
@@ -694,6 +724,286 @@ async fn settled_proxy_port(state: &ServerStateHandle) -> Option<u16> {
     }
 }
 
+/// The answerer control socket's file name, beside the daemon's identity
+/// dir (its provider instance dir) — the native door the answerer's
+/// handover verbs knock on, the counterpart of the VM host daemon's
+/// `control.sock` (its `minvmd` control module's socket of the same
+/// name): one door per daemon, in a dir only this operator (and root)
+/// can reach.
+pub const ANSWERER_CONTROL_SOCK_FILE: &str = "control.sock";
+
+/// The largest request line the answerer control socket will read: a
+/// request is one small verb, so anything past this bound is not one.
+const ANSWER_CONTROL_MAX_LINE: usize = 64 * 1024;
+
+/// How long the answerer control socket waits for one request line: the
+/// door answers one ask per connect, so a connection that parks without
+/// asking is released at the bound rather than held for the daemon's
+/// life.
+const CONTROL_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Binds and serves the daemon's answerer control socket (NET-122's
+/// native half of the same door the VM host daemon serves): the socket
+/// answers the answerer's status and handover verbs —
+/// `answerer_status`, `release_answerer`, `release_answerer_cancel` —
+/// from the acquisition's status cell ([`AnswererStatus`]), and nothing
+/// else: this daemon's boxes register over RPC channels, not over this
+/// door, so every box verb is refused as a wrong-door ask.
+///
+/// The socket lives in the daemon's identity dir (its provider instance
+/// dir, the dir its node id is), at [`ANSWERER_CONTROL_SOCK_FILE`], bound
+/// before the answerer's acquisition starts so a control surface is
+/// there whatever the acquisition decides; a daemon with no identity dir
+/// configured (a harness server) serves from its state dir. Bound on the
+/// calling task so a failure to bind surfaces to the caller, and the
+/// accept loop runs detached for the daemon's life.
+///
+/// Access is the file's: owner-only (0600), in a dir only this operator
+/// and root can reach. The peer check is belt to that braces: a request
+/// is served when its peer is this daemon's own uid, or — for the two
+/// handover verbs alone — root, whose install step (the answerer
+/// service's) is the only asker that runs as root.
+pub(crate) async fn spawn_answerer_control(
+    state: &ServerStateHandle,
+    status: crate::net::answerer::AnswererStatus,
+) -> std::io::Result<()> {
+    let dir = match state.daemon_identity_dir().await {
+        Some(dir) => dir,
+        None => state.minimal_state_dir().await,
+    };
+    let sock_path = std::path::PathBuf::from(dir.as_str()).join(ANSWERER_CONTROL_SOCK_FILE);
+    // A socket left by a previous run of this same daemon instance is
+    // stale the moment this one binds; a live one is another daemon's
+    // door, not this one's to remove, so the bind is refused in its name
+    // rather than taking the file out from under a daemon still serving
+    // it. The probe is the connect the door's own askers make: a corpse
+    // refuses it, a live listener takes it.
+    use std::os::unix::fs::FileTypeExt as _;
+
+    match std::fs::symlink_metadata(&sock_path) {
+        Ok(meta) if meta.file_type().is_socket() => {
+            if tokio::net::UnixStream::connect(&sock_path).await.is_ok() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AddrInUse,
+                    format!(
+                        "another daemon is already serving the answerer control socket at {}",
+                        sock_path.display()
+                    ),
+                ));
+            }
+            let _ = std::fs::remove_file(&sock_path);
+        }
+        _ => {}
+    }
+    let listener = tokio::net::UnixListener::bind(&sock_path)?;
+    std::fs::set_permissions(
+        &sock_path,
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )?;
+    let shutdown = state.shutdown_token().await;
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => return,
+                accepted = listener.accept() => {
+                    let Ok((stream, _)) = accepted else { return };
+                    let status = status.clone();
+                    tokio::spawn(serve_answerer_control(stream, status));
+                }
+            }
+        }
+    });
+    tracing::info!(
+        component = "zone-answerer",
+        socket = %sock_path.display(),
+        "the answerer control socket is listening; it answers the answerer's status and \
+         handover verbs"
+    );
+    Ok(())
+}
+
+/// Serves one answerer control connection: one request line, one reply
+/// line, the same shape every control socket of this system speaks (a
+/// [`BoxControlRequest`] in, a [`BoxControlReply`] out), with this
+/// daemon's bounds on both.
+async fn serve_answerer_control(
+    mut stream: tokio::net::UnixStream,
+    status: crate::net::answerer::AnswererStatus,
+) {
+    use tokio::io::AsyncWriteExt as _;
+
+    // The peer check comes at accept, before a byte is read, as on the VM
+    // host daemon's door: this daemon's own uid may ask every verb, root
+    // only the handover's two, and any other uid is closed on with a
+    // debug line. The 0600 socket mode is the primary gate; this is
+    // defence in depth against a mis-moded file or dir.
+    let own_uid = current_uid();
+    let peer_uid = match stream.peer_cred() {
+        Ok(cred) => cred.uid(),
+        Err(error) => {
+            tracing::debug!(
+                component = "zone-answerer",
+                %error,
+                "answerer control-socket peer check failed"
+            );
+            return;
+        }
+    };
+    let root_peer = peer_uid == 0 && own_uid != 0;
+    if peer_uid != own_uid && !root_peer {
+        tracing::debug!(
+            component = "zone-answerer",
+            peer_uid,
+            "refused an answerer control-socket connection from a uid that is neither this \
+             daemon's nor root"
+        );
+        return;
+    }
+    let reply = match read_control_request(&mut stream).await {
+        // A connect-and-close probe sent no line: nothing to answer.
+        Ok(None) => return,
+        Ok(Some(line)) => {
+            // An unparseable line is a status ask, not an error reply: the
+            // status ask is the read this door always answers, so a
+            // probe's garbage gets the status and closes, rather than a
+            // parse-failure no client of this door ever sends.
+            let request: BoxControlRequest =
+                serde_json_lenient::from_str(&line).unwrap_or(BoxControlRequest::AnswererStatus);
+            if !answerer_control_admits(peer_uid, own_uid, &request) {
+                tracing::warn!(
+                    component = "zone-answerer",
+                    peer_uid,
+                    "refused an answerer control-socket request from root: root may only \
+                     release the answerer or cancel a release"
+                );
+                return;
+            }
+            match request {
+                BoxControlRequest::AnswererStatus => BoxControlReply::Status(status.get()),
+                BoxControlRequest::ReleaseAnswerer => {
+                    let reply = status.release().await;
+                    tracing::info!(
+                        acted = reply.acted,
+                        component = "zone-answerer",
+                        "answer to a release request: {}",
+                        reply.detail
+                    );
+                    BoxControlReply::AnswererRelease {
+                        acted: reply.acted,
+                        detail: reply.detail,
+                    }
+                }
+                BoxControlRequest::ReleaseAnswererCancel => {
+                    let reply = status.release_cancel().await;
+                    tracing::info!(
+                        acted = reply.acted,
+                        component = "zone-answerer",
+                        "answer to a release-cancel request: {}",
+                        reply.detail
+                    );
+                    BoxControlReply::AnswererRelease {
+                        acted: reply.acted,
+                        detail: reply.detail,
+                    }
+                }
+                BoxControlRequest::Register(_)
+                | BoxControlRequest::Withdraw(_)
+                | BoxControlRequest::AdmitPort(_)
+                | BoxControlRequest::WithdrawPort(_)
+                | BoxControlRequest::ReadRow(_)
+                | BoxControlRequest::AdmitAsk(_)
+                | BoxControlRequest::RecordAskAnswer(_)
+                | BoxControlRequest::SubscribeAsks(_) => BoxControlReply::Error {
+                    error: "the native daemon's control socket answers only the answerer \
+                            verbs; boxes register over the daemon's RPC channels"
+                        .to_string(),
+                },
+            }
+        }
+        Err(error) => BoxControlReply::Error {
+            error: format!("could not read the request line: {error}"),
+        },
+    };
+    let line = match serde_json_lenient::to_string(&reply) {
+        Ok(mut line) => {
+            line.push('\n');
+            line
+        }
+        Err(_) => "{\"error\":\"the reply did not serialize\"}\n".to_string(),
+    };
+    let _ = stream.write_all(line.as_bytes()).await;
+    let _ = stream.flush().await;
+}
+
+/// Reads one request line off a control connection, bounded by
+/// [`ANSWER_CONTROL_MAX_LINE`] and by
+/// [`CONTROL_REQUEST_TIMEOUT`]: a request is one small verb one connect
+/// sends whole, so a connection that sends none — or half of one — is
+/// released after the bound instead of being held for the daemon's life.
+/// `Ok(None)` is a connection that said nothing — a probe's
+/// connect-and-close, answered with nothing.
+async fn read_control_request(
+    stream: &mut tokio::net::UnixStream,
+) -> std::io::Result<Option<String>> {
+    use tokio::io::AsyncReadExt as _;
+
+    let mut line = Vec::new();
+    let mut buf = [0u8; 1024];
+    let read = async {
+        loop {
+            let read = stream.read(&mut buf).await?;
+            if read == 0 {
+                return if line.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(String::from_utf8_lossy(&line).into_owned()))
+                };
+            }
+            if let Some(newline) = buf[..read].iter().position(|byte| *byte == b'\n') {
+                line.extend_from_slice(&buf[..newline]);
+                return Ok(Some(String::from_utf8_lossy(&line).into_owned()));
+            }
+            line.extend_from_slice(&buf[..read]);
+            if line.len() > ANSWER_CONTROL_MAX_LINE {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "the control request exceeded the line bound",
+                ));
+            }
+        }
+    };
+    match tokio::time::timeout(CONTROL_REQUEST_TIMEOUT, read).await {
+        Ok(result) => result,
+        Err(_elapsed) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "the control request did not arrive in time",
+        )),
+    }
+}
+
+/// This daemon's own uid — the peer check's own half.
+/// Whether the answerer control socket serves `request` from `peer_uid`,
+/// the gate the VM host daemon's door applies: this daemon's own uid asks
+/// every verb, and root — the answerer service's install step, connecting
+/// to a daemon that is not root's — only the handover's release and its
+/// cancel. Any other uid was closed on at accept.
+fn answerer_control_admits(peer_uid: u32, own_uid: u32, request: &BoxControlRequest) -> bool {
+    if peer_uid == own_uid {
+        return true;
+    }
+    peer_uid == 0
+        && matches!(
+            request,
+            BoxControlRequest::ReleaseAnswerer | BoxControlRequest::ReleaseAnswererCancel
+        )
+}
+
+fn current_uid() -> u32 {
+    // SAFETY: getuid takes no arguments and cannot fault.
+    unsafe { libc::getuid() }
+}
+
 /// `ConfigureLoadout`: composes a created session's loadout from the
 /// project config in its workspace plus the client's contribution.
 /// Resolves the session's live actor and routes the contribution to it;
@@ -802,7 +1112,16 @@ async fn serve_finalize_session(
                 });
             };
             Ok(match h.finalize().await {
-                Ok(activate_hooks) => Errorable::Ok(FinalizeSessionResponse { activate_hooks }),
+                Ok(mut response) => {
+                    // The reply is `deny_unknown_fields`, so a client that
+                    // did not ask for the yielded ports would refuse a reply
+                    // naming them and abort its activation: only a client
+                    // that asked gets the list (the yield itself stands).
+                    if !req.report_shared_port_collisions {
+                        response.shared_port_collisions.clear();
+                    }
+                    Errorable::Ok(response)
+                }
                 Err(e) => Errorable::Err {
                     error: e.to_string(),
                 },
@@ -865,13 +1184,13 @@ async fn serve_destroy_session(
                 .flatten()
                 .and_then(|record| record.name);
             match mngr.delete_session(req.id).await {
-                Ok(()) => {
+                Ok(hook_failures) => {
                     tracing::info!(
                         session_id = %req.id,
                         session_name = session_name.as_deref().unwrap_or(ANONYMOUS_SESSION),
                         "session destroyed"
                     );
-                    Ok(Errorable::Ok(DestroySessionResponse))
+                    Ok(Errorable::Ok(DestroySessionResponse { hook_failures }))
                 }
                 Err(e) => Ok(Errorable::Err {
                     error: e.to_string(),
@@ -1097,16 +1416,13 @@ async fn serve_get_effective_session_policy(
 /// empty list — the honest answer for a box that is not running, since a
 /// publish lives only while its box does.
 ///
-/// Each row's reachability state is filled here, at read time, from the same
-/// set the box's relay gate was compiled from — the declared ports
-/// [`declared_ingress_ports`] — because it is a fact about the box, not about
-/// the bind: a runtime-published port is bound on the host at once, but the
-/// frame only reaches the box through the relay gate its attach installed,
-/// and that gate admits the ports the *declaration* named. So a runtime
-/// publish reads `pending` until the gate's admitted set grows to include
-/// runtime-published ports, and a publish of a port the declaration already
-/// names — the one overlap — is not pending, because the declared forward is
-/// what answers at that address.
+/// Every row reads not pending: a runtime publish admits its port at the
+/// box's relay gate in the same turn it records the mapping (NET-044), so a
+/// listed publish is reachable. The `pending` field stays on the wire so a
+/// client can still tell this daemon's rows from an older daemon's. The
+/// listen watcher's rows — the in-range listens the box's `allow` stance
+/// published — follow the exposes' rows, reachable too: the watcher admits
+/// each port at the gate as its publish's last step.
 async fn serve_get_live_ingress(
     s: ServerStateHandle,
     c: RuChannel<Msg>,
@@ -1126,37 +1442,19 @@ async fn serve_get_live_ingress(
                 None => Ok(Errorable::Err {
                     error: "no session found".to_string(),
                 }),
-                Some(session) => {
-                    // The admitted set the gate is compiled from, per
-                    // mapping's transport — an unreadable record reads as
-                    // "nothing admitted", so its mappings all read pending: a
-                    // row is reachable only when the gate is known to admit
-                    // it.
-                    let record = session.record().await.ok();
-                    let policy = record.as_ref().map(|record| &record.policy);
-                    match session.live_ingress().await {
-                        Ok(live) => Ok(Errorable::Ok(
-                            live.into_iter()
-                                .map(|mut mapping| {
-                                    let admitted = crate::net::switch::declared_ingress_ports(
-                                        policy,
-                                        mapping.proto,
-                                    );
-                                    // The daemon knows the state, so it says
-                                    // it: `Some`, never the unknown a reply
-                                    // from a daemon older than the field
-                                    // decodes as.
-                                    mapping.pending =
-                                        Some(!admitted.contains(&mapping.internal_port));
-                                    mapping
-                                })
-                                .collect(),
-                        )),
-                        Err(e) => Ok(Errorable::Err {
-                            error: e.to_string(),
-                        }),
-                    }
-                }
+                Some(session) => match session.live_ingress().await {
+                    // The actor's own rows, `pending: Some(false)` each: the
+                    // publish admitted the port when it recorded the row. The
+                    // listen watcher's rows follow the exposes' as they
+                    // stand: the gate admitted each one as its publish's
+                    // last step.
+                    Ok(live) => Ok(Errorable::Ok(
+                        live.exposed.into_iter().chain(live.listened).collect(),
+                    )),
+                    Err(e) => Ok(Errorable::Err {
+                        error: e.to_string(),
+                    }),
+                },
             }
         })
         .await
@@ -1204,9 +1502,19 @@ async fn serve_get_session_runtime_facts(
                         &crate::session_host::host_ip_enforcement_fact(),
                         record.host_ip_enforcement,
                     );
+                    // The ports this box's attach yields because a sibling at
+                    // the same shared loopback address holds them (first-come):
+                    // the same registry record the attach path reads to skip
+                    // those forwards, surfaced so the policy view can mark the
+                    // declared rows that are served elsewhere. Empty for every
+                    // mode but a shared-address own-ip box — and read behind
+                    // the registry's lock, a plain map lookup, so it never
+                    // holds up the reply.
+                    let shared_port_collisions = shared_port_collisions_of(&mngr, record.id);
                     Ok(Errorable::Ok(minimald_rpc::SessionRuntimeFacts {
                         id: record.id,
                         host_ip_enforcement,
+                        shared_port_collisions,
                     }))
                 }
             }
@@ -2284,8 +2592,9 @@ mod tests {
     use minimald_rpc::{
         CreateSession, CreateSessionRequest, DestroySessionRequest, EffectiveEgress,
         EffectiveSessionPolicy, EgressPolicy, GetEffectiveSessionPolicy,
-        GetEffectiveSessionPolicyRequest, GetSessionPolicy, GetSessionPolicyRequest,
-        RenameSessionRequest, SessionPolicy, Shutdown, ShutdownRequest, ShutdownResponse,
+        GetEffectiveSessionPolicyRequest, GetSessionPolicy, GetSessionPolicyRequest, IngressPolicy,
+        IpProto, PortMapping, RenameSessionRequest, SessionPolicy, Shutdown, ShutdownRequest,
+        ShutdownResponse,
     };
     use paths::HostAbsPath;
     use sessions::{NetworkMode, SessionId};
@@ -3220,6 +3529,7 @@ mod tests {
                 // verdict, so no host's gate refuses it and the fact is what
                 // shows, on any host this test runs on.
                 host_ip_enforcement: Some(fact.enforcement),
+                shared_port_collisions: Vec::new(),
                 attrs: None,
             }]
         );
@@ -4009,11 +4319,11 @@ mod tests {
             "the refusal names the rule it refused over, by field and entry: {error}"
         );
         assert!(
-            error.contains("this host decides a host-address box's egress verdict per box"),
+            error.contains("host_ip boxes on this host enforce only deny-all egress"),
             "the refusal says whose verdict it is that cannot enforce the rule: {error}"
         );
         assert!(
-            error.contains("own-address boxes enforce them"),
+            error.contains("which enforces them"),
             "the refusal says own-address boxes enforce these rules, so the \
              person who typed the declaration is told where they do work: {error}"
         );
@@ -4022,8 +4332,8 @@ mod tests {
         // enforces them — the words a person reads last are the ones they
         // can act on.
         assert!(
-            error.contains("remove these rules")
-                && error.contains("declare deny-all egress")
+            error.contains("Remove them")
+                && error.contains("--deny-all-egress")
                 && error.contains("all three allow lists present and empty"),
             "the refusal names the remedy for the rules it refused: {error}"
         );
@@ -4072,6 +4382,7 @@ mod tests {
                 logged.lines().any(|line| {
                     line.contains("refused a create whose host-address declaration names rules")
                         && line.contains(&format!("session_name=Some(\"{name}\")"))
+                        && line.contains("network_mode=host_ip")
                         && line.contains("host_ip_enforcement=per_box")
                         && line.contains(rule)
                 }),
@@ -5648,6 +5959,52 @@ mod tests {
         );
     }
 
+    /// The `session created` log line names the session's network mode beside
+    /// its id and name, in the CLI's `--network` spellings (`none` / `host_ip`
+    /// / `own_ip`) so the bundle's tail reads like the command a person typed.
+    /// Attributed by session id, because under libtest the capture buffer is
+    /// shared by every test in the binary — assertions on it say `contains`,
+    /// never `equals`.
+    #[tokio::test]
+    async fn session_created_line_names_the_network_mode() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let capture = crate::test_harness::captured_log();
+
+        // One box per mode: the default (host-address), a NoNet box, and an
+        // own-address box. Each create succeeds because none declares egress
+        // (so the unenforceable-declaration gate never fires) and the native
+        // test host is not a microVM (so an own-address box needs no handed
+        // addresses).
+        let host_ip = req("host-address", "/uwu");
+        let host_id = client.call::<CreateSession>(&host_ip).await.unwrap().id;
+
+        let mut no_net = req("no-network", "/uwu");
+        no_net.config.network = NetworkMode::NoNet;
+        let none_id = client.call::<CreateSession>(&no_net).await.unwrap().id;
+
+        let mut own_ip = req("own-address", "/uwu");
+        own_ip.config.network = NetworkMode::OwnIp;
+        let own_id = client.call::<CreateSession>(&own_ip).await.unwrap().id;
+
+        let log = capture.contents();
+        for (id, spelling) in [
+            (&host_id, "host_ip"),
+            (&none_id, "none"),
+            (&own_id, "own_ip"),
+        ] {
+            assert!(
+                log.lines().any(|line| {
+                    line.contains("session created")
+                        && line.contains(&format!("session_id={id}"))
+                        && line.contains(&format!("network_mode={spelling} "))
+                }),
+                "the session created line for {id} must name its network mode \
+                 {spelling}, got: {log}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn create_session_rejects_policy_incompatible_with_network_mode() {
         let server = TestServer::new().await;
@@ -5680,7 +6037,56 @@ mod tests {
         assert_eq!(
             resp,
             Errorable::Err {
-                error: "egress policy is only valid for an own-IP or host-address PTask, not NoNet"
+                error: "egress rules need network mode own_ip or host_ip (this box is none): \
+                        a none box has no network to apply them to"
+                    .to_string()
+            }
+        );
+
+        // The rejected session left nothing behind in the store.
+        let mngr = server.state.sessions_manager().await;
+        assert!(mngr.list().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_session_rejects_static_ingress_on_host_net() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+
+        // A static ingress mapping on a host-address box is a configuration the
+        // daemon refuses at create time, naming the policy field and the box's
+        // mode (not a CLI flag: any client may send this): an own-IP box is the
+        // only mode with a published address to apply the mapping to. Built by
+        // hand to bypass the CLI-side refusal so the daemon path itself is what
+        // is exercised.
+        let ingress = IngressPolicy {
+            port_mappings: vec![PortMapping {
+                external_port: 18080,
+                internal_port: 80,
+                proto: IpProto::Tcp,
+            }],
+            dynamic_allowed_range: None,
+            dynamic_ingress: None,
+        };
+        let resp = client
+            .call::<CreateSession>(&CreateSessionRequest {
+                config: minimald_rpc::SessionConfig {
+                    name: Some("bad-ingress".to_string()),
+                    project_path: HostAbsPath::try_new("/uwu").unwrap(),
+                    network: NetworkMode::HostNet,
+                    policy: SessionPolicy::new(None, Some(ingress)),
+                    box_addresses: None,
+                    hooks_enabled: true,
+                    attrs: Default::default(),
+                },
+                must_match_version: None,
+            })
+            .await;
+        assert_eq!(
+            resp,
+            Errorable::Err {
+                error: "ingress port mappings need network mode own_ip (this box is host_ip): \
+                        only an own-IP box has a published address to apply them to"
                     .to_string()
             }
         );
@@ -5812,7 +6218,7 @@ mod tests {
         let resp = client
             .call::<DestroySession>(&DestroySessionRequest { id: session_id })
             .await;
-        assert_eq!(resp, Errorable::Ok(DestroySessionResponse));
+        assert_eq!(resp, Errorable::Ok(DestroySessionResponse::default()));
 
         // The record is gone: it no longer resolves by id...
         let get_session = client
@@ -6079,5 +6485,99 @@ mod tests {
         assert_eq!(resp.peers[0].public_key, remote.public().to_base64());
         // Keep the sink alive until the assertions complete.
         drop(_sink_rx);
+    }
+
+    /// The answerer control socket's gate mirrors the VM host daemon's
+    /// door: the daemon's own uid asks every verb, root only the handover's
+    /// release and its cancel — a status ask or a box verb from root is
+    /// refused — and any other uid nothing.
+    #[test]
+    fn answerer_control_admits_root_only_the_handover_verbs() {
+        let own = 1000;
+        for request in [
+            BoxControlRequest::AnswererStatus,
+            BoxControlRequest::ReleaseAnswerer,
+            BoxControlRequest::ReleaseAnswererCancel,
+        ] {
+            assert!(answerer_control_admits(own, own, &request), "{request:?}");
+        }
+        assert!(answerer_control_admits(
+            0,
+            own,
+            &BoxControlRequest::ReleaseAnswerer
+        ));
+        assert!(answerer_control_admits(
+            0,
+            own,
+            &BoxControlRequest::ReleaseAnswererCancel
+        ));
+        assert!(
+            !answerer_control_admits(0, own, &BoxControlRequest::AnswererStatus),
+            "root asking the status is refused"
+        );
+        assert!(
+            !answerer_control_admits(
+                0,
+                own,
+                &BoxControlRequest::ReadRow(minimald_rpc::ReadRowRequest {
+                    name: "web".to_string(),
+                })
+            ),
+            "root asking a row read is refused"
+        );
+        assert!(!answerer_control_admits(
+            4242,
+            own,
+            &BoxControlRequest::ReleaseAnswerer
+        ));
+    }
+
+    /// A stale control socket — a file at the daemon's own path that no
+    /// listener answers — is unlinked and re-bound; a live one is refused
+    /// and left in place, never taken out from under the daemon serving it.
+    #[tokio::test]
+    async fn answerer_control_rebinds_a_stale_socket_and_refuses_a_live_one() {
+        let server = TestServer::new().await;
+        let dir = std::path::PathBuf::from(server.state.minimal_state_dir().await.as_str());
+        let sock = dir.join(ANSWERER_CONTROL_SOCK_FILE);
+
+        // A corpse: bound, then its listener dropped, so the file stays.
+        drop(std::os::unix::net::UnixListener::bind(&sock).expect("a stale socket binds"));
+        assert!(sock.exists(), "the stale socket file is left behind");
+        spawn_answerer_control(
+            &server.state,
+            crate::net::answerer::AnswererStatus::starting(),
+        )
+        .await
+        .expect("a stale socket is unlinked and re-bound");
+        let mut stream = tokio::net::UnixStream::connect(&sock)
+            .await
+            .expect("the re-bound socket answers");
+        stream
+            .write_all(b"{\"verb\":\"answerer_status\"}\n")
+            .await
+            .expect("the ask is written");
+        let mut reply = String::new();
+        stream
+            .read_to_string(&mut reply)
+            .await
+            .expect("the reply is read");
+        assert!(
+            reply.contains("state"),
+            "the re-bound door answers its own uid a status: {reply}"
+        );
+
+        // Live: a second bind at the same path is refused, the file kept.
+        let refused = spawn_answerer_control(
+            &server.state,
+            crate::net::answerer::AnswererStatus::starting(),
+        )
+        .await
+        .expect_err("a live door is not taken");
+        assert_eq!(refused.kind(), std::io::ErrorKind::AddrInUse);
+        assert!(
+            tokio::net::UnixStream::connect(&sock).await.is_ok(),
+            "the live door still answers"
+        );
     }
 }

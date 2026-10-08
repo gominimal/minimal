@@ -210,6 +210,9 @@ pub fn register_box(
         ingress_ports: Vec::new(),
         egress,
         credentialed_upstream: None,
+        dynamic_ingress: None,
+        dynamic_allowed_range: None,
+        hold: false,
     });
     let mut line = serde_json_lenient::to_string(&request)
         .map_err(|e| format!("serialize the box registration: {e}"))?;

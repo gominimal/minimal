@@ -100,6 +100,9 @@ ot.workspace = true
 inquire.workspace = true
 
 [dev-dependencies]
+# `term` for the pty that stands in for the user's terminal in the attach
+# tests.
+nix = { workspace = true, features = ["term"] }
 minimald = { path = "../minimald", features = ["test-support"] }
 minvmd = { path = "../minvmd", default-features = false, features = ["test-support"] }
 # `test-util` (not in tokio's `full`) for `#[tokio::test(start_paused = true)]`:
