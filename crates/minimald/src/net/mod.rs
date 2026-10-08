@@ -59,10 +59,11 @@ use std::io;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::process::{Child, Command};
-use tokio::sync::watch;
+use tokio::sync::{Mutex, watch};
 
 // The gvproxy-switch primitives (subnet arithmetic, MAC derivation, wire
 // constants, `-config` rendering) live in the shared `switch` crate.
@@ -446,6 +447,34 @@ pub struct SwitchClient {
     /// actually bound once its startup retry has it serving. `None` when no
     /// port is known, which leaves the node with no opening.
     hostname_proxy_port: Option<u16>,
+    /// Whether that port is safe to compile a box's opening from: `false`
+    /// from construction until [`Self::set_hostname_proxy_port`] records
+    /// the port the proxy actually bound — the transition
+    /// [`hostname_proxy_serving_port`] waits for — because a seeded default
+    /// is only the bind's *request*, which the OS may relocate when busy
+    /// (NET-025), and a box compiled against it would point its node
+    /// address's opening at whatever unrelated host process holds the
+    /// reselected port (design §7.1). A pinned seed is no exception: it
+    /// never relocates (NET-024), but a busy one is retried while another
+    /// host process holds it, so it too waits for the recorded bind.
+    hostname_proxy_serving: bool,
+    /// Whether a proxy bind is still to come on this host: set by a seeded
+    /// port, and by [`Self::with_hostname_proxy_pending`] for the OS-picks
+    /// `0`, which seeds no port but still binds one. A switch with nothing
+    /// pending (no proxy on this host) answers [`hostname_proxy_serving_port`]
+    /// at once; one with a bind pending waits for it, whether or not a port
+    /// was seeded.
+    hostname_proxy_pending: bool,
+    /// The leases of the attached boxes [`hostname_proxy_serving_port`]
+    /// compiled with no opening because the proxy was still not serving past
+    /// its settle: told in-session at launch, said again with the remedy when
+    /// the serving transition lands ([`Self::set_hostname_proxy_port`] hands
+    /// the count back), and dropped only at detach — the box keeps its
+    /// openingless rules until then, so the transition never clears it, and
+    /// a launch that reads it after the bind still tells its session. A set
+    /// keyed by lease, so one box is counted once and a box that left is not
+    /// counted.
+    hostname_proxy_stranded: std::collections::HashSet<Ipv4Addr>,
 }
 
 impl SwitchClient {
@@ -476,6 +505,9 @@ impl SwitchClient {
             transport: SwitchTransport::default(),
             host_id: crate::net::dns::DEFAULT_HOST_ID.to_owned(),
             hostname_proxy_port: None,
+            hostname_proxy_serving: false,
+            hostname_proxy_pending: false,
+            hostname_proxy_stranded: std::collections::HashSet::new(),
         }
     }
 
@@ -501,6 +533,17 @@ impl SwitchClient {
     #[must_use]
     pub fn with_hostname_proxy_port(mut self, port: Option<u16>) -> Self {
         self.hostname_proxy_port = port;
+        self.hostname_proxy_pending |= port.is_some();
+        self
+    }
+
+    /// Marks a proxy bind as still to come even when no port was seeded —
+    /// the OS-picks `0`, whose port is known only once bound — so a box
+    /// attaching before it waits for the bind like any other, rather than
+    /// taking "no port known" as "no proxy on this host".
+    #[must_use]
+    pub fn with_hostname_proxy_pending(mut self, pending: bool) -> Self {
+        self.hostname_proxy_pending |= pending;
         self
     }
 
@@ -511,12 +554,48 @@ impl SwitchClient {
         self.hostname_proxy_port
     }
 
+    /// The port a box may compile its opening from right now, without
+    /// waiting: the port once the proxy serves on it, `None`
+    /// before then (fail closed, design §7.1).
+    #[must_use]
+    pub fn serving_hostname_proxy_port(&self) -> Option<u16> {
+        self.hostname_proxy_port
+            .filter(|_| self.hostname_proxy_serving)
+    }
+
+    /// Whether a proxy bind is still to come and has not landed: the window
+    /// in which [`Self::serving_hostname_proxy_port`] withholds the port.
+    #[must_use]
+    pub fn hostname_proxy_unsettled(&self) -> bool {
+        self.hostname_proxy_pending && !self.hostname_proxy_serving
+    }
+
+    /// Whether the box on `lease` attached with no node-address opening
+    /// because the proxy was not serving past the settle (see
+    /// [`hostname_proxy_serving_port`]).
+    #[must_use]
+    pub fn hostname_proxy_stranded(&self, lease: Ipv4Addr) -> bool {
+        self.hostname_proxy_stranded.contains(&lease)
+    }
+
     /// Re-points the port this switch's boxes are compiled with to the port
-    /// the proxy actually bound, called once its startup retry has it serving
-    /// (see [`crate::net::switch::compiled_egress`]): an OS-selected port
-    /// replaces the configured/default opening the switch was built with.
-    pub fn set_hostname_proxy_port(&mut self, port: Option<u16>) {
+    /// the proxy actually bound, called once its startup has bound it and
+    /// spawned its serve loop (see [`crate::net::switch::compiled_egress`]):
+    /// an OS-selected port replaces the configured/default opening the
+    /// switch was built with. This call is also the serving transition: from
+    /// it on, the port is one a box may compile its node address's opening
+    /// from. Returns how many boxes attached openingless before it (see
+    /// [`hostname_proxy_serving_port`]) — on the transition only, so a
+    /// repeat call answers `0` — leaving each box's own marker in place
+    /// until it detaches.
+    pub fn set_hostname_proxy_port(&mut self, port: Option<u16>) -> usize {
         self.hostname_proxy_port = port;
+        let was_serving = std::mem::replace(&mut self.hostname_proxy_serving, true);
+        if was_serving {
+            0
+        } else {
+            self.hostname_proxy_stranded.len()
+        }
     }
 
     /// Sets how PTask taps reach the switch. The DM2 default is
@@ -674,6 +753,9 @@ impl SwitchClient {
     /// Propagates teardown failures from [`stop`](Self::stop).
     pub async fn detach(&mut self, released: Ipv4Addr) -> Result<(), NetError> {
         self.attached = self.attached.saturating_sub(1);
+        // The box on that lease is gone: it no longer needs a restart to
+        // reach the hostname proxy, and a later box may take the lease.
+        self.hostname_proxy_stranded.remove(&released);
         if self.allocator.release(released) {
             tracing::debug!(ip = %released, "released the lease with the attach");
         }
@@ -854,6 +936,82 @@ impl SwitchClient {
         }
         let _ = tokio::fs::remove_file(self.control_socket()).await;
         Ok(())
+    }
+}
+
+/// How long [`hostname_proxy_serving_port`] waits for the serving
+/// transition before failing closed, and how often it re-checks while it
+/// waits. A settle, not a wait: the transition normally lands within
+/// milliseconds of an attach, and a proxy still unserving past it is one
+/// whose startup retry is backing off over a port some other process holds
+/// (NET-021) — at which point a box compiled against the seeded port would
+/// point its opening at whatever unrelated host process holds the port the
+/// OS reselected, which is exactly what failing closed (design §7.1: no
+/// opening) is the safe answer to.
+const HOSTNAME_PROXY_SERVE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+const HOSTNAME_PROXY_SERVE_POLL: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// The hostname proxy's port for a box's own-address set (design §7.1):
+/// the port the proxy actually bound, once its startup has it bound — not
+/// the configured/default port the switch was seeded with, which is only the
+/// bind's request and may have been relocated by the OS when busy
+/// (NET-025). Bounded-waits for that transition, then fails closed: `None`
+/// past [`HOSTNAME_PROXY_SERVE_WAIT`]. A switch with no bind pending (no
+/// proxy on this host) answers at once. Called on the attach path — where a
+/// box may arrive while the proxy's detached startup driver is still
+/// retrying — so no box can compile a node-address opening against a port
+/// that is not yet the proxy's own.
+///
+/// `stranded` is the lease of the box whose relay opening this resolves:
+/// failing closed for it records the box as stranded (and warns), so its
+/// launch can say so in-session and the serving transition can name it
+/// with the remedy. `None` is a lookup that compiles no box's opening — a
+/// caller-check registration — which fails closed without counting a box.
+pub(crate) async fn hostname_proxy_serving_port(
+    switch: &Arc<Mutex<SwitchClient>>,
+    stranded: Option<Ipv4Addr>,
+) -> Option<u16> {
+    let deadline = tokio::time::Instant::now() + HOSTNAME_PROXY_SERVE_WAIT;
+    loop {
+        // Untimed on purpose: the deadline bounds the serving transition, not
+        // contention on the switch mutex. Both callers take this same lock
+        // unbounded immediately before (the `subnet()` read), so timing this
+        // acquisition would not bound the attach, and the fail-closed path
+        // below must hold the lock to record the box stranded. The lock is
+        // dropped before every poll, so a waiter cannot starve the transition
+        // writer (`set_hostname_proxy_port`, from `record_bound`).
+        let mut switch = switch.lock().await;
+        let port = switch.hostname_proxy_port();
+        if !switch.hostname_proxy_unsettled() {
+            return port;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            match stranded {
+                Some(lease) => {
+                    switch.hostname_proxy_stranded.insert(lease);
+                    drop(switch);
+                    tracing::warn!(
+                        ?port,
+                        %lease,
+                        "the hostname proxy is not serving yet; a box attaching now is \
+                         compiled with no node-address opening rather than against \
+                         the port it was seeded with (design §7.1), and cannot reach \
+                         the hostname proxy until it restarts once the proxy serves"
+                    );
+                }
+                None => {
+                    drop(switch);
+                    tracing::debug!(
+                        ?port,
+                        "the hostname proxy is not serving yet; a registration resolved \
+                         now carries no node-address opening (design §7.1)"
+                    );
+                }
+            }
+            return None;
+        }
+        drop(switch);
+        tokio::time::sleep(HOSTNAME_PROXY_SERVE_POLL).await;
     }
 }
 
@@ -1223,5 +1381,150 @@ mod tests {
         // withdraws the lease with the attach — the drawn address stays
         // spent regardless, the draw cursor never regresses.
         switch.detach(result.lease.ip).await.expect("detach");
+    }
+
+    /// Design §7.1, the three shapes the attach path can meet: a switch that
+    /// never learned a port answers at once; one whose proxy is not serving
+    /// yet fails closed instead of handing out its seeded request; one whose
+    /// proxy is serving hands over the port actually bound.
+    #[tokio::test(start_paused = true)]
+    async fn serving_port_fails_closed_until_the_proxy_serves() {
+        use std::sync::Arc;
+
+        // No port known: no proxy on this host — answered immediately, not
+        // waited on.
+        let unseeded = Arc::new(tokio::sync::Mutex::new(SwitchClient::new(
+            "/nonexistent/gvproxy-binary",
+            "/run/minimal/gvproxy",
+        )));
+        let lease = Ipv4Addr::new(10, 88, 0, 7);
+        assert_eq!(
+            hostname_proxy_serving_port(&unseeded, Some(lease)).await,
+            None
+        );
+
+        // Seeded but not serving: the seeded port is only the bind's
+        // request, so it must not become a box's opening. Fails closed,
+        // within the wait bound, so an attach cannot hang behind it.
+        let seeded = Arc::new(tokio::sync::Mutex::new(
+            SwitchClient::new("/nonexistent/gvproxy-binary", "/run/minimal/gvproxy")
+                .with_hostname_proxy_port(Some(7654)),
+        ));
+        let start = tokio::time::Instant::now();
+        assert_eq!(
+            hostname_proxy_serving_port(&seeded, Some(lease)).await,
+            None,
+            "a seeded-but-unserving switch must not hand its seed to a box"
+        );
+        assert!(
+            start.elapsed() >= HOSTNAME_PROXY_SERVE_WAIT,
+            "the fail-closed answer must come from the wait running out, not before"
+        );
+
+        // Serving: the port the proxy actually bound — here a relocation
+        // away from the seed — is the answer, returned at once.
+        let serving = Arc::new(tokio::sync::Mutex::new(
+            SwitchClient::new("/nonexistent/gvproxy-binary", "/run/minimal/gvproxy")
+                .with_hostname_proxy_port(Some(7654)),
+        ));
+        serving.lock().await.set_hostname_proxy_port(Some(41913));
+        assert_eq!(
+            hostname_proxy_serving_port(&serving, Some(lease)).await,
+            Some(41913)
+        );
+
+        // The box that failed closed above is counted — once, however many
+        // times its own lookups fail closed, and never for a lookup that
+        // compiles no box's opening (a caller-check registration) — and the
+        // serving transition hands the count back once (for its remedy line),
+        // keeping the box's own marker: it stays openingless until it
+        // detaches, and a launch reading it after the bind still says so.
+        assert!(seeded.lock().await.hostname_proxy_stranded(lease));
+        assert_eq!(
+            hostname_proxy_serving_port(&seeded, Some(lease)).await,
+            None
+        );
+        assert_eq!(hostname_proxy_serving_port(&seeded, None).await, None);
+        assert_eq!(seeded.lock().await.set_hostname_proxy_port(Some(41914)), 1);
+        assert!(seeded.lock().await.hostname_proxy_stranded(lease));
+        assert_eq!(seeded.lock().await.set_hostname_proxy_port(Some(41914)), 0);
+    }
+
+    /// A pinned seed (NET-024) is pending like any other until the bind is
+    /// recorded: it never relocates, but a busy one is retried while another
+    /// host process holds it, so compiling a box's opening from it would let
+    /// the box reach that foreign process (design §7.1). Not yet bound, it
+    /// fails closed past the settle and records the box as stranded; once
+    /// the bind is recorded, it is the answer.
+    #[tokio::test(start_paused = true)]
+    async fn a_pinned_seed_waits_for_the_bind_like_any_other() {
+        use std::sync::Arc;
+
+        let lease = Ipv4Addr::new(10, 88, 0, 9);
+        let pinned = Arc::new(tokio::sync::Mutex::new(
+            SwitchClient::new("/nonexistent/gvproxy-binary", "/run/minimal/gvproxy")
+                .with_hostname_proxy_port(Some(7654)),
+        ));
+        let start = tokio::time::Instant::now();
+        assert_eq!(
+            hostname_proxy_serving_port(&pinned, Some(lease)).await,
+            None,
+            "a pinned seed not yet bound must not become a box's opening"
+        );
+        assert!(start.elapsed() >= HOSTNAME_PROXY_SERVE_WAIT);
+        assert!(pinned.lock().await.hostname_proxy_stranded(lease));
+
+        assert_eq!(pinned.lock().await.set_hostname_proxy_port(Some(7654)), 1);
+        assert_eq!(
+            hostname_proxy_serving_port(&pinned, Some(lease)).await,
+            Some(7654)
+        );
+    }
+
+    /// The race itself: a box that starts attaching while the proxy is
+    /// still unbound waits, and the bind landing mid-wait — relocated off
+    /// the seed — hands it the bound port, never the seed.
+    #[tokio::test(start_paused = true)]
+    async fn a_waiting_attach_takes_the_port_bound_mid_wait() {
+        use std::sync::Arc;
+
+        let switch = Arc::new(tokio::sync::Mutex::new(
+            SwitchClient::new("/nonexistent/gvproxy-binary", "/run/minimal/gvproxy")
+                .with_hostname_proxy_port(Some(7654)),
+        ));
+        let waiter = tokio::spawn({
+            let switch = Arc::clone(&switch);
+            async move { hostname_proxy_serving_port(&switch, Some(Ipv4Addr::new(10, 88, 0, 7))).await }
+        });
+        tokio::time::sleep(HOSTNAME_PROXY_SERVE_POLL * 3).await;
+        assert!(!waiter.is_finished(), "the attach waits for the bind");
+        assert_eq!(switch.lock().await.set_hostname_proxy_port(Some(41913)), 0);
+        assert_eq!(waiter.await.expect("waiter"), Some(41913));
+    }
+
+    /// The same race behind the OS-picks `0`, which seeds no port at all:
+    /// a bind is still pending, so a box attaching before it waits and
+    /// takes the port bound mid-wait, rather than reading "no port known"
+    /// as "no proxy here" and attaching openingless for good.
+    #[tokio::test(start_paused = true)]
+    async fn an_os_picked_port_is_waited_for_not_read_as_no_proxy() {
+        use std::sync::Arc;
+
+        let switch = Arc::new(tokio::sync::Mutex::new(
+            SwitchClient::new("/nonexistent/gvproxy-binary", "/run/minimal/gvproxy")
+                .with_hostname_proxy_port(None)
+                .with_hostname_proxy_pending(true),
+        ));
+        let waiter = tokio::spawn({
+            let switch = Arc::clone(&switch);
+            async move { hostname_proxy_serving_port(&switch, Some(Ipv4Addr::new(10, 88, 0, 7))).await }
+        });
+        tokio::time::sleep(HOSTNAME_PROXY_SERVE_POLL * 3).await;
+        assert!(
+            !waiter.is_finished(),
+            "the attach waits for the OS-picked bind"
+        );
+        assert_eq!(switch.lock().await.set_hostname_proxy_port(Some(41915)), 0);
+        assert_eq!(waiter.await.expect("waiter"), Some(41915));
     }
 }
