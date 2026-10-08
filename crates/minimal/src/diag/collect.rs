@@ -1777,6 +1777,203 @@ mod tests {
         assert_eq!(refused.traces.endpoint, None);
     }
 
+    /// The bundle path the child of
+    /// [`a_bundle_collected_with_telemetry_on_carries_no_secret`] writes;
+    /// set only in that child.
+    const T18_OUT: &str = "DIAG_T18_BUNDLE_OUT";
+    /// The state and config directories that child collects from.
+    const T18_STATE: &str = "DIAG_T18_STATE_DIR";
+    const T18_CONFIG: &str = "DIAG_T18_CONFIG_DIR";
+
+    /// Not a test on its own: the process
+    /// [`a_bundle_collected_with_telemetry_on_carries_no_secret`] spawns (this
+    /// test binary, with telemetry settings in its real environment) to run
+    /// `min bug`'s collection, [`crate::diag::cmd_bug`], host side only. Run
+    /// on its own it returns at once.
+    #[tokio::test]
+    #[ignore = "the child process of a_bundle_collected_with_telemetry_on_carries_no_secret"]
+    async fn telemetry_on_bundle_child() {
+        let Some(out) = std::env::var_os(T18_OUT) else {
+            return;
+        };
+        let dir = |name| PathBuf::from(std::env::var_os(name).unwrap());
+        let global = crate::GlobalArgs {
+            repo_dir: None,
+            minimal_dir: Some(dir(T18_STATE)),
+            config_dir: Some(dir(T18_CONFIG)),
+            provider: None,
+            no_input: true,
+            vm: None,
+        };
+        let args = crate::diag::BugArgs {
+            output: Some(PathBuf::from(out)),
+            no_guest: true,
+            guest_timeout_secs: 5,
+            log_tail_bytes: diagnostics::LOG_TAIL_CAP,
+            upload: false,
+            portal: crate::diag::PortalArgs {
+                context: None,
+                token: None,
+                endpoint: crate::diag::upload::DEFAULT_ENDPOINT.to_owned(),
+            },
+        };
+        // Boxed: `cmd_bug` is a large future (clippy::large_futures).
+        Box::pin(crate::diag::cmd_bug(&global, args)).await.unwrap();
+    }
+
+    /// Plan T18 (spec 25 TEL-044, TEL-051): `min bug` run with telemetry on
+    /// carries the spool, names the telemetry settings without their values,
+    /// and lets no secret through. The collection runs in a child process
+    /// whose real environment holds the settings (an endpoint with
+    /// credentials, a tenant path and a query; exporter headers, one
+    /// percent-encoded), because `min bug` reads its own environment; the
+    /// spool holds a header value in free text, a secret-shaped attribute, a
+    /// header-like attribute and a remote URL with a token in it. Every file
+    /// in the bundle is then opened and searched for each secret.
+    #[tokio::test]
+    async fn a_bundle_collected_with_telemetry_on_carries_no_secret() {
+        const SECRETS: &[&str] = &[
+            "ingestPASSWORD9",
+            "TENANTsecret77",
+            "QUERYsecret55",
+            "hcaik_HEADERsecret01",
+            "BEARERsecret02",
+            "opensesame-api-k3y",
+            "AUTHZsecret03",
+            "ghp_REMOTEtoken1234567890abcdefABCDEF12",
+        ];
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = tmp.path().join("state");
+        let config = tmp.path().join("config");
+        let spool_dir = tmp.path().join("spool");
+        for d in [&state, &config, &spool_dir] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(
+            spool_dir.join("minimal-cli-1-1700000000000.jsonl"),
+            concat!(
+                r#"{"resourceSpans":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"minimal-cli"}}]},"#,
+                r#""scopeSpans":[{"spans":[{"traceId":"0af7651916cd43dd8448eb211c80319c","spanId":"b7ad6b7169203331","#,
+                r#""name":"cmd","endTimeUnixNano":"200","attributes":["#,
+                r#"{"key":"cmd.name","value":{"stringValue":"ls"}},"#,
+                r#"{"key":"note","value":{"stringValue":"sent hcaik_HEADERsecret01 to the collector"}},"#,
+                r#"{"key":"vendor.api_key","value":{"stringValue":"opensesame-api-k3y"}},"#,
+                r#"{"key":"http.request.header.authorization","value":{"stringValue":"Bearer AUTHZsecret03"}},"#,
+                r#"{"key":"vcs.remote","value":{"stringValue":"https://x-access-token:ghp_REMOTEtoken1234567890abcdefABCDEF12@github.com/o/r.git"}}"#,
+                r#"]}]}]}]}"#,
+                "\n",
+                r#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[{"body":{"stringValue":"export failed: BEARERsecret02 refused"}}]}]}]}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        let out = tmp.path().join("bundle.tar.zst");
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child.args([
+            "--exact",
+            "diag::collect::tests::telemetry_on_bundle_child",
+            "--ignored",
+        ]);
+        for (k, _) in std::env::vars_os() {
+            let name = k.to_string_lossy();
+            if name.starts_with("OTEL_")
+                || name.starts_with("MINIMAL_")
+                || name == "DO_NOT_TRACK"
+                || name == "TRACEPARENT"
+            {
+                child.env_remove(&k);
+            }
+        }
+        child
+            .env(T18_OUT, &out)
+            .env(T18_STATE, &state)
+            .env(T18_CONFIG, &config)
+            .env("MINIMAL_TELEMETRY", "1")
+            .env("MINIMAL_OTEL_SPOOL_DIR", &spool_dir)
+            .env(
+                "MINIMAL_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+                "https://ingest:ingestPASSWORD9@collector.example:4318/TENANTsecret77/v1/traces",
+            )
+            .env(
+                "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+                "https://collector.example:4318/v1/logs?key=QUERYsecret55",
+            )
+            .env(
+                "MINIMAL_OTEL_EXPORTER_OTLP_HEADERS",
+                "x-honeycomb-team=hcaik_HEADERsecret01,authorization=Bearer%20BEARERsecret02",
+            );
+        let status = child.status().unwrap();
+        assert!(status.success(), "the collecting child failed: {status}");
+
+        let files = {
+            let bytes = std::fs::read(&out).unwrap();
+            let decoder = async_compression::tokio::bufread::ZstdDecoder::new(&bytes[..]);
+            let mut entries = async_tar::Archive::new(decoder).entries().unwrap();
+            let mut files = BTreeMap::new();
+            while let Some(entry) = entries.next().await {
+                let mut entry = entry.unwrap();
+                let path = entry.path().unwrap().to_string_lossy().into_owned();
+                let mut contents = Vec::new();
+                entry.read_to_end(&mut contents).await.unwrap();
+                // Drop the bundle's root directory.
+                let rel = path
+                    .split_once('/')
+                    .map_or(path.clone(), |(_, r)| r.to_owned());
+                files.insert(rel, contents);
+            }
+            files
+        };
+
+        // The spool travels, its harmless attribute intact.
+        let spool = files
+            .get("telemetry/spool/minimal-cli-1-1700000000000.jsonl")
+            .unwrap_or_else(|| panic!("no spool file in {:?}", files.keys()));
+        let spool = String::from_utf8_lossy(spool);
+        assert!(
+            spool.contains("\"cmd.name\"") && spool.contains("\"ls\""),
+            "{spool}"
+        );
+        // Every secret-bearing value is still there, redacted in place:
+        // scrubbed, not dropped with its record.
+        for kept in [
+            "\"vendor.api_key\"",
+            "\"vcs.remote\"",
+            "@github.com/o/r.git",
+            "export failed:",
+        ] {
+            assert!(spool.contains(kept), "{kept} missing: {spool}");
+        }
+        assert!(spool.matches("<redacted").count() >= 5, "{spool}");
+
+        // The settings are named, their values are not.
+        let telemetry: serde_json_lenient::Value =
+            serde_json_lenient::from_slice(&files["host/telemetry.json"]).unwrap();
+        assert_eq!(telemetry["enabled"], true, "{telemetry}");
+        assert_eq!(
+            telemetry["traces"]["endpoint"],
+            "https://collector.example:4318"
+        );
+        let env = String::from_utf8_lossy(&files["host/env.json"]);
+        for name in [
+            "MINIMAL_TELEMETRY",
+            "MINIMAL_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+            "MINIMAL_OTEL_EXPORTER_OTLP_HEADERS",
+        ] {
+            assert!(
+                env.contains(name),
+                "{name} is not named in host/env.json: {env}"
+            );
+        }
+
+        // No secret anywhere in the bundle.
+        for (path, bytes) in &files {
+            let text = String::from_utf8_lossy(bytes);
+            for secret in SECRETS {
+                assert!(!text.contains(secret), "{secret} in {path}:\n{text}");
+            }
+        }
+    }
+
     /// TEL-051: the bundle reads one spool directory, the one `min bug`'s
     /// own environment names, and says so. A spool a producer pinned through
     /// its own `MINIMAL_OTEL_SPOOL_DIR` stays out, and `host/telemetry.json`
