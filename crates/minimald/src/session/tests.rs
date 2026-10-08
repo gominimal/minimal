@@ -9628,3 +9628,79 @@ async fn stop_unexposes_before_withdrawing_the_report() {
     door.abort();
     crate::net::listeners::clear_vm_report_door_for_tests(&sock);
 }
+
+/// A `Hooks`-origin host whose record holds a registered host-side row is not
+/// replaced for an attaching terminal: ending its PTask would end the shuttle
+/// connection the row is tied to, and the in-VM daemon cannot re-register it.
+#[test]
+fn replaces_host_for_terminal_skips_a_registered_box() {
+    use super::{HostOrigin, replaces_host_for_terminal};
+    assert!(!replaces_host_for_terminal(HostOrigin::Hooks, true, true));
+}
+
+/// Without a host-side row the respawn behaviour is unchanged: a
+/// `Hooks`-origin host with a terminal-declaring attach is replaced, and no
+/// other origin is replaced regardless.
+#[test]
+fn replaces_host_for_terminal_keeps_native_respawn() {
+    use super::{HostOrigin, replaces_host_for_terminal};
+    assert!(replaces_host_for_terminal(HostOrigin::Hooks, true, false));
+    assert!(!replaces_host_for_terminal(HostOrigin::Hooks, false, false));
+    assert!(!replaces_host_for_terminal(HostOrigin::Exec, true, false));
+    assert!(!replaces_host_for_terminal(
+        HostOrigin::Interactive,
+        true,
+        false
+    ));
+}
+
+/// The wiring behind `replaces_host_for_terminal_skips_a_registered_box`: a
+/// hook-launched host for a box whose record holds a host-side row (its
+/// creator handed it `box_addresses`) is kept when a terminal attaches, so the
+/// box is launched exactly once, and the terminal's `TERM` reaches the kept
+/// shell through the republished attach-env file instead. The box without a
+/// row is `a_hook_launched_shell_takes_the_attaching_terminals_term`.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hook_launched_shell_of_a_registered_box_is_kept_for_a_terminal() {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("activated");
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = create_handed_own_ip_session_with_hook(
+        &mut client,
+        "hooked-kept",
+        std::net::Ipv4Addr::new(100, 64, 128, 23),
+        std::net::Ipv4Addr::new(127, 0, 64, 23),
+        sessions::wire::primitives::WireLifecycleHook {
+            on_activate: Some(inline(marker_body(&marker))),
+            ..Default::default()
+        },
+    )
+    .await;
+    finalize_session(&mut client, id).await;
+    assert!(
+        marker.exists(),
+        "the activate hook should have brought a host up headlessly"
+    );
+    assert_eq!(
+        super::launch_publish_seam::observed(id).len(),
+        1,
+        "the activate hook launches the box once"
+    );
+
+    let mut channel = client.open_shell_with_term(id, "xterm-256color").await;
+    await_echo(&mut channel).await;
+
+    assert_eq!(
+        super::launch_publish_seam::observed(id).len(),
+        1,
+        "a terminal attach must not relaunch a box that holds a host-side row"
+    );
+    let published = published_attach_env(&server, id).await;
+    assert!(
+        published.contains("export TERM='xterm-256color'"),
+        "the kept shell takes the terminal's TERM through the republished \
+         attach-env; got: {published:?}"
+    );
+}

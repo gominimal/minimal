@@ -612,10 +612,13 @@ impl SwitchClient {
     /// ([`IpAllocator::hand`]) — and leaves with the attach: [`Self::detach`]
     /// withdraws it, so the same box's re-attach re-hands it. That re-handed
     /// address comes from the host's persisted row — the registration
-    /// allocated it into the host-side table and nothing on the host
-    /// withdraws it — and detach never touches that row: the daemon-side
-    /// lease ends with the attach, the host-side row does not. What this
-    /// daemon cannot yet check is that the address it is handed is still the
+    /// allocated it into the host-side table — and detach never touches that
+    /// row: the daemon-side lease ends with the attach, the host-side row
+    /// does not. The row goes when the box's shuttle connection ends (the
+    /// box's PTask stops) or when its creator withdraws it, so a re-attach
+    /// here after the previous PTask ended finds no row unless the creator
+    /// registers again. What this daemon cannot yet check is that the
+    /// address it is handed is still the
     /// row's for this box: the host-row check by box id — the same address
     /// for the same box, a refusal on mismatch — lands with the box id in
     /// the registration (T44, #1660, NET-133), which names it as the gap;
