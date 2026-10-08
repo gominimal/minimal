@@ -343,3 +343,47 @@ Instead of a bare datatype string, an argument can be declared as a table with a
 args.name = { type = "string", help = "who to greet", default = "world" }
 exec = "echo Hello %{name}"
 ```
+
+## Networking {#networking}
+
+A task has no `--network` flag of its own. It uses the network of the
+session that runs it, which the session's
+[`--network` mode](./cli-min.md#session-activate) sets:
+
+- `min task run` composes an ephemeral session with the default mode,
+  `host_ip`.
+- `min run <task>` inside a session and
+  [`min session run <session> <task>`](./cli-min.md#session-run) run the task
+  in a session that already exists. The task takes that session's mode.
+
+`host_ip` (the default) shares the host's network namespace. The task
+reaches everything the host reaches. This includes the host-side hostname
+proxy, the port clients point `HTTP(S)_PROXY` at. `min ls` prints the port
+in use. On a native Linux host the proxy listens on `127.0.0.1:7654` by
+default, and picks a free port when 7654 is busy. On a native host only,
+[`minimald run --hostname-proxy-port`](./cli-minimald.md#run) pins it.
+
+On a host where Minimal runs in a VM (macOS), the task shares the VM's
+network, not your computer's. `127.0.0.1` inside the task is the VM's
+loopback. A service listening on your computer's loopback is not reachable
+at that address. The VM helper assigns the proxy port there, so read it from
+`min ls` rather than assuming 7654.
+
+`own_ip` gives the task its own address on the host's switch, in its own
+network namespace. This namespace is a second box beside the session's box,
+not the session's namespace. `127.0.0.1` inside the task is the task's own
+loopback, so a connection to it does not reach the hostname proxy on the host.
+Outbound traffic goes through the switch, so a task that fetches from the
+network does not need the proxy. The task also follows the session's egress
+policy: when the session cannot reach a destination, the task cannot reach it
+either.
+
+On a VM-backed host, which includes every macOS host, a task in an `own_ip`
+session has no outbound reach yet. The task takes a switch address that the
+host's table of boxes does not hold. The switch drops traffic from such an
+address. Run a task that needs the network in a `host_ip`
+session there.
+
+`none` gives the task no network. Every connection to a destination outside
+the task fails. When a task needs the network, give its session a mode that
+has one.
