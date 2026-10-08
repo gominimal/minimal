@@ -510,9 +510,13 @@ pub(crate) async fn release_held_box_name(
 /// that fails or times out releases nothing, and a name no hold kept (an
 /// own-address box's, a `none` box's) is the goal state already holding.
 ///
-/// A destroy no client of this host issues — the daemon's own reap — still
-/// leaves the hold until the VM host daemon restarts: holds carry no
-/// liveness signal of their own.
+/// Known limits, each leaving a hold until the VM host daemon restarts,
+/// because holds carry no liveness signal of their own (the place for one
+/// is the held-registration lease, not a second release path): a destroy no
+/// client of this host issues — the daemon's own reap — and a rename made
+/// from another client while this attach runs, then a Delete. The rename
+/// moved the hold to a name this lookup never sees, and once the session is
+/// gone its last name cannot be read back.
 pub(crate) async fn release_held_name_after_attach(sock: &std::path::Path, name: &str) {
     use minimald_rpc::{GetSessionRecord, GetSessionRecordRequest};
     let lookup = tokio::time::timeout(BOX_CONTROL_TIMEOUT, async {
