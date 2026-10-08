@@ -5921,11 +5921,21 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
     echo "::error::no free candidate port among 18130-18133 for the host-side listener"
     fail
   fi
+  # Each task first waits (up to 10 s) for a default route in its own
+  # namespace. The daemon wires a task's own-IP namespace AFTER the process
+  # has started (exec.rs attach_or_reap; the default route is the last step),
+  # so a curl that runs at once can fail on an unwired namespace and exit
+  # before the wiring, which then fails with "nsenter: reassociate to
+  # namespaces failed: No such process" (seen on the KVM lane). The wait
+  # keeps the legs about the mode, not about that launch race. A none task
+  # never gets a route, so it waits out the 10 s and then fails to connect.
+  # shellcheck disable=SC2016 # expanded by the task's bash, not here
+  tn_wait='for _ in {1..100}; do while read -r _ d _; do case $d in 00000000) break 2;; esac; done < /proc/net/route; sleep 0.1; done; '
   {
     hook_seed_preamble
-    printf '\n[tasks.e2e-tn-egress-com]\nbash = "curl -fsS --max-time 30 -o /dev/null https://example.com"\n'
-    printf '\n[tasks.e2e-tn-egress-org]\nbash = "curl -fsS --max-time 30 -o /dev/null https://example.org"\n'
-    printf '\n[tasks.e2e-tn-loopback]\nbash = "curl -fsS --max-time 5 -o /dev/null http://127.0.0.1:%s/"\n' "$TN_LB_PORT"
+    printf '\n[tasks.e2e-tn-egress-com]\nbash = "%scurl -fsS --max-time 30 -o /dev/null https://example.com"\n' "$tn_wait"
+    printf '\n[tasks.e2e-tn-egress-org]\nbash = "%scurl -fsS --max-time 30 -o /dev/null https://example.org"\n' "$tn_wait"
+    printf '\n[tasks.e2e-tn-loopback]\nbash = "%scurl -fsS --max-time 5 -o /dev/null http://127.0.0.1:%s/"\n' "$tn_wait" "$TN_LB_PORT"
   } > "$TN_SEED_DIR/minimal.toml"
   mkdir "$TN_SEED_DIR/.git"
 
