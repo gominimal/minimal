@@ -449,7 +449,11 @@ pub enum EffectiveEgress {
 // The strictness is also the wire contract with an older `min`: an old client
 // rejects a key it has no field for, so a fact that did not exist when it was
 // built must ride its own reply (`GetSessionRuntimeFacts`, the way live
-// ingress rides `GetLiveIngress`) rather than a new field here.
+// ingress rides `GetLiveIngress`) rather than a new field here. The
+// credentialed-upstream lane (NET-134) breaks that rule deliberately: a
+// policy reply a client cannot read is a visible error, while a lane it
+// cannot see is a security fact this command exists to state, and the lane
+// rides nowhere else — no other reply carries it.
 #[serde(deny_unknown_fields)]
 pub struct EffectiveSessionPolicy {
     /// The effective egress: the declaration, or the default the rollout
@@ -457,6 +461,14 @@ pub struct EffectiveSessionPolicy {
     pub egress: EffectiveEgress,
     /// Ingress policy; `None` when no explicit ingress config is present.
     pub ingress: Option<IngressPolicy>,
+    /// The box's credentialed-upstream lane (NET-134), carried verbatim
+    /// from the declaration: `Some` marks the Box Egress Proxy's listener
+    /// as the box's infrastructure — the one destination its egress rules
+    /// never decide — and `None` is no lane. Skipped when `None`, so a
+    /// lane-less box serializes exactly as it did before this field
+    /// existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credentialed_upstream: Option<CredentialedUpstream>,
 }
 
 /// Resolves the effective egress of a box (NET-074/NET-077): a declared

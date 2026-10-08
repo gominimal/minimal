@@ -289,7 +289,24 @@ the absence to, by name and marked as what it is. `deny-all (default)`
 marks an own-address box once the deny-all default is in force.
 `allow-all (default)` marks a box behind the opt-out or one that shares
 its host's network namespace. The `(default)` mark distinguishes a verdict
-the box declared from the same verdict the default gave it. The ingress
+the box declared from the same verdict the default gave it.
+
+A box activated with `--credentialed-upstream` prints one more row in the
+egress block:
+
+```
+egress
+  deny-all (default)
+  credentialed upstream  box egress proxy listener
+```
+
+The row names the lane the declaration opened: the box's frames to the
+box egress proxy's listener are admitted on the credential the proxy
+itself checks, the one destination the rows above never decide, and the
+listener is the lane's whole reach — everything else to the proxy's
+address stays refused. A box without the lane prints no row, so silence
+reads as the no-lane case, never as an undeclared one.
+ The ingress
 block lists the published port mappings the session's `--ingress` flags
 declared (or `deny-all` when the box leaves ingress undeclared). The
 `dynamic ports` row joins them when the box declared a `--dynamic-range`.
@@ -348,7 +365,11 @@ and `network`. The `ingress` block has a `kind` tag, `deny_all` or
 the box set `--dynamic-ingress`, and `default` when the stance is the deny
 an absent setting gives. Both keys are new in the `min/v1/session-policy`
 shape. A client written against the earlier document ignores them. A
-client that reads them finds a value in every `ingress` object.
+client that reads them finds a value in every `ingress` object. The
+document also carries `credentialed_upstream` when the box declared a
+lane, and leaves the key out when it did not — the same gate as the text
+row, so the key's absence is the no-lane claim rather than a lane a
+client could mistake for a null one.
 
 With `-o json`, a failed run writes one `min/v1/error` object on stderr and
 exits non-zero, with no plain-text error line. The `code` field names the

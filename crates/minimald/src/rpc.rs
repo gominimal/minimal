@@ -1296,11 +1296,12 @@ async fn serve_get_session_policy(
 
 /// The `GetEffectiveSessionPolicy` reply for one record's policy and network
 /// mode: the egress half resolved to what the gate enforces, the ingress half
-/// verbatim. NET-079's enforcement state answers beside this reply, over
-/// `GetSessionRuntimeFacts` — never as a field here, because the policy
-/// struct is `deny_unknown_fields`: an older `min` rejects a key it has no
-/// field for, so a fact that did not exist when that client was built must
-/// ride its own reply or the rules stop reading at all.
+/// verbatim, and the credentialed-upstream lane (NET-134) verbatim — the
+/// one fact that does not ride its own reply: an older `min` rejects a key
+/// it has no field for (`deny_unknown_fields`), and the issue that added the
+/// lane took that visible error over a lane the report is silent about,
+/// since the lane rides nowhere else. NET-079's enforcement state still
+/// answers beside this reply, over `GetSessionRuntimeFacts`.
 /// `phase` is the rollout
 /// phase to resolve under — the handler serves
 /// [`sessions::EGRESS_DEFAULT_PHASE`], the phase this build ships, while the
@@ -1316,6 +1317,7 @@ pub(crate) fn effective_policy_reply(
     minimald_rpc::EffectiveSessionPolicy {
         egress: sessions::effective_egress(policy.egress.as_ref(), network, phase, opt_out),
         ingress: policy.ingress.clone(),
+        credentialed_upstream: policy.credentialed_upstream.clone(),
     }
 }
 
@@ -5652,6 +5654,10 @@ mod tests {
     /// the absent section as `None`: the default reaches the client without
     /// rewriting the record. A box that declared its own egress answers it
     /// verbatim, survived the JSON round trip, with its ingress beside it.
+    /// NET-134: a box that declared a credentialed upstream answers the lane
+    /// over the same reply — `Some` over the wire, spelled in the JSON —
+    /// while a box that declared none answers `None` and serializes without
+    /// the key, byte-identical to the reply this field did not exist for.
     #[tokio::test]
     async fn effective_policy_response_round_trips() {
         let server = TestServer::new().await;
@@ -5670,6 +5676,12 @@ mod tests {
         )
         .await;
         let bare_id = own_ip_session(&mut client, "bare-egress", SessionPolicy::default()).await;
+        let laned_policy = SessionPolicy {
+            egress: None,
+            ingress: None,
+            credentialed_upstream: Some(sessions::CredentialedUpstream::default()),
+        };
+        let laned_id = own_ip_session(&mut client, "laned-egress", laned_policy.clone()).await;
 
         // The default's own case, with the phase passed explicitly
         // (NET-074): an own-address box that declared nothing is deny-all
@@ -5684,6 +5696,7 @@ mod tests {
             EffectiveSessionPolicy {
                 egress: EffectiveEgress::DenyAll,
                 ingress: None,
+                credentialed_upstream: None,
             },
             "an own-address box with no egress section must answer deny-all in force",
         );
@@ -5691,16 +5704,22 @@ mod tests {
         // The response carries that posture across the wire codec it
         // travels as — the strict shape untouched beside it: the effective
         // reply spells the default, `deny_all`, and decodes back to the
-        // same value.
+        // same value. A lane-less reply serializes without the lane's key:
+        // the shape an older client reads.
         let deny_all = EffectiveSessionPolicy {
             egress: EffectiveEgress::DenyAll,
             ingress: None,
+            credentialed_upstream: None,
         };
         let wire = serde_json_lenient::to_string(&minimald_rpc::Errorable::Ok(deny_all.clone()))
             .expect("the deny-all reply must serialize");
         assert!(
             wire.contains(r#""egress":"deny_all""#),
             "the wire must carry the deny-all posture, got: {wire}",
+        );
+        assert!(
+            !wire.contains("credentialed_upstream"),
+            "a reply without a lane must serialize without the lane's key, got: {wire}",
         );
         assert_eq!(
             serde_json_lenient::from_str::<minimald_rpc::Errorable<EffectiveSessionPolicy>>(&wire)
@@ -5745,6 +5764,40 @@ mod tests {
             .unwrap();
         assert_eq!(declared.egress, EffectiveEgress::Declared(egress));
         assert_eq!(declared.ingress, None);
+
+        // A declared lane round-trips too: the reply answers it as `Some`
+        // over the real wire, spelled in the JSON the codec travels as,
+        // while the strict declaration keeps it beside the record.
+        let laned = client
+            .call::<GetEffectiveSessionPolicy>(&GetEffectiveSessionPolicyRequest::Id(laned_id))
+            .await
+            .unwrap();
+        assert_eq!(
+            laned.credentialed_upstream,
+            Some(sessions::CredentialedUpstream::default()),
+            "the wire must answer the lane a declared box carries",
+        );
+        let lane_wire = serde_json_lenient::to_string(&minimald_rpc::Errorable::Ok(laned.clone()))
+            .expect("the laned reply must serialize");
+        assert!(
+            lane_wire.contains(r#""credentialed_upstream":{}"#),
+            "the wire must spell the lane, got: {lane_wire}",
+        );
+        let strict_laned = client
+            .call::<GetSessionPolicy>(&GetSessionPolicyRequest::Id(laned_id))
+            .await
+            .unwrap();
+        assert_eq!(
+            strict_laned, laned_policy,
+            "the strict policy reply must keep the lane as declared",
+        );
+
+        // The bare box answers no lane: `None` on the reply, and absent
+        // from the wire — the reply that predates the lane.
+        assert_eq!(
+            bare.credentialed_upstream, None,
+            "a box that declared no lane must answer none",
+        );
     }
 
     /// NET-077: a daemon started with the deny-all opt-out keeps the shipped
@@ -5780,6 +5833,7 @@ mod tests {
             EffectiveSessionPolicy {
                 egress: EffectiveEgress::AllowAll,
                 ingress: None,
+                credentialed_upstream: None,
             },
             "behind the opt-out, an absent egress section keeps the shipped allow-all",
         );
