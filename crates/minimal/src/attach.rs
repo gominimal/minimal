@@ -382,10 +382,11 @@ async fn box_record_on(
 
 /// A pickable session. `Display` renders the row the user sees and fuzzy-
 /// searches against; the carried entry preserves the id/name so the chosen
-/// one can be attached without a follow-up round-trip.
+/// one can be attached without a follow-up round-trip. Boxed, as in
+/// [`Picked::Session`], so the entry's size stays off every picker row.
 #[derive(Clone)]
 struct SessionCandidate {
-    entry: ListSessionsEntry,
+    entry: Box<ListSessionsEntry>,
     label: String,
 }
 
@@ -477,8 +478,9 @@ impl fmt::Display for PickerRow {
 
 /// The user's choice from the attach picker.
 pub(crate) enum Picked {
-    /// Attach to this existing session.
-    Session(ListSessionsEntry),
+    /// Attach to this existing session. Boxed: the entry is far larger
+    /// than the create arm, which carries nothing.
+    Session(Box<ListSessionsEntry>),
     /// The create row was chosen: activate a fresh session for the cwd and
     /// attach, exactly as `min session activate --attach .` would.
     CreateNew,
@@ -523,7 +525,7 @@ pub(crate) fn pick_session(
         .iter()
         .map(|e| {
             PickerRow::Session(SessionCandidate {
-                entry: (*e).clone(),
+                entry: Box::new((*e).clone()),
                 label: format_candidate(e, cwd),
             })
         })
@@ -993,7 +995,7 @@ mod tests {
             SessionStatus::Active,
         );
         let row = PickerRow::Session(SessionCandidate {
-            entry: e.clone(),
+            entry: Box::new(e.clone()),
             label: format_candidate(&e, &cwd("/a")),
         });
         match resolve_pick(row) {
