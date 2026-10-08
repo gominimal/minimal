@@ -6105,6 +6105,12 @@ async fn unaudited_allow_keeps_a_forward_the_switch_would_not_unbind() {
         live[0].internal_port, 3000,
         "the recorded forward is the unaudited publish's own"
     );
+    assert_eq!(
+        live[0].pending,
+        Some(true),
+        "the gate refuses the retained forward, so its row reads pending, \
+         never reachable"
+    );
     let served = served.lock().expect("served lock").clone();
     assert_eq!(
         served.len(),

@@ -3325,7 +3325,7 @@ impl Session {
             gate.withdraw_exposed(port);
         }
         let mut unbound = true;
-        if let Some(live) = live {
+        if let Some(mut live) = live {
             match crate::net::policy::unexpose_forwarder(&control, &live.forwarder).await {
                 // Unbound: the switch holds no forward at its `local` any
                 // more, so the row entry and the publication-set entry go
@@ -3347,7 +3347,11 @@ impl Session {
                     // retractable by nothing. Recorded back, mapping and
                     // all, rather than never taken, because the sweep that
                     // would retry the unexpose — [`Self::stop_running`] —
-                    // draws from the same cell.
+                    // draws from the same cell. The gate refuses the port,
+                    // so the row it lists reads pending, never reachable:
+                    // `min session policy` must not show a refused port as
+                    // admitted (NET-044).
+                    live.mapping.pending = Some(true);
                     if let Err(unrecorded) = self.live_ingress.record(live) {
                         // The spawn ended while this withdrawal was in
                         // flight, so the cell refuses the record and the
