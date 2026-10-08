@@ -3411,6 +3411,256 @@ async fn an_activate_hook_launch_finds_the_box_s_address_already_published() {
     assert_eq!(address, handed, "the name answers at the hand, exactly");
 }
 
+/// A box whose record carries host-handed addresses (T66) has a host-side
+/// row keyed on that address. When its host loop ends — the shell exited —
+/// the ended loop already withdrew the row (NET-138), so re-minting a fresh
+/// host here would re-attach "rowless": the host gate silently drops the
+/// box's frames from an unregistered source. The attach must refuse with the
+/// typed `BoxHostRowEnded` refusal (surfaced to the client on the channel)
+/// instead of re-minting, and no second host may launch — the hands are the
+/// host-side creator's, and re-registering a row is exactly what a daemon
+/// must never do.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_box_holding_a_host_row_refuses_remint_after_its_host_loop_ends() {
+    let handed = std::net::Ipv4Addr::new(127, 0, 64, 23);
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = finalize_handed_own_ip_session(
+        &mut client,
+        "web",
+        std::net::Ipv4Addr::new(100, 64, 128, 23),
+        handed,
+    )
+    .await;
+
+    // The first attach mints the host and arms the mock shell.
+    let mut channel = client.open_shell(id).await;
+    await_echo(&mut channel).await;
+    assert_eq!(
+        super::launch_publish_seam::observed(id).len(),
+        1,
+        "the first attach is the box's one and only launch so far"
+    );
+
+    // Exit the shell: the host loop ends, withdrawing the host-side row.
+    keep_exit(&mut channel).await;
+
+    // Re-attaching must refuse rather than re-mint a rowless host. The
+    // refusal rides the channel as an attach error, then the channel closes.
+    let mut second = client.open_shell(id).await;
+    let refusal = collect_to_close(&mut second).await;
+    assert!(
+        refusal.contains("Error attaching to session:"),
+        "the refusal must be surfaced as an attach error; got: {refusal:?}"
+    );
+    assert!(
+        refusal.contains("host-side network registration"),
+        "the refusal must name the host-row cause; got: {refusal:?}"
+    );
+    assert!(
+        refusal.contains("min session activate"),
+        "the refusal must name the step that registers a box again; got: {refusal:?}"
+    );
+    assert_eq!(
+        super::launch_publish_seam::observed(id).len(),
+        1,
+        "no second host may be minted for a box whose host row was withdrawn"
+    );
+}
+
+/// Asserts that an attach to `id` is refused with the typed
+/// `BoxHostRowEnded` refusal, surfaced on the channel before it closes.
+async fn assert_attach_refused_rowless(client: &mut TestClient, id: SessionId) {
+    let mut channel = client.open_shell(id).await;
+    let refusal = collect_to_close(&mut channel).await;
+    assert!(
+        refusal.contains("Error attaching to session:")
+            && refusal.contains("host-side network registration"),
+        "the attach must be refused for the ended host-side row; got: {refusal:?}"
+    );
+}
+
+/// A registered box's shell exits with the files kept, and its `on_detach`
+/// hook still runs (spec 11): the actor launches a host over the dead one for
+/// it. That hook host is alive in the slot, but it is not the launch that
+/// bound the box's host-side row (NET-138), so the next attach refuses rather
+/// than keeping a rowless host for the terminal.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_detach_hook_host_of_a_registered_box_is_refused_to_the_next_attach() {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("detached");
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = create_handed_own_ip_session_with_hook(
+        &mut client,
+        "hooked-detach",
+        std::net::Ipv4Addr::new(100, 64, 128, 24),
+        std::net::Ipv4Addr::new(127, 0, 64, 24),
+        sessions::wire::primitives::WireLifecycleHook {
+            on_detach: Some(inline(marker_body(&marker))),
+            ..Default::default()
+        },
+    )
+    .await;
+    finalize_session(&mut client, id).await;
+
+    let mut channel = client.open_shell(id).await;
+    await_echo(&mut channel).await;
+    keep_exit(&mut channel).await;
+    assert!(
+        await_marker(&marker).await,
+        "the detach hook runs even though the box's row has ended"
+    );
+    soon(|| super::launch_publish_seam::observed(id).len() == 2).await;
+
+    assert_attach_refused_rowless(&mut client, id).await;
+    assert_eq!(
+        super::launch_publish_seam::observed(id).len(),
+        2,
+        "the refused attach launches nothing"
+    );
+}
+
+/// The exec path's half: a registered box whose host is gone is not
+/// relaunched by `ensure_host` — the relaunch would run rowless.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ensure_host_refuses_a_registered_box_whose_host_ended() {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = finalize_handed_own_ip_session(
+        &mut client,
+        "exec-rowless",
+        std::net::Ipv4Addr::new(100, 64, 128, 25),
+        std::net::Ipv4Addr::new(127, 0, 64, 25),
+    )
+    .await;
+    let manager = server.state.sessions_manager().await;
+    let handle = manager
+        .get_session(crate::sessions::SessionKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the box resolves");
+    let host = handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("the box's first launch binds its row");
+    let again = handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("the live binding host is reused");
+    assert!(again.same_host(&host), "the binding host is the one reused");
+
+    host.kill(false).await.expect("the box's host ends");
+    soon(|| !host.is_alive()).await;
+    match handle.ensure_host("tester".to_string()).await {
+        Err(crate::session::AttachError::BoxHostRowEnded) => {}
+        Err(other) => panic!("refused for another reason: {other}"),
+        Ok(_) => panic!("a registered box was relaunched rowless"),
+    }
+}
+
+/// A daemon restart ends every PTask, and with them the host-side rows. The
+/// record remembers that a launch bound this box's row, so the restarted
+/// actor — no host in its slot — refuses the attach instead of minting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restarted_registered_box_whose_row_was_bound_refuses_the_attach() {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = finalize_handed_own_ip_session(
+        &mut client,
+        "restart-rowless",
+        std::net::Ipv4Addr::new(100, 64, 128, 26),
+        std::net::Ipv4Addr::new(127, 0, 64, 26),
+    )
+    .await;
+    let manager = server.state.sessions_manager().await;
+    let handle = manager
+        .get_session(crate::sessions::SessionKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the box resolves");
+    handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("the box's first launch binds its row");
+
+    // Stop the actor and evict it, so the next lookup spawns a fresh one
+    // from the on-disk record — a daemon restart.
+    handle.stop().await;
+    manager.evict(id).await;
+    let handle = manager
+        .get_session(crate::sessions::SessionKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the box resolves after the restart");
+    let record = handle.record().await.expect("the record reads back");
+    assert_eq!(record.status, sessions::SessionStatus::Active);
+    assert!(record.host_row_bound, "the binding survives the restart");
+
+    assert_attach_refused_rowless(&mut client, id).await;
+    match handle.ensure_host("tester".to_string()).await {
+        Err(crate::session::AttachError::BoxHostRowEnded) => {}
+        Err(other) => panic!("refused for another reason: {other}"),
+        Ok(_) => panic!("a restarted registered box was launched rowless"),
+    }
+}
+
+/// A registered box that activated without launching (no activate hook) has
+/// no row bound yet: its first attach mints normally, and that launch binds
+/// the row, recorded on the record a restarted actor reads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_registered_box_never_launched_mints_and_binds_its_row() {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = finalize_handed_own_ip_session(
+        &mut client,
+        "first-launch",
+        std::net::Ipv4Addr::new(100, 64, 128, 27),
+        std::net::Ipv4Addr::new(127, 0, 64, 27),
+    )
+    .await;
+    let manager = server.state.sessions_manager().await;
+    let handle = manager
+        .get_session(crate::sessions::SessionKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the box resolves");
+    let record = handle.record().await.expect("the record reads back");
+    assert!(record.box_addresses.is_some(), "the box is registered");
+    assert!(!record.host_row_bound, "no launch has bound the row yet");
+
+    let mut channel = client.open_shell(id).await;
+    await_echo(&mut channel).await;
+    assert!(
+        handle
+            .record()
+            .await
+            .expect("the record reads back")
+            .host_row_bound,
+        "the first launch binds the row"
+    );
+
+    // Persisted, not only held by this actor: a fresh actor reads it back.
+    drop(channel);
+    handle.stop().await;
+    manager.evict(id).await;
+    let handle = manager
+        .get_session(crate::sessions::SessionKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the box resolves after the restart");
+    assert!(
+        handle
+            .record()
+            .await
+            .expect("the record reads back")
+            .host_row_bound,
+        "the binding is on the on-disk record"
+    );
+}
+
 /// #2070's error path: the publish now precedes the activate hooks, so a
 /// hook that fails leaves it standing on the unpromoted record — and the
 /// destroy the client's activate cleanup sends withdraws it with the name,
@@ -8081,8 +8331,17 @@ async fn box_with_listen_plan(
     std::sync::Arc<crate::net::switch::SessionGate>,
     std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 ) {
-    let (handle, gate, served, _gate, _id) =
-        box_with_scripted_plan(client, manager, name, switch, loopback, range, Vec::new()).await;
+    let (handle, gate, served, _gate, _id) = box_with_scripted_plan(
+        client,
+        manager,
+        name,
+        true,
+        switch,
+        loopback,
+        range,
+        Vec::new(),
+    )
+    .await;
     (handle, gate, served)
 }
 
@@ -8092,10 +8351,21 @@ async fn box_with_listen_plan(
 /// test can hold one surface's bind in flight while the other races it for
 /// the port — and the box's session id comes back with it, so a test can reach the
 /// publication set its launch is running on through the seam.
+///
+/// `handed` says whether the box is a registered one, its creator handing it
+/// `switch` and `loopback` (T66), or a self-allocated one whose registry row
+/// the fixture pins at the same pair. A registered box's first launch binds
+/// its host-side row and no later launch may run (NET-138), so a test that
+/// relaunches the box builds it unhanded.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a test fixture; each caller names every fact of the box it builds"
+)]
 async fn box_with_scripted_plan(
     client: &mut TestClient,
     manager: &crate::sessions::ManagerHandle,
     name: &str,
+    handed: bool,
     switch: std::net::Ipv4Addr,
     loopback: std::net::Ipv4Addr,
     range: (u16, u16),
@@ -8111,15 +8381,33 @@ async fn box_with_scripted_plan(
     // address: both surfaces' forwards bind at the address the box's name
     // answers at, exactly as they do for a production box.
     manager.land_range_verdict(crate::net::dns::RangeVerdict::Present);
-    let id = finalize_dynamic_ingress_session(
-        client,
-        name,
-        switch,
-        loopback,
-        Some(sessions::DynamicIngress::Allow),
-        Some(range),
-    )
-    .await;
+    let id = if handed {
+        finalize_dynamic_ingress_session(
+            client,
+            name,
+            switch,
+            loopback,
+            Some(sessions::DynamicIngress::Allow),
+            Some(range),
+        )
+        .await
+    } else {
+        let id = finalize_self_allocated_dynamic_ingress_session(
+            client,
+            name,
+            Some(sessions::DynamicIngress::Allow),
+            Some(range),
+        )
+        .await;
+        // The registry is the only place a self-allocated box's addresses
+        // live: pin its publish at `loopback` and its lease at `switch`, so
+        // the runtime publish reads the same pair a handed box carries.
+        let registry = manager.hostnames();
+        let mut registry = registry.write().expect("registry lock");
+        registry.publish_own_address(id, name, loopback, std::collections::BTreeSet::new());
+        registry.report_own_address(id, name, switch, std::collections::BTreeMap::new());
+        id
+    };
     let handle = manager
         .get_session(crate::sessions::SessionKeyPredicate::Id(id))
         .await
@@ -9041,6 +9329,7 @@ async fn concurrent_expose_and_listen_publish_bind_once() {
         &mut client,
         &manager,
         "ownrace",
+        true,
         switch,
         loopback,
         range,
@@ -9307,6 +9596,7 @@ async fn cancelled_publish_releases_its_reservation() {
         &mut client,
         &manager,
         "owncancel",
+        true,
         switch,
         loopback,
         (port, port),
@@ -9429,6 +9719,7 @@ async fn revocation_during_in_flight_bind_leaves_no_forward() {
         &mut client,
         &manager,
         "ownrevoke",
+        true,
         switch,
         loopback,
         (a_port, b_port),
@@ -9561,6 +9852,7 @@ async fn revocation_withdraws_regardless_of_owner() {
         &mut client,
         &manager,
         "ownrevoke",
+        true,
         switch,
         loopback,
         range,
@@ -9625,7 +9917,9 @@ async fn revocation_withdraws_regardless_of_owner() {
 /// answer for its successor — the same port is exposable again after the
 /// respawn, and listen-publishable: the respawned box's watcher publishes
 /// it once the box's process binds it, and the expose asking then is the
-/// duplicate the fresh set says it is.
+/// duplicate the fresh set says it is. The box is unhanded: a registered
+/// box is never relaunched (NET-138), and the set's ownership does not
+/// depend on registration.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn respawn_frees_published_ports() {
     let _capture = crate::test_harness::captured_log();
@@ -9641,6 +9935,7 @@ async fn respawn_frees_published_ports() {
         &mut client,
         &manager,
         "ownrespawn",
+        false,
         switch,
         loopback,
         (port, port),
