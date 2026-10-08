@@ -3394,6 +3394,42 @@ pub fn serving_proxy_port(reported: Option<u16>, proxy_down: Option<&ProxyDown>)
     if proxy_down.is_some() { None } else { reported }
 }
 
+/// The surface verdict with a proxy-down sibling folded in (T93): a
+/// `Proxy` verdict beside the VM host daemon's cause becomes
+/// [`LiveSurface::ProxyNotServing`] with that cause, so the NAME SURFACE
+/// line names why the live surface is not serving. Any other verdict is
+/// returned unchanged; its cause prints on a line of its own
+/// ([`proxy_down_line_beside`]).
+#[must_use]
+pub fn surface_beside_proxy_down(
+    surface: LiveSurface,
+    proxy_down: Option<&ProxyDown>,
+) -> LiveSurface {
+    match (surface, proxy_down) {
+        (LiveSurface::Proxy, Some(down)) => LiveSurface::ProxyNotServing {
+            port: down.port,
+            cause: down.cause.clone(),
+        },
+        (surface, _) => surface,
+    }
+}
+
+/// The standalone proxy-down line beside a (folded) surface verdict, so
+/// the cause is named exactly once: `None` when the verdict is
+/// [`LiveSurface::ProxyNotServing`], whose NAME SURFACE line already names
+/// the cause, and the [`proxy_down_line`] beside a `Native` verdict or no
+/// verdict at all.
+#[must_use]
+pub fn proxy_down_line_beside(
+    surface: Option<&LiveSurface>,
+    proxy_down: Option<&ProxyDown>,
+) -> Option<String> {
+    if matches!(surface, Some(LiveSurface::ProxyNotServing { .. })) {
+        return None;
+    }
+    proxy_down.map(proxy_down_line)
+}
+
 /// The proxy's publish outcome as its own printed line (T93): the same
 /// named cause — the port the failure is about, the thing to free — said
 /// beside the answerer's own facts instead of in place of them, and
@@ -4374,6 +4410,71 @@ mod tests {
         assert!(
             !native_surface_at(&detection.0, port, true, false, None),
             "and the verdict for the same read is the proxy's, not native"
+        );
+    }
+
+    /// One proxy verdict per surface (T93): with a proxy-down sibling, the
+    /// lines a session start or a listing prints — the standalone cause
+    /// line, when any, and the NAME SURFACE line — name the cause exactly
+    /// once, whatever the verdict (Native, Proxy, none, or the
+    /// pre-acquisition `ProxyNotServing` arm), and never name the reported
+    /// port as serving or routing.
+    #[test]
+    fn a_proxy_down_sibling_is_named_once_beside_any_verdict() {
+        let causes = [
+            ProxyDownCause::PortHeld,
+            ProxyDownCause::RedrawsRanOut,
+            ProxyDownCause::PublishUnconfirmed,
+            ProxyDownCause::PortHeldAfterStart { holder: None },
+        ];
+        for cause in causes {
+            let down = ProxyDown {
+                port: 19_911,
+                cause: cause.clone(),
+            };
+            let serving = serving_proxy_port(Some(7_654), Some(&down));
+            assert_eq!(serving, None, "a down proxy has no serving port");
+            let verdicts = [
+                None,
+                Some(LiveSurface::Native),
+                Some(LiveSurface::Proxy),
+                Some(LiveSurface::ProxyNotServing {
+                    port: 19_911,
+                    cause: cause.clone(),
+                }),
+            ];
+            for verdict in verdicts {
+                let folded = verdict.map(|surface| surface_beside_proxy_down(surface, Some(&down)));
+                let mut lines: Vec<String> = proxy_down_line_beside(folded.as_ref(), Some(&down))
+                    .into_iter()
+                    .collect();
+                if let Some(surface) = folded.clone() {
+                    lines.push(name_surface_line(surface, serving));
+                }
+                let all = lines.join("\n");
+                assert_eq!(
+                    all.matches("127.0.0.1:19911").count(),
+                    1,
+                    "the cause is named exactly once for {folded:?}: {all}"
+                );
+                assert!(
+                    !all.contains("still serves") && !all.contains("routes through it on"),
+                    "no line names the down proxy as serving for {folded:?}: {all}"
+                );
+                assert!(
+                    !matches!(folded, Some(LiveSurface::Proxy)),
+                    "a Proxy verdict beside a cause must fold: {all}"
+                );
+            }
+        }
+        // Without a sibling nothing folds and no cause line prints.
+        assert_eq!(
+            surface_beside_proxy_down(LiveSurface::Proxy, None),
+            LiveSurface::Proxy
+        );
+        assert_eq!(
+            proxy_down_line_beside(Some(&LiveSurface::Native), None),
+            None
         );
     }
 

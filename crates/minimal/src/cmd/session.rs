@@ -1065,22 +1065,6 @@ pub(crate) async fn activate_session(
         created.hostname_routing_unavailable.as_deref(),
         "min session activate",
     );
-    // The other routing fact the create reply carries: the port this daemon's
-    // hostnames route through, printed where the session started — the same
-    // fact `min ls` prints on its routing line. NET-026's discovery on this
-    // surface; and the report a port has to carry when it is *not* the one the
-    // recipes assume — a VM whose host port the host already held walked to
-    // one of its own (NET-059), a native daemon whose default was busy asked
-    // the OS for a free one (NET-025) — so a walked port is never a log line
-    // alone. Absent while the proxy is still coming up, or from a daemon that
-    // predates the field: nothing to print for it then, exactly as in `min
-    // ls`.
-    if let Some(port) = created.hostname_proxy_port {
-        eprintln!(
-            "{}",
-            hostname_proxy_start_line(hostname_proxy_start_vm(global), port)
-        );
-    }
     // NET-122/NET-123/NET-138: the naming lines, printed once per session
     // start — after the create, and re-surfaced when the daemon reports this
     // session at the 127.0.0.1 interim because its session-start bind
@@ -1123,6 +1107,35 @@ pub(crate) async fn activate_session(
                 None,
             ),
         };
+    // The proxy and surface lines below never name the reported port as
+    // serving while the reply carries a proxy-down sibling, and its cause
+    // prints exactly once: folded into a Proxy verdict's NAME SURFACE line
+    // (`ProxyNotServing`), or on a line of its own beside a Native verdict
+    // or no verdict — never both, and never beside a "still serves" or
+    // "routes through it".
+    let proxy_down_sibling = vm_answerer
+        .as_ref()
+        .and_then(|reply| reply.proxy_down.as_ref());
+    let serving_proxy_port =
+        crate::resolver::serving_proxy_port(created.hostname_proxy_port, proxy_down_sibling);
+    // The other routing fact the create reply carries: the port this daemon's
+    // hostnames route through, printed where the session started — the same
+    // fact `min ls` prints on its routing line. NET-026's discovery on this
+    // surface; and the report a port has to carry when it is *not* the one the
+    // recipes assume — a VM whose host port the host already held walked to
+    // one of its own (NET-059), a native daemon whose default was busy asked
+    // the OS for a free one (NET-025) — so a walked port is never a log line
+    // alone. Absent while the proxy is still coming up, or from a daemon that
+    // predates the field: nothing to print for it then, exactly as in `min
+    // ls`. Not printed beside a proxy-down sibling either: the VM host
+    // daemon's verdict is that the proxy is not serving, and the cause
+    // names itself below.
+    if let Some(port) = serving_proxy_port {
+        eprintln!(
+            "{}",
+            hostname_proxy_start_line(hostname_proxy_start_vm(global), port)
+        );
+    }
     // The interim itself, named at every session start on a VM-backed host
     // — TTY and non-TTY, ahead of the warning, the advisory and the verdict
     // below — because who answers the zone is the machine fact the names
@@ -1133,28 +1146,12 @@ pub(crate) async fn activate_session(
     // from the answerer field — even while the proxy is down or its
     // publish unconfirmed, because the sibling cause no longer displaces
     // the state — and the proxy's publish outcome, when the reply carries
-    // one, names itself on the line of its own.
+    // one, names itself once below, with the surface verdict.
     if let Some(reply) = &vm_answerer
         && let Some(line) = vm_host_answerer_start_line(reply.answerer.clone())
     {
         eprintln!("{line}");
     }
-    if let Some(down) = vm_answerer
-        .as_ref()
-        .and_then(|reply| reply.proxy_down.as_ref())
-    {
-        eprintln!("{}", crate::resolver::proxy_down_line(down));
-    }
-    // The surface lines below never name the reported port as serving
-    // while the reply carries a proxy-down sibling: the cause line above
-    // is the host-side verdict on the proxy, and a "still serves" or
-    // "routes through it" beside it would contradict it.
-    let serving_proxy_port = crate::resolver::serving_proxy_port(
-        created.hostname_proxy_port,
-        vm_answerer
-            .as_ref()
-            .and_then(|reply| reply.proxy_down.as_ref()),
-    );
     if held_no_channel && let Some(answerer_port) = answerer_port {
         // NET-138's warning, at every session start — TTY and non-TTY: it
         // rides stderr unconditionally, because the first lookup that
@@ -1170,8 +1167,12 @@ pub(crate) async fn activate_session(
         // user is the proxy's (NET-019 keeps it serving). Logged as the
         // same session-start record the native arm logs, with the fact
         // that decided it.
+        let surface = crate::resolver::surface_beside_proxy_down(
+            crate::resolver::LiveSurface::Proxy,
+            proxy_down_sibling,
+        );
         tracing::info!(
-            surface = ?crate::resolver::LiveSurface::Proxy,
+            surface = ?surface,
             held_no_channel = true,
             answerer_bound = false,
             answerer_port = answerer_port,
@@ -1179,10 +1180,7 @@ pub(crate) async fn activate_session(
         );
         eprintln!(
             "{}",
-            crate::resolver::name_surface_line(
-                crate::resolver::LiveSurface::Proxy,
-                serving_proxy_port,
-            )
+            crate::resolver::name_surface_line(surface, serving_proxy_port)
         );
     } else if answerer_port.is_none()
         && let Some((port, cause)) = proxy_down
@@ -1254,9 +1252,9 @@ pub(crate) async fn activate_session(
         // this CLI's own query on a VM-backed one — and the reserved range
         // on this host's own loopback. Decided before the advisory prints
         // only so the range its read holds can be the advisory's too — one
-        // probe, one host — while the printed order stays the advisory's
-        // and then the surface's. `None` — the answerer not bound — prints
-        // nothing: no native surface to name, and the ports and the
+        // probe, one host — while the printed order stays the cause's, the
+        // advisory's and then the surface's. `None` — the answerer not
+        // bound — prints nothing: no native surface to name, and the ports and the
         // advisory have told the proxy's story. The proxy's half is said
         // with the native arm either way (NET-019): the `HTTP(S)_PROXY`
         // recipes this activation prints keep working beside native DNS,
@@ -1266,7 +1264,20 @@ pub(crate) async fn activate_session(
             Some(answerer_port),
             answerer_bound,
         )
-        .await;
+        .await
+        .map(|verdict| crate::resolver::LiveSurfaceVerdict {
+            surface: crate::resolver::surface_beside_proxy_down(
+                verdict.surface,
+                proxy_down_sibling,
+            ),
+            ..verdict
+        });
+        if let Some(line) = crate::resolver::proxy_down_line_beside(
+            surface_verdict.as_ref().map(|verdict| &verdict.surface),
+            proxy_down_sibling,
+        ) {
+            eprintln!("{line}");
+        }
         // The advisory shares that verdict's range read: the daemon's
         // interim flag is not this host's range fact — on a VM-backed host
         // it reads the guest's loopback, which always carries the range —

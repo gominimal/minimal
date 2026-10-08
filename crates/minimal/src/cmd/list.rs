@@ -777,7 +777,12 @@ pub fn format_ls(
         let vm_answerer_line = vm_answerer
             .as_ref()
             .and_then(|reply| crate::resolver::vm_host_answerer_line(reply.answerer.clone()));
-        let proxy_down_line = proxy_down.map(crate::resolver::proxy_down_line);
+        // A Proxy verdict beside the cause becomes the cause-naming
+        // surface, and the standalone cause row prints only when the
+        // surface row does not already name it: one proxy verdict per VM.
+        let surface =
+            surface.map(|surface| crate::resolver::surface_beside_proxy_down(surface, proxy_down));
+        let proxy_down_line = crate::resolver::proxy_down_line_beside(surface.as_ref(), proxy_down);
         if let Some(answerer) = resp.zone_answerer_port {
             writeln!(
                 out,
@@ -812,7 +817,7 @@ pub fn format_ls(
         if resp.hostname_proxy_port.is_some()
             || resp.zone_answerer_port.is_some()
             || vm_answerer_line.is_some()
-            || proxy_down_line.is_some()
+            || proxy_down.is_some()
         {
             writeln!(out)?;
         }
@@ -1076,7 +1081,14 @@ pub fn format_ls_across_vms(
             // VM's answerer line — the same words the single-VM listing
             // prints — because each VM's proxy publishes on a host port of
             // its own and fails on its own.
-            if let Some(line) = proxy_down.map(crate::resolver::proxy_down_line) {
+            // A Proxy verdict beside the cause becomes the cause-naming
+            // surface, and the standalone cause row prints only when the
+            // surface row does not already name it: one proxy verdict per VM.
+            let surface = surface_at(index)
+                .map(|surface| crate::resolver::surface_beside_proxy_down(surface, proxy_down));
+            if let Some(line) =
+                crate::resolver::proxy_down_line_beside(surface.as_ref(), proxy_down)
+            {
                 writeln!(
                     out,
                     "HOSTNAME PROXY:  {vm:<width$} {line}",
@@ -1093,7 +1105,7 @@ pub fn format_ls_across_vms(
             // the advisory the activation path prints (NET-122) says how to
             // get from one surface to the other. `--raw` and `--json` stay
             // machine-readable-only, as for the ports.
-            if let Some(surface) = surface_at(index) {
+            if let Some(surface) = surface {
                 writeln!(
                     out,
                     "NAME SURFACE:    {vm:<width$} {}",

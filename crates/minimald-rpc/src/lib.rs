@@ -1313,12 +1313,14 @@ impl<'de> Deserialize<'de> for AnswererStatusReply {
                 )));
             }
         };
-        let proxy_down = match object.remove("proxy_down") {
-            Some(value) => {
-                serde_json_lenient::from_value(value).map_err(serde::de::Error::custom)?
-            }
-            None => None,
-        };
+        // The sibling is read leniently: a cause this client does not know
+        // (a newer daemon's variant) reads as no proxy fact, never as a
+        // decode failure that would drop the answerer's state with it —
+        // the displacement the sibling exists to remove.
+        let proxy_down = object
+            .remove("proxy_down")
+            .and_then(|value| serde_json_lenient::from_value::<Option<ProxyDown>>(value).ok())
+            .flatten();
         let answerer = serde_json_lenient::from_value(serde_json_lenient::Value::Object(object))
             .map_err(serde::de::Error::custom)?;
         Ok(Self {
@@ -4006,6 +4008,22 @@ mod tests {
                 proxy_down: None,
             }),
             "the state the older daemon answered is the state the read returns"
+        );
+
+        // A newer daemon's cause this client does not know still yields
+        // the answerer's state: the unparseable sibling reads as no proxy
+        // fact instead of failing the whole Status decode.
+        let future: BoxControlReply = serde_json_lenient::from_str(
+            r#"{"state":"holder","port":7656,"proxy_down":{"port":1,"cause":"future"}}"#,
+        )
+        .expect("an unknown proxy-down cause still decodes the status");
+        assert_eq!(
+            future,
+            BoxControlReply::Status(AnswererStatusReply {
+                answerer: ZoneAnswererStatus::Holder { port: 7_656 },
+                proxy_down: None,
+            }),
+            "an unknown cause drops the sibling, never the answerer's state"
         );
     }
 }
