@@ -2937,7 +2937,8 @@ pub(crate) struct SandboxLauncher {
     /// attaches with instead of drawing one, and the published loopback
     /// address the host side names the box by. Ignored by every other
     /// network mode; `None` for a session the activating client did not
-    /// register, which self-allocates as it always has.
+    /// register, which self-allocates on a native host and is refused on a
+    /// VM host, where the in-VM daemon draws nothing (NET-138).
     pub(crate) box_addresses: Option<sessions::BoxAddresses>,
     /// Composition to merge into the launcher's baseline packages and
     /// vars. Patches and lifecycle hooks are ignored today.

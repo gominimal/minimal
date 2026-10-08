@@ -539,6 +539,7 @@ pub(crate) async fn activate_session(
         project_path: abs_path.clone(),
         network,
         policy,
+        task_addresses: Vec::new(),
         box_addresses: None,
         hooks_enabled: !args.no_hooks,
         attrs: Default::default(),
@@ -716,6 +717,10 @@ pub(crate) async fn activate_session(
     config.box_addresses = registered
         .as_ref()
         .map(|registration| registration.addresses);
+    config.task_addresses = registered
+        .as_ref()
+        .map(|registration| registration.task_addresses.clone())
+        .unwrap_or_default();
 
     use minimald_rpc::{
         ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, CreateSessionRequest,
@@ -802,6 +807,10 @@ pub(crate) async fn activate_session(
                     config.box_addresses = registered
                         .as_ref()
                         .map(|registration| registration.addresses);
+                    config.task_addresses = registered
+                        .as_ref()
+                        .map(|registration| registration.task_addresses.clone())
+                        .unwrap_or_default();
                     continue;
                 }
                 // A create failure that is not a retryable autogen collision
@@ -5700,6 +5709,7 @@ mod tests {
                 dynamic_ingress: None,
                 dynamic_allowed_range: None,
                 hold: false,
+                task_slots: 0,
             },
         )
         .await
@@ -5707,6 +5717,52 @@ mod tests {
         assert!(
             refused.to_string().contains("address plan is exhausted"),
             "the refusal surfaces with its reason: {refused}"
+        );
+    }
+
+    /// NET-138: an own-address activation asks the VM host for its box's
+    /// task addresses in the same registration, and is handed them back for
+    /// the create to carry, so the in-VM daemon draws nothing for a task
+    /// run either.
+    #[tokio::test]
+    async fn activation_registers_task_slots_for_own_ip_box() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let provider_dir = dir.path().join("providers").join("local-minvmd0");
+        std::fs::create_dir_all(&provider_dir).unwrap();
+        let requests = fake_vm_host(
+            provider_dir.join("control.sock"),
+            r#"{"switch_address":"100.64.128.0","loopback_address":"127.0.64.0","box_id":"0123456789abcdef0123456789abcdef","task_addresses":["100.64.128.1","100.64.128.2"]}"#
+                .to_string(),
+        )
+        .await;
+        let handed = register_box_for_activation(
+            paths::ProviderKind::Minvmd,
+            Some(dir.path()),
+            NetworkMode::OwnIp,
+            "web",
+            &sessions::SessionPolicy::default(),
+        )
+        .await
+        .expect("the registration is answered")
+        .expect("an own-address box on a VM-backed host registers");
+        assert_eq!(
+            handed.task_addresses,
+            vec![
+                std::net::Ipv4Addr::new(100, 64, 128, 1),
+                std::net::Ipv4Addr::new(100, 64, 128, 2),
+            ],
+            "the task addresses the host handed come back for the create"
+        );
+        let seen = requests.lock().unwrap();
+        let request: minimald_rpc::BoxControlRequest =
+            serde_json_lenient::from_str(&seen[0]).expect("the request is the wire type");
+        let minimald_rpc::BoxControlRequest::Register(request) = request else {
+            panic!("a registration is carried by the register verb");
+        };
+        assert_eq!(
+            request.task_slots,
+            minimald_rpc::TASK_SLOTS_PER_BOX,
+            "the activation asks for its box's task addresses"
         );
     }
 
@@ -5798,6 +5854,7 @@ mod tests {
             },
             status: sessions::SessionStatus::default(),
             hooks_enabled: true,
+            task_addresses: Vec::new(),
             box_addresses: Some(addresses),
             host_ip_enforcement: None,
             host_row_bound: false,

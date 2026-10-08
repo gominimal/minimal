@@ -460,6 +460,12 @@ pub struct SessionConfig {
     /// has.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub box_addresses: Option<BoxAddresses>,
+    /// The task addresses the same registration handed (NET-138): the
+    /// switch addresses the box's task runs attach at, each filed on the
+    /// host under the box's own row. Empty for every activation that
+    /// handed no box addresses.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub task_addresses: Vec<std::net::Ipv4Addr>,
     /// Whether the session runs the lifecycle hooks composed into it.
     /// Cleared by `min session activate --no-hooks`, and persisted onto
     /// the session record so the later attach/detach/destroy
@@ -575,7 +581,7 @@ impl<'de> Deserialize<'de> for BoxId {
 /// the id it is handed, and the client's record, the sealed member's
 /// claims and the proxy's attachment name the box by the same id. A
 /// re-registration is a new creation and is handed a new id.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RegisteredBox {
     /// The box's address on the switch ([`BoxAddresses::switch_address`]).
     pub switch_address: std::net::Ipv4Addr,
@@ -585,7 +591,22 @@ pub struct RegisteredBox {
     /// The box id the published row holds: the box's own UUIDv7, handed
     /// back to the registering client.
     pub box_id: BoxId,
+    /// The task addresses filed with the box ([`RegisterBoxRequest::task_slots`]):
+    /// one switch address per task slot, each a row of its own carrying
+    /// the box's id and egress. Empty from a host that predates them, or
+    /// for a registration that asked for none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub task_addresses: Vec<std::net::Ipv4Addr>,
 }
+
+/// How many task addresses an activation registers with its box: the
+/// number of task runs (`min run` from inside the box, or a task run over
+/// exec) one session holds an address for at once. Task runs are
+/// interactive, so concurrency beyond a handful is rare, and the cost is
+/// four addresses of a hand-out run of thousands on the default switch
+/// (126 on a carved /24) — small enough that every own-address box can
+/// pay it up front rather than draw inside the VM.
+pub const TASK_SLOTS_PER_BOX: u8 = 4;
 
 /// The wire types of the VM host daemon's box control socket (T66): the
 /// one door a client has to the host-side box table (NET-138).
@@ -660,6 +681,13 @@ pub struct RegisterBoxRequest {
     /// creator withdraws it.
     #[serde(default)]
     pub hold: bool,
+    /// How many task addresses to register with the box (NET-138): the
+    /// host draws one switch address per slot and files each as a row
+    /// carrying the box's id and egress, withdrawn with the box. Zero —
+    /// the default, and what a client that predates the field sends —
+    /// registers none.
+    #[serde(default)]
+    pub task_slots: u8,
 }
 
 /// The one line a held registration's client writes on the lease
@@ -3175,6 +3203,7 @@ mod tests {
                 // The non-`None` shape of the handed addresses: a fixture
                 // leaving it `None` would round-trip green even if the
                 // field never reached the wire.
+                task_addresses: Vec::new(),
                 box_addresses: Some(BoxAddresses {
                     switch_address: std::net::Ipv4Addr::new(100, 64, 0, 2),
                     loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 0),

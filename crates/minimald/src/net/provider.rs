@@ -290,10 +290,10 @@ pub(crate) fn attached_lease(
 /// for that too. `box_addresses` carries the switch and loopback addresses
 /// the VM host daemon handed the box's registration (T66): its switch
 /// address is what this `OwnIp` PTask attaches with instead of drawing one,
-/// because the host-side table's row is keyed by it. A task launch passes
-/// `None` deliberately — the task's sandbox is not the box the registration
-/// named, and attaching it at the box's address would key its frames to the
-/// session's row. `decision` carries the verdict decision this launch itself
+/// because the host-side table's row is keyed by it. A task launch goes
+/// through [`task_network_for`] instead — the task's sandbox is not the box
+/// the registration named, and attaching it at the box's address would key
+/// its frames to the session's row. `decision` carries the verdict decision this launch itself
 /// read for the box before it reserved anything (NET-079) — the launch's own
 /// fresh fact, never another launch's, which a process-wide memo left a
 /// concurrent launch free to read in its place. A task launch passes `None`
@@ -329,9 +329,39 @@ pub(crate) fn network_for(
             policy,
             own_address,
             box_addresses,
+            task_slots: None,
             reserved: std::sync::Mutex::new(None),
         }),
         _ => Arc::new(sandbox2::NoNet),
+    }
+}
+
+/// [`network_for`] for a task run (NET-138): an `OwnIp` task attaches at
+/// one of the task addresses the VM host registered with its session's box
+/// (`task_addresses`, off the session record) — each a host-side row
+/// carrying the box's id and egress — never at the box's own address and
+/// never at one it draws. No task addresses is the plain draw, which only a
+/// native switch makes ([`SwitchClient::attach_task_slot`]). Every other
+/// mode is [`network_for`]'s, with no reporter, no handed box addresses and
+/// no classifier decision: a task owns no proxy route and places no leaf.
+pub(crate) fn task_network_for(
+    mode: NetworkMode,
+    switch: &Arc<Mutex<SwitchClient>>,
+    identity: &str,
+    policy: Option<sessions::SessionPolicy>,
+    task_addresses: Vec<std::net::Ipv4Addr>,
+) -> Arc<dyn Network> {
+    match mode {
+        NetworkMode::OwnIp => Arc::new(OwnIpNetwork {
+            switch: Arc::clone(switch),
+            identity: identity.to_string(),
+            policy,
+            own_address: None,
+            box_addresses: None,
+            task_slots: Some(task_addresses),
+            reserved: std::sync::Mutex::new(None),
+        }),
+        _ => network_for(mode, switch, identity, policy, None, None, None),
     }
 }
 
@@ -573,9 +603,13 @@ struct OwnIpNetwork {
     /// with instead of drawing one — the host-side table's row is keyed by
     /// it, so a self-allocated lease would never match — and the published
     /// loopback address the host side names the box by. `None` for a launch
-    /// the activating client did not register, which draws as it always
-    /// has.
+    /// the activating client did not register, which draws on a native
+    /// switch and is refused on one the VM host owns (NET-138).
     box_addresses: Option<sessions::BoxAddresses>,
+    /// For a task launch ([`task_network_for`]), the task addresses the VM
+    /// host registered with the session's box (NET-138): the PTask attaches
+    /// at the first one no task run holds. `None` for a box's own launch.
+    task_slots: Option<Vec<std::net::Ipv4Addr>>,
     /// Taken by `plan`, taken back out by `attach` or `abandon`. A `std` mutex,
     /// never held across an await, so a cancelled launch cannot leak it.
     reserved: std::sync::Mutex<Option<Reserved>>,
@@ -587,6 +621,7 @@ impl std::fmt::Debug for OwnIpNetwork {
             .field("identity", &self.identity)
             .field("has_policy", &self.policy.is_some())
             .field("handed_addresses", &self.box_addresses.is_some())
+            .field("task_slots", &self.task_slots)
             .finish_non_exhaustive()
     }
 }
@@ -597,19 +632,23 @@ impl Network for OwnIpNetwork {
     /// sandbox layer assigns the address as it creates the tap.
     ///
     /// The lease is the host's handed address when the box was registered
-    /// (T66) — the address the host-side table's row is keyed by — and a
-    /// self-allocated one otherwise, exactly as before this existed.
+    /// (T66) — the address the host-side table's row is keyed by — a free
+    /// one of the session's task addresses for a task launch (NET-138), and
+    /// a self-allocated one otherwise, which only a native switch draws.
     fn plan(&self) -> PlanFuture<'_> {
         Box::pin(async move {
             let (lease, control, subnet) = {
                 let mut s = self.switch.lock().await;
                 let subnet = s.subnet();
-                let attach = match self.box_addresses.as_ref() {
-                    Some(handed) => s
+                let attach = match (self.box_addresses.as_ref(), self.task_slots.as_deref()) {
+                    (Some(handed), _) => s
                         .attach_handed(handed.switch_address)
                         .await
                         .map_err(NetworkError::new)?,
-                    None => s.attach().await.map_err(NetworkError::new)?,
+                    (None, Some(slots)) => {
+                        s.attach_task_slot(slots).await.map_err(NetworkError::new)?
+                    }
+                    (None, None) => s.attach().await.map_err(NetworkError::new)?,
                 };
                 let control = match s.transport() {
                     crate::net::SwitchTransport::LocalSpawn => {
@@ -676,7 +715,11 @@ impl Network for OwnIpNetwork {
                 &self.identity,
                 self.policy.as_ref(),
                 self.own_address.as_ref(),
-                self.box_addresses.is_some(),
+                self.box_addresses.is_some()
+                    || self
+                        .task_slots
+                        .as_ref()
+                        .is_some_and(|slots| !slots.is_empty()),
             )
             .await
             .map_err(NetworkError::new)?;
@@ -716,14 +759,18 @@ mod tests {
 
     /// A switch whose attach/detach are pure bookkeeping: `HostShuttle` leaves
     /// the gvproxy process to `minvmd`, so only the count moves.
+    ///
+    /// It lets the daemon draw, which a VM host's switch never does in
+    /// production (NET-138): these tests drive the draw path itself, with
+    /// no host to hand them addresses.
     fn counting_switch() -> Arc<Mutex<SwitchClient>> {
         Arc::new(Mutex::new(
-            SwitchClient::new("/usr/bin/gvproxy", "/run/minimal/gvproxy").with_transport(
-                crate::net::SwitchTransport::HostShuttle {
+            SwitchClient::new("/usr/bin/gvproxy", "/run/minimal/gvproxy")
+                .with_transport(crate::net::SwitchTransport::HostShuttle {
                     cid: crate::net::VSOCK_HOST_CID,
                     port: crate::net::VSOCK_GVPROXY_SHUTTLE_PORT,
-                },
-            ),
+                })
+                .allowing_self_allocation(),
         ))
     }
 

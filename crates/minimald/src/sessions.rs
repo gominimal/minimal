@@ -106,6 +106,9 @@ fn build_record(
         // included — reuses the address the host table still holds instead
         // of drawing a new one the row would not match.
         box_addresses: config.box_addresses,
+        // Task runs attach at these, one run per address, so the in-VM
+        // daemon draws nothing for a task either (NET-138).
+        task_addresses: config.task_addresses,
         status,
         hooks_enabled: config.hooks_enabled,
         // Daemon-owned from its first line: a create holds no launch's
@@ -1989,6 +1992,7 @@ pub(crate) mod tests {
             project_path: HostAbsPath::try_new("/proj").unwrap(),
             network: sessions::NetworkMode::default(),
             policy: Default::default(),
+            task_addresses: Vec::new(),
             box_addresses: None,
             hooks_enabled: true,
             attrs: Default::default(),

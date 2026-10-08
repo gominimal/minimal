@@ -152,6 +152,10 @@ pub struct RegisteredWithVmHost {
     /// the one spelling the row, the attachment and a diagnostic all name
     /// it by — or `None` when the answering daemon predates ids.
     pub box_id: Option<minimald_rpc::BoxId>,
+    /// The task addresses filed with the box (NET-138), which the create
+    /// request carries so the box's task runs attach at them instead of
+    /// drawing; empty from a daemon that predates them.
+    pub task_addresses: Vec<std::net::Ipv4Addr>,
     /// The registration's lease, held until the session is active and
     /// committed then; `None` from a daemon that predates ids, which
     /// predates leases too and answered one-shot.
@@ -179,6 +183,7 @@ pub async fn register_box_with_vm_host(
                 loopback_address: web.loopback_address,
             },
             box_id: Some(web.box_id),
+            task_addresses: web.task_addresses,
             lease: Some(BoxLease { stream }),
         }),
         // A daemon that predates ids answers with the bare pair the
@@ -186,6 +191,7 @@ pub async fn register_box_with_vm_host(
         minimald_rpc::BoxControlReply::Addresses(addresses) => Ok(RegisteredWithVmHost {
             addresses,
             box_id: None,
+            task_addresses: Vec::new(),
             lease: None,
         }),
         minimald_rpc::BoxControlReply::Error { error } => {
@@ -475,6 +481,9 @@ async fn register_box_at(
         // activation that dies before then — an interrupt, a crash, a
         // withdrawal that never lands — leaves no row holding its name.
         hold: true,
+        // The task addresses the box's task runs attach at, filed with the
+        // box so the in-VM daemon draws nothing for a task (NET-138).
+        task_slots: minimald_rpc::TASK_SLOTS_PER_BOX,
     };
     let registration = tokio::time::timeout(
         BOX_CONTROL_TIMEOUT,

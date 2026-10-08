@@ -481,6 +481,7 @@ pub async fn activate(
         policy: SessionPolicy::default(),
         // An own-address box on a VM-backed host is handed its addresses by
         // the registration [`create_registering`] makes first.
+        task_addresses: Vec::new(),
         box_addresses: None,
         // Same default as an activate with no flags: the dashboard
         // has no `--no-hooks` of its own, and a session created here
@@ -714,6 +715,11 @@ async fn create_registering<C: Send>(
             .registration
             .as_ref()
             .map(|registration| registration.addresses);
+        config.task_addresses = row
+            .registration
+            .as_ref()
+            .map(|registration| registration.task_addresses.clone())
+            .unwrap_or_default();
         let error = match create(client, config.clone()).await {
             Ok(Errorable::Ok(created)) => return Ok((created, row)),
             Ok(Errorable::Err { error }) => error,
@@ -849,6 +855,7 @@ mod tests {
             .unwrap(),
             network: NetworkMode::OwnIp,
             policy: SessionPolicy::default(),
+            task_addresses: Vec::new(),
             box_addresses: None,
             hooks_enabled: true,
             attrs: Default::default(),
@@ -875,11 +882,12 @@ mod tests {
             switch_address: std::net::Ipv4Addr::new(100, 64, 0, 2),
             loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 0),
             box_id,
+            task_addresses: Vec::new(),
         };
         let server = fake_vm_host(
             &dir.path()
                 .join(minimal_client::attach::VM_HOST_CONTROL_SOCK_FILE),
-            vec![minimald_rpc::BoxControlReply::Registered(handed)],
+            vec![minimald_rpc::BoxControlReply::Registered(handed.clone())],
         );
         let mut sent = Vec::new();
         let (_, row) = create_registering(
@@ -932,6 +940,62 @@ mod tests {
         );
     }
 
+    /// NET-138 from the dashboard: an own-address create asks the host for
+    /// the box's task addresses with its registration, and the create
+    /// carries the ones handed back, so the in-VM daemon draws nothing for a
+    /// task run either.
+    #[tokio::test]
+    async fn tui_activation_registers_task_slots_for_own_ip_box() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ssh_sock = dir.path().join("ssh.sock");
+        let task_addresses = vec![
+            std::net::Ipv4Addr::new(100, 64, 0, 3),
+            std::net::Ipv4Addr::new(100, 64, 0, 4),
+        ];
+        let server = fake_vm_host(
+            &dir.path()
+                .join(minimal_client::attach::VM_HOST_CONTROL_SOCK_FILE),
+            vec![minimald_rpc::BoxControlReply::Registered(
+                minimald_rpc::RegisteredBox {
+                    switch_address: std::net::Ipv4Addr::new(100, 64, 0, 2),
+                    loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 0),
+                    box_id: minimald_rpc::BoxId::from_bytes([7; 16]),
+                    task_addresses: task_addresses.clone(),
+                },
+            )],
+        );
+        let mut sent = Vec::new();
+        create_registering(
+            &ssh_sock,
+            own_ip_config(dir.path(), Some("web")),
+            &mut sent,
+            |sent, config| {
+                sent.push(config);
+                Box::pin(async { Ok(Errorable::Ok(created())) })
+            },
+        )
+        .await
+        .expect("the registered box is created");
+        let lines = server.join().unwrap();
+        let request: minimald_rpc::BoxControlRequest =
+            serde_json_lenient::from_str(lines[0].trim()).expect("the request is the wire type");
+        let minimald_rpc::BoxControlRequest::Register(request) = request else {
+            panic!("a registration is carried by the register verb");
+        };
+        assert_eq!(
+            request.task_slots,
+            minimald_rpc::TASK_SLOTS_PER_BOX,
+            "the registration asks for the box's task addresses"
+        );
+        let [config] = sent.as_slice() else {
+            panic!("one create, got {}", sent.len());
+        };
+        assert_eq!(
+            config.task_addresses, task_addresses,
+            "the create carries the task addresses the host handed"
+        );
+    }
+
     /// A dashboard create that fails after its box registered withdraws the
     /// row — its creator presenting the name, the pair and the id the
     /// registration handed back — and surfaces the create's own error, not
@@ -953,6 +1017,7 @@ mod tests {
                     switch_address: addresses.switch_address,
                     loopback_address: addresses.loopback_address,
                     box_id,
+                    task_addresses: Vec::new(),
                 }),
                 minimald_rpc::BoxControlReply::Addresses(addresses),
             ],
@@ -1072,6 +1137,7 @@ mod tests {
                     switch_address: addresses.switch_address,
                     loopback_address: addresses.loopback_address,
                     box_id: minimald_rpc::BoxId::from_bytes([3; 16]),
+                    task_addresses: Vec::new(),
                 },
             )],
         );
@@ -1107,6 +1173,7 @@ mod tests {
             status: sessions::SessionStatus::default(),
             hooks_enabled: true,
             box_addresses,
+            task_addresses: Vec::new(),
             host_ip_enforcement: None,
             host_row_bound: false,
             attrs: Default::default(),
@@ -1157,6 +1224,7 @@ mod tests {
             },
             status: sessions::SessionStatus::default(),
             hooks_enabled: true,
+            task_addresses: Vec::new(),
             box_addresses: Some(handed),
             host_ip_enforcement: None,
             host_row_bound: false,

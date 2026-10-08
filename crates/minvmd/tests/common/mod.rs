@@ -213,6 +213,7 @@ pub fn register_box(
         dynamic_ingress: None,
         dynamic_allowed_range: None,
         hold: false,
+        task_slots: 0,
     });
     let mut line = serde_json_lenient::to_string(&request)
         .map_err(|e| format!("serialize the box registration: {e}"))?;

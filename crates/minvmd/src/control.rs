@@ -1077,6 +1077,7 @@ fn resume_reply(
                 switch_address: record.switch_addr(),
                 loopback_address: record.loopback_addr(),
                 box_id: minimald_rpc::BoxId::from_bytes(record.box_id()),
+                task_addresses: record.task_addrs().to_vec(),
             }),
             Err(error) => {
                 let released = boxes.release_unless_owned(&claim, || {
@@ -1451,13 +1452,21 @@ fn register_box(
         dynamic_ingress: request.dynamic_ingress,
         dynamic_allowed_range: request.dynamic_allowed_range,
     };
-    match boxes.register_client_box_since(spec, loopback_addr, claim.generation()) {
+    // The box's task addresses are filed with it (NET-138), so the in-VM
+    // daemon draws nothing for a task run either.
+    match boxes.register_client_box_since(
+        spec,
+        loopback_addr,
+        request.task_slots,
+        claim.generation(),
+    ) {
         Ok(record) => {
             tracing::info!(
                 box = %record.name(),
                 box_id = %crate::bep_attach::BoxIdText(&record.box_id()),
                 switch_address = %record.switch_addr(),
                 loopback_address = %record.loopback_addr(),
+                task_addresses = ?record.task_addrs(),
                 egress = %declared_egress,
                 "registered box with the VM host daemon; addresses allocated"
             );
@@ -1465,6 +1474,7 @@ fn register_box(
                 switch_address: record.switch_addr(),
                 loopback_address: record.loopback_addr(),
                 box_id: minimald_rpc::BoxId::from_bytes(record.box_id()),
+                task_addresses: record.task_addrs().to_vec(),
             })
         }
         Err(error) => {
@@ -2845,6 +2855,68 @@ mod tests {
         }
     }
 
+    /// NET-138 over the control socket: a registration that asks for task
+    /// slots is handed one task address per slot — capped at
+    /// [`minimald_rpc::TASK_SLOTS_PER_BOX`] — each from the hand-out run and
+    /// each a published row of the box's, carrying its id; the creator's
+    /// withdrawal of the box takes them with it.
+    #[test]
+    fn task_addresses_registered_with_box_and_handed() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (sock_path, _server, registry, _answerer, _proxy_publish) =
+            spawn_server(dir.path()).expect("server binds");
+        let web = handed(
+            register(
+                &sock_path,
+                &RegisterBoxRequest {
+                    name: "web".to_string(),
+                    ingress_ports: Vec::new(),
+                    egress: None,
+                    credentialed_upstream: None,
+                    dynamic_ingress: None,
+                    dynamic_allowed_range: None,
+                    hold: false,
+                    task_slots: u8::MAX,
+                },
+            )
+            .expect("the registration is answered"),
+        );
+        assert_eq!(
+            web.task_addresses.len(),
+            usize::from(minimald_rpc::TASK_SLOTS_PER_BOX),
+            "one task address per slot, capped host-side"
+        );
+        let table = registry.table();
+        for &task in &web.task_addresses {
+            assert_ne!(task, web.switch_address);
+            assert!(
+                u32::from(task) > u32::from(Ipv4Addr::new(100, 64, 127, 254)),
+                "a task address comes from the hand-out run, never the reserve: {task}"
+            );
+            let row = table
+                .by_source(task.octets())
+                .expect("each task address is a published row");
+            assert_eq!(row.task_row_of(), Some(web.switch_address));
+            assert_eq!(minimald_rpc::BoxId::from_bytes(row.box_id()), web.box_id);
+        }
+
+        let withdrawn = registry
+            .withdraw_client_box(
+                "web",
+                web.switch_address,
+                web.loopback_address,
+                Some(web.box_id.to_bytes()),
+            )
+            .expect("the creator withdraws its box");
+        assert!(withdrawn.is_some());
+        assert!(
+            web.task_addresses
+                .iter()
+                .all(|task| table.by_source(task.octets()).is_none()),
+            "the task rows go with the box"
+        );
+    }
+
     /// The end-to-end shape of the layer: the activating client registers
     /// over the control socket, the host allocates the box's switch and
     /// loopback addresses into its table and hands them back, allocations
@@ -2879,6 +2951,7 @@ mod tests {
                     dynamic_ingress: None,
                     dynamic_allowed_range: None,
                     hold: false,
+                    task_slots: 0,
                 },
             )
             .expect("first registration is answered"),
@@ -2949,6 +3022,7 @@ mod tests {
                     dynamic_ingress: None,
                     dynamic_allowed_range: None,
                     hold: false,
+                    task_slots: 0,
                 },
             )
             .expect("second registration is answered"),
@@ -2993,6 +3067,7 @@ mod tests {
                     dynamic_ingress: None,
                     dynamic_allowed_range: None,
                     hold: false,
+                    task_slots: 0,
                 },
             )
             .expect("server still serves after a refused request"),
@@ -3108,6 +3183,7 @@ mod tests {
                     dynamic_ingress: None,
                     dynamic_allowed_range: None,
                     hold: false,
+                    task_slots: 0,
                 },
             )
             .expect("the registration is answered"),
@@ -3183,6 +3259,7 @@ mod tests {
                     dynamic_ingress: None,
                     dynamic_allowed_range: None,
                     hold: false,
+                    task_slots: 0,
                 },
             )
             .expect("the registration is answered"),
@@ -3296,6 +3373,7 @@ mod tests {
                     dynamic_ingress: None,
                     dynamic_allowed_range: None,
                     hold: false,
+                    task_slots: 0,
                 },
             )
             .expect("the marker box is registered"),
@@ -3547,6 +3625,7 @@ mod tests {
                     dynamic_ingress: None,
                     dynamic_allowed_range: None,
                     hold: false,
+                    task_slots: 0,
                 },
             )
             .expect("a registration still answers around the read"),
@@ -3997,6 +4076,7 @@ mod tests {
                     dynamic_ingress: Some(sessions::DynamicIngress::Allow),
                     dynamic_allowed_range: Some((3000, 3999)),
                     hold: false,
+                    task_slots: 0,
                 },
             )
             .expect("the registration is answered"),
@@ -4139,6 +4219,7 @@ mod tests {
                     dynamic_ingress: None,
                     dynamic_allowed_range: None,
                     hold: false,
+                    task_slots: 0,
                 },
             )
             .expect("the registration is answered"),
@@ -4194,6 +4275,7 @@ mod tests {
                     dynamic_ingress: Some(sessions::DynamicIngress::Allow),
                     dynamic_allowed_range: Some((3000, 3999)),
                     hold: false,
+                    task_slots: 0,
                 },
             )
             .expect("the registration is answered"),
@@ -4284,6 +4366,7 @@ mod tests {
                     dynamic_ingress: None,
                     dynamic_allowed_range: None,
                     hold: false,
+                    task_slots: 0,
                 },
             )
             .expect("the registration is answered"),
@@ -4406,6 +4489,7 @@ mod tests {
                         dynamic_ingress: Some(sessions::DynamicIngress::Ask),
                         dynamic_allowed_range: Some((ASK_PORT, ASK_PORT + 999)),
                         hold: false,
+                        task_slots: 0,
                     },
                 )
                 .expect("the registration is answered"),
@@ -5198,6 +5282,7 @@ mod tests {
                 dynamic_ingress: None,
                 dynamic_allowed_range: None,
                 hold: false,
+                task_slots: 0,
             },
         )
         .expect("the second connection is served");
@@ -5316,6 +5401,7 @@ mod tests {
                     dynamic_ingress: Some(sessions::DynamicIngress::Allow),
                     dynamic_allowed_range: Some((3000, 3999)),
                     hold: false,
+                    task_slots: 0,
                 },
             )
             .expect("the registration is answered"),
@@ -5614,6 +5700,7 @@ mod tests {
             dynamic_ingress: None,
             dynamic_allowed_range: None,
             hold: false,
+            task_slots: 0,
         }
     }
 
@@ -5844,6 +5931,7 @@ mod tests {
         let mut stream = TestStream::connect(sock_path).expect("the door accepts");
         let request = BoxControlRequest::Register(RegisterBoxRequest {
             hold: true,
+            task_slots: 0,
             ..box_request(name)
         });
         let mut line = serde_json_lenient::to_string(&request).expect("the request serializes");

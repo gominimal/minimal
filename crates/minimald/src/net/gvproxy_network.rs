@@ -751,7 +751,19 @@ mod tests {
     /// an attach's own address alike.
     #[tokio::test]
     async fn own_ip_attach_uses_handed_address() {
-        let switch = vm_host_switch();
+        // The draw below stands in for a native one: a VM host's switch
+        // refuses every draw in production (NET-138,
+        // `host_shuttle_switch_refuses_self_allocation`), and this test
+        // lets it draw so the reserve's disjointness stays pinned here.
+        let switch = Arc::new(Mutex::new(
+            SwitchClient::new("/usr/bin/gvproxy", "/run/minimal/gvproxy")
+                .with_host_id("aaaa1")
+                .with_transport(SwitchTransport::HostShuttle {
+                    cid: crate::net::VSOCK_HOST_CID,
+                    port: crate::net::VSOCK_GVPROXY_SHUTTLE_PORT,
+                })
+                .allowing_self_allocation(),
+        ));
         // The handed address comes from the hand-out run — the plan run's
         // upper half, above the daemon's self-allocation reserve, which is
         // where a real host's registrations hand from.
@@ -803,8 +815,8 @@ mod tests {
             "the abandon releases the handed lease with the count"
         );
 
-        // The next box — one the activating client did not register —
-        // self-allocates from the daemon's reserve: the plan run's lower
+        // The next box — one the activating client did not register — draws
+        // from the daemon's reserve, as a native one does: the plan run's lower
         // half, a sub-run disjoint from the hand-out run the handed address
         // came from, so the two allocators cannot meet and the handed
         // address is never drawn.

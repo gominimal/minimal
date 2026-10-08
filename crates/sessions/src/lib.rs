@@ -1063,10 +1063,23 @@ pub struct Record {
     /// the host table still holds a row for; drawing a fresh one would
     /// silently orphan the row and drop the box to the egress gate's
     /// unregistered-source interim. Defaults to `None` for records that
-    /// predate the field (every pre-T66 session): those boxes self-allocate
-    /// exactly as they always have.
+    /// predate the field (every pre-T66 session): on a VM-backed host such
+    /// a box is refused at launch and must be re-activated, since the
+    /// in-VM daemon draws no address of its own once its switch is the
+    /// host's (NET-138); a native host self-allocates as it always has.
     #[serde(default)]
     pub box_addresses: Option<BoxAddresses>,
+
+    /// The task addresses the same registration handed (NET-138): the
+    /// switch addresses this box's task runs attach at, one run per
+    /// address at a time. Each is a row on the host carrying the box's id
+    /// and egress, withdrawn with the box. Kept off [`BoxAddresses`] so
+    /// that pair stays `Copy`. Empty for every record that handed no box
+    /// addresses, and for one that predates the field — a VM-backed task
+    /// run under such a record is refused and the session must be
+    /// re-activated.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub task_addresses: Vec<std::net::Ipv4Addr>,
 
     /// The per-box egress enforcement this session's own launch placed its
     /// host-address box under (NET-079): `per_box` when the launch placed the
@@ -1313,6 +1326,7 @@ mod tests {
             policy,
             status: SessionStatus::default(),
             hooks_enabled: true,
+            task_addresses: Vec::new(),
             box_addresses: None,
             host_ip_enforcement: None,
             host_row_bound: false,

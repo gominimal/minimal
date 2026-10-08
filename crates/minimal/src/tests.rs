@@ -2315,6 +2315,7 @@ async fn create_box_on(
                     .expect("the test cwd as a host path"),
                 network: sessions::NetworkMode::NoNet,
                 policy: sessions::SessionPolicy::default(),
+                task_addresses: Vec::new(),
                 box_addresses: None,
                 hooks_enabled: true,
                 attrs: Default::default(),

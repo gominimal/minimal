@@ -522,6 +522,7 @@ async fn create_toolchain_session(
             policy: sessions::SessionPolicy::new(Some(egress), None),
             // The addresses the registration handed back, so the in-VM
             // daemon attaches the box at its row's lease.
+            task_addresses: Vec::new(),
             box_addresses: Some(addresses),
             hooks_enabled: true,
             attrs: Default::default(),

@@ -113,7 +113,7 @@ const TERM_GRACE: Duration = Duration::from_secs(5);
 #[non_exhaustive]
 pub enum NetError {
     /// The daemon's self-allocation reserve — the sub-run of the plan's PTask
-    /// run it draws task sandboxes and unregistered boxes from — has no
+    /// run a native daemon draws its task sandboxes and boxes from — has no
     /// address free: every one is held by a live attach, still inside its
     /// reuse quarantine, or still named by a live gate row or flow.
     #[error(
@@ -140,8 +140,8 @@ pub enum NetError {
     #[error("handed switch address {address} is already held by a lease (MAC {holder})")]
     HandedAddressCollision { address: Ipv4Addr, holder: MacAddr },
     /// The host handed the box a switch address inside this daemon's
-    /// self-allocation reserve (T66) — the sub-run task sandboxes and
-    /// unregistered boxes draw from. Host and daemon keep disjoint sub-runs
+    /// self-allocation reserve (T66) — the sub-run a native daemon draws
+    /// from. Host and daemon keep disjoint sub-runs
     /// of the plan's PTask run (the daemon's half is [`self_allocation_run`],
     /// the host's mirror `minvmd`'s `box_registry::hand_out_run`), so a
     /// handed address inside the reserve means the two sides disagree about
@@ -155,6 +155,21 @@ pub enum NetError {
         address: Ipv4Addr,
         subnet: SwitchSubnet,
     },
+    /// An attach on a switch the VM host owns asked this daemon to draw an
+    /// address of its own (NET-138): once a control socket exists the host
+    /// registers every box and task address, and the in-VM daemon draws
+    /// nothing. The session predates host registration — its record carries
+    /// no handed address for this attach — and must be re-activated.
+    #[error(
+        "this session predates host registration of its addresses, and the VM host no longer \
+         lets the daemon draw one; destroy the session and re-activate it"
+    )]
+    SelfAllocationRetired,
+    /// Every task address the host registered with the session's box
+    /// (NET-138) is held by a task run still in progress: one task run
+    /// attaches per address at a time.
+    #[error("{slots} task runs already in progress for this session; wait for one to finish")]
+    TaskSlotsBusy { slots: usize },
     /// Spawning the gvproxy binary failed.
     #[error("spawning gvproxy at {path:?}: {source}")]
     Spawn {
@@ -207,18 +222,19 @@ pub struct AttachResult {
 /// more, a PTask run holding an odd number of addresses.
 ///
 /// The plan's PTask run is split into two disjoint sub-runs so the two
-/// allocators that draw on it cannot meet: this daemon self-allocates task
-/// sandboxes and unregistered boxes from the lower half, and the VM host
-/// daemon hands registered boxes only from the upper half — the run above
-/// this reserve. The host's half is the same midpoint rule mirrored in
+/// allocators that draw on it cannot meet: a native daemon self-allocates
+/// from the lower half, and the VM host daemon hands registered boxes and
+/// their task addresses only from the upper half — the run above this
+/// reserve. The host's half is the same midpoint rule mirrored in
 /// `minvmd`'s `box_registry::hand_out_run`; one rule, two statements, so
 /// change both together — each side's tests pin the default plan's split
 /// literally.
 ///
-/// This is the interim allocation shape (NET-138): task sandboxes
-/// self-allocate from the reserve until the task registering every live box
-/// host-side retires daemon-side allocation, after which a daemon with a
-/// control socket draws nothing — every own-address box arrives handed.
+/// A daemon whose switch is the VM host's ([`SwitchTransport::HostShuttle`])
+/// draws nothing from it (NET-138): every own-address box arrives handed,
+/// and every task run attaches at a task address registered with its box
+/// ([`SwitchClient::attach_task_slot`]). [`SwitchClient::attach`] refuses
+/// there with [`NetError::SelfAllocationRetired`].
 #[must_use]
 pub fn self_allocation_run(subnet: SwitchSubnet) -> (u32, u32) {
     let first = subnet.first_ptask();
@@ -258,9 +274,9 @@ const _: () = assert!(
 ///
 /// Two allocation shapes: [`Self::allocate`] draws a self-allocation from
 /// the plan run's lower half — the sub-run [`self_allocation_run`] reserves
-/// for this daemon (task sandboxes, unregistered boxes) — and [`Self::hand`]
-/// records the address the VM host daemon handed a registered box, from the
-/// upper half. The two sub-runs are disjoint, so a self-allocation can never
+/// for a native daemon — and [`Self::hand`] records the address the VM host
+/// daemon handed a registered box or one of its task runs, from the upper
+/// half. The two sub-runs are disjoint, so a self-allocation can never
 /// spend a handed address, nor the reverse. A lease's life is its
 /// attachment's, handed or drawn alike: it joins the static-lease table the
 /// switch is configured from when the tap arrives and leaves with the attach
@@ -284,10 +300,9 @@ const _: () = assert!(
 /// it: that re-hand is the same row coming back, and the collision refusal
 /// guards only an address an attach still holds.
 ///
-/// The interim this shape ships in: task sandboxes self-allocate from the
-/// reserve until the task registering every live box host-side (NET-138)
-/// retires self-allocation, after which no daemon-side draw happens once a
-/// control socket exists — every own-address box arrives handed.
+/// Under a VM host no daemon-side draw happens (NET-138): every own-address
+/// box and every task run arrives handed, and [`SwitchClient::attach`]
+/// refuses to reach [`Self::allocate`] on a switch the host owns.
 #[derive(Debug)]
 pub struct IpAllocator {
     subnet: SwitchSubnet,
@@ -565,6 +580,12 @@ pub struct SwitchClient {
     /// keyed by lease, so one box is counted once and a box that left is not
     /// counted.
     hostname_proxy_stranded: std::collections::HashSet<Ipv4Addr>,
+    /// Whether [`Self::attach`] may draw on a [`SwitchTransport::HostShuttle`]
+    /// switch: never in production (NET-138), and only for a test that
+    /// drives the draw path over a shuttle switch without a host to hand it
+    /// addresses ([`Self::allowing_self_allocation`]).
+    #[cfg(test)]
+    allow_self_allocation: bool,
 }
 
 impl SwitchClient {
@@ -598,6 +619,8 @@ impl SwitchClient {
             hostname_proxy_serving: false,
             hostname_proxy_pending: false,
             hostname_proxy_stranded: std::collections::HashSet::new(),
+            #[cfg(test)]
+            allow_self_allocation: false,
         }
     }
 
@@ -698,6 +721,27 @@ impl SwitchClient {
         self
     }
 
+    /// Lets [`Self::attach`] draw on a [`SwitchTransport::HostShuttle`]
+    /// switch, for a test of the draw path that has no host to hand it
+    /// addresses. Production has no such switch (NET-138).
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn allowing_self_allocation(mut self) -> Self {
+        self.allow_self_allocation = true;
+        self
+    }
+
+    /// Whether this switch may draw an address of its own: only when it
+    /// spawns its own gvproxy, the native shape (NET-102). A switch the VM
+    /// host owns draws nothing (NET-138).
+    fn self_allocates(&self) -> bool {
+        #[cfg(test)]
+        if self.allow_self_allocation {
+            return true;
+        }
+        matches!(self.transport, SwitchTransport::LocalSpawn)
+    }
+
     /// How this switch's PTask taps reach the gvproxy switch.
     #[must_use]
     pub fn transport(&self) -> SwitchTransport {
@@ -749,10 +793,20 @@ impl SwitchClient {
     /// fires `true` when gvproxy exits unexpectedly; the caller should tear down
     /// the PTask's tap relay when the signal fires.
     ///
+    /// Only a native switch draws ([`SwitchTransport::LocalSpawn`],
+    /// NET-102). On a switch the VM host owns, every address is the host's
+    /// to hand (NET-138) — a box's at [`Self::attach_handed`], a task
+    /// run's at [`Self::attach_task_slot`] — and a draw is refused.
+    ///
     /// # Errors
     ///
-    /// Propagates config-write, spawn, and socket-readiness failures.
+    /// [`NetError::SelfAllocationRetired`] on a
+    /// [`SwitchTransport::HostShuttle`] switch; propagates config-write,
+    /// spawn, and socket-readiness failures.
     pub async fn attach(&mut self) -> Result<AttachResult, NetError> {
+        if !self.self_allocates() {
+            return Err(NetError::SelfAllocationRetired);
+        }
         let lease = self.allocator.allocate()?;
         // DM2 spawns + configures gvproxy locally; DM1/3/4 (HostShuttle) leaves
         // gvproxy to `minvmd` on the host, so skip the spawn/config steps and
@@ -826,6 +880,35 @@ impl SwitchClient {
         );
         let exit_signal = self.exit_tx.subscribe();
         Ok(AttachResult { lease, exit_signal })
+    }
+
+    /// Attaches a task run at one of the task addresses the host registered
+    /// with its session's box (NET-138): the first of `slots` no attach
+    /// holds, through [`Self::attach_handed`]. A slot frees when the task
+    /// run that held it detaches, so the session's runs in progress are
+    /// exactly the slots the switch's live leases hold, and no other state
+    /// is kept.
+    ///
+    /// No slots at all — a session whose registration handed none, or one
+    /// that predates them — is the plain [`Self::attach`]: a native switch
+    /// draws, and a switch the VM host owns refuses with
+    /// [`NetError::SelfAllocationRetired`].
+    ///
+    /// # Errors
+    ///
+    /// [`NetError::TaskSlotsBusy`] when every slot is held; otherwise what
+    /// [`Self::attach_handed`] or [`Self::attach`] returns.
+    pub async fn attach_task_slot(&mut self, slots: &[Ipv4Addr]) -> Result<AttachResult, NetError> {
+        if slots.is_empty() {
+            return self.attach().await;
+        }
+        for &slot in slots {
+            match self.attach_handed(slot).await {
+                Err(NetError::HandedAddressCollision { .. }) => {}
+                attached => return attached,
+            }
+        }
+        Err(NetError::TaskSlotsBusy { slots: slots.len() })
     }
 
     /// Records that a PTask detached, withdrawing its lease with it (T66):
@@ -1464,25 +1547,134 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn host_shuttle_attach_allocates_without_spawning_gvproxy() {
-        // In HostShuttle mode `minvmd` owns gvproxy, so `attach` must not try to
-        // spawn the (here nonexistent) binary: it allocates a lease and only
-        // tracks the attach count. A LocalSpawn switch pointed at the same
-        // missing binary would instead fail in `ensure_running`.
-        let dir = tempfile::TempDir::new().expect("tempdir");
-        let mut switch =
-            SwitchClient::new("/nonexistent/gvproxy-binary", dir.path().join("gvproxy"))
-                .with_transport(SwitchTransport::HostShuttle {
-                    cid: VSOCK_HOST_CID,
-                    port: VSOCK_GVPROXY_SHUTTLE_PORT,
-                });
+    /// A switch the VM host owns, pointed at a gvproxy binary that does not
+    /// exist: `minvmd` owns gvproxy in HostShuttle mode, so nothing here may
+    /// try to spawn it.
+    fn host_shuttle_switch(dir: &std::path::Path) -> SwitchClient {
+        SwitchClient::new("/nonexistent/gvproxy-binary", dir.join("gvproxy")).with_transport(
+            SwitchTransport::HostShuttle {
+                cid: VSOCK_HOST_CID,
+                port: VSOCK_GVPROXY_SHUTTLE_PORT,
+            },
+        )
+    }
 
-        let result = switch.attach().await.expect("host-shuttle attach");
-        assert_eq!(result.lease.ip, Ipv4Addr::new(100, 64, 0, 2));
+    /// The first `n` addresses of the default plan's hand-out run: the
+    /// upper half the VM host hands boxes and task addresses from.
+    fn handed_addresses(n: u32) -> Vec<Ipv4Addr> {
+        let (_, reserve_last) = self_allocation_run(AddressPlan::default().switch_subnet());
+        (1..=n).map(|k| Ipv4Addr::from(reserve_last + k)).collect()
+    }
+
+    #[tokio::test]
+    async fn host_shuttle_attach_handed_without_spawning_gvproxy() {
+        // In HostShuttle mode `minvmd` owns gvproxy, so a handed attach must
+        // not try to spawn the (here nonexistent) binary: it records the
+        // lease and only tracks the attach count. A LocalSpawn switch
+        // pointed at the same missing binary would instead fail in
+        // `ensure_running`.
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut switch = host_shuttle_switch(dir.path());
+        let handed = handed_addresses(1)[0];
+        let result = switch
+            .attach_handed(handed)
+            .await
+            .expect("host-shuttle attach");
+        assert_eq!(result.lease.ip, handed);
         // No gvproxy child was spawned; detach decrements the count and
         // withdraws the lease with the attach.
         switch.detach(result.lease).await.expect("detach");
+    }
+
+    /// NET-138's hard guarantee: on a switch the VM host owns, the daemon
+    /// draws nothing — a draw is refused, telling the user to re-activate,
+    /// and leaves no lease and no attach behind.
+    #[tokio::test]
+    async fn host_shuttle_switch_refuses_self_allocation() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut switch = host_shuttle_switch(dir.path());
+        let Err(err) = switch.attach().await else {
+            panic!("a switch the VM host owns draws nothing");
+        };
+        assert!(
+            matches!(err, NetError::SelfAllocationRetired),
+            "refused as retired: {err}"
+        );
+        assert!(
+            err.to_string().contains("re-activate"),
+            "the refusal names the remedy: {err}"
+        );
+        assert!(switch.leases().is_empty(), "nothing was drawn");
+        assert_eq!(switch.attached(), 0);
+        // A task run with no task address on its record is the same draw,
+        // refused the same way.
+        let Err(err) = switch.attach_task_slot(&[]).await else {
+            panic!("a task run with no task address draws nothing either");
+        };
+        assert!(matches!(err, NetError::SelfAllocationRetired), "{err}");
+    }
+
+    /// A native switch keeps self-allocation (NET-102): its draw reaches the
+    /// reserve, and fails only where spawning the (missing) gvproxy does.
+    #[tokio::test]
+    async fn local_spawn_switch_still_self_allocates() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut switch =
+            SwitchClient::new("/nonexistent/gvproxy-binary", dir.path().join("gvproxy"));
+        let err = match switch.attach().await {
+            Ok(_) => panic!("the missing gvproxy binary cannot be spawned"),
+            Err(err) => err,
+        };
+        assert!(
+            !matches!(err, NetError::SelfAllocationRetired),
+            "a native switch is never refused the draw: {err}"
+        );
+        let (reserve_first, _) = self_allocation_run(switch.subnet());
+        assert_eq!(
+            switch.leases().first().map(|lease| lease.ip),
+            Some(Ipv4Addr::from(reserve_first)),
+            "the draw reached the reserve"
+        );
+    }
+
+    /// A task run attaches at a task address registered with its box
+    /// (NET-138): the first one no run holds, and a slot frees when the run
+    /// holding it detaches.
+    #[tokio::test]
+    async fn own_ip_task_attaches_at_a_handed_task_address() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut switch = host_shuttle_switch(dir.path());
+        let slots = handed_addresses(2);
+        let first = switch.attach_task_slot(&slots).await.expect("a free slot");
+        assert_eq!(first.lease.ip, slots[0]);
+        let second = switch.attach_task_slot(&slots).await.expect("a free slot");
+        assert_eq!(second.lease.ip, slots[1], "a held slot is skipped");
+        switch.detach(first.lease).await.expect("detach");
+        let again = switch.attach_task_slot(&slots).await.expect("a freed slot");
+        assert_eq!(again.lease.ip, slots[0], "the freed slot is taken again");
+    }
+
+    /// Every task address held: the run is refused with how many are in
+    /// progress, and nothing is drawn in their place.
+    #[tokio::test]
+    async fn own_ip_task_refused_when_no_task_address_free() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut switch = host_shuttle_switch(dir.path());
+        let slots = handed_addresses(2);
+        for _ in &slots {
+            switch.attach_task_slot(&slots).await.expect("a free slot");
+        }
+        let Err(err) = switch.attach_task_slot(&slots).await else {
+            panic!("no slot is free");
+        };
+        assert!(matches!(err, NetError::TaskSlotsBusy { slots: 2 }), "{err}");
+        assert!(
+            err.to_string()
+                .contains("2 task runs already in progress for this session"),
+            "{err}"
+        );
+        assert_eq!(switch.leases().len(), 2, "nothing was drawn beside them");
+        assert_eq!(switch.attached(), 2);
     }
 
     /// A native daemon's switch: a /24 inside the default /16, whose

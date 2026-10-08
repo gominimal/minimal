@@ -1037,6 +1037,7 @@ mod tests {
             policy: policy.clone(),
             status: sessions::SessionStatus::Active,
             hooks_enabled: true,
+            task_addresses: Vec::new(),
             box_addresses: None,
             host_ip_enforcement: None,
             host_row_bound: false,

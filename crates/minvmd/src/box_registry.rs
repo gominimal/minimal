@@ -394,6 +394,17 @@ pub struct BoxRecord {
     /// end of its attachment (NET-138, [`RowLiveness`]). Bookkeeping, like
     /// the attribution mark: not compared.
     liveness: Mutex<RowLiveness>,
+    /// The switch address of the box row this is a **task row** of
+    /// (NET-138): a row filed with its box at registration, at one of the
+    /// box's task addresses, carrying the box's id (NET-133) and its egress,
+    /// with no ingress, no names and no credentialed lane. A task row stands
+    /// exactly as long as its box's row: it is withdrawn with the box on
+    /// every path that removes the box, never because its own relay ended,
+    /// and restored with it. `None` for a box's own row.
+    task_row_of: Option<Ipv4Addr>,
+    /// The task addresses filed with this box ([`Self::task_row_of`]):
+    /// empty for a task row, and for a box that registered none.
+    task_addrs: Vec<Ipv4Addr>,
 }
 
 /// A row's liveness as the host reads it at its end of the box's
@@ -453,7 +464,9 @@ impl PartialEq for BoxRecord {
             && self.credentialed_upstream == other.credentialed_upstream
             && self.dynamic_ingress == other.dynamic_ingress
             && self.dynamic_range == other.dynamic_range
-            && self.egress_allow_list == other.egress_allow_list)
+            && self.egress_allow_list == other.egress_allow_list
+            && self.task_row_of == other.task_row_of
+            && self.task_addrs == other.task_addrs)
         {
             return false;
         }
@@ -521,7 +534,11 @@ impl BoxRecord {
     /// `now`: the instant it detached, once it has stood detached for
     /// [`DETACH_GRACE`]; or `now`, once its creator resumed it
     /// [`RESUME_ATTACH_BOUND`] ago and no relay has carried it since.
+    /// A task row has no bound of its own: it goes with its box's row.
     fn past_its_bound(&self, now: Instant) -> Option<Instant> {
+        if self.is_task_row() {
+            return None;
+        }
         let liveness = self.liveness();
         let past = |since: Option<Instant>, bound| {
             since.filter(|since| now.saturating_duration_since(*since) >= bound)
@@ -537,6 +554,39 @@ impl BoxRecord {
         self.liveness
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The switch address of the box row this is a task row of, or `None`
+    /// for a box's own row ([`BoxRecord`]'s task rows, NET-138).
+    #[must_use]
+    pub fn task_row_of(&self) -> Option<Ipv4Addr> {
+        self.task_row_of
+    }
+
+    /// Whether this is a task row: one filed with a box at one of its task
+    /// addresses, rather than the box's own row.
+    #[must_use]
+    pub fn is_task_row(&self) -> bool {
+        self.task_row_of.is_some()
+    }
+
+    /// The task addresses filed with this box, in the order they were
+    /// drawn: each the key of a task row of this box's.
+    #[must_use]
+    pub fn task_addrs(&self) -> &[Ipv4Addr] {
+        &self.task_addrs
+    }
+
+    /// The addresses this row's withdrawal holds against reuse: its switch
+    /// address, and its box's published loopback address for a box's own
+    /// row. A task row publishes nothing at the loopback, which its box's
+    /// row holds.
+    fn revocation_addrs(&self) -> Vec<[u8; 4]> {
+        if self.is_task_row() {
+            vec![self.switch_addr.octets()]
+        } else {
+            revocation_addrs(self.switch_addr, self.loopback_addr)
+        }
     }
 
     /// The box's own id (BEP-070): minted once for this creation — by
@@ -762,6 +812,7 @@ pub struct BoxRegistration {
     credentialed_upstream: Option<sessions::CredentialedUpstream>,
     dynamic_ingress: Option<DynamicIngress>,
     dynamic_allowed_range: Option<(u16, u16)>,
+    task_addrs: Vec<Ipv4Addr>,
 }
 
 impl BoxRegistration {
@@ -784,7 +835,16 @@ impl BoxRegistration {
             credentialed_upstream: None,
             dynamic_ingress: None,
             dynamic_allowed_range: None,
+            task_addrs: Vec::new(),
         }
+    }
+
+    /// The task addresses filed with the box (NET-138): one task row each,
+    /// published and withdrawn with the box's own row.
+    #[must_use]
+    pub fn with_task_addresses(mut self, addrs: impl IntoIterator<Item = Ipv4Addr>) -> Self {
+        self.task_addrs = addrs.into_iter().collect();
+        self
     }
 
     /// The ports this namespace admitted — the ingress **and** publish
@@ -912,6 +972,10 @@ struct Creation {
     credentialed_upstream: Option<sessions::CredentialedUpstream>,
     dynamic_ingress: Option<DynamicIngress>,
     dynamic_allowed_range: Option<(u16, u16)>,
+    /// The task addresses filed with the box (NET-138), persisted with it
+    /// so a reload and a resume restore its task rows with its own.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    task_addresses: Vec<Ipv4Addr>,
     standing: bool,
 }
 
@@ -920,6 +984,7 @@ impl Creation {
         spec: &ClientBoxSpec,
         switch_address: Ipv4Addr,
         loopback_address: Ipv4Addr,
+        task_addresses: Vec<Ipv4Addr>,
         id: BoxId,
     ) -> Self {
         Self {
@@ -932,6 +997,7 @@ impl Creation {
             credentialed_upstream: spec.credentialed_upstream.clone(),
             dynamic_ingress: spec.dynamic_ingress,
             dynamic_allowed_range: spec.dynamic_allowed_range,
+            task_addresses,
             standing: true,
         }
     }
@@ -1045,16 +1111,16 @@ fn read_registry_file(path: &std::path::Path) -> Vec<Creation> {
 ///
 /// The plan's PTask run is split into two disjoint sub-runs so the two
 /// allocators that draw on it cannot meet: this host hands a registered box
-/// only from the upper half, and the in-VM daemon self-allocates task
-/// sandboxes and unregistered boxes from the lower half — the run below this
-/// hand-out run. The daemon's half is the same midpoint rule mirrored in
-/// `minimald::net::self_allocation_run`; one rule, two statements, so change
-/// both together — each side's tests pin the default plan's split literally.
+/// and its task addresses only from the upper half, and the lower half — the
+/// run below this hand-out run — is the self-allocation reserve a native
+/// daemon draws from. The daemon's half is the same midpoint rule mirrored
+/// in `minimald::net::self_allocation_run`; one rule, two statements, so
+/// change both together — each side's tests pin the default plan's split
+/// literally.
 ///
-/// This is the interim allocation shape (NET-138): the daemon keeps
-/// self-allocating from the reserve until the task registering every live
-/// box host-side retires daemon-side allocation, after which a daemon with a
-/// control socket draws nothing — every own-address box arrives handed.
+/// An in-VM daemon draws nothing (NET-138): every own-address box arrives
+/// handed, and so does every task run, at a task address filed with its box
+/// here. The reserve stays unused under a host that registers boxes.
 #[must_use]
 fn hand_out_run(subnet: SwitchSubnet) -> (u32, u32) {
     let first = subnet.first_ptask();
@@ -2315,7 +2381,7 @@ impl BoxRegistry {
             .expect("the row lock is never held across a panic, so it cannot be poisoned");
         let switch_address = rows
             .values()
-            .find(|record| record.box_id == box_id)?
+            .find(|record| record.box_id == box_id && !record.is_task_row())?
             .switch_addr();
         let mut book = self
             .asks
@@ -2852,15 +2918,12 @@ impl BoxRegistry {
     /// Republishes a persisted creation's row at load, detached from
     /// `now`. Returns whether the row stands.
     fn reinstate(&self, creation: &Creation, now: Instant) -> bool {
-        if !self
-            .switch_book()
-            .take(creation.switch_address, now, creation.id())
-        {
+        if let Err(addr) = self.take_creation_addrs(creation, now) {
             tracing::warn!(
                 box = %creation.name,
-                addr = %creation.switch_address,
-                "could not reload a persisted box's row: its switch address is not the \
-                 hand-out run's to give it"
+                %addr,
+                "could not reload a persisted box's row: one of its switch addresses is not \
+                 the hand-out run's to give it"
             );
             return false;
         }
@@ -2868,6 +2931,7 @@ impl BoxRegistry {
             creation.spec(),
             creation.switch_address,
             creation.loopback_address,
+            creation.task_addresses.clone(),
             creation.id(),
         );
         match self.try_register_since(registration, None, None) {
@@ -2883,10 +2947,42 @@ impl BoxRegistry {
                 true
             }
             Err(error) => {
-                self.give_back_switch_addr(creation.switch_address, false, creation.id());
+                self.give_back_creation_addrs(creation);
                 tracing::warn!(box = %creation.name, %error, "could not reload a persisted box's row");
                 false
             }
+        }
+    }
+
+    /// Takes every switch address `creation` holds — its box's and each of
+    /// its task addresses — from the hand-out book, all or none: on the
+    /// first one the book will not give, the ones taken go back, and that
+    /// address is the error.
+    fn take_creation_addrs(&self, creation: &Creation, now: Instant) -> Result<(), Ipv4Addr> {
+        let mut book = self.switch_book();
+        let addrs =
+            std::iter::once(creation.switch_address).chain(creation.task_addresses.iter().copied());
+        let mut taken = Vec::new();
+        for addr in addrs {
+            if !book.take(addr, now, creation.id()) {
+                for addr in taken {
+                    book.give_back(addr, now, false, creation.id());
+                }
+                return Err(addr);
+            }
+            taken.push(addr);
+        }
+        Ok(())
+    }
+
+    /// Returns every switch address `creation` holds to the hand-out book,
+    /// unspent: the refusal after [`Self::take_creation_addrs`] published
+    /// no row.
+    fn give_back_creation_addrs(&self, creation: &Creation) {
+        for addr in
+            std::iter::once(creation.switch_address).chain(creation.task_addresses.iter().copied())
+        {
+            self.give_back_switch_addr(addr, false, creation.id());
         }
     }
 
@@ -3119,6 +3215,42 @@ impl BoxRegistry {
         // port.
         let dynamic_ingress = registration.dynamic_ingress.unwrap_or(DynamicIngress::Deny);
         let dynamic_range = registration.dynamic_allowed_range;
+        // The box's task rows (NET-138), compiled from the same declaration
+        // the box's row is: its id, its egress — the lease each checks is
+        // the task's own address — and nothing else. No ingress, no names,
+        // no dynamic grant, no credentialed lane: a task run reaches out
+        // under its box's egress and is reached by nothing.
+        let task_rows: Vec<Arc<BoxRecord>> = registration
+            .task_addrs
+            .iter()
+            .map(|&task_addr| {
+                Arc::new(BoxRecord {
+                    name: registration.name.clone(),
+                    box_id,
+                    switch_addr: task_addr,
+                    loopback_addr: registration.loopback_addr,
+                    admitted_ports: Vec::new(),
+                    declared_names: Vec::new(),
+                    egress: EgressRules::from_policy(
+                        registration.egress.as_ref(),
+                        self.subnet.dns_server().octets(),
+                        task_addr.octets(),
+                    ),
+                    resolves_names,
+                    dns_hosts: dns_hosts.clone(),
+                    deny_all,
+                    credentialed_upstream: false,
+                    dynamic_ingress: DynamicIngress::Deny,
+                    dynamic_range: None,
+                    runtime_ports: Mutex::new(RowRuntime::default()),
+                    egress_allow_list: egress_allow_list.clone(),
+                    attributed: AtomicBool::new(false),
+                    liveness: Mutex::new(RowLiveness::default()),
+                    task_row_of: Some(registration.switch_addr),
+                    task_addrs: Vec::new(),
+                })
+            })
+            .collect();
         let record = Arc::new(BoxRecord {
             name: registration.name,
             box_id,
@@ -3157,6 +3289,8 @@ impl BoxRegistry {
             loopback_addr: registration.loopback_addr,
             admitted_ports: registration.admitted_ports,
             declared_names: registration.declared_names,
+            task_row_of: None,
+            task_addrs: registration.task_addrs,
         });
         // NET-133: the box's proxy attachment is issued from the row's own
         // host facts — the name, both addresses, and the box's own id
@@ -3183,10 +3317,11 @@ impl BoxRegistry {
             .rows
             .write()
             .expect("the row lock is never held across a panic, so it cannot be poisoned");
-        if let Some(held) = self
-            .revoking
-            .first_held(&revocation_addrs(record.switch_addr, record.loopback_addr))
-        {
+        let held_against = std::iter::once(&record)
+            .chain(&task_rows)
+            .flat_map(|row| row.revocation_addrs())
+            .collect::<Vec<_>>();
+        if let Some(held) = self.revoking.first_held(&held_against) {
             drop(rows);
             let addr = Ipv4Addr::from(held);
             tracing::warn!(
@@ -3212,6 +3347,9 @@ impl BoxRegistry {
             );
         }
         rows.insert(record.switch_addr.octets(), Arc::clone(&record));
+        for task in &task_rows {
+            rows.insert(task.switch_addr.octets(), Arc::clone(task));
+        }
         let created = creation.is_some();
         if let Some(creation) = creation {
             self.creations()
@@ -3230,6 +3368,42 @@ impl BoxRegistry {
             .remove(&record.switch_addr.octets());
         self.ping();
         Ok(record)
+    }
+
+    /// Removes the task rows filed with `record` ([`BoxRecord::task_row_of`])
+    /// from `rows`, under the write of the row lock that removed `record`,
+    /// and takes each one's revocation hold under the same lock: a task row
+    /// is withdrawn with its box, on every path that removes the box
+    /// (NET-138). A row at a task address that is not this box's task row
+    /// is left alone. Hand the result to [`Self::retire_task_rows`] once
+    /// the lock is dropped.
+    fn remove_task_rows(
+        &self,
+        rows: &mut Rows,
+        record: &BoxRecord,
+    ) -> Vec<(Arc<BoxRecord>, Option<RowWithdrawal>)> {
+        let mut removed = Vec::new();
+        for addr in &record.task_addrs {
+            let ours = rows.get(&addr.octets()).is_some_and(|task| {
+                task.task_row_of == Some(record.switch_addr) && task.box_id == record.box_id
+            });
+            if let Some(task) = rows.remove(&addr.octets()).filter(|_| ours) {
+                let withdrawal = self.begin_revocation(&task);
+                removed.push((task, withdrawal));
+            }
+        }
+        removed
+    }
+
+    /// Retires the task rows [`Self::remove_task_rows`] removed, as the
+    /// box's own row is retired, and returns each one's switch address to
+    /// the hand-out book. Called after the row lock is dropped.
+    fn retire_task_rows(&self, task_rows: Vec<(Arc<BoxRecord>, Option<RowWithdrawal>)>) {
+        for (task, withdrawal) in task_rows {
+            let (addr, attributed, box_id) = (task.switch_addr, task.was_attributed(), task.box_id);
+            self.retired(&Some(task), withdrawal);
+            self.give_back_switch_addr(addr, attributed, box_id);
+        }
     }
 
     /// [`Self::try_register`] for a test that never registers at a held
@@ -3289,9 +3463,11 @@ impl BoxRegistry {
         self.retire_proxy_attachment(switch_addr, box_ended);
         let removed = rows.remove(&switch_addr.octets());
         let mut rowless = false;
-        if let Some(record) = &removed {
+        let mut task_rows = Vec::new();
+        if let Some(record) = removed.as_deref().filter(|record| !record.is_task_row()) {
             self.bump_withdrawal_generation(record.name());
             rowless = self.creation_rowless(record);
+            task_rows = self.remove_task_rows(&mut rows, record);
         }
         // The hold is taken under the same lock the row leaves under, so no
         // registration can land at the address in between.
@@ -3300,6 +3476,7 @@ impl BoxRegistry {
             .and_then(|record| self.begin_revocation(record));
         drop(rows);
         self.retired(&removed, withdrawal);
+        self.retire_task_rows(task_rows);
         if let Some(record) = &removed {
             self.give_back_switch_addr(record.switch_addr, record.was_attributed(), record.box_id);
         }
@@ -3385,7 +3562,13 @@ impl BoxRegistry {
         spec: ClientBoxSpec,
         loopback_addr: Ipv4Addr,
     ) -> Result<Arc<BoxRecord>, AllocationError> {
-        self.register_client_box_as(spec, loopback_addr, crate::bep_attach::mint_box_id(), None)
+        self.register_client_box_as(
+            spec,
+            loopback_addr,
+            0,
+            crate::bep_attach::mint_box_id(),
+            None,
+        )
     }
 
     /// [`Self::register_client_box_at`] for a registration that read its
@@ -3396,15 +3579,24 @@ impl BoxRegistry {
     /// [`AllocationError::WithdrawnWhileAllocating`]: no row, no attachment,
     /// and the caller hands the address back to the answerer unless
     /// something else owns it ([`Self::release_unless_owned`]).
+    ///
+    /// `task_slots` task addresses are filed with the box (NET-138) — at
+    /// most [`minimald_rpc::TASK_SLOTS_PER_BOX`], whatever the client asked
+    /// for — each drawn from the same hand-out book as the box's own and
+    /// published as a task row of it ([`BoxRecord::task_row_of`]). A
+    /// registration that cannot draw every one is refused like one that
+    /// cannot draw its own address, and returns every address it drew.
     pub fn register_client_box_since(
         &self,
         spec: ClientBoxSpec,
         loopback_addr: Ipv4Addr,
+        task_slots: u8,
         generation: u64,
     ) -> Result<Arc<BoxRecord>, AllocationError> {
         self.register_client_box_as(
             spec,
             loopback_addr,
+            task_slots,
             crate::bep_attach::mint_box_id(),
             Some(generation),
         )
@@ -3417,6 +3609,7 @@ impl BoxRegistry {
         &self,
         spec: ClientBoxSpec,
         loopback_addr: Ipv4Addr,
+        task_slots: u8,
         id: BoxId,
         generation: Option<u64>,
     ) -> Result<Arc<BoxRecord>, AllocationError> {
@@ -3475,13 +3668,33 @@ impl BoxRegistry {
             return Err(AllocationError::RevocationPending { addr });
         }
         let switch_addr = self.draw_switch_addr()?;
-        let creation = Creation::new(&spec, switch_addr, loopback_addr, id);
-        let registration = self.client_registration(spec, switch_addr, loopback_addr, id);
+        // The task addresses come from the same book, after the box's own:
+        // a draw that runs dry refuses the whole registration, and every
+        // address drawn for it goes back unspent.
+        let mut task_addrs = Vec::new();
+        for _ in 0..task_slots.min(minimald_rpc::TASK_SLOTS_PER_BOX) {
+            match self.draw_switch_addr() {
+                Ok(addr) => task_addrs.push(addr),
+                Err(error) => {
+                    for addr in std::iter::once(switch_addr).chain(task_addrs) {
+                        self.give_back_switch_addr(addr, false, id);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        let creation = Creation::new(&spec, switch_addr, loopback_addr, task_addrs.clone(), id);
+        let registration =
+            self.client_registration(spec, switch_addr, loopback_addr, task_addrs.clone(), id);
         // A refusal after the draw publishes no row, so no frame of the box
-        // was ever attributed: the address goes straight back, with no
+        // was ever attributed: the addresses go straight back, with no
         // quarantine, and the refusal spends nothing.
         self.try_register_since(registration, generation, Some(creation))
-            .inspect_err(|_| self.give_back_switch_addr(switch_addr, false, id))
+            .inspect_err(|_| {
+                for &addr in std::iter::once(&switch_addr).chain(&task_addrs) {
+                    self.give_back_switch_addr(addr, false, id);
+                }
+            })
     }
 
     /// The registration a client box's declaration compiles to at its
@@ -3494,10 +3707,12 @@ impl BoxRegistry {
         spec: ClientBoxSpec,
         switch_addr: Ipv4Addr,
         loopback_addr: Ipv4Addr,
+        task_addrs: Vec<Ipv4Addr>,
         id: BoxId,
     ) -> BoxRegistration {
         let mut registration = BoxRegistration::new(spec.name, switch_addr, loopback_addr)
-            .with_admitted_ports(spec.ingress_ports);
+            .with_admitted_ports(spec.ingress_ports)
+            .with_task_addresses(task_addrs);
         // A client box is an own-address box (only those register), so an
         // absent `egress` section is the egress default's to fill, exactly as
         // the guest daemon fills it (NET-074/NET-077): deny-all once the
@@ -3547,6 +3762,30 @@ impl BoxRegistry {
         let loopback_addr = take_next(&self.next_loopback_addr, first, last)
             .ok_or(AllocationError::LoopbackExhausted)?;
         self.register_client_box_at(spec, loopback_addr)
+    }
+
+    /// [`Self::register_client_box`] with `task_slots` task addresses filed
+    /// with the box, as the control socket's registration files them
+    /// ([`Self::register_client_box_since`]).
+    #[cfg(test)]
+    pub fn register_client_box_with_task_slots(
+        &self,
+        spec: ClientBoxSpec,
+        task_slots: u8,
+    ) -> Result<Arc<BoxRecord>, AllocationError> {
+        let slice = self
+            .loopback_slice
+            .ok_or(AllocationError::UnplannedSubnet(self.subnet))?;
+        let (first, last) = box_loopback_run(slice);
+        let loopback_addr = take_next(&self.next_loopback_addr, first, last)
+            .ok_or(AllocationError::LoopbackExhausted)?;
+        self.register_client_box_as(
+            spec,
+            loopback_addr,
+            task_slots,
+            crate::bep_attach::mint_box_id(),
+            None,
+        )
     }
 
     /// Whether some live row, attachment or kept creation already holds
@@ -3650,7 +3889,12 @@ impl BoxRegistry {
             .rows
             .write()
             .expect("the row lock is never held across a panic, so it cannot be poisoned");
-        let Some(record) = rows.get(&switch_addr.octets()) else {
+        // A task row is never withdrawn by itself: it goes with its box's
+        // row, which is what the pair names (NET-138).
+        let Some(record) = rows
+            .get(&switch_addr.octets())
+            .filter(|record| !record.is_task_row())
+        else {
             // Nothing to remove, but the withdrawal still counts: a
             // registration under the name whose address is still being
             // allocated must not land after it.
@@ -3718,11 +3962,16 @@ impl BoxRegistry {
                 .is_some_and(|creation| creation.id() == record.box_id)
                 && creations.remove(&key).is_some()
         });
+        let task_rows = removed
+            .as_deref()
+            .map(|record| self.remove_task_rows(&mut rows, record))
+            .unwrap_or_default();
         let withdrawal = removed
             .as_deref()
             .and_then(|record| self.begin_revocation(record));
         drop(rows);
         self.retired(&removed, withdrawal);
+        self.retire_task_rows(task_rows);
         if let Some(record) = &removed {
             self.give_back_switch_addr(record.switch_addr, record.was_attributed(), record.box_id);
         }
@@ -3826,34 +4075,35 @@ impl BoxRegistry {
                 allocated: allocated_loopback,
             });
         }
-        let addrs = revocation_addrs(creation.switch_address, creation.loopback_address);
+        let mut addrs = revocation_addrs(creation.switch_address, creation.loopback_address);
+        addrs.extend(creation.task_addresses.iter().map(|addr| addr.octets()));
         if let Some(addr) = self.wait_for_revocations(&addrs, REVOCATION_WAIT) {
             return Err(AllocationError::RevocationPending { addr }.into());
         }
         let now = self.now();
-        if !self
-            .switch_book()
-            .take(creation.switch_address, now, creation.id())
-        {
+        // The box's task rows are restored with its own (NET-138), so every
+        // one of its addresses must still be its to take.
+        if let Err(addr) = self.take_creation_addrs(&creation, now) {
             return Err(ResumeError::SwitchAddressHeld {
                 name: name.to_string(),
-                addr: creation.switch_address,
+                addr,
             });
         }
         let registration = self.client_registration(
             creation.spec(),
             creation.switch_address,
             creation.loopback_address,
+            creation.task_addresses.clone(),
             creation.id(),
         );
-        let id = creation.id();
         let standing = Creation {
             standing: true,
             ..creation
         };
+        let taken = standing.clone();
         let record = self
             .try_register_since(registration, Some(generation), Some(standing))
-            .inspect_err(|_| self.give_back_switch_addr(switch_addr, false, id))?;
+            .inspect_err(|_| self.give_back_creation_addrs(&taken))?;
         record.liveness().resumed_since = Some(now);
         tracing::info!(
             box = %record.name(),
@@ -3884,6 +4134,12 @@ impl BoxRegistry {
         };
         let mut liveness = record.liveness();
         liveness.carriers = liveness.carriers.saturating_sub(1);
+        // A task row's relay ending detaches nothing: the row stands as
+        // long as its box's (NET-138), and a task run ends far more often
+        // than its box does.
+        if record.is_task_row() {
+            return;
+        }
         if liveness.carriers == 0 && liveness.detached_since.is_none() {
             liveness.detached_since = Some(now);
             tracing::info!(
@@ -3932,7 +4188,7 @@ impl BoxRegistry {
         if !subscribed {
             return None;
         }
-        let addrs = revocation_addrs(record.switch_addr, record.loopback_addr);
+        let addrs = record.revocation_addrs();
         self.revoking.hold(&addrs);
         Some(RowWithdrawal {
             switch_addr: record.switch_addr,
@@ -4173,7 +4429,7 @@ impl BoxRegistry {
             .read()
             .expect("the row lock is never held across a panic, so it cannot be poisoned");
         rows.values()
-            .filter(|record| canonical_box_name(record.name()) == asked)
+            .filter(|record| !record.is_task_row() && canonical_box_name(record.name()) == asked)
             .max_by_key(|record| record.box_id())
             .cloned()
     }
@@ -4343,7 +4599,8 @@ impl BoxRegistry {
                  poisoned",
         );
         let mut view = zone_answer::ZoneView::new();
-        for record in rows.values() {
+        // A task row publishes no name: its box's row holds the box's.
+        for record in rows.values().filter(|record| !record.is_task_row()) {
             view.hold(
                 zone_name(record.name()),
                 zone_answer::ZoneRow {
@@ -4715,10 +4972,10 @@ impl BoxTable {
     /// the one set of addresses a published row is ever keyed by, and so the
     /// one set whose rows the host-side creator will supply (T66's registration
     /// path). The run spans both of the plan's sub-runs — the daemon's
-    /// self-allocation reserve included, because a task sandbox holds a
-    /// reserve address and stays an unregistered source; the host hands
-    /// registered boxes only from the upper half
-    /// (`hand_out_run`). The subnet's own infrastructure sits outside that
+    /// self-allocation reserve included, which an in-VM daemon no longer
+    /// draws from (NET-138), so a source there is an unregistered one; the
+    /// host hands registered boxes and their task addresses only from the
+    /// upper half (`hand_out_run`). The subnet's own infrastructure sits outside that
     /// run: the gateway the resolver carve-out is keyed to, the host alias,
     /// and the guest daemon's own tap, which the registry publishes a row for
     /// itself. The gate's unregistered drop (NET-085) refuses a source only
@@ -4859,9 +5116,12 @@ impl switch::bep_host::BepBoxSource for RegisteredBoxes {
         // outside the hand-out run every client box is allocated from,
         // so excluding that one address names exactly the node row.
         let node_addr = self.table.subnet().daemon_ip();
+        // A task row declares no credentialed lane, so it buys no share
+        // either: the pool is partitioned by the boxes that may reach it.
         self.table
             .rows()
             .iter()
+            .filter(|row| !row.is_task_row())
             .map(|row| row.switch_addr())
             .filter(|addr| *addr != node_addr)
             .collect()
@@ -5405,6 +5665,7 @@ mod tests {
                     dynamic_allowed_range: None,
                 },
                 Ipv4Addr::from(u32::from(web.loopback_addr()) + 1),
+                0,
                 web.box_id(),
                 None,
             )
@@ -6124,6 +6385,195 @@ mod tests {
         );
     }
 
+    /// The task rows filed with `web`, as the gate resolves them by source.
+    fn task_rows_of(registry: &BoxRegistry, web: &BoxRecord) -> Vec<Arc<BoxRecord>> {
+        let table = registry.table();
+        web.task_addrs()
+            .iter()
+            .filter_map(|addr| table.by_source(addr.octets()))
+            .collect()
+    }
+
+    /// NET-138, NET-133: a task row carries its box's id and its box's
+    /// egress — compiled with the task's own address as its lease — and
+    /// nothing else: no ingress, no names, no dynamic grant, no credentialed
+    /// lane. It publishes no name and is no box to look up by one.
+    #[test]
+    fn task_row_carries_box_egress_and_no_credentialed_lane() {
+        let registry = BoxRegistry::new(SUBNET);
+        let mut spec = client_spec("web");
+        spec.ingress_ports = vec![8080];
+        spec.egress = Some(EgressPolicy {
+            allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
+            allow_dns_hosts: Some(vec!["example.com".to_string()]),
+            ..EgressPolicy::default()
+        });
+        spec.credentialed_upstream = Some(sessions::CredentialedUpstream {});
+        spec.dynamic_ingress = Some(DynamicIngress::Allow);
+        spec.dynamic_allowed_range = Some((9000, 9100));
+        let web = registry
+            .register_client_box_with_task_slots(spec, 2)
+            .expect("the plan has addresses for the box and its tasks");
+        assert!(
+            web.declares_credentialed_upstream(),
+            "the box keeps its lane"
+        );
+
+        let tasks = task_rows_of(&registry, &web);
+        assert_eq!(tasks.len(), 2, "one row per task address");
+        for task in &tasks {
+            assert_eq!(task.task_row_of(), Some(web.switch_addr()));
+            assert_eq!(task.box_id(), web.box_id(), "the box's own id");
+            assert_eq!(task.egress_allow_list(), web.egress_allow_list());
+            assert_eq!(task.allow_dns_hosts(), web.allow_dns_hosts());
+            assert_eq!(
+                task.egress(),
+                &EgressRules::from_policy(
+                    Some(&EgressPolicy {
+                        allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
+                        allow_dns_hosts: Some(vec!["example.com".to_string()]),
+                        ..EgressPolicy::default()
+                    }),
+                    SUBNET.dns_server().octets(),
+                    task.switch_addr().octets(),
+                ),
+                "the box's egress, leased to the task's own address"
+            );
+            assert!(!task.declares_credentialed_upstream(), "no lane");
+            assert!(task.admitted_ports().is_empty(), "no ingress");
+            assert!(task.declared_names().is_empty(), "no names");
+            assert_eq!(task.dynamic_ingress(), DynamicIngress::Deny);
+            assert_eq!(task.dynamic_range(), None);
+            assert!(task.task_addrs().is_empty());
+        }
+        assert!(
+            registry
+                .row_by_name("web")
+                .is_some_and(|row| Arc::ptr_eq(&row, &web)),
+            "the box's name finds the box's row, never a task's"
+        );
+        assert_eq!(
+            registry.zone_view().rows().count(),
+            1,
+            "a task row publishes no name"
+        );
+    }
+
+    /// NET-138: a task row is never withdrawn because its own relay ended —
+    /// a task run ends far more often than its box — and holds its address
+    /// for the next run.
+    #[test]
+    fn task_row_outlives_its_attachment_ending() {
+        let registry = BoxRegistry::new(SUBNET);
+        registry.spawn_withdrawal_drainer(|_| {});
+        let web = registry
+            .register_client_box_with_task_slots(client_spec("web"), 1)
+            .expect("the plan has addresses for the box and its task");
+        let [task] = task_rows_of(&registry, &web)
+            .try_into()
+            .expect("one task row");
+
+        relay_carried_and_ended(&registry, &[&task]);
+        registry.advance_clock(DETACH_GRACE * 2);
+        let_the_drainer_sweep();
+        assert!(!task.is_detached(), "a task run's end detaches nothing");
+        let held = registry
+            .table()
+            .by_source(task.switch_addr().octets())
+            .expect("the task row stands past any grace");
+        assert!(Arc::ptr_eq(&held, &task));
+        assert_eq!(registry.live_switch_addrs(), 2, "both addresses stay out");
+    }
+
+    /// NET-138: a task row is withdrawn with its box on every path that
+    /// removes the box — its creator's withdrawal and the end of its grace
+    /// (the resume bound and an uncommitted lease end through the same two)
+    /// — and its address goes back to the book. A withdrawal naming a task
+    /// address withdraws nothing: the row goes with its box, not alone.
+    #[test]
+    fn task_rows_withdrawn_with_their_box() {
+        let registry = BoxRegistry::new(SUBNET);
+        let web = registry
+            .register_client_box_with_task_slots(client_spec("web"), 2)
+            .expect("the plan has addresses for the box and its tasks");
+        let tasks = task_rows_of(&registry, &web);
+        assert_eq!(registry.live_switch_addrs(), 3);
+        assert_eq!(
+            registry.withdraw_client_box("web", tasks[0].switch_addr(), web.loopback_addr(), None),
+            Ok(None),
+            "a task address names no row its creator withdraws"
+        );
+        assert_eq!(task_rows_of(&registry, &web).len(), 2, "nothing withdrawn");
+
+        registry
+            .withdraw_client_box("web", web.switch_addr(), web.loopback_addr(), None)
+            .expect("the creator withdraws its box");
+        assert!(
+            task_rows_of(&registry, &web).is_empty(),
+            "with its task rows"
+        );
+        assert_eq!(registry.live_switch_addrs(), 0, "every address goes back");
+        assert!(registry.table().is_empty());
+
+        let registry = BoxRegistry::new(SUBNET);
+        registry.spawn_withdrawal_drainer(|_| {});
+        let web = registry
+            .register_client_box_with_task_slots(client_spec("web"), 2)
+            .expect("the plan has addresses for the box and its tasks");
+        relay_carried_and_ended(&registry, &[&web]);
+        wait_until(|| web.is_detached(), "the row detaches at its relay's end");
+        registry.advance_clock(DETACH_GRACE);
+        wait_until(
+            || registry.table().is_empty(),
+            "the box's row and its task rows go at its grace's end",
+        );
+        assert_eq!(registry.live_switch_addrs(), 0);
+    }
+
+    /// NET-138: a box's task rows persist with it — reloaded with its row,
+    /// and restored with it when its creator resumes a row withdrawn after
+    /// its grace — at the same addresses, under the box's id.
+    #[test]
+    fn task_rows_restored_with_a_resumed_box() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let web = persisted_registry(&dir)
+            .register_client_box_with_task_slots(client_spec("web"), 2)
+            .expect("the plan has addresses for the box and its tasks");
+
+        let registry = persisted_registry(&dir);
+        let reloaded = registry.row_by_name("web").expect("the row is reloaded");
+        assert_eq!(reloaded.task_addrs(), web.task_addrs());
+        let tasks = task_rows_of(&registry, &reloaded);
+        assert_eq!(tasks.len(), 2, "its task rows are reloaded with it");
+        assert!(tasks.iter().all(|task| task.box_id() == web.box_id()));
+        assert_eq!(registry.live_switch_addrs(), 3);
+
+        registry.spawn_withdrawal_drainer(|_| {});
+        registry.advance_clock(DETACH_GRACE);
+        wait_until(
+            || registry.table().is_empty(),
+            "the reloaded box goes at its grace's end, its task rows with it",
+        );
+        let claim = registry.begin_registration("web");
+        let resumed = registry
+            .resume_client_box(
+                "web",
+                web.switch_addr(),
+                web.loopback_addr(),
+                Some(web.box_id()),
+                web.loopback_addr(),
+                claim.generation(),
+            )
+            .expect("the creator resumes its box");
+        assert_eq!(resumed.task_addrs(), web.task_addrs());
+        assert_eq!(
+            task_rows_of(&registry, &resumed).len(),
+            2,
+            "its task rows are restored with it"
+        );
+        assert_eq!(registry.live_switch_addrs(), 3);
+    }
+
     /// NET-138: a box whose creator withdrew it cannot be resumed — the
     /// creation ends with the creator's withdrawal, row or no row.
     #[test]
@@ -6233,7 +6683,7 @@ mod tests {
         let loopback = old.loopback_addr();
         let waiting = registry.clone();
         let registering = std::thread::spawn(move || {
-            waiting.register_client_box_since(client_spec("web"), loopback, generation)
+            waiting.register_client_box_since(client_spec("web"), loopback, 0, generation)
         });
         std::thread::sleep(Duration::from_millis(200));
         // A withdrawal under the name lands while the registration waits,

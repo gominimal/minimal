@@ -224,32 +224,23 @@ pub(crate) fn task_network(
         phase,
         deny_all_opt_out,
     );
-    crate::net::provider::network_for(
+    crate::net::provider::task_network_for(
         record.network,
         switch,
         &format!("{session}-task"),
         egress.map(|section| sessions::SessionPolicy::new(Some(section), None)),
-        None,
-        // Deliberately not the record's handed addresses (T66): the task's
-        // sandbox is not the box the registration named — attaching it at the
+        // Never the record's handed box addresses (T66): the task's sandbox
+        // is not the box the registration named — attaching it at the
         // session box's address would key its frames to the session's row.
-        // A task's sandbox self-allocates, as it always has.
-        //
-        // The interim, stated plainly: task sandboxes self-allocate from the
-        // daemon's reserve — the plan run's lower half
-        // (`crate::net::self_allocation_run`) — until the task registering
-        // every live box host-side (NET-138) retires self-allocation, after
-        // which no daemon-side draw happens once a control socket exists.
-        // The VM host daemon hands registered boxes only from the run above
-        // the reserve, so the two allocators cannot meet; the daemon-side
-        // refusals (`IpAllocator::hand`) stay the guard against a pair that
-        // disagrees about the split.
-        None,
-        // Deliberately no classifier decision (NET-079): a task places no
-        // leaf in the cohort's subtrees, so there is no per-box verdict for
-        // a task's plan to follow — the session's own launch carries the
-        // decision its reader read, and this one has none to carry.
-        None,
+        // A task attaches at one of the task addresses the same
+        // registration filed with the box (NET-138), each a host-side row
+        // carrying the box's id and egress, so no daemon-side draw happens
+        // once a control socket exists. A native daemon, whose record holds
+        // none, draws from its reserve (`crate::net::self_allocation_run`);
+        // an in-VM one refuses the draw (`SwitchClient::attach`). There is
+        // no classifier decision to carry (NET-079): a task places no leaf
+        // in the cohort's subtrees.
+        record.task_addresses.clone(),
     )
 }
 
@@ -2669,6 +2660,7 @@ mod tests {
             project_path: paths::HostAbsPath::try_new("/tmp/project").unwrap(),
             network: mode,
             policy: sessions::SessionPolicy::default(),
+            task_addresses: Vec::new(),
             box_addresses: None,
             status: sessions::SessionStatus::Active,
             hooks_enabled: true,
@@ -2716,6 +2708,9 @@ mod tests {
         let mut record = record_with(sessions::NetworkMode::OwnIp);
         record.name = Some("web".to_string());
         record.policy.ingress = Some(sessions::IngressPolicy::default());
+        // A VM host's switch draws nothing (NET-138): the task attaches at a
+        // task address its box's registration filed.
+        record.task_addresses = vec![std::net::Ipv4Addr::new(100, 64, 128, 2)];
         let own_ip = super::task_network(&record, &switch, sessions::EGRESS_DEFAULT_PHASE, false);
         let plan = own_ip.plan().await.unwrap();
         assert!(
@@ -2756,6 +2751,81 @@ mod tests {
             false,
         );
         assert!(format!("{unnamed:?}").contains(&sessions::SessionId::nil().to_string()));
+    }
+
+    /// A VM host's switch, which hands every address and draws none
+    /// (NET-138).
+    #[cfg(target_os = "linux")]
+    fn vm_host_switch() -> std::sync::Arc<tokio::sync::Mutex<crate::net::SwitchClient>> {
+        std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::net::SwitchClient::new("/usr/bin/gvproxy", "/run/minimal/gvproxy")
+                .with_transport(crate::net::SwitchTransport::HostShuttle {
+                    cid: crate::net::VSOCK_HOST_CID,
+                    port: crate::net::VSOCK_GVPROXY_SHUTTLE_PORT,
+                }),
+        ))
+    }
+
+    /// NET-138 for a task run, whichever door started it — `min run` from
+    /// inside the box and a task run over exec both plan through
+    /// [`super::task_network`]: the task's sandbox attaches at a task
+    /// address its box's registration filed, the first one no run holds,
+    /// and never draws one of its own.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn in_box_run_task_draws_a_task_slot() {
+        let switch = vm_host_switch();
+        let mut record = record_with(sessions::NetworkMode::OwnIp);
+        record.task_addresses = vec![
+            std::net::Ipv4Addr::new(100, 64, 128, 2),
+            std::net::Ipv4Addr::new(100, 64, 128, 3),
+        ];
+        let first = super::task_network(&record, &switch, sessions::EGRESS_DEFAULT_PHASE, false);
+        first.plan().await.expect("a free task address");
+        let second = super::task_network(&record, &switch, sessions::EGRESS_DEFAULT_PHASE, false);
+        second.plan().await.expect("a second free task address");
+        let held: Vec<_> = switch
+            .lock()
+            .await
+            .leases()
+            .iter()
+            .map(|lease| lease.ip)
+            .collect();
+        assert_eq!(
+            held, record.task_addresses,
+            "each run holds one task address"
+        );
+
+        let third = super::task_network(&record, &switch, sessions::EGRESS_DEFAULT_PHASE, false);
+        let err = third.plan().await.expect_err("every task address is held");
+        assert!(
+            err.to_string()
+                .contains("2 task runs already in progress for this session"),
+            "{err}"
+        );
+        first.abandon().await;
+        third
+            .plan()
+            .await
+            .expect("the address the first run held is free again");
+    }
+
+    /// A VM session record from before task addresses were registered
+    /// carries none: its task run is refused, naming the remedy, rather
+    /// than drawn an address no host row is keyed by.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn legacy_unregistered_vm_record_refused_with_reactivate_message() {
+        let switch = vm_host_switch();
+        let record = record_with(sessions::NetworkMode::OwnIp);
+        let task = super::task_network(&record, &switch, sessions::EGRESS_DEFAULT_PHASE, false);
+        let err = task.plan().await.expect_err("nothing is drawn");
+        assert!(
+            err.to_string()
+                .contains("destroy the session and re-activate it"),
+            "{err}"
+        );
+        assert!(switch.lock().await.leases().is_empty());
     }
 
     /// NET-074/NET-076/NET-077 for the task path: a task runs under the same
