@@ -658,6 +658,198 @@ fn signal_child(pid: libc::pid_t, signal: libc::c_int, signal_name: &str) {
     }
 }
 
+/// Reap a leftover gvproxy of this VM before a fresh one is spawned.
+///
+/// A crashed or `SIGKILL`ed `minvmd` cannot run its clean teardown: the
+/// supervisor's pidfd stop paths fire only on an orderly stop, so its gvproxy
+/// — which holds no alive lock — survives with the host-side forwards still
+/// bound. Unlinking the stale switch socket ([`crate::sock::remove_stale_socket`])
+/// then lets the new gvproxy start while the leftover still holds the ports,
+/// leaving two switches silently overlapping. Killing the leftover first
+/// closes that window.
+///
+/// The match is anchored on both the gvproxy binary path and the per-VM
+/// switch-socket path (the discipline `scripts/reap-vms.sh` uses): the socket
+/// alone is the per-VM discriminator but can appear in an unrelated process's
+/// argv, and the binary alone would match another consumer's gvproxy. This
+/// caller holds this VM's alive lock, so any process matching both anchors is
+/// genuinely a leftover of a dead supervisor.
+///
+/// Best-effort: a leftover that cannot be signalled is warned about, never a
+/// boot failure. An orphaned `__krun-vmm` is deliberately not reaped here —
+/// it holds the alive lock, so the start has already failed fast naming it.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+pub(crate) fn reap_stale_gvproxy(binary: &Path, switch_sock: &Path) {
+    // Collect first, then kill: never act on a /proc snapshot mid-scan.
+    for pid in find_stale_gvproxy_pids(binary, switch_sock) {
+        tracing::warn!(
+            pid,
+            binary = %binary.display(),
+            switch_socket = %switch_sock.display(),
+            "killing stale gvproxy left by a crashed supervisor",
+        );
+        // SAFETY: kill(2) takes a pid and a signal number and touches no
+        // memory (the same contract as `signal_child` above).
+        if unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) } != 0 {
+            let error = io::Error::last_os_error();
+            // ESRCH: it exited while we scanned — the expected race; the
+            // fresh spawn replaces nothing, which is the point.
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                tracing::warn!(pid, %error, "signalling stale gvproxy failed");
+            }
+        }
+    }
+    for pid in find_stale_gvproxy_pids(binary, switch_sock) {
+        wait_until_gone(pid);
+    }
+}
+
+/// Whether `cmdline` — raw NUL-separated bytes from `/proc/<pid>/cmdline`, or
+/// one `ps -axo command=` line — is a stale gvproxy of this VM: it must carry
+/// both the binary path and the `-listen unix://<sock>` token
+/// [`GvproxyConfig::argv`] hands gvproxy. Pure, so its tests run everywhere.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+pub(crate) fn cmdline_matches_stale_gvproxy(
+    cmdline: &[u8],
+    binary: &Path,
+    switch_sock: &Path,
+) -> bool {
+    // Path bytes, not `display()`: a non-UTF-8 path must still match itself.
+    let has_binary = binary.as_os_str().as_encoded_bytes();
+    let has_sock = format!("unix://{}", switch_sock.display());
+    let has_sock = has_sock.as_bytes();
+    bytes_contain(cmdline, has_binary) && bytes_contain(cmdline, has_sock)
+}
+
+/// A plain bytes-contains, spelled out so the predicate above stays a
+/// whole-line match over NUL-separated fields.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn bytes_contain(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// The pids whose cmdlines mark them as a stale gvproxy of this VM: a `/proc`
+/// cmdline scan on Linux.
+#[cfg(target_os = "linux")]
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn find_stale_gvproxy_pids(binary: &Path, switch_sock: &Path) -> Vec<u32> {
+    let mut pids = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return pids;
+    };
+    for entry in entries.flatten() {
+        // Only numeric names are processes; everything else in /proc is noise.
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|s| s.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        // Never signal ourselves, whatever argv this process carries.
+        if pid == std::process::id() {
+            continue;
+        }
+        // Exited mid-scan, or a kernel thread with an empty cmdline.
+        let Ok(cmdline) = std::fs::read(entry.path().join("cmdline")) else {
+            continue;
+        };
+        if cmdline_matches_stale_gvproxy(&cmdline, binary, switch_sock) {
+            pids.push(pid);
+        }
+    }
+    pids
+}
+
+/// The macOS twin of [`find_stale_gvproxy_pids`]: parse `/bin/ps
+/// -axo pid=,command=` for the same dual anchor (pgrep cannot express the
+/// AND of two needles). Truncation of a long argv by `ps` is the accepted
+/// risk `scripts/reap-vms.sh` already carries.
+#[cfg(target_os = "macos")]
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn find_stale_gvproxy_pids(binary: &Path, switch_sock: &Path) -> Vec<u32> {
+    let mut pids = Vec::new();
+    let Ok(output) = std::process::Command::new("/bin/ps")
+        .args(["-axo", "pid=,command="])
+        .output()
+    else {
+        return pids;
+    };
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        // `pid=,command=` prints the pid, whitespace, then the full argv;
+        // the pid token is fixed-width so the first split is the only one.
+        let Some((pid, command)) = line.trim_start().split_once(char::is_whitespace) else {
+            continue;
+        };
+        let Ok(pid) = pid.parse::<u32>() else {
+            continue;
+        };
+        if pid == std::process::id() {
+            continue;
+        }
+        if cmdline_matches_stale_gvproxy(command.as_bytes(), binary, switch_sock) {
+            pids.push(pid);
+        }
+    }
+    pids
+}
+
+/// Wait, bounded, for a killed leftover to be gone, so the gvproxy this caller
+/// is about to spawn cannot overlap the forwards the leftover still holds.
+/// `kill(pid, 0)` failing means the process is gone; a zombie counts as gone
+/// too — its sockets and ports were released the moment it exited, and only
+/// its exit status is still unread. A timeout is warned about, not fatal:
+/// this reap is best-effort and must never block a boot indefinitely.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn wait_until_gone(pid: u32) {
+    let deadline = std::time::Instant::now() + STALE_GONE_TIMEOUT;
+    loop {
+        // SAFETY: kill(pid, 0) probes for existence without delivering a
+        // signal; the same probe as `pid_is_alive` in the tests below.
+        let alive = unsafe { libc::kill(pid as libc::pid_t, 0) == 0 };
+        if !alive || proc_state_is_zombie(pid) || std::time::Instant::now() >= deadline {
+            if alive && std::time::Instant::now() >= deadline {
+                tracing::warn!(pid, "stale gvproxy still alive after SIGKILL; leaving it");
+            }
+            return;
+        }
+        std::thread::sleep(STALE_GONE_POLL_INTERVAL);
+    }
+}
+
+/// Whether `/proc/<pid>/stat` reports state `Z` (zombie). Unreadable means
+/// not-a-zombie — the caller keeps polling. Off Linux there is no `/proc`,
+/// so nothing is ever a zombie and the wait falls back to the liveness probe.
+#[cfg(target_os = "linux")]
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn proc_state_is_zombie(pid: u32) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    // The state letter follows the last `)`: comm can embed spaces or
+    // parentheses, so never parse from the front of the line.
+    match stat.rsplit_once(')') {
+        Some((_comm, rest)) => rest.trim_start().starts_with('Z'),
+        None => false,
+    }
+}
+
+/// No `/proc` off Linux: nothing is ever a zombie, and the wait falls back
+/// to the liveness probe alone.
+#[cfg(not(target_os = "linux"))]
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn proc_state_is_zombie(_pid: u32) -> bool {
+    false
+}
+
+/// How long the reap wait gives a killed leftover before warning.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+const STALE_GONE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The poll cadence of the bounded reap wait.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+const STALE_GONE_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
 /// A host gvproxy switch owned by `minvmd`'s synchronous supervisor, running on
 /// its own dedicated current-thread tokio runtime.
 ///
@@ -1521,5 +1713,131 @@ mod tests {
         assert_eq!(policy.allow_subnets(), ["10.0.0.0/8"]);
         assert_eq!(policy.allow_protocols(), [IpProto::Tcp]);
         assert!(policy.allow_dns_hosts().is_empty());
+    }
+
+    /// A stand-in "gvproxy" carrying the argv [`GvproxyConfig::argv`] hands
+    /// the real binary: `-config … -listen unix://<sock> -ssh-port -1`. Unlike
+    /// [`stayalive_gvproxy`], it must NOT `exec` — /proc keeps the kernel's
+    /// shebang exec of the script, so the full argv stays visible in cmdline.
+    fn stale_gvproxy_stand_in(dir: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("stale-gvproxy.sh");
+        std::fs::write(&path, "#!/bin/sh\nwhile :; do sleep 1; done\n")
+            .expect("write stale gvproxy stand-in");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod stale gvproxy stand-in");
+        path
+    }
+
+    #[test]
+    fn stale_gvproxy_cmdline_requires_both_anchors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let binary = dir.path().join("gvproxy");
+        let sock = dir.path().join("switch.sock");
+        let cmdline = format!(
+            "{}\0-config\0{}\0-listen\0unix://{}\0-ssh-port\0-1\0",
+            binary.display(),
+            dir.path().join("gvproxy.yaml").display(),
+            sock.display(),
+        );
+        assert!(cmdline_matches_stale_gvproxy(
+            cmdline.as_bytes(),
+            &binary,
+            &sock
+        ));
+        // Binary alone matches another consumer's gvproxy — not this VM's.
+        let no_sock = format!(
+            "{}\0-config\0x\0-listen\0unix://elsewhere\0",
+            binary.display()
+        );
+        assert!(!cmdline_matches_stale_gvproxy(
+            no_sock.as_bytes(),
+            &binary,
+            &sock
+        ));
+        // Socket alone can appear in an unrelated process's argv — not a
+        // gvproxy of this VM.
+        let no_binary = format!(
+            "/other/bin\0-config\0x\0-listen\0unix://{}\0-ssh-port\0-1\0",
+            sock.display()
+        );
+        assert!(!cmdline_matches_stale_gvproxy(
+            no_binary.as_bytes(),
+            &binary,
+            &sock
+        ));
+        // Neither anchor: no match at all.
+        let neither = b"/other/bin\0-listen\0unix://elsewhere\0".as_slice();
+        assert!(!cmdline_matches_stale_gvproxy(neither, &binary, &sock));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reap_kills_stale_gvproxy_left_by_crashed_supervisor() {
+        use std::os::unix::process::ExitStatusExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("switch.sock");
+        let stand_in = stale_gvproxy_stand_in(dir.path());
+        let mut child = std::process::Command::new(&stand_in)
+            .arg("-config")
+            .arg(dir.path().join("gvproxy.yaml"))
+            .arg("-listen")
+            .arg(format!("unix://{}", sock.display()))
+            .arg("-ssh-port")
+            .arg("-1")
+            .spawn()
+            .expect("spawn stale gvproxy stand-in");
+        // The reaper scans /proc, so wait until the stand-in's cmdline is
+        // visible before reaping — a spawn-then-scan race on slow runners.
+        let seen_by = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < seen_by {
+            let cmdline =
+                std::fs::read(format!("/proc/{}/cmdline", child.id())).expect("stand-in cmdline");
+            if cmdline_matches_stale_gvproxy(&cmdline, &stand_in, &sock) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        reap_stale_gvproxy(&stand_in, &sock);
+        let killed_by = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match child.try_wait().expect("try_wait stand-in") {
+                Some(status) => {
+                    assert_eq!(status.signal(), Some(libc::SIGKILL));
+                    break;
+                }
+                None if std::time::Instant::now() < killed_by => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                None => panic!("stale gvproxy stand-in survived the reap"),
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reap_leaves_a_different_vms_gvproxy_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let other_sock = dir.path().join("other-switch.sock");
+        let stand_in = stale_gvproxy_stand_in(dir.path());
+        let mut child = std::process::Command::new(&stand_in)
+            .arg("-config")
+            .arg(dir.path().join("gvproxy.yaml"))
+            .arg("-listen")
+            .arg(format!("unix://{}", other_sock.display()))
+            .arg("-ssh-port")
+            .arg("-1")
+            .spawn()
+            .expect("spawn other VM's stand-in");
+        // Reap for a switch socket this stand-in does not carry: it belongs
+        // to a different VM, whose supervisor may still be alive.
+        let absent_sock = dir.path().join("this-switch.sock");
+        reap_stale_gvproxy(&stand_in, &absent_sock);
+        assert!(
+            pid_is_alive(child.id()),
+            "the reap must not touch another VM's gvproxy"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }

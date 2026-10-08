@@ -671,6 +671,15 @@ fn run_foreground() -> Result<()> {
             let switch_sock =
                 crate::net::resolve_switch_sock().context("resolving switch socket")?;
             crate::sock::prepare_socket_dir(&switch_sock).context("preparing switch socket dir")?;
+            // A crashed supervisor (SIGKILL, abort) leaves its gvproxy alive:
+            // the pidfd stop paths are clean-stop-only and gvproxy holds no
+            // alive lock, so nothing reaps it. Unlinking the stale socket
+            // below would let the fresh gvproxy bind while the leftover still
+            // holds the host-side forwards. Kill it first — cmdline-matched on
+            // both the gvproxy binary and this VM's switch socket, the
+            // anchoring reap-vms.sh uses; this supervisor's alive lock rules
+            // out a live same-instance supervisor.
+            crate::net::reap_stale_gvproxy(&binary, &switch_sock);
             crate::sock::remove_stale_socket(&switch_sock)
                 .context("removing stale switch socket")?;
             // The gate binds the socket beside the switch socket, so a stale
