@@ -170,6 +170,18 @@ pub enum NetError {
     /// attaches per address at a time.
     #[error("{slots} task runs already in progress for this session; wait for one to finish")]
     TaskSlotsBusy { slots: usize },
+    /// A task run on a switch the VM host owns, for a box the host
+    /// registered no task address with (NET-138): task addresses are
+    /// best-effort, and the host files none while its hand-out run is near
+    /// full — or the session predates them. The in-VM daemon draws nothing,
+    /// so the run cannot attach.
+    #[error(
+        "this box has no task addresses on this host (the VM host registers up to {capacity} \
+         per box, and registered none: its address run was nearly full when the box \
+         registered, or the session predates task addresses); destroy the session and \
+         re-activate it once other boxes have been destroyed"
+    )]
+    NoTaskAddresses { capacity: u8 },
     /// Spawning the gvproxy binary failed.
     #[error("spawning gvproxy at {path:?}: {source}")]
     Spawn {
@@ -889,17 +901,23 @@ impl SwitchClient {
     /// exactly the slots the switch's live leases hold, and no other state
     /// is kept.
     ///
-    /// No slots at all — a session whose registration handed none, or one
-    /// that predates them — is the plain [`Self::attach`]: a native switch
-    /// draws, and a switch the VM host owns refuses with
-    /// [`NetError::SelfAllocationRetired`].
+    /// No slots at all is the plain [`Self::attach`] on a native switch,
+    /// which draws; a switch the VM host owns refuses it with
+    /// [`NetError::NoTaskAddresses`] — the session's registration handed
+    /// none (task addresses are best-effort), or it predates them.
     ///
     /// # Errors
     ///
-    /// [`NetError::TaskSlotsBusy`] when every slot is held; otherwise what
+    /// [`NetError::TaskSlotsBusy`] when every slot is held,
+    /// [`NetError::NoTaskAddresses`] as above; otherwise what
     /// [`Self::attach_handed`] or [`Self::attach`] returns.
     pub async fn attach_task_slot(&mut self, slots: &[Ipv4Addr]) -> Result<AttachResult, NetError> {
         if slots.is_empty() {
+            if !self.self_allocates() {
+                return Err(NetError::NoTaskAddresses {
+                    capacity: minimald_rpc::TASK_SLOTS_PER_BOX,
+                });
+            }
             return self.attach().await;
         }
         for &slot in slots {
@@ -1606,12 +1624,21 @@ mod tests {
         );
         assert!(switch.leases().is_empty(), "nothing was drawn");
         assert_eq!(switch.attached(), 0);
-        // A task run with no task address on its record is the same draw,
-        // refused the same way.
+        // A task run with no task address on its record draws nothing
+        // either, refused as a box without task addresses on this host.
         let Err(err) = switch.attach_task_slot(&[]).await else {
             panic!("a task run with no task address draws nothing either");
         };
-        assert!(matches!(err, NetError::SelfAllocationRetired), "{err}");
+        assert!(
+            matches!(err, NetError::NoTaskAddresses { capacity: 4 }),
+            "{err}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("no task addresses on this host") && message.contains("up to 4"),
+            "the refusal names the box's state and the capacity: {message}"
+        );
+        assert!(switch.leases().is_empty(), "nothing was drawn");
     }
 
     /// A native switch keeps self-allocation (NET-102): its draw reaches the

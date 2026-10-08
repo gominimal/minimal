@@ -1155,6 +1155,34 @@ const _: () = assert!(
     "the switch address quarantine must outlast a DNS pin's admission window"
 );
 
+/// The box row `record` is a task row of, when it is one and that box
+/// row stands for the same box (NET-138).
+fn box_row_of<'rows>(rows: &'rows Rows, record: &BoxRecord) -> Option<&'rows Arc<BoxRecord>> {
+    let parent = rows.get(&record.task_row_of()?.octets())?;
+    (parent.box_id == record.box_id).then_some(parent)
+}
+
+/// Whether a relay carries any of `parent`'s task rows. Called with the
+/// box row's liveness held: each task row's lock is taken after it.
+fn task_rows_carried(rows: &Rows, parent: &BoxRecord) -> bool {
+    parent.task_addrs().iter().any(|addr| {
+        rows.get(&addr.octets())
+            .filter(|task| task.box_id == parent.box_id && task.is_task_row())
+            .is_some_and(|task| task.liveness().carriers > 0)
+    })
+}
+
+/// How many hand-out addresses a task-slot draw always leaves for a new
+/// box's own address (NET-138): task slots are best-effort, so the
+/// registry stops drawing them once the book could hand fewer than this,
+/// and a box is never refused because task slots took its address. Sixteen
+/// keeps room for sixteen new boxes once task slots stop being handed:
+/// about an eighth of a carved /24's hand-out run of 125, so the first
+/// twenty-odd boxes there still get their full
+/// [`minimald_rpc::TASK_SLOTS_PER_BOX`] slots each, and a rounding error
+/// against the default plan's run of thousands.
+pub const TASK_SLOT_FLOOR: usize = 16;
+
 /// The hand-out run's book (NET-138, design §7.1): which of the run's
 /// switch addresses are out — drawn for a row that stands or a
 /// registration in flight — and which came back, when. Modeled on the
@@ -1290,6 +1318,25 @@ impl SwitchAddressBook {
                 .filter(|wait| !wait.is_zero())
                 .min(),
         })
+    }
+
+    /// How many addresses draws at `now` could still hand, by the rules
+    /// [`Self::draw`] keeps: the run's never-drawn addresses, and the
+    /// returned ones whose eligibility has passed that `held` does not
+    /// hold. The task-slot floor ([`TASK_SLOT_FLOOR`]) is measured on it.
+    fn spare(&self, now: Instant, held: impl Fn(Ipv4Addr) -> bool) -> usize {
+        let never_drawn = self.next.map_or(0, |next| {
+            let ahead = usize::try_from(self.last - next).map_or(usize::MAX, |n| n + 1);
+            let taken = self.out.range(next..).count()
+                + self.free.iter().filter(|&&(addr, ..)| addr >= next).count();
+            ahead.saturating_sub(taken)
+        });
+        let reusable = self
+            .free
+            .iter()
+            .filter(|&&(addr, eligible, _)| now >= eligible && !held(Ipv4Addr::from(addr)))
+            .count();
+        never_drawn + reusable
     }
 
     /// Returns `addr` at `now` from the box `returned_by`, quarantined
@@ -3091,6 +3138,27 @@ impl BoxRegistry {
         .map_err(AllocationError::SwitchExhausted)
     }
 
+    /// Draws a task address from the hand-out book, as [`Self::draw_switch_addr`]
+    /// draws a box's, but only while the book could still hand more than
+    /// [`TASK_SLOT_FLOOR`] addresses: `None` once a task slot would eat into
+    /// what new boxes need, or the book hands nothing.
+    fn draw_task_addr(&self) -> Option<Ipv4Addr> {
+        let now = self.now();
+        let mut book = self.switch_book();
+        let rows = self
+            .rows
+            .read()
+            .expect("the row lock is never held across a panic, so it cannot be poisoned");
+        let held = |addr: Ipv4Addr| {
+            rows.contains_key(&addr.octets())
+                || self.revoking.first_held(&[addr.octets()]).is_some()
+        };
+        if book.spare(now, held) <= TASK_SLOT_FLOOR {
+            return None;
+        }
+        book.draw(now, held).ok()
+    }
+
     /// Returns a removed row's switch address to the hand-out book:
     /// quarantined when the row was ever attributed
     /// ([`BoxRecord::was_attributed`]), at once when no frame of its box
@@ -3580,12 +3648,13 @@ impl BoxRegistry {
     /// and the caller hands the address back to the answerer unless
     /// something else owns it ([`Self::release_unless_owned`]).
     ///
-    /// `task_slots` task addresses are filed with the box (NET-138) — at
-    /// most [`minimald_rpc::TASK_SLOTS_PER_BOX`], whatever the client asked
-    /// for — each drawn from the same hand-out book as the box's own and
-    /// published as a task row of it ([`BoxRecord::task_row_of`]). A
-    /// registration that cannot draw every one is refused like one that
-    /// cannot draw its own address, and returns every address it drew.
+    /// Up to `task_slots` task addresses are filed with the box (NET-138) —
+    /// at most [`minimald_rpc::TASK_SLOTS_PER_BOX`], whatever the client
+    /// asked for — each drawn from the same hand-out book as the box's own
+    /// and published as a task row of it ([`BoxRecord::task_row_of`]). They
+    /// are best-effort: the draw stops while the book is at
+    /// [`TASK_SLOT_FLOOR`], and the box registers with however many it got,
+    /// which the row's [`BoxRecord::task_addrs`] says.
     pub fn register_client_box_since(
         &self,
         spec: ClientBoxSpec,
@@ -3668,20 +3737,22 @@ impl BoxRegistry {
             return Err(AllocationError::RevocationPending { addr });
         }
         let switch_addr = self.draw_switch_addr()?;
-        // The task addresses come from the same book, after the box's own:
-        // a draw that runs dry refuses the whole registration, and every
-        // address drawn for it goes back unspent.
-        let mut task_addrs = Vec::new();
-        for _ in 0..task_slots.min(minimald_rpc::TASK_SLOTS_PER_BOX) {
-            match self.draw_switch_addr() {
-                Ok(addr) => task_addrs.push(addr),
-                Err(error) => {
-                    for addr in std::iter::once(switch_addr).chain(task_addrs) {
-                        self.give_back_switch_addr(addr, false, id);
-                    }
-                    return Err(error);
-                }
-            }
+        // The task addresses come from the same book, after the box's own,
+        // best-effort: as many as the book can spare above the floor it
+        // keeps for new boxes ([`TASK_SLOT_FLOOR`]), zero included. A box
+        // is refused only when its own address cannot be drawn.
+        let task_addrs: Vec<Ipv4Addr> = (0..task_slots.min(minimald_rpc::TASK_SLOTS_PER_BOX))
+            .map_while(|_| self.draw_task_addr())
+            .collect();
+        if task_addrs.len() < usize::from(task_slots.min(minimald_rpc::TASK_SLOTS_PER_BOX)) {
+            tracing::warn!(
+                box = %spec.name,
+                asked = task_slots,
+                filed = task_addrs.len(),
+                floor = TASK_SLOT_FLOOR,
+                "the hand-out run is nearly full; the box registers with fewer task addresses \
+                 than it asked for"
+            );
         }
         let creation = Creation::new(&spec, switch_addr, loopback_addr, task_addrs.clone(), id);
         let registration =
@@ -3779,6 +3850,18 @@ impl BoxRegistry {
         let (first, last) = box_loopback_run(slice);
         let loopback_addr = take_next(&self.next_loopback_addr, first, last)
             .ok_or(AllocationError::LoopbackExhausted)?;
+        self.register_client_box_at_with_task_slots(spec, loopback_addr, task_slots)
+    }
+
+    /// [`Self::register_client_box_with_task_slots`] at a published
+    /// loopback address the test picks.
+    #[cfg(test)]
+    pub fn register_client_box_at_with_task_slots(
+        &self,
+        spec: ClientBoxSpec,
+        loopback_addr: Ipv4Addr,
+        task_slots: u8,
+    ) -> Result<Arc<BoxRecord>, AllocationError> {
         self.register_client_box_as(
             spec,
             loopback_addr,
@@ -4132,22 +4215,39 @@ impl BoxRegistry {
         else {
             return;
         };
-        let mut liveness = record.liveness();
-        liveness.carriers = liveness.carriers.saturating_sub(1);
-        // A task row's relay ending detaches nothing: the row stands as
-        // long as its box's (NET-138), and a task run ends far more often
-        // than its box does.
-        if record.is_task_row() {
-            return;
+        // A box and its task rows are one liveness unit (NET-138): a task
+        // run carrying keeps its box's row standing, so the box row is
+        // detached only once no relay carries the box's own address nor
+        // any of its task addresses. Locks run box row, then task rows.
+        let parent = match record.task_row_of() {
+            None => Arc::clone(record),
+            Some(_) => {
+                {
+                    let mut liveness = record.liveness();
+                    liveness.carriers = liveness.carriers.saturating_sub(1);
+                }
+                let Some(parent) = box_row_of(&rows, record) else {
+                    return;
+                };
+                Arc::clone(parent)
+            }
+        };
+        let mut liveness = parent.liveness();
+        if !record.is_task_row() {
+            liveness.carriers = liveness.carriers.saturating_sub(1);
         }
-        if liveness.carriers == 0 && liveness.detached_since.is_none() {
+        if liveness.carriers == 0
+            && liveness.detached_since.is_none()
+            && !task_rows_carried(&rows, &parent)
+        {
             liveness.detached_since = Some(now);
             tracing::info!(
-                box = %record.name(),
-                switch_addr = %record.switch_addr(),
+                box = %parent.name(),
+                switch_addr = %parent.switch_addr(),
                 grace = ?DETACH_GRACE,
-                "a box's attachment ended; its row is detached and is withdrawn after the \
-                 grace unless the box attaches again"
+                "a box's attachment and every task run's ended; its row is detached and is \
+                 withdrawn with its task rows after the grace unless the box or a task run \
+                 attaches again"
             );
         }
     }
@@ -4939,15 +5039,25 @@ impl BoxTable {
             .expect("the row lock is never held across a panic, so it cannot be poisoned");
         let record = rows.get(&src)?;
         record.attributed.store(true, Ordering::Relaxed);
-        let mut liveness = record.liveness();
-        liveness.carriers = liveness.carriers.saturating_add(1);
-        liveness.resumed_since = None;
-        if liveness.detached_since.take().is_some() {
+        // A task row carried keeps its box's row standing (NET-138): the
+        // box row's detach and resume bound clear as if the box carried.
+        // Locks run box row, then task row, as in the drainer's detach.
+        let parent = box_row_of(&rows, record).unwrap_or(record);
+        let mut parent_liveness = parent.liveness();
+        parent_liveness.resumed_since = None;
+        if parent_liveness.detached_since.take().is_some() {
             tracing::info!(
-                box = %record.name(),
-                switch_addr = %record.switch_addr(),
-                "a detached box attached again; its row stays"
+                box = %parent.name(),
+                switch_addr = %parent.switch_addr(),
+                task_addr = ?record.is_task_row().then(|| record.switch_addr()),
+                "a detached box or one of its task runs attached again; its row stays"
             );
+        }
+        if record.is_task_row() {
+            let mut liveness = record.liveness();
+            liveness.carriers = liveness.carriers.saturating_add(1);
+        } else {
+            parent_liveness.carriers = parent_liveness.carriers.saturating_add(1);
         }
         Some(record.box_id)
     }
@@ -6459,9 +6569,9 @@ mod tests {
         );
     }
 
-    /// NET-138: a task row is never withdrawn because its own relay ended —
-    /// a task run ends far more often than its box — and holds its address
-    /// for the next run.
+    /// NET-138: a task run's relay ending detaches nothing while its box's
+    /// own relay carries: the task row stands as long as its box's, for the
+    /// next run.
     #[test]
     fn task_row_outlives_its_attachment_ending() {
         let registry = BoxRegistry::new(SUBNET);
@@ -6472,17 +6582,150 @@ mod tests {
         let [task] = task_rows_of(&registry, &web)
             .try_into()
             .expect("one task row");
+        registry
+            .table()
+            .mark_attributed(web.switch_addr().octets())
+            .expect("the box's relay carries its row");
 
         relay_carried_and_ended(&registry, &[&task]);
+        let_the_drainer_sweep();
         registry.advance_clock(DETACH_GRACE * 2);
         let_the_drainer_sweep();
         assert!(!task.is_detached(), "a task run's end detaches nothing");
+        assert!(!web.is_detached(), "nor its box, whose relay carries");
         let held = registry
             .table()
             .by_source(task.switch_addr().octets())
             .expect("the task row stands past any grace");
         assert!(Arc::ptr_eq(&held, &task));
         assert_eq!(registry.live_switch_addrs(), 2, "both addresses stay out");
+    }
+
+    /// NET-138: a box and its task rows are one liveness unit. A task run
+    /// whose relay carries keeps its box's row standing past the grace after
+    /// the box's own relay ends; once the task's relay ends too, the box row
+    /// detaches and the unit is withdrawn after the grace.
+    #[test]
+    fn a_running_task_keeps_its_box_row_past_the_grace() {
+        let registry = BoxRegistry::new(SUBNET);
+        registry.spawn_withdrawal_drainer(|_| {});
+        let web = registry
+            .register_client_box_with_task_slots(client_spec("web"), 1)
+            .expect("the plan has addresses for the box and its task");
+        let [task] = task_rows_of(&registry, &web)
+            .try_into()
+            .expect("one task row");
+        let table = registry.table();
+        let task_carried = table
+            .mark_attributed(task.switch_addr().octets())
+            .expect("the task's relay carries its row");
+
+        relay_carried_and_ended(&registry, &[&web]);
+        let_the_drainer_sweep();
+        assert!(
+            !web.is_detached(),
+            "a task run carrying keeps the box attached"
+        );
+        registry.advance_clock(DETACH_GRACE * 2);
+        let_the_drainer_sweep();
+        for row in [&web, &task] {
+            let held = table
+                .by_source(row.switch_addr().octets())
+                .expect("the box and its task row stand past the grace");
+            assert!(Arc::ptr_eq(&held, row));
+        }
+
+        table.report_withdrawals(vec![(task.switch_addr().octets(), task_carried)]);
+        wait_until(
+            || web.is_detached(),
+            "the box row detaches once no relay carries the unit",
+        );
+        registry.advance_clock(DETACH_GRACE);
+        wait_until(
+            || {
+                table.by_source(web.switch_addr().octets()).is_none()
+                    && table.by_source(task.switch_addr().octets()).is_none()
+            },
+            "the unit is withdrawn once its grace passes",
+        );
+        assert_eq!(registry.live_switch_addrs(), 0);
+    }
+
+    fn register_carved_with_task_slots(
+        registry: &BoxRegistry,
+        name: &str,
+    ) -> Result<Arc<BoxRecord>, AllocationError> {
+        registry.register_client_box_at_with_task_slots(
+            client_spec(name),
+            CARVED_LOOPBACK,
+            minimald_rpc::TASK_SLOTS_PER_BOX,
+        )
+    }
+
+    /// NET-138: task slots are best-effort. A box registers with as many as
+    /// the book can spare above [`TASK_SLOT_FLOOR`] — fewer than it asked
+    /// for, down to none — and is never refused for want of them.
+    #[test]
+    fn a_box_registers_with_fewer_task_slots_when_the_book_is_short() {
+        let registry = BoxRegistry::new(carved());
+        // Leave the floor and three more: the box's own address and two
+        // task slots.
+        for index in 0..CARVED_RUN - TASK_SLOT_FLOOR - 3 {
+            register_carved(&registry, &format!("box{index}"))
+                .expect("the carved run holds an address for every box");
+        }
+
+        let web = register_carved_with_task_slots(&registry, "web")
+            .expect("a box is registered on its own address");
+        assert_eq!(web.task_addrs().len(), 2, "two of the four task slots");
+        assert_eq!(task_rows_of(&registry, &web).len(), 2);
+
+        let api = register_carved_with_task_slots(&registry, "api")
+            .expect("a box with no task slot to spare still registers");
+        assert!(api.task_addrs().is_empty(), "the book is at its floor");
+        assert_eq!(
+            registry.live_switch_addrs(),
+            CARVED_RUN - TASK_SLOT_FLOOR + 1,
+            "the floor gave only the new box's own address"
+        );
+    }
+
+    /// NET-138: task slots never take the addresses new boxes need. Boxes
+    /// that each ask for every task slot register until the run is drawn
+    /// through, and the last [`TASK_SLOT_FLOOR`] of them register with none:
+    /// the floor was held for their own addresses.
+    #[test]
+    fn task_slots_never_starve_a_new_box() {
+        let registry = BoxRegistry::new(carved());
+        let mut boxes = Vec::new();
+        let refusal = loop {
+            match register_carved_with_task_slots(&registry, &format!("box{}", boxes.len())) {
+                Ok(row) => boxes.push(row),
+                Err(error) => break error,
+            }
+        };
+        assert!(
+            matches!(refusal, AllocationError::SwitchExhausted(_)),
+            "only an exhausted run refuses a box: {refusal:?}"
+        );
+        assert_eq!(
+            registry.live_switch_addrs(),
+            CARVED_RUN,
+            "every address out"
+        );
+        let slotless = boxes
+            .iter()
+            .rev()
+            .take_while(|row| row.task_addrs().is_empty())
+            .count();
+        assert!(
+            slotless >= TASK_SLOT_FLOOR,
+            "the floor kept {slotless} addresses for new boxes, short of {TASK_SLOT_FLOOR}"
+        );
+        assert!(
+            boxes[0].task_addrs().len() == usize::from(minimald_rpc::TASK_SLOTS_PER_BOX),
+            "a box registered while the book is roomy gets every task slot"
+        );
     }
 
     /// NET-138: a task row is withdrawn with its box on every path that

@@ -503,6 +503,19 @@ async fn register_box_at(
                 "registered the box with the VM host daemon; its addresses are \
                  the host table's to decide by"
             );
+            // Task addresses are best-effort (NET-138): a nearly full
+            // hand-out run registers the box with fewer, down to none.
+            if web.task_addresses.len() < usize::from(minimald_rpc::TASK_SLOTS_PER_BOX) {
+                tracing::warn!(
+                    box = %name,
+                    "the VM host registered {} of {} task addresses for this box: its \
+                     address run is nearly full, so at most {} task runs may be in \
+                     progress at once",
+                    web.task_addresses.len(),
+                    minimald_rpc::TASK_SLOTS_PER_BOX,
+                    web.task_addresses.len(),
+                );
+            }
             Ok(web)
         }
         Ok(Err(error)) => Err(error.context(
