@@ -112,6 +112,8 @@ fn build_record(
         // outcome to record, and the key a client might assert in `attrs`
         // is stripped above, so only a launch ever writes this field.
         host_ip_enforcement: None,
+        // Daemon-owned as well: only a launch binds the box's host-side row.
+        host_row_bound: false,
         attrs: config.attrs,
     };
     record

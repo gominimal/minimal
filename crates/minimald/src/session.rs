@@ -67,10 +67,11 @@ pub enum AttachError {
     /// The session host is alive but busy (its mailbox stayed full past the
     /// attach deadline). The client should retry.
     SessionBusy,
-    /// The session host's loop ended, but this box carries host-handed
-    /// addresses (T66) whose host-side row the ended loop already withdrew
-    /// (NET-138); the host gate drops re-attached frames from an unregistered
-    /// source, so re-minting here would re-attach "rowless". Only the box's
+    /// This box carries host-handed addresses (T66) and the launch that bound
+    /// its host-side row no longer holds the slot — its loop ended, a later
+    /// launch replaced it, or the daemon restarted — so the row is withdrawn
+    /// (NET-138). The host gate drops frames from an unregistered source, so
+    /// any host handed out now would be "rowless". Only the box's
     /// creator registers a row, and today only a session activation does, so
     /// the message names that as the way forward.
     BoxHostRowEnded,
@@ -865,6 +866,13 @@ pub struct Session {
     /// interactive attach may respawn it. See [`HostOrigin`].
     host_origin: HostOrigin,
 
+    /// Whether the host in the slot is the launch that bound this box's
+    /// host-side row (NET-138): set by that launch, cleared by every later
+    /// one. In memory only, so a restarted actor starts without it — the
+    /// restart ended the PTask the row was tied to. See
+    /// [`Self::host_row_lost`].
+    slot_holds_row: bool,
+
     /// Whether this daemon opted out of the deny-all egress default
     /// (NET-077), threaded from the server config: the launcher resolves
     /// this session's effective egress (NET-074) against it, and the task
@@ -975,6 +983,8 @@ impl Session {
             // conservative default — it is the one value that never licenses
             // a respawn.
             host_origin: HostOrigin::Interactive,
+            // No host yet, so none holds a row.
+            slot_holds_row: false,
             // Forwards are registered as their channels open; a session
             // starts with none.
             forwards: Vec::new(),
@@ -2475,7 +2485,11 @@ impl Session {
                     }));
                 }
 
-                let mut record = record;
+                // Re-read rather than reuse the record read above: the
+                // activate-hook launch wrote its own facts to it (the
+                // placement outcome, the host-row binding), and promoting a
+                // stale copy would erase them.
+                let mut record = self.record.record().await?;
                 record.status = SessionStatus::Active;
                 self.record.write(record.clone()).await?;
                 Ok(minimald_rpc::FinalizeSessionResponse {
@@ -3963,17 +3977,22 @@ impl Session {
         // and materializing without them would produce a broken
         // sandbox rootfs. See [`Session::finalize`] for the
         // transition.
-        let holds_host_row = {
-            let record = self
-                .record
-                .record()
-                .await
-                .map_err(AttachError::LoadoutFailed)?;
-            if record.status != SessionStatus::Active {
-                return Err(AttachError::SessionPending);
-            }
-            record.box_addresses.is_some()
-        };
+        let record = self
+            .record
+            .record()
+            .await
+            .map_err(AttachError::LoadoutFailed)?;
+        if record.status != SessionStatus::Active {
+            return Err(AttachError::SessionPending);
+        }
+        // Before any respawn or re-mint below: a registered box whose row is
+        // gone must not be handed a rowless host, whichever way the slot came
+        // to be without its binding launch — the shell exited, a hook run
+        // relaunched over a dead host, or the daemon restarted.
+        if self.host_row_lost(&record) {
+            return Err(AttachError::BoxHostRowEnded);
+        }
+        let holds_host_row = record.box_addresses.is_some();
 
         // A host minted to run hooks has an environment that describes no
         // terminal, because there was none — and the shell's `environ` cannot
@@ -4041,17 +4060,12 @@ impl Session {
                 {
                     Ok(()) => Ok(()),
                     Err(session_host::HostAttachError::Closed(channel, sz)) => {
-                        // A box whose record carries host-handed addresses
-                        // (T66) has a host-side row keyed on that address.
-                        // The ended loop already withdrew the row (NET-138),
-                        // and the host gate drops re-attached frames from an
-                        // unregistered source — re-minting here would
-                        // re-attach "rowless" and silently drop the box's
-                        // frames. Refuse instead of re-minting: only the
-                        // box's creator registers a row (NET-138).
-                        // `holds_host_row` is the Active-gated record read at
-                        // the top of this attach.
-                        if holds_host_row {
+                        // A registered box's row ended with this loop
+                        // (NET-138); re-minting would re-attach it rowless.
+                        // The check at the top of this attach normally
+                        // refuses first, but the loop can end between that
+                        // check and this send, so ask again.
+                        if self.host_row_lost(&record) {
                             return Err(AttachError::BoxHostRowEnded);
                         }
                         // The host's loop has ended; mint a fresh one from the
@@ -4182,6 +4196,10 @@ impl Session {
             None => (None, spawn.await),
         };
         let (host, task, host_ip_enforcement) = spawned.map_err(AttachError::SpawnFailed)?;
+        // Whatever this launch replaces, the slot it goes into no longer
+        // holds the launch that bound the box's host-side row; only the
+        // binding launch itself, below, sets this again.
+        self.slot_holds_row = false;
         // NET-079: the launch that just ran records its own outcome for
         // this session's box on the box's record here — the one path every
         // launch takes, so an attach, an exec, an activation and a hook run
@@ -4195,7 +4213,48 @@ impl Session {
             let _ = host.kill(false).await;
             return Err(AttachError::LaunchRecordUnwritable(e));
         }
+        // The first launch of a registered box binds its host-side row
+        // (NET-138). Recorded on the record, so a restarted daemon knows the
+        // row is gone, before the box is handed back: a binding that cannot
+        // be recorded would let a later launch past the restart run
+        // rowless, so it fails the launch like the outcome write above.
+        if record.box_addresses.is_some()
+            && !record.host_row_bound
+            && let Err(e) = self.record_host_row_bound().await
+        {
+            let _ = host.kill(false).await;
+            return Err(AttachError::LaunchRecordUnwritable(e));
+        }
         Ok((channel, (host, task)))
+    }
+
+    /// Records on this session's record that a launch bound the box's
+    /// host-side row, and marks the slot's coming host as that launch. See
+    /// [`Self::host_row_lost`].
+    async fn record_host_row_bound(&mut self) -> Result<(), std::io::Error> {
+        let mut record = self.record.record().await?;
+        record.host_row_bound = true;
+        self.record.write(record).await?;
+        self.slot_holds_row = true;
+        Ok(())
+    }
+
+    /// Whether this registered box's host-side row is gone (NET-138): the
+    /// record says a launch bound it, and the slot does not hold that
+    /// launch's host alive. The row lives exactly as long as the binding
+    /// launch's switch attachment and the daemon never registers it again,
+    /// so a box in this state must not be handed a host — every one would
+    /// be rowless, and the host gate silently drops a rowless box's frames.
+    /// False for a box that carries no host-handed addresses, and for a
+    /// registered box no launch has bound yet: its first launch binds it.
+    fn host_row_lost(&self, record: &Record) -> bool {
+        let slot_alive = matches!(
+            &self.inner,
+            SessionInner::Active { host: Some((h, _)), .. } if h.is_alive()
+        );
+        record.box_addresses.is_some()
+            && record.host_row_bound
+            && !(self.slot_holds_row && slot_alive)
     }
 
     /// Records the launch's own placement outcome on this session's record
@@ -4328,6 +4387,12 @@ impl Session {
                 .map_err(AttachError::LoadoutFailed)?;
             if record.status != SessionStatus::Active {
                 return Err(AttachError::SessionPending);
+            }
+            // Attach's refusal, for the same reason: neither the host a
+            // later launch left in the slot nor a fresh one would hold the
+            // registered box's host-side row.
+            if self.host_row_lost(&record) {
+                return Err(AttachError::BoxHostRowEnded);
             }
         }
 
