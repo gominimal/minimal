@@ -1213,6 +1213,8 @@ mod tests {
             // round-trip of a `Some` is proved at the daemon's own launch
             // record, which a client reads back through `GetSessionRecord`.
             host_ip_enforcement: None,
+            // Non-default too, for the same reason: `false` is its serde default.
+            host_row_bound: true,
             attrs: [("color".to_string(), "blue".to_string())]
                 .into_iter()
                 .collect(),
