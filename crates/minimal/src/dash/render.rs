@@ -757,6 +757,18 @@ fn render_footer(model: &Model, frame: &mut Frame, area: Rect) {
             ]);
             frame.render_widget(Paragraph::new(line), area);
         }
+        Some(Action::ConfirmCreateUpload { root, .. }) => {
+            let line = Line::from(vec![
+                Span::styled(
+                    format!(" {root} is not a repository root; upload it? "),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" y / n ", Style::default().fg(Color::Gray)),
+            ]);
+            frame.render_widget(Paragraph::new(line), area);
+        }
         Some(Action::Rename { input, .. }) => {
             frame.render_widget(
                 Paragraph::new(Line::from(vec![

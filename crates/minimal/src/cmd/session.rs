@@ -1203,6 +1203,7 @@ pub(crate) async fn activate_session(
                     )
                 },
                 true,
+                UploadProgress::Bar,
             )
             .await;
             if let Err(error) = uploaded {

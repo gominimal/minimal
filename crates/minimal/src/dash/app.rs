@@ -71,6 +71,9 @@ pub enum Action {
     Rename { key: SessionKey, input: String },
     /// `n`: the create form.
     Create(CreateForm),
+    /// A dashboard create paused on the undeclared non-VCS upload confirm
+    /// (the CLI's #770 prompt): "y" uploads the root, "n"/Esc skips it.
+    ConfirmCreateUpload { token: u64, root: String },
 }
 
 /// The create form's fields. `field` is which one has input focus.
@@ -137,6 +140,16 @@ pub enum Msg {
         /// The deny-all egress default binds the new box (NET-074).
         egress_deny_all_default: bool,
     },
+    /// A create paused for the undeclared non-VCS upload confirm: the
+    /// background task holds the create and awaits the user's answer on
+    /// `reply`. The driver stashes `reply` keyed by `token` (a `oneshot::Sender`
+    /// cannot live in [`Action`], which derives `Clone`/`Eq`) and opens the
+    /// confirm modal.
+    CreateUploadConfirm {
+        token: u64,
+        root: String,
+        reply: tokio::sync::oneshot::Sender<bool>,
+    },
 }
 
 /// Side effects [`update`] asks the driver to run.
@@ -157,6 +170,13 @@ pub enum Effect {
     /// Suspend the TUI, attach to the session over ssh, and resume when the
     /// user detaches.
     Attach(SessionKey),
+    /// Answer a paused create's upload confirm. Handled inline by the run
+    /// loop (it owns the stashed `oneshot::Sender`, which cannot live in this
+    /// `Effect`).
+    AnswerCreateUpload {
+        token: u64,
+        confirmed: bool,
+    },
     /// Persist the last-focused session to `dash-state.json`.
     SaveState,
 }
@@ -542,6 +562,12 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
             vec![Effect::Refresh]
         }
         Msg::Key(key) => update_key(model, key),
+        // Intercepted by the run loop before `update` (it carries the create
+        // task's reply sender); reaching here would drop that reply and hang
+        // the create.
+        Msg::CreateUploadConfirm { .. } => {
+            unreachable!("CreateUploadConfirm is handled by the run loop")
+        }
     }
 }
 
@@ -696,6 +722,23 @@ fn update_modal(model: &mut Model, key: KeyEvent) -> Vec<Effect> {
             (KeyCode::Char('n'), KeyModifiers::NONE) | (KeyCode::Esc, _) => {
                 model.action = None;
                 Vec::new()
+            }
+            _ => Vec::new(),
+        },
+        Action::ConfirmCreateUpload { token, .. } => match (key.code, key.modifiers) {
+            (KeyCode::Char('y'), KeyModifiers::NONE) => {
+                model.action = None;
+                vec![Effect::AnswerCreateUpload {
+                    token,
+                    confirmed: true,
+                }]
+            }
+            (KeyCode::Char('n'), KeyModifiers::NONE) | (KeyCode::Esc, _) => {
+                model.action = None;
+                vec![Effect::AnswerCreateUpload {
+                    token,
+                    confirmed: false,
+                }]
             }
             _ => Vec::new(),
         },
@@ -900,6 +943,36 @@ pub struct DashOptions {
     pub contribution: sessions::wire::request::WireContribution,
 }
 
+/// One create waiting on an upload confirm: the token keys it, `root` is
+/// shown in the footer, and `reply` is answered when the user presses y/n.
+struct PendingConfirm {
+    token: u64,
+    root: String,
+    reply: tokio::sync::oneshot::Sender<bool>,
+}
+
+/// The next upload-confirm token. A create task picks one before it sends
+/// [`Msg::CreateUploadConfirm`]; the driver keys the stashed reply by it, so
+/// two creates in flight never answer each other's prompt.
+fn next_confirm_token() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Show the oldest pending upload confirm if no other modal is open.
+fn show_pending_confirm(model: &mut Model, pending: &mut VecDeque<PendingConfirm>) {
+    if model.action.is_some() {
+        return;
+    }
+    if let Some(p) = pending.front() {
+        model.action = Some(Action::ConfirmCreateUpload {
+            token: p.token,
+            root: p.root.clone(),
+        });
+    }
+}
+
 /// Entry point for `min dash`: discover providers, then drive the
 /// Elm loop until the user quits.
 pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
@@ -934,6 +1007,10 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
     // report back over this channel.
     let (bg_tx, mut bg_rx) = tokio::sync::mpsc::channel::<Msg>(8);
 
+    // Creates paused on an upload confirm, oldest first. Each carries the
+    // `oneshot::Sender` its task awaits; the modal answers the front one.
+    let mut pending_confirms: VecDeque<PendingConfirm> = VecDeque::new();
+
     // Prime the list immediately rather than waiting out the first tick.
     let mut inbox: VecDeque<Msg> = VecDeque::from([Msg::Tick]);
     loop {
@@ -961,11 +1038,36 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
             }
         };
 
+        // A create pausing for the upload confirm is not a pure state
+        // transition (it carries the task's reply sender), so the driver
+        // intercepts it, stashes the sender, and opens the modal itself.
+        let msg = match msg {
+            Msg::CreateUploadConfirm { token, root, reply } => {
+                pending_confirms.push_back(PendingConfirm { token, root, reply });
+                show_pending_confirm(&mut model, &mut pending_confirms);
+                continue;
+            }
+            other => other,
+        };
+
         for effect in update(&mut model, msg) {
             match effect {
                 // State persistence is local disk, not a daemon call, so it
                 // runs inline rather than going through `exec_effect`.
                 Effect::SaveState => save_state(&model, opts.minimal_dir.as_deref()),
+                // The upload confirm the user just answered: deliver the
+                // stashed reply and, if another create is waiting, show its
+                // modal now that `update` closed this one.
+                Effect::AnswerCreateUpload { token, confirmed } => {
+                    if let Some(i) = pending_confirms.iter().position(|p| p.token == token) {
+                        // `remove` needs the index; the element is known to
+                        // exist from the `position` above.
+                        if let Some(p) = pending_confirms.remove(i) {
+                            let _ = p.reply.send(confirmed);
+                        }
+                    }
+                    show_pending_confirm(&mut model, &mut pending_confirms);
+                }
                 // Attach suspends the TUI around a blocking ssh child; it
                 // needs the terminal guard, so it can't live in exec_effect.
                 Effect::Attach(key) => match providers.iter_mut().find(|p| p.label == key.provider)
@@ -1042,7 +1144,57 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
                                 )?;
                                 let abs = paths::HostAbsPath::try_new(utf8)
                                     .context("invalid project path")?;
-                                rpc::activate(&sock, name, abs, network, contribution).await
+                                // The resolve walk and the gate's stats are
+                                // blocking filesystem traversals; run them off
+                                // the async worker so a stalled mount can't
+                                // stall the runtime.
+                                let invoked_from = abs.as_utf8_path().to_path_buf();
+                                let (upload_root, decision) = {
+                                    let dir = invoked_from.clone();
+                                    tokio::task::spawn_blocking(move || {
+                                        let root = crate::resolve_upload_root(&dir)?;
+                                        let decision =
+                                            crate::decide_workspace_upload(&root, false, false);
+                                        Ok::<_, anyhow::Error>((root, decision))
+                                    })
+                                    .await
+                                    .context("resolving the upload root")??
+                                };
+                                // The undeclared non-VCS root gets the CLI's
+                                // confirm here, through the TUI, before the
+                                // session is created: a form pre-filled with
+                                // the home directory must not stream it on
+                                // three Enters (#770).
+                                let decision = if decision == crate::UploadDecision::Confirm {
+                                    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                                    let _ = tx
+                                        .send(Msg::CreateUploadConfirm {
+                                            token: next_confirm_token(),
+                                            root: upload_root.to_string(),
+                                            reply: reply_tx,
+                                        })
+                                        .await;
+                                    if reply_rx.await.unwrap_or(false) {
+                                        crate::UploadDecision::Upload
+                                    } else {
+                                        // The user declined: skip the upload the
+                                        // same way the CLI's confirm does,
+                                        // creating the session on an empty box.
+                                        crate::UploadDecision::SkipUndeclared
+                                    }
+                                } else {
+                                    decision
+                                };
+                                rpc::activate(
+                                    &sock,
+                                    name,
+                                    abs,
+                                    upload_root,
+                                    network,
+                                    decision,
+                                    contribution,
+                                )
+                                .await
                             }
                             .await;
                             let msg = match result {
@@ -1079,6 +1231,9 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
                 }
             }
         }
+        // A modal may have just closed (a destroy/rename/create answered): if
+        // a create confirm was queued behind it, show it now.
+        show_pending_confirm(&mut model, &mut pending_confirms);
         if model.quit {
             break;
         }
@@ -1194,8 +1349,12 @@ async fn exec_effect(
             Some(Msg::ActionDone(result))
         }
         // Handled inline by the run loop: SaveState is local disk, Attach
-        // needs the terminal guard, Create spawns a background task.
-        Effect::SaveState | Effect::Attach(_) | Effect::Create { .. } => None,
+        // needs the terminal guard, Create spawns a background task, and
+        // AnswerCreateUpload delivers a stashed reply the loop owns.
+        Effect::SaveState
+        | Effect::Attach(_)
+        | Effect::Create { .. }
+        | Effect::AnswerCreateUpload { .. } => None,
     }
 }
 
@@ -1673,6 +1832,73 @@ mod tests {
             }
         )));
         assert!(model.action.is_none());
+    }
+
+    #[test]
+    fn create_upload_confirm_answers_y_and_n() {
+        let mut model = two_providers();
+        model.action = Some(Action::ConfirmCreateUpload {
+            token: 7,
+            root: "/srv/data".to_string(),
+        });
+        let effects = update(&mut model, key(KeyCode::Char('y')));
+        assert!(model.action.is_none());
+        assert!(effects.iter().any(|e| matches!(
+            e,
+            Effect::AnswerCreateUpload {
+                token: 7,
+                confirmed: true
+            }
+        )));
+
+        model.action = Some(Action::ConfirmCreateUpload {
+            token: 8,
+            root: "/srv/data".to_string(),
+        });
+        let effects = update(&mut model, key(KeyCode::Esc));
+        assert!(model.action.is_none());
+        assert!(effects.iter().any(|e| matches!(
+            e,
+            Effect::AnswerCreateUpload {
+                token: 8,
+                confirmed: false
+            }
+        )));
+    }
+
+    /// Two creates can pause on the upload confirm at once: the second waits
+    /// behind whichever modal is open and is shown only once the first is
+    /// answered, so neither task's reply is dropped.
+    #[test]
+    fn pending_upload_confirms_queue_behind_an_open_modal() {
+        let mut model = two_providers();
+        let (tx1, _rx1) = tokio::sync::oneshot::channel();
+        let (tx2, _rx2) = tokio::sync::oneshot::channel();
+        let mut pending = VecDeque::from([
+            PendingConfirm {
+                token: 1,
+                root: "a".into(),
+                reply: tx1,
+            },
+            PendingConfirm {
+                token: 2,
+                root: "b".into(),
+                reply: tx2,
+            },
+        ]);
+
+        // Another modal owns the footer: the confirm waits.
+        model.action = Some(Action::ConfirmDestroy(skey("host", 1), "x".into()));
+        show_pending_confirm(&mut model, &mut pending);
+        assert!(matches!(model.action, Some(Action::ConfirmDestroy(..))));
+
+        // With the footer free, the oldest confirm shows, keyed by its token.
+        model.action = None;
+        show_pending_confirm(&mut model, &mut pending);
+        assert!(matches!(
+            model.action,
+            Some(Action::ConfirmCreateUpload { token: 1, .. })
+        ));
     }
 
     #[test]

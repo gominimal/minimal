@@ -457,19 +457,21 @@ pub async fn release_held_name_after_attach(
 /// `min session activate` makes, through the same client library
 /// ([`create_registering`]).
 ///
-/// The upload root is resolved like the CLI's: walk up from the form's path
-/// to the nearest `minimal.toml` repo root, and refuse the upload when that
-/// root isn't a VCS checkout — the CLI asks for confirmation there (#770),
-/// and a TUI form pre-filled with the current directory must not stream a
-/// home directory to the daemon on three Enters.
+/// The upload root and its [`crate::UploadDecision`] are resolved by the
+/// caller — the create task — so the TUI could ask its own confirm before
+/// anything reached the daemon. Only [`crate::UploadDecision::Upload`] and the
+/// skip decisions arrive here; `Confirm` is resolved against the create form's
+/// modal first.
 ///
 /// Loadout hooks that name an external script are dropped on the way — see
 /// [`without_external_hook_scripts`].
-pub async fn activate(
+pub(crate) async fn activate(
     sock: &Path,
     name: Option<String>,
     project_path: paths::HostAbsPath,
+    upload_root: camino::Utf8PathBuf,
     network: NetworkMode,
+    decision: crate::UploadDecision,
     contribution: sessions::wire::request::WireContribution,
 ) -> Result<Activated, anyhow::Error> {
     let mut client = Client::connect(sock).await?;
@@ -530,27 +532,19 @@ pub async fn activate(
     // the VM host daemon to withdraw the row on the lease's close.
     let lease = row.take_lease();
     let flow = minimal_client::box_registration::finalize_holding_lease(lease, async {
-        // The upload-root walk and VCS-root stat are blocking filesystem
-        // traversals; run them off the async worker so a stalled mount
-        // can't stall the runtime.
-        let dir = project_path.as_utf8_path().to_path_buf();
-        let (upload_root, is_repo) = tokio::task::spawn_blocking(move || {
-            let root = crate::resolve_upload_root(&dir)?;
-            let repo = minimal_client::file_upload::is_vcs_root(root.as_std_path());
-            Ok::<_, anyhow::Error>((root, repo))
-        })
-        .await
-        .context("resolving the upload root")??;
-        if !is_repo {
-            anyhow::bail!(
-                "refusing to upload '{upload_root}': not a repository root (no .git, .hg, or .jj). \
-                 Run `min session activate` to upload a non-repo directory with confirmation"
-            );
-        }
-        client
-            .upload_workspace_files_quiet(id, upload_root.as_std_path())
-            .await
-            .context("uploading project files")?;
+        // The caller resolved the root and the decision; the upload is the
+        // shared CLI path (quiet: the TUI owns the screen).
+        crate::run_workspace_upload(
+            &mut client,
+            id,
+            project_path.as_utf8_path(),
+            &upload_root,
+            decision,
+            || Ok(false),
+            false,
+            crate::UploadProgress::Quiet,
+        )
+        .await?;
         // Collect the upload pairs before the contribution moves into the
         // ConfigureLoadout RPC, through the collection `min session
         // activate` uses: they land in the final composition of a
@@ -1459,7 +1453,10 @@ mod version_gate_tests {
             .enumerate()
             .filter_map(|(i, l)| {
                 let t = l.trim_start();
-                let t = t.strip_prefix("pub ").unwrap_or(t);
+                let t = t
+                    .strip_prefix("pub(crate) ")
+                    .or_else(|| t.strip_prefix("pub "))
+                    .unwrap_or(t);
                 let t = t.strip_prefix("async ").unwrap_or(t);
                 t.strip_prefix("fn ")
                     .map(|rest| (i, rest.split(['(', '<']).next().unwrap_or("").to_string()))
