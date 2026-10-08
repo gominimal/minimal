@@ -5957,6 +5957,10 @@ pub(crate) mod tests {
                 "missing {expected:?} in: {logged}"
             );
         }
+        assert!(
+            !logged.contains("session=100.64.0.77"),
+            "the box's address is not named as a session: {logged}"
+        );
     }
 
     /// NET-084: a frame whose source is not the relay's lease never reaches
