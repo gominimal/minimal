@@ -1968,6 +1968,7 @@ pub(crate) async fn activate_box(
                     )
                 },
                 true,
+                UploadProgress::Bar,
             )
             .await;
             if let Err(error) = uploaded {

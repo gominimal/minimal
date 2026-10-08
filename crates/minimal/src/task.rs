@@ -772,6 +772,7 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
             )
         },
         false,
+        crate::UploadProgress::Bar,
     )
     .await?;
 
