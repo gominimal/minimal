@@ -989,8 +989,7 @@ pub(crate) async fn hostname_proxy_serving_port(
         // acquisition would not bound the attach, and the fail-closed path
         // below must hold the lock to record the box stranded. The lock is
         // dropped before every poll, so a waiter cannot starve the transition
-        // writer (`set_hostname_proxy_port`, from `record_bound`) — the review
-        // thread on the serving wait settled this.
+        // writer (`set_hostname_proxy_port`, from `record_bound`).
         let mut switch = switch.lock().await;
         let port = switch.hostname_proxy_port();
         if !switch.hostname_proxy_unsettled() {
