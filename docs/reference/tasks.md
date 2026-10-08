@@ -343,3 +343,34 @@ Instead of a bare datatype string, an argument can be declared as a table with a
 args.name = { type = "string", help = "who to greet", default = "world" }
 exec = "echo Hello %{name}"
 ```
+
+## Networking {#networking}
+
+A task has no `--network` flag of its own. Its network is the network of the
+session that runs it, taken from the session's
+[`--network` mode](./cli-min.md#session-activate):
+
+- `min task run` composes an ephemeral session with the default mode,
+  `host_ip`: the task shares the host's network namespace.
+- `min run <task>`, from inside a session, and
+  [`min session run <session> <task>`](./cli-min.md#session-run) run the task
+  as a guest of a session that already exists, so the task takes that
+  session's mode.
+
+`host_ip` (the default) shares the host's network namespace, so the task
+reaches everything the host reaches, including the host-side hostname proxy
+at `127.0.0.1:7654` — the port clients point `HTTP(S)_PROXY` at, `7654` by
+default (the [`minimald` `--hostname-proxy-port`
+flag](./cli-minimald.md#global-flags)).
+
+`own_ip` gives the task an address of its own on the host's switch, in its
+own network namespace. `127.0.0.1:7654` no longer reaches that proxy: the
+loopback it names is now the task's own, not the host's. Outbound traffic
+still works — the task resolves and routes through the switch, whose
+gateway is `100.64.0.1` on the default subnet — so a task that fetches
+from the network needs no proxy at all.
+
+`none` gives the task no network: every socket it opens to a destination
+outside itself fails, so a `packages` install that needs the network fails
+with it. Pre-install what a `none` session's task needs, or give the session
+a mode that has a network.

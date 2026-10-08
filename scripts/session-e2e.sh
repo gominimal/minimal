@@ -88,6 +88,8 @@
 #                                    host.min.internal resolves, and its
 #                                    TCP 53 is dropped (NET-141)
 #   task_run                         `min task run` / `min session run` loop
+#   task_network_inherits_session    a task's network mode follows its session
+#                                    (own_ip egress + loopback isolation, none)
 #   hooks                            lifecycle hooks, loadouts, patches, shells
 #   skip_scaffold                    the daemon-scaffolded blueprint upload lane
 #   sandbox                          interactive attach: in-sandbox `min add`
@@ -379,6 +381,8 @@ SESSION_NAME="e2e-banner"
 SEED_DIR=""
 SEEDED_MFILE=""
 TASK_SEED_DIR="" # seeded by the `min task run` proof below; removed on teardown
+TN_SEED_DIR="" # seeded by the task-network proof below; removed on teardown
+TN_LISTENER_PID="" # the task-network proof's host-side http.server; killed on teardown
 HOOK_SEED_DIR="" # seeded by the lifecycle-hooks proof below; removed on teardown
 PATCH_SRC_DIR="" # patch sources for the patch-modes proof; removed on teardown
 SKIP_SEED_DIR="" # seeded by the skip-lane scaffold proof below; removed on teardown
@@ -890,6 +894,11 @@ teardown() {
   [ -n "$SEED_DIR" ] && rm -rf "$SEED_DIR"
   [ -n "$SEEDED_MFILE" ] && rm -f "$SEEDED_MFILE"
   [ -n "$TASK_SEED_DIR" ] && rm -rf "$TASK_SEED_DIR"
+  [ -n "$TN_SEED_DIR" ] && rm -rf "$TN_SEED_DIR"
+  if [ -n "$TN_LISTENER_PID" ]; then
+    kill "$TN_LISTENER_PID" 2>/dev/null || true
+    TN_LISTENER_PID=""
+  fi
   [ -n "$HOOK_SEED_DIR" ] && rm -rf "$HOOK_SEED_DIR"
   [ -n "$PATCH_SRC_DIR" ] && rm -rf "$PATCH_SRC_DIR"
   [ -n "$SKIP_SEED_DIR" ] && rm -rf "$SKIP_SEED_DIR"
@@ -5871,6 +5880,163 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
 
   echo "task run proof OK"
   echo "::endgroup::"
+fi
+}
+
+# A task run against an EXISTING session inherits that session's network
+# mode (exec.rs task_network): a task in an own-IP session gets the session's
+# namespace — its loopback is its own, not the host's — while its egress
+# still works through the switch; a task in a none session has no network at
+# all. Own seeded project (the shared seed declares no tasks), switch-gated
+# like the own-IP proofs above (a task in an own-IP session needs the tap the
+# switch carries): MINVMD_GVPROXY_BIN on a VM lane, E2E_NATIVE_SWITCH on the
+# native one.
+proof_task_network_inherits_session() {
+if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
+  if [ -z "${MINVMD_GVPROXY_BIN:-}" ] && [ -z "$E2E_NATIVE_SWITCH" ]; then
+    echo "task network proof SKIPPED (no switch: neither MINVMD_GVPROXY_BIN (VM) nor E2E_NATIVE_SWITCH (native) is set)"
+  else
+  echo "::group::task network proof (a task inherits its session's network mode)"
+  native_switch_daemon
+  TN_SEED_DIR="$(hook_mktemp /tmp/mnltn.XXXXXX)"
+  TN_LISTENER_PID=""
+  # The listener's port is baked into the task TOML as a literal (the task's
+  # shell never sees this script's variables), so pick the port BEFORE the
+  # tasks are written. Probed free with a bind, the network-posture proof's
+  # pattern (np_port_free).
+  TN_LB_PORT=""
+  for tn_cand in 18130 18131 18132 18133; do
+    if np_port_free "$tn_cand"; then
+      TN_LB_PORT="$tn_cand"
+      break
+    fi
+  done
+  if [ -z "$TN_LB_PORT" ]; then
+    echo "::error::no free candidate port among 18130-18133 for the host-side listener"
+    fail
+  fi
+  {
+    hook_seed_preamble
+    printf '\n[tasks.e2e-tn-egress-com]\nbash = "curl -fsS --max-time 30 -o /dev/null https://example.com"\n'
+    printf '\n[tasks.e2e-tn-egress-org]\nbash = "curl -fsS --max-time 30 -o /dev/null https://example.org"\n'
+    printf '\n[tasks.e2e-tn-loopback]\nbash = "curl -fsS --max-time 5 -o /dev/null http://127.0.0.1:%s/"\n' "$TN_LB_PORT"
+  } > "$TN_SEED_DIR/minimal.toml"
+  mkdir "$TN_SEED_DIR/.git"
+
+  # The host-side listener the loopback task must NOT reach: bound to the
+  # host's loopback (the network-posture proof's pattern). The task's own
+  # 127.0.0.1 is its namespace's loopback, a different interface than this
+  # one — the reach leg asserts exactly that.
+  TN_HOST_DIR="$WORK/tn-host-listener"
+  mkdir -p "$TN_HOST_DIR"
+  printf 'tn-host-listener-ok\n' > "$TN_HOST_DIR/marker"
+  ( cd "$TN_HOST_DIR" && exec python3 -m http.server "$TN_LB_PORT" --bind 127.0.0.1 ) \
+    >/dev/null 2>"$WORK/tn-hostsrv.err" &
+  TN_LISTENER_PID=$!
+  tn_up=""
+  for _ in $(seq 1 40); do
+    if [ "$(curl -sS --max-time 5 -o /dev/null -w '%{http_code}' \
+      "http://127.0.0.1:$TN_LB_PORT/marker" 2>/dev/null || true)" = "200" ]; then
+      tn_up=1
+      break
+    fi
+    sleep 0.25
+  done
+  if [ -z "$tn_up" ]; then
+    echo "::error::the host-side listener never answered on 127.0.0.1:$TN_LB_PORT"
+    echo "--- server stderr ---"; cat "$WORK/tn-hostsrv.err" 2>/dev/null || true
+    kill "$TN_LISTENER_PID" 2>/dev/null || true
+    TN_LISTENER_PID=""
+    fail
+  fi
+  echo "host listener: answers 200 on 127.0.0.1:$TN_LB_PORT"
+
+  # -- own-IP: the task runs inside the session's namespace ------------------
+  tn_sid="$(cd "$TN_SEED_DIR" && mnl session activate . --no-prompt \
+    --name e2e-tn-ownip --network own_ip 2>"$WORK/tn-activate.err")" || {
+    echo "::error::'min session activate --network own_ip' failed for the task-network proof"
+    echo "--- stderr ---"; cat "$WORK/tn-activate.err" 2>/dev/null || true
+    kill "$TN_LISTENER_PID" 2>/dev/null || true
+    TN_LISTENER_PID=""
+    fail
+  }
+  tn_sid="$(printf '%s\n' "$tn_sid" | tail -n1 | tr -d '\r')"
+
+  # Egress, the outbound proofs' shape: two hosts, three attempts each, one
+  # answering passes (a host that fails all three is a warning, not a fail —
+  # the other host proves the box's egress).
+  tn_egress_ok=0
+  for tn_h in com org; do
+    tn_status=1
+    for tn_t in 1 2 3; do
+      mnl session run "$tn_sid" "e2e-tn-egress-$tn_h" >/dev/null 2>"$WORK/tn-egress.err"
+      tn_status=$?
+      echo "exec: min session run e2e-tn-egress-$tn_h (own-IP session, attempt $tn_t) → exit $tn_status"
+      [ "$tn_status" -eq 0 ] && break
+      if [ "$tn_t" -lt 3 ]; then
+        echo "  retrying in $((tn_t * 3))s"
+        sleep "$((tn_t * 3))"
+      fi
+    done
+    if [ "$tn_status" -eq 0 ]; then
+      tn_egress_ok=$((tn_egress_ok + 1))
+    else
+      echo "::warning::outbound from the own-IP session's task to example.$tn_h failed all 3 attempts; not fatal while the other host still proves egress"
+      cat "$WORK/tn-egress.err" 2>/dev/null || true
+    fi
+  done
+  if [ "$tn_egress_ok" -eq 0 ]; then
+    echo "::error::a task in an own-IP session completed an outbound request against no host — its egress does not work"
+    echo "--- last task stderr ---"; cat "$WORK/tn-egress.err" 2>/dev/null || true
+    mnl session destroy --force "$tn_sid" >/dev/null 2>&1 || true
+    kill "$TN_LISTENER_PID" 2>/dev/null || true
+    TN_LISTENER_PID=""
+    fail
+  fi
+  echo "own-IP session task: egress OK ($tn_egress_ok of 2 hosts answered)"
+
+  # Loopback: the listener answers on the host, and the task still cannot
+  # reach it — its 127.0.0.1 is its own namespace's loopback.
+  mnl session run "$tn_sid" e2e-tn-loopback >/dev/null 2>"$WORK/tn-loopback.err"
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    echo "::error::a task in an own-IP session reached the host's listener at 127.0.0.1:$TN_LB_PORT — its loopback is not its own"
+    mnl session destroy --force "$tn_sid" >/dev/null 2>&1 || true
+    kill "$TN_LISTENER_PID" 2>/dev/null || true
+    TN_LISTENER_PID=""
+    fail
+  fi
+  echo "own-IP session task: 127.0.0.1:$TN_LB_PORT unreachable (exit $rc: $(head -n1 "$WORK/tn-loopback.err" 2>/dev/null || true))"
+  mnl session destroy --force "$tn_sid" >/dev/null 2>&1 || true
+
+  # -- none: the task has no network at all ----------------------------------
+  tn_none_sid="$(cd "$TN_SEED_DIR" && mnl session activate . --no-prompt \
+    --name e2e-tn-none --network none 2>"$WORK/tn-none-activate.err")" || {
+    echo "::error::'min session activate --network none' failed for the task-network proof"
+    echo "--- stderr ---"; cat "$WORK/tn-none-activate.err" 2>/dev/null || true
+    kill "$TN_LISTENER_PID" 2>/dev/null || true
+    TN_LISTENER_PID=""
+    fail
+  }
+  tn_none_sid="$(printf '%s\n' "$tn_none_sid" | tail -n1 | tr -d '\r')"
+  mnl session run "$tn_none_sid" e2e-tn-egress-com >/dev/null 2>"$WORK/tn-none-egress.err"
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    echo "::error::a task in a none session completed an outbound request — it has no network"
+    mnl session destroy --force "$tn_none_sid" >/dev/null 2>&1 || true
+    kill "$TN_LISTENER_PID" 2>/dev/null || true
+    TN_LISTENER_PID=""
+    fail
+  fi
+  echo "none session task: outbound refused (exit $rc: $(head -n1 "$WORK/tn-none-egress.err" 2>/dev/null || true))"
+  mnl session destroy --force "$tn_none_sid" >/dev/null 2>&1 || true
+
+  kill "$TN_LISTENER_PID" 2>/dev/null || true
+  TN_LISTENER_PID=""
+  rm -rf "$TN_SEED_DIR"; TN_SEED_DIR=""
+  echo "task network proof OK (own-IP: egress via the switch, host loopback unreachable; none: no network)"
+  echo "::endgroup::"
+  fi
 fi
 }
 
@@ -21871,6 +22037,7 @@ case "${1:-}" in
     proof_own_ip
     proof_own_ip_egress_declared_and_enforced
     proof_task_run
+    proof_task_network_inherits_session
     proof_hooks
     proof_skip_scaffold
     proof_tty_relay
@@ -21946,7 +22113,7 @@ case "${1:-}" in
     # rely on the lane's daemon or the host's packet filter as it found them.
     proof_daemon_fetch_under_deny_all_host_address_box
     ;;
-  lifecycle | session_exec | session_rename | session_outbound_request | own_ip | own_ip_egress_declared_and_enforced | task_run | hooks \
+  lifecycle | session_exec | session_rename | session_outbound_request | own_ip | own_ip_egress_declared_and_enforced | task_run | task_network_inherits_session | hooks \
     | skip_scaffold | tty_relay | sandbox | restart | fresh_install_own_ip_ingress_publishes_loopback \
     | own_ip_box_registers_with_the_vm_host_without_a_provider_flag \
     | vm_host_row_read_tracks_create_and_destroy \
@@ -21979,7 +22146,7 @@ case "${1:-}" in
   *)
     echo "usage: $0 [case]"
     echo "  no argument: every proof, in the whole-lane order"
-    echo "  cases: lifecycle session_exec session_rename session_outbound_request own_ip own_ip_egress_declared_and_enforced task_run hooks"
+    echo "  cases: lifecycle session_exec session_rename session_outbound_request own_ip own_ip_egress_declared_and_enforced task_run task_network_inherits_session hooks"
     echo "         skip_scaffold tty_relay sandbox restart fresh_install_own_ip_ingress_publishes_loopback"
     echo "         own_ip_box_registers_with_the_vm_host_without_a_provider_flag"
     echo "         vm_host_row_read_tracks_create_and_destroy"
