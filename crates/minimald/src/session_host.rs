@@ -58,6 +58,17 @@ const CHORD_FLUSH_IDLE: std::time::Duration = std::time::Duration::from_millis(5
 /// [`SHELL_EXIT_PROMPT`].
 pub(crate) const SHELL_EXIT_NO_CHANGES: &str = "No files changed since activation.";
 
+/// The shell-exit prompt's Keep item.
+pub(crate) const SHELL_EXIT_KEEP: &str =
+    "Exit, leaving the session filesystem in place and recoverable";
+
+/// The Keep item for a registered box, whose host-side row ended with its
+/// shell (NET-138): the session keeps its files but can only be destroyed.
+/// Removed when the host-side re-registration lands (inbox#1020).
+pub(crate) const SHELL_EXIT_KEEP_REGISTERED: &str = "Exit, keeping the session's files. Its \
+     network registration ended with the shell, so you can only destroy this session, not \
+     attach to it or run commands in it.";
+
 /// Header of the dialog a runtime port-publish request decided `ask` renders
 /// over the channel (NET-045), asking the attached human whether the box may
 /// publish the port. Exposed so tests can await its appearance in the
@@ -519,6 +530,10 @@ struct Binding {
     /// Daemon-side directory the save-then-delete lane archives into
     /// (`<minimal_state_dir>/archives`). Created on demand at save time.
     archives_dir: std::path::PathBuf,
+    /// Whether the box is registered (see [`HostParams::holds_host_row`]):
+    /// the shell-exit prompt's Keep item says the session cannot be
+    /// attached to again.
+    holds_host_row: bool,
     /// Cancelled by the host when it sheds this binding (see
     /// [`Host::shed_binding`]). A separate signal rather than a
     /// [`BindingMsg`], because a binding is shed exactly when its mailbox is
@@ -580,6 +595,10 @@ async fn retire_binding((tx, mut task, shed): BindingSlot, msg: BindingMsg) {
 impl Binding {
     /// Spawns a new binding task for a given channel, returning objects
     /// which the owning [`Host`] should own to communicate with it.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one call site, which hands over the host's per-binding facts by name"
+    )]
     pub(crate) async fn spawn(
         channel: Channel<Msg>,
         stdin_tx: mpsc::Sender<StdinMsg>,
@@ -588,6 +607,7 @@ impl Binding {
         delta: Option<Arc<DeltaSource>>,
         name: String,
         archives_dir: std::path::PathBuf,
+        holds_host_row: bool,
     ) -> BindingSlot {
         let (tx, rx) = mpsc::channel(4);
         let shed = CancellationToken::new();
@@ -601,6 +621,7 @@ impl Binding {
             delta,
             name,
             archives_dir,
+            holds_host_row,
             shed: shed.clone(),
         };
 
@@ -947,6 +968,7 @@ impl Binding {
                     self.control.as_ref(),
                     &self.archives_dir,
                     &self.name,
+                    self.holds_host_row,
                     rs.make_reader(),
                     &mut w,
                 )
@@ -1190,6 +1212,7 @@ impl Binding {
         control: Option<&SessionControl>,
         archives_dir: &std::path::Path,
         name: &str,
+        holds_host_row: bool,
         mut r: R,
         mut w: W,
     ) -> ExitDisposition
@@ -1246,8 +1269,16 @@ impl Binding {
             Delete,
         }
 
-        let mut items =
-            vec!["Exit, leaving the session filesystem in place and recoverable".to_string()];
+        // A registered box's host-side row ended with its shell (NET-138), and
+        // the daemon refuses to hand it a rowless host, so keeping it keeps its
+        // files and nothing else. This wording is removed when the host-side
+        // re-registration lands (inbox#1020).
+        let keep_item = if holds_host_row {
+            SHELL_EXIT_KEEP_REGISTERED
+        } else {
+            SHELL_EXIT_KEEP
+        };
+        let mut items = vec![keep_item.to_string()];
         let mut choices = vec![ExitChoice::Keep];
         // Destination for the save-then-delete lane, fixed while the prompt
         // is up so the rendered path is the path written — including across
@@ -2316,6 +2347,10 @@ pub(crate) struct Host<P: SessionProcess, G: SessionGuard> {
     // Daemon-side directory the save-then-delete lane archives into, handed
     // to each binding alongside `delta`.
     archives_dir: std::path::PathBuf,
+
+    // Whether the box is registered (see [`HostParams::holds_host_row`]),
+    // handed to each binding for its shell-exit prompt.
+    holds_host_row: bool,
 
     // The per-channel session-key chord matcher: the negotiated leader chord
     // that enters command mode, the detach/forward subcommand keys, the bell
@@ -4957,6 +4992,10 @@ pub(crate) struct HostParams {
     pub control: Option<SessionControl>,
     pub delta: Option<Arc<DeltaSource>>,
     pub archives_dir: std::path::PathBuf,
+    /// Whether the session's record carries host-handed addresses (T66): the
+    /// box is registered, so its host-side row ends with this host's shell
+    /// (NET-138). The shell-exit prompt words its Keep item for that.
+    pub holds_host_row: bool,
     pub session_id: sessions::SessionId,
     pub composition: Option<Arc<sessions::core::compose::Composition>>,
     pub connection_env: ConnectionEnv,
@@ -5228,6 +5267,7 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
             control,
             delta,
             archives_dir,
+            holds_host_row,
             session_id,
             composition,
             connection_env,
@@ -5355,6 +5395,7 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
             workspace_root,
             session_name,
             archives_dir,
+            holds_host_row,
             connection_env,
             home_dir,
             seal_injection,
@@ -6137,6 +6178,7 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
             self.delta.clone(),
             self.session_name.clone(),
             self.archives_dir.clone(),
+            self.holds_host_row,
         )
         .await;
 

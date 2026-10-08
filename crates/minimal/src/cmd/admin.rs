@@ -78,7 +78,10 @@ where
         match tokio::io::copy(&mut stdin, &mut tx).await {
             // The daemon closed its end, so there is no write half left to
             // shut down: macOS fails that shutdown with ENOTCONN.
-            Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => {
+                tracing::debug!(error = %err, "stdin→daemon copy ended: daemon stopped reading");
+                Ok(())
+            }
             res => {
                 res?;
                 tx.shutdown().await
@@ -110,7 +113,10 @@ where
 /// pipe (os error 32)`.
 fn ignore_broken_pipe(result: std::io::Result<u64>) -> std::io::Result<u64> {
     match result {
-        Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => Ok(0),
+        Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => {
+            tracing::debug!(error = %err, "daemon→stdout copy ended: downstream reader closed");
+            Ok(0)
+        }
         other => other,
     }
 }
@@ -497,18 +503,66 @@ mod tests {
         });
     }
 
+    /// A shared buffer the DEBUG capture subscriber renders into.
+    #[derive(Clone, Default)]
+    struct DebugLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for DebugLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("the test owns the log")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl DebugLog {
+        /// Everything rendered so far.
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().expect("the test owns the log")).into_owned()
+        }
+    }
+
+    /// Capture every DEBUG line the current thread emits while the guard
+    /// lives. The current-thread test runtime drives the bridge on the test's
+    /// own thread, so the thread-local default subscriber sees its lines; no
+    /// global subscriber is installed.
+    fn capture_debug_lines() -> (DebugLog, tracing::subscriber::DefaultGuard) {
+        let log = DebugLog::default();
+        let writer = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        (log, guard)
+    }
+
     /// When the downstream reader closes early (BrokenPipe), the bridge treats
     /// it as normal termination rather than surfacing `error: proxy: Broken
-    /// pipe (os error 32)`.
+    /// pipe (os error 32)`. The swallow is still visible as a DEBUG line
+    /// naming the side whose pipe broke.
     #[tokio::test]
     async fn proxy_bridge_exits_quietly_on_broken_pipe() {
         let (bridge, daemon) = tokio::net::UnixStream::pair().expect("socket pair");
         writing_daemon(daemon);
         let stdout = FailingWriter(std::io::ErrorKind::BrokenPipe);
 
+        let (log, _guard) = capture_debug_lines();
         proxy_bridge(bridge, &[][..], stdout)
             .await
             .expect("a broken pipe downstream is not a proxy failure");
+        assert!(
+            log.text().contains("daemon→stdout"),
+            "the swallowed pipe must be logged naming its side, got {:?}",
+            log.text()
+        );
     }
 
     /// Any error other than BrokenPipe is still surfaced with the `proxy`
@@ -529,10 +583,11 @@ mod tests {
     }
 
     /// When the daemon stops reading first, the stdin-to-socket copy hits
-    /// `BrokenPipe`. The bridge treats that as normal termination and still
-    /// drains the daemon's remaining output to stdout instead of failing or
-    /// truncating it. Linux only: there a write to a peer that shut down its
-    /// read side fails with `EPIPE` at once.
+    /// `BrokenPipe`. The bridge treats that as normal termination — logged as
+    /// a DEBUG line naming the stdin→daemon side — and still drains the
+    /// daemon's remaining output to stdout instead of failing or truncating
+    /// it. Linux only: there a write to a peer that shut down its read side
+    /// fails with `EPIPE` at once.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn proxy_bridge_drains_daemon_output_after_stdin_broken_pipe() {
@@ -558,6 +613,7 @@ mod tests {
         });
 
         let mut stdout = Vec::new();
+        let (log, _guard) = capture_debug_lines();
         tokio::time::timeout(
             std::time::Duration::from_secs(10),
             proxy_bridge(bridge, tokio::io::repeat(b'x'), &mut stdout),
@@ -566,5 +622,10 @@ mod tests {
         .expect("the bridge must not hang after a broken pipe")
         .expect("a broken pipe towards the daemon is not a proxy failure");
         assert_eq!(stdout, b"hello", "the daemon's output must be drained");
+        assert!(
+            log.text().contains("stdin→daemon"),
+            "the swallowed pipe must be logged naming its side, got {:?}",
+            log.text()
+        );
     }
 }
