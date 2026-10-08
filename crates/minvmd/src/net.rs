@@ -88,7 +88,10 @@ pub use egress_gate::EgressGate;
 pub mod answerer;
 mod forward_revoke;
 mod shuttle;
+mod stale_gvproxy;
 pub use shuttle::{VSOCK_GVPROXY_SHUTTLE_PORT, resolve_gate_sock, resolve_switch_sock};
+#[cfg_attr(not(minvmd_libkrun), allow(unused_imports))]
+pub(crate) use stale_gvproxy::reap_stale_gvproxy;
 mod baseline;
 pub use baseline::{NodeBaselinePhase, NodePlaneBaseline};
 pub use switch::bep_host::{BepBoxSource, BepWire};

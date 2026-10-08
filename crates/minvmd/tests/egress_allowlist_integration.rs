@@ -850,7 +850,10 @@ async fn configure_and_finalize(
             .await
             .map_err(|e| format!("request_subsystem: {e}"))?;
 
-        let req = FinalizeSessionRequest { session_id };
+        let req = FinalizeSessionRequest {
+            session_id,
+            report_shared_port_collisions: false,
+        };
         let body = serde_json_lenient::to_vec(&req)
             .map_err(|e| format!("serialize FinalizeSession request: {e}"))?;
         let mut rpc = channel.into_stream();

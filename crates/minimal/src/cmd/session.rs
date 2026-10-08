@@ -49,6 +49,18 @@ async fn control_request_with_vm_host(
     sock_path: &std::path::Path,
     request: minimald_rpc::BoxControlRequest,
 ) -> anyhow::Result<minimald_rpc::BoxControlReply> {
+    control_exchange_with_vm_host(sock_path, request)
+        .await
+        .map(|(reply, _stream)| reply)
+}
+
+/// [`control_request_with_vm_host`] that hands the connection back beside
+/// the reply, for a verb whose connection outlives its one exchange — the
+/// held registration's lease ([`BoxLease`]).
+async fn control_exchange_with_vm_host(
+    sock_path: &std::path::Path,
+    request: minimald_rpc::BoxControlRequest,
+) -> anyhow::Result<(minimald_rpc::BoxControlReply, tokio::net::UnixStream)> {
     use tokio::io::AsyncBufReadExt as _;
     use tokio::io::AsyncWriteExt as _;
 
@@ -68,7 +80,9 @@ async fn control_request_with_vm_host(
         .await
         .context("writing the box control request")?;
     let mut reply = String::new();
-    tokio::io::BufReader::new(stream)
+    // The daemon writes nothing past its one reply line until the client
+    // writes again, so the reader buffers nothing the connection still owes.
+    tokio::io::BufReader::new(&mut stream)
         .read_line(&mut reply)
         .await
         .context("reading the box control reply")?;
@@ -81,7 +95,59 @@ async fn control_request_with_vm_host(
         .with_context(|| {
             format!("the VM host daemon's box control reply did not parse: {reply}")
         })?;
-    Ok(reply)
+    Ok((reply, stream))
+}
+
+/// A held registration's lease ([`minimald_rpc::RegisterBoxRequest::hold`]):
+/// the connection the registration was answered on, kept open while the
+/// activation runs. Dropping it uncommitted — an activation that fails, is
+/// interrupted, or dies — closes the connection, and the VM host daemon
+/// withdraws the row on that close, so a row whose activation never went
+/// active does not hold its name until the daemon restarts. [`Self::commit`]
+/// keeps the row once the session is active.
+#[derive(Debug)]
+struct BoxLease {
+    stream: tokio::net::UnixStream,
+}
+
+impl BoxLease {
+    /// Commit the lease: write the one commit line and close, so the row
+    /// stays when the connection does. A commit that cannot be written is
+    /// a daemon that already closed the lease — one that predates leases
+    /// and answered one-shot, or one that went away — and is logged, not
+    /// fatal: the session is already active.
+    async fn commit(mut self) {
+        use tokio::io::AsyncWriteExt as _;
+        let line = format!("{}\n", minimald_rpc::REGISTRATION_COMMIT_LINE);
+        match tokio::time::timeout(BOX_CONTROL_TIMEOUT, self.stream.write_all(line.as_bytes()))
+            .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::debug!(%error, "could not commit the box's registration lease");
+            }
+            Err(_) => tracing::debug!(
+                "the box's registration lease commit did not complete in {BOX_CONTROL_TIMEOUT:?}"
+            ),
+        }
+    }
+}
+
+/// Run `finalize` — the step that makes the session active — with the
+/// registration's lease held across it, and commit the lease only when it
+/// succeeds. A failure drops the lease uncommitted, so the VM host daemon
+/// withdraws the row with the activation.
+async fn finalize_holding_lease<T>(
+    lease: Option<BoxLease>,
+    finalize: impl std::future::Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    let finalized = finalize.await;
+    if finalized.is_ok()
+        && let Some(lease) = lease
+    {
+        lease.commit().await;
+    }
+    finalized
 }
 
 /// What a successful registration with the VM host daemon hands the
@@ -102,6 +168,10 @@ struct RegisteredWithVmHost {
     /// the one spelling the row, the attachment and a diagnostic all name
     /// it by — or `None` when the answering daemon predates ids.
     box_id: Option<minimald_rpc::BoxId>,
+    /// The registration's lease, held until the session is active and
+    /// committed then; `None` from a daemon that predates ids, which
+    /// predates leases too and answered one-shot.
+    lease: Option<BoxLease>,
 }
 
 /// Registers an own-address box with the VM host daemon over its control
@@ -110,26 +180,29 @@ async fn register_box_with_vm_host(
     sock_path: &std::path::Path,
     request: minimald_rpc::RegisterBoxRequest,
 ) -> anyhow::Result<RegisteredWithVmHost> {
-    match control_request_with_vm_host(
+    let (reply, stream) = control_exchange_with_vm_host(
         sock_path,
         minimald_rpc::BoxControlRequest::Register(request),
     )
-    .await?
-    {
+    .await?;
+    match reply {
         // The answer a daemon this build boots beside sends: the addresses
-        // beside the id the published row holds.
+        // beside the id the published row holds, on the connection a held
+        // registration keeps as its lease.
         minimald_rpc::BoxControlReply::Registered(web) => Ok(RegisteredWithVmHost {
             addresses: sessions::BoxAddresses {
                 switch_address: web.switch_address,
                 loopback_address: web.loopback_address,
             },
             box_id: Some(web.box_id),
+            lease: Some(BoxLease { stream }),
         }),
         // A daemon that predates ids answers with the bare pair the
         // registration has always been answered with.
         minimald_rpc::BoxControlReply::Addresses(addresses) => Ok(RegisteredWithVmHost {
             addresses,
             box_id: None,
+            lease: None,
         }),
         minimald_rpc::BoxControlReply::Error { error } => {
             anyhow::bail!("the VM host daemon refused the box registration: {error}")
@@ -543,6 +616,10 @@ async fn register_box_for_activation(
             .ingress
             .as_ref()
             .and_then(|ingress| ingress.dynamic_allowed_range),
+        // The row is held as a lease until the session is active: an
+        // activation that dies before then — an interrupt, a crash, a
+        // withdrawal that never lands — leaves no row holding its name.
+        hold: true,
     };
     let registration = tokio::time::timeout(
         BOX_CONTROL_TIMEOUT,
@@ -573,6 +650,38 @@ async fn register_box_for_activation(
              {BOX_CONTROL_TIMEOUT:?}; the session does not start with the box \
              unregistered"
         )),
+    }
+}
+
+/// [`register_box_for_activation`] for an activation whose session name may
+/// be autogen. The VM host daemon refuses a registration whose name folds
+/// to one a live row already holds; for an autogen `name` that refusal is a
+/// name collision like the create's, so the name is re-minted with `remint`
+/// and registered again, within the bounded budget ([`should_retry_autogen`])
+/// the `CreateSession` collision retry spends — `attempts` is shared with
+/// it. A refused registration publishes no row, so nothing is withdrawn
+/// between attempts. A user-supplied name, any other failure, and a spent
+/// budget surface the error unchanged. The refusal is matched across the
+/// whole error chain: the daemon's reason is its innermost cause.
+#[allow(clippy::too_many_arguments)]
+async fn register_box_reminting_autogen(
+    kind: paths::ProviderKind,
+    minimal_dir: Option<&std::path::Path>,
+    network: sessions::NetworkMode,
+    name: &mut String,
+    policy: &sessions::SessionPolicy,
+    autogen: bool,
+    attempts: &mut u32,
+    mut remint: impl FnMut() -> String,
+) -> anyhow::Result<Option<RegisteredWithVmHost>> {
+    loop {
+        match register_box_for_activation(kind, minimal_dir, network, name, policy).await {
+            Err(error) if should_retry_autogen(autogen, *attempts, &format!("{error:#}")) => {
+                *attempts += 1;
+                *name = remint();
+            }
+            registered => return registered,
+        }
     }
 }
 
@@ -917,15 +1026,23 @@ pub(crate) async fn activate_session(
     // resolved once, here, and the withdrawals ride on it.
     let kind = daemon_provider_kind(global);
     let control_sock = vm_host_control_sock(kind, global.minimal_dir.as_deref());
-    let mut registered = register_box_for_activation(
+    // An autogen name can collide with a live box's row the same way it
+    // can with a session (the row stays live until its session's destroy):
+    // the registration's refusal re-mints it within the same budget the
+    // create's collision retry below spends.
+    let mut attempts = 0u32;
+    let mut registered = register_box_reminting_autogen(
         kind,
         global.minimal_dir.as_deref(),
         config.network,
         config
             .name
-            .as_deref()
+            .as_mut()
             .expect("the session name is minted before the create"),
         &config.policy,
+        autogen,
+        &mut attempts,
+        || autogen_session_name(&utf8_path, &random_hex4()),
     )
     .await?;
     // The registration is the client's record of the box: the addresses
@@ -942,7 +1059,7 @@ pub(crate) async fn activate_session(
     // re-mint the hex suffix and retry a bounded number of times. A
     // user-supplied name never retries — its collision, and any other failure
     // (e.g. a policy/network-mode validation error), surfaces unchanged.
-    let mut attempts = 0u32;
+    // `attempts` carries over from the registration's own collision retry.
     let created = loop {
         let resp = client
             .oneshot_rpc::<CreateSession>(CreateSessionRequest {
@@ -984,6 +1101,8 @@ pub(crate) async fn activate_session(
                         config.box_addresses,
                     )
                     .await;
+                    // The abandoned row's lease goes with it, uncommitted.
+                    drop(registered.take());
                     config.name = Some(autogen_session_name(&utf8_path, &random_hex4()));
                     // A registered box's row carries the name it was
                     // registered under (T66), so the re-mint re-registers;
@@ -998,12 +1117,15 @@ pub(crate) async fn activate_session(
                     // reused, so the re-registration is a new creation, and
                     // the host mints it a new id, which replaces the record
                     // (NET-133).
-                    registered = register_box_for_activation(
+                    registered = register_box_reminting_autogen(
                         kind,
                         global.minimal_dir.as_deref(),
                         config.network,
-                        config.name.as_deref().expect("just re-minted"),
+                        config.name.as_mut().expect("just re-minted"),
                         &config.policy,
+                        autogen,
+                        &mut attempts,
+                        || autogen_session_name(&utf8_path, &random_hex4()),
                     )
                     .await?;
                     config.box_addresses = registered
@@ -1662,12 +1784,21 @@ pub(crate) async fn activate_session(
     // are exact matches (same source), so collapsing is safe.
     collected_patches.sort_by(|a, b| a.1.as_str().cmp(b.1.as_str()));
     collected_patches.dedup_by(|a, b| a.1.as_str() == b.1.as_str());
-    if let Err(e) = upload_and_finalize(
-        &mut client,
-        id,
-        &collected_patches,
-        &hook_scripts,
-        finalize_hook_budget,
+    // The registration's lease is held across the finalize and committed
+    // only once the session is active: until then an activation that dies
+    // leaves the VM host daemon to withdraw the row on the lease's close.
+    let lease = registered
+        .as_mut()
+        .and_then(|registration| registration.lease.take());
+    if let Err(e) = finalize_holding_lease(
+        lease,
+        upload_and_finalize(
+            &mut client,
+            id,
+            &collected_patches,
+            &hook_scripts,
+            finalize_hook_budget,
+        ),
     )
     .await
     {
@@ -1926,7 +2057,7 @@ pub(crate) fn resolve_smart_attach(
                     attach::created_from_suffix(&entry, &cwd)
                 );
             }
-            Ok(SmartAttach::Attach(entry))
+            Ok(SmartAttach::Attach(Box::new(entry)))
         }
         attach::SmartResolve::Pick(cands) => {
             if global.no_input || !attach::can_pick_interactively() {
@@ -1943,8 +2074,9 @@ pub(crate) fn resolve_smart_attach(
 
 /// Outcome of smart attach resolution when the user gave no explicit session.
 pub(crate) enum SmartAttach {
-    /// Attach to this resolved or picked session.
-    Attach(minimald_rpc::ListSessionsEntry),
+    /// Attach to this resolved or picked session. Boxed: the entry is far
+    /// larger than the other arms, which carry nothing.
+    Attach(Box<minimald_rpc::ListSessionsEntry>),
     /// The picker's create row was chosen: activate a fresh session for the
     /// cwd and attach, exactly as `min session activate --attach .` would.
     CreateForCwd,
@@ -2288,6 +2420,10 @@ pub async fn cmd_session_policy(
         Ok(minimald_rpc::Errorable::Err { .. }) | Err(_) => None,
     };
     let host_ip_enforcement = facts.as_ref().and_then(|facts| facts.host_ip_enforcement);
+    let shared_port_collisions = facts
+        .as_ref()
+        .map(|facts| facts.shared_port_collisions.clone())
+        .unwrap_or_default();
     // (NET-044) — the rows that make a `min net expose` visible rather than
     // only permitted. Fetched through the text walk's own degrade of the
     // shared fetch: warn on stderr and print no section — the JSON
@@ -2318,6 +2454,7 @@ pub async fn cmd_session_policy(
                 &policy,
                 record.network,
                 host_ip_enforcement,
+                &shared_port_collisions,
                 fabric,
             )?;
             write_live_ingress(&mut out, &live)?;
@@ -2483,6 +2620,7 @@ pub fn format_policy(
     effective: &sessions::EffectiveSessionPolicy,
     network: sessions::NetworkMode,
     host_ip_enforcement: Option<sessions::HostIpEnforcement>,
+    shared_port_collisions: &[minimald_rpc::SharedPortCollision],
     fabric: Option<switch::SwitchSubnet>,
 ) -> Result<(), anyhow::Error> {
     // A none box has no network, so it can carry no egress or ingress
@@ -2612,11 +2750,29 @@ pub fn format_policy(
                     writeln!(out, "  deny-all")?;
                 }
                 for mapping in &ingress.port_mappings {
-                    writeln!(
-                        out,
-                        "  {}  :{} → :{}",
-                        mapping.proto, mapping.external_port, mapping.internal_port
-                    )?;
+                    // NET-129: a declared port another box at the same shared
+                    // loopback address holds is served by that box — this
+                    // box's attach yielded the forward (first-come) — so the
+                    // row says whose it is rather than reading as this box's
+                    // own. Every other declared row prints as before; an
+                    // empty list, or one a client too old to fetch could not
+                    // pass, marks nothing.
+                    let held_by = shared_port_collisions
+                        .iter()
+                        .find(|c| c.port == mapping.external_port)
+                        .map(|c| format!(" (held by {})", c.held_by));
+                    match held_by {
+                        Some(mark) => writeln!(
+                            out,
+                            "  {}  :{} → :{}{}",
+                            mapping.proto, mapping.external_port, mapping.internal_port, mark
+                        )?,
+                        None => writeln!(
+                            out,
+                            "  {}  :{} → :{}",
+                            mapping.proto, mapping.external_port, mapping.internal_port
+                        )?,
+                    }
                 }
             }
         }
@@ -2884,6 +3040,18 @@ struct PolicyJson<'a> {
     /// rendering's warning lines, for a machine. Absent when there are none.
     #[serde(skip_serializing_if = "<[u16]>::is_empty")]
     unaudited_listen_ports: &'a [u16],
+    /// NET-129: the declared ports this box yields because another box at
+    /// the same shared loopback address holds them, as the wire's own rows
+    /// (`port`, and the holding box as `held_by`) — the text rendering's
+    /// "(held by …)" marks. Omitted when empty, the reading a daemon that
+    /// predates the fact, or a facts fetch that failed, also leaves.
+    #[serde(skip_serializing_if = "no_shared_port_collisions")]
+    shared_port_collisions: &'a [minimald_rpc::SharedPortCollision],
+}
+
+/// Serde helper: leave [`PolicyJson::shared_port_collisions`] out when empty.
+fn no_shared_port_collisions(rows: &&[minimald_rpc::SharedPortCollision]) -> bool {
+    rows.is_empty()
 }
 
 /// The live rows as the document carries them — the two states a client
@@ -2918,8 +3086,17 @@ pub fn write_policy_json(
     network: sessions::NetworkMode,
     fabric: Option<switch::SwitchSubnet>,
     live: Result<Vec<minimald_rpc::LiveMapping>, String>,
+    shared_port_collisions: &[minimald_rpc::SharedPortCollision],
 ) -> Result<(), anyhow::Error> {
-    write_policy_json_noting(out, effective, network, fabric, live, &[])
+    write_policy_json_noting(
+        out,
+        effective,
+        network,
+        fabric,
+        live,
+        shared_port_collisions,
+        &[],
+    )
 }
 
 /// [`write_policy_json`], with the permitted listening ports the daemon left
@@ -2933,6 +3110,7 @@ pub fn write_policy_json_noting(
     network: sessions::NetworkMode,
     fabric: Option<switch::SwitchSubnet>,
     live: Result<Vec<minimald_rpc::LiveMapping>, String>,
+    shared_port_collisions: &[minimald_rpc::SharedPortCollision],
     unaudited_listen_ports: &[u16],
 ) -> Result<(), anyhow::Error> {
     // A none box has no policy to describe; the text rendering's one-line
@@ -2947,6 +3125,7 @@ pub fn write_policy_json_noting(
             node_plane_baseline: None,
             live_ingress: None,
             unaudited_listen_ports: &[],
+            shared_port_collisions: &[],
         }
     } else {
         // The baseline set is a switch-fabric surface, held to the same
@@ -2994,6 +3173,13 @@ pub fn write_policy_json_noting(
                 Err(_) => LiveIngressJson::Unavailable,
             }),
             unaudited_listen_ports,
+            // Ingress's own gate: a host-address box has no per-session
+            // ingress, so it yields nothing a key could claim.
+            shared_port_collisions: if network == sessions::NetworkMode::HostNet {
+                &[]
+            } else {
+                shared_port_collisions
+            },
         }
     };
     let encoded =
@@ -3121,6 +3307,7 @@ async fn session_policy_json_inputs(
         sessions::EffectiveSessionPolicy,
         Result<Vec<minimald_rpc::LiveMapping>, String>,
         Vec<u16>,
+        Vec<minimald_rpc::SharedPortCollision>,
     ),
     PolicyJsonFailure,
 > {
@@ -3156,23 +3343,33 @@ async fn session_policy_json_inputs(
         .map_err(|error| PolicyJsonFailure::PolicyUnavailable(format!("{error:#}")))?;
 
     let live = fetch_live_ingress(&mut client, session).await;
-    // The listen publishes the audit log refused (NET-046), from the runtime
-    // facts the text walk reads them from. An optional fact: a daemon that
-    // cannot serve it says nothing to warn about.
+    // The listen publishes the audit log refused (NET-046) and the yielded
+    // shared-address ports (NET-129), from the runtime facts the text walk
+    // reads them from. Optional facts: a daemon that cannot answer — an older
+    // build, a session mid-teardown — leaves both keys out, as a box with
+    // nothing to say does.
     let facts_lookup = match SessionLookup::parse(session) {
         SessionLookup::Id(id) => minimald_rpc::GetSessionRuntimeFactsRequest::Id(id),
         SessionLookup::Name(n) => minimald_rpc::GetSessionRuntimeFactsRequest::Name(n),
     };
-    let unaudited_listen_ports = match client
+    let (unaudited_listen_ports, shared_port_collisions) = match client
         .oneshot_rpc::<minimald_rpc::GetSessionRuntimeFacts>(facts_lookup)
         .await
     {
-        Ok(minimald_rpc::Errorable::Ok(facts)) => facts.unaudited_listen_ports,
-        Ok(minimald_rpc::Errorable::Err { .. }) | Err(_) => Vec::new(),
+        Ok(minimald_rpc::Errorable::Ok(facts)) => {
+            (facts.unaudited_listen_ports, facts.shared_port_collisions)
+        }
+        Ok(minimald_rpc::Errorable::Err { .. }) | Err(_) => (Vec::new(), Vec::new()),
     };
 
     match resp {
-        minimald_rpc::Errorable::Ok(policy) => Ok((record, policy, live, unaudited_listen_ports)),
+        minimald_rpc::Errorable::Ok(policy) => Ok((
+            record,
+            policy,
+            live,
+            unaudited_listen_ports,
+            shared_port_collisions,
+        )),
         minimald_rpc::Errorable::Err { error } => {
             Err(PolicyJsonFailure::PolicyUnavailable(error.to_string()))
         }
@@ -3188,7 +3385,7 @@ async fn session_policy_json_inputs(
 /// by every command that takes `-o json` — writes, so the error path is
 /// one mechanism rather than a per-command one.
 async fn session_policy_as_json(global: &GlobalArgs, session: &str) -> Result<(), anyhow::Error> {
-    let (record, policy, live, unaudited_listen_ports) =
+    let (record, policy, live, unaudited_listen_ports, shared_port_collisions) =
         match session_policy_json_inputs(global, session).await {
             Ok(inputs) => inputs,
             Err(failure) => return Err(failure.machine_failure().into()),
@@ -3206,6 +3403,7 @@ async fn session_policy_as_json(global: &GlobalArgs, session: &str) -> Result<()
         record.network,
         fabric,
         live,
+        &shared_port_collisions,
         &unaudited_listen_ports,
     )
     .context(OutputWriteError)?;
@@ -4163,7 +4361,7 @@ mod tests {
             ("allower", DynamicIngress::Allow),
             ("denier", DynamicIngress::Deny),
         ] {
-            stand.register(name, stance).await;
+            let _held = stand.register(name, stance).await;
             let row = stand
                 .registry
                 .row_by_name(name)
@@ -4451,7 +4649,7 @@ mod tests {
             }),
         };
         let mut out = Vec::new();
-        format_policy(&mut out, &policy, NetworkMode::OwnIp, None, None).unwrap();
+        format_policy(&mut out, &policy, NetworkMode::OwnIp, None, &[], None).unwrap();
         let rendered = String::from_utf8(out).unwrap();
         assert!(
             rendered.contains("  dynamic ingress  allow"),
@@ -4478,7 +4676,7 @@ mod tests {
             }),
         };
         let mut out = Vec::new();
-        format_policy(&mut out, &policy, NetworkMode::OwnIp, None, None).unwrap();
+        format_policy(&mut out, &policy, NetworkMode::OwnIp, None, &[], None).unwrap();
         let rendered = String::from_utf8(out).unwrap();
         assert!(
             rendered.contains("  tcp  :8080 → :80"),
@@ -4501,7 +4699,7 @@ mod tests {
             ingress: None,
         };
         let mut out = Vec::new();
-        format_policy(&mut out, &policy, NetworkMode::OwnIp, None, None).unwrap();
+        format_policy(&mut out, &policy, NetworkMode::OwnIp, None, &[], None).unwrap();
         let rendered = String::from_utf8(out).unwrap();
         assert!(rendered.contains("egress\n"), "{rendered}");
         assert!(rendered.contains("  allow-all\n"), "{rendered}");
@@ -4532,7 +4730,7 @@ mod tests {
 
         // Own-address: the name, and no dimension rows — never blankness.
         let mut out = Vec::new();
-        format_policy(&mut out, &declared, NetworkMode::OwnIp, None, None).unwrap();
+        format_policy(&mut out, &declared, NetworkMode::OwnIp, None, &[], None).unwrap();
         let rendered = String::from_utf8(out).unwrap();
         assert!(
             rendered.contains("egress\n  deny-all\n"),
@@ -4560,7 +4758,7 @@ mod tests {
             ingress: None,
         };
         let mut out = Vec::new();
-        format_policy(&mut out, &defaulted, NetworkMode::OwnIp, None, None).unwrap();
+        format_policy(&mut out, &defaulted, NetworkMode::OwnIp, None, &[], None).unwrap();
         let default_rendered = String::from_utf8(out).unwrap();
         assert!(
             default_rendered.contains("egress\n  deny-all (default)\n"),
@@ -4582,7 +4780,15 @@ mod tests {
         // the box declared nothing to carry.
         let egress_of = |policy: &EffectiveSessionPolicy| {
             let mut out = Vec::new();
-            write_policy_json(&mut out, policy, NetworkMode::OwnIp, None, Ok(Vec::new())).unwrap();
+            write_policy_json(
+                &mut out,
+                policy,
+                NetworkMode::OwnIp,
+                None,
+                Ok(Vec::new()),
+                &[],
+            )
+            .unwrap();
             serde_json_lenient::from_slice::<serde_json_lenient::Value>(&out).unwrap()["egress"]
                 .clone()
         };
@@ -4627,6 +4833,7 @@ mod tests {
             &declared,
             NetworkMode::HostNet,
             Some(sessions::HostIpEnforcement::PerBox),
+            &[],
             None,
         )
         .unwrap();
@@ -4649,7 +4856,7 @@ mod tests {
             ingress: None,
         };
         let mut out = Vec::new();
-        format_policy(&mut out, &not_deny_all, NetworkMode::OwnIp, None, None).unwrap();
+        format_policy(&mut out, &not_deny_all, NetworkMode::OwnIp, None, &[], None).unwrap();
         let rendered = String::from_utf8(out).unwrap();
         assert!(
             rendered.contains("  subnets  10.0.0.0/8"),
@@ -4684,7 +4891,7 @@ mod tests {
             ingress: None,
         };
         let mut out = Vec::new();
-        format_policy(&mut out, &deny_all, NetworkMode::OwnIp, None, None).unwrap();
+        format_policy(&mut out, &deny_all, NetworkMode::OwnIp, None, &[], None).unwrap();
         let rendered = String::from_utf8(out).unwrap();
         assert!(
             rendered.contains("egress\n  deny-all (default)\n"),
@@ -4702,7 +4909,7 @@ mod tests {
             ingress: None,
         };
         let mut out = Vec::new();
-        format_policy(&mut out, &allow_all, NetworkMode::OwnIp, None, None).unwrap();
+        format_policy(&mut out, &allow_all, NetworkMode::OwnIp, None, &[], None).unwrap();
         let rendered = String::from_utf8(out).unwrap();
         assert!(
             rendered.contains("egress\n  allow-all (default)\n"),
@@ -4731,6 +4938,7 @@ mod tests {
             &unenforced,
             NetworkMode::HostNet,
             Some(sessions::HostIpEnforcement::None),
+            &[],
             None,
         )
         .unwrap();
@@ -4752,6 +4960,7 @@ mod tests {
             &enforced,
             NetworkMode::HostNet,
             Some(sessions::HostIpEnforcement::PerBox),
+            &[],
             None,
         )
         .unwrap();
@@ -4770,7 +4979,7 @@ mod tests {
             ingress: None,
         };
         let mut out = Vec::new();
-        format_policy(&mut out, &silent, NetworkMode::HostNet, None, None).unwrap();
+        format_policy(&mut out, &silent, NetworkMode::HostNet, None, &[], None).unwrap();
         let rendered = String::from_utf8(out).unwrap();
         assert!(
             !rendered.contains("per-box enforcement"),
@@ -4995,7 +5204,7 @@ mod tests {
             }),
         };
         let mut out = Vec::new();
-        format_policy(&mut out, &policy, NetworkMode::OwnIp, None, None).unwrap();
+        format_policy(&mut out, &policy, NetworkMode::OwnIp, None, &[], None).unwrap();
         write_live_ingress(&mut out, &live).unwrap();
         let rendered = String::from_utf8(out).unwrap();
         let (declared, live_rows) = rendered
@@ -5085,6 +5294,7 @@ mod tests {
                 NetworkMode::OwnIp,
                 None,
                 Ok(Vec::new()),
+                &[],
                 ports,
             )
             .unwrap();
@@ -5097,6 +5307,103 @@ mod tests {
         assert!(
             document(&[]).get("unaudited_listen_ports").is_none(),
             "no refused listen, no key"
+        );
+    }
+
+    /// NET-129: a declared port another box at the same shared loopback
+    /// address holds is served by that box, so the declared row says whose
+    /// it is rather than reading as this box's own. The mark names the
+    /// holding box; a row whose port nobody else holds prints as before;
+    /// an empty list marks nothing.
+    #[test]
+    fn policy_marks_a_yielded_shared_address_port() {
+        let policy = EffectiveSessionPolicy {
+            egress: EffectiveEgress::AllowAll,
+            ingress: Some(IngressPolicy {
+                port_mappings: vec![
+                    PortMapping {
+                        proto: IpProto::Tcp,
+                        external_port: 8080,
+                        internal_port: 8080,
+                    },
+                    PortMapping {
+                        proto: IpProto::Udp,
+                        external_port: 5353,
+                        internal_port: 5353,
+                    },
+                ],
+                dynamic_allowed_range: None,
+                dynamic_ingress: None,
+            }),
+        };
+        let collisions = vec![minimald_rpc::SharedPortCollision {
+            port: 8080,
+            held_by: "first.min.internal".to_string(),
+        }];
+
+        let mut out = Vec::new();
+        format_policy(
+            &mut out,
+            &policy,
+            NetworkMode::OwnIp,
+            None,
+            &collisions,
+            None,
+        )
+        .unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(
+            rendered.contains("  tcp  :8080 → :8080 (held by first.min.internal)\n"),
+            "the yielded port's row names the box that holds it: {rendered}"
+        );
+        assert!(
+            rendered.contains("  udp  :5353 → :5353\n"),
+            "a port no other box holds prints unmarked: {rendered}"
+        );
+
+        // The `-o json` document carries the same rows, so a parser can tell
+        // the yielded mapping from one this box serves; with none, the key
+        // is absent.
+        let mut out = Vec::new();
+        write_policy_json(
+            &mut out,
+            &policy,
+            NetworkMode::OwnIp,
+            None,
+            Ok(Vec::new()),
+            &collisions,
+        )
+        .unwrap();
+        let document = String::from_utf8(out).unwrap();
+        assert!(
+            document.contains(
+                r#""shared_port_collisions":[{"port":8080,"held_by":"first.min.internal"}]"#
+            ),
+            "the document names the yielded port and its holder: {document}"
+        );
+        let mut out = Vec::new();
+        write_policy_json(
+            &mut out,
+            &policy,
+            NetworkMode::OwnIp,
+            None,
+            Ok(Vec::new()),
+            &[],
+        )
+        .unwrap();
+        let document = String::from_utf8(out).unwrap();
+        assert!(
+            !document.contains("shared_port_collisions"),
+            "no yields, no key: {document}"
+        );
+
+        // No collisions, no marks: the same declaration renders as before.
+        let mut out = Vec::new();
+        format_policy(&mut out, &policy, NetworkMode::OwnIp, None, &[], None).unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(
+            rendered.contains("  tcp  :8080 → :8080\n"),
+            "an empty collision list marks nothing: {rendered}"
         );
     }
 
@@ -5362,6 +5669,10 @@ mod tests {
                 panic!("a registration is carried by the register verb");
             };
             assert_eq!(request.name, "web");
+            assert!(
+                request.hold,
+                "the activation holds its registration as a lease"
+            );
             assert_eq!(request.ingress_ports, vec![8080, 5432]);
             assert_eq!(request.egress.as_ref(), policy.egress.as_ref());
             assert!(
@@ -5421,6 +5732,7 @@ mod tests {
                 credentialed_upstream: None,
                 dynamic_ingress: None,
                 dynamic_allowed_range: None,
+                hold: false,
             },
         )
         .await
@@ -5640,6 +5952,253 @@ mod tests {
         assert!(
             !attachments.holds_id(id.to_bytes()),
             "the withdrawn box's id is held by no attachment"
+        );
+    }
+
+    /// The VM host daemon refuses a registration whose name folds to a
+    /// live row's, and that refusal reads as a name collision: an autogen
+    /// name re-mints and registers again under the fresh name, within the
+    /// shared budget, while a user-supplied name surfaces the refusal —
+    /// naming the held spelling — unchanged. Driven against the real
+    /// control server so a rewording of the daemon's refusal cannot
+    /// silently break the retry.
+    #[tokio::test]
+    async fn autogen_registration_reminted_on_a_held_name() {
+        let policy = sessions::SessionPolicy {
+            egress: None,
+            ingress: None,
+            credentialed_upstream: None,
+        };
+        let dir = tempfile::TempDir::new().unwrap();
+        let provider_dir = dir.path().join("providers").join("local-minvmd0");
+        std::fs::create_dir_all(&provider_dir).unwrap();
+        let sock_path = provider_dir.join("control.sock");
+        let registry = minvmd::box_registry::BoxRegistry::new(switch::SwitchSubnet::default());
+        let _server = minvmd::control::spawn(
+            sock_path,
+            registry.clone(),
+            minvmd::net::answerer::AnswererStatus::allocating_for_tests("session-test-node"),
+            minvmd::control::ProxyPublishStatus::default(),
+        )
+        .expect("the control server binds its socket");
+        let minimal_dir = Some(dir.path());
+
+        let mut held = "Proj-9c1e".to_string();
+        let mut attempts = 0u32;
+        // Bound for the test's life: the registration's lease holds the
+        // row, and dropping it would withdraw the row.
+        let _held_box = register_box_reminting_autogen(
+            paths::ProviderKind::Minvmd,
+            minimal_dir,
+            NetworkMode::OwnIp,
+            &mut held,
+            &policy,
+            true,
+            &mut attempts,
+            || unreachable!("a free name registers on the first try"),
+        )
+        .await
+        .expect("the first box registers")
+        .expect("an own-address box on a VM-backed host registers");
+        assert_eq!(attempts, 0);
+
+        // An autogen name folding to the live row's re-mints and registers.
+        let mut name = "proj-9c1e".to_string();
+        let registered = register_box_reminting_autogen(
+            paths::ProviderKind::Minvmd,
+            minimal_dir,
+            NetworkMode::OwnIp,
+            &mut name,
+            &policy,
+            true,
+            &mut attempts,
+            || "proj-77aa".to_string(),
+        )
+        .await
+        .expect("the held autogen name is re-minted, not fatal")
+        .expect("the re-minted name registers");
+        assert_eq!(
+            name, "proj-77aa",
+            "the activation carries the re-minted name"
+        );
+        assert_eq!(attempts, 1, "the re-mint spent one attempt of the budget");
+        assert_eq!(
+            registry
+                .row_by_name("proj-77aa")
+                .expect("the re-minted name holds a row")
+                .switch_addr(),
+            registered.addresses.switch_address,
+        );
+
+        // A user-supplied name never re-mints: the refusal surfaces, naming
+        // the spelling the live row holds.
+        let mut user = "PROJ-9C1E".to_string();
+        let refused = register_box_reminting_autogen(
+            paths::ProviderKind::Minvmd,
+            minimal_dir,
+            NetworkMode::OwnIp,
+            &mut user,
+            &policy,
+            false,
+            &mut 0,
+            || unreachable!("a user-supplied name is never re-minted"),
+        )
+        .await
+        .expect_err("a user-supplied held name is refused");
+        let refused = format!("{refused:#}");
+        assert!(
+            refused.contains("a box named Proj-9c1e already exists"),
+            "the refusal names the held spelling: {refused}"
+        );
+        assert_eq!(user, "PROJ-9C1E", "the user's name is left as given");
+    }
+
+    /// The registration's lease is held across the finalize — the daemon
+    /// sees neither a byte nor a close while it runs — and committed only
+    /// when it succeeds: one commit line, then the close. A failed finalize
+    /// closes the lease with no commit, the close the daemon withdraws on.
+    #[tokio::test]
+    async fn finalize_holding_lease_commits_only_on_success() {
+        use tokio::io::AsyncReadExt as _;
+
+        async fn lease_pair(
+            listener: &tokio::net::UnixListener,
+            sock_path: &std::path::Path,
+        ) -> (BoxLease, tokio::net::UnixStream) {
+            let (client, accepted) = tokio::join!(
+                tokio::net::UnixStream::connect(sock_path),
+                listener.accept()
+            );
+            (
+                BoxLease {
+                    stream: client.expect("the lease connects"),
+                },
+                accepted.expect("the daemon side accepts").0,
+            )
+        }
+
+        /// Whether the daemon side has seen nothing — no byte, no close —
+        /// within a short wait.
+        async fn untouched(daemon: &mut tokio::net::UnixStream) -> bool {
+            let mut buf = [0u8; 16];
+            tokio::time::timeout(std::time::Duration::from_millis(50), daemon.read(&mut buf))
+                .await
+                .is_err()
+        }
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let sock_path = dir.path().join("control.sock");
+        let listener = tokio::net::UnixListener::bind(&sock_path).unwrap();
+
+        let (lease, mut daemon) = lease_pair(&listener, &sock_path).await;
+        let finalized = finalize_holding_lease(Some(lease), async {
+            assert!(
+                untouched(&mut daemon).await,
+                "the lease is held, uncommitted, while the finalize runs"
+            );
+            Ok(7)
+        })
+        .await
+        .expect("the finalize succeeds");
+        assert_eq!(finalized, 7);
+        let mut seen = String::new();
+        daemon.read_to_string(&mut seen).await.unwrap();
+        assert_eq!(
+            seen,
+            format!("{}\n", minimald_rpc::REGISTRATION_COMMIT_LINE),
+            "a finalized session commits its lease, then closes it"
+        );
+
+        let (lease, mut daemon) = lease_pair(&listener, &sock_path).await;
+        let failed = finalize_holding_lease(Some(lease), async {
+            assert!(
+                untouched(&mut daemon).await,
+                "the lease is held, uncommitted, while the finalize runs"
+            );
+            Err::<(), _>(anyhow::anyhow!("finalize failed"))
+        })
+        .await;
+        assert!(failed.is_err(), "the finalize's failure surfaces unchanged");
+        let mut seen = String::new();
+        daemon.read_to_string(&mut seen).await.unwrap();
+        assert!(
+            seen.is_empty(),
+            "a failed finalize closes the lease uncommitted, got {seen:?}"
+        );
+
+        finalize_holding_lease(None, async { Ok(()) })
+            .await
+            .expect("a registration with no lease finalizes as ever");
+    }
+
+    /// Against the real control server: a registration the activation
+    /// holds and drops uncommitted is withdrawn by the VM host daemon, so
+    /// its name registers again at once; one committed after its session
+    /// went active keeps its row past the lease's close.
+    #[tokio::test]
+    async fn activation_lease_withdraws_uncommitted_and_keeps_committed() {
+        let policy = sessions::SessionPolicy {
+            egress: None,
+            ingress: None,
+            credentialed_upstream: None,
+        };
+        let dir = tempfile::TempDir::new().unwrap();
+        let provider_dir = dir.path().join("providers").join("local-minvmd0");
+        std::fs::create_dir_all(&provider_dir).unwrap();
+        let sock_path = provider_dir.join("control.sock");
+        let registry = minvmd::box_registry::BoxRegistry::new(switch::SwitchSubnet::default());
+        let _server = minvmd::control::spawn(
+            sock_path,
+            registry.clone(),
+            minvmd::net::answerer::AnswererStatus::allocating_for_tests("session-test-node"),
+            minvmd::control::ProxyPublishStatus::default(),
+        )
+        .expect("the control server binds its socket");
+        let minimal_dir = Some(dir.path());
+        let policy = &policy;
+        let register = move || {
+            register_box_for_activation(
+                paths::ProviderKind::Minvmd,
+                minimal_dir,
+                NetworkMode::OwnIp,
+                "web",
+                policy,
+            )
+        };
+
+        let dropped = register()
+            .await
+            .expect("the box registers")
+            .expect("an own-address box on a VM-backed host registers");
+        assert!(
+            dropped.lease.is_some(),
+            "the registration is held as a lease"
+        );
+        assert!(registry.row_by_name("web").is_some());
+        drop(dropped);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while registry.row_by_name("web").is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "an uncommitted lease's close withdraws its row"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let mut kept = register()
+            .await
+            .expect("the withdrawn name registers again at once")
+            .expect("an own-address box on a VM-backed host registers");
+        kept.lease
+            .take()
+            .expect("the registration is held as a lease")
+            .commit()
+            .await;
+        drop(kept);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            registry.row_by_name("web").is_some(),
+            "a committed lease keeps its row past the close"
         );
     }
 
