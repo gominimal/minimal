@@ -5884,10 +5884,12 @@ fi
 }
 
 # A task run against an EXISTING session inherits that session's network
-# mode (exec.rs task_network): a task in an own-IP session gets the session's
-# namespace — its loopback is its own, not the host's — while its egress
-# still works through the switch; a task in a none session has no network at
-# all. Own seeded project (the shared seed declares no tasks), switch-gated
+# MODE (exec.rs task_network): a task in an own-IP session gets an own-IP
+# namespace of its own beside the session's box — its loopback is its own,
+# not the host's — while its egress still works through the switch; a task
+# in a none session has no network at all. Each refusal leg asserts curl's
+# exit code, so a task that fails for another reason (curl missing, the task
+# never starting) cannot pass for a refused connection. Own seeded project (the shared seed declares no tasks), switch-gated
 # like the own-IP proofs above (a task in an own-IP session needs the tap the
 # switch carries): MINVMD_GVPROXY_BIN on a VM lane, E2E_NATIVE_SWITCH on the
 # native one.
@@ -5996,11 +5998,19 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
   echo "own-IP session task: egress OK ($tn_egress_ok of 2 hosts answered)"
 
   # Loopback: the listener answers on the host, and the task still cannot
-  # reach it — its 127.0.0.1 is its own namespace's loopback.
+  # reach it — its 127.0.0.1 is its own namespace's loopback, where nothing
+  # listens, so curl must exit 7 (could not connect). The task's exit code is
+  # the client's (the task_run proof's exit relay), and the egress leg above
+  # already proved curl runs in this session's tasks.
   mnl session run "$tn_sid" e2e-tn-loopback >/dev/null 2>"$WORK/tn-loopback.err"
   rc=$?
-  if [ "$rc" -eq 0 ]; then
-    echo "::error::a task in an own-IP session reached the host's listener at 127.0.0.1:$TN_LB_PORT — its loopback is not its own"
+  if [ "$rc" -ne 7 ]; then
+    if [ "$rc" -eq 0 ]; then
+      echo "::error::a task in an own-IP session reached the host's listener at 127.0.0.1:$TN_LB_PORT — its loopback is not its own"
+    else
+      echo "::error::the own-IP session's loopback task exited $rc, want 7 (curl: could not connect) — it failed for a reason other than an empty loopback"
+      echo "--- task stderr ---"; cat "$WORK/tn-loopback.err" 2>/dev/null || true
+    fi
     mnl session destroy --force "$tn_sid" >/dev/null 2>&1 || true
     kill "$TN_LISTENER_PID" 2>/dev/null || true
     TN_LISTENER_PID=""
@@ -6019,10 +6029,18 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
     fail
   }
   tn_none_sid="$(printf '%s\n' "$tn_none_sid" | tail -n1 | tr -d '\r')"
+  # The refusal must be the network's: curl exits 6 (could not resolve the
+  # host) or 7 (could not connect). Any other exit — 127 for a missing curl,
+  # a task that never started — is a failure of the proof, not a refusal.
   mnl session run "$tn_none_sid" e2e-tn-egress-com >/dev/null 2>"$WORK/tn-none-egress.err"
   rc=$?
-  if [ "$rc" -eq 0 ]; then
-    echo "::error::a task in a none session completed an outbound request — it has no network"
+  if [ "$rc" -ne 6 ] && [ "$rc" -ne 7 ]; then
+    if [ "$rc" -eq 0 ]; then
+      echo "::error::a task in a none session completed an outbound request — it has no network"
+    else
+      echo "::error::the none session's egress task exited $rc, want 6 or 7 (curl: could not resolve / connect) — it failed for a reason other than having no network"
+      echo "--- task stderr ---"; cat "$WORK/tn-none-egress.err" 2>/dev/null || true
+    fi
     mnl session destroy --force "$tn_none_sid" >/dev/null 2>&1 || true
     kill "$TN_LISTENER_PID" 2>/dev/null || true
     TN_LISTENER_PID=""

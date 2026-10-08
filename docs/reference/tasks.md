@@ -346,31 +346,29 @@ exec = "echo Hello %{name}"
 
 ## Networking {#networking}
 
-A task has no `--network` flag of its own. Its network is the network of the
-session that runs it, taken from the session's
-[`--network` mode](./cli-min.md#session-activate):
+A task has no `--network` flag of its own. It uses the network of the
+session that runs it, which the session's
+[`--network` mode](./cli-min.md#session-activate) sets:
 
 - `min task run` composes an ephemeral session with the default mode,
-  `host_ip`: the task shares the host's network namespace.
-- `min run <task>`, from inside a session, and
+  `host_ip`.
+- `min run <task>` inside a session and
   [`min session run <session> <task>`](./cli-min.md#session-run) run the task
-  as a guest of a session that already exists, so the task takes that
-  session's mode.
+  in a session that already exists. The task takes that session's mode.
 
-`host_ip` (the default) shares the host's network namespace, so the task
-reaches everything the host reaches, including the host-side hostname proxy
-at `127.0.0.1:7654` — the port clients point `HTTP(S)_PROXY` at, `7654` by
-default (the [`minimald` `--hostname-proxy-port`
-flag](./cli-minimald.md#global-flags)).
+`host_ip` (the default) shares the host's network namespace. The task
+reaches everything the host reaches. This includes the host-side hostname
+proxy at `127.0.0.1:7654`, the port clients point `HTTP(S)_PROXY` at. That
+port is the default of the [`minimald` `--hostname-proxy-port`
+flag](./cli-minimald.md#global-flags).
 
-`own_ip` gives the task an address of its own on the host's switch, in its
-own network namespace. `127.0.0.1:7654` no longer reaches that proxy: the
-loopback it names is now the task's own, not the host's. Outbound traffic
-still works — the task resolves and routes through the switch, whose
-gateway is `100.64.0.1` on the default subnet — so a task that fetches
-from the network needs no proxy at all.
+`own_ip` gives the task its own address on the host's switch, in its own
+network namespace. This namespace is a second box beside the session's box,
+not the session's namespace. `127.0.0.1` inside the task is the task's own
+loopback, so a connection to it does not reach the hostname proxy on the host.
+Outbound traffic goes through the switch, so a task that fetches from the
+network does not need the proxy.
 
-`none` gives the task no network: every socket it opens to a destination
-outside itself fails, so a `packages` install that needs the network fails
-with it. Pre-install what a `none` session's task needs, or give the session
-a mode that has a network.
+`none` gives the task no network. Every connection to a destination outside
+the task fails. When a task needs the network, give its session a mode that
+has one.
