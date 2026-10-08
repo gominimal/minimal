@@ -1403,8 +1403,9 @@ fn withdraw_report(boxes: &BoxRegistry, request: &WithdrawPortRequest) -> BoxCon
 }
 
 /// Serve the read-only row verb (NET-138): the live row the asked-for name
-/// resolves to under the identity rule — a box's id on the host is its
-/// name, exact, and liveness is the table's own fact — answered with its
+/// resolves to under the alias rule — the name is matched in its canonical
+/// form ([`crate::net::answerer::canonical_box_name`]), and liveness is
+/// the table's own fact ([`BoxRegistry::row_by_name`]) — answered with its
 /// switch address, its derived egress allow-list, and its declared and
 /// runtime-admitted ports. A name no live box holds answers the no-row
 /// marker: a withdrawn row is gone, not archived, so a destroyed box's

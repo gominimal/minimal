@@ -2935,9 +2935,11 @@ impl BoxRegistry {
     /// destroyed box's last row. `None` when no live row carries the name.
     ///
     /// Exact match alone is not the rule: the table does not hold names
-    /// unique. Rows are keyed by switch address, and a box recreated under
-    /// its name gets a new row beside the old one, which stays until its
-    /// withdrawal lands (up to NET-138's 60 s for an attachment's end).
+    /// unique. Rows are keyed by switch address; a client registration is
+    /// refused while a live row holds its folded name
+    /// ([`AllocationError::NameAlreadyHeld`]), but a row registered in
+    /// process ([`Self::try_register`]) can sit beside an older one under
+    /// the same name until the older one's withdrawal lands.
     /// While both are held, the alias resolves to the newest creation —
     /// the row with the greatest id, because every id is a UUIDv7 this
     /// process minted ([`crate::bep_attach::mint_box_id`]), and the crate
@@ -4808,7 +4810,7 @@ mod tests {
         assert!(registry.row_by_name("web").is_none());
         assert!(
             registry.row_by_name("Web").is_none(),
-            "no alias form but the name"
+            "a withdrawn name answers no row in any folded spelling"
         );
     }
 
