@@ -1,7 +1,10 @@
-# libkrun (containers/libkrun) pinned source build for macOS.
-# Single source of truth for the libkrun that macOS CI links/boots against
-# AND that the release ships — built by scripts/build-libkrun-macos.sh
-# (trimmed: --no-default-features --features blk,net).
+# libkrun (containers/libkrun) pinned source build, plus every patch in
+# vendor/libkrun/patches/ applied in sorted order.
+# Single source of truth for the libkrun that CI links/boots against AND that
+# the release ships, on both hosts: the macOS dylib built by
+# scripts/build-libkrun-macos.sh and the static musl libkrun.a that the Linux
+# minvmd links, built by scripts/build-libkrun-linux.sh. Both are trimmed:
+# --no-default-features --features blk,net.
 # `commit` is the resolved commit of `version` at pin time; the build fetches
 # the commit, so a moved/deleted tag cannot change what we build.
 version=v1.19.6
