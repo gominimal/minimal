@@ -503,64 +503,44 @@ mod tests {
         });
     }
 
-    /// A minimal DEBUG-and-up subscriber for the tests that assert on the
-    /// bridge's swallowed-pipe lines. `enabled` filters to DEBUG so only the
-    /// lines under test reach the log, and `event` records each line's
-    /// message.
+    /// A shared buffer the DEBUG capture subscriber renders into.
     #[derive(Clone, Default)]
-    struct DebugLog(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+    struct DebugLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
 
-    /// Records an event's `message` field — the swallowed-pipe line's text.
-    struct MessageField<'a>(&'a mut String);
+    impl std::io::Write for DebugLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("the test owns the log")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
 
-    impl tracing::field::Visit for MessageField<'_> {
-        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-            if field.name() == "message" {
-                use std::fmt::Write as _;
-                let _ = write!(self.0, "{value:?}");
-            }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
         }
     }
 
     impl DebugLog {
-        /// The lines said so far, in order.
-        fn lines(&self) -> Vec<String> {
-            self.0.lock().expect("the test owns the log").clone()
+        /// Everything rendered so far.
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().expect("the test owns the log")).into_owned()
         }
-    }
-
-    impl tracing::Subscriber for DebugLog {
-        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
-            *metadata.level() <= tracing::Level::DEBUG
-        }
-
-        fn event(&self, event: &tracing::Event<'_>) {
-            let mut line = String::new();
-            event.record(&mut MessageField(&mut line));
-            self.0.lock().expect("the test owns the log").push(line);
-        }
-
-        // The bridge emits no span, so the span half of the trait is inert: a
-        // single id that nothing records into and nothing enters.
-        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-            tracing::span::Id::from_u64(1)
-        }
-
-        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
-
-        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
-
-        fn enter(&self, _span: &tracing::span::Id) {}
-
-        fn exit(&self, _span: &tracing::span::Id) {}
     }
 
     /// Capture every DEBUG line the current thread emits while the guard
     /// lives. The current-thread test runtime drives the bridge on the test's
-    /// own thread, so the thread-local default subscriber sees its lines.
+    /// own thread, so the thread-local default subscriber sees its lines; no
+    /// global subscriber is installed.
     fn capture_debug_lines() -> (DebugLog, tracing::subscriber::DefaultGuard) {
         let log = DebugLog::default();
-        let guard = tracing::subscriber::set_default(log.clone());
+        let writer = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
         (log, guard)
     }
 
@@ -579,11 +559,9 @@ mod tests {
             .await
             .expect("a broken pipe downstream is not a proxy failure");
         assert!(
-            log.lines()
-                .iter()
-                .any(|line| line.contains("daemon→stdout")),
+            log.text().contains("daemon→stdout"),
             "the swallowed pipe must be logged naming its side, got {:?}",
-            log.lines()
+            log.text()
         );
     }
 
@@ -645,9 +623,9 @@ mod tests {
         .expect("a broken pipe towards the daemon is not a proxy failure");
         assert_eq!(stdout, b"hello", "the daemon's output must be drained");
         assert!(
-            log.lines().iter().any(|line| line.contains("stdin→daemon")),
+            log.text().contains("stdin→daemon"),
             "the swallowed pipe must be logged naming its side, got {:?}",
-            log.lines()
+            log.text()
         );
     }
 }
