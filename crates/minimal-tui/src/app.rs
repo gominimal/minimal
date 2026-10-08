@@ -56,6 +56,10 @@ pub struct ProviderView {
 pub struct Detail {
     pub record: Option<sessions::Record>,
     pub policy: Option<sessions::EffectiveSessionPolicy>,
+    /// Why the policy could not be fetched, when it could not: a daemon that
+    /// predates `GetEffectiveSessionPolicy` refuses the RPC, and the pane
+    /// says so instead of sitting on "loading policy…".
+    pub policy_error: Option<String>,
 }
 
 /// A modal prompt capturing footer input, if one is open.
@@ -823,7 +827,13 @@ fn fetch_focused(model: &Model) -> Vec<Effect> {
     let Some(key) = model.focused() else {
         return Vec::new();
     };
-    if model.details.contains_key(&key) {
+    // A detail whose policy fetch failed is not an answer: retry it on the
+    // next pass rather than caching the failure for the session's lifetime.
+    if model
+        .details
+        .get(&key)
+        .is_some_and(|d| d.policy_error.is_none())
+    {
         return Vec::new();
     }
     vec![Effect::FetchDetail(key)]
@@ -1063,7 +1073,18 @@ async fn exec_effect(
             let provider = providers.iter_mut().find(|p| p.label == key.provider)?;
             match rpc::fetch_detail(provider, key.id).await {
                 Ok((record, policy)) => {
-                    Some(Msg::DetailLoaded(key, Box::new(Detail { record, policy })))
+                    let (policy, policy_error) = match policy {
+                        Ok(policy) => (Some(policy), None),
+                        Err(e) => (None, Some(e)),
+                    };
+                    Some(Msg::DetailLoaded(
+                        key,
+                        Box::new(Detail {
+                            record,
+                            policy,
+                            policy_error,
+                        }),
+                    ))
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "detail fetch failed");
@@ -1587,6 +1608,31 @@ mod tests {
         update(&mut model, key(KeyCode::Down));
         let effects = update(&mut model, key(KeyCode::Up));
         assert!(!effects.iter().any(|e| matches!(e, Effect::FetchDetail(_))));
+    }
+
+    #[test]
+    fn a_failed_policy_fetch_is_retried() {
+        let mut model = two_providers();
+        update(&mut model, key(KeyCode::Down));
+        // The policy fetch failed (an older daemon, a transient error): the
+        // failure is shown but not cached as the session's answer.
+        update(
+            &mut model,
+            Msg::DetailLoaded(
+                skey("host", 1),
+                Box::new(Detail {
+                    policy_error: Some("request subsystem failed".to_string()),
+                    ..Detail::default()
+                }),
+            ),
+        );
+        update(&mut model, key(KeyCode::Down));
+        let effects = update(&mut model, key(KeyCode::Up));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::FetchDetail(k) if k.id == id(1)))
+        );
     }
 
     #[test]

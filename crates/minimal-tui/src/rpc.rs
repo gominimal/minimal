@@ -235,21 +235,36 @@ pub async fn refresh(provider: &mut Provider) -> Result<ProviderData, anyhow::Er
 /// the gate enforces — so the pane's `(default)` mark can show when the
 /// deny-all a session is held to is the rollout's default, not its own
 /// declaration (what `min session policy` renders).
+///
+/// A failed policy lookup does not cost the pane its record: it comes back
+/// as the policy's `Err`, for the pane to name. A daemon that predates
+/// `GetEffectiveSessionPolicy` refuses the subsystem, and that is the case
+/// this keeps visible.
 pub async fn fetch_detail(
     provider: &mut Provider,
     id: SessionId,
-) -> Result<(Option<sessions::Record>, Option<EffectiveSessionPolicy>), anyhow::Error> {
+) -> Result<
+    (
+        Option<sessions::Record>,
+        Result<EffectiveSessionPolicy, String>,
+    ),
+    anyhow::Error,
+> {
     let record = timed::<GetSessionRecord>(&mut provider.client, GetSessionRecordRequest::Id(id))
         .await
         .context("GetSessionRecord RPC failed")?
         .record;
-    let policy = timed::<GetEffectiveSessionPolicy>(
+    let policy = match timed::<GetEffectiveSessionPolicy>(
         &mut provider.client,
         GetEffectiveSessionPolicyRequest::Id(id),
     )
     .await
-    .context("GetEffectiveSessionPolicy RPC failed")?
-    .ok();
+    .context("GetEffectiveSessionPolicy RPC failed")
+    {
+        Ok(Errorable::Ok(policy)) => Ok(policy),
+        Ok(Errorable::Err { error }) => Err(error),
+        Err(e) => Err(format!("{e:#}")),
+    };
     Ok((record, policy))
 }
 

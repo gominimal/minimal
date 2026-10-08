@@ -495,10 +495,19 @@ fn policy_lines(model: &Model, key: &SessionKey) -> Vec<Line<'static>> {
         ));
     } else {
         match detail.and_then(|d| d.policy.as_ref()) {
-            None => lines.push(Line::styled(
-                "loading policy…",
-                Style::default().fg(Color::Gray),
-            )),
+            None => match detail.and_then(|d| d.policy_error.as_deref()) {
+                // Named, not left loading: an older daemon without the
+                // effective-policy RPC lands here, and "loading" would wait
+                // on an answer that never comes.
+                Some(error) => lines.push(Line::styled(
+                    format!("policy unavailable: {error}"),
+                    Style::default().fg(Color::Yellow),
+                )),
+                None => lines.push(Line::styled(
+                    "loading policy…",
+                    Style::default().fg(Color::Gray),
+                )),
+            },
             Some(policy) => {
                 lines.push(Line::styled(
                     "egress",
