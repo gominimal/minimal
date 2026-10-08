@@ -19,7 +19,10 @@
 //!    When the parent also bound the guest report door (T94), its path
 //!    arrives as `MINVMD_GUEST_REPORT_SOCK` and is registered for
 //!    `VM_HOST_BOX_REPORT_PORT` the same way, so the in-VM daemon's port
-//!    reports reach the VM host daemon's host-held grant.
+//!    reports reach the VM host daemon's host-held grant. Likewise the
+//!    guest telemetry door (`MINVMD_GUEST_TELEMETRY_SOCK`, registered for
+//!    `VSOCK_TELEMETRY_PORT`), over which the in-VM daemon's telemetry
+//!    records reach the host's exporter (TEL-034).
 //! 6. On macOS, registers the timekeep socket for `VSOCK_TIMEKEEP_PORT`
 //!    (host→guest) and starts the thread that sends the host wall clock to the
 //!    guest, so a host suspend does not leave the guest clock frozen
@@ -138,6 +141,19 @@ fn run_vmm() -> Result<()> {
     {
         ctx.add_vsock_port(minimald_rpc::VM_HOST_BOX_REPORT_PORT, &guest_report_sock)
             .context("registering the guest report door's vsock port")?;
+    }
+
+    // The guest telemetry door's vsock port (TEL-034): registered only when
+    // the supervisor bound the door, which is what the env names; the
+    // in-VM daemon's telemetry records then reach the host over it.
+    if let Some(guest_telemetry_sock) =
+        std::env::var_os(crate::guest_telemetry::GUEST_TELEMETRY_SOCK_ENV).filter(|p| !p.is_empty())
+    {
+        ctx.add_vsock_port(
+            crate::guest_telemetry::VSOCK_TELEMETRY_PORT,
+            &guest_telemetry_sock,
+        )
+        .context("registering the guest telemetry door's vsock port")?;
     }
 
     // Host wall-clock updates (host→guest, `crate::timekeep`), macOS only.
