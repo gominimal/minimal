@@ -120,7 +120,7 @@
 //! the row goes with the entry when the listener closes — and its decision
 //! record in the local audit log ([`crate::audit`]).
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
@@ -780,6 +780,13 @@ struct PublicationSet {
     /// read the same way on every call.
     ports: BTreeMap<u16, PublicationEntry>,
     next_token: u64,
+    /// The permitted listening ports the watcher could not publish because
+    /// their allow's `Published` record could not be written (NET-046):
+    /// the box listens, the rules permit, and nothing is published until
+    /// the audit log takes the record. Kept here, beside the rows, so
+    /// `min session policy` reads the failure from the same set it reads
+    /// the publications from, and never hears a silent drop.
+    audit_refused: BTreeSet<u16>,
 }
 
 impl BoxPublications {
@@ -880,11 +887,60 @@ impl BoxPublications {
     /// Any future revocation path (an expose-revoke, a `dynamic_ingress`
     /// policy change) calls this, with no owner check.
     pub fn revoke_all(&self) {
+        let mut set = self.set.lock().expect("box publications lock poisoned");
+        set.ports.clear();
+        set.audit_refused.clear();
+    }
+
+    /// Lists the listen watcher's committed publication of `port` as `row`
+    /// in `min session policy` (NET-044): the row a publication committed
+    /// unadmitted — its allow's record refused — carries only once its gate
+    /// admits the port, so a policy read never lists a port the gate
+    /// refuses. `owner`'s own published entry only.
+    pub fn list(&self, port: u16, owner: PublicationOwner, row: minimald_rpc::LiveMapping) {
+        let mut set = self.set.lock().expect("box publications lock poisoned");
+        if let Some(entry) = set
+            .ports
+            .get_mut(&port)
+            .filter(|entry| entry.owner == owner && entry.published)
+        {
+            entry.listed = Some(row);
+        }
+    }
+
+    /// Marks `port` as a permitted listen the watcher could not publish
+    /// because the audit log refused its record (`refused`), or clears the
+    /// mark once the record is written or the listener is gone.
+    pub fn mark_audit_refused(&self, port: u16, refused: bool) {
+        let mut set = self.set.lock().expect("box publications lock poisoned");
+        if refused {
+            set.audit_refused.insert(port);
+        } else {
+            set.audit_refused.remove(&port);
+        }
+    }
+
+    /// Keeps the audit-refused marks only for the ports `keep` still names:
+    /// a listener that closed takes its mark with it.
+    pub fn retain_audit_refused(&self, keep: impl Fn(u16) -> bool) {
         self.set
             .lock()
             .expect("box publications lock poisoned")
-            .ports
-            .clear();
+            .audit_refused
+            .retain(|port| keep(*port));
+    }
+
+    /// The permitted listening ports left unpublished because their audit
+    /// record could not be written, in port order — the warning rows
+    /// `min session policy` prints.
+    pub fn audit_refused(&self) -> Vec<u16> {
+        self.set
+            .lock()
+            .expect("box publications lock poisoned")
+            .audit_refused
+            .iter()
+            .copied()
+            .collect()
     }
 }
 
@@ -1426,6 +1482,9 @@ impl WatchState {
         // decides: an entry survives only while a process in the box is
         // still listening on its port.
         self.backoff.retain(|port, _| listening.contains(port));
+        self.plan
+            .publications
+            .retain_audit_refused(|port| listening.contains(&port));
         self.reported_contention
             .retain(|port| listening.contains(port));
         self.listening = listening;
@@ -1556,7 +1615,24 @@ impl WatchState {
                         self.unrecorded.remove(&port);
                         self.reported_withdrawal_failures.remove(&port);
                         self.reported_contention.remove(&port);
+                        self.plan.publications.mark_audit_refused(port, false);
+                        // Admitted first, listed after: the entry was
+                        // committed unlisted when its record was refused,
+                        // so the row that reads reachable appears only
+                        // once the gate admits (NET-044).
                         self.plan.gate.admit_published(port);
+                        if let Some(mapping) = self.forwards.get(&port) {
+                            self.plan.publications.list(
+                                port,
+                                PublicationOwner::Listen,
+                                minimald_rpc::LiveMapping {
+                                    local: mapping.local().to_string(),
+                                    internal_port: port,
+                                    proto: IpProto::Tcp,
+                                    pending: Some(false),
+                                },
+                            );
+                        }
                         tracing::info!(
                             session = %self.plan.box_name,
                             host = %self.plan.published,
@@ -1752,7 +1828,9 @@ impl WatchState {
                                 // box through a publish the log could not
                                 // take. A record the log refuses unwinds the
                                 // publish before it was ever admitted: the
-                                // reservation commits unadmitted only so
+                                // reservation commits unadmitted and
+                                // unlisted — no policy row claims a port
+                                // the gate refuses — only so
                                 // [`Self::close`] owns the forward's unwind —
                                 // a forward whose unexpose fails stays held,
                                 // with its `unrecorded` mark, for the retry —
@@ -1769,7 +1847,7 @@ impl WatchState {
                                 )
                                 .await
                                 {
-                                    if !reservation.record_listed(row) {
+                                    if !reservation.record() {
                                         // Revoked under the bind as well:
                                         // nothing was admitted, so the
                                         // revoked arm's unbind is the whole
@@ -1821,6 +1899,7 @@ impl WatchState {
                                     return Appearance::Settled;
                                 }
                                 self.forwards.insert(port, mapping);
+                                self.plan.publications.mark_audit_refused(port, false);
                                 tracing::info!(
                                     session = %self.plan.box_name,
                                     host = %self.plan.published,
@@ -2010,8 +2089,19 @@ impl WatchState {
                 "the listening port's allow could not be audited; the publish unwound"
             );
         }
-        self.unrecorded.insert(port);
         self.close(port, "its allow could not be audited").await;
+        // The mark rides only a forward that outlived the unwind: one the
+        // switch took down needs no record retry — the next publish binds
+        // afresh — and leaving the mark on it would make every retry's
+        // close write a second `PublishFailed` the streak already wrote.
+        if self.forwards.contains_key(&port) {
+            self.unrecorded.insert(port);
+        }
+        // The failure reaches `min session policy` as a warning row for as
+        // long as the box listens and the log refuses: a watcher-driven
+        // publish has no caller to answer, so the row is where the user
+        // reads it.
+        self.plan.publications.mark_audit_refused(port, true);
         if refusals == 0 {
             // The streak's one decision record (NET-046): the allow stood,
             // the publish did not. Best-effort, like every refusal's — a
@@ -3276,6 +3366,9 @@ mod tests {
             audit_records(dir.path()).is_empty(),
             "no record was written through the planted link"
         );
+        // The failure is not silent: the set `min session policy` reads
+        // names the permitted port the audit log kept unpublished.
+        soon(|| publications.audit_refused() == vec![port]).await;
 
         // The log heals: the port is still owed, so the backoff's retry
         // binds afresh, records the allow, and admits it.
@@ -3284,16 +3377,30 @@ mod tests {
         assert_eq!(rebound.path, "/services/forwarder/expose");
         assert_eq!(rebound.local, format!("{PUBLISHED}:{port}"));
         soon(|| gate.admits_tcp(port)).await;
-        // The unwind's own best-effort `publish_failed` record may land in
-        // the healed log too, depending on when the heal raced it; the
-        // publication's `published` record is the one this proof reads.
-        let published: Vec<_> = audit_records(dir.path())
-            .into_iter()
+        // The streak writes at most one `publish_failed` — its first
+        // refusal's, best-effort, which the refusing log may have dropped —
+        // and the retries the backoff made wrote none; the publication's
+        // `published` record is the healed publish's own.
+        let records = audit_records(dir.path());
+        let failed = records
+            .iter()
+            .filter(|record| record["outcome"] == "publish_failed")
+            .count();
+        assert!(
+            failed <= 1,
+            "one publish_failed record per streak at most: {records:?}"
+        );
+        let published: Vec<_> = records
+            .iter()
             .filter(|record| record["outcome"] == "published")
             .collect();
         assert_eq!(published.len(), 1, "the healed publish wrote its record");
         assert_eq!(published[0]["port"], port);
         assert_eq!(publications.listen_rows().len(), 1);
+        assert!(
+            publications.audit_refused().is_empty(),
+            "the healed publish clears the policy warning"
+        );
 
         drop(listener);
         watcher.stop().await;

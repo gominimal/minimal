@@ -8161,6 +8161,84 @@ async fn box_with_scripted_plan(
     (handle, gate, served, gate_sender, id)
 }
 
+/// NET-046 fails a listen-publish closed, and the failure is not silent:
+/// while the audit log refuses the allow's record the runtime-facts reply
+/// `min session policy` reads names the permitted port left unpublished,
+/// with the log it could not write, and lists no reachable row for it; once
+/// the log takes records again the watcher publishes afresh and the
+/// warning clears.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runtime_facts_name_a_listen_the_audit_log_refused() {
+    use minimald_rpc::{GetSessionRuntimeFacts, GetSessionRuntimeFactsRequest};
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let manager = server.state.sessions_manager().await;
+
+    // A free port number for the box's range; the listener binds it only
+    // once the audit log refuses, so the box's own creation audits freely.
+    let port = port_of(&listening_socket());
+    let switch = std::net::Ipv4Addr::new(100, 64, 128, 94);
+    let loopback = std::net::Ipv4Addr::new(127, 0, 64, 94);
+    let (handle, gate, _served, _gate_sender, id) = box_with_scripted_plan(
+        &mut client,
+        &manager,
+        "unaudited",
+        switch,
+        loopback,
+        (port, port),
+        Vec::new(),
+    )
+    .await;
+    let state_dir = server.state.minimal_state_dir().await;
+    let state_dir = state_dir.as_utf8_path().as_std_path().to_path_buf();
+    let planted = state_dir.join("planted");
+    std::fs::create_dir_all(&planted).unwrap();
+    std::os::unix::fs::symlink(&planted, state_dir.join("audit")).unwrap();
+    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, port))
+        .expect("bind the box's listener on its range's port");
+
+    listed_once(&handle, |rows| rows.unaudited_listen_ports == vec![port]).await;
+    let facts = client
+        .call::<GetSessionRuntimeFacts>(&GetSessionRuntimeFactsRequest::Id(id))
+        .await
+        .unwrap();
+    assert_eq!(facts.unaudited_listen_ports, vec![port]);
+    assert_eq!(
+        facts.audit_log.as_deref(),
+        Some(
+            crate::audit::log_path(&state_dir)
+                .display()
+                .to_string()
+                .as_str()
+        ),
+        "the warning names the log that refused the record"
+    );
+    assert!(
+        !gate.admits_tcp(port),
+        "the unaudited listen is not admitted"
+    );
+    assert!(
+        handle
+            .live_ingress()
+            .await
+            .expect("the actor answers")
+            .listened
+            .is_empty(),
+        "no reachable row is listed for a port the gate refuses"
+    );
+
+    std::fs::remove_file(state_dir.join("audit")).unwrap();
+    soon(|| gate.admits_tcp(port)).await;
+    listed_once(&handle, |rows| rows.unaudited_listen_ports.is_empty()).await;
+    let facts = client
+        .call::<GetSessionRuntimeFacts>(&GetSessionRuntimeFactsRequest::Id(id))
+        .await
+        .unwrap();
+    assert!(facts.unaudited_listen_ports.is_empty());
+    assert!(facts.audit_log.is_none());
+    drop(listener);
+}
+
 /// NET-047, the port one surface already holds: whichever of the box's two
 /// runtime surfaces reaches a port first, the port is bound once. A port the
 /// listen watcher published, asked for by `min net expose`, is answered with
@@ -8485,6 +8563,7 @@ async fn expose_on_listen_published_port_is_already_published() {
                 proto: sessions::IpProto::Tcp,
                 pending: Some(false),
             }],
+            unaudited_listen_ports: Vec::new(),
         },
         "the refused request published nothing; the listen's publication is listed once"
     );

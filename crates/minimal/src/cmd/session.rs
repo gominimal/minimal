@@ -2280,13 +2280,14 @@ pub async fn cmd_session_policy(
         SessionLookup::Id(id) => minimald_rpc::GetSessionRuntimeFactsRequest::Id(id),
         SessionLookup::Name(n) => minimald_rpc::GetSessionRuntimeFactsRequest::Name(n),
     };
-    let host_ip_enforcement = match client
+    let facts = match client
         .oneshot_rpc::<minimald_rpc::GetSessionRuntimeFacts>(facts_lookup)
         .await
     {
-        Ok(minimald_rpc::Errorable::Ok(facts)) => facts.host_ip_enforcement,
+        Ok(minimald_rpc::Errorable::Ok(facts)) => Some(facts),
         Ok(minimald_rpc::Errorable::Err { .. }) | Err(_) => None,
     };
+    let host_ip_enforcement = facts.as_ref().and_then(|facts| facts.host_ip_enforcement);
     // (NET-044) — the rows that make a `min net expose` visible rather than
     // only permitted. Fetched through the text walk's own degrade of the
     // shared fetch: warn on stderr and print no section — the JSON
@@ -2320,6 +2321,13 @@ pub async fn cmd_session_policy(
                 fabric,
             )?;
             write_live_ingress(&mut out, &live)?;
+            if let Some(facts) = &facts {
+                write_unaudited_listen_ports(
+                    &mut out,
+                    &facts.unaudited_listen_ports,
+                    facts.audit_log.as_deref(),
+                )?;
+            }
             out.flush().context("Failed to write policy")?;
             Ok(())
         }
@@ -2658,6 +2666,30 @@ pub fn write_live_ingress(
             out,
             "  {}  {} → :{}{}",
             mapping.proto, mapping.local, mapping.internal_port, reachability
+        )?;
+    }
+    Ok(())
+}
+
+/// The warnings `min session policy` prints for the permitted listening
+/// ports the daemon left unpublished because their audit record could not
+/// be written (NET-046 fails closed): a listen-publish is driven by the
+/// box's own listener, with no caller to answer, so this line is where the
+/// failure reaches the user. One line per port; nothing when the list is
+/// empty.
+pub fn write_unaudited_listen_ports(
+    out: &mut impl std::io::Write,
+    ports: &[u16],
+    audit_log: Option<&str>,
+) -> Result<(), anyhow::Error> {
+    let audit_log = audit_log.map_or_else(
+        || "the audit log".to_string(),
+        |path| format!("the audit log {path}"),
+    );
+    for port in ports {
+        writeln!(
+            out,
+            "warning: port {port} is permitted but not published: {audit_log} cannot be written"
         )?;
     }
     Ok(())
@@ -4965,6 +4997,31 @@ mod tests {
             String::from_utf8(out).unwrap(),
             "",
             "a box that published nothing prints no live section"
+        );
+    }
+
+    /// A listen-publish the audit log refused (NET-046) reaches the user
+    /// as one warning line per port in `min session policy`, naming the
+    /// log; an empty list prints nothing.
+    #[test]
+    fn unaudited_listen_ports_print_one_warning_per_port() {
+        let mut out = Vec::new();
+        write_unaudited_listen_ports(&mut out, &[3000, 3001], Some("/state/audit/decisions.log"))
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "warning: port 3000 is permitted but not published: \
+             the audit log /state/audit/decisions.log cannot be written\n\
+             warning: port 3001 is permitted but not published: \
+             the audit log /state/audit/decisions.log cannot be written\n",
+        );
+
+        let mut out = Vec::new();
+        write_unaudited_listen_ports(&mut out, &[], None).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "",
+            "nothing refused, nothing said"
         );
     }
 

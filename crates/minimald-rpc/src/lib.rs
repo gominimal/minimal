@@ -2116,6 +2116,20 @@ pub struct SessionRuntimeFacts {
     /// be read back — the same states
     /// [`ListSessionsEntry::host_ip_enforcement`] names.
     pub host_ip_enforcement: Option<HostIpEnforcement>,
+    /// The permitted listening ports the box's listen watcher left
+    /// unpublished because their allow's audit record could not be written
+    /// (NET-046 fails closed), in port order. A watcher-driven publish has
+    /// no caller to answer, so this is where its failure reaches the user:
+    /// `min session policy` prints a warning per port. Absent when empty,
+    /// and absent from a daemon that predates the field — both read as
+    /// nothing to warn about.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unaudited_listen_ports: Vec<u16>,
+    /// The daemon's audit log path the warnings for
+    /// [`Self::unaudited_listen_ports`] name. Set only beside a non-empty
+    /// list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit_log: Option<String>,
 }
 
 impl OneshotSshRpc for GetSessionRuntimeFacts {
@@ -3127,8 +3141,21 @@ mod tests {
         let facts = SessionRuntimeFacts {
             id: SessionId::nil(),
             host_ip_enforcement: Some(HostIpEnforcement::None),
+            unaudited_listen_ports: Vec::new(),
+            audit_log: None,
         };
         assert_eq!(round_trip(&facts), facts);
+        let unaudited = SessionRuntimeFacts {
+            unaudited_listen_ports: vec![3000, 3001],
+            audit_log: Some("/state/audit/decisions.log".to_string()),
+            ..facts.clone()
+        };
+        assert_eq!(round_trip(&unaudited), unaudited);
+        let empty = serde_json_lenient::to_string(&facts).expect("facts serialize");
+        assert!(
+            !empty.contains("unaudited_listen_ports") && !empty.contains("audit_log"),
+            "an empty unaudited list is omitted from the wire: {empty}"
+        );
         match serde_json_lenient::from_str::<Errorable<SessionRuntimeFacts>>(
             r#"{"error":"no session found"}"#,
         )
@@ -3149,6 +3176,8 @@ mod tests {
                 SessionRuntimeFacts {
                     id: SessionId::nil(),
                     host_ip_enforcement: Some(HostIpEnforcement::PerBox),
+                    unaudited_listen_ports: Vec::new(),
+                    audit_log: None,
                 },
                 "the facts this client knows decode beside a key it does not"
             ),

@@ -425,6 +425,10 @@ pub(crate) struct LiveIngressRows {
     /// The listen watcher's publications of in-range listens under `allow`,
     /// in port order: one per listener still holding its port.
     pub(crate) listened: Vec<minimald_rpc::LiveMapping>,
+    /// The permitted listening ports the listen watcher left unpublished
+    /// because their audit record could not be written (NET-046), in port
+    /// order — the warnings `min session policy` prints.
+    pub(crate) unaudited_listen_ports: Vec<u16>,
 }
 
 enum SessionMessage {
@@ -3017,7 +3021,26 @@ impl Session {
                     reason: None,
                 };
                 match crate::audit::try_append(&state_dir, &record).await {
-                    Ok(()) => (Ok(mapping), true),
+                    Ok(()) => {
+                        // The record is written, so the box's relay gate
+                        // admits the port now, before the caller hears the
+                        // publish (NET-044): an answered publish is
+                        // reachable, never a bound forward the gate
+                        // refuses. Nothing listening yet is answered by the
+                        // box's own kernel with a reset, so no gate state
+                        // waits on a listener, and a listener closing later
+                        // never withdraws this admission — the box's stop
+                        // does. A box with no relay gate (no switch
+                        // attached) has nothing in front of it to admit
+                        // through.
+                        if let Some(gate) = self
+                            .reported_switch_address
+                            .and_then(crate::net::switch::live_gate)
+                        {
+                            gate.admit_exposed(port);
+                        }
+                        (Ok(mapping), true)
+                    }
                     Err(error) => (
                         Err(self
                             .withdraw_unaudited(box_name, port, decision, error)
@@ -3203,11 +3226,11 @@ impl Session {
         let control = self.switch_control().await;
         let live = self.live_ingress.take(port);
         // The gate refuses the port before the forward comes down (NET-044),
-        // the same order the box's stop takes every publication in: an
-        // allow already refused cannot be crossed while its forward unbinds,
-        // and the admission this publish put up is this withdrawal's to
-        // take — the stop's sweep never saw a publish that never stood. A
-        // relay already gone took its gate with it.
+        // the same order the box's stop takes every publication in. The
+        // publish admits only after its record is written, so an unaudited
+        // allow was never admitted and this is a no-op kept as the
+        // fail-closed backstop: an allow refused cannot be crossed while
+        // its forward unbinds. A relay already gone took its gate with it.
         if let Some(gate) = self
             .reported_switch_address
             .and_then(crate::net::switch::live_gate)
@@ -3542,26 +3565,24 @@ impl Session {
             crate::net::listeners::unreport_port(&control, switch_address, port, source).await;
             return Err(ExposeFailure::Refused(ExposeRefusal::NotAttached));
         }
-        // The publish stands, so the box's relay gate admits the port now,
-        // in the same turn (NET-044): a publish is reachable, never a bound
-        // forward the gate refuses. Nothing listening yet is answered by the
-        // box's own kernel with a reset, so no gate state waits on a
-        // listener, and a listener closing later never withdraws this
-        // admission — the box's stop does. A box with no relay gate (no
-        // switch attached) has nothing in front of it to admit through.
+        // The publish stands, but the box's relay gate does not admit the
+        // port here: an allow is admitted only once its `Published` record
+        // is written (NET-046), so the admission is
+        // [`Self::answer_expose_because`]'s, made right after the record —
+        // every caller that gets this mapping ends there. Until then the
+        // forward is bound and the gate refuses it, so nothing crosses an
+        // allow the audit log has not taken.
         //
-        // The gate's sets are keyed by the box's internal port. This admits
-        // `port`, and the stop withdraws `forwarder.internal_port()`; the two
-        // agree only because an expose binds the same number on both sides.
-        // A host-port remap would split them and leave the admission behind,
-        // so the assert pins them to the one internal-port space.
+        // The gate's sets are keyed by the box's internal port. The answer
+        // admits `port`, and the stop withdraws `forwarder.internal_port()`;
+        // the two agree only because an expose binds the same number on
+        // both sides. A host-port remap would split them and leave the
+        // admission behind, so the assert pins them to the one
+        // internal-port space.
         debug_assert_eq!(
             mapping.internal_port, port,
             "the admitted port must be the forward's internal port, the one the stop withdraws"
         );
-        if let Some(gate) = crate::net::switch::live_gate(switch_address) {
-            gate.admit_exposed(port);
-        }
         Ok(mapping)
     }
 
@@ -3590,6 +3611,7 @@ impl Session {
         LiveIngressRows {
             exposed: self.live_ingress.snapshot(),
             listened: self.publications.listen_rows(),
+            unaudited_listen_ports: self.publications.audit_refused(),
         }
     }
 

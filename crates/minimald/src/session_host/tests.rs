@@ -5793,6 +5793,25 @@ async fn expose_unrecordable_allow_is_refused_and_deny_still_refuses() {
     std::fs::create_dir_all(&planted).unwrap();
     std::os::unix::fs::symlink(&planted, state_dir.join("audit")).unwrap();
 
+    // A sampler that reads the gate the whole time the refused publish
+    // runs: the admission waits on the record (NET-046), so an allow the
+    // log refuses is never admitted, not even for the length of the audit
+    // write and the unwind after it.
+    let ever_admitted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sampling = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let sampler = {
+        let gate = std::sync::Arc::clone(&gate);
+        let ever_admitted = std::sync::Arc::clone(&ever_admitted);
+        let sampling = std::sync::Arc::clone(&sampling);
+        tokio::spawn(async move {
+            while sampling.load(std::sync::atomic::Ordering::SeqCst) {
+                if gate.admits_tcp(3000) {
+                    ever_admitted.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+    };
     match web_handle.expose_dynamic(3000).await {
         Err(crate::net::policy::ExposeFailure::Publish { port: 3000, source }) => assert!(
             source.to_string().contains("audit log"),
@@ -5800,9 +5819,15 @@ async fn expose_unrecordable_allow_is_refused_and_deny_still_refuses() {
         ),
         other => panic!("an allow that cannot be audited is refused: {other:?}"),
     }
+    sampling.store(false, std::sync::atomic::Ordering::SeqCst);
+    sampler.await.unwrap();
+    assert!(
+        !ever_admitted.load(std::sync::atomic::Ordering::SeqCst),
+        "an allow whose record the log refused is never admitted at the relay gate"
+    );
     assert!(
         !gate.admits_tcp(3000),
-        "the unaudited allow's relay-gate admission is withdrawn with the publish"
+        "the unaudited allow is not admitted at the relay gate"
     );
     assert!(
         web_handle
