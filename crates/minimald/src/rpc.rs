@@ -909,6 +909,8 @@ async fn serve_answerer_control(
                 }
                 BoxControlRequest::Register(_)
                 | BoxControlRequest::Withdraw(_)
+                | BoxControlRequest::HoldBoxName(_)
+                | BoxControlRequest::ReleaseBoxName(_)
                 | BoxControlRequest::AdmitPort(_)
                 | BoxControlRequest::WithdrawPort(_)
                 | BoxControlRequest::ReadRow(_)

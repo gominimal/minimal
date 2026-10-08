@@ -1874,6 +1874,16 @@ pub struct BoxRegistry {
     /// namespaces whose declarations stay published while they are not
     /// running, keyed by the row's own key and shared by every clone.
     stopped: Arc<RwLock<BTreeSet<[u8; 4]>>>,
+    /// The box names this daemon holds in the zone with no row behind them
+    /// (the `host_ip` interim): a name held here answers NODATA under the
+    /// zone apex where an unheld name answers NXDOMAIN. Keyed by the
+    /// name's [`canonical_box_name`] form and shared by every clone; the
+    /// [`Self::zone_view`] fold keeps a row's entry for a name a row
+    /// publishes, so a hold never shadows a row. Each hold carries the
+    /// session that made it, when its client named one, so a release
+    /// frees only that session's hold, never a newer session's under the
+    /// same name.
+    held_names: Arc<RwLock<BTreeMap<String, Option<sessions::SessionId>>>>,
     /// The table's change pings: one `()` to every live subscriber whenever
     /// a row lands, goes, or is marked stopped. The host answerer
     /// ([`crate::net::answerer`]) subscribes — a daemon that does not hold
@@ -1961,6 +1971,7 @@ impl Clone for BoxRegistry {
             subnet: self.subnet,
             rows: self.rows.clone(),
             stopped: Arc::clone(&self.stopped),
+            held_names: Arc::clone(&self.held_names),
             table_pings: Arc::clone(&self.table_pings),
             withdrawal_reports: self.withdrawal_reports.clone(),
             withdrawal_reports_rx: Mutex::new(None),
@@ -1993,6 +2004,7 @@ impl BoxRegistry {
             subnet,
             rows: Arc::new(RwLock::new(BTreeMap::new())),
             stopped: Arc::new(RwLock::new(BTreeSet::new())),
+            held_names: Arc::new(RwLock::new(BTreeMap::new())),
             table_pings: Arc::new(Mutex::new(Vec::new())),
             withdrawal_reports: reports,
             withdrawal_reports_rx: Mutex::new(Some(reports_rx)),
@@ -3030,6 +3042,68 @@ impl BoxRegistry {
         held
     }
 
+    /// Holds box `name`'s name in the zone with no row behind it (the
+    /// `host_ip` interim): from here a lookup of `<name>.min.internal`
+    /// answers NODATA where an unheld name answers NXDOMAIN. Idempotent;
+    /// a name a live row publishes is the row's — the fold in
+    /// [`Self::zone_view`] keeps the row's entry, so the two coexist.
+    /// `owner` is the session the hold is for: a later hold of the name
+    /// takes it over. Returns whether the table did not hold the name
+    /// already.
+    pub fn hold_box_name(&self, name: &str, owner: Option<sessions::SessionId>) -> bool {
+        let inserted = self
+            .held_names
+            .write()
+            .expect("the held names' lock is never held across a panic, so it cannot be poisoned")
+            .insert(canonical_box_name(name), owner)
+            .is_none();
+        if inserted {
+            tracing::info!(
+                box = %name,
+                "held a box name in the zone with no row behind it; it answers NODATA"
+            );
+            self.ping();
+        }
+        inserted
+    }
+
+    /// Releases a name [`Self::hold_box_name`] holds: the name answers
+    /// nothing again — NXDOMAIN, the pre-box state. A name no hold kept
+    /// is the goal state already holding. Returns whether a hold was
+    /// actually released.
+    ///
+    /// With an `owner`, the release frees every hold that session made,
+    /// under whatever name it holds now (a rename moved it), plus `name`'s
+    /// hold when no session owns it; a hold another session made under
+    /// `name` stays. Without one, `name`'s hold goes whoever made it.
+    pub fn release_held_name(&self, name: &str, owner: Option<sessions::SessionId>) -> bool {
+        let canonical = canonical_box_name(name);
+        let mut held = self
+            .held_names
+            .write()
+            .expect("the held names' lock is never held across a panic, so it cannot be poisoned");
+        let before = held.len();
+        match owner {
+            Some(owner) => held.retain(|held_name, held_by| match held_by {
+                Some(session) => *session != owner,
+                None => *held_name != canonical,
+            }),
+            None => {
+                held.remove(&canonical);
+            }
+        }
+        let removed = held.len() != before;
+        drop(held);
+        if removed {
+            tracing::info!(
+                box = %name,
+                "released a held box name; it answers nothing again"
+            );
+            self.ping();
+        }
+        removed
+    }
+
     /// Subscribes to the table's change pings: one `()` per registration,
     /// withdrawal, and stopped mark, for as long as the returned receiver
     /// lives. The host answerer subscribes — a daemon that does not hold
@@ -3080,6 +3154,11 @@ impl BoxRegistry {
     /// namespace it names is not running. The view is a snapshot, built
     /// fresh by whoever asks — a lookup, a dump, a registration — so it
     /// can never hold a row the table has already let go.
+    ///
+    /// The names held with no row behind them ([`Self::hold_box_name`],
+    /// the `host_ip` interim) fold in after the rows as address-less
+    /// entries: a name a row publishes is the row's, and a name only
+    /// held answers NODATA.
     #[must_use]
     pub fn zone_view(&self) -> zone_answer::ZoneView {
         // The rows lock first, the stopped set inside it — the order every
@@ -3103,6 +3182,27 @@ impl BoxRegistry {
                     live: !stopped.contains(&record.switch_addr.octets()),
                 },
             );
+        }
+        drop(stopped);
+        drop(rows);
+        // Held names fold in after the rows: a name a row publishes keeps
+        // the row's entry — replacing it would drop the address a live box
+        // answers with — and a name only held answers NODATA.
+        let held_names = self
+            .held_names
+            .read()
+            .expect("the held names' lock is never held across a panic, so it cannot be poisoned");
+        for name in held_names.keys() {
+            let zone_name = zone_name(name);
+            if view.rows().find(|(held, _)| *held == zone_name).is_none() {
+                view.hold(
+                    zone_name,
+                    zone_answer::ZoneRow {
+                        address: None,
+                        live: true,
+                    },
+                );
+            }
         }
         view
     }
@@ -4620,6 +4720,112 @@ mod tests {
             sessions::core::zone_answer::Verdict::Nxdomain,
             "a withdrawn namespace's name is held by nothing"
         );
+    }
+
+    /// The `host_ip` interim: a box that shares the node's own row
+    /// publishes no row of its own, so its name is held with no row
+    /// behind it — NODATA, never NXDOMAIN for a box that exists — and the
+    /// release ends the interim with the session that bought it.
+    #[test]
+    fn the_zone_view_holds_a_host_ip_box_name_with_no_row_behind_it() {
+        let registry = BoxRegistry::new(SUBNET);
+        let a = sessions::core::zone_answer::Lookup {
+            name: "web.min.internal".to_string(),
+            record: sessions::core::zone_answer::RecordType::A,
+            origin: sessions::core::zone_answer::Origin::OnMachine,
+        };
+        assert_eq!(
+            sessions::core::zone_answer::decide(&a, &registry.zone_view()),
+            sessions::core::zone_answer::Verdict::Nxdomain,
+            "a name nothing holds is NXDOMAIN, the pre-box state"
+        );
+
+        // The hold: NODATA, idempotent whatever the case it was asked in.
+        assert!(registry.hold_box_name("web", None));
+        assert!(!registry.hold_box_name("WEB", None));
+        let view = registry.zone_view();
+        assert_eq!(
+            view.rows()
+                .find(|(name, _)| *name == "web.min.internal")
+                .map(|(_, row)| *row),
+            Some(zone_answer::ZoneRow {
+                address: None,
+                live: true,
+            }),
+            "a held name is held with no address and live"
+        );
+        assert_eq!(
+            sessions::core::zone_answer::decide(&a, &view),
+            sessions::core::zone_answer::Verdict::Nodata,
+            "a held name answers NODATA: the box exists, no address to tell"
+        );
+
+        // The release: back to the pre-box state; a repeat is the goal
+        // state already holding.
+        assert!(registry.release_held_name("web", None));
+        assert!(!registry.release_held_name("web", None));
+        assert_eq!(
+            sessions::core::zone_answer::decide(&a, &registry.zone_view()),
+            sessions::core::zone_answer::Verdict::Nxdomain,
+            "a released name answers nothing again"
+        );
+
+        // A row's name is the row's: the hold does not shadow the address
+        // the row answers with, and releasing it leaves the row standing.
+        let web = registry.register(BoxRegistration::new(
+            "web",
+            Ipv4Addr::new(100, 64, 0, 9),
+            Ipv4Addr::new(127, 0, 64, 9),
+        ));
+        assert!(registry.hold_box_name("web", None));
+        assert_eq!(
+            sessions::core::zone_answer::decide(&a, &registry.zone_view()),
+            sessions::core::zone_answer::Verdict::Address(web.loopback_addr()),
+            "a name a row publishes answers the row's address, hold or no hold"
+        );
+        assert!(registry.release_held_name("web", None));
+        assert_eq!(
+            sessions::core::zone_answer::decide(&a, &registry.zone_view()),
+            sessions::core::zone_answer::Verdict::Address(web.loopback_addr()),
+            "the row keeps answering its address once the hold is gone"
+        );
+    }
+
+    /// A release that names its session frees only that session's hold: a
+    /// newer session that took the name keeps its own, and a hold a rename
+    /// moved to another name is freed by the session it belongs to.
+    #[test]
+    fn a_session_release_frees_only_that_sessions_holds() {
+        let registry = BoxRegistry::new(SUBNET);
+        let held = |registry: &BoxRegistry, name: &str| {
+            registry
+                .zone_view()
+                .rows()
+                .any(|(held, _)| held == zone_name(name))
+        };
+        let old = sessions::SessionId::parse_str("00000000-0000-4000-8000-000000000001").unwrap();
+        let new = sessions::SessionId::parse_str("00000000-0000-4000-8000-000000000002").unwrap();
+
+        // A newer session took the name: the old session's release leaves it.
+        assert!(registry.hold_box_name("web", Some(old)));
+        assert!(!registry.hold_box_name("web", Some(new)));
+        assert!(!registry.release_held_name("web", Some(old)));
+        assert!(held(&registry, "web"), "the newer session's hold stays");
+        assert!(registry.release_held_name("web", Some(new)));
+        assert!(!held(&registry, "web"));
+
+        // A rename moved the hold: the session's release frees it there.
+        assert!(registry.hold_box_name("api", Some(old)));
+        assert!(registry.release_held_name("web", Some(old)));
+        assert!(
+            !held(&registry, "api"),
+            "the moved hold went with its session"
+        );
+
+        // A hold no session owns goes with its name.
+        assert!(registry.hold_box_name("db", None));
+        assert!(registry.release_held_name("db", Some(new)));
+        assert!(!held(&registry, "db"));
     }
 
     /// NET-133's trust boundary, on the proxy's attachments: the guest never

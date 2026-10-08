@@ -921,6 +921,17 @@ fn serve_request(
             let reply = order.apply(|| withdraw_box(boxes, answerer, request));
             write_reply(stream, &reply)
         }
+        // The hold and its release take a ticket like the verbs they
+        // bracket: each changes the table the answerer answers from, so
+        // each publishes in its own turn, never mid-fold.
+        (BoxControlRequest::HoldBoxName(request), ControlDoor::Host) => {
+            let reply = order.apply(|| hold_box_name(boxes, &request.name, request.session_id));
+            write_reply(stream, &reply)
+        }
+        (BoxControlRequest::ReleaseBoxName(request), ControlDoor::Host) => {
+            let reply = order.apply(|| release_box_name(boxes, &request.name, request.session_id));
+            write_reply(stream, &reply)
+        }
         (BoxControlRequest::AnswererStatus, ControlDoor::Host) => {
             // The read-only status answers the host facts the CLI's
             // surfaces read (T93): why the hostname proxy is not serving
@@ -1181,6 +1192,8 @@ fn request_verb(request: &BoxControlRequest) -> &'static str {
     match request {
         BoxControlRequest::Register(_) => "register",
         BoxControlRequest::Withdraw(_) => "withdraw",
+        BoxControlRequest::HoldBoxName(_) => "hold_box_name",
+        BoxControlRequest::ReleaseBoxName(_) => "release_box_name",
         BoxControlRequest::AnswererStatus => "answerer_status",
         BoxControlRequest::AdmitPort(_) => "admit_port",
         BoxControlRequest::WithdrawPort(_) => "withdraw_port",
@@ -1470,6 +1483,38 @@ fn withdraw_box(
                 error: error.to_string(),
             }
         }
+    }
+}
+
+/// Hold a `host_ip` box's name in the host's zone with no row behind it:
+/// the interim that answers the name NODATA until the node's bind mirror
+/// lands. `held` true either way — a name the table already holds is the
+/// goal state, not a refusal.
+fn hold_box_name(
+    boxes: &BoxRegistry,
+    name: &str,
+    session_id: Option<sessions::SessionId>,
+) -> BoxControlReply {
+    boxes.hold_box_name(name, session_id);
+    BoxControlReply::NameHeld {
+        name: name.to_string(),
+        held: true,
+    }
+}
+
+/// Release a name a hold kept: the name answers nothing again. `held`
+/// false either way — a name no hold kept is the goal state already
+/// holding — and a release that names its session frees only that
+/// session's holds (see [`BoxRegistry::release_held_name`]).
+fn release_box_name(
+    boxes: &BoxRegistry,
+    name: &str,
+    session_id: Option<sessions::SessionId>,
+) -> BoxControlReply {
+    boxes.release_held_name(name, session_id);
+    BoxControlReply::NameHeld {
+        name: name.to_string(),
+        held: false,
     }
 }
 
@@ -2532,8 +2577,8 @@ mod tests {
     use std::time::Duration;
 
     use minimald_rpc::{
-        BoxControlReply, BoxControlRequest, RegisterBoxRequest, WithdrawBoxRequest,
-        ZoneAnswererStatus,
+        BoxControlReply, BoxControlRequest, HoldBoxNameRequest, RegisterBoxRequest,
+        WithdrawBoxRequest, ZoneAnswererStatus,
     };
     use switch::SwitchSubnet;
 
@@ -2695,6 +2740,12 @@ mod tests {
             }
             BoxControlReply::AnswererRelease { detail, .. } => {
                 panic!("a box verb is never answered with a release reply, got {detail}")
+            }
+            BoxControlReply::NameHeld { name, held } => {
+                panic!(
+                    "a registration is answered with the registered box, got a name-hold \
+                     reply for {name:?} (held: {held})"
+                )
             }
         }
     }
@@ -3034,6 +3085,12 @@ mod tests {
             BoxControlReply::AnswererRelease { detail, .. } => {
                 panic!("a box verb is never answered with a release reply, got {detail}")
             }
+            BoxControlReply::NameHeld { name, held } => {
+                panic!(
+                    "a withdrawal echoes the pair it went by, got a name-hold reply for \
+                     {name:?} (held: {held})"
+                )
+            }
         }
         assert!(
             registry
@@ -3132,6 +3189,12 @@ mod tests {
                 BoxControlReply::AnswererRelease { detail, .. } => {
                     panic!("a box verb is never answered with a release reply, got {detail}")
                 }
+                BoxControlReply::NameHeld { name, held } => {
+                    panic!(
+                        "a foreign pair's withdrawal must be refused, got a name-hold reply \
+                         for {name:?} (held: {held})"
+                    )
+                }
             }
         }
         assert!(
@@ -3189,6 +3252,12 @@ mod tests {
             }
             BoxControlReply::AnswererRelease { detail, .. } => {
                 panic!("a box verb is never answered with a release reply, got {detail}")
+            }
+            BoxControlReply::NameHeld { name, held } => {
+                panic!(
+                    "a repeat withdrawal echoes the pair, got a name-hold reply for {name:?} \
+                     (held: {held})"
+                )
             }
         }
 
@@ -3315,6 +3384,73 @@ mod tests {
                 .is_some(),
             "the read-only verb leaves the row the registration published"
         );
+    }
+
+    /// The `host_ip` interim over the host door: a hold answers the
+    /// name-hold marker and leaves the name in the zone view with no
+    /// address (NODATA), whatever case it was asked in; the release
+    /// answers the marker with `held: false` and takes the name out of the
+    /// view (NXDOMAIN again), and a repeat release is the goal state
+    /// already holding.
+    #[test]
+    fn a_held_name_is_held_and_released_over_the_control_socket() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (sock_path, _server, registry, _answerer, _proxy_publish) =
+            spawn_server(dir.path()).expect("server binds");
+        let held_row = |registry: &BoxRegistry| {
+            registry
+                .zone_view()
+                .rows()
+                .find(|(name, _)| *name == "web.min.internal")
+                .map(|(_, row)| *row)
+        };
+
+        let reply = control(
+            &sock_path,
+            &BoxControlRequest::HoldBoxName(HoldBoxNameRequest {
+                name: "Web".to_string(),
+                session_id: None,
+            }),
+        )
+        .expect("the hold is answered");
+        assert_eq!(
+            reply,
+            BoxControlReply::NameHeld {
+                name: "Web".to_string(),
+                held: true,
+            }
+        );
+        assert_eq!(
+            held_row(&registry),
+            Some(sessions::core::zone_answer::ZoneRow {
+                address: None,
+                live: true,
+            }),
+            "the held name is in the zone with no address behind it"
+        );
+
+        for _ in 0..2 {
+            let reply = control(
+                &sock_path,
+                &BoxControlRequest::ReleaseBoxName(HoldBoxNameRequest {
+                    name: "web".to_string(),
+                    session_id: None,
+                }),
+            )
+            .expect("the release is answered");
+            assert_eq!(
+                reply,
+                BoxControlReply::NameHeld {
+                    name: "web".to_string(),
+                    held: false,
+                }
+            );
+            assert_eq!(
+                held_row(&registry),
+                None,
+                "a released name is out of the zone"
+            );
+        }
     }
 
     /// The drawn port's story (T93): a guest that reports its publish was
