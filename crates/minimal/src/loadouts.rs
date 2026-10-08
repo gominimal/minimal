@@ -7,12 +7,12 @@ use anyhow::{Context as _, bail};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::config::{read_client_config, resolve_minimal_config_dir};
+use crate::config::{read_client_config, read_user_policy, resolve_minimal_config_dir};
 use crate::{GlobalArgs, LoadoutListArgs};
 
 /// The user's choice of which loadouts to apply for a session
 /// activation, resolved from CLI flags before disk I/O begins.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum LoadoutSelection {
     /// `--no-loadouts` set — apply nothing regardless of config.
     None,
@@ -514,6 +514,91 @@ pub(crate) fn compose_user_contribution(
     composer
         .compose(policy, options)
         .map_err(|e| anyhow::anyhow!("composing loadouts: {e}"))
+}
+
+// =========================================================================
+// Shared activation inputs
+// =========================================================================
+
+/// Everything a session activation resolves from the client's config and
+/// loadouts before it touches the daemon: the composed contribution, the
+/// staged loadout hook scripts, the finalize hook budget, and the user policy
+/// the composition may have amended.
+///
+/// The CLI-only fields ([`Self::initial_policy`], [`Self::compose_options`],
+/// [`Self::loadout_names`]) exist so the interactive-pending flows can drive
+/// their gating and print their orientation line without re-reading the
+/// config; the dashboard ignores them.
+pub struct ActivationInputs {
+    pub contribution: sessions::wire::request::WireContribution,
+    pub hook_scripts: Vec<sessions::client::hookscripts::StagedScript>,
+    pub hook_budget: Duration,
+    pub user_policy: sessions::core::policy::UserPolicy,
+    /// The user policy before composition, so a caller that drives
+    /// interactive gating can tell whether a prompt appended rules worth
+    /// saving.
+    pub initial_policy: sessions::core::policy::UserPolicy,
+    /// The compose options the daemon-side pending gate re-uses.
+    pub compose_options: sessions::core::compose::ComposeOptions,
+    /// The active loadouts' names, for the CLI's "Applying loadouts" line.
+    pub loadout_names: Vec<String>,
+}
+
+impl ActivationInputs {
+    /// Print the "Applying loadouts" orientation line the CLI emits at
+    /// session start. Never called by the dashboard, which owns its screen.
+    pub(crate) fn announce_loadouts(&self) {
+        if !self.loadout_names.is_empty() {
+            eprintln!("Applying loadouts: {}", self.loadout_names.join(", "));
+        }
+    }
+}
+
+/// Read the client config and user policy, resolve `selection` into the
+/// active loadouts, and stage/validate/compose everything an activation
+/// needs — the one sequence `min session activate`, `min task run`, and the
+/// dashboard all run. `project` is the activation's project root: the
+/// loadout hook scripts are anchored against it, its own hooks are checked,
+/// and its `[session]` hook timeouts size the finalize budget.
+///
+/// Run before the daemon connection: a missing loadout, a malformed config, or
+/// a mistyped hook script must fail on this machine, not after a session
+/// exists on the daemon.
+pub(crate) fn prepare_activation_inputs(
+    global: &GlobalArgs,
+    project: &paths::HostAbsPath,
+    selection: LoadoutSelection,
+    hooks_enabled: bool,
+) -> Result<ActivationInputs, anyhow::Error> {
+    let cfg = read_client_config(global)?;
+    let user_policy = read_user_policy(global)?;
+    let initial_policy = user_policy.clone();
+    let compose_options = compose_options_from_config(&cfg);
+    let active = resolve_active_loadouts(selection, &cfg, global)?;
+    let loadout_names = active
+        .loadouts
+        .iter()
+        .map(|l| l.name().as_ref().to_owned())
+        .collect();
+    let hook_scripts = stage_loadout_hook_scripts(&active, project, hooks_enabled)?;
+    // The project's hooks reach the daemon inside the uploaded mfile, so they
+    // never pass through the staging above; the checks a staging pass would
+    // have made are still worth making here.
+    if hooks_enabled {
+        check_project_hooks(project)?;
+    }
+    let hook_budget = activate_hook_budget(&active, project.as_utf8_path(), hooks_enabled);
+    let (contribution, user_policy) =
+        compose_user_contribution(active, user_policy, compose_options, hooks_enabled)?;
+    Ok(ActivationInputs {
+        contribution,
+        hook_scripts,
+        hook_budget,
+        user_policy,
+        initial_policy,
+        compose_options,
+        loadout_names,
+    })
 }
 
 // =========================================================================

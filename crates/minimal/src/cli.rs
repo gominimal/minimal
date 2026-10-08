@@ -528,7 +528,7 @@ pub struct MeshJoinArgs {
 // Deliberately NOT a doc comment: clap propagates a flattened struct's doc
 // comment into the parent command's long_about, which would replace the
 // top-level `min --help` description with this text.
-#[derive(Debug, Default, Args)]
+#[derive(Debug, Default, Clone, Args)]
 pub struct GlobalArgs {
     /// Use the given directory as the repository root, instead of the current
     /// working directory.
