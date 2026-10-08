@@ -97,6 +97,8 @@ min session activate --attach
 
 Joining a project that already ships a `minimal.toml`? Skip `min init`; the walkthrough below covers it.
 
+For a step-by-step version that runs a coding agent and brings its commits back to your checkout, follow the [quickstart](docs/guide/quickstart.md).
+
 ### See every session in `min dash`
 
 The demo above is three sessions of one repository, each from its own checkout on its own branch. Activate a session from each checkout without attaching, then open the dash:

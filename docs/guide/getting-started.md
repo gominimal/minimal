@@ -9,3 +9,5 @@ New to Minimal? Like everyday usage, getting started with Minimal is simple. Thi
 As a local-first, declarative build system, Minimal makes sure that all builds and dev environments run entirely on your machine within isolated sandboxes. Minimal creates a consistent foundation for all users, whether developer, AI agent, or CI, around the org's tech stack.
 
 Minimal is available for download on both Linux and macOS. [Learn more.](https://minimal.dev)
+
+In a hurry? The [quickstart](./quickstart.md) takes you from install to a coding agent working in an isolated session in about three minutes.
