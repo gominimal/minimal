@@ -53,6 +53,13 @@ JSON. When the daemon reports a shared resource pool, the table is headed
 by a `RESOURCE POOL:` line (CPU cores, memory, and the number of sessions
 sharing them); `--raw` omits it.
 
+Another box at the same shared loopback address can hold a port this box
+declares, and this box does not forward it. The list prints one stderr line
+per such port after the table:
+`warning: <session>: port <p> is held by <box>; not forwarded`.
+With `--json` the entry lists those ports under `shared_port_collisions`,
+each with `port` and `held_by`, and the key is absent when there are none.
+
 `min ls` is the same command kept bare at the top level — a deliberate
 exception to the `min <noun> <verb>` convention, since it is the
 highest-traffic command in the CLI; `min session ls` is the noun-level alias.
@@ -355,7 +362,7 @@ box that published it first holds it, and a later box does not forward it.
 Activation prints a `warning:` line on stderr for each such port, naming
 the box that holds it. The text output marks the declared row
 `(held by <box>)`, and the document lists the rows under
-`shared_port_collisions`, each with `port` and the holding box as `other`.
+`shared_port_collisions`, each with `port` and the holding box as `held_by`.
 The key is absent when another box holds none of the box's ports.
 
 With `-o json`, a failed run writes one `min/v1/error` object on stderr and

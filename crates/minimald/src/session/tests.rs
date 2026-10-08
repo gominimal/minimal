@@ -5356,7 +5356,7 @@ async fn a_handed_reserved_address_waits_for_the_verdict_before_it_publishes() {
 /// the registry's, to act on.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn shared_address_port_collision_reported_at_finalize_without_attached_client() {
+async fn shared_address_port_collision_reported_not_translated() {
     let shared = std::net::Ipv4Addr::new(127, 0, 64, 9);
     let server = TestServer::new().await;
     let capture = crate::test_harness::captured_log();
@@ -5494,7 +5494,7 @@ async fn shared_address_port_collision_reported_at_finalize_without_attached_cli
         second_reply.shared_port_collisions,
         vec![minimald_rpc::SharedPortCollision {
             port: 18080,
-            other: "first.min.internal".to_string(),
+            held_by: "first.min.internal".to_string(),
         }],
         "the finalize reply names the yielded port and the box that holds it"
     );

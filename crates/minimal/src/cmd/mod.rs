@@ -707,7 +707,7 @@ fn shared_port_collision_warning(collision: &minimald_rpc::SharedPortCollision) 
     format!(
         "warning: port {} is already held by {}; this session will not \
          forward it (first-come on the shared address)",
-        collision.port, collision.other
+        collision.port, collision.held_by
     )
 }
 
@@ -901,7 +901,7 @@ mod tests {
     fn shared_port_collision_warning_names_the_port_and_its_holder() {
         let line = super::shared_port_collision_warning(&minimald_rpc::SharedPortCollision {
             port: 18080,
-            other: "first.min.internal".to_string(),
+            held_by: "first.min.internal".to_string(),
         });
         assert_eq!(
             line,

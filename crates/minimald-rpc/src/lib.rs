@@ -231,6 +231,18 @@ pub struct ListSessionsEntry {
     /// other surfaces read as "not a host-address session".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_ip_enforcement: Option<HostIpEnforcement>,
+    /// The declared ingress ports this box yields because another box at the
+    /// same shared loopback address holds them (NET-129, first-come), one
+    /// entry per port naming the holding box: the same registry read
+    /// [`SessionRuntimeFacts::shared_port_collisions`] answers from, so a
+    /// listing and the policy view cannot disagree. Serde-defaulted, so an
+    /// entry from a daemon that predates the field decodes as empty, and
+    /// omitted when empty, so the common entry is unchanged on the wire.
+    /// Neither this entry nor [`ListSessionsResponse`] is
+    /// `deny_unknown_fields`, so a client that predates the field ignores a
+    /// populated list rather than refusing the listing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shared_port_collisions: Vec<SharedPortCollision>,
 }
 
 /// The git state of a session's project path, probed by the client on the
@@ -1709,7 +1721,7 @@ pub struct SharedPortCollision {
     /// The port both boxes declared and the holding box serves.
     pub port: u16,
     /// The holding box's name, as the warning names it.
-    pub other: String,
+    pub held_by: String,
 }
 
 /// Serde helper: omit [`FinalizeSessionResponse::package_check_skipped`]
@@ -2567,7 +2579,7 @@ mod tests {
         let yielded = FinalizeSessionResponse {
             shared_port_collisions: vec![SharedPortCollision {
                 port: 8080,
-                other: "first.min.internal".to_string(),
+                held_by: "first.min.internal".to_string(),
             }],
             ..Default::default()
         };
@@ -2582,7 +2594,7 @@ mod tests {
             back.shared_port_collisions,
             vec![SharedPortCollision {
                 port: 8080,
-                other: "first.min.internal".to_string(),
+                held_by: "first.min.internal".to_string(),
             }],
             "the collision list must round-trip"
         );
@@ -3531,6 +3543,71 @@ mod tests {
             }))
         );
         assert_eq!(round_trip(&with), with);
+    }
+
+    /// NET-129's listing half survives version skew both ways without a
+    /// request flag, because neither [`ListSessionsResponse`] nor
+    /// [`ListSessionsEntry`] is `deny_unknown_fields`. A newer daemon's
+    /// populated entry carries one key more than an older client knows, and
+    /// these types skip a key they do not know — shown here with a key this
+    /// build does not know either, the position an older client is in. An
+    /// older daemon's entry carries no list and decodes as empty, and an
+    /// empty list stays off the wire.
+    #[test]
+    fn list_sessions_shared_port_collisions_survive_version_skew_both_ways() {
+        let entry = |collisions: Vec<SharedPortCollision>| ListSessionsEntry {
+            id: SessionId::nil(),
+            name: Some("second".to_string()),
+            project_path: None,
+            status: sessions::SessionStatus::Active,
+            git: None,
+            attrs: None,
+            host_ip_enforcement: None,
+            shared_port_collisions: collisions,
+        };
+        let response = |sessions| ListSessionsResponse {
+            resource_pool: None,
+            sessions,
+            daemon_version: None,
+            hostname_routing_unavailable: None,
+            hostname_proxy_port: None,
+            zone_answerer_port: None,
+            answerer_bound: false,
+        };
+
+        let quiet = serde_json_lenient::to_string(&response(vec![entry(Vec::new())]))
+            .expect("must serialize");
+        assert!(
+            !quiet.contains("shared_port_collisions"),
+            "an empty list must not be serialized, got {quiet}"
+        );
+
+        let yielded = entry(vec![SharedPortCollision {
+            port: 8080,
+            held_by: "first.min.internal".to_string(),
+        }]);
+        let mut wire =
+            serde_json_lenient::to_value(response(vec![yielded.clone()])).expect("serializes");
+        assert_eq!(
+            wire["sessions"][0]["shared_port_collisions"],
+            serde_json_lenient::json!([{"port": 8080, "held_by": "first.min.internal"}]),
+            "a yielded port is listed under its wire key: {wire}"
+        );
+
+        // A newer daemon's reply, one key past what this build knows: still
+        // decodes, so an older client's listing survives a populated list.
+        wire["sessions"][0]["a_later_field"] = serde_json_lenient::json!([1]);
+        wire["a_later_field"] = serde_json_lenient::json!(true);
+        let newer: ListSessionsResponse =
+            serde_json_lenient::from_value(wire).expect("unknown keys are ignored");
+        assert_eq!(newer.sessions, vec![yielded]);
+
+        // An older daemon's entry: no list, decoded as empty.
+        let older: ListSessionsResponse = serde_json_lenient::from_str(
+            r#"{"sessions":[{"id":"00000000-0000-0000-0000-000000000000","name":"second","attrs":null}]}"#,
+        )
+        .expect("a pre-field entry must decode");
+        assert!(older.sessions[0].shared_port_collisions.is_empty());
     }
 
     /// The port-report verbs (NET-138) round-trip as the fixed, size-bounded

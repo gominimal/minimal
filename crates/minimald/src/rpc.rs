@@ -179,6 +179,9 @@ async fn serve_list_sessions(
                     .into_iter()
                     .zip(enforcement)
                     .map(|(i, host_ip_enforcement)| ListSessionsEntry {
+                        // NET-129: the listing names the ports this box
+                        // yields, from the same read the runtime facts use.
+                        shared_port_collisions: shared_port_collisions_of(&mngr, i.id),
                         id: i.id,
                         name: i.name,
                         project_path: Some(i.project_path),
@@ -206,6 +209,28 @@ async fn serve_list_sessions(
             })
         })
         .await
+}
+
+/// The ports a box's attach yields because a sibling at the same shared
+/// loopback address holds them (NET-129, first-come), as the wire names
+/// them: the one registry read both the runtime facts and the listing answer
+/// from, so `min session policy` and `min session list` cannot disagree.
+/// Empty for every mode but a shared-address own-ip box; a plain map lookup
+/// behind the registry's lock, so it never holds up a reply.
+fn shared_port_collisions_of(
+    mngr: &crate::sessions::ManagerHandle,
+    id: SessionId,
+) -> Vec<minimald_rpc::SharedPortCollision> {
+    let registry = mngr.hostnames();
+    let routes = registry.read().expect("hostname registry lock poisoned");
+    routes
+        .shared_port_collisions(id)
+        .into_iter()
+        .map(|c| minimald_rpc::SharedPortCollision {
+            port: c.port,
+            held_by: c.other,
+        })
+        .collect()
 }
 
 fn detect_resource_pool() -> Option<ResourcePool> {
@@ -1485,18 +1510,7 @@ async fn serve_get_session_runtime_facts(
                     // mode but a shared-address own-ip box — and read behind
                     // the registry's lock, a plain map lookup, so it never
                     // holds up the reply.
-                    let shared_port_collisions = {
-                        let registry = mngr.hostnames();
-                        let routes = registry.read().expect("hostname registry lock poisoned");
-                        routes
-                            .shared_port_collisions(record.id)
-                            .into_iter()
-                            .map(|c| minimald_rpc::SharedPortCollision {
-                                port: c.port,
-                                other: c.other,
-                            })
-                            .collect()
-                    };
+                    let shared_port_collisions = shared_port_collisions_of(&mngr, record.id);
                     Ok(Errorable::Ok(minimald_rpc::SessionRuntimeFacts {
                         id: record.id,
                         host_ip_enforcement,
@@ -3515,6 +3529,7 @@ mod tests {
                 // verdict, so no host's gate refuses it and the fact is what
                 // shows, on any host this test runs on.
                 host_ip_enforcement: Some(fact.enforcement),
+                shared_port_collisions: Vec::new(),
                 attrs: None,
             }]
         );

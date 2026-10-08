@@ -665,6 +665,7 @@ fn twin_entry(
         status,
         git: None,
         host_ip_enforcement: None,
+        shared_port_collisions: Vec::new(),
         attrs: None,
     }
 }

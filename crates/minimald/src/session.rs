@@ -2434,7 +2434,7 @@ impl Session {
                     .into_iter()
                     .map(|c| minimald_rpc::SharedPortCollision {
                         port: c.port,
-                        other: c.other,
+                        held_by: c.other,
                     })
                     .collect();
                 #[cfg(not(target_os = "linux"))]

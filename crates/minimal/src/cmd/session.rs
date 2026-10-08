@@ -2618,7 +2618,7 @@ pub fn format_policy(
                     let held_by = shared_port_collisions
                         .iter()
                         .find(|c| c.port == mapping.external_port)
-                        .map(|c| format!(" (held by {})", c.other));
+                        .map(|c| format!(" (held by {})", c.held_by));
                     match held_by {
                         Some(mark) => writeln!(
                             out,
@@ -2871,7 +2871,7 @@ struct PolicyJson<'a> {
     live_ingress: Option<LiveIngressJson>,
     /// NET-129: the declared ports this box yields because another box at
     /// the same shared loopback address holds them, as the wire's own rows
-    /// (`port`, and the holding box as `other`) — the text rendering's
+    /// (`port`, and the holding box as `held_by`) — the text rendering's
     /// "(held by …)" marks. Omitted when empty, the reading a daemon that
     /// predates the fact, or a facts fetch that failed, also leaves.
     #[serde(skip_serializing_if = "no_shared_port_collisions")]
@@ -5075,7 +5075,7 @@ mod tests {
         };
         let collisions = vec![minimald_rpc::SharedPortCollision {
             port: 8080,
-            other: "first.min.internal".to_string(),
+            held_by: "first.min.internal".to_string(),
         }];
 
         let mut out = Vec::new();
@@ -5114,7 +5114,7 @@ mod tests {
         let document = String::from_utf8(out).unwrap();
         assert!(
             document.contains(
-                r#""shared_port_collisions":[{"port":8080,"other":"first.min.internal"}]"#
+                r#""shared_port_collisions":[{"port":8080,"held_by":"first.min.internal"}]"#
             ),
             "the document names the yielded port and its holder: {document}"
         );
