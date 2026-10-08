@@ -16587,18 +16587,23 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
       echo "held: a host connection to $po_addr:$PO_HOLD is established through its declared forward, and the box holds it open"
     fi
 
-    # Count the terminate records at this box's switch address BEFORE the
-    # destroy: the log dir carries every earlier case's records too (a
+    # Snapshot the terminate records at this box's switch address BEFORE
+    # the destroy: the log dir carries every earlier case's records too (a
     # daemon's file outlives it), and address allocation starts over on a
     # fresh daemon, so an earlier box's records can sit at this box's
-    # address. The leg below requires a NEW record — one more than this —
-    # so a stale record can never pass it.
-    po_term_before=0
+    # address. The leg below requires a record NOT in this snapshot, so a
+    # stale record can never pass it. A set of lines, not a count: each
+    # line carries its own timestamp, so retention pruning a rotated
+    # day-file between here and the check cannot hide a new one. Keyed by
+    # the whole field — `"switch_addr":"<addr>"` — so 10.0.0.1 never
+    # matches a record for 10.0.0.12.
+    po_term_key="\"switch_addr\":\"$po_switch_addr\""
+    po_term_msg="terminated the connections the box's forwarders carried"
+    po_term_before_file="$WORK/po-term-before.log"
+    : >"$po_term_before_file"
     if [ -n "$po_switch_addr" ]; then
-      po_term_before="$(minvmd_log_lines \
-        "terminated the connections the box's forwarders carried" \
-        | grep -cF -- "$po_switch_addr")"
-      po_term_before="${po_term_before:-0}"
+      minvmd_log_lines "$po_term_msg" | grep -F -- "$po_term_key" \
+        >"$po_term_before_file" || true
     fi
     mnl session destroy --force "$po_sid" >/dev/null 2>&1 || true
     po_destroyed_ms=$(now_ms)
@@ -16657,8 +16662,7 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
       # half can lean on there — `po_switch_addr` marks the lane).
       po_gate_recs=""
       if [ -n "$po_switch_addr" ]; then
-        po_gate_recs="$(minvmd_log_lines "switch_addr" 2>/dev/null \
-          | grep -F -- "$po_switch_addr" || true)"
+        po_gate_recs="$(minvmd_log_lines "$po_term_key" 2>/dev/null || true)"
       fi
       if kill -0 "$po_hold_pid" 2>/dev/null; then
         kill "$po_hold_pid" 2>/dev/null || true
@@ -16683,9 +16687,9 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
       # the switch address — and a FIN the box's own stack sent removes
       # no tracked flow, so the held connection IS in the table a real
       # revocation terminates. So on the lane that can read the gate's
-      # records, a close without a NEW terminate record (one more than
-      # `po_term_before`, the count this half took before the destroy —
-      # an earlier box's records can share the address) was not revocation
+      # records, a close without a NEW terminate record (one absent from
+      # the snapshot this half took before the destroy — an earlier box's
+      # records can share the address) was not revocation
       # at all: the box's own FIN (its socat holder torn down with it),
       # which reaches the host the same way — the two were this leg's
       # flake. Absent the record, say which, so the next failure is not
@@ -16693,16 +16697,12 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
       if [ -n "$po_switch_addr" ]; then
         po_term_rec=""
         for _ in $(seq 1 60); do
-          po_term_now="$(minvmd_log_lines \
-            "terminated the connections the box's forwarders carried" 2>/dev/null \
-            | grep -cF -- "$po_switch_addr")"
-          po_term_now="${po_term_now:-0}"
-          if [ "$po_term_now" -gt "$po_term_before" ]; then
-            po_term_rec="$(minvmd_log_lines \
-              "terminated the connections the box's forwarders carried" 2>/dev/null \
-              | grep -F -- "$po_switch_addr" | tail -n1)"
-            break
-          fi
+          # grep -vxFf with an empty snapshot keeps every line: no record
+          # before the destroy, so any record now is new.
+          po_term_rec="$(minvmd_log_lines "$po_term_msg" 2>/dev/null \
+            | grep -F -- "$po_term_key" \
+            | grep -vxFf "$po_term_before_file" | tail -n1)"
+          [ -n "$po_term_rec" ] && break
           sleep 0.25
         done
         if [ -n "$po_term_rec" ]; then
@@ -16711,6 +16711,7 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
         else
           echo "::error::the held connection to $po_addr:$PO_HOLD ended, but the egress gate wrote no terminate record for the box's switch address $po_switch_addr after its box was destroyed — so the gate never reset it; the close was the box's own FIN, and revocation did not terminate the connection (design §7.1)"
           echo "--- egress gate records for this box (bind, unbind, terminate) ---"
+          po_gate_recs="$(minvmd_log_lines "$po_term_key" 2>/dev/null || true)"
           if [ -n "$po_gate_recs" ]; then
             printf '%s\n' "$po_gate_recs" | tail -n 20
           else
