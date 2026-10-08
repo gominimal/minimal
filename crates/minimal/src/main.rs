@@ -56,7 +56,8 @@ async fn run() -> ExitCode {
 
     // Parse before installing the subscriber, so the shell completion handler can
     // be configured to log to stderr instead of stdout.
-    let cli = minimal::Cli::parse();
+    let cli = minimal::Cli::try_parse()
+        .unwrap_or_else(|err| minimal::with_retired_command_hint(err).exit());
     minimal::theme::install();
 
     // Publish `--vm` before any path resolution, so the socket, the state dir,

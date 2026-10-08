@@ -82,6 +82,9 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
         Some(Command::Net(NetArgs {
             command: NetCommand::Forward(args),
         })) => cmd_net_forward(&cli.global_args, args).await,
+        Some(Command::Net(NetArgs {
+            command: NetCommand::Setup(args),
+        })) => cmd_net_setup(&cli.global_args, args).await,
         Some(Command::Dirs) => dirs::cmd_dirs(&cli.global_args),
         Some(Command::Bug(args)) => diag::cmd_bug(&cli.global_args, args).await,
         Some(Command::Diag(diag::DiagArgs { command })) => match command {
@@ -701,6 +704,16 @@ pub(crate) async fn best_effort_destroy(
     }
 }
 
+/// The stderr line activation prints for a declared port the box yields
+/// because another box at the same shared loopback address holds it.
+fn shared_port_collision_warning(collision: &minimald_rpc::SharedPortCollision) -> String {
+    format!(
+        "warning: port {} is already held by {}; this session will not \
+         forward it (first-come on the shared address)",
+        collision.port, collision.held_by
+    )
+}
+
 /// Upload the composition's patches and external hook scripts (if
 /// any) and finalize the session. The session is `Materializing` at
 /// entry; `Active` on success. On upload/finalize failure the session
@@ -736,7 +749,10 @@ pub(crate) async fn upload_and_finalize(
     use minimald_rpc::{FinalizeSession, FinalizeSessionRequest};
     let resp = client
         .oneshot_rpc_with_hook_budget::<FinalizeSession>(
-            FinalizeSessionRequest { session_id },
+            FinalizeSessionRequest {
+                session_id,
+                report_shared_port_collisions: true,
+            },
             hook_budget,
         )
         .await
@@ -767,6 +783,14 @@ pub(crate) async fn upload_and_finalize(
                      did not resolve in time or could not be evaluated; see the daemon \
                      log); unknown package names will surface at first exec"
                 );
+            }
+            // First-come on a shared loopback address: another box at the
+            // same address holds this port, so this box's attach yields the
+            // forward. The box activates and serves its other ports, but
+            // without this line the only trace of the yield is the daemon
+            // log — a user reading a green activate would never know.
+            for collision in &ok.shared_port_collisions {
+                eprintln!("{}", shared_port_collision_warning(collision));
             }
             Ok(())
         }
@@ -870,4 +894,22 @@ pub(crate) fn composition_failure_message(project_dir: &camino::Utf8Path, error:
          the cause below names the project configuration, fix it there; otherwise re-run.\
          \n\ncause: {error}"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    /// NET-129: the activate warning for a yielded shared-address port is a
+    /// `warning:` line naming the port and the box that holds it.
+    #[test]
+    fn shared_port_collision_warning_names_the_port_and_its_holder() {
+        let line = super::shared_port_collision_warning(&minimald_rpc::SharedPortCollision {
+            port: 18080,
+            held_by: "first.min.internal".to_string(),
+        });
+        assert_eq!(
+            line,
+            "warning: port 18080 is already held by first.min.internal; this session \
+             will not forward it (first-come on the shared address)"
+        );
+    }
 }

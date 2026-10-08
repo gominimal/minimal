@@ -2575,7 +2575,7 @@ fn switch_rows_of(
     let mut seen: HashMap<String, u8> = HashMap::new();
     let mut switch_rows = Vec::with_capacity(rows.len());
     for record in rows {
-        let own = record.name().to_ascii_lowercase();
+        let own = crate::net::answerer::canonical_box_name(record.name());
         let mut names = Vec::with_capacity(record.declared_names().len() + 1);
         for name in
             std::iter::once(own.as_str()).chain(record.declared_names().iter().map(String::as_str))

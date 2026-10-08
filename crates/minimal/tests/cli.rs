@@ -93,6 +93,7 @@ fn ls_shows_shared_resource_pool() {
             status: sessions::SessionStatus::Active,
             git: None,
             host_ip_enforcement: None,
+            shared_port_collisions: Vec::new(),
             attrs: None,
         }],
     };
@@ -132,6 +133,7 @@ fn ls_table_exposes_project_path_and_status() {
             status: sessions::SessionStatus::Active,
             git: None,
             host_ip_enforcement: None,
+            shared_port_collisions: Vec::new(),
             attrs: None,
         }],
     };
@@ -175,6 +177,7 @@ fn ls_table_shows_host_address_enforcement() {
         status: sessions::SessionStatus::Active,
         git: None,
         host_ip_enforcement: enforcement,
+        shared_port_collisions: Vec::new(),
         attrs: None,
     };
     let resp = ListSessionsResponse {
@@ -219,6 +222,84 @@ fn ls_table_shows_host_address_enforcement() {
     assert_eq!(cells_of("own-address")[3], "-", "got:\n{text}");
 }
 
+/// NET-129's listing half: a box that yields a declared port at a shared
+/// address gets one `warning:` line per port naming the box (by id when it
+/// has no name), the port and the holder; a box that yields nothing gets
+/// none. `--json` carries the rows under the entry's `shared_port_collisions`
+/// key, present only on the entry that yields.
+#[test]
+fn ls_reports_yielded_shared_address_ports() {
+    let entry = |name: Option<&str>, n: u64, collisions| minimald_rpc::ListSessionsEntry {
+        id: SessionId::parse_str(&format!("00000000-0000-0000-0000-{n:012}")).unwrap(),
+        name: name.map(str::to_string),
+        project_path: Some(paths::HostAbsPath::try_new("/work/proj").unwrap()),
+        status: sessions::SessionStatus::Active,
+        git: None,
+        host_ip_enforcement: None,
+        shared_port_collisions: collisions,
+        attrs: None,
+    };
+    let held = |port| minimald_rpc::SharedPortCollision {
+        port,
+        held_by: "first.min.internal".to_string(),
+    };
+    let resp = ListSessionsResponse {
+        daemon_version: None,
+        hostname_routing_unavailable: None,
+        hostname_proxy_port: None,
+        zone_answerer_port: None,
+        answerer_bound: false,
+        resource_pool: None,
+        sessions: vec![
+            entry(Some("first"), 1, Vec::new()),
+            entry(Some("second"), 2, vec![held(8080), held(9090)]),
+            entry(None, 3, vec![held(8080)]),
+        ],
+    };
+    let listings = vec![VmListing {
+        vm: "default".to_string(),
+        resp: resp.clone(),
+        control_sock: None,
+    }];
+
+    assert_eq!(
+        shared_port_collision_lines(&listings),
+        vec![
+            "warning: second: port 8080 is held by first.min.internal; not forwarded",
+            "warning: second: port 9090 is held by first.min.internal; not forwarded",
+            "warning: 00000000-0000-0000-0000-000000000003: port 8080 is held by \
+             first.min.internal; not forwarded",
+        ]
+    );
+
+    let mut out = Vec::new();
+    format_ls(
+        &mut out,
+        &LsArgs {
+            raw: false,
+            json: true,
+        },
+        &resp,
+        None,
+        None,
+    )
+    .unwrap();
+    let document: Value = serde_json_lenient::from_slice(&out).unwrap();
+    let sessions = document["sessions"].as_array().unwrap();
+    assert!(
+        sessions[0].get("shared_port_collisions").is_none(),
+        "a box that yields nothing carries no key: {document}"
+    );
+    assert_eq!(
+        sessions[1]["shared_port_collisions"],
+        serde_json_lenient::json!([
+            {"port": 8080, "held_by": "first.min.internal"},
+            {"port": 9090, "held_by": "first.min.internal"},
+        ]),
+        "the yielding box lists each port and its holder: {document}"
+    );
+}
+
 /// The multi-VM table carries the same EGRESS cell, one column right of the
 /// single-VM one because each row leads with its VM.
 #[test]
@@ -230,6 +311,7 @@ fn ls_across_vms_table_shows_host_address_enforcement() {
         status: sessions::SessionStatus::Active,
         git: None,
         host_ip_enforcement: enforcement,
+        shared_port_collisions: Vec::new(),
         attrs: None,
     };
     let listing = |vm: &str, sessions| VmListing {
@@ -894,7 +976,15 @@ async fn policy_shows_resolved_dynamic_ingress() {
         };
 
         let mut out = Vec::new();
-        format_policy(&mut out, &policy, sessions::NetworkMode::OwnIp, None, None).unwrap();
+        format_policy(
+            &mut out,
+            &policy,
+            sessions::NetworkMode::OwnIp,
+            None,
+            &[],
+            None,
+        )
+        .unwrap();
         let text = String::from_utf8(out).unwrap();
         let row = if declared {
             format!("  dynamic ingress  {mode}\n")
@@ -920,6 +1010,7 @@ async fn policy_shows_resolved_dynamic_ingress() {
             sessions::NetworkMode::OwnIp,
             None,
             Ok(vec![]),
+            &[],
         )
         .unwrap();
         let document: Value = serde_json_lenient::from_slice(&out).unwrap();
@@ -1476,6 +1567,7 @@ async fn policy_json_carries_schema_and_pending() {
         sessions::NetworkMode::OwnIp,
         None,
         Ok(live),
+        &[],
     )
     .unwrap();
     let document: Value = serde_json_lenient::from_slice(&out).unwrap();
@@ -1538,6 +1630,7 @@ async fn policy_json_carries_schema_and_pending() {
         sessions::NetworkMode::OwnIp,
         None,
         Ok(vec![pre_field]),
+        &[],
     )
     .unwrap();
     let document: Value = serde_json_lenient::from_slice(&out).unwrap();
@@ -1576,6 +1669,7 @@ fn policy_json_distinguishes_unavailable_live_rows_from_none_published() {
         sessions::NetworkMode::OwnIp,
         None,
         Ok(Vec::new()),
+        &[],
     )
     .unwrap();
     let document: Value = serde_json_lenient::from_slice(&out).unwrap();
@@ -1594,6 +1688,7 @@ fn policy_json_distinguishes_unavailable_live_rows_from_none_published() {
         sessions::NetworkMode::OwnIp,
         None,
         Err("live port mappings are unavailable: no session found".to_string()),
+        &[],
     )
     .unwrap();
     let document: Value = serde_json_lenient::from_slice(&out).unwrap();
@@ -1611,6 +1706,7 @@ fn policy_json_distinguishes_unavailable_live_rows_from_none_published() {
         sessions::NetworkMode::NoNet,
         None,
         Ok(Vec::new()),
+        &[],
     )
     .unwrap();
     let document: Value = serde_json_lenient::from_slice(&out).unwrap();
@@ -1706,7 +1802,15 @@ async fn policy_shows_effective_egress() {
     );
 
     let mut out = Vec::new();
-    format_policy(&mut out, &policy, sessions::NetworkMode::OwnIp, None, None).unwrap();
+    format_policy(
+        &mut out,
+        &policy,
+        sessions::NetworkMode::OwnIp,
+        None,
+        &[],
+        None,
+    )
+    .unwrap();
     let text = String::from_utf8(out).unwrap();
     assert!(
         text.contains("subnets  10.0.0.0/8"),
@@ -1753,6 +1857,7 @@ async fn policy_shows_effective_egress() {
         &policy,
         sessions::NetworkMode::HostNet,
         None,
+        &[],
         None,
     )
     .unwrap();
@@ -1793,6 +1898,7 @@ async fn policy_shows_effective_egress() {
         &policy,
         sessions::NetworkMode::HostNet,
         Some(host_ip_enforcement),
+        &[],
         None,
     )
     .unwrap();
@@ -1828,7 +1934,15 @@ async fn policy_shows_effective_egress() {
         }
     };
     let mut out = Vec::new();
-    format_policy(&mut out, &policy, sessions::NetworkMode::NoNet, None, None).unwrap();
+    format_policy(
+        &mut out,
+        &policy,
+        sessions::NetworkMode::NoNet,
+        None,
+        &[],
+        None,
+    )
+    .unwrap();
     let text = String::from_utf8(out).unwrap();
     assert_eq!(
         text, "No network policy (NoNet)\n",
@@ -1906,6 +2020,7 @@ async fn policy_shows_deny_all_default() {
         &in_force,
         sessions::NetworkMode::OwnIp,
         None,
+        &[],
         None,
     )
     .unwrap();
@@ -1964,6 +2079,7 @@ async fn policy_shows_deny_all_default() {
         &policy,
         sessions::NetworkMode::HostNet,
         None,
+        &[],
         None,
     )
     .unwrap();
@@ -2244,6 +2360,7 @@ async fn policy_shows_unset_egress_as_named_default() {
         &own_policy,
         sessions::NetworkMode::OwnIp,
         None,
+        &[],
         None,
     )
     .unwrap();
@@ -2277,6 +2394,7 @@ async fn policy_shows_unset_egress_as_named_default() {
         sessions::NetworkMode::OwnIp,
         None,
         Ok(Vec::new()),
+        &[],
     )
     .unwrap();
     let own_document: Value = serde_json_lenient::from_slice(&out).unwrap();
@@ -2342,6 +2460,7 @@ async fn policy_shows_unset_egress_as_named_default() {
         &host_policy,
         sessions::NetworkMode::HostNet,
         Some(enforcement),
+        &[],
         None,
     )
     .unwrap();
@@ -2387,6 +2506,7 @@ async fn policy_shows_unset_egress_as_named_default() {
         &declared_policy,
         sessions::NetworkMode::OwnIp,
         None,
+        &[],
         None,
     )
     .unwrap();
@@ -2411,6 +2531,7 @@ async fn policy_shows_unset_egress_as_named_default() {
         sessions::NetworkMode::OwnIp,
         None,
         Ok(Vec::new()),
+        &[],
     )
     .unwrap();
     let declared_document: Value = serde_json_lenient::from_slice(&out).unwrap();
@@ -2484,6 +2605,7 @@ fn policy_shows_baseline_set() {
         &deny_all,
         sessions::NetworkMode::OwnIp,
         None,
+        &[],
         Some(fabric),
     )
     .unwrap();
@@ -2546,6 +2668,7 @@ fn policy_shows_baseline_set() {
         &deny_all,
         sessions::NetworkMode::HostNet,
         None,
+        &[],
         Some(fabric),
     )
     .unwrap();
@@ -2565,6 +2688,7 @@ fn policy_shows_baseline_set() {
         &deny_all,
         sessions::NetworkMode::OwnIp,
         None,
+        &[],
         None,
     )
     .unwrap();
@@ -3062,9 +3186,9 @@ async fn min_prints_discovered_proxy_port() {
 /// configuration no host process consults), the daemon's answerer bound,
 /// and the reserved local range present on this host's loopback. With the
 /// answerer bound and no hook (this host), both verbs must name the
-/// *proxy* as the live surface and print the NET-122 advisory beside it;
-/// with the hook and the range present too, the same decision says native
-/// and the advisory goes quiet.
+/// *proxy* as the live surface and point at `min net setup` on that line,
+/// with no advisory beside it (NET-122 is opt-in); with the hook and the
+/// range present too, the same decision says native and the pointer goes.
 ///
 /// The daemon's half is brought up the way its start path brings it — the
 /// proxy and the answerer driven to serving on OS-selected ports — and the
@@ -3135,7 +3259,7 @@ async fn activate_and_ls_report_native_surface() {
     // inside a VM-backed host's guest cannot speak for the host's resolver,
     // and this host's own reads say nothing routes the zone to the answerer
     // — so both verbs name the proxy as the live surface, with where it
-    // serves, and neither prints the native words.
+    // serves, points at `min net setup`, and neither prints the native words.
     let out = run_min(&args, &["ls"]).await;
     let ls_stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     assert!(
@@ -3147,16 +3271,20 @@ async fn activate_and_ls_report_native_surface() {
         "the surface line must name where the proxy serves: {ls_stdout}"
     );
     assert!(
+        ls_stdout.contains("run `min net setup`"),
+        "the proxy surface line must point at `min net setup`: {ls_stdout}"
+    );
+    assert!(
         !ls_stdout.contains("native DNS is the live name surface"),
         "a host with no hook must not be told native DNS is live: {ls_stdout}"
     );
 
     // `min session activate`, at the moment the user is about to rely on the
     // names — and before the upload and the loadout, so the line is not lost
-    // above a failed activate's output. The advisory rides beside the line
-    // (NET-122): this host cannot resolve the zone natively, so the session
-    // start must say what is missing — the exact command to run, or the
-    // host fact that makes one dead — and never a prompt.
+    // above a failed activate's output. Host DNS is opt-in (NET-122): this
+    // host cannot resolve the zone natively, so the surface line points at
+    // `min net setup`, and the session start prints no advisory and no part
+    // of the privileged script — and never a prompt.
     let project = tempfile::TempDir::new().unwrap();
     std::fs::create_dir(project.path().join(".git")).unwrap();
     std::fs::write(
@@ -3191,22 +3319,21 @@ async fn activate_and_ls_report_native_surface() {
         "a host with no hook must not be told native DNS is live: {activate_stderr}"
     );
     assert!(
-        activate_stderr.contains("note:"),
-        "activate must print the naming advisory beside the surface line, got: {activate_stderr}"
+        activate_stderr.contains("run `min net setup`"),
+        "activate's surface line must point at `min net setup`, got: {activate_stderr}"
     );
     assert!(
-        activate_stderr.contains("Configure the host's resolver")
-            || activate_stderr.contains("bypass systemd-resolved"),
-        "the advisory names what is missing — the command to run, or the host fact that \
-         makes one dead: {activate_stderr}"
+        !activate_stderr.contains("note:") && !activate_stderr.contains("#!/bin/sh"),
+        "a session start prints no advisory and no setup script, got: {activate_stderr}"
     );
 
     // The positive arm, in process (see the test's doc): the native verdict
     // fed to the formatter `cmd_ls` prints through, over this daemon's live
     // reply — which carries the real proxy port the line's second half
     // names. A host whose three facts all hold is told native DNS is the
-    // live surface, the proxy's half stays beside it (NET-019), and the
-    // NET-122 advisory a native host no longer needs does not ride it.
+    // live surface, the proxy's half stays beside it (NET-019), and neither
+    // the NET-122 advisory nor the pointer a native host no longer needs
+    // rides it.
     let mut native_out = Vec::new();
     format_ls(
         &mut native_out,
@@ -3232,7 +3359,9 @@ async fn activate_and_ls_report_native_surface() {
         "the native arm keeps the proxy's half beside it (NET-019): {native_ls}"
     );
     assert!(
-        !native_ls.contains("note:") && !native_ls.contains("Configure the host's resolver"),
+        !native_ls.contains("note:")
+            && !native_ls.contains("Configure the host's resolver")
+            && !native_ls.contains("min net setup"),
         "a host the verdict calls native is a configured one: no advisory rides its list, \
          got: {native_ls}"
     );
@@ -3945,7 +4074,10 @@ async fn create_session_with(
         }
     }
     match client
-        .call::<FinalizeSession>(&FinalizeSessionRequest { session_id: id })
+        .call::<FinalizeSession>(&FinalizeSessionRequest {
+            session_id: id,
+            report_shared_port_collisions: false,
+        })
         .await
     {
         minimald_rpc::Errorable::Ok(_) => {}

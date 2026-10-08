@@ -61,6 +61,22 @@ pub const DEFAULT_SUBNET: SwitchSubnet = SwitchSubnet {
 /// the range the zone answers.
 pub const RESERVED_LOCAL_RANGE: (Ipv4Addr, u8) = (Ipv4Addr::new(127, 0, 64, 0), 24);
 
+/// The run of [`RESERVED_LOCAL_RANGE`] a box's published address may come
+/// from (design §7.1): the range's `.2` to its last-but-one address (`.254`
+/// of the /24). The network address, `.1` and the broadcast address are
+/// never a box's.
+///
+/// The one definition of that run: the answerer's address book hands boxes
+/// out of it, and the box registry's single-node test cursor clamps its
+/// slice to it, so the two cannot drift.
+#[must_use]
+pub fn box_loopback_interior() -> (Ipv4Addr, Ipv4Addr) {
+    let (network, prefix) = RESERVED_LOCAL_RANGE;
+    let size = 1u32 << (32 - u32::from(prefix));
+    let first = u32::from(network);
+    (Ipv4Addr::from(first + 2), Ipv4Addr::from(first + size - 2))
+}
+
 /// Prefix of the reserved local range slice each switch (one gvproxy) publishes
 /// its boxes at. A /27 is 32 addresses — 32 published boxes per switch — and a
 /// /24 range holds exactly eight of them, which is also how many switches the
@@ -624,6 +640,17 @@ mod tests {
         assert_eq!(BEP_MAC.to_string(), "52:54:00:40:ff:fc");
         assert_eq!(net.daemon_ip(), Ipv4Addr::new(100, 64, 255, 253));
         assert_eq!(net.host_alias(), Ipv4Addr::new(100, 64, 255, 254));
+    }
+
+    /// Design §7.1: a box's published address is the reserved local range's
+    /// interior, `.2` to `.254`, never its network address, `.1` or its
+    /// broadcast.
+    #[test]
+    fn box_loopback_interior_is_the_range_s_dot2_to_dot254() {
+        assert_eq!(
+            box_loopback_interior(),
+            (Ipv4Addr::new(127, 0, 64, 2), Ipv4Addr::new(127, 0, 64, 254))
+        );
     }
 
     /// The lease run's end has one source: the run the lease book hands from
