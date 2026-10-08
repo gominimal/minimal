@@ -305,10 +305,17 @@ frames to the box egress proxy's listener, and the proxy checks their
 credential. The rows above never decide that destination. The listener is
 the lane's whole reach. The gate still refuses everything else the box
 sends to the proxy's address. A box without the lane omits the row, so
-the missing row means the box runs without a lane. The gate that admits
-the lane sits only in front of own-address boxes. A box in another mode
-that declared a lane still prints the row, marked with its mode, for
-example `(not in effect: host_ip box)`.
+the missing row means the box runs without a lane.
+
+The gate that admits the lane sits only in front of own-address boxes. A
+box in any other mode still prints the row it declared, marked as not in
+effect, with the box's mode named:
+
+```
+egress
+  allow-all (default)
+  credentialed upstream  box egress proxy listener (not in effect: host_ip box)
+```
 
 The ingress block lists the published port mappings the session's
 `--ingress` flags declared (or `deny-all` when the box leaves ingress

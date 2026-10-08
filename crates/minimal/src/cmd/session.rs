@@ -2878,27 +2878,31 @@ struct PolicyJson<'a> {
     /// restated for a machine: a box without the lane has no key, so a
     /// client cannot mistake an absent lane for a null one.
     #[serde(skip_serializing_if = "Option::is_none")]
-    credentialed_upstream: Option<PolicyCredentialedUpstreamJson>,
+    credentialed_upstream: Option<PolicyCredentialedUpstreamJson<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     node_plane_baseline: Option<PolicyBaselineJson>,
     #[serde(skip_serializing_if = "Option::is_none")]
     live_ingress: Option<LiveIngressJson>,
 }
 
-/// A declared credentialed-upstream lane as the document carries it:
-/// `effective` is whether the box's network mode admits the lane (own-address
-/// only), the machine form of the text row's `(not in effect: …)` mark.
+/// A declared credentialed-upstream lane as the document carries it: the
+/// declaration as declared, plus `effective`, whether the box's network
+/// mode admits the lane (own-address only) — the machine form of the text
+/// row's `(not in effect: …)` mark.
 #[derive(serde::Serialize)]
-struct PolicyCredentialedUpstreamJson {
+struct PolicyCredentialedUpstreamJson<'a> {
+    #[serde(flatten)]
+    lane: &'a sessions::CredentialedUpstream,
     effective: bool,
 }
 
-impl PolicyCredentialedUpstreamJson {
+impl<'a> PolicyCredentialedUpstreamJson<'a> {
     fn from_effective(
-        effective: &sessions::EffectiveSessionPolicy,
+        effective: &'a sessions::EffectiveSessionPolicy,
         network: sessions::NetworkMode,
     ) -> Option<Self> {
-        effective.credentialed_upstream.as_ref().map(|_| Self {
+        effective.credentialed_upstream.as_ref().map(|lane| Self {
+            lane,
             effective: sessions::CredentialedUpstream::in_effect(network),
         })
     }
