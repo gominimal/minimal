@@ -2328,10 +2328,11 @@ mod tests {
     /// range spanning the two names exactly the ports this test holds:
     /// nothing another process bound elsewhere in the ephemeral range falls
     /// inside it, so no such listener can race this test's publication.
-    /// Port `p + 1` is skipped when something else holds it and the loop
-    /// tries the next ephemeral pair.
+    /// Port `p + 1` is skipped when something else holds it and the next
+    /// ephemeral pair is tried, a bounded number of times.
     fn adjacent_listeners() -> (TcpListener, TcpListener) {
-        loop {
+        const ATTEMPTS: usize = 64;
+        for _ in 0..ATTEMPTS {
             let loopback = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
                 .expect("an ephemeral port binds on the loopback alone");
             let Some(next) = port_of(&loopback).checked_add(1) else {
@@ -2341,6 +2342,7 @@ mod tests {
                 return (loopback, any);
             }
         }
+        panic!("no free adjacent port pair found in {ATTEMPTS} ephemeral binds");
     }
 
     /// The box's lease on the test switch.
