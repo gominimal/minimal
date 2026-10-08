@@ -6037,7 +6037,8 @@ mod tests {
         assert_eq!(
             resp,
             Errorable::Err {
-                error: "egress policy is only valid for an own-IP or host-address PTask, not NoNet"
+                error: "egress rules need network mode own_ip or host_ip (this box is none): \
+                        a none box has no network to apply them to"
                     .to_string()
             }
         );

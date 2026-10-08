@@ -254,8 +254,15 @@ session's `PATH`.
 min session destroy [--all] [-f|--force] [SESSION]
 ```
 
-Destroys (terminates) a session. `--all` destroys all sessions;
-`-f/--force` skips the confirmation when destroying all sessions.
+Destroys a session and ends its processes. `--all` destroys all sessions.
+`-f/--force` skips the confirmation.
+
+Before it destroys one session, the command asks for confirmation if the
+session holds uncommitted changes or commits that no remote has. It also asks
+if the daemon cannot report that state. The command destroys a clean session without
+a prompt. Without a terminal, or under `--no-input`, nobody can answer, so the
+command refuses unless you pass `-f`. `--all` without a terminal also refuses
+unless you pass `-f`.
 
 ### `session rename`
 

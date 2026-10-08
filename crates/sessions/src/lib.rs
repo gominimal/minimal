@@ -537,8 +537,13 @@ pub enum PolicyError {
     /// An egress policy was set on a [`NetworkMode::NoNet`] `PTask`. An
     /// own-address (`OwnIp`) and a host-address (`HostNet`) box both carry a
     /// network their egress rules can bound; a none box has none, so there is
-    /// nothing to enforce the declaration on and it is rejected.
-    #[error("egress policy is only valid for an own-IP or host-address PTask, not {mode:?}")]
+    /// nothing to enforce the declaration on and it is rejected. Names the
+    /// mode word, not the `Debug` name, as the ingress variants below do.
+    #[error(
+        "egress rules need network mode own_ip or host_ip (this box is {}): a none box \
+         has no network to apply them to",
+        .mode.word()
+    )]
     EgressRequiresNetwork { mode: NetworkMode },
     /// A static ingress port mapping was set on a `PTask` that is not
     /// [`NetworkMode::OwnIp`]. Names the policy fields and the mode word, not
@@ -1480,11 +1485,18 @@ mod tests {
             NetworkMode::NoNet,
             SessionPolicy::new(Some(EgressPolicy::default()), None),
         );
+        let err = record.validate_policy().unwrap_err();
         assert_eq!(
-            record.validate_policy(),
-            Err(PolicyError::EgressRequiresNetwork {
+            err,
+            PolicyError::EgressRequiresNetwork {
                 mode: NetworkMode::NoNet
-            })
+            }
+        );
+        // The refusal names the mode word, not the `Debug` name.
+        assert_eq!(
+            err.to_string(),
+            "egress rules need network mode own_ip or host_ip (this box is none): a none box \
+             has no network to apply them to"
         );
     }
 
