@@ -1301,6 +1301,90 @@ pub enum ProxyDownCause {
     },
 }
 
+/// The hostname proxy's terminal publish outcome the status reply carries
+/// beside the answerer's state (T93): the port the failure is about, and
+/// its named cause. A sibling of [`ZoneAnswererStatus`] on
+/// [`AnswererStatusReply`], never a replacement for it — the answerer's
+/// state is a fact about the machine's zone answerer and the proxy's
+/// publish outcome a fact about the proxy, and one reply can carry both
+/// without either substituting for the other.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProxyDown {
+    /// The port the supervisor reserved and the guest could not publish.
+    pub port: u16,
+    /// What kept the proxy from serving on that port.
+    pub cause: ProxyDownCause,
+}
+
+/// The answerer-status verb's answer (T93): the machine's zone-answerer
+/// state as the daemon holds it ([`ZoneAnswererStatus`]), with the
+/// hostname proxy's publish outcome — when the supervisor reached a cause
+/// that names one — riding beside it as [`Self::proxy_down`] rather than
+/// in place of it. The proxy-down cause is a fact about the proxy, never
+/// a state of the answerer: substituting it for the answerer's state
+/// dropped the zone-answerer facts entirely, leaving the CLI unable to
+/// name who answers the zone or to probe for native DNS while the proxy
+/// was down or its publish unconfirmed.
+///
+/// The wire shape is the status's own flat document — `state` at the top
+/// level — with `proxy_down` an optional sibling key: a client that
+/// predates the field ignores it (unknown fields are not refused), and a
+/// client that knows it reads `None` from a daemon that predates it. The
+/// older substituting shape — `state: "proxy_not_serving"` naming no
+/// answerer fact — stays a variant a new client still parses, for the
+/// daemons that still send it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AnswererStatusReply {
+    /// The machine's zone-answerer state, flattened so `state` stays at
+    /// the document's top level, exactly where every reader of the
+    /// status verb looks for it.
+    #[serde(flatten)]
+    pub answerer: ZoneAnswererStatus,
+    /// Why this VM's hostname proxy is not serving, when the supervisor
+    /// reached a cause that names it: the port the failure is about and
+    /// its cause. `None` in every state where the status says nothing
+    /// about the proxy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_down: Option<ProxyDown>,
+}
+
+impl<'de> Deserialize<'de> for AnswererStatusReply {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Manual on purpose: `flatten` inside an untagged variant's
+        // payload is a shape serde cannot deserialize (it buffers into a
+        // private format the untagged machinery rejects), so the reply
+        // splits instead — the document whole, the sibling key out, the
+        // rest through the status's own tagged shape, and the sibling
+        // parsed as the fact it names.
+        let whole = serde_json_lenient::Value::deserialize(deserializer)?;
+        let mut object = match whole {
+            serde_json_lenient::Value::Object(map) => map,
+            other => {
+                return Err(serde::de::Error::custom(format!(
+                    "the answerer status is a JSON object; got {other}"
+                )));
+            }
+        };
+        // The sibling is read leniently: a cause this client does not know
+        // (a newer daemon's variant) reads as no proxy fact, never as a
+        // decode failure that would drop the answerer's state with it —
+        // the displacement the sibling exists to remove.
+        let proxy_down = object
+            .remove("proxy_down")
+            .and_then(|value| serde_json_lenient::from_value::<Option<ProxyDown>>(value).ok())
+            .flatten();
+        let answerer = serde_json_lenient::from_value(serde_json_lenient::Value::Object(object))
+            .map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            answerer,
+            proxy_down,
+        })
+    }
+}
+
 /// The addresses a successful registration hands back
 /// ([`sessions::BoxAddresses`]): the box's switch address and its published
 /// loopback address, both allocated on the host from the address plan the
@@ -1426,8 +1510,13 @@ pub enum BoxControlReply {
     /// warn with.
     Error { error: String },
     /// The answerer-status read succeeded: the state of the machine's
-    /// zone answerer as the daemon holds it ([`ZoneAnswererStatus`]).
-    Status(ZoneAnswererStatus),
+    /// zone answerer as the daemon holds it, with the hostname proxy's
+    /// publish outcome riding beside it as a sibling rather than in
+    /// place of it ([`AnswererStatusReply`] — T93). The flat `state` key
+    /// stays where every reader of the status verb looks for it, so an
+    /// older client still parses the answerer state and merely misses
+    /// the sibling.
+    Status(AnswererStatusReply),
     /// The read-only row verb's answer for a live box: the row's switch
     /// address, its derived egress allow-list, and its declared and
     /// runtime-admitted ports ([`BoxRow`]).
@@ -4112,5 +4201,120 @@ mod tests {
         )
         .expect("an error reply still decodes");
         assert!(matches!(error, BoxControlReply::Error { .. }));
+    }
+
+    /// The answerer-status reply's shape (T93): the answerer's state
+    /// rides flat — `state` at the document's top level, exactly where
+    /// every reader of the status verb looks for it — with the hostname
+    /// proxy's publish outcome a sibling key beside it, never in place of
+    /// it. The sibling is optional in both directions: a client that
+    /// predates it ignores it, and a client that knows it reads `None`
+    /// from a daemon that predates it.
+    #[test]
+    fn box_control_answerer_status_reply_round_trip() {
+        // Without a proxy-down cause the wire is the status's own document,
+        // byte for byte the shape it always was.
+        let plain = BoxControlReply::Status(AnswererStatusReply {
+            answerer: ZoneAnswererStatus::Holder { port: 7_656 },
+            proxy_down: None,
+        });
+        let wire = serde_json_lenient::to_string(&plain).expect("serialize");
+        assert_eq!(
+            wire, r#"{"state":"holder","port":7656}"#,
+            "no cause to name means no sibling key: the wire is the old shape"
+        );
+        assert_eq!(round_trip(&plain), plain);
+
+        // With the proxy down the reply carries both facts: the answerer's
+        // state in its own place, the cause named beside it — not in place
+        // of it.
+        let with_cause = BoxControlReply::Status(AnswererStatusReply {
+            answerer: ZoneAnswererStatus::Holder { port: 7_656 },
+            proxy_down: Some(ProxyDown {
+                port: 19_911,
+                cause: ProxyDownCause::PortHeld,
+            }),
+        });
+        let wire = serde_json_lenient::to_string(&with_cause).expect("serialize");
+        for field in [
+            r#""state":"holder""#,
+            r#""port":7656"#,
+            r#""proxy_down":{"port":19911,"cause":"port_held"}"#,
+        ] {
+            assert!(wire.contains(field), "the reply spells {field}: {wire}");
+        }
+        assert_eq!(round_trip(&with_cause), with_cause);
+        // An older client decodes the status payload as the bare
+        // `ZoneAnswererStatus` its `Status` variant held: the sibling key is
+        // an unknown field it ignores, never a decode failure.
+        let older_client: ZoneAnswererStatus =
+            serde_json_lenient::from_str(&wire).expect("an older client still decodes the reply");
+        assert_eq!(older_client, ZoneAnswererStatus::Holder { port: 7_656 });
+
+        // The unconfirmed publish rides the sibling the same way, beside
+        // whatever state the answerer itself is in.
+        let unconfirmed = BoxControlReply::Status(AnswererStatusReply {
+            answerer: ZoneAnswererStatus::Starting,
+            proxy_down: Some(ProxyDown {
+                port: 19_916,
+                cause: ProxyDownCause::PublishUnconfirmed,
+            }),
+        });
+        let wire = serde_json_lenient::to_string(&unconfirmed).expect("serialize");
+        assert!(
+            wire.contains(r#""state":"starting""#)
+                && wire.contains(r#""cause":"publish_unconfirmed""#),
+            "the unconfirmed publish is a sibling of the answerer's state: {wire}"
+        );
+        assert_eq!(round_trip(&unconfirmed), unconfirmed);
+
+        // A daemon that predates the sibling — its reply names only the
+        // state — decodes with the cause `None` an absent fact is.
+        let older: BoxControlReply =
+            serde_json_lenient::from_str(r#"{"state":"manager_held","port":7656}"#)
+                .expect("an older daemon's status still decodes");
+        assert_eq!(
+            older,
+            BoxControlReply::Status(AnswererStatusReply {
+                answerer: ZoneAnswererStatus::ManagerHeld { port: 7_656 },
+                proxy_down: None,
+            }),
+            "a reply that says nothing about the proxy reads as no proxy fact"
+        );
+
+        // The old substituting shape still parses: a daemon that answers
+        // the proxy failure in the state's own place is read as exactly
+        // that, claiming no answerer facts the reply does not carry.
+        let substituting: BoxControlReply = serde_json_lenient::from_str(
+            r#"{"state":"proxy_not_serving","port":19911,"cause":"redraws_ran_out"}"#,
+        )
+        .expect("the substituting shape still decodes");
+        assert_eq!(
+            substituting,
+            BoxControlReply::Status(AnswererStatusReply {
+                answerer: ZoneAnswererStatus::ProxyNotServing {
+                    port: 19_911,
+                    cause: ProxyDownCause::RedrawsRanOut,
+                },
+                proxy_down: None,
+            }),
+            "the state the older daemon answered is the state the read returns"
+        );
+
+        // A newer daemon's cause this client does not know still yields
+        // the answerer's state: the unparseable sibling reads as no proxy
+        // fact instead of failing the whole Status decode.
+        let future: BoxControlReply = serde_json_lenient::from_str(
+            r#"{"state":"holder","port":7656,"proxy_down":{"port":1,"cause":"future"}}"#,
+        )
+        .expect("an unknown proxy-down cause still decodes the status");
+        assert_eq!(
+            future,
+            BoxControlReply::Status(AnswererStatusReply {
+                answerer: ZoneAnswererStatus::Holder { port: 7_656 },
+                proxy_down: None,
+            }),
+            "an unknown cause drops the sibling, never the answerer's state"
+        );
     }
 }

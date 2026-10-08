@@ -591,7 +591,7 @@ pub async fn cmd_ls(global: &GlobalArgs, args: LsArgs) -> Result<(), anyhow::Err
     // modes that can print them, like the detection below it: `--json` and
     // `--raw` are machine-readable-only and pay no host read, socket or
     // query either one.
-    let vm_answerers: Vec<Option<minimald_rpc::ZoneAnswererStatus>> = if args.json || args.raw {
+    let vm_answerers: Vec<Option<minimald_rpc::AnswererStatusReply>> = if args.json || args.raw {
         Vec::new()
     } else {
         let mut read = Vec::with_capacity(listings.len());
@@ -616,11 +616,11 @@ pub async fn cmd_ls(global: &GlobalArgs, args: LsArgs) -> Result<(), anyhow::Err
     // daemon's report would have decided: the read that cannot be made —
     // no control socket, the deadline, a daemon that predates the verb —
     // keeps the silence a daemon-report verdict is, for that VM alone.
-    for (index, status) in vm_answerers.iter().enumerate() {
-        if let Some(status) = status
+    for (index, reply) in vm_answerers.iter().enumerate() {
+        if let Some(reply) = reply
             && let Some(slot) = surfaces.get_mut(index)
         {
-            *slot = crate::resolver::vm_host_name_surface(status.clone()).await;
+            *slot = crate::resolver::vm_host_name_surface(reply.clone()).await;
         }
     }
     format_ls_across_vms(
@@ -778,7 +778,7 @@ pub fn format_ls(
     args: &LsArgs,
     resp: &minimald_rpc::ListSessionsResponse,
     surface: Option<crate::resolver::LiveSurface>,
-    vm_answerer: Option<minimald_rpc::ZoneAnswererStatus>,
+    vm_answerer: Option<minimald_rpc::AnswererStatusReply>,
 ) -> Result<(), anyhow::Error> {
     if args.json {
         let json = serde_json_lenient::to_string_pretty(resp)
@@ -819,16 +819,34 @@ pub fn format_ls(
     // field: nothing to print for it then. `--raw` and `--json` stay
     // machine-readable-only, so a port line never lands in a pipeline.
     if !args.raw {
-        if let Some(port) = resp.hostname_proxy_port {
+        // A proxy-down sibling (T93) is the host-side verdict on the proxy:
+        // the reported port is not named as serving beside it, and the
+        // cause row below is this VM's one HOSTNAME PROXY row.
+        let proxy_down = vm_answerer
+            .as_ref()
+            .and_then(|reply| reply.proxy_down.as_ref());
+        let serving_proxy_port =
+            crate::resolver::serving_proxy_port(resp.hostname_proxy_port, proxy_down);
+        if let Some(port) = serving_proxy_port {
             writeln!(
                 out,
                 "HOSTNAME PROXY:  listening on 127.0.0.1:{port} · <name>.min.internal routes through it"
             )?;
         }
-        // The VM host daemon's line is computed once here, because the
+        // The VM host daemon's two facts are computed here, because the
         // blank line below rides on what printed, not on what was read:
-        // the pre-acquisition state prints no line and forces no blank one.
-        let vm_answerer_line = vm_answerer.and_then(crate::resolver::vm_host_answerer_line);
+        // the pre-acquisition state prints no answerer line and forces no
+        // blank one, and a proxy cause rides beside whatever the answerer's
+        // own state decided — displacing nothing, displaced by nothing.
+        let vm_answerer_line = vm_answerer
+            .as_ref()
+            .and_then(|reply| crate::resolver::vm_host_answerer_line(reply.answerer.clone()));
+        // A Proxy verdict beside the cause becomes the cause-naming
+        // surface, and the standalone cause row prints only when the
+        // surface row does not already name it: one proxy verdict per VM.
+        let surface =
+            surface.map(|surface| crate::resolver::surface_beside_proxy_down(surface, proxy_down));
+        let proxy_down_line = crate::resolver::proxy_down_line_beside(surface.as_ref(), proxy_down);
         if let Some(answerer) = resp.zone_answerer_port {
             writeln!(
                 out,
@@ -836,6 +854,15 @@ pub fn format_ls(
             )?;
         } else if let Some(line) = &vm_answerer_line {
             writeln!(out, "ZONE ANSWERER:   {line}")?;
+        }
+        // T93's sibling, in the list's own voice: when the reply carries
+        // the proxy's publish outcome as well as the answerer's state —
+        // the daemon naming both services in one reply — the failure is
+        // said beside the answerer's line, in the row the serving proxy
+        // names itself in. A daemon with no proxy cause, serving or
+        // merely silent, prints nothing here.
+        if let Some(line) = &proxy_down_line {
+            writeln!(out, "HOSTNAME PROXY:  {line}")?;
         }
         // NET-018: say which of the two surfaces is live — the one verdict
         // both verbs share ([`resolver::live_name_surfaces`]). `None` — the
@@ -848,12 +875,13 @@ pub fn format_ls(
             writeln!(
                 out,
                 "NAME SURFACE:    {}",
-                crate::resolver::name_surface_line(surface, resp.hostname_proxy_port)
+                crate::resolver::name_surface_line(surface, serving_proxy_port)
             )?;
         }
         if resp.hostname_proxy_port.is_some()
             || resp.zone_answerer_port.is_some()
             || vm_answerer_line.is_some()
+            || proxy_down.is_some()
         {
             writeln!(out)?;
         }
@@ -971,7 +999,7 @@ pub fn format_ls_across_vms(
     args: &LsArgs,
     listings: &[VmListing],
     surfaces: &[Option<crate::resolver::LiveSurface>],
-    vm_answerers: &[Option<minimald_rpc::ZoneAnswererStatus>],
+    vm_answerers: &[Option<minimald_rpc::AnswererStatusReply>],
 ) -> Result<(), anyhow::Error> {
     // The verdict of the listing at `index`, `None` when the caller passed
     // none for it — a machine mode never prints the line, and a direct
@@ -1074,7 +1102,16 @@ pub fn format_ls_across_vms(
                 )?;
                 facts += 1;
             }
-            if let Some(port) = listing.resp.hostname_proxy_port {
+            // A proxy-down sibling (T93) is this VM's host-side verdict on
+            // its proxy: the reported port is not named as serving beside
+            // it, and the cause row below is the VM's one HOSTNAME PROXY row.
+            let answerer = answerer_at(index);
+            let proxy_down = answerer
+                .as_ref()
+                .and_then(|reply| reply.proxy_down.as_ref());
+            let serving_proxy_port =
+                crate::resolver::serving_proxy_port(listing.resp.hostname_proxy_port, proxy_down);
+            if let Some(port) = serving_proxy_port {
                 writeln!(
                     out,
                     "HOSTNAME PROXY:  {vm:<width$} listening on 127.0.0.1:{port} · <name>.min.internal routes through it",
@@ -1091,12 +1128,34 @@ pub fn format_ls_across_vms(
                     width = VM_COLUMN_WIDTH,
                 )?;
                 facts += 1;
-            } else if let Some(line) =
-                answerer_at(index).and_then(crate::resolver::vm_host_answerer_line)
+            } else if let Some(line) = answerer_at(index)
+                .as_ref()
+                .and_then(|reply| crate::resolver::vm_host_answerer_line(reply.answerer.clone()))
             {
                 writeln!(
                     out,
                     "ZONE ANSWERER:   {vm:<width$} {line}",
+                    vm = listing.vm,
+                    width = VM_COLUMN_WIDTH,
+                )?;
+                facts += 1;
+            }
+            // T93's sibling, in the multi-VM list's own voice: the proxy's
+            // publish outcome, named with the VM it belongs to beside that
+            // VM's answerer line — the same words the single-VM listing
+            // prints — because each VM's proxy publishes on a host port of
+            // its own and fails on its own.
+            // A Proxy verdict beside the cause becomes the cause-naming
+            // surface, and the standalone cause row prints only when the
+            // surface row does not already name it: one proxy verdict per VM.
+            let surface = surface_at(index)
+                .map(|surface| crate::resolver::surface_beside_proxy_down(surface, proxy_down));
+            if let Some(line) =
+                crate::resolver::proxy_down_line_beside(surface.as_ref(), proxy_down)
+            {
+                writeln!(
+                    out,
+                    "HOSTNAME PROXY:  {vm:<width$} {line}",
                     vm = listing.vm,
                     width = VM_COLUMN_WIDTH,
                 )?;
@@ -1110,11 +1169,11 @@ pub fn format_ls_across_vms(
             // the advisory the activation path prints (NET-122) says how to
             // get from one surface to the other. `--raw` and `--json` stay
             // machine-readable-only, as for the ports.
-            if let Some(surface) = surface_at(index) {
+            if let Some(surface) = surface {
                 writeln!(
                     out,
                     "NAME SURFACE:    {vm:<width$} {}",
-                    crate::resolver::name_surface_line(surface, listing.resp.hostname_proxy_port),
+                    crate::resolver::name_surface_line(surface, serving_proxy_port),
                     vm = listing.vm,
                     width = VM_COLUMN_WIDTH,
                 )?;

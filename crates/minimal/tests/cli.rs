@@ -3408,7 +3408,10 @@ fn ls_names_the_vm_host_daemon_as_the_zone_answerer() {
         },
         &resp,
         Some(resolver::LiveSurface::Native),
-        Some(minimald_rpc::ZoneAnswererStatus::Holder { port: 7_656 }),
+        Some(minimald_rpc::AnswererStatusReply {
+            answerer: minimald_rpc::ZoneAnswererStatus::Holder { port: 7_656 },
+            proxy_down: None,
+        }),
     )
     .unwrap();
     let holder_ls = String::from_utf8(out).unwrap();
@@ -3445,7 +3448,10 @@ fn ls_names_the_vm_host_daemon_as_the_zone_answerer() {
         },
         &resp,
         Some(resolver::LiveSurface::Proxy),
-        Some(minimald_rpc::ZoneAnswererStatus::PortHeldNoChannel { port: 7_656 }),
+        Some(minimald_rpc::AnswererStatusReply {
+            answerer: minimald_rpc::ZoneAnswererStatus::PortHeldNoChannel { port: 7_656 },
+            proxy_down: None,
+        }),
     )
     .unwrap();
     let held_ls = String::from_utf8(out).unwrap();
@@ -3472,7 +3478,10 @@ fn ls_names_the_vm_host_daemon_as_the_zone_answerer() {
         },
         &resp,
         None,
-        Some(minimald_rpc::ZoneAnswererStatus::Holder { port: 7_656 }),
+        Some(minimald_rpc::AnswererStatusReply {
+            answerer: minimald_rpc::ZoneAnswererStatus::Holder { port: 7_656 },
+            proxy_down: None,
+        }),
     )
     .unwrap();
     let raw_ls = String::from_utf8(out).unwrap();
@@ -3492,7 +3501,10 @@ fn ls_names_the_vm_host_daemon_as_the_zone_answerer() {
         },
         &resp,
         None,
-        Some(minimald_rpc::ZoneAnswererStatus::Starting),
+        Some(minimald_rpc::AnswererStatusReply {
+            answerer: minimald_rpc::ZoneAnswererStatus::Starting,
+            proxy_down: None,
+        }),
     )
     .unwrap();
     let starting_ls = String::from_utf8(out).unwrap();
@@ -3500,6 +3512,309 @@ fn ls_names_the_vm_host_daemon_as_the_zone_answerer() {
         starting_ls, "No active sessions.\n",
         "a status with nothing to say yet prints nothing: {starting_ls}"
     );
+}
+
+/// T93's sibling, as the list renders it: a reply that carries the
+/// answerer's own state *and* the hostname proxy's publish outcome keeps
+/// both — the ZONE ANSWERER row prints from the answerer field while the
+/// proxy is down or its publish unconfirmed, and the cause names itself
+/// on a `HOSTNAME PROXY` row of its own, never in place of the answerer's
+/// and never claiming to be the live surface. The cause row carries the
+/// blank-line bookkeeping on its own, so it separates the header from the
+/// body exactly as a printed answerer row does.
+#[test]
+fn ls_keeps_the_answerer_row_beside_a_down_proxy() {
+    let resp = ListSessionsResponse {
+        daemon_version: None,
+        hostname_routing_unavailable: None,
+        hostname_proxy_port: None,
+        zone_answerer_port: None,
+        answerer_bound: false,
+        resource_pool: None,
+        sessions: Vec::new(),
+    };
+
+    // A holder answering the zone while another process on the host holds
+    // the proxy's port: both rows print, each naming its own service.
+    let mut out = Vec::new();
+    format_ls(
+        &mut out,
+        &LsArgs {
+            raw: false,
+            json: false,
+        },
+        &resp,
+        None,
+        Some(minimald_rpc::AnswererStatusReply {
+            answerer: minimald_rpc::ZoneAnswererStatus::Holder { port: 7_656 },
+            proxy_down: Some(minimald_rpc::ProxyDown {
+                port: 19_911,
+                cause: minimald_rpc::ProxyDownCause::PortHeld,
+            }),
+        }),
+    )
+    .unwrap();
+    let held_ls = String::from_utf8(out).unwrap();
+    assert!(
+        held_ls
+            .contains("ZONE ANSWERER:   answered by the VM host daemon (single-operator interim)"),
+        "the answerer row prints even while the proxy is down: {held_ls}"
+    );
+    assert!(
+        held_ls.contains("this VM's minvmd holds it on 127.0.0.1:7656 (UDP)"),
+        "and it still names the holder: {held_ls}"
+    );
+    assert!(
+        held_ls.contains(
+            "HOSTNAME PROXY:  the hostname proxy is not serving — another \
+             process on the host holds 127.0.0.1:19911"
+        ),
+        "the cause names itself on a row of its own: {held_ls}"
+    );
+    assert!(
+        !held_ls.contains("the hostname proxy is the live name surface; it is not serving"),
+        "the cause row must not claim to be the surface the names resolve through: {held_ls}"
+    );
+    assert!(
+        held_ls.contains("\n\nNo active sessions."),
+        "the two rows carry the blank line before the body: {held_ls}"
+    );
+
+    // The unconfirmed publish, beside a pre-acquisition answerer: the
+    // answerer row keeps its silence, and the cause row — the only thing
+    // that printed — carries the blank line on its own.
+    let mut out = Vec::new();
+    format_ls(
+        &mut out,
+        &LsArgs {
+            raw: false,
+            json: false,
+        },
+        &resp,
+        None,
+        Some(minimald_rpc::AnswererStatusReply {
+            answerer: minimald_rpc::ZoneAnswererStatus::Starting,
+            proxy_down: Some(minimald_rpc::ProxyDown {
+                port: 19_917,
+                cause: minimald_rpc::ProxyDownCause::PublishUnconfirmed,
+            }),
+        }),
+    )
+    .unwrap();
+    let unconfirmed_ls = String::from_utf8(out).unwrap();
+    assert!(
+        !unconfirmed_ls.contains("ZONE ANSWERER:"),
+        "the pre-acquisition state still prints no answerer row: {unconfirmed_ls}"
+    );
+    assert!(
+        unconfirmed_ls.starts_with("HOSTNAME PROXY:  hostname proxy publish unconfirmed"),
+        "the unconfirmed publish is the row that prints: {unconfirmed_ls}"
+    );
+    assert!(
+        unconfirmed_ls.contains("\n\nNo active sessions."),
+        "a cause row on its own still separates the header from the body: {unconfirmed_ls}"
+    );
+
+    // A reply with no cause prints no proxy row at all — a serving or a
+    // merely silent proxy claims nothing here.
+    let mut out = Vec::new();
+    format_ls(
+        &mut out,
+        &LsArgs {
+            raw: false,
+            json: false,
+        },
+        &resp,
+        None,
+        Some(minimald_rpc::AnswererStatusReply {
+            answerer: minimald_rpc::ZoneAnswererStatus::Holder { port: 7_656 },
+            proxy_down: None,
+        }),
+    )
+    .unwrap();
+    let plain_ls = String::from_utf8(out).unwrap();
+    assert!(
+        !plain_ls.contains("HOSTNAME PROXY:"),
+        "a reply without a cause prints no proxy row: {plain_ls}"
+    );
+
+    // A daemon that reports a proxy port beside a down-proxy sibling: the
+    // cause row is the one HOSTNAME PROXY row, and neither it nor the NAME
+    // SURFACE row names the reported port as serving.
+    let reported = ListSessionsResponse {
+        hostname_proxy_port: Some(7_654),
+        ..resp.clone()
+    };
+    let down_reply = minimald_rpc::AnswererStatusReply {
+        answerer: minimald_rpc::ZoneAnswererStatus::Holder { port: 7_656 },
+        proxy_down: Some(minimald_rpc::ProxyDown {
+            port: 19_911,
+            cause: minimald_rpc::ProxyDownCause::PortHeld,
+        }),
+    };
+    for surface in [resolver::LiveSurface::Native, resolver::LiveSurface::Proxy] {
+        let mut out = Vec::new();
+        format_ls(
+            &mut out,
+            &LsArgs {
+                raw: false,
+                json: false,
+            },
+            &reported,
+            Some(surface.clone()),
+            Some(down_reply.clone()),
+        )
+        .unwrap();
+        let ls = String::from_utf8(out).unwrap();
+        // One proxy verdict per VM: beside a Native verdict the cause is
+        // its own HOSTNAME PROXY row; a Proxy verdict folds the cause into
+        // the NAME SURFACE row and prints no separate cause row.
+        let cause_rows = match surface {
+            resolver::LiveSurface::Proxy => 0,
+            _ => 1,
+        };
+        assert_eq!(
+            ls.matches("HOSTNAME PROXY:").count(),
+            cause_rows,
+            "the cause prints on at most one proxy row: {ls}"
+        );
+        assert_eq!(
+            ls.matches("another process on the host holds 127.0.0.1:19911")
+                .count(),
+            1,
+            "the cause is named exactly once: {ls}"
+        );
+        assert!(
+            !ls.contains("listening on 127.0.0.1:7654"),
+            "a down proxy is not listed as listening: {ls}"
+        );
+        assert!(
+            !ls.contains("still serves") && !ls.contains("routes through it on"),
+            "the surface row does not name a down proxy as serving: {ls}"
+        );
+        assert!(
+            ls.contains("NAME SURFACE:") && ls.contains("not serving"),
+            "the surface row agrees the proxy is not serving: {ls}"
+        );
+    }
+}
+
+/// The multi-VM listing keeps one proxy verdict per VM, as the single-VM
+/// one does: the VM whose reply carries a proxy-down sibling gets no
+/// `listening on` row for its reported port, its cause is named exactly
+/// once (its own `HOSTNAME PROXY` row beside a Native verdict, folded into
+/// its NAME SURFACE row beside a Proxy verdict), and its surface row never
+/// names the down proxy as serving. The other VM's rows are untouched.
+#[test]
+fn ls_across_vms_names_one_proxy_verdict_per_vm() {
+    let listing = |vm: &str, proxy_port: u16| VmListing {
+        vm: vm.to_string(),
+        resp: ListSessionsResponse {
+            daemon_version: None,
+            hostname_routing_unavailable: None,
+            hostname_proxy_port: Some(proxy_port),
+            zone_answerer_port: None,
+            answerer_bound: false,
+            resource_pool: None,
+            sessions: Vec::new(),
+        },
+        control_sock: None,
+    };
+    let listings = vec![listing("default", 7_654), listing("alpha", 7_655)];
+    let answerers = vec![
+        Some(minimald_rpc::AnswererStatusReply {
+            answerer: minimald_rpc::ZoneAnswererStatus::Holder { port: 7_656 },
+            proxy_down: Some(minimald_rpc::ProxyDown {
+                port: 19_911,
+                cause: minimald_rpc::ProxyDownCause::PortHeld,
+            }),
+        }),
+        Some(minimald_rpc::AnswererStatusReply {
+            answerer: minimald_rpc::ZoneAnswererStatus::Registered { port: 7_656 },
+            proxy_down: None,
+        }),
+    ];
+    for down_surface in [resolver::LiveSurface::Native, resolver::LiveSurface::Proxy] {
+        let mut out = Vec::new();
+        format_ls_across_vms(
+            &mut out,
+            &LsArgs {
+                raw: false,
+                json: false,
+            },
+            &listings,
+            &[
+                Some(down_surface.clone()),
+                Some(resolver::LiveSurface::Proxy),
+            ],
+            &answerers,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        let rows_of = |prefix: &str, vm: &str| -> Vec<String> {
+            text.lines()
+                .filter(|l| {
+                    l.strip_prefix(prefix)
+                        .is_some_and(|rest| rest.trim_start().starts_with(&format!("{vm} ")))
+                })
+                .map(str::to_string)
+                .collect()
+        };
+
+        // The down VM: no listening row, the cause named exactly once.
+        let default_proxy = rows_of("HOSTNAME PROXY:", "default");
+        let cause_rows = match down_surface {
+            resolver::LiveSurface::Proxy => 0,
+            _ => 1,
+        };
+        assert_eq!(
+            default_proxy.len(),
+            cause_rows,
+            "the down VM's cause prints on at most one proxy row:\n{text}"
+        );
+        assert!(
+            default_proxy
+                .iter()
+                .all(|row| row.contains("another process on the host holds 127.0.0.1:19911")),
+            "the down VM's proxy row is its cause row:\n{text}"
+        );
+        assert!(
+            !text.contains("listening on 127.0.0.1:7654"),
+            "a down proxy is not listed as listening:\n{text}"
+        );
+        assert_eq!(
+            text.matches("another process on the host holds 127.0.0.1:19911")
+                .count(),
+            1,
+            "the down VM's cause is named exactly once:\n{text}"
+        );
+        let default_surface = rows_of("NAME SURFACE:", "default");
+        assert_eq!(default_surface.len(), 1, "got:\n{text}");
+        assert!(
+            !default_surface[0].contains("still serves")
+                && !default_surface[0].contains("routes through it on"),
+            "the down VM's surface row does not name its proxy as serving:\n{text}"
+        );
+        assert!(
+            default_surface[0].contains("not serving"),
+            "the down VM's surface row agrees the proxy is not serving:\n{text}"
+        );
+
+        // The other VM: its own listening row and serving surface, as before.
+        let alpha_proxy = rows_of("HOSTNAME PROXY:", "alpha");
+        assert_eq!(alpha_proxy.len(), 1, "got:\n{text}");
+        assert!(
+            alpha_proxy[0]
+                .ends_with("listening on 127.0.0.1:7655 · <name>.min.internal routes through it"),
+            "the serving VM's proxy row is unchanged:\n{text}"
+        );
+        let alpha_surface = rows_of("NAME SURFACE:", "alpha");
+        assert_eq!(alpha_surface.len(), 1, "got:\n{text}");
+        assert!(
+            alpha_surface[0].contains("routes through it on 127.0.0.1:7655"),
+            "the serving VM's surface row still names its proxy:\n{text}"
+        );
+    }
 }
 
 // --- retired surfaces (NET-109 / NET-110) ---
