@@ -450,7 +450,14 @@ fn host_control(
 /// Best-effort for a caller that does not know whether the daemon is
 /// VM-backed: no control socket beside it is nothing to do, and a refusal
 /// or a failed exchange warns and leaves the name answering as it did.
-pub fn hold_box_name_beside(ssh_sock: &Path, box_name: &str, hold: bool) {
+/// `session_id` is the session the hold is for: a release that names it
+/// frees only that session's hold.
+pub fn hold_box_name_beside(
+    ssh_sock: &Path,
+    box_name: &str,
+    session_id: Option<sessions::SessionId>,
+    hold: bool,
+) {
     let Some(control_sock) = ssh_sock
         .parent()
         .map(|dir| dir.join(VM_HOST_CONTROL_SOCK_FILE))
@@ -462,6 +469,7 @@ pub fn hold_box_name_beside(ssh_sock: &Path, box_name: &str, hold: bool) {
     }
     let request = minimald_rpc::HoldBoxNameRequest {
         name: box_name.to_string(),
+        session_id,
     };
     let (verb, operation) = if hold {
         (
@@ -779,7 +787,7 @@ mod tests {
         let ssh_sock = dir.path().join("ssh.sock");
 
         // No control socket: nothing to connect to, nothing happens.
-        hold_box_name_beside(&ssh_sock, "web", false);
+        hold_box_name_beside(&ssh_sock, "web", None, false);
 
         let listener =
             std::os::unix::net::UnixListener::bind(dir.path().join(VM_HOST_CONTROL_SOCK_FILE))
@@ -799,8 +807,9 @@ mod tests {
             }
             seen
         });
-        hold_box_name_beside(&ssh_sock, "web", false);
-        hold_box_name_beside(&ssh_sock, "api", true);
+        let id = sessions::SessionId::nil();
+        hold_box_name_beside(&ssh_sock, "web", Some(id), false);
+        hold_box_name_beside(&ssh_sock, "api", Some(id), true);
         let seen = server.join().unwrap();
         let decode = |line: &str| -> minimald_rpc::BoxControlRequest {
             serde_json_lenient::from_str(line.trim()).expect("the request is the wire type")
@@ -809,6 +818,7 @@ mod tests {
             panic!("a release is carried by the release verb");
         };
         assert_eq!(release.name, "web");
+        assert_eq!(release.session_id, Some(id));
         let minimald_rpc::BoxControlRequest::HoldBoxName(hold) = decode(&seen[1]) else {
             panic!("a hold is carried by the hold verb");
         };

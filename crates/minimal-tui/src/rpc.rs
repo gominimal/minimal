@@ -266,10 +266,10 @@ fn holds_name(record: &sessions::Record) -> bool {
 
 /// Holds or releases a name on the VM host daemon beside `sock`, off the
 /// async workers: the control exchange is a blocking socket call.
-async fn hold_box_name(sock: &Path, name: &str, hold: bool) {
+async fn hold_box_name(sock: &Path, name: &str, id: SessionId, hold: bool) {
     let (sock, name) = (sock.to_path_buf(), name.to_string());
     if let Err(error) = tokio::task::spawn_blocking(move || {
-        minimal_client::attach::hold_box_name_beside(&sock, &name, hold);
+        minimal_client::attach::hold_box_name_beside(&sock, &name, Some(id), hold);
     })
     .await
     {
@@ -295,7 +295,7 @@ pub async fn destroy(provider: &mut Provider, id: SessionId) -> Result<(), anyho
     {
         Errorable::Ok(_) => {
             if let Some(name) = record.filter(holds_name).and_then(|record| record.name) {
-                hold_box_name(&provider.sock, &name, false).await;
+                hold_box_name(&provider.sock, &name, id, false).await;
             }
             Ok(())
         }
@@ -324,9 +324,9 @@ pub async fn rename(
         Errorable::Ok(_) => {
             if let Some(record) = record.filter(holds_name) {
                 if let Some(old_name) = record.name.as_deref() {
-                    hold_box_name(&provider.sock, old_name, false).await;
+                    hold_box_name(&provider.sock, old_name, id, false).await;
                 }
-                hold_box_name(&provider.sock, new_name, true).await;
+                hold_box_name(&provider.sock, new_name, id, true).await;
             }
             Ok(())
         }
@@ -334,20 +334,18 @@ pub async fn rename(
     }
 }
 
-/// Releases `name`'s zone hold once an attach from the dashboard has ended
-/// with no session left by that name: the shell-exit prompt's Delete
-/// destroys the session daemon-side, past [`destroy`]. A lookup that fails
-/// releases nothing; a session still there keeps its hold.
-pub async fn release_held_name_after_attach(provider: &mut Provider, name: &str) {
-    let lookup = timed::<GetSessionRecord>(
-        &mut provider.client,
-        GetSessionRecordRequest::Name(name.to_string()),
-    )
-    .await;
+/// Releases session `id`'s zone hold once an attach from the dashboard has
+/// ended with the session gone: the shell-exit prompt's Delete destroys the
+/// session daemon-side, past [`destroy`]. A lookup that fails releases
+/// nothing; a session still there keeps its hold, and the release names
+/// the session, so a newer session under `name` keeps its own.
+pub async fn release_held_name_after_attach(provider: &mut Provider, id: SessionId, name: &str) {
+    let lookup =
+        timed::<GetSessionRecord>(&mut provider.client, GetSessionRecordRequest::Id(id)).await;
     if let Ok(resp) = lookup
         && resp.record.is_none()
     {
-        hold_box_name(&provider.sock, name, false).await;
+        hold_box_name(&provider.sock, name, id, false).await;
     }
 }
 

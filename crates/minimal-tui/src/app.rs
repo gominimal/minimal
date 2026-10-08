@@ -930,7 +930,7 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
                         if let Some(name) = box_name.as_deref()
                             && let Some(p) = providers.iter_mut().find(|p| p.label == key.provider)
                         {
-                            rpc::release_held_name_after_attach(p, name).await;
+                            rpc::release_held_name_after_attach(p, key.id, name).await;
                         }
                         inbox.push_back(Msg::Tick);
                     }

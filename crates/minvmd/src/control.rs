@@ -925,11 +925,11 @@ fn serve_request(
         // bracket: each changes the table the answerer answers from, so
         // each publishes in its own turn, never mid-fold.
         (BoxControlRequest::HoldBoxName(request), ControlDoor::Host) => {
-            let reply = order.apply(|| hold_box_name(boxes, &request.name));
+            let reply = order.apply(|| hold_box_name(boxes, &request.name, request.session_id));
             write_reply(stream, &reply)
         }
         (BoxControlRequest::ReleaseBoxName(request), ControlDoor::Host) => {
-            let reply = order.apply(|| release_box_name(boxes, &request.name));
+            let reply = order.apply(|| release_box_name(boxes, &request.name, request.session_id));
             write_reply(stream, &reply)
         }
         (BoxControlRequest::AnswererStatus, ControlDoor::Host) => {
@@ -1490,8 +1490,12 @@ fn withdraw_box(
 /// the interim that answers the name NODATA until the node's bind mirror
 /// lands. `held` true either way — a name the table already holds is the
 /// goal state, not a refusal.
-fn hold_box_name(boxes: &BoxRegistry, name: &str) -> BoxControlReply {
-    boxes.hold_box_name(name);
+fn hold_box_name(
+    boxes: &BoxRegistry,
+    name: &str,
+    session_id: Option<sessions::SessionId>,
+) -> BoxControlReply {
+    boxes.hold_box_name(name, session_id);
     BoxControlReply::NameHeld {
         name: name.to_string(),
         held: true,
@@ -1500,9 +1504,14 @@ fn hold_box_name(boxes: &BoxRegistry, name: &str) -> BoxControlReply {
 
 /// Release a name a hold kept: the name answers nothing again. `held`
 /// false either way — a name no hold kept is the goal state already
-/// holding.
-fn release_box_name(boxes: &BoxRegistry, name: &str) -> BoxControlReply {
-    boxes.release_held_name(name);
+/// holding — and a release that names its session frees only that
+/// session's holds (see [`BoxRegistry::release_held_name`]).
+fn release_box_name(
+    boxes: &BoxRegistry,
+    name: &str,
+    session_id: Option<sessions::SessionId>,
+) -> BoxControlReply {
+    boxes.release_held_name(name, session_id);
     BoxControlReply::NameHeld {
         name: name.to_string(),
         held: false,
@@ -3400,6 +3409,7 @@ mod tests {
             &sock_path,
             &BoxControlRequest::HoldBoxName(HoldBoxNameRequest {
                 name: "Web".to_string(),
+                session_id: None,
             }),
         )
         .expect("the hold is answered");
@@ -3424,6 +3434,7 @@ mod tests {
                 &sock_path,
                 &BoxControlRequest::ReleaseBoxName(HoldBoxNameRequest {
                     name: "web".to_string(),
+                    session_id: None,
                 }),
             )
             .expect("the release is answered");

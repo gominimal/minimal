@@ -706,6 +706,12 @@ pub struct HoldBoxNameRequest {
     /// The box's name, as the session's create names it: the label the
     /// zone holds under the apex, normalized there.
     pub name: String,
+    /// The session the hold is for. A hold records it, and a release that
+    /// carries it frees only that session's holds, wherever a rename moved
+    /// them, never a newer session's under the same name. `None` from a
+    /// client that predates the field: the release is by name alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<sessions::SessionId>,
 }
 
 /// What side of the in-VM daemon reported a runtime-admitted port (NET-045,
