@@ -2627,42 +2627,37 @@ pub fn format_policy(
         return Ok(());
     }
     writeln!(out, "egress")?;
-    match &effective.egress {
-        sessions::EffectiveEgress::DenyAll => writeln!(out, "  deny-all (default)")?,
-        sessions::EffectiveEgress::AllowAll => writeln!(out, "  allow-all (default)")?,
-        sessions::EffectiveEgress::Declared(egress) if declares_deny_all(egress) => {
-            // The declared deny-all section, by name rather than as its
-            // rows: every list empty renders as blankness, which reads as
-            // nothing — the one rendering this block must never print
-            // (NET-075's "never nothing"). The same verdict the default
-            // resolves to, spelled without the mark, because the box
-            // declared it: the mark is the difference between a verdict the
-            // box chose and the one the rollout chose for it, and the JSON
-            // document carries the same distinction as `source`.
-            writeln!(out, "  deny-all")?;
-        }
-        sessions::EffectiveEgress::Declared(egress) => {
-            write_rules(out, "subnets", egress.allow_subnets.as_ref(), "allow-all")?;
-            write_rules(
+    if let Some(label) = effective.egress.summary_label() {
+        // A verdict by name rather than as rows: the defaults marked as
+        // defaults, and the declared deny-all section unmarked — every list
+        // empty would render as blankness, which reads as nothing, the one
+        // rendering this block must never print (NET-075's "never
+        // nothing"). The mark is the difference between a verdict the box
+        // chose and the one the rollout chose for it, and the JSON document
+        // carries the same distinction as `source`. The label is the
+        // `sessions` crate's, shared with the TUI's detail pane.
+        writeln!(out, "  {label}")?;
+    } else if let sessions::EffectiveEgress::Declared(egress) = &effective.egress {
+        write_rules(out, "subnets", egress.allow_subnets.as_ref(), "allow-all")?;
+        write_rules(
+            out,
+            "dns hosts",
+            egress.allow_dns_hosts.as_ref(),
+            "allow-all",
+        )?;
+        match &egress.allow_protocols {
+            None => writeln!(out, "  protocols  allow-all")?,
+            Some(protos) => writeln!(
                 out,
-                "dns hosts",
-                egress.allow_dns_hosts.as_ref(),
-                "allow-all",
-            )?;
-            match &egress.allow_protocols {
-                None => writeln!(out, "  protocols  allow-all")?,
-                Some(protos) => writeln!(
-                    out,
-                    "  protocols  {}",
-                    protos
-                        .iter()
-                        .map(|p| p.to_string())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )?,
-            }
-            write_rules(out, "deny subnets", egress.deny_subnets.as_ref(), "(none)")?;
+                "  protocols  {}",
+                protos
+                    .iter()
+                    .map(|p| p.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )?,
         }
+        write_rules(out, "deny subnets", egress.deny_subnets.as_ref(), "(none)")?;
     }
     // NET-079's per-box enforcement, as the egress block's closing row: a
     // host-address box's verdict is decided on the host's cgroup tree, so
@@ -2954,7 +2949,7 @@ impl<'a> PolicyEgressJson<'a> {
             // present-and-empty lists it would print as blankness — and its
             // `rules` ride beside the name the way every declaration's do.
             sessions::EffectiveEgress::Declared(section) => Self {
-                effective: if declares_deny_all(section) {
+                effective: if section.admits_nothing() {
                     "deny-all"
                 } else {
                     "rules"
@@ -3350,22 +3345,6 @@ fn normalize_subnets(entries: &[String]) -> Vec<String> {
         .iter()
         .map(|entry| sessions::normalized_cidr(entry).unwrap_or_else(|| entry.clone()))
         .collect()
-}
-
-/// Whether a declared egress section is the deny-all shape: every allow
-/// list present and empty, nothing admitted on any dimension. The same
-/// shape [`sessions::EgressPolicy::deny_all`] writes and `--deny-all-egress`
-/// maps to, and the one the host-address classifier decides its deny verdict
-/// on — `deny_subnets` is not consulted, because a box that allows nothing
-/// has nothing to deny on top. The rendering's own predicate rather than a
-/// shared one in `sessions`, so [`format_policy`] states its reading of the
-/// section where it renders it: present-and-empty reads as deny-all, the
-/// absence `None` reads as the dimension's allow-all default, and the two
-/// must not render the same.
-fn declares_deny_all(egress: &sessions::EgressPolicy) -> bool {
-    egress.allow_subnets.as_ref().is_some_and(Vec::is_empty)
-        && egress.allow_dns_hosts.as_ref().is_some_and(Vec::is_empty)
-        && egress.allow_protocols.as_ref().is_some_and(Vec::is_empty)
 }
 
 /// One egress rule row: the CIDR or hostname list, or the default the policy

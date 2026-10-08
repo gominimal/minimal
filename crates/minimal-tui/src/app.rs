@@ -55,7 +55,11 @@ pub struct ProviderView {
 #[derive(Debug, Clone, Default)]
 pub struct Detail {
     pub record: Option<sessions::Record>,
-    pub policy: Option<sessions::SessionPolicy>,
+    pub policy: Option<sessions::EffectiveSessionPolicy>,
+    /// Why the policy could not be fetched, when it could not: a daemon that
+    /// predates `GetEffectiveSessionPolicy` refuses the RPC, and the pane
+    /// says so instead of sitting on "loading policy…".
+    pub policy_error: Option<String>,
 }
 
 /// A modal prompt capturing footer input, if one is open.
@@ -174,6 +178,11 @@ pub struct Model {
     pub scroll: usize,
     pub filter: FilterState,
     pub details: HashMap<SessionKey, Detail>,
+    /// When each cached detail's policy fetch last failed, so the retry is
+    /// throttled to [`REDISCOVERY_INTERVAL`] instead of riding every 2s
+    /// refresh tick: a daemon that predates `GetEffectiveSessionPolicy`
+    /// refuses it every time.
+    pub policy_failed_at: HashMap<SessionKey, DateTime<Utc>>,
     pub screens: HashMap<SessionKey, ScreenFetch>,
     /// The most recent bell timestamp acknowledged for a session; a bell
     /// newer than this lights the `●` indicator.
@@ -212,6 +221,7 @@ impl Model {
             scroll: 0,
             filter: FilterState::default(),
             details: HashMap::new(),
+            policy_failed_at: HashMap::new(),
             screens: HashMap::new(),
             bells_seen: HashMap::new(),
             action: None,
@@ -486,6 +496,7 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
                 })
                 .collect();
             model.details.retain(|k, _| live.contains(k));
+            model.policy_failed_at.retain(|k, _| live.contains(k));
             model.screens.retain(|k, _| live.contains(k));
             model.bells_seen.retain(|k, _| live.contains(k));
             // The cursor may have (re)landed on a session — restore from the
@@ -496,6 +507,11 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
             fetch_focused(model)
         }
         Msg::DetailLoaded(key, detail) => {
+            if detail.policy_error.is_some() {
+                model.policy_failed_at.insert(key.clone(), model.now);
+            } else {
+                model.policy_failed_at.remove(&key);
+            }
             model.details.insert(key, *detail);
             Vec::new()
         }
@@ -823,8 +839,24 @@ fn fetch_focused(model: &Model) -> Vec<Effect> {
     let Some(key) = model.focused() else {
         return Vec::new();
     };
-    if model.details.contains_key(&key) {
-        return Vec::new();
+    // A detail whose policy fetch failed is not an answer: retry it rather
+    // than caching the failure for the session's lifetime, but no sooner
+    // than REDISCOVERY_INTERVAL after the failure — an older daemon refuses
+    // the RPC every time, and the 2s tick would otherwise re-ask forever.
+    if let Some(detail) = model.details.get(&key) {
+        if detail.policy_error.is_none() {
+            return Vec::new();
+        }
+        let retry_due = model.policy_failed_at.get(&key).is_none_or(|&t| {
+            model
+                .now
+                .signed_duration_since(t)
+                .to_std()
+                .is_ok_and(|d| d >= REDISCOVERY_INTERVAL)
+        });
+        if !retry_due {
+            return Vec::new();
+        }
     }
     vec![Effect::FetchDetail(key)]
 }
@@ -1063,7 +1095,18 @@ async fn exec_effect(
             let provider = providers.iter_mut().find(|p| p.label == key.provider)?;
             match rpc::fetch_detail(provider, key.id).await {
                 Ok((record, policy)) => {
-                    Some(Msg::DetailLoaded(key, Box::new(Detail { record, policy })))
+                    let (policy, policy_error) = match policy {
+                        Ok(policy) => (Some(policy), None),
+                        Err(e) => (None, Some(e)),
+                    };
+                    Some(Msg::DetailLoaded(
+                        key,
+                        Box::new(Detail {
+                            record,
+                            policy,
+                            policy_error,
+                        }),
+                    ))
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "detail fetch failed");
@@ -1588,6 +1631,37 @@ mod tests {
         update(&mut model, key(KeyCode::Down));
         let effects = update(&mut model, key(KeyCode::Up));
         assert!(!effects.iter().any(|e| matches!(e, Effect::FetchDetail(_))));
+    }
+
+    #[test]
+    fn a_failed_policy_fetch_is_retried() {
+        let mut model = two_providers();
+        update(&mut model, key(KeyCode::Down));
+        // The policy fetch failed (an older daemon, a transient error): the
+        // failure is shown but not cached as the session's answer.
+        update(
+            &mut model,
+            Msg::DetailLoaded(
+                skey("host", 1),
+                Box::new(Detail {
+                    policy_error: Some("request subsystem failed".to_string()),
+                    ..Detail::default()
+                }),
+            ),
+        );
+        // Not straight away: an older daemon refuses every time, so the
+        // retry waits out REDISCOVERY_INTERVAL rather than riding each tick.
+        update(&mut model, key(KeyCode::Down));
+        let effects = update(&mut model, key(KeyCode::Up));
+        assert!(!effects.iter().any(|e| matches!(e, Effect::FetchDetail(_))));
+        model.now += chrono::Duration::from_std(REDISCOVERY_INTERVAL).unwrap();
+        update(&mut model, key(KeyCode::Down));
+        let effects = update(&mut model, key(KeyCode::Up));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::FetchDetail(k) if k.id == id(1)))
+        );
     }
 
     #[test]

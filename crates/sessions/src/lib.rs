@@ -431,6 +431,24 @@ pub enum EffectiveEgress {
     Declared(EgressPolicy),
 }
 
+impl EffectiveEgress {
+    /// The one-line verdict the egress block prints in place of its rows,
+    /// or `None` when the section has rule rows to list. A default is marked
+    /// as one (`deny-all (default)`, `allow-all (default)`); a declared
+    /// deny-all ([`EgressPolicy::admits_nothing`]) prints unmarked, because
+    /// the box chose it. The single source for `min session policy` and the
+    /// TUI's detail pane, so the two never spell a verdict differently.
+    #[must_use]
+    pub fn summary_label(&self) -> Option<&'static str> {
+        match self {
+            Self::DenyAll => Some("deny-all (default)"),
+            Self::AllowAll => Some("allow-all (default)"),
+            Self::Declared(egress) if egress.admits_nothing() => Some("deny-all"),
+            Self::Declared(_) => None,
+        }
+    }
+}
+
 /// The answer `GetEffectiveSessionPolicy` serves and `min session policy`
 /// renders (NET-075) — the shape that can carry
 /// [`EffectiveEgress::DenyAll`] without rewriting the strict
@@ -1179,6 +1197,28 @@ impl Record {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The verdict strings `min session policy` and the TUI pane both print.
+    #[test]
+    fn effective_egress_summary_labels_are_pinned() {
+        assert_eq!(
+            EffectiveEgress::DenyAll.summary_label(),
+            Some("deny-all (default)")
+        );
+        assert_eq!(
+            EffectiveEgress::AllowAll.summary_label(),
+            Some("allow-all (default)")
+        );
+        assert_eq!(
+            EffectiveEgress::Declared(EgressPolicy::deny_all()).summary_label(),
+            Some("deny-all")
+        );
+        let rules = EgressPolicy {
+            allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
+            ..EgressPolicy::deny_all()
+        };
+        assert_eq!(EffectiveEgress::Declared(rules).summary_label(), None);
+    }
 
     /// `word()` pins the CLI and spec vocabulary, and stays distinct from
     /// the serde form where the two spellings differ: a refactor that
