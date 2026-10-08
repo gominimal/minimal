@@ -430,6 +430,29 @@ the box's namespaces — is exercised by the daemon's harness test with a
 host-side stand-in relay rather than a real box; a root-integration proof of
 that leg (`just test-root-integration`) is still owed to the root lane.
 
+### `net setup`
+
+```
+min net setup
+```
+
+Prints the command that sets this host up to resolve and reach boxes by
+name, for this host's current state. It never runs the command and never
+asks for privilege: you copy it and run it yourself. On a host that needs no
+step, it prints that there is nothing to run.
+
+A session start also checks the host's resolver for the box zone. If the
+resolver is not configured and the start is interactive, it prints the same
+command in full.
+Under `--no-prompt` or `--no-input`, or with stderr not a terminal, the start
+prints one line instead. That line names what is missing and points here, so
+the command does not bury a scripted start's log on every activation.
+
+The command points at the port the daemon's zone answerer listens on, so it
+needs a running daemon that has bound its answerer. It does not start one:
+with no daemon reachable, it prints an error and exits 1, and starting a
+session first brings the daemon up.
+
 ### `stop`
 
 ```

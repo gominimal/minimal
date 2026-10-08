@@ -1015,6 +1015,18 @@ fn provider_local_minimald_is_the_host_backend() {
 }
 
 #[test]
+fn net_setup_parses_to_the_setup_command() {
+    use clap::Parser as _;
+    let cli = Cli::try_parse_from(["min", "net", "setup"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Some(Command::Net(NetArgs {
+            command: NetCommand::Setup
+        }))
+    ));
+}
+
+#[test]
 fn no_provider_defaults_to_the_host_backend() {
     use clap::Parser as _;
     let cli = Cli::try_parse_from(["min", "ls"]).unwrap();

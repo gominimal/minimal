@@ -231,6 +231,82 @@ pub(crate) fn control_sock_beside(ssh_sock: &std::path::Path) -> Option<std::pat
         .map(|dir| dir.join(minvmd::control::CONTROL_SOCK_FILE))
 }
 
+/// The host reads the resolver advisory is decided from (NET-122): this
+/// host's resolver detection and its answerer service step, read together,
+/// with the control sockets the step asks to release the hook port recorded
+/// for the render. Shared by the session start and `min net setup`, so the
+/// command a start points at and the command it prints come from the same
+/// reads.
+pub(crate) async fn advisory_host_reads(
+    global: &GlobalArgs,
+) -> (
+    (
+        crate::resolver::Hook,
+        Option<String>,
+        crate::resolver::RangeStep,
+    ),
+    crate::resolver::AnswererStep,
+) {
+    let (detection, answerer_step) = tokio::join!(
+        crate::resolver::session_detection(),
+        crate::resolver::read_answerer_step()
+    );
+    // The daemons the step asks to release the hook port: this CLI's
+    // own state dir's — its VM host daemons, default VM and named VMs
+    // alike, or its native daemon — never another state dir's.
+    let controls = match daemon_provider_kind(global) {
+        paths::ProviderKind::Minvmd => {
+            client::enumerate_vm_sockets(global.minimal_dir.as_deref(), true)
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|vm| control_sock_beside(&vm.sock))
+                .map(|sock| sock.display().to_string())
+                .collect()
+        }
+        paths::ProviderKind::Minimald => {
+            client::resolve_socket_path(global.minimal_dir.as_deref(), false)
+                .ok()
+                .and_then(|sock| control_sock_beside(&sock))
+                .into_iter()
+                .map(|sock| sock.display().to_string())
+                .collect()
+        }
+    };
+    crate::resolver::set_handover_controls(controls);
+    (detection, answerer_step)
+}
+
+/// The hint a one-line advisory ends with: the command that prints the
+/// full one.
+const NET_SETUP_HINT: &str = "Run `min net setup` to print the command that configures it.";
+
+/// The advisory text a session start prints (NET-122): the advisory whole
+/// when the start is interactive, [`short_advisory`] otherwise. Pure, so
+/// the tests assert both forms without capturing stderr.
+pub(crate) fn start_advisory_text(advisory: &str, interactive: bool) -> String {
+    if interactive {
+        advisory.to_string()
+    } else {
+        short_advisory(advisory)
+    }
+}
+
+/// The one-line form of an advisory: its first line, the `note: <facts>.`
+/// a full advisory starts with, without the trailing "… with:" lead-in
+/// sentence that introduces the command block, followed by
+/// [`NET_SETUP_HINT`].
+pub(crate) fn short_advisory(advisory: &str) -> String {
+    let first = advisory.lines().next().unwrap_or_default().trim_end();
+    let facts = if first.ends_with(" with:") {
+        // The lead-in is the last sentence; the facts end at the period
+        // before it.
+        first.rfind(". ").map_or(first, |end| &first[..=end])
+    } else {
+        first
+    };
+    format!("{facts} {NET_SETUP_HINT}")
+}
+
 /// The machine's zone-answerer state, read from the VM host daemon's
 /// control socket (NET-138) — the read-only status verb, over the same
 /// socket the box rows ride, so the posture (a 0600 socket in the provider
@@ -1190,32 +1266,7 @@ pub(crate) async fn activate_session(
         // daemon's channel protocol — the native daemon publishes into the
         // same machine-global channel a VM host daemon does, so the same
         // service is the one to hand its zone to.
-        let (detection, answerer_step) = tokio::join!(
-            crate::resolver::session_detection(),
-            crate::resolver::read_answerer_step()
-        );
-        // The daemons the step asks to release the hook port: this CLI's
-        // own state dir's — its VM host daemons, default VM and named VMs
-        // alike, or its native daemon — never another state dir's.
-        let controls = match daemon_provider_kind(global) {
-            paths::ProviderKind::Minvmd => {
-                client::enumerate_vm_sockets(global.minimal_dir.as_deref(), true)
-                    .unwrap_or_default()
-                    .iter()
-                    .filter_map(|vm| control_sock_beside(&vm.sock))
-                    .map(|sock| sock.display().to_string())
-                    .collect()
-            }
-            paths::ProviderKind::Minimald => {
-                client::resolve_socket_path(global.minimal_dir.as_deref(), false)
-                    .ok()
-                    .and_then(|sock| control_sock_beside(&sock))
-                    .into_iter()
-                    .map(|sock| sock.display().to_string())
-                    .collect()
-            }
-        };
-        crate::resolver::set_handover_controls(controls);
+        let (detection, answerer_step) = advisory_host_reads(global).await;
         // NET-018: name the live surface at the moment the user is about to
         // rely on the names — decided in the one function both verbs share
         // (`resolver`), from the same detection the advisory reads: this
@@ -1254,11 +1305,19 @@ pub(crate) async fn activate_session(
             &answerer_step,
         );
         if let Some(advisory) = &name_advisory {
-            // Printed whole on every start, interactive or not (NET-122:
-            // the start names the exact command, and a scripted start's log
-            // is its only record), after a blank line so the note and its
-            // command block stand apart from the lines above them.
-            eprintln!("\n{advisory}");
+            // NET-122: whole, with the exact command, on an interactive
+            // start, after a blank line so the note and its command block
+            // stand apart from the lines above them. Any other start gets
+            // one line: it repeats on every activation, and the command
+            // block would bury the session's own errors. The one line keeps
+            // the facts and names `min net setup`, which prints the same
+            // command from the same host reads.
+            let interactive = !args.no_prompt && should_announce_session(global);
+            if interactive {
+                eprintln!("\n{}", start_advisory_text(advisory, true));
+            } else {
+                eprintln!("{}", start_advisory_text(advisory, false));
+            }
         }
         if let Some(verdict) = surface_verdict {
             // The host-side record of that verdict, the half the daemon's own
@@ -3874,6 +3933,42 @@ mod tests {
         DynamicIngress, EffectiveEgress, EffectiveSessionPolicy, IngressPolicy, IpProto,
         NetworkMode, PortMapping,
     };
+
+    const FULL_ADVISORY: &str = "note: the resolver file is missing. Configure the \
+                                 host's resolver with:\n  sudo sh -c '…'";
+
+    /// NET-122: an interactive start prints the advisory whole, with the
+    /// exact command.
+    #[test]
+    fn interactive_start_prints_full_advisory() {
+        assert_eq!(start_advisory_text(FULL_ADVISORY, true), FULL_ADVISORY);
+    }
+
+    /// NET-122: any other start prints one line that keeps the facts, drops
+    /// the command and its lead-in, and names `min net setup`.
+    #[test]
+    fn non_interactive_start_prints_short_advisory() {
+        let short = start_advisory_text(FULL_ADVISORY, false);
+        assert_eq!(short, short_advisory(FULL_ADVISORY));
+        assert_eq!(short.lines().count(), 1, "{short}");
+        assert!(
+            short.starts_with("note: the resolver file is missing."),
+            "{short}"
+        );
+        assert!(!short.contains("sudo"), "{short}");
+        assert!(!short.contains("with:"), "{short}");
+        assert!(short.ends_with(NET_SETUP_HINT), "{short}");
+    }
+
+    /// A one-line advisory (no command block) is kept whole, plus the hint.
+    #[test]
+    fn short_advisory_keeps_a_one_line_advisory() {
+        let advisory = "note: host lookups bypass the resolver.";
+        assert_eq!(
+            short_advisory(advisory),
+            format!("{advisory} {NET_SETUP_HINT}")
+        );
+    }
 
     #[test]
     fn normalize_subnets_masks_host_bits_and_keeps_the_rest() {

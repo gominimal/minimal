@@ -981,6 +981,8 @@ pub enum NetCommand {
     /// installed or configured on the remote side. Stays in the foreground
     /// and closes with the session.
     Forward(NetForwardArgs),
+    /// Print the command that sets this host up to resolve and reach boxes by name (does not run it)
+    Setup,
 }
 
 #[derive(Debug, Args)]

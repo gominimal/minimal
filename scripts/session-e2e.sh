@@ -7005,6 +7005,10 @@ proof_local_range_reserved_by_privileged_step() {
     fail
   }
   echo "activated $RANGE_NAME ($(printf '%s' "$range_sid" | tail -n1 | tr -d '\r')); answerer on 127.0.0.1:$range_port"
+  # A non-interactive start prints the advisory as one line; the full
+  # command is what `min net setup` prints, from the same host reads.
+  range_setup="$WORK/range-net-setup.out"
+  mnl net setup >"$range_setup" 2>&1 || true
 
   # The command the advisory named, exactly as a user would have copied it:
   # on macOS it spans several lines, because the two files' bytes ride
@@ -7014,13 +7018,14 @@ proof_local_range_reserved_by_privileged_step() {
     index($0, lead) > 0 { started = 1; next }
     started && !first { sub(/^  /, ""); first = 1 }
     started { print; if (substr($0, length($0), 1) == q) exit }
-  ' "$range_err")"
+  ' "$range_setup")"
   case "$range_cmd" in
     "sudo sh -c '"*) ;;
     *)
-      echo "::error::no range-reserving advisory on the activate's stderr (got: '$range_cmd')"
+      echo "::error::no range-reserving advisory from 'min net setup' (got: '$range_cmd')"
       echo "  (the lead-in must say the command configures the resolver and reserves the range)"
       echo "--- activate stderr ---"; cat "$range_err" 2>/dev/null || true
+      echo "--- min net setup ---"; cat "$range_setup" 2>/dev/null || true
       fail
       ;;
   esac
@@ -7473,6 +7478,10 @@ proof_native_resolution_without_proxy_env() {
   }
   native_sid="$(printf '%s\n' "$native_sid" | tail -n1 | tr -d '\r')"
   echo "activated $NATIVE_NAME ($native_sid); answerer on 127.0.0.1:$native_port"
+  # A non-interactive start prints the advisory as one line; the full
+  # command is what `min net setup` prints, from the same host reads.
+  native_setup="$WORK/native-net-setup.out"
+  mnl net setup >"$native_setup" 2>&1 || true
 
   # The command the advisory named: the line after its lead-in, de-indented —
   # exactly what a user would have copied off the terminal. The lead-in's
@@ -7482,7 +7491,7 @@ proof_native_resolution_without_proxy_env() {
   # for boxes) with:" on macOS, whose command
   # carries the range step NET-123 folds into it); the range-reserving case
   # below extracts the multi-line command whole.
-  native_cmd="$(advisory_command_from "$native_err" "Configure the host's resolver")"
+  native_cmd="$(advisory_command_from "$native_setup" "Configure the host's resolver")"
 
   if [ -n "$native_cmd" ]; then
     # The command must name this platform's mechanism and THIS daemon's
@@ -8274,6 +8283,10 @@ proof_box_name_resolves_natively_without_proxy() {
   }
   bn_sid="$(printf '%s\n' "$bn_sid" | tail -n1 | tr -d '\r')"
   echo "activated $BN_WEB_NAME ($bn_sid); answerer on 127.0.0.1:$bn_port"
+  # A non-interactive start prints the advisory as one line; the full
+  # command is what `min net setup` prints, from the same host reads.
+  bn_setup="$WORK/bn-net-setup.out"
+  mnl net setup >"$bn_setup" 2>&1 || true
   # The surface the activation reports — printed, not asserted: before the
   # advisory's command runs it is the proxy's surface, and the verdict the
   # command is about to move is the second box's to report (NET-018).
@@ -8328,7 +8341,7 @@ proof_box_name_resolves_natively_without_proxy() {
   # NET-122: the advisory, on the activate's stderr — the exact command, no
   # prompt anywhere in the path. The command must name this platform's
   # mechanism and THIS daemon's answerer, and be one the user runs.
-  bn_cmd="$(advisory_command_from "$bn_err" "Configure the host's resolver")"
+  bn_cmd="$(advisory_command_from "$bn_setup" "Configure the host's resolver")"
   if [ -n "$bn_cmd" ]; then
     case "$bn_cmd" in
       *resolvectl*) ;;
@@ -9156,6 +9169,10 @@ for row in json.load(open(sys.argv[1])):
 
   local asr_a_sid asr_a_err="$WORK/asr-a-activate.err"
   asr_a_sid="$(asr_activate mnl e2e-asr-a "$asr_a_err")" || fail
+  # A non-interactive start prints the advisory as one line; the full
+  # command is what `min net setup` prints, from the same host reads.
+  local asr_a_setup="$WORK/asr-a-net-setup.out"
+  mnl net setup >"$asr_a_setup" 2>&1 || true
   local asr_a_ip
   asr_a_ip="$(asr_zone_address "$asr_base_a" e2e-asr-a.min.internal)"
   if [ -z "$asr_a_ip" ]; then
@@ -9208,12 +9225,13 @@ for row in json.load(open(sys.argv[1])):
 
   # ---- 2. the advisory hands the port to the service -----------------------
   local asr_cmd
-  asr_cmd="$(advisory_command_from "$asr_a_err" "Configure the host's resolver")"
+  asr_cmd="$(advisory_command_from "$asr_a_setup" "Configure the host's resolver")"
   case "$asr_cmd" in
     *minzoned*) ;;
     *)
       echo "::error::node A's session start printed no advisory carrying the answerer service step"
       echo "--- activate stderr ---"; cat "$asr_a_err" 2>/dev/null || true
+      echo "--- min net setup ---"; cat "$asr_a_setup" 2>/dev/null || true
       fail
       ;;
   esac
@@ -9673,6 +9691,10 @@ proof_native_answerer_survives_session_stop() {
 
   local nasr_a_sid nasr_a_err="$WORK/nasr-a-activate.err" nasr_a_ip
   nasr_a_sid="$(nasr_activate mnl e2e-nasr-a "$nasr_a_err")" || fail
+  # A non-interactive start prints the advisory as one line; the full
+  # command is what `min net setup` prints, from the same host reads.
+  local nasr_a_setup="$WORK/nasr-a-net-setup.out"
+  mnl net setup >"$nasr_a_setup" 2>&1 || true
   nasr_a_ip="$(nasr_address e2e-nasr-a.min.internal)"
   if [ -z "$nasr_a_ip" ]; then
     echo "::error::e2e-nasr-a.min.internal does not answer from node A's interim on 127.0.0.1:$nasr_port"
@@ -9683,12 +9705,13 @@ proof_native_answerer_survives_session_stop() {
 
   # ---- 2. the advisory hands the port to the service -----------------------
   local nasr_cmd
-  nasr_cmd="$(advisory_command_from "$nasr_a_err" "Configure the host's resolver")"
+  nasr_cmd="$(advisory_command_from "$nasr_a_setup" "Configure the host's resolver")"
   case "$nasr_cmd" in
     *minzoned*) ;;
     *)
       echo "::error::node A's native session start printed no advisory carrying the answerer service step"
       echo "--- activate stderr ---"; cat "$nasr_a_err" 2>/dev/null || true
+      echo "--- min net setup ---"; cat "$nasr_a_setup" 2>/dev/null || true
       fail
       ;;
   esac

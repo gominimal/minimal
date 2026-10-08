@@ -11,6 +11,94 @@ use super::*;
 /// is what makes the forward end with the session instead of outliving it.
 const SESSION_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// What `min net setup` prints when the daemon has no answerer port to point
+/// a command at.
+const NET_SETUP_NO_PORT: &str =
+    "the daemon is not running or has not bound its answerer yet; start a session first";
+
+/// What `min net setup` prints on a host that needs no step.
+const NET_SETUP_NOTHING_TO_RUN: &str =
+    "This host is already set up to resolve boxes by name; there is nothing to run.";
+
+/// `min net setup`: print the command that sets this host up to resolve and
+/// reach boxes by name (NET-122), the same command an interactive session
+/// start prints, from the same host reads. It never runs the command and
+/// never prompts.
+///
+/// The answerer port is the one `min ls` reads: each listed VM's own state
+/// from its VM host daemon's control socket (NET-138), else the daemon's
+/// listing. It never starts a daemon: with none reachable, or none that
+/// reports a port, there is no port to point a command at, so it says so
+/// and exits 1.
+pub async fn cmd_net_setup(global: &GlobalArgs) -> Result<(), anyhow::Error> {
+    let listings = match ls_listings(global).await {
+        Ok(listings) => listings,
+        Err(err) => {
+            tracing::debug!("min net setup: no daemon listing: {err:#}");
+            Vec::new()
+        }
+    };
+    let mut answerer = None;
+    let mut held_no_channel = None;
+    for listing in &listings {
+        let (port, bound, held) =
+            match crate::cmd::session::vm_host_answerer_status_at(listing.control_sock.clone())
+                .await
+            {
+                Some(status) => {
+                    let read = crate::resolver::host_answerer_read(status).await;
+                    (read.port, read.answerer_bound, read.held_no_channel)
+                }
+                None => (
+                    listing.resp.zone_answerer_port,
+                    listing.resp.answerer_bound,
+                    false,
+                ),
+            };
+        match port {
+            // A port no channel reaches is no daemon's answerer: a session
+            // start names that fact instead of the advisory, and so does
+            // this, unless another listing reports a port that answers.
+            Some(port) if held => held_no_channel = held_no_channel.or(Some(port)),
+            Some(port) => {
+                answerer = Some((port, bound));
+                break;
+            }
+            None => {}
+        }
+    }
+    let Some((port, bound)) = answerer else {
+        match held_no_channel {
+            Some(port) => eprintln!("{}", crate::resolver::port_held_no_channel_warning(port)),
+            None => eprintln!("{NET_SETUP_NO_PORT}"),
+        }
+        std::process::exit(1);
+    };
+    let (detection, answerer_step) = crate::cmd::session::advisory_host_reads(global).await;
+    // The range read a session start shares with its advisory, so the two
+    // name the same missing facts.
+    let range_present =
+        crate::resolver::live_name_surface_with_range_at(&detection, Some(port), bound)
+            .await
+            .and_then(|verdict| verdict.range_present);
+    let advisory = crate::resolver::session_advisory_at(
+        &detection,
+        Some(port),
+        false,
+        range_present,
+        &answerer_step,
+    );
+    println!("{}", net_setup_output(advisory.as_deref()));
+    Ok(())
+}
+
+/// What `min net setup` prints for an advisory: the advisory whole, or the
+/// sentence that says this host needs no step. Pure, so the test asserts it
+/// without capturing stdout.
+fn net_setup_output(advisory: Option<&str>) -> String {
+    advisory.map_or_else(|| NET_SETUP_NOTHING_TO_RUN.to_string(), str::to_string)
+}
+
 /// `min net forward <SESSION> <LOCAL>:<PORT>`: bind `localhost:<LOCAL>` and
 /// relay every accepted connection over the session's SSH channel to
 /// `127.0.0.1:<PORT>` inside the box.
@@ -218,4 +306,20 @@ async fn relay(
         tracing::warn!(local_port, box_port, %peer, error = %e, "forward connection failed");
     }
     tracing::info!(local_port, box_port, %peer, "forward connection closed");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// NET-122: `min net setup` prints the advisory whole, command block
+    /// included, and on a host that needs no step says there is nothing to
+    /// run.
+    #[test]
+    fn net_setup_prints_the_advisory_command() {
+        let advisory = "note: the resolver file is missing. Configure the host's \
+                        resolver with:\n  sudo sh -c 'true'";
+        assert_eq!(net_setup_output(Some(advisory)), advisory);
+        assert_eq!(net_setup_output(None), NET_SETUP_NOTHING_TO_RUN);
+    }
 }
