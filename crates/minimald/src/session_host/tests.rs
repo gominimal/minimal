@@ -5759,15 +5759,34 @@ async fn expose_unrecordable_allow_is_refused_and_deny_still_refuses() {
     let capture = captured_log();
     let server = TestServer::new().await;
     let mut client = server.connect().await;
-    let (_web, web_handle) = dynamic_ingress_box(
-        &server,
+    let manager = server.state.sessions_manager().await;
+    manager.land_range_verdict(crate::net::dns::RangeVerdict::Present);
+    // An address no other test's box uses: the live-gate table is
+    // process-wide, and this test's point is the gate's own state.
+    let switch = std::net::Ipv4Addr::new(100, 64, 128, 93);
+    let web = finalize_dynamic_ingress_session(
         &mut client,
         "web",
+        switch,
+        std::net::Ipv4Addr::new(127, 0, 64, 93),
         Some(sessions::DynamicIngress::Allow),
         Some((3000, 3999)),
     )
     .await;
+    let web_handle = manager
+        .get_session(crate::sessions::SessionKeyPredicate::Id(web))
+        .await
+        .unwrap()
+        .expect("the allowing box resolves");
     let (_db, db_handle) = dynamic_ingress_box(&server, &mut client, "db", None, None).await;
+    let gate = std::sync::Arc::new(crate::net::switch::SessionGate::for_session(
+        "web".to_string(),
+        switch,
+        &sessions::SessionPolicy::default(),
+        crate::net::SwitchSubnet::default(),
+        None,
+    ));
+    crate::net::switch::register_live_gate_for_test(switch, &gate);
     web_handle
         .ensure_host("tester".to_string())
         .await
@@ -5787,6 +5806,25 @@ async fn expose_unrecordable_allow_is_refused_and_deny_still_refuses() {
     std::fs::create_dir_all(&planted).unwrap();
     std::os::unix::fs::symlink(&planted, state_dir.join("audit")).unwrap();
 
+    // A sampler that reads the gate the whole time the refused publish
+    // runs: the admission waits on the record (NET-046), so an allow the
+    // log refuses is never admitted, not even for the length of the audit
+    // write and the unwind after it.
+    let ever_admitted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sampling = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let sampler = {
+        let gate = std::sync::Arc::clone(&gate);
+        let ever_admitted = std::sync::Arc::clone(&ever_admitted);
+        let sampling = std::sync::Arc::clone(&sampling);
+        tokio::spawn(async move {
+            while sampling.load(std::sync::atomic::Ordering::SeqCst) {
+                if gate.admits_tcp(3000) {
+                    ever_admitted.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+    };
     match web_handle.expose_dynamic(3000).await {
         Err(crate::net::policy::ExposeFailure::Publish { port: 3000, source }) => assert!(
             source.to_string().contains("audit log"),
@@ -5794,6 +5832,16 @@ async fn expose_unrecordable_allow_is_refused_and_deny_still_refuses() {
         ),
         other => panic!("an allow that cannot be audited is refused: {other:?}"),
     }
+    sampling.store(false, std::sync::atomic::Ordering::SeqCst);
+    sampler.await.unwrap();
+    assert!(
+        !ever_admitted.load(std::sync::atomic::Ordering::SeqCst),
+        "an allow whose record the log refused is never admitted at the relay gate"
+    );
+    assert!(
+        !gate.admits_tcp(3000),
+        "the unaudited allow is not admitted at the relay gate"
+    );
     assert!(
         web_handle
             .live_ingress()
@@ -5817,6 +5865,20 @@ async fn expose_unrecordable_allow_is_refused_and_deny_still_refuses() {
         )) => {}
         other => panic!("an unrecordable deny still refuses: {other:?}"),
     }
+
+    // Once the audit log takes records again the same publish stands: the
+    // gate holds no residue of the refused attempt, and the allow is
+    // admitted afresh — a refusal withdrawn leaves the box none the
+    // worse for having been refused.
+    std::fs::remove_file(state_dir.join("audit")).unwrap();
+    web_handle
+        .expose_dynamic(3000)
+        .await
+        .expect("an auditable allow publishes again");
+    assert!(
+        gate.admits_tcp(3000),
+        "the republished allow is admitted at the box's relay gate"
+    );
     forwarder.abort();
 
     let log = capture.contents();
@@ -6042,6 +6104,12 @@ async fn unaudited_allow_keeps_a_forward_the_switch_would_not_unbind() {
     assert_eq!(
         live[0].internal_port, 3000,
         "the recorded forward is the unaudited publish's own"
+    );
+    assert_eq!(
+        live[0].pending,
+        Some(true),
+        "the gate refuses the retained forward, so its row reads pending, \
+         never reachable"
     );
     let served = served.lock().expect("served lock").clone();
     assert_eq!(

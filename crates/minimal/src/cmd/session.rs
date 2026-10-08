@@ -2590,15 +2590,18 @@ pub async fn cmd_session_policy(
         SessionLookup::Id(id) => minimald_rpc::GetSessionRuntimeFactsRequest::Id(id),
         SessionLookup::Name(n) => minimald_rpc::GetSessionRuntimeFactsRequest::Name(n),
     };
-    let (host_ip_enforcement, shared_port_collisions) = match client
+    let facts = match client
         .oneshot_rpc::<minimald_rpc::GetSessionRuntimeFacts>(facts_lookup)
         .await
     {
-        Ok(minimald_rpc::Errorable::Ok(facts)) => {
-            (facts.host_ip_enforcement, facts.shared_port_collisions)
-        }
-        Ok(minimald_rpc::Errorable::Err { .. }) | Err(_) => (None, Vec::new()),
+        Ok(minimald_rpc::Errorable::Ok(facts)) => Some(facts),
+        Ok(minimald_rpc::Errorable::Err { .. }) | Err(_) => None,
     };
+    let host_ip_enforcement = facts.as_ref().and_then(|facts| facts.host_ip_enforcement);
+    let shared_port_collisions = facts
+        .as_ref()
+        .map(|facts| facts.shared_port_collisions.clone())
+        .unwrap_or_default();
     // (NET-044) — the rows that make a `min net expose` visible rather than
     // only permitted. Fetched through the text walk's own degrade of the
     // shared fetch: warn on stderr and print no section — the JSON
@@ -2633,6 +2636,13 @@ pub async fn cmd_session_policy(
                 fabric,
             )?;
             write_live_ingress(&mut out, &live)?;
+            if let Some(facts) = &facts {
+                write_unaudited_listen_ports(
+                    &mut out,
+                    &facts.unaudited_listen_ports,
+                    facts.audit_log.as_deref(),
+                )?;
+            }
             out.flush().context("Failed to write policy")?;
             Ok(())
         }
@@ -2990,6 +3000,30 @@ pub fn write_live_ingress(
     Ok(())
 }
 
+/// The warnings `min session policy` prints for the permitted listening
+/// ports the daemon left unpublished because their audit record could not
+/// be written (NET-046 fails closed): a listen-publish is driven by the
+/// box's own listener, with no caller to answer, so this line is where the
+/// failure reaches the user. One line per port; nothing when the list is
+/// empty.
+pub fn write_unaudited_listen_ports(
+    out: &mut impl std::io::Write,
+    ports: &[u16],
+    audit_log: Option<&str>,
+) -> Result<(), anyhow::Error> {
+    let audit_log = audit_log.map_or_else(
+        || "the audit log".to_string(),
+        |path| format!("the audit log {path}"),
+    );
+    for port in ports {
+        writeln!(
+            out,
+            "warning: port {port} is permitted but not published: {audit_log} cannot be written"
+        )?;
+    }
+    Ok(())
+}
+
 /// The schema string of the document `min session policy -o json` writes:
 /// the stamp a client checks before it reads anything else, held as a
 /// constant so the renderer and the tests that pin the document cite one
@@ -3174,6 +3208,11 @@ struct PolicyJson<'a> {
     node_plane_baseline: Option<PolicyBaselineJson>,
     #[serde(skip_serializing_if = "Option::is_none")]
     live_ingress: Option<LiveIngressJson>,
+    /// The permitted listening ports the daemon left unpublished because
+    /// their audit record could not be written (NET-046) — the text
+    /// rendering's warning lines, for a machine. Absent when there are none.
+    #[serde(skip_serializing_if = "<[u16]>::is_empty")]
+    unaudited_listen_ports: &'a [u16],
     /// NET-129: the declared ports this box yields because another box at
     /// the same shared loopback address holds them, as the wire's own rows
     /// (`port`, and the holding box as `held_by`) — the text rendering's
@@ -3222,6 +3261,31 @@ pub fn write_policy_json(
     live: Result<Vec<minimald_rpc::LiveMapping>, String>,
     shared_port_collisions: &[minimald_rpc::SharedPortCollision],
 ) -> Result<(), anyhow::Error> {
+    write_policy_json_noting(
+        out,
+        effective,
+        network,
+        fabric,
+        live,
+        shared_port_collisions,
+        &[],
+    )
+}
+
+/// [`write_policy_json`], with the permitted listening ports the daemon left
+/// unpublished because their audit record could not be written (NET-046)
+/// carried as `unaudited_listen_ports` — the key a machine reads the
+/// fail-closed listen-publish from, the way a person reads the text
+/// rendering's warning lines.
+pub fn write_policy_json_noting(
+    out: &mut impl std::io::Write,
+    effective: &sessions::EffectiveSessionPolicy,
+    network: sessions::NetworkMode,
+    fabric: Option<switch::SwitchSubnet>,
+    live: Result<Vec<minimald_rpc::LiveMapping>, String>,
+    shared_port_collisions: &[minimald_rpc::SharedPortCollision],
+    unaudited_listen_ports: &[u16],
+) -> Result<(), anyhow::Error> {
     // A none box has no policy to describe; the text rendering's one-line
     // note is prose for a person, so the document carries the schema and
     // the mode alone, and every other key's absence says why.
@@ -3233,6 +3297,7 @@ pub fn write_policy_json(
             ingress: None,
             node_plane_baseline: None,
             live_ingress: None,
+            unaudited_listen_ports: &[],
             shared_port_collisions: &[],
         }
     } else {
@@ -3280,6 +3345,7 @@ pub fn write_policy_json(
                 Ok(rows) => LiveIngressJson::Rows(rows),
                 Err(_) => LiveIngressJson::Unavailable,
             }),
+            unaudited_listen_ports,
             // Ingress's own gate: a host-address box has no per-session
             // ingress, so it yields nothing a key could claim.
             shared_port_collisions: if network == sessions::NetworkMode::HostNet {
@@ -3413,6 +3479,7 @@ async fn session_policy_json_inputs(
         sessions::Record,
         sessions::EffectiveSessionPolicy,
         Result<Vec<minimald_rpc::LiveMapping>, String>,
+        Vec<u16>,
         Vec<minimald_rpc::SharedPortCollision>,
     ),
     PolicyJsonFailure,
@@ -3449,24 +3516,33 @@ async fn session_policy_json_inputs(
         .map_err(|error| PolicyJsonFailure::PolicyUnavailable(format!("{error:#}")))?;
 
     let live = fetch_live_ingress(&mut client, session).await;
-    // The yielded shared-address ports (NET-129), from the runtime facts the
-    // text walk reads them from, degrading the same way: a daemon that
-    // cannot answer — an older build, a session mid-teardown — leaves the
-    // key out, as a box that yields nothing does.
+    // The listen publishes the audit log refused (NET-046) and the yielded
+    // shared-address ports (NET-129), from the runtime facts the text walk
+    // reads them from. Optional facts: a daemon that cannot answer — an older
+    // build, a session mid-teardown — leaves both keys out, as a box with
+    // nothing to say does.
     let facts_lookup = match SessionLookup::parse(session) {
         SessionLookup::Id(id) => minimald_rpc::GetSessionRuntimeFactsRequest::Id(id),
         SessionLookup::Name(n) => minimald_rpc::GetSessionRuntimeFactsRequest::Name(n),
     };
-    let shared_port_collisions = match client
+    let (unaudited_listen_ports, shared_port_collisions) = match client
         .oneshot_rpc::<minimald_rpc::GetSessionRuntimeFacts>(facts_lookup)
         .await
     {
-        Ok(minimald_rpc::Errorable::Ok(facts)) => facts.shared_port_collisions,
-        Ok(minimald_rpc::Errorable::Err { .. }) | Err(_) => Vec::new(),
+        Ok(minimald_rpc::Errorable::Ok(facts)) => {
+            (facts.unaudited_listen_ports, facts.shared_port_collisions)
+        }
+        Ok(minimald_rpc::Errorable::Err { .. }) | Err(_) => (Vec::new(), Vec::new()),
     };
 
     match resp {
-        minimald_rpc::Errorable::Ok(policy) => Ok((record, policy, live, shared_port_collisions)),
+        minimald_rpc::Errorable::Ok(policy) => Ok((
+            record,
+            policy,
+            live,
+            unaudited_listen_ports,
+            shared_port_collisions,
+        )),
         minimald_rpc::Errorable::Err { error } => {
             Err(PolicyJsonFailure::PolicyUnavailable(error.to_string()))
         }
@@ -3482,7 +3558,7 @@ async fn session_policy_json_inputs(
 /// by every command that takes `-o json` — writes, so the error path is
 /// one mechanism rather than a per-command one.
 async fn session_policy_as_json(global: &GlobalArgs, session: &str) -> Result<(), anyhow::Error> {
-    let (record, policy, live, shared_port_collisions) =
+    let (record, policy, live, unaudited_listen_ports, shared_port_collisions) =
         match session_policy_json_inputs(global, session).await {
             Ok(inputs) => inputs,
             Err(failure) => return Err(failure.machine_failure().into()),
@@ -3494,13 +3570,14 @@ async fn session_policy_as_json(global: &GlobalArgs, session: &str) -> Result<()
     let fabric = (daemon_provider_kind(global) == paths::ProviderKind::Minvmd)
         .then_some(switch::SwitchSubnet::default());
     let mut out = std::io::stdout();
-    write_policy_json(
+    write_policy_json_noting(
         &mut out,
         &policy,
         record.network,
         fabric,
         live,
         &shared_port_collisions,
+        &unaudited_listen_ports,
     )
     .context(OutputWriteError)?;
     out.flush().context(OutputWriteError)?;
@@ -5353,6 +5430,60 @@ mod tests {
             String::from_utf8(out).unwrap(),
             "",
             "a box that published nothing prints no live section"
+        );
+    }
+
+    /// A listen-publish the audit log refused (NET-046) reaches the user
+    /// as one warning line per port in `min session policy`, naming the
+    /// log; an empty list prints nothing.
+    #[test]
+    fn unaudited_listen_ports_print_one_warning_per_port() {
+        let mut out = Vec::new();
+        write_unaudited_listen_ports(&mut out, &[3000, 3001], Some("/state/audit/decisions.log"))
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "warning: port 3000 is permitted but not published: \
+             the audit log /state/audit/decisions.log cannot be written\n\
+             warning: port 3001 is permitted but not published: \
+             the audit log /state/audit/decisions.log cannot be written\n",
+        );
+
+        let mut out = Vec::new();
+        write_unaudited_listen_ports(&mut out, &[], None).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "",
+            "nothing refused, nothing said"
+        );
+
+        // The `-o json` document carries the same ports for a machine, and
+        // leaves the key out when there are none.
+        let policy = EffectiveSessionPolicy {
+            egress: EffectiveEgress::AllowAll,
+            ingress: None,
+        };
+        let document = |ports: &[u16]| {
+            let mut out = Vec::new();
+            write_policy_json_noting(
+                &mut out,
+                &policy,
+                NetworkMode::OwnIp,
+                None,
+                Ok(Vec::new()),
+                &[],
+                ports,
+            )
+            .unwrap();
+            serde_json_lenient::from_slice::<serde_json_lenient::Value>(&out).unwrap()
+        };
+        assert_eq!(
+            document(&[3000])["unaudited_listen_ports"],
+            serde_json_lenient::json!([3000])
+        );
+        assert!(
+            document(&[]).get("unaudited_listen_ports").is_none(),
+            "no refused listen, no key"
         );
     }
 
