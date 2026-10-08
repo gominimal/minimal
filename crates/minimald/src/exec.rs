@@ -2675,6 +2675,7 @@ mod tests {
             // No launch ever minted these records, so none has recorded its
             // outcome on one.
             host_ip_enforcement: None,
+            host_row_bound: false,
             attrs: Default::default(),
         }
     }

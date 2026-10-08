@@ -3499,10 +3499,10 @@ proof_daemon_fetch_under_deny_all_host_address_box() {
   fi
   grep -q "deny_subnets 0.0.0.0/0" "$WORK/net080-refused-range.err" \
     || { echo "::error::the refused create does not name the rule it refused over (deny_subnets 0.0.0.0/0)"; cat "$WORK/net080-refused-range.err" 2>/dev/null || true; fail; }
-  grep -q "own-address boxes enforce them" "$WORK/net080-refused-range.err" \
+  grep -qF -- "--network own_ip, which enforces them" "$WORK/net080-refused-range.err" \
     || { echo "::error::the refused create does not say own-address boxes enforce these rules"; cat "$WORK/net080-refused-range.err" 2>/dev/null || true; fail; }
-  grep -q "remove these rules" "$WORK/net080-refused-range.err" \
-    || { echo "::error::the refused create does not end with what to do (remove these rules)"; cat "$WORK/net080-refused-range.err" 2>/dev/null || true; fail; }
+  grep -q "Remove them" "$WORK/net080-refused-range.err" \
+    || { echo "::error::the refused create does not end with what to do (Remove them)"; cat "$WORK/net080-refused-range.err" 2>/dev/null || true; fail; }
   if (cd "$NET080_SEED_DIR" && mnl session activate . --no-prompt \
       --name e2e-net080-refused-list --network host_ip \
       --allow-subnets 10.0.0.0/8) >/dev/null 2>"$WORK/net080-refused-list.err"; then
@@ -18001,9 +18001,10 @@ eib_vm_ask_legs() {
   vm_ask_answered() { # $1 sid, $2 allow|deny, $3 label
     local a_pid="" a_live="" a_rc=0
     # shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
-    E2E_PTY_COMMANDS="> /home/eib-$3-live
-sleep 20
-exit" E2E_PTY_ASK="$2" E2E_PTY_ANSWER=keep \
+    # Leaves by the detach chord once the ask is answered, never by `exit`:
+    # the box's first host holds its host-side row (NET-138), and a later
+    # exec must reach that same live host rather than be refused a new one.
+    E2E_PTY_COMMANDS="> /home/eib-$3-live" E2E_PTY_ASK="$2" E2E_PTY_DETACH=1 \
       python3 "$ROOT/scripts/e2e-attach-pty.py" - min ${E2E_MINIMAL_ARGS:-} session attach "$1" \
       >"$WORK/eib-vm-$3-attach.out" 2>"$WORK/eib-vm-$3-attach.err" &
     a_pid=$!
@@ -18151,6 +18152,63 @@ exit" E2E_PTY_ASK="$2" E2E_PTY_ANSWER=keep \
   grep -F '"event":"ask"' "$host_audit" 2>/dev/null | sed 's/^/  /' || true
 }
 
+# The shell-exit leg of a registered box, on a VM lane (NET-138): an own_ip
+# box's first host holds its host-side row, and the row ends with that host's
+# shell. Attach, `exit`, and answer the session-exit prompt Keep: the Keep
+# item says the kept session can only be destroyed, and an exec into it is
+# then refused with the row-ended error instead of being handed a rowless
+# host. The attach runs through the real pty driver: only a tty can answer
+# the session-exit prompt.
+# $1 = box name. Echoes the session it created on fd 3, for the caller's
+# teardown.
+eib_vm_rowless_leg() {
+  local name="$1" seed="" sid="" rc=0 err=""
+  seed="$(hook_mktemp /tmp/mnlevr.XXXXXX)"
+  hook_seed_preamble > "$seed/minimal.toml"
+  mkdir "$seed/.git"
+  if ! sid="$(cd "$seed" && mnl session activate . --no-prompt \
+      --name "$name" --network own_ip \
+      2>"$WORK/eib-vm-rowless-activate.err")"; then
+    echo "::error::the VM-backed own_ip create for $name failed"
+    cat "$WORK/eib-vm-rowless-activate.err" 2>/dev/null || true
+    rm -rf "$seed"
+    return 1
+  fi
+  rm -rf "$seed"
+  sid="$(printf '%s\n' "$sid" | tail -n1 | tr -d '\r')"
+  echo "$sid" >&3
+  echo "registered box (VM lane): $sid ($name, own_ip)"
+
+  # shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
+  if ! E2E_PTY_COMMANDS="exit" E2E_PTY_ANSWER=keep \
+      python3 "$ROOT/scripts/e2e-attach-pty.py" - min ${E2E_MINIMAL_ARGS:-} session attach "$sid" \
+      >"$WORK/eib-vm-rowless-attach.out" 2>"$WORK/eib-vm-rowless-attach.err"; then
+    echo "::error::the pty attach to the registered box $name failed"
+    cat "$WORK/eib-vm-rowless-attach.out" "$WORK/eib-vm-rowless-attach.err" 2>/dev/null || true
+    return 1
+  fi
+  if ! grep -qF "network registration ended with the shell" "$WORK/eib-vm-rowless-attach.out"; then
+    echo "::error::the registered box's session-exit prompt does not say its network registration ended with the shell (NET-138)"
+    sed 's/^/  /' "$WORK/eib-vm-rowless-attach.out" 2>/dev/null || true
+    return 1
+  fi
+  echo "the registered box's Keep item says the kept session can only be destroyed (NET-138)"
+
+  mnl session exec "$sid" "true" \
+    >"$WORK/eib-vm-rowless-exec.out" 2>"$WORK/eib-vm-rowless-exec.err" || rc=$?
+  err="$(cat "$WORK/eib-vm-rowless-exec.out" "$WORK/eib-vm-rowless-exec.err" 2>/dev/null | tr '\n' ' ')"
+  echo "exec into the kept registered box -> exit $rc: ${err:-<no output>}"
+  if [ "$rc" -eq 0 ]; then
+    echo "::error::an exec into a registered box whose shell exited succeeded — the daemon handed it a rowless host (NET-138)"
+    return 1
+  fi
+  case "$err" in
+    *"host-side network registration"*) ;;
+    *) echo "::error::the refused exec does not name the ended host-side network registration (got: '$err')"; return 1 ;;
+  esac
+  echo "an exec into the kept registered box is refused with the row-ended error, not run rowless (NET-138)"
+}
+
 # ---------------------------------------------------------------------------
 # `min net expose` from inside the box, end to end (NET-043, NET-045, NET-046,
 # NET-047): the request a process in the box sends with the CLI's own helper,
@@ -18220,6 +18278,7 @@ proof_expose_from_inside_box() {
   local eib_reached="" eib_policy_row=""
   local eib_allow_name="e2e-inside-allow" eib_yes_name="e2e-inside-ask-yes"
   local eib_no_name="e2e-inside-ask-no" eib_nobody_name="e2e-inside-ask-nobody"
+  local eib_rowless_name="e2e-inside-rowless"
   local eib_deny_name="e2e-inside-deny"
   local eib_port=3000                  # the port every box asks for
   local eib_lo=3000 eib_hi=3005        # the range every create declares
@@ -18454,6 +18513,9 @@ proof_expose_from_inside_box() {
     # host address:port is gvproxy's "proxy already running", not an answer.
     eib_vm_ask_legs "$((eib_port + 1))" "$eib_lo" "$eib_hi" \
       "$eib_yes_name" "$eib_no_name" "$eib_nobody_name" 3>>"$eib_vm_sids"
+
+    # ---- a registered box's shell exits: the kept box is refused (NET-138) --
+    eib_vm_rowless_leg "$eib_rowless_name" 3>>"$eib_vm_sids" || fail
 
     # ---- the deny box: refused inside the box, recorded nowhere -------------
     EIB_DENY_SEED_DIR="$(hook_mktemp /tmp/mnlevd.XXXXXX)"
