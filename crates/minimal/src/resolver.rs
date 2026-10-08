@@ -31,10 +31,9 @@ use std::net::Ipv4Addr;
 use std::time::Duration;
 use switch::loopback::RangeProbe;
 
-/// The zone the daemon's answerer holds. Mirrors
-/// `minimald::net::dns::HOSTNAME_SUFFIX`; the CLI does not depend on the
-/// daemon crate, so the two constants move together.
-pub(crate) const ZONE: &str = "min.internal";
+/// The zone the daemon's answerer holds: the sessions zone's apex, the one
+/// spelling the daemons' registries read too.
+pub(crate) const ZONE: &str = sessions::core::zone_answer::ZONE_APEX;
 
 /// The link dedicated to [`ZONE`]'s DNS hook on Linux: a dummy interface
 /// the advisory's command creates, whose only job is to carry the routing
@@ -3560,6 +3559,15 @@ pub(crate) async fn naming_surface() -> NamingSurface {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The CLI's zone spellings are the sessions zone's, byte for byte: the
+    /// hook's zone is the apex, and the macOS resolver file is named for it.
+    #[test]
+    fn zone_spellings_are_the_sessions_zone() {
+        assert_eq!(ZONE, "min.internal");
+        assert_eq!(ZONE, sessions::core::zone_answer::ZONE_APEX);
+        assert_eq!(RESOLVER_FILE, format!("/etc/resolver/{ZONE}"));
+    }
 
     /// The answerer step's inputs as a test renders them: the stand-in
     /// program, the operator, the machine-global channel, and two control
