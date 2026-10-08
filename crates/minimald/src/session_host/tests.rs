@@ -964,7 +964,7 @@ fn layer_session_env_precedence() {
 /// the launcher hands [`crate::session_shell::resolve`] to pick the
 /// shell it spawns. Nothing else sets the key — the sandbox's
 /// `/usr/bin/bash` default lives a layer below this, inside
-/// `sandbox2`'s `command_env` — so its absence here is exactly the
+/// `sandbox`'s `command_env` — so its absence here is exactly the
 /// "no shell was asked for" case that keeps bash the default.
 #[test]
 fn a_composed_shell_reaches_the_layered_env() {
@@ -1437,14 +1437,14 @@ async fn kill_to_a_wedged_host_gives_up_instead_of_parking() {
     );
 }
 
-/// A [`sandbox2::NetGuard`] that records whether its teardown ran, so a test
+/// A [`sandbox::NetGuard`] that records whether its teardown ran, so a test
 /// can assert the session's network is released exactly when the shell
 /// process ends — and left up while it is merely detached.
 struct RecordingNetGuard {
     torn_down: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
-impl sandbox2::NetGuard for RecordingNetGuard {
+impl sandbox::NetGuard for RecordingNetGuard {
     fn teardown(
         self: Box<Self>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
@@ -1856,16 +1856,16 @@ fn daemon_enters_its_own_leaf() {
     // The installer's tree, as a stand-in holds it: both directories made,
     // and the kernel's files modelled into the daemon's leaf, because
     // nothing behind the stand-in makes them at `mkdir` time.
-    std::fs::create_dir_all(sandbox2::classifier::daemon_leaf(root))
+    std::fs::create_dir_all(sandbox::classifier::daemon_leaf(root))
         .expect("the installer makes the daemon's leaf");
-    std::fs::create_dir_all(root.join(sandbox2::classifier::BOXES_DIR))
+    std::fs::create_dir_all(root.join(sandbox::classifier::BOXES_DIR))
         .expect("the installer makes the box cohort");
-    model_cgroup_files(&sandbox2::classifier::daemon_leaf(root));
+    model_cgroup_files(&sandbox::classifier::daemon_leaf(root));
 
-    sandbox2::classifier::enter_daemon_leaf(root)
+    sandbox::classifier::enter_daemon_leaf(root)
         .expect("the daemon enters its own leaf in the installer's tree");
 
-    let daemon = sandbox2::classifier::daemon_leaf(root);
+    let daemon = sandbox::classifier::daemon_leaf(root);
     let procs = daemon.join("cgroup.procs");
     assert_eq!(
         std::fs::read_to_string(&procs).expect("reading the daemon leaf's procs file"),
@@ -1874,10 +1874,10 @@ fn daemon_enters_its_own_leaf() {
     );
     assert_eq!(
         daemon,
-        root.join(sandbox2::classifier::DAEMON_LEAF),
+        root.join(sandbox::classifier::DAEMON_LEAF),
         "the daemon's leaf is one component under the tree root"
     );
-    let cohort = root.join(sandbox2::classifier::BOXES_DIR);
+    let cohort = root.join(sandbox::classifier::BOXES_DIR);
     assert!(
         cohort.is_dir(),
         "the cohort directory exists for the boxes to come"
@@ -1899,13 +1899,13 @@ fn daemon_enters_its_own_leaf() {
     // the cohort, never beside it and never in the daemon's leaf, so no box
     // is ever placed in the daemon's leaf and the daemon never in a box's.
     let a_box =
-        sandbox2::classifier::create_box_leaf(root, "a session", sandbox2::config::Verdict::Deny)
+        sandbox::classifier::create_box_leaf(root, "a session", sandbox::config::Verdict::Deny)
             .expect("creating a box's leaf in the same tree");
     assert_eq!(
         a_box.parent(),
         Some(
-            root.join(sandbox2::classifier::BOXES_DIR)
-                .join(sandbox2::config::DENY_DIR)
+            root.join(sandbox::classifier::BOXES_DIR)
+                .join(sandbox::config::DENY_DIR)
                 .as_path()
         ),
         "a box's leaf lives in its verdict's subtree, one level under the \
@@ -1923,7 +1923,7 @@ fn daemon_enters_its_own_leaf() {
     // Entering again is harmless: a daemon that restarts into the leaf it
     // already holds stays one member, and on a real tree the kernel keeps
     // the membership set — the second write is a no-op there.
-    sandbox2::classifier::enter_daemon_leaf(root).expect("re-entering the daemon's leaf");
+    sandbox::classifier::enter_daemon_leaf(root).expect("re-entering the daemon's leaf");
     let members = std::fs::read_to_string(&procs).expect("re-reading the daemon leaf's procs");
     assert!(
         members
@@ -1947,11 +1947,11 @@ fn daemon_enters_its_own_leaf() {
     // leave the guest with no tree at all, which is the state every
     // host-address box there is refused on.
     let bare = tempfile::tempdir().expect("a bare stand-in tree, nothing installed in it");
-    let slice = std::path::Path::new(sandbox2::classifier::TREE_ROOT)
+    let slice = std::path::Path::new(sandbox::classifier::TREE_ROOT)
         .file_name()
         .expect("the tree root is a path with a name");
     let root = bare.path().join(slice);
-    let entry = sandbox2::classifier::enter_daemon_leaf(&root)
+    let entry = sandbox::classifier::enter_daemon_leaf(&root)
         .expect_err("over a bare stand-in no kernel made the daemon leaf's cgroup.procs");
     assert_eq!(
         entry.kind(),
@@ -1959,16 +1959,16 @@ fn daemon_enters_its_own_leaf() {
         "the entry's write is a migration into a leaf that must already hold \
          its kernel-made files: a missing one is a missing leaf"
     );
-    let cohort = root.join(sandbox2::classifier::BOXES_DIR);
+    let cohort = root.join(sandbox::classifier::BOXES_DIR);
     for (dir, level) in [
         (root.as_path(), "the tree root"),
         (cohort.as_path(), "the cohort the subtrees live in"),
         (
-            cohort.join(sandbox2::config::DENY_DIR).as_path(),
+            cohort.join(sandbox::config::DENY_DIR).as_path(),
             "the deny subtree",
         ),
         (
-            cohort.join(sandbox2::config::ALLOW_DIR).as_path(),
+            cohort.join(sandbox::config::ALLOW_DIR).as_path(),
             "the allow subtree",
         ),
     ] {
@@ -1979,7 +1979,7 @@ fn daemon_enters_its_own_leaf() {
         );
     }
     assert!(
-        sandbox2::classifier::daemon_leaf(&root).is_dir(),
+        sandbox::classifier::daemon_leaf(&root).is_dir(),
         "the pid-1 entry builds its own leaf where it has the privilege to"
     );
 }
@@ -2011,7 +2011,7 @@ fn daemon_enters_its_own_leaf() {
 #[test]
 fn which_undecided_host_address_boxes_are_refused_and_with_what_words() {
     use crate::net::classifier::{Cause, Decision};
-    use sandbox2::config::Verdict;
+    use sandbox::config::Verdict;
     use sessions::NetworkMode;
 
     const BROKEN_IMAGE: &str = "(broken guest image)";
@@ -2112,7 +2112,7 @@ fn which_undecided_host_address_boxes_are_refused_and_with_what_words() {
     .expect("a native deny-all box whose marker outlived its table is refused");
     assert!(
         ineffective.contains(table_not_in_force)
-            && ineffective.contains(&sandbox2::classifier::install_hint()),
+            && ineffective.contains(&sandbox::classifier::install_hint()),
         "the native TableNotEffective refusal names the cause and the command \
          that ends it: {ineffective}"
     );
@@ -2213,7 +2213,7 @@ fn which_undecided_host_address_boxes_are_refused_and_with_what_words() {
 /// between creating the leaf and spawning the box into it — or another
 /// session's, which the same session id cannot be. The kernel's own
 /// emptiness test tells them apart, and it is the `rmdir` of
-/// [`sandbox2::classifier::remove_box_leaf`]: a cgroup holding a process
+/// [`sandbox::classifier::remove_box_leaf`]: a cgroup holding a process
 /// cannot be removed, so a leftover that goes was nobody's and one that
 /// stays belongs to a session the daemon no longer knows. Driven over a
 /// stand-in tree, where the modelled kernel files stand in for the members:
@@ -2222,14 +2222,14 @@ fn which_undecided_host_address_boxes_are_refused_and_with_what_words() {
 #[test]
 fn a_leftover_leaf_is_reclaimed_but_a_held_one_refuses_the_launch() {
     let tree = tempfile::tempdir().expect("a temp dir standing in for the tree");
-    let cohort = tree.path().join(sandbox2::classifier::BOXES_DIR);
-    let subtree = cohort.join(sandbox2::config::DENY_DIR);
+    let cohort = tree.path().join(sandbox::classifier::BOXES_DIR);
+    let subtree = cohort.join(sandbox::config::DENY_DIR);
     std::fs::create_dir_all(&subtree).expect("the cohort directory and its subtree");
     let id = sessions::SessionId::nil();
     // One verdict for the whole proof: the reclaim is the same code path in
     // either subtree, and a box's verdict is fixed at create.
-    let verdict = sandbox2::config::Verdict::Deny;
-    let named = sandbox2::classifier::box_leaf(tree.path(), &id.to_string(), verdict);
+    let verdict = sandbox::config::Verdict::Deny;
+    let named = sandbox::classifier::box_leaf(tree.path(), &id.to_string(), verdict);
 
     // The fresh launch: nothing to find, so nothing to reclaim.
     let (leaf, reclaimed) = super::create_or_reclaim_box_leaf(tree.path(), &id, verdict)
@@ -2309,21 +2309,21 @@ fn host_ip_enforcement_says_what_the_launch_decided() {
     let tree = tempfile::tempdir().expect("a temp dir standing in for the tree");
     std::fs::create_dir_all(
         tree.path()
-            .join(sandbox2::classifier::BOXES_DIR)
-            .join(sandbox2::config::DENY_DIR),
+            .join(sandbox::classifier::BOXES_DIR)
+            .join(sandbox::config::DENY_DIR),
     )
     .expect("the cohort directory and its subtree");
-    let leaf = sandbox2::config::ClassifierLeaf::new(
-        sandbox2::classifier::create_box_leaf(
+    let leaf = sandbox::config::ClassifierLeaf::new(
+        sandbox::classifier::create_box_leaf(
             tree.path(),
             "a placed box",
-            sandbox2::config::Verdict::Deny,
+            sandbox::config::Verdict::Deny,
         )
         .expect("the leaf the launch places its box in"),
     );
     let deny_all = sessions::EgressPolicy::deny_all();
     let placed = |mode,
-                  leaf: Option<sandbox2::config::ClassifierLeaf>,
+                  leaf: Option<sandbox::config::ClassifierLeaf>,
                   declaration: Option<&sessions::EgressPolicy>| {
         super::host_ip_enforcement(mode, leaf.as_ref(), declaration)
     };
@@ -2383,15 +2383,15 @@ fn launch_record_never_per_box_for_unenforceable_declaration() {
     let tree = tempfile::tempdir().expect("a temp dir standing in for the tree");
     std::fs::create_dir_all(
         tree.path()
-            .join(sandbox2::classifier::BOXES_DIR)
-            .join(sandbox2::config::ALLOW_DIR),
+            .join(sandbox::classifier::BOXES_DIR)
+            .join(sandbox::config::ALLOW_DIR),
     )
     .expect("the cohort directory and its subtree");
-    let leaf = sandbox2::config::ClassifierLeaf::new(
-        sandbox2::classifier::create_box_leaf(
+    let leaf = sandbox::config::ClassifierLeaf::new(
+        sandbox::classifier::create_box_leaf(
             tree.path(),
             "a placed box whose rules are unenforced",
-            sandbox2::config::Verdict::Allow,
+            sandbox::config::Verdict::Allow,
         )
         .expect("the leaf the launch places its box in"),
     );
@@ -2456,14 +2456,14 @@ fn a_torn_down_boxs_leaf_removal_outlasts_its_last_moments() {
     let tree = tempfile::tempdir().expect("a temp dir standing in for the tree");
     std::fs::create_dir_all(
         tree.path()
-            .join(sandbox2::classifier::BOXES_DIR)
-            .join(sandbox2::config::DENY_DIR),
+            .join(sandbox::classifier::BOXES_DIR)
+            .join(sandbox::config::DENY_DIR),
     )
     .expect("the cohort directory and its subtree");
-    let leaf = sandbox2::classifier::create_box_leaf(
+    let leaf = sandbox::classifier::create_box_leaf(
         tree.path(),
         "a torn-down box",
-        sandbox2::config::Verdict::Deny,
+        sandbox::config::Verdict::Deny,
     )
     .expect("the box's leaf, as its teardown finds it");
     model_cgroup_files(&leaf);
@@ -2491,10 +2491,10 @@ fn a_torn_down_boxs_leaf_removal_outlasts_its_last_moments() {
     // attempts are spent, and the refusal the caller warns with is the
     // kernel's own test that the cgroup still holds a process — here, the
     // `rmdir`'s ENOTEMPTY over the modelled file.
-    let held = sandbox2::classifier::create_box_leaf(
+    let held = sandbox::classifier::create_box_leaf(
         tree.path(),
         "a box still dying",
-        sandbox2::config::Verdict::Deny,
+        sandbox::config::Verdict::Deny,
     )
     .expect("the leaf of a box whose teardown could not remove it");
     model_cgroup_files(&held);
@@ -2700,7 +2700,7 @@ fn launcher_with(
         // Production's root; a test that drives the launch over a stand-in
         // tree it built (the unenforced-launch proof) overrides this one
         // field, the same seam the real daemon's every path reads.
-        classifier_root: std::path::PathBuf::from(sandbox2::classifier::TREE_ROOT),
+        classifier_root: std::path::PathBuf::from(sandbox::classifier::TREE_ROOT),
         // Production's table: the daemon's own mount table, read live. A
         // launch driven over a stand-in tree overrides this one too, for the
         // same reason — the host's own mount table covers no stand-in tree,
@@ -2746,13 +2746,13 @@ async fn guest_launch_refuses_only_the_unplaced_host_address_box() {
     // launch's answer. The placement probe is the same one the launch runs,
     // so the skip is the deployment's own state, printed rather than passed
     // off as a pass.
-    if sandbox2::classifier::probe_child_placement(
-        std::path::Path::new(sandbox2::classifier::TREE_ROOT),
+    if sandbox::classifier::probe_child_placement(
+        std::path::Path::new(sandbox::classifier::TREE_ROOT),
         // The deny subtree: the strictest verdict's placement is the one
         // these proofs need to be impossible here — if the daemon can place
         // a child in it, a host-address launch gets its leaf and the proof
         // would measure a different launch's answer.
-        sandbox2::config::Verdict::Deny,
+        sandbox::config::Verdict::Deny,
     )
     .is_ok()
     {
@@ -2844,7 +2844,7 @@ async fn guest_launch_refuses_only_the_unplaced_host_address_box() {
 /// itself, never widened to the host's.
 #[test]
 fn a_none_mountinfo_knob_answers_over_the_daemons_own_mount_table() {
-    let live = sandbox2::classifier::own_mountinfo();
+    let live = sandbox::classifier::own_mountinfo();
     if live.is_none() {
         eprintln!(
             "skipping a_none_mountinfo_knob_answers_over_the_daemons_own_mount_table: \
@@ -2890,7 +2890,7 @@ fn a_none_mountinfo_knob_answers_over_the_daemons_own_mount_table() {
 )]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unenforcing_native_host_runs_host_ip_box_unenforced() {
-    use sandbox2::config::Verdict;
+    use sandbox::config::Verdict;
     use sessions::NetworkMode;
 
     // The window the launches write the daemon's process-global classifier
@@ -2908,19 +2908,19 @@ async fn unenforcing_native_host_runs_host_ip_box_unenforced() {
     let scratch = tempfile::tempdir().expect("a scratch dir for the stand-in mount");
     let mountpoint = scratch.path().join("cgroup");
     let root = mountpoint.join(
-        std::path::Path::new(sandbox2::classifier::TREE_ROOT)
+        std::path::Path::new(sandbox::classifier::TREE_ROOT)
             .file_name()
             .expect("the tree root is a slice below the cgroup2 mount root"),
     );
     for verdict in [Verdict::Deny, Verdict::Allow] {
         let subtree = root
-            .join(sandbox2::classifier::BOXES_DIR)
+            .join(sandbox::classifier::BOXES_DIR)
             .join(verdict.dir_name());
         std::fs::create_dir_all(&subtree).expect("the step makes the subtree");
         model_cgroup_files(&subtree);
     }
     assert!(
-        !root.join(sandbox2::classifier::TABLE_MARKER).exists(),
+        !root.join(sandbox::classifier::TABLE_MARKER).exists(),
         "the stand-in models the step's half missing: no marker, so no \
          loaded table"
     );
@@ -3138,7 +3138,7 @@ async fn unenforcing_native_host_runs_host_ip_box_unenforced() {
 )]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_native_launch_over_either_probe_cause_runs_records_none_and_advises() {
-    use sandbox2::config::Verdict;
+    use sandbox::config::Verdict;
     use sessions::NetworkMode;
 
     // The window the launches write the daemon's process-global classifier
@@ -3156,18 +3156,18 @@ async fn a_native_launch_over_either_probe_cause_runs_records_none_and_advises()
     let scratch = tempfile::tempdir().expect("a scratch dir for the stand-in mount");
     let mountpoint = scratch.path().join("cgroup");
     let root = mountpoint.join(
-        std::path::Path::new(sandbox2::classifier::TREE_ROOT)
+        std::path::Path::new(sandbox::classifier::TREE_ROOT)
             .file_name()
             .expect("the tree root is a slice below the cgroup2 mount root"),
     );
     for verdict in [Verdict::Deny, Verdict::Allow] {
         let subtree = root
-            .join(sandbox2::classifier::BOXES_DIR)
+            .join(sandbox::classifier::BOXES_DIR)
             .join(verdict.dir_name());
         std::fs::create_dir_all(&subtree).expect("the step makes the subtree");
         model_cgroup_files(&subtree);
     }
-    std::fs::create_dir_all(root.join(sandbox2::classifier::TABLE_MARKER))
+    std::fs::create_dir_all(root.join(sandbox::classifier::TABLE_MARKER))
         .expect("the step writes the marker");
     std::fs::create_dir_all(root.join("ct-mark-mask-0x30000000"))
         .expect("the step records the ct-mark mask beside the marker");
@@ -3181,7 +3181,7 @@ async fn a_native_launch_over_either_probe_cause_runs_records_none_and_advises()
     // The launch's *placement* probe is a different throwaway leaf and is
     // left alone, so the box's placement answers honestly over the
     // stand-in: the kernel behind it is not there.
-    let squatted = sandbox2::classifier::box_leaf(
+    let squatted = sandbox::classifier::box_leaf(
         &root,
         &format!("filter-probe-{}", std::process::id()),
         Verdict::Deny,
@@ -3312,7 +3312,7 @@ async fn a_native_launch_over_either_probe_cause_runs_records_none_and_advises()
 )]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn launch_refuses_unenforceable_host_ip_declaration_after_host_gains_per_box() {
-    use sandbox2::config::Verdict;
+    use sandbox::config::Verdict;
     use sessions::NetworkMode;
 
     // The window the launches write the daemon's process-global classifier
@@ -3330,18 +3330,18 @@ async fn launch_refuses_unenforceable_host_ip_declaration_after_host_gains_per_b
     let scratch = tempfile::tempdir().expect("a scratch dir for the stand-in mount");
     let mountpoint = scratch.path().join("cgroup");
     let root = mountpoint.join(
-        std::path::Path::new(sandbox2::classifier::TREE_ROOT)
+        std::path::Path::new(sandbox::classifier::TREE_ROOT)
             .file_name()
             .expect("the tree root is a slice below the cgroup2 mount root"),
     );
     for verdict in [Verdict::Deny, Verdict::Allow] {
         let subtree = root
-            .join(sandbox2::classifier::BOXES_DIR)
+            .join(sandbox::classifier::BOXES_DIR)
             .join(verdict.dir_name());
         std::fs::create_dir_all(&subtree).expect("the step makes the subtree");
         model_cgroup_files(&subtree);
     }
-    std::fs::create_dir_all(root.join(sandbox2::classifier::TABLE_MARKER))
+    std::fs::create_dir_all(root.join(sandbox::classifier::TABLE_MARKER))
         .expect("the step writes the marker");
     std::fs::create_dir_all(root.join("ct-mark-mask-0x30000000"))
         .expect("the step records the ct-mark mask beside the marker");
@@ -3459,7 +3459,7 @@ async fn launch_refuses_unenforceable_host_ip_declaration_after_host_gains_per_b
     // The box never landed in `boxes/allow`: the refusal is before the leaf
     // is allocated, so the subtree holds no leaf of this box's.
     assert!(
-        !sandbox2::classifier::box_leaf(&root, &session_id.to_string(), Verdict::Allow).exists(),
+        !sandbox::classifier::box_leaf(&root, &session_id.to_string(), Verdict::Allow).exists(),
         "the refused launch allocated no leaf for the box: {}",
         root.display()
     );
@@ -3547,13 +3547,13 @@ async fn the_unenforced_record_fires_on_every_launch_and_carries_the_field() {
     // leaf, and on a delegated host the launch gets one, so there is nothing
     // to record — the skip is the deployment's own state, printed rather than
     // passed off as a pass.
-    if sandbox2::classifier::probe_child_placement(
-        std::path::Path::new(sandbox2::classifier::TREE_ROOT),
+    if sandbox::classifier::probe_child_placement(
+        std::path::Path::new(sandbox::classifier::TREE_ROOT),
         // The deny subtree: the strictest verdict's placement is the one
         // these proofs need to be impossible here — if the daemon can place
         // a child in it, a host-address launch gets its leaf and the proof
         // would measure a different launch's answer.
-        sandbox2::config::Verdict::Deny,
+        sandbox::config::Verdict::Deny,
     )
     .is_ok()
     {
@@ -3658,13 +3658,13 @@ async fn a_hook_launch_does_not_advise_unenforced_placement() {
     // place a child in (the guest refusal test's skip, for the same reason).
     // On a delegated host the launch gets a leaf and neither launch advises,
     // so there is nothing to tell apart here.
-    if sandbox2::classifier::probe_child_placement(
-        std::path::Path::new(sandbox2::classifier::TREE_ROOT),
+    if sandbox::classifier::probe_child_placement(
+        std::path::Path::new(sandbox::classifier::TREE_ROOT),
         // The deny subtree: the strictest verdict's placement is the one
         // these proofs need to be impossible here — if the daemon can place
         // a child in it, a host-address launch gets its leaf and the proof
         // would measure a different launch's answer.
-        sandbox2::config::Verdict::Deny,
+        sandbox::config::Verdict::Deny,
     )
     .is_ok()
     {
@@ -3784,7 +3784,7 @@ async fn a_hook_launch_does_not_advise_unenforced_placement() {
 /// the text are decided where they are written.
 #[test]
 fn the_guests_unenforced_host_address_box_advises_with_the_interim() {
-    use sandbox2::config::Verdict;
+    use sandbox::config::Verdict;
     use sessions::NetworkMode;
     use std::path::Path;
 
@@ -3795,8 +3795,8 @@ fn the_guests_unenforced_host_address_box_advises_with_the_interim() {
         crate::net::classifier::Cause::GuestTableNotLoaded,
     );
     let decided = crate::net::classifier::Decision::decided();
-    let leaf = sandbox2::config::ClassifierLeaf::under(
-        Path::new(sandbox2::classifier::TREE_ROOT),
+    let leaf = sandbox::config::ClassifierLeaf::under(
+        Path::new(sandbox::classifier::TREE_ROOT),
         "a session",
         Verdict::Allow,
     );
@@ -3893,9 +3893,9 @@ async fn a_guests_refused_host_address_box_is_refused_and_not_advised() {
     // they need a host whose tree cannot place one — on a delegated host
     // every guest host-address launch places and proceeds, and there is
     // nothing here to measure.
-    if sandbox2::classifier::probe_child_placement(
-        std::path::Path::new(sandbox2::classifier::TREE_ROOT),
-        sandbox2::config::Verdict::Deny,
+    if sandbox::classifier::probe_child_placement(
+        std::path::Path::new(sandbox::classifier::TREE_ROOT),
+        sandbox::config::Verdict::Deny,
     )
     .is_ok()
     {
@@ -3990,7 +3990,7 @@ async fn a_guests_refused_host_address_box_is_refused_and_not_advised() {
 /// No lane that builds this crate can produce that tree: the kernel alone
 /// makes a cgroup's `cgroup.procs` appear at a `mkdir`, and over a stand-in
 /// tree the placement probe fails on exactly that file by design (pinned in
-/// sandbox2's own proof), so a launch-driven placed-guest box exists only on
+/// sandbox's own proof), so a launch-driven placed-guest box exists only on
 /// a microVM image that built its tree and skipped its table. Rather than
 /// skip on every lane, this proof runs the placed box's assertions where the
 /// launch decides them, on every host: the outcome its placed leaf records,
@@ -4008,14 +4008,14 @@ async fn a_guests_refused_host_address_box_is_refused_and_not_advised() {
 /// construction.
 #[test]
 fn a_guests_placed_unenforced_host_address_box_advises_at_its_start() {
-    use sandbox2::config::Verdict;
+    use sandbox::config::Verdict;
     use sessions::NetworkMode;
 
     // A placed leaf of a box that carries an egress section — the one the
     // interim lets run. Its directory is the shape the daemon's placement
     // creates; the mapping below reads only that the leaf is placed.
-    let leaf = sandbox2::config::ClassifierLeaf::new(
-        std::path::Path::new(sandbox2::classifier::TREE_ROOT)
+    let leaf = sandbox::config::ClassifierLeaf::new(
+        std::path::Path::new(sandbox::classifier::TREE_ROOT)
             .join("boxes/allow/a-guests-placed-proof"),
     );
     let undecidable = crate::net::classifier::Decision::undecidable(

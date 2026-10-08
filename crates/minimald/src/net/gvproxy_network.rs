@@ -17,7 +17,7 @@ use std::os::fd::OwnedFd;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use sandbox2::NetGuard;
+use sandbox::NetGuard;
 use tokio::sync::Mutex;
 
 use crate::net::dns;
@@ -241,7 +241,7 @@ impl NetGuard for OwnIpGuard {
 /// The lease was already allocated and gvproxy already ensured-running by the
 /// provider's plan, so this only does the post-spawn relay + ingress. A failure
 /// here just propagates: the release of that lease stays with the launch
-/// (`sandbox2::PlannedLaunch`), and detaching as well would double-decrement
+/// (`sandbox::PlannedLaunch`), and detaching as well would double-decrement
 /// gvproxy's attach count.
 ///
 /// `handed_from_host` says whether `lease`'s address is the address the VM host
@@ -545,7 +545,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    use sandbox2::NetGuard as _;
+    use sandbox::NetGuard as _;
     use switch::MacAddr;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};

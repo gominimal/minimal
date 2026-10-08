@@ -1,5 +1,5 @@
 [package]
-name = "sandbox2"
+name = "sandbox"
 description = "The sandbox layer: namespaced (user, mount, network) process launch on Linux via hakoniwa, with the plan → container → spawn → attach sequence every build, task and session sandbox goes through; network wiring is supplied by the consumer as an impl Network."
 version = "0.0.1"
 rust-version.workspace = true

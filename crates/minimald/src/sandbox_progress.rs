@@ -729,7 +729,7 @@ mod tests {
     fn fetch_record() -> FetchRecord {
         FetchRecord {
             box_id: "a session".to_string(),
-            leaf: Some(sandbox2::classifier::DAEMON_LEAF),
+            leaf: Some(sandbox::classifier::DAEMON_LEAF),
             cache_host: "cache.minimal.dev".to_string(),
             objects: BTreeMap::from([("jq".to_string(), "jq (version 1.7.1)".to_string())]),
         }

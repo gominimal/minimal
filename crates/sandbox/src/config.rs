@@ -246,7 +246,7 @@ pub const ALLOW_DIR: &str = "allow";
 /// Decided once, from the declaration, at the box's launch: a declaration is
 /// fixed at create (tightening is recreate), so the verdict is a property of
 /// the leaf the box is placed in rather than something a launch or a stop
-/// edits. `sandbox2` knows the *name* of the verdict and nothing about the
+/// edits. `sandbox` knows the *name* of the verdict and nothing about the
 /// declarations that map onto it — the mapping lives where the declaration
 /// does, in the daemon, so this crate never learns what an egress section is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

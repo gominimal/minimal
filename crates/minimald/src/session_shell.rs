@@ -37,8 +37,8 @@ struct KnownShell {
     /// Argv after the program itself.
     args: &'static [&'static str],
     /// A `PS1` in *this shell's* prompt syntax, for shells that cannot
-    /// read the bash-syntax one `sandbox2` sets as the session default
-    /// (`crates/sandbox2/src/config.rs`). `None` means that default is
+    /// read the bash-syntax one `sandbox` sets as the session default
+    /// (`crates/sandbox/src/config.rs`). `None` means that default is
     /// already right — bash's own, and `sh`'s, since `sh` is bash — or
     /// that the shell ignores `PS1` altogether, as fish and nushell do.
     ///
@@ -132,7 +132,7 @@ const DEFAULT_SHELL: &str = "bash";
 /// Where a session's binaries live. Packages build `--prefix=/usr`, and
 /// the generic rootfs has no `/bin`, so this is the only directory worth
 /// probing — the same rule
-/// [`sandbox2::Sandbox::command`] applies when it resolves a bare
+/// [`sandbox::Sandbox::command`] applies when it resolves a bare
 /// program name.
 const BIN_DIR: &str = "usr/bin";
 
@@ -364,7 +364,7 @@ mod tests {
         }
     }
 
-    /// zsh cannot read the bash-syntax `PS1` that `sandbox2` sets as the
+    /// zsh cannot read the bash-syntax `PS1` that `sandbox` sets as the
     /// session default — handed it, zsh prints the escapes as text
     /// (`\[\033[01;32m\]\u@\h…` on the prompt line). It gets the same
     /// prompt in its own grammar instead.

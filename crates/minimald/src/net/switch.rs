@@ -177,7 +177,7 @@ pub fn open_tap(name: &str) -> io::Result<OwnedFd> {
 /// driving the same wiring the daemon does.
 ///
 /// The namespace is identified by PID, addressing `/proc/<pid>/ns/net` — the
-/// namespace `sandbox2` unshared for the PTask, surfaced to the launcher via the
+/// namespace `sandbox` unshared for the PTask, surfaced to the launcher via the
 /// `hakoniwa::Child`'s PID.
 #[must_use]
 pub fn tap_netns_commands(
@@ -243,7 +243,7 @@ fn trusted_program(program: &str) -> String {
 /// Run on the `minimald` (daemon) side; requires `CAP_NET_ADMIN` in the host
 /// namespace, which is why it is the mechanism only where the daemon has that
 /// privilege by deployment — inside a microVM, reached over vsock; see
-/// `net::provider::tap_mechanism`. `sandbox2` never calls this — it only
+/// `net::provider::tap_mechanism`. `sandbox` never calls this — it only
 /// unshares the namespace and surfaces the PID (no dependency cycle).
 ///
 /// # Errors

@@ -4,7 +4,7 @@ use anyhow::anyhow;
 use graph::{BuildSpec, BuildSpecRef, SpecTest, SubsetInput, Transitives};
 use lcache::{CacheErr, MetaInner};
 use ot::{OpTracker, Operation};
-use sandbox2::config::SandboxMapped;
+use sandbox::config::SandboxMapped;
 
 use crate::{Error, Options, Runnable, SubsetBuild};
 
@@ -112,7 +112,7 @@ impl<'a> StandaloneTest<'a> {
     }
 
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    fn invocations(&self, test: &SpecTest) -> Result<Vec<sandbox2::config::Invocation>, Error> {
+    fn invocations(&self, test: &SpecTest) -> Result<Vec<sandbox::config::Invocation>, Error> {
         if test.cmds.is_empty() || test.cmds[0].is_empty() {
             return Err(Error::Other(anyhow!(
                 "cannot test spec: no test command specified"
@@ -123,7 +123,7 @@ impl<'a> StandaloneTest<'a> {
             .cmds
             .iter()
             .filter_map(|e| e.split_at_checked(1))
-            .map(|(exec, args)| sandbox2::config::Invocation {
+            .map(|(exec, args)| sandbox::config::Invocation {
                 executable: exec[0].clone(),
                 args: args.to_vec(),
                 envs: Default::default(),
@@ -135,7 +135,7 @@ impl<'a> StandaloneTest<'a> {
     #[cfg(target_os = "linux")]
     async fn execute_in_sandbox(
         &mut self,
-        sandbox: &mut sandbox2::Sandbox<()>,
+        sandbox: &mut sandbox::Sandbox<()>,
         test: &SpecTest,
     ) -> Result<Vec<StandaloneTestError>, Error> {
         let invocations = self.invocations(test)?;
@@ -149,9 +149,11 @@ impl<'a> StandaloneTest<'a> {
             .await
         {
             Ok(()) => Ok(vec![]),
-            Err(sandbox2::Error::Execution(
-                sandbox2::error::ExecutionError::InvocationFailed { idx, code, .. },
-            )) => {
+            Err(sandbox::Error::Execution(sandbox::error::ExecutionError::InvocationFailed {
+                idx,
+                code,
+                ..
+            })) => {
                 let inv = &invocations[idx];
                 Ok(vec![StandaloneTestError {
                     program: inv.executable.clone(),
@@ -167,7 +169,7 @@ impl<'a> StandaloneTest<'a> {
     #[cfg(not(target_os = "linux"))]
     async fn execute_in_sandbox(
         &mut self,
-        _sandbox: &mut sandbox2::Sandbox<()>,
+        _sandbox: &mut sandbox::Sandbox<()>,
         _test: &SpecTest,
     ) -> Result<Vec<StandaloneTestError>, Error> {
         Err(crate::sandbox_unsupported())
@@ -201,16 +203,16 @@ impl<'a> Runnable for StandaloneTest<'a> {
 
         let (deps, needs_dns, needs_internet) = self.dependencies(build, test, opts).await?;
 
-        let mut config = sandbox2::config::Config::new("test")
+        let mut config = sandbox::config::Config::new("test")
             .with_rootfs(deps.into_iter())
             .with_dns(needs_dns)
             // A test that needs neither DNS nor the internet runs in an empty
             // network namespace; anything else shares the host's. Said as a plan
             // rather than as a mode: the sandbox layer acts on plans.
             .with_plan(if !needs_dns && !needs_internet {
-                sandbox2::NetPlan::isolated()
+                sandbox::NetPlan::isolated()
             } else {
-                sandbox2::NetPlan::host()
+                sandbox::NetPlan::host()
             })
             .with_hostname("test")
             .with_env_var("HOME", "/tmp");

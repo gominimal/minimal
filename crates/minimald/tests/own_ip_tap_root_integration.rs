@@ -1,6 +1,6 @@
 //! Proof that the sandbox layer builds an own-IP tap where a plan asks for one:
-//! a [`sandbox2::NetPlan`] with tap parameters, `new_container` from it, a real
-//! spawn, and [`sandbox2::Spawned::from_child`] handing the descriptor out — how
+//! a [`sandbox::NetPlan`] with tap parameters, `new_container` from it, a real
+//! spawn, and [`sandbox::Spawned::from_child`] handing the descriptor out — how
 //! a native (DM2) own-IP PTask gets its tap, rootless. No switch is attached.
 //!
 //! `#[ignore]`, and early-returns unless `MINIMALD_NETNS_TEST` is set; the
@@ -12,8 +12,8 @@ use std::net::Ipv4Addr;
 use std::path::Path;
 
 use minimald::net::{DEFAULT_MTU, SwitchSubnet};
-use sandbox2::config::{Config, SandboxMapped};
-use sandbox2::{NetPlan, Spawned, TapSpec};
+use sandbox::config::{Config, SandboxMapped};
+use sandbox::{NetPlan, Spawned, TapSpec};
 
 /// `/bin/true` and the libraries `ldd` says it loads, at their own paths, plus
 /// the `usr/lib` the sandbox layer's `lib64` symlink expects.

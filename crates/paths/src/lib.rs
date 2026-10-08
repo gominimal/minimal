@@ -66,7 +66,7 @@ impl Realm for Host {
     const NAME: &'static str = "host";
 }
 
-/// A sandbox rootfs constructed by `sandbox2`.
+/// A sandbox rootfs constructed by `sandbox`.
 #[derive(Debug, Copy, Clone)]
 pub struct Sandbox;
 impl Realm for Sandbox {

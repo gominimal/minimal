@@ -26,7 +26,7 @@ mod env;
 use graph::Error as GraphError;
 use graph::{BinProvider, BuildSpecRef, Graph, MaskingBinProvider, Transitives};
 use mfile::{EnvPatches, EnvVarValue, LinkConfig, Task};
-pub use sandbox2::config::Invocation;
+pub use sandbox::config::Invocation;
 
 mod mfile_search_strategy;
 pub use mfile_search_strategy::MFileSearchStrategy;
@@ -934,7 +934,7 @@ impl Context {
     #[allow(clippy::too_many_arguments)]
     /// Builds an [`env::Env`] whose sandbox shares the host network. Use
     /// [`make_env_with_network`](Self::make_env_with_network) to run it under
-    /// another [`sandbox2::Network`] (e.g. an isolated PTask).
+    /// another [`sandbox::Network`] (e.g. an isolated PTask).
     pub async fn make_env<'a, S: PackageSelection>(
         &'a mut self,
         name: &'a str,
@@ -954,7 +954,7 @@ impl Context {
             patches,
             env_vars,
             packages,
-            std::sync::Arc::new(sandbox2::HostNet),
+            std::sync::Arc::new(sandbox::HostNet),
             home,
             WdLayout::BoundDir,
         )
@@ -962,7 +962,7 @@ impl Context {
     }
 
     /// Like [`make_env`](Self::make_env) but runs the sandbox under the given
-    /// [`sandbox2::Network`], so callers (e.g. the minimald task-exec path) can
+    /// [`sandbox::Network`], so callers (e.g. the minimald task-exec path) can
     /// give a task the same network as its session rather than always the
     /// host's. A provider, not a mode: the caller owns the mode and what it
     /// means, and the sandbox layer acts on what the provider says to do.
@@ -987,7 +987,7 @@ impl Context {
         patches: Option<&'a EnvPatches>,
         env_vars: Option<&'a BTreeMap<String, EnvVarValue>>,
         packages: S,
-        network: std::sync::Arc<dyn sandbox2::Network>,
+        network: std::sync::Arc<dyn sandbox::Network>,
         home: PatchHome,
         wd_layout: WdLayout,
     ) -> Result<env::Env<'a>, Error> {

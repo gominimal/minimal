@@ -37,6 +37,39 @@ crates and the product surface, and §3 adds which plane each crate belongs to
 When you change a crate's scope, update its `Cargo.toml` description too, so
 this information stays current.
 
+## Naming: box, Box Type, sandbox
+
+Use these terms in code, comments, docs and commit messages:
+
+- A **box** is the thing itself: its record, id, state, lifecycle, events,
+  spec and processes. Code about the box says box: `BoxId`, `BoxRecord`,
+  `BoxState`, `BoxSpec`.
+- **session**, **task**, **agent**, **service**, **build** and
+  **container-build** are **Box Type** names. Each names a kind of box, never
+  the box itself. `min session` and `min task` are type-filtered forms of the
+  box commands.
+- A **sandbox** is the operating-system isolation (namespaces, mounts,
+  cgroups) that boxes and package builds both run in: the `sandbox` crate.
+- A **Box Host** is the machine that hosts boxes. Give a module or type that
+  name only when it models that machine.
+
+Rules that follow from these:
+
+- `box` is a reserved word in Rust. A module about boxes is `boxes` or
+  `box_<noun>`, and a type is `Box<Noun>`. A bare `Box` shadows
+  `std::boxed::Box`.
+- Code never uses session or task to mean the box. Some wire, on-disk,
+  printed and environment names say session because a spec keeps them for
+  compatibility. Those keep their serialised name, and the Rust name says box
+  with a serde `rename` or `alias`.
+- A box's behaviour follows the settings in its spec (`lifetime`,
+  `pty_enabled`, `timeout`, the network mode), never its Box Type name. Only
+  the code that resolves Box Types reads a type name. A new type, built in or
+  declared by a project, then works with the code paths that exist.
+- New files, modules and types about the box take box names from the start.
+  Rename code that still says session for the box in a pull request of its
+  own. Never mix a rename into a move or a feature change.
+
 ## Platform matrix
 
 | Platform | What you can build and test |

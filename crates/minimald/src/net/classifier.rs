@@ -68,7 +68,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use common::fetchers::AnyUrl;
-use sandbox2::config::Verdict;
+use sandbox::config::Verdict;
 
 /// The loopback address the box zone's answerer serves at — the one
 /// destination a deny-all host-address box's connections are admitted to
@@ -390,7 +390,7 @@ impl Cause {
     /// table names nothing: no command is known to make a probe run.
     pub fn install_command(self) -> Option<String> {
         match self {
-            Self::StepNotInstalled => Some(sandbox2::classifier::install_hint()),
+            Self::StepNotInstalled => Some(sandbox::classifier::install_hint()),
             Self::CannotConfine
             | Self::GuestTableNotLoaded
             | Self::TableNotEffective
@@ -426,14 +426,14 @@ impl Cause {
 pub fn advisory_text(cause: Cause, declaration: &sessions::EgressPolicy) -> String {
     let verdict = verdict_of(Some(declaration));
     let unenforceable = !unenforceable_rules(Some(declaration)).is_empty();
-    let asked = if verdict == sandbox2::config::Verdict::Deny {
+    let asked = if verdict == sandbox::config::Verdict::Deny {
         "you asked this box for no network access"
     } else if unenforceable {
         "you asked this box for limited network access"
     } else {
         "this box declares egress"
     };
-    let refuses = verdict == sandbox2::config::Verdict::Deny
+    let refuses = verdict == sandbox::config::Verdict::Deny
         && matches!(cause, Cause::TableNotEffective | Cause::ProbeUnreadable);
     let outcome = if refuses {
         "so it refuses to start the box"
@@ -454,7 +454,7 @@ pub fn advisory_text(cause: Cause, declaration: &sessions::EgressPolicy) -> Stri
             None => format!(
                 "Enforce it: start the box with --network own_ip, which enforces it now   \
                  ({} can't fix this: {})",
-                sandbox2::classifier::install_hint(),
+                sandbox::classifier::install_hint(),
                 cause.detail()
             ),
         }
@@ -818,7 +818,7 @@ static PROBE_LEAF_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// behind by a probe that died before its own cleanup is remade, not
 /// wedged into, by the next.
 fn probe_leaf(root: &Path) -> PathBuf {
-    sandbox2::classifier::box_leaf(
+    sandbox::classifier::box_leaf(
         root,
         &format!("filter-probe-{}", std::process::id()),
         Verdict::Deny,
@@ -1173,7 +1173,7 @@ const REHEARSAL_MOUNTINFO_ENV: &str = "MINIMAL_OVERRIDE_CGROUP_MOUNTINFO";
 /// guest's resolver carve-out is the node's DNS layer at the switch gateway
 /// ([`GUEST_RESOLVER_CARVE_OUT_LINE`]).
 pub struct GuestRender<'a> {
-    /// The tree root this daemon itself laid out: `sandbox2`'s
+    /// The tree root this daemon itself laid out: `sandbox`'s
     /// `classifier::TREE_ROOT`, under the cgroup2 its boot mounted.
     pub tree_root: &'a Path,
     /// The resolver Minimal owns for a host-address box on this guest: the
@@ -1494,7 +1494,7 @@ pub fn load_guest_table_over(
     }
     tracing::info!(
         sha256 = %digest,
-        marker = %sandbox2::classifier::TABLE_MARKER,
+        marker = %sandbox::classifier::TABLE_MARKER,
         "loaded the guest's classifier table and wrote its presence marker"
     );
     Ok(GuestLoad { digest })
@@ -1505,7 +1505,7 @@ pub fn load_guest_table_over(
 /// this daemon made, so only a daemon still holding one keeps the removal
 /// from succeeding.
 fn clear_marker_records(root: &Path) -> Result<(), String> {
-    let marker = root.join(sandbox2::classifier::TABLE_MARKER);
+    let marker = root.join(sandbox::classifier::TABLE_MARKER);
     if marker.exists() {
         std::fs::remove_dir(&marker).map_err(|cause| {
             format!("removing the stale marker at {}: {cause}", marker.display())
@@ -1549,7 +1549,7 @@ fn write_guest_marker(mask: u32, root: &Path) -> Result<(), String> {
             ))
         }
     })?;
-    let marker = root.join(sandbox2::classifier::TABLE_MARKER);
+    let marker = root.join(sandbox::classifier::TABLE_MARKER);
     std::fs::create_dir(&marker).or_else(|cause| {
         if cause.kind() == std::io::ErrorKind::AlreadyExists {
             Ok(())
@@ -1905,7 +1905,7 @@ pub(crate) fn decide_over(
     // kind of host. A mount table that cannot be read is the same absence
     // of evidence, and the check may not report a host as confining on no
     // evidence.
-    let confining = sandbox2::classifier::cgroup2_covering(root, mountinfo.unwrap_or(""))
+    let confining = sandbox::classifier::cgroup2_covering(root, mountinfo.unwrap_or(""))
         .is_some_and(|(_, nsdelegate)| nsdelegate);
     if !confining {
         return Decision::undecidable(Cause::CannotConfine);
@@ -1999,14 +1999,14 @@ pub fn decide_now(root: &Path, mountinfo: Option<&str>, guest: bool) -> Decision
 /// way. A leaf that is not there, or one this daemon is not in, reads as
 /// what it is: no leaf of the daemon's own.
 ///
-/// [`enter_daemon_leaf`]: sandbox2::classifier::enter_daemon_leaf
+/// [`enter_daemon_leaf`]: sandbox::classifier::enter_daemon_leaf
 pub fn daemon_fetch_leaf(root: &Path) -> Option<&'static str> {
     let members =
-        std::fs::read_to_string(sandbox2::classifier::daemon_leaf(root).join(PROCS_FILE)).ok()?;
+        std::fs::read_to_string(sandbox::classifier::daemon_leaf(root).join(PROCS_FILE)).ok()?;
     members
         .lines()
         .any(|member| member.trim().parse::<u32>() == Ok(std::process::id()))
-        .then_some(sandbox2::classifier::DAEMON_LEAF)
+        .then_some(sandbox::classifier::DAEMON_LEAF)
 }
 
 /// NET-080: the node-plane record for the daemon's own fetches — one line
@@ -2170,7 +2170,7 @@ pub(crate) fn url_object(url: &str) -> String {
 fn subtrees_delegated(root: &Path) -> bool {
     [Verdict::Deny, Verdict::Allow].iter().all(|verdict| {
         let subtree = root
-            .join(sandbox2::classifier::BOXES_DIR)
+            .join(sandbox::classifier::BOXES_DIR)
             .join(verdict.dir_name());
         DELEGATION_FILES
             .iter()
@@ -2187,7 +2187,7 @@ fn subtrees_delegated(root: &Path) -> bool {
 /// is a step that did not finish — the state a failed re-install leaves —
 /// and reads the same as no step at all.
 fn table_marker_present(root: &Path) -> bool {
-    root.join(sandbox2::classifier::TABLE_MARKER).is_dir() && recorded_ct_mark_mask(root).is_some()
+    root.join(sandbox::classifier::TABLE_MARKER).is_dir() && recorded_ct_mark_mask(root).is_some()
 }
 
 /// The ct-mark mask the loaded table classifies cohort and node plane
@@ -2303,7 +2303,7 @@ pub(crate) fn stale_carve_out_refusal(
         |target| target.to_string(),
     );
     let live_words = live.map_or_else(|| "no live answerer".to_string(), |bound| bound.to_string());
-    let install = sandbox2::classifier::install_hint();
+    let install = sandbox::classifier::install_hint();
     let re_render = format!(
         "{install} --undo, then {install} re-renders the carve-out for the answerer's \
          default port; a daemon whose answerer is bound elsewhere has no self-service \
@@ -2362,7 +2362,7 @@ fn standin_mount() -> StandinMount {
     // name on a real host.
     let mountpoint = scratch.path().join("cgroup");
     let root = mountpoint.join(
-        std::path::Path::new(sandbox2::classifier::TREE_ROOT)
+        std::path::Path::new(sandbox::classifier::TREE_ROOT)
             .file_name()
             .expect("the tree root is a slice below the cgroup2 mount root"),
     );
@@ -2787,7 +2787,7 @@ mod tests {
     /// The tree root's own name — the component the installer renders a
     /// ruleset's cgroup paths below their covering mount from.
     fn tree_root_name() -> &'static str {
-        std::path::Path::new(sandbox2::classifier::TREE_ROOT)
+        std::path::Path::new(sandbox::classifier::TREE_ROOT)
             .file_name()
             .and_then(std::ffi::OsStr::to_str)
             .expect("the tree root is a slice below the cgroup2 mount root")
@@ -2807,12 +2807,12 @@ mod tests {
     fn installed_cohort(root: &Path) {
         for verdict in [Verdict::Deny, Verdict::Allow] {
             let subtree = root
-                .join(sandbox2::classifier::BOXES_DIR)
+                .join(sandbox::classifier::BOXES_DIR)
                 .join(verdict.dir_name());
             std::fs::create_dir_all(&subtree).expect("the step makes the subtree");
             model_delegation_files(&subtree);
         }
-        std::fs::create_dir_all(root.join(sandbox2::classifier::TABLE_MARKER))
+        std::fs::create_dir_all(root.join(sandbox::classifier::TABLE_MARKER))
             .expect("the step writes the table's marker");
         std::fs::create_dir_all(root.join(TEST_CT_MARK_RECORD))
             .expect("the step records the ct-mark mask beside the marker");
@@ -2845,7 +2845,7 @@ mod tests {
         );
         let ruleset = String::from_utf8(printed.stdout).expect("the rendered ruleset is text");
         let rel = tree_root_name();
-        let cohort_path = format!("{}/{}", rel, sandbox2::classifier::BOXES_DIR);
+        let cohort_path = format!("{}/{}", rel, sandbox::classifier::BOXES_DIR);
         let classify = chain_rules(&ruleset, "classify");
         assert_eq!(
             classify.len(),
@@ -2951,7 +2951,7 @@ mod tests {
         let root = tree.path();
         installed_cohort(root);
         let deny = root
-            .join(sandbox2::classifier::BOXES_DIR)
+            .join(sandbox::classifier::BOXES_DIR)
             .join(Verdict::Deny.dir_name());
         std::fs::set_permissions(&deny, std::fs::Permissions::from_mode(0o555))
             .expect("the deny subtree refuses the probe its leaf");
@@ -2987,8 +2987,8 @@ mod tests {
     fn node_plane_and_cohort_distinct_sources() {
         let tree = tempfile::tempdir().expect("a temp dir standing in for the tree");
         let root = tree.path();
-        let cohort = root.join(sandbox2::classifier::BOXES_DIR);
-        let daemon = sandbox2::classifier::daemon_leaf(root);
+        let cohort = root.join(sandbox::classifier::BOXES_DIR);
+        let daemon = sandbox::classifier::daemon_leaf(root);
 
         // The node plane's identity is keyed on the daemon's leaf, a sibling
         // of the cohort and never inside it: a daemon leaf under `boxes/`
@@ -3010,7 +3010,7 @@ mod tests {
         // every box leaf is one deeper, in one subtree or the other, never
         // the cohort itself.
         for (verdict, id) in [(Verdict::Deny, "a deny-all box"), (Verdict::Allow, "a box")] {
-            let leaf = sandbox2::classifier::box_leaf(root, id, verdict);
+            let leaf = sandbox::classifier::box_leaf(root, id, verdict);
             assert_eq!(
                 leaf.parent().and_then(Path::parent),
                 Some(cohort.as_path()),
@@ -3042,7 +3042,7 @@ mod tests {
         children.sort();
         assert_eq!(
             children,
-            [sandbox2::config::ALLOW_DIR, sandbox2::config::DENY_DIR],
+            [sandbox::config::ALLOW_DIR, sandbox::config::DENY_DIR],
             "the cohort holds the two subtrees and nothing else"
         );
 
@@ -3068,7 +3068,7 @@ mod tests {
         // refuses to render half a pair, and refuses a mask that is not
         // two contiguous bits.
         let rel = tree_root_name();
-        let cohort_path = format!("{}/{}", rel, sandbox2::classifier::BOXES_DIR);
+        let cohort_path = format!("{}/{}", rel, sandbox::classifier::BOXES_DIR);
         let ruleset = rendered_ruleset();
         assert!(
             ruleset.contains("type filter hook output priority mangle"),
@@ -3189,9 +3189,9 @@ mod tests {
         let tree = tempfile::tempdir().expect("a temp dir standing in for the tree");
         let root = tree.path();
         let deny_subtree = root
-            .join(sandbox2::classifier::BOXES_DIR)
-            .join(sandbox2::config::DENY_DIR);
-        let leaf = sandbox2::config::ClassifierLeaf::under(root, "a session", Verdict::Deny);
+            .join(sandbox::classifier::BOXES_DIR)
+            .join(sandbox::config::DENY_DIR);
+        let leaf = sandbox::config::ClassifierLeaf::under(root, "a session", Verdict::Deny);
         assert_eq!(
             leaf.dir().parent(),
             Some(deny_subtree.as_path()),
@@ -3204,8 +3204,8 @@ mod tests {
         assert_ne!(
             leaf.dir().parent(),
             Some(
-                root.join(sandbox2::classifier::BOXES_DIR)
-                    .join(sandbox2::config::ALLOW_DIR)
+                root.join(sandbox::classifier::BOXES_DIR)
+                    .join(sandbox::config::ALLOW_DIR)
                     .as_path()
             ),
             "the deny-all box's leaf is in the deny subtree alone"
@@ -3222,8 +3222,8 @@ mod tests {
         let deny_subtree = format!(
             "{}/{}/{}",
             rel,
-            sandbox2::classifier::BOXES_DIR,
-            sandbox2::config::DENY_DIR
+            sandbox::classifier::BOXES_DIR,
+            sandbox::config::DENY_DIR
         );
         let ruleset = rendered_ruleset();
         let output = chain_rules(&ruleset, "output");
@@ -3685,7 +3685,7 @@ mod tests {
             "the output chain does one thing, route a cgroup to its chain: {output:?}"
         );
         assert!(
-            output[0].contains(sandbox2::config::DENY_DIR) && output[0].ends_with("jump deny_out"),
+            output[0].contains(sandbox::config::DENY_DIR) && output[0].ends_with("jump deny_out"),
             "the one jump is the deny subtree's, so nothing else is decided \
              against a deny-all box: {output:?}"
         );
@@ -3869,7 +3869,7 @@ mod tests {
             "the resident box is declared deny-all, so its leaf sits in the \
              subtree the refusing rule matches"
         );
-        let resident = sandbox2::classifier::create_box_leaf(&root, "a session", Verdict::Deny)
+        let resident = sandbox::classifier::create_box_leaf(&root, "a session", Verdict::Deny)
             .expect("the launch makes the deny-all box's leaf");
 
         // The daemon's own leaf, entered the way the daemon enters it at
@@ -3877,10 +3877,10 @@ mod tests {
         // performs — its own pid into its leaf's `cgroup.procs` — and the
         // leaf needs the delegation-contract files modelled into it, because
         // nothing behind the stand-in makes them at mkdir.
-        let daemon = sandbox2::classifier::daemon_leaf(&root);
+        let daemon = sandbox::classifier::daemon_leaf(&root);
         std::fs::create_dir_all(&daemon).expect("the step makes the daemon's own leaf");
         model_delegation_files(&daemon);
-        sandbox2::classifier::enter_daemon_leaf(&root)
+        sandbox::classifier::enter_daemon_leaf(&root)
             .expect("the daemon enters its own leaf, in the tree the box is resident in");
 
         // The fetch's leg: a connection the daemon opens from its own leaf,
@@ -4014,7 +4014,7 @@ mod tests {
         let leaf = daemon_fetch_leaf(&root);
         assert_eq!(
             leaf,
-            Some(sandbox2::classifier::DAEMON_LEAF),
+            Some(sandbox::classifier::DAEMON_LEAF),
             "the daemon that entered its own leaf above reads back as in it, \
              which is the premise the record's leaf field is about to claim"
         );
@@ -4052,7 +4052,7 @@ mod tests {
                 "the record names the host fetched: {line}"
             );
             assert!(
-                line.contains(sandbox2::classifier::DAEMON_LEAF),
+                line.contains(sandbox::classifier::DAEMON_LEAF),
                 "the record names the leaf the fetch left from: {line}"
             );
             assert!(
@@ -4087,7 +4087,7 @@ mod tests {
         let mount = standin_mount();
         let root = mount.root.clone();
         installed_cohort(&root);
-        let daemon = sandbox2::classifier::daemon_leaf(&root);
+        let daemon = sandbox::classifier::daemon_leaf(&root);
         std::fs::create_dir_all(&daemon).expect("the step makes the daemon's own leaf");
         model_delegation_files(&daemon);
 
@@ -4139,11 +4139,11 @@ mod tests {
         // The entry the daemon performs at start, over the same tree: the
         // leaf read turns, and the line with it — the fetch is now recorded
         // as leaving from the leaf the tree holds for it, beside the cohort.
-        sandbox2::classifier::enter_daemon_leaf(&root)
+        sandbox::classifier::enter_daemon_leaf(&root)
             .expect("the daemon enters its own leaf over the stand-in tree");
         assert_eq!(
             daemon_fetch_leaf(&root),
-            Some(sandbox2::classifier::DAEMON_LEAF),
+            Some(sandbox::classifier::DAEMON_LEAF),
             "the daemon that entered its leaf reads back as in it"
         );
         let (log, guard) = capture_node_plane_log();
@@ -4170,7 +4170,7 @@ mod tests {
         // none to name — the same line as the unplaced daemon's, read the
         // same way by a bundle's tail on a host that never ran the install.
         let bare = tempfile::tempdir().expect("a bare stand-in tree, nothing installed in it");
-        let slice = std::path::Path::new(sandbox2::classifier::TREE_ROOT)
+        let slice = std::path::Path::new(sandbox::classifier::TREE_ROOT)
             .file_name()
             .expect("the tree root is a path with a name");
         assert_eq!(
@@ -4668,7 +4668,7 @@ mod tests {
         // — for a guest, that is the state a launch refuses rather than
         // places (design §7.1).
         installed_cohort(root);
-        std::fs::remove_dir_all(root.join(sandbox2::classifier::TABLE_MARKER))
+        std::fs::remove_dir_all(root.join(sandbox::classifier::TABLE_MARKER))
             .expect("removing the marker");
         assert_eq!(
             decide(root, Some(&mountinfo(root, true)), false, refused_reading).cause(),
@@ -4690,7 +4690,7 @@ mod tests {
         // whose table's bits it cannot name.
         std::fs::remove_dir_all(root.join(TEST_CT_MARK_RECORD))
             .expect("removing the recorded mask");
-        std::fs::create_dir_all(root.join(sandbox2::classifier::TABLE_MARKER))
+        std::fs::create_dir_all(root.join(sandbox::classifier::TABLE_MARKER))
             .expect("the step writes the table's marker");
         assert_eq!(
             decide(root, Some(&mountinfo(root, true)), false, refused_reading).cause(),
@@ -4740,7 +4740,7 @@ mod tests {
         // the listing is handed to the decision here as the fact a guest
         // whose boot loaded its table reads (the recheck itself is pinned
         // in `guest_decide_rechecks_table_not_only_marker`).
-        std::fs::create_dir_all(root.join(sandbox2::classifier::TABLE_MARKER))
+        std::fs::create_dir_all(root.join(sandbox::classifier::TABLE_MARKER))
             .expect("the step writes the table's marker");
         let decided = decide(root, Some(&mountinfo(root, true)), false, refused_reading);
         assert!(
@@ -5174,7 +5174,7 @@ mod tests {
         let read = || {
             decide_now(
                 root,
-                sandbox2::classifier::own_mountinfo().as_deref(),
+                sandbox::classifier::own_mountinfo().as_deref(),
                 crate::guest::is_microvm_daemon(),
             )
         };
@@ -5828,7 +5828,7 @@ mod tests {
             "the digest the boot logs covers exactly the bytes piped to the load"
         );
         assert!(
-            root.join(sandbox2::classifier::TABLE_MARKER).is_dir(),
+            root.join(sandbox::classifier::TABLE_MARKER).is_dir(),
             "the marker is written after the load"
         );
         assert!(
@@ -5855,7 +5855,7 @@ mod tests {
             "the check that refused is the only call: no load ran behind it"
         );
         assert!(
-            !root.join(sandbox2::classifier::TABLE_MARKER).is_dir(),
+            !root.join(sandbox::classifier::TABLE_MARKER).is_dir(),
             "a refused check writes no marker, and the one a previous load \
              wrote does not survive a load that did not run"
         );
@@ -5872,7 +5872,7 @@ mod tests {
             other => panic!("a refused load is the load's own failure, not {other:?}"),
         }
         assert!(
-            !root.join(sandbox2::classifier::TABLE_MARKER).is_dir(),
+            !root.join(sandbox::classifier::TABLE_MARKER).is_dir(),
             "a refused load writes no marker"
         );
         assert!(
@@ -5910,7 +5910,7 @@ mod tests {
             load_guest_table(&guest_bash(), &nft, &params)
                 .expect("the load runs over an nft stub that accepts it");
             assert!(
-                root.join(sandbox2::classifier::TABLE_MARKER).is_dir(),
+                root.join(sandbox::classifier::TABLE_MARKER).is_dir(),
                 "the load that succeeded wrote the marker"
             );
         };
@@ -5943,7 +5943,7 @@ mod tests {
             }
         }
         assert!(
-            !root.join(sandbox2::classifier::TABLE_MARKER).is_dir(),
+            !root.join(sandbox::classifier::TABLE_MARKER).is_dir(),
             "a render that never returned writes no marker, and takes the \
              standing one away first"
         );
@@ -5961,7 +5961,7 @@ mod tests {
             other => panic!("a check that never returns is the check's own failure, not {other:?}"),
         }
         assert!(
-            !root.join(sandbox2::classifier::TABLE_MARKER).is_dir(),
+            !root.join(sandbox::classifier::TABLE_MARKER).is_dir(),
             "no load ran behind a check that never answered, so no marker stands"
         );
 
@@ -5985,7 +5985,7 @@ mod tests {
             other => panic!("a load that never returns is the load's own failure, not {other:?}"),
         }
         assert!(
-            !root.join(sandbox2::classifier::TABLE_MARKER).is_dir(),
+            !root.join(sandbox::classifier::TABLE_MARKER).is_dir(),
             "a table nobody loaded is not marked present"
         );
     }
@@ -6052,7 +6052,7 @@ mod tests {
              the guest's boot reaches its load: {held:?}"
         );
         assert!(
-            root.join(sandbox2::classifier::TABLE_MARKER).is_dir(),
+            root.join(sandbox::classifier::TABLE_MARKER).is_dir(),
             "the load the ordered boot ran wrote its marker"
         );
 
@@ -6061,7 +6061,7 @@ mod tests {
         // and a host that allows it keeps the verdict the order is for — and
         // still loads, because the marker's table is not the listeners'.
         let cause = std::io::Error::other("the loopback would not come up");
-        let _ = std::fs::remove_dir_all(root.join(sandbox2::classifier::TABLE_MARKER));
+        let _ = std::fs::remove_dir_all(root.join(sandbox::classifier::TABLE_MARKER));
         let (ran, held_at_load) = (
             std::cell::RefCell::new(Vec::new()),
             std::cell::Cell::new(None),
@@ -6102,14 +6102,14 @@ mod tests {
              bind keeps the verdict the order is for"
         );
         assert!(
-            root.join(sandbox2::classifier::TABLE_MARKER).is_dir(),
+            root.join(sandbox::classifier::TABLE_MARKER).is_dir(),
             "the load is not gated on the loopback or the listeners: the \
              marker's table is still the decision's own fact"
         );
 
         // And a hold that cannot bind is the same: logged, and the load
         // still runs, so the tree it leaves is the fact a launch reads.
-        let _ = std::fs::remove_dir_all(root.join(sandbox2::classifier::TABLE_MARKER));
+        let _ = std::fs::remove_dir_all(root.join(sandbox::classifier::TABLE_MARKER));
         let ran = std::cell::RefCell::new(Vec::new());
         boot_guest_classifier(
             || {
@@ -6129,7 +6129,7 @@ mod tests {
         );
         assert_eq!(*ran.borrow(), ["loopback", "listeners", "load"]);
         assert!(
-            root.join(sandbox2::classifier::TABLE_MARKER).is_dir(),
+            root.join(sandbox::classifier::TABLE_MARKER).is_dir(),
             "a hold that cannot bind does not stop the load"
         );
         clear_probe_listeners();
@@ -6161,7 +6161,7 @@ mod tests {
         load_guest_table(&guest_bash(), &nft, &params)
             .expect("the load runs over an nft stub that accepts it");
         assert!(
-            root.join(sandbox2::classifier::TABLE_MARKER).is_dir(),
+            root.join(sandbox::classifier::TABLE_MARKER).is_dir(),
             "the previous load wrote its marker"
         );
 
@@ -6187,7 +6187,7 @@ mod tests {
             "no check ran behind a render that failed"
         );
         assert!(
-            !root.join(sandbox2::classifier::TABLE_MARKER).is_dir(),
+            !root.join(sandbox::classifier::TABLE_MARKER).is_dir(),
             "a failed render leaves no marker, and the one a previous load \
              wrote does not survive a load that did not run"
         );
@@ -6238,12 +6238,12 @@ mod tests {
             "the load the stub refuses fails"
         );
         assert!(
-            !root.join(sandbox2::classifier::TABLE_MARKER).is_dir(),
+            !root.join(sandbox::classifier::TABLE_MARKER).is_dir(),
             "a failed load leaves no marker to vouch for a table"
         );
         assert!(
-            root.join(sandbox2::classifier::BOXES_DIR)
-                .join(sandbox2::config::DENY_DIR)
+            root.join(sandbox::classifier::BOXES_DIR)
+                .join(sandbox::config::DENY_DIR)
                 .is_dir(),
             "the subtrees stay: only the table's marker is the boot's half"
         );
@@ -6351,7 +6351,7 @@ mod tests {
         // its subtrees but no marker is still the interim, and no listing is
         // consulted for it either.
         installed_cohort(root);
-        std::fs::remove_dir_all(root.join(sandbox2::classifier::TABLE_MARKER))
+        std::fs::remove_dir_all(root.join(sandbox::classifier::TABLE_MARKER))
             .expect("removing the marker");
         let listed = std::cell::Cell::new(0);
         let still_unmarked = decide_over(root, Some(&table), true, refused_reading, || {
@@ -6364,7 +6364,7 @@ mod tests {
             "the marker gates the recheck too: subtrees alone are no table"
         );
         assert_eq!(listed.get(), 0, "no listing is read without the marker");
-        std::fs::create_dir_all(root.join(sandbox2::classifier::TABLE_MARKER))
+        std::fs::create_dir_all(root.join(sandbox::classifier::TABLE_MARKER))
             .expect("restoring the marker");
 
         // A table the kernel no longer holds behind its marker — a flush, a

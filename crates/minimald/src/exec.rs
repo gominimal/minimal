@@ -139,11 +139,11 @@ fn task_start_dir(
         return Ok(None);
     }
     if working.join(cwd).is_dir() {
-        Ok(Some(format!("/{}/{cwd}", sandbox2::SESSION_DEFAULT_WD)))
+        Ok(Some(format!("/{}/{cwd}", sandbox::SESSION_DEFAULT_WD)))
     } else {
         Err(format!(
             "minimal: {cwd} is not in the uploaded tree; running the task at /{}\n",
-            sandbox2::SESSION_DEFAULT_WD
+            sandbox::SESSION_DEFAULT_WD
         ))
     }
 }
@@ -214,7 +214,7 @@ pub(crate) fn task_network(
     switch: &std::sync::Arc<tokio::sync::Mutex<crate::net::SwitchClient>>,
     phase: sessions::EgressDefaultPhase,
     deny_all_opt_out: bool,
-) -> std::sync::Arc<dyn sandbox2::Network> {
+) -> std::sync::Arc<dyn sandbox::Network> {
     let id = record.id.to_string();
     let session = record.name.as_deref().unwrap_or(&id);
     let egress = crate::session::effective_egress_section(
@@ -297,12 +297,12 @@ impl Reapable for hakoniwa::Child {
 
 /// Step 3 of a task launch: wire the process's namespace, or kill and reap the
 /// process so it does not run on with the network it failed to get — as
-/// `sandbox2::run_with_cancel` does. `PlannedLaunch`'s drop releases the plan.
+/// `sandbox::run_with_cancel` does. `PlannedLaunch`'s drop releases the plan.
 async fn attach_or_reap<P: Reapable>(
-    planned: sandbox2::PlannedLaunch,
-    spawned: sandbox2::Spawned,
+    planned: sandbox::PlannedLaunch,
+    spawned: sandbox::Spawned,
     child: &mut P,
-) -> io::Result<Box<dyn sandbox2::NetGuard>> {
+) -> io::Result<Box<dyn sandbox::NetGuard>> {
     match planned.attach(spawned).await {
         Ok(guard) => Ok(guard),
         Err(e) => {
@@ -491,7 +491,7 @@ async fn task_producer(
                 let mut child = cmd
                     .spawn()
                     .map_err(|e| io::Error::other(format!("command launch failed: {}", e)))?;
-                let spawned = sandbox2::Spawned::from_child(&mut child);
+                let spawned = sandbox::Spawned::from_child(&mut child);
                 let guard = attach_or_reap(planned, spawned, &mut child).await?;
                 let mut process = HakoniwaProcess::new(child, guard);
                 // The fallback notice leads the first invocation's stderr.
@@ -562,7 +562,7 @@ pub struct HakoniwaProcess {
 /// guard would never detach. It runs on its own task instead, and `wait`
 /// awaits the handle, which survives being dropped and re-awaited.
 struct NetRelease {
-    guard: Option<Box<dyn sandbox2::NetGuard>>,
+    guard: Option<Box<dyn sandbox::NetGuard>>,
     /// The teardown in flight, once started.
     running: Option<JoinHandle<()>>,
 }
@@ -581,7 +581,7 @@ impl Drop for NetRelease {
 }
 
 impl NetRelease {
-    fn new(guard: Box<dyn sandbox2::NetGuard>) -> Self {
+    fn new(guard: Box<dyn sandbox::NetGuard>) -> Self {
         Self {
             guard: Some(guard),
             running: None,
@@ -622,7 +622,7 @@ enum WaitState {
 }
 
 impl HakoniwaProcess {
-    fn new(child: hakoniwa::Child, net_guard: Box<dyn sandbox2::NetGuard>) -> Self {
+    fn new(child: hakoniwa::Child, net_guard: Box<dyn sandbox::NetGuard>) -> Self {
         Self {
             pid: child.id() as libc::pid_t,
             state: WaitState::Spawned(Box::new(child)),
@@ -2788,10 +2788,7 @@ mod tests {
             plan.isolates_netns(),
             "an own-IP task gets its own namespace"
         );
-        assert!(matches!(
-            plan.resolver(),
-            sandbox2::Resolver::Nameservers(_)
-        ));
+        assert!(matches!(plan.resolver(), sandbox::Resolver::Nameservers(_)));
         // Its own identity on the switch, and the session's *effective*
         // egress (NET-074) — resolved under the phase this build ships, so
         // the same rules the session's own gate enforces, whatever the
@@ -3040,12 +3037,12 @@ mod tests {
 
         #[derive(Debug)]
         struct Refuses;
-        impl sandbox2::Network for Refuses {
-            fn plan(&self) -> sandbox2::PlanFuture<'_> {
-                Box::pin(std::future::ready(Ok(sandbox2::NetPlan::isolated())))
+        impl sandbox::Network for Refuses {
+            fn plan(&self) -> sandbox::PlanFuture<'_> {
+                Box::pin(std::future::ready(Ok(sandbox::NetPlan::isolated())))
             }
-            fn attach(&self, _: sandbox2::Spawned) -> sandbox2::AttachFuture<'_> {
-                Box::pin(std::future::ready(Err(sandbox2::NetworkError::new(
+            fn attach(&self, _: sandbox::Spawned) -> sandbox::AttachFuture<'_> {
+                Box::pin(std::future::ready(Err(sandbox::NetworkError::new(
                     std::io::Error::other("switch refused the client"),
                 ))))
             }
@@ -3060,13 +3057,13 @@ mod tests {
             }
         }
 
-        let planned = sandbox2::PlannedLaunch::begin(Arc::new(Refuses))
+        let planned = sandbox::PlannedLaunch::begin(Arc::new(Refuses))
             .await
             .expect("planning succeeds; it is the attach that fails");
         assert!(planned.plan().isolates_netns());
 
         let mut child = Child { reaped: false };
-        let err = super::attach_or_reap(planned, sandbox2::Spawned::new(1), &mut child)
+        let err = super::attach_or_reap(planned, sandbox::Spawned::new(1), &mut child)
             .await
             .err()
             .expect("a refused attach must surface as an error");
@@ -3082,7 +3079,7 @@ mod tests {
         go: std::sync::Arc<tokio::sync::Notify>,
         done: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
-    impl sandbox2::NetGuard for SlowGuard {
+    impl sandbox::NetGuard for SlowGuard {
         fn teardown(
             self: Box<Self>,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {

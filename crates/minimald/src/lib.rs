@@ -59,8 +59,8 @@ pub struct ChannelConfig {
 /// refusal carries too.
 #[cfg(target_os = "linux")]
 #[must_use]
-pub fn userns_restriction_fix(restriction: sandbox2::UsernsRestriction) -> String {
-    restriction.remedy(sandbox2::RemedyTarget::Daemon {
+pub fn userns_restriction_fix(restriction: sandbox::UsernsRestriction) -> String {
+    restriction.remedy(sandbox::RemedyTarget::Daemon {
         bin: &server::this_daemon_path(),
     })
 }

@@ -48,7 +48,7 @@ pub(crate) use helpers::*;
 /// handful of `/proc` reads on a path that has already failed.
 #[cfg(target_os = "linux")]
 fn userns_spawn_hint() -> Option<String> {
-    sandbox2::user_namespaces_restriction()
+    sandbox::user_namespaces_restriction()
         .map(|r| format!("{r} — fix: {}", crate::userns_restriction_fix(r)))
 }
 
@@ -5137,7 +5137,7 @@ impl Session {
             for_hooks,
             // The classifier tree the privileged step installs natively and
             // the guest's own boot mounts; see the field's doc.
-            classifier_root: std::path::PathBuf::from(sandbox2::classifier::TREE_ROOT),
+            classifier_root: std::path::PathBuf::from(sandbox::classifier::TREE_ROOT),
             // The mount table the launch's classifier facts answer over is
             // the daemon's own, read live on every launch; see the field's
             // doc.
@@ -6317,7 +6317,7 @@ pub(crate) mod launch_record_seam {
             .is_some_and(|failing| failing.contains_key(id))
     }
 
-    pub(super) fn teardown_guard(id: SessionId) -> Option<Box<dyn sandbox2::NetGuard>> {
+    pub(super) fn teardown_guard(id: SessionId) -> Option<Box<dyn sandbox::NetGuard>> {
         let failing = FAILING
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -6327,7 +6327,7 @@ pub(crate) mod launch_record_seam {
 
     struct TeardownFlag(Arc<AtomicBool>);
 
-    impl sandbox2::NetGuard for TeardownFlag {
+    impl sandbox::NetGuard for TeardownFlag {
         fn teardown(
             self: Box<Self>,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {

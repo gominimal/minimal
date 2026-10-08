@@ -430,7 +430,7 @@ pub struct Injection {
     seal_none_box: bool,
     /// The box's classifier leaf (NET-079), joined before the namespaces.
     /// `None` on a host that places no box.
-    leaf: Option<sandbox2::config::ClassifierLeaf>,
+    leaf: Option<sandbox::config::ClassifierLeaf>,
 }
 
 impl Injection {
@@ -517,7 +517,7 @@ impl Injection {
     /// the box mounts over the tree it joined through leaves no path to
     /// write a migration to at all. Writing the shim's pid from the daemon's
     /// namespaces puts it, and the program it forks, in the leaf.
-    pub fn with_classifier_leaf(mut self, leaf: sandbox2::config::ClassifierLeaf) -> Self {
+    pub fn with_classifier_leaf(mut self, leaf: sandbox::config::ClassifierLeaf) -> Self {
         self.leaf = Some(leaf);
         self
     }
@@ -722,8 +722,8 @@ pub fn shim_main(args: ShimArgs) -> Result<i32, NsenterError> {
     // runtime is built), so the failure goes to the inherited stderr, which
     // is the daemon's.
     if let Some(leaf) = &args.classifier_leaf {
-        let leaf = sandbox2::config::ClassifierLeaf::new(leaf);
-        if let Err(source) = sandbox2::classifier::place_pid(&leaf.procs(), std::process::id()) {
+        let leaf = sandbox::config::ClassifierLeaf::new(leaf);
+        if let Err(source) = sandbox::classifier::place_pid(&leaf.procs(), std::process::id()) {
             if leaf.is_deny() {
                 eprintln!(
                     "minimald: joining the deny-all box's classifier leaf {}: {source}",
@@ -850,7 +850,7 @@ pub fn shim_main(args: ShimArgs) -> Result<i32, NsenterError> {
             // syscalls and owns no state; this is the pre-exec moment it is
             // for, in the box's user namespace with the capabilities joining
             // it granted.
-            sandbox2::assume_box_credentials()
+            sandbox::assume_box_credentials()
         });
 
         cmd.pre_exec(move || {
@@ -861,7 +861,7 @@ pub fn shim_main(args: ShimArgs) -> Result<i32, NsenterError> {
             // joins the namespaces later and must load it itself.
             // SAFETY: `filter` is a `&'static` owned by the process-wide
             // OnceLock, valid and immutable for the program's lifetime.
-            sandbox2::install_socket_family_filter(socket_family_filter)?;
+            sandbox::install_socket_family_filter(socket_family_filter)?;
             Ok(())
         });
     }
@@ -1239,18 +1239,16 @@ fn spawn_failed_on_missing_chdir(source: &std::io::Error, chdir: Option<&Path>) 
 /// box's own network namespace confines them, so it applies only when the
 /// join enters that namespace (`join` names `Net`); an injection that stays
 /// in the daemon's namespace gets the unix-only seal instead, fail closed
-/// ([`sandbox2::SocketSeal::in_netns`]).
+/// ([`sandbox::SocketSeal::in_netns`]).
 fn injection_socket_filter(
     seal_none_box: bool,
     join: &[Namespace],
-) -> &'static sandbox2::SocketFamilyFilter {
+) -> &'static sandbox::SocketFamilyFilter {
     if seal_none_box {
         let joins_box_netns = join.contains(&Namespace::Net);
-        sandbox2::socket_family_filter_for_seal(
-            sandbox2::SocketSeal::Full.in_netns(joins_box_netns),
-        )
+        sandbox::socket_family_filter_for_seal(sandbox::SocketSeal::Full.in_netns(joins_box_netns))
     } else {
-        sandbox2::socket_family_filter_for_confined_families()
+        sandbox::socket_family_filter_for_confined_families()
     }
 }
 
@@ -1309,7 +1307,7 @@ mod tests {
     /// namespace, and the unix-only seal when the join set leaves `Net` out.
     #[test]
     fn none_injection_relaxes_only_when_joining_the_box_netns() {
-        use sandbox2::SocketSeal;
+        use sandbox::SocketSeal;
         let with_net = [Namespace::User, Namespace::Mnt, Namespace::Net];
         let without_net = [Namespace::User, Namespace::Mnt];
         assert_eq!(
@@ -1623,7 +1621,7 @@ mod tests {
     #[test]
     fn the_classifier_leaf_travels_on_the_shims_argv_when_one_is_set() {
         let leaf =
-            sandbox2::config::ClassifierLeaf::new("/sys/fs/cgroup/minimald.slice/boxes/allow/b");
+            sandbox::config::ClassifierLeaf::new("/sys/fs/cgroup/minimald.slice/boxes/allow/b");
         let shim = tempfile::NamedTempFile::new().expect("a temp file to stand in for the shim");
 
         let mut sleep = Command::new("/bin/sleep")

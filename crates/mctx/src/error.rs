@@ -35,7 +35,7 @@ pub enum Error {
         code: i32,
         reason: String,
         stderr: String,
-        /// Last ~4 KiB of stdout (captured by sandbox2 alongside stderr).
+        /// Last ~4 KiB of stdout (captured by sandbox alongside stderr).
         /// Useful when build scripts redirect stderr away (e.g.
         /// `pip install ... 2>/dev/null || true`) and the real
         /// diagnostic only appears on stdout.
@@ -259,13 +259,13 @@ impl From<check::Error> for Error {
     }
 }
 
-impl From<sandbox2::Error> for Error {
-    fn from(value: sandbox2::Error) -> Self {
+impl From<sandbox::Error> for Error {
+    fn from(value: sandbox::Error) -> Self {
         match value {
-            sandbox2::Error::IO(s, p, e) => Self::IO(s, p, e),
-            sandbox2::Error::HardlinkFailed(e) => e.into(),
-            sandbox2::Error::Execution(e) => match e {
-                sandbox2::error::ExecutionError::InvocationFailed {
+            sandbox::Error::IO(s, p, e) => Self::IO(s, p, e),
+            sandbox::Error::HardlinkFailed(e) => e.into(),
+            sandbox::Error::Execution(e) => match e {
+                sandbox::error::ExecutionError::InvocationFailed {
                     idx,
                     code,
                     reason,
@@ -279,25 +279,25 @@ impl From<sandbox2::Error> for Error {
                     stdout,
                 },
                 #[cfg(target_os = "linux")]
-                sandbox2::error::ExecutionError::SpawnFailed(e) => {
+                sandbox::error::ExecutionError::SpawnFailed(e) => {
                     Self::Other(anyhow::anyhow!("spawn failed: {}", e))
                 }
-                sandbox2::error::ExecutionError::Cancelled => {
+                sandbox::error::ExecutionError::Cancelled => {
                     Self::Other(anyhow::anyhow!("execution cancelled"))
                 }
-                sandbox2::error::ExecutionError::MountError { .. } => {
+                sandbox::error::ExecutionError::MountError { .. } => {
                     Self::Other(anyhow::anyhow!(e.to_string()))
                 }
-                sandbox2::error::ExecutionError::NetworkIsolationUnavailable => {
+                sandbox::error::ExecutionError::NetworkIsolationUnavailable => {
                     Self::Other(anyhow::anyhow!(e.to_string()))
                 }
             },
-            sandbox2::Error::Output(e) => Self::Other(e.into()),
-            sandbox2::Error::MappedFile(p) => Self::Other(anyhow::anyhow!(
+            sandbox::Error::Output(e) => Self::Other(e.into()),
+            sandbox::Error::MappedFile(p) => Self::Other(anyhow::anyhow!(
                 "internal: file {} mapped to rootfs",
                 p.display()
             )),
-            sandbox2::Error::Network(e) => Self::Other(anyhow::anyhow!(e.to_string())),
+            sandbox::Error::Network(e) => Self::Other(anyhow::anyhow!(e.to_string())),
         }
     }
 }

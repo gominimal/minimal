@@ -10,13 +10,13 @@
 //! ## The in-sandbox `min` command channel
 //!
 //! Packages, tasks and checks can be driven from *inside* a running session via
-//! the `min` helper, which talks to `/run/minenv_sock`. [`sandbox2`]'s listener
+//! the `min` helper, which talks to `/run/minenv_sock`. [`sandbox`]'s listener
 //! is synchronous — a blocking `accept()` loop on its own OS thread — which is
 //! why the equivalent handler in `mctx` has to spin up a fresh tokio runtime per
 //! command. Here we bridge that synchronous world to the daemon's async runtime
 //! with an actor:
 //!
-//! - [`BridgeChannel`] is the trivial synchronous [`sandbox2::Channel`]. For each
+//! - [`BridgeChannel`] is the trivial synchronous [`sandbox::Channel`]. For each
 //!   request it clones the connection and forwards it (with the request line)
 //!   down an mpsc to the actor, then returns immediately.
 //! - [`SessionChannel`] is the actor: it owns the context and graph and processes
@@ -40,8 +40,8 @@ use mfile::{EnvPatches, EnvVarValue};
 use op::Runnable;
 use ot::OpTracker;
 use paths::{DaemonAbsPath, DaemonRelPath, SandboxAbsPath};
-use sandbox2::config::{ClassifierLeaf, Config, SandboxMapped};
-use sandbox2::{Container, Sandbox};
+use sandbox::config::{ClassifierLeaf, Config, SandboxMapped};
+use sandbox::{Container, Sandbox};
 use tempfile::TempDir;
 use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, spawn_blocking};
@@ -207,12 +207,12 @@ const ATTACH_ENV_HOOK_NU: &str = constcat::concat!(
 /// Where the session's workspace appears *inside* the sandbox. The daemon sees
 /// the same directory at [`SessionChannel::working`], so this is the prefix
 /// that translates a path typed in the sandbox into one the daemon can write.
-pub(crate) const WORKSPACE_ROOT: &str = constcat::concat!("/", sandbox2::SESSION_DEFAULT_WD);
+pub(crate) const WORKSPACE_ROOT: &str = constcat::concat!("/", sandbox::SESSION_DEFAULT_WD);
 
 /// Where the session's home directory appears inside the sandbox, backed by
 /// [`SessionChannel::home`]. The second of the two directories a sandbox path
 /// can name on the daemon's side.
-pub(crate) const HOME_ROOT: &str = constcat::concat!("/", sandbox2::SESSION_HOME);
+pub(crate) const HOME_ROOT: &str = constcat::concat!("/", sandbox::SESSION_HOME);
 
 /// The parameters used to construct an [`Env`].
 ///
@@ -233,7 +233,7 @@ pub struct EnvArgs {
     patches: Option<EnvPatches>,
     env_vars: Option<BTreeMap<String, EnvVarValue>>,
     ot: Option<OpTracker>,
-    network: sandbox2::NetPlan,
+    network: sandbox::NetPlan,
     /// Weak handle to the owning session actor, wired into the command channel
     /// so in-sandbox `min` commands can drive session side-ops (e.g. builds).
     /// Every session env has one — this `Env` is always session-scoped.
@@ -276,7 +276,7 @@ impl EnvArgs {
             patches: None,
             env_vars: None,
             ot: None,
-            network: sandbox2::NetPlan::host(),
+            network: sandbox::NetPlan::host(),
             session,
             include_package_attr_wiring: true,
             classifier_leaf: None,
@@ -350,7 +350,7 @@ impl EnvArgs {
     /// Sets what the session sandbox's network looks like when no provider
     /// decides it — a plan, because that is what the sandbox layer acts on.
     #[must_use]
-    pub fn with_network(mut self, plan: sandbox2::NetPlan) -> Self {
+    pub fn with_network(mut self, plan: sandbox::NetPlan) -> Self {
         self.network = plan;
         self
     }
@@ -624,7 +624,7 @@ impl Env {
     }
 
     /// Creates a fresh container in this environment's sandbox.
-    pub fn container(&mut self, plan: &sandbox2::NetPlan) -> std::io::Result<Container> {
+    pub fn container(&mut self, plan: &sandbox::NetPlan) -> std::io::Result<Container> {
         self.sandbox.new_container(plan).map_err(sandbox_err_to_io)
     }
 
@@ -641,18 +641,18 @@ impl Env {
     #[cfg_attr(test, allow(dead_code))]
     pub(crate) fn closure_report_path(
         &self,
-        leaf: &sandbox2::config::ClassifierLeaf,
+        leaf: &sandbox::config::ClassifierLeaf,
     ) -> std::path::PathBuf {
         self.sandbox.closure_report_path(leaf)
     }
 
     /// Holds the program of every command `container` spawns at a start gate
-    /// until the returned gate is released; see [`sandbox2::Sandbox::hold_start`].
+    /// until the returned gate is released; see [`sandbox::Sandbox::hold_start`].
     #[cfg_attr(test, allow(dead_code))]
     pub(crate) fn hold_start(
         &self,
         container: &mut Container,
-    ) -> std::io::Result<sandbox2::StartGate> {
+    ) -> std::io::Result<sandbox::StartGate> {
         self.sandbox
             .hold_start(container)
             .map_err(sandbox_err_to_io)
@@ -722,8 +722,8 @@ fn err_to_io(e: Error) -> std::io::Error {
     std::io::Error::other(e.to_string())
 }
 
-/// Converts a [`sandbox2::Error`] into an [`std::io::Error`].
-fn sandbox_err_to_io(e: sandbox2::Error) -> std::io::Error {
+/// Converts a [`sandbox::Error`] into an [`std::io::Error`].
+fn sandbox_err_to_io(e: sandbox::Error) -> std::io::Error {
     std::io::Error::other(e.to_string())
 }
 
@@ -820,7 +820,7 @@ struct ChannelRequest {
     stream: UnixStream,
 }
 
-/// The synchronous [`sandbox2::Channel`] that bridges the listener thread to the
+/// The synchronous [`sandbox::Channel`] that bridges the listener thread to the
 /// async [`SessionChannel`] actor. It does no work itself beyond handing each
 /// request off; the connection clone stays open in the actor until the handler
 /// finishes, at which point dropping it closes the connection and the client's
@@ -829,7 +829,7 @@ struct BridgeChannel {
     tx: mpsc::Sender<ChannelRequest>,
 }
 
-impl sandbox2::Channel for BridgeChannel {
+impl sandbox::Channel for BridgeChannel {
     fn handle(&mut self, stream: &mut UnixStream, line: &str, _rootfs: &Path) {
         let stream = match stream.try_clone() {
             Ok(s) => s,
@@ -1174,7 +1174,7 @@ impl SessionChannel {
         crate::sandbox_progress::FetchRecord {
             box_id: self.box_id.clone(),
             leaf: crate::net::classifier::daemon_fetch_leaf(Path::new(
-                sandbox2::classifier::TREE_ROOT,
+                sandbox::classifier::TREE_ROOT,
             )),
             cache_host: crate::net::classifier::cache_host(
                 &self.ctx.daemon_context().config().remote_cache_url(),
