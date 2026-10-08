@@ -133,7 +133,7 @@ included, with every refusal logged (NET-001 to NET-004).
 - **NET-003** THE SYSTEM SHALL resolve `host.min.internal` from host-address, own-address, and VM-backed boxes to the address that reaches the host's loopback: `127.0.0.1` on the host, the switch's host-gateway address inside boxes.
   tier:     T0
   verify:   cargo nextest run -p minimald host_min_internal_resolves_to_host_reach_address_per_mode
-  <!-- S1a/AC2; prose 3; ubiquitous; "inside boxes" per design §7.1 without qualification: an own-address box on a native host sits on the switch too; a host-address box on a native host shares the host's namespace and its answer; resolution only: reach over the name is local reach under the box's egress rules (NET-079; design §7.1 local names), so a deny-all box resolves it and reaches nothing -->
+  <!-- S1a/AC2; prose 3; ubiquitous; "inside boxes" per design §7.1 without qualification: an own-address box on a native host sits on the switch too; a host-address box on a native host shares the host's namespace and its answer; resolution only: box→host reach over the name is default-deny except configured host exposures (design §7.1), and an exposure is local reach under the box's egress rules (NET-079; design §7.1 local names), so an allow-all box reaches only the exposures and a deny-all box resolves the name and reaches nothing -->
   - WHERE the host is VM-backed, WHILE a box is a host-address box THE SYSTEM SHALL resolve its lookups through the node's DNS layer and never through the host's own resolver.
     tier:   T0
     verify: cargo nextest run -p minimald host_ip_box_resolves_through_node_dns_layer
@@ -142,7 +142,7 @@ included, with every refusal logged (NET-001 to NET-004).
 - **NET-004** WHEN a box connects to the literal `100.64.255.254` THE SYSTEM SHALL route the connection as `host.min.internal` and emit a deprecation notice.
   tier:     T0
   verify:   cargo nextest run -p minimald legacy_host_literal_routes_with_deprecation
-  <!-- S1a/AC2; prose 3; event-driven; "for one release" is a plan fact -->
+  <!-- S1a/AC2; prose 3; event-driven; "for one release" is a plan fact; routing as `host.min.internal` means the literal reaches what that name reaches: box→host default-deny except configured host exposures (design §7.1), so the deprecated spelling grants nothing the name does not -->
 
 - **NET-006** THE SYSTEM SHALL answer `*.min.internal` names only to lookups that originate on the machine.
   tier:     T0
@@ -165,6 +165,10 @@ included, with every refusal logged (NET-001 to NET-004).
   property: for every host with the reserved local range present and every sequence of publish and withdraw operations from every allocator on it, up to 8 live boxes, no two live own-address or `none` boxes hold the same loopback address
   harness:  kani_loopback_alloc_injective, exhaustive to 8 live boxes across allocators; requires the allocator to be a pure function over one host-wide owned set of leased addresses, separate from the publish call and from any allocator's own state
   <!-- S1b-2a; prose 6; event-driven; the no-collision clause is the universal for spec-tiers; "host-global" per design §7.1: allocation is host-global through the answerer's authenticated channel for every allocator, the helper for each VM (NET-138) and each native daemon, and no in-VM daemon self-assigns; host-address boxes mirror their node's address (NET-129); a host without the range publishes at `127.0.0.1` under NET-123's interim, outside this requirement -->
+  - WHEN the allocator frees a box's host loopback address THE SYSTEM SHALL hold it back from allocation for the positive answer TTL.
+    tier:   T0
+    verify: cargo nextest run -p minvmd released_address_is_not_reused_within_the_answer_ttl
+    <!-- design §7.1; event-driven; allocation runs through the answerer's authenticated channel from `.2` upward within the reserved range, and co-resident nodes never self-assign; a client that resolved the released name can still connect for the answer's 15 s positive TTL, so an early reuse would hand that connection to a different box; this hold is one of two on the address: NET-138's withdrawal path holds it too, from the row's withdrawal until the host has unbound every forward the withdrawn box published there, and refuses a registration at it meanwhile, so the allocator hands out an address only after both holds have cleared, whichever clears later -->
 
 - **NET-011** WHEN a session is finalised THE SYSTEM SHALL register `<name>.min.internal` for the box's loopback address.
   tier:     T0
@@ -422,7 +426,7 @@ included, with every refusal logged (NET-001 to NET-004).
     tier:   T0
     verify: cargo nextest run -p minimald egress_drop_logged_rate_limited
     <!-- S8a/AC2; prose 40; unwanted -->
-  - WHILE a box runs with an own address, IF it opens a flow to one of the switch's own addresses THEN THE SYSTEM SHALL drop it whatever the box's `egress.allow_subnets` says, except at three port-scoped openings: the resolver's port on the gateway address; the proxy's address for a box on a credentialed lane (NET-134); and configured host exposures over the host alias, reached as local reach under the box's rules.
+  - WHILE a box runs with an own address, IF it opens a flow to one of the switch's own addresses THEN THE SYSTEM SHALL drop it whatever the box's `egress.allow_subnets` says, except at four port-scoped openings: the resolver's port on the gateway address, the proxy's address for a box on a credentialed lane (NET-134), configured host exposures over the host alias (reached as local reach under the box's rules), and the hostname proxy's port on the node address while the node serves the interim proxy (design §7.1, NET-070).
     tier:   T0
     verify: cargo nextest run -p minvmd box_cannot_reach_switch_api
     <!-- S8a/AC2; prose 40; state+unwanted; a frame-level decision on every plane: design §5.3 (direct-to-IP flows admitted by CIDR rules are always intersected with the infrastructure deny set) and §4.3 rule 2 applied to every box-plane packet, not only DNS answers (NET-067 carries the DNS-answer intersection); the switch's gateway serves its own forwarder and zone configuration from inside the VM, so a CIDR rule covering the switch subnet must not reach it; on a VM-backed host the host-side gate enforces it outside the boundary and the in-VM relay carries the same verdict; on a native host the daemon's relay is the only leg and its switch gateway is the same control surface -->
@@ -614,7 +618,7 @@ included, with every refusal logged (NET-001 to NET-004).
   - WHEN the VM boots THE SYSTEM SHALL assign the hostname-proxy port in the host-side helper, hand it to the in-VM daemon before it listens, and bind the daemon's hostname proxy to that port and no other.
     tier:   T0
     verify: cargo nextest run -p minvmd node_port_assigned_on_host_and_handed_to_daemon
-    <!-- S10a/AC1; prose 51; event-driven; NET-025's free-port selection stays the native daemon's; on a VM-backed host the selection moves to the helper so the node's row is host-authored, and the helper publishes its node's rows into the host's one answerer over its authenticated channel (design §7.1: one always-on answerer per host, its listener socket held by the service manager, never a session-daemon child; co-resident nodes write into one answerer, never two); NET-124 to NET-128 hold in that answerer wherever it is hosted; until the host answerer service exists (NET-122's privileged step installs it), the helper that binds the hook port hosts the answerer as a recorded single-operator interim (the port held by a session process, not the manager), a second helper writes into it over the same channel instead of binding, and the interim is surfaced at session start; NET-026's discovery is unchanged, `min` still reads the port in use from the daemon -->
+    <!-- S10a/AC1; prose 51; event-driven; NET-025's free-port selection stays the native daemon's; on a VM-backed host the selection moves to the helper so the node's row is host-authored, and the helper publishes its node's rows into the host's one answerer over its authenticated channel (design §7.1: one always-on answerer per host, its listener socket held by the service manager, never a session-daemon child; co-resident nodes write into one answerer, never two); NET-124 to NET-128 hold in that answerer wherever it is hosted; until the host answerer service exists (NET-122's privileged step installs it), the helper that binds the hook port hosts the answerer as a recorded single-operator interim (the port held by a session process, not the manager), a second helper writes into it over the same channel instead of binding, and the interim is surfaced at session start; the interim's channel is per user, so a helper under another state dir of the same operator publishes into it instead of binding, and the channel admits peers of the same user, and root for the release verbs only; NET-026's discovery is unchanged, `min` still reads the port in use from the daemon -->
   - IF the in-VM daemon reports an address, a name, a declared port or a rule for any row THEN THE SYSTEM SHALL keep it out of the table.
     tier:   T0
     verify: cargo nextest run -p minvmd host_table_never_sourced_from_guest
@@ -714,7 +718,7 @@ included, with every refusal logged (NET-001 to NET-004).
 - **NET-134** WHILE a box declares a credentialed upstream THE SYSTEM SHALL admit its connections to the node-local Box Egress Proxy's listener as part of its infrastructure set, whatever its egress rules, and its connections to any other host destination only as those rules admit them.
   tier:     T0
   verify:   ./scripts/session-e2e.sh deny_all_box_reaches_proxy_and_no_other_host_port
-  <!-- state-driven; design §7.1 (v0.8.3) and Gatehouse §6.10 (v1.24): the steered proxy address is infrastructure, the machine-internal analogue of the fabric pin's infrastructure set (design §4.4), never an egress carve-out, never spec-declared, and it grants nothing: the proxy's own checks and the box's egress still govern every upstream; the resolver stays the one carve-out from a deny-all verdict (NET-074, NET-079); `host.min.internal` stays local reach under the box's rules (NET-003) -->
+  <!-- state-driven; design §7.1 (v0.8.3) and Gatehouse §6.10 (v1.24): the steered proxy address is infrastructure, the machine-internal analogue of the fabric pin's infrastructure set (design §4.4), never an egress carve-out, never spec-declared, and it grants nothing: the proxy's own checks and the box's egress still govern every upstream; the resolver stays the one carve-out from a deny-all verdict (NET-074, NET-079); `host.min.internal` stays default-deny except configured host exposures, each local reach under the box's rules (NET-003) -->
   - WHILE a box declares no credentialed upstream THE SYSTEM SHALL steer none of its flows to the proxy's listener and refuse its direct connections to it under the box-to-host default-deny.
     tier:   T0
     verify: ./scripts/session-e2e.sh box_without_credentialed_lane_cannot_reach_proxy
