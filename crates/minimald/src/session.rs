@@ -3154,9 +3154,10 @@ impl Session {
     }
 
     /// Fails an allow closed whose audit record could not be written
-    /// (NET-046): the publish that stood is withdrawn — the forward unbound
-    /// first, then the port given back in the box's publication set, then
-    /// the VM host daemon's row withdrawn, because the host's gate retracts
+    /// (NET-046): the publish that stood is withdrawn — the gate's admission
+    /// taken first, then the forward unbound, then the port given back in
+    /// the box's publication set, then the VM host daemon's row withdrawn,
+    /// because the host's gate retracts
     /// a runtime port only while the row still holds it — and the caller
     /// hears a failed publish that says why. The warn line is the refusal's
     /// record of last resort: the audit log that refused the allow may
@@ -3201,6 +3202,18 @@ impl Session {
         };
         let control = self.switch_control().await;
         let live = self.live_ingress.take(port);
+        // The gate refuses the port before the forward comes down (NET-044),
+        // the same order the box's stop takes every publication in: an
+        // allow already refused cannot be crossed while its forward unbinds,
+        // and the admission this publish put up is this withdrawal's to
+        // take — the stop's sweep never saw a publish that never stood. A
+        // relay already gone took its gate with it.
+        if let Some(gate) = self
+            .reported_switch_address
+            .and_then(crate::net::switch::live_gate)
+        {
+            gate.withdraw_exposed(port);
+        }
         let mut unbound = true;
         if let Some(live) = live {
             match crate::net::policy::unexpose_forwarder(&control, &live.forwarder).await {
