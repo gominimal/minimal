@@ -1407,11 +1407,12 @@ mod tests {
     /// Every node-row label the zone defines is reserved: a registry that
     /// keys a new row under the apex must not let a session take its
     /// label, so the reserved list has to carry the label too. This pins
-    /// the list to the zone's labels — a label added there without a
-    /// matching reserved entry fails here rather than in production.
+    /// the list to the zone's labels: a label added to
+    /// [`crate::core::zone_answer::NODE_ROW_LABELS`] without a matching
+    /// reserved entry fails here rather than in production.
     #[test]
     fn reserved_session_names_carry_every_node_row_label() {
-        for label in [HOST_ROW_LABEL, NODE_ROW_LABEL] {
+        for label in crate::core::zone_answer::NODE_ROW_LABELS {
             assert!(
                 RESERVED_SESSION_NAMES
                     .iter()

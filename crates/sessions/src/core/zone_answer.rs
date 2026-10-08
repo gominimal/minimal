@@ -77,6 +77,11 @@ pub const HOST_ROW_NAME: &str = "host.min.internal";
 /// so a session cannot take a node's name.
 pub const NODE_ROW_LABEL: &str = "minimald";
 
+/// Every node-row label the zone defines. A new node row's label goes
+/// here; the store's tests read this list, so a label added without a
+/// matching reserved session name fails them.
+pub const NODE_ROW_LABELS: [&str; 2] = [HOST_ROW_LABEL, NODE_ROW_LABEL];
+
 /// The record type of one lookup, as the decision classifies it: A is the
 /// only type the zone answers with data, and every other type — AAAA,
 /// TXT, SRV, anything a resolver asks besides A — is NODATA on a held
