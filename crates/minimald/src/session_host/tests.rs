@@ -3349,7 +3349,7 @@ async fn launch_refuses_unenforceable_host_ip_declaration_after_host_gains_per_b
     );
 
     let capture = crate::test_harness::captured_log();
-    const REFUSAL: &str = "cannot enforce the rules this box's declaration names";
+    const REFUSAL: &str = "host_ip boxes on this host enforce only deny-all egress";
     // The box's declaration: the narrowing a per-box host has no verdict for,
     // in the CLI's own spelling of `--deny-subnets`.
     let narrowing = sessions::SessionPolicy::new(
@@ -3433,12 +3433,12 @@ async fn launch_refuses_unenforceable_host_ip_declaration_after_host_gains_per_b
         "the launch's refusal names the rule it refused over: {refusal}"
     );
     assert!(
-        refusal.contains("own-address boxes enforce them"),
+        refusal.contains("which enforces them"),
         "the launch's refusal says own-address boxes enforce these rules, \
          the same words the create's would have said: {refusal}"
     );
     assert!(
-        refusal.contains("remove these rules"),
+        refusal.contains("Remove them"),
         "the launch's refusal ends with what to do, the same remedy the \
          create's would have named: {refusal}"
     );
