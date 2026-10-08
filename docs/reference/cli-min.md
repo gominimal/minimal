@@ -291,8 +291,8 @@ marks an own-address box once the deny-all default is in force.
 its host's network namespace. The `(default)` mark distinguishes a verdict
 the box declared from the same verdict the default gave it.
 
-A box activated with `--credentialed-upstream` prints one more row in the
-egress block:
+An own-address box activated with `--credentialed-upstream` prints one
+more row in the egress block:
 
 ```
 egress
@@ -305,7 +305,9 @@ frames to the box egress proxy's listener, and the proxy checks their
 credential. The rows above never decide that destination. The listener is
 the lane's whole reach. The gate still refuses everything else the box
 sends to the proxy's address. A box without the lane omits the row, so
-the missing row means the box runs without a lane.
+the missing row means the box runs without a lane. A host-address box
+omits it too: the gate that admits the lane sits only in front of
+own-address boxes.
 
 The ingress block lists the published port mappings the session's `--ingress` flags
 declared (or `deny-all` when the box leaves ingress undeclared). The
@@ -366,8 +368,8 @@ the box set `--dynamic-ingress`, and `default` when the stance is the deny
 an absent setting gives. Both keys are new in the `min/v1/session-policy`
 shape. A client written against the earlier document ignores them. A
 client that reads them finds a value in every `ingress` object. The
-document also carries `credentialed_upstream`, an object, when the box
-declared a lane. It leaves the key out when the box declared none. The
+document also carries `credentialed_upstream`, an object, when an
+own-address box declared a lane. It leaves the key out when the box declared none. The
 text row follows the same rule, so a missing key means the box runs
 without a lane.
 

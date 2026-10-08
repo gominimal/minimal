@@ -2547,8 +2547,11 @@ pub fn format_policy(
     // stays refused. Printed only when the policy carries the lane;
     // `None`, the declaration every policy without one holds, is no lane,
     // and a row for it would claim one — silence says the box runs without
-    // the credential, under its egress rules alone.
-    if effective.credentialed_upstream.is_some() {
+    // the credential, under its egress rules alone. A switch-fabric
+    // surface, like the baseline block below: the lane is admitted at the
+    // switch's gate, which only own-address boxes sit behind, so a
+    // host-address box prints no row for a lane nothing enforces there.
+    if network == sessions::NetworkMode::OwnIp && effective.credentialed_upstream.is_some() {
         writeln!(out, "  credentialed upstream  box egress proxy listener")?;
     }
     // The node-plane baseline set, beside the box's rules (NET-130): the
@@ -2947,8 +2950,11 @@ pub fn write_policy_json(
                 .then(|| PolicyIngressJson::from_effective(effective.ingress.as_ref())),
             // The lane rides the document the way the text rendering prints
             // it: only when declared, so the key's absence is the no-lane
-            // claim.
-            credentialed_upstream: effective.credentialed_upstream.as_ref(),
+            // claim. Held to the same own-address gate: the switch is the
+            // only place the lane is admitted.
+            credentialed_upstream: (network == sessions::NetworkMode::OwnIp)
+                .then_some(effective.credentialed_upstream.as_ref())
+                .flatten(),
             node_plane_baseline,
             // The wire's own rows, `pending` included — an empty list is a
             // claim about the box (it published nothing), which is what the
@@ -4791,6 +4797,23 @@ mod tests {
         assert!(
             unlaned_json.get("credentialed_upstream").is_none(),
             "a box without a lane carries no key, got: {unlaned_json}"
+        );
+
+        // A host-address box sits behind no switch gate, so a declared
+        // lane there is admitted nowhere: neither surface claims it.
+        let mut out = Vec::new();
+        format_policy(&mut out, &laned, NetworkMode::HostNet, None, None).unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(
+            !rendered.contains("credentialed upstream"),
+            "a host-address box must print no lane row, got: {rendered}"
+        );
+        let mut out = Vec::new();
+        write_policy_json(&mut out, &laned, NetworkMode::HostNet, None, Ok(Vec::new())).unwrap();
+        let host_json: serde_json_lenient::Value = serde_json_lenient::from_slice(&out).unwrap();
+        assert!(
+            host_json.get("credentialed_upstream").is_none(),
+            "a host-address box carries no lane key, got: {host_json}"
         );
     }
 
