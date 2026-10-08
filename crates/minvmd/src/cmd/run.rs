@@ -678,10 +678,12 @@ fn run_foreground() -> Result<()> {
             // holds the host-side forwards. Kill it first — matched on exact
             // argv tokens: argv[0] is the gvproxy binary and `-listen` names
             // this VM's switch socket. This supervisor's alive lock rules out
-            // a live same-instance supervisor. This thread is the synchronous
-            // supervisor thread, not a tokio worker, so the reap's bounded
-            // wait may block it.
-            crate::net::reap_stale_gvproxy(&binary, &switch_sock);
+            // a live same-instance supervisor, so a match owned by a live
+            // minvmd fails the start rather than spawning a duplicate switch.
+            // This thread is the synchronous supervisor thread, not a tokio
+            // worker, so the reap's bounded wait may block it.
+            crate::net::reap_stale_gvproxy(&binary, &switch_sock)
+                .context("reaping a stale gvproxy")?;
             crate::sock::remove_stale_socket(&switch_sock)
                 .context("removing stale switch socket")?;
             // The gate binds the socket beside the switch socket, so a stale

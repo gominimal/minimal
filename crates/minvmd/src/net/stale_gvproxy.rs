@@ -30,8 +30,9 @@ const STALE_GONE_TIMEOUT: Duration = Duration::from_secs(2);
 ///
 /// The caller holds this VM's alive lock, so no other supervisor of this VM
 /// is live and any process matching both anchors is a dead supervisor's
-/// leftover. As a backstop, a match whose parent is a live `minvmd` is left
-/// alone and warned about, and this process and its parent are never
+/// leftover. A match whose parent is a live `minvmd` breaks that invariant:
+/// the start fails closed with an error instead of spawning a duplicate
+/// switch, and nothing is killed. This process and its parent are never
 /// candidates.
 ///
 /// Each kill re-verifies the argv against the pid it signals. On Linux the
@@ -42,42 +43,75 @@ const STALE_GONE_TIMEOUT: Duration = Duration::from_secs(2);
 ///
 /// The wait for the leftovers to go is bounded to [`STALE_GONE_TIMEOUT`] in
 /// total. It blocks the calling thread, which is the synchronous supervisor
-/// thread and never a tokio worker. Best-effort throughout: a leftover that
-/// cannot be signalled or outlives the wait is warned about and never fails
-/// the boot.
-pub(crate) fn reap_stale_gvproxy(binary: &Path, switch_sock: &Path) {
+/// thread and never a tokio worker. Apart from the live-owner error, the reap
+/// is best-effort: a leftover that cannot be signalled or outlives the wait
+/// is warned about and never fails the boot.
+pub(crate) fn reap_stale_gvproxy(binary: &Path, switch_sock: &Path) -> anyhow::Result<()> {
+    reap_with(&HostProcesses, binary, switch_sock)
+}
+
+/// The process lookups the reap decides on: the scan and the parent lookup.
+/// A seam so a test can stage a live-minvmd-owned match without a real
+/// `minvmd` parent process.
+trait ProcessLookup {
+    fn all_pids(&self) -> Vec<u32>;
+    fn argv(&self, pid: u32) -> Option<Vec<Vec<u8>>>;
+    fn ppid(&self, pid: u32) -> Option<u32>;
+}
+
+/// The host's process table.
+struct HostProcesses;
+
+impl ProcessLookup for HostProcesses {
+    fn all_pids(&self) -> Vec<u32> {
+        os::all_pids()
+    }
+    fn argv(&self, pid: u32) -> Option<Vec<Vec<u8>>> {
+        os::argv(pid)
+    }
+    fn ppid(&self, pid: u32) -> Option<u32> {
+        os::ppid(pid)
+    }
+}
+
+fn reap_with(procs: &impl ProcessLookup, binary: &Path, switch_sock: &Path) -> anyhow::Result<()> {
     let me = std::process::id();
     // SAFETY: getppid(2) takes no arguments and cannot fail.
     let my_parent = unsafe { libc::getppid() } as u32;
-    let mut killed = Vec::new();
     // Collect the candidates first, then signal each after a fresh check.
-    let candidates: Vec<u32> = os::all_pids()
+    let candidates: Vec<u32> = procs
+        .all_pids()
         .into_iter()
         .filter(|&pid| pid != me && pid != my_parent)
         .filter(|&pid| {
-            os::argv(pid).is_some_and(|argv| argv_is_stale_gvproxy(&argv, binary, switch_sock))
+            procs
+                .argv(pid)
+                .is_some_and(|argv| argv_is_stale_gvproxy(&argv, binary, switch_sock))
         })
         .collect();
-    for pid in candidates {
-        if os::ppid(pid)
-            .and_then(os::argv)
-            .is_some_and(|parent| argv_is_minvmd(&parent))
+    // Fail closed before killing anything: a live minvmd owning this VM's
+    // switch means the alive-lock invariant is broken, and spawning would
+    // bind a second switch beside it.
+    for &pid in &candidates {
+        if let Some(parent) = procs
+            .ppid(pid)
+            .filter(|&parent| procs.argv(parent).is_some_and(|argv| argv_is_minvmd(&argv)))
         {
+            anyhow::bail!(
+                "a gvproxy (pid {pid}) on this VM's switch socket is owned by a live minvmd \
+                 (pid {parent}); stop it before starting"
+            );
+        }
+    }
+    let mut killed = Vec::new();
+    for pid in candidates {
+        if let Some(victim) = os::kill_if_still_stale(pid, binary, switch_sock) {
             tracing::warn!(
                 pid,
+                binary = %binary.display(),
                 switch_socket = %switch_sock.display(),
-                "a gvproxy on this VM's switch socket is parented by a live minvmd; \
-                 leaving it alone",
+                "killed stale gvproxy left by a crashed supervisor",
             );
-            continue;
-        }
-        tracing::warn!(
-            pid,
-            binary = %binary.display(),
-            switch_socket = %switch_sock.display(),
-            "killing stale gvproxy left by a crashed supervisor",
-        );
-        if let Some(victim) = os::kill_if_still_stale(pid, binary, switch_sock) {
             killed.push(victim);
         }
     }
@@ -90,6 +124,7 @@ pub(crate) fn reap_stale_gvproxy(binary: &Path, switch_sock: &Path) {
             );
         }
     }
+    Ok(())
 }
 
 /// Whether `argv` is a gvproxy of this VM: argv\[0\] is exactly `binary`, and
@@ -534,6 +569,52 @@ mod tests {
         assert_eq!(parse_procargs2(b"\x01"), None);
     }
 
+    /// A staged process table: pid -> (argv, ppid).
+    struct FakeProcesses(Vec<(u32, Vec<Vec<u8>>, u32)>);
+
+    impl ProcessLookup for FakeProcesses {
+        fn all_pids(&self) -> Vec<u32> {
+            self.0.iter().map(|(pid, ..)| *pid).collect()
+        }
+        fn argv(&self, pid: u32) -> Option<Vec<Vec<u8>>> {
+            self.0
+                .iter()
+                .find(|(p, ..)| *p == pid)
+                .map(|(_, a, _)| a.clone())
+        }
+        fn ppid(&self, pid: u32) -> Option<u32> {
+            self.0.iter().find(|(p, ..)| *p == pid).map(|(.., pp)| *pp)
+        }
+    }
+
+    #[test]
+    fn reap_fails_closed_on_a_live_minvmd_owned_gvproxy() {
+        let bin = Path::new("/opt/m/gvproxy");
+        let sock = Path::new("/run/vm/gvproxy-switch.sock");
+        // Pids above Linux's and macOS's pid ceilings, so neither is this test or its parent.
+        let (gvproxy, owner) = (5_000_002, 5_000_001);
+        let procs = FakeProcesses(vec![
+            (owner, tokens(&["/opt/m/minvmd", "run"]), 1),
+            (
+                gvproxy,
+                tokens(&[
+                    "/opt/m/gvproxy",
+                    "-listen",
+                    "unix:///run/vm/gvproxy-switch.sock",
+                ]),
+                owner,
+            ),
+        ]);
+
+        let err = reap_with(&procs, bin, sock).expect_err("a live owner must fail the start");
+
+        assert_eq!(
+            err.to_string(),
+            "a gvproxy (pid 5000002) on this VM's switch socket is owned by a live minvmd \
+             (pid 5000001); stop it before starting"
+        );
+    }
+
     /// A stand-in gvproxy whose argv is the one the real spawn hands gvproxy:
     /// argv[0] is `binary` (via `arg0`; the file need not exist) and the
     /// `-listen unix://<sock>` pair is present as separate tokens. `/bin/sh`
@@ -582,7 +663,7 @@ mod tests {
         let mut child = spawn_stand_in(&binary, &sock);
         await_visible(&child, &binary, &sock);
 
-        reap_stale_gvproxy(&binary, &sock);
+        reap_stale_gvproxy(&binary, &sock).expect("reap");
 
         // The reap returns once the leftover is gone (a zombie, here, since
         // this test is its parent), so the exit is reapable without a wait.
@@ -616,7 +697,7 @@ mod tests {
         let mut ours = spawn_stand_in(&binary, &sock);
         await_visible(&ours, &binary, &sock);
 
-        reap_stale_gvproxy(&binary, &sock);
+        reap_stale_gvproxy(&binary, &sock).expect("reap");
 
         // The reap returns once the leftover is gone (a zombie, since this
         // test is its parent).
