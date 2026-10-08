@@ -3204,7 +3204,8 @@ pub fn socket_family_filter_for_none_box() -> &'static SocketFamilyFilter {
 
 /// Returns a pointer to the built-in confined-families socket-family filter:
 /// it admits the families the box's own network namespace confines — unix,
-/// inet, inet6, netlink, packet — and refuses everything else with
+/// inet, inet6, netlink (the `NETLINK_ROUTE` protocol only), packet — and
+/// refuses everything else, other netlink protocols included, with
 /// `EAFNOSUPPORT`, `AF_VSOCK` (the family that reaches the host whatever
 /// network namespace the caller sits in) included, so an own-address or
 /// host-address box keeps its inet sockets and cannot reach past its
@@ -4654,7 +4655,8 @@ ff02::2\tip6-allrouters
     /// full `none` seal for [`NetPlan::none`], the confined-families seal for
     /// every other plan — and the seal picks the filter.  Both are
     /// allowlists: the none seal admits the families its own network
-    /// namespace confines (`AF_UNIX`, `AF_INET`, `AF_INET6`, `AF_NETLINK`);
+    /// namespace confines (`AF_UNIX`, `AF_INET`, `AF_INET6`, `AF_NETLINK`
+    /// with `NETLINK_ROUTE` only);
     /// the confined-families seal adds `AF_PACKET` (refused by the missing
     /// `CAP_NET_RAW` no box holds, per NET-083, not by this filter).  Both
     /// refuse `AF_VSOCK` — the family that reaches the host whatever
