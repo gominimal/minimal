@@ -55,7 +55,7 @@ pub struct ProviderView {
 #[derive(Debug, Clone, Default)]
 pub struct Detail {
     pub record: Option<sessions::Record>,
-    pub policy: Option<sessions::SessionPolicy>,
+    pub policy: Option<sessions::EffectiveSessionPolicy>,
 }
 
 /// A modal prompt capturing footer input, if one is open.

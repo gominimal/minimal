@@ -505,18 +505,25 @@ fn policy_lines(model: &Model, key: &SessionKey) -> Vec<Line<'static>> {
                     Style::default().add_modifier(Modifier::BOLD),
                 ));
                 match &policy.egress {
-                    None => lines.push(Line::raw("  allow-all")),
+                    sessions::EffectiveEgress::DenyAll => {
+                        lines.push(Line::raw("  deny-all (default)"));
+                    }
+                    sessions::EffectiveEgress::AllowAll => {
+                        lines.push(Line::raw("  allow-all (default)"));
+                    }
                     // A declared deny-all — every allow list present and
                     // empty — prints by name, as `min session policy` does,
-                    // never as rows of blankness.
-                    Some(egress)
+                    // never as rows of blankness. Unmarked: this deny-all is
+                    // the box's own declaration, not the rollout's default
+                    // forced on an absent one.
+                    sessions::EffectiveEgress::Declared(egress)
                         if egress.allow_subnets.as_ref().is_some_and(Vec::is_empty)
                             && egress.allow_dns_hosts.as_ref().is_some_and(Vec::is_empty)
                             && egress.allow_protocols.as_ref().is_some_and(Vec::is_empty) =>
                     {
                         lines.push(Line::raw("  deny-all"));
                     }
-                    Some(egress) => {
+                    sessions::EffectiveEgress::Declared(egress) => {
                         policy_list(&mut lines, "subnets", &egress.allow_subnets);
                         policy_list(&mut lines, "dns hosts", &egress.allow_dns_hosts);
                         match &egress.allow_protocols {

@@ -213,14 +213,14 @@ fn detail_pane_with_policy() {
         key,
         Detail {
             record: Some(record(Some("api-staging"), NetworkMode::OwnIp)),
-            policy: Some(sessions::SessionPolicy::new(
-                Some(sessions::EgressPolicy {
+            policy: Some(sessions::EffectiveSessionPolicy {
+                egress: sessions::EffectiveEgress::Declared(sessions::EgressPolicy {
                     allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
                     allow_dns_hosts: None,
                     allow_protocols: None,
                     deny_subnets: Some(vec!["192.168.0.0/16".to_string()]),
                 }),
-                Some(sessions::IngressPolicy {
+                ingress: Some(sessions::IngressPolicy {
                     port_mappings: vec![sessions::PortMapping {
                         external_port: 8080,
                         internal_port: 80,
@@ -229,7 +229,7 @@ fn detail_pane_with_policy() {
                     dynamic_allowed_range: None,
                     dynamic_ingress: None,
                 }),
-            )),
+            }),
         },
     );
     // Focus the session.
@@ -254,15 +254,15 @@ fn detail_pane_names_a_declared_deny_all() {
         key,
         Detail {
             record: Some(record(Some("api-staging"), NetworkMode::OwnIp)),
-            policy: Some(sessions::SessionPolicy::new(
-                Some(sessions::EgressPolicy {
+            policy: Some(sessions::EffectiveSessionPolicy {
+                egress: sessions::EffectiveEgress::Declared(sessions::EgressPolicy {
                     allow_subnets: Some(vec![]),
                     allow_dns_hosts: Some(vec![]),
                     allow_protocols: Some(vec![]),
                     deny_subnets: None,
                 }),
-                None,
-            )),
+                ingress: None,
+            }),
         },
     );
     model.cursor = 1;
@@ -270,6 +270,34 @@ fn detail_pane_names_a_declared_deny_all() {
     assert!(rendered.contains("  deny-all "), "{rendered}");
     assert!(!rendered.contains("  subnets "), "{rendered}");
     assert!(!rendered.contains("dns hosts"), "{rendered}");
+}
+
+/// An own-address box with no egress declaration, under the deny-all
+/// default: the pane shows what the gate enforces — `deny-all (default)` —
+/// as `min session policy` does, not the bare declaration's allow-all.
+#[test]
+fn detail_pane_marks_the_deny_all_default() {
+    let mut model = fixed_model(vec![provider(
+        "host",
+        vec![entry(1, Some("api-staging"), "/src/api")],
+    )]);
+    let key = SessionKey {
+        provider: "host".to_string(),
+        id: id(1),
+    };
+    model.details.insert(
+        key,
+        Detail {
+            record: Some(record(Some("api-staging"), NetworkMode::OwnIp)),
+            policy: Some(sessions::EffectiveSessionPolicy {
+                egress: sessions::EffectiveEgress::DenyAll,
+                ingress: None,
+            }),
+        },
+    );
+    // Focus the session.
+    model.cursor = 1;
+    insta::assert_snapshot!(render(&mut model));
 }
 
 #[test]
@@ -286,14 +314,14 @@ fn detail_pane_shows_dynamic_ingress() {
         key,
         Detail {
             record: Some(record(Some("api-staging"), NetworkMode::OwnIp)),
-            policy: Some(sessions::SessionPolicy::new(
-                Some(sessions::EgressPolicy {
+            policy: Some(sessions::EffectiveSessionPolicy {
+                egress: sessions::EffectiveEgress::Declared(sessions::EgressPolicy {
                     allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
                     allow_dns_hosts: None,
                     allow_protocols: None,
                     deny_subnets: Some(vec!["192.168.0.0/16".to_string()]),
                 }),
-                Some(sessions::IngressPolicy {
+                ingress: Some(sessions::IngressPolicy {
                     port_mappings: vec![sessions::PortMapping {
                         external_port: 8080,
                         internal_port: 80,
@@ -302,7 +330,7 @@ fn detail_pane_shows_dynamic_ingress() {
                     dynamic_allowed_range: None,
                     dynamic_ingress: Some(sessions::DynamicIngress::Ask),
                 }),
-            )),
+            }),
         },
     );
     // Focus the session.

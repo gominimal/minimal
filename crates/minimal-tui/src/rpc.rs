@@ -12,10 +12,11 @@ use anyhow::Context as _;
 use minimal_client::Client;
 use minimald_rpc::{
     CreateSession, CreateSessionRequest, DestroySession, DestroySessionRequest, Errorable,
-    GetSessionPolicy, GetSessionPolicyRequest, GetSessionRecord, GetSessionRecordRequest,
-    GetVersion, ListSessions, OneshotSshRpc, RenameSession, RenameSessionRequest, SessionConfig,
+    GetEffectiveSessionPolicy, GetEffectiveSessionPolicyRequest, GetSessionRecord,
+    GetSessionRecordRequest, GetVersion, ListSessions, OneshotSshRpc, RenameSession,
+    RenameSessionRequest, SessionConfig,
 };
-use sessions::{NetworkMode, SessionId, SessionPolicy};
+use sessions::{EffectiveSessionPolicy, NetworkMode, SessionId, SessionPolicy};
 
 /// Deadline for the UI-loop RPCs. The draw loop awaits these inline, so a
 /// wedged-but-connected daemon (a suspended microVM behind libkrun's
@@ -229,19 +230,26 @@ pub async fn refresh(provider: &mut Provider) -> Result<ProviderData, anyhow::Er
 }
 
 /// The record + networking policy behind the detail pane, fetched with one
-/// RPC each per focus change.
+/// RPC each per focus change. The policy is the *effective* one — the same
+/// answer `GetSessionPolicy` serves, with the egress half resolved to what
+/// the gate enforces — so the pane's `(default)` mark can show when the
+/// deny-all a session is held to is the rollout's default, not its own
+/// declaration (what `min session policy` renders).
 pub async fn fetch_detail(
     provider: &mut Provider,
     id: SessionId,
-) -> Result<(Option<sessions::Record>, Option<SessionPolicy>), anyhow::Error> {
+) -> Result<(Option<sessions::Record>, Option<EffectiveSessionPolicy>), anyhow::Error> {
     let record = timed::<GetSessionRecord>(&mut provider.client, GetSessionRecordRequest::Id(id))
         .await
         .context("GetSessionRecord RPC failed")?
         .record;
-    let policy = timed::<GetSessionPolicy>(&mut provider.client, GetSessionPolicyRequest::Id(id))
-        .await
-        .context("GetSessionPolicy RPC failed")?
-        .ok();
+    let policy = timed::<GetEffectiveSessionPolicy>(
+        &mut provider.client,
+        GetEffectiveSessionPolicyRequest::Id(id),
+    )
+    .await
+    .context("GetEffectiveSessionPolicy RPC failed")?
+    .ok();
     Ok((record, policy))
 }
 
