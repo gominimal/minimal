@@ -529,6 +529,16 @@ fn infrastructure_destination(
 /// rules ([`GateAdmit::ProxyLane`]).
 const PROXY_LANE_RULE: &str = "egress-uncredentialed-proxy-destination";
 
+/// The rule name for the ingress drop of an opening TCP packet (SYN set, ACK
+/// clear) sourced from the Box Egress Proxy's address toward a box's
+/// published inside port (NET-134's ingress arm): the proxy only answers a
+/// credentialed box's dial and never opens toward a box, so such a packet has
+/// no legitimate origin. Its own rule, not [`PROXY_LANE_RULE`]'s: that one
+/// names a box reaching for the proxy, this one the proxy's address reaching
+/// for a box. The proxy's answers (SYN-ACK, ACK, data, FIN, RST) are never
+/// dropped under it.
+const PROXY_OPENING_RULE: &str = "egress-proxy-opening-toward-box";
+
 /// The rule name for the drop of an in-plan source no published namespace
 /// holds (NET-085): a frame whose source is an address the plan could hand
 /// to a box but no row does. It carries its own rule — beside rule 0's
@@ -3227,6 +3237,11 @@ async fn relay_switch_frames_to_guest(
                 && pkt.tcp_flags & egress::TCP_SYN != 0
                 && pkt.tcp_flags & egress::TCP_ACK == 0
             {
+                limiter.warn_proxy_opening(
+                    record.switch_addr().octets(),
+                    record.name(),
+                    pkt.dst.port(),
+                );
                 continue;
             }
             let now = Instant::now();
@@ -3772,8 +3787,11 @@ impl ReplyTables {
     ///
     /// A frame sourced from the switch subnet's Box Egress Proxy address
     /// records nothing: the decline comes before any record is consulted or
-    /// minted, and the frame itself is still delivered (only the reply-flow
-    /// recording is declined). A box on a credentialed lane does dial the
+    /// minted. Of such frames the ingress leg never hands this an opening TCP
+    /// packet (SYN set, ACK clear) — it drops that one before calling here
+    /// ([`PROXY_OPENING_RULE`]) — while every other proxy-sourced frame, the
+    /// proxy's answers to a box's dial included, is still delivered with only
+    /// the reply-flow recording declined. A box on a credentialed lane does dial the
     /// proxy's listener (NET-134), but the proxy only answers: it never opens
     /// a connection toward a box, so a proxy-sourced opening packet at a
     /// box's published port has no legitimate origin, and the stream it
@@ -4901,6 +4919,39 @@ impl DropLimiter {
                     "refusing inbound flows at the reply-flow cap for more distinct clients \
                      and boxes than the gate keeps a window for; one line per rule covers \
                      the rest",
+                );
+                true
+            }
+        }
+    }
+
+    /// Emits the drop's line for one opening TCP packet from the Box Egress
+    /// Proxy's address toward a box's published inside port
+    /// ([`PROXY_OPENING_RULE`]): the same rate limit a drop's line answers
+    /// to, keyed by the box's address and the rule — the source is always
+    /// the proxy, so keying by it would fold every box into one window —
+    /// and naming the box and the port. Returns whether a line was written.
+    fn warn_proxy_opening(&self, box_addr: [u8; 4], namespace: &str, port: u16) -> bool {
+        match self.should_warn_at(Some(box_addr), PROXY_OPENING_RULE, Instant::now()) {
+            WarnDecision::Silent => false,
+            WarnDecision::Named => {
+                tracing::warn!(
+                    destination = %Ipv4Addr::from(box_addr),
+                    namespace,
+                    port,
+                    rule_matched = PROXY_OPENING_RULE,
+                    "dropped an opening TCP packet from the box egress proxy's address \
+                     toward a box's published port; the proxy only answers and never \
+                     opens toward a box",
+                );
+                true
+            }
+            WarnDecision::Overflow => {
+                tracing::warn!(
+                    rule_matched = PROXY_OPENING_RULE,
+                    "dropped opening TCP packets from the box egress proxy's address toward \
+                     more distinct boxes than the gate keeps a window per address for; one \
+                     line per rule covers the rest",
                 );
                 true
             }
@@ -8964,6 +9015,16 @@ mod tests {
             None,
             "the dropped opening packet opened no reply-flow record for the node"
         );
+        // A SYN carrying other flags but no ACK is still an opening packet by
+        // the reply-flow table's own shape, and is dropped the same way.
+        let odd_opening = dns_pins::tests::tcp_frame(
+            Ipv4Addr::from(proxy),
+            40001,
+            Ipv4Addr::from(node_addr),
+            7654,
+            sessions::core::egress::TCP_SYN | sessions::core::egress::TCP_FIN,
+        );
+        send_frame(&mut switch, &odd_opening).await;
 
         // The proxy's answer to a credentialed box's dial — a SYN-ACK from
         // the proxy's address toward the published inside port — is not an
@@ -12785,6 +12846,17 @@ mod tests {
             ),
             WarnDecision::Named
         );
+    }
+
+    /// The proxy-opening drop's line answers to the drop cadence per box:
+    /// one line for a box's first dropped opening packet, silence for the
+    /// next within the interval, and its own line for another box.
+    #[test]
+    fn proxy_opening_drop_line_is_rate_limited_per_box() {
+        let limiter = DropLimiter::new();
+        assert!(limiter.warn_proxy_opening([100, 64, 0, 10], "web", 7654));
+        assert!(!limiter.warn_proxy_opening([100, 64, 0, 10], "web", 7654));
+        assert!(limiter.warn_proxy_opening([100, 64, 0, 11], "api", 7654));
     }
 
     /// The limiter's window table is bounded, because the source address it
