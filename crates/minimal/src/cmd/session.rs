@@ -1234,9 +1234,10 @@ pub(crate) async fn activate_session(
         // daemon's report on a native host, this CLI's own query on a
         // VM-backed one — and the reserved range on this host's own
         // loopback. `None` — the answerer not bound — prints the proxy's
-        // line: there is no native surface to name. The proxy's half is said with the native arm either way
-        // (NET-019): the `HTTP(S)_PROXY` recipes this activation prints keep
-        // working beside native DNS, so nothing already captured goes stale.
+        // line: there is no native surface to name. The proxy's half is said
+        // with the native arm either way (NET-019): the `HTTP(S)_PROXY`
+        // recipes this activation prints keep working beside native DNS, so
+        // nothing already captured goes stale.
         //
         // Host DNS is opt-in (NET-122): the start never prints the
         // privileged step. While the host is not set up the proxy is the
@@ -1274,7 +1275,10 @@ pub(crate) async fn activate_session(
             );
             eprintln!(
                 "{}",
-                crate::resolver::name_surface_line(verdict.surface, created.hostname_proxy_port)
+                crate::resolver::start_name_surface_line(
+                    Some(verdict.surface),
+                    created.hostname_proxy_port
+                )
             );
         } else {
             // The answerer is reported but not bound yet: no native surface
@@ -1289,10 +1293,7 @@ pub(crate) async fn activate_session(
             );
             eprintln!(
                 "{}",
-                crate::resolver::name_surface_line(
-                    crate::resolver::LiveSurface::Proxy,
-                    created.hostname_proxy_port,
-                )
+                crate::resolver::start_name_surface_line(None, created.hostname_proxy_port)
             );
         }
     }

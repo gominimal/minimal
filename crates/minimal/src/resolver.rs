@@ -3656,6 +3656,15 @@ async fn range_present_on_host() -> bool {
 pub const NET_SETUP_POINTER: &str =
     "; for these names in a browser or other host programs, run `min net setup`";
 
+/// The name-surface line a session start prints (NET-018, NET-122): the
+/// verdict's surface, or, with no verdict (the answerer not bound yet), the
+/// proxy's, which is the live surface then and whose line points at
+/// `min net setup`. A start with an answerer port never goes without the
+/// pointer.
+pub fn start_name_surface_line(verdict: Option<LiveSurface>, proxy_port: Option<u16>) -> String {
+    name_surface_line(verdict.unwrap_or(LiveSurface::Proxy), proxy_port)
+}
+
 /// NET-018's report: the line `min ls` and `min session activate` print,
 /// naming the surface [`live_name_surfaces`] decided is live. `proxy_port`
 /// is the port the same reply carries, when the proxy came up: NET-019
@@ -4760,6 +4769,17 @@ exit 0
         assert!(
             !native_surface_at(&detection.0, port, true, false, None),
             "and the verdict for the same read is the proxy's, not native"
+        );
+    }
+
+    #[test]
+    fn a_start_with_an_unbound_answerer_names_the_proxy_and_points_at_setup() {
+        let line = start_name_surface_line(None, Some(15390));
+        assert_eq!(line, name_surface_line(LiveSurface::Proxy, Some(15390)));
+        assert!(line.ends_with(NET_SETUP_POINTER), "{line}");
+        assert_eq!(
+            start_name_surface_line(Some(LiveSurface::Native), Some(15390)),
+            name_surface_line(LiveSurface::Native, Some(15390))
         );
     }
 
