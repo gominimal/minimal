@@ -1379,8 +1379,10 @@ const OWN_TABLE: &str = "this host's own table";
 /// is refused, like every name the answerer holds first.
 ///
 /// Public so the CLI's query asks for the name this answerer holds — one
-/// definition, so the question and the answer cannot drift apart.
-pub const HOST_NAME: &str = "host.min.internal";
+/// definition, so the question and the answer cannot drift apart. The name
+/// itself is the sessions zone's host row, the one spelling every registry
+/// reads.
+pub const HOST_NAME: &str = zone_answer::HOST_ROW_NAME;
 
 /// The source the answerer's own [`HOST_NAME`] row keeps its name under in
 /// the fold: the keeper a refused registration's warn names.
@@ -3555,6 +3557,15 @@ mod tests {
     use crate::box_registry::BoxRegistration;
 
     use super::*;
+
+    /// The answerer's own row is the sessions zone's host row, byte for byte:
+    /// the CLI's liveness query reads [`HOST_NAME`], so a spelling that drifts
+    /// from the zone fails here rather than as a dead liveness probe.
+    #[test]
+    fn host_name_is_the_zone_host_row() {
+        assert_eq!(HOST_NAME, "host.min.internal");
+        assert_eq!(HOST_NAME, zone_answer::HOST_ROW_NAME);
+    }
 
     /// A `MakeWriter` accumulating everything written into a shared buffer, so
     /// a test can assert on the structured fields a `tracing` event emitted —

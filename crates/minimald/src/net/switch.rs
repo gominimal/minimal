@@ -68,6 +68,7 @@ use super::{DEFAULT_MTU, PtaskLease, SwitchSubnet};
 use sessions::core::egress::{
     self, DropReason, FrameSummary, FrameVerdict, IngressRules, ListenVerdict,
 };
+use sessions::core::zone_answer;
 use switch::refusal;
 
 /// `ioctl` request number for `TUNSETIFF` (set the tap/tun interface a fd backs).
@@ -943,8 +944,9 @@ pub(crate) const IPPROTO_UDP: u8 = 17;
 /// deprecation notice tells a box to use instead of the literal. `pub(crate)`:
 /// the DNS gate answers for the same row, whose reply carries the switch's
 /// NAT'd host alias, and reads the name here rather than a second spelling
-/// of it.
-pub(crate) const HOST_MIN_INTERNAL: &str = "host.min.internal";
+/// of it. The name itself lives in the sessions zone, the one source both
+/// daemons and the store's reserved names read.
+pub(crate) const HOST_MIN_INTERNAL: &str = zone_answer::HOST_ROW_NAME;
 
 /// The limiter key the deprecation notice logs under: its own rule, so a
 /// policy warning on the same relay never consumes the notice's interval and
