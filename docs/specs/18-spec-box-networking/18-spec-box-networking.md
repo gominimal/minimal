@@ -5,7 +5,7 @@ owner: norrietaylor
 epic: gominimal/inbox#646
 arch: https://github.com/gominimal/arch/blob/5c1201517ba07347344fb9725efb06ee39d5c03e/specs/networking/deployment-and-egress-gateway.md
 arch_sha: "5c1201517ba07347344fb9725efb06ee39d5c03e"
-updated: 2026-09-25
+updated: 2026-10-07
 ---
 
 # NET — Box networking on the local host: preview by name and bounded egress
@@ -752,10 +752,22 @@ included, with every refusal logged (NET-001 to NET-004).
     verify: cargo nextest run -p minimald failed_forwarder_bind_is_reported_not_substituted
     <!-- design §7.1: a failed bind is "a surfaced error, never a silent fallback or a standing-capability grant"; unwanted; NET-020 covers the hostname listener -->
 
-- **NET-122** WHILE the host's native resolver is not configured for the box zone, WHEN a session starts THE SYSTEM SHALL print an advisory naming the exact command that configures it, with no privilege prompt.
+- **NET-122** WHILE the host's native resolver is not configured for the box zone, WHEN a session starts THE SYSTEM SHALL print an advisory naming what is missing and the exact command that configures it, or the command that prints it, with no privilege prompt.
   tier:     T0
   verify:   cargo nextest run -p minimal session_start_advises_resolver_command_without_prompt
   <!-- S1b-1; design §7.1 (host-OS resolution per OS); state+event; `/etc/resolver/min.internal` with its `port` directive on macOS, the systemd-resolved routing-domain link on Linux; NET-009's WHERE presupposes it and the Box Egress Proxy document's default `dns` steering needs it -->
+  - WHERE the session start is interactive THE SYSTEM SHALL print the advisory in full, with the exact command.
+    tier:   T0
+    verify: cargo nextest run -p minimal interactive_start_prints_full_advisory
+    <!-- state-driven; interactive means stderr is a terminal and neither `--no-prompt` nor `--no-input` is set; the full command embeds the range program and the service definitions and runs to tens of lines, which is what a person at a terminal copies -->
+  - WHERE the session start is not interactive THE SYSTEM SHALL print the advisory as one line that names what is missing and the command that prints the exact command.
+    tier:   T0
+    verify: cargo nextest run -p minimal non_interactive_start_prints_short_advisory
+    <!-- state-driven; a scripted or agent start repeats on every activation, and a full command block on each buries the session's own errors; the one line keeps the facts in the log and points at the command that prints the rest -->
+  - WHEN the operator asks for the host setup command THE SYSTEM SHALL print the exact command for this host's current state without running it, with no privilege prompt.
+    tier:   T0
+    verify: cargo nextest run -p minimal net_setup_prints_the_advisory_command
+    <!-- event-driven; `min net setup`; the same command a full advisory names, from the same host reads, so a non-interactive start and this command never disagree; it prints nothing to run on a host that needs no step, and says so -->
   - WHERE the host is hooked THE SYSTEM SHALL install, by the privileged step, the box-zone answerer as a host service whose listener and channel sockets the service manager holds, running as the operator, from a root-owned non-user-writable program.
     tier:   T0
     verify: cargo nextest run -p minimal advisory_installs_manager_held_answerer
@@ -912,7 +924,7 @@ loopback answerer held by the host's service manager, published addresses come
 from a reserved local range (`127.0.64.0/24`), Linux uses a systemd-resolved
 routing domain on a dedicated link of routable scope, and macOS uses
 `/etc/resolver/min.internal` with a `port` directive, written once by the
-advisory command NET-122 names at session start. On macOS the same command
+advisory command NET-122 names at session start, or prints on request. On macOS the same command
 reserves the local range: it installs a root-held boot step that re-applies
 exactly the reserved range at each start, at root-owned paths no user can
 write, so the range is present before any session starts and no daemon
