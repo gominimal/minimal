@@ -4337,8 +4337,27 @@ mod tests {
     async fn a_walked_publication_keeps_the_bind_and_reports_the_rung() {
         use std::net::{IpAddr, Ipv4Addr};
 
+        let buf = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let dir = TempDir::new().unwrap();
+        let state = ServerStateHandle::new(test_config(&dir), None)
+            .await
+            .unwrap();
+
         // A free port stands in for the documented default, with a free rung
-        // above it for the walk to land on.
+        // above it for the walk to land on. Probed last, right before the
+        // drive binds it: the probe has to be released for the drive to take
+        // the port, and every sibling test process allocating loopback ports
+        // in between can land on it — the drive then relocates (the busy
+        // default's NET-025 fallback) and publishes a port the ledger never
+        // held, which is a different test. Keeping the state's construction
+        // (host-key generation included) out of that window makes it
+        // microseconds wide instead of tens of milliseconds.
         let (default_port, rung) = loop {
             let probe = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
             let port = probe.local_addr().unwrap().port();
@@ -4352,18 +4371,6 @@ mod tests {
             }
             break (port, rung);
         };
-
-        let buf = CaptureWriter::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(buf.clone())
-            .with_ansi(false)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
-
-        let dir = TempDir::new().unwrap();
-        let state = ServerStateHandle::new(test_config(&dir), None)
-            .await
-            .unwrap();
 
         // The forwarder's ledger with the default already held — the host
         // loopback as a second VM's daemon finds it.
@@ -5568,22 +5575,6 @@ mod tests {
 
         use crate::net::answerer::{AnswerScope, ZoneAnswerer, encode_query};
 
-        // A free port stands in for the documented default, with a free rung
-        // above it for the walk to land on.
-        let (default_port, rung) = loop {
-            let probe = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-            let port = probe.local_addr().unwrap().port();
-            drop(probe);
-            let Some(rung) = next_host_publish_port(port) else {
-                continue;
-            };
-            match std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, rung)) {
-                Ok(rung_probe) => drop(rung_probe),
-                Err(_) => continue,
-            }
-            break (port, rung);
-        };
-
         let buf = CaptureWriter::default();
         let subscriber = tracing_subscriber::fmt()
             .with_writer(buf.clone())
@@ -5600,6 +5591,29 @@ mod tests {
             .write()
             .expect("registry lock")
             .register_host_net(SessionId::nil(), "web");
+
+        // A free port stands in for the documented default, with a free rung
+        // above it for the walk to land on. Probed last, right before the
+        // drive binds it: the probe has to be released for the drive to take
+        // the port, and every sibling test process allocating loopback ports
+        // in between can land on it — the drive then relocates (the busy
+        // default's NET-025 fallback) and publishes a port the ledger never
+        // held, which is a different test. Keeping the state's construction
+        // (host-key generation included) out of that window makes it
+        // microseconds wide instead of tens of milliseconds.
+        let (default_port, rung) = loop {
+            let probe = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let port = probe.local_addr().unwrap().port();
+            drop(probe);
+            let Some(rung) = next_host_publish_port(port) else {
+                continue;
+            };
+            match std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, rung)) {
+                Ok(rung_probe) => drop(rung_probe),
+                Err(_) => continue,
+            }
+            break (port, rung);
+        };
 
         // The forwarder's ledger with the default already held — the host
         // loopback as a second VM's daemon finds it.
