@@ -1296,12 +1296,14 @@ async fn serve_get_session_policy(
 
 /// The `GetEffectiveSessionPolicy` reply for one record's policy and network
 /// mode: the egress half resolved to what the gate enforces, the ingress half
-/// verbatim, and the credentialed-upstream lane (NET-134) verbatim — the
-/// one fact that does not ride its own reply: an older `min` rejects a key
-/// it has no field for (`deny_unknown_fields`), and the issue that added the
-/// lane took that visible error over a lane the report is silent about,
-/// since the lane rides nowhere else. NET-079's enforcement state still
-/// answers beside this reply, over `GetSessionRuntimeFacts`.
+/// verbatim, and the credentialed-upstream lane (NET-134) verbatim. The
+/// policy struct is `deny_unknown_fields`: an older `min` rejects a key it
+/// has no field for. The reply rule follows from that. A field that changes
+/// what the box can reach goes in this strict reply, so an older `min`
+/// fails visibly instead of under-reporting the box's reach (NET-134's
+/// lane). Descriptive state, such as NET-079's enforcement state, still
+/// answers beside this reply, over `GetSessionRuntimeFacts`, so an older
+/// client keeps reading the rules.
 /// `phase` is the rollout
 /// phase to resolve under — the handler serves
 /// [`sessions::EGRESS_DEFAULT_PHASE`], the phase this build ships, while the
