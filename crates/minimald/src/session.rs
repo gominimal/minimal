@@ -112,8 +112,8 @@ impl fmt::Display for AttachError {
             }
             AttachError::BoxHostRowEnded => write!(
                 f,
-                "this session's shell exited, which ended its host-side network \
-                 registration, and the daemon cannot register it again; destroy \
+                "this session's shell has ended, and with it the session's host-side \
+                 network registration; the daemon cannot register it again; destroy \
                  the session with `min session destroy` and start a new one with \
                  `min session activate`"
             ),
