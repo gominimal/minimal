@@ -5217,4 +5217,50 @@ mod tests {
         assert!(host.boxes.row_by_name("web").is_none());
         assert!(!host.boxes.tracks_registrations_of("web"));
     }
+
+    /// A registration whose name folds to a live row's is refused through
+    /// the door, the refusal names the held spelling, and the held
+    /// loopback is not released: the answerer allocates by the name's
+    /// canonical form, so a release by the refused name would free the
+    /// live row's address.
+    #[test]
+    fn folded_equal_name_refused_and_does_not_release_the_held_loopback() {
+        let host = SlowAllocation::start();
+        let live = host.register_live("Web");
+
+        let refused = control(
+            &host.sock_path,
+            &BoxControlRequest::Register(box_request("web")),
+        )
+        .expect("the registration is answered");
+        let held = match &refused {
+            BoxControlReply::Error { error } => {
+                assert_eq!(
+                    error,
+                    &AllocationError::NameAlreadyHeld {
+                        held: "Web".to_string()
+                    }
+                    .to_string(),
+                    "the refusal names the held spelling, got {refused:?}"
+                );
+                "Web"
+            }
+            other => panic!("a folded-equal name is refused, got {other:?}"),
+        };
+        assert_eq!(held, "Web");
+
+        // The live row stands in its own spelling and still holds its
+        // address — the refusal released nothing.
+        let row = host.boxes.row_by_name("WEB").expect("the live row stands");
+        assert_eq!(row.loopback_addr(), live.loopback_address);
+        assert!(
+            host.releases_of("web").is_empty(),
+            "the refusal released nothing: the live row's address stays held"
+        );
+        assert_eq!(
+            host.answerer.allocate("web"),
+            Ok(live.loopback_address),
+            "the answerer still holds the live row's address for its box"
+        );
+    }
 }

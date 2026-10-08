@@ -773,7 +773,10 @@ fn hand_out_run(subnet: SwitchSubnet) -> (u32, u32) {
 /// box address comes from — the plan's switch lease run and the published
 /// loopback slice — are finite; exhausting one is an answer to hand back
 /// over the control socket, not a panic.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+///
+/// Not `Copy`: every variant that names a box carries its [`String`] name,
+/// and the refusal is built once, answered with, and dropped.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum AllocationError {
     /// Every switch address in the plan's lease run is published.
     #[error("the switch's address plan is exhausted; no box address remains")]
@@ -818,6 +821,18 @@ pub enum AllocationError {
     /// the registration was read, so the registration writes no row.
     #[error("the box was withdrawn while its address was being allocated")]
     WithdrawnWhileAllocating,
+    /// The name folds to one a live row already holds: the answerer keys
+    /// an address by the name's canonical form
+    /// ([`crate::net::answerer::canonical_box_name`]), so two rows under
+    /// folded-equal names would share one published address — one box, one
+    /// address, one row. The registration is refused before any address is
+    /// spent, and names the spelling the live row holds.
+    #[error("a box named {held} already exists")]
+    NameAlreadyHeld {
+        /// The name the live row holds, in its registered spelling: the
+        /// one the refusal reports back to the asking client.
+        held: String,
+    },
 }
 
 /// One box name's registration bookkeeping: how many registrations of it
@@ -2407,7 +2422,10 @@ impl BoxRegistry {
     /// A mint that collides with an id a live row or attachment already
     /// holds is refused ([`AllocationError::CollidingBoxId`], BEP-070) —
     /// never re-minted — before any address is spent, and said as one warn
-    /// line naming the id.
+    /// line naming the id. A name that folds to one a live row already
+    /// holds is refused the same way ([`AllocationError::NameAlreadyHeld`]):
+    /// the answerer keys a published address by the name's canonical form,
+    /// so two rows under folded-equal names would share one address.
     pub fn register_client_box_at(
         &self,
         spec: ClientBoxSpec,
@@ -2439,7 +2457,7 @@ impl BoxRegistry {
     }
 
     /// [`Self::register_client_box_at`] with the freshly minted `id` it
-    /// creates the box as: the one door the collision check guards, split
+    /// creates the box as: the one door the collision checks guard, split
     /// out so a test can drive a colliding mint.
     fn register_client_box_as(
         &self,
@@ -2469,6 +2487,23 @@ impl BoxRegistry {
         // that decides.
         if generation.is_some_and(|read| read != self.withdrawal_generation(&spec.name)) {
             return Err(AllocationError::WithdrawnWhileAllocating);
+        }
+        // The answerer keys a published address by the name's canonical
+        // form, so a registration whose name folds to a live row's would
+        // share that row's address: one box, one address, one row. The
+        // check runs after the withdrawal-generation one — a registration
+        // raced by a withdrawal answers as withdrawn while allocating —
+        // and before any address is spent. The refusal names the
+        // spelling the live row holds — the answerer's fold is the rule,
+        // not the row's own spelling, so the asking client learns which
+        // box holds the name as its holder registered it.
+        if let Some(held) = self.held_name_for(&spec.name) {
+            tracing::warn!(
+                asked = %spec.name,
+                held = %held,
+                "refused a box registration whose name a live row already holds"
+            );
+            return Err(AllocationError::NameAlreadyHeld { held });
         }
         // A withdrawn box's revocation may still hold the published address
         // the answerer handed back: the answerer releases a box's address at
@@ -2567,6 +2602,23 @@ impl BoxRegistry {
             .is_some_and(|attachments| attachments.holds_id(id))
     }
 
+    /// The name a live row holds that `name` folds to, in the row's own
+    /// spelling, or `None` when no live row's name folds to it. The
+    /// answerer allocates a published address by the name's canonical form
+    /// ([`crate::net::answerer::canonical_box_name`]), so two live rows
+    /// under folded-equal names would share one address; this is the check
+    /// that keeps the live set one row per folded name.
+    fn held_name_for(&self, name: &str) -> Option<String> {
+        let asked = canonical_box_name(name);
+        let rows = self
+            .rows
+            .read()
+            .expect("the row lock is never held across a panic, so it cannot be poisoned");
+        rows.values()
+            .find(|record| canonical_box_name(record.name()) == asked)
+            .map(|record| record.name().to_string())
+    }
+
     /// Withdraws the client box's row when the pair `(name, switch_addr,
     /// loopback_addr)` proves its client is the row's creator, returning the
     /// row removed — `Ok(None)` when no row is published at `switch_addr` at
@@ -2580,7 +2632,10 @@ impl BoxRegistry {
     /// ([`ClientBoxSpec`]'s allocation), which only the registering session's
     /// record carries; a row published under another name or another
     /// loopback is not the requesting client's to remove and is refused with
-    /// [`WithdrawError`]. The withdrawn addresses are not returned to the
+    /// [`WithdrawError`]. The name in the proof is compared in its
+    /// canonical form, the answerer's fold: a box registered under "Web"
+    /// is withdrawn by its own name in any spelling that folds to it.
+    /// The withdrawn addresses are not returned to the
     /// allocation cursors — spent for good, as [`Self::register_client_box`]
     /// documents — and what their frames do next is the gate phase's to say
     /// ([`Self::withdraw`]). The box's proxy attachment goes with the row
@@ -2613,7 +2668,7 @@ impl BoxRegistry {
             self.bump_withdrawal_generation(name);
             return Ok(None);
         };
-        if record.name() != name {
+        if canonical_box_name(record.name()) != canonical_box_name(name) {
             return Err(WithdrawError::NotTheCreatorsRow {
                 switch_addr,
                 held_name: record.name().to_string(),
@@ -2886,16 +2941,19 @@ impl BoxRegistry {
     /// While both are held, the alias resolves to the newest creation —
     /// the row with the greatest id, because every id is a UUIDv7 this
     /// process minted ([`crate::bep_attach::mint_box_id`]), and the crate
-    /// orders those by creation within a process. The name carries no
-    /// other alias form: it is matched in its registered spelling.
+    /// orders those by creation within a process. The name is matched in
+    /// its canonical form ([`crate::net::answerer::canonical_box_name`]):
+    /// the answerer keys the box's published address by that form, so the
+    /// row table and the address hold one box to a folded-equal name.
     #[must_use]
     pub fn row_by_name(&self, name: &str) -> Option<Arc<BoxRecord>> {
+        let asked = canonical_box_name(name);
         let rows = self
             .rows
             .read()
             .expect("the row lock is never held across a panic, so it cannot be poisoned");
         rows.values()
-            .filter(|record| record.name() == name)
+            .filter(|record| canonical_box_name(record.name()) == asked)
             .max_by_key(|record| record.box_id())
             .cloned()
     }
@@ -4751,6 +4809,132 @@ mod tests {
         assert!(
             registry.row_by_name("Web").is_none(),
             "no alias form but the name"
+        );
+    }
+
+    /// The answerer keys a published address by the name's canonical
+    /// form, so a client registration whose name folds to a live row's
+    /// is refused — one box, one address, one row — before any address
+    /// is spent, naming the spelling the live row holds; the row's own
+    /// spelling is what everyone reads back.
+    #[test]
+    fn folded_equal_name_refused_and_the_live_row_keeps_its_spelling() {
+        let (log, _guard) = crate::net::egress_gate::test_support::capture_log();
+        let registry = BoxRegistry::new(SUBNET);
+        let web = registry
+            .register_client_box(ClientBoxSpec {
+                name: "Web".to_string(),
+                ingress_ports: Vec::new(),
+                egress: None,
+                credentialed_upstream: None,
+                dynamic_ingress: None,
+                dynamic_allowed_range: None,
+            })
+            .expect("the plan has an address for the first box");
+
+        // A second client asks under a spelling that folds to the live
+        // row's name: refused, naming the spelling the row holds.
+        let refused = registry
+            .register_client_box(ClientBoxSpec {
+                name: "web".to_string(),
+                ingress_ports: Vec::new(),
+                egress: None,
+                credentialed_upstream: None,
+                dynamic_ingress: None,
+                dynamic_allowed_range: None,
+            })
+            .expect_err("one published address is one box's");
+        assert_eq!(
+            refused,
+            AllocationError::NameAlreadyHeld {
+                held: "Web".to_string()
+            },
+            "the refusal names the held spelling, not the asking one"
+        );
+        assert!(
+            refused
+                .to_string()
+                .contains("a box named Web already exists"),
+            "the refusal's sentence names the held spelling: {refused}"
+        );
+
+        // The refusal spent nothing: the live row stands untouched, in
+        // its own spelling, and resolves under every folded spelling.
+        let rows = registry.table().rows();
+        assert_eq!(rows.len(), 1, "a refused registration publishes no row");
+        assert_eq!(
+            row_identity(&rows[0]),
+            row_identity(&web),
+            "the live row is the live box's, untouched by the refusal"
+        );
+        assert_eq!(
+            registry
+                .row_by_name("WEB")
+                .expect("the name resolves in every folded spelling")
+                .name(),
+            "Web",
+            "the row keeps its holder's spelling, the one its holder reads"
+        );
+        let next = registry
+            .register_client_box(ClientBoxSpec {
+                name: "db".to_string(),
+                ingress_ports: Vec::new(),
+                egress: None,
+                credentialed_upstream: None,
+                dynamic_ingress: None,
+                dynamic_allowed_range: None,
+            })
+            .expect("the plan has a second hand-out address");
+        assert_eq!(
+            next.switch_addr(),
+            Ipv4Addr::from(u32::from(web.switch_addr()) + 1),
+            "the refusal spent no address: the next registration takes the \
+             hand-out run's next, the address the refused one would have spent"
+        );
+
+        // One warn line names the refusal and both spellings — the line a
+        // bundle's daemon log tail reads a refused registration by.
+        let logged = log.contents();
+        assert_eq!(
+            logged
+                .matches("refused a box registration whose name a live row already holds")
+                .count(),
+            1,
+            "one warn line per refused registration, got: {logged}"
+        );
+        assert!(
+            logged.contains("asked=web") && logged.contains("held=Web"),
+            "the warn line names the asking and the held spelling, got: {logged}"
+        );
+    }
+
+    /// A withdrawal presents the same name-folding proof the registration
+    /// answers under: a box registered as "web" is withdrawn by its own
+    /// creator under "WEB", and the row the matching address pair points
+    /// at is removed — never refused as another box's row.
+    #[test]
+    fn withdraw_folds_the_asking_name() {
+        let registry = BoxRegistry::new(SUBNET);
+        let web = registry
+            .register_client_box(ClientBoxSpec {
+                name: "web".to_string(),
+                ingress_ports: Vec::new(),
+                egress: None,
+                credentialed_upstream: None,
+                dynamic_ingress: None,
+                dynamic_allowed_range: None,
+            })
+            .expect("the plan has an address for the first box");
+        assert!(
+            registry
+                .withdraw_client_box("WEB", web.switch_addr(), web.loopback_addr())
+                .expect("the asking name folds to the row's, so the proof stands")
+                .is_some(),
+            "the folded-equal name withdraws the row its pair proves"
+        );
+        assert!(
+            registry.row_by_name("web").is_none(),
+            "the row is withdrawn, not held against a folded-equal ask"
         );
     }
 
