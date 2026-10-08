@@ -2388,8 +2388,8 @@ mod tests {
     use std::time::Duration;
 
     use minimald_rpc::{
-        BoxControlReply, BoxControlRequest, RegisterBoxRequest, WithdrawBoxRequest,
-        ZoneAnswererStatus,
+        BoxControlReply, BoxControlRequest, HoldBoxNameRequest, RegisterBoxRequest,
+        WithdrawBoxRequest, ZoneAnswererStatus,
     };
     use switch::SwitchSubnet;
 
@@ -3189,6 +3189,71 @@ mod tests {
                 .is_some(),
             "the read-only verb leaves the row the registration published"
         );
+    }
+
+    /// The `host_ip` interim over the host door: a hold answers the
+    /// name-hold marker and leaves the name in the zone view with no
+    /// address (NODATA), whatever case it was asked in; the release
+    /// answers the marker with `held: false` and takes the name out of the
+    /// view (NXDOMAIN again), and a repeat release is the goal state
+    /// already holding.
+    #[test]
+    fn a_held_name_is_held_and_released_over_the_control_socket() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (sock_path, _server, registry, _answerer, _proxy_publish) =
+            spawn_server(dir.path()).expect("server binds");
+        let held_row = |registry: &BoxRegistry| {
+            registry
+                .zone_view()
+                .rows()
+                .find(|(name, _)| *name == "web.min.internal")
+                .map(|(_, row)| *row)
+        };
+
+        let reply = control(
+            &sock_path,
+            &BoxControlRequest::HoldBoxName(HoldBoxNameRequest {
+                name: "Web".to_string(),
+            }),
+        )
+        .expect("the hold is answered");
+        assert_eq!(
+            reply,
+            BoxControlReply::NameHeld {
+                name: "Web".to_string(),
+                held: true,
+            }
+        );
+        assert_eq!(
+            held_row(&registry),
+            Some(sessions::core::zone_answer::ZoneRow {
+                address: None,
+                live: true,
+            }),
+            "the held name is in the zone with no address behind it"
+        );
+
+        for _ in 0..2 {
+            let reply = control(
+                &sock_path,
+                &BoxControlRequest::ReleaseBoxName(HoldBoxNameRequest {
+                    name: "web".to_string(),
+                }),
+            )
+            .expect("the release is answered");
+            assert_eq!(
+                reply,
+                BoxControlReply::NameHeld {
+                    name: "web".to_string(),
+                    held: false,
+                }
+            );
+            assert_eq!(
+                held_row(&registry),
+                None,
+                "a released name is out of the zone"
+            );
+        }
     }
 
     /// The drawn port's story (T93): a guest that reports its publish was

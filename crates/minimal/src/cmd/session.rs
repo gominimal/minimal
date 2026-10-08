@@ -314,13 +314,15 @@ pub(crate) fn vm_host_answerer_start_line(
 /// admitting anything.
 ///
 /// Always quiet when it owes nothing: a session that registered no box — a
-/// native host, a refused registration — withdraws nothing and says
-/// nothing. A `host_ip` box registered no row but its activation held its
-/// name in the zone, so the withdrawal releases that hold instead,
-/// best-effort the same way. A withdrawal that cannot be made —
-/// no control socket, a daemon that predates the verb and refuses the
-/// line, the deadline — leaves the row published and warns
-/// rather than failing the destroy or the activation error it rides on;
+/// native host, a host-ip box sharing the node's own row, a refused
+/// registration — withdraws nothing and says nothing. In particular it
+/// never releases a held `host_ip` name: an activation that failed holds
+/// none (the hold is made only once the session is active), and the name
+/// may be a live session's — an autogen collision is exactly that — so
+/// only the destroy of the session that held it releases it
+/// ([`release_held_box_name`]). A withdrawal that cannot be made — no
+/// control socket, a daemon that predates the verb and refuses the line,
+/// the deadline — leaves the row published and warns rather than failing the destroy or the activation error it rides on;
 /// the daemon restarting between registration and withdrawal answers the
 /// withdrawal as already gone, which is the goal state either way.
 pub(crate) async fn withdraw_box_row(
@@ -330,11 +332,6 @@ pub(crate) async fn withdraw_box_row(
 ) {
     let Some(name) = name else { return };
     let Some(addresses) = box_addresses else {
-        // A box that registered no row — a `host_ip` box, whose activation
-        // held its name in the zone — owes the zone only that held name,
-        // so release it here (best-effort, warned below) and be done. A
-        // name no hold kept is the goal state already holding.
-        hold_box_name_with_vm_host(control_sock, name, false).await;
         return;
     };
     let Some(sock_path) = control_sock else {
@@ -484,6 +481,24 @@ pub(crate) async fn withdraw_box_row(
     }
 }
 
+/// Releases the zone hold a destroyed session's activation made, when the
+/// session registered no row (`box_addresses` is `None` — a `host_ip` box
+/// holds its name in place of a row): the destroy-side twin of the hold
+/// [`activate_session`] makes once the session is active. Best-effort and
+/// warn-only like the hold; a name no hold kept is the goal state already
+/// holding, so a `none` box's release changes nothing.
+pub(crate) async fn release_held_box_name(
+    control_sock: Option<std::path::PathBuf>,
+    name: Option<&str>,
+    box_addresses: Option<sessions::BoxAddresses>,
+) {
+    if box_addresses.is_some() {
+        return;
+    }
+    let Some(name) = name else { return };
+    hold_box_name_with_vm_host(control_sock, name, false).await;
+}
+
 /// Holds or releases a `host_ip` box's name on the VM host daemon, by
 /// `hold`, best-effort: the hold is the interim that answers the name
 /// NODATA where an unheld name answers NXDOMAIN, and the release ends the
@@ -543,8 +558,8 @@ async fn hold_box_name_with_vm_host(
 /// it is an own-address box: a `host_ip` box shares the node's own row in
 /// the host table, and a `none` box has no switch address at all — both
 /// register nothing and attach exactly as they always have. A `host_ip`
-/// box's name is held in the zone instead (best-effort), answering NODATA
-/// rather than NXDOMAIN.
+/// box's name is held in the zone instead (best-effort, NODATA rather than
+/// NXDOMAIN), but only once its session is active ([`activate_session`]).
 ///
 /// The box's own id comes back with it (NET-133): the request carries no
 /// id, the host mints one for this creation, and the reply returns the id
@@ -570,17 +585,6 @@ async fn register_box_for_activation(
     policy: &sessions::SessionPolicy,
 ) -> anyhow::Result<Option<RegisteredWithVmHost>> {
     if kind != paths::ProviderKind::Minvmd || network != sessions::NetworkMode::OwnIp {
-        if kind == paths::ProviderKind::Minvmd && network == sessions::NetworkMode::HostNet {
-            // The `host_ip` interim: the name is held in the zone with no
-            // row behind it, so it answers NODATA instead of NXDOMAIN
-            // (best-effort, warned within the helper).
-            hold_box_name_with_vm_host(
-                vm_host_control_sock(paths::ProviderKind::Minvmd, minimal_dir),
-                name,
-                true,
-            )
-            .await;
-        }
         return Ok(None);
     }
     // The control socket sits beside the ssh socket in the provider dir the
@@ -989,8 +993,8 @@ pub(crate) async fn activate_session(
     // hands them back, and the create request carries them so the in-VM
     // daemon attaches with the handed switch address instead of drawing its
     // own. A `host_ip` box shares the node's own row, so it registers no
-    // row of its own — its name is held in the zone instead (NODATA) —
-    // and a `none` box, or a native daemon with no box table, registers
+    // row of its own — its name is held in the zone instead (NODATA) once
+    // the session is active, below — and a `none` box, or a native daemon with no box table, registers
     // nothing and attaches as it always has.
     // A registration that cannot be made ends the activation here, with its
     // cause: no session exists yet to clean up, and a box that went on to
@@ -1773,6 +1777,19 @@ pub(crate) async fn activate_session(
     // (the attach hand-off below and the user's own session are fair game
     // for interrupts, but not this cleanup).
     drop(interrupt_guard);
+
+    // The `host_ip` interim: the box shares the node's own row, so its name
+    // is held in the zone with no row behind it and answers NODATA instead
+    // of NXDOMAIN (best-effort, warned within the helper). Held only now
+    // the session is active, so an activation that dies or fails earlier
+    // — its unfinalized session reaped with the connection — leaves no
+    // hold behind; the destroy releases it ([`release_held_box_name`]).
+    if kind == paths::ProviderKind::Minvmd
+        && config.network == sessions::NetworkMode::HostNet
+        && let Some(name) = config.name.as_deref()
+    {
+        hold_box_name_with_vm_host(control_sock.clone(), name, true).await;
+    }
 
     println!("{id}");
 
@@ -3760,12 +3777,13 @@ pub(crate) async fn destroy_session(
         // presenting the pair the registration handed back. Best-effort: a
         // withdrawal that cannot be made leaves the row published and warns
         // rather than failing a destroy that already succeeded.
-        withdraw_box_row(
-            vm_host_control_sock(daemon_provider_kind(global), global.minimal_dir.as_deref()),
-            name,
-            box_addresses,
-        )
-        .await;
+        // A box that registered no row held its name in the zone instead
+        // (`host_ip`); the same destroy releases it, best-effort the same
+        // way.
+        let control_sock =
+            vm_host_control_sock(daemon_provider_kind(global), global.minimal_dir.as_deref());
+        withdraw_box_row(control_sock.clone(), name, box_addresses).await;
+        release_held_box_name(control_sock, name, box_addresses).await;
     } else {
         bail!("DestroySession returned an error from the daemon");
     }
@@ -5724,8 +5742,8 @@ mod tests {
     /// T66's destroy side: the client holding a destroyed session's record
     /// withdraws the row its activation registered — one withdraw request
     /// naming the pair the registration handed back — and a session that
-    /// registered no row (no pair) releases the name its activation held
-    /// instead, while no name or no VM host sends nothing at all.
+    /// registered no box (no pair, no name, no VM host) sends nothing at
+    /// all.
     #[tokio::test]
     async fn destroy_sends_the_withdraw() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -5769,26 +5787,19 @@ mod tests {
             assert_eq!(request.loopback_address, handed.loopback_address);
         }
 
-        // And a session that registered no row owes the zone only its held
-        // name: a `host_ip` box's withdrawal releases the name its
-        // activation held — one release request, the marker reply back —
-        // while no name or no VM host sends nothing, on the same socket.
+        // And a session that registered nothing owes nothing: no pair, no
+        // name, no VM host — each sends nothing, on the same socket.
         withdraw_box_row(
             vm_host_control_sock(paths::ProviderKind::Minvmd, global.minimal_dir.as_deref()),
             Some("web"),
             None,
         )
         .await;
-        {
-            let seen = requests.lock().unwrap();
-            assert_eq!(seen.len(), 2, "no pair on the record, one name release");
-            let request: minimald_rpc::BoxControlRequest =
-                serde_json_lenient::from_str(&seen[1]).expect("the request is the wire type");
-            let minimald_rpc::BoxControlRequest::ReleaseBoxName(request) = request else {
-                panic!("a held name's withdrawal is carried by the release verb");
-            };
-            assert_eq!(request.name, "web");
-        }
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            1,
+            "no pair on the record, no withdrawal"
+        );
         withdraw_box_row(
             vm_host_control_sock(paths::ProviderKind::Minvmd, global.minimal_dir.as_deref()),
             None,
@@ -5797,7 +5808,7 @@ mod tests {
         .await;
         assert_eq!(
             requests.lock().unwrap().len(),
-            2,
+            1,
             "no name on the record, no withdrawal"
         );
         withdraw_box_row(
@@ -5808,9 +5819,80 @@ mod tests {
         .await;
         assert_eq!(
             requests.lock().unwrap().len(),
-            2,
+            1,
             "no VM host to withdraw from, no withdrawal"
         );
+    }
+
+    /// The `host_ip` interim's destroy side: a destroyed session that
+    /// registered no row releases the name its activation held — one
+    /// release request naming it — while a session with a row releases
+    /// nothing (its row's withdrawal is its whole debt), and a failed
+    /// activation's withdrawal of a row-less box sends nothing at all: the
+    /// name may be a live session's (an autogen collision), so only the
+    /// destroy of the session that held it may release it. The hold itself
+    /// is the hold verb, and the marker reply is quiet.
+    #[tokio::test]
+    async fn destroy_releases_a_held_name_and_a_failed_activation_does_not() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let provider_dir = dir.path().join("providers").join("local-minvmd0");
+        std::fs::create_dir_all(&provider_dir).unwrap();
+        let sock_path = provider_dir.join("control.sock");
+        let requests = fake_vm_host(
+            sock_path.clone(),
+            r#"{"name":"web","held":false}"#.to_string(),
+        )
+        .await;
+        let control_sock = || vm_host_control_sock(paths::ProviderKind::Minvmd, Some(dir.path()));
+        let decode = |line: &str| -> minimald_rpc::BoxControlRequest {
+            serde_json_lenient::from_str(line).expect("the request is the wire type")
+        };
+
+        // A failed activation's withdrawal of a row-less box: nothing sent.
+        withdraw_box_row(control_sock(), Some("web"), None).await;
+        assert!(
+            requests.lock().unwrap().is_empty(),
+            "a row-less withdrawal never releases a name a live session may hold"
+        );
+
+        // The activation's hold, once the session is active.
+        hold_box_name_with_vm_host(control_sock(), "web", true).await;
+        {
+            let seen = requests.lock().unwrap();
+            assert_eq!(seen.len(), 1, "one hold, one request");
+            let minimald_rpc::BoxControlRequest::HoldBoxName(request) = decode(&seen[0]) else {
+                panic!("a hold is carried by the hold verb");
+            };
+            assert_eq!(request.name, "web");
+        }
+
+        // The destroy of a session with a row releases nothing.
+        let handed = sessions::BoxAddresses {
+            switch_address: std::net::Ipv4Addr::new(100, 64, 0, 2),
+            loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 0),
+        };
+        release_held_box_name(control_sock(), Some("web"), Some(handed)).await;
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            1,
+            "a row's box holds no name"
+        );
+
+        // The destroy of a row-less session releases its name.
+        release_held_box_name(control_sock(), Some("web"), None).await;
+        {
+            let seen = requests.lock().unwrap();
+            assert_eq!(seen.len(), 2, "one release, one request");
+            let minimald_rpc::BoxControlRequest::ReleaseBoxName(request) = decode(&seen[1]) else {
+                panic!("a held name's release is carried by the release verb");
+            };
+            assert_eq!(request.name, "web");
+        }
+
+        // No name, or no VM host: nothing sent.
+        release_held_box_name(control_sock(), None, None).await;
+        release_held_box_name(None, Some("web"), None).await;
+        assert_eq!(requests.lock().unwrap().len(), 2, "nothing to release by");
     }
 
     /// The macOS shape of every VM-backed gate (NET-081's other half): the
