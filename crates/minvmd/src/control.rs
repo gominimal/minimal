@@ -5234,21 +5234,17 @@ mod tests {
             &BoxControlRequest::Register(box_request("web")),
         )
         .expect("the registration is answered");
-        let held = match &refused {
-            BoxControlReply::Error { error } => {
-                assert_eq!(
-                    error,
-                    &AllocationError::NameAlreadyHeld {
-                        held: "Web".to_string()
-                    }
-                    .to_string(),
-                    "the refusal names the held spelling, got {refused:?}"
-                );
-                "Web"
-            }
+        match &refused {
+            BoxControlReply::Error { error } => assert_eq!(
+                error,
+                &AllocationError::NameAlreadyHeld {
+                    held: "Web".to_string()
+                }
+                .to_string(),
+                "the refusal names the held spelling, got {refused:?}"
+            ),
             other => panic!("a folded-equal name is refused, got {other:?}"),
-        };
-        assert_eq!(held, "Web");
+        }
 
         // The live row stands in its own spelling and still holds its
         // address — the refusal released nothing.

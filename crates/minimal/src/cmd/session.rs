@@ -576,6 +576,38 @@ async fn register_box_for_activation(
     }
 }
 
+/// [`register_box_for_activation`] for an activation whose session name may
+/// be autogen. The VM host daemon refuses a registration whose name folds
+/// to one a live row already holds; for an autogen `name` that refusal is a
+/// name collision like the create's, so the name is re-minted with `remint`
+/// and registered again, within the bounded budget ([`should_retry_autogen`])
+/// the `CreateSession` collision retry spends — `attempts` is shared with
+/// it. A refused registration publishes no row, so nothing is withdrawn
+/// between attempts. A user-supplied name, any other failure, and a spent
+/// budget surface the error unchanged. The refusal is matched across the
+/// whole error chain: the daemon's reason is its innermost cause.
+#[allow(clippy::too_many_arguments)]
+async fn register_box_reminting_autogen(
+    kind: paths::ProviderKind,
+    minimal_dir: Option<&std::path::Path>,
+    network: sessions::NetworkMode,
+    name: &mut String,
+    policy: &sessions::SessionPolicy,
+    autogen: bool,
+    attempts: &mut u32,
+    mut remint: impl FnMut() -> String,
+) -> anyhow::Result<Option<RegisteredWithVmHost>> {
+    loop {
+        match register_box_for_activation(kind, minimal_dir, network, name, policy).await {
+            Err(error) if should_retry_autogen(autogen, *attempts, &format!("{error:#}")) => {
+                *attempts += 1;
+                *name = remint();
+            }
+            registered => return registered,
+        }
+    }
+}
+
 /// The session-start line for a box the activation registered with the VM
 /// host daemon (T66): the one line the start output owes the registration,
 /// naming the VM host daemon the row lives on and the switch address the box
@@ -917,15 +949,23 @@ pub(crate) async fn activate_session(
     // resolved once, here, and the withdrawals ride on it.
     let kind = daemon_provider_kind(global);
     let control_sock = vm_host_control_sock(kind, global.minimal_dir.as_deref());
-    let mut registered = register_box_for_activation(
+    // An autogen name can collide with a live box's row the same way it
+    // can with a session (the row stays live until its session's destroy):
+    // the registration's refusal re-mints it within the same budget the
+    // create's collision retry below spends.
+    let mut attempts = 0u32;
+    let mut registered = register_box_reminting_autogen(
         kind,
         global.minimal_dir.as_deref(),
         config.network,
         config
             .name
-            .as_deref()
+            .as_mut()
             .expect("the session name is minted before the create"),
         &config.policy,
+        autogen,
+        &mut attempts,
+        || autogen_session_name(&utf8_path, &random_hex4()),
     )
     .await?;
     // The registration is the client's record of the box: the addresses
@@ -942,7 +982,7 @@ pub(crate) async fn activate_session(
     // re-mint the hex suffix and retry a bounded number of times. A
     // user-supplied name never retries — its collision, and any other failure
     // (e.g. a policy/network-mode validation error), surfaces unchanged.
-    let mut attempts = 0u32;
+    // `attempts` carries over from the registration's own collision retry.
     let created = loop {
         let resp = client
             .oneshot_rpc::<CreateSession>(CreateSessionRequest {
@@ -998,12 +1038,15 @@ pub(crate) async fn activate_session(
                     // reused, so the re-registration is a new creation, and
                     // the host mints it a new id, which replaces the record
                     // (NET-133).
-                    registered = register_box_for_activation(
+                    registered = register_box_reminting_autogen(
                         kind,
                         global.minimal_dir.as_deref(),
                         config.network,
-                        config.name.as_deref().expect("just re-minted"),
+                        config.name.as_mut().expect("just re-minted"),
                         &config.policy,
+                        autogen,
+                        &mut attempts,
+                        || autogen_session_name(&utf8_path, &random_hex4()),
                     )
                     .await?;
                     config.box_addresses = registered
@@ -5509,6 +5552,102 @@ mod tests {
             !attachments.holds_id(id.to_bytes()),
             "the withdrawn box's id is held by no attachment"
         );
+    }
+
+    /// The VM host daemon refuses a registration whose name folds to a
+    /// live row's, and that refusal reads as a name collision: an autogen
+    /// name re-mints and registers again under the fresh name, within the
+    /// shared budget, while a user-supplied name surfaces the refusal —
+    /// naming the held spelling — unchanged. Driven against the real
+    /// control server so a rewording of the daemon's refusal cannot
+    /// silently break the retry.
+    #[tokio::test]
+    async fn autogen_registration_reminted_on_a_held_name() {
+        let policy = sessions::SessionPolicy {
+            egress: None,
+            ingress: None,
+            credentialed_upstream: None,
+        };
+        let dir = tempfile::TempDir::new().unwrap();
+        let provider_dir = dir.path().join("providers").join("local-minvmd0");
+        std::fs::create_dir_all(&provider_dir).unwrap();
+        let sock_path = provider_dir.join("control.sock");
+        let registry = minvmd::box_registry::BoxRegistry::new(switch::SwitchSubnet::default());
+        let _server = minvmd::control::spawn(
+            sock_path,
+            registry.clone(),
+            minvmd::net::answerer::AnswererStatus::allocating_for_tests("session-test-node"),
+            minvmd::control::ProxyPublishStatus::default(),
+        )
+        .expect("the control server binds its socket");
+        let minimal_dir = Some(dir.path());
+
+        let mut held = "Proj-9c1e".to_string();
+        let mut attempts = 0u32;
+        register_box_reminting_autogen(
+            paths::ProviderKind::Minvmd,
+            minimal_dir,
+            NetworkMode::OwnIp,
+            &mut held,
+            &policy,
+            true,
+            &mut attempts,
+            || unreachable!("a free name registers on the first try"),
+        )
+        .await
+        .expect("the first box registers")
+        .expect("an own-address box on a VM-backed host registers");
+        assert_eq!(attempts, 0);
+
+        // An autogen name folding to the live row's re-mints and registers.
+        let mut name = "proj-9c1e".to_string();
+        let registered = register_box_reminting_autogen(
+            paths::ProviderKind::Minvmd,
+            minimal_dir,
+            NetworkMode::OwnIp,
+            &mut name,
+            &policy,
+            true,
+            &mut attempts,
+            || "proj-77aa".to_string(),
+        )
+        .await
+        .expect("the held autogen name is re-minted, not fatal")
+        .expect("the re-minted name registers");
+        assert_eq!(
+            name, "proj-77aa",
+            "the activation carries the re-minted name"
+        );
+        assert_eq!(attempts, 1, "the re-mint spent one attempt of the budget");
+        assert_eq!(
+            registry
+                .row_by_name("proj-77aa")
+                .expect("the re-minted name holds a row")
+                .switch_addr(),
+            registered.addresses.switch_address,
+        );
+
+        // A user-supplied name never re-mints: the refusal surfaces, naming
+        // the spelling the live row holds.
+        let mut user = "PROJ-9C1E".to_string();
+        let refused = register_box_reminting_autogen(
+            paths::ProviderKind::Minvmd,
+            minimal_dir,
+            NetworkMode::OwnIp,
+            &mut user,
+            &policy,
+            false,
+            &mut 0,
+            || unreachable!("a user-supplied name is never re-minted"),
+        )
+        .await
+        .expect_err("a user-supplied held name is refused");
+        let refused = format!("{refused:#}");
+        assert!(
+            refused.contains("a box named Proj-9c1e already exists"),
+            "the refusal names the held spelling: {refused}"
+        );
+        assert_eq!(user, "PROJ-9C1E", "the user's name is left as given");
     }
 
     /// NET-138's status read: the machine's zone-answerer state is read

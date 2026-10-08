@@ -2493,10 +2493,9 @@ impl BoxRegistry {
         // share that row's address: one box, one address, one row. The
         // check runs after the withdrawal-generation one — a registration
         // raced by a withdrawal answers as withdrawn while allocating —
-        // and before any address is spent. The refusal names the
-        // spelling the live row holds — the answerer's fold is the rule,
-        // not the row's own spelling, so the asking client learns which
-        // box holds the name as its holder registered it.
+        // and before any address is spent. The collision is decided in
+        // the answerer's fold, and the refusal reports the held row's own
+        // spelling, so the asking client learns which box holds the name.
         if let Some(held) = self.held_name_for(&spec.name) {
             tracing::warn!(
                 asked = %spec.name,
