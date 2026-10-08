@@ -2338,8 +2338,10 @@ mod tests {
             let Some(next) = port_of(&loopback).checked_add(1) else {
                 continue;
             };
-            if let Ok(any) = TcpListener::bind((Ipv4Addr::UNSPECIFIED, next)) {
-                return (loopback, any);
+            match TcpListener::bind((Ipv4Addr::UNSPECIFIED, next)) {
+                Ok(any) => return (loopback, any),
+                Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {}
+                Err(error) => panic!("binding the adjacent any-address listener failed: {error}"),
             }
         }
         panic!("no free adjacent port pair found in {ATTEMPTS} ephemeral binds");
