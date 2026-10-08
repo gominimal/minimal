@@ -358,16 +358,19 @@ session that runs it, which the session's
 
 `host_ip` (the default) shares the host's network namespace. The task
 reaches everything the host reaches. This includes the host-side hostname
-proxy at `127.0.0.1:7654`, the port clients point `HTTP(S)_PROXY` at. That
-port is the default of the [`minimald` `--hostname-proxy-port`
-flag](./cli-minimald.md#global-flags).
+proxy, the port clients point `HTTP(S)_PROXY` at. It listens on
+`127.0.0.1:7654` by default, and picks a free port when 7654 is busy. `min
+ls` prints the port in use, and [`minimald run
+--hostname-proxy-port`](./cli-minimald.md#run) pins it.
 
 `own_ip` gives the task its own address on the host's switch, in its own
 network namespace. This namespace is a second box beside the session's box,
 not the session's namespace. `127.0.0.1` inside the task is the task's own
 loopback, so a connection to it does not reach the hostname proxy on the host.
 Outbound traffic goes through the switch, so a task that fetches from the
-network does not need the proxy.
+network does not need the proxy. The task also follows the session's egress
+policy: when the session cannot reach a destination, the task cannot reach it
+either.
 
 `none` gives the task no network. Every connection to a destination outside
 the task fails. When a task needs the network, give its session a mode that
