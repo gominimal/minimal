@@ -3110,8 +3110,9 @@ pub fn write_policy_json(
     shared_port_collisions: &[minimald_rpc::SharedPortCollision],
 ) -> Result<(), anyhow::Error> {
     // A none box has no policy to describe; the text rendering's one-line
-    // note is prose for a person, so the document carries the schema and
-    // the mode alone, and every other key's absence says why.
+    // note is prose for a person, so the document carries the schema, the
+    // mode, and a declared lane (marked not in effect) alone, and every
+    // other key's absence says why.
     let document = if network == sessions::NetworkMode::NoNet {
         PolicyJson {
             schema: POLICY_JSON_SCHEMA,
