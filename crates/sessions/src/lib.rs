@@ -1035,6 +1035,17 @@ pub struct Record {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_ip_enforcement: Option<HostIpEnforcement>,
 
+    /// Whether a launch has bound this box's host-side row (NET-138): set,
+    /// and persisted, by the first host launch of a box that carries
+    /// [`Self::box_addresses`]. The row lives exactly as long as that
+    /// launch's switch attachment and is never registered again, so once
+    /// this is set, any host other than that first launch's is rowless —
+    /// including every host after a daemon restart. Daemon-owned, like
+    /// [`Self::host_ip_enforcement`]. Defaults to `false` for records that
+    /// predate the field and for a registered box that has not launched yet.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub host_row_bound: bool,
+
     /// Free-form attributes.
     pub attrs: BTreeMap<String, String>,
 }
@@ -1203,6 +1214,7 @@ mod tests {
             hooks_enabled: true,
             box_addresses: None,
             host_ip_enforcement: None,
+            host_row_bound: false,
             attrs: BTreeMap::new(),
         }
     }
