@@ -2879,6 +2879,11 @@ struct PolicyJson<'a> {
     node_plane_baseline: Option<PolicyBaselineJson>,
     #[serde(skip_serializing_if = "Option::is_none")]
     live_ingress: Option<LiveIngressJson>,
+    /// The permitted listening ports the daemon left unpublished because
+    /// their audit record could not be written (NET-046) — the text
+    /// rendering's warning lines, for a machine. Absent when there are none.
+    #[serde(skip_serializing_if = "<[u16]>::is_empty")]
+    unaudited_listen_ports: &'a [u16],
 }
 
 /// The live rows as the document carries them — the two states a client
@@ -2914,6 +2919,22 @@ pub fn write_policy_json(
     fabric: Option<switch::SwitchSubnet>,
     live: Result<Vec<minimald_rpc::LiveMapping>, String>,
 ) -> Result<(), anyhow::Error> {
+    write_policy_json_noting(out, effective, network, fabric, live, &[])
+}
+
+/// [`write_policy_json`], with the permitted listening ports the daemon left
+/// unpublished because their audit record could not be written (NET-046)
+/// carried as `unaudited_listen_ports` — the key a machine reads the
+/// fail-closed listen-publish from, the way a person reads the text
+/// rendering's warning lines.
+pub fn write_policy_json_noting(
+    out: &mut impl std::io::Write,
+    effective: &sessions::EffectiveSessionPolicy,
+    network: sessions::NetworkMode,
+    fabric: Option<switch::SwitchSubnet>,
+    live: Result<Vec<minimald_rpc::LiveMapping>, String>,
+    unaudited_listen_ports: &[u16],
+) -> Result<(), anyhow::Error> {
     // A none box has no policy to describe; the text rendering's one-line
     // note is prose for a person, so the document carries the schema and
     // the mode alone, and every other key's absence says why.
@@ -2925,6 +2946,7 @@ pub fn write_policy_json(
             ingress: None,
             node_plane_baseline: None,
             live_ingress: None,
+            unaudited_listen_ports: &[],
         }
     } else {
         // The baseline set is a switch-fabric surface, held to the same
@@ -2971,6 +2993,7 @@ pub fn write_policy_json(
                 Ok(rows) => LiveIngressJson::Rows(rows),
                 Err(_) => LiveIngressJson::Unavailable,
             }),
+            unaudited_listen_ports,
         }
     };
     let encoded =
@@ -3097,6 +3120,7 @@ async fn session_policy_json_inputs(
         sessions::Record,
         sessions::EffectiveSessionPolicy,
         Result<Vec<minimald_rpc::LiveMapping>, String>,
+        Vec<u16>,
     ),
     PolicyJsonFailure,
 > {
@@ -3132,9 +3156,23 @@ async fn session_policy_json_inputs(
         .map_err(|error| PolicyJsonFailure::PolicyUnavailable(format!("{error:#}")))?;
 
     let live = fetch_live_ingress(&mut client, session).await;
+    // The listen publishes the audit log refused (NET-046), from the runtime
+    // facts the text walk reads them from. An optional fact: a daemon that
+    // cannot serve it says nothing to warn about.
+    let facts_lookup = match SessionLookup::parse(session) {
+        SessionLookup::Id(id) => minimald_rpc::GetSessionRuntimeFactsRequest::Id(id),
+        SessionLookup::Name(n) => minimald_rpc::GetSessionRuntimeFactsRequest::Name(n),
+    };
+    let unaudited_listen_ports = match client
+        .oneshot_rpc::<minimald_rpc::GetSessionRuntimeFacts>(facts_lookup)
+        .await
+    {
+        Ok(minimald_rpc::Errorable::Ok(facts)) => facts.unaudited_listen_ports,
+        Ok(minimald_rpc::Errorable::Err { .. }) | Err(_) => Vec::new(),
+    };
 
     match resp {
-        minimald_rpc::Errorable::Ok(policy) => Ok((record, policy, live)),
+        minimald_rpc::Errorable::Ok(policy) => Ok((record, policy, live, unaudited_listen_ports)),
         minimald_rpc::Errorable::Err { error } => {
             Err(PolicyJsonFailure::PolicyUnavailable(error.to_string()))
         }
@@ -3150,10 +3188,11 @@ async fn session_policy_json_inputs(
 /// by every command that takes `-o json` — writes, so the error path is
 /// one mechanism rather than a per-command one.
 async fn session_policy_as_json(global: &GlobalArgs, session: &str) -> Result<(), anyhow::Error> {
-    let (record, policy, live) = match session_policy_json_inputs(global, session).await {
-        Ok(inputs) => inputs,
-        Err(failure) => return Err(failure.machine_failure().into()),
-    };
+    let (record, policy, live, unaudited_listen_ports) =
+        match session_policy_json_inputs(global, session).await {
+            Ok(inputs) => inputs,
+            Err(failure) => return Err(failure.machine_failure().into()),
+        };
     // The fabric the baseline set builds from — keyed the same way the text
     // rendering keys it (see the comment in [`cmd_session_policy`]): the
     // backend this command actually talks to, with no fabric named for the
@@ -3161,7 +3200,15 @@ async fn session_policy_as_json(global: &GlobalArgs, session: &str) -> Result<()
     let fabric = (daemon_provider_kind(global) == paths::ProviderKind::Minvmd)
         .then_some(switch::SwitchSubnet::default());
     let mut out = std::io::stdout();
-    write_policy_json(&mut out, &policy, record.network, fabric, live).context(OutputWriteError)?;
+    write_policy_json_noting(
+        &mut out,
+        &policy,
+        record.network,
+        fabric,
+        live,
+        &unaudited_listen_ports,
+    )
+    .context(OutputWriteError)?;
     out.flush().context(OutputWriteError)?;
     Ok(())
 }
@@ -5022,6 +5069,34 @@ mod tests {
             String::from_utf8(out).unwrap(),
             "",
             "nothing refused, nothing said"
+        );
+
+        // The `-o json` document carries the same ports for a machine, and
+        // leaves the key out when there are none.
+        let policy = EffectiveSessionPolicy {
+            egress: EffectiveEgress::AllowAll,
+            ingress: None,
+        };
+        let document = |ports: &[u16]| {
+            let mut out = Vec::new();
+            write_policy_json_noting(
+                &mut out,
+                &policy,
+                NetworkMode::OwnIp,
+                None,
+                Ok(Vec::new()),
+                ports,
+            )
+            .unwrap();
+            serde_json_lenient::from_slice::<serde_json_lenient::Value>(&out).unwrap()
+        };
+        assert_eq!(
+            document(&[3000])["unaudited_listen_ports"],
+            serde_json_lenient::json!([3000])
+        );
+        assert!(
+            document(&[]).get("unaudited_listen_ports").is_none(),
+            "no refused listen, no key"
         );
     }
 
