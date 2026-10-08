@@ -134,14 +134,18 @@ printf '%s\n' "$cmd"
 grep -q "minzoned" <<<"$cmd" || fail "the command does not install minzoned"
 grep -q "launchctl bootstrap system $PLIST" <<<"$cmd" \
   || fail "the command does not bootstrap $LABEL"
-[ "$(grep -o 'sudo ' <<<"$cmd" | wc -l | tr -d ' ')" = 1 ] \
-  || fail "the command must ask for sudo exactly once"
+# `min net setup` runs this script with `sudo sh`, its one elevation, so
+# no step may call sudo itself (comment lines may name it).
+case "$cmd" in '#!/bin/sh'*) ;; *) fail "the command is not a /bin/sh script" ;; esac
+if grep -v '^[[:space:]]*#' <<<"$cmd" | grep -q 'sudo'; then
+  fail "a step of the command calls sudo itself"
+fi
 echo "::endgroup::"
 
 # --- 2. Run it ---------------------------------------------------------------
 
 echo "::group::run the command"
-sh -c "$cmd" || fail "the install command exited non-zero"
+sudo -n sh -c "$cmd" || fail "the install command exited non-zero"
 echo "::endgroup::"
 
 # --- 3. Custody --------------------------------------------------------------
@@ -250,7 +254,7 @@ echo "::endgroup::"
 # --- 7. Re-run ---------------------------------------------------------------
 
 echo "::group::the command re-runs clean"
-sh -c "$cmd" || fail "re-running the install command exited non-zero"
+sudo -n sh -c "$cmd" || fail "re-running the install command exited non-zero"
 expect_answer host.min.internal "NOERROR 127.0.0.1"
 echo "::endgroup::"
 

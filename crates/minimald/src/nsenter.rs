@@ -489,9 +489,10 @@ impl Injection {
     /// Mark this injection as entering a none box, so the shim reinstalls the
     /// none plan's full socket-family seal — every family but the ones the
     /// box's own network namespace confines (`AF_UNIX`, `AF_INET`,
-    /// `AF_INET6`, `AF_NETLINK`) — after joining the namespaces.  That seal
-    /// applies only when the injection joins the box's own network namespace;
-    /// one that does not falls back to `AF_UNIX` alone
+    /// `AF_INET6`, `AF_NETLINK` with `NETLINK_ROUTE` only) — after joining
+    /// the namespaces.  That seal applies only when the injection joins the
+    /// box's own network namespace; one that does not falls back to `AF_UNIX`
+    /// alone
     /// ([`injection_socket_filter`]).
     ///
     /// Every injection is sealed: without this marker the shim reinstalls the
@@ -648,7 +649,7 @@ pub struct ShimArgs {
 
     /// When present, the target session is a none box and the shim must
     /// re-install its full socket-family seal after joining the namespaces —
-    /// unix, inet, inet6 and netlink admitted when the join enters the box's
+    /// unix, inet, inet6 and netlink route admitted when the join enters the box's
     /// own network namespace, `AF_UNIX` alone when it does not. When absent the shim re-installs the
     /// confined-families seal, the one every other box launches under, which
     /// admits the families the box's namespace confines and refuses the
@@ -1234,7 +1235,7 @@ fn spawn_failed_on_missing_chdir(source: &std::io::Error, chdir: Option<&Path>) 
 }
 
 /// The socket-family filter an injected process installs after joining a
-/// box.  A none box's relaxed seal admits inet and netlink only because the
+/// box.  A none box's relaxed seal admits inet and netlink route only because the
 /// box's own network namespace confines them, so it applies only when the
 /// join enters that namespace (`join` names `Net`); an injection that stays
 /// in the daemon's namespace gets the unix-only seal instead, fail closed

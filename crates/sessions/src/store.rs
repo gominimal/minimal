@@ -10,7 +10,10 @@ use uuid::Uuid;
 
 use paths::{DaemonAbsPath, DaemonRelPath, sub_path};
 
-use crate::{Record, SessionId};
+use crate::{
+    Record, SessionId,
+    core::zone_answer::{HOST_ROW_LABEL, NODE_ROW_LABEL},
+};
 
 /// Describes the session object yielded by [`Loader`].
 pub trait SessionObject: Sized + Send + Clone + 'static + std::fmt::Debug {
@@ -791,8 +794,10 @@ impl DiskLoader {
 /// fixed host row, `local` is the legacy three-label form's host-id label,
 /// `localhost` is the loopback name, and `minimald` is the node namespace's
 /// row in the zone. Refused under ASCII case folding because box names are
-/// lower-cased.
-const RESERVED_SESSION_NAMES: [&str; 4] = ["host", "local", "localhost", "minimald"];
+/// lower-cased. The two node-row labels are read from
+/// [`crate::core::zone_answer`] so this list cannot drift from the
+/// registries that key those rows.
+const RESERVED_SESSION_NAMES: [&str; 4] = [HOST_ROW_LABEL, "local", "localhost", NODE_ROW_LABEL];
 
 /// Reject a session name that would break a downstream output contract.
 ///
@@ -1397,6 +1402,24 @@ mod tests {
                 validate_session_name(bad).err().map(|e| e.kind()),
                 Some(ErrorKind::InvalidInput),
                 "expected `{bad:?}` to be rejected",
+            );
+        }
+    }
+
+    /// Every node-row label the zone defines is reserved: a registry that
+    /// keys a new row under the apex must not let a session take its
+    /// label, so the reserved list has to carry the label too. This pins
+    /// the list to the zone's labels: a label added to
+    /// [`crate::core::zone_answer::NODE_ROW_LABELS`] without a matching
+    /// reserved entry fails here rather than in production.
+    #[test]
+    fn reserved_session_names_carry_every_node_row_label() {
+        for label in crate::core::zone_answer::NODE_ROW_LABELS {
+            assert!(
+                RESERVED_SESSION_NAMES
+                    .iter()
+                    .any(|reserved| reserved.eq_ignore_ascii_case(label)),
+                "node-row label `{label}` is missing from the reserved names"
             );
         }
     }

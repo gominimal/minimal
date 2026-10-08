@@ -595,19 +595,9 @@ struct AddressBook {
 /// longest a host resolver may keep answering the old name with it.
 const REUSE_QUARANTINE: Duration = Duration::from_secs(zone_answer::ANSWER_TTL_SECS as u64);
 
-/// The box addresses the answerer hands out: the reserved local range's
-/// `.2` to its last-but-one address (`.254` of the /24). The network
-/// address, `.1` and the broadcast address are never a box's.
-fn box_address_range() -> (Ipv4Addr, Ipv4Addr) {
-    let (network, prefix) = switch::RESERVED_LOCAL_RANGE;
-    let size = 1u32 << (32 - u32::from(prefix));
-    let first = u32::from(network);
-    (Ipv4Addr::from(first + 2), Ipv4Addr::from(first + size - 2))
-}
-
 /// Whether `address` is one the answerer hands a box.
 fn in_box_range(address: Ipv4Addr) -> bool {
-    let (first, last) = box_address_range();
+    let (first, last) = switch::box_loopback_interior();
     first <= address && address <= last
 }
 
@@ -642,7 +632,7 @@ impl AddressBook {
             .iter()
             .find(|(_, (was, _))| *was == holder)
             .map(|(address, _)| *address);
-        let (first, last) = box_address_range();
+        let (first, last) = switch::box_loopback_interior();
         let free = own.or_else(|| {
             (u32::from(first)..=u32::from(last))
                 .map(Ipv4Addr::from)
@@ -767,11 +757,15 @@ fn box_zone_name(name: &str) -> String {
 
 /// The one form a box's registry name is compared in wherever it keys the
 /// box's published address: the answerer's allocations and releases
-/// ([`box_zone_name`]) and the box registry's in-flight registrations
-/// ([`crate::box_registry::BoxRegistry::begin_registration`]). Names are
-/// DNS labels, so the fold is ASCII lower-case: "Web" and "web" are one
-/// box to the answerer, and must be one to everything its hold is checked
-/// against.
+/// ([`box_zone_name`]), the box registry's in-flight registrations
+/// ([`crate::box_registry::BoxRegistry::begin_registration`]), and its
+/// live rows — the row table's name lookups
+/// ([`crate::box_registry::BoxRegistry::row_by_name`]), a client
+/// registration's name-collision refusal
+/// ([`crate::box_registry::AllocationError::NameAlreadyHeld`]), and a
+/// client withdrawal's name proof. Names are DNS labels, so the fold is
+/// ASCII lower-case: "Web" and "web" are one box to the answerer, and must
+/// be one to everything its hold is checked against.
 pub(crate) fn canonical_box_name(name: &str) -> String {
     name.to_ascii_lowercase()
 }
@@ -891,7 +885,7 @@ impl RegisteredTables {
                 && address != Ipv4Addr::LOCALHOST
             {
                 if !in_box_range(address) {
-                    let (first, last) = box_address_range();
+                    let (first, last) = switch::box_loopback_interior();
                     refused.push(RefusedRow {
                         name: row.name,
                         reason: format!(
@@ -1385,8 +1379,10 @@ const OWN_TABLE: &str = "this host's own table";
 /// is refused, like every name the answerer holds first.
 ///
 /// Public so the CLI's query asks for the name this answerer holds — one
-/// definition, so the question and the answer cannot drift apart.
-pub const HOST_NAME: &str = "host.min.internal";
+/// definition, so the question and the answer cannot drift apart. The name
+/// itself is the sessions zone's host row, the one spelling every registry
+/// reads.
+pub const HOST_NAME: &str = zone_answer::HOST_ROW_NAME;
 
 /// The source the answerer's own [`HOST_NAME`] row keeps its name under in
 /// the fold: the keeper a refused registration's warn names.
@@ -3562,6 +3558,15 @@ mod tests {
 
     use super::*;
 
+    /// The answerer's own row is the sessions zone's host row, byte for byte:
+    /// the CLI's liveness query reads [`HOST_NAME`], so a spelling that drifts
+    /// from the zone fails here rather than as a dead liveness probe.
+    #[test]
+    fn host_name_is_the_zone_host_row() {
+        assert_eq!(HOST_NAME, "host.min.internal");
+        assert_eq!(HOST_NAME, zone_answer::HOST_ROW_NAME);
+    }
+
     /// A `MakeWriter` accumulating everything written into a shared buffer, so
     /// a test can assert on the structured fields a `tracing` event emitted —
     /// the same scaffolding the native daemon's answerer tests build, because
@@ -5544,7 +5549,7 @@ mod tests {
         // With every other address held, the allocation fails naming the
         // wait — it never hands the quarantined address out early.
         let mut full = AddressBook::default();
-        let (first, last) = box_address_range();
+        let (first, last) = switch::box_loopback_interior();
         for (index, _) in (u32::from(first)..=u32::from(last)).enumerate() {
             full.allocate_at("node-a", &format!("box{index}"), t0)
                 .expect("the range holds it");

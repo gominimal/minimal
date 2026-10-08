@@ -465,6 +465,24 @@ pub enum EffectiveEgress {
     Declared(EgressPolicy),
 }
 
+impl EffectiveEgress {
+    /// The one-line verdict the egress block prints in place of its rows,
+    /// or `None` when the section has rule rows to list. A default is marked
+    /// as one (`deny-all (default)`, `allow-all (default)`); a declared
+    /// deny-all ([`EgressPolicy::admits_nothing`]) prints unmarked, because
+    /// the box chose it. The single source for `min session policy` and the
+    /// TUI's detail pane, so the two never spell a verdict differently.
+    #[must_use]
+    pub fn summary_label(&self) -> Option<&'static str> {
+        match self {
+            Self::DenyAll => Some("deny-all (default)"),
+            Self::AllowAll => Some("allow-all (default)"),
+            Self::Declared(egress) if egress.admits_nothing() => Some("deny-all"),
+            Self::Declared(_) => None,
+        }
+    }
+}
+
 /// The answer `GetEffectiveSessionPolicy` serves and `min session policy`
 /// renders (NET-075) — the shape that can carry
 /// [`EffectiveEgress::DenyAll`] without rewriting the strict
@@ -583,8 +601,13 @@ pub enum PolicyError {
     /// An egress policy was set on a [`NetworkMode::NoNet`] `PTask`. An
     /// own-address (`OwnIp`) and a host-address (`HostNet`) box both carry a
     /// network their egress rules can bound; a none box has none, so there is
-    /// nothing to enforce the declaration on and it is rejected.
-    #[error("egress policy is only valid for an own-IP or host-address PTask, not {mode:?}")]
+    /// nothing to enforce the declaration on and it is rejected. Names the
+    /// mode word, not the `Debug` name, as the ingress variants below do.
+    #[error(
+        "egress rules need network mode own_ip or host_ip (this box is {}): a none box \
+         has no network to apply them to",
+        .mode.word()
+    )]
     EgressRequiresNetwork { mode: NetworkMode },
     /// A static ingress port mapping was set on a `PTask` that is not
     /// [`NetworkMode::OwnIp`]. Names the policy fields and the mode word, not
@@ -1221,6 +1244,28 @@ impl Record {
 mod tests {
     use super::*;
 
+    /// The verdict strings `min session policy` and the TUI pane both print.
+    #[test]
+    fn effective_egress_summary_labels_are_pinned() {
+        assert_eq!(
+            EffectiveEgress::DenyAll.summary_label(),
+            Some("deny-all (default)")
+        );
+        assert_eq!(
+            EffectiveEgress::AllowAll.summary_label(),
+            Some("allow-all (default)")
+        );
+        assert_eq!(
+            EffectiveEgress::Declared(EgressPolicy::deny_all()).summary_label(),
+            Some("deny-all")
+        );
+        let rules = EgressPolicy {
+            allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
+            ..EgressPolicy::deny_all()
+        };
+        assert_eq!(EffectiveEgress::Declared(rules).summary_label(), None);
+    }
+
     /// `word()` pins the CLI and spec vocabulary, and stays distinct from
     /// the serde form where the two spellings differ: a refactor that
     /// routed either through the other would rename a log field or a wire
@@ -1548,11 +1593,18 @@ mod tests {
             NetworkMode::NoNet,
             SessionPolicy::new(Some(EgressPolicy::default()), None),
         );
+        let err = record.validate_policy().unwrap_err();
         assert_eq!(
-            record.validate_policy(),
-            Err(PolicyError::EgressRequiresNetwork {
+            err,
+            PolicyError::EgressRequiresNetwork {
                 mode: NetworkMode::NoNet
-            })
+            }
+        );
+        // The refusal names the mode word, not the `Debug` name.
+        assert_eq!(
+            err.to_string(),
+            "egress rules need network mode own_ip or host_ip (this box is none): a none box \
+             has no network to apply them to"
         );
     }
 

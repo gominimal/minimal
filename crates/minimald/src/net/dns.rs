@@ -70,8 +70,9 @@ use std::time::Duration;
 
 use super::SwitchSubnet;
 
-/// The DNS suffix every PTask box name carries (see the module docs).
-pub const HOSTNAME_SUFFIX: &str = "min.internal";
+/// The DNS suffix every PTask box name carries (see the module docs). Read
+/// from the sessions zone's apex, the one spelling every registry shares.
+pub const HOSTNAME_SUFFIX: &str = sessions::core::zone_answer::ZONE_APEX;
 
 /// Whether `name` is a box-zone name — the zone apex itself or any name under
 /// it (NET-072). `name` is an already-normalized qname in presentation form:
@@ -2484,6 +2485,28 @@ mod tests {
     /// declaration behind it.
     fn leased_ports() -> BTreeMap<u16, u16> {
         BTreeMap::from([(18080, 8080)])
+    }
+
+    /// The daemon's zone spellings are the sessions zone's, byte for byte:
+    /// the box suffix is the apex, the switch's host name and the host-net
+    /// `/etc/hosts` entry are the host row, and the gvproxy config renders
+    /// the zone and the host row's label. A spelling that drifts from the
+    /// zone fails here.
+    #[test]
+    fn zone_spellings_are_the_sessions_zone() {
+        use sessions::core::zone_answer::{HOST_ROW_LABEL, HOST_ROW_NAME, ZONE_APEX};
+
+        assert_eq!(HOSTNAME_SUFFIX, "min.internal");
+        assert_eq!(HOSTNAME_SUFFIX, ZONE_APEX);
+        assert_eq!(crate::net::switch::HOST_MIN_INTERNAL, "host.min.internal");
+        assert_eq!(sandbox2::HOST_MIN_INTERNAL, HOST_ROW_NAME);
+        let yaml = ::switch::render_gvproxy_config(::switch::SwitchSubnet::default(), &[]);
+        assert!(
+            yaml.contains(&format!(
+                "    - name: \"{ZONE_APEX}.\"\n      records:\n        - name: \"{HOST_ROW_LABEL}\"\n"
+            )),
+            "the gvproxy zone record spells the zone's host row; config was:\n{yaml}"
+        );
     }
 
     /// NET-072's name boundary: the zone the gate carves out of the

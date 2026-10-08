@@ -4552,6 +4552,14 @@ impl SessionLauncher for SandboxLauncher {
             command.stdin(hakoniwa::Stdio::from(pty.dup_slave_fd()?));
             command.stdout(hakoniwa::Stdio::from(pty.dup_slave_fd()?));
             let tty_path = pty.slave_path().to_path_buf();
+            // Kept for one notice written after the switch attach below (an
+            // own-address box the hostname proxy stranded), so it is said in
+            // the terminal, not only in the daemon's log. Never for a hook
+            // launch: its pty is read by nobody. Dropped before the launch
+            // returns, so it never outlives the shell's own slave fds.
+            let late_notice_fd = (matches!(network_mode, NetworkMode::OwnIp) && !for_hooks)
+                .then(|| pty.dup_slave_fd().ok())
+                .flatten();
             let (master, slave) = pty.into_fds();
             command.stderr(hakoniwa::Stdio::from(slave));
 
@@ -4562,11 +4570,11 @@ impl SessionLauncher for SandboxLauncher {
             // `command`/`container` no longer borrow `env`, so it can be moved
             // into the host to keep its backing files alive.
             drop(container);
-            Ok::<_, io::Error>((env, master, process, tty_path))
+            Ok::<_, io::Error>((env, master, process, tty_path, late_notice_fd))
         }
         .await;
 
-        let (env, master, process, tty_path) = match build_and_spawn {
+        let (env, master, process, tty_path, late_notice_fd) = match build_and_spawn {
             Ok(parts) => parts,
             Err(e) => return Err(e),
         };
@@ -4661,6 +4669,30 @@ impl SessionLauncher for SandboxLauncher {
             .as_ref()
             .and_then(|reporter| reporter.published_address());
         let gate = lease.and_then(crate::net::switch::live_gate);
+        // Design §7.1: a box that attached while the hostname proxy was not
+        // serving past the settle was compiled with no node-address opening
+        // (fail closed rather than at a port the proxy may not hold), so it
+        // cannot reach the hostname proxy until it restarts. Said in the
+        // session's own terminal — the person whose `HTTP(S)_PROXY` requests
+        // will not route is told why and what clears it — beside the
+        // daemon's warning. Best-effort, like the banner notices above.
+        if let (Some(fd), Some(lease)) = (late_notice_fd, lease)
+            && net_switch.lock().await.hostname_proxy_stranded(lease)
+        {
+            use std::io::Write as _;
+            let written = std::fs::File::from(fd).write_all(
+                b"minimal: the hostname proxy was not serving yet when this session's \
+                  box attached, so the box cannot reach it (*.min.internal requests \
+                  through HTTP(S)_PROXY will not route); restart the session once the \
+                  daemon's hostname proxy serves\r\n",
+            );
+            if let Err(e) = written {
+                tracing::debug!(
+                    error = %e,
+                    "could not print the hostname-proxy notice to the terminal"
+                );
+            }
+        }
         if matches!(network_mode, NetworkMode::OwnIp)
             && (lease.is_none() || published.is_none() || gate.is_none())
         {
