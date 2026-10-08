@@ -257,21 +257,60 @@ pub async fn fetch_screen(
     Ok(resp.ok())
 }
 
+/// Whether a session holds its name in the VM host's zone in place of a
+/// row: a `host_ip` box shares the node's own row, so `min session
+/// activate` holds its name (NODATA) instead of registering one.
+fn holds_name(record: &sessions::Record) -> bool {
+    record.network == NetworkMode::HostNet && record.box_addresses.is_none()
+}
+
+/// Holds or releases a name on the VM host daemon beside `sock`, off the
+/// async workers: the control exchange is a blocking socket call.
+async fn hold_box_name(sock: &Path, name: &str, hold: bool) {
+    let (sock, name) = (sock.to_path_buf(), name.to_string());
+    if let Err(error) = tokio::task::spawn_blocking(move || {
+        minimal_client::attach::hold_box_name_beside(&sock, &name, hold);
+    })
+    .await
+    {
+        tracing::warn!(%error, "the box name hold's thread failed");
+    }
+}
+
+/// The session's record, best-effort: `None` when it cannot be read.
+async fn record_of(provider: &mut Provider, id: SessionId) -> Option<sessions::Record> {
+    timed::<GetSessionRecord>(&mut provider.client, GetSessionRecordRequest::Id(id))
+        .await
+        .ok()
+        .and_then(|resp| resp.record)
+}
+
+/// Destroys the session, then releases the zone hold its name kept when it
+/// is a `host_ip` box, the release `min session destroy` makes too.
 pub async fn destroy(provider: &mut Provider, id: SessionId) -> Result<(), anyhow::Error> {
+    let record = record_of(provider, id).await;
     match timed::<DestroySession>(&mut provider.client, DestroySessionRequest { id })
         .await
         .context("DestroySession RPC failed")?
     {
-        Errorable::Ok(_) => Ok(()),
+        Errorable::Ok(_) => {
+            if let Some(name) = record.filter(holds_name).and_then(|record| record.name) {
+                hold_box_name(&provider.sock, &name, false).await;
+            }
+            Ok(())
+        }
         Errorable::Err { error } => Err(anyhow::anyhow!(error)),
     }
 }
 
+/// Renames the session; a `host_ip` box's zone hold moves with the name, as
+/// `min session rename` moves it.
 pub async fn rename(
     provider: &mut Provider,
     id: SessionId,
     new_name: &str,
 ) -> Result<(), anyhow::Error> {
+    let record = record_of(provider, id).await;
     match timed::<RenameSession>(
         &mut provider.client,
         RenameSessionRequest {
@@ -282,8 +321,33 @@ pub async fn rename(
     .await
     .context("RenameSession RPC failed")?
     {
-        Errorable::Ok(_) => Ok(()),
+        Errorable::Ok(_) => {
+            if let Some(record) = record.filter(holds_name) {
+                if let Some(old_name) = record.name.as_deref() {
+                    hold_box_name(&provider.sock, old_name, false).await;
+                }
+                hold_box_name(&provider.sock, new_name, true).await;
+            }
+            Ok(())
+        }
         Errorable::Err { error } => Err(anyhow::anyhow!(error)),
+    }
+}
+
+/// Releases `name`'s zone hold once an attach from the dashboard has ended
+/// with no session left by that name: the shell-exit prompt's Delete
+/// destroys the session daemon-side, past [`destroy`]. A lookup that fails
+/// releases nothing; a session still there keeps its hold.
+pub async fn release_held_name_after_attach(provider: &mut Provider, name: &str) {
+    let lookup = timed::<GetSessionRecord>(
+        &mut provider.client,
+        GetSessionRecordRequest::Name(name.to_string()),
+    )
+    .await;
+    if let Ok(resp) = lookup
+        && resp.record.is_none()
+    {
+        hold_box_name(&provider.sock, name, false).await;
     }
 }
 
