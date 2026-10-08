@@ -695,6 +695,34 @@ pub struct RegisterBoxRequest {
 /// from then on the row stays when the connection closes.
 pub const REGISTRATION_COMMIT_LINE: &str = "commit";
 
+/// How each of the VM host daemon's address-capacity refusals of a
+/// registration opens: the switch's hand-out run, the loopback slice, and
+/// the machine's zone answerer, each with nothing left to hand out. The
+/// refusal travels as a [`BoxControlReply::Error`] sentence; the daemon
+/// spells these openings from here and the client classifies a refusal by
+/// them ([`is_address_capacity_refusal`]), so the two cannot drift.
+pub const SWITCH_PLAN_EXHAUSTED: &str = "the switch's address plan is exhausted";
+/// See [`SWITCH_PLAN_EXHAUSTED`].
+pub const LOOPBACK_SLICE_EXHAUSTED: &str = "the host's loopback slice is exhausted";
+/// See [`SWITCH_PLAN_EXHAUSTED`]: the answerer's refusal, which names the
+/// run after it.
+pub const BOX_ADDRESSES_EXHAUSTED: &str = "every box address in";
+
+/// Whether a registration refusal is the host running out of addresses
+/// for a box — the host cannot hold one more — rather than a refusal of
+/// this box's declaration. Matched anywhere in the sentence: the control
+/// socket prefixes the answerer's reason with its own.
+#[must_use]
+pub fn is_address_capacity_refusal(error: &str) -> bool {
+    [
+        SWITCH_PLAN_EXHAUSTED,
+        LOOPBACK_SLICE_EXHAUSTED,
+        BOX_ADDRESSES_EXHAUSTED,
+    ]
+    .iter()
+    .any(|opening| error.contains(opening))
+}
+
 /// The withdrawal a destroyed session's client sends for the row its
 /// activation registered: the name the row went by and the pair the
 /// registration handed back. The pair is the proof that the withdrawer is

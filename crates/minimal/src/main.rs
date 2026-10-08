@@ -147,7 +147,7 @@ async fn run() -> ExitCode {
                 MachineModeAnswer::Quiet => return ExitCode::from(141),
                 MachineModeAnswer::Object(failure) => {
                     emit_machine_mode_error(&failure);
-                    return ExitCode::FAILURE;
+                    return ExitCode::from(failure_exit_code(&e));
                 }
             }
         }
@@ -157,9 +157,30 @@ async fn run() -> ExitCode {
             return ExitCode::from(141);
         }
         eprintln!("error: {e:#}");
-        return ExitCode::FAILURE;
+        return ExitCode::from(failure_exit_code(&e));
     }
     ExitCode::SUCCESS
+}
+
+/// The exit code a failed run ends with, from the architecture's reserved
+/// codes ("Exit codes"): 7 when the VM host could not be reached to
+/// register or resume an own-address box's row (provider/host
+/// unreachable, #1790), 8 when the host refused the registration for want
+/// of addresses (insufficient resources), and 1, the unspecified error,
+/// for everything else — a refusal the host answered included. Both
+/// output modes end with the same code.
+fn failure_exit_code(e: &anyhow::Error) -> u8 {
+    if e.downcast_ref::<minimal_client::box_registration::HostUnreachable>()
+        .is_some()
+    {
+        return 7;
+    }
+    if e.downcast_ref::<minimal_client::box_registration::HostAddressesExhausted>()
+        .is_some()
+    {
+        return 8;
+    }
+    1
 }
 
 /// Whether the error's root cause is a broken pipe: the writer's reader
@@ -189,15 +210,38 @@ enum MachineModeAnswer {
 /// payload it already failed into. A broken pipe means the consumer hung
 /// up, so the run exits quietly. A failure the command tagged as its own
 /// document write ([`minimal::OutputWriteError`]) is `output_failed`, so a
-/// script can tell it from a crash. Anything else is `unspecified`, the
-/// exit table's unspecified error, with the chain as its message and no
-/// hint, because nothing about it is known to name a remedy.
+/// script can tell it from a crash. A VM host that could not be reached is
+/// `host_unreachable`, and one out of addresses `insufficient_resources`,
+/// beside the exit codes [`failure_exit_code`] gives them. Anything else is
+/// `unspecified`, the exit table's unspecified error, with the chain as its
+/// message and no hint, because nothing about it is known to name a remedy.
 fn machine_mode_answer(e: &anyhow::Error) -> MachineModeAnswer {
     if let Some(failure) = e.downcast_ref::<minimal::MachineModeFailure>() {
         return MachineModeAnswer::Object(failure.clone());
     }
     if is_broken_pipe(e) {
         return MachineModeAnswer::Quiet;
+    }
+    if e.downcast_ref::<minimal_client::box_registration::HostUnreachable>()
+        .is_some()
+    {
+        return MachineModeAnswer::Object(minimal::MachineModeFailure::new(
+            "host_unreachable",
+            format!("{e:#}"),
+            "the VM host daemon is not answering; check that it is running (`minvmd status`)"
+                .to_string(),
+        ));
+    }
+    if e.downcast_ref::<minimal_client::box_registration::HostAddressesExhausted>()
+        .is_some()
+    {
+        return MachineModeAnswer::Object(minimal::MachineModeFailure::new(
+            "insufficient_resources",
+            format!("{e:#}"),
+            "the VM host has no address left for another box; destroy a session you no \
+             longer need and try again"
+                .to_string(),
+        ));
     }
     if e.downcast_ref::<minimal::OutputWriteError>().is_some() {
         return MachineModeAnswer::Object(minimal::MachineModeFailure::new(
@@ -700,6 +744,40 @@ mod tests {
             1,
             "one object, one line, nothing else: {line}"
         );
+    }
+
+    /// #1790: a VM host that could not be reached ends the run with 7 —
+    /// provider/host unreachable — found through every context the
+    /// activation adds over it, and a machine-mode run answers it with the
+    /// `host_unreachable` object and the same code. Any other failure stays
+    /// the unspecified error, 1, in both modes.
+    #[test]
+    fn host_unreachable_exits_7_in_both_output_modes() {
+        let unreachable = minimal_client::box_registration::HostUnreachable::over(
+            std::io::Error::from(std::io::ErrorKind::NotFound),
+            "connecting to the VM host daemon's box control socket at /x/control.sock",
+        )
+        .context("registering the box with the VM host daemon failed")
+        .context("activating the session");
+        assert_eq!(failure_exit_code(&unreachable), 7);
+        match machine_mode_answer(&unreachable) {
+            MachineModeAnswer::Object(failure) => {
+                assert_eq!(failure.code(), "host_unreachable");
+                assert!(
+                    failure.message().contains("/x/control.sock"),
+                    "the message is the chain the text mode prints: {}",
+                    failure.message()
+                );
+            }
+            MachineModeAnswer::Quiet => panic!("an unreachable host is an error object"),
+        }
+
+        let refused = anyhow::anyhow!("the VM host daemon refused the box registration: no");
+        assert_eq!(failure_exit_code(&refused), 1);
+        match machine_mode_answer(&refused) {
+            MachineModeAnswer::Object(failure) => assert_eq!(failure.code(), "unspecified"),
+            MachineModeAnswer::Quiet => panic!("a refusal is an error object"),
+        }
     }
 
     /// A broken pipe anywhere in the error chain is classified as such, so

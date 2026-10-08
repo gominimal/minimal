@@ -1410,11 +1410,14 @@ pub enum AllocationError {
     /// and still inside its reuse quarantine ([`SwitchAddressBook`]). The
     /// counts say which, so the refusal tells an exhausted plan from one
     /// that frees an address shortly.
-    #[error("the switch's address plan is exhausted: {0}")]
+    #[error("{}: {}", minimald_rpc::SWITCH_PLAN_EXHAUSTED, .0)]
     SwitchExhausted(HandOutCounts),
     /// Every address in the loopback slice this subnet's switch publishes
     /// at is handed out.
-    #[error("the host's loopback slice is exhausted; no published address remains")]
+    #[error(
+        "{}; no published address remains",
+        minimald_rpc::LOOPBACK_SLICE_EXHAUSTED
+    )]
     LoopbackExhausted,
     /// The address plan does not serve this registry's subnet, so no box
     /// address can be allocated against it. An explicit registration
@@ -4914,12 +4917,17 @@ fn box_loopback_run(slice: switch::LoopbackSlice) -> (u32, u32) {
 /// ([`BoxRegistry::register_client_box`]); the daemon's switch addresses
 /// come from the hand-out book ([`SwitchAddressBook`]). Relaxed ordering: a
 /// cursor's only invariant is that no two takes return the same address,
-/// which an atomic add gives on every ordering; the run's bounds are
-/// checked on the taken value, so even a cursor advanced past its run's
-/// end (or wrapped) hands out nothing.
+/// which an atomic update gives on every ordering. The cursor advances by
+/// a checked add, so it stops at `u32::MAX` rather than wrapping back
+/// into a run it already handed out, and the run's bounds are checked on
+/// the taken value, so a cursor past its run's end hands out nothing.
 #[cfg(test)]
 fn take_next(cursor: &AtomicU32, first: u32, last: u32) -> Option<Ipv4Addr> {
-    let next = cursor.fetch_add(1, Ordering::Relaxed);
+    let next = cursor
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+            next.checked_add(1)
+        })
+        .ok()?;
     (first <= next && next <= last).then(|| Ipv4Addr::from(next))
 }
 
@@ -7130,6 +7138,25 @@ mod tests {
             "a registration of the name in flight owns the address, so it is not released"
         );
         drop(in_flight);
+    }
+
+    /// The loopback cursor never wraps (#1790): at `u32::MAX` it stops,
+    /// so a run that spans the whole space hands nothing past its end
+    /// rather than handing its first address again.
+    #[test]
+    fn take_next_never_wraps_its_cursor() {
+        let cursor = AtomicU32::new(u32::MAX - 1);
+        assert_eq!(
+            take_next(&cursor, 0, u32::MAX),
+            Some(Ipv4Addr::from(u32::MAX - 1))
+        );
+        assert_eq!(take_next(&cursor, 0, u32::MAX), None, "the cursor's end");
+        assert_eq!(
+            take_next(&cursor, 0, u32::MAX),
+            None,
+            "a cursor at its end stays there, never wrapping back to 0.0.0.0"
+        );
+        assert_eq!(cursor.load(Ordering::Relaxed), u32::MAX);
     }
 
     /// Activate-and-destroy cycles past the run's size never exhaust it: a

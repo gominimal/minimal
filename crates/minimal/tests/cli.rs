@@ -4505,3 +4505,140 @@ async fn task_run_exits_with_held_open_stdin_pipe() {
         String::from_utf8_lossy(&stdout)
     );
 }
+
+// --- fail closed on an unreachable VM host (#1790) ---
+//
+// An own-address activation on a VM-backed host registers its box with the
+// VM host daemon first; under the in-force gate a box with no host row
+// reaches nothing, so a registration that cannot be made ends the
+// activation with the architecture's reserved code: 7 when the host cannot
+// be reached, 8 when it refused for want of addresses, and 1 for any other
+// refusal. Driven through the compiled binary: the contract is the exit
+// status.
+
+/// Runs `min session activate --network own_ip` against a VM host state
+/// dir — its daemon recorded Running with the alive lock held, so the
+/// activation spawns nothing, and a real daemon on its ssh socket, so the
+/// create is one registration away from succeeding — whose box control
+/// socket `stand_up` puts in place, or not. The value `stand_up` returns is
+/// held until the binary exits.
+async fn activate_own_ip_on_vm_host<G>(
+    stand_up: impl FnOnce(&std::path::Path) -> G,
+) -> std::process::Output {
+    let state = tempfile::TempDir::new().unwrap();
+    let provider_dir = state.path().join("providers").join("local-minvmd0");
+    let state_dir = minvmd::state::StateDir::new(provider_dir.clone()).unwrap();
+    state_dir
+        .write_state(&minvmd::state::State {
+            lifecycle: minvmd::lifecycle::Lifecycle::Running,
+            ..minvmd::state::State::stopped()
+        })
+        .unwrap();
+    let _alive = state_dir.try_acquire_alive_lock().unwrap();
+    let server = minimald::test_harness::TestServer::new().await;
+    server.listen_on_uds(&provider_dir.join("ssh.sock")).await;
+    let _control = stand_up(&provider_dir.join("control.sock"));
+
+    let project = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir(project.path().join(".git")).unwrap();
+    let config_dir = tempfile::TempDir::new().unwrap();
+    tokio::process::Command::new(env!("CARGO_BIN_EXE_min"))
+        .args(["--minimal-dir".as_ref(), state.path().as_os_str()])
+        .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
+        .args(["--provider", "local-minvmd", "--no-input"])
+        .args(["session", "activate"])
+        .arg(project.path())
+        .args(["--name", "web", "--network", "own_ip", "--no-prompt"])
+        .output()
+        .await
+        .expect("the min binary should be invocable")
+}
+
+/// A box control socket that answers every request with `reply`, one line
+/// per connection.
+fn answering_control_sock(path: &std::path::Path, reply: &'static str) {
+    let listener = tokio::net::UnixListener::bind(path).unwrap();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let mut lines = tokio::io::BufReader::new(stream);
+            let mut line = String::new();
+            if lines.read_line(&mut line).await.is_err() {
+                return;
+            }
+            let mut writer = lines.into_inner();
+            let _ = writer.write_all(format!("{reply}\n").as_bytes()).await;
+        }
+    });
+}
+
+/// No control socket beside the VM host's ssh socket: the registration
+/// cannot connect, so the activation fails closed with 7, naming the
+/// socket it could not reach.
+#[tokio::test]
+async fn activate_exits_7_when_the_vm_host_is_unreachable() {
+    let out = activate_own_ip_on_vm_host(|_| ()).await;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(7), "stderr: {stderr}");
+    assert!(
+        stderr.contains("control socket") && stderr.contains("control.sock"),
+        "the error names the socket it could not reach: {stderr}"
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "no session id for an activation that failed"
+    );
+}
+
+/// A control socket that accepts the registration and never answers: the
+/// bound passes, and the activation fails closed with 7 rather than
+/// hanging or starting the box unregistered.
+#[tokio::test]
+async fn activate_exits_7_when_the_vm_host_does_not_answer_in_time() {
+    let out = activate_own_ip_on_vm_host(|path| {
+        // Bound and never accepted: the connect lands in the backlog and
+        // the request's reply never comes.
+        std::os::unix::net::UnixListener::bind(path).unwrap()
+    })
+    .await;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(7), "stderr: {stderr}");
+    assert!(
+        stderr.contains("did not answer the box registration"),
+        "the error names the deadline: {stderr}"
+    );
+}
+
+/// A refusal the VM host answers is not an unreachable host: the host was
+/// reached. A refusal of the declaration is the unspecified error, 1.
+#[tokio::test]
+async fn activate_exits_1_when_the_vm_host_refuses_the_box() {
+    let out = activate_own_ip_on_vm_host(|path| {
+        answering_control_sock(path, r#"{"error":"the declaration names no box"}"#);
+    })
+    .await;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "stderr: {stderr}");
+    assert!(
+        stderr.contains("refused the box registration: the declaration names no box"),
+        "the error carries the daemon's reason: {stderr}"
+    );
+}
+
+/// A refusal for want of addresses is the host unable to hold one more
+/// box: insufficient resources, 8.
+#[tokio::test]
+async fn activate_exits_8_when_the_vm_host_is_out_of_addresses() {
+    let out = activate_own_ip_on_vm_host(|path| {
+        answering_control_sock(
+            path,
+            r#"{"error":"the switch's address plan is exhausted: 0 live, 0 quarantined, 0 capacity"}"#,
+        );
+    })
+    .await;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(8), "stderr: {stderr}");
+    assert!(
+        stderr.contains("address plan is exhausted"),
+        "the error carries the daemon's reason: {stderr}"
+    );
+}

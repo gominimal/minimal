@@ -579,47 +579,20 @@ fn run_foreground() -> Result<()> {
     // allocated switch and loopback addresses from, and asks for the
     // answerer's state — the read that never goes through the in-VM
     // daemon, because a guest relaying a host fact is forgeable from
-    // inside the escape boundary. Bound before the guest boots, so a
+    // inside the escape boundary — and the guest report door's bridge pair
+    // beside it (T94, NET-138). Both are bound before the guest boots, so a
     // session activated against this VM can only ever be handed an address
-    // this table holds. Best-effort at startup, like the switch above: a
-    // bind failure is warned and the VM still boots — a registration then
-    // degrades to the gate's announced interim, exactly as against a
-    // supervisor predating the socket — rather than failing a boot the
-    // client could still activate against.
-    let _control = crate::control::resolve_control_sock()
-        .and_then(|sock_path| {
-            crate::control::spawn(
-                sock_path,
-                boxes.clone(),
-                answerer_status.clone(),
-                proxy_publish.clone(),
-            )
-        })
-        .inspect_err(|error| {
-            tracing::warn!(
-                %error,
-                "failed to bind the box-registration control socket; own-address \
-                 activations will not be handed addresses (the egress gate's \
-                 announced interim applies)"
-            );
-        })
-        .ok();
-
-    // The guest report door's bridge pair (T94, NET-138): the door is bound
-    // and handed to the VMM child as one step — the env the child registers
-    // [`minimald_rpc::VM_HOST_BOX_REPORT_PORT`] against is produced only
-    // when the door bound, so the door stands exactly once the bridge is
-    // up: no boot bridges a door it did not bind, and no bound door waits
-    // behind a bridge that never comes up. Best-effort at startup, like
-    // the control socket above: a bind failure is warned and the VM still
-    // boots — its runtime publishes then fail the in-VM report instead of
-    // being recorded, which the box's own log says — rather than failing a
-    // boot a registration could still activate against.
-    let guest_report_door = crate::control::resolve_control_sock()
-        .and_then(|sock_path| {
-            guest_report_door_env(&sock_path, &boxes, &answerer_status, &proxy_publish)
-        })
-        .ok();
+    // this table holds. A bind failure of either is fatal (#1790): with no
+    // control socket no own-address box can register, and the gate admits
+    // no unregistered source, so a VM booted without it would run boxes
+    // that reach nothing — the supervisor exits naming the socket instead.
+    let (_control, guest_report_door) = bind_box_doors(
+        &crate::control::resolve_control_sock()
+            .context("resolving the box-registration control socket's path")?,
+        &boxes,
+        &answerer_status,
+        &proxy_publish,
+    )?;
 
     // The host answerer (NET-138): the box zone's answerer on the host
     // loopback, answering from this host-authored table — the same
@@ -636,7 +609,7 @@ fn run_foreground() -> Result<()> {
     // one, is the one answerer the machine runs. Started beside the switch,
     // before the guest boots, so the node row the registration above
     // published answers from the moment the VM does — best-effort at
-    // startup, like the control socket: a thread that could not spawn is
+    // startup, unlike the control socket: a thread that could not spawn is
     // warned and the VM still boots, its names then answering from whatever
     // answerer holds the port.
     if let Err(error) =
@@ -897,12 +870,11 @@ fn run_foreground() -> Result<()> {
         // The guest report door's path travels the same way the marker
         // socket's does: the child is the process that owns the libkrun
         // context, so it is the one that registers the door's vsock port at
-        // [`minimald_rpc::VM_HOST_BOX_REPORT_PORT`] — and it registers it
-        // only when the supervisor bound a door, which is what the env
+        // [`minimald_rpc::VM_HOST_BOX_REPORT_PORT`] — the door the
+        // supervisor bound before the first boot, which is what the env
         // names. A redraw hands the same door to the fresh boot.
-        if let Some((name, path)) = guest_report_door.as_ref() {
-            cmd.env(name, path);
-        }
+        let (name, path) = &guest_report_door;
+        cmd.env(name, path);
         child = cmd
             .env(MARKER_SOCK_ENV, &marker_sock_path)
             // The node's proxy port travels to the guest through the VMM child's
@@ -2190,13 +2162,67 @@ fn draw_publish_generation() -> u64 {
     hasher.finish()
 }
 
+/// Bind the host's two box doors beside each other before the guest boots
+/// (T66, T94, NET-138): the box-registration control socket at
+/// `control_sock_path`, whose accept loop's handle the caller holds for the
+/// daemon's life, and the guest report door beside it, answered as the env
+/// pair the VMM child registers the door's vsock port from. Either bind
+/// failing is the supervisor's startup error, naming the socket and the
+/// cause (#1790): under the in-force gate a box with no host row reaches
+/// nothing, so there is no interim a boot without its doors could degrade
+/// to.
+#[cfg_attr(
+    not(minvmd_libkrun),
+    allow(
+        dead_code,
+        reason = "only the libkrun boot loop binds the doors, so every other \
+                  target compiles them unreached"
+    )
+)]
+fn bind_box_doors(
+    control_sock_path: &std::path::Path,
+    boxes: &crate::box_registry::BoxRegistry,
+    answerer: &crate::net::answerer::AnswererStatus,
+    proxy_publish: &crate::control::ProxyPublishStatus,
+) -> Result<(
+    std::thread::JoinHandle<()>,
+    (&'static str, std::path::PathBuf),
+)> {
+    use anyhow::Context as _;
+    let control = crate::control::spawn(
+        control_sock_path.to_path_buf(),
+        boxes.clone(),
+        answerer.clone(),
+        proxy_publish.clone(),
+    )
+    .with_context(|| {
+        format!(
+            "binding the box-registration control socket at {}; own-address boxes cannot \
+             register without it",
+            control_sock_path.display()
+        )
+    })?;
+    let guest_report_door =
+        guest_report_door_env(control_sock_path, boxes, answerer, proxy_publish).with_context(
+            || {
+                format!(
+                    "binding the guest report door at {}",
+                    control_sock_path
+                        .with_file_name(crate::control::GUEST_CONTROL_SOCK_FILE)
+                        .display()
+                )
+            },
+        )?;
+    Ok((control, guest_report_door))
+}
+
 /// Bind the guest report door (T94) beside `control_sock_path` and answer
 /// the env pair the VMM child registers the door's vsock port at
 /// [`minimald_rpc::VM_HOST_BOX_REPORT_PORT`] from — the bridge's two halves
 /// as one step, so the door is bound only once the bridge is up. A bind
-/// failure is warned and answered as the caller's `None`: the boot loop
-/// then hands the child no env at all, so no boot bridges a door it did
-/// not bind, and no bound door stands behind a bridge that never comes up.
+/// failure answers no env at all, and [`bind_box_doors`] fails the boot on
+/// it: no boot bridges a door it did not bind, and no bound door stands
+/// behind a bridge that never comes up.
 #[cfg_attr(
     not(minvmd_libkrun),
     allow(
@@ -2216,14 +2242,7 @@ fn guest_report_door_env(
         boxes.clone(),
         answerer.clone(),
         proxy_publish.clone(),
-    )
-    .inspect_err(|error| {
-        tracing::warn!(
-            %error,
-            "failed to bind the guest report door; the in-VM daemon's runtime \
-             publishes will not be recorded in the host-held grant"
-        );
-    })?;
+    )?;
     Ok((crate::control::GUEST_REPORT_SOCK_ENV, door))
 }
 
@@ -3594,8 +3613,8 @@ mod tests {
     /// from happen together, so the door is bound only once the bridge is
     /// up: the pair names a live socket at the door's own file name beside
     /// the control socket, and a bind that cannot happen answers no env at
-    /// all — no boot bridges a door it did not bind, and no bound door
-    /// stands behind a bridge that never comes up.
+    /// all — no boot bridges a door it did not bind (the boot fails on it,
+    /// [`super::bind_box_doors`]).
     #[test]
     fn guest_report_door_bound_only_behind_its_bridge() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -3639,6 +3658,59 @@ mod tests {
             super::guest_report_door_env(&blocked_sock, &boxes, &answerer, &proxy_publish).is_err(),
             "a guest-door path held by a non-socket file refuses the bind, and \
              the env the child would register it from"
+        );
+    }
+
+    /// #1790: a door that cannot bind is the supervisor's startup error,
+    /// never a warning the VM boots past. A non-socket file at the control
+    /// socket's path refuses the control bind, and one at the guest door's
+    /// path refuses the door's; each error names the path it could not
+    /// bind and the cause.
+    #[test]
+    fn box_door_bind_failure_is_a_startup_error() {
+        let boxes = crate::box_registry::BoxRegistry::new(switch::DEFAULT_SUBNET);
+        let answerer = crate::net::answerer::AnswererStatus::starting();
+        let proxy_publish = crate::control::ProxyPublishStatus::new();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let control_sock = dir.path().join(crate::control::CONTROL_SOCK_FILE);
+        std::fs::write(&control_sock, "not a socket").expect("seeding the blocking file");
+        let error = super::bind_box_doors(&control_sock, &boxes, &answerer, &proxy_publish)
+            .expect_err("a control socket path held by a non-socket file fails the startup");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(&format!(
+                "binding the box-registration control socket at {}",
+                control_sock.display()
+            )) && message.contains("is not a socket"),
+            "the error names the control socket and the cause: {message}"
+        );
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let control_sock = dir.path().join(crate::control::CONTROL_SOCK_FILE);
+        let door = control_sock.with_file_name(crate::control::GUEST_CONTROL_SOCK_FILE);
+        std::fs::write(&door, "not a socket").expect("seeding the blocking file");
+        let error = super::bind_box_doors(&control_sock, &boxes, &answerer, &proxy_publish)
+            .expect_err("a guest door path held by a non-socket file fails the startup");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(&format!(
+                "binding the guest report door at {}",
+                door.display()
+            )),
+            "the error names the guest report door: {message}"
+        );
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let control_sock = dir.path().join(crate::control::CONTROL_SOCK_FILE);
+        let (_control, (name, door)) =
+            super::bind_box_doors(&control_sock, &boxes, &answerer, &proxy_publish)
+                .expect("both doors bind on a clear path");
+        assert_eq!(name, crate::control::GUEST_REPORT_SOCK_ENV);
+        assert!(
+            std::os::unix::net::UnixStream::connect(&control_sock).is_ok()
+                && std::os::unix::net::UnixStream::connect(&door).is_ok(),
+            "both doors are live sockets once the startup binds them"
         );
     }
 }

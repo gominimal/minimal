@@ -1924,7 +1924,9 @@ pub(crate) async fn session_via_ssh(
         Some(_) => attached_session_record(sock, id).await.ok().flatten(),
         None => None,
     };
-    resume_box_row(sock, record.as_ref()).await;
+    // A VM host that cannot be reached fails the attach or the exec
+    // closed (#1790): the box's row cannot be asked back.
+    resume_box_row(sock, record.as_ref()).await?;
 
     if wire.is_none() {
         let stdin_is_tty = std::io::stdin().is_terminal();
@@ -5861,7 +5863,9 @@ mod tests {
             attrs: Default::default(),
         };
         let ssh_sock = dir.path().join("ssh.sock");
-        resume_box_row(&ssh_sock, Some(&record)).await;
+        resume_box_row(&ssh_sock, Some(&record))
+            .await
+            .expect("the VM host answers the resume");
         {
             let seen = requests.lock().unwrap();
             assert_eq!(seen.len(), 1, "one resume before the attach");
@@ -5876,7 +5880,9 @@ mod tests {
         }
 
         record.box_addresses = None;
-        resume_box_row(&ssh_sock, Some(&record)).await;
+        resume_box_row(&ssh_sock, Some(&record))
+            .await
+            .expect("a session with no row asks nothing");
         assert_eq!(
             requests.lock().unwrap().len(),
             1,

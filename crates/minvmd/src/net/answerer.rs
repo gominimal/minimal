@@ -655,16 +655,18 @@ impl AddressBook {
             let (held, quarantined) = (self.held.len(), self.released.len());
             return Err(match next {
                 Some(wait) => format!(
-                    "every box address in {first}-{last} is held or was released less than \
+                    "{} {first}-{last} is held or was released less than \
                      {} s ago (the answer TTL a host resolver may still serve it under): \
                      {held} of {capacity} are held by live boxes and {quarantined} are \
                      quarantined; the next one frees in {} s",
+                    minimald_rpc::BOX_ADDRESSES_EXHAUSTED,
                     REUSE_QUARANTINE.as_secs(),
                     wait.as_secs().max(1)
                 ),
                 None => format!(
-                    "every box address in {first}-{last} is held ({held} of {capacity} by \
-                     live boxes); none remains to hand out"
+                    "{} {first}-{last} is held ({held} of {capacity} by \
+                     live boxes); none remains to hand out",
+                    minimald_rpc::BOX_ADDRESSES_EXHAUSTED,
                 ),
             });
         };

@@ -421,22 +421,38 @@ fn host_control(
     anyhow::Error,
 > {
     use std::io::{BufRead as _, Write as _};
-    let mut stream = std::os::unix::net::UnixStream::connect(control_sock).with_context(|| {
-        format!(
-            "connecting to the VM host daemon's control socket at {}",
-            control_sock.display()
+
+    use crate::box_registration::HostUnreachable;
+    // Every failure short of a reply is the host unreached
+    // ([`HostUnreachable`]); a reply that does not parse is a host that
+    // answered.
+    let mut stream = std::os::unix::net::UnixStream::connect(control_sock).map_err(|error| {
+        HostUnreachable::over(
+            error,
+            format!(
+                "connecting to the VM host daemon's control socket at {}",
+                control_sock.display()
+            ),
         )
     })?;
-    stream.set_read_timeout(Some(HOST_ASK_CONTROL_TIMEOUT))?;
-    stream.set_write_timeout(Some(HOST_ASK_CONTROL_TIMEOUT))?;
+    stream
+        .set_read_timeout(Some(HOST_ASK_CONTROL_TIMEOUT))
+        .and_then(|()| stream.set_write_timeout(Some(HOST_ASK_CONTROL_TIMEOUT)))
+        .map_err(|error| HostUnreachable::over(error, "bounding the control exchange"))?;
     let mut line = serde_json_lenient::to_string(request).context("serializing the request")?;
     line.push('\n');
-    stream.write_all(line.as_bytes())?;
+    stream
+        .write_all(line.as_bytes())
+        .map_err(|error| HostUnreachable::over(error, "writing the control request"))?;
     let mut reader = std::io::BufReader::new(stream);
     let mut reply = String::new();
-    reader.read_line(&mut reply)?;
+    reader
+        .read_line(&mut reply)
+        .map_err(|error| HostUnreachable::over(error, "reading the control reply"))?;
     if reply.trim().is_empty() {
-        anyhow::bail!("the VM host daemon closed its control socket without answering");
+        return Err(HostUnreachable::error(
+            "the VM host daemon closed its control socket without answering",
+        ));
     }
     let reply = serde_json_lenient::from_str(reply.trim())
         .with_context(|| format!("the VM host daemon's reply did not parse: {reply}"))?;
@@ -579,17 +595,22 @@ pub fn withdraw_box_row_beside(
 /// keeps the one that stands. `box_id` narrows the proof to one creation,
 /// where the caller holds it.
 ///
-/// Best-effort and blocking: a resume that cannot be made — the socket
-/// unreachable, a daemon that predates the verb or holds no registration
-/// of the box — is a warn line, and the attach goes ahead: the in-VM
-/// daemon still refuses to relaunch a box whose row is gone. Returns
-/// whether the daemon answered with the row.
+/// Blocking. A resume the daemon answers without the row — a daemon that
+/// predates the verb or holds no registration of the box — is a warn
+/// line, and the attach goes ahead: the in-VM daemon still refuses to
+/// relaunch a box whose row is gone. Returns whether the daemon answered
+/// with the row.
+///
+/// # Errors
+///
+/// [`crate::box_registration::HostUnreachable`] when the daemon cannot be
+/// reached at all (#1790): the caller fails closed on it.
 pub fn resume_box_row_at(
     control_sock: &Path,
     box_name: &str,
     addresses: sessions::BoxAddresses,
     box_id: Option<minimald_rpc::BoxId>,
-) -> bool {
+) -> anyhow::Result<bool> {
     let request = minimald_rpc::BoxControlRequest::ResumeBox(minimald_rpc::ResumeBoxRequest {
         name: box_name.to_string(),
         switch_address: addresses.switch_address,
@@ -606,7 +627,7 @@ pub fn resume_box_row_at(
                 switch_address = %row.switch_address,
                 "the box's host row stands"
             );
-            return true;
+            return Ok(true);
         }
         Ok((minimald_rpc::BoxControlReply::Registered(row), _)) => format!(
             "the daemon answered with a different address pair, switch address {}",
@@ -616,13 +637,20 @@ pub fn resume_box_row_at(
             format!("the daemon refused it: {error}")
         }
         Ok((other, _)) => format!("another verb's reply: {other:?}"),
+        Err(error)
+            if error
+                .downcast_ref::<crate::box_registration::HostUnreachable>()
+                .is_some() =>
+        {
+            return Err(error);
+        }
         Err(error) => format!("{error:#}"),
     };
     tracing::warn!(
         box = %box_name,
         "the box's host row could not be resumed ({failure})"
     );
-    false
+    Ok(false)
 }
 
 impl HostAsks {

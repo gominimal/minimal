@@ -333,12 +333,18 @@ pub async fn record_of(provider: &mut Provider, id: SessionId) -> Option<session
 /// that ends in the shell-exit prompt's Delete leaves no record to read it
 /// from, and [`release_held_name_after_attach`] still owes the row's
 /// withdrawal. `None` when the record cannot be read or holds no row.
+///
+/// # Errors
+///
+/// The VM host daemon cannot be reached (#1790): the attach does not go
+/// ahead, and the status line shows the message `min session attach`
+/// fails with.
 pub async fn prepare_attach(
     sock: &Path,
     record: Option<sessions::Record>,
-) -> Option<sessions::BoxAddresses> {
-    minimal_client::box_registration::resume_box_row(sock, record.as_ref()).await;
-    record.and_then(|record| record.box_addresses)
+) -> anyhow::Result<Option<sessions::BoxAddresses>> {
+    minimal_client::box_registration::resume_box_row(sock, record.as_ref()).await?;
+    Ok(record.and_then(|record| record.box_addresses))
 }
 
 /// Settles what destroyed session `id` held on the VM host daemon beside
@@ -1143,7 +1149,9 @@ mod tests {
         );
         let mut record = own_ip_record(Some(addresses));
         record.name = Some("web".to_string());
-        let pair = prepare_attach(&ssh_sock, Some(record)).await;
+        let pair = prepare_attach(&ssh_sock, Some(record))
+            .await
+            .expect("the VM host answers the resume");
         assert_eq!(pair, Some(addresses), "the attach keeps the pair it read");
         let lines = server.join().unwrap();
         assert_eq!(lines.len(), 1, "one resume before the attach");

@@ -18,6 +18,55 @@ use anyhow::Context as _;
 /// cannot hang the activation or destroy the user asked for.
 pub const BOX_CONTROL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// The VM host daemon could not be reached over its box control socket
+/// (#1790): no provider dir to find the socket in, a connect or an
+/// exchange that failed, or no answer inside [`BOX_CONTROL_TIMEOUT`]. An
+/// own-address box then has no host row, and under the in-force gate a box
+/// with none reaches nothing, so the activation fails closed on it — `min`
+/// exits 7 (provider/host unreachable, the architecture's exit codes), and
+/// the dashboard shows the same message. A refusal the daemon answers is
+/// never this: the host was reached.
+#[derive(Debug)]
+pub struct HostUnreachable(String);
+
+impl HostUnreachable {
+    /// `message`, with no cause beneath it: a deadline that passed.
+    pub fn error(message: impl Into<String>) -> anyhow::Error {
+        anyhow::Error::new(Self(message.into()))
+    }
+
+    /// `message` over `cause`, the failure that left the host unreached;
+    /// the chain reads as it did before the type carried it.
+    pub fn over(cause: impl Into<anyhow::Error>, message: impl Into<String>) -> anyhow::Error {
+        cause.into().context(Self(message.into()))
+    }
+}
+
+impl std::fmt::Display for HostUnreachable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for HostUnreachable {}
+
+/// The VM host daemon refused a registration for want of addresses: its
+/// switch hand-out run, its loopback slice or the machine's zone answerer
+/// has none left ([`minimald_rpc::is_address_capacity_refusal`]). The host
+/// cannot hold one more box, so `min` exits 8 (insufficient resources, the
+/// architecture's exit codes); every other refusal stays the unspecified
+/// error.
+#[derive(Debug)]
+pub struct HostAddressesExhausted(String);
+
+impl std::fmt::Display for HostAddressesExhausted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for HostAddressesExhausted {}
+
 /// One control-socket exchange with the VM host daemon (T66): one JSON
 /// line in — the verb's request — and one line out — the untagged reply
 /// the verb is answered with.
@@ -48,12 +97,18 @@ async fn control_exchange_with_vm_host(
     use tokio::io::AsyncBufReadExt as _;
     use tokio::io::AsyncWriteExt as _;
 
+    // A connect, a write, a read that fails, or a close with no answer is
+    // the host unreached ([`HostUnreachable`]); a reply that does not parse
+    // is a host that answered, and stays the unspecified error.
     let mut stream = tokio::net::UnixStream::connect(sock_path)
         .await
-        .with_context(|| {
-            format!(
-                "connecting to the VM host daemon's box control socket at {}",
-                sock_path.display()
+        .map_err(|error| {
+            HostUnreachable::over(
+                error,
+                format!(
+                    "connecting to the VM host daemon's box control socket at {}",
+                    sock_path.display()
+                ),
             )
         })?;
     let mut line =
@@ -62,18 +117,18 @@ async fn control_exchange_with_vm_host(
     stream
         .write_all(line.as_bytes())
         .await
-        .context("writing the box control request")?;
+        .map_err(|error| HostUnreachable::over(error, "writing the box control request"))?;
     let mut reply = String::new();
     // The daemon writes nothing past its one reply line until the client
     // writes again, so the reader buffers nothing the connection still owes.
     tokio::io::BufReader::new(&mut stream)
         .read_line(&mut reply)
         .await
-        .context("reading the box control reply")?;
+        .map_err(|error| HostUnreachable::over(error, "reading the box control reply"))?;
     if reply.trim().is_empty() {
-        anyhow::bail!(
-            "the VM host daemon closed its control socket without answering the box control request"
-        );
+        return Err(HostUnreachable::error(
+            "the VM host daemon closed its control socket without answering the box control request",
+        ));
     }
     let reply: minimald_rpc::BoxControlReply = serde_json_lenient::from_str(reply.trim())
         .with_context(|| {
@@ -195,7 +250,11 @@ pub async fn register_box_with_vm_host(
             lease: None,
         }),
         minimald_rpc::BoxControlReply::Error { error } => {
-            anyhow::bail!("the VM host daemon refused the box registration: {error}")
+            let refusal = format!("the VM host daemon refused the box registration: {error}");
+            if minimald_rpc::is_address_capacity_refusal(&error) {
+                return Err(HostAddressesExhausted(refusal).into());
+            }
+            Err(anyhow::anyhow!(refusal))
         }
         // The reply shapes are disjoint, so this arm is a daemon speaking
         // another verb's answer to a register — not an address pair either
@@ -327,14 +386,22 @@ pub async fn withdraw_box_row(
 /// from its own record of the registration. Best-effort, bounded by
 /// [`BOX_CONTROL_TIMEOUT`], and silent for a session with no box row (a
 /// native host, a `host_ip` or `none` box).
-pub async fn resume_box_row(sock: &Path, record: Option<&sessions::Record>) {
+///
+/// # Errors
+///
+/// [`HostUnreachable`] when the VM host daemon cannot be reached — the
+/// control socket cannot be connected to or exchanged with, or no answer
+/// comes in time: the box's row cannot be asked back, so the attach or the
+/// exec fails closed rather than running against a box that may reach
+/// nothing. A refusal the daemon answers stays a warn line.
+pub async fn resume_box_row(sock: &Path, record: Option<&sessions::Record>) -> anyhow::Result<()> {
     let Some(control_sock) = control_sock_beside(sock) else {
-        return;
+        return Ok(());
     };
     let Some((name, addresses)) =
         record.and_then(|record| Some((record.name.clone()?, record.box_addresses?)))
     else {
-        return;
+        return Ok(());
     };
     let box_name = name.clone();
     let resumed = tokio::time::timeout(
@@ -344,12 +411,16 @@ pub async fn resume_box_row(sock: &Path, record: Option<&sessions::Record>) {
         }),
     )
     .await;
-    if resumed.is_err() {
-        tracing::warn!(
-            after = ?BOX_CONTROL_TIMEOUT,
-            box = %name,
-            "the VM host daemon did not answer the box row resume in time"
-        );
+    match resumed {
+        Ok(Ok(Ok(_))) => Ok(()),
+        Ok(Ok(Err(error))) => Err(error.context(format!(
+            "asking the VM host daemon for box {name}'s host row back failed"
+        ))),
+        Ok(Err(join)) => Err(anyhow::Error::new(join).context("the box row resume did not run")),
+        Err(_) => Err(HostUnreachable::error(format!(
+            "the VM host daemon did not answer the box row resume for {name} in \
+             {BOX_CONTROL_TIMEOUT:?}"
+        ))),
     }
 }
 
@@ -398,10 +469,14 @@ pub async fn register_box_for_activation(
     // daemon connection resolves through, so the client finds both by the
     // same rule — named VMs included, since the resolution reads the same
     // process-global VM name.
-    let ssh_sock = crate::resolve_socket_path(minimal_dir, true)
-        .context("resolving the VM host provider dir to register the box's host row")?;
+    let ssh_sock = crate::resolve_socket_path(minimal_dir, true).map_err(|error| {
+        HostUnreachable::over(
+            error,
+            "resolving the VM host provider dir to register the box's host row",
+        )
+    })?;
     let sock_path = control_sock_beside(&ssh_sock)
-        .ok_or_else(|| anyhow::anyhow!("no provider dir resolved for the ssh socket"))?;
+        .ok_or_else(|| HostUnreachable::error("no provider dir resolved for the ssh socket"))?;
     register_box_at(&sock_path, name, policy).await.map(Some)
 }
 
@@ -522,11 +597,11 @@ async fn register_box_at(
             "registering the box with the VM host daemon failed; the session \
              does not start with the box unregistered",
         )),
-        Err(_) => Err(anyhow::anyhow!(
+        Err(_) => Err(HostUnreachable::error(format!(
             "the VM host daemon did not answer the box registration in \
              {BOX_CONTROL_TIMEOUT:?}; the session does not start with the box \
              unregistered"
-        )),
+        ))),
     }
 }
 

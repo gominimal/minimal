@@ -958,7 +958,16 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
                             Some(_) => {
                                 rpc::prepare_attach(&sock, rpc::record_of(p, key.id).await).await
                             }
-                            None => None,
+                            None => Ok(None),
+                        };
+                        // A VM host that cannot be reached fails the attach
+                        // closed (#1790), with the CLI's message.
+                        let box_addresses = match box_addresses {
+                            Ok(box_addresses) => box_addresses,
+                            Err(error) => {
+                                model.status = Some(format!("error: {error:#}"));
+                                continue;
+                            }
                         };
                         attach_and_resume(
                             &mut terminal,
