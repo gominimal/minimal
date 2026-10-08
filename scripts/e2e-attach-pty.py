@@ -28,7 +28,8 @@ to fire `on_detach`):
                     quiet, instead of ending it with `exit`. The session's
                     SHELL then survives, which is what a test of re-attaching
                     to a still-running shell needs: `exit` ends that shell,
-                    and the next attach mints a new one.
+                    and the next attach mints a new one. With E2E_PTY_ASK
+                    set, the chord also waits until the ask is answered.
   E2E_PTY_ASK       answer a runtime port-publish ask the attached human is
                     shown: `allow` selects Allow (Down then Enter — Deny
                     stands highlighted), `deny` takes the highlighted Deny
@@ -378,7 +379,10 @@ try:
         # (0x17) here; that key retired as a detach, so a stale byte now just
         # reaches the shell — where readline eats it as delete-previous-word
         # and rings the bell — and the attach never ends.
-        if DETACH and staged and not detached and quiet >= 2:
+        # With an ask to answer, the chord also waits for that answer: the
+        # ask arrives from outside on no schedule of this driver's, and the
+        # terminal has to still be attached for its dialog to render.
+        if DETACH and staged and not detached and quiet >= 2 and (not ask or ask_answered):
             os.write(fd, b"\x1dd")
             detached = True
         if not answered and EXIT_PROMPT in bytes(buf).lower():
