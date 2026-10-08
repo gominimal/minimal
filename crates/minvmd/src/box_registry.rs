@@ -3146,12 +3146,12 @@ impl BoxRegistry {
 /// hands too.
 ///
 /// That interior is the answerer's own hand-out run, read from its one
-/// definition ([`crate::net::answerer::box_address_range`]) rather than
-/// restated; this run is the tests' single-node cursor clamped to it, so a
-/// test box never holds an address the answerer would refuse.
+/// definition ([`switch::box_loopback_interior`]) rather than restated;
+/// this run is the tests' single-node cursor clamped to it, so a test box
+/// never holds an address the answerer would refuse.
 #[cfg(test)]
 fn box_loopback_run(slice: switch::LoopbackSlice) -> (u32, u32) {
-    let (box_first, box_last) = crate::net::answerer::box_address_range();
+    let (box_first, box_last) = switch::box_loopback_interior();
     let first = u32::from(slice.first()).max(u32::from(box_first));
     let last = u32::from(slice.last()).min(u32::from(box_last));
     (first, last)
@@ -3835,9 +3835,10 @@ mod tests {
 
     /// Design §7.1, the loopback run a box may take: the reserved local
     /// range's `.2` to its last-but-one address, never its network
-    /// address, `.1` or its broadcast — the answerer's own hand-out run,
-    /// restated for the single-node cursor. Pinned on both ends: the
-    /// reserved local range's default slice and its last.
+    /// address, `.1` or its broadcast — the answerer's own hand-out run
+    /// ([`switch::box_loopback_interior`]), clamped to the single-node
+    /// cursor's slice. Pinned on both ends: the reserved local range's
+    /// default slice and its last.
     #[test]
     fn client_boxes_take_only_the_range_s_interior() {
         // The default plan's slice starts at the range's network address,
