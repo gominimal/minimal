@@ -5383,6 +5383,35 @@ async fn shared_address_port_collision_reported_at_finalize_without_attached_cli
     .await;
     let second_reply = finalize_session(&mut client, second).await;
 
+    // A client that predates the field did not ask for the list, and its
+    // reply type refuses a key it does not know — so the daemon leaves the
+    // list off that reply even though the box yields, instead of failing
+    // the older client's activation over a report it cannot read.
+    let third = create_handed_own_ip_session(
+        &mut client,
+        "third",
+        std::net::Ipv4Addr::new(100, 64, 128, 11),
+        shared,
+    )
+    .await;
+    let older_client_reply = finalize_session_asking(&mut client, third, false).await;
+    assert!(
+        older_client_reply.shared_port_collisions.is_empty(),
+        "a client that did not ask gets no collision list: {older_client_reply:?}"
+    );
+    assert!(
+        !server
+            .state
+            .sessions_manager()
+            .await
+            .hostnames()
+            .read()
+            .expect("registry lock")
+            .shared_port_collisions(third)
+            .is_empty(),
+        "the third box still yields the port; only the report is withheld"
+    );
+
     // Both names answer at the one shared address while no client is attached.
     let (_, first_address) = zone_answer_for(&server, "first.min.internal")
         .await
@@ -5472,35 +5501,6 @@ async fn shared_address_port_collision_reported_at_finalize_without_attached_cli
     assert!(
         first_finalize_reply.shared_port_collisions.is_empty(),
         "the box that holds its port yields nothing, and its reply says so"
-    );
-
-    // A client that predates the field did not ask for the list, and its
-    // reply type refuses a key it does not know — so the daemon leaves the
-    // list off that reply even though the box yields, instead of failing
-    // the older client's activation over a report it cannot read.
-    let third = create_handed_own_ip_session(
-        &mut client,
-        "third",
-        std::net::Ipv4Addr::new(100, 64, 128, 11),
-        shared,
-    )
-    .await;
-    let older_client_reply = finalize_session_asking(&mut client, third, false).await;
-    assert!(
-        older_client_reply.shared_port_collisions.is_empty(),
-        "a client that did not ask gets no collision list: {older_client_reply:?}"
-    );
-    assert!(
-        !server
-            .state
-            .sessions_manager()
-            .await
-            .hostnames()
-            .read()
-            .expect("registry lock")
-            .shared_port_collisions(third)
-            .is_empty(),
-        "the third box still yields the port; only the report is withheld"
     );
 
     // The collision reached the log and named both boxes and the port.
