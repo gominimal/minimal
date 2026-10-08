@@ -205,7 +205,17 @@ mod os {
             unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::c_long, 0 as libc::c_long) }
                 as libc::c_int;
         if raw < 0 {
-            return None; // Already gone.
+            // ESRCH: already gone. Anything else (ENOSYS on a pre-5.3 kernel,
+            // a seccomp filter) leaves the leftover alive, so say so.
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                tracing::warn!(
+                    pid,
+                    %error,
+                    "opening a pidfd on stale gvproxy failed; not reaping it",
+                );
+            }
+            return None;
         }
         // SAFETY: `raw` is a valid fd just returned by pidfd_open.
         let pidfd = unsafe { OwnedFd::from_raw_fd(raw) };
@@ -602,9 +612,23 @@ mod tests {
         let other_binary = dir.path().join("gvproxy-other");
         let mut other_bin = spawn_stand_in(&other_binary, &sock);
         await_visible(&other_bin, &other_binary, &sock);
+        // This VM's leftover, so the same reap is shown to be active.
+        let mut ours = spawn_stand_in(&binary, &sock);
+        await_visible(&ours, &binary, &sock);
 
         reap_stale_gvproxy(&binary, &sock);
 
+        // The reap returns once the leftover is gone (a zombie, since this
+        // test is its parent).
+        let by = Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            if let Some(status) = ours.try_wait().expect("try_wait ours") {
+                break status;
+            }
+            assert!(Instant::now() < by, "this VM's leftover survived the reap");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
         assert!(
             other_vm.try_wait().expect("try_wait").is_none(),
             "the reap must not touch another VM's gvproxy"
