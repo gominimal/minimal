@@ -1123,6 +1123,24 @@ mod tests {
         );
     }
 
+    /// NET-122: the `--show --json` document is compact — no whitespace
+    /// after a key's colon — because `scripts/install.sh`'s offer gates on
+    /// the substring `"state":"missing"` in the bytes, not on a parse. A
+    /// pretty-printed report would silently turn every offer off.
+    #[test]
+    fn finalize_install_show_json_is_compact_for_the_installers_substring_match() {
+        let plan = Plan {
+            items: vec![done("userns-profile"), missing("names", "names")],
+        };
+        let json = plan.json();
+        assert!(json.contains(r#""state":"done""#), "{json}");
+        assert!(json.contains(r#""state":"missing""#), "{json}");
+        for (i, _) in json.match_indices(r#""state":"#) {
+            let after = json.as_bytes()[i + r#""state":"#.len()];
+            assert_eq!(after, b'"', "whitespace after a state colon in {json}");
+        }
+    }
+
     /// NET-122: a run writes the exact script `--show --script` prints to
     /// a file only the operator can read, and elevates once — `sudo sh`
     /// of that file. The closing line is the one the spec names.
