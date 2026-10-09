@@ -71,8 +71,9 @@ The release artifacts redistribute two Apache-2.0 components, pinned in
   release links it statically into the `minvmd` binary
   (`scripts/build-libkrun-linux.sh`).
 - gvproxy v0.8.9 from gvisor-tap-vsock
-  (`vendor/gvproxy/gvproxy.lock`), in the macOS (darwin/arm64) release
-  artifacts, https://github.com/containers/gvisor-tap-vsock
+  (`vendor/gvproxy/gvproxy.lock`), the upstream pre-built binaries,
+  https://github.com/containers/gvisor-tap-vsock. Both the macOS
+  (darwin/arm64) and the Linux (amd64, arm64) releases distribute it.
 
 Apache-2.0 redistribution requires us to keep the license and notices.
 The root `NOTICE` file attributes both components.

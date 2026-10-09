@@ -16,7 +16,7 @@ components:
     Licensed under the Apache License, Version 2.0
     https://github.com/containers/libkrun
 
-  * gvproxy from gvisor-tap-vsock (v0.8.9), in the macOS (darwin/arm64)
-    release artifacts
+  * gvproxy from gvisor-tap-vsock (v0.8.9), unmodified, in the macOS
+    (darwin/arm64) and Linux (amd64, arm64) release artifacts
     Licensed under the Apache License, Version 2.0
     https://github.com/containers/gvisor-tap-vsock
