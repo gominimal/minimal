@@ -1539,6 +1539,17 @@ async fn a_mint_whose_host_wedges_reports_busy_instead_of_death() {
         !refusal.contains("exited before"),
         "a wedged host must not be reported as exited, got: {refusal:?}"
     );
+
+    // The busy refusal asks for a retry, so the retry must reach the wedged
+    // host: kept in the slot, it refuses busy again rather than a fresh host
+    // being minted over it (the seam is taken once, so a second mint would
+    // launch an ordinary host and the retry would attach).
+    let mut retry = client.open_shell(id).await;
+    let refusal = collect_to_close(&mut retry).await;
+    assert!(
+        refusal.contains("session host is busy; retry the attach once it drains"),
+        "a retry must reach the kept wedged host, not mint a second one, got: {refusal:?}"
+    );
 }
 
 // ---- lifecycle hooks -------------------------------------------------

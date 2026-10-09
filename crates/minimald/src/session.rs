@@ -4641,12 +4641,15 @@ impl Session {
         // the attach deadline. The first is surfaced as a spawn failure rather
         // than leaving a dead, channel-less host — which is why the host is
         // stored only once it is bound. The second must not read as death: it
-        // is the same wedged case the re-attach path refuses with `SessionBusy`.
+        // is the same wedged case the re-attach path refuses with `SessionBusy`,
+        // and the host is stored before refusing, so a retry reaches it through
+        // that path instead of minting a second host over it, and teardown
+        // stops it instead of a dropped `JoinHandle` detaching a live loop.
         //
         // The launch already folded this attach's connection facts into the
         // shell's environment, so nothing new is passed here: the host holds
         // them, and an empty map means "no revision", not "no terminal".
-        match launched
+        let outcome = match launched
             .0
             .attach(
                 channel,
@@ -4656,7 +4659,7 @@ impl Session {
             )
             .await
         {
-            Ok(()) => {}
+            Ok(()) => Ok(()),
             // The host's loop ended before the attach could be delivered.
             Err(session_host::HostAttachError::Closed(..)) => {
                 return Err(AttachError::SpawnFailed(std::io::Error::other(
@@ -4666,11 +4669,9 @@ impl Session {
             // The host is alive but its mailbox stayed full past the attach
             // deadline: the same wedged case the re-attach path refuses with
             // `SessionBusy`, and for the same reason — re-minting would abort
-            // a busy-but-healthy shell.
-            Err(session_host::HostAttachError::Timeout) => {
-                return Err(AttachError::SessionBusy);
-            }
-        }
+            // a busy-but-healthy shell. The host is still stored below.
+            Err(session_host::HostAttachError::Timeout) => Err(AttachError::SessionBusy),
+        };
         let SessionInner::Active { host, .. } = &mut self.inner else {
             unreachable!("mint_session_host is only reachable from the Active state");
         };
@@ -4687,7 +4688,7 @@ impl Session {
         // Minted by an attach: its environment describes the terminal that is
         // here, so nothing may replace it out from under that client.
         self.host_origin = HostOrigin::Interactive;
-        Ok(())
+        outcome
     }
 
     /// True when this session's composition declares at least one script for
