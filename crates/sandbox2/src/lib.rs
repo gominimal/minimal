@@ -162,6 +162,76 @@ impl<C: Channel> Sandbox<C> {
         self.base_dir.join("run").join(name)
     }
 
+    /// Holds the program of every command `container` spawns at a start gate:
+    /// the command's pre-exec closure builds the whole box — namespaces,
+    /// classifier placement, credentials, seal — and then waits, before it
+    /// execs the program, until the returned [`StartGate`] is released or
+    /// dropped.
+    ///
+    /// For a launch whose box must exist before its program may run: minimald
+    /// runs a session's activate hooks in the namespaces of a box it launched
+    /// for them, and the box's program is the session's interactive shell,
+    /// whose startup files are the user's own and must not run before those
+    /// hooks have.
+    ///
+    /// The gate is a FIFO in the box's `/run`, which the daemon creates and
+    /// holds open for writing; the box opens it for reading and waits for
+    /// end-of-file, which the kernel delivers when the last writer closes.
+    /// Each call makes a FIFO of its own, so two gates on one sandbox never
+    /// share one: a container's commands wait at the gate its own call
+    /// returned, and releasing one gate starts no other container's program.
+    #[cfg(target_os = "linux")]
+    pub fn hold_start(&self, container: &mut Container) -> Result<StartGate, Error> {
+        use std::os::fd::FromRawFd as _;
+        use std::os::unix::ffi::OsStrExt as _;
+
+        static NEXT_GATE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let name = format!(
+            "{START_GATE_NAME}-{}",
+            NEXT_GATE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let path = self.base_dir.join("run").join(&name);
+        // A FIFO left at this name by an earlier daemon process has no
+        // writer; replace it rather than share it.
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(Error::IO("removing a stale start gate", path, e)),
+        }
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|e| {
+            Error::IO(
+                "naming the start gate",
+                path.clone(),
+                std::io::Error::other(e),
+            )
+        })?;
+        // SAFETY: `mkfifo(3)` with a NUL-terminated path and a mode.
+        if unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) } != 0 {
+            return Err(Error::IO(
+                "creating the start gate",
+                path,
+                std::io::Error::last_os_error(),
+            ));
+        }
+        // `O_RDWR` on a FIFO opens without waiting for a reader (Linux
+        // `fifo(7)`), and makes this the writer whose close releases the box.
+        // SAFETY: `open(2)` with a NUL-terminated path.
+        let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
+        if fd < 0 {
+            return Err(Error::IO(
+                "opening the start gate",
+                path,
+                std::io::Error::last_os_error(),
+            ));
+        }
+        container.start_gate = Some(Path::new("/run").join(&name));
+        Ok(StartGate {
+            // SAFETY: `fd` is a fresh descriptor nothing else owns.
+            _writer: unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) },
+            path,
+        })
+    }
+
     /// Creates a new sandbox, containing all filesystem state within `base_dir`.
     pub(crate) fn new(base_dir: PathBuf, config: Config, channel: C) -> Result<Self, Error> {
         // Setup the rootfs
@@ -396,6 +466,40 @@ pub struct Container {
     /// its pre-exec closure brings that namespace's `lo` up.  A box sharing
     /// the host's (or VM's) namespace leaves its `lo` alone.
     fresh_netns: bool,
+    /// The start gate a command from this container waits at before it execs
+    /// its program, as the box spells it (`/run/<START_GATE_NAME>-<n>`). Set by
+    /// [`Sandbox::hold_start`]; `None` runs the program at once.
+    start_gate: Option<PathBuf>,
+}
+
+/// The prefix of a start gate's FIFO name in the box's `/run`; each gate adds
+/// its own number. See [`Sandbox::hold_start`].
+pub const START_GATE_NAME: &str = "minimal-start-gate";
+
+/// The daemon's half of a box's start gate: the one writer of the FIFO the
+/// box's first process waits on, just before it execs its program. The
+/// program runs once every writer has closed, so dropping this — or calling
+/// [`Self::release`], which says so at the call site — lets it start. A
+/// daemon that loses the gate any other way (its host dropped, the daemon
+/// gone) releases it too: the gate can delay the program, never wedge it.
+#[derive(Debug)]
+pub struct StartGate {
+    _writer: std::os::fd::OwnedFd,
+    /// The FIFO, host-side, removed when the gate goes. A box that has not
+    /// opened it by then finds no gate and runs at once, which is what a
+    /// released gate means anyway.
+    path: PathBuf,
+}
+
+impl StartGate {
+    /// Lets the gated program exec.
+    pub fn release(self) {}
+}
+
+impl Drop for StartGate {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -457,6 +561,7 @@ impl Container {
             self.fresh_netns,
             sandbox.config.classifier_leaf.clone(),
             sandbox.config.force_cover_fallback,
+            self.start_gate.clone(),
         )?;
 
         Ok(command)
@@ -1164,6 +1269,7 @@ fn install_box_credentials(
     fresh_netns: bool,
     classifier_leaf: Option<config::ClassifierLeaf>,
     force_cover_fallback: bool,
+    start_gate: Option<PathBuf>,
 ) -> Result<(), Error> {
     let program = command.get_program().to_string();
     let args = command.get_args();
@@ -1212,6 +1318,7 @@ fn install_box_credentials(
                 classifier_join.as_deref(),
                 force_cover_fallback,
                 closure_report.as_deref(),
+                start_gate.as_deref(),
             )
         })
     };
@@ -1381,6 +1488,10 @@ fn bring_lo_up() -> std::io::Result<()> {
 /// Split out of the closure so each unsafe operation sits in its own block
 /// rather than inheriting the one around `command_from_closure`.
 #[cfg(target_os = "linux")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one call site, the closure, which hands over each fact it captured"
+)]
 fn exec_box_program(
     program: &str,
     args: &[String],
@@ -1389,6 +1500,7 @@ fn exec_box_program(
     classifier_join: Option<&Path>,
     force_cover_fallback: bool,
     closure_report: Option<&Path>,
+    start_gate: Option<&Path>,
 ) -> ! {
     // Cap the box's PTY count before the credentials drop: PTYs are a
     // machine-wide pool, and the box's devpts instance was mounted without a
@@ -1541,6 +1653,11 @@ fn exec_box_program(
             &format!("lo-down errno {}", e.raw_os_error().unwrap_or(0)),
         );
     }
+    // Opened before the credentials drop, while the box still holds its
+    // user namespace's root: the FIFO sits in the daemon-owned `/run`, which
+    // the box uid cannot open. Waited on only after the seal is in, the last
+    // step before the exec.
+    let start_gate = start_gate.and_then(open_start_gate);
     // SAFETY: `assume_box_credentials` is async-signal-safe; this is the
     // pre-exec moment it is for, with the namespace built and CAP_SETPCAP in
     // it still held.
@@ -1553,6 +1670,14 @@ fn exec_box_program(
         if let Err(e) = unsafe { install_socket_family_filter(socket_family_filter) } {
             exit_child("installing the socket-family filter", &e, closure_report);
         }
+    }
+    // Held here until the daemon releases the gate (see
+    // [`Sandbox::hold_start`]): the box is complete — placed, credentialed,
+    // sealed — so processes injected into its namespaces run in the box they
+    // would find once the program is up, while the program itself has not
+    // started.
+    if let Some(gate) = start_gate {
+        wait_at_start_gate(gate);
     }
     // `command_from_closure` replaces the program with this closure; exec
     // into the real program so the spawn runs what the caller asked for, now
@@ -1696,6 +1821,65 @@ fn execv_in_child(program: &str, args: &[String]) -> std::io::Error {
     unsafe { libc::execv(argv_c[0].as_ptr(), argv_ptrs.as_ptr()) };
     // execv returns only on failure.
     std::io::Error::last_os_error()
+}
+
+/// Opens the box's end of its start gate, read-only. Non-blocking for the
+/// open, so a gate the daemon already released (no writer left) cannot park
+/// the child in `open(2)`; blocking again for the read, so
+/// [`wait_at_start_gate`] waits for the release. A gate that cannot be
+/// opened is not waited on: the gate may delay the program, never stop it
+/// from running.
+#[cfg(target_os = "linux")]
+fn open_start_gate(path: &Path) -> Option<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd as _;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `open(2)` with a NUL-terminated path; it reads no other memory.
+    let fd = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: `fd` is a fresh descriptor this child owns.
+    let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+    // SAFETY: `fcntl(2)` on a descriptor this child owns.
+    let cleared = unsafe {
+        let flags = libc::fcntl(std::os::fd::AsRawFd::as_raw_fd(&fd), libc::F_GETFL);
+        flags >= 0
+            && libc::fcntl(
+                std::os::fd::AsRawFd::as_raw_fd(&fd),
+                libc::F_SETFL,
+                flags & !libc::O_NONBLOCK,
+            ) == 0
+    };
+    cleared.then_some(fd)
+}
+
+/// Waits until the daemon releases the start gate: a read on the FIFO
+/// returns end-of-file once its last writer, the daemon's [`StartGate`],
+/// closes. Any other outcome — a byte, an error — ends the wait too.
+#[cfg(target_os = "linux")]
+fn wait_at_start_gate(gate: std::os::fd::OwnedFd) {
+    let mut byte = 0u8;
+    loop {
+        // SAFETY: `read(2)` into a one-byte buffer that outlives the call.
+        let n = unsafe {
+            libc::read(
+                std::os::fd::AsRawFd::as_raw_fd(&gate),
+                (&raw mut byte).cast(),
+                1,
+            )
+        };
+        if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        break;
+    }
 }
 
 /// Reports a failure of the forked child on its stderr and exits it with 127,
@@ -2181,6 +2365,7 @@ impl<C: Channel> Sandbox<C> {
             container,
             socket_family_filter,
             fresh_netns: isolate,
+            start_gate: None,
         })
     }
 
@@ -5828,6 +6013,128 @@ int main(int argc, char **argv) {
         let held = launch_box_probe(name, leaf, probe_args, false).await;
         held.release_hold();
         held.report().await
+    }
+
+    /// The start gate (#2118): a command whose container holds its start
+    /// builds its box and then waits, before it execs its program, until the
+    /// gate is released. While the gate is held the box's process is alive
+    /// and the program has done nothing; released, the program runs to
+    /// completion. Two gates on one sandbox are independent: releasing the
+    /// second starts only its own box, and the first waits for its own.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_held_start_runs_the_program_only_once_released() {
+        if let Some(reason) = user_namespaces_restriction() {
+            eprintln!(
+                "skipping a_held_start_runs_the_program_only_once_released: \
+                 this host denies the unprivileged user namespace every \
+                 sandbox starts by unsharing: {reason}"
+            );
+            return;
+        }
+
+        let name = "start-gate";
+        let base_dir = box_base_dir(name);
+        let build = tempfile::tempdir_in(&base_dir)
+            .unwrap_or_else(|e| panic!("a temp dir under {}: {e}", base_dir.display()));
+        let probe = compile_cgroup_probe(build.path());
+        let source = build.path().join("rootfs-src");
+        probe_rootfs(&source, &probe);
+        let sandbox_home = tempfile::tempdir_in(&base_dir)
+            .unwrap_or_else(|e| panic!("a temp dir under {}: {e}", base_dir.display()));
+        let mut sandbox = Config::new(name)
+            .with_rootfs(std::iter::once(SandboxMapped::Dir(source)))
+            .with_dns(false)
+            .build(sandbox_home.path().join("sandbox"), ())
+            .await
+            .expect("building the box");
+
+        let plan = sandbox.built_in_plan();
+        let run = sandbox.base_dir.join("run");
+        // Both gates are armed before either box spawns: the order in which a
+        // shared FIFO would hand the first box the second gate.
+        let mut armed = Vec::new();
+        for mark in ["first", "second"] {
+            let mut container = sandbox
+                .new_container(&plan)
+                .expect("building the box's container");
+            let gate = sandbox
+                .hold_start(&mut container)
+                .expect("holding the box's start");
+            armed.push((mark, gate, container));
+        }
+        let mut held = Vec::new();
+        for (mark, gate, container) in armed {
+            let mut command = sandbox
+                .command(
+                    &container,
+                    "/usr/bin/probe",
+                    [format!("MARK:/run/{mark}")],
+                    std::iter::empty::<(&str, &str)>(),
+                )
+                .expect("building the probe command");
+            let child = command.spawn().expect("spawning the probe in the box");
+            held.push((run.join(mark), gate, child, container));
+        }
+
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        for (mark, _, child, _) in &mut held {
+            assert!(
+                !mark.exists(),
+                "a program ran while its start was held: {}",
+                mark.display()
+            );
+            assert!(
+                child.try_wait().expect("polling the held box").is_none(),
+                "a held box exited before its start was released"
+            );
+        }
+
+        // Released in reverse: the second gate starts only the second box.
+        let (first_mark, first_gate, mut first_child, _first_container) = held.remove(0);
+        let (second_mark, second_gate, mut second_child, _second_container) = held.remove(0);
+        second_gate.release();
+        let status = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            tokio::task::spawn_blocking(move || second_child.wait()),
+        )
+        .await
+        .expect("the released box ran to completion in time")
+        .expect("spawn_blocking join")
+        .expect("waiting for the released box");
+        assert!(status.success(), "the released probe failed: {status:?}");
+        assert!(
+            second_mark.exists(),
+            "the released program never ran: no mark at {}",
+            second_mark.display()
+        );
+        assert!(
+            !first_mark.exists(),
+            "releasing the second gate started the first box's program"
+        );
+        assert!(
+            first_child
+                .try_wait()
+                .expect("polling the still-held box")
+                .is_none(),
+            "the first box exited while its own gate was still held"
+        );
+
+        first_gate.release();
+        let status = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            tokio::task::spawn_blocking(move || first_child.wait()),
+        )
+        .await
+        .expect("the released box ran to completion in time")
+        .expect("spawn_blocking join")
+        .expect("waiting for the released box");
+        assert!(status.success(), "the released probe failed: {status:?}");
+        assert!(
+            first_mark.exists(),
+            "the released program never ran: no mark at {}",
+            first_mark.display()
+        );
     }
 
     /// The devpts remount, in a real box launched from the production path:

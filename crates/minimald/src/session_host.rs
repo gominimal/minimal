@@ -1636,6 +1636,12 @@ pub(crate) struct Launched<P, G> {
     /// is this launch's own from the moment it is built: it never survives
     /// to a spawn that did not gather it.
     listen_plan: Option<crate::net::listeners::ListenPlan>,
+    /// The gate holding the launched shell before it execs, on a launch
+    /// minted only for lifecycle hooks (see [`SandboxLauncher::for_hooks`]):
+    /// the box exists for the hooks to run in, while the shell — whose
+    /// startup files are the user's — waits for the first attach. `None` on
+    /// every other launch, whose shell starts at once.
+    start_gate: Option<sandbox2::StartGate>,
 }
 
 /// Actor messages to a [`Host`].
@@ -2327,6 +2333,10 @@ pub(crate) struct Host<P: SessionProcess, G: SessionGuard> {
     /// leaf is reachable. `None` on a host that places no box.
     #[cfg_attr(test, allow(dead_code))]
     leaf: Option<sandbox2::config::ClassifierLeaf>,
+
+    /// The launch's start gate, held until the first attach; see
+    /// [`Launched::start_gate`] and [`Self::attach`].
+    start_gate: Option<sandbox2::StartGate>,
 
     // The session's display name, handed to each binding so the shell-exit
     // prompt's save-then-delete lane can name its archive.
@@ -4469,6 +4479,19 @@ impl SessionLauncher for SandboxLauncher {
                 .container(&plan)
                 .map_err(|e| io::Error::other(format!("container build: {e}")))?;
             container.set_session_leader();
+            // A launch minted only for hooks holds its shell at the gate: the
+            // hooks need the box, not the shell, and the shell's startup —
+            // the user's rc files and prompt commands — must not run ahead of
+            // the activate hooks it may depend on. The first attach releases
+            // it (see [`Host::attach`]).
+            let start_gate = if for_hooks {
+                Some(
+                    env.hold_start(&mut container)
+                        .map_err(|e| io::Error::other(format!("start gate: {e}")))?,
+                )
+            } else {
+                None
+            };
 
             let pty = Pty::open(sz).map_err(|e| io::Error::other(format!("pty open: {e}")))?;
 
@@ -4570,11 +4593,11 @@ impl SessionLauncher for SandboxLauncher {
             // `command`/`container` no longer borrow `env`, so it can be moved
             // into the host to keep its backing files alive.
             drop(container);
-            Ok::<_, io::Error>((env, master, process, tty_path, late_notice_fd))
+            Ok::<_, io::Error>((env, master, process, tty_path, late_notice_fd, start_gate))
         }
         .await;
 
-        let (env, master, process, tty_path, late_notice_fd) = match build_and_spawn {
+        let (env, master, process, tty_path, late_notice_fd, start_gate) = match build_and_spawn {
             Ok(parts) => parts,
             Err(e) => return Err(e),
         };
@@ -4773,6 +4796,7 @@ impl SessionLauncher for SandboxLauncher {
             // host that runs the box: taken when the host builds, so a
             // cancelled launch's plan never reaches any host at all.
             listen_plan,
+            start_gate,
         })
     }
 }
@@ -4974,6 +4998,9 @@ impl SessionLauncher for MockLauncher {
             // The plan the launch gathered, riding to the host the way a
             // real launch's plan rides: taken when the host builds.
             listen_plan: self.listen_plan,
+            // The mock's process is a plain host child with no pre-exec
+            // closure to hold it.
+            start_gate: None,
         })
     }
 }
@@ -5300,6 +5327,7 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
             leaf,
             host_ip_enforcement,
             listen_plan,
+            start_gate,
         } = launcher
             .launch(
                 crate::guest::is_microvm_daemon(),
@@ -5400,6 +5428,7 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
             home_dir,
             seal_injection,
             leaf,
+            start_gate,
             chord_matcher: ChordMatcher::new(SessionKeys::default()),
             chord_flush_deadline: None,
             guard,
@@ -6194,6 +6223,19 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
         }
 
         self.set_size(sz);
+
+        // A host minted for hooks holds its shell at the start gate until a
+        // client is here for it: released now, with the binding installed and
+        // the pty sized, so the shell's startup runs after the activate hooks
+        // and on the terminal that attached — the order a shell minted by an
+        // attach has always had.
+        if let Some(gate) = self.start_gate.take() {
+            tracing::info!(
+                session = %self.session_name,
+                "released the hook-launched session shell to start for the attaching client"
+            );
+            gate.release();
+        }
 
         // After the binding is installed and sized, so a hook writing to
         // the terminal reaches the client that just attached.

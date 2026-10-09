@@ -646,6 +646,18 @@ impl Env {
         self.sandbox.closure_report_path(leaf)
     }
 
+    /// Holds the program of every command `container` spawns at a start gate
+    /// until the returned gate is released; see [`sandbox2::Sandbox::hold_start`].
+    #[cfg_attr(test, allow(dead_code))]
+    pub(crate) fn hold_start(
+        &self,
+        container: &mut Container,
+    ) -> std::io::Result<sandbox2::StartGate> {
+        self.sandbox
+            .hold_start(container)
+            .map_err(sandbox_err_to_io)
+    }
+
     /// The assembled session rootfs on the daemon's filesystem.
     ///
     /// Exposed so the launcher can answer "is this shell installed in
