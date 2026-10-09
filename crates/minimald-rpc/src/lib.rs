@@ -141,13 +141,45 @@ pub fn version_skew_message(cli: &str, daemon: &str) -> Option<String> {
     })
 }
 
-/// The remedy every user-namespace refusal names (NET-141): the install
-/// step that loads the profile allowing the namespace for Minimal alone.
-/// Never `sudo sysctl`: a sysctl typed by hand turns the protection off for
-/// every program, is lost at boot, and leaves the install's record unchanged,
-/// so the next start would advise it again.
-pub const USER_NAMESPACE_REMEDY: &str = "Finish the install to allow it for Minimal only: \
-    min finalize-install   (see what it changes first: min finalize-install --show)";
+/// A host's reason for refusing the unprivileged user namespace every
+/// session sandbox starts by unsharing, paired with the remedy that cause
+/// takes (NET-141). The remedy is the cause's own: `min finalize-install`
+/// installs only the AppArmor profile, so it is named for the AppArmor
+/// restriction alone; a host with user namespaces switched off needs the
+/// sysctl made persistent, or a kernel built with them.
+///
+/// Lives in the wire crate because the daemon spells the refusal — it is
+/// the side that read the host — and the client decides by its lead
+/// ([`is_user_namespace_refusal`]) that a create's error is this refusal
+/// rather than any other create failure. `mip` mirrors the same two texts
+/// by hand rather than depend on this crate for them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UserNamespaceRefusal {
+    /// The cause clause, read inside the refusal's parenthesis.
+    pub cause: &'static str,
+    /// The remedy, the refusal's second line.
+    pub remedy: &'static str,
+}
+
+/// `kernel.apparmor_restrict_unprivileged_userns=1` with an unconfined
+/// daemon (stock Ubuntu 24.04+): the install step loads the profile that
+/// allows the namespace for Minimal alone. Never `sudo sysctl` here: that
+/// turns the protection off for every program, is lost at boot, and leaves
+/// the install's record unchanged, so the next start would advise it again.
+pub const USER_NAMESPACE_APPARMOR_REFUSAL: UserNamespaceRefusal = UserNamespaceRefusal {
+    cause: "Ubuntu restricts unprivileged user namespaces",
+    remedy: "Finish the install to allow it for Minimal only: min finalize-install   \
+             (see what it changes first: min finalize-install --show)",
+};
+
+/// `user.max_user_namespaces` is zero, or missing because the kernel was
+/// built without `CONFIG_USER_NS`: no profile can lift this, so the remedy
+/// is the sysctl made persistent, or a kernel that has the namespace.
+pub const USER_NAMESPACE_DISABLED_REFUSAL: UserNamespaceRefusal = UserNamespaceRefusal {
+    cause: "user namespaces are switched off (user.max_user_namespaces=0 or no kernel support)",
+    remedy: "Set user.max_user_namespaces above 0 persistently (a /etc/sysctl.d drop-in) or \
+             use a kernel with CONFIG_USER_NS.",
+};
 
 /// How a user-namespace refusal opens — the lead the client recognises a
 /// refused create by, so it prints the refusal verbatim instead of wrapping
@@ -155,23 +187,20 @@ pub const USER_NAMESPACE_REMEDY: &str = "Finish the install to allow it for Mini
 const USER_NAMESPACE_REFUSAL_LEAD: &str =
     "this machine blocks the private sandbox every box runs in (";
 
-/// The operator-facing refusal a create answers when the host's
-/// user-namespace verdict refuses the sandbox (NET-141): the cause clause,
-/// then the remedy on its own line.
-///
-/// Lives in the wire crate because the daemon spells it — it is the side
-/// that read the host — and the client decides by its lead
-/// ([`is_user_namespace_refusal`]) that the reply is this refusal rather
-/// than any other create failure.
-#[must_use]
-pub fn user_namespace_refusal(cause: &str) -> String {
-    format!(
-        "{USER_NAMESPACE_REFUSAL_LEAD}{cause}), so no box can start here yet.\n\
-         {USER_NAMESPACE_REMEDY}"
-    )
+impl UserNamespaceRefusal {
+    /// The operator-facing refusal a create answers with: the cause clause
+    /// in the lead sentence, then the remedy on its own line.
+    #[must_use]
+    pub fn message(&self) -> String {
+        format!(
+            "{USER_NAMESPACE_REFUSAL_LEAD}{}), so no box can start here yet.\n{}",
+            self.cause, self.remedy
+        )
+    }
 }
 
-/// Whether a create's error is a [`user_namespace_refusal`].
+/// Whether a create's error is a [`UserNamespaceRefusal::message`], of
+/// either cause.
 #[must_use]
 pub fn is_user_namespace_refusal(error: &str) -> bool {
     error.starts_with(USER_NAMESPACE_REFUSAL_LEAD)
@@ -3281,19 +3310,37 @@ mod tests {
     /// protection off for every program (NET-141).
     #[test]
     fn user_namespace_refusal_names_the_cause_and_the_install_step() {
-        let msg = user_namespace_refusal("Ubuntu restricts unprivileged user namespaces");
+        let apparmor = USER_NAMESPACE_APPARMOR_REFUSAL.message();
         assert_eq!(
-            msg,
+            apparmor,
             "this machine blocks the private sandbox every box runs in (Ubuntu restricts \
              unprivileged user namespaces), so no box can start here yet.\n\
              Finish the install to allow it for Minimal only: min finalize-install   \
              (see what it changes first: min finalize-install --show)"
         );
         assert!(
-            !msg.contains("sysctl"),
-            "the remedy must never be a sysctl: {msg}"
+            !apparmor.contains("sysctl"),
+            "the AppArmor remedy is never a sysctl: {apparmor}"
         );
-        assert!(is_user_namespace_refusal(&msg));
+
+        // Switched-off namespaces: no profile lifts it, so the install step
+        // is not named; the persistent sysctl (or a kernel with it) is.
+        let disabled = USER_NAMESPACE_DISABLED_REFUSAL.message();
+        assert_eq!(
+            disabled,
+            "this machine blocks the private sandbox every box runs in (user namespaces are \
+             switched off (user.max_user_namespaces=0 or no kernel support)), so no box can \
+             start here yet.\n\
+             Set user.max_user_namespaces above 0 persistently (a /etc/sysctl.d drop-in) or \
+             use a kernel with CONFIG_USER_NS."
+        );
+        assert!(
+            !disabled.contains("finalize-install"),
+            "the install step cannot lift a disabled namespace: {disabled}"
+        );
+
+        assert!(is_user_namespace_refusal(&apparmor));
+        assert!(is_user_namespace_refusal(&disabled));
         assert!(!is_user_namespace_refusal(
             "A session with that name already exists"
         ));

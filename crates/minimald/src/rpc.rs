@@ -346,7 +346,7 @@ async fn serve_create_session(
                      namespace every session sandbox needs"
                 );
                 return Ok(Errorable::Err {
-                    error: minimald_rpc::user_namespace_refusal(user_namespace_cause(restriction)),
+                    error: user_namespace_refusal_for(restriction).message(),
                 });
             }
 
@@ -521,21 +521,27 @@ async fn serve_create_session(
 /// carries.
 const HOST_IP_ENFORCEMENT_ATTR: &str = "host_ip_enforcement";
 
-/// The cause clause a user-namespace refusal carries (NET-141): the host's
-/// restriction in the words the person reads, never the sysctl that would
-/// lift it for every program.
-fn user_namespace_cause(restriction: crate::server::UsernsRestriction) -> &'static str {
+/// The refusal a host's user-namespace restriction yields (NET-141): the
+/// cause in the words the person reads, paired with that cause's own
+/// remedy — the install step for the AppArmor restriction, the persistent
+/// sysctl (or a kernel with the namespace) when it is switched off. `pub`
+/// because the daemon binary's start-up warning names the same remedy.
+#[must_use]
+pub fn user_namespace_refusal_for(
+    restriction: crate::server::UsernsRestriction,
+) -> minimald_rpc::UserNamespaceRefusal {
     use crate::server::UsernsRestriction;
     match restriction {
-        UsernsRestriction::ApparmorUnconfined => "Ubuntu restricts unprivileged user namespaces",
+        UsernsRestriction::ApparmorUnconfined => minimald_rpc::USER_NAMESPACE_APPARMOR_REFUSAL,
         // `Disabled` is also what a kernel built without CONFIG_USER_NS
-        // yields (the sysctl file is missing), so the clause names both.
-        UsernsRestriction::Disabled => {
-            "user namespaces are switched off (user.max_user_namespaces=0 or no kernel support)"
-        }
+        // yields (the sysctl file is missing); the text names both.
+        UsernsRestriction::Disabled => minimald_rpc::USER_NAMESPACE_DISABLED_REFUSAL,
         // `UsernsRestriction` is #[non_exhaustive]; a future variant is
-        // still a refusal, named as such until its own clause lands here.
-        _ => "this host restricts unprivileged user namespaces",
+        // still a refusal, pointed at the docs until its own text lands.
+        _ => minimald_rpc::UserNamespaceRefusal {
+            cause: "this host restricts unprivileged user namespaces",
+            remedy: "See https://docs.minimal.dev/reference/linux-host-setup.",
+        },
     }
 }
 
@@ -5299,14 +5305,21 @@ mod tests {
         let server = TestServer::new().await;
         let mut client = server.connect().await;
 
-        for (verdict, cause) in [
+        // Each cause carries its own remedy: the install step lifts only the
+        // AppArmor restriction, so a switched-off namespace names the
+        // persistent sysctl instead and never the install step.
+        for (verdict, cause, remedy, never) in [
             (
                 crate::server::UsernsRestriction::ApparmorUnconfined,
                 "Ubuntu restricts unprivileged user namespaces",
+                "min finalize-install --show",
+                "sysctl",
             ),
             (
                 crate::server::UsernsRestriction::Disabled,
                 "user.max_user_namespaces=0 or no kernel support",
+                "Set user.max_user_namespaces above 0 persistently (a /etc/sysctl.d drop-in)",
+                "finalize-install",
             ),
         ] {
             server.state.set_user_namespace_verdict(Some(verdict)).await;
@@ -5321,12 +5334,12 @@ mod tests {
             );
             assert!(error.contains(cause), "missing the cause: {error}");
             assert!(
-                error.contains("min finalize-install --show"),
-                "missing the remedy and its preview: {error}"
+                error.contains(remedy),
+                "missing the cause's remedy: {error}"
             );
             assert!(
-                !error.contains("sysctl"),
-                "a sysctl is never the remedy: {error}"
+                !error.contains(never),
+                "the other cause's remedy must not be named: {error}"
             );
             assert!(
                 client.call::<ListSessions>(&()).await.sessions.is_empty(),

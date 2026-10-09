@@ -1093,7 +1093,7 @@ async fn async_main() -> Result<(), MainError> {
         config.user_namespace_verdict = Some(restriction);
         tracing::warn!(
             reason = %restriction,
-            fix = minimald_rpc::USER_NAMESPACE_REMEDY,
+            fix = minimald::rpc::user_namespace_refusal_for(restriction).remedy,
             docs = "https://docs.minimal.dev/reference/linux-host-setup",
             "sessions will fail to start: this host refuses the unprivileged user \
              namespace every session sandbox needs"

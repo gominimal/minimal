@@ -256,11 +256,21 @@ pub async fn run_task(
     if let Some(restriction) = sandbox2::user_namespaces_restriction() {
         warn!(
             reason = %restriction,
-            // The same sentence `minimald_rpc::USER_NAMESPACE_REMEDY` spells
-            // for the session path; mip takes no dependency on the session
-            // wire crate for one string, so keep the two identical by hand.
-            fix = "Finish the install to allow it for Minimal only: min finalize-install   \
-                   (see what it changes first: min finalize-install --show)",
+            // The same sentences `minimald_rpc::USER_NAMESPACE_APPARMOR_REFUSAL`
+            // and `USER_NAMESPACE_DISABLED_REFUSAL` spell for the session
+            // path; mip takes no dependency on the session wire crate for two
+            // strings, so keep them identical by hand. The remedy is the
+            // cause's own: the install step loads only the AppArmor profile.
+            fix = match restriction {
+                sandbox2::UsernsRestriction::Disabled => {
+                    "Set user.max_user_namespaces above 0 persistently (a /etc/sysctl.d \
+                     drop-in) or use a kernel with CONFIG_USER_NS."
+                }
+                _ => {
+                    "Finish the install to allow it for Minimal only: min finalize-install   \
+                     (see what it changes first: min finalize-install --show)"
+                }
+            },
             docs = "https://docs.minimal.dev/reference/linux-host-setup",
             "builds will fail to start: this host refuses the unprivileged user \
              namespace every build sandbox needs"
