@@ -275,7 +275,22 @@ pub struct Config {
     /// declares its own egress section is unaffected either way.
     #[serde(default)]
     pub deny_all_opt_out: bool,
+    /// The host's verdict on the unprivileged user namespace every session
+    /// sandbox starts by unsharing, as [`sandbox2::user_namespaces_restriction`]
+    /// read it from the daemon's own process at start-up (NET-141). `None`
+    /// — no restriction, or a daemon that has not read its host — lets a
+    /// create through; a restriction refuses every create before anything
+    /// is allocated. Seeded by the daemon binary, the one place the probe is
+    /// meaningful (the sandbox child is forked from that process, so its
+    /// label is what the kernel checks), never persisted or handed in.
+    #[serde(skip)]
+    pub user_namespace_verdict: Option<UsernsRestriction>,
 }
+
+/// The verdict [`Config::user_namespace_verdict`] carries, re-exported so
+/// the daemon binary and the harness-driven tests name it without a
+/// `sandbox2` dependency of their own.
+pub use sandbox2::UsernsRestriction;
 
 impl Config {
     /// Resolves the configured gvproxy binary path, falling back to the
@@ -751,6 +766,20 @@ impl ServerStateHandle {
     /// gets reflects the daemon that is actually serving it.
     pub(crate) async fn deny_all_opt_out(&self) -> bool {
         self.0.lock().await.config.deny_all_opt_out
+    }
+
+    /// The host's user-namespace verdict the create gate decides on
+    /// (NET-141) — see [`Config::user_namespace_verdict`].
+    pub(crate) async fn user_namespace_verdict(&self) -> Option<UsernsRestriction> {
+        self.0.lock().await.config.user_namespace_verdict
+    }
+
+    /// Stands in for the daemon binary's start-up read on a harness server,
+    /// whose config carries no verdict: the seam the create-gate tests set a
+    /// refusing host through, scoped to this server alone.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn set_user_namespace_verdict(&self, verdict: Option<UsernsRestriction>) {
+        self.0.lock().await.config.user_namespace_verdict = verdict;
     }
 
     /// Clears the hostname-routing unavailability note: the proxy's startup
@@ -2773,6 +2802,7 @@ pub(crate) fn test_config(dir: &std::path::Path) -> Config {
         // The default every unit-test daemon runs: the rollout phase this
         // build ships, not opted out.
         deny_all_opt_out: false,
+        user_namespace_verdict: None,
     }
 }
 

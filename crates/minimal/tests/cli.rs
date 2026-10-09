@@ -1143,9 +1143,13 @@ async fn activate_refuses_unconfinable_sandbox_before_session_creation() {
     let project_canon = project.path().canonicalize().unwrap();
     let config_dir = tempfile::TempDir::new().unwrap();
 
-    minimald::session_host::set_user_namespace_verdict(Some(
-        minimald::session_host::UsernsRestriction::ApparmorUnconfined,
-    ));
+    daemon
+        .server
+        .state
+        .set_user_namespace_verdict(Some(
+            minimald::server::UsernsRestriction::ApparmorUnconfined,
+        ))
+        .await;
     let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_min"))
         .args(["--minimal-dir".as_ref(), minimal_dir.as_os_str()])
         .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
@@ -1157,7 +1161,7 @@ async fn activate_refuses_unconfinable_sandbox_before_session_creation() {
         .output()
         .await
         .expect("the min binary should be invocable");
-    minimald::session_host::set_user_namespace_verdict(None);
+    daemon.server.state.set_user_namespace_verdict(None).await;
 
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);

@@ -288,6 +288,9 @@ fn config_in(temp: &TempDir, deny_all_opt_out: bool) -> Config {
         // runtime-dir lock, deriving the octet from the per-start id.
         daemon_identity_dir: None,
         deny_all_opt_out,
+        // No start-up read on a harness server: a test that needs a
+        // refusing host sets it through `ServerStateHandle::set_user_namespace_verdict`.
+        user_namespace_verdict: None,
     }
 }
 

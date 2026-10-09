@@ -1012,7 +1012,7 @@ async fn async_main() -> Result<(), MainError> {
     }
 
     // Setup the server config (shared by the UDS and vsock transports).
-    let config = Config {
+    let mut config = Config {
         host_key: HostKey::OnDisk {
             path: sub_path!(cli.client_instance_dir(), "ssh_host_ed25519_key")
                 .as_utf8_path()
@@ -1052,6 +1052,9 @@ async fn async_main() -> Result<(), MainError> {
                 .egress_deny_all_opt_out,
             std::env::var(EGRESS_DENY_ALL_OPT_OUT_ENV).ok().as_deref(),
         ),
+        // Seeded by the preflight below, once this process's own label has
+        // been read (NET-141).
+        user_namespace_verdict: None,
     };
     // Ensure the SSH host key is accessible in a instance-specific known_hosts file.
     // R1.2: load once and reuse in the vsock beacon so there is no redundant disk read.
@@ -1087,7 +1090,7 @@ async fn async_main() -> Result<(), MainError> {
     // binds, so this stays silent on the vsock path.
     #[cfg(target_os = "linux")]
     if let Some(restriction) = sandbox2::user_namespaces_restriction() {
-        minimald::session_host::set_user_namespace_verdict(Some(restriction));
+        config.user_namespace_verdict = Some(restriction);
         tracing::warn!(
             reason = %restriction,
             fix = minimald_rpc::USER_NAMESPACE_REMEDY,

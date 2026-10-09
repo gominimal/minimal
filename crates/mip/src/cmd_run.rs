@@ -256,7 +256,10 @@ pub async fn run_task(
     if let Some(restriction) = sandbox2::user_namespaces_restriction() {
         warn!(
             reason = %restriction,
-            fix = "finish the install to allow it for Minimal only: min finalize-install \
+            // The same sentence `minimald_rpc::USER_NAMESPACE_REMEDY` spells
+            // for the session path; mip takes no dependency on the session
+            // wire crate for one string, so keep the two identical by hand.
+            fix = "Finish the install to allow it for Minimal only: min finalize-install   \
                    (see what it changes first: min finalize-install --show)",
             docs = "https://docs.minimal.dev/reference/linux-host-setup",
             "builds will fail to start: this host refuses the unprivileged user \

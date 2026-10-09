@@ -339,7 +339,7 @@ async fn serve_create_session(
             // so the activation fails on a reply that names the cause and
             // the remedy, and nothing is left behind for its caller to tear
             // down.
-            if let Some(restriction) = crate::session_host::user_namespace_verdict() {
+            if let Some(restriction) = s.user_namespace_verdict().await {
                 tracing::warn!(
                     reason = %restriction,
                     "session create refused: this host refuses the unprivileged user \
@@ -524,12 +524,14 @@ const HOST_IP_ENFORCEMENT_ATTR: &str = "host_ip_enforcement";
 /// The cause clause a user-namespace refusal carries (NET-141): the host's
 /// restriction in the words the person reads, never the sysctl that would
 /// lift it for every program.
-fn user_namespace_cause(restriction: crate::session_host::UsernsRestriction) -> &'static str {
-    use crate::session_host::UsernsRestriction;
+fn user_namespace_cause(restriction: crate::server::UsernsRestriction) -> &'static str {
+    use crate::server::UsernsRestriction;
     match restriction {
         UsernsRestriction::ApparmorUnconfined => "Ubuntu restricts unprivileged user namespaces",
+        // `Disabled` is also what a kernel built without CONFIG_USER_NS
+        // yields (the sysctl file is missing), so the clause names both.
         UsernsRestriction::Disabled => {
-            "user namespaces are switched off: user.max_user_namespaces=0"
+            "user namespaces are switched off (user.max_user_namespaces=0 or no kernel support)"
         }
         // `UsernsRestriction` is #[non_exhaustive]; a future variant is
         // still a refusal, named as such until its own clause lands here.
@@ -5291,33 +5293,25 @@ mod tests {
     /// sandbox refuses the create itself, and the reply carries the verdict
     /// — the cause in words and `min finalize-install` as the remedy, never
     /// a sysctl — with nothing allocated for a caller to tear down. The
-    /// guard is held across the awaited creates because the verdict is
-    /// process-global: under libtest a create driven by another test would
-    /// be refused over a verdict this test set.
-    #[expect(
-        clippy::await_holding_lock,
-        reason = "the verdict is process-global, so the guard must span the awaited \
-                  creates it is held for"
-    )]
+    /// verdict is this server's own state, so no other test's create sees it.
     #[tokio::test]
     async fn create_reply_carries_user_namespace_verdict() {
-        let _verdict_window = PROBE_TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
         let server = TestServer::new().await;
         let mut client = server.connect().await;
 
         for (verdict, cause) in [
             (
-                crate::session_host::UsernsRestriction::ApparmorUnconfined,
+                crate::server::UsernsRestriction::ApparmorUnconfined,
                 "Ubuntu restricts unprivileged user namespaces",
             ),
             (
-                crate::session_host::UsernsRestriction::Disabled,
-                "user.max_user_namespaces=0",
+                crate::server::UsernsRestriction::Disabled,
+                "user.max_user_namespaces=0 or no kernel support",
             ),
         ] {
-            crate::session_host::set_user_namespace_verdict(Some(verdict));
+            server.state.set_user_namespace_verdict(Some(verdict)).await;
             let refused = client.call::<CreateSession>(&req("refused", "/uwu")).await;
-            crate::session_host::set_user_namespace_verdict(None);
+            server.state.set_user_namespace_verdict(None).await;
             let error = refused
                 .err()
                 .expect("a create under a refusing verdict must be refused");
