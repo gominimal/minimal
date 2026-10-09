@@ -5263,7 +5263,7 @@ ff02::2\tip6-allrouters
     /// and the CLI knows every argument the privileged step takes.
     #[cfg(target_os = "linux")]
     #[test]
-    fn the_install_hint_names_where_the_installer_lives() {
+    fn the_install_hint_names_the_installed_verb() {
         let hint = classifier::install_hint();
         assert_eq!(hint, "min finalize-install");
         assert!(!hint.contains("curl"), "{hint}");

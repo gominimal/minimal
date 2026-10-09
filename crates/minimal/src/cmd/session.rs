@@ -923,13 +923,17 @@ pub(crate) async fn activate_session(
             ),
         };
     // The host line below never names the reported port as serving while
-    // the reply carries a proxy-down sibling, and its cause prints exactly
-    // once: folded into a Proxy verdict's host line (`ProxyNotServing`), or
-    // on a line of its own beside a Native verdict — never both, and never
-    // beside a `via 127.0.0.1:<port>`.
+    // the reply carries a proxy-down sibling, and the cause — the sibling's,
+    // or a native daemon's own report — prints exactly once, in place of
+    // the line's resolution half whatever the verdict (NET-020), never
+    // beside a `via 127.0.0.1:<port>` and never as a line of its own.
     let proxy_down_sibling = vm_answerer
         .as_ref()
         .and_then(|reply| reply.proxy_down.as_ref());
+    let proxy_cause = crate::resolver::host_line_proxy_cause(
+        proxy_down_sibling,
+        created.hostname_routing_unavailable.as_deref(),
+    );
     // The port this daemon's hostnames route through (NET-026's discovery on
     // this surface) is the `via 127.0.0.1:<port>` of the one host line
     // below: a VM whose host port the host already held walked to one of
@@ -982,21 +986,17 @@ pub(crate) async fn activate_session(
         // user is the proxy's (NET-019 keeps it serving). Logged as the
         // same session-start record the native arm logs, with the fact
         // that decided it.
-        let surface = crate::resolver::surface_beside_proxy_down(
-            crate::resolver::LiveSurface::Proxy,
-            proxy_down_sibling,
-        );
+        let surface = crate::resolver::LiveSurface::Proxy;
         tracing::info!(
             surface = ?surface,
             held_no_channel = true,
             answerer_bound = false,
             answerer_port = answerer_port,
+            hostname_proxy_down = ?proxy_down,
             "session start decided the live name surface for this host"
         );
         Some(surface)
-    } else if answerer_port.is_none()
-        && let Some((port, cause)) = proxy_down
-    {
+    } else if answerer_port.is_none() && proxy_down.is_some() {
         // T93: the VM host daemon's own verdict on the hostname proxy's
         // publication — a terminal publish failure, named with the port it
         // is about and its cause instead of a bare "not serving" — printed
@@ -1011,10 +1011,12 @@ pub(crate) async fn activate_session(
         // answerer verdict and the sibling cause has its surface decided
         // by the answerer arm below: the cause has already named the
         // proxy's half on the line of its own above, and the answerer's
-        // half is the detection's to read.
-        let surface = crate::resolver::LiveSurface::ProxyNotServing { port, cause };
+        // half is the detection's to read. The verdict is the proxy's; the
+        // cause rides the host line in place of its resolution half.
+        let surface = crate::resolver::LiveSurface::Proxy;
         tracing::info!(
             surface = ?surface,
+            hostname_proxy_down = ?proxy_down,
             "session start decided the live name surface for this host"
         );
         Some(surface)
@@ -1026,9 +1028,9 @@ pub(crate) async fn activate_session(
         // own query on a VM-backed one — and the reserved range on this
         // host's own loopback. `None` — the answerer not bound — is the
         // proxy's surface: there is no native surface to name. A
-        // proxy-down sibling folds into a Proxy surface (`ProxyNotServing`)
-        // and otherwise prints on a line of its own, ahead of the host
-        // line's. The proxy keeps serving beside native DNS (NET-019): the
+        // proxy-down cause never moves the verdict — it replaces the host
+        // line's resolution half beside whichever verdict this read
+        // decides. The proxy keeps serving beside native DNS (NET-019): the
         // `HTTP(S)_PROXY` recipes this activation prints keep working, so
         // nothing already captured goes stale.
         let detection = crate::resolver::session_detection().await;
@@ -1037,30 +1039,9 @@ pub(crate) async fn activate_session(
             Some(answerer_port),
             answerer_bound,
         )
-        .await
-        .map(|verdict| crate::resolver::LiveSurfaceVerdict {
-            surface: crate::resolver::surface_beside_proxy_down(
-                verdict.surface,
-                proxy_down_sibling,
-            ),
-            ..verdict
-        });
-        // With no verdict the proxy is the live surface, folded with the
-        // sibling the same way, so the cause still prints exactly once.
-        let unbound_surface = crate::resolver::surface_beside_proxy_down(
-            crate::resolver::LiveSurface::Proxy,
-            proxy_down_sibling,
-        );
-        if let Some(line) = crate::resolver::proxy_down_line_beside(
-            Some(
-                surface_verdict
-                    .as_ref()
-                    .map_or(&unbound_surface, |verdict| &verdict.surface),
-            ),
-            proxy_down_sibling,
-        ) {
-            eprintln!("{line}");
-        }
+        .await;
+        // With no verdict the proxy is the live surface.
+        let unbound_surface = crate::resolver::LiveSurface::Proxy;
         match surface_verdict {
             Some(verdict) => {
                 // The host-side record of that verdict, the half the
@@ -1092,8 +1073,7 @@ pub(crate) async fn activate_session(
             }
             None => {
                 // The answerer is reported but not bound yet: no native
-                // surface to name, so the proxy is the live one — or,
-                // beside a proxy-down sibling, the cause instead.
+                // surface to name, so the proxy is the live one.
                 tracing::info!(
                     surface = ?unbound_surface,
                     answerer_bound = false,
@@ -1105,21 +1085,24 @@ pub(crate) async fn activate_session(
             }
         }
     } else {
-        // No answerer reported and no proxy cause — a daemon that predates
+        // No answerer reported and no VM sibling — a daemon that predates
         // the field, or the VM-backed pre-acquisition state: the proxy is
-        // the surface the names route through while it serves, and nothing
-        // is said while nothing serves yet.
-        serving_proxy_port.map(|_| {
-            crate::resolver::surface_beside_proxy_down(
-                crate::resolver::LiveSurface::Proxy,
-                proxy_down_sibling,
-            )
-        })
+        // the surface the names route through while it serves, or the
+        // daemon's own report says why it does not, and nothing is said
+        // while nothing serves yet and nothing is reported.
+        (serving_proxy_port.is_some() || proxy_cause.is_some())
+            .then_some(crate::resolver::LiveSurface::Proxy)
     };
     if let Some(surface) = surface {
         eprintln!(
             "{}",
-            crate::resolver::host_line(box_name, &surface, serving_proxy_port, host_install)
+            crate::resolver::host_line_beside(
+                box_name,
+                &surface,
+                serving_proxy_port,
+                host_install,
+                proxy_cause.as_deref(),
+            )
         );
     }
     let id = created.id;

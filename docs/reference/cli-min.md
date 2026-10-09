@@ -529,10 +529,15 @@ min finalize-install [--show [--script | --json]] [--undo]
 
 The installer runs without privilege. Anything on this host that needs root
 is left for this command, which runs it in one `sudo` call. Until it runs,
-the hostname proxy serves box names, and the host line that
-`min session activate` prints ends with
-``install not finished (<missing items>) — run `min finalize-install` ``.
-A session start never prints or runs the privileged step.
+the hostname proxy serves box names. The host line that
+`min session activate` prints says where the box name resolves:
+`names: <box>.min.internal via 127.0.0.1:<port>` while the proxy serves the
+names, or `names: <box>.min.internal resolves in any browser on this machine`
+once this host resolves the zone natively. While any item is not done, the
+line ends with `; finish setup: min finalize-install`. When the proxy failed
+to bind, the cause replaces the resolution: `names: the hostname proxy is not
+serving — <cause>`, with the same clause after it when it applies. A session
+start never prints or runs the privileged step.
 
 The script holds only what this host is missing from:
 

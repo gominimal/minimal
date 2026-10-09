@@ -3971,10 +3971,10 @@ pub fn install_clause(unfinished: bool) -> &'static str {
 /// where native DNS is deployed, `names: <box>.min.internal via
 /// 127.0.0.1:<port>` where it is not, and — independently — the clause
 /// `; finish setup: min finalize-install` while any finalize-install item
-/// is not done. A proxy-down cause (NET-020) replaces the resolution half
-/// in both forms and leaves the clause as it was. One line, never a block,
-/// so the activation's own output stays what the operator reads. Pure, so
-/// tests assert the words without capturing stderr.
+/// is not done. One line, never a block, so the activation's own output
+/// stays what the operator reads. Pure, so tests assert the words without
+/// capturing stderr. [`host_line_beside`] is the same line with a
+/// proxy-down cause (NET-020) in place of the resolution half.
 #[must_use]
 pub fn host_line(
     box_name: &str,
@@ -3982,14 +3982,37 @@ pub fn host_line(
     proxy_port: Option<u16>,
     host: HostInstall,
 ) -> String {
+    host_line_beside(box_name, surface, proxy_port, host, None)
+}
+
+/// [`host_line`] beside a proxy-down cause (NET-020), in both of the
+/// line's forms: when the hostname proxy failed to bind — the VM host
+/// daemon's sibling cause, or a native daemon's own report — the cause
+/// replaces the resolution half, `names: the hostname proxy is not serving
+/// — <cause>`, whatever the surface verdict says, because a name the line
+/// claims resolves while the proxy is down is the claim a failing lookup
+/// contradicts first. The install clause is still the verdict's: a host
+/// whose native DNS is deployed and whose every item is done has nothing
+/// to finish, proxy down or not.
+#[must_use]
+pub fn host_line_beside(
+    box_name: &str,
+    surface: &LiveSurface,
+    proxy_port: Option<u16>,
+    host: HostInstall,
+    proxy_cause: Option<&str>,
+) -> String {
     let name = format!("{box_name}.{ZONE}");
-    let names = match surface {
-        LiveSurface::Native => format!("{name} resolves in any browser on this machine"),
-        LiveSurface::Proxy => match proxy_port {
+    let names = match (proxy_cause, surface) {
+        (Some(cause), _) => format!("the hostname proxy is not serving — {cause}"),
+        (None, LiveSurface::Native) => {
+            format!("{name} resolves in any browser on this machine")
+        }
+        (None, LiveSurface::Proxy) => match proxy_port {
             Some(port) => format!("{name} via 127.0.0.1:{port}"),
             None => "the hostname proxy is not serving".to_string(),
         },
-        LiveSurface::ProxyNotServing { port, cause } => {
+        (None, LiveSurface::ProxyNotServing { port, cause }) => {
             format!(
                 "the hostname proxy is not serving — {}",
                 proxy_down_detail(*port, cause)
@@ -4000,6 +4023,22 @@ pub fn host_line(
         "names: {names}{}",
         install_clause(install_unfinished(surface, host))
     )
+}
+
+/// The proxy-down cause a session start's host line names (NET-020), from
+/// either report the create reply can carry: the VM host daemon's sibling
+/// cause, in the words [`name_surface_line`]'s folded arm uses, or a native
+/// daemon's own reason for its hostname proxy not serving. `None` while the
+/// proxy serves. The sibling wins where both are present: it names the
+/// port the host reserved, which the daemon inside the VM cannot see.
+#[must_use]
+pub fn host_line_proxy_cause(
+    proxy_down: Option<&ProxyDown>,
+    routing_unavailable: Option<&str>,
+) -> Option<String> {
+    proxy_down
+        .map(|down| proxy_down_detail(down.port, &down.cause))
+        .or_else(|| routing_unavailable.map(str::to_string))
 }
 
 /// The named cause of a proxy that is not serving (T93), the words both
@@ -4869,7 +4908,85 @@ mod tests {
             "names: the hostname proxy is not serving — another process on the host holds \
              127.0.0.1:7654; finish setup: min finalize-install"
         );
-        for line in [&unfinished, &names_done, &finished, &down] {
+        // NET-020 in both forms: the cause the start reads beside its
+        // verdict replaces the resolution half whether the verdict was the
+        // proxy's or native DNS — a line that said the name resolves while
+        // the proxy is down is the claim a failing lookup contradicts first
+        // — and the clause stays the pre-fold verdict's: a finished native
+        // host grows none, an unfinished one keeps it.
+        let sibling = ProxyDown {
+            port: 7654,
+            cause: ProxyDownCause::PortHeld,
+        };
+        let cause = host_line_proxy_cause(Some(&sibling), None).expect("the sibling's cause");
+        let native_down = host_line_beside(
+            "web",
+            &LiveSurface::Native,
+            Some(7654),
+            HostInstall::default(),
+            Some(&cause),
+        );
+        assert_eq!(
+            native_down,
+            "names: the hostname proxy is not serving — another process on the host holds \
+             127.0.0.1:7654"
+        );
+        let native_down_open = host_line_beside(
+            "web",
+            &LiveSurface::Native,
+            Some(7654),
+            others_open,
+            Some(&cause),
+        );
+        assert_eq!(
+            native_down_open,
+            "names: the hostname proxy is not serving — another process on the host holds \
+             127.0.0.1:7654; finish setup: min finalize-install"
+        );
+        // A native daemon's own report — no VM sibling — is the cause in the
+        // daemon's words, and a Proxy verdict beside it never claims a port.
+        let daemon_cause = host_line_proxy_cause(
+            None,
+            Some("could not bind 127.0.0.1:7654: address in use. Remedy: free the port"),
+        )
+        .expect("the daemon's reason");
+        let proxy_down_native_daemon = host_line_beside(
+            "web",
+            &LiveSurface::Proxy,
+            Some(7654),
+            HostInstall::default(),
+            Some(&daemon_cause),
+        );
+        assert_eq!(
+            proxy_down_native_daemon,
+            "names: the hostname proxy is not serving — could not bind 127.0.0.1:7654: \
+             address in use. Remedy: free the port; finish setup: min finalize-install"
+        );
+        assert!(
+            !proxy_down_native_daemon.contains("via 127.0.0.1"),
+            "a down proxy is never named as the route: {proxy_down_native_daemon}"
+        );
+        // The sibling wins where both are present, and nothing is a cause
+        // while the proxy serves.
+        assert_eq!(
+            host_line_proxy_cause(Some(&sibling), Some("stale")).as_deref(),
+            Some("another process on the host holds 127.0.0.1:7654")
+        );
+        assert_eq!(host_line_proxy_cause(None, None), None);
+        assert_eq!(
+            host_line_beside("web", &LiveSurface::Native, Some(7654), others_open, None),
+            names_done,
+            "no cause: the same line host_line prints"
+        );
+        for line in [
+            &unfinished,
+            &names_done,
+            &finished,
+            &down,
+            &native_down,
+            &native_down_open,
+            &proxy_down_native_daemon,
+        ] {
             assert_eq!(line.lines().count(), 1, "one line, never a block: {line}");
             assert!(line.starts_with("names: "), "{line}");
             assert!(
