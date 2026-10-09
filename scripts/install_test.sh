@@ -2340,7 +2340,7 @@ case_for() {
         install)                            case_install ;;
         apparmor)                           case_apparmor ;;
         apparmor_uninstall)                 case_apparmor_uninstall ;;
-        finalize_install_uninstall)                case_finalize_install_uninstall ;;
+        finalize_install_uninstall)         case_finalize_install_uninstall ;;
         installer_offers_finalize_install_on_a_tty) case_installer_offers_finalize_install_on_a_tty ;;
         installer_prints_the_pointer_when_declined_or_without_tty)
             case_installer_prints_the_pointer_when_declined_or_without_tty ;;
