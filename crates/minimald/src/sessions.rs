@@ -265,6 +265,13 @@ pub struct Manager {
     /// so each one resolves its own effective egress (NET-074) the same way
     /// the RPC path does.
     deny_all_opt_out: bool,
+
+    /// The startup probe's diagnosis of why this host refuses the
+    /// unprivileged user namespace every sandbox needs, with the fix to
+    /// run — `None` when the probe found nothing. Threaded from the server
+    /// config into every session actor so a spawn failure names the
+    /// restriction instead of the bare "host exited" symptom.
+    userns_spawn_hint: Option<String>,
 }
 
 impl Manager {
@@ -276,6 +283,7 @@ impl Manager {
         daemon_ctx: Arc<mctx::DaemonContext>,
         net_switch: Arc<Mutex<crate::net::SwitchClient>>,
         deny_all_opt_out: bool,
+        userns_spawn_hint: Option<String>,
     ) -> Result<ManagerHandle, std::io::Error> {
         let store = Store::init(minimal_state_dir.clone()).await?;
 
@@ -582,6 +590,7 @@ impl Manager {
             #[cfg(target_os = "linux")]
             loopback,
             deny_all_opt_out,
+            userns_spawn_hint,
         };
 
         tokio::spawn(mngr.mainloop());
@@ -1093,6 +1102,7 @@ impl Manager {
             net_switch: Arc::clone(&self.net_switch),
             manager: self.weak_self.clone(),
             deny_all_opt_out: self.deny_all_opt_out,
+            userns_spawn_hint: self.userns_spawn_hint.clone(),
             #[cfg(target_os = "linux")]
             hostnames: Arc::clone(&self.hostnames),
             #[cfg(target_os = "linux")]
@@ -2075,13 +2085,14 @@ pub(crate) mod tests {
             .unwrap();
         let daemon_ctx = Arc::new(mctx::DaemonContext::init(mctx_config).unwrap());
         // `false`: these tests run the default the build ships, not the
-        // opt-out.
+        // opt-out. `None`: no startup probe ran, so no diagnosis to name.
         Manager::init(
             daemon_abs(&state),
             daemon_abs(&cache),
             daemon_ctx,
             switch,
             false,
+            None,
         )
         .await
         .unwrap()

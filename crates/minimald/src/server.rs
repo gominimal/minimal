@@ -275,6 +275,14 @@ pub struct Config {
     /// declares its own egress section is unaffected either way.
     #[serde(default)]
     pub deny_all_opt_out: bool,
+
+    /// The startup probe's diagnosis of why this host refuses the
+    /// unprivileged user namespace every session sandbox needs, with the
+    /// fix to run — `None` when the probe found nothing (or never ran,
+    /// off-Linux). Threaded to the session actors so a spawn failure names
+    /// the restriction instead of a bare "host exited" symptom.
+    #[serde(default)]
+    pub userns_spawn_hint: Option<String>,
 }
 
 impl Config {
@@ -566,6 +574,10 @@ impl ServerState {
                 // task path resolve the same effective egress the daemon
                 // was started with (NET-074/NET-077).
                 config.deny_all_opt_out,
+                // The startup probe's diagnosis + fix, so a spawn failure on
+                // a userns-restricted host names the restriction (see
+                // [`Config::userns_spawn_hint`]).
+                config.userns_spawn_hint.clone(),
             )
             .await?,
             config,
@@ -2773,6 +2785,8 @@ pub(crate) fn test_config(dir: &std::path::Path) -> Config {
         // The default every unit-test daemon runs: the rollout phase this
         // build ships, not opted out.
         deny_all_opt_out: false,
+        // No probe ran for a unit-test config, so no diagnosis to name.
+        userns_spawn_hint: None,
     }
 }
 

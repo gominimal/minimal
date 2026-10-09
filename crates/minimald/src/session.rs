@@ -38,6 +38,21 @@ mod helpers;
 
 pub(crate) use helpers::*;
 
+/// The error a failed host attach surfaces: the bare symptom, plus the
+/// startup probe's diagnosis and fix when it has one. A host that dies in
+/// the launch-to-attach window on a userns-restricted host (stock Ubuntu
+/// 24.04+) otherwise leaves the client with a symptom that names neither
+/// the restriction nor the fix — the probe already logged both, so carry
+/// them into the error the client actually sees.
+fn spawn_failed_error(userns_spawn_hint: Option<&str>) -> std::io::Error {
+    match userns_spawn_hint {
+        Some(hint) => std::io::Error::other(format!(
+            "session host exited before its channel could attach — {hint}"
+        )),
+        None => std::io::Error::other("session host exited before its channel could attach"),
+    }
+}
+
 /// An error that occurred when attaching to a running session/its-shell.
 #[derive(Debug)]
 pub enum AttachError {
@@ -197,6 +212,13 @@ pub(crate) struct SessionConfig {
     /// it so a diagnostics bundle can name the posture without the daemon's
     /// flags.
     pub deny_all_opt_out: bool,
+
+    /// The startup probe's diagnosis of why this host refuses the
+    /// unprivileged user namespace every sandbox needs, with the fix to
+    /// run — `None` when the probe found nothing (or never ran, off-Linux).
+    /// A spawn failure that lands here names the restriction instead of the
+    /// bare "host exited" symptom.
+    pub userns_spawn_hint: Option<String>,
 }
 
 /// The egress *section* the gate compiles for a session: the materialized
@@ -909,6 +931,12 @@ pub struct Session {
     /// path reads it through the handle for the same resolution.
     deny_all_opt_out: bool,
 
+    /// The startup probe's diagnosis of why this host refuses the
+    /// unprivileged user namespace every sandbox needs, with the fix to
+    /// run — `None` when the probe found nothing. A spawn failure names it
+    /// (see [`spawn_failed_error`]) so the attach error explains itself.
+    userns_spawn_hint: Option<String>,
+
     /// The live direct-tcpip forwards opened for this session: one abort
     /// handle per relay the connection layer spawned. Pruned as relays
     /// finish; every live one is aborted by [`Session::stop_running`], so a
@@ -989,6 +1017,7 @@ impl Session {
             net_switch,
             manager,
             deny_all_opt_out,
+            userns_spawn_hint,
             #[cfg(target_os = "linux")]
             hostnames,
             #[cfg(target_os = "linux")]
@@ -1002,6 +1031,7 @@ impl Session {
             daemon_ctx,
             net_switch,
             deny_all_opt_out,
+            userns_spawn_hint,
             tracker: OpTracker::new_root(),
             inner,
             workspace_baseline: WorkspaceBaseline::Unarmed,
@@ -4650,9 +4680,7 @@ impl Session {
             )
             .await
             .map_err(|_| {
-                AttachError::SpawnFailed(std::io::Error::other(
-                    "session host exited before its channel could attach",
-                ))
+                AttachError::SpawnFailed(spawn_failed_error(self.userns_spawn_hint.as_deref()))
             })?;
         let SessionInner::Active { host, .. } = &mut self.inner else {
             unreachable!("mint_session_host is only reachable from the Active state");

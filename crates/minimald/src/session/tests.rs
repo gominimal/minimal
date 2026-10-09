@@ -164,6 +164,34 @@ fn inherited_session_env_prefix_not_substring() {
     );
 }
 
+/// A spawn failure with no probe diagnosis keeps the bare symptom — the
+/// exact message the pre-hint daemon surfaced, so an unrestricted host (or
+/// an off-Linux one, where no probe runs) sees no change.
+#[test]
+fn spawn_failed_error_without_a_hint_keeps_the_bare_symptom() {
+    assert_eq!(
+        super::spawn_failed_error(None).to_string(),
+        "session host exited before its channel could attach"
+    );
+}
+
+/// A spawn failure with a probe diagnosis names it: the symptom stays (the
+/// host did exit before attaching) and the restriction + fix the startup
+/// probe logged follow it, so the error a client sees on a userns-
+/// restricted host explains itself.
+#[test]
+fn spawn_failed_error_with_a_hint_names_the_restriction_and_fix() {
+    let hint = "kernel.apparmor_restrict_unprivileged_userns=1 and this \
+                 process is unconfined — fix: install minimald's AppArmor \
+                 profile (one-time, needs root)";
+    let msg = super::spawn_failed_error(Some(hint)).to_string();
+    assert!(
+        msg.starts_with("session host exited before its channel could attach — "),
+        "the symptom must stay the error's lead: {msg}"
+    );
+    assert!(msg.contains(hint), "the diagnosis must travel whole: {msg}");
+}
+
 /// Reads the session record for `id`, or `None` once it has been deleted.
 async fn record_exists(client: &mut TestClient, id: SessionId) -> bool {
     client
