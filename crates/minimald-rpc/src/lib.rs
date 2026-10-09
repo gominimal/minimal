@@ -3350,12 +3350,16 @@ mod tests {
                  verdict per box: the classifier's privileged step is not \
                  installed on this host. While it cannot, its host-address \
                  boxes run unenforced — whatever the boxes' declarations \
-                 say. Install the classifier's privileged step with:\n  \
+                 say; only a host-address box with an egress section is \
+                 affected, and a box with none behaves the same with or \
+                 without the step. Install the classifier's privileged \
+                 step with:\n  \
                  run: curl -fsSLO https://raw.githubusercontent.com/gominimal/\
                  minimal/main/scripts/install-host-classifier.sh && sudo bash \
                  ./install-host-classifier.sh --user <the account this \
-                 daemon runs as> --cohort-address <cohort address> \
-                 --node-plane-address <node-plane address>"
+                 daemon runs as> --cohort-address <what the boxes cohort \
+                 leaves as> --node-plane-address <what the rest of the \
+                 slice leaves as>"
                     .to_string(),
             ),
             host_ip_enforcement: Some("none".into()),
@@ -3384,7 +3388,9 @@ mod tests {
                  verdict per box: no cgroup2 mount with nsdelegate covers \
                  the classifier tree, so a box could migrate out of its \
                  leaf. While it cannot, its host-address boxes run \
-                 unenforced — whatever the boxes' declarations say."
+                 unenforced — whatever the boxes' declarations say; only a \
+                 host-address box with an egress section is affected, and \
+                 a box with none behaves the same with or without the step."
                     .to_string(),
             ),
             host_ip_enforcement: Some("none".into()),

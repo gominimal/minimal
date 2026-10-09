@@ -517,7 +517,10 @@ const HOST_IP_ENFORCEMENT_ATTR: &str = "host_ip_enforcement";
 /// leave even a deny-all box running unenforced, while the two probe causes
 /// refuse a deny-all box at placement — an advisory that said "whatever the
 /// declarations say" over a refusal would deny the refusal a person is about
-/// to hit — and in the guest every cause refuses.
+/// to hit — and in the guest every cause refuses. The clause carries the
+/// scoping sentence with it on the same condition: only a host-address box
+/// with an egress section is affected, and a box with none behaves the
+/// same with or without the step.
 fn classifier_advisory_text(cause: classifier::Cause, guest: bool) -> String {
     let mut advisory = format!(
         "note: this host cannot decide a host-address box's egress verdict \
@@ -538,7 +541,19 @@ fn classifier_advisory_text(cause: classifier::Cause, guest: bool) -> String {
                 | classifier::Cause::GuestTableNotLoaded
         )
     {
-        advisory.push_str(" — whatever the boxes' declarations say");
+        // The scoping sentence a person at a first activate needs, on the
+        // same arm: the note matters only to a host-address box that
+        // declares egress, and a box with no egress section is allow-all —
+        // it needs no verdict enforced, so it runs the same with or
+        // without the step (NET-079's sub-requirement names the section
+        // itself as the thing that runs unenforced). Over a refusal the
+        // sentence would be false — a deny-all declaration is the one
+        // thing the probe causes do refuse — so it rides only here.
+        advisory.push_str(
+            " — whatever the boxes' declarations say; only a host-address \
+             box with an egress section is affected, and a box with none \
+             behaves the same with or without the step",
+        );
     }
     if let Some(command) = cause.install_command() {
         // The command ends the advisory with nothing after it, so the line

@@ -948,7 +948,13 @@ pub mod classifier {
     /// a hint that named neither is a command the step itself refuses). The
     /// hint spells the whole command, so the advisory that carries it never
     /// has to name a placeholder for the one thing the daemon knows — only
-    /// for the two things this host does.
+    /// for the two things this host does, and each placeholder says what
+    /// the value it stands for is in the installer's own words
+    /// (`require_identities` names the two the same way), because the
+    /// daemon cannot fill them: no marker on the host records a past
+    /// install's choice (only the ct-mark mask is recorded), and the
+    /// installer refuses to guess — the identities are this host's to
+    /// pick, distinct from each other per NET-078.
     #[cfg(target_os = "linux")]
     #[must_use]
     pub fn install_hint() -> String {
@@ -958,7 +964,8 @@ pub mod classifier {
             "run: curl -fsSLO \
              https://raw.githubusercontent.com/gominimal/minimal/main/scripts/install-host-classifier.sh \
              && sudo bash ./install-host-classifier.sh --user {account} \
-             --cohort-address <cohort address> --node-plane-address <node-plane address>"
+             --cohort-address <what the boxes cohort leaves as> \
+             --node-plane-address <what the rest of the slice leaves as>"
         )
     }
 

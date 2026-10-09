@@ -5006,7 +5006,9 @@ mod tests {
                 "note: this host cannot decide a host-address box's egress verdict \
                  per box: the classifier's privileged step is not installed on this \
                  host. While it cannot, its host-address boxes run unenforced — \
-                 whatever the boxes' declarations say. Install the classifier's \
+                 whatever the boxes' declarations say; only a host-address box with \
+                 an egress section is affected, and a box with none behaves the \
+                 same with or without the step. Install the classifier's \
                  privileged step with:\n  run: curl -fsSLO \
                  https://raw.githubusercontent.com/gominimal/minimal/main/scripts/\
                  install-host-classifier.sh && sudo bash ./install-host-classifier.sh \
@@ -5023,7 +5025,9 @@ mod tests {
                 "note: this host cannot decide a host-address box's egress verdict \
                  per box: the classifier's privileged step is not installed on this \
                  host. While it cannot, its host-address boxes run unenforced — \
-                 whatever the boxes' declarations say."
+                 whatever the boxes' declarations say; only a host-address box with \
+                 an egress section is affected, and a box with none behaves the \
+                 same with or without the step."
             ),
             "the start prints the daemon's spelling verbatim, so the log, the \
              reply, and the terminal cannot disagree, got: {rendered}"
@@ -5052,7 +5056,9 @@ mod tests {
                  per box: no cgroup2 mount with nsdelegate covers the classifier \
                  tree, so a box could migrate out of its leaf. While it cannot, \
                  its host-address boxes run unenforced — whatever the boxes' \
-                 declarations say.",
+                 declarations say; only a host-address box with an egress section \
+                 is affected, and a box with none behaves the same with or \
+                 without the step.",
             ),
             Some("none"),
         );
@@ -5064,7 +5070,7 @@ mod tests {
             "the advisory must name this cause in words too: {rendered}"
         );
         assert!(
-            rendered.ends_with("declarations say.\n"),
+            rendered.ends_with("without the step.\n"),
             "no command ends this cause, so the advisory must end with the \
              state it named: {rendered}"
         );
