@@ -818,6 +818,7 @@ mod tests {
             hooks_enabled: true,
             task_addresses: Vec::new(),
             box_addresses: Some(addresses),
+            box_id: None,
             host_ip_enforcement: None,
             host_row_bound: false,
             attrs: Default::default(),
