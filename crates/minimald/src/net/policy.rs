@@ -616,7 +616,9 @@ impl ExposeRefusal {
                     "{self}: a --network none box has no address to publish at. Forward it \
                      from the host instead: {forward}"
                 ),
-                sessions::NetworkMode::HostNet | sessions::NetworkMode::OwnIp => format!(
+                // `NetworkMode` is non-exhaustive; every other mode gets the
+                // own-address advice.
+                _ => format!(
                     "{self}. Re-activate with --network own_ip and --dynamic-ingress allow \
                      --dynamic-range <lo>-<hi> (or --dynamic-ingress ask) to allow it, or \
                      forward it from the host now: {forward}"
