@@ -3649,6 +3649,17 @@ enum GateAdmit {
 /// window only has to outlast one relay round trip.
 const REFUSAL_WINDOW: Duration = Duration::from_secs(5);
 
+/// How many of one box's refusable connects one client source may hold
+/// noted at once ([`ReplyTables::observe_refusable`]): an eighth of the
+/// per-box cap, so a single client flooding SYNs at unpublished ports
+/// cannot take every note and leave another client's connect to time out.
+const REFUSAL_NOTES_PER_SOURCE: usize = egress::REPLY_MAX_FLOWS_PER_BOX / 8;
+
+/// One box's refusal notes ([`BoxReplies`]'s `refusals`): each noted
+/// connect's tuple, with the acknowledgement its refusal carries, the
+/// instant it stops being refusable and the client's address.
+type RefusalNotes = HashMap<egress::FlowTuple, (u32, Instant, [u8; 4])>;
+
 /// The gate's reply-flow records (NET-040's answer half): one [`BoxReplies`]
 /// entry per registered box the gate's ingress leg has delivered an opening
 /// packet to, keyed by the row's switch address — the same key the gate
@@ -3711,9 +3722,11 @@ struct BoxReplies {
     /// The box's refusable connects (NET-014): each bare SYN the ingress leg
     /// delivered at a port no applied publish dials, keyed by its tuple in
     /// the client's direction, with the acknowledgement the refusal of it
-    /// carries and the instant it stops being refusable. Bounded by the
-    /// shared per-box cap; see [`ReplyTables::refusal_admits`].
-    refusals: Mutex<HashMap<egress::FlowTuple, (u32, Instant)>>,
+    /// carries, the instant it stops being refusable and the client's
+    /// address. Bounded by the shared per-box cap, and each client source
+    /// by its share ([`REFUSAL_NOTES_PER_SOURCE`]); see
+    /// [`ReplyTables::refusal_admits`].
+    refusals: Mutex<RefusalNotes>,
     /// Whether the box's first-record line has been said.
     first_record: AtomicBool,
     /// Whether the table-filled line has been said.
@@ -3931,9 +3944,10 @@ impl ReplyTables {
     /// not die at them either, or a deny-all box's unpublished port reads as
     /// the timeout NET-014 retires. A SYN from the Box Egress Proxy's
     /// address notes nothing — the proxy never opens toward a box (NET-134)
-    /// — and at the per-box cap, once expired notes are swept, a new SYN
-    /// notes nothing: the client's connect degrades to the timeout, never
-    /// to an admission.
+    /// — and at the per-box cap, or at its client's share of it
+    /// ([`REFUSAL_NOTES_PER_SOURCE`]), once expired notes are swept, a new
+    /// SYN notes nothing: the client's connect degrades to the timeout,
+    /// never to an admission.
     pub(crate) fn observe_refusable(
         &self,
         record: &Arc<BoxRecord>,
@@ -3954,15 +3968,24 @@ impl ReplyTables {
             .lock()
             .expect("the reply-flow table's lock is held only across one decision");
         let tuple = reply_tuple_of(pkt);
-        if !refusals.contains_key(&tuple) && refusals.len() >= egress::REPLY_MAX_FLOWS_PER_BOX {
-            refusals.retain(|_, (_, until)| *until > now);
-            if refusals.len() >= egress::REPLY_MAX_FLOWS_PER_BOX {
+        let client = pkt.src.ip().octets();
+        let full = |refusals: &RefusalNotes| {
+            refusals.len() >= egress::REPLY_MAX_FLOWS_PER_BOX
+                || refusals
+                    .values()
+                    .filter(|(_, _, from)| *from == client)
+                    .count()
+                    >= REFUSAL_NOTES_PER_SOURCE
+        };
+        if !refusals.contains_key(&tuple) && full(&refusals) {
+            refusals.retain(|_, (_, until, _)| *until > now);
+            if full(&refusals) {
                 return;
             }
         }
         let ack =
             switch::refusal::seq_acknowledging(pkt.tcp_seq, pkt.tcp_payload_len, pkt.tcp_flags);
-        refusals.insert(tuple, (ack, now + REFUSAL_WINDOW));
+        refusals.insert(tuple, (ack, now + REFUSAL_WINDOW, client));
     }
 
     /// The verdict's refusal half (NET-014): whether one frame `record`'s
@@ -4000,11 +4023,11 @@ impl ReplyTables {
             .expect("the reply-flow table's lock is held only across one decision");
         let connect = reply_tuple_of(pkt).reversed();
         match refusals.get(&connect).copied() {
-            Some((_, until)) if until <= now => {
+            Some((_, until, _)) if until <= now => {
                 refusals.remove(&connect);
                 false
             }
-            Some((ack, _)) if ack == pkt.tcp_ack => {
+            Some((ack, _, _)) if ack == pkt.tcp_ack => {
                 refusals.remove(&connect);
                 true
             }
@@ -7578,6 +7601,59 @@ mod tests {
         assert!(
             decide(&refusal_of(&fresh)).is_err(),
             "a refusal after the window drops like any frame the row refuses"
+        );
+    }
+
+    /// NET-014's refusal notes are shared out per client source: one
+    /// sibling flooding SYNs at a deny-all box's unpublished ports holds at
+    /// most its share of the box's notes, so its connects past the share
+    /// time out while another sibling's connect is still refused promptly.
+    #[test]
+    fn one_source_cannot_take_every_refusal_note() {
+        const FLOODER: [u8; 4] = [100, 64, 0, 10];
+        const OTHER: [u8; 4] = [100, 64, 0, 11];
+        let registry = BoxRegistry::new(SUBNET);
+        let record = registry.register(
+            BoxRegistration::new("web", Ipv4Addr::from(LEASE), Ipv4Addr::LOCALHOST)
+                .with_egress_policy(EgressPolicy::deny_all()),
+        );
+        let table = registry.table();
+        let baseline = NodePlaneBaseline::built_in(SUBNET);
+        let pins = dns_pins::DnsPins::new(SUBNET);
+        let replies = ReplyTables::new();
+        let decide = |frame: &[u8]| {
+            let l4 = dns_pins::parse_ipv4_l4(frame)
+                .expect("the frame builder's IPv4 header always parses");
+            let summary = sessions::core::egress::summarize(frame);
+            gate_verdict(&summary, Some(&l4), &table, &baseline, &pins, &replies)
+        };
+        let note = |frame: &[u8]| {
+            let l4 = dns_pins::parse_ipv4_l4(frame)
+                .expect("the frame builder's IPv4 header always parses");
+            replies.observe_refusable(&record, &l4, SUBNET, Instant::now());
+        };
+
+        let share = u16::try_from(super::REFUSAL_NOTES_PER_SOURCE).expect("the share is small");
+        for port in 0..share {
+            note(&sibling_syn(FLOODER, LEASE, 20000 + port, 1000));
+        }
+        let past_share = sibling_syn(FLOODER, LEASE, 20000 + share, 1000);
+        note(&past_share);
+        assert!(
+            decide(&refusal_of(&past_share)).is_err(),
+            "a source at its share notes no more: its connect times out"
+        );
+        let other = sibling_syn(OTHER, LEASE, 20000, 1000);
+        note(&other);
+        assert_eq!(
+            decide(&refusal_of(&other)),
+            Ok(GateAdmit::Row),
+            "another source's connect is still refused, not timed out"
+        );
+        assert_eq!(
+            decide(&refusal_of(&sibling_syn(FLOODER, LEASE, 20000, 1000))),
+            Ok(GateAdmit::Row),
+            "the flooder's noted connects within its share are refused"
         );
     }
 
