@@ -539,11 +539,12 @@ The script holds only what this host is missing from:
 - the AppArmor profile that allows user namespaces for the sandbox
 - names: the resolver link and the box-name service, plus the reserved local
   range on macOS
-- the classifier tree that enforces a host-address box's egress declaration,
-  with a root-owned copy of its privileged step under `/usr/local/lib/minimal`
-  and a systemd path unit that places the daemon's listener in its leaf on
-  every daemon start. An un-enrolled host needs no source identity for it:
-  nothing is translated until an association adds the reserved addresses
+- the classifier tree that enforces a host-address box's egress declaration.
+  The step keeps a root-owned copy of itself under `/usr/local/lib/minimal`.
+  A systemd path unit places the daemon's listener in its leaf on every
+  daemon start. An un-enrolled host doesn't need a source identity for it.
+  The classifier translates nothing until an association adds the reserved
+  addresses
 - membership of the `kvm` group, only when the configured provider is the
   Linux VM provider
 
