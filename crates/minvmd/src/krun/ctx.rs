@@ -10,7 +10,7 @@
 //! consume the context ([`Context::start_enter`]) take `self` so the type
 //! system prevents use-after-free / double-free.
 
-use std::ffi::{CString, c_char};
+use std::ffi::{CString, OsStr, c_char};
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::OnceLock;
@@ -31,12 +31,12 @@ pub struct Context {
 impl Context {
     /// Create a new libkrun configuration context.
     ///
-    /// If the `MINVMD_KRUN_LOG` environment variable is set (see
-    /// [`KRUN_LOG_ENV`]), libkrun's logging is configured to stderr at the
-    /// corresponding level before the context is created, so bring-up itself
-    /// is captured.
+    /// libkrun's logging is configured to stderr before the context is
+    /// created, so bring-up itself is captured: at error level by default, or
+    /// at the level named by the `MINVMD_KRUN_LOG` environment variable (see
+    /// [`KRUN_LOG_ENV`]).
     pub fn create() -> Result<Self, VmError> {
-        configure_logging_from_env()?;
+        configure_logging()?;
         // SAFETY: krun_create_ctx takes no arguments and either returns a
         // non-negative ctx_id (owned by the caller until krun_free_ctx) or a
         // negative errno. No pointer or lifetime invariants apply.
@@ -347,15 +347,18 @@ impl Drop for Context {
     }
 }
 
-/// Environment variable that, when set to a non-empty value, configures
-/// libkrun's logging. The value is a level name (`off`, `error`, `warn`,
+/// Environment variable that, when set to a non-empty value, overrides
+/// libkrun's log level. The value is a level name (`off`, `error`, `warn`,
 /// `info`, `debug`, `trace`; case-insensitive) or the equivalent numeric
-/// level `0`–`5`. Unset or empty leaves libkrun's logging at its default.
+/// level `0`–`5`. Unset or empty logs libkrun's errors only.
 pub const KRUN_LOG_ENV: &str = "MINVMD_KRUN_LOG";
 
-/// Configure libkrun's logging to stderr from [`KRUN_LOG_ENV`], if set.
+/// Configure libkrun's logging to stderr, which the VMM supervisor captures
+/// in `run.log`.
 ///
-/// A no-op when the variable is unset or empty. A set-but-unrecognised value
+/// With [`KRUN_LOG_ENV`] unset or empty, libkrun logs at error level and
+/// ignores `RUST_LOG`, so a failure libkrun survives (a refused vsock
+/// stream, say) still leaves a host-side trace. A set-but-unrecognised value
 /// is a hard error ([`VmError::InvalidLogLevel`]) rather than a silent
 /// fallback, so a typo in the level surfaces at start-up.
 ///
@@ -365,19 +368,10 @@ pub const KRUN_LOG_ENV: &str = "MINVMD_KRUN_LOG";
 /// return code. `KRUN_LOG_ENV` is read on each call (it cannot change between
 /// them) so an invalid value is reported consistently even before the logger
 /// would be initialized.
-fn configure_logging_from_env() -> Result<(), VmError> {
+fn configure_logging() -> Result<(), VmError> {
     static LOG_INIT_RET: OnceLock<i32> = OnceLock::new();
 
-    let Some(raw_value) = std::env::var_os(KRUN_LOG_ENV) else {
-        return Ok(());
-    };
-    let value = raw_value.to_string_lossy();
-    if value.trim().is_empty() {
-        return Ok(());
-    }
-    let level = parse_log_level(&value).ok_or_else(|| VmError::InvalidLogLevel {
-        value: value.into_owned(),
-    })?;
+    let (level, options) = log_settings(std::env::var_os(KRUN_LOG_ENV).as_deref())?;
 
     let ret = *LOG_INIT_RET.get_or_init(|| {
         // SAFETY: krun_init_log takes four values by value (no pointers). The
@@ -389,12 +383,26 @@ fn configure_logging_from_env() -> Result<(), VmError> {
                 raw::LOG_TARGET_DEFAULT,
                 level as u32,
                 raw::LOG_STYLE_AUTO,
-                raw::LOG_OPTIONS_DEFAULT,
+                options,
             )
         }
     });
     raw::check_backend("krun_init_log", ret)?;
     Ok(())
+}
+
+/// Resolve the `krun_init_log` level and options from a [`KRUN_LOG_ENV`]
+/// value: error level when unset or empty, otherwise the named level, with
+/// libkrun's env overrides off either way so `RUST_LOG` cannot change it.
+fn log_settings(value: Option<&OsStr>) -> Result<(raw::LogLevel, u32), VmError> {
+    let value = value.map(OsStr::to_string_lossy);
+    let Some(value) = value.filter(|v| !v.trim().is_empty()) else {
+        return Ok((raw::LogLevel::Error, raw::LOG_OPTION_NO_ENV));
+    };
+    let level = parse_log_level(&value).ok_or_else(|| VmError::InvalidLogLevel {
+        value: value.into_owned(),
+    })?;
+    Ok((level, raw::LOG_OPTION_NO_ENV))
 }
 
 /// Map a [`KRUN_LOG_ENV`] value to a [`raw::LogLevel`], accepting either a
@@ -495,6 +503,27 @@ mod tests {
         assert_eq!(parse_log_level("0"), Some(LogLevel::Off));
         assert_eq!(parse_log_level("3"), Some(LogLevel::Info));
         assert_eq!(parse_log_level("5"), Some(LogLevel::Trace));
+    }
+
+    #[test]
+    fn log_settings_default_to_errors_without_env_overrides() {
+        let expected = (raw::LogLevel::Error, raw::LOG_OPTION_NO_ENV);
+        assert_eq!(log_settings(None).unwrap(), expected);
+        assert_eq!(log_settings(Some(OsStr::new("  "))).unwrap(), expected);
+    }
+
+    #[test]
+    fn log_settings_honour_the_env_level() {
+        assert_eq!(
+            log_settings(Some(OsStr::new("debug"))).unwrap(),
+            (raw::LogLevel::Debug, raw::LOG_OPTION_NO_ENV)
+        );
+        assert_eq!(
+            log_settings(Some(OsStr::new("off"))).unwrap(),
+            (raw::LogLevel::Off, raw::LOG_OPTION_NO_ENV)
+        );
+        let err = log_settings(Some(OsStr::new("verbose"))).unwrap_err();
+        assert!(matches!(err, VmError::InvalidLogLevel { .. }), "{err:?}");
     }
 
     #[test]
