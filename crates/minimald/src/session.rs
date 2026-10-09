@@ -879,6 +879,13 @@ pub struct Session {
     /// [`Self::host_row_lost`].
     slot_holds_row: bool,
 
+    /// Whether the last [`Self::host_row_lost`] read found the binding
+    /// launch's host gone and the VM host daemon's row still standing, so
+    /// the launch that follows rejoins that row. The next attach or exec
+    /// launch takes it and marks its host as holding the row; a hook launch,
+    /// which reads nothing first, drops it.
+    relaunch_row_confirmed: bool,
+
     /// Whether this daemon opted out of the deny-all egress default
     /// (NET-077), threaded from the server config: the launcher resolves
     /// this session's effective egress (NET-074) against it, and the task
@@ -991,6 +998,7 @@ impl Session {
             host_origin: HostOrigin::Interactive,
             // No host yet, so none holds a row.
             slot_holds_row: false,
+            relaunch_row_confirmed: false,
             // Forwards are registered as their channels open; a session
             // starts with none.
             forwards: Vec::new(),
@@ -4228,6 +4236,9 @@ impl Session {
         phase: LaunchPhase,
         for_hooks: bool,
     ) -> Result<(Option<Channel<Msg>>, LaunchedHost), AttachError> {
+        // Taken first, so a confirmation never outlives the launch it was
+        // read for, whichever way that launch ends.
+        let rejoins_row = std::mem::take(&mut self.relaunch_row_confirmed) && !for_hooks;
         let record = self.record.record().await.unwrap();
         let paths = self.paths().await;
         // Kept before the launcher consumes `attach_env`: the launch folds
@@ -4302,8 +4313,11 @@ impl Session {
         let (host, task, host_ip_enforcement) = spawned.map_err(AttachError::SpawnFailed)?;
         // Whatever this launch replaces, the slot it goes into no longer
         // holds the launch that bound the box's host-side row; only the
-        // binding launch itself, below, sets this again.
-        self.slot_holds_row = false;
+        // binding launch itself, below, sets this again — or a relaunch the
+        // VM host daemon just confirmed its standing row for, which rejoins
+        // the switch under that row.
+        self.slot_holds_row =
+            record.box_addresses.is_some() && record.host_row_bound && rejoins_row;
         // The first launch of a registered box binds its host-side row
         // (NET-138). Recorded on the record, so a restarted daemon knows the
         // row is gone, before anything else can fail the launch: the kill
@@ -4362,7 +4376,12 @@ impl Session {
     /// relaunch rejoins the switch under it. The answer is the host's
     /// table, never a fact this daemon asserts; a host that cannot be asked
     /// — a native host, or a door that does not answer — reads as no row.
-    async fn host_row_lost(&self, record: &Record) -> bool {
+    ///
+    /// A row the host confirms while the slot holds no live host is left
+    /// for the relaunch that follows ([`Self::relaunch_row_confirmed`]), so
+    /// later attaches and execs reuse that host without asking again.
+    async fn host_row_lost(&mut self, record: &Record) -> bool {
+        self.relaunch_row_confirmed = false;
         let slot_alive = matches!(
             &self.inner,
             SessionInner::Active { host: Some((h, _)), .. } if h.is_alive()
@@ -4374,8 +4393,11 @@ impl Session {
             return false;
         }
         let control = self.switch_control().await;
-        crate::net::listeners::host_row_standing(&control, addresses.switch_address).await
-            != Some(true)
+        let standing = crate::net::listeners::host_row_standing(&control, addresses.switch_address)
+            .await
+            == Some(true);
+        self.relaunch_row_confirmed = standing && !slot_alive;
+        !standing
     }
 
     /// Records the launch's own placement outcome on this session's record

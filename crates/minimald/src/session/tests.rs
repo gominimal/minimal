@@ -3690,6 +3690,70 @@ async fn ensure_host_relaunches_a_registered_box_while_its_host_row_stands() {
     door.abort();
 }
 
+/// NET-138: a relaunch the VM host daemon confirmed a standing row for
+/// rejoins that row, so the slot marks its host as holding it. A later exec
+/// reuses that live host without asking the host again, and so still runs
+/// when the report door no longer answers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ensure_host_reuses_a_relaunched_host_without_the_report_door() {
+    let switch_address = std::net::Ipv4Addr::new(100, 64, 128, 29);
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = finalize_handed_own_ip_session(
+        &mut client,
+        "exec-rejoined",
+        switch_address,
+        std::net::Ipv4Addr::new(127, 0, 64, 29),
+    )
+    .await;
+    let manager = server.state.sessions_manager().await;
+    let handle = manager
+        .get_session(crate::sessions::SessionKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the box resolves");
+    let host = handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("the box's first launch binds its row");
+    let sock = handle
+        .net_switch()
+        .await
+        .unwrap()
+        .lock()
+        .await
+        .control_socket();
+    let door_sock = sock.with_file_name("row-door.sock");
+    let (door, _reads, replies) = fake_report_door(&door_sock).await;
+    crate::net::listeners::seed_vm_report_door_for_tests(&sock, &door_sock);
+
+    host.kill(false).await.expect("the box's host ends");
+    soon(|| !host.is_alive()).await;
+    replies
+        .send(minimald_rpc::BoxControlReply::RowStanding {
+            switch_address,
+            row_standing: true,
+        })
+        .expect("the report door stand-in lives");
+    let relaunched = handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("a box whose host row stands is relaunched");
+
+    // The report door goes away: a read now answers nothing, which reads
+    // as no row. The live relaunched host holds its row all the same.
+    crate::net::listeners::clear_vm_report_door_for_tests(&sock);
+    door.abort();
+    let again = handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("the live relaunched host is reused without a read");
+    assert!(
+        again.same_host(&relaunched),
+        "the relaunched host is the one reused"
+    );
+}
+
 /// A daemon restart ends every PTask, and with them the host-side rows. The
 /// record remembers that a launch bound this box's row, so the restarted
 /// actor — no host in its slot — refuses the attach instead of minting.
