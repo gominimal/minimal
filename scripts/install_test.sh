@@ -2252,7 +2252,7 @@ case_for() {
         install)                            case_install ;;
         apparmor)                           case_apparmor ;;
         apparmor_uninstall)                 case_apparmor_uninstall ;;
-        finalize_install_uninstall)                case_finalize_install_uninstall ;;
+        finalize_install_uninstall)         case_finalize_install_uninstall ;;
         checksum_mismatch)                  case_checksum_mismatch ;;
         target_validation)                  case_target_validation ;;
         prefix_resolution)                  case_prefix_resolution ;;

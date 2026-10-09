@@ -11,22 +11,33 @@ use super::*;
 pub(crate) const FINISHED: &str =
     "Every part of the install is finished on this machine; there is nothing to run.";
 
-/// The last line of a completed run.
+/// The last line of a completed run that added no group membership.
 pub(crate) const PICKED_UP: &str = "Running boxes pick this up on their next start.";
 
+/// The last line of a completed run that added the operator to the `kvm`
+/// group: a membership is read at login, so no running process has it yet.
+pub(crate) const NEEDS_LOGIN: &str = "KVM group membership starts at your next login: log out \
+     and back in, or restart the daemon from a new login.";
+
 /// The file route a caller without a terminal is pointed at.
-pub(crate) const SCRIPT_POINTER: &str = "min finalize-install --show --script > f && sudo sh f";
+pub(crate) const SCRIPT_POINTER: &str =
+    "f=$(mktemp) && min finalize-install --show --script > \"$f\" && sudo sh \"$f\"";
 
 /// The heading the items no script can fix are listed under.
 pub(crate) const CANNOT_HEADING: &str = "can't do on this machine:";
+
+/// What a waiting item is listed as.
+pub(crate) const WAITING: &str = "waiting on a daemon";
 
 /// The `--show --json` document's schema.
 pub(crate) const SCHEMA: &str = "min/v1/finalize-install";
 
 /// The names item's cause when no daemon reports an answerer port to
 /// point the resolver at.
-const NO_PORT: &str =
-    "the daemon is not running or has not bound its answerer yet; start a session first";
+const NO_PORT: &str = "no daemon is reachable to report its answerer port";
+
+/// The KVM item's id, read by the run to pick its closing line.
+pub(crate) const KVM_ID: &str = "kvm-group";
 
 /// One item's state on this host.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -38,6 +49,9 @@ pub(crate) enum ItemState {
     Missing,
     /// A host fact no script changes blocks it; `cause` says which.
     Cannot,
+    /// Wanted, but not renderable until a daemon reports what the step
+    /// needs; `cause` says what is awaited. Never blocks the other items.
+    Waiting,
 }
 
 /// One part of the install, as `--show` lists it and the script carries it.
@@ -101,6 +115,18 @@ impl Item {
             script: None,
         }
     }
+
+    fn waiting(id: &'static str, label: &'static str, cause: String) -> Self {
+        Item {
+            id,
+            label,
+            state: ItemState::Waiting,
+            today: None,
+            step: None,
+            cause: Some(cause),
+            script: None,
+        }
+    }
 }
 
 /// The `--show --json` document.
@@ -137,10 +163,17 @@ impl Plan {
             .filter(|item| item.state == ItemState::Cannot)
     }
 
-    /// The exit status `--show --json` ends with: 0 once every item is
-    /// done, 1 while any is not.
+    /// The exit status `--show --json` and a run that runs nothing end
+    /// with: 0 once every item is done, 1 while any is not — missing,
+    /// waiting or blocked alike, since none of those is a finished host.
     pub(crate) fn exit_code(&self) -> i32 {
         i32::from(!self.finished())
+    }
+
+    /// Whether the script adds the operator to the `kvm` group, which
+    /// decides the closing line: a membership is read at login.
+    pub(crate) fn adds_kvm_group(&self) -> bool {
+        self.missing().any(|item| item.id == KVM_ID)
     }
 
     /// The one script a run executes and `--show --script` prints: one
@@ -180,6 +213,11 @@ impl Plan {
         {
             match item.state {
                 ItemState::Done => out.push_str(&format!("  ✓ {}\n", item.label)),
+                ItemState::Waiting => out.push_str(&format!(
+                    "  ✗ {} — {WAITING} ({})\n",
+                    item.label,
+                    item.cause.as_deref().unwrap_or_default()
+                )),
                 _ => {
                     out.push_str(&format!("  ✗ {}\n", item.label));
                     if let Some(today) = &item.today {
@@ -258,6 +296,12 @@ pub async fn cmd_finalize_install(
     global: &GlobalArgs,
     args: FinalizeInstallArgs,
 ) -> Result<(), anyhow::Error> {
+    if let Some(message) = undo_flags_refusal(&args) {
+        use clap::CommandFactory as _;
+        Cli::command()
+            .error(clap::error::ErrorKind::MissingRequiredArgument, message)
+            .exit();
+    }
     if args.undo {
         return cmd_finalize_install_undo(args.show);
     }
@@ -280,13 +324,14 @@ pub async fn cmd_finalize_install(
         }
         return Ok(());
     }
-    eprint!("{}", plan.summary());
+    print!("{}", plan.summary());
     let Some(script) = plan.script() else {
-        if plan.finished() {
-            return Ok(());
+        // Nothing a script can do here: a finished host (exit 0), or one
+        // whose every open item is blocked or waiting (exit 1).
+        if plan.exit_code() != 0 {
+            std::process::exit(plan.exit_code());
         }
-        // Every open item is one no script can fix: there is nothing to run.
-        std::process::exit(1);
+        return Ok(());
     };
     // The installed service runs as one operator; replacing another user's
     // is not this user's call (spec 18's open question on several users).
@@ -295,15 +340,33 @@ pub async fn cmd_finalize_install(
         std::process::exit(1);
     }
     run_as_root(&script)?;
-    eprintln!("{PICKED_UP}");
+    println!("{}", closing_line(plan.adds_kvm_group()));
     Ok(())
+}
+
+/// The line a completed run ends with: [`NEEDS_LOGIN`] when the script
+/// added the operator to the `kvm` group, else [`PICKED_UP`].
+pub(crate) fn closing_line(added_kvm_group: bool) -> &'static str {
+    if added_kvm_group {
+        NEEDS_LOGIN
+    } else {
+        PICKED_UP
+    }
+}
+
+/// Why `--undo` refuses its flags, when it does: `--undo` runs the removal
+/// or, with `--show --script`, prints it; `--show` alone has no summary to
+/// show for a removal, so it is refused rather than guessed at.
+pub(crate) fn undo_flags_refusal(args: &FinalizeInstallArgs) -> Option<&'static str> {
+    (args.undo && args.show && !args.script)
+        .then_some("--undo takes --show only with --script: `min finalize-install --undo --show --script` prints the removal script")
 }
 
 /// `min finalize-install --undo`: remove everything the step installs on
 /// this host (NET-122's removal). The script reads no daemon, so it works
 /// with nothing running, and every step of it tolerates what is already
-/// gone, so it succeeds on a clean host. With `show` it prints the script
-/// and runs nothing.
+/// gone, so it succeeds on a clean host. With `--show --script` it prints
+/// the script and runs nothing.
 fn cmd_finalize_install_undo(show: bool) -> Result<(), anyhow::Error> {
     let script = crate::resolver::undo_command();
     if show {
@@ -462,11 +525,13 @@ async fn names_item_on_this_host(global: &GlobalArgs) -> Item {
         }
     }
     let Some((port, bound)) = answerer else {
+        // No port to point a script at yet: the item waits on a daemon,
+        // and never blocks the items the script can carry without one.
         let cause = match held_no_channel {
             Some(port) => crate::resolver::port_held_no_channel_warning(port),
             None => NO_PORT.to_string(),
         };
-        return Item::cannot(NAMES_ID, NAMES_LABEL, cause);
+        return Item::waiting(NAMES_ID, NAMES_LABEL, cause);
     };
     let (detection, answerer_step) = crate::cmd::session::advisory_host_reads(global).await;
     // The range read the live-surface verdict makes, so the item names the
@@ -504,7 +569,6 @@ pub(crate) mod linux {
     const USERNS_LABEL: &str = "the private sandbox every box runs in";
     pub(crate) const CLASSIFIER_ID: &str = "classifier";
     const CLASSIFIER_LABEL: &str = "per-box egress limits for host-address boxes";
-    pub(crate) const KVM_ID: &str = "kvm-group";
     const KVM_LABEL: &str = "KVM access for the Linux VM provider";
 
     /// The profile the step installs, the very file the checkout ships.
@@ -583,6 +647,20 @@ pub(crate) mod linux {
             ));
         }
         let extra = daemon.filter(|d| !daemon_in_stock_path(d));
+        // The path is written into an AppArmor tunable, whose values are
+        // whitespace-separated and `#`-commented, and into a single-quoted
+        // shell word: a path those cannot carry is a fact no script fixes.
+        if extra.is_some_and(|d| d.contains(['\'', '#']) || d.contains(char::is_whitespace)) {
+            return Some(Item::cannot(
+                USERNS_ID,
+                USERNS_LABEL,
+                format!(
+                    "minimald's path ({}) holds a quote, a hash or whitespace, which an \
+                     AppArmor tunable cannot name; install it under a plain path",
+                    extra.unwrap_or_default()
+                ),
+            ));
+        }
         Some(Item::missing(
             USERNS_ID,
             USERNS_LABEL,
@@ -612,9 +690,11 @@ pub(crate) mod linux {
              {PROFILE_HEREDOC}\n\
              chmod 0644 {APPARMOR_DIR}/tunables/minimald {APPARMOR_DIR}/minimald\n"
         );
-        if let Some(path) = extra_daemon_path.filter(|p| !p.contains(['\'', '\n'])) {
+        if let Some(path) = extra_daemon_path {
             script.push_str(&format!(
-                "mkdir -p {APPARMOR_DIR}/tunables/minimald.d\n\
+                "# Attach the profile to this host's minimald too. This replaces the local\n\
+                 # attachment set (what install-apparmor-profile.sh --path wrote, if anything).\n\
+                 mkdir -p {APPARMOR_DIR}/tunables/minimald.d\n\
                  printf '@{{minimald_bin}} += %s\\n' '{path}' > \
                  {APPARMOR_DIR}/tunables/minimald.d/local\n"
             ));
@@ -930,14 +1010,108 @@ mod tests {
         assert!(script.contains("echo names"), "{script}");
         assert!(!script.contains("nsdelegate"), "{script}");
         assert_eq!(plan.exit_code(), 1);
+    }
 
-        // Only unfixable items: nothing to run, and not finished either.
+    /// NET-122: when every missing item is one no script can fix, the run
+    /// lists them under their heading, runs nothing, and exits non-zero —
+    /// never the finished sentence, since a blocked host is not finished.
+    #[test]
+    fn finalize_install_all_blocked_runs_nothing_and_exits_non_zero() {
         let blocked = Plan {
-            items: vec![cannot("names", "no daemon")],
+            items: vec![cannot("userns-profile", "no user namespaces")],
         };
         assert_eq!(blocked.script(), None);
         assert!(!blocked.finished());
         assert_eq!(blocked.exit_code(), 1);
+        let summary = blocked.summary();
+        assert!(summary.contains(CANNOT_HEADING), "{summary}");
+        assert!(!summary.contains(FINISHED), "{summary}");
+
+        // Done beside a blocked item is the same host: no script, exit 1.
+        let done_and_cannot = Plan {
+            items: vec![
+                done("names"),
+                cannot("userns-profile", "no user namespaces"),
+            ],
+        };
+        assert_eq!(done_and_cannot.script(), None);
+        assert_eq!(done_and_cannot.exit_code(), 1);
+        let summary = done_and_cannot.summary();
+        assert!(!summary.contains(FINISHED), "{summary}");
+        assert!(summary.contains(CANNOT_HEADING), "{summary}");
+    }
+
+    /// NET-122: with no daemon, the names item is listed as waiting on one,
+    /// with its cause, under the summary — not under the unfixable heading
+    /// — and the items that need no daemon still run; a waiting item never
+    /// finishes the host.
+    #[test]
+    fn finalize_install_without_daemon_runs_the_items_that_need_none() {
+        let plan = Plan {
+            items: vec![
+                missing("userns-profile", "userns"),
+                Item::waiting("names", "box names", "no daemon is reachable".to_string()),
+            ],
+        };
+        let summary = plan.summary();
+        assert!(
+            summary.contains("  ✗ box names — waiting on a daemon (no daemon is reachable)\n"),
+            "{summary}"
+        );
+        assert!(!summary.contains(CANNOT_HEADING), "{summary}");
+        assert!(!summary.contains(FINISHED), "{summary}");
+        let script = plan.script().expect("the userns item still runs");
+        assert!(script.contains("echo userns"), "{script}");
+        assert_eq!(plan.exit_code(), 1);
+        let value: serde_json_lenient::Value = serde_json_lenient::from_str(&plan.json()).unwrap();
+        assert_eq!(value["items"][1]["state"], "waiting");
+        assert_eq!(value["finished"], false);
+
+        // Waiting alone: nothing to run, exit 1, no finished sentence.
+        let waiting = Plan {
+            items: vec![Item::waiting("names", "box names", "no daemon".to_string())],
+        };
+        assert_eq!(waiting.script(), None);
+        assert_eq!(waiting.exit_code(), 1);
+        assert!(!waiting.summary().contains(FINISHED));
+    }
+
+    /// NET-122: a run that added the operator to the KVM group ends with the
+    /// login note, exactly; one that installed anything else ends with the
+    /// pick-up line.
+    #[test]
+    fn finalize_install_kvm_group_closing_line_names_a_new_login() {
+        let with_kvm = Plan {
+            items: vec![missing("names", "names"), missing(KVM_ID, "kvm")],
+        };
+        assert!(with_kvm.adds_kvm_group());
+        assert_eq!(closing_line(with_kvm.adds_kvm_group()), NEEDS_LOGIN);
+        assert_eq!(
+            NEEDS_LOGIN,
+            "KVM group membership starts at your next login: log out and back in, or restart \
+             the daemon from a new login."
+        );
+        let without = Plan {
+            items: vec![missing("names", "names"), done(KVM_ID)],
+        };
+        assert!(!without.adds_kvm_group());
+        assert_eq!(closing_line(without.adds_kvm_group()), PICKED_UP);
+    }
+
+    /// `--undo` takes `--show` only with `--script`: `--undo --show` alone
+    /// is refused as a usage error, the other combinations are not.
+    #[test]
+    fn finalize_install_undo_refuses_show_without_script() {
+        let args = |show, script, undo| FinalizeInstallArgs {
+            show,
+            script,
+            json: false,
+            undo,
+        };
+        assert!(undo_flags_refusal(&args(true, false, true)).is_some());
+        assert_eq!(undo_flags_refusal(&args(true, true, true)), None);
+        assert_eq!(undo_flags_refusal(&args(false, false, true)), None);
+        assert_eq!(undo_flags_refusal(&args(true, false, false)), None);
     }
 
     /// NET-122: without a terminal the run goes through `sudo -n`, and when
@@ -961,7 +1135,7 @@ mod tests {
         assert!(message.ends_with(SCRIPT_POINTER), "{message}");
         assert_eq!(
             SCRIPT_POINTER,
-            "min finalize-install --show --script > f && sudo sh f"
+            "f=$(mktemp) && min finalize-install --show --script > \"$f\" && sudo sh \"$f\""
         );
     }
 
@@ -1216,12 +1390,28 @@ mod tests {
             userns_item_over(&UsernsFacts {
                 profile_installed: true,
                 tunables_name_daemon: true,
-                ..dev
+                ..dev.clone()
             })
             .unwrap()
             .state,
             ItemState::Done
         );
+
+        // A path an AppArmor tunable cannot name is a fact no script fixes,
+        // never a silently dropped attachment.
+        for path in [
+            "/opt/my minimal/minimald",
+            "/opt/min#1/minimald",
+            "/opt/it's/minimald",
+        ] {
+            let item = userns_item_over(&UsernsFacts {
+                daemon: Some(path.to_string()),
+                ..dev.clone()
+            })
+            .unwrap();
+            assert_eq!(item.state, ItemState::Cannot, "{path}");
+            assert!(item.cause.as_deref().unwrap().contains(path), "{item:?}");
+        }
     }
 
     /// The classifier item's table: done on the marker; blocked by the
