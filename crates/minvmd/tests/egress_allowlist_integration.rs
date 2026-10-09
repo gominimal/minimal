@@ -511,7 +511,7 @@ async fn create_toolchain_session(
     // The box's row, filed with the VM host the way `min session activate`
     // files it: a box with no row is an unregistered source the gate drops
     // unconditionally (NET-085), its resolver queries included.
-    let addresses = common::register_box(control_sock, &name, Some(egress.clone()))?;
+    let (addresses, box_id) = common::register_box(control_sock, &name, Some(egress.clone()))?;
 
     let req = CreateSessionRequest {
         config: minimald_rpc::SessionConfig {
@@ -523,7 +523,7 @@ async fn create_toolchain_session(
             // The addresses the registration handed back, so the in-VM
             // daemon attaches the box at its row's lease.
             task_addresses: Vec::new(),
-            box_id: None,
+            box_id: Some(box_id),
             box_addresses: Some(addresses),
             hooks_enabled: true,
             attrs: Default::default(),
