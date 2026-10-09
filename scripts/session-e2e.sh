@@ -80,8 +80,8 @@
 #   own_ip                           `--network own_ip` tap + switch attach
 #   own_ip_egress_declared_and_enforced
 #                                    the four egress fields declared, allowed
-#                                    and disallowed connections, the coming
-#                                    deny-all announcement, and the opt-out;
+#                                    and disallowed connections, the in-force
+#                                    deny-all default and its note;
 #                                    a deny-all box's names outside the box
 #                                    zone are REFUSED fast at its relay, a
 #                                    zone TXT is NODATA there, while
@@ -1652,14 +1652,17 @@ published_loopback_host() {
 # (`--allow-subnets`, `--allow-dns-hosts`, `--allow-protocols`, `--deny-subnets`)
 # through an own-address box, checks that `min session policy` shows the
 # effective rules, proves an allowed connection completes and a disallowed one
-# is dropped silently and logged, and records the deny-all default story around
-# it: while the default is only announced this build still allows a bare
-# own-address box and prints the coming change; an explicit deny-all declaration
-# stands in for the in-force default to show the box reaching nothing; and the
-# announcement names the opt-out flag that keeps the prior default. The same
-# deny-all box carries NET-141's deny-all case: its relay answers a name
+# is dropped silently and logged, and proves the deny-all default in force
+# (NET-074/NET-075): a bare own-address box is told its default on one line at
+# activate, `min session policy` shows `deny-all (default)`, and the box
+# reaches nothing — not a literal destination an explicitly allowing box
+# reaches in the same run, and not an external name, which fails fast at
+# resolution while host.min.internal still resolves. An explicit deny-all
+# declaration carries NET-141's deny-all case: its relay answers a name
 # outside the box zone REFUSED, fast, while host.min.internal still resolves,
-# and its TCP to the resolver's port is dropped.
+# and its TCP to the resolver's port is dropped. NET-077's opt-out is not
+# driven here (it needs a daemon restarted with it); it stays with the unit
+# test deny_all_opt_out_keeps_prior_default.
 proof_own_ip_egress_declared_and_enforced() {
   echo "::group::own-IP egress: declared and enforced (NET T20)"
 
@@ -1705,41 +1708,45 @@ proof_own_ip_egress_declared_and_enforced() {
     return 1
   }
 
-  # ---- NET-076: the coming deny-all default is announced -------------------
-  # A bare own-address box still allows everything while the default is only
-  # announced, but the user is told what is coming and how to keep the current
-  # behaviour.
-  announce_sid="$(cd "$EGRESS_SEED_DIR" && mnl session activate . --no-prompt \
-    --name e2e-egress-announce --network own_ip 2>"$WORK/egress-announce.err")" || {
-    echo "::error::'min session activate --network own_ip' (announcement probe) failed"
-    cat "$WORK/egress-announce.err" 2>/dev/null || true
+  # ---- NET-074/NET-075/NET-076: a bare own-address box has deny-all --------
+  # The default is in force: an own-address box with no egress section is
+  # told so on one line at activate (and the retired announcement, NET-076,
+  # no longer prints), and `min session policy` names the default it got.
+  # This daemon runs without the opt-out, so the default binds. The box is
+  # kept for the reach legs below, which need a live control first.
+  egress_in_force_note="egress: deny-all (default for an own-ip box with no egress section)"
+  bare_sid="$(cd "$EGRESS_SEED_DIR" && mnl session activate . --no-prompt \
+    --name e2e-egress-bare --network own_ip 2>"$WORK/egress-bare.err")" || {
+    echo "::error::'min session activate --network own_ip' (bare box) failed"
+    cat "$WORK/egress-bare.err" 2>/dev/null || true
     fail
   }
-  announce_sid="$(printf '%s\n' "$announce_sid" | tail -n1 | tr -d '\r')"
-  if ! grep -q "Heads-up: the next release denies all external reach" "$WORK/egress-announce.err"; then
-    echo "::error::activate did not announce the coming deny-all default (NET-076)"
-    cat "$WORK/egress-announce.err" 2>/dev/null || true
+  bare_sid="$(printf '%s\n' "$bare_sid" | tail -n1 | tr -d '\r')"
+  bare_note_count="$(grep -cF -- "$egress_in_force_note" "$WORK/egress-bare.err" || true)"
+  if [ "$bare_note_count" != 1 ]; then
+    echo "::error::NET-074: activate of a bare own-address box did not print the in-force note once (got ${bare_note_count:-0})"
+    cat "$WORK/egress-bare.err" 2>/dev/null || true
     fail
   fi
-  # A VM-backed lane names the VM host's variable, never the native flag:
-  # the flag does not reach the guest's egress default.
-  if [ "$min_daemon" = minvmd ]; then
-    if ! grep -qF -- "MINVMD_EGRESS_DENY_ALL_OPT_OUT=1" "$WORK/egress-announce.err"; then
-      echo "::error::the deny-all announcement did not name MINVMD_EGRESS_DENY_ALL_OPT_OUT=1 (VM lane)"
-      cat "$WORK/egress-announce.err" 2>/dev/null || true
-      fail
-    fi
-    if grep -qF -- "--egress-deny-all-opt-out" "$WORK/egress-announce.err"; then
-      echo "::error::the VM-lane deny-all announcement named the native --egress-deny-all-opt-out flag"
-      cat "$WORK/egress-announce.err" 2>/dev/null || true
-      fail
-    fi
-  elif ! grep -qF -- "--egress-deny-all-opt-out" "$WORK/egress-announce.err"; then
-    echo "::error::the deny-all announcement did not name the --egress-deny-all-opt-out flag"
-    cat "$WORK/egress-announce.err" 2>/dev/null || true
+  if grep -q "Heads-up" "$WORK/egress-bare.err"; then
+    echo "::error::NET-076: the retired deny-all announcement still printed at activate"
+    cat "$WORK/egress-bare.err" 2>/dev/null || true
     fail
   fi
-  echo "NET-076 OK: activate announced the coming default and named the opt-out"
+  echo "NET-076 OK: no announcement; activate printed the in-force note once"
+
+  bare_policy="$(mnl session policy "$bare_sid" 2>"$WORK/egress-bare-policy.err")" || {
+    echo "::error::'min session policy' failed for the bare box"
+    cat "$WORK/egress-bare-policy.err" 2>/dev/null || true
+    fail
+  }
+  echo "effective policy of the bare box:"
+  printf '%s\n' "$bare_policy" | sed 's/^/  /'
+  if ! grep -qF "deny-all (default)" <<<"$bare_policy"; then
+    echo "::error::NET-075: 'min session policy' did not show the deny-all default for a bare own-address box"
+    fail
+  fi
+  echo "NET-075 OK: the bare box's policy shows deny-all (default)"
 
   # The remaining probes exercise allowed/disallowed flows against the public
   # internet, so they follow the same weather-aware policy as
@@ -1793,23 +1800,39 @@ proof_own_ip_egress_declared_and_enforced() {
     return 1
   }
 
-  if egress_reachability_probe "$announce_sid" "announce" example.com example.org; then
-    echo "allowed-connection OK: a bare box still reaches the network during the announcement"
+  # The control box: an own-address box that declares reach to every
+  # address, so it reaches what the lane reaches. It declares egress, so no
+  # in-force note prints for it.
+  open_sid="$(cd "$EGRESS_SEED_DIR" && mnl session activate . --no-prompt \
+    --name e2e-egress-open --network own_ip --allow-subnets 0.0.0.0/0 \
+    2>"$WORK/egress-open.err")" || {
+    echo "::error::'min session activate --network own_ip --allow-subnets 0.0.0.0/0' failed"
+    cat "$WORK/egress-open.err" 2>/dev/null || true
+    fail
+  }
+  open_sid="$(printf '%s\n' "$open_sid" | tail -n1 | tr -d '\r')"
+  if grep -qF -- "$egress_in_force_note" "$WORK/egress-open.err"; then
+    echo "::error::a box that declared egress was given the in-force note for a box with no egress section"
+    cat "$WORK/egress-open.err" 2>/dev/null || true
+    fail
+  fi
+
+  if egress_reachability_probe "$open_sid" "open" example.com example.org; then
+    echo "allowed-connection OK: a box that declares reach to every address reaches the network"
   else
-    echo "allowed-connection WARNING: the bare box could not prove external reachability; the announcement text and opt-out were still verified above"
+    echo "allowed-connection WARNING: the allowing box could not prove external reachability; the note and policy were still verified above"
   fi
 
   # ---- the destination the declared box must be refused, proven live first --
   # NET-062's drop is only meaningful against a destination this lane can
   # actually reach: a connection nobody could have completed reads as a
   # "silent drop" on a networkless lane, which is enforcement nobody enforced.
-  # So the SAME run first asks a box with NO egress section — the announce box
-  # above, which the announcement phase still leaves unrestricted — to
-  # complete the exact connection the declared box must be refused. Its
-  # completing proves the destination is live and reachable through this
-  # switch fabric, so the declared box's non-completion below can only be its
-  # own rules — and it doubles as the reach the coming deny-all default takes
-  # away (NET-074).
+  # So the SAME run first asks the allowing box above — its egress admits
+  # every address — to complete the exact connection the declared box must
+  # be refused. Its completing proves the destination is live and reachable
+  # through this switch fabric, so the declared box's non-completion below
+  # can only be its own rules — and so is the bare box's, which is the reach
+  # the deny-all default takes away (NET-074).
   #
   # The destination is a LITERAL public address, and it is chosen so nothing
   # the declared box admits can ever cover it. Its allow subnets are a
@@ -1828,21 +1851,21 @@ proof_own_ip_egress_declared_and_enforced() {
   # name this box pins (example.com) can never resolve to — and being
   # literals, no resolver has to agree with anything for the probe to run.
   # Two of them, because a lane whose network blocks one still deserves the
-  # proof: the first the bare box reaches is the one the declared box must be
-  # refused.
+  # proof: the first the allowing box reaches is the one the declared box
+  # must be refused.
   egress_disallowed_dst=""
   for egress_dst_candidate in 1.1.1.1 9.9.9.9; do
     for egress_dst_try in 1 2 3; do
-      egress_dst_out="$(mnl session exec "$announce_sid" \
+      egress_dst_out="$(mnl session exec "$open_sid" \
         "curl -sS -o /dev/null -w 'HTTP:%{http_code}' --max-time 20 https://$egress_dst_candidate/" \
         2>"$WORK/egress-dst-live.err")"
       egress_dst_rc=$?
       if egress_curl_answered "$egress_dst_rc" "${egress_dst_out:-}"; then
         egress_disallowed_dst="$egress_dst_candidate"
-        echo "control GET https://$egress_dst_candidate/ from the bare box -> ${egress_dst_out:-<none>} (attempt ${egress_dst_try}/3): the destination is live on this lane, so the declared box below must be refused this same connection"
+        echo "control GET https://$egress_dst_candidate/ from the allowing box -> ${egress_dst_out:-<none>} (attempt ${egress_dst_try}/3): the destination is live on this lane, so the declared box below must be refused this same connection"
         break
       fi
-      echo "control GET https://$egress_dst_candidate/ from the bare box failed on attempt ${egress_dst_try}/3 (rc ${egress_dst_rc}, got '${egress_dst_out:-<none>}')"
+      echo "control GET https://$egress_dst_candidate/ from the allowing box failed on attempt ${egress_dst_try}/3 (rc ${egress_dst_rc}, got '${egress_dst_out:-<none>}')"
       cat "$WORK/egress-dst-live.err" 2>/dev/null || true
       if [ "$egress_dst_try" -lt 3 ]; then
         sleep 3
@@ -1853,9 +1876,59 @@ proof_own_ip_egress_declared_and_enforced() {
     fi
   done
   if [ -z "$egress_disallowed_dst" ]; then
-    echo "::warning::the bare box could not reach a disallowed candidate destination on this run, so the disallowed-connection drop below is skipped as a weather warning (without this control a non-completion would be indistinguishable from a dead route)"
+    echo "::warning::the allowing box could not reach a disallowed candidate destination on this run, so the disallowed-connection drop below is skipped as a weather warning (without this control a non-completion would be indistinguishable from a dead route)"
   fi
-  mnl session destroy --force "$announce_sid" >/dev/null 2>&1 || true
+
+  # ---- NET-074: the bare box reaches nothing outside itself ----------------
+  # The literal destination the allowing box just completed a connection to
+  # must not complete from the bare box: same run, same fabric, so a
+  # non-completion is the default's doing, not a dead route.
+  if [ -z "$egress_disallowed_dst" ]; then
+    echo "::warning::NET-074: the bare box's reach assertion is skipped as a weather warning (the allowing box reached no candidate destination above)"
+  else
+    mnl session exec "$bare_sid" \
+      "curl -sS -o /dev/null -w 'HTTP:%{http_code}' --max-time 10 https://$egress_disallowed_dst/" \
+      >"$WORK/egress-bare-ip.out" 2>"$WORK/egress-bare-ip.err"
+    bare_ip_rc=$?
+    bare_ip_status="$(cat "$WORK/egress-bare-ip.out" 2>/dev/null)"
+    echo "bare-box GET https://$egress_disallowed_dst/ -> rc=$bare_ip_rc status=${bare_ip_status:-<none>} curl: $(tr '\n' ' ' < "$WORK/egress-bare-ip.err" 2>/dev/null)"
+    if egress_curl_answered "$bare_ip_rc" "${bare_ip_status:-}"; then
+      echo "::error::NET-074: a bare own-address box completed a connection to $egress_disallowed_dst, which the allowing box reached in this run; the deny-all default did not bind"
+      cat "$WORK/egress-bare-ip.err" 2>/dev/null || true
+      fail
+    fi
+    echo "NET-074 OK: the bare box did not reach $egress_disallowed_dst, which the allowing box reached in this run"
+  fi
+
+  # An external name fails fast at resolution: the relay refuses every name
+  # outside the box zone for a deny-all box, so the lookup is answered, never
+  # left to time out. Timed inside the box, so the exec's own round trip is
+  # not counted; single-quoted so the box's shell, not this one, expands it.
+  # The zone still resolves: host.min.internal answers from the same box.
+  # shellcheck disable=SC2016
+  bare_lookup="$(mnl session exec "$bare_sid" \
+    's=$(date +%s%N); getent ahostsv4 example.com; rc=$?; e=$(date +%s%N); echo "rc=$rc ms=$(( (e - s) / 1000000 ))"' \
+    2>"$WORK/egress-bare-getent.err" | tr -d '\r' | tail -n1)" || true
+  echo "NET-074: getent ahostsv4 example.com from the bare box -> ${bare_lookup:-<none>}"
+  bare_lookup_rc="$(printf '%s' "$bare_lookup" | sed -n 's/^rc=\([0-9]*\) .*/\1/p')"
+  bare_lookup_ms="$(printf '%s' "$bare_lookup" | sed -n 's/.* ms=\([0-9]*\)$/\1/p')"
+  if [ -z "$bare_lookup_rc" ] || [ "$bare_lookup_rc" = 0 ] || [ -z "$bare_lookup_ms" ] \
+     || [ "$bare_lookup_ms" -ge 5000 ]; then
+    echo "::error::NET-074: the bare box's lookup of example.com did not fail fast (want a non-zero getent exit inside 5000 ms, got '${bare_lookup:-none}')"
+    cat "$WORK/egress-bare-getent.err" 2>/dev/null || true
+    fail
+  fi
+  bare_host="$(mnl session exec "$bare_sid" "getent ahostsv4 host.min.internal" \
+    2>"$WORK/egress-bare-host.err" | awk 'NR == 1 { print $1 }' | tr -d '\r')" || true
+  echo "NET-074: host.min.internal from the bare box -> ${bare_host:-<none>}"
+  if ! printf '%s' "$bare_host" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+    echo "::error::NET-074: host.min.internal did not resolve from the bare box (got '${bare_host:-none}')"
+    cat "$WORK/egress-bare-host.err" 2>/dev/null || true
+    fail
+  fi
+  echo "NET-074 OK: the bare box's external name fails fast at resolution and host.min.internal resolves"
+  mnl session destroy --force "$bare_sid" >/dev/null 2>&1 || true
+  mnl session destroy --force "$open_sid" >/dev/null 2>&1 || true
 
   # ---- NET-060/061/062/063: four-field declaration, effective rules, drop --
   # The allowed list is intentionally narrow: one non-loopback documentation
@@ -1880,8 +1953,8 @@ proof_own_ip_egress_declared_and_enforced() {
     fail
   }
   declare_sid="$(printf '%s\n' "$declare_sid" | tail -n1 | tr -d '\r')"
-  if grep -q "Heads-up: the next release denies all external reach" "$WORK/egress-declared.err"; then
-    echo "::error::a declared box was announced as if it had no egress section"
+  if grep -qF -- "$egress_in_force_note" "$WORK/egress-declared.err"; then
+    echo "::error::a declared box was given the in-force note for a box with no egress section"
     cat "$WORK/egress-declared.err" 2>/dev/null || true
     fail
   fi
@@ -1911,7 +1984,7 @@ proof_own_ip_egress_declared_and_enforced() {
   # lane's network and the allowed path — and, on the SAME run, separates a
   # policy drop from a dead network, which is what lets the fast-failure
   # branches below be hard fails instead of weather warnings. The control's
-  # result is kept for the deny-all stand-in further down, whose own
+  # result is kept for the declared deny-all box further down, whose own
   # reachability cannot be probed from itself (it reaches nothing by
   # construction, so a guard run from it could never pass).
   declared_reach_ok=0
@@ -1924,15 +1997,15 @@ proof_own_ip_egress_declared_and_enforced() {
     # name outside `allow_dns_hosts` is a resolver matter (design §5.3 refuses
     # non-matching names at resolution), so the drop is proven against a
     # destination ADDRESS no rule and no pin admits — the literal chosen and
-    # proven live further up, from the bare box, in this same run. Two
-    # controls bracket it: the bare box's completed connection to the very
+    # proven live further up, from the allowing box, in this same run. Two
+    # controls bracket it: the allowing box's completed connection to the very
     # destination (a live destination on this lane, reached through the same
     # fabric) and this box's own completed connection to example.com above
     # (this box's network and its allowed path), so a non-completion here is
     # neither a dead route nor a dead box, and a fast refusal is the box's own
     # doing rather than weather.
     if [ -z "$egress_disallowed_dst" ]; then
-      echo "::warning::NET-062: the disallowed-address drop is skipped as a weather warning (the bare box reached no candidate destination above, so a drop here would prove nothing about the rules)"
+      echo "::warning::NET-062: the disallowed-address drop is skipped as a weather warning (the allowing box reached no candidate destination above, so a drop here would prove nothing about the rules)"
     else
       deny_start_ms="$(now_ms)"
       mnl session exec "$declare_sid" \
@@ -1944,7 +2017,7 @@ proof_own_ip_egress_declared_and_enforced() {
       deny_err="$(tr '\n' ' ' < "$WORK/egress-deny-ip.err" 2>/dev/null)"
       echo "disallowed-address GET https://$egress_disallowed_dst/ -> rc=$deny_rc status=${deny_status:-<none>} elapsed=${deny_elapsed_ms}ms curl: ${deny_err:-<none>}"
       if egress_curl_answered "$deny_rc" "${deny_status:-}"; then
-        echo "::error::NET-062: a connection to an address no rule admits ($egress_disallowed_dst) completed — the bare box completed this same connection above, so the lane reaches the destination and the egress rules did not enforce"
+        echo "::error::NET-062: a connection to an address no rule admits ($egress_disallowed_dst) completed — the allowing box completed this same connection above, so the lane reaches the destination and the egress rules did not enforce"
         cat "$WORK/egress-deny-ip.err" 2>/dev/null || true
         fail
       fi
@@ -1954,11 +2027,11 @@ proof_own_ip_egress_declared_and_enforced() {
         fail
       fi
       if [ "$deny_elapsed_ms" -ge 6000 ]; then
-        echo "NET-062 OK: the disallowed connection to $egress_disallowed_dst dropped silently (no answer and no reset until the 10 s timeout), while the bare box completed the same connection in this run"
+        echo "NET-062 OK: the disallowed connection to $egress_disallowed_dst dropped silently (no answer and no reset until the 10 s timeout), while the allowing box completed the same connection in this run"
         assert_egress_drop_logged
         echo "NET-062 (rate-limited warning) OK: the drop is logged"
       else
-        echo "::error::NET-062: the disallowed connection failed in ${deny_elapsed_ms}ms — a fast refusal, not a silent drop. The controls bracketing this probe (the bare box's completed connection to the same destination, and this box's own to https://example.com) both completed on this run, so the network path is alive and the fast failure is the box's own doing"
+        echo "::error::NET-062: the disallowed connection failed in ${deny_elapsed_ms}ms — a fast refusal, not a silent drop. The controls bracketing this probe (the allowing box's completed connection to the same destination, and this box's own to https://example.com) both completed on this run, so the network path is alive and the fast failure is the box's own doing"
         cat "$WORK/egress-deny-ip.err" 2>/dev/null || true
         fail
       fi
@@ -1997,15 +2070,11 @@ proof_own_ip_egress_declared_and_enforced() {
     echo "allowed/disallowed-connection WARNING: the declared box could not complete its allowed connection to https://example.com; the connection assertions that need the public internet are skipped as weather warnings"
   fi
 
-  # ---- NET-074 stand-in: no egress section reaches nothing once the default
-  # is in force. The shipped phase is announced, so we exercise the
-  # enforcement shape with an explicit deny-all declaration
-  # (`--deny-all-egress`, every allow list present and empty — the very
-  # section the in-force default materializes); the unit and CLI tests
-  # already cover the in-force resolution, and the announcement above covers
-  # the transition notice. This is a stand-in for NET-074's REACH only:
-  # NET-075's `deny-all` rendering in `min session policy` stays with the CLI
-  # tests that pin it.
+  # ---- a declared deny-all box: `--deny-all-egress`, every allow list
+  # present and empty — the very section the in-force default materializes
+  # for the bare box above (NET-074), here declared, so the box carries it
+  # whatever the daemon's opt-out says. It carries NET-141's deny-all case
+  # below, and reaches nothing.
   deny_all_sid="$(cd "$EGRESS_SEED_DIR" && mnl session activate . --no-prompt \
     --name e2e-egress-deny-all --network own_ip \
     --deny-all-egress \
@@ -2143,7 +2212,7 @@ if len(r) >= 8 and r[0:2] == b"\x4d\x31" and r[2] & 0x80:
   # the control — a hard assertion when it passed, a weather warning when it
   # did not — and probe the same endpoint the control just proved answers.
   if [ "$declared_reach_ok" != 1 ]; then
-    echo "::warning::NET-074: the declared box could not prove external reachability in this run, so the deny-all stand-in's reach assertion is skipped as a weather warning"
+    echo "::warning::the declared box could not prove external reachability in this run, so the declared deny-all box's reach assertion is skipped as a weather warning"
   else
     deny_all_start_ms="$(now_ms)"
     mnl session exec "$deny_all_sid" \
@@ -2169,11 +2238,11 @@ if len(r) >= 8 and r[0:2] == b"\x4d\x31" and r[2] & 0x80:
     fi
     echo "deny-all GET https://example.com -> rc=$deny_all_rc status=${deny_all_status:-<none>} elapsed=${deny_all_elapsed_ms}ms ($deny_all_outcome) curl: ${deny_all_err:-<none>}"
     if [ "$deny_all_outcome" != "fast resolver refusal" ]; then
-      echo "::error::NET-074/NET-141: the deny-all box's GET https://example.com did not fail at resolution — its relay refuses every name outside the box zone, so no connection should have been tried"
+      echo "::error::NET-141: the deny-all box's GET https://example.com did not fail at resolution — its relay refuses every name outside the box zone, so no connection should have been tried"
       cat "$WORK/egress-deny-all-curl.err" 2>/dev/null || true
       fail
     fi
-    echo "NET-074 OK: a box with no effective external reach gets nothing (explicit deny-all stand-in for the in-force default)"
+    echo "declared deny-all OK: a box that declared no external reach gets nothing"
   fi
 
   mnl session destroy --force "$declare_sid" >/dev/null 2>&1 || true
@@ -3730,7 +3799,7 @@ proof_daemon_fetch_under_deny_all_host_address_box() {
 # lands. So the case freezes the CLI instead. It single-steps the activation
 # under SIGSTOP/SIGCONT, so the CLI never runs more than a few milliseconds
 # unobserved. It stops for good once the CLI has printed the deny-all
-# announcement (the same NET-076 text the egress proof above asserts, printed
+# in-force note (the same NET-076 text the egress proof above asserts, printed
 # immediately before the guard is armed) AND holds the fixture's bulk data
 # open. That combination means the project upload is under way: after the
 # guard, before the configure. Then the SIGINT lands while the CLI is
@@ -3790,8 +3859,12 @@ proof_own_ip_box_registers_with_the_vm_host_without_a_provider_flag() {
   mnl stop --force >/dev/null 2>&1 || true
 
   # ---- (a) create registers the box with the VM host daemon ----------------
+  # The box declares reach to every address: it is the live control for the
+  # declared box's refusal below, and a bare own-address box now has the
+  # deny-all default (NET-074), so it could not be one.
   boxreg_sid="$(cd "$BOXREG_SEED_DIR" && RUST_LOG="warn,minvmd=debug" mnl session activate . \
-    --no-prompt --name e2e-box-reg --network own_ip 2>"$WORK/boxreg-activate.err")" || {
+    --no-prompt --name e2e-box-reg --network own_ip --allow-subnets 0.0.0.0/0 \
+    2>"$WORK/boxreg-activate.err")" || {
     echo "::error::'min session activate --network own_ip' (no provider flag) failed"
     cat "$WORK/boxreg-activate.err" 2>/dev/null || true
     fail
@@ -3803,7 +3876,7 @@ proof_own_ip_box_registers_with_the_vm_host_without_a_provider_flag() {
     cat "$WORK/boxreg-activate.err" 2>/dev/null || true
     fail
   fi
-  echo "bare own-address box: $boxreg_sid (activated with no provider flag)"
+  echo "own-address box: $boxreg_sid (activated with no provider flag; egress open to every address)"
 
   # The registration, straight from the VM host daemon's record: one INFO
   # line per box, naming it and the address pair it allocated. The CLI could
@@ -3856,8 +3929,8 @@ proof_own_ip_box_registers_with_the_vm_host_without_a_provider_flag() {
   # ---- the destination the declared box below must be refused, proven live --
   # Same doctrine as the egress proof above: a non-completion only means
   # enforcement if this lane can reach the destination at all, so the SAME
-  # connection is first completed from the box with NO egress section
-  # (allow-all while the shipped default is only announced). The destination
+  # connection is first completed from the box above, whose declared egress
+  # admits every address. The destination
   # is a literal public anycast endpoint, live on 443 and chosen so nothing
   # the declared box admits can ever cover it — no resolver has to agree with
   # anything for the probe to run. curl always writes its -w line, and
@@ -3872,17 +3945,17 @@ proof_own_ip_box_registers_with_the_vm_host_without_a_provider_flag() {
       if [ "$boxreg_dst_rc" -eq 0 ] \
         || { [ -n "${boxreg_dst_out:-}" ] && [ "$boxreg_dst_out" != "HTTP:000" ]; }; then
         boxreg_live_dst="$boxreg_dst"
-        echo "control GET https://$boxreg_dst/ from the bare box -> ${boxreg_dst_out:-<none>} (attempt ${boxreg_try}/3): the destination is live on this lane, so the declared box below must be refused this same connection"
+        echo "control GET https://$boxreg_dst/ from the allowing box -> ${boxreg_dst_out:-<none>} (attempt ${boxreg_try}/3): the destination is live on this lane, so the declared box below must be refused this same connection"
         break
       fi
-      echo "control GET https://$boxreg_dst/ from the bare box failed on attempt ${boxreg_try}/3 (rc ${boxreg_dst_rc}, got '${boxreg_dst_out:-<none>}')"
+      echo "control GET https://$boxreg_dst/ from the allowing box failed on attempt ${boxreg_try}/3 (rc ${boxreg_dst_rc}, got '${boxreg_dst_out:-<none>}')"
       cat "$WORK/boxreg-dst-live.err" 2>/dev/null || true
       [ "$boxreg_try" -lt 3 ] && sleep 3
     done
     [ -n "$boxreg_live_dst" ] && break
   done
   if [ -z "$boxreg_live_dst" ]; then
-    echo "::warning::the bare box reached no candidate destination on this run, so the declared box's refusal below is skipped as a weather warning (without this control a non-completion would be indistinguishable from a dead route)"
+    echo "::warning::the allowing box reached no candidate destination on this run, so the declared box's refusal below is skipped as a weather warning (without this control a non-completion would be indistinguishable from a dead route)"
   fi
 
   # ---- (b) destroy withdraws the row ---------------------------------------
@@ -3922,7 +3995,7 @@ proof_own_ip_box_registers_with_the_vm_host_without_a_provider_flag() {
   # that an interrupt would kill it with the row still published — and drops
   # the guard once the session is Active. The guard aborts the half-built
   # session, withdraws the box row, and exits 130. What the HOST can see of
-  # "the create returned" is the deny-all announcement a box with no egress
+  # "the create returned" is the deny-all in-force note a box with no egress
   # section prints to stderr immediately before the guard is armed, and of
   # "the upload is under way" is the bulk file held open. This half freezes
   # the backgrounded activation once both are true (see the header comment)
@@ -3938,7 +4011,7 @@ proof_own_ip_box_registers_with_the_vm_host_without_a_provider_flag() {
   BOXREG_CTRLC_PID=$!
   # Single-step the activation until it is frozen inside the window (see the
   # header comment): each step stops the CLI, looks, and lets it run ~10 ms
-  # more. Once the deny-all announcement is on stderr the guard is armed, and
+  # more. Once the deny-all in-force note is on stderr the guard is armed, and
   # once the bulk file is also open the project upload is under way. The CLI
   # is left stopped there, so nothing it does next can race the interrupt.
   # lsof reports the resolved path on macOS (/tmp is /private/tmp), so the
@@ -3950,7 +4023,7 @@ proof_own_ip_box_registers_with_the_vm_host_without_a_provider_flag() {
   while [ "$SECONDS" -lt "$boxreg_ctrlc_deadline" ]; do
     kill -STOP "$BOXREG_CTRLC_PID" 2>/dev/null || break
     if [ -z "$boxreg_ctrlc_armed" ] \
-      && grep -q "Heads-up: the next release denies all external reach" \
+      && grep -qF -- "egress: deny-all (default for an own-ip box with no egress section)" \
         "$WORK/boxreg-ctrlc.err" 2>/dev/null; then
       boxreg_ctrlc_armed=1
     fi
@@ -3968,7 +4041,7 @@ proof_own_ip_box_registers_with_the_vm_host_without_a_provider_flag() {
     sleep 0.01
   done
   if [ -z "$boxreg_ctrlc_armed" ]; then
-    echo "::error::the interrupted activation never announced the deny-all default on stderr — the create did not return (or failed outright), so the Ctrl-C guard was never in play"
+    echo "::error::the interrupted activation never printed the deny-all in-force note on stderr — the create did not return (or failed outright), so the Ctrl-C guard was never in play"
     cat "$WORK/boxreg-ctrlc.err" 2>/dev/null || true
     kill -9 "$BOXREG_CTRLC_PID" 2>/dev/null || true
     BOXREG_CTRLC_PID=""
@@ -4160,7 +4233,7 @@ proof_own_ip_box_registers_with_the_vm_host_without_a_provider_flag() {
   if [ "$boxreg_declared_reach_ok" -ne 1 ]; then
     echo "::warning::the declared box's allowed connection to https://example.com did not complete, so the refusal below is skipped as a weather warning (the row is registered; the behavioural half needs the public internet)"
   elif [ -z "$boxreg_live_dst" ]; then
-    echo "::warning::the declared box's refusal is skipped as a weather warning (no candidate destination was live from the bare box above)"
+    echo "::warning::the declared box's refusal is skipped as a weather warning (no candidate destination was live from the allowing box above)"
   else
     # The refusal, hard-failed on every shape that is not a silent drop: an
     # answer, a reset, or a fast failure — bracketed by the two controls that
@@ -4176,7 +4249,7 @@ proof_own_ip_box_registers_with_the_vm_host_without_a_provider_flag() {
     echo "undeclared GET https://$boxreg_live_dst/ from the declared box -> rc=$boxreg_refuse_rc status=${boxreg_refuse_status:-<none>} elapsed=${boxreg_refuse_elapsed_ms}ms curl: ${boxreg_refuse_err:-<none>}"
     if [ "$boxreg_refuse_rc" -eq 0 ] \
       || { [ -n "${boxreg_refuse_status:-}" ] && [ "$boxreg_refuse_status" != "HTTP:000" ]; }; then
-      echo "::error::the declared box's connection to $boxreg_live_dst answered — the bare box completed this same connection above and this box's own allowed connection completed, so the declared egress did not enforce"
+      echo "::error::the declared box's connection to $boxreg_live_dst answered — the allowing box completed this same connection above and this box's own allowed connection completed, so the declared egress did not enforce"
       cat "$WORK/boxreg-refuse.err" 2>/dev/null || true
       fail
     fi
@@ -4186,11 +4259,11 @@ proof_own_ip_box_registers_with_the_vm_host_without_a_provider_flag() {
       fail
     fi
     if [ "$boxreg_refuse_elapsed_ms" -lt 6000 ]; then
-      echo "::error::the declared box's undeclared connection failed in ${boxreg_refuse_elapsed_ms}ms — a fast refusal, not a silent drop. Both controls completed in this run (the bare box reached the destination, and this box reached its allowed name), so the network is alive and the fast failure is this box's own doing"
+      echo "::error::the declared box's undeclared connection failed in ${boxreg_refuse_elapsed_ms}ms — a fast refusal, not a silent drop. Both controls completed in this run (the allowing box reached the destination, and this box reached its allowed name), so the network is alive and the fast failure is this box's own doing"
       cat "$WORK/boxreg-refuse.err" 2>/dev/null || true
       fail
     fi
-    echo "declared egress: the undeclared destination $boxreg_live_dst is refused (no answer and no reset until the 10 s timeout), while the bare box completed the same connection and this box completed its allowed one"
+    echo "declared egress: the undeclared destination $boxreg_live_dst is refused (no answer and no reset until the 10 s timeout), while the allowing box completed the same connection and this box completed its allowed one"
 
     # The host-side gate's own account, where the frame reached it. An honest
     # box's in-guest egress leg applies the same declared policy and refuses
@@ -5962,8 +6035,12 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
   # -- own-IP (native only): its own namespace beside the session's box ----
   tn_own_proven=""
   if [ -z "$E2E_VM" ]; then
+  # The session declares reach to every address: an own-address box with no
+  # egress section gets the deny-all default (NET-074), and the egress leg
+  # below needs a task that can reach example.com.
   tn_sid="$(cd "$TN_SEED_DIR" && mnl session activate . --no-prompt \
-    --name e2e-tn-ownip --network own_ip 2>"$WORK/tn-activate.err")" || {
+    --name e2e-tn-ownip --network own_ip --allow-subnets 0.0.0.0/0 \
+    2>"$WORK/tn-activate.err")" || {
     echo "::error::'min session activate --network own_ip' failed for the task-network proof"
     echo "--- stderr ---"; cat "$WORK/tn-activate.err" 2>/dev/null || true
     kill "$TN_LISTENER_PID" 2>/dev/null || true
@@ -13127,7 +13204,7 @@ proof_proxy_sees_each_vm_box_by_its_switch_address() {
 #     that declared the lane reaches the proxy's acceptor on its listener
 #     port, and nothing else on the host answers it.
 #   * box_without_credentialed_lane_cannot_reach_proxy — a box with no
-#     lane, allow-all rules included so only the lane's absence can refuse
+#     lane, rules open to every address so only the lane's absence can refuse
 #     the address, has every frame to the proxy's address dropped at the
 #     FIRST gate, its own relay, inside the guest: the connect runs out its
 #     window with no reset, and the host gate's log stays silent, because
@@ -13421,8 +13498,8 @@ proof_deny_all_box_reaches_proxy_and_no_other_host_port() {
   echo "::endgroup::"
 }
 
-# The refusal's half: a box with NO lane — allow-all rules, so nothing but
-# the lane's absence can refuse the proxy's address — gets silence at the
+# The refusal's half: a box with NO lane — rules open to every address, so
+# nothing but the lane's absence can refuse the proxy's address — gets silence at the
 # proxy's address and one rate-limited warn line in the daemon's log, the
 # refused frame's source (the box's own switch address) and the rule that
 # dropped it named. The control runs first: the same box's probe to a
@@ -13450,13 +13527,16 @@ proof_box_without_credentialed_lane_cannot_reach_proxy() {
   hook_seed_preamble > "$CRED_NO_LANE_SEED_DIR/minimal.toml"
   mkdir "$CRED_NO_LANE_SEED_DIR/.git"
 
-  # No lane and no rules: the allow-all default. Any rules at all would
-  # give the refusal a second author; this box's declaration is empty, so
-  # the only thing that can refuse the proxy's address is the lane's
-  # absence.
+  # No lane, and rules open to every address. A narrower declaration would
+  # give the refusal a second author, and so would no section at all: an
+  # own-address box with no egress section gets the deny-all default
+  # (NET-074), which would also drop the sibling control below. With
+  # 0.0.0.0/0 the only thing that can refuse the proxy's address is the
+  # lane's absence.
   nolane_sid="$(cd "$CRED_NO_LANE_SEED_DIR" && mnl session activate . --no-prompt \
-    --name e2e-cred-nolane --network own_ip 2>"$WORK/cred-nolane.err")" || {
-    echo "::error::'min session activate --network own_ip' failed for the no-lane case"
+    --name e2e-cred-nolane --network own_ip --allow-subnets 0.0.0.0/0 \
+    2>"$WORK/cred-nolane.err")" || {
+    echo "::error::'min session activate --network own_ip --allow-subnets 0.0.0.0/0' failed for the no-lane case"
     cat "$WORK/cred-nolane.err" 2>/dev/null || true
     cred_fail
   }
@@ -13477,7 +13557,7 @@ proof_box_without_credentialed_lane_cannot_reach_proxy() {
 
   # The control: a sibling own-address box's lease, at a port the sibling
   # publishes (so its ingress gate admits the SYN) and nothing in it
-  # listens on. An allow-all row admits the lease, so the frame crosses the
+  # listens on. A row open to every address admits the lease, so the frame crosses the
   # box's relay, the gate and the switch to the sibling, whose kernel
   # resets the connect. A reset here proves the fabric and the gates' admit
   # path are live for this box; the proxy's address is a whole different
@@ -13597,8 +13677,8 @@ proof_box_without_credentialed_lane_cannot_reach_proxy() {
 #     ahead of the box's first delivered connection, and the ended box's
 #     withdrawn with its row while its sibling's second connection is
 #     still answered from its own address;
-#   * the lane's necessity (NET-134): a third box with no lane — allow-all
-#     rules, so only the lane's absence can refuse — gets silence at the
+#   * the lane's necessity (NET-134): a third box with no lane — rules open
+#     to every address, so only the lane's absence can refuse — gets silence at the
 #     proxy's address while its control probe to the node's own address is
 #     reset through the same fabric, the host gate's log says nothing, and
 #     no delivery is ever recorded for its address;
@@ -13693,8 +13773,10 @@ proof_proxy_sees_boxes_by_address() {
   # (the box's own relay admitting the proxy's address as the lane's
   # infrastructure under 0.0.0.0/0, and the VM host's gate under the row's
   # declared lane) and still arrives attributed to the box's own address; C
-  # declares nothing — no lane, allow-all rules — so nothing but the lane's
-  # absence can refuse the proxy's address for it.
+  # declares no lane and rules open to every address (with no section it
+  # would get the deny-all default, NET-074, and its sibling control would
+  # drop), so nothing but the lane's absence can refuse the proxy's address
+  # for it.
   PSBA_SEED_DIR_A="$(hook_mktemp /tmp/mnlpsba.XXXXXX)"
   hook_seed_preamble > "$PSBA_SEED_DIR_A/minimal.toml"
   mkdir "$PSBA_SEED_DIR_A/.git"
@@ -13728,8 +13810,9 @@ proof_proxy_sees_boxes_by_address() {
   psba_sid_b="$(printf '%s\n' "$psba_sid_b" | tail -n1 | tr -d '\r')"
   cred_wait_registered "the proxy-views case's box B" "e2e-psba-b"
   psba_sid_c="$(cd "$PSBA_SEED_DIR_C" && mnl session activate . --no-prompt \
-    --name e2e-psba-nolane --network own_ip 2>"$WORK/psba-box-c.err")" || {
-    echo "::error::'min session activate --network own_ip' failed for the proxy-views case's laneless box"
+    --name e2e-psba-nolane --network own_ip --allow-subnets 0.0.0.0/0 \
+    2>"$WORK/psba-box-c.err")" || {
+    echo "::error::'min session activate --network own_ip --allow-subnets 0.0.0.0/0' failed for the proxy-views case's laneless box"
     cat "$WORK/psba-box-c.err" 2>/dev/null || true
     cred_fail
   }
@@ -13988,7 +14071,7 @@ proof_proxy_sees_boxes_by_address() {
     cred_case_log | grep -- "egress-uncredentialed-proxy-destination" | tail -n5 | sed 's/^/  /'
     cred_fail
   fi
-  echo "the laneless box ($psba_ip_c, allow-all, no lane) was silent at $proxy_ip:$proxy_port for ${probe_ms}ms; the host gate stayed silent"
+  echo "the laneless box ($psba_ip_c, open to every address, no lane) was silent at $proxy_ip:$proxy_port for ${probe_ms}ms; the host gate stayed silent"
 
   # The host process's leg: NET-132's IF-clause, end to end. A process
   # outside every box connects straight to the acceptor's own unix socket
@@ -16165,10 +16248,14 @@ proof_own_ip_deny_all_box_answers_published_port() {
     DA_SIBLING_SEED_DIR="$(hook_mktemp /tmp/mnlds.XXXXXX)"
     hook_seed_preamble > "$DA_SIBLING_SEED_DIR/minimal.toml"
     mkdir "$DA_SIBLING_SEED_DIR/.git"
+    # The sibling declares the fabric: leg 3 has it dial the deny-all box's
+    # lease, and with no egress section it would get the deny-all default
+    # (NET-074) and drop its own dial.
     da_sibling_sid="$(cd "$DA_SIBLING_SEED_DIR" && mnl session activate . --no-prompt \
       --name "$DA_SIBLING_NAME" --network own_ip \
+      --allow-subnets 100.64.0.0/10 --allow-protocols tcp \
       --ingress "$DA_SIB_EXT:$DA_SIB_INT" 2>"$WORK/da-sibling-activate.err")" || {
-      echo "::error::'min session activate --network own_ip --ingress ...' for the sibling box failed"
+      echo "::error::'min session activate --network own_ip --allow-subnets ... --ingress ...' for the sibling box failed"
       echo "--- stderr ---"; cat "$WORK/da-sibling-activate.err" 2>/dev/null || true
       fail
     }

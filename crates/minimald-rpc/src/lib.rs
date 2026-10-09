@@ -1770,14 +1770,15 @@ pub struct CreateSessionResponse {
     /// own build: the phase is a build-time constant both sides share
     /// ([`sessions::EGRESS_DEFAULT_PHASE`]), but the opt-out is set on the
     /// daemon alone. Carried here — on the reply the activation path
-    /// already holds — so `min session activate` can keep its coming-change
-    /// notice (NET-076) off a deployment that has already chosen to keep
-    /// the shipped default: the notice's remedy names the very flag an
-    /// opted-out daemon runs, and would tell it to do what it has done.
+    /// already holds — so `min session activate` can keep its in-force note
+    /// (NET-074) off a deployment that opted out: its bare boxes keep
+    /// allow-all, and a note saying deny-all would be false there. (The
+    /// field first carried the announcement, NET-076, now retired; it stays
+    /// for client and daemon skew.)
     ///
     /// `None` from a daemon that predates the field — and a daemon that
     /// predates it cannot have the opt-out flag either, so a client reading
-    /// `None` prints the notice exactly as this reply's older readers did.
+    /// `None` reads it as not opted out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deny_all_opt_out: Option<bool>,
     /// Whether this daemon's box-zone answerer is bound in its own namespace

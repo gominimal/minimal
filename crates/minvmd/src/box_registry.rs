@@ -2681,7 +2681,7 @@ pub struct BoxRegistry {
     egress_default_phase: sessions::EgressDefaultPhase,
     /// The operator's deny-all opt-out (NET-077), read from
     /// `MINVMD_EGRESS_DENY_ALL_OPT_OUT` by the supervisor: with it set, a
-    /// client box with no `egress` section keeps the shipped allow-all in
+    /// client box with no `egress` section keeps the earlier allow-all in
     /// every phase — the same default the guest daemon is handed on its boot
     /// line, so the host gate never denies what the guest allows. That
     /// agreement also needs this registry's phase to match the guest's
@@ -2792,9 +2792,9 @@ impl BoxRegistry {
         self
     }
 
-    /// Builds this registry under the egress default's other phase arm, for
-    /// the tests that pin what an undeclared row compiles to once the
-    /// default is in force — the arm the shipped constant flips onto.
+    /// Builds this registry under a named egress default phase, for the
+    /// tests that pin what an undeclared row compiles to under each arm —
+    /// the announced one no build ships now as well as the in-force one.
     #[cfg(test)]
     #[must_use]
     pub(crate) fn with_egress_default_phase(mut self, phase: sessions::EgressDefaultPhase) -> Self {
@@ -3607,8 +3607,7 @@ impl BoxRegistry {
     /// decided by its rules; a box with **no** row — one whose registration
     /// never reached the daemon, or whose row was withdrawn — is an
     /// unregistered source the gate drops unconditionally (NET-085), so no
-    /// flip that lands with the last row source (T66's follow-up) changes
-    /// it, and this registration makes none.
+    /// egress default phase changes it, and this registration makes none.
     ///
     /// The published loopback address is not this registry's to pick:
     /// allocation is host-global (design §7.1), so `loopback_addr` comes from
@@ -5489,7 +5488,7 @@ mod tests {
     /// operator's opt-out — the same pair the guest daemon resolves it by —
     /// so an opted-out VM host never denies at the host what the guest
     /// allows. Announced, it allows all; in force, it denies all unless the
-    /// opt-out is set, when it keeps the shipped allow-all. A declared
+    /// opt-out is set, when it keeps the earlier allow-all. A declared
     /// section is carried verbatim in every arm.
     #[test]
     fn undeclared_row_default_follows_phase_and_opt_out() {
@@ -5524,7 +5523,7 @@ mod tests {
 
         assert!(
             reach(Announced, false, None),
-            "announced, an undeclared box keeps the shipped allow-all"
+            "announced, an undeclared box keeps the earlier allow-all"
         );
         assert!(
             reach(InForce, true, None),

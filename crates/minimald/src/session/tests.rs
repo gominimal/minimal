@@ -2678,11 +2678,11 @@ fn ipv4_frame(proto: u8, dst: [u8; 4], dst_port: u16) -> Vec<u8> {
 }
 
 /// NET-074: an own-address box created with no `egress` section reaches
-/// nothing outside itself, once the deny-all default is in force. The phase
-/// is passed explicitly — this build ships the default as announced
-/// (NET-076), so the in-force posture is proven by name, not by whatever
-/// the shipped constant happens to be — and the launcher's gate policy under
-/// it is the deny-all section, whose compiled rules drop every external
+/// nothing outside itself, and this build ships the deny-all default in
+/// force (asserted first, so the constant cannot slip back unnoticed). The
+/// phase is also passed explicitly to the resolver, so the in-force posture
+/// is proven by name, and the launcher's gate policy under it is the
+/// deny-all section, whose compiled rules drop every external
 /// destination in every transport, while the resolver Minimal owns for the
 /// box still answers, at its address *and* its port (NET-079). The
 /// session-start line names the phase, the opt-out, and the posture this
@@ -2702,6 +2702,12 @@ async fn own_ip_default_deny_all() {
     // verdicts below turn on the egress dimension alone. The lease check
     // itself (NET-084) is proven in `sessions::core::egress`.
     let lease = [10, 0, 0, 5];
+
+    assert_eq!(
+        sessions::EGRESS_DEFAULT_PHASE,
+        sessions::EgressDefaultPhase::InForce,
+        "this build ships the deny-all default in force (NET-074)",
+    );
 
     // The launcher's resolution for an own-address box that declared
     // nothing, once the default is in force: the deny-all section, egress

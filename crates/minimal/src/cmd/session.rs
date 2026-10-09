@@ -1128,25 +1128,20 @@ pub(crate) async fn activate_session(
     // runs there and not only in a log the person was not reading.
     print_classifier_advisory(&mut std::io::stderr(), &created);
 
-    // The coming-change notice (NET-076), printed while the deny-all egress
-    // default is announced but not yet in force. Scoped to the box it would
-    // change — an own-address session that declared no egress — on a daemon
-    // that has not opted out of the change (NET-077): the opt-out is the
-    // one rollout fact this side cannot know, so it is read off the create
-    // reply above, and a daemon that has already set the flag has already
-    // taken the remedy the notice names. Silent once the phase turns (see
-    // [`deny_all_default_notice`]). Printed after the session exists and
-    // before the work on it, so the warning is not lost above a failed
-    // activate's output.
+    // The in-force note (NET-074): one line naming the default an
+    // own-address session that declared no egress now has, and how to
+    // declare reach. Scoped to the box the default binds — an own-address
+    // session with no egress section — on a daemon that has not opted out
+    // (NET-077): the opt-out is the daemon's own fact, so it is read off the
+    // create reply above, and an opted-out daemon's box keeps allow-all and
+    // needs no note. Printed after the session exists and before the work
+    // on it, so it is not lost above a failed activate's output.
     if config.network == minimald_rpc::NetworkMode::OwnIp
         && config.policy.egress.is_none()
         && created.deny_all_opt_out != Some(true)
-        && let Some(notice) = deny_all_default_notice(
-            sessions::EGRESS_DEFAULT_PHASE,
-            kind == paths::ProviderKind::Minvmd,
-        )
+        && let Some(note) = deny_all_default_notice(sessions::EGRESS_DEFAULT_PHASE)
     {
-        eprintln!("{notice}");
+        eprintln!("{note}");
     }
 
     // When a subnet flag carries host bits (e.g. `--deny-subnets 10.0.0.1/8`),
@@ -2244,40 +2239,24 @@ pub async fn cmd_session_policy(
     }
 }
 
-/// The coming-change notice `min session activate` prints while the
-/// deny-all egress default is announced but not yet in force (NET-076):
-/// what changes for an own-address box that declares no egress, and how a
-/// deployment keeps the shipped default while it moves. `None` in every
-/// other phase — once the default is in force the change is no longer
-/// coming, and a box that reaches nothing needs no note about it.
+/// The one-line note `min session activate` prints for an own-address box
+/// that declares no egress while the deny-all default is in force
+/// (NET-074): the default the box now has, and the flags that declare its
+/// reach. `None` under [`sessions::EgressDefaultPhase::Announced`]: the
+/// announcement that phase printed (NET-076) is retired with it, and an
+/// absent section still allows all there, so there is nothing to note.
 ///
 /// The opt-out half of the scope is the caller's to check: the daemon, not
-/// the client, knows whether it set `--egress-deny-all-opt-out` (NET-077),
-/// so [`activate_session`] reads it off the create reply and stays silent
-/// for a deployment the change is not coming for.
-///
-/// `vm_backed` picks the remedy the host can actually take: a native daemon
-/// takes the `--egress-deny-all-opt-out` flag, while on a VM-backed host the
-/// daemon is the VM's pid-1 and has no flags to read, so the opt-out is
-/// `MINVMD_EGRESS_DENY_ALL_OPT_OUT`, set for the VM host daemon's next start.
-pub fn deny_all_default_notice(
-    phase: sessions::EgressDefaultPhase,
-    vm_backed: bool,
-) -> Option<&'static str> {
-    match (phase, vm_backed) {
-        (sessions::EgressDefaultPhase::Announced, false) => Some(
-            "Heads-up: the next release denies all external reach for an own-address \
-             session that declares no egress. Declare what the session needs with the \
-             activate egress flags, or start the daemon with \
-             --egress-deny-all-opt-out to keep this default.",
+/// the client, knows whether it set its opt-out (NET-077), so
+/// [`activate_session`] reads it off the create reply and stays silent for
+/// a box the default does not bind.
+pub fn deny_all_default_notice(phase: sessions::EgressDefaultPhase) -> Option<&'static str> {
+    match phase {
+        sessions::EgressDefaultPhase::Announced => None,
+        sessions::EgressDefaultPhase::InForce => Some(
+            "egress: deny-all (default for an own-ip box with no egress section); declare \
+             reach with the --allow-subnets, --allow-dns-hosts and --allow-protocols flags",
         ),
-        (sessions::EgressDefaultPhase::Announced, true) => Some(
-            "Heads-up: the next release denies all external reach for an own-address \
-             session that declares no egress. Declare what the session needs with the \
-             activate egress flags, or restart the VM host daemon (minvmd) with \
-             MINVMD_EGRESS_DENY_ALL_OPT_OUT=1 to keep this default.",
-        ),
-        (sessions::EgressDefaultPhase::InForce, _) => None,
     }
 }
 

@@ -186,6 +186,8 @@ types, gvproxy filter/portfwd API integration
   CIDR strings), `allow_dns_hosts` (list of FQDNs), and `allow_protocols` (list
   of `tcp`, `udp`, `icmp`). Absent fields default to allow-all. Specifying `egress`
   on a `NoNet` or `HostNet` PTask is a parse-time error with a clear message.
+  Superseded for own-address boxes: one with no `egress` section now gets
+  deny-all ([spec 18 NET-074](../18-spec-box-networking/18-spec-box-networking.md)).
 - **R2.2**: `minimald` shall translate the egress rules from R2.1 into gvproxy's
   filter or policy API at PTask launch. Traffic not matching any allow rule shall
   be dropped. A `tracing::warn!` is emitted on the first drop per PTask per rule

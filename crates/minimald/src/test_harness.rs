@@ -121,11 +121,10 @@ impl TestServer {
 
     /// [`Self::new_in`] on a daemon that opted out of the deny-all egress
     /// default (NET-077): the same server, but one whose boxes with no
-    /// `egress` section keep the shipped allow-all. Every other harness
-    /// server runs the default this build ships — as announced (NET-076), so
-    /// its boxes with no `egress` section still allow all too; the tests that
-    /// need the deny-all posture pass `EgressDefaultPhase::InForce` by name
-    /// rather than asking a harness server for it.
+    /// `egress` section keep the earlier allow-all. Every other harness
+    /// server runs the default this build ships — in force (NET-074), so its
+    /// own-address boxes with no `egress` section reach nothing outside
+    /// themselves.
     pub async fn new_opted_out_in(temp: TempDir) -> Self {
         Self::over(config_in(&temp, true), temp).await
     }

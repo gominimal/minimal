@@ -472,25 +472,16 @@ fn run_foreground() -> Result<()> {
     // address plan cannot drift apart. The daemon therefore keeps the egress
     // it had before the gate existed, its own package fetches above all.
     //
-    // An own-address box's lease is not a row this process can name: the guest
-    // daemon's own allocator mints it inside the VM, so no host-side process
-    // knows it — not this supervisor, and not the CLI that asked for the box.
-    // Until the creator-side registration (T66, #1711) supplies those rows,
-    // such a source is what the gate's announced interim is for: an address
-    // inside the plan's lease block but held by no row is admitted — with a
-    // warn naming T66 on every admit — so an own-address box keeps the egress
-    // it had before the gate existed, while everything outside the block, and
-    // every row that *is* published, stays exactly as decided.
-    //
-    // What that admits, said plainly: under the interim the host-side gate
-    // cannot attribute a frame to the box it came from unless a row holds the
-    // address, so a box with restrictive rules can be escaped by sourcing
-    // frames from any unregistered in-block address — NET-081's host-side
-    // guarantee is deferred to T66 until its rows land and its flip of
-    // `UNREGISTERED_SOURCE_PHASE` (egress_gate) puts the per-box default in
-    // force. Every admit under the interim is rate-limited-warned, so a
-    // diagnostic bundle's daemon log tail shows a host running it.
-    // `UNREGISTERED_SOURCE_PHASE` (egress_gate) is the constant T66 flips.
+    // An own-address box's row is not one this process names on its own:
+    // the activating client registers the box over the control socket below
+    // (T66, #1711), and the registry hands out its switch address, so the
+    // row stands before the box's first frame. A frame from an address no
+    // row holds is dropped, unconditionally (NET-085), and the egress
+    // default is in force (`UNREGISTERED_SOURCE_PHASE`, egress_gate): a row
+    // with no egress section reaches nothing outside itself, unless the
+    // operator set `MINVMD_EGRESS_DENY_ALL_OPT_OUT` when this process
+    // started (NET-077), and a publish at an address no row holds is
+    // refused.
     //
     // The proxy's attachment table (NET-133): one attachment per box, held
     // by this process for the VM's life. The registry is its one writer —

@@ -265,13 +265,13 @@ pub struct Config {
     #[serde(default)]
     pub daemon_identity_dir: Option<DaemonAbsPath>,
 
-    /// The daemon's opt-out of the deny-all egress default (NET-077). While
-    /// the default is in force (see [`sessions::EGRESS_DEFAULT_PHASE`]), an
+    /// The daemon's opt-out of the deny-all egress default (NET-077). With
+    /// the default in force (see [`sessions::EGRESS_DEFAULT_PHASE`]), an
     /// own-address box created with no `egress` section reaches nothing
-    /// outside itself (NET-074) and shows `deny all` in `min session policy`
-    /// (NET-075). A deployment that cannot carry that in this release opts
-    /// out, and its boxes keep the shipped allow-all default of 03-spec
-    /// R2.1. Set by `minimald listen --egress-deny-all-opt-out`; a box that
+    /// outside itself (NET-074) and shows `deny-all (default)` in
+    /// `min session policy` (NET-075). A deployment that cannot carry that
+    /// yet opts out, and its boxes keep the earlier allow-all default of
+    /// 03-spec R2.1. Set by `minimald listen --egress-deny-all-opt-out`; a box that
     /// declares its own egress section is unaffected either way.
     #[serde(default)]
     pub deny_all_opt_out: bool,

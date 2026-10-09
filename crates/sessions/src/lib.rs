@@ -407,14 +407,14 @@ impl SessionPolicy {
 //
 // An absent `egress` section used to mean allow-all on every dimension
 // (03-spec R2.1). The deny-all default replaces that for an own-address box:
-// once in force it reaches nothing outside itself, an opt-out keeps the
-// shipped default, and the release before it only announces the change.
+// in force, it reaches nothing outside itself, and an opt-out keeps the
+// earlier allow-all. The release before it only announced the change.
 // ---------------------------------------------------------------------------
 
 /// Which release the deny-all egress default is in (NET-074..NET-077): a
 /// build-time fact, not configuration, because it is decided by which build
 /// is running. Every path that needs it — the session gate, the session-start
-/// log line, `min session policy`, the activate announcement — reads
+/// log line, `min session policy`, the activate note — reads
 /// [`EGRESS_DEFAULT_PHASE`] rather than a flag nobody could set differently
 /// within one build.
 ///
@@ -425,7 +425,9 @@ impl SessionPolicy {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum EgressDefaultPhase {
     /// The coming default is announced at activate (NET-076); an absent
-    /// `egress` section still allows all.
+    /// `egress` section still allows all. The release before the default
+    /// bound; kept so the cutover's arms stay named and tested, and no
+    /// build ships it now.
     Announced,
     /// The default binds: an own-address box created with no `egress`
     /// section reaches nothing outside itself (NET-074) and shows
@@ -434,13 +436,14 @@ pub enum EgressDefaultPhase {
     InForce,
 }
 
-/// The phase this build ships: the coming default is announced (NET-076),
-/// so an absent `egress` section still allows all and `activate` prints the
-/// change it will bring. The release that turns the default in force is a
-/// plan fact, and no plan has named one yet; when one does, this constant is
-/// the whole cutover — every reader of it (the session gate, the
-/// session-start line, `min session policy`, the activate notice) follows.
-pub const EGRESS_DEFAULT_PHASE: EgressDefaultPhase = EgressDefaultPhase::Announced;
+/// The phase this build ships: the deny-all default is in force (NET-074),
+/// so an own-address box with no `egress` section reaches nothing outside
+/// itself unless its daemon opted out (NET-077), and the announcement
+/// (NET-076) is retired. This constant is the whole cutover — every reader
+/// of it (the session gate, the session-start line, `min session policy`,
+/// the activate note) follows — and minvmd's own phase must match it (a
+/// build-time assertion there refuses a split).
+pub const EGRESS_DEFAULT_PHASE: EgressDefaultPhase = EgressDefaultPhase::InForce;
 
 /// The egress a box's traffic is actually held to: its declared section when
 /// it has one, otherwise the default [`effective_egress`] resolves for an
@@ -455,10 +458,9 @@ pub enum EffectiveEgress {
     /// nothing outside the box is reachable, the resolver Minimal owns for
     /// it excepted (NET-079).
     DenyAll,
-    /// The shipped default (03-spec R2.1): every dimension allows all. What
-    /// an absent section keeps before the default is in force, behind the
-    /// daemon's opt-out (NET-077), and on any box without an address of its
-    /// own.
+    /// The earlier default (03-spec R2.1): every dimension allows all. What
+    /// an absent section keeps behind the daemon's opt-out (NET-077), on any
+    /// box without an address of its own, and under the announced phase.
     #[default]
     AllowAll,
     /// The box declared its own egress section; carried verbatim.

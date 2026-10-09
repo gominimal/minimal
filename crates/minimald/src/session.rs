@@ -183,15 +183,14 @@ pub(crate) struct SessionConfig {
 }
 
 /// The egress *section* the gate compiles for a session: the materialized
-/// form of [`sessions::effective_egress`]'s answer — `None` for the shipped
-/// allow-all, the deny-all section for an absent declaration under the
+/// form of [`sessions::effective_egress`]'s answer — `None` for the
+/// allow-all default, the deny-all section for an absent declaration under the
 /// in-force default (NET-074), and a declaration verbatim. `phase` is the
 /// rollout phase to resolve under — the launcher and the task path pass
-/// [`sessions::EGRESS_DEFAULT_PHASE`], the phase this build ships, while the
-/// tests pass [`sessions::EgressDefaultPhase::InForce`] so the posture the
-/// rollout ends at stays proven while the default is only announced
-/// (NET-076). `opt_out` is the daemon's deny-all opt-out (NET-077), threaded
-/// from the server config.
+/// [`sessions::EGRESS_DEFAULT_PHASE`], the phase this build ships, and the
+/// tests name [`sessions::EgressDefaultPhase::InForce`] so the posture they
+/// prove does not hang on that constant. `opt_out` is the daemon's deny-all
+/// opt-out (NET-077), threaded from the server config.
 ///
 /// Shared by the session launcher (the box's own gate) and the task path
 /// ([`crate::exec::task_network`]), so a task runs under the same egress
@@ -212,7 +211,7 @@ pub(crate) fn effective_egress_section(
 /// The policy the gate enforces for a session: its declared ingress, and its
 /// egress resolved to the section [`effective_egress_section`] names — the
 /// deny-all section for an own-address box with no `egress` section once the
-/// default is in force (NET-074), the shipped allow-all for everything an
+/// default is in force (NET-074), the allow-all default for everything an
 /// opt-out (NET-077) or an earlier phase leaves in place, and a declaration
 /// verbatim. `phase` resolves under, exactly as [`effective_egress_section`]
 /// documents. The declaration on the record is left untouched: the strict

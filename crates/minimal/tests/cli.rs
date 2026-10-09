@@ -2702,21 +2702,24 @@ fn policy_shows_baseline_set() {
     );
 }
 
-/// While the deny-all egress default is announced but not yet in force,
-/// `min session activate` prints the coming change (NET-076) — what turns
-/// for a bare own-address box, and how to keep the shipped default. Driven
+/// With the deny-all egress default in force, `min session activate` prints
+/// one line for a bare own-address box (NET-074): the default it now has and
+/// the flags that declare its reach, once per activate. The announcement
+/// that preceded it (NET-076) is retired: no "Heads-up" line prints. Driven
 /// through the compiled binary so the assertion is on what the user actually
-/// sees; the phase this build ships is announced, so the notice is the
-/// shipped path, and its scoping is exercised with it: a bare own-address
-/// activate prints, a host-address one (a box the change does not reach)
-/// does not, and a daemon that opted out (NET-077 — a deployment the change
-/// is not coming for, and one that has already taken the remedy the notice
-/// names) is not announced at either. The other phase is gated by
-/// construction — once the default is in force the change is no longer
-/// coming, and the notice is `None`.
+/// sees, with the scoping exercised alongside: a box that declares egress is
+/// not noted, a host-address box (which owns no address to deny from) is
+/// not, and a daemon that opted out (NET-077), whose box keeps allow-all, is
+/// not either.
 #[cfg(target_os = "linux")]
 #[tokio::test]
-async fn deny_all_announcement_printed() {
+async fn deny_all_in_force_note_printed() {
+    const NOTE: &str = "egress: deny-all (default for an own-ip box with no egress section)";
+    assert_eq!(
+        sessions::EGRESS_DEFAULT_PHASE,
+        sessions::EgressDefaultPhase::InForce,
+        "this build ships the deny-all default in force"
+    );
     let (_daemon, args) = setup().await;
     let project = tempfile::TempDir::new().unwrap();
     std::fs::create_dir(project.path().join(".git")).unwrap();
@@ -2725,26 +2728,24 @@ async fn deny_all_announcement_printed() {
         "# test minimal.toml\n[stack]\nuse = \"shell\"\n",
     )
     .unwrap();
-
-    // The shipped path: activating a bare own-address box succeeds and
-    // prints the notice — the change, its scope, and the way to keep the
-    // default.
-    let own_ip = run_min(
-        &args,
-        &[
+    let activate = |name: &'static str, extra: &'static [&'static str]| {
+        let mut argv = vec![
             "session",
             "activate",
             project.path().to_str().unwrap(),
             "--name",
-            "notice-own-ip",
-            "--network",
-            "own_ip",
+            name,
             "--sync",
             "tarball",
             "--no-prompt",
-        ],
-    )
-    .await;
+        ];
+        argv.extend_from_slice(extra);
+        argv
+    };
+
+    // The shipped path: a bare own-address box activates and is told, on
+    // one line, what it has and how to declare reach.
+    let own_ip = run_min(&args, &activate("note-own-ip", &["--network", "own_ip"])).await;
     assert!(
         own_ip.status.success(),
         "activating a bare own-address box must succeed, but the binary \
@@ -2753,108 +2754,81 @@ async fn deny_all_announcement_printed() {
         String::from_utf8_lossy(&own_ip.stderr),
     );
     let own_ip_stderr = String::from_utf8_lossy(&own_ip.stderr).into_owned();
+    assert_eq!(
+        own_ip_stderr.matches(NOTE).count(),
+        1,
+        "a bare own-address activate prints the in-force note once:\n{own_ip_stderr}"
+    );
+    let line = own_ip_stderr
+        .lines()
+        .find(|line| line.contains(NOTE))
+        .expect("the note is on one line");
     assert!(
-        own_ip_stderr.contains("Heads-up: the next release denies all external reach"),
-        "activating a bare own-address box must print the coming change:\n{own_ip_stderr}"
+        line.contains("--allow-subnets") && line.contains("--allow-dns-hosts"),
+        "the note names the flags that declare reach: {line}"
     );
     assert!(
-        own_ip_stderr.contains("own-address"),
-        "the notice must scope the change to own-address sessions:\n{own_ip_stderr}"
-    );
-    assert!(
-        own_ip_stderr.contains("--egress-deny-all-opt-out"),
-        "the notice must say how to keep the shipped default:\n{own_ip_stderr}"
+        !own_ip_stderr.contains("Heads-up"),
+        "the announcement is retired once the default is in force:\n{own_ip_stderr}"
     );
 
-    // Scoped to the boxes the change would reach: a host-address box
-    // shares its host's namespace and owns no address to deny from, so
-    // its activate announces nothing.
-    let host_net_stderr = run_min_stderr(
+    // A box that declared egress has the section it declared: no note.
+    let declared_stderr = run_min_stderr(
         &args,
-        &[
-            "session",
-            "activate",
-            project.path().to_str().unwrap(),
-            "--name",
-            "notice-host-net",
-            "--network",
-            "host_ip",
-            "--sync",
-            "tarball",
-            "--no-prompt",
-        ],
+        &activate(
+            "note-declared",
+            &["--network", "own_ip", "--allow-subnets", "10.0.0.0/8"],
+        ),
     )
     .await;
     assert!(
-        !host_net_stderr.contains("Heads-up"),
-        "a host-address box the change does not reach must not be announced \
-         at:\n{host_net_stderr}"
+        !declared_stderr.contains(NOTE),
+        "a box that declared egress is not noted:\n{declared_stderr}"
     );
 
-    // And scoped to the daemons the change is coming for: an opted-out
-    // daemon (NET-077) has already chosen to keep the shipped default —
-    // the exact remedy this notice names — so announcing at it would tell
-    // it to do what it has done. The opt-out is the daemon's own fact, so
-    // this half runs against a second daemon started with the flag.
+    // A host-address box shares its host's namespace and owns no address
+    // to deny from, so the default does not bind it.
+    let host_net_stderr =
+        run_min_stderr(&args, &activate("note-host-net", &["--network", "host_ip"])).await;
+    assert!(
+        !host_net_stderr.contains(NOTE),
+        "a host-address box the default does not bind is not noted:\n{host_net_stderr}"
+    );
+
+    // And an opted-out daemon (NET-077) keeps allow-all for the same bare
+    // box, so the note would be false there. The opt-out is the daemon's
+    // own fact, so this half runs against a second daemon started with it.
     let (_opted_out, opted_out_args, _opted_out_dir) = setup_opted_out().await;
     let opted_out = run_min(
         &opted_out_args,
-        &[
-            "session",
-            "activate",
-            project.path().to_str().unwrap(),
-            "--name",
-            "notice-opted-out",
-            "--network",
-            "own_ip",
-            "--sync",
-            "tarball",
-            "--no-prompt",
-        ],
+        &activate("note-opted-out", &["--network", "own_ip"]),
     )
     .await;
     assert!(
         opted_out.status.success(),
-        "activating a bare own-address box must still succeed on an opted-out \
+        "activating a bare own-address box must succeed on an opted-out \
          daemon, but the binary exited {}:\n{}",
         opted_out.status,
         String::from_utf8_lossy(&opted_out.stderr),
     );
     let opted_out_stderr = String::from_utf8_lossy(&opted_out.stderr).into_owned();
     assert!(
-        !opted_out_stderr.contains("Heads-up"),
-        "a daemon that has already taken the notice's remedy must not be \
-         told to take it:\n{opted_out_stderr}"
+        !opted_out_stderr.contains(NOTE),
+        "an opted-out daemon's bare box keeps allow-all and is not noted:\n{opted_out_stderr}"
     );
 
-    // The other phase, gated by construction: once the default is in
-    // force the change is no longer coming, and nothing prints.
+    // The announced phase prints nothing: its announcement is retired.
     assert!(
-        deny_all_default_notice(sessions::EgressDefaultPhase::InForce, false).is_none()
-            && deny_all_default_notice(sessions::EgressDefaultPhase::InForce, true).is_none(),
-        "the notice must not print once the default is in force"
-    );
-
-    // On a VM-backed host the daemon is the VM's pid-1 and reads no flags:
-    // the remedy the notice names is the VM host daemon's variable, and the
-    // native flag is not offered there.
-    let vm_notice = deny_all_default_notice(sessions::EgressDefaultPhase::Announced, true)
-        .expect("the notice prints on a VM-backed host while announced");
-    assert!(
-        vm_notice.contains("MINVMD_EGRESS_DENY_ALL_OPT_OUT=1"),
-        "a VM-backed host's notice must name the variable that opts it out: {vm_notice}"
-    );
-    assert!(
-        !vm_notice.contains("--egress-deny-all-opt-out"),
-        "a VM-backed host's notice must not name the native daemon's flag: {vm_notice}"
+        deny_all_default_notice(sessions::EgressDefaultPhase::Announced).is_none(),
+        "the retired announcement must not print"
     );
 }
 
 /// [`setup`] on a daemon that opted out of the deny-all egress default
 /// (NET-077): the same UDS-listening harness server, but one whose boxes
 /// with no `egress` section keep the shipped allow-all. Only the
-/// announcement test needs a daemon with the other rollout posture, so the
-/// builder stays here beside it rather than in the shared harness.
+/// in-force note's test needs a daemon with the other rollout posture, so
+/// the builder stays here beside it rather than in the shared harness.
 ///
 /// The caller must keep both returned values alive for as long as it talks
 /// to the daemon: the server owns the daemon's state, the tempdir the

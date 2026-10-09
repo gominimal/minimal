@@ -182,8 +182,8 @@ impl Exec for TaskExec {
 /// The network a task gets: the provider for its session's mode (017-005),
 /// carrying the session's *effective* egress (NET-074) — a task in an
 /// own-address session runs under whatever the session's own gate enforces:
-/// the deny-all default once it is in force, the shipped allow-all while it
-/// is only announced — and none of its ingress. Shared by the two ways a
+/// the deny-all default in force, allow-all behind the opt-out — and none of
+/// its ingress. Shared by the two ways a
 /// task starts — over an exec channel here, and from inside the session
 /// (`env::SessionChannel::run_task`).
 ///
@@ -194,9 +194,8 @@ impl Exec for TaskExec {
 /// handle either: a task owns no proxy route of its own, so no lease is ever
 /// reported for it. `phase` is the rollout phase to resolve the egress under
 /// — both callers pass [`sessions::EGRESS_DEFAULT_PHASE`], the phase this
-/// build ships, while the tests pass the phase by name so the posture the
-/// rollout ends at stays proven while the default is only announced
-/// (NET-076) — and `deny_all_opt_out` is the daemon's opt-out (NET-077),
+/// build ships, while the tests pass the phase by name so each arm's posture
+/// stays proven — and `deny_all_opt_out` is the daemon's opt-out (NET-077),
 /// read through the session handle so a task resolves its egress exactly as
 /// the launcher did. It carries no classifier decision either (NET-079):
 /// a task places no leaf in the cohort's subtrees, so no per-box verdict
@@ -205,11 +204,11 @@ impl Exec for TaskExec {
 /// A gate is attached only where that egress has rules to enforce: the
 /// deny-all section the in-force default resolves an absent declaration to,
 /// or the box's own declaration. An absent section — the allow-all the
-/// announced phase and the opt-out both leave in place — passes `None`, as
+/// opt-out (or the announced phase) leaves in place — passes `None`, as
 /// every task did before the deny-all default: a gate with no ingress
 /// declaration blocks a task's *inbound* too (`allowed`/`udp_allowed` empty),
-/// so attaching one where nothing needs gating would change behaviour an
-/// announcement is not allowed to.
+/// so attaching one where nothing needs gating would change behaviour the
+/// opt-out exists to keep.
 pub(crate) fn task_network(
     record: &sessions::Record,
     switch: &std::sync::Arc<tokio::sync::Mutex<crate::net::SwitchClient>>,
@@ -2832,23 +2831,21 @@ mod tests {
     /// egress default its session does, and nothing else changes with it. A
     /// gate is attached only where the effective egress has rules to enforce,
     /// because a gate with no ingress declaration blocks a task's *inbound*
-    /// too — so under Announced, with no opt-out, a bare own-address task
-    /// attaches ungated exactly as every task did before the deny-all
-    /// default: the announcement may change nothing yet. Under InForce the
-    /// same bare box's task carries the deny-all gate.
+    /// too. Under InForce, the shipped phase, a bare own-address task with no
+    /// opt-out carries the deny-all gate. The retired announced arm, pinned
+    /// here by name, attaches the same task ungated, as every task did before
+    /// the deny-all default.
     ///
-    /// What the announcement defers is the *default* for a box that declared
-    /// nothing. A box that declared an `egress` section is enforced on its
-    /// session's own PTask in every phase, so a task in such a session
-    /// carries that declaration's gate even now, under the phase this build
-    /// ships — the same inbound posture the in-force case below already
-    /// accepts: a task PTask holds no ingress of its own, so its gate
-    /// default-blocks unsolicited inbound.
+    /// The phase decides only the *default* for a box that declared nothing.
+    /// A box that declared an `egress` section is enforced on its session's
+    /// own PTask in every phase, so a task in such a session carries that
+    /// declaration's gate under either phase — the same inbound posture the
+    /// in-force case below accepts: a task PTask holds no ingress of its own,
+    /// so its gate default-blocks unsolicited inbound.
     ///
     /// The phase is passed by name, not read from the shipped constant, so
-    /// the in-force posture stays proven while the default is only
-    /// announced. `own_ip_default_deny_all` proves what the deny-all section
-    /// itself enforces.
+    /// both arms stay proven whichever one ships. `own_ip_default_deny_all`
+    /// proves what the deny-all section itself enforces.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn a_task_gate_follows_the_egress_default() {
@@ -2917,7 +2914,7 @@ mod tests {
         // it: the declaration is enforced on the session's own PTask in every
         // phase, so a task in that session resolves the same section its
         // session's gate did — the declaration verbatim, not the deny-all
-        // section and not nothing — even under the phase this build ships.
+        // section and not nothing — under either phase.
         let section = sessions::EgressPolicy {
             allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
             ..sessions::EgressPolicy::default()

@@ -531,8 +531,8 @@ included, with every refusal logged (NET-001 to NET-004).
 
 - **NET-076** WHILE the deny-all default is announced but not yet in force THE SYSTEM SHALL print the coming change at activate.
   tier:     T0
-  verify:   cargo nextest run -p minimal deny_all_announcement_printed
-  <!-- S9a/AC2; prose 48; state-driven; interview decision -->
+  verify:   cargo nextest run -p minimal deny_all_in_force_note_printed
+  <!-- S9a/AC2; prose 48; state-driven; interview decision; window ended: the default is in force as of the change that flips both phase constants, so the announcement is retired and the verify test pins that it no longer prints -->
 
 - **NET-077** WHERE the deny-all opt-out flag is set THE SYSTEM SHALL keep the shipped allow-all default for a box with no `egress` section.
   tier:     T0
@@ -1052,8 +1052,8 @@ both are observable; recording the window only in the plan was considered and
 rejected as leaving the opt-out flag unbound. Precedence: before the default is
 in force, and whenever the opt-out flag is set, an absent `egress` section
 keeps the shipped allow-all default of 03-spec R2.1; once in force without the
-opt-out, NET-074 and NET-075 apply. The release that brings it into force is a
-plan fact.
+opt-out, NET-074 and NET-075 apply. The default is now in force, so the
+announcement window NET-076 bound is over.
 
 **Bounds that were chosen here.** "Local-only" for `*.min.internal` means the
 zone is answered only to lookups that originate on the machine (NET-006);

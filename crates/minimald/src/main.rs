@@ -271,15 +271,14 @@ pub struct ListenArgs {
     #[arg(long)]
     gvproxy_bin: Option<std::path::PathBuf>,
 
-    /// Keep the shipped allow-all egress default for a box that declares no
-    /// `egress` section (NET-077). While the deny-all default is in force
-    /// (see [`sessions::EGRESS_DEFAULT_PHASE`]), an own-address box created
-    /// with no egress declaration reaches nothing outside itself (NET-074)
-    /// and shows `deny all` in `min session policy` (NET-075). Opt out to
-    /// keep the prior default — a deployment that cannot carry the change in
-    /// this release — and retire the flag once yours declares its boxes'
-    /// egress. A box that declares its own egress section is unaffected
-    /// either way.
+    /// Keep the earlier allow-all egress default for a box that declares no
+    /// `egress` section (NET-077). With the deny-all default in force (see
+    /// [`sessions::EGRESS_DEFAULT_PHASE`]), an own-address box created with
+    /// no egress declaration reaches nothing outside itself (NET-074) and
+    /// shows `deny-all (default)` in `min session policy` (NET-075). Opt out
+    /// to keep the prior default — a deployment that cannot carry the change
+    /// yet — and retire the flag once yours declares its boxes' egress. A
+    /// box that declares its own egress section is unaffected either way.
     #[arg(long, default_value_t = false)]
     egress_deny_all_opt_out: bool,
 }

@@ -3361,14 +3361,22 @@ mod tests {
         // A row is its creator's to withdraw, so a live row whose proof
         // does not match is refused with the reason and stays published:
         // another box's name at this row's address, and the right name with
-        // a loopback the registration did not hand back.
+        // a loopback the registration did not hand back. Its egress admits
+        // the destination the gate's marker frame below is sent to: a box
+        // with no egress section has the deny-all default (NET-074), so it
+        // could not carry the marker.
         let db = handed(
             register(
                 &sock_path,
                 &RegisterBoxRequest {
                     name: "db".to_string(),
                     ingress_ports: Vec::new(),
-                    egress: None,
+                    egress: Some(sessions::EgressPolicy {
+                        allow_protocols: Some(vec![sessions::IpProto::Tcp]),
+                        allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
+                        allow_dns_hosts: None,
+                        deny_subnets: None,
+                    }),
                     credentialed_upstream: None,
                     dynamic_ingress: None,
                     dynamic_allowed_range: None,

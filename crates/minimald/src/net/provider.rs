@@ -281,8 +281,8 @@ pub(crate) fn attached_lease(
 /// default-block per finding #2), while other modes have no relay to gate;
 /// `None` attaches ungated. The session launcher passes the box's *effective*
 /// policy (NET-074), and a task launch passes its session's effective egress
-/// alone when the rollout leaves one in force, `None` while the default is
-/// only announced or the daemon opted out — an ungated task keeps the open
+/// alone when the rollout leaves one in force, `None` when the daemon opted
+/// out (or under the announced phase) — an ungated task keeps the open
 /// inbound it always had — because a task carries none of its session's
 /// ingress, the session's own PTask being attached at the same time.
 /// `own_address` carries the registry handle an own-address launch reports its
