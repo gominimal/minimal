@@ -1011,11 +1011,8 @@ async fn async_main() -> Result<(), MainError> {
         )));
     }
 
-    // Setup the server config (shared by the UDS and vsock transports). `mut`:
-    // the Linux userns probe below folds its diagnosis into this config
-    // before `Server::run` takes it.
-    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
-    let mut config = Config {
+    // Setup the server config (shared by the UDS and vsock transports).
+    let config = Config {
         host_key: HostKey::OnDisk {
             path: sub_path!(cli.client_instance_dir(), "ssh_host_ed25519_key")
                 .as_utf8_path()
@@ -1055,11 +1052,6 @@ async fn async_main() -> Result<(), MainError> {
                 .egress_deny_all_opt_out,
             std::env::var(EGRESS_DENY_ALL_OPT_OUT_ENV).ok().as_deref(),
         ),
-        // Set by the Linux userns probe below: the diagnosis + fix a spawn
-        // failure should name, so the attach error a client sees on a
-        // restricted host explains itself. `None` everywhere else (no probe,
-        // or none triggered).
-        userns_spawn_hint: None,
     };
     // Ensure the SSH host key is accessible in a instance-specific known_hosts file.
     // R1.2: load once and reuse in the vsock beacon so there is no redundant disk read.
@@ -1094,32 +1086,7 @@ async fn async_main() -> Result<(), MainError> {
     // silent on the vsock path.
     #[cfg(target_os = "linux")]
     if let Some(restriction) = sandbox2::user_namespaces_restriction() {
-        let fix = match restriction {
-            sandbox2::UsernsRestriction::ApparmorUnconfined => {
-                // The loader lands under the installer's `data` prefix, which
-                // resolves through $XDG_DATA_HOME exactly like
-                // `paths::minimal_data_dir` — don't hardcode ~/.local/share.
-                // A daemon at a path outside the profile's tunable (a custom
-                // MINIMAL_BIN, a dev build) needs the binary attached too.
-                format!(
-                    "install minimald's AppArmor profile (one-time, needs root): sudo bash \
-                     {data}/apparmor/install-apparmor-profile.sh --path {bin} (from a checkout: \
-                     sudo scripts/install-apparmor-profile.sh --path {bin})",
-                    data = paths::minimal_data_dir(),
-                    bin = std::env::current_exe()
-                        .ok()
-                        .and_then(|p| p.to_str().map(str::to_owned))
-                        .unwrap_or_else(|| "<path to this minimald binary>".to_string()),
-                )
-            }
-            sandbox2::UsernsRestriction::Disabled => {
-                "re-enable user namespaces, e.g. sudo sysctl -w user.max_user_namespaces=15000"
-                    .to_string()
-            }
-            // `UsernsRestriction` is #[non_exhaustive]; future variants get
-            // the docs pointer until a matching remediation lands here.
-            _ => "see the linux-host-setup doc".to_string(),
-        };
+        let fix = minimald::userns_restriction_fix(restriction);
         tracing::warn!(
             reason = %restriction,
             fix,
@@ -1127,11 +1094,6 @@ async fn async_main() -> Result<(), MainError> {
             "sessions will fail to start: this host refuses the unprivileged user \
              namespace every session sandbox needs"
         );
-        // The same diagnosis, carried to the attach error: the warn above
-        // only reaches this log, while the client whose `min` attach dies
-        // on the restriction sees the spawn error — fold the reason and
-        // the fix into it so the error explains itself.
-        config.userns_spawn_hint = Some(format!("{restriction} — fix: {fix}"));
     }
 
     // Track the host's wall clock, when configured.

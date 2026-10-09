@@ -38,12 +38,31 @@ mod helpers;
 
 pub(crate) use helpers::*;
 
+/// Why this host refuses the unprivileged user namespace every session
+/// sandbox needs, with the fix to run — `None` when nothing is visible.
+///
+/// Probed at failure time rather than reused from the daemon's startup
+/// probe: the sysctls it reads take effect live (the host-setup doc's
+/// `sysctl -w` fix needs no daemon restart), so a startup verdict could
+/// name a restriction already lifted, or miss one set since. The probe is a
+/// handful of `/proc` reads on a path that has already failed.
+#[cfg(target_os = "linux")]
+fn userns_spawn_hint() -> Option<String> {
+    sandbox2::user_namespaces_restriction()
+        .map(|r| format!("{r} — fix: {}", crate::userns_restriction_fix(r)))
+}
+
+/// Off Linux no user namespace is involved, so there is nothing to name.
+#[cfg(not(target_os = "linux"))]
+fn userns_spawn_hint() -> Option<String> {
+    None
+}
+
 /// The error a failed host attach surfaces: the bare symptom, plus the
-/// startup probe's diagnosis and fix when it has one. A host that dies in
-/// the launch-to-attach window on a userns-restricted host (stock Ubuntu
-/// 24.04+) otherwise leaves the client with a symptom that names neither
-/// the restriction nor the fix — the probe already logged both, so carry
-/// them into the error the client actually sees.
+/// userns diagnosis and fix when there is one (see [`userns_spawn_hint`]).
+/// A host that dies in the launch-to-attach window on a userns-restricted
+/// host (stock Ubuntu 24.04+) otherwise leaves the client with a symptom
+/// that names neither the restriction nor the fix.
 fn spawn_failed_error(userns_spawn_hint: Option<&str>) -> std::io::Error {
     match userns_spawn_hint {
         Some(hint) => std::io::Error::other(format!(
@@ -212,13 +231,6 @@ pub(crate) struct SessionConfig {
     /// it so a diagnostics bundle can name the posture without the daemon's
     /// flags.
     pub deny_all_opt_out: bool,
-
-    /// The startup probe's diagnosis of why this host refuses the
-    /// unprivileged user namespace every sandbox needs, with the fix to
-    /// run — `None` when the probe found nothing (or never ran, off-Linux).
-    /// A spawn failure that lands here names the restriction instead of the
-    /// bare "host exited" symptom.
-    pub userns_spawn_hint: Option<String>,
 }
 
 /// The egress *section* the gate compiles for a session: the materialized
@@ -931,12 +943,6 @@ pub struct Session {
     /// path reads it through the handle for the same resolution.
     deny_all_opt_out: bool,
 
-    /// The startup probe's diagnosis of why this host refuses the
-    /// unprivileged user namespace every sandbox needs, with the fix to
-    /// run — `None` when the probe found nothing. A spawn failure names it
-    /// (see [`spawn_failed_error`]) so the attach error explains itself.
-    userns_spawn_hint: Option<String>,
-
     /// The live direct-tcpip forwards opened for this session: one abort
     /// handle per relay the connection layer spawned. Pruned as relays
     /// finish; every live one is aborted by [`Session::stop_running`], so a
@@ -1021,7 +1027,6 @@ impl Session {
             net_switch,
             manager,
             deny_all_opt_out,
-            userns_spawn_hint,
             #[cfg(target_os = "linux")]
             hostnames,
             #[cfg(target_os = "linux")]
@@ -1035,7 +1040,6 @@ impl Session {
             daemon_ctx,
             net_switch,
             deny_all_opt_out,
-            userns_spawn_hint,
             tracker: OpTracker::new_root(),
             inner,
             workspace_baseline: WorkspaceBaseline::Unarmed,
@@ -4687,7 +4691,7 @@ impl Session {
             )
             .await
             .map_err(|_| {
-                AttachError::SpawnFailed(spawn_failed_error(self.userns_spawn_hint.as_deref()))
+                AttachError::SpawnFailed(spawn_failed_error(userns_spawn_hint().as_deref()))
             })?;
         let SessionInner::Active { host, .. } = &mut self.inner else {
             unreachable!("mint_session_host is only reachable from the Active state");
