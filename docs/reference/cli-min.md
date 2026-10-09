@@ -696,8 +696,8 @@ id and the delete token that the upload printed. The portal deletes the
 bundle and any diagnosis made from it, and the command prints
 `Deleted <id>`. It fails with a plain error when the portal has no such
 bundle, or when the token does not match the bundle. A bundle is missing
-when nobody uploaded it, it expired, or someone already deleted it. `--endpoint` follows the same HTTPS rule
-as the upload.
+when nobody uploaded it, it expired, or someone already deleted it.
+`--endpoint` follows the same HTTPS rule as the upload.
 
 ### `init`, `add`, `update`
 
