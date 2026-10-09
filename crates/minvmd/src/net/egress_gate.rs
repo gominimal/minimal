@@ -3223,10 +3223,22 @@ async fn relay_switch_frames_to_guest(
         // A TCP frame delivered there is also noted in the forwarded-flow
         // table: the connection it belongs to rides one of the box's
         // forwards, and the box's end resets it ([`revoke_box_forwards`]).
-        if let Some(pkt) = dns_pins::parse_ipv4_l4(&frame[..n])
-            && let Some(record) = table.by_source(pkt.dst.ip().octets())
-            && forwards.inside_published(record.switch_addr().octets(), pkt.dst.port())
-        {
+        //
+        // A bare SYN at a port no publish dials is delivered as before —
+        // the box's ingress there is the in-VM relay's to decide — and noted
+        // as refusable, so the reset that decision answers it with reaches
+        // the client whatever the box's egress rules say (NET-014,
+        // [`ReplyTables::observe_refusable`]).
+        let delivered = dns_pins::parse_ipv4_l4(&frame[..n]).and_then(|pkt| {
+            let record = table.by_source(pkt.dst.ip().octets())?;
+            let published =
+                forwards.inside_published(record.switch_addr().octets(), pkt.dst.port());
+            Some((pkt, record, published))
+        });
+        if let Some((pkt, record, false)) = &delivered {
+            replies.observe_refusable(record, pkt, table.subnet(), Instant::now());
+        }
+        if let Some((pkt, record, true)) = delivered {
             // NET-134's ingress arm: the box egress proxy answers and never
             // opens toward a box, so a bare SYN from its address to a
             // published inside port has no legitimate origin. Dropping the
@@ -3631,6 +3643,12 @@ enum GateAdmit {
     ProxyLane,
 }
 
+/// How long a bare SYN the ingress leg delivered at a port no publish dials
+/// stays refusable ([`ReplyTables::observe_refusable`]): the refusal follows
+/// the SYN at once, and a retransmitted SYN notes the connect afresh, so the
+/// window only has to outlast one relay round trip.
+const REFUSAL_WINDOW: Duration = Duration::from_secs(5);
+
 /// The gate's reply-flow records (NET-040's answer half): one [`BoxReplies`]
 /// entry per registered box the gate's ingress leg has delivered an opening
 /// packet to, keyed by the row's switch address — the same key the gate
@@ -3690,6 +3708,12 @@ struct BoxReplies {
     /// The box's reply-flow records: the shared table, with its windows and
     /// its per-box cap, behind the one lock a single decision takes.
     flows: Mutex<egress::ReplyFlows>,
+    /// The box's refusable connects (NET-014): each bare SYN the ingress leg
+    /// delivered at a port no applied publish dials, keyed by its tuple in
+    /// the client's direction, with the acknowledgement the refusal of it
+    /// carries and the instant it stops being refusable. Bounded by the
+    /// shared per-box cap; see [`ReplyTables::refusal_admits`].
+    refusals: Mutex<HashMap<egress::FlowTuple, (u32, Instant)>>,
     /// Whether the box's first-record line has been said.
     first_record: AtomicBool,
     /// Whether the table-filled line has been said.
@@ -3703,6 +3727,7 @@ impl BoxReplies {
         Self {
             record: Arc::clone(record),
             flows: Mutex::new(egress::ReplyFlows::new()),
+            refusals: Mutex::new(HashMap::new()),
             first_record: AtomicBool::new(false),
             table_filled: AtomicBool::new(false),
         }
@@ -3894,6 +3919,97 @@ impl ReplyTables {
         let admits = flows.reply_admits(reply_tuple_of(pkt), pkt.tcp_flags, now);
         note_flows_ended(record, before - flows.len(), "expired or closed by the box");
         admits
+    }
+
+    /// The ingress leg's refusal half (NET-014): notes one bare SYN the leg
+    /// is about to deliver toward `record`'s box at a port no applied
+    /// publish dials, so the refusal the box's side answers it with can
+    /// reach the client ([`Self::refusal_admits`]). The ingress at such a
+    /// port is the in-VM relay's to decide, and what it decides for a port
+    /// nothing published is a reset; on the native lane that reset leaves
+    /// the relay without passing the box's egress rules, and here it must
+    /// not die at them either, or a deny-all box's unpublished port reads as
+    /// the timeout NET-014 retires. A SYN from the Box Egress Proxy's
+    /// address notes nothing — the proxy never opens toward a box (NET-134)
+    /// — and at the per-box cap, once expired notes are swept, a new SYN
+    /// notes nothing: the client's connect degrades to the timeout, never
+    /// to an admission.
+    pub(crate) fn observe_refusable(
+        &self,
+        record: &Arc<BoxRecord>,
+        pkt: &dns_pins::L4Packet,
+        subnet: SwitchSubnet,
+        now: Instant,
+    ) {
+        if pkt.proto != egress::IPPROTO_TCP
+            || pkt.tcp_flags & (egress::TCP_SYN | egress::TCP_ACK | egress::TCP_RST)
+                != egress::TCP_SYN
+            || pkt.src.ip().octets() == subnet.box_egress_proxy_address().octets()
+        {
+            return;
+        }
+        let entry = self.entry(record);
+        let mut refusals = entry
+            .refusals
+            .lock()
+            .expect("the reply-flow table's lock is held only across one decision");
+        let tuple = reply_tuple_of(pkt);
+        if !refusals.contains_key(&tuple) && refusals.len() >= egress::REPLY_MAX_FLOWS_PER_BOX {
+            refusals.retain(|_, (_, until)| *until > now);
+            if refusals.len() >= egress::REPLY_MAX_FLOWS_PER_BOX {
+                return;
+            }
+        }
+        let ack =
+            switch::refusal::seq_acknowledging(pkt.tcp_seq, pkt.tcp_payload_len, pkt.tcp_flags);
+        refusals.insert(tuple, (ack, now + REFUSAL_WINDOW));
+    }
+
+    /// The verdict's refusal half (NET-014): whether one frame `record`'s
+    /// box sent is the refusal of a connect [`Self::observe_refusable`]
+    /// noted — a reset in exactly the shape a kernel, or the in-VM relay's
+    /// gate, refuses a bare SYN with (RST|ACK, sequence zero, no payload,
+    /// acknowledging the SYN), the exact reverse of the noted tuple, inside
+    /// [`REFUSAL_WINDOW`]. An admitted refusal consumes its note, so one
+    /// delivered SYN buys at most one reset; every other frame — a SYN-ACK
+    /// from the same port, a reset with other numbers, anything toward a
+    /// client that sent no SYN — is the row's rules' to decide, so the box
+    /// can answer a connect with its refusal and initiate nothing.
+    pub(crate) fn refusal_admits(
+        &self,
+        record: &Arc<BoxRecord>,
+        pkt: &dns_pins::L4Packet,
+        now: Instant,
+    ) -> bool {
+        if pkt.proto != egress::IPPROTO_TCP
+            || pkt.tcp_flags != egress::TCP_RST | egress::TCP_ACK
+            || pkt.tcp_seq != 0
+            || pkt.tcp_payload_len != 0
+        {
+            return false;
+        }
+        let Some(entry) = self.entry_of(record.switch_addr().octets()) else {
+            return false;
+        };
+        if !Arc::ptr_eq(&entry.record, record) {
+            return false;
+        }
+        let mut refusals = entry
+            .refusals
+            .lock()
+            .expect("the reply-flow table's lock is held only across one decision");
+        let connect = reply_tuple_of(pkt).reversed();
+        match refusals.get(&connect).copied() {
+            Some((_, until)) if until <= now => {
+                refusals.remove(&connect);
+                false
+            }
+            Some((ack, _)) if ack == pkt.tcp_ack => {
+                refusals.remove(&connect);
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Retires the entries of the boxes whose traffic the relay that ended
@@ -4158,6 +4274,13 @@ fn gate_verdict(
     // this admission — it can only answer a flow a client's packet earned.
     // A frame no record admits stays exactly where it was, with every check
     // below deciding it as it always has.
+    // NET-014 rides the same arm: the refusal of a bare SYN the ingress leg
+    // delivered at a port no publish dials — the reset the in-VM relay's
+    // gate (or the box's kernel) answers it with, in a kernel refusal's
+    // exact shape and numbers — passes once, whatever the row's rules say,
+    // so a connect to a deny-all box's unpublished port is refused rather
+    // than timed out ([`ReplyTables::refusal_admits`]). It too is only ever
+    // an answer: nothing the box sends notes a connect.
     // A frame to the Box Egress Proxy's address is never a record's to
     // admit: the proxy only answers a lane's dial and never opens a flow
     // toward a box (NET-134), so no record can legitimately reverse to it,
@@ -4166,7 +4289,8 @@ fn gate_verdict(
     if let Some(pkt) = l4
         && summary.destination() != Some(table.subnet().box_egress_proxy_address().octets())
         && let Some(record) = table.by_source(src)
-        && replies.reply_admits(&record, pkt, Instant::now())
+        && (replies.reply_admits(&record, pkt, Instant::now())
+            || replies.refusal_admits(&record, pkt, Instant::now()))
     {
         return Ok(GateAdmit::Row);
     }
@@ -7332,6 +7456,172 @@ mod tests {
             }),
             "an answer from the mapping's external end reverses no recorded \
              flow: no publish dials that port"
+        );
+    }
+
+    /// A sibling's bare SYN with its sequence number set, the way a kernel
+    /// opens: the TCP header is the frame builder's last twenty bytes.
+    fn sibling_syn(src: [u8; 4], dst: [u8; 4], dst_port: u16, seq: u32) -> Vec<u8> {
+        let mut syn = dns_pins::tests::tcp_frame(
+            Ipv4Addr::from(src),
+            40000,
+            Ipv4Addr::from(dst),
+            dst_port,
+            sessions::core::egress::TCP_SYN,
+        );
+        let at = syn.len() - 20 + 4;
+        syn[at..at + 4].copy_from_slice(&seq.to_be_bytes());
+        syn
+    }
+
+    /// The reset the in-VM relay's gate refuses `syn` with (NET-014): the
+    /// shared builder's bytes, so the gate is tested against the refusal
+    /// the guest actually writes.
+    fn refusal_of(syn: &[u8]) -> Vec<u8> {
+        let segment = switch::refusal::classify(syn).expect("the SYN parses as the relay reads it");
+        switch::refusal::refused_tcp_reset(syn, &segment)
+            .expect("a bare SYN is refused with a reset")
+    }
+
+    /// NET-014 on the host gate, for a deny-all box: a sibling's connect to
+    /// a port the box never published is refused, not timed out. The in-VM
+    /// relay answers the SYN the ingress leg delivered with a reset sourced
+    /// from the box, and the box's deny-all rules must not swallow it — the
+    /// ingress leg's note of the delivered SYN admits its refusal, exactly
+    /// once, in exactly a kernel refusal's shape and numbers. Nothing else
+    /// rides the note: the box's SYN-ACK from the same port, a reset with
+    /// other numbers, a reset nobody's SYN asked for, and the box's own
+    /// connect to the sibling all still drop under the row's deny-all.
+    #[test]
+    fn gate_verdict_admits_deny_all_box_refusal_of_sibling_connect() {
+        const SIBLING: [u8; 4] = [100, 64, 0, 10];
+        let registry = BoxRegistry::new(SUBNET);
+        let record = registry.register(
+            BoxRegistration::new("web", Ipv4Addr::from(LEASE), Ipv4Addr::LOCALHOST)
+                .with_admitted_ports([8080])
+                .with_egress_policy(EgressPolicy::deny_all()),
+        );
+        registry.register(
+            BoxRegistration::new("peer", Ipv4Addr::from(SIBLING), Ipv4Addr::LOCALHOST)
+                .with_egress_policy(EgressPolicy {
+                    allow_protocols: Some(vec![sessions::IpProto::Tcp]),
+                    allow_subnets: Some(vec!["100.64.0.0/10".to_string()]),
+                    allow_dns_hosts: None,
+                    deny_subnets: None,
+                }),
+        );
+        let table = registry.table();
+        let baseline = NodePlaneBaseline::built_in(SUBNET);
+        let pins = dns_pins::DnsPins::new(SUBNET);
+        let replies = ReplyTables::new();
+        let decide = |frame: &[u8]| {
+            let l4 = dns_pins::parse_ipv4_l4(frame)
+                .expect("the frame builder's IPv4 header always parses");
+            let summary = sessions::core::egress::summarize(frame);
+            gate_verdict(&summary, Some(&l4), &table, &baseline, &pins, &replies)
+        };
+        let note = |frame: &[u8], now: Instant| {
+            let l4 = dns_pins::parse_ipv4_l4(frame)
+                .expect("the frame builder's IPv4 header always parses");
+            replies.observe_refusable(&record, &l4, SUBNET, now);
+        };
+
+        let syn = sibling_syn(SIBLING, LEASE, 18121, 1000);
+        let reset = refusal_of(&syn);
+        assert!(
+            decide(&reset).is_err(),
+            "a reset no delivered SYN asked for is the deny-all row's to drop"
+        );
+
+        note(&syn, Instant::now());
+        let syn_ack = dns_pins::tests::tcp_frame(
+            Ipv4Addr::from(LEASE),
+            18121,
+            Ipv4Addr::from(SIBLING),
+            40000,
+            sessions::core::egress::TCP_SYN | sessions::core::egress::TCP_ACK,
+        );
+        assert!(
+            decide(&syn_ack).is_err(),
+            "the note admits a refusal, never an accept at the unpublished port"
+        );
+        let other_numbers = refusal_of(&sibling_syn(SIBLING, LEASE, 18121, 5000));
+        assert!(
+            decide(&other_numbers).is_err(),
+            "a reset that does not acknowledge the noted SYN is not its refusal"
+        );
+        assert_eq!(
+            decide(&reset),
+            Ok(GateAdmit::Row),
+            "the refusal of the delivered SYN reaches the sibling: refused, not timed out"
+        );
+        assert!(
+            decide(&reset).is_err(),
+            "one delivered SYN buys one refusal"
+        );
+
+        // The box's own connect to the sibling: deny-all still means the box
+        // initiates nothing, and a refusal note opens nothing for it.
+        note(&syn, Instant::now());
+        let initiated = sibling_syn(LEASE, SIBLING, 18118, 7);
+        assert!(
+            decide(&initiated).is_err(),
+            "the deny-all box's own SYN to its sibling still drops"
+        );
+
+        // A note outlives no window: a refusal after it is the row's again.
+        let fresh = sibling_syn(SIBLING, LEASE, 18122, 1000);
+        let expired = Instant::now()
+            .checked_sub(super::REFUSAL_WINDOW)
+            .expect("the monotonic clock has run past one refusal window");
+        note(&fresh, expired);
+        assert!(
+            decide(&refusal_of(&fresh)).is_err(),
+            "a refusal after the window drops like any frame the row refuses"
+        );
+    }
+
+    /// The same refusal end to end through both legs: a sibling's SYN at a
+    /// deny-all box's unpublished port arrives on the switch end and is
+    /// delivered, and the reset the box's side answers with reaches the
+    /// switch — while the box's own SYN toward the sibling does not.
+    #[tokio::test]
+    async fn host_gate_delivers_deny_all_box_refusal_of_unpublished_port() {
+        const SIBLING: [u8; 4] = [100, 64, 0, 10];
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register(
+            BoxRegistration::new("web", Ipv4Addr::from(LEASE), Ipv4Addr::LOCALHOST)
+                .with_admitted_ports([8080])
+                .with_egress_policy(EgressPolicy::deny_all()),
+        );
+        let publish = expose_request("127.0.0.1:8080", "100.64.0.9:8080", "tcp");
+        let h = gate_over_control(registry, publish).await;
+        let (mut guest, mut switch) = connect_over(&h).await;
+
+        let initiated = sibling_syn(LEASE, SIBLING, 18118, 7);
+        send_frame(&mut guest, &initiated).await;
+        let marker = arp_frame(LEASE);
+        send_frame(&mut guest, &marker).await;
+        assert_eq!(
+            expect_frame(&mut switch).await,
+            marker,
+            "the deny-all box's own SYN to its sibling dropped; the marker passed"
+        );
+        expect_silence(&mut switch).await;
+
+        let syn = sibling_syn(SIBLING, LEASE, 18121, 1000);
+        send_frame(&mut switch, &syn).await;
+        assert_eq!(
+            expect_frame(&mut guest).await,
+            syn,
+            "the sibling's SYN at the unpublished port is delivered to the box's side"
+        );
+        let reset = refusal_of(&syn);
+        send_frame(&mut guest, &reset).await;
+        assert_eq!(
+            expect_frame(&mut switch).await,
+            reset,
+            "the refusal reaches the sibling through the deny-all box's gate (NET-014)"
         );
     }
 
