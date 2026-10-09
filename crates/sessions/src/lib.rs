@@ -1008,7 +1008,9 @@ impl Serialize for BoxId {
 
 impl<'de> Deserialize<'de> for BoxId {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let text: &str = Deserialize::deserialize(deserializer)?;
+        // Owned, not borrowed: a record read from a file or a request read
+        // off a socket is deserialized from a reader, which lends no `&str`.
+        let text = String::deserialize(deserializer)?;
         let bytes = hex::decode(text).map_err(serde::de::Error::custom)?;
         let bytes: [u8; 16] = match bytes.try_into() {
             Ok(bytes) => bytes,
@@ -1345,6 +1347,17 @@ impl Record {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A box id reads back from a reader, which lends no borrowed string —
+    /// the path a record on disk and a request off a socket both take.
+    #[test]
+    fn box_id_deserializes_from_a_reader() {
+        let id = BoxId::from_bytes([0x42; 16]);
+        let wire = serde_json_lenient::to_string(&id).expect("an id serializes");
+        let read: BoxId =
+            serde_json_lenient::from_reader(wire.as_bytes()).expect("an id reads from a reader");
+        assert_eq!(read, id);
+    }
 
     /// The verdict strings `min session policy` and the TUI pane both print.
     #[test]
