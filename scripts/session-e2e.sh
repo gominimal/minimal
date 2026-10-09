@@ -15761,10 +15761,14 @@ proof_min_internal_names_through_proxy() {
     PROXY_OWN_SEED_DIR="$(hook_mktemp /tmp/mnlpo.XXXXXX)"
     hook_seed_preamble > "$PROXY_OWN_SEED_DIR/minimal.toml"
     mkdir "$PROXY_OWN_SEED_DIR/.git"
+    # Rules open to every address: with no egress section the box would get
+    # the deny-all default (NET-074), which drops the NET-004 connect below
+    # on its own, so the leg would pass whatever the infrastructure deny set
+    # did. With 0.0.0.0/0 that set is the only thing left to drop it.
     PROXY_OWN_SID="$(cd "$PROXY_OWN_SEED_DIR" && mnl session activate . --no-prompt \
-      --name "$PROXY_OWN_NAME" --network own_ip \
+      --name "$PROXY_OWN_NAME" --network own_ip --allow-subnets 0.0.0.0/0 \
       --ingress "$PROXY_OWN_EXTERNAL_PORT:$PROXY_BOX_PORT" 2>"$WORK/proxy-own.err")" || {
-      echo "::error::'min session activate --network own_ip --ingress ...' failed"
+      echo "::error::'min session activate --network own_ip --allow-subnets 0.0.0.0/0 --ingress ...' failed"
       echo "--- stderr ---"; cat "$WORK/proxy-own.err" 2>/dev/null || true
       fail
     }
@@ -15829,7 +15833,9 @@ proof_min_internal_names_through_proxy() {
 
     # NET-004: the deprecated literal itself. Box→host reach over the alias
     # is default-deny except configured host exposures (design §7.1), and
-    # none is configured, so the box's own relay drops the connect: no
+    # none is configured, so the box's own relay drops the connect — though
+    # its egress rules admit every address (0.0.0.0/0 above), so the drop
+    # is the infrastructure deny set's and not the deny-all default's: no
     # answer and no reset until the timeout, and the relay names the drop
     # under the infrastructure deny set's rule. The deprecation notice is
     # not asserted: the relay emits it only for a frame its verdict admits,
