@@ -160,6 +160,15 @@ zoned-build:
 zoned-link-check: zoned-build
     scripts/check-zoned-links.sh target/debug/minzoned
 
+# The .icns is committed (packaging/macos/AppIcon.icns); this re-renders it
+# from packaging/macos/app-icon.svg after a change to the source. Needs
+# rsvg-convert (`brew install librsvg`) and iconutil.
+#
+# Render the macOS app icon from its SVG source.
+[macos]
+app-icon:
+    scripts/build-app-icon.sh
+
 # Build the `min` CLI.
 minimal-cli:
     cargo build -p minimal --locked

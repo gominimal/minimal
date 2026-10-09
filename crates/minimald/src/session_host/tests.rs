@@ -1748,6 +1748,8 @@ impl SessionLauncher for SealingMockLauncher {
             // No launch this mock stands for gathered a listen plan, so
             // the host it builds starts no listener watcher.
             listen_plan: None,
+            // A plain host child: no pre-exec closure to hold.
+            start_gate: None,
         })
     }
 }
