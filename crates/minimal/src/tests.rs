@@ -1088,6 +1088,7 @@ fn finalize_install_parses_its_flags() {
         &["min", "finalize-install", "--script"][..],
         &["min", "finalize-install", "--json"],
         &["min", "finalize-install", "--show", "--json", "--undo"],
+        &["min", "finalize-install", "--undo", "--show", "--json"],
         &["min", "finalize-install", "--show", "--json", "--script"],
         &["min", "net", "setup"],
     ] {
