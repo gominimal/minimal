@@ -3236,7 +3236,8 @@ async fn activate_and_ls_report_native_surface() {
     // inside a VM-backed host's guest cannot speak for the host's resolver,
     // and this host's own reads say nothing routes the zone to the answerer
     // — so both verbs name the proxy as the live surface, with where it
-    // serves, points at `min finalize-install`, and neither prints the native words.
+    // serves, end with the install clause that points at `min
+    // finalize-install`, and neither prints the native words.
     let out = run_min(&args, &["ls"]).await;
     let ls_stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     assert!(
@@ -3244,12 +3245,11 @@ async fn activate_and_ls_report_native_surface() {
         "`min ls` must report the proxy as the live surface on a hook-less host, got: {ls_stdout}"
     );
     assert!(
-        ls_stdout.contains(&format!("routes through it on 127.0.0.1:{port}")),
-        "the surface line must name where the proxy serves: {ls_stdout}"
-    );
-    assert!(
-        ls_stdout.contains("run `min finalize-install`"),
-        "the proxy surface line must point at `min finalize-install`: {ls_stdout}"
+        ls_stdout.contains(&format!(
+            "routes through it on 127.0.0.1:{port}; finish setup: min finalize-install"
+        )),
+        "the surface row must name where the proxy serves and end with the install clause: \
+         {ls_stdout}"
     );
     assert!(
         !ls_stdout.contains("native DNS is the live name surface"),
@@ -3258,10 +3258,11 @@ async fn activate_and_ls_report_native_surface() {
 
     // `min session activate`, at the moment the user is about to rely on the
     // names — and before the upload and the loadout, so the line is not lost
-    // above a failed activate's output. Host DNS is opt-in (NET-122): this
-    // host cannot resolve the zone natively, so the surface line points at
-    // `min finalize-install`, and the session start prints no advisory and no part
-    // of the privileged script — and never a prompt.
+    // above a failed activate's output. One host line naming the box
+    // (NET-018): host DNS is opt-in (NET-122), so this host's name routes via
+    // the proxy's port and the line ends with the install clause; the
+    // session start prints no advisory and no part of the privileged script
+    // — and never a prompt. The two old lines are gone.
     let project = tempfile::TempDir::new().unwrap();
     std::fs::create_dir(project.path().join(".git")).unwrap();
     std::fs::write(
@@ -3284,20 +3285,29 @@ async fn activate_and_ls_report_native_surface() {
     )
     .await;
     assert!(
-        activate_stderr.contains("the hostname proxy is the live name surface"),
-        "activate must report the proxy as the live surface on a hook-less host, got: {activate_stderr}"
+        activate_stderr.contains(&format!(
+            "names: native-surface.min.internal via 127.0.0.1:{port}; finish setup: \
+             min finalize-install"
+        )),
+        "activate must print the one host line naming the box, the proxy's port and the \
+         install clause, got: {activate_stderr}"
+    );
+    assert_eq!(
+        activate_stderr
+            .lines()
+            .filter(|line| line.starts_with("names: "))
+            .count(),
+        1,
+        "a default start prints exactly one host line, got: {activate_stderr}"
     );
     assert!(
-        activate_stderr.contains(&format!("routes through it on 127.0.0.1:{port}")),
-        "activate's line must name where the proxy serves: {activate_stderr}"
-    );
-    assert!(
-        !activate_stderr.contains("native DNS is the live name surface"),
+        !activate_stderr.contains("resolves in any browser"),
         "a host with no hook must not be told native DNS is live: {activate_stderr}"
     );
     assert!(
-        activate_stderr.contains("run `min finalize-install`"),
-        "activate's surface line must point at `min finalize-install`, got: {activate_stderr}"
+        !activate_stderr.contains("HOSTNAME PROXY:")
+            && !activate_stderr.contains("live name surface"),
+        "the two old lines are gone from the start, got: {activate_stderr}"
     );
     assert!(
         !activate_stderr.contains("note:") && !activate_stderr.contains("#!/bin/sh"),
@@ -3339,16 +3349,101 @@ async fn activate_and_ls_report_native_surface() {
         !native_ls.contains("note:")
             && !native_ls.contains("Configure the host's resolver")
             && !native_ls.contains("min finalize-install"),
-        "a host the verdict calls native is a configured one: no advisory rides its list, \
-         got: {native_ls}"
+        "a host the verdict calls native is a finished one: no advisory and no install \
+         clause rides its list, got: {native_ls}"
     );
-    // And the words are activate's: one function renders the line for both
-    // verbs, so the native words `min ls` printed are the words the session
-    // start prints at the moment the user relies on the names.
-    let activate_words = resolver::name_surface_line(resolver::LiveSurface::Native, Some(port));
+    // And the install clause is activate's: the row ends with the same
+    // words the session start's host line ends with, so the two verbs point
+    // at the same step while anything is open, and at nothing once done.
+    let finished = resolver::host_line(
+        "native-surface",
+        &resolver::LiveSurface::Native,
+        Some(port),
+        resolver::HostInstall::default(),
+    );
+    assert_eq!(
+        finished, "names: native-surface.min.internal resolves in any browser on this machine",
+        "a finished host's start line carries no clause"
+    );
+}
+
+/// NET-018: `min ls` keeps its detail rows — `HOSTNAME PROXY:` with the
+/// port, `ZONE ANSWERER:` with the answerer's — and its `NAME SURFACE:` row
+/// ends with the same install clause the session start's host line carries
+/// while this host's install is unfinished. Driven through the compiled
+/// binary against a daemon whose two listeners serve, on a host whose
+/// resolver is not configured for the zone, so what is asserted is what the
+/// user sees.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn ls_keeps_detail_rows_and_name_surface_clause() {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    use minimald::server::{
+        RetryBackoff, retry_hostname_proxy_until_serving, retry_zone_answerer_until_serving,
+    };
+    use minimald_rpc::ListSessions;
+
+    let (daemon, args) = setup().await;
+    let compressed = RetryBackoff::new(
+        std::time::Duration::from_millis(5),
+        std::time::Duration::from_millis(40),
+    );
+    tokio::join!(
+        retry_hostname_proxy_until_serving(
+            daemon.server.state.clone(),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            compressed,
+        ),
+        retry_zone_answerer_until_serving(
+            daemon.server.state.clone(),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            compressed,
+        ),
+    );
+    let mut client = connect_daemon(&args).await.unwrap();
+    let resp = client.oneshot_rpc::<ListSessions>(()).await.unwrap();
+    let port = resp.hostname_proxy_port.expect("the proxy's port");
+    let answerer_port = resp.zone_answerer_port.expect("the answerer's port");
+
+    let out = run_min(&args, &["ls"]).await;
+    let ls_stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let row = |prefix: &str| {
+        ls_stdout
+            .lines()
+            .find(|line| line.starts_with(prefix))
+            .unwrap_or_else(|| panic!("a `{prefix}` row in:\n{ls_stdout}"))
+            .to_string()
+    };
     assert!(
-        native_ls.contains(&activate_words),
-        "`min ls` and activate print the same native words: {native_ls} vs {activate_words}"
+        row("HOSTNAME PROXY:").contains(&format!("listening on 127.0.0.1:{port}")),
+        "the proxy detail row stays, with the port: {ls_stdout}"
+    );
+    assert!(
+        row("ZONE ANSWERER:").contains(&format!("listening on 127.0.0.1:{answerer_port} (UDP)")),
+        "the answerer detail row stays, with the port: {ls_stdout}"
+    );
+    let surface = row("NAME SURFACE:");
+    assert!(
+        surface.ends_with("; finish setup: min finalize-install"),
+        "the surface row ends with the install clause while the install is unfinished: \
+         {surface}"
+    );
+    assert_eq!(
+        ls_stdout.matches("min finalize-install").count(),
+        1,
+        "the pointer prints once, on the surface row alone: {ls_stdout}"
+    );
+    // The same clause the session start's host line ends with.
+    let start = resolver::host_line(
+        "web",
+        &resolver::LiveSurface::Proxy,
+        Some(port),
+        resolver::HostInstall::default(),
+    );
+    assert!(
+        start.ends_with("; finish setup: min finalize-install"),
+        "both verbs end with the same install clause: {start}"
     );
 }
 

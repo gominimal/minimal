@@ -382,6 +382,34 @@ async fn plan_for_this_host(global: &GlobalArgs) -> Plan {
     Plan { items }
 }
 
+/// The install facts the host line reads beyond the surface verdict
+/// (NET-018): whether any item of this host's plan other than names is not
+/// done — the same items, under the same scoping, [`plan_for_this_host`]
+/// carries, probed from this host alone (no daemon read: the names item is
+/// the surface verdict the line already holds). Every item is Linux-only,
+/// so a macOS host reads `false`.
+pub(crate) fn host_install_for_this_host(global: &GlobalArgs) -> crate::resolver::HostInstall {
+    let mut others = Vec::new();
+    #[cfg(target_os = "linux")]
+    {
+        if !global.use_minvmd() {
+            others.extend(linux::userns_item_on_this_host());
+        }
+        if global.use_minvmd() {
+            others.push(linux::kvm_item_on_this_host());
+        } else {
+            others.push(linux::classifier_item_on_this_host());
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = global;
+    crate::resolver::HostInstall {
+        other_items_unfinished: others
+            .iter()
+            .any(|item: &Item| item.state != ItemState::Done),
+    }
+}
+
 /// The names item's id and label.
 const NAMES_ID: &str = "names";
 const NAMES_LABEL: &str = "box names for every host program";

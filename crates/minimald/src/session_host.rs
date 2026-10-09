@@ -4323,6 +4323,20 @@ impl SessionLauncher for SandboxLauncher {
                 "the session's host-address box runs unenforced on this host",
             );
         }
+        // The banner is the advisory's in-box surface, and follows the
+        // advisory's rule (NET-079): a native daemon only — per-box
+        // enforcement is a native-host fact, and the guest's state is the
+        // interim's, said in the record above — and only while the box
+        // declares egress, because a box that declared nothing asked for no
+        // enforcement. Its text is the create reply's own, so the terminal
+        // the start printed into and the shell it opens say the same thing.
+        let banner = (advise && !guest && policy.egress.is_some()).then(|| {
+            let cause = decision
+                .as_ref()
+                .and_then(crate::net::classifier::Decision::cause)
+                .unwrap_or(crate::net::classifier::Cause::StepNotInstalled);
+            crate::net::classifier::advisory_text(cause, classifier_verdict)
+        });
 
         // Step 1 (pre-spawn): the provider for this PTask's mode reserves what
         // the sandbox needs — for own-IP, a lease and a running gvproxy — and
@@ -4510,14 +4524,17 @@ impl SessionLauncher for SandboxLauncher {
             // per box yet is told so at its own start, like any host's.
             // And never on a hook launch: its
             // pty is read by nobody, and a hook run is not a session start.
-            if advise {
-                let notice = unenforced_placement_notice(guest, leaf.as_ref());
+            if let Some(notice) = &banner {
                 // The same write the shell fallback notice uses, for the
-                // same reasons: onto the pty's slave, best-effort, CRLF —
-                // see the comment there.
+                // same reasons: onto the pty's slave, best-effort, CRLF on
+                // each of the advisory's two lines — see the comment there.
+                let text = notice
+                    .lines()
+                    .map(|line| format!("minimal: {line}\r\n"))
+                    .collect::<String>();
                 let written = pty.dup_slave_fd().and_then(|fd| {
                     use std::io::Write as _;
-                    std::fs::File::from(fd).write_all(format!("minimal: {notice}\r\n").as_bytes())
+                    std::fs::File::from(fd).write_all(text.as_bytes())
                 });
                 if let Err(e) = written {
                     tracing::debug!(

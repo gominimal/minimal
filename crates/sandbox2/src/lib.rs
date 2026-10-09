@@ -1028,43 +1028,18 @@ pub mod classifier {
             .map(str::to_string)
     }
 
-    /// The account this daemon runs as: the daemon knows its own uid, and
-    /// the *name* is what a person types after the installer's `--user`, so
-    /// it is looked up rather than guessed. A uid with no account — a
-    /// container running a bare uid — is the `None` the hint below names
-    /// its fallback for.
-    #[cfg(target_os = "linux")]
-    #[must_use]
-    pub fn own_account() -> Option<String> {
-        nix::unistd::User::from_uid(nix::unistd::getuid())
-            .ok()
-            .flatten()
-            .map(|user| user.name)
-    }
-
     /// The command a person runs on this host to give this daemon a
-    /// classifier tree. A stock install does not ship the installer (the
-    /// release stages only the apparmor one), so the hint names where the
-    /// script lives in the source repository rather than a `scripts/` path
-    /// the host does not have. The installer takes the account the daemon
-    /// runs as and the two source identities the classification rests on
-    /// (NET-078 — what the boxes cohort leaves as, and what the rest of the
-    /// slice leaves as; the step refuses to render one without the other, so
-    /// a hint that named neither is a command the step itself refuses). The
-    /// hint spells the whole command, so the advisory that carries it never
-    /// has to name a placeholder for the one thing the daemon knows — only
-    /// for the two things this host does.
+    /// classifier tree: `min finalize-install`, the one verb that finishes
+    /// this host's install. The CLI knows the account the daemon runs as
+    /// and the two source identities the classification rests on
+    /// (NET-078), so the hint names no placeholder for a person to fill
+    /// and no script to fetch; every advisory that carries it — the
+    /// daemon's start-up warn line, the native unenforced notice,
+    /// `Cause::StepNotInstalled`'s command — points at the same verb.
     #[cfg(target_os = "linux")]
     #[must_use]
     pub fn install_hint() -> String {
-        let account =
-            own_account().unwrap_or_else(|| "<the account this daemon runs as>".to_string());
-        format!(
-            "run: curl -fsSLO \
-             https://raw.githubusercontent.com/gominimal/minimal/main/scripts/install-host-classifier.sh \
-             && sudo bash ./install-host-classifier.sh --user {account} \
-             --cohort-address <cohort address> --node-plane-address <node-plane address>"
-        )
+        "min finalize-install".to_string()
     }
 
     /// Makes one level of the classifier layout, taking `AlreadyExists` as
@@ -5282,32 +5257,18 @@ ff02::2\tip6-allrouters
     // NET-079: each host-address box in its own classifier leaf, kept there.
     // ---------------------------------------------------------------------
 
-    /// A stock install does not ship the classifier installer, so the hint
-    /// says where to fetch it — the raw file, not GitHub's HTML viewer page,
-    /// which a `curl` of the URL would save and `sudo` would then run — rather
-    /// than name a checkout-relative `scripts/` path, and still spells the
-    /// `--user` the daemon knows.
+    /// The hint names `min finalize-install` — the verb that finishes this
+    /// host's install — not a script to fetch or a placeholder a person
+    /// fills in: a stock install does not ship the classifier installer,
+    /// and the CLI knows every argument the privileged step takes.
     #[cfg(target_os = "linux")]
     #[test]
     fn the_install_hint_names_where_the_installer_lives() {
         let hint = classifier::install_hint();
-        assert!(
-            hint.contains(
-                "https://raw.githubusercontent.com/gominimal/minimal/main/scripts/install-host-classifier.sh"
-            ),
-            "{hint}"
-        );
-        assert!(!hint.contains("/blob/"), "{hint}");
-        assert!(!hint.contains("sudo scripts/"), "{hint}");
-        // The fetch saves the file under its own name, so the run that
-        // follows finds it; a downloaded file has no executable bit, so the
-        // hint runs it via bash.
-        assert!(hint.contains("curl -fsSLO https://"), "{hint}");
-        assert!(
-            hint.contains("sudo bash ./install-host-classifier.sh"),
-            "{hint}"
-        );
-        assert!(hint.contains("--user "), "{hint}");
+        assert_eq!(hint, "min finalize-install");
+        assert!(!hint.contains("curl"), "{hint}");
+        assert!(!hint.contains("install-host-classifier.sh"), "{hint}");
+        assert!(!hint.contains('<'), "no placeholder: {hint}");
     }
 
     /// The mount-table half of the confinement: which cgroup2 mounts a host's
@@ -5403,25 +5364,25 @@ ff02::2\tip6-allrouters
         );
     }
 
-    /// The install hint names every argument the installer requires of a
-    /// person (NET-078): the account the daemon runs as — the one thing the
-    /// daemon knows and would otherwise make the reader look up — and the
-    /// two source identities, which the step refuses to render one of
-    /// without the other, so a hint without them is a command the installer
-    /// itself refuses. Pinned as data: the daemon's start-up warn line, the
-    /// native unenforced notice and `Cause::StepNotInstalled`'s command all
-    /// carry this string, and the installer's own `--check` hint names the
-    /// same two flags, so the two spellings cannot drift apart unseen.
+    /// The hint asks nothing of a person that the CLI already knows
+    /// (NET-078): the account the daemon runs as and the two source
+    /// identities are the installer's to find, so the hint carries none of
+    /// the installer's flags. Pinned as data: the daemon's start-up warn
+    /// line, the native unenforced notice and `Cause::StepNotInstalled`'s
+    /// command all carry this string.
     #[cfg(target_os = "linux")]
     #[test]
     fn install_hint_names_the_installers_required_identities() {
         let hint = classifier::install_hint();
         assert!(
-            hint.contains("install-host-classifier.sh"),
-            "the hint names the privileged step's install: {hint}"
+            hint.starts_with("min finalize-install"),
+            "the hint names the verb that finishes the install: {hint}"
         );
-        for flag in ["--cohort-address", "--node-plane-address"] {
-            assert!(hint.contains(flag), "the hint names {flag}: {hint}");
+        for flag in ["--user", "--cohort-address", "--node-plane-address"] {
+            assert!(
+                !hint.contains(flag),
+                "the hint asks nothing for {flag}: {hint}"
+            );
         }
     }
 

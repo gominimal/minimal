@@ -398,6 +398,53 @@ impl Cause {
     }
 }
 
+/// The advisory a native host that cannot decide per box owes a session
+/// start whose box declares egress (NET-079): what the person asked the box
+/// for, that this machine cannot enforce it yet, what the box does instead,
+/// and the two ways to enforce it — `min finalize-install`, which finishes
+/// this host's install, or an own-address start, which enforces now. Two
+/// lines, the second indented, spelled once here so the create reply `min
+/// session activate` prints verbatim, the daemon's log line for that create
+/// and the banner the launch writes into the box's pty agree by
+/// construction. A declaration that admits nothing asked for "no network
+/// access"; any other declaration asked for "limited" access. The two probe
+/// causes refuse a deny-all box at placement rather than run it unenforced
+/// ([`Cause::host_ip_box_outcome`]), so over those the line says the box is
+/// refused instead of claiming it runs. A cause no install ends names the
+/// own-address start alone and says why the install cannot help, so the
+/// advisory never hands a person a command that leaves the cause standing.
+/// It is never a prompt: it names what a person may run, and running it is
+/// the person's act, never the session start's.
+pub fn advisory_text(cause: Cause, verdict: sandbox2::config::Verdict) -> String {
+    let asked = match verdict {
+        sandbox2::config::Verdict::Deny => "no network access",
+        sandbox2::config::Verdict::Allow => "limited network access",
+    };
+    let refuses = verdict == sandbox2::config::Verdict::Deny
+        && matches!(cause, Cause::TableNotEffective | Cause::ProbeUnreadable);
+    let outcome = if refuses {
+        "so it refuses to start the box"
+    } else {
+        "so the box can still reach the network"
+    };
+    let enforce = match cause.install_command() {
+        Some(command) => format!(
+            "Enforce it: {command}   (or start the box with --network own_ip, which \
+             enforces it now)"
+        ),
+        None => format!(
+            "Enforce it: start the box with --network own_ip, which enforces it now   \
+             ({} can't fix this: {})",
+            sandbox2::classifier::install_hint(),
+            cause.detail()
+        ),
+    };
+    format!(
+        "note: you asked this box for {asked}, but this machine can't enforce it yet, \
+         {outcome}.\n  {enforce}"
+    )
+}
+
 /// Whether this host can decide a host-address box's egress verdict per box
 /// (NET-079), and why not when it cannot: the fact the daemon reads at
 /// start and again before each host-address launch, the create response
@@ -4393,12 +4440,8 @@ mod tests {
         let command = cause
             .install_command()
             .expect("the step's cause is the one a command ends");
-        assert!(
-            command.contains("install-host-classifier.sh"),
-            "the command is the privileged step's install: {command}"
-        );
-        assert!(
-            command.contains("sudo bash ./install-host-classifier.sh"),
+        assert_eq!(
+            command, "min finalize-install",
             "the command is the one a person runs, spelled exactly: {command}"
         );
 
@@ -4574,8 +4617,8 @@ mod tests {
         let command = cause
             .install_command()
             .expect("reloading the table is the command that ends it");
-        assert!(
-            command.contains("install-host-classifier.sh"),
+        assert_eq!(
+            command, "min finalize-install",
             "the command is the one thing that reloads the table: {command}"
         );
 

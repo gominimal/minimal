@@ -3622,7 +3622,7 @@ async fn the_unenforced_record_fires_on_every_launch_and_carries_the_field() {
             });
         assert!(
             record.contains(NOTICE),
-            "the record carries the same text the session's banner gets: {record}"
+            "the record carries the placement's own words: {record}"
         );
         assert!(
             record.contains(MACHINE_FIELD),
@@ -3856,16 +3856,16 @@ fn the_guests_unenforced_host_address_box_advises_with_the_interim() {
         notice,
         "the guest's notice is the interim's words whatever its leaf is"
     );
-    // The native notice still names the step, in both of its own shapes.
+    // The native notice still names the step's install, in both of its own
+    // shapes — `min finalize-install`, never a script or a placeholder.
     assert!(
-        super::unenforced_placement_notice(false, None).contains("install-host-classifier.sh"),
-        "an unplaced native box is told to install the step"
+        super::unenforced_placement_notice(false, None).contains("min finalize-install"),
+        "an unplaced native box is told to finish the install"
     );
     assert!(
-        super::unenforced_placement_notice(false, Some(&leaf))
-            .contains("install-host-classifier.sh"),
+        super::unenforced_placement_notice(false, Some(&leaf)).contains("min finalize-install"),
         "a placed native box on a host that cannot decide is told to \
-         install the step too"
+         finish the install too"
     );
 }
 

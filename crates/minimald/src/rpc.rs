@@ -385,8 +385,12 @@ async fn serve_create_session(
             }
             let fact = crate::session_host::host_ip_enforcement_fact();
             let classifier_cause = fact.cause;
-            let classifier_advisory =
-                create_classifier_advisory(in_microvm, req.config.network, classifier_cause);
+            let classifier_advisory = create_classifier_advisory(
+                in_microvm,
+                req.config.network,
+                classifier_cause,
+                req.config.policy.egress.as_ref(),
+            );
             let host_ip_enforcement = crate::session_host::displayed_host_ip_enforcement(
                 in_microvm,
                 req.config.network,
@@ -502,56 +506,6 @@ async fn serve_create_session(
 /// carries.
 const HOST_IP_ENFORCEMENT_ATTR: &str = "host_ip_enforcement";
 
-/// The advisory a cause yields for the reply (NET-079): the cause in words,
-/// the state it leaves the box in, and — only when the cause is one the
-/// command ends — the exact command that ends it. Spelled here, on the one
-/// side that read the host, so the daemon's log line, the reply a client
-/// prints verbatim, and the start that prints it agree by construction, and
-/// the advisory is never a prompt: it names what a person may run, and
-/// running it (and any privilege prompt it carries) is the person's act,
-/// never the session start's.
-///
-/// The state it names is the box outcome the cause leaves, with the
-/// "whatever the boxes' declarations say" clause carried only while that
-/// outcome names no refusals: natively the step's and the mount's causes
-/// leave even a deny-all box running unenforced, while the two probe causes
-/// refuse a deny-all box at placement — an advisory that said "whatever the
-/// declarations say" over a refusal would deny the refusal a person is about
-/// to hit — and in the guest every cause refuses.
-fn classifier_advisory_text(cause: classifier::Cause, guest: bool) -> String {
-    let mut advisory = format!(
-        "note: this host cannot decide a host-address box's egress verdict \
-         per box: {}. While it cannot, {}",
-        cause.detail(),
-        cause.host_ip_box_outcome(guest),
-    );
-    // The clause holds exactly while the outcome sentence names no
-    // refusals — the same causes [`classifier::Cause::host_ip_box_outcome`]
-    // spells "run unenforced" for on a native host, mirrored here so the
-    // clause and the outcome it qualifies cannot drift apart. `guest` is
-    // folded into the mirror: every guest outcome names refusals.
-    if !guest
-        && matches!(
-            cause,
-            classifier::Cause::StepNotInstalled
-                | classifier::Cause::CannotConfine
-                | classifier::Cause::GuestTableNotLoaded
-        )
-    {
-        advisory.push_str(" — whatever the boxes' declarations say");
-    }
-    if let Some(command) = cause.install_command() {
-        // The command ends the advisory with nothing after it, so the line
-        // a person copies from the terminal is the command, verbatim.
-        advisory.push_str(&format!(
-            ". Install the classifier's privileged step with:\n  {command}"
-        ));
-    } else {
-        advisory.push('.');
-    }
-    advisory
-}
-
 /// The refusal an own-address create gets on a VM-backed node when it
 /// carries no handed addresses (NET-081): the VM host allocates every
 /// box-plane address and hands it in through the registration its control
@@ -577,27 +531,32 @@ fn refuse_unhanded_vm_box(
     Ok(())
 }
 
-/// The advisory a create owes the start it answers (NET-079): only when both
-/// halves it is about are true — the daemon is not running inside a microVM,
-/// and the session is a host-address box, whose verdict is the one the
-/// host's cgroup tree decides. In the guest the start-up line and each
-/// launch's own record already say the interim's state, and a guest's
-/// causes name its image's builder rather than anything the person starting
-/// a session could run; an own-address box's verdict is decided on address
-/// leases, so there is no per-box state to advise about. Over a host-address
-/// box on a native host, the advisory is the cause in words —
-/// [`classifier_advisory_text`]'s, the same text the daemon's log line for
-/// an advisory-carrying create carries. Pure over its inputs, so the gate
-/// is pinned where it is written.
+/// The advisory a create owes the start it answers (NET-079): only when
+/// every half it is about is true — the daemon is not running inside a
+/// microVM, the session is a host-address box, whose verdict is the one the
+/// host's cgroup tree decides, and the box declares egress at all. In the
+/// guest the start-up line and each launch's own record already say the
+/// interim's state, and a guest's causes name its image's builder rather
+/// than anything the person starting a session could run; an own-address
+/// box's verdict is decided on address leases, so there is no per-box state
+/// to advise about; and a box that declared nothing asked for no enforcement,
+/// so there is nothing to tell it the host cannot enforce — the host fact
+/// is still recorded on the reply, for `min session policy` to show. Over a
+/// declaring host-address box on a native host, the advisory is
+/// [`classifier::advisory_text`]'s — the same text the daemon's log line for
+/// an advisory-carrying create carries. Pure over its inputs, so the gate is
+/// pinned where it is written.
 fn create_classifier_advisory(
     in_microvm: bool,
     network: minimald_rpc::NetworkMode,
     cause: Option<classifier::Cause>,
+    egress: Option<&sessions::EgressPolicy>,
 ) -> Option<String> {
     if in_microvm || network != minimald_rpc::NetworkMode::HostNet {
         return None;
     }
-    cause.map(|cause| classifier_advisory_text(cause, false))
+    egress?;
+    cause.map(|cause| classifier::advisory_text(cause, classifier::verdict_of(egress)))
 }
 
 /// The bind probe over the reserved local range, on the blocking pool —
@@ -3625,10 +3584,11 @@ mod tests {
             .collect()
     }
 
-    /// NET-079: a native create on a host that cannot decide per box answers
-    /// with the advisory the requirement spells — the cause in words, the
-    /// state it leaves the box in, and, only when the cause is one the
-    /// command ends, the exact command that ends it. Both causes a test has
+    /// NET-079: a native create of a box that declares egress, on a host
+    /// that cannot decide per box, answers with the advisory the requirement
+    /// spells — what the box asked for, that this machine cannot enforce it
+    /// yet, and the two ways to enforce it, naming `min finalize-install`
+    /// only when the cause is one the install ends. Both causes a test has
     /// to set as the fact, because the daemon's own host decides them for
     /// real: the step never having run, and a mount that cannot confine a
     /// box at all — so the advisory a person reads is never handed an
@@ -3651,6 +3611,11 @@ mod tests {
         let server = TestServer::new().await;
         let mut client = server.connect().await;
         let capture = crate::test_harness::captured_log();
+        let deny_all = |name: &str| {
+            let mut request = req(name, "/uwu");
+            request.config.policy.egress = Some(sessions::EgressPolicy::deny_all());
+            request
+        };
 
         // The fact a start-up read over a step-missing host leaves: state
         // `none`, cause the step's — the state the daemon's own start-up
@@ -3659,25 +3624,23 @@ mod tests {
             classifier::Cause::StepNotInstalled,
         ));
         let step_missing = client
-            .call::<CreateSession>(&req("step-missing", "/uwu"))
+            .call::<CreateSession>(&deny_all("step-missing"))
             .await
             .unwrap();
         let advisory = step_missing
             .classifier_advisory
             .expect("a create on a step-missing host carries the advisory");
-        assert!(
-            advisory.contains("the classifier's privileged step is not installed on this host"),
-            "the advisory must name the cause in words, got: {advisory}"
-        );
-        assert!(
-            advisory.contains("its host-address boxes run unenforced"),
-            "the advisory must say the state it leaves the box in, got: {advisory}"
+        assert_eq!(
+            advisory,
+            "note: you asked this box for no network access, but this machine can't \
+             enforce it yet, so the box can still reach the network.\n  Enforce it: min \
+             finalize-install   (or start the box with --network own_ip, which enforces \
+             it now)",
+            "the advisory is the requirement's two lines, verbatim"
         );
         // The command's spelling is the install hint's own, pinned in the
-        // classifier crate; the pin here is that the advisory carries the
-        // whole of it, verbatim, whatever the hint currently says — a
-        // stock install ships no `scripts/` tree, so the hint names where
-        // the script lives in the repository instead.
+        // classifier crate; the pin here is that the advisory carries it
+        // whole, whatever the hint currently says.
         let install = sandbox2::classifier::install_hint();
         assert!(
             advisory.contains(&install),
@@ -3690,12 +3653,13 @@ mod tests {
         );
 
         // The cannot-confine fact over the same box: the cause is the
-        // mount's, so the advisory names it and nothing to run.
+        // mount's, so the advisory names the own-address start alone and
+        // says why the install cannot help.
         crate::session_host::set_host_ip_enforcement_fact(&classifier::Decision::undecidable(
             classifier::Cause::CannotConfine,
         ));
         let cannot_confine = client
-            .call::<CreateSession>(&req("cannot-confine", "/uwu"))
+            .call::<CreateSession>(&deny_all("cannot-confine"))
             .await
             .unwrap();
         crate::session_host::clear_host_ip_enforcement_fact();
@@ -3704,14 +3668,18 @@ mod tests {
             .expect("a host that cannot confine still gets the advisory");
         assert!(
             advisory.contains(
-                "no cgroup2 mount with nsdelegate covers the classifier tree, so a \
-                 box could migrate out of its leaf"
+                "min finalize-install can't fix this: no cgroup2 mount with nsdelegate \
+                 covers the classifier tree, so a box could migrate out of its leaf"
             ),
             "the advisory must name this cause in words too, got: {advisory}"
         );
         assert!(
-            !advisory.contains("install-host-classifier"),
-            "no command ends this cause, so the advisory must name none: {advisory}"
+            !advisory.contains("Enforce it: min finalize-install"),
+            "no install ends this cause, so the advisory must not hand it out: {advisory}"
+        );
+        assert!(
+            advisory.contains("Enforce it: start the box with --network own_ip"),
+            "the own-address start is the one remedy left: {advisory}"
         );
         assert!(
             !advisory.contains('?'),
@@ -3731,7 +3699,7 @@ mod tests {
         );
         let step_line = &step_line[0];
         assert!(
-            step_line.contains("advisory=\"note: this host cannot decide"),
+            step_line.contains("advisory=\"note: you asked this box"),
             "the logged line must carry the advisory's own text, not only \
              its facts, got: {step_line}"
         );
@@ -5127,26 +5095,88 @@ mod tests {
     /// image's builder rather than anything the person starting a session
     /// could run. Pinned pure over the create's gate: the test harness
     /// builds native daemons only, so the guest arm is the gate's, with the
-    /// same cause a native host-address create advises on as the input that
-    /// proves the `None` is the guest's doing and not the cause's.
+    /// same cause and declaration a native host-address create advises on as
+    /// the input that proves the `None` is the guest's doing and not the
+    /// cause's.
     #[test]
     fn microvm_create_has_no_classifier_advisory() {
         let cause = Some(classifier::Cause::StepNotInstalled);
+        let deny_all = sessions::EgressPolicy::deny_all();
         assert_eq!(
-            super::create_classifier_advisory(true, NetworkMode::HostNet, cause),
+            super::create_classifier_advisory(true, NetworkMode::HostNet, cause, Some(&deny_all)),
             None,
             "a microVM's daemon carries no classifier advisory, whatever its \
              sessions or its fact"
         );
         assert!(
-            super::create_classifier_advisory(false, NetworkMode::HostNet, cause).is_some(),
+            super::create_classifier_advisory(false, NetworkMode::HostNet, cause, Some(&deny_all))
+                .is_some(),
             "the same cause over a native host-address create does advise — \
              the contrast that proves the guest arm is the gate's own"
         );
         assert_eq!(
-            super::create_classifier_advisory(false, NetworkMode::OwnIp, cause),
+            super::create_classifier_advisory(false, NetworkMode::OwnIp, cause, Some(&deny_all)),
             None,
             "the own-address arm stays the gate's own too, guest or not"
+        );
+    }
+
+    /// The advisory prints only while the box declares egress: a box that
+    /// declared nothing asked for no enforcement, so a native host that
+    /// cannot decide per box tells it nothing — the fact still rides the
+    /// reply for `min session policy` — while a deny-all declaration gets
+    /// the requirement's two lines verbatim, an allow-list declaration the
+    /// same two lines naming "limited" access, and a VM-backed daemon
+    /// nothing even over a declaring box.
+    #[test]
+    fn classifier_advisory_prints_only_while_box_declares_egress() {
+        let cause = Some(classifier::Cause::StepNotInstalled);
+        assert_eq!(
+            super::create_classifier_advisory(false, NetworkMode::HostNet, cause, None),
+            None,
+            "a box that declares no egress is told nothing"
+        );
+        let deny_all = sessions::EgressPolicy::deny_all();
+        assert_eq!(
+            super::create_classifier_advisory(false, NetworkMode::HostNet, cause, Some(&deny_all))
+                .as_deref(),
+            Some(
+                "note: you asked this box for no network access, but this machine can't \
+                 enforce it yet, so the box can still reach the network.\n  Enforce it: min \
+                 finalize-install   (or start the box with --network own_ip, which \
+                 enforces it now)"
+            ),
+            "a deny-all declaration gets the requirement's two lines"
+        );
+        let allow_list = sessions::EgressPolicy {
+            allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
+            ..sessions::EgressPolicy::default()
+        };
+        assert_eq!(
+            super::create_classifier_advisory(
+                false,
+                NetworkMode::HostNet,
+                cause,
+                Some(&allow_list)
+            )
+            .as_deref(),
+            Some(
+                "note: you asked this box for limited network access, but this machine \
+                 can't enforce it yet, so the box can still reach the network.\n  Enforce \
+                 it: min finalize-install   (or start the box with --network own_ip, which \
+                 enforces it now)"
+            ),
+            "an allow-list declaration asked for limited access"
+        );
+        assert_eq!(
+            super::create_classifier_advisory(true, NetworkMode::HostNet, cause, Some(&deny_all)),
+            None,
+            "a VM-backed daemon never advises, declaration or not"
+        );
+        assert_eq!(
+            super::create_classifier_advisory(false, NetworkMode::HostNet, None, Some(&deny_all)),
+            None,
+            "a host that decides per box has nothing to advise"
         );
     }
 
@@ -5192,63 +5222,58 @@ mod tests {
     /// stand-in can carry either — a fake tree's probe child never places,
     /// so the stand-ins answer a step or mount cause, and a stand-in that
     /// carried a decided tree would need a table whose refusal the probe
-    /// could read. The two are the exception's one limit: natively the
-    /// outcome names the refusal — a deny-all host-address box is refused at
-    /// placement — so the advisory must not claim the boxes' declarations do
-    /// not matter over a refusal a person is about to hit. The table a
-    /// reload would fix still names the command; the probe no command can
-    /// make run names none. And in the guest every cause refuses, so the
-    /// clause never appears there either.
+    /// could read. The two are the exception's one limit: natively a
+    /// deny-all host-address box is refused at placement — so the advisory
+    /// must not claim the box runs over a refusal a person is about to hit,
+    /// while a box the host does run says so. The table a reload would fix
+    /// still names the install; the probe no command can make run names the
+    /// own-address start alone.
     #[test]
     fn advisory_over_a_probe_cause_names_the_refusal_not_a_blanket_unenforced() {
+        use sandbox2::config::Verdict;
         let not_effective =
-            super::classifier_advisory_text(classifier::Cause::TableNotEffective, false);
+            classifier::advisory_text(classifier::Cause::TableNotEffective, Verdict::Deny);
         assert!(
-            not_effective.contains(
-                "its deny-all host-address boxes are refused and its other \
-                 host-address boxes run unenforced"
-            ),
+            not_effective.contains("so it refuses to start the box"),
             "the probe cause's advisory names the refusal, got: {not_effective}"
         );
         assert!(
-            !not_effective.contains("whatever the boxes' declarations say"),
-            "the clause holds only while no box is refused, got: {not_effective}"
+            !not_effective.contains("so the box can still reach the network"),
+            "a refused box is not said to run, got: {not_effective}"
         );
         assert!(
-            not_effective.contains(&sandbox2::classifier::install_hint()),
+            not_effective.contains("Enforce it: min finalize-install"),
             "a table the marker vouches for but the probe does not is the one \
-             the step's install reloads, so the advisory still carries the \
-             command, got: {not_effective}"
+             the install reloads, so the advisory still carries the command, \
+             got: {not_effective}"
         );
         assert!(
             !not_effective.contains('?'),
             "the advisory names what a person may run; it never asks: {not_effective}"
         );
-
-        let unreadable = super::classifier_advisory_text(classifier::Cause::ProbeUnreadable, false);
+        let allowed =
+            classifier::advisory_text(classifier::Cause::TableNotEffective, Verdict::Allow);
         assert!(
-            unreadable.contains(
-                "its deny-all host-address boxes are refused and its other \
-                 host-address boxes run unenforced"
-            ),
-            "an unreadable probe leaves the same refusal-naming outcome, \
-             got: {unreadable}"
-        );
-        assert!(
-            !unreadable.contains("whatever the boxes' declarations say"),
-            "the clause still does not apply, got: {unreadable}"
-        );
-        assert!(
-            !unreadable.contains("install-host-classifier"),
-            "no command is known to make a probe run, so none is named, \
-             got: {unreadable}"
+            allowed.contains("so the box can still reach the network"),
+            "a box that needs no deny verdict still runs, and is told so: {allowed}"
         );
 
-        let guest = super::classifier_advisory_text(classifier::Cause::StepNotInstalled, true);
+        let unreadable =
+            classifier::advisory_text(classifier::Cause::ProbeUnreadable, Verdict::Deny);
         assert!(
-            !guest.contains("whatever the boxes' declarations say"),
-            "a guest refuses a deny-all box on every cause, so its advisory \
-             must not claim the declarations do not matter, got: {guest}"
+            unreadable.contains("so it refuses to start the box"),
+            "an unreadable probe leaves the same refusal, got: {unreadable}"
+        );
+        assert!(
+            !unreadable.contains("Enforce it: min finalize-install"),
+            "no command is known to make a probe run, so the install is not \
+             handed out, got: {unreadable}"
+        );
+        assert!(
+            unreadable.contains("Enforce it: start the box with --network own_ip")
+                && unreadable.contains("min finalize-install can't fix this:"),
+            "the own-address start is the one remedy, and the line says why \
+             the install is not: {unreadable}"
         );
     }
 
