@@ -259,10 +259,10 @@ included, with every refusal logged (NET-001 to NET-004).
     tier:   T0
     verify: cargo nextest run -p minimal activate_host_line_carries_finish_setup_clause_while_items_missing
     <!-- state-driven; the clause is the pointer NET-122 owes an unfinished host, so a session start and `min finalize-install --show` agree on whether anything is left; a finished host has no clause -->
-  - WHEN `min ls` runs THE SYSTEM SHALL keep its `HOSTNAME PROXY:` and `ZONE ANSWERER:` detail rows and print the same resolution clause and install clause as the activate host line on its `NAME SURFACE:` row.
+  - WHEN `min ls` runs THE SYSTEM SHALL keep its `HOSTNAME PROXY:` and `ZONE ANSWERER:` detail rows, keep the resolution wording of its `NAME SURFACE:` row, and end that row with the same install clause as the activate host line while any item is missing.
     tier:   T0
     verify: cargo nextest run -p minimal ls_keeps_detail_rows_and_name_surface_clause
-    <!-- event-driven; the listing is where the detail belongs: the port, the answerer and the surface each get a row there, while an activation gets one line -->
+    <!-- event-driven; the listing is per daemon and names no box, so its row keeps its own words, `the hostname proxy is the live name surface · <name>.min.internal routes through it on 127.0.0.1:<port>` or `native DNS is the live name surface · …`, and only the install clause `; finish setup: min finalize-install` is shared with the host line; a listener failure (NET-020) stays on the `HOSTNAME PROXY:` row here; the port, the answerer and the surface each get a row, while an activation gets one line -->
 
 - **NET-019** WHERE host-OS resolution and published addresses are both deployed on the host THE SYSTEM SHALL keep the hostname proxy serving.
   tier:     T0
