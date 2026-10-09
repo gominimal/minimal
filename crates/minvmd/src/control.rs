@@ -1054,11 +1054,13 @@ fn registration_reply(
 }
 
 /// Resume a box's row for its creator ([`BoxRegistry::resume_client_box`],
-/// NET-138) in its door's apply order and build the reply: the shape of a
-/// registration, because a resume whose row was withdrawn is one — counted
-/// in flight under the name and its published address asked of the
-/// answerer before the ticket, which hands the name back the address it
-/// holds or held for it. A refusal hands that address back unless
+/// NET-138) and build the reply: the shape of a registration. A row that
+/// stands is answered at once, with no ticket and nothing asked of the
+/// answerer: the resume changes nothing about it. A resume whose row was
+/// withdrawn is a registration — counted in flight under the creation's
+/// own name, which a rename does not change, and its published address
+/// asked of the answerer before the ticket, which hands the name back the
+/// address it holds for it. A refusal hands that address back unless
 /// something else owns it, as a refused registration does.
 fn resume_reply(
     boxes: &BoxRegistry,
@@ -1066,14 +1068,37 @@ fn resume_reply(
     order: &Arc<ApplyOrder>,
     request: minimald_rpc::ResumeBoxRequest,
 ) -> BoxControlReply {
-    let claim = boxes.begin_registration(&request.name);
-    let allocated = match allocate_box_address(answerer, &request.name) {
+    let refused = |error: crate::box_registry::ResumeError| {
+        tracing::info!(box = %request.name, error = %error, "box row resume refused");
+        BoxControlReply::Error {
+            error: error.to_string(),
+        }
+    };
+    let name = match boxes.resumable(
+        &request.name,
+        request.switch_address,
+        request.loopback_address,
+        request.box_id.map(minimald_rpc::BoxId::to_bytes),
+    ) {
+        Ok(crate::box_registry::Resumable::Standing(record)) => {
+            return BoxControlReply::Registered(RegisteredBox {
+                switch_address: record.switch_addr(),
+                loopback_address: record.loopback_addr(),
+                box_id: minimald_rpc::BoxId::from_bytes(record.box_id()),
+                task_addresses: record.task_addrs().to_vec(),
+            });
+        }
+        Ok(crate::box_registry::Resumable::Dormant { name }) => name,
+        Err(error) => return refused(error),
+    };
+    let claim = boxes.begin_registration(&name);
+    let allocated = match allocate_box_address(answerer, &name) {
         Ok(allocated) => allocated,
         Err(reply) => return reply,
     };
     order.apply(move || {
         match boxes.resume_client_box(
-            &request.name,
+            &name,
             request.switch_address,
             request.loopback_address,
             request.box_id.map(minimald_rpc::BoxId::to_bytes),
@@ -1088,11 +1113,11 @@ fn resume_reply(
             }),
             Err(error) => {
                 let released = boxes.release_unless_owned(&claim, || {
-                    answerer.release_address(&request.name);
+                    answerer.release_address(&name);
                 });
                 tracing::info!(
                     address_released = released,
-                    box = %request.name,
+                    box = %name,
                     error = %error,
                     "box row resume refused"
                 );
@@ -4279,6 +4304,83 @@ mod tests {
         assert!(!row.was_attributed(), "the read attributes nothing");
         assert!(!row.is_detached(), "the read detaches nothing");
         assert_eq!(registry.live_switch_addrs(), 1, "the read frees nothing");
+    }
+
+    /// NET-138: a resume of a row that stands is answered from the row
+    /// alone — no published address is asked of the answerer for it — so a
+    /// slow answerer never holds a standing box's attach or exec.
+    #[test]
+    fn a_standing_resume_asks_the_answerer_nothing() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let sock_path = dir.path().join(CONTROL_SOCK_FILE);
+        let boxes = BoxRegistry::new(SUBNET);
+        // The registration's allocation is answered; every later one is
+        // held for the test's life.
+        let allocations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&allocations);
+        let mut gates = Vec::new();
+        let answerer = AnswererStatus::allocating_for_tests_with(
+            "control-test-node",
+            move || {
+                if counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    return None;
+                }
+                let (gate, held) = std::sync::mpsc::channel();
+                gates.push(gate);
+                Some(held)
+            },
+            |_, _| {},
+        );
+        let _server = spawn(
+            sock_path.clone(),
+            boxes.clone(),
+            answerer,
+            ProxyPublishStatus::new(),
+        )
+        .expect("server binds");
+        for _ in 0..500 {
+            if TestStream::connect(&sock_path).is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let web = handed(
+            register(
+                &sock_path,
+                &RegisterBoxRequest {
+                    name: "web".to_string(),
+                    ingress_ports: Vec::new(),
+                    egress: None,
+                    credentialed_upstream: None,
+                    dynamic_ingress: None,
+                    dynamic_allowed_range: None,
+                    hold: false,
+                    task_slots: 0,
+                },
+            )
+            .expect("the registration is answered"),
+        );
+
+        let (answered, answer) = std::sync::mpsc::channel();
+        let resume = BoxControlRequest::ResumeBox(minimald_rpc::ResumeBoxRequest {
+            name: "web".to_string(),
+            switch_address: web.switch_address,
+            loopback_address: web.loopback_address,
+            box_id: Some(web.box_id),
+        });
+        std::thread::spawn(move || {
+            let _ = answered.send(control(&sock_path, &resume));
+        });
+        let reply = answer
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the standing resume is answered while the answerer holds")
+            .expect("the resume is answered");
+        assert_eq!(handed(reply), web, "the standing row as it stands");
+        assert_eq!(
+            allocations.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "only the registration asked the answerer"
+        );
     }
 
     /// The doors are the verb's access control (NET-138): the read-only row

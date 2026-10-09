@@ -1400,7 +1400,7 @@ async fn relay_frames(
     // The rows those sources were attributed to, by box id: what the relay
     // reports at its end, so the registry detaches the boxes this
     // connection carried and no newer box handed one of their addresses.
-    let mut carried: Vec<([u8; 4], crate::bep_attach::BoxId)> = Vec::new();
+    let mut carried = crate::box_registry::RelayCarry::default();
     {
         let egress = relay_frames_to_switch(
             &mut guest,
@@ -1491,7 +1491,7 @@ async fn relay_frames(
     }
     pins.retire(&attributed);
     replies.retire(&attributed);
-    table.report_withdrawals(std::mem::take(&mut carried));
+    table.report_withdrawals(carried.into_report());
 }
 
 /// One control request on a connection, decided before any of it is written
@@ -3317,7 +3317,7 @@ async fn relay_frames_to_switch(
     limiter: &DropLimiter,
     forwards: &PublishedForwards,
     attributed: &mut Vec<[u8; 4]>,
-    carried: &mut Vec<([u8; 4], crate::bep_attach::BoxId)>,
+    carried: &mut crate::box_registry::RelayCarry,
 ) -> io::Result<()> {
     let mut len_buf = [0u8; 2];
     let mut frame = vec![0u8; max_frame()];
@@ -3432,14 +3432,15 @@ async fn relay_frames_to_switch(
         };
         if let Some(src) = src
             && src != baseline.node_addr()
-            && !attributed.contains(&src)
         {
             // The row's switch address is quarantined at its withdrawal
-            // from here on: this connection may now key state by it.
-            if let Some(box_id) = table.mark_attributed(src) {
-                carried.push((src, box_id));
+            // from here on: this connection may now key state by it. The
+            // mark is once per row, not per source: a row reinstated while
+            // this relay carries its box is marked again (NET-138).
+            table.carry(src, carried);
+            if !attributed.contains(&src) {
+                attributed.push(src);
             }
-            attributed.push(src);
         }
         // The box's DNS datagram, read once for both checks below: only for
         // a UDP frame headed to DNS's port — UDP is most of a box's traffic

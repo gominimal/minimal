@@ -59,7 +59,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::net::Ipv4Addr;
 #[cfg(test)]
 use std::sync::atomic::AtomicU32;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock};
 use std::time::{Duration, Instant};
 
@@ -127,15 +127,29 @@ pub const DETACH_GRACE: Duration = Duration::from_secs(45);
 /// minutes covers several times that, so a slow boot does not lose the
 /// row it was resumed for, while a resume nobody follows with an attach
 /// holds its addresses no longer than this. NET-138's 60 s runs from the
-/// end of an attachment, and a resumed row has none yet.
+/// end of an attachment, and a reinstated row has had none since it was
+/// published. The bound is armed only when a resume reinstates a withdrawn
+/// row: a resume of a row that stands changes nothing about its liveness,
+/// so it never stretches a detached row's grace past
+/// [`NET_138_WITHDRAWAL_BOUND`] nor puts a bound on a row a relay carries.
 pub const RESUME_ATTACH_BOUND: Duration = Duration::from_secs(300);
+
+/// NET-138's bound on a detached row: withdrawn no later than 60 seconds
+/// from the end of its box's attachment, whatever its creator asks for in
+/// between ([`BoxRegistry::resume_client_box`] leaves a standing row's
+/// grace as it runs).
+pub const NET_138_WITHDRAWAL_BOUND: Duration = Duration::from_secs(60);
 
 /// How often the drainer looks for detached rows whose grace has passed.
 pub const DETACH_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 
 const _: () = assert!(
-    DETACH_GRACE.as_secs() + DETACH_SWEEP_INTERVAL.as_secs() < 60,
+    DETACH_GRACE.as_secs() + DETACH_SWEEP_INTERVAL.as_secs() < NET_138_WITHDRAWAL_BOUND.as_secs(),
     "a detached row must be withdrawn inside NET-138's 60 s bound"
+);
+const _: () = assert!(
+    NET_138_WITHDRAWAL_BOUND.as_secs() == 60,
+    "NET-138 bounds a detached row's withdrawal at 60 s from its attachment's end"
 );
 
 /// The file the registry persists its client boxes' registrations to, in
@@ -384,7 +398,7 @@ pub struct BoxRecord {
     /// reads.
     egress_allow_list: Vec<String>,
     /// Whether a frame of the box ever crossed the gate under this row
-    /// ([`BoxTable::mark_attributed`]): set once by the relay that first
+    /// ([`BoxTable::carry`]): set once by the relay that first
     /// attributes the row's source, never cleared. A row withdrawn before
     /// it was ever attributed returns its switch address with no
     /// quarantine ([`SwitchAddressBook`]), since nothing on the host keyed
@@ -414,10 +428,10 @@ pub struct BoxRecord {
 ///
 /// - **awaiting** — no relay has carried it yet, and no grace runs: a
 ///   fresh registration stands until its box's first frame or its
-///   creator's withdrawal; one its creator resumed
-///   ([`BoxRegistry::resume_client_box`]) stands until its box's first
-///   frame, or until [`RESUME_ATTACH_BOUND`] passes and it is withdrawn as
-///   at a grace's end;
+///   creator's withdrawal; one its creator reinstated
+///   ([`BoxRegistry::resume_client_box`]) stands until a relay carries its
+///   box or one of its task rows, or until [`RESUME_ATTACH_BOUND`] passes
+///   and it is withdrawn as at a grace's end;
 /// - **attached** — at least one relay carries it;
 /// - **detached** — its last relay ended, or it was reloaded from the
 ///   persisted registry at start ([`BoxRegistry::persisting_to`]); it is
@@ -431,8 +445,9 @@ pub struct BoxRecord {
 struct RowLiveness {
     carriers: usize,
     detached_since: Option<Instant>,
-    /// When its creator resumed the row, while no relay has carried it
-    /// since ([`RESUME_ATTACH_BOUND`]).
+    /// When its creator reinstated the row, while no relay has carried it
+    /// since ([`RESUME_ATTACH_BOUND`]). Never set on a row that stood when
+    /// it was resumed.
     resumed_since: Option<Instant>,
 }
 
@@ -517,7 +532,7 @@ impl BoxRecord {
     }
 
     /// Whether a frame of the box ever crossed the gate under this row
-    /// ([`BoxTable::mark_attributed`]).
+    /// ([`BoxTable::carry`]).
     #[must_use]
     pub fn was_attributed(&self) -> bool {
         self.attributed.load(Ordering::Relaxed)
@@ -532,10 +547,12 @@ impl BoxRecord {
 
     /// When the row's attachment ended, if it is due its withdrawal at
     /// `now`: the instant it detached, once it has stood detached for
-    /// [`DETACH_GRACE`]; or `now`, once its creator resumed it
-    /// [`RESUME_ATTACH_BOUND`] ago and no relay has carried it since.
+    /// [`DETACH_GRACE`]; or `now`, once its creator reinstated it
+    /// [`RESUME_ATTACH_BOUND`] ago and no relay has carried its box since —
+    /// neither the box's own address nor any of its task rows in `rows`,
+    /// the one liveness unit a box and its task runs are (NET-138).
     /// A task row has no bound of its own: it goes with its box's row.
-    fn past_its_bound(&self, now: Instant) -> Option<Instant> {
+    fn past_its_bound(&self, rows: &Rows, now: Instant) -> Option<Instant> {
         if self.is_task_row() {
             return None;
         }
@@ -544,7 +561,7 @@ impl BoxRecord {
             since.filter(|since| now.saturating_duration_since(*since) >= bound)
         };
         past(liveness.detached_since, DETACH_GRACE).or_else(|| {
-            (liveness.carriers == 0)
+            (liveness.carriers == 0 && !task_rows_carried(rows, self))
                 .then(|| past(liveness.resumed_since, RESUME_ATTACH_BOUND).map(|_| now))
                 .flatten()
         })
@@ -953,10 +970,14 @@ pub struct ClientBoxSpec {
 /// a row stands for it. A creation lives from its registration until its
 /// creator withdraws the box ([`BoxRegistry::withdraw_client_box`]) or a
 /// new registration takes its name; a row withdrawn at the end of its
-/// detach grace leaves the creation **dormant** (`standing: false`),
-/// holding no address, for its creator to resume
-/// ([`BoxRegistry::resume_client_box`]). Dormant creations are not capped:
-/// they hold neither address, and there is at most one per box name.
+/// detach grace leaves the creation **dormant** (`standing: false`) for
+/// its creator to resume ([`BoxRegistry::resume_client_box`]). A creation,
+/// standing or dormant, keeps its addresses reserved: its switch and task
+/// addresses stay out of the hand-out book — taken again from a fresh book
+/// at reload — and its published loopback address stays the answerer's
+/// link for its name, so a resume finds every address its box was created
+/// with. Its creator's withdrawal releases them all. There is at most one
+/// creation per box name.
 ///
 /// The file format: one JSON object per creation in
 /// [`RegistryFile::boxes`], its fields named as here.
@@ -1062,44 +1083,70 @@ fn write_registry_file(path: &std::path::Path, file: &RegistryFile) -> std::io::
 }
 
 /// Reads the creations persisted at `path`: none when there is no file
-/// yet, and none — said as one warn line — when the file cannot be read,
-/// does not parse, or is of another version than [`REGISTRY_FILE_VERSION`].
-/// A file this build cannot vouch for reloads no row, which leaves its
-/// boxes unregistered sources the gate drops (NET-085): fail-closed.
-fn read_registry_file(path: &std::path::Path) -> Vec<Creation> {
+/// yet. A file that cannot be read, does not parse, or is of another
+/// version than [`REGISTRY_FILE_VERSION`] reloads no row — its boxes are
+/// unregistered sources the gate drops (NET-085): fail-closed — and is set
+/// aside ([`set_aside_registry_file`]) rather than written over, said as an
+/// error line, so the creations it may still hold are there to recover.
+/// `None` when it could not be set aside: the caller then persists
+/// nothing, since the first write would replace it.
+fn read_registry_file(path: &std::path::Path) -> Option<Vec<Creation>> {
     #[derive(serde::Deserialize)]
     struct Version {
         version: u32,
     }
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
-        Err(error) => {
-            tracing::warn!(path = %path.display(), %error, "could not read the persisted box registry; reloading no rows");
-            return Vec::new();
-        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Some(Vec::new()),
+        Err(error) => return set_aside_registry_file(path, &error.to_string()),
     };
     match serde_json_lenient::from_slice::<Version>(&bytes) {
         Ok(Version { version }) if version == REGISTRY_FILE_VERSION => {}
         Ok(Version { version }) => {
-            tracing::warn!(
-                path = %path.display(),
-                version,
-                expected = REGISTRY_FILE_VERSION,
-                "the persisted box registry is of another version; reloading no rows"
+            return set_aside_registry_file(
+                path,
+                &format!("version {version}, this build reads {REGISTRY_FILE_VERSION}"),
             );
-            return Vec::new();
         }
-        Err(error) => {
-            tracing::warn!(path = %path.display(), %error, "the persisted box registry does not parse; reloading no rows");
-            return Vec::new();
-        }
+        Err(error) => return set_aside_registry_file(path, &error.to_string()),
     }
     match serde_json_lenient::from_slice::<RegistryFile>(&bytes) {
-        Ok(file) => file.boxes,
+        Ok(file) => Some(file.boxes),
+        Err(error) => set_aside_registry_file(path, &error.to_string()),
+    }
+}
+
+/// Renames the unusable registry file at `path` aside, to the same name
+/// with an `.unusable-<unix seconds>` suffix, and says so as an error line
+/// naming `why`. Returns no creations when it is set aside, and `None` —
+/// persistence off for this process, said as a second error line — when
+/// the rename fails.
+fn set_aside_registry_file(path: &std::path::Path, why: &str) -> Option<Vec<Creation>> {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs());
+    let mut aside = path.as_os_str().to_owned();
+    aside.push(format!(".unusable-{stamp}"));
+    let aside = std::path::PathBuf::from(aside);
+    match std::fs::rename(path, &aside) {
+        Ok(()) => {
+            tracing::error!(
+                path = %path.display(),
+                aside = %aside.display(),
+                why,
+                "the persisted box registry is unusable; it is set aside and no rows are reloaded"
+            );
+            Some(Vec::new())
+        }
         Err(error) => {
-            tracing::warn!(path = %path.display(), %error, "the persisted box registry does not parse; reloading no rows");
-            Vec::new()
+            tracing::error!(
+                path = %path.display(),
+                why,
+                %error,
+                "the persisted box registry is unusable and could not be set aside; \
+                 no rows are reloaded and none are persisted by this process"
+            );
+            None
         }
     }
 }
@@ -1371,8 +1418,8 @@ impl SwitchAddressBook {
     }
 
     /// Takes `addr` itself out for the box `taker`, at `now`: the draw a
-    /// row reinstated at its own address makes — one reloaded at start, or
-    /// one its creator resumed ([`BoxRegistry::resume_client_box`]). An
+    /// creation reloaded at start makes for its own addresses
+    /// ([`BoxRegistry::persisting_to`]). An
     /// address inside the run that is not out is taken: a never-drawn one,
     /// a returned one whose eligibility has passed, or a returned one
     /// inside its quarantine when `taker` is the box that returned it —
@@ -1583,18 +1630,31 @@ pub enum ResumeError {
         /// The address the answerer allocated for the name now.
         allocated: Ipv4Addr,
     },
-    /// The box's switch address was handed to another box while it had
-    /// no row, or is inside another box's reuse quarantine.
-    #[error("box {name:?}'s switch address {addr} is held by another box")]
-    SwitchAddressHeld {
-        /// The name the resume presented.
-        name: String,
-        /// The switch address the creation holds.
-        addr: Ipv4Addr,
-    },
     /// The row could not be published at the box's addresses.
     #[error(transparent)]
     Allocation(#[from] AllocationError),
+}
+
+/// What a resume finds before anything is allocated for it
+/// ([`BoxRegistry::resumable`]).
+#[derive(Debug)]
+pub enum Resumable {
+    /// The creation's row stands: the resume's answer, as it stands.
+    Standing(Arc<BoxRecord>),
+    /// The creation is dormant: its row is reinstated under `name`, the
+    /// name it was registered under, which the answerer holds its
+    /// published address by.
+    Dormant {
+        /// The creation's own name.
+        name: String,
+    },
+}
+
+/// The row that stands for `creation`, when one does: the row at its
+/// switch address, of its box id.
+fn standing_row_of<'rows>(rows: &'rows Rows, creation: &Creation) -> Option<&'rows Arc<BoxRecord>> {
+    rows.get(&creation.switch_address.octets())
+        .filter(|record| record.box_id == creation.id() && !record.is_task_row())
 }
 
 /// Why a client-driven withdrawal was refused. The pair a withdrawal
@@ -2702,6 +2762,11 @@ pub struct BoxRegistry {
     /// Serializes the persisted file's writes, so the last write to land
     /// is of the newest creations, whichever handle wrote it.
     persist_turn: Arc<Mutex<()>>,
+    /// The table's row epoch, shared by every clone and every [`BoxTable`]:
+    /// bumped each time a row lands, so a relay that marked a source
+    /// carried learns that the row there may be a new one to mark
+    /// ([`BoxTable::carry`]).
+    row_epoch: Arc<AtomicU64>,
 }
 
 /// A clone shares the live rows, the hand-out book, and the withdrawal
@@ -2736,6 +2801,7 @@ impl Clone for BoxRegistry {
             creations: Arc::clone(&self.creations),
             persisted_at: self.persisted_at.clone(),
             persist_turn: Arc::clone(&self.persist_turn),
+            row_epoch: Arc::clone(&self.row_epoch),
         }
     }
 }
@@ -2777,6 +2843,7 @@ impl BoxRegistry {
             creations: Arc::new(Mutex::new(BTreeMap::new())),
             persisted_at: None,
             persist_turn: Arc::new(Mutex::new(())),
+            row_epoch: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -2863,8 +2930,10 @@ impl BoxRegistry {
     }
 
     /// The one locked decision both releases take: under the row lock and
-    /// then the generations' lock, `release` runs unless a live row holds
-    /// `key` or more than `own` registrations of it are in flight.
+    /// then the generations' lock, `release` runs unless a live row or a
+    /// kept creation holds `key` — a dormant creation's published address
+    /// stays reserved for its resume ([`Creation`]) — or more than `own`
+    /// registrations of it are in flight.
     fn release_unless_owned_past(&self, key: &str, own: u32, release: impl FnOnce()) -> bool {
         let rows = self
             .rows
@@ -2877,7 +2946,7 @@ impl BoxRegistry {
         let others_in_flight = generations
             .get(key)
             .map_or(0, |entry| entry.in_flight.saturating_sub(own));
-        if row_holds || others_in_flight > 0 {
+        if row_holds || others_in_flight > 0 || self.creations().contains_key(key) {
             return false;
         }
         release();
@@ -2929,22 +2998,29 @@ impl BoxRegistry {
     /// instant ([`RowLiveness`]): the VM the row's box ran in ended with
     /// the previous run, so the row is withdrawn once [`DETACH_GRACE`]
     /// passes unless the box's shuttle carries a frame from its address
-    /// again, or its creator resumes it ([`Self::resume_client_box`]). A
-    /// dormant creation stays dormant. The hand-out book takes each
-    /// reinstated row's switch address; its quarantine is not persisted
-    /// ([`SwitchAddressBook`]). A creation that cannot be reinstated — an
-    /// address outside the run, or already taken by an earlier entry — is
-    /// kept dormant and said as a warn line.
+    /// again. A resume does not extend that grace; once the row has gone,
+    /// its creator's resume reinstates it ([`Self::resume_client_box`]). A
+    /// dormant creation stays dormant. The hand-out book takes every
+    /// creation's switch and task addresses, dormant ones' included, so a
+    /// fresh book hands none of them to a new box; their quarantine is not
+    /// persisted ([`SwitchAddressBook`]). A creation whose addresses the
+    /// book will not give — an address outside the run, or one an earlier
+    /// entry took — is dropped and said as a warn line; one whose row
+    /// cannot be published is kept dormant, its addresses reserved.
     ///
     /// The file is written after every change to the creations: mode 0600,
     /// written to a temporary file and renamed over the last
     /// ([`write_registry_file`]), versioned ([`REGISTRY_FILE_VERSION`]).
     /// A write that fails is a warn line, and the creations stay held in
     /// this process: the rows decide frames from memory, and the file only
-    /// outlives the process.
+    /// outlives the process. A file found unusable is set aside, never
+    /// written over ([`read_registry_file`]); when it cannot be, this
+    /// registry persists nothing.
     #[must_use]
     pub fn persisting_to(mut self, path: std::path::PathBuf) -> Self {
-        let loaded = read_registry_file(&path);
+        let Some(loaded) = read_registry_file(&path) else {
+            return self;
+        };
         self.persisted_at = Some(Arc::new(path));
         let now = self.now();
         for mut creation in loaded {
@@ -2953,6 +3029,17 @@ impl BoxRegistry {
                 tracing::warn!(
                     box = %creation.name,
                     "the persisted box registry names a box twice; reloading the first only"
+                );
+                continue;
+            }
+            // Every creation, dormant ones included, holds its switch and
+            // task addresses: a fresh book hands none of them to a new box.
+            if let Err(addr) = self.take_creation_addrs(&creation, now) {
+                tracing::warn!(
+                    box = %creation.name,
+                    %addr,
+                    "could not reload a persisted box: one of its switch addresses is not the \
+                     hand-out run's to give it; its creation is dropped"
                 );
                 continue;
             }
@@ -2965,18 +3052,12 @@ impl BoxRegistry {
         self
     }
 
-    /// Republishes a persisted creation's row at load, detached from
-    /// `now`. Returns whether the row stands.
+    /// Republishes a persisted standing creation's row at load, detached
+    /// from `now`, its addresses already taken back from the book
+    /// ([`Self::take_creation_addrs`]). Returns whether the row stands; a
+    /// row that cannot be published leaves the creation dormant, its
+    /// addresses still reserved for a later resume.
     fn reinstate(&self, creation: &Creation, now: Instant) -> bool {
-        if let Err(addr) = self.take_creation_addrs(creation, now) {
-            tracing::warn!(
-                box = %creation.name,
-                %addr,
-                "could not reload a persisted box's row: one of its switch addresses is not \
-                 the hand-out run's to give it"
-            );
-            return false;
-        }
         let registration = self.client_registration(
             creation.spec(),
             creation.switch_address,
@@ -2997,7 +3078,6 @@ impl BoxRegistry {
                 true
             }
             Err(error) => {
-                self.give_back_creation_addrs(creation);
                 tracing::warn!(box = %creation.name, %error, "could not reload a persisted box's row");
                 false
             }
@@ -3025,14 +3105,14 @@ impl BoxRegistry {
         Ok(())
     }
 
-    /// Returns every switch address `creation` holds to the hand-out book,
-    /// unspent: the refusal after [`Self::take_creation_addrs`] published
-    /// no row.
+    /// Returns every switch address `creation` holds to the hand-out book:
+    /// its creator withdrew a dormant box. Quarantined, as a row that was
+    /// attributed returns its address: a dormant creation's row stood once.
     fn give_back_creation_addrs(&self, creation: &Creation) {
         for addr in
             std::iter::once(creation.switch_address).chain(creation.task_addresses.iter().copied())
         {
-            self.give_back_switch_addr(addr, false, creation.id());
+            self.give_back_switch_addr(addr, true, creation.id());
         }
     }
 
@@ -3068,7 +3148,8 @@ impl BoxRegistry {
     }
 
     /// Marks `record`'s creation dormant, when the record is the
-    /// creation's row: its row is gone, and it holds no address. Called
+    /// creation's row: its row is gone, and its addresses stay reserved
+    /// for it ([`Creation`]). Called
     /// under the row lock that removed the row. Returns whether a creation
     /// changed.
     fn creation_rowless(&self, record: &BoxRecord) -> bool {
@@ -3421,6 +3502,9 @@ impl BoxRegistry {
         for task in &task_rows {
             rows.insert(task.switch_addr.octets(), Arc::clone(task));
         }
+        // Under the write that published the rows: a relay that reads the
+        // new epoch finds them ([`BoxTable::carry`]).
+        self.row_epoch.fetch_add(1, Ordering::Release);
         let created = creation.is_some();
         if let Some(creation) = creation {
             self.creations()
@@ -3468,12 +3552,19 @@ impl BoxRegistry {
 
     /// Retires the task rows [`Self::remove_task_rows`] removed, as the
     /// box's own row is retired, and returns each one's switch address to
-    /// the hand-out book. Called after the row lock is dropped.
-    fn retire_task_rows(&self, task_rows: Vec<(Arc<BoxRecord>, Option<RowWithdrawal>)>) {
+    /// the hand-out book when `give_back` says to — not for a box whose
+    /// creation keeps them reserved. Called after the row lock is dropped.
+    fn retire_task_rows(
+        &self,
+        task_rows: Vec<(Arc<BoxRecord>, Option<RowWithdrawal>)>,
+        give_back: bool,
+    ) {
         for (task, withdrawal) in task_rows {
             let (addr, attributed, box_id) = (task.switch_addr, task.was_attributed(), task.box_id);
             self.retired(&Some(task), withdrawal);
-            self.give_back_switch_addr(addr, attributed, box_id);
+            if give_back {
+                self.give_back_switch_addr(addr, attributed, box_id);
+            }
         }
     }
 
@@ -3509,7 +3600,7 @@ impl BoxRegistry {
     pub fn withdraw(&self, switch_addr: Ipv4Addr) -> Option<Arc<BoxRecord>> {
         // The box's end is observed here, so the withdrawal's own line
         // measures itself against this instant (NET-133's bound).
-        self.withdraw_where(switch_addr, |_| Some(Instant::now()))
+        self.withdraw_where(switch_addr, |_, _| Some(Instant::now()))
     }
 
     /// Withdraws the row at `switch_addr` when `ended_at` says its box
@@ -3524,13 +3615,13 @@ impl BoxRegistry {
     fn withdraw_where(
         &self,
         switch_addr: Ipv4Addr,
-        ended_at: impl FnOnce(&BoxRecord) -> Option<Instant>,
+        ended_at: impl FnOnce(&Rows, &BoxRecord) -> Option<Instant>,
     ) -> Option<Arc<BoxRecord>> {
         let mut rows = self
             .rows
             .write()
             .expect("the row lock is never held across a panic, so it cannot be poisoned");
-        let box_ended = ended_at(rows.get(&switch_addr.octets())?)?;
+        let box_ended = ended_at(&rows, rows.get(&switch_addr.octets())?)?;
         self.retire_proxy_attachment(switch_addr, box_ended);
         let removed = rows.remove(&switch_addr.octets());
         let mut rowless = false;
@@ -3547,8 +3638,10 @@ impl BoxRegistry {
             .and_then(|record| self.begin_revocation(record));
         drop(rows);
         self.retired(&removed, withdrawal);
-        self.retire_task_rows(task_rows);
-        if let Some(record) = &removed {
+        // A dormant creation keeps its switch and task addresses reserved
+        // ([`Creation`]): only a row no creation is kept for returns them.
+        self.retire_task_rows(task_rows, !rowless);
+        if let Some(record) = removed.as_ref().filter(|_| !rowless) {
             self.give_back_switch_addr(record.switch_addr, record.was_attributed(), record.box_id);
         }
         if rowless {
@@ -3901,21 +3994,30 @@ impl BoxRegistry {
             .is_some_and(|attachments| attachments.holds_id(id))
     }
 
-    /// The name a live row holds that `name` folds to, in the row's own
-    /// spelling, or `None` when no live row's name folds to it. The
-    /// answerer allocates a published address by the name's canonical form
+    /// The name a live row or a kept creation holds that `name` folds to,
+    /// in its own spelling, or `None` when none folds to it. The answerer
+    /// allocates a published address by the name's canonical form
     /// ([`crate::net::answerer::canonical_box_name`]), so two live rows
     /// under folded-equal names would share one address; this is the check
-    /// that keeps the live set one row per folded name.
+    /// that keeps the live set one row per folded name. A dormant creation
+    /// holds its name too ([`Creation`]): its creator may still resume it,
+    /// and a registration under the name would replace it.
     fn held_name_for(&self, name: &str) -> Option<String> {
         let asked = canonical_box_name(name);
         let rows = self
             .rows
             .read()
             .expect("the row lock is never held across a panic, so it cannot be poisoned");
-        rows.values()
+        let live = rows
+            .values()
             .find(|record| canonical_box_name(record.name()) == asked)
-            .map(|record| record.name().to_string())
+            .map(|record| record.name().to_string());
+        drop(rows);
+        live.or_else(|| {
+            self.creations()
+                .get(&asked)
+                .map(|creation| creation.name.clone())
+        })
     }
 
     /// Withdraws the client box's row when the pair `(name, switch_addr,
@@ -3995,10 +4097,13 @@ impl BoxRegistry {
                         && creation.loopback_address == loopback_addr
                         && box_id.is_none_or(|asked| asked == creation.id())
                 });
-                proven && creations.remove(&key).is_some()
+                if proven { creations.remove(&key) } else { None }
             };
             drop(rows);
-            if ended {
+            // Its addresses were reserved for it while it was dormant; they
+            // go back with it.
+            if let Some(creation) = &ended {
+                self.give_back_creation_addrs(creation);
                 self.persist();
             }
             return Ok(None);
@@ -4056,7 +4161,7 @@ impl BoxRegistry {
             .and_then(|record| self.begin_revocation(record));
         drop(rows);
         self.retired(&removed, withdrawal);
-        self.retire_task_rows(task_rows);
+        self.retire_task_rows(task_rows, true);
         if let Some(record) = &removed {
             self.give_back_switch_addr(record.switch_addr, record.was_attributed(), record.box_id);
         }
@@ -4066,53 +4171,24 @@ impl BoxRegistry {
         Ok(removed)
     }
 
-    /// Gives a creator its box's row back (NET-138): the row its creator
-    /// registered as box `name`, handed the pair `(switch_addr,
-    /// loopback_addr)` — and, when the creator knows it, created as
-    /// `box_id` — reinstated from the registry's own creation ([`Creation`])
-    /// when the row was withdrawn after its detach grace, or held as it
-    /// stands when it was not. The pair is the creator's proof, as for a
-    /// withdrawal ([`Self::withdraw_client_box`]), and the lookup key: every
-    /// fact the row holds comes from the creation this host kept — the
-    /// declaration its creator registered, compiled under this registry's
-    /// egress default — never from the request, and never from the guest.
-    ///
-    /// A row that stands is set **awaiting** ([`RowLiveness`]): no grace
-    /// runs until a relay that carried it ends, and a row no relay carries
-    /// within [`RESUME_ATTACH_BOUND`] is withdrawn as at a grace's end, its
-    /// creation kept for a later resume. A dormant creation's row is
-    /// published at its own switch address — taken from the hand-out book,
-    /// which hands it back inside its quarantine only to the box that
-    /// returned it ([`SwitchAddressBook::take`]) — and at the published
-    /// loopback address the answerer holds for the name now,
-    /// `allocated_loopback`, which must be the one the box was created
-    /// with. The reinstated row is awaiting too, under its original id.
-    ///
-    /// `generation` is the name's withdrawal generation read before the
-    /// answerer allocated ([`Self::begin_registration`]): a withdrawal that
-    /// landed since refuses the resume, as it refuses a registration.
-    ///
-    /// # Errors
-    ///
-    /// [`ResumeError`]: the registry keeps no creation under the name, the
-    /// pair or the id is not the creation's, the box's addresses are no
-    /// longer its own to take, or the row cannot be published. A refusal
-    /// changes nothing; the caller hands the answerer's address back unless
-    /// something else owns it ([`Self::release_unless_owned`]).
-    pub fn resume_client_box(
+    /// The creation a resume presenting `(name, switch_addr, loopback_addr)`
+    /// and `box_id` proves its creator holds: looked up by the box id when
+    /// the resume names one — a session renamed since its registration
+    /// still finds its box — and by the name otherwise, or when no creation
+    /// holds the id.
+    fn resumable_creation(
         &self,
         name: &str,
         switch_addr: Ipv4Addr,
         loopback_addr: Ipv4Addr,
         box_id: Option<BoxId>,
-        allocated_loopback: Ipv4Addr,
-        generation: u64,
-    ) -> Result<Arc<BoxRecord>, ResumeError> {
-        let rows = self
-            .rows
-            .read()
-            .expect("the row lock is never held across a panic, so it cannot be poisoned");
-        let creation = self.creations().get(&canonical_box_name(name)).cloned();
+    ) -> Result<Creation, ResumeError> {
+        let creations = self.creations();
+        let creation = box_id
+            .and_then(|asked| creations.values().find(|creation| creation.id() == asked))
+            .or_else(|| creations.get(&canonical_box_name(name)))
+            .cloned();
+        drop(creations);
         let Some(creation) = creation else {
             return Err(ResumeError::NoCreation {
                 name: name.to_string(),
@@ -4134,21 +4210,116 @@ impl BoxRegistry {
                 asked_box_id: asked,
             });
         }
-        if let Some(record) = rows.get(&switch_addr.octets())
-            && record.box_id == creation.id()
-        {
-            let now = self.now();
-            let mut liveness = record.liveness();
-            liveness.detached_since = None;
-            if liveness.carriers == 0 {
-                liveness.resumed_since = Some(now);
-            }
-            drop(liveness);
+        Ok(creation)
+    }
+
+    /// What a resume presenting `(name, switch_addr, loopback_addr)` and
+    /// `box_id` finds, read before anything is allocated for it: the row,
+    /// when it stands — the resume's whole answer, which needs no published
+    /// address asked of the answerer — or the creation's own name, under
+    /// which its dormant row is reinstated ([`Self::resume_client_box`]).
+    ///
+    /// # Errors
+    ///
+    /// [`ResumeError`], as [`Self::resume_client_box`] refuses.
+    pub fn resumable(
+        &self,
+        name: &str,
+        switch_addr: Ipv4Addr,
+        loopback_addr: Ipv4Addr,
+        box_id: Option<BoxId>,
+    ) -> Result<Resumable, ResumeError> {
+        let creation = self.resumable_creation(name, switch_addr, loopback_addr, box_id)?;
+        self.withdraw_if_past_its_bound(&creation);
+        let rows = self
+            .rows
+            .read()
+            .expect("the row lock is never held across a panic, so it cannot be poisoned");
+        Ok(match standing_row_of(&rows, &creation) {
+            Some(record) => Resumable::Standing(Arc::clone(record)),
+            None => Resumable::Dormant {
+                name: creation.name,
+            },
+        })
+    }
+
+    /// Withdraws `creation`'s row when it stands past its bound — its grace
+    /// or its resume bound has run out, and the drainer's next sweep
+    /// withdraws it ([`Self::withdraw_expired_detached`]) — so a resume
+    /// racing that sweep reinstates the row rather than answering with one
+    /// about to go.
+    fn withdraw_if_past_its_bound(&self, creation: &Creation) {
+        let now = self.now();
+        self.withdraw_where(creation.switch_address, |rows, record| {
+            (record.box_id == creation.id())
+                .then(|| record.past_its_bound(rows, now))
+                .flatten()
+        });
+    }
+
+    /// Gives a creator its box's row back (NET-138): the row its creator
+    /// registered as box `name`, handed the pair `(switch_addr,
+    /// loopback_addr)` — and, when the creator knows it, created as
+    /// `box_id` — reinstated from the registry's own creation ([`Creation`])
+    /// when the row was withdrawn after its detach grace, or held as it
+    /// stands when it was not. The pair is the creator's proof, as for a
+    /// withdrawal ([`Self::withdraw_client_box`]), and the lookup key: every
+    /// fact the row holds comes from the creation this host kept — the
+    /// declaration its creator registered, compiled under this registry's
+    /// egress default — never from the request, and never from the guest.
+    ///
+    /// A row that stands is answered as it stands ([`RowLiveness`]): a
+    /// detached row's grace keeps running from its attachment's end, so a
+    /// resume never holds it past [`NET_138_WITHDRAWAL_BOUND`]. A dormant
+    /// creation's row is published at its own switch address and task
+    /// addresses, which the creation kept reserved while it was dormant
+    /// ([`Creation`]), and at the published loopback address the answerer
+    /// holds for the name now, `allocated_loopback`, which must be the one
+    /// the box was created with. The creation is found by `box_id` when
+    /// the resume names one, so a session renamed since still resumes it. The reinstated row is awaiting, under its original id: no
+    /// grace runs until a relay that carried it ends, and a row no relay
+    /// carries — neither its box nor any of its task rows — within
+    /// [`RESUME_ATTACH_BOUND`] is withdrawn as at a grace's end, its
+    /// creation kept for a later resume.
+    ///
+    /// `generation` is the name's withdrawal generation read before the
+    /// answerer allocated ([`Self::begin_registration`]): a withdrawal that
+    /// landed since refuses the resume, as it refuses a registration.
+    ///
+    /// # Errors
+    ///
+    /// [`ResumeError`]: the registry keeps no creation under the name, the
+    /// pair or the id is not the creation's, or the row cannot be
+    /// published. A refusal
+    /// changes nothing; the caller hands the answerer's address back unless
+    /// something else owns it ([`Self::release_unless_owned`]).
+    pub fn resume_client_box(
+        &self,
+        name: &str,
+        switch_addr: Ipv4Addr,
+        loopback_addr: Ipv4Addr,
+        box_id: Option<BoxId>,
+        allocated_loopback: Ipv4Addr,
+        generation: u64,
+    ) -> Result<Arc<BoxRecord>, ResumeError> {
+        let creation = self.resumable_creation(name, switch_addr, loopback_addr, box_id)?;
+        self.withdraw_if_past_its_bound(&creation);
+        let rows = self
+            .rows
+            .read()
+            .expect("the row lock is never held across a panic, so it cannot be poisoned");
+        let name = creation.name.clone();
+        // A row that stands is answered as it stands: its liveness is the
+        // relays' to change, never the creator's. A detached row's grace
+        // keeps running from its attachment's end (NET-138's 60 s), and a
+        // row a relay carries, or one awaiting its first frame, takes no
+        // bound from a resume.
+        if let Some(record) = standing_row_of(&rows, &creation) {
             tracing::info!(
                 box = %record.name(),
                 switch_addr = %record.switch_addr(),
-                bound = ?RESUME_ATTACH_BOUND,
-                "its creator resumed a box whose row stands; the row awaits its box's frames"
+                detached = record.is_detached(),
+                "its creator resumed a box whose row stands; the row is left as it stands"
             );
             return Ok(Arc::clone(record));
         }
@@ -4166,14 +4337,9 @@ impl BoxRegistry {
             return Err(AllocationError::RevocationPending { addr }.into());
         }
         let now = self.now();
-        // The box's task rows are restored with its own (NET-138), so every
-        // one of its addresses must still be its to take.
-        if let Err(addr) = self.take_creation_addrs(&creation, now) {
-            return Err(ResumeError::SwitchAddressHeld {
-                name: name.to_string(),
-                addr,
-            });
-        }
+        // The box's switch and task addresses stayed reserved for its
+        // creation while it was dormant ([`Creation`]), so the row and its
+        // task rows are restored at them with nothing to take.
         let registration = self.client_registration(
             creation.spec(),
             creation.switch_address,
@@ -4185,10 +4351,7 @@ impl BoxRegistry {
             standing: true,
             ..creation
         };
-        let taken = standing.clone();
-        let record = self
-            .try_register_since(registration, Some(generation), Some(standing))
-            .inspect_err(|_| self.give_back_creation_addrs(&taken))?;
+        let record = self.try_register_since(registration, Some(generation), Some(standing))?;
         record.liveness().resumed_since = Some(now);
         tracing::info!(
             box = %record.name(),
@@ -4262,17 +4425,21 @@ impl BoxRegistry {
     /// leaves under, so a row a relay carried since the scan stays.
     fn withdraw_expired_detached(&self) -> Vec<Arc<BoxRecord>> {
         let now = self.now();
-        let expired: Vec<Ipv4Addr> = self
+        let rows = self
             .rows
             .read()
-            .expect("the row lock is never held across a panic, so it cannot be poisoned")
+            .expect("the row lock is never held across a panic, so it cannot be poisoned");
+        let expired: Vec<Ipv4Addr> = rows
             .values()
-            .filter(|record| record.past_its_bound(now).is_some())
+            .filter(|record| record.past_its_bound(&rows, now).is_some())
             .map(|record| record.switch_addr)
             .collect();
+        drop(rows);
         expired
             .into_iter()
-            .filter_map(|addr| self.withdraw_where(addr, |record| record.past_its_bound(now)))
+            .filter_map(|addr| {
+                self.withdraw_where(addr, |rows, record| record.past_its_bound(rows, now))
+            })
             .collect()
     }
 
@@ -4815,14 +4982,17 @@ impl BoxRegistry {
     /// by, is what the report rides (and a row whose traffic never ends is
     /// never detached).
     ///
-    /// Each withdrawal also hands the box's published loopback address back
-    /// to the machine's answerer, by running `release_address` with the
-    /// row's name, unless something else owns it
-    /// ([`Self::release_withdrawn_unless_owned`]: a live row under the
-    /// name, or a registration of it in flight) — the same release the
-    /// creator's withdrawal makes, so a box whose session ends daemon-side
-    /// does not hold its address until this process exits. Its switch
-    /// address goes back to the hand-out book inside the withdrawal.
+    /// A withdrawn row whose creation the registry keeps leaves the
+    /// creation dormant with every address reserved for it ([`Creation`]):
+    /// its switch and task addresses stay out of the hand-out book, and its
+    /// published loopback address stays its name's at the answerer, so its
+    /// creator's resume finds them all. Any other withdrawal hands the
+    /// box's published loopback address back to the machine's answerer, by
+    /// running `release_address` with the row's name, unless something else
+    /// owns it ([`Self::release_withdrawn_unless_owned`]: a live row or a
+    /// kept creation under the name, or a registration of it in flight),
+    /// and its switch address goes back to the hand-out book inside the
+    /// withdrawal.
     ///
     /// The thread holds a clone of this registry, so it withdraws the same
     /// rows every other handle sees. That clone carries one of the
@@ -4889,6 +5059,7 @@ impl BoxRegistry {
             withdrawal_reports: self.withdrawal_reports.clone(),
             row_withdrawals: Arc::clone(&self.row_withdrawals),
             revoking: Arc::clone(&self.revoking),
+            row_epoch: Arc::clone(&self.row_epoch),
         }
     }
 }
@@ -4989,6 +5160,7 @@ pub struct BoxTable {
     withdrawal_reports: std::sync::mpsc::Sender<WithdrawalReport>,
     row_withdrawals: RowWithdrawals,
     revoking: Arc<Revoking>,
+    row_epoch: Arc<AtomicU64>,
 }
 
 impl BoxTable {
@@ -5028,9 +5200,8 @@ impl BoxTable {
 
     /// Marks the row at `src` attributed and carried, when one is held, and
     /// returns its box's id: a frame of its box crossed the gate on a relay
-    /// that reports the address, with the id, at its end. The relay marks
-    /// each source once per connection, when it first attributes it, so the
-    /// cost is one row lookup per box per connection. Like the withdrawal
+    /// that reports the address, with the id, at its end. A relay marks
+    /// through [`Self::carry`], once per row it carries. Like the withdrawal
     /// report, it is a fact the host observed at its end of the box's
     /// attachment, not a row operation: it changes nothing the gate decides
     /// by, only whether the row's switch address is quarantined when the
@@ -5039,36 +5210,113 @@ impl BoxTable {
     /// re-attributed and stays. Both are stored under the row lock's read
     /// half, and a withdrawal decides after taking the write half, so a
     /// mark made while the row stood is always seen.
+    #[cfg(test)]
     pub fn mark_attributed(&self, src: [u8; 4]) -> Option<BoxId> {
         let rows = self
             .rows
             .read()
             .expect("the row lock is never held across a panic, so it cannot be poisoned");
         let record = rows.get(&src)?;
-        record.attributed.store(true, Ordering::Relaxed);
-        // A task row carried keeps its box's row standing (NET-138): the
-        // box row's detach and resume bound clear as if the box carried.
-        // Locks run box row, then task row, as in the drainer's detach.
-        let parent = box_row_of(&rows, record).unwrap_or(record);
-        let mut parent_liveness = parent.liveness();
-        parent_liveness.resumed_since = None;
-        if parent_liveness.detached_since.take().is_some() {
-            tracing::info!(
-                box = %parent.name(),
-                switch_addr = %parent.switch_addr(),
-                task_addr = ?record.is_task_row().then(|| record.switch_addr()),
-                "a detached box or one of its task runs attached again; its row stays"
-            );
-        }
-        if record.is_task_row() {
-            let mut liveness = record.liveness();
-            liveness.carriers = liveness.carriers.saturating_add(1);
-        } else {
-            parent_liveness.carriers = parent_liveness.carriers.saturating_add(1);
-        }
+        mark_row(&rows, record);
         Some(record.box_id)
     }
 
+    /// Marks `src` carried by the relay `relay` is the record of: attributes
+    /// the row at it and counts the relay as one of its carriers, once per
+    /// row rather than once per source. A source the relay already marked
+    /// is marked again when the row at it is a new one — its creator
+    /// reinstated it while this relay carried its box (NET-138), or a row
+    /// landed where none stood when the relay first attributed the source
+    /// — so a live relay always counts as one carrier of the row its box's
+    /// frames are decided by. A frame of a source the relay marked, while
+    /// no row has landed since, costs one atomic read.
+    pub fn carry(&self, src: [u8; 4], relay: &mut RelayCarry) {
+        let epoch = self.row_epoch.load(Ordering::Acquire);
+        let seen = relay.marked.iter().any(|(addr, _)| *addr == src);
+        if seen && epoch == relay.epoch {
+            return;
+        }
+        let stale = epoch != relay.epoch;
+        relay.epoch = epoch;
+        if !seen {
+            relay.marked.push((src, std::sync::Weak::new()));
+        }
+        let rows = self
+            .rows
+            .read()
+            .expect("the row lock is never held across a panic, so it cannot be poisoned");
+        for (addr, marked) in &mut relay.marked {
+            if !stale && *addr != src {
+                continue;
+            }
+            let Some(record) = rows.get(addr) else {
+                continue;
+            };
+            if std::sync::Weak::ptr_eq(marked, &Arc::downgrade(record)) {
+                continue;
+            }
+            mark_row(&rows, record);
+            *marked = Arc::downgrade(record);
+            if !relay.carried.contains(&(*addr, record.box_id)) {
+                relay.carried.push((*addr, record.box_id));
+            }
+        }
+    }
+}
+
+/// What one relay marked carried ([`BoxTable::carry`]): each source it
+/// attributed with the row it marked there, and the sources with the box
+/// ids it reports at its end ([`BoxTable::report_withdrawals`]). Bounded
+/// by the rows: a source is recorded once, whatever the guest sends.
+#[derive(Debug, Default)]
+pub struct RelayCarry {
+    /// The table's row epoch the marks were last checked against.
+    epoch: u64,
+    /// Each source the relay attributed, with the row it marked for it —
+    /// dangling when no row stood there.
+    marked: Vec<([u8; 4], std::sync::Weak<BoxRecord>)>,
+    /// The sources the relay carried, each with its row's box id: the
+    /// report the relay files at its end.
+    carried: WithdrawalReport,
+}
+
+impl RelayCarry {
+    /// The report the relay files at its end: every source it carried,
+    /// with the box id of the row it marked there.
+    #[must_use]
+    pub fn into_report(self) -> WithdrawalReport {
+        self.carried
+    }
+}
+
+/// Marks `record` attributed and carried by one relay more: the row's
+/// half of [`BoxTable::carry`]. Called under the read of the row lock
+/// `rows` was read through.
+fn mark_row(rows: &Rows, record: &Arc<BoxRecord>) {
+    record.attributed.store(true, Ordering::Relaxed);
+    // A task row carried keeps its box's row standing (NET-138): the
+    // box row's detach and resume bound clear as if the box carried.
+    // Locks run box row, then task row, as in the drainer's detach.
+    let parent = box_row_of(rows, record).unwrap_or(record);
+    let mut parent_liveness = parent.liveness();
+    parent_liveness.resumed_since = None;
+    if parent_liveness.detached_since.take().is_some() {
+        tracing::info!(
+            box = %parent.name(),
+            switch_addr = %parent.switch_addr(),
+            task_addr = ?record.is_task_row().then(|| record.switch_addr()),
+            "a detached box or one of its task runs attached again; its row stays"
+        );
+    }
+    if record.is_task_row() {
+        let mut liveness = record.liveness();
+        liveness.carriers = liveness.carriers.saturating_add(1);
+    } else {
+        parent_liveness.carriers = parent_liveness.carriers.saturating_add(1);
+    }
+}
+
+impl BoxTable {
     /// The published namespace holding the switch address `src`, when one
     /// does. This is the whole of the gate's per-frame routing: an address a
     /// row holds is decided by that row's rules, and an address no row holds
@@ -5164,7 +5412,7 @@ impl BoxTable {
 
     /// Files a withdrawal report: `sources` are the switch addresses whose
     /// relayed traffic the calling connection carried, each with the box id
-    /// [`Self::mark_attributed`] returned for it, and the connection is at
+    /// [`Self::carry`] filed for it, and the connection is at
     /// its end — the guest closed it, it errored, or the gate refused what
     /// followed. The registry's drainer detaches each reported row no other
     /// relay still carries, and withdraws it once its grace passes with no
@@ -5993,7 +6241,14 @@ mod tests {
         let web = registry
             .register_client_box(spec("web"))
             .expect("the plan has an address for the box");
-        assert!(registry.withdraw(web.switch_addr()).is_some());
+        // Its creator's destroy, which ends the creation and its name's
+        // hold, not only the row.
+        assert!(
+            registry
+                .withdraw_client_box("web", web.switch_addr(), web.loopback_addr(), None)
+                .expect("the creator's pair")
+                .is_some()
+        );
         let withdrawal = withdrawn.try_recv().expect("the subscriber is told");
 
         let started = Instant::now();
@@ -6109,6 +6364,24 @@ mod tests {
         table.report_withdrawals(carried);
     }
 
+    /// Its creator's destroy of the client box `row` is: the creator's
+    /// withdrawal, which ends the creation and returns its addresses — a
+    /// row the drainer withdraws leaves them reserved ([`Creation`]).
+    fn destroy(registry: &BoxRegistry, row: &BoxRecord) {
+        assert!(
+            registry
+                .withdraw_client_box(
+                    row.name(),
+                    row.switch_addr(),
+                    row.loopback_addr(),
+                    Some(row.box_id())
+                )
+                .expect("the creator's own pair")
+                .is_some(),
+            "the creator's destroy removes the row"
+        );
+    }
+
     /// Polls `holds` until it does, failing the test after five seconds.
     fn wait_until(holds: impl Fn() -> bool, what: &str) {
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -6195,12 +6468,14 @@ mod tests {
         );
     }
 
-    /// NET-138, design §7.1: a row detached past its grace is withdrawn as
-    /// the drainer always withdrew one — its published address handed back
-    /// to the answerer by name, its switch address returned to the hand-out
-    /// book under the quarantine its attribution earned.
+    /// NET-138, design §7.1: a row detached past its grace is withdrawn,
+    /// and its creation kept dormant with both addresses reserved for its
+    /// resume ([`Creation`]): its published address is not handed back to
+    /// the answerer, its switch address not returned to the book. The
+    /// creator's destroy returns the switch address, under the quarantine
+    /// its attribution earned.
     #[test]
-    fn a_detached_row_is_withdrawn_after_the_grace_and_frees_both_addresses() {
+    fn a_detached_row_is_withdrawn_after_the_grace_and_keeps_both_addresses() {
         let registry = BoxRegistry::new(SUBNET);
         let (released, releases) = std::sync::mpsc::channel();
         registry.spawn_withdrawal_drainer(move |name| {
@@ -6211,26 +6486,29 @@ mod tests {
             .expect("the plan has an address for the box");
         relay_carried_and_ended(&registry, &[&web]);
         wait_until(|| web.is_detached(), "the row detaches at its relay's end");
-        assert!(
-            releases.recv_timeout(Duration::from_millis(200)).is_err(),
-            "nothing is released while the row is detached"
-        );
 
         registry.advance_clock(DETACH_GRACE);
-        assert_eq!(
-            releases.recv_timeout(Duration::from_secs(5)).as_deref(),
-            Ok("web"),
-            "the published address goes back to the answerer"
+        wait_until(
+            || registry.row_by_name("web").is_none(),
+            "the row is withdrawn at its grace's end",
         );
         assert!(
-            registry.row_by_name("web").is_none(),
-            "the row is withdrawn"
+            releases.recv_timeout(Duration::from_millis(200)).is_err(),
+            "the dormant creation keeps its published address"
         );
         assert_eq!(
             registry.live_switch_addrs(),
-            0,
-            "the switch address is not out"
+            1,
+            "and its switch address stays out"
         );
+        assert!(registry.returned_switch_addrs().is_empty());
+
+        assert_eq!(
+            registry.withdraw_client_box("web", web.switch_addr(), web.loopback_addr(), None),
+            Ok(None),
+            "the creator's destroy ends the dormant creation"
+        );
+        assert_eq!(registry.live_switch_addrs(), 0);
         assert_eq!(
             registry.returned_switch_addrs(),
             vec![(web.switch_addr(), false)],
@@ -6288,7 +6566,9 @@ mod tests {
 
     /// NET-138: a reloaded row no relay carries again is withdrawn after its
     /// grace, as any detached row is, and stays withdrawn across the next
-    /// reload: its creation is kept dormant, holding no address.
+    /// reload: its creation is kept dormant, its switch address reserved
+    /// for it across the reload too, so the reloaded book hands it to no
+    /// other box.
     #[test]
     fn a_reloaded_row_not_reattributed_is_withdrawn() {
         let dir = tempfile::tempdir().expect("a temp dir");
@@ -6302,24 +6582,41 @@ mod tests {
             let _ = released.send(name.to_string());
         });
         after.advance_clock(DETACH_GRACE);
-        assert_eq!(
-            releases.recv_timeout(Duration::from_secs(5)).as_deref(),
-            Ok("web"),
-            "the reloaded row is withdrawn once its grace passes"
+        wait_until(
+            || after.row_by_name("web").is_none(),
+            "the reloaded row is withdrawn once its grace passes",
         );
-        assert!(after.row_by_name("web").is_none());
-        assert_eq!(
-            after.returned_switch_addrs(),
-            vec![(web.switch_addr(), true)],
-            "a reloaded row no frame crossed returns its address with no quarantine"
+        assert!(
+            releases.recv_timeout(Duration::from_millis(200)).is_err(),
+            "its published address stays the dormant creation's"
         );
+        assert!(after.returned_switch_addrs().is_empty());
+        assert_eq!(after.live_switch_addrs(), 1, "its switch address stays out");
 
         let again = persisted_registry(&dir);
         assert!(
             again.row_by_name("web").is_none(),
             "a dormant creation reloads no row"
         );
-        assert_eq!(again.live_switch_addrs(), 0);
+        assert_eq!(
+            again.live_switch_addrs(),
+            1,
+            "the reload reserves the dormant creation's switch address"
+        );
+        let api = again
+            .register_client_box(client_spec("api"))
+            .expect("the plan has an address for another box");
+        assert_ne!(
+            api.switch_addr(),
+            web.switch_addr(),
+            "and never hands it to another box"
+        );
+        assert_eq!(
+            again.withdraw_client_box("web", web.switch_addr(), web.loopback_addr(), None),
+            Ok(None),
+            "the creator's destroy ends the dormant creation"
+        );
+        assert_eq!(again.live_switch_addrs(), 1, "only the new box's is out");
     }
 
     /// NET-138: the persisted registry is its owner's alone — mode 0600,
@@ -6363,6 +6660,42 @@ mod tests {
             persisted_registry(&dir).row_by_name("web").is_none(),
             "a file of another version reloads no row"
         );
+    }
+
+    /// NET-138: a registry file this build cannot use — of another version,
+    /// or not parsing — is set aside under a suffixed name, never written
+    /// over by the next registration, so what it held is there to recover.
+    #[test]
+    fn an_unusable_registry_file_is_set_aside_not_overwritten() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join(REGISTRY_FILE);
+        for unusable in [&br#"{"version": 99, "boxes": []}"#[..], b"not json at all"] {
+            for entry in std::fs::read_dir(dir.path()).expect("the dir lists") {
+                std::fs::remove_file(entry.expect("an entry").path()).expect("a file removed");
+            }
+            std::fs::write(&path, unusable).expect("an unusable file");
+
+            let registry = persisted_registry(&dir);
+            registry
+                .register_client_box(client_spec("web"))
+                .expect("the plan has an address for the box");
+
+            let aside: Vec<_> = std::fs::read_dir(dir.path())
+                .expect("the dir lists")
+                .map(|entry| entry.expect("an entry").path())
+                .filter(|entry| entry.to_string_lossy().contains(".unusable-"))
+                .collect();
+            assert_eq!(aside.len(), 1, "the unusable file is set aside");
+            assert_eq!(
+                std::fs::read(&aside[0]).expect("the set-aside file reads"),
+                unusable,
+                "as it was"
+            );
+            let file: RegistryFile =
+                serde_json_lenient::from_slice(&std::fs::read(&path).expect("the file reads"))
+                    .expect("the new file parses whole");
+            assert_eq!(file.boxes.len(), 1, "and a new file holds the new creation");
+        }
     }
 
     /// NET-138: a creator resumes its box's row once the row was withdrawn
@@ -6440,10 +6773,93 @@ mod tests {
         assert!(Arc::ptr_eq(&again, &resumed), "the standing row itself");
     }
 
-    /// NET-138: a resumed row no relay carries within its bound is
-    /// withdrawn as a detached row is at its grace's end — both addresses
-    /// returned, so the dormant creation left behind holds neither — and
-    /// the creation is kept, so a later resume still works.
+    /// NET-138: a dormant creation holds its name — a registration under
+    /// it, in any spelling that folds to it, is refused rather than taking
+    /// the name its creator may still resume — until its creator destroys
+    /// it.
+    #[test]
+    fn a_dormant_creation_holds_its_name() {
+        let registry = BoxRegistry::new(SUBNET);
+        let web = registry
+            .register_client_box(client_spec("web"))
+            .expect("the plan has an address for the box");
+        assert!(registry.withdraw(web.switch_addr()).is_some());
+        assert!(registry.row_by_name("web").is_none(), "the row is gone");
+        for asked in ["web", "WEB"] {
+            assert_eq!(
+                registry
+                    .register_client_box(client_spec(asked))
+                    .map(|row| row.box_id()),
+                Err(AllocationError::NameAlreadyHeld {
+                    held: "web".to_string()
+                }),
+                "{asked} folds to the dormant creation's name"
+            );
+        }
+        assert_eq!(
+            registry.withdraw_client_box("web", web.switch_addr(), web.loopback_addr(), None),
+            Ok(None)
+        );
+        registry
+            .register_client_box(client_spec("web"))
+            .expect("a destroyed creation holds no name");
+    }
+
+    /// NET-138: a resume naming the box's id finds its creation whatever the
+    /// session is called now — renamed since its registration — and answers
+    /// the row under the creation's own name; without the id, a renamed
+    /// session's resume finds nothing. [`BoxRegistry::resumable`] reads
+    /// the same lookup, answering a standing row as itself and a dormant
+    /// creation by its own name.
+    #[test]
+    fn a_resume_by_box_id_survives_a_rename() {
+        let registry = BoxRegistry::new(SUBNET);
+        let web = registry
+            .register_client_box(client_spec("web"))
+            .expect("the plan has an address for the box");
+        let (switch, loopback) = (web.switch_addr(), web.loopback_addr());
+        assert!(
+            matches!(
+                registry.resumable("renamed", switch, loopback, Some(web.box_id())),
+                Ok(Resumable::Standing(row)) if Arc::ptr_eq(&row, &web)
+            ),
+            "a standing row is the resume's whole answer"
+        );
+        assert!(registry.withdraw(switch).is_some());
+        assert!(
+            matches!(
+                registry.resumable("renamed", switch, loopback, Some(web.box_id())),
+                Ok(Resumable::Dormant { name }) if name == "web"
+            ),
+            "a dormant creation is resumed under its own name"
+        );
+        assert!(
+            matches!(
+                registry.resumable("renamed", switch, loopback, None),
+                Err(ResumeError::NoCreation { .. })
+            ),
+            "by name alone a renamed session finds nothing"
+        );
+
+        let claim = registry.begin_registration("web");
+        let resumed = registry
+            .resume_client_box(
+                "renamed",
+                switch,
+                loopback,
+                Some(web.box_id()),
+                loopback,
+                claim.generation(),
+            )
+            .expect("the id finds the creation");
+        assert_eq!(resumed.name(), "web", "under the creation's own name");
+        assert_eq!(resumed.box_id(), web.box_id());
+    }
+
+    /// NET-138: a resume that reinstates a withdrawn row arms its bound: the
+    /// row no relay carries within it is withdrawn as a detached row is at
+    /// its grace's end, its addresses still reserved for the dormant
+    /// creation left behind, which a later resume reinstates again.
     #[test]
     fn an_unattributed_resume_is_withdrawn_after_its_bound() {
         let dir = tempfile::tempdir().expect("a temp dir");
@@ -6456,6 +6872,13 @@ mod tests {
         let web = registry
             .register_client_box(client_spec("web"))
             .expect("the plan has an address for the box");
+        relay_carried_and_ended(&registry, &[&web]);
+        wait_until(|| web.is_detached(), "the row detaches at its relay's end");
+        registry.advance_clock(DETACH_GRACE);
+        wait_until(
+            || registry.row_by_name("web").is_none(),
+            "the row is withdrawn at its grace's end",
+        );
         let resume = || {
             let claim = registry.begin_registration("web");
             registry.resume_client_box(
@@ -6467,7 +6890,7 @@ mod tests {
                 claim.generation(),
             )
         };
-        resume().expect("the creator resumes its standing row");
+        resume().expect("the creator reinstates its withdrawn row");
         registry.advance_clock(RESUME_ATTACH_BOUND.saturating_sub(Duration::from_secs(10)));
         let_the_drainer_sweep();
         assert!(
@@ -6482,12 +6905,12 @@ mod tests {
         );
         assert_eq!(
             registry.live_switch_addrs(),
-            0,
-            "the dormant creation holds no switch address"
+            1,
+            "the dormant creation keeps its switch address reserved"
         );
-        wait_until(
-            || released.lock().expect("the test's lock").as_slice() == ["web"],
-            "the loopback address goes back to the answerer",
+        assert!(
+            released.lock().expect("the test's lock").is_empty(),
+            "and its loopback address: nothing goes back to the answerer"
         );
 
         let again = resume().expect("the kept creation resumes again");
@@ -6499,6 +6922,193 @@ mod tests {
         assert!(
             registry.row_by_name("web").is_some(),
             "a resumed row its box attached to is no longer bound"
+        );
+    }
+
+    /// NET-138 (finding: a resume extends a detached row): a resume of a
+    /// row that stands — detached, its grace running — leaves the row as it
+    /// stands. It neither clears the grace nor arms the longer resume
+    /// bound, so the row is withdrawn at its grace's end, inside
+    /// [`NET_138_WITHDRAWAL_BOUND`] of its attachment's end; and a resume
+    /// of a fresh, never-attached row arms nothing either.
+    #[test]
+    fn a_standing_resume_leaves_the_detached_rows_grace() {
+        let registry = BoxRegistry::new(SUBNET);
+        registry.spawn_withdrawal_drainer(|_| {});
+        let web = registry
+            .register_client_box(client_spec("web"))
+            .expect("the plan has an address for the box");
+        let resume = || {
+            let claim = registry.begin_registration("web");
+            registry.resume_client_box(
+                "web",
+                web.switch_addr(),
+                web.loopback_addr(),
+                Some(web.box_id()),
+                web.loopback_addr(),
+                claim.generation(),
+            )
+        };
+        let fresh = resume().expect("a standing row resumes as it is");
+        assert!(Arc::ptr_eq(&fresh, &web), "the standing row itself");
+        registry.advance_clock(RESUME_ATTACH_BOUND * 2);
+        let_the_drainer_sweep();
+        assert!(
+            registry.row_by_name("web").is_some(),
+            "a standing row's resume arms no bound"
+        );
+
+        relay_carried_and_ended(&registry, &[&web]);
+        wait_until(|| web.is_detached(), "the row detaches at its relay's end");
+        registry.advance_clock(DETACH_GRACE.saturating_sub(Duration::from_secs(10)));
+        let resumed = resume().expect("a detached row resumes as it stands");
+        assert!(Arc::ptr_eq(&resumed, &web), "the standing row itself");
+        assert!(web.is_detached(), "its grace still runs");
+        registry.advance_clock(Duration::from_secs(10));
+        wait_until(
+            || registry.row_by_name("web").is_none(),
+            "the row is withdrawn at its grace's end, not held to the resume bound",
+        );
+    }
+
+    /// NET-138: a resume that arrives once a detached row's grace has run
+    /// out, before the drainer's sweep withdrew it, does not answer with
+    /// the row about to go: the row is withdrawn and reinstated, under the
+    /// resume's bound.
+    #[test]
+    fn a_resume_racing_the_grace_end_reinstates_the_row() {
+        // No drainer: the sweep has not run yet.
+        let registry = BoxRegistry::new(SUBNET);
+        let web = registry
+            .register_client_box(client_spec("web"))
+            .expect("the plan has an address for the box");
+        // A relay carried the row and ended, as the drainer detaches it.
+        registry.table().mark_attributed(web.switch_addr().octets());
+        registry.detach(web.switch_addr().octets(), web.box_id());
+        assert!(web.is_detached(), "the row detaches at its relay's end");
+        registry.advance_clock(DETACH_GRACE);
+        assert!(
+            matches!(
+                registry.resumable(
+                    "web",
+                    web.switch_addr(),
+                    web.loopback_addr(),
+                    Some(web.box_id())
+                ),
+                Ok(Resumable::Dormant { .. })
+            ),
+            "a row past its grace is no standing answer"
+        );
+        let claim = registry.begin_registration("web");
+        let resumed = registry
+            .resume_client_box(
+                "web",
+                web.switch_addr(),
+                web.loopback_addr(),
+                Some(web.box_id()),
+                web.loopback_addr(),
+                claim.generation(),
+            )
+            .expect("the creator reinstates its row");
+        assert!(!Arc::ptr_eq(&resumed, &web), "a reinstated row");
+        assert!(!resumed.is_detached(), "awaiting its box under the bound");
+    }
+
+    /// NET-138: a reinstated row's bound is its unit's — a task row its
+    /// task run's relay carries keeps the reinstated box row standing past
+    /// the resume bound, as it keeps a detached one past the grace.
+    #[test]
+    fn a_reinstated_unit_a_task_run_carries_is_not_withdrawn_at_the_bound() {
+        let registry = BoxRegistry::new(SUBNET);
+        registry.spawn_withdrawal_drainer(|_| {});
+        let web = registry
+            .register_client_box_with_task_slots(client_spec("web"), 1)
+            .expect("the plan has addresses for the box and its task");
+        relay_carried_and_ended(&registry, &[&web]);
+        wait_until(|| web.is_detached(), "the row detaches at its relay's end");
+        registry.advance_clock(DETACH_GRACE);
+        wait_until(
+            || registry.row_by_name("web").is_none(),
+            "the unit is withdrawn at its grace's end",
+        );
+
+        let claim = registry.begin_registration("web");
+        let resumed = registry
+            .resume_client_box(
+                "web",
+                web.switch_addr(),
+                web.loopback_addr(),
+                Some(web.box_id()),
+                web.loopback_addr(),
+                claim.generation(),
+            )
+            .expect("the creator reinstates its withdrawn row");
+        let [task] = task_rows_of(&registry, &resumed)
+            .try_into()
+            .expect("its task row is reinstated with it");
+        let table = registry.table();
+        // A task row is carried without its box's own row being marked:
+        // the carrier count on the box row stays zero.
+        let mut relay = RelayCarry::default();
+        table.carry(task.switch_addr().octets(), &mut relay);
+        registry.advance_clock(RESUME_ATTACH_BOUND * 2);
+        let_the_drainer_sweep();
+        assert!(
+            registry
+                .row_by_name("web")
+                .is_some_and(|row| Arc::ptr_eq(&row, &resumed)),
+            "a unit a relay carries stands past the resume bound"
+        );
+    }
+
+    /// NET-138: a relay that carried a box's source before its row was
+    /// withdrawn and reinstated — the box's shuttle stayed up while the row
+    /// went — counts as a carrier of the reinstated row on its next frame,
+    /// so the row is attributed and its bound cleared, and the relay's end
+    /// detaches it rather than leaving it to the bound alone.
+    #[test]
+    fn a_relay_already_carrying_a_source_re_attributes_a_reinstated_row() {
+        let registry = BoxRegistry::new(SUBNET);
+        registry.spawn_withdrawal_drainer(|_| {});
+        let web = registry
+            .register_client_box(client_spec("web"))
+            .expect("the plan has an address for the box");
+        let table = registry.table();
+        let src = web.switch_addr().octets();
+        let mut relay = RelayCarry::default();
+        table.carry(src, &mut relay);
+        // The row goes from under the live relay.
+        assert!(registry.withdraw(web.switch_addr()).is_some());
+
+        let claim = registry.begin_registration("web");
+        let resumed = registry
+            .resume_client_box(
+                "web",
+                web.switch_addr(),
+                web.loopback_addr(),
+                Some(web.box_id()),
+                web.loopback_addr(),
+                claim.generation(),
+            )
+            .expect("the creator reinstates its withdrawn row");
+        assert!(!Arc::ptr_eq(&resumed, &web), "a new row at the address");
+        assert!(!resumed.was_attributed(), "not yet carried");
+
+        table.carry(src, &mut relay);
+        assert!(
+            resumed.was_attributed(),
+            "the relay's next frame attributes the reinstated row"
+        );
+        registry.advance_clock(RESUME_ATTACH_BOUND * 2);
+        let_the_drainer_sweep();
+        assert!(
+            registry.row_by_name("web").is_some(),
+            "a reinstated row a relay carries is past its bound"
+        );
+        table.report_withdrawals(relay.into_report());
+        wait_until(
+            || resumed.is_detached(),
+            "the relay's end detaches the reinstated row",
         );
     }
 
@@ -6655,10 +7265,10 @@ mod tests {
             },
             "the unit is withdrawn once its grace passes",
         );
-        // The drainer returns the addresses after it removes the rows.
-        wait_until(
-            || registry.live_switch_addrs() == 0,
-            "every address goes back once the grace passes",
+        assert_eq!(
+            registry.live_switch_addrs(),
+            2,
+            "the dormant creation keeps both addresses reserved"
         );
     }
 
@@ -6741,9 +7351,11 @@ mod tests {
 
     /// NET-138: a task row is withdrawn with its box on every path that
     /// removes the box — its creator's withdrawal and the end of its grace
-    /// (the resume bound and an uncommitted lease end through the same two)
-    /// — and its address goes back to the book. A withdrawal naming a task
-    /// address withdraws nothing: the row goes with its box, not alone.
+    /// (the resume bound and an uncommitted lease end through the same two).
+    /// Its address goes back to the book with its box's when the creator
+    /// withdraws, and stays reserved with its box's while the creation is
+    /// dormant. A withdrawal naming a task address withdraws nothing: the
+    /// row goes with its box, not alone.
     #[test]
     fn task_rows_withdrawn_with_their_box() {
         let registry = BoxRegistry::new(SUBNET);
@@ -6781,11 +7393,17 @@ mod tests {
             || registry.table().is_empty(),
             "the box's row and its task rows go at its grace's end",
         );
-        // The drainer returns the addresses after it removes the rows.
-        wait_until(
-            || registry.live_switch_addrs() == 0,
-            "every address goes back at the grace's end",
+        assert_eq!(
+            registry.live_switch_addrs(),
+            3,
+            "the dormant creation keeps every address reserved"
         );
+        assert_eq!(
+            registry.withdraw_client_box("web", web.switch_addr(), web.loopback_addr(), None),
+            Ok(None),
+            "the creator's destroy ends the dormant creation"
+        );
+        assert_eq!(registry.live_switch_addrs(), 0, "every address goes back");
     }
 
     /// NET-138: a box's task rows persist with it — reloaded with its row,
@@ -6870,7 +7488,7 @@ mod tests {
         let registry = BoxRegistry::new(carved());
         let rows = fill_carved_run(&registry);
         let gone = &rows[7];
-        assert!(registry.withdraw(gone.switch_addr()).is_some());
+        destroy(&registry, gone);
 
         assert!(
             matches!(
@@ -6905,9 +7523,9 @@ mod tests {
         let registry = BoxRegistry::new(carved());
         let rows = fill_carved_run(&registry);
         let (first_back, second_back) = (&rows[40], &rows[3]);
-        assert!(registry.withdraw(first_back.switch_addr()).is_some());
+        destroy(&registry, first_back);
         registry.advance_clock(Duration::from_secs(10));
-        assert!(registry.withdraw(second_back.switch_addr()).is_some());
+        destroy(&registry, second_back);
         registry.advance_clock(SWITCH_REUSE_QUARANTINE);
 
         let next = register_carved(&registry, "next").expect("both quarantines have passed");
@@ -6932,7 +7550,7 @@ mod tests {
             .register_client_box(client_spec("old"))
             .expect("the plan has an address for the box");
         registry.table().mark_attributed(old.switch_addr().octets());
-        assert!(registry.withdraw(old.switch_addr()).is_some());
+        destroy(&registry, &old);
         // The old box's revocation holds its loopback address, so the next
         // registration at it waits — past its early checks, before its draw.
         let hold = withdrawn.try_recv().expect("the subscriber is told");
@@ -6994,8 +7612,8 @@ mod tests {
             register_carved(&registry, "late"),
             Err(AllocationError::SwitchExhausted(_))
         ));
-        assert!(registry.withdraw(attributed.switch_addr()).is_some());
-        assert!(registry.withdraw(never.switch_addr()).is_some());
+        destroy(&registry, &attributed);
+        destroy(&registry, &never);
 
         let quiet = register_carved(&registry, "quiet")
             .expect("nothing was attributed to the row, so its address is free at once");
@@ -7028,7 +7646,7 @@ mod tests {
     fn switch_exhaustion_names_live_and_quarantined() {
         let registry = BoxRegistry::new(carved());
         let rows = fill_carved_run(&registry);
-        assert!(registry.withdraw(rows[0].switch_addr()).is_some());
+        destroy(&registry, &rows[0]);
         registry.advance_clock(Duration::from_secs(100));
         let error = register_carved(&registry, "late").expect_err("the run is exhausted");
         let AllocationError::SwitchExhausted(counts) = &error else {
@@ -7069,11 +7687,12 @@ mod tests {
         let registry = BoxRegistry::new(carved());
         let mut rows = fill_carved_run(&registry);
         let filler = rows.pop().expect("the run is full");
-        assert!(registry.withdraw(filler.switch_addr()).is_some());
+        destroy(&registry, &filler);
         registry.advance_clock(SWITCH_REUSE_QUARANTINE);
         let old = register_carved(&registry, "web").expect("the address is free again");
-        // The old box ends daemon-side; its creator's withdrawal is late.
-        assert!(registry.withdraw(old.switch_addr()).is_some());
+        // The old box is destroyed; a duplicate of its creator's
+        // withdrawal arrives late.
+        destroy(&registry, &old);
         let new = register_carved(&registry, "web").expect("never attributed, so free at once");
         assert_eq!(
             (new.switch_addr(), new.loopback_addr()),
@@ -7105,13 +7724,13 @@ mod tests {
         );
     }
 
-    /// NET-133, design §7.1: the drainer's withdrawal — a box whose shuttle
-    /// closed, whatever ended its session, once its detach grace passed —
-    /// hands the box's published address back to the answerer by name,
-    /// unless something else owns the name: here, a registration of it
-    /// still in flight.
+    /// NET-133, NET-138, design §7.1: the drainer's withdrawal of a client
+    /// box — a box whose shuttle closed, once its detach grace passed —
+    /// leaves its published address with the answerer: the dormant
+    /// creation keeps it reserved for its resume, and only its creator's
+    /// destroy hands it back.
     #[test]
-    fn drainer_withdrawal_releases_answerer_address() {
+    fn drainer_withdrawal_keeps_a_dormant_creations_answerer_address() {
         let registry = BoxRegistry::new(SUBNET);
         let (released, releases) = std::sync::mpsc::channel();
         registry.spawn_withdrawal_drainer(move |name| {
@@ -7120,31 +7739,30 @@ mod tests {
         let web = registry
             .register_client_box(client_spec("web"))
             .expect("the plan has an address for the box");
-        let api = registry
-            .register_client_box(client_spec("api"))
-            .expect("the plan has an address for the box");
-        let in_flight = registry.begin_registration("api");
 
-        relay_carried_and_ended(&registry, &[&api, &web]);
-        wait_until(
-            || api.is_detached() && web.is_detached(),
-            "both rows detach",
-        );
+        relay_carried_and_ended(&registry, &[&web]);
+        wait_until(|| web.is_detached(), "the row detaches");
         registry.advance_clock(DETACH_GRACE);
-        assert_eq!(
-            releases.recv_timeout(Duration::from_secs(5)).as_deref(),
-            Ok("web"),
-            "the withdrawn box's address goes back to the answerer"
-        );
-        assert!(
-            registry.row_by_name("api").is_none(),
-            "both rows were withdrawn"
+        wait_until(
+            || registry.row_by_name("web").is_none(),
+            "the row is withdrawn",
         );
         assert!(
             releases.recv_timeout(Duration::from_millis(200)).is_err(),
-            "a registration of the name in flight owns the address, so it is not released"
+            "the dormant creation owns the address, so it is not released"
         );
-        drop(in_flight);
+        assert!(
+            !registry.release_withdrawn_unless_owned("web", || {}),
+            "nor by any withdrawal's release while the creation is kept"
+        );
+        assert_eq!(
+            registry.withdraw_client_box("web", web.switch_addr(), web.loopback_addr(), None),
+            Ok(None)
+        );
+        assert!(
+            registry.release_withdrawn_unless_owned("web", || {}),
+            "the destroy's release hands it back"
+        );
     }
 
     /// The loopback cursor never wraps (#1790): at `u32::MAX` it stops,
@@ -7176,7 +7794,7 @@ mod tests {
             let row = register_carved(&registry, &format!("cycle{cycle}"))
                 .unwrap_or_else(|error| panic!("cycle {cycle} found the run exhausted: {error}"));
             registry.table().mark_attributed(row.switch_addr().octets());
-            assert!(registry.withdraw(row.switch_addr()).is_some());
+            destroy(&registry, &row);
             registry.advance_clock(SWITCH_REUSE_QUARANTINE);
         }
         assert_eq!(
