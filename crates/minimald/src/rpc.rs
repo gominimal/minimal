@@ -3782,7 +3782,7 @@ mod tests {
             created
                 .classifier_advisory
                 .as_deref()
-                .is_some_and(|advisory| advisory.contains("its host-address boxes run unenforced")),
+                .is_some_and(|advisory| advisory.contains("so the box can still reach the network")),
             "the reply must carry the advisory that says the same state in \
              words, got: {:?}",
             created.classifier_advisory
@@ -5065,19 +5065,23 @@ mod tests {
         crate::session_host::set_host_ip_enforcement_fact(&classifier::Decision::undecidable(
             classifier::Cause::StepNotInstalled,
         ));
-        // The contrast: the same fact over a host-address box carries it.
-        let host_address = client
-            .call::<CreateSession>(&req("host-address", "/uwu"))
-            .await
-            .unwrap();
+        // The contrast: the same fact over a declaring host-address box
+        // carries it.
+        let mut host_address = req("host-address", "/uwu");
+        host_address.config.policy = SessionPolicy::new(Some(EgressPolicy::deny_all()), None);
+        let host_address = client.call::<CreateSession>(&host_address).await.unwrap();
         assert!(
             host_address.classifier_advisory.is_some(),
             "the fact carries a cause, so a host-address create over it \
              advises — the contrast this proof needs, got: {:?}",
             host_address.classifier_advisory
         );
-        let own_address =
-            own_ip_create_reply(&mut client, "own-address", SessionPolicy::default()).await;
+        let own_address = own_ip_create_reply(
+            &mut client,
+            "own-address",
+            SessionPolicy::new(Some(EgressPolicy::deny_all()), None),
+        )
+        .await;
         assert_eq!(
             own_address.classifier_advisory, None,
             "an own-address box's verdict is decided on address leases, so \
