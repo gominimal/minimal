@@ -2760,6 +2760,30 @@ impl Session {
             }
         };
         let box_name = record.name.clone().unwrap_or_else(|| record.id.to_string());
+        // A host-address box is answered before its stance is read: it
+        // shares the host's network, so the port already answers there, and
+        // its record can carry no `dynamic_ingress` (the policy validation
+        // refuses one), so the stance check could only ever deny it — true
+        // of the setting, and wrong about the port. No decision is made, so
+        // nothing is audited (NET-046); the request's one info line says
+        // what became of it.
+        if record.network == sessions::NetworkMode::HostNet {
+            let refusal = crate::net::policy::ExposeRefusal::NeedsNoExposing { port };
+            tracing::info!(
+                name = %box_name,
+                port,
+                network_mode = record.network.word(),
+                outcome = "needs no exposing",
+                reason = %refusal,
+                "dynamic ingress expose"
+            );
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "the asker may already be gone; there is nothing to answer then"
+            )]
+            let _ = reply.send(Err(ExposeFailure::Refused(refusal)));
+            return;
+        }
         // The setting the request is evaluated against (NET-043), spelled the
         // way the record carries it: the deny-all default for a box that
         // declared nothing.

@@ -1693,12 +1693,25 @@ impl SessionChannel {
                     }
                     _ => {}
                 }
+                // A refusal names its way forward with the box's name and
+                // the port asked for; a host-address box's port needs no
+                // exposing at all, which is the goal met rather than an
+                // error, so it is a plain message and the helper exits 0.
+                let line = match &failure {
+                    crate::net::policy::ExposeFailure::Refused(
+                        refusal @ crate::net::policy::ExposeRefusal::NeedsNoExposing { .. },
+                    ) => format!("msg:{}", refusal.for_caller(&self.name, port_number)),
+                    crate::net::policy::ExposeFailure::Refused(refusal) => {
+                        format!("error: {}", refusal.for_caller(&self.name, port_number))
+                    }
+                    _ => format!("error: {failure}"),
+                };
                 #[expect(
                     clippy::let_underscore_must_use,
                     reason = "the reply channel is best-effort: a peer may be gone before \
                               the reply lands, and there is nowhere to report that to"
                 )]
-                let _ = writeln!(stream, "error: {failure}");
+                let _ = writeln!(stream, "{line}");
             }
         }
     }
@@ -2820,6 +2833,116 @@ exit $rc
             served.lock().expect("served lock").len(),
             2,
             "one mapping is one request, and both publishes reached the switch"
+        );
+    }
+
+    /// Drives one in-box `min net expose <port>` against the session that
+    /// owns the channel and returns the reply lines, for the refusal tests
+    /// below: each pins the line the box's caller reads, which is where a
+    /// refusal names its way forward.
+    async fn expose_reply(
+        handle: &crate::session::SessionHandle,
+        name: &str,
+        port: u16,
+    ) -> Vec<String> {
+        let (_state, _rootfs, _cwd, mut chan) = setup_channel_with(handle.downgrade(), name);
+        let (mut ours, theirs) = UnixStream::pair().unwrap();
+        #[expect(
+            clippy::large_futures,
+            reason = "the handle future carries the harness's whole channel; the test awaits \
+                      it to completion"
+        )]
+        chan.handle(&format!("net-expose%{port}"), &mut ours).await;
+        drop(ours);
+        read_lines(&theirs)
+    }
+
+    /// The deny refusal names the way forward: the setting that allows a
+    /// publish, and the host-side forward that needs no policy change, with
+    /// the box's name and the port asked for filled in by the daemon. Still
+    /// an `error:` line, so the helper exits 1.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn expose_deny_reply_names_the_way_forward() {
+        let server = crate::test_harness::TestServer::new().await;
+        let mut client = server.connect().await;
+        let id = crate::session::tests::finalize_dynamic_ingress_session(
+            &mut client,
+            "web",
+            std::net::Ipv4Addr::new(100, 64, 128, 52),
+            std::net::Ipv4Addr::new(127, 0, 64, 52),
+            None,
+            None,
+        )
+        .await;
+        let manager = server.state.sessions_manager().await;
+        let handle = manager
+            .get_session(crate::sessions::SessionKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .expect("the box resolves");
+        assert_eq!(
+            expose_reply(&handle, "web", 3001).await,
+            vec![
+                "error: dynamic ingress is denied for this box (the default). Re-activate \
+                 with --dynamic-ingress ask --dynamic-range <lo>-<hi> to allow it, or \
+                 forward it from the host now: min net forward web <local>:3001"
+            ],
+        );
+    }
+
+    /// An `ask` with nobody attached names the two ways forward: attach a
+    /// terminal and retry, or have the host forward the port. Still an
+    /// `error:` line, so the helper exits 1.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn expose_ask_unattended_reply_names_the_way_forward() {
+        let server = crate::test_harness::TestServer::new().await;
+        let mut client = server.connect().await;
+        let id = crate::session::tests::finalize_dynamic_ingress_session(
+            &mut client,
+            "web",
+            std::net::Ipv4Addr::new(100, 64, 128, 53),
+            std::net::Ipv4Addr::new(127, 0, 64, 53),
+            Some(sessions::DynamicIngress::Ask),
+            Some((3000, 3999)),
+        )
+        .await;
+        let manager = server.state.sessions_manager().await;
+        let handle = manager
+            .get_session(crate::sessions::SessionKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .expect("the box resolves");
+        // No host is running, so nobody is attached to answer.
+        assert_eq!(
+            expose_reply(&handle, "web", 3001).await,
+            vec![
+                "error: dynamic ingress is set to ask and nobody is attached to answer: \
+                 attach a terminal (min session attach web) and retry, or have the host \
+                 forward it (min net forward web <local>:3001)"
+            ],
+        );
+    }
+
+    /// A host-address box's port needs no exposing: the reply says where it
+    /// already answers, as a plain `msg:` line, so the helper exits 0 — the
+    /// goal is met, and an error would read as a failure.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn expose_host_address_reply_is_a_plain_message() {
+        let server = crate::test_harness::TestServer::new().await;
+        let mut client = server.connect().await;
+        let id = crate::test_harness::create_configured_session(&mut client, "web", "/uwu").await;
+        let manager = server.state.sessions_manager().await;
+        let handle = manager
+            .get_session(crate::sessions::SessionKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .expect("the box resolves");
+        assert_eq!(
+            expose_reply(&handle, "web", 3001).await,
+            vec![
+                "msg:port 3001 needs no exposing: this box shares the host's network, so it \
+                 already answers at web.min.internal:3001 (and localhost:3001)"
+            ],
         );
     }
 

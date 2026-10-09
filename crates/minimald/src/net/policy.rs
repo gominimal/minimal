@@ -578,6 +578,39 @@ pub enum ExposeRefusal {
         port: u16,
         owner: super::listeners::PublicationOwner,
     },
+    /// The box shares the host's network (`host_ip`), so the port already
+    /// answers on the host and there is nothing to publish. The request's
+    /// goal is met, not refused, so the in-box caller hears this as a plain
+    /// message and exits 0.
+    NeedsNoExposing { port: u16 },
+}
+
+impl ExposeRefusal {
+    /// The line the in-box `min net expose` prints for this refusal: the
+    /// verdict and, where a way forward exists, the way forward, named with
+    /// the host-side box name and the port the request asked for, so a
+    /// detached agent reading it has its next command. The verdict alone
+    /// (`Display`) is what the log line and the audit record carry.
+    #[must_use]
+    pub fn for_caller(&self, box_name: &str, port: u16) -> String {
+        match self {
+            Self::DeniedByPolicy => format!(
+                "{self} (the default). Re-activate with --dynamic-ingress ask \
+                 --dynamic-range <lo>-<hi> to allow it, or forward it from the \
+                 host now: min net forward {box_name} <local>:{port}"
+            ),
+            Self::AskNeedsAnswer => format!(
+                "{self}: attach a terminal (min session attach {box_name}) and \
+                 retry, or have the host forward it (min net forward {box_name} \
+                 <local>:{port})"
+            ),
+            Self::NeedsNoExposing { port } => format!(
+                "{self}, so it already answers at {box_name}.min.internal:{port} \
+                 (and localhost:{port})"
+            ),
+            _ => self.to_string(),
+        }
+    }
 }
 
 impl fmt::Display for ExposeRefusal {
@@ -614,6 +647,10 @@ impl fmt::Display for ExposeRefusal {
                 f,
                 "port {port} is published already by this box ({})",
                 owner.as_str()
+            ),
+            Self::NeedsNoExposing { port } => write!(
+                f,
+                "port {port} needs no exposing: this box shares the host's network"
             ),
         }
     }
@@ -1417,6 +1454,35 @@ mod tests {
         assert!(json.contains("\"local\":\"127.0.0.1:5353\""), "got: {json}");
         assert!(json.contains("\"remote\":\"100.64.0.7:53\""), "got: {json}");
         assert!(json.contains("\"protocol\":\"udp\""), "got: {json}");
+    }
+
+    #[test]
+    fn refusals_name_the_way_forward_for_the_caller() {
+        // The in-box line carries the verdict and the next command, named
+        // with the host-side box name and the port asked for; the verdict
+        // alone is what the log and the audit record keep.
+        assert_eq!(
+            ExposeRefusal::DeniedByPolicy.for_caller("web", 3001),
+            "dynamic ingress is denied for this box (the default). Re-activate with \
+             --dynamic-ingress ask --dynamic-range <lo>-<hi> to allow it, or forward \
+             it from the host now: min net forward web <local>:3001"
+        );
+        assert_eq!(
+            ExposeRefusal::AskNeedsAnswer.for_caller("web", 3001),
+            "dynamic ingress is set to ask and nobody is attached to answer: attach a \
+             terminal (min session attach web) and retry, or have the host forward it \
+             (min net forward web <local>:3001)"
+        );
+        assert_eq!(
+            ExposeRefusal::NeedsNoExposing { port: 3001 }.for_caller("web", 3001),
+            "port 3001 needs no exposing: this box shares the host's network, so it \
+             already answers at web.min.internal:3001 (and localhost:3001)"
+        );
+        // A refusal with no way forward beyond its own words is its verdict.
+        assert_eq!(
+            ExposeRefusal::NoDynamicRange.for_caller("web", 3001),
+            ExposeRefusal::NoDynamicRange.to_string()
+        );
     }
 
     #[test]
