@@ -972,8 +972,12 @@ enum HostOrigin {
     /// describes a terminal.
     Interactive,
     /// Minted by [`Session::launch_host_for_hooks`] to run lifecycle hooks.
-    /// Nothing of the user's runs in it: activation hooks have completed by
-    /// the time an attach can arrive, so the shell is safe to replace.
+    /// Nothing of the user's runs in it: its shell waits at the launch's
+    /// start gate, before it execs, until an attach releases it (see
+    /// `session_host::Launched::start_gate`), so neither the shell nor its
+    /// startup files have run when an attach arrives, and it is safe to
+    /// replace. A host kept instead ([`replaces_host_for_terminal`]) starts
+    /// its shell at that attach, after the activate hooks.
     Hooks,
     /// Minted by [`Session::ensure_host`] to serve an exec. The command is
     /// live inside that sandbox, so replacing the shell would kill it — this
@@ -4143,15 +4147,18 @@ impl Session {
 
         // A host minted to run hooks has an environment that describes no
         // terminal, because there was none — and the shell's `environ` cannot
-        // be revised in place. Nothing of the user's is running in it (the
-        // activation hooks it was launched for have completed by the time an
-        // attach can arrive), so replace it with one minted for the terminal
-        // that is actually here. An `Exec`-minted host is deliberately not
+        // be revised in place. Nothing of the user's is running in it (its
+        // shell is still held at the launch's start gate, and the activation
+        // hooks it was launched for have completed by the time an attach can
+        // arrive), so replace it with one minted for the terminal that is
+        // actually here. An `Exec`-minted host is deliberately not
         // replaced: a command is live inside that sandbox, and killing it to
         // improve `TERM` is a bad trade. A box the host registered is not
         // replaced either, because ending its PTask ends the shuttle
         // connection the host-side row is tied to. Both cases ride on the
-        // per-attach environment the host republishes instead.
+        // per-attach environment the host republishes instead; a kept hook
+        // host's shell starts only now, when this attach releases its start
+        // gate, so its startup still runs after the activate hooks (#2118).
         let declares_terminal = attach_env.declares_terminal();
         let respawn_for_terminal =
             replaces_host_for_terminal(self.host_origin, declares_terminal, holds_host_row);
