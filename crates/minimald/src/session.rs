@@ -4632,15 +4632,21 @@ impl Session {
             .await?;
         let channel = channel.expect("progress hands back the channel it was given");
 
-        // Wire the channel to the freshly launched host. A failure here means
-        // the host died in the window between launch and attach; surface it as
-        // a spawn failure rather than leaving a dead, channel-less host — which
-        // is why the host is stored only once it is bound.
+        #[cfg(test)]
+        let launched = mint_attach_seam::apply(*self.record.id(), launched).await;
+
+        // Wire the channel to the freshly launched host. A failure here is
+        // one of two things: the host died in the window between launch and
+        // attach, or it is alive but wedged and its mailbox stayed full past
+        // the attach deadline. The first is surfaced as a spawn failure rather
+        // than leaving a dead, channel-less host — which is why the host is
+        // stored only once it is bound. The second must not read as death: it
+        // is the same wedged case the re-attach path refuses with `SessionBusy`.
         //
         // The launch already folded this attach's connection facts into the
         // shell's environment, so nothing new is passed here: the host holds
         // them, and an empty map means "no revision", not "no terminal".
-        launched
+        match launched
             .0
             .attach(
                 channel,
@@ -4649,11 +4655,22 @@ impl Session {
                 session_keys,
             )
             .await
-            .map_err(|_| {
-                AttachError::SpawnFailed(std::io::Error::other(
+        {
+            Ok(()) => {}
+            // The host's loop ended before the attach could be delivered.
+            Err(session_host::HostAttachError::Closed(..)) => {
+                return Err(AttachError::SpawnFailed(std::io::Error::other(
                     "session host exited before its channel could attach",
-                ))
-            })?;
+                )));
+            }
+            // The host is alive but its mailbox stayed full past the attach
+            // deadline: the same wedged case the re-attach path refuses with
+            // `SessionBusy`, and for the same reason — re-minting would abort
+            // a busy-but-healthy shell.
+            Err(session_host::HostAttachError::Timeout) => {
+                return Err(AttachError::SessionBusy);
+            }
+        }
         let SessionInner::Active { host, .. } = &mut self.inner else {
             unreachable!("mint_session_host is only reachable from the Active state");
         };
@@ -6066,6 +6083,95 @@ pub(crate) mod launch_record_seam {
             self.0.store(true, Ordering::SeqCst);
             Box::pin(async {})
         }
+    }
+}
+
+/// The test seam for the window between a mint's launch and its attach: a
+/// test seeds the failure that lands there for one session id, and the mint
+/// applies it to the host it just launched before wiring the channel. The
+/// take is once: a failure belongs to the mint that reads it, and a session a
+/// test seeded nothing for mints an ordinary host. Keyed by session id, like
+/// the launch-record seam, so tests running beside each other in one process
+/// never answer each other's mints.
+///
+/// The seam never fabricates the error itself — it only puts the freshly
+/// launched host into the state that produces it, so what the mint's own
+/// `attach` call returns, and how that maps onto the refusal the client sees,
+/// is exactly what production runs.
+#[cfg(test)]
+pub(crate) mod mint_attach_seam {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    use sessions::SessionId;
+
+    use crate::session_host::{HOST_MAILBOX_CAPACITY, HostHandle, WedgedMailbox};
+
+    /// The failure a seeded mint must hit: the host's loop ending before the
+    /// attach could be delivered, or a wedged loop whose mailbox stays full.
+    pub(crate) enum Failure {
+        HostDiedBeforeAttach,
+        HostWedged,
+    }
+
+    static SEEDED: Mutex<Option<HashMap<SessionId, Failure>>> = Mutex::new(None);
+    // Held for the daemon's lifetime so a wedged handle's mailbox never
+    // drains: an undrained mailbox is what keeps it wedged. Keyed by session
+    // id, like SEEDED, so tests running beside each other in one process keep
+    // their own stand-in's mailbox.
+    static WEDGED_MAILBOXES: Mutex<Option<HashMap<SessionId, WedgedMailbox>>> = Mutex::new(None);
+
+    /// Makes the next mint of `id` hit `failure` between its launch and its
+    /// attach.
+    pub(crate) fn seed(id: SessionId, failure: Failure) {
+        SEEDED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert_with(HashMap::new)
+            .insert(id, failure);
+    }
+
+    /// Applies the failure seeded for `id`, if any, to the host this mint
+    /// just launched. Once: the seeded failure is taken, not borrowed, so a
+    /// later mint of the same session mints an ordinary host. Takes the
+    /// launched pair and hands it back so the mint's binding needs no
+    /// mutation the non-test build would flag as unused.
+    pub(crate) async fn apply(
+        id: SessionId,
+        mut launched: super::LaunchedHost,
+    ) -> super::LaunchedHost {
+        let seeded = SEEDED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+            .and_then(|seeded| seeded.remove(&id));
+        match seeded {
+            None => {}
+            Some(Failure::HostDiedBeforeAttach) => {
+                // End the host's loop now, and wait for the end so the host
+                // (and its mailbox) is gone before the mint's attach sends:
+                // the send finds the channel closed rather than racing a
+                // loop that might still drain it.
+                launched.1.abort();
+                let _ = (&mut launched.1).await;
+            }
+            Some(Failure::HostWedged) => {
+                // Swap in a wedged stand-in and fill its mailbox to capacity
+                // through the production sender, so the mint's own attach
+                // send cannot queue and runs out its deadline.
+                let (wedged, mailbox) = HostHandle::wedged();
+                launched.0 = wedged;
+                WEDGED_MAILBOXES
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get_or_insert_with(HashMap::new)
+                    .insert(id, mailbox);
+                for i in 0..HOST_MAILBOX_CAPACITY {
+                    launched.0.rename(format!("mint-attach-seam-{i}")).await;
+                }
+            }
+        }
+        launched
     }
 }
 
