@@ -647,8 +647,8 @@ pub(crate) async fn best_effort_destroy(
 fn shared_port_collision_warning(collision: &minimald_rpc::SharedPortCollision) -> String {
     format!(
         "warning: port {} is already held by {}; this session will not \
-         forward it (first-come on the shared address); start one of them \
-         with --network own_ip to give it its own address",
+         forward it (first-come on the shared address); recreate one of them \
+         with a different external port, e.g. --ingress <other>:<internal>",
         collision.port, collision.held_by
     )
 }
@@ -844,8 +844,9 @@ pub(crate) fn composition_failure_message(project_dir: &camino::Utf8Path, error:
 #[cfg(test)]
 mod tests {
     /// NET-129: the activate warning for a yielded shared-address port is a
-    /// `warning:` line naming the port, the box that holds it, and the
-    /// `--network own_ip` way out of the collision.
+    /// `warning:` line naming the port, the box that holds it, and the way
+    /// out of the collision: a different external port, since the check keys
+    /// on the `--ingress` external port and both boxes are already `own_ip`.
     #[test]
     fn shared_port_collision_warning_names_the_port_its_holder_and_the_way_out() {
         let line = super::shared_port_collision_warning(&minimald_rpc::SharedPortCollision {
@@ -855,8 +856,9 @@ mod tests {
         assert_eq!(
             line,
             "warning: port 18080 is already held by first.min.internal; this session \
-             will not forward it (first-come on the shared address); start one of \
-             them with --network own_ip to give it its own address"
+             will not forward it (first-come on the shared address); recreate one \
+             of them with a different external port, e.g. --ingress \
+             <other>:<internal>"
         );
     }
 }
