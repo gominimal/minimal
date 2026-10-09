@@ -1921,13 +1921,24 @@ pub(crate) async fn session_via_ssh(
     // The session's record, read before the attach or the exec on a
     // VM-backed host — one with a VM host daemon's control socket beside
     // `sock` — for the pair its box's row was registered with. A lookup
-    // that fails reads as no row.
+    // that fails reads as no row, and says so: the row is then not asked
+    // back, and the in-VM daemon's own row check decides the launch.
     let record = match control_sock_beside(sock).filter(|control| control.exists()) {
-        Some(_) => attached_session_record(sock, id).await.ok().flatten(),
+        Some(_) => match attached_session_record(sock, id).await {
+            Ok(record) => record,
+            Err(error) => {
+                tracing::warn!(
+                    "could not read the session's record ({error:#}); its box row \
+                     is not asked back first"
+                );
+                None
+            }
+        },
         None => None,
     };
     // A VM host that cannot be reached fails the attach or the exec
-    // closed (#1790): the box's row cannot be asked back.
+    // closed (#1790); one that answers late or refuses is a warn line, and
+    // the attach or the exec goes on (NET-138).
     resume_box_row(sock, record.as_ref()).await?;
 
     if wire.is_none() {

@@ -338,7 +338,8 @@ pub async fn record_of(provider: &mut Provider, id: SessionId) -> Option<session
 ///
 /// The VM host daemon cannot be reached (#1790): the attach does not go
 /// ahead, and the status line shows the message `min session attach`
-/// fails with.
+/// fails with. A daemon that answers late or refuses the resume is a warn
+/// line, and the attach goes on (NET-138), as `min session attach` does.
 pub async fn prepare_attach(
     sock: &Path,
     record: Option<sessions::Record>,

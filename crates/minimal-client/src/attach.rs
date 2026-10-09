@@ -420,6 +420,29 @@ fn host_control(
     ),
     anyhow::Error,
 > {
+    host_control_within(control_sock, request, HOST_ASK_CONTROL_TIMEOUT)
+}
+
+/// The bound on a box row exchange the async front-ends run on a blocking
+/// thread under [`crate::box_registration::BOX_CONTROL_TIMEOUT`]: one second
+/// past it, so the caller's own deadline is the one that answers, and the
+/// thread ends soon after the caller gives up on it rather than holding the
+/// runtime's shutdown — and the process's exit — for the ask bound.
+const BOX_CONTROL_THREAD_BOUND: std::time::Duration =
+    std::time::Duration::from_secs(crate::box_registration::BOX_CONTROL_TIMEOUT.as_secs() + 1);
+
+/// [`host_control`] bounded by `timeout` instead ([`BOX_CONTROL_THREAD_BOUND`]).
+fn host_control_within(
+    control_sock: &Path,
+    request: &minimald_rpc::BoxControlRequest,
+    timeout: std::time::Duration,
+) -> Result<
+    (
+        minimald_rpc::BoxControlReply,
+        std::io::BufReader<std::os::unix::net::UnixStream>,
+    ),
+    anyhow::Error,
+> {
     use std::io::{BufRead as _, Write as _};
 
     use crate::box_registration::HostUnreachable;
@@ -436,8 +459,8 @@ fn host_control(
         )
     })?;
     stream
-        .set_read_timeout(Some(HOST_ASK_CONTROL_TIMEOUT))
-        .and_then(|()| stream.set_write_timeout(Some(HOST_ASK_CONTROL_TIMEOUT)))
+        .set_read_timeout(Some(timeout))
+        .and_then(|()| stream.set_write_timeout(Some(timeout)))
         .map_err(|error| HostUnreachable::over(error, "bounding the control exchange"))?;
     let mut line = serde_json_lenient::to_string(request).context("serializing the request")?;
     line.push('\n');
@@ -537,7 +560,7 @@ pub fn withdraw_box_row_at(
         loopback_address: addresses.loopback_address,
         box_id,
     });
-    let failure = match host_control(control_sock, &request) {
+    let failure = match host_control_within(control_sock, &request, BOX_CONTROL_THREAD_BOUND) {
         Ok((minimald_rpc::BoxControlReply::Addresses(handed), _)) if handed == addresses => {
             tracing::info!(
                 box = %box_name,
@@ -617,7 +640,7 @@ pub fn resume_box_row_at(
         loopback_address: addresses.loopback_address,
         box_id,
     });
-    let failure = match host_control(control_sock, &request) {
+    let failure = match host_control_within(control_sock, &request, BOX_CONTROL_THREAD_BOUND) {
         Ok((minimald_rpc::BoxControlReply::Registered(row), _))
             if row.switch_address == addresses.switch_address
                 && row.loopback_address == addresses.loopback_address =>

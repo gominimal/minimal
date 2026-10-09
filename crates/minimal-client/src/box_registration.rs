@@ -390,10 +390,13 @@ pub async fn withdraw_box_row(
 /// # Errors
 ///
 /// [`HostUnreachable`] when the VM host daemon cannot be reached — the
-/// control socket cannot be connected to or exchanged with, or no answer
-/// comes in time: the box's row cannot be asked back, so the attach or the
-/// exec fails closed rather than running against a box that may reach
-/// nothing. A refusal the daemon answers stays a warn line.
+/// control socket cannot be connected to or exchanged with: the box's row
+/// cannot be asked back, so the attach or the exec fails closed. A daemon
+/// that answers nothing within [`BOX_CONTROL_TIMEOUT`], and a refusal the
+/// daemon answers, stay warn lines (NET-138): this is a session that already
+/// exists, and the in-VM daemon's own row check before it relaunches the
+/// box's host is the gate that fails closed. Exit 7 stays with the
+/// registration a create makes.
 pub async fn resume_box_row(sock: &Path, record: Option<&sessions::Record>) -> anyhow::Result<()> {
     let Some(control_sock) = control_sock_beside(sock) else {
         return Ok(());
@@ -419,10 +422,19 @@ pub async fn resume_box_row(sock: &Path, record: Option<&sessions::Record>) -> a
             "asking the VM host daemon for box {name}'s host row back failed"
         ))),
         Ok(Err(join)) => Err(anyhow::Error::new(join).context("the box row resume did not run")),
-        Err(_) => Err(HostUnreachable::error(format!(
-            "the VM host daemon did not answer the box row resume for {name} in \
-             {BOX_CONTROL_TIMEOUT:?}"
-        ))),
+        // A slow daemon is not an unreachable one (NET-138): the row may well
+        // stand, and the in-VM daemon's own row check before it relaunches
+        // the box's host is the gate that fails closed, so the attach or
+        // the exec goes on.
+        Err(_) => {
+            tracing::warn!(
+                box = %name,
+                after = ?BOX_CONTROL_TIMEOUT,
+                "the VM host daemon did not answer the box row resume in time; \
+                 going on, and the box's host relaunches only while its row stands"
+            );
+            Ok(())
+        }
     }
 }
 
@@ -785,6 +797,83 @@ mod tests {
         .await
         .expect("a native host registers nothing");
         assert!(registered.is_none());
+    }
+
+    /// A control socket that never answers.
+    fn silent_vm_host(dir: &tempfile::TempDir) -> (PathBuf, std::os::unix::net::UnixListener) {
+        let sock = dir.path().join(crate::attach::VM_HOST_CONTROL_SOCK_FILE);
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        (sock, listener)
+    }
+
+    fn own_ip_record(addresses: sessions::BoxAddresses) -> sessions::Record {
+        sessions::Record {
+            id: sessions::SessionId::nil(),
+            name: Some("web".to_string()),
+            username: None,
+            project_path: paths::HostAbsPath::try_new("/p").unwrap(),
+            network: sessions::NetworkMode::OwnIp,
+            policy: sessions::SessionPolicy::default(),
+            status: sessions::SessionStatus::default(),
+            hooks_enabled: true,
+            task_addresses: Vec::new(),
+            box_addresses: Some(addresses),
+            host_ip_enforcement: None,
+            host_row_bound: false,
+            attrs: Default::default(),
+        }
+    }
+
+    const PAIR: sessions::BoxAddresses = sessions::BoxAddresses {
+        switch_address: std::net::Ipv4Addr::new(100, 64, 0, 2),
+        loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 0),
+    };
+
+    /// NET-138: a resume the VM host daemon does not answer in time, on an
+    /// attach or an exec into a session that exists, warns and goes on —
+    /// the in-VM daemon's row check is the gate — while a daemon that
+    /// cannot be connected to at all still fails it as host-unreachable.
+    #[tokio::test]
+    async fn resume_timeout_goes_on_and_an_absent_host_fails_closed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_, _listener) = silent_vm_host(&dir);
+        let ssh_sock = dir.path().join(paths::SSH_SOCK_FILE);
+        resume_box_row(&ssh_sock, Some(&own_ip_record(PAIR)))
+            .await
+            .expect("a resume that times out warns and goes on");
+
+        let absent = tempfile::TempDir::new().unwrap();
+        let error = resume_box_row(
+            &absent.path().join(paths::SSH_SOCK_FILE),
+            Some(&own_ip_record(PAIR)),
+        )
+        .await
+        .expect_err("no VM host daemon to ask fails the attach closed");
+        assert!(
+            error.downcast_ref::<HostUnreachable>().is_some(),
+            "{error:#}"
+        );
+    }
+
+    /// The blocking exchange behind a box row withdrawal ends with the
+    /// caller's deadline, so a silent daemon cannot hold the runtime's
+    /// shutdown — and `min`'s exit — for the ask bound past it.
+    #[test]
+    fn a_silent_daemon_does_not_hold_the_exit_past_the_deadline() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (sock, _listener) = silent_vm_host(&dir);
+        let started = std::time::Instant::now();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(withdraw_box_row(Some(sock), Some("web"), Some(PAIR), None));
+        drop(runtime);
+        assert!(
+            started.elapsed() < BOX_CONTROL_TIMEOUT + std::time::Duration::from_secs(3),
+            "the runtime's shutdown waited {:?} on the abandoned exchange",
+            started.elapsed()
+        );
     }
 
     /// The registration's lease is held across the finalize — the daemon
