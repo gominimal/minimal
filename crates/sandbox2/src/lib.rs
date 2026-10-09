@@ -177,14 +177,22 @@ impl<C: Channel> Sandbox<C> {
     /// The gate is a FIFO in the box's `/run`, which the daemon creates and
     /// holds open for writing; the box opens it for reading and waits for
     /// end-of-file, which the kernel delivers when the last writer closes.
+    /// Each call makes a FIFO of its own, so two gates on one sandbox never
+    /// share one: a container's commands wait at the gate its own call
+    /// returned, and releasing one gate starts no other container's program.
     #[cfg(target_os = "linux")]
     pub fn hold_start(&self, container: &mut Container) -> Result<StartGate, Error> {
         use std::os::fd::FromRawFd as _;
         use std::os::unix::ffi::OsStrExt as _;
 
-        let path = self.base_dir.join("run").join(START_GATE_NAME);
-        // A gate left from an earlier launch of this sandbox has no writer;
-        // replace it rather than share it.
+        static NEXT_GATE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let name = format!(
+            "{START_GATE_NAME}-{}",
+            NEXT_GATE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let path = self.base_dir.join("run").join(&name);
+        // A FIFO left at this name by an earlier daemon process has no
+        // writer; replace it rather than share it.
         match fs::remove_file(&path) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -216,10 +224,11 @@ impl<C: Channel> Sandbox<C> {
                 std::io::Error::last_os_error(),
             ));
         }
-        container.start_gate = Some(Path::new("/run").join(START_GATE_NAME));
+        container.start_gate = Some(Path::new("/run").join(&name));
         Ok(StartGate {
             // SAFETY: `fd` is a fresh descriptor nothing else owns.
             _writer: unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) },
+            path,
         })
     }
 
@@ -458,13 +467,13 @@ pub struct Container {
     /// the host's (or VM's) namespace leaves its `lo` alone.
     fresh_netns: bool,
     /// The start gate a command from this container waits at before it execs
-    /// its program, as the box spells it (`/run/<START_GATE_NAME>`). Set by
+    /// its program, as the box spells it (`/run/<START_GATE_NAME>-<n>`). Set by
     /// [`Sandbox::hold_start`]; `None` runs the program at once.
     start_gate: Option<PathBuf>,
 }
 
-/// The name of the start gate's FIFO in the box's `/run`; see
-/// [`Sandbox::hold_start`].
+/// The prefix of a start gate's FIFO name in the box's `/run`; each gate adds
+/// its own number. See [`Sandbox::hold_start`].
 pub const START_GATE_NAME: &str = "minimal-start-gate";
 
 /// The daemon's half of a box's start gate: the one writer of the FIFO the
@@ -476,11 +485,21 @@ pub const START_GATE_NAME: &str = "minimal-start-gate";
 #[derive(Debug)]
 pub struct StartGate {
     _writer: std::os::fd::OwnedFd,
+    /// The FIFO, host-side, removed when the gate goes. A box that has not
+    /// opened it by then finds no gate and runs at once, which is what a
+    /// released gate means anyway.
+    path: PathBuf,
 }
 
 impl StartGate {
     /// Lets the gated program exec.
     pub fn release(self) {}
+}
+
+impl Drop for StartGate {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -6000,7 +6019,8 @@ int main(int argc, char **argv) {
     /// builds its box and then waits, before it execs its program, until the
     /// gate is released. While the gate is held the box's process is alive
     /// and the program has done nothing; released, the program runs to
-    /// completion.
+    /// completion. Two gates on one sandbox are independent: releasing the
+    /// second starts only its own box, and the first waits for its own.
     #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_held_start_runs_the_program_only_once_released() {
@@ -6030,37 +6050,53 @@ int main(int argc, char **argv) {
             .expect("building the box");
 
         let plan = sandbox.built_in_plan();
-        let mut container = sandbox
-            .new_container(&plan)
-            .expect("building the box's container");
-        let gate = sandbox
-            .hold_start(&mut container)
-            .expect("holding the box's start");
-        let mut command = sandbox
-            .command(
-                &container,
-                "/usr/bin/probe",
-                ["MARK:/run/started".to_string()],
-                std::iter::empty::<(&str, &str)>(),
-            )
-            .expect("building the probe command");
-        let mut child = command.spawn().expect("spawning the probe in the box");
-        let started = sandbox.base_dir.join("run").join("started");
+        let run = sandbox.base_dir.join("run");
+        // Both gates are armed before either box spawns: the order in which a
+        // shared FIFO would hand the first box the second gate.
+        let mut armed = Vec::new();
+        for mark in ["first", "second"] {
+            let mut container = sandbox
+                .new_container(&plan)
+                .expect("building the box's container");
+            let gate = sandbox
+                .hold_start(&mut container)
+                .expect("holding the box's start");
+            armed.push((mark, gate, container));
+        }
+        let mut held = Vec::new();
+        for (mark, gate, container) in armed {
+            let mut command = sandbox
+                .command(
+                    &container,
+                    "/usr/bin/probe",
+                    [format!("MARK:/run/{mark}")],
+                    std::iter::empty::<(&str, &str)>(),
+                )
+                .expect("building the probe command");
+            let child = command.spawn().expect("spawning the probe in the box");
+            held.push((run.join(mark), gate, child, container));
+        }
 
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        assert!(
-            !started.exists(),
-            "the program ran while its start was held"
-        );
-        assert!(
-            child.try_wait().expect("polling the held box").is_none(),
-            "the held box exited before its start was released"
-        );
+        for (mark, _, child, _) in &mut held {
+            assert!(
+                !mark.exists(),
+                "a program ran while its start was held: {}",
+                mark.display()
+            );
+            assert!(
+                child.try_wait().expect("polling the held box").is_none(),
+                "a held box exited before its start was released"
+            );
+        }
 
-        gate.release();
+        // Released in reverse: the second gate starts only the second box.
+        let (first_mark, first_gate, mut first_child, _first_container) = held.remove(0);
+        let (second_mark, second_gate, mut second_child, _second_container) = held.remove(0);
+        second_gate.release();
         let status = tokio::time::timeout(
             std::time::Duration::from_secs(30),
-            tokio::task::spawn_blocking(move || child.wait()),
+            tokio::task::spawn_blocking(move || second_child.wait()),
         )
         .await
         .expect("the released box ran to completion in time")
@@ -6068,9 +6104,36 @@ int main(int argc, char **argv) {
         .expect("waiting for the released box");
         assert!(status.success(), "the released probe failed: {status:?}");
         assert!(
-            started.exists(),
+            second_mark.exists(),
             "the released program never ran: no mark at {}",
-            started.display()
+            second_mark.display()
+        );
+        assert!(
+            !first_mark.exists(),
+            "releasing the second gate started the first box's program"
+        );
+        assert!(
+            first_child
+                .try_wait()
+                .expect("polling the still-held box")
+                .is_none(),
+            "the first box exited while its own gate was still held"
+        );
+
+        first_gate.release();
+        let status = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            tokio::task::spawn_blocking(move || first_child.wait()),
+        )
+        .await
+        .expect("the released box ran to completion in time")
+        .expect("spawn_blocking join")
+        .expect("waiting for the released box");
+        assert!(status.success(), "the released probe failed: {status:?}");
+        assert!(
+            first_mark.exists(),
+            "the released program never ran: no mark at {}",
+            first_mark.display()
         );
     }
 
