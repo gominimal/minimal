@@ -488,6 +488,7 @@ pub async fn activate(
         // An own-address box on a VM-backed host is handed its addresses by
         // the registration [`create_registering`] makes first.
         task_addresses: Vec::new(),
+        box_id: None,
         box_addresses: None,
         // Same default as an activate with no flags: the dashboard
         // has no `--no-hooks` of its own, and a session created here
@@ -726,6 +727,10 @@ async fn create_registering<C: Send>(
             .as_ref()
             .map(|registration| registration.task_addresses.clone())
             .unwrap_or_default();
+        config.box_id = row
+            .registration
+            .as_ref()
+            .and_then(|registration| registration.box_id);
         let error = match create(client, config.clone()).await {
             Ok(Errorable::Ok(created)) => return Ok((created, row)),
             Ok(Errorable::Err { error }) => error,
@@ -862,6 +867,7 @@ mod tests {
             network: NetworkMode::OwnIp,
             policy: SessionPolicy::default(),
             task_addresses: Vec::new(),
+            box_id: None,
             box_addresses: None,
             hooks_enabled: true,
             attrs: Default::default(),
@@ -1183,6 +1189,7 @@ mod tests {
             box_addresses,
             task_addresses: Vec::new(),
             host_ip_enforcement: None,
+            box_id: None,
             host_row_bound: false,
             attrs: Default::default(),
         }
@@ -1235,6 +1242,7 @@ mod tests {
             task_addresses: Vec::new(),
             box_addresses: Some(handed),
             host_ip_enforcement: None,
+            box_id: None,
             host_row_bound: false,
             attrs: Default::default(),
         };

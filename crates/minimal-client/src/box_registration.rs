@@ -398,16 +398,18 @@ pub async fn resume_box_row(sock: &Path, record: Option<&sessions::Record>) -> a
     let Some(control_sock) = control_sock_beside(sock) else {
         return Ok(());
     };
-    let Some((name, addresses)) =
-        record.and_then(|record| Some((record.name.clone()?, record.box_addresses?)))
+    let Some((name, addresses, box_id)) = record
+        .and_then(|record| Some((record.name.clone()?, record.box_addresses?, record.box_id)))
     else {
         return Ok(());
     };
     let box_name = name.clone();
+    // The id the registration handed back finds the box's creation on the
+    // host whatever the session is named now (NET-138).
     let resumed = tokio::time::timeout(
         BOX_CONTROL_TIMEOUT,
         tokio::task::spawn_blocking(move || {
-            crate::attach::resume_box_row_at(&control_sock, &box_name, addresses, None)
+            crate::attach::resume_box_row_at(&control_sock, &box_name, addresses, box_id)
         }),
     )
     .await;

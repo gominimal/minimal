@@ -398,6 +398,7 @@ mod tests {
             // No launch has recorded anything: these records are built
             // straight from disk-side seeds, never launched.
             host_ip_enforcement: None,
+            box_id: None,
             host_row_bound: false,
             attrs: Default::default(),
         }

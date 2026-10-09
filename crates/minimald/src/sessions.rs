@@ -115,6 +115,8 @@ fn build_record(
         // outcome to record, and the key a client might assert in `attrs`
         // is stripped above, so only a launch ever writes this field.
         host_ip_enforcement: None,
+        // The id the host's row of the box holds, beside its addresses.
+        box_id: config.box_id,
         // Daemon-owned as well: only a launch binds the box's host-side row.
         host_row_bound: false,
         attrs: config.attrs,
@@ -1993,6 +1995,7 @@ pub(crate) mod tests {
             network: sessions::NetworkMode::default(),
             policy: Default::default(),
             task_addresses: Vec::new(),
+            box_id: None,
             box_addresses: None,
             hooks_enabled: true,
             attrs: Default::default(),

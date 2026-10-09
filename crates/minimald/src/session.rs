@@ -145,6 +145,23 @@ pub struct SessionPaths {
     pub hooks: DaemonAbsPath,
 }
 
+/// The control channel `switch`'s switch is reached on: its control
+/// socket for a switch this daemon spawned, the host shuttle's vsock port
+/// for the VM host's.
+pub(crate) async fn switch_control_of(
+    switch: &Mutex<crate::net::SwitchClient>,
+) -> crate::net::policy::ControlChannel {
+    let switch = switch.lock().await;
+    match switch.transport() {
+        crate::net::SwitchTransport::LocalSpawn => {
+            crate::net::policy::ControlChannel::Unix(switch.control_socket())
+        }
+        crate::net::SwitchTransport::HostShuttle { cid, port } => {
+            crate::net::policy::ControlChannel::Vsock { cid, port }
+        }
+    }
+}
+
 /// Everything a [`Session`] actor needs at spawn time. Every session actor
 /// is spawned through [`Session::run`] with one of these, whether it is
 /// backed by a freshly allocated record (the `CreateSession` path) or an
@@ -3691,15 +3708,7 @@ impl Session {
     /// a lock held only for the two sync reads — never across the publish it
     /// feeds.
     async fn switch_control(&self) -> crate::net::policy::ControlChannel {
-        let switch = self.net_switch.lock().await;
-        match switch.transport() {
-            crate::net::SwitchTransport::LocalSpawn => {
-                crate::net::policy::ControlChannel::Unix(switch.control_socket())
-            }
-            crate::net::SwitchTransport::HostShuttle { cid, port } => {
-                crate::net::policy::ControlChannel::Vsock { cid, port }
-            }
-        }
+        switch_control_of(&self.net_switch).await
     }
 
     /// The live dynamic-ingress mappings — the rows `min session policy`
@@ -4392,10 +4401,17 @@ impl Session {
         if !record.host_row_bound || (self.slot_holds_row && slot_alive) {
             return false;
         }
+        // A registered box whose record names no box id cannot be told
+        // from another box handed its address: no row, fail-closed.
+        let Some(box_id) = record.box_id else {
+            self.relaunch_row_confirmed = false;
+            return true;
+        };
         let control = self.switch_control().await;
-        let standing = crate::net::listeners::host_row_standing(&control, addresses.switch_address)
-            .await
-            == Some(true);
+        let standing =
+            crate::net::listeners::host_row_standing(&control, addresses.switch_address, box_id)
+                .await
+                == Some(true);
         self.relaunch_row_confirmed = standing && !slot_alive;
         !standing
     }

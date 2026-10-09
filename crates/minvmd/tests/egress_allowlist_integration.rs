@@ -523,6 +523,7 @@ async fn create_toolchain_session(
             // The addresses the registration handed back, so the in-VM
             // daemon attaches the box at its row's lease.
             task_addresses: Vec::new(),
+            box_id: None,
             box_addresses: Some(addresses),
             hooks_enabled: true,
             attrs: Default::default(),

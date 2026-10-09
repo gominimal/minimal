@@ -6737,6 +6737,7 @@ dependencies = [
  "camino",
  "common",
  "globset",
+ "hex",
  "indoc",
  "nutype",
  "paths",

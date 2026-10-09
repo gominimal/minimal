@@ -540,6 +540,7 @@ pub(crate) async fn activate_session(
         network,
         policy,
         task_addresses: Vec::new(),
+        box_id: None,
         box_addresses: None,
         hooks_enabled: !args.no_hooks,
         attrs: Default::default(),
@@ -721,6 +722,9 @@ pub(crate) async fn activate_session(
         .as_ref()
         .map(|registration| registration.task_addresses.clone())
         .unwrap_or_default();
+    config.box_id = registered
+        .as_ref()
+        .and_then(|registration| registration.box_id);
 
     use minimald_rpc::{
         ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, CreateSessionRequest,
@@ -811,6 +815,9 @@ pub(crate) async fn activate_session(
                         .as_ref()
                         .map(|registration| registration.task_addresses.clone())
                         .unwrap_or_default();
+                    config.box_id = registered
+                        .as_ref()
+                        .and_then(|registration| registration.box_id);
                     continue;
                 }
                 // A create failure that is not a retryable autogen collision
@@ -5838,6 +5845,7 @@ mod tests {
             task_addresses: Vec::new(),
             box_addresses: Some(addresses),
             host_ip_enforcement: None,
+            box_id: None,
             host_row_bound: false,
             attrs: Default::default(),
         };

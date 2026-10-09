@@ -1220,6 +1220,7 @@ mod tests {
             // record, which a client reads back through `GetSessionRecord`.
             host_ip_enforcement: None,
             // Non-default too, for the same reason: `false` is its serde default.
+            box_id: None,
             host_row_bound: true,
             attrs: [("color".to_string(), "blue".to_string())]
                 .into_iter()

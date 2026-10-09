@@ -567,6 +567,7 @@ pub fn create_session_req(name: &str, project: &str) -> minimald_rpc::CreateSess
             network: sessions::NetworkMode::default(),
             policy: Default::default(),
             task_addresses: Vec::new(),
+            box_id: None,
             box_addresses: None,
             hooks_enabled: true,
             attrs: Default::default(),

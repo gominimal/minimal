@@ -646,6 +646,7 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
         network: sessions::NetworkMode::HostNet,
         policy: sessions::SessionPolicy::default(),
         task_addresses: Vec::new(),
+        box_id: None,
         box_addresses: None,
         // Same default as an activate with no flags, matching the
         // loadout handling below. `min task run` has no `--no-hooks` of

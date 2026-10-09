@@ -381,14 +381,17 @@ pub(crate) fn reports_to_vm_host(control: &ControlChannel) -> bool {
 /// grace, or once its creator resumed it. `None` when the host could not be
 /// asked: a native host, which holds no rows, or a door that did not answer
 /// within [`REPORT_DEADLINE`] over its attempts. The caller reads `None` as
-/// no row, fail-closed.
+/// no row, fail-closed. The host answers for `box_id` alone: a row it
+/// handed another box at the address is not this box's.
 pub(crate) async fn host_row_standing(
     control: &ControlChannel,
     switch_address: Ipv4Addr,
+    box_id: minimald_rpc::BoxId,
 ) -> Option<bool> {
     let channel = box_report_channel(control)?;
     let request = minimald_rpc::BoxControlRequest::RowStanding(minimald_rpc::RowStandingRequest {
         switch_address,
+        box_id: Some(box_id),
     });
     let deadline = tokio::time::Instant::now() + REPORT_DEADLINE;
     for attempt in 1..=REPORT_ATTEMPTS {

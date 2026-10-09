@@ -1040,6 +1040,7 @@ mod tests {
             task_addresses: Vec::new(),
             box_addresses: None,
             host_ip_enforcement: None,
+            box_id: None,
             host_row_bound: false,
             attrs: std::collections::BTreeMap::new(),
         };

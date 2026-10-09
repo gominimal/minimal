@@ -2775,6 +2775,7 @@ async fn own_ip_default_deny_all() {
                 network: sessions::NetworkMode::OwnIp,
                 policy: sessions::SessionPolicy::default(),
                 task_addresses: Vec::new(),
+                box_id: None,
                 box_addresses: None,
                 hooks_enabled: true,
                 attrs: Default::default(),
@@ -2834,6 +2835,7 @@ fn own_ip_session_req(name: &str) -> minimald_rpc::CreateSessionRequest {
                 credentialed_upstream: None,
             },
             task_addresses: Vec::new(),
+            box_id: None,
             box_addresses: None,
             hooks_enabled: true,
             attrs: Default::default(),
@@ -2857,8 +2859,12 @@ fn own_ip_handed_session_req(
         switch_address: switch,
         loopback_address: loopback,
     });
+    request.config.box_id = Some(HANDED_BOX_ID);
     request
 }
+
+/// The box id every handed session in these tests was registered as.
+const HANDED_BOX_ID: minimald_rpc::BoxId = minimald_rpc::BoxId::from_bytes([0x42; 16]);
 
 /// Drives Create → ConfigureLoadout → FinalizeSession for an own-address box
 /// and returns its id. No attach ever happens along the way: the box is
@@ -3665,9 +3671,10 @@ async fn ensure_host_relaunches_a_registered_box_while_its_host_row_stands() {
     assert_eq!(
         read,
         minimald_rpc::BoxControlRequest::RowStanding(minimald_rpc::RowStandingRequest {
-            switch_address
+            switch_address,
+            box_id: Some(HANDED_BOX_ID),
         }),
-        "the read names the row's own key and nothing else"
+        "the read names the row's own key and the box's id, nothing else"
     );
 
     relaunched
@@ -3686,6 +3693,75 @@ async fn ensure_host_relaunches_a_registered_box_while_its_host_row_stands() {
         Err(other) => panic!("refused for another reason: {other}"),
         Ok(_) => panic!("a box the host holds no row for was relaunched rowless"),
     }
+    crate::net::listeners::clear_vm_report_door_for_tests(&sock);
+    door.abort();
+}
+
+/// NET-138: a registered box whose record names no box id cannot be told
+/// from another box the host handed its address, so its ended host is not
+/// relaunched even while the host would say a row stands at the address:
+/// the read is never asked, and the box is refused as rowless.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ensure_host_refuses_a_registered_box_whose_record_names_no_box_id() {
+    let switch_address = std::net::Ipv4Addr::new(100, 64, 128, 30);
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let mut request = own_ip_handed_session_req(
+        "exec-unnamed-id",
+        switch_address,
+        std::net::Ipv4Addr::new(127, 0, 64, 30),
+    );
+    request.config.box_id = None;
+    use minimald_rpc::{ConfigureLoadout, ConfigureLoadoutRequest, CreateSession};
+    let id = client.call::<CreateSession>(&request).await.unwrap().id;
+    crate::test_harness::unwrap_ready(
+        client
+            .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
+                session_id: id,
+                contribution: Default::default(),
+            })
+            .await
+            .unwrap(),
+    );
+    finalize_session(&mut client, id).await;
+    let manager = server.state.sessions_manager().await;
+    let handle = manager
+        .get_session(crate::sessions::SessionKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the box resolves");
+    let host = handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("the box's first launch binds its row");
+    let sock = handle
+        .net_switch()
+        .await
+        .unwrap()
+        .lock()
+        .await
+        .control_socket();
+    let door_sock = sock.with_file_name("row-door.sock");
+    let (door, mut reads, replies) = fake_report_door(&door_sock).await;
+    crate::net::listeners::seed_vm_report_door_for_tests(&sock, &door_sock);
+
+    host.kill(false).await.expect("the box's host ends");
+    soon(|| !host.is_alive()).await;
+    replies
+        .send(minimald_rpc::BoxControlReply::RowStanding {
+            switch_address,
+            row_standing: true,
+        })
+        .expect("the report door stand-in lives");
+    match handle.ensure_host("tester".to_string()).await {
+        Err(crate::session::AttachError::BoxHostRowEnded) => {}
+        Err(other) => panic!("refused for another reason: {other}"),
+        Ok(_) => panic!("a box with no id was relaunched on an address-only read"),
+    }
+    assert!(
+        reads.try_recv().is_err(),
+        "no row read was asked without a box id"
+    );
     crate::net::listeners::clear_vm_report_door_for_tests(&sock);
     door.abort();
 }
@@ -6657,6 +6733,7 @@ async fn create_logs_dynamic_ingress() {
                 network: sessions::NetworkMode::OwnIp,
                 policy: sessions::SessionPolicy::default(),
                 task_addresses: Vec::new(),
+                box_id: None,
                 box_addresses: None,
                 hooks_enabled: true,
                 attrs: Default::default(),

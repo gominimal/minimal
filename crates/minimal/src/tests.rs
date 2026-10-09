@@ -2316,6 +2316,7 @@ async fn create_box_on(
                 network: sessions::NetworkMode::NoNet,
                 policy: sessions::SessionPolicy::default(),
                 task_addresses: Vec::new(),
+                box_id: None,
                 box_addresses: None,
                 hooks_enabled: true,
                 attrs: Default::default(),

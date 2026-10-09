@@ -929,14 +929,21 @@ fn serve_request(
         // The table is this supervisor's, and a supervisor runs one VM and
         // binds this door for that VM's vsock bridge alone, so the answer
         // is only ever about the asking VM's own rows. A map lookup: it
-        // changes no row, no liveness and no attribution.
+        // changes no row, no liveness and no attribution. The read is
+        // answered for the box id it names alone: a row another box was
+        // handed the address under is not the asking box's row, and a read
+        // that names no id is answered as no row, fail-closed.
         (BoxControlRequest::RowStanding(request), ControlDoor::GuestReports) => {
             let reply = BoxControlReply::RowStanding {
                 switch_address: request.switch_address,
                 row_standing: boxes
                     .table()
                     .by_source(request.switch_address.octets())
-                    .is_some(),
+                    .is_some_and(|record| {
+                        request.box_id.is_some_and(|asked| {
+                            !record.is_task_row() && asked.to_bytes() == record.box_id()
+                        })
+                    }),
             };
             write_reply(stream, &reply)
         }
@@ -4232,9 +4239,12 @@ mod tests {
             )
             .expect("the registration is answered"),
         );
-        let standing = |sock: &std::path::Path, switch_address| match control(
+        let standing = |sock: &std::path::Path, switch_address, box_id| match control(
             &sock.with_file_name(GUEST_CONTROL_SOCK_FILE),
-            &BoxControlRequest::RowStanding(minimald_rpc::RowStandingRequest { switch_address }),
+            &BoxControlRequest::RowStanding(minimald_rpc::RowStandingRequest {
+                switch_address,
+                box_id,
+            }),
         )
         .expect("the read is answered")
         {
@@ -4242,16 +4252,28 @@ mod tests {
             other => panic!("expected a row-standing answer, got {other:?}"),
         };
         assert!(
-            standing(&sock_path, web.switch_address),
+            standing(&sock_path, web.switch_address, Some(web.box_id)),
             "its own VM's row stands"
         );
         assert!(
-            !standing(&other_sock_path, web.switch_address),
+            !standing(&other_sock_path, web.switch_address, Some(web.box_id)),
             "another VM's door knows nothing of the box"
         );
         assert!(
-            !standing(&sock_path, Ipv4Addr::new(100, 64, 0, 200)),
+            !standing(&sock_path, Ipv4Addr::new(100, 64, 0, 200), Some(web.box_id)),
             "an address no row holds does not stand"
+        );
+        assert!(
+            !standing(
+                &sock_path,
+                web.switch_address,
+                Some(minimald_rpc::BoxId::from_bytes([0xee; 16]))
+            ),
+            "a row of another box at the address does not stand for this one"
+        );
+        assert!(
+            !standing(&sock_path, web.switch_address, None),
+            "a read naming no box is answered fail-closed"
         );
         let row = registry.row_by_name("web").expect("the row stands");
         assert!(!row.was_attributed(), "the read attributes nothing");

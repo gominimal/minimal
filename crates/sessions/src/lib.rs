@@ -947,6 +947,82 @@ where
     Ok(name.filter(|name| !name.is_empty()))
 }
 
+/// A box's identity on its host: 16 bytes — one `UUIDv7`, 32 lowercase hex
+/// digits on the wire — minted once per box by the host-side creator
+/// outside the VM, with its random fields from the host's OS CSPRNG
+/// (BEP-070): never a counter, never a digest of the box's facts, never
+/// anything a process inside the VM could predict or arrange. The
+/// registration that publishes the box's row mints it — a client never
+/// presents one — the row and the proxy's attachment hold it, and the
+/// reply hands it back so the client records the id its box was created
+/// as.
+///
+/// Unique per creation by construction: a box recreated with the same
+/// name and the same addresses is a new box, and its id says so. Ids are
+/// never reused — no registration can present one, and the host refuses a
+/// mint that collides with a record it holds — so a revocation scoped to
+/// an id stays scoped forever. The all-zero id is not
+/// a mint's output and never names a box: the delivery header carried it
+/// for "no box named" before ids were the box's own, and the acceptor
+/// that reads a delivered header refuses it like any other id the
+/// source's attachment does not hold.
+///
+/// On the wire it is one hex string, the same 32 lowercase digits a
+/// diagnostic names a box id by — so a log line, a transcript and a
+/// socket capture all read the same spelling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct BoxId([u8; 16]);
+
+impl BoxId {
+    /// Wraps `bytes` as a box id — the shape a registration's reply
+    /// carries and a delivery header fills from the box's attachment.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+
+    /// The id's own 16 bytes.
+    #[must_use]
+    pub fn to_bytes(self) -> [u8; 16] {
+        self.0
+    }
+}
+
+impl std::fmt::Display for BoxId {
+    /// 32 lowercase hex digits — the one fixed form every diagnostic that
+    /// names a box id uses, so a tail can compare two lines for the same
+    /// box.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for byte in self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+impl Serialize for BoxId {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&hex::encode(self.0))
+    }
+}
+
+impl<'de> Deserialize<'de> for BoxId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text: &str = Deserialize::deserialize(deserializer)?;
+        let bytes = hex::decode(text).map_err(serde::de::Error::custom)?;
+        let bytes: [u8; 16] = match bytes.try_into() {
+            Ok(bytes) => bytes,
+            Err(bytes) => {
+                return Err(serde::de::Error::custom(format!(
+                    "a box id is 32 hex digits (16 bytes); got {} bytes",
+                    bytes.len()
+                )));
+            }
+        };
+        Ok(Self(bytes))
+    }
+}
+
 /// The pair of addresses a VM host daemon allocates for a box and hands
 /// back to its creator (T66): where the box lives on the switch, and where
 /// it is published on the guest's loopback.
@@ -1082,6 +1158,17 @@ pub struct Record {
     /// re-activated.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub task_addresses: Vec<std::net::Ipv4Addr>,
+
+    /// The box id the same registration handed back (BEP-070, NET-138):
+    /// the id the host's row of this box holds. The in-VM daemon names it
+    /// when it asks whether the box's row still stands, and the creator
+    /// when it resumes the row, so a row the host handed another box at
+    /// the same address is never taken for this box's. `None` for a record
+    /// that handed no box addresses, and for one that predates the field:
+    /// a registered box with no id is never answered as standing, so it
+    /// must be re-activated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub box_id: Option<BoxId>,
 
     /// The per-box egress enforcement this session's own launch placed its
     /// host-address box under (NET-079): `per_box` when the launch placed the
@@ -1331,6 +1418,7 @@ mod tests {
             task_addresses: Vec::new(),
             box_addresses: None,
             host_ip_enforcement: None,
+            box_id: None,
             host_row_bound: false,
             attrs: BTreeMap::new(),
         }

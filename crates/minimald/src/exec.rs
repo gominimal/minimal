@@ -243,6 +243,43 @@ pub(crate) fn task_network(
     )
 }
 
+/// Refuses a task run of a registered box whose host-side row is not its
+/// own any more (NET-138): a task attaches at one of the task addresses
+/// filed with the box's row, and those task rows stand exactly as long as
+/// the box's row, so the run asks the VM host daemon whether the row of
+/// the box's id still stands at its switch address before it attaches. A
+/// row the host handed another box at that address answers no, so the run
+/// never attaches under another box's row. A record that names no box id,
+/// and a host that cannot be asked, read as no row: fail-closed. A box the
+/// host registered nothing for (a native host, a `host_ip` or `none` box)
+/// asks nothing.
+async fn ensure_task_rows_stand(
+    record: &sessions::Record,
+    switch: &tokio::sync::Mutex<crate::net::SwitchClient>,
+) -> io::Result<()> {
+    let Some(addresses) = record.box_addresses else {
+        return Ok(());
+    };
+    let standing = match record.box_id {
+        Some(box_id) => {
+            let control = crate::session::switch_control_of(switch).await;
+            crate::net::listeners::host_row_standing(&control, addresses.switch_address, box_id)
+                .await
+                == Some(true)
+        }
+        None => false,
+    };
+    if standing {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "box {}'s row on the VM host has ended, so a task run in it would reach \
+             nothing; destroy and re-activate the session",
+            record.name.as_deref().unwrap_or("(unnamed)")
+        )))
+    }
+}
+
 /// The slice of `hakoniwa::Child` the attach-failure arm needs, so the arm can
 /// be tested without a container.
 trait Reapable {
@@ -377,9 +414,12 @@ async fn task_producer(
             task.vars
                 .insert(name.clone(), mfile::EnvVarValue::Value(value.clone()));
         }
+        let record = session.record().await?;
+        let switch = session.net_switch().await?;
+        ensure_task_rows_stand(&record, &switch).await?;
         let network = task_network(
-            &session.record().await?,
-            &session.net_switch().await?,
+            &record,
+            &switch,
             sessions::EGRESS_DEFAULT_PHASE,
             session.deny_all_opt_out().await?,
         );
@@ -2666,9 +2706,45 @@ mod tests {
             // No launch ever minted these records, so none has recorded its
             // outcome on one.
             host_ip_enforcement: None,
+            box_id: None,
             host_row_bound: false,
             attrs: Default::default(),
         }
+    }
+
+    /// NET-138: a task run of a registered box whose record names no box
+    /// id is refused before anything attaches — the host cannot be asked
+    /// for that box's row, and an address-only answer could be another
+    /// box's — while a box the host registered nothing for asks nothing.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_task_run_of_a_registered_box_with_no_box_id_is_refused() {
+        let switch = tokio::sync::Mutex::new(
+            crate::net::SwitchClient::new("/usr/bin/gvproxy", "/run/minimal/gvproxy")
+                .with_transport(crate::net::SwitchTransport::HostShuttle {
+                    cid: crate::net::VSOCK_HOST_CID,
+                    port: crate::net::VSOCK_GVPROXY_SHUTTLE_PORT,
+                }),
+        );
+        let unregistered = record_with(sessions::NetworkMode::OwnIp);
+        super::ensure_task_rows_stand(&unregistered, &switch)
+            .await
+            .expect("a box with no host registration asks nothing");
+
+        let mut registered = record_with(sessions::NetworkMode::OwnIp);
+        registered.name = Some("web".to_string());
+        registered.box_addresses = Some(sessions::BoxAddresses {
+            switch_address: std::net::Ipv4Addr::new(100, 64, 128, 1),
+            loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 2),
+        });
+        registered.task_addresses = vec![std::net::Ipv4Addr::new(100, 64, 128, 2)];
+        let refused = super::ensure_task_rows_stand(&registered, &switch)
+            .await
+            .expect_err("a registered box with no id is never answered as standing");
+        assert!(
+            refused.to_string().contains("row on the VM host has ended"),
+            "{refused}"
+        );
     }
 
     /// 017-005. A task's sandbox is planned for its session's mode; `OwnIp`
