@@ -403,6 +403,18 @@ jobs:
                     --workspace-remap "$GITHUB_WORKSPACE" --profile vm \
                     --run-ignored all --no-tests=fail \
                     -E 'binary(krun_smoke_integration)'
+            - name: Reap a cancelled run's leftovers before the VM harnesses
+              # A run cancelled mid-harness skips every later step, the reap
+              # below included, so its minvmd, `__krun-vmm` and gvproxy outlive
+              # it on this self-hosted runner. The stray gvproxy keeps the
+              # hostname proxy port 7654, and every later run's first harness
+              # boot fails with "hostname proxy port 7654 held by pid … (gvproxy)".
+              # Same reap and order as the step below.
+              run: |
+                  pkill -x minvmd 2>/dev/null || true
+                  pkill -f '__krun-vmm' 2>/dev/null || true
+                  pkill -f gvproxy 2>/dev/null || true
+                  sleep 1
             - name: VM integration harnesses (auto-discovered from the archive)
               # Run every full-boot harness the archive carries by the `_integration`
               # convention — `binary(/_integration$/)` minus the `_root_integration` harnesses
