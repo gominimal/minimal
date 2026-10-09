@@ -64,11 +64,6 @@ pub const LOG_TARGET_DEFAULT: c_int = -1;
 /// colour escape sequences.
 pub const LOG_STYLE_AUTO: u32 = 0;
 
-/// Default (empty) `options` bitmask for `krun_init_log`. Notably this leaves
-/// libkrun's own env-var overrides enabled (as opposed to
-/// `KRUN_LOG_OPTION_NO_ENV`).
-pub const LOG_OPTIONS_DEFAULT: u32 = 0;
-
 /// `KRUN_LOG_OPTION_NO_ENV`: ignore `RUST_LOG` and `RUST_LOG_STYLE`, so the
 /// level passed to `krun_init_log` is the level libkrun logs at.
 pub const LOG_OPTION_NO_ENV: u32 = 1;

@@ -392,8 +392,8 @@ fn configure_logging() -> Result<(), VmError> {
 }
 
 /// Resolve the `krun_init_log` level and options from a [`KRUN_LOG_ENV`]
-/// value: error level with libkrun's env overrides off when unset or empty,
-/// otherwise the named level with libkrun's defaults.
+/// value: error level when unset or empty, otherwise the named level, with
+/// libkrun's env overrides off either way so `RUST_LOG` cannot change it.
 fn log_settings(value: Option<&OsStr>) -> Result<(raw::LogLevel, u32), VmError> {
     let value = value.map(OsStr::to_string_lossy);
     let Some(value) = value.filter(|v| !v.trim().is_empty()) else {
@@ -402,7 +402,7 @@ fn log_settings(value: Option<&OsStr>) -> Result<(raw::LogLevel, u32), VmError> 
     let level = parse_log_level(&value).ok_or_else(|| VmError::InvalidLogLevel {
         value: value.into_owned(),
     })?;
-    Ok((level, raw::LOG_OPTIONS_DEFAULT))
+    Ok((level, raw::LOG_OPTION_NO_ENV))
 }
 
 /// Map a [`KRUN_LOG_ENV`] value to a [`raw::LogLevel`], accepting either a
@@ -516,11 +516,11 @@ mod tests {
     fn log_settings_honour_the_env_level() {
         assert_eq!(
             log_settings(Some(OsStr::new("debug"))).unwrap(),
-            (raw::LogLevel::Debug, raw::LOG_OPTIONS_DEFAULT)
+            (raw::LogLevel::Debug, raw::LOG_OPTION_NO_ENV)
         );
         assert_eq!(
             log_settings(Some(OsStr::new("off"))).unwrap(),
-            (raw::LogLevel::Off, raw::LOG_OPTIONS_DEFAULT)
+            (raw::LogLevel::Off, raw::LOG_OPTION_NO_ENV)
         );
         let err = log_settings(Some(OsStr::new("verbose"))).unwrap_err();
         assert!(matches!(err, VmError::InvalidLogLevel { .. }), "{err:?}");
