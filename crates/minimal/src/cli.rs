@@ -1039,7 +1039,7 @@ pub struct FinalizeInstallArgs {
     /// With --show, print the report as JSON (schema `min/v1/finalize-install`); exits non-zero while any part is missing
     #[arg(long, requires = "show", conflicts_with = "undo")]
     pub json: bool,
-    /// Remove everything the step installed on this host (with --show, print the removal script instead)
+    /// Remove everything the step installed on this host (with --show --script, print the removal script instead)
     #[arg(long)]
     pub undo: bool,
 }
