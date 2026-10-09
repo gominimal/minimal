@@ -212,11 +212,19 @@ included, with every refusal logged (NET-001 to NET-004).
   verify:   cargo nextest run -p minimald run_box_ends_when_its_run_ends
   <!-- S1b-2c; event-driven within the WHILE; `min task run` creates a session for the run, execs the task into it, and today destroys it from the client; the destroy moves to the daemon side of the exec's exit so a lost client strands no session; the abandoned-launch reap covers only un-finalized sessions and does not reach this case -->
 
-- **NET-141** WHEN an activation targets a host whose user-namespace verdict refuses the sandbox THE SYSTEM SHALL fail the activation before the session is created, naming the cause and `min finalize-install` as the remedy, with `--show` for the step it runs, exit non-zero, and leave no session behind.
+- **NET-141** WHEN an activation targets a host whose user-namespace verdict refuses the sandbox THE SYSTEM SHALL fail the activation before the session is created, name the cause, exit non-zero, and leave no session behind.
   tier:     T0
   verify:   cargo nextest run -p minimal activate_refuses_unconfinable_sandbox_before_session_creation
   verify:   cargo nextest run -p minimald create_reply_carries_user_namespace_verdict
-  <!-- event-driven; the verdict is the host's: an AppArmor restriction on unprivileged user namespaces, or `max_user_namespaces=0`; the daemon decides it and carries it in the create reply, so the client fails the activation on that reply and a refused create persists nothing; the remedy is NET-122's step, which installs the user-namespace profile, and never `sudo sysctl`: a sysctl typed by hand is lost at boot and leaves the install's record unchanged, so the next start advises it again -->
+  <!-- event-driven; the verdict is the host's; the daemon decides it and carries it in the create reply, so the client fails the activation on that reply and a refused create persists nothing; the remedy depends on the cause, below, because `min finalize-install`'s user-namespace item installs the AppArmor profile and nothing else -->
+  - WHERE the cause is an AppArmor restriction on unprivileged user namespaces THE SYSTEM SHALL name `min finalize-install` as the remedy, with `--show` for the step it runs.
+    tier:   T0
+    verify: cargo nextest run -p minimal activate_refusal_names_finalize_install_for_apparmor_restriction
+    <!-- optional-feature; the profile is the step's user-namespace item, so this is the one cause the step fixes -->
+  - WHERE the cause is `user.max_user_namespaces=0` or a kernel without user-namespace support THE SYSTEM SHALL name the sysctl key and the persistent change, a `sysctl.d` drop-in setting `user.max_user_namespaces` or a kernel built with `CONFIG_USER_NS`, and not name `min finalize-install`.
+    tier:   T0
+    verify: cargo nextest run -p minimal activate_refusal_names_sysctl_for_max_user_namespaces_zero
+    <!-- optional-feature; the step has no item for this cause, so pointing at it would send the operator to a run that changes nothing; a `sudo sysctl` typed by hand is lost at boot, so the refusal names the change that survives one -->
 
 - **NET-016** WHILE a box is running, WHEN a process in it starts listening on a port its ingress rules permit and no declaration names THE SYSTEM SHALL publish that port on the box's address.
   tier:     T0
@@ -237,12 +245,21 @@ included, with every refusal logged (NET-001 to NET-004).
 - **NET-018** WHERE host-OS resolution and published addresses are both deployed on the host THE SYSTEM SHALL report native DNS as the live name surface in `min session activate` and `min ls`.
   tier:     T0
   verify:   cargo nextest run -p minimal activate_and_ls_report_native_surface
-  <!-- S1b-3; prose 12; optional-feature; WHERE per design §7.1 v0.5 supersession condition -->
-  - WHEN a box is activated THE SYSTEM SHALL print one host line naming the box: ``names: <box>.min.internal via 127.0.0.1:<port> · install not finished (<missing items>) — run `min finalize-install` `` while this host's install is unfinished, and `names: <box>.min.internal resolves in any browser on this machine` once it is finished.
+  <!-- S1b-3; prose 12; optional-feature; WHERE per design §7.1 v0.5 supersession condition; the line and row that report it are NET-142's -->
+
+- **NET-142** WHEN a box is activated THE SYSTEM SHALL print one host line naming the box, whose resolution clause is `names: <box>.min.internal via 127.0.0.1:<port>`, where `<port>` is the hostname-proxy port.
+  tier:     T0
+  verify:   cargo nextest run -p minimal activate_prints_one_host_line_per_install_state
+  <!-- event-driven; one line, never a block, so the activation's own output stays what the operator reads; the resolution clause is keyed on the host-DNS state (below) and the install clause on the rest of the install, independently, since a host can have native DNS and still lack the classifier, or the reverse; `<port>` is the port NET-026 discovers -->
+  - WHERE host-OS resolution and published addresses are both deployed on the host THE SYSTEM SHALL print the resolution clause as `names: <box>.min.internal resolves in any browser on this machine`, with no port.
     tier:   T0
-    verify: cargo nextest run -p minimal activate_prints_one_host_line_per_install_state
-    <!-- event-driven; one line, never a block, so the activation's own output stays what the operator reads; the pointer NET-122 owes an unfinished host is the line's tail, so the two verbs print the same words; `<port>` is the hostname-proxy port NET-026 discovers; the missing items are the ones `min finalize-install --show` lists -->
-  - WHEN `min ls` runs THE SYSTEM SHALL keep its `HOSTNAME PROXY:` and `ZONE ANSWERER:` detail rows and repeat the activate host line's install clause on its `NAME SURFACE:` row.
+    verify: cargo nextest run -p minimal activate_host_line_names_native_dns_when_deployed
+    <!-- optional-feature; the WHERE is NET-018's; the port is `min ls`'s to print on that host -->
+  - WHILE any `min finalize-install` item is missing THE SYSTEM SHALL end the host line with the install clause `; finish setup: min finalize-install`, whatever its resolution clause.
+    tier:   T0
+    verify: cargo nextest run -p minimal activate_host_line_carries_finish_setup_clause_while_items_missing
+    <!-- state-driven; the clause is the pointer NET-122 owes an unfinished host, so a session start and `min finalize-install --show` agree on whether anything is left; a finished host has no clause -->
+  - WHEN `min ls` runs THE SYSTEM SHALL keep its `HOSTNAME PROXY:` and `ZONE ANSWERER:` detail rows and print the same resolution clause and install clause as the activate host line on its `NAME SURFACE:` row.
     tier:   T0
     verify: cargo nextest run -p minimal ls_keeps_detail_rows_and_name_surface_clause
     <!-- event-driven; the listing is where the detail belongs: the port, the answerer and the surface each get a row there, while an activation gets one line -->
@@ -252,10 +269,10 @@ included, with every refusal logged (NET-001 to NET-004).
   verify:   cargo nextest run -p minimald proxy_keeps_serving_after_supersession
   <!-- S1b-3; prose 12; optional-feature; interview decision; WHERE per design §7.1 v0.5 -->
 
-- **NET-020** IF the host-side hostname listener cannot bind or publish THEN THE SYSTEM SHALL print the reason and the remedy in `min session activate` and `min ls`, in place of the name half of the activate host line and with the rest of that line unchanged.
+- **NET-020** IF the host-side hostname listener cannot bind or publish THEN THE SYSTEM SHALL print the reason and the remedy in `min session activate` and `min ls`, as `names: <cause>` in place of the host line's resolution clause, in both its forms, with the install clause after it when one applies.
   tier:     T0
   verify:   cargo nextest run -p minimal listener_failure_reported_with_remedy
-  <!-- S2a/AC1; prose 13; unwanted; the activate surface stays one line (NET-018): a proxy-down cause replaces `<box>.min.internal via 127.0.0.1:<port>` and the install clause after it stays as it was; `min ls` carries the cause on its `HOSTNAME PROXY:` row -->
+  <!-- S2a/AC1; prose 13; unwanted; the activate surface stays one line (NET-142): the cause stands in for the resolution clause whether that clause named the proxy or native DNS, since native DNS answers through the same listener, and the install clause is decided on its own; `min ls` carries the cause on its `HOSTNAME PROXY:` row -->
 
 - **NET-021** IF the host-side hostname listener cannot bind or publish THEN THE SYSTEM SHALL retry with backoff until it succeeds.
   tier:     T0
@@ -285,7 +302,7 @@ included, with every refusal logged (NET-001 to NET-004).
 - **NET-026** WHEN `min` connects to a daemon THE SYSTEM SHALL discover the hostname-proxy port in use and print it.
   tier:     T0
   verify:   cargo nextest run -p minimal min_prints_discovered_proxy_port
-  <!-- S2b/AC1; prose 16; event-driven; on activation the port is the `via 127.0.0.1:<port>` of NET-018's one host line, and `min ls` prints it on its `HOSTNAME PROXY:` row -->
+  <!-- S2b/AC1; prose 16; event-driven; `min ls` prints the port on its `HOSTNAME PROXY:` row on every host, and that row is where the test reads it; the activate host line (NET-142) carries it only in its proxy form, since on a host with native DNS deployed the line names no port -->
 
 - **NET-027** WHILE two daemons run on one machine THE SYSTEM SHALL route both daemons' box hostnames at the same time.
   tier:     T0
@@ -821,14 +838,18 @@ included, with every refusal logged (NET-001 to NET-004).
   tier:     T0
   verify:   cargo nextest run -p minimal finalize_install_names_missing_items_and_runs_the_script
   <!-- S1b-1; design §7.1 (host-OS resolution per OS) and §7.4 (the classifier's privileged step); state+event; `min finalize-install`; the script holds only what this host is missing from: the AppArmor user-namespace profile, names (the resolver link and the box-zone answerer, plus the reserved range on macOS), the classifier tree, and membership of the KVM group only where the configured provider is the Linux VM provider; host DNS is opt-in: the proxy is the name surface until the operator takes the step; `/etc/resolver/min.internal` with its `port` directive on macOS, the systemd-resolved routing-domain link on Linux; NET-009's WHERE presupposes it and the Box Egress Proxy document's default `dns` steering needs it -->
-  - WHILE the host is not configured for host DNS and the daemon reports an answerer port, WHEN a session starts THE SYSTEM SHALL point at `min finalize-install` on the name-surface line without printing the privileged script or prompting for privilege.
+  - WHILE any item is missing, WHEN a session starts THE SYSTEM SHALL point at `min finalize-install` by the host line's install clause (NET-142) without printing the privileged script or prompting for privilege.
     tier:   T0
     verify: cargo nextest run -p minimal session_start_points_at_finalize_install_without_the_advisory
-    <!-- state+event; the CLI test `activate_and_ls_report_native_surface` checks both verbs' output; the pointer is the tail of NET-018's one host line, so `min session activate` and `min ls` print the same words; a finished host has no pointer; a scripted or agent start that repeats on every activation carries one clause, never a script block that buries the session's own errors -->
-  - WHEN the operator runs `min finalize-install` THE SYSTEM SHALL write the script for this host's current state to a file with mode `0600` that only the operator can read, run it as root with one privilege elevation, remove the file, exit with the script's status, and end a completed run with the line `Running boxes pick this up on their next start.`.
+    <!-- state+event; the CLI test `activate_and_ls_report_native_surface` checks both verbs' output; the clause is `; finish setup: min finalize-install`, the tail of NET-142's one host line, so `min session activate` and `min ls` print the same words; a finished host has no clause; a scripted or agent start that repeats on every activation carries one clause, never a script block that buries the session's own errors -->
+  - WHEN the operator runs `min finalize-install` THE SYSTEM SHALL write the script for this host's current state to a file with mode `0600` that only the operator can read, run it as root with one privilege elevation, remove the file, exit with the script's status, and end a completed run that installed any item other than the KVM group with the line `Running boxes pick this up on their next start.`.
     tier:   T0
     verify: cargo nextest run -p minimal finalize_install_runs_the_script_with_one_elevation
     <!-- event-driven; `min finalize-install` runs `sudo sh <file>`; the operator's request is the consent, so that `sudo` is the only prompt; the summary of what is missing goes to stderr; the closing line tells the operator that no running box changes under them, since each picks the step up when it next starts -->
+  - WHEN a completed run added the operator to the KVM group THE SYSTEM SHALL end with the line `KVM group membership starts at your next login: log out and back in, or restart the daemon from a new login.`.
+    tier:   T0
+    verify: cargo nextest run -p minimal finalize_install_kvm_group_closing_line_names_a_new_login
+    <!-- event-driven; group membership reaches only the processes of a new login, so a daemon started from the current one keeps its old groups and no box start picks the change up; the other items' closing line is not true for this one -->
   - WHILE every part of the install is finished on this host, WHEN the operator runs `min finalize-install` THE SYSTEM SHALL print `Every part of the install is finished on this machine; there is nothing to run.`, run nothing, and exit zero.
     tier:   T0
     verify: cargo nextest run -p minimal finalize_install_finished_host_runs_nothing_and_exits_zero
@@ -836,20 +857,28 @@ included, with every refusal logged (NET-001 to NET-004).
   - IF a host fact that no script can change blocks an item THEN THE SYSTEM SHALL list that item with its cause under `can't do on this machine:` and run the remaining items.
     tier:   T0
     verify: cargo nextest run -p minimal finalize_install_lists_unfixable_facts_and_runs_the_rest
-    <!-- unwanted; cgroup2 mounted without delegation-boundary namespaces is one such fact (NET-079); an item no script can fix is no reason to withhold the ones a script can, so the run is never refused whole on it -->
-  - WHILE no TTY is attached, WHEN the operator runs `min finalize-install` THE SYSTEM SHALL run the script through `sudo -n`, and IF `sudo -n` cannot run it without a prompt THEN print the summary and the pointer `min finalize-install --show --script > f && sudo sh f`, run nothing, and exit 1.
+    <!-- unwanted; cgroup2 mounted without delegation-boundary namespaces is one such fact (NET-079); an item no script can fix is no reason to withhold the ones a script can, so the run is never refused on it while another item can run -->
+  - WHILE a host fact that no script can change blocks every missing item, WHEN the operator runs `min finalize-install` THE SYSTEM SHALL list them under `can't do on this machine:`, run nothing, and exit non-zero.
+    tier:   T0
+    verify: cargo nextest run -p minimal finalize_install_all_blocked_runs_nothing_and_exits_non_zero
+    <!-- state+event; that host is not finished, so it is not the zero-exit finished case, and nothing can be run on it, so it is not a run either; the non-zero exit is what a script reads -->
+  - WHILE no daemon is reachable, WHEN the operator runs `min finalize-install` THE SYSTEM SHALL list the names item as `waiting on a daemon` under the summary and run the remaining items.
+    tier:   T0
+    verify: cargo nextest run -p minimal finalize_install_without_daemon_runs_the_items_that_need_none
+    <!-- state+event; the names item points the resolver at the port the daemon's answerer binds, so it waits on one; the user-namespace profile, the classifier tree and the KVM group need no daemon and are not held back by one; the names item is retried on the next run, or by an activation, and the host line carries the install clause until then; the command starts no daemon -->
+  - WHILE no TTY is attached, WHEN the operator runs `min finalize-install` THE SYSTEM SHALL run the script through `sudo -n`, and IF `sudo -n` cannot run it without a prompt THEN print the summary and the pointer `f=$(mktemp) && min finalize-install --show --script > "$f" && sudo sh "$f"`, run nothing, and exit 1.
     tier:   T0
     verify: cargo nextest run -p minimal finalize_install_without_tty_exits_one_with_script_pointer
     <!-- state+event; a prompt with no terminal to answer it hangs the caller, so an agent or a script gets the file route instead; a cached `sudo` credential still runs the step -->
-  - WHEN the operator runs `min finalize-install --show` THE SYSTEM SHALL print the summary of what this host is missing, without running anything and with no privilege prompt.
+  - WHEN the operator runs `min finalize-install --show` THE SYSTEM SHALL print the summary of what this host is missing, without running anything and with no privilege prompt, and exit zero whatever the items' states.
     tier:   T0
     verify: cargo nextest run -p minimal finalize_install_show_names_missing_items_without_prompt
-    <!-- event-driven; the summary is the one a run prints before it elevates, so what `--show` names is what a run installs -->
-  - WHEN the operator runs `min finalize-install --show --script` THE SYSTEM SHALL print, without running it and with no privilege prompt, the same script that a run executes on stdout, with the summary on stderr. The script is POSIX shell that stops at its first failed statement. Its header says what it configures and that it runs as root, and a comment introduces each step.
+    <!-- event-driven; the summary is the one a run prints before it elevates, so what `--show` names is what a run installs; the exit status says only that the summary printed, since `--show --json` is the form that answers whether anything is left -->
+  - WHEN the operator runs `min finalize-install --show --script` THE SYSTEM SHALL print, without running it and with no privilege prompt, the same script that a run executes on stdout, with the summary on stderr, and exit zero whatever the items' states. The script is POSIX shell that stops at its first failed statement. Its header says what it configures and that it runs as root, and a comment introduces each step.
     tier:   T0
     verify: cargo nextest run -p minimal finalize_install_show_script_is_an_annotated_posix_script
-    <!-- event-driven; one renderer is the script's only source, so the shown script and the run script never disagree; the script on stdout and the summary on stderr, for an operator who reviews or adapts it and for the session e2e, which runs the shown file; no statement elevates on its own and no outer quoting layer wraps it -->
-  - WHEN the operator runs `min finalize-install --show --json` THE SYSTEM SHALL print one JSON document under the schema `min/v1/finalize-install` whose items carry stable ids and each item's state, and exit non-zero while any item is missing.
+    <!-- event-driven; one renderer is the script's only source, so the shown script and the run script never disagree; the script on stdout and the summary on stderr, for an operator who reviews or adapts it and for the session e2e, which runs the shown file; no statement elevates on its own and no outer quoting layer wraps it; the zero exit is what lets the no-TTY pointer chain `&& sudo sh` after it -->
+  - WHEN the operator runs `min finalize-install --show --json` THE SYSTEM SHALL print one JSON document under the schema `min/v1/finalize-install` whose items carry stable ids and each item's state, and exit non-zero while any item is missing, in whichever state: ready to install, waiting on a daemon, or blocked by a host fact.
     tier:   T0
     verify: cargo nextest run -p minimal finalize_install_show_json_carries_stable_item_ids_and_exit_status
     <!-- event-driven; the ids are the contract a caller matches on, never the summary's words; the exit status is the one-bit answer for a script that only needs to know whether anything is left -->
@@ -880,7 +909,7 @@ included, with every refusal logged (NET-001 to NET-004).
   tier:     T0
   verify:   cargo nextest run -p minimald session_start_probes_reserved_range
   <!-- S1b-2a; design §7.1 (macOS per-box addresses, the privileged step); event-driven; on Linux the range is always present on `lo` and the probe is a macOS concern; the routing-domain link carries the §4.2 hook carve-out address, not the range -->
-  - IF the reserved range is absent THEN THE SYSTEM SHALL publish the box at `127.0.0.1`, point at `min finalize-install` (NET-122) on the name-surface line, and neither prompt nor hang.
+  - IF the reserved range is absent THEN THE SYSTEM SHALL publish the box at `127.0.0.1`, point at `min finalize-install` by the host line's install clause (NET-142), and neither prompt nor hang.
     tier:   T0
     verify: cargo nextest run -p minimald absent_range_publishes_interim_and_readvises
     <!-- design §7.1; unwanted; the interim is a per-host state that the privileged step supersedes -->
