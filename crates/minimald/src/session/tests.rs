@@ -7883,7 +7883,12 @@ async fn expose_host_address_answers_before_the_stance() {
 
     match handle.expose_dynamic(3001).await {
         Err(crate::net::policy::ExposeFailure::Refused(
-            crate::net::policy::ExposeRefusal::NeedsNoExposing { port: 3001 },
+            crate::net::policy::ExposeRefusal::NeedsNoExposing {
+                port: 3001,
+                // The harness daemon is native, so the host's loopback
+                // answers too.
+                host_loopback: true,
+            },
         )) => {}
         other => panic!("a host-address box's port needs no exposing: {other:?}"),
     }

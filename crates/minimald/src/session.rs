@@ -2768,7 +2768,15 @@ impl Session {
         // nothing is audited (NET-046); the request's one info line says
         // what became of it.
         if record.network == sessions::NetworkMode::HostNet {
-            let refusal = crate::net::policy::ExposeRefusal::NeedsNoExposing { port };
+            // Where the port answers: the name always; the host's loopback
+            // only natively, since on a VM-backed host the loopback the box
+            // shares is the guest's (NET-129).
+            let host_loopback =
+                !crate::net::listeners::reports_to_vm_host(&self.switch_control().await);
+            let refusal = crate::net::policy::ExposeRefusal::NeedsNoExposing {
+                port,
+                host_loopback,
+            };
             tracing::info!(
                 name = %box_name,
                 port,

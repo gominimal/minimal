@@ -581,8 +581,11 @@ pub enum ExposeRefusal {
     /// The box shares the host's network (`host_ip`), so the port already
     /// answers on the host and there is nothing to publish. The request's
     /// goal is met, not refused, so the in-box caller hears this as a plain
-    /// message and exits 0.
-    NeedsNoExposing { port: u16 },
+    /// message and exits 0. `host_loopback` says whether the host's own
+    /// loopback is one of the places it answers: true on a native host, and
+    /// false on a VM-backed one, where the loopback the box shares is the
+    /// guest's and the name is the only host-reachable answer (NET-129).
+    NeedsNoExposing { port: u16, host_loopback: bool },
 }
 
 impl ExposeRefusal {
@@ -604,10 +607,17 @@ impl ExposeRefusal {
                  retry, or have the host forward it (min net forward {box_name} \
                  <local>:{port})"
             ),
-            Self::NeedsNoExposing { port } => format!(
+            Self::NeedsNoExposing {
+                port,
+                host_loopback: true,
+            } => format!(
                 "{self}, so it already answers at {box_name}.min.internal:{port} \
                  (and localhost:{port})"
             ),
+            Self::NeedsNoExposing {
+                port,
+                host_loopback: false,
+            } => format!("{self}, so it already answers at {box_name}.min.internal:{port}"),
             _ => self.to_string(),
         }
     }
@@ -648,7 +658,7 @@ impl fmt::Display for ExposeRefusal {
                 "port {port} is published already by this box ({})",
                 owner.as_str()
             ),
-            Self::NeedsNoExposing { port } => write!(
+            Self::NeedsNoExposing { port, .. } => write!(
                 f,
                 "port {port} needs no exposing: this box shares the host's network"
             ),
@@ -1473,10 +1483,25 @@ mod tests {
              terminal (min session attach web) and retry, or have the host forward it \
              (min net forward web <local>:3001)"
         );
+        // Natively the host's loopback answers too; on a VM-backed host the
+        // loopback the box shares is the guest's, so only the name is named.
         assert_eq!(
-            ExposeRefusal::NeedsNoExposing { port: 3001 }.for_caller("web", 3001),
+            ExposeRefusal::NeedsNoExposing {
+                port: 3001,
+                host_loopback: true
+            }
+            .for_caller("web", 3001),
             "port 3001 needs no exposing: this box shares the host's network, so it \
              already answers at web.min.internal:3001 (and localhost:3001)"
+        );
+        assert_eq!(
+            ExposeRefusal::NeedsNoExposing {
+                port: 3001,
+                host_loopback: false
+            }
+            .for_caller("web", 3001),
+            "port 3001 needs no exposing: this box shares the host's network, so it \
+             already answers at web.min.internal:3001"
         );
         // A refusal with no way forward beyond its own words is its verdict.
         assert_eq!(

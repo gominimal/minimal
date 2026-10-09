@@ -2925,7 +2925,9 @@ exit $rc
 
     /// A host-address box's port needs no exposing: the reply says where it
     /// already answers, as a plain `msg:` line, so the helper exits 0 — the
-    /// goal is met, and an error would read as a failure.
+    /// goal is met, and an error would read as a failure. The harness daemon
+    /// is native, so the host's loopback is named beside the name; the
+    /// VM-backed rendering, without it, is pinned in `net::policy`'s tests.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn expose_host_address_reply_is_a_plain_message() {
         let server = crate::test_harness::TestServer::new().await;
