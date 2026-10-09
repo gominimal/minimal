@@ -890,6 +890,12 @@ included, with every refusal logged (NET-001 to NET-004).
     tier:   T0
     verify: cargo nextest run -p minimal advisory_installs_manager_held_answerer
     <!-- design §7.1 (one always-on answerer per host, its sockets held by the service manager, the answerer running as the operator and never root); state-driven; a launchd plist with socket activation on macOS, a systemd system socket and service pair on Linux, never a user-session unit; the step copies the answerer program to a root-owned path and the unit names that copy, never a user-writable binary; the copy carries the channel protocol version, and `min finalize-install` reinstalls it when it differs from the daemon's, so an upgrade re-runs the step -->
+  - WHERE the host is not VM-backed, WHEN the classifier step runs THE SYSTEM SHALL install, beside the classifier tree, a root-owned placement unit that watches the daemon's listening socket path and places the socket's holder into the daemon leaf on every daemon start, moving no process that already stands inside the classifier tree, and record a launch made before placement as not decidable per box.
+    tier:   T0
+    verify: cargo nextest run -p minimal classifier_step_places_the_daemon_on_every_start
+    verify: cargo nextest run -p minimald launch_before_placement_reads_not_per_box
+    verify: just test-installer host_classifier_tree_installed
+    <!-- design §7.4 and §4.1; event-driven within the WHERE; the placement unit is an artefact of the one-time privileged install, so a daemon restart needs no root step to land in its leaf again, while box placement stays with the daemon; a process already inside the tree is a box or the daemon's own leaf and is never moved; a launch that outruns placement reads as not decidable per box (NET-079) rather than as enforced; one unit per host today, and a unit per account and socket is a later step -->
   - WHEN the operator runs `min finalize-install --undo` THE SYSTEM SHALL remove everything the step installed on this host, without a daemon, and exit zero on a host that holds none of it.
     tier:   T0
     verify: cargo nextest run -p minimal finalize_install_undo_removes_what_the_step_installs
