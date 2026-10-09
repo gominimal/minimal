@@ -192,6 +192,20 @@ fn spawn_failed_error_with_a_hint_names_the_restriction_and_fix() {
     assert!(msg.contains(hint), "the diagnosis must travel whole: {msg}");
 }
 
+/// A launch failure keeps its own message and kind, and gains the
+/// diagnosis only when the probe found one.
+#[test]
+fn with_userns_hint_appends_the_diagnosis_and_keeps_the_kind() {
+    let base = || std::io::Error::new(std::io::ErrorKind::PermissionDenied, "uid_map write");
+    let bare = super::with_userns_hint(base(), None);
+    assert_eq!(bare.kind(), std::io::ErrorKind::PermissionDenied);
+    assert_eq!(bare.to_string(), "uid_map write");
+
+    let hinted = super::with_userns_hint(base(), Some("restricted — fix: x"));
+    assert_eq!(hinted.kind(), std::io::ErrorKind::PermissionDenied);
+    assert_eq!(hinted.to_string(), "uid_map write — restricted — fix: x");
+}
+
 /// Reads the session record for `id`, or `None` once it has been deleted.
 async fn record_exists(client: &mut TestClient, id: SessionId) -> bool {
     client

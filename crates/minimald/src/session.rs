@@ -64,11 +64,21 @@ fn userns_spawn_hint() -> Option<String> {
 /// host (stock Ubuntu 24.04+) otherwise leaves the client with a symptom
 /// that names neither the restriction nor the fix.
 fn spawn_failed_error(userns_spawn_hint: Option<&str>) -> std::io::Error {
+    with_userns_hint(
+        std::io::Error::other("session host exited before its channel could attach"),
+        userns_spawn_hint,
+    )
+}
+
+/// `err` with the userns diagnosis and fix appended when there is one,
+/// keeping its kind. A launch that fails outright on a userns-restricted
+/// host (an own-ip session wiring the netns of a child that already died on
+/// its `uid_map` write) otherwise reaches the client with the same
+/// cause-less symptom as a host that dies before its attach.
+fn with_userns_hint(err: std::io::Error, userns_spawn_hint: Option<&str>) -> std::io::Error {
     match userns_spawn_hint {
-        Some(hint) => std::io::Error::other(format!(
-            "session host exited before its channel could attach — {hint}"
-        )),
-        None => std::io::Error::other("session host exited before its channel could attach"),
+        Some(hint) => std::io::Error::new(err.kind(), format!("{err} — {hint}")),
+        None => err,
     }
 }
 
@@ -4360,7 +4370,9 @@ impl Session {
             }
             None => (None, spawn.await),
         };
-        let (host, task, host_ip_enforcement) = spawned.map_err(AttachError::SpawnFailed)?;
+        let (host, task, host_ip_enforcement) = spawned.map_err(|e| {
+            AttachError::SpawnFailed(with_userns_hint(e, userns_spawn_hint().as_deref()))
+        })?;
         // The confirmation was a read, not a reservation: the VM host daemon
         // may have withdrawn the row at its grace's end between that read
         // and this launch (NET-138). Read it again now the new host is up,
@@ -4690,8 +4702,15 @@ impl Session {
                 session_keys,
             )
             .await
-            .map_err(|_| {
-                AttachError::SpawnFailed(spawn_failed_error(userns_spawn_hint().as_deref()))
+            .map_err(|e| {
+                // Only a host whose loop ended can be one that died on its
+                // namespace setup; a timed-out one is alive, so the userns
+                // hint would misattribute it.
+                let hint = match e {
+                    session_host::HostAttachError::Closed(..) => userns_spawn_hint(),
+                    session_host::HostAttachError::Timeout => None,
+                };
+                AttachError::SpawnFailed(spawn_failed_error(hint.as_deref()))
             })?;
         let SessionInner::Active { host, .. } = &mut self.inner else {
             unreachable!("mint_session_host is only reachable from the Active state");
