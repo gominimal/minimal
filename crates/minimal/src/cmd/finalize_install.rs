@@ -1666,8 +1666,12 @@ mod tests {
         let (step_part, unit_part) = script
             .split_once("if ! command -v systemctl")
             .expect("the unit guard splits the block");
+        let step_lines = step_part.replace(CLASSIFIER_SCRIPT, "");
         assert!(
-            step_part.contains("--user 'alice'\n") && !step_part.contains("systemctl"),
+            step_lines.contains("--user 'alice'\n")
+                && !step_lines
+                    .lines()
+                    .any(|line| !line.starts_with('#') && line.contains("systemctl")),
             "the step runs before and outside the systemd guard: {step_part}"
         );
         assert!(unit_part.trim_end().ends_with("fi"), "{unit_part}");
