@@ -62,12 +62,12 @@ pub(crate) const SHELL_EXIT_NO_CHANGES: &str = "No files changed since activatio
 pub(crate) const SHELL_EXIT_KEEP: &str =
     "Exit, leaving the session filesystem in place and recoverable";
 
-/// The Keep item for a registered box, whose host-side row ended with its
-/// shell (NET-138): the session keeps its files but can only be destroyed.
-/// Removed when the host-side re-registration lands (inbox#1020).
+/// The Keep item for a registered box, whose host-side row ends with its
+/// shell (NET-138): the client resumes the row before its next attach or
+/// exec, so the kept session comes back under the same addresses.
 pub(crate) const SHELL_EXIT_KEEP_REGISTERED: &str = "Exit, keeping the session's files. Its \
-     network registration ended with the shell, so you can only destroy this session, not \
-     attach to it or run commands in it.";
+     network registration ends with the shell and is restored when you attach or exec into \
+     the session again.";
 
 /// Header of the dialog a runtime port-publish request decided `ask` renders
 /// over the channel (NET-045), asking the attached human whether the box may
@@ -1269,10 +1269,9 @@ impl Binding {
             Delete,
         }
 
-        // A registered box's host-side row ended with its shell (NET-138), and
-        // the daemon refuses to hand it a rowless host, so keeping it keeps its
-        // files and nothing else. This wording is removed when the host-side
-        // re-registration lands (inbox#1020).
+        // A registered box's host-side row ends with its shell (NET-138); the
+        // client resumes it before the next attach or exec, so the Keep item
+        // says the registration comes back rather than that nothing does.
         let keep_item = if holds_host_row {
             SHELL_EXIT_KEEP_REGISTERED
         } else {

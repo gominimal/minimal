@@ -3449,13 +3449,16 @@ async fn an_activate_hook_launch_finds_the_box_s_address_already_published() {
 
 /// A box whose record carries host-handed addresses (T66) has a host-side
 /// row keyed on that address. When its host loop ends — the shell exited —
-/// the ended loop already withdrew the row (NET-138), so re-minting a fresh
-/// host here would re-attach "rowless": the host gate silently drops the
-/// box's frames from an unregistered source. The attach must refuse with the
-/// typed `BoxHostRowEnded` refusal (surfaced to the client on the channel)
-/// instead of re-minting, and no second host may launch — the hands are the
+/// the row ends with it (NET-138), and only the box's creator resumes it. No
+/// VM host daemon answers here that the row stands — as for a client that
+/// does not resume, or a resume that failed — so re-minting a fresh host
+/// would re-attach "rowless": the host gate silently drops the box's frames
+/// from an unregistered source. The attach must refuse with the typed
+/// `BoxHostRowEnded` refusal (surfaced to the client on the channel) instead
+/// of re-minting, and no second host may launch — the hands are the
 /// host-side creator's, and re-registering a row is exactly what a daemon
-/// must never do.
+/// must never do. The standing-row relaunch is
+/// `ensure_host_relaunches_a_registered_box_while_its_host_row_stands`.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_box_holding_a_host_row_refuses_remint_after_its_host_loop_ends() {

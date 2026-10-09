@@ -6904,16 +6904,15 @@ async fn rendered_shell_exit_prompt(holds_host_row: bool) -> String {
 }
 
 /// A registered box's Keep item says what keeping it leaves (NET-138): the
-/// files, and only a destroy, because its network registration ended with
-/// the shell. An unregistered box's prompt is unchanged.
+/// files, with the network registration that ends with the shell restored on
+/// the next attach or exec. An unregistered box's prompt is unchanged.
 #[tokio::test]
-async fn shell_exit_keep_item_names_the_ended_registration_for_a_registered_box() {
+async fn shell_exit_keep_item_names_the_restored_registration_for_a_registered_box() {
     let registered = rendered_shell_exit_prompt(true).await;
     assert!(
         registered.contains(
-            "Exit, keeping the session's files. Its network registration ended with the \
-             shell, so you can only destroy this session, not attach to it or run commands \
-             in it."
+            "Exit, keeping the session's files. Its network registration ends with the \
+             shell and is restored when you attach or exec into the session again."
         ),
         "the registered box's Keep item; got: {registered:?}"
     );
@@ -6928,7 +6927,7 @@ async fn shell_exit_keep_item_names_the_ended_registration_for_a_registered_box(
         "an unregistered box keeps its Keep item; got: {unregistered:?}"
     );
     assert!(
-        !unregistered.contains("network registration ended"),
+        !unregistered.contains("network registration ends"),
         "an unregistered box's prompt is unchanged; got: {unregistered:?}"
     );
     let delete = "Delete, all in-session files permanently deleted";
