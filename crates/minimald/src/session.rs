@@ -4639,12 +4639,13 @@ impl Session {
         // one of two things: the host died in the window between launch and
         // attach, or it is alive but wedged and its mailbox stayed full past
         // the attach deadline. The first is surfaced as a spawn failure rather
-        // than leaving a dead, channel-less host — which is why the host is
-        // stored only once it is bound. The second must not read as death: it
-        // is the same wedged case the re-attach path refuses with `SessionBusy`,
-        // and the host is stored before refusing, so a retry reaches it through
-        // that path instead of minting a second host over it, and teardown
-        // stops it instead of a dropped `JoinHandle` detaching a live loop.
+        // than leaving a dead, channel-less host — which is why a host whose
+        // loop already ended is never stored. The second must not read as
+        // death: it is the same wedged case the re-attach path refuses with
+        // `SessionBusy`, and the host is stored before refusing, so a retry
+        // reaches it through that path instead of minting a second host over
+        // it, and teardown stops it instead of a dropped `JoinHandle`
+        // detaching a live loop.
         //
         // The launch already folded this attach's connection facts into the
         // shell's environment, so nothing new is passed here: the host holds
@@ -6157,11 +6158,17 @@ pub(crate) mod mint_attach_seam {
                 let _ = (&mut launched.1).await;
             }
             Some(Failure::HostWedged) => {
-                // Swap in a wedged stand-in and fill its mailbox to capacity
-                // through the production sender, so the mint's own attach
-                // send cannot queue and runs out its deadline.
+                // End the real host's loop, as above, so nothing of it
+                // outlives the swap. Then swap in a wedged stand-in, paired
+                // with a task that stays pending like a live wedged loop, so
+                // the stored (handle, task) pair describes one host. Fill the
+                // stand-in's mailbox to capacity through the production
+                // sender, so the mint's own attach send cannot queue and runs
+                // out its deadline.
+                launched.1.abort();
+                let _ = (&mut launched.1).await;
                 let (wedged, mailbox) = HostHandle::wedged();
-                launched.0 = wedged;
+                launched = (wedged, tokio::spawn(std::future::pending()));
                 WEDGED_MAILBOXES
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
