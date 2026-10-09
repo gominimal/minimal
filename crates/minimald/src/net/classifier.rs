@@ -2264,8 +2264,10 @@ pub(crate) fn live_answerer() -> Option<SocketAddr> {
 /// be refused because the table's carve-out is stale, and the words that say
 /// so: the recorded target is not the live answerer bind, no answerer is
 /// bound, or the table recorded no carve-out at all. The words name the
-/// cause, both values, and the install that re-renders the carve-out onto
-/// the live bind. `None` when the carve-out names the live answerer.
+/// cause, both values, and the one verb that re-renders the carve-out onto
+/// the live bind — `min finalize-install`, bare: the CLI reads the bind
+/// itself, so the remedy carries no flags a person would have to fill.
+/// `None` when the carve-out names the live answerer.
 pub(crate) fn stale_carve_out_refusal(
     recorded: Option<SocketAddrV4>,
     live: Option<SocketAddr>,
@@ -2284,15 +2286,16 @@ pub(crate) fn stale_carve_out_refusal(
     let live_words = live.map_or_else(|| "no live answerer".to_string(), |bound| bound.to_string());
     let remedy = match live_v4 {
         Some(bound) => format!(
-            "{} --answerer-address {} --answerer-port {}",
-            sandbox2::classifier::install_hint(),
-            bound.ip(),
-            bound.port()
+            "re-render the carve-out onto the live bind {bound}: {}, which reads the \
+             answerer's address and port itself",
+            sandbox2::classifier::install_hint()
         ),
-        None => "start the daemon's zone answerer on an IPv4 loopback address, then re-run \
-                 the classifier install with --answerer-address and --answerer-port set to \
-                 its bind"
-            .to_string(),
+        None => format!(
+            "start the daemon's zone answerer on an IPv4 loopback address, then re-render \
+             the carve-out onto its bind: {}, which reads the answerer's address and port \
+             itself",
+            sandbox2::classifier::install_hint()
+        ),
     };
     Some(format!(
         "{}: stale carve-out: the table admits {recorded_words} and the zone answerer is \
@@ -5458,8 +5461,9 @@ mod tests {
 
     /// A native deny-all launch is refused when the table's carve-out is not
     /// the live answerer bind, or when the table recorded none: the words are
-    /// the table-not-effective cause, both values, and the install that
-    /// re-renders onto the live bind.
+    /// the table-not-effective cause, both values, and the bare verb that
+    /// re-renders onto the live bind — never the verb with flags it does not
+    /// take.
     #[test]
     fn native_deny_all_refused_when_carve_out_target_is_stale() {
         let recorded = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 7656);
@@ -5471,7 +5475,7 @@ mod tests {
             "stale carve-out",
             "127.0.0.1:7656",
             "127.0.0.1:7700",
-            "--answerer-address 127.0.0.1 --answerer-port 7700",
+            "re-render the carve-out onto the live bind 127.0.0.1:7700: min finalize-install",
         ] {
             assert!(
                 refusal.contains(needle),
@@ -5484,6 +5488,52 @@ mod tests {
             unrecorded.contains("no recorded carve-out") && unrecorded.contains("127.0.0.1:7700"),
             "the refusal names the missing record and the live bind: {unrecorded}"
         );
+    }
+
+    /// Every remedy the daemon renders for a person names a command that
+    /// exists: `min finalize-install` bare — the CLI reads the answerer bind
+    /// and the source identities itself — never with flags of the installer
+    /// script appended, and never the script or a fetch of it. Over every
+    /// cause and verdict the advisory takes, both arms of the stale
+    /// carve-out refusal, and the cause's own command.
+    #[test]
+    fn rendered_remedies_never_append_flags_to_the_install_verb() {
+        let live = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7700);
+        let recorded = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 7656);
+        let mut rendered = vec![
+            stale_carve_out_refusal(Some(recorded), Some(live)).expect("stale"),
+            stale_carve_out_refusal(Some(recorded), None).expect("no live answerer"),
+            stale_carve_out_refusal(None, Some(live)).expect("no record"),
+        ];
+        for cause in [
+            Cause::StepNotInstalled,
+            Cause::CannotConfine,
+            Cause::GuestTableNotLoaded,
+            Cause::TableNotEffective,
+            Cause::ProbeUnreadable,
+        ] {
+            for verdict in [
+                sandbox2::config::Verdict::Deny,
+                sandbox2::config::Verdict::Allow,
+            ] {
+                rendered.push(advisory_text(cause, verdict));
+            }
+            rendered.extend(cause.install_command());
+        }
+        for text in rendered {
+            assert!(
+                !text.contains("min finalize-install --"),
+                "the verb takes none of the installer's flags: {text}"
+            );
+            assert!(
+                !text.contains("install-host-classifier.sh") && !text.contains("curl"),
+                "the remedy is the verb, never the script or a fetch: {text}"
+            );
+            assert!(
+                !text.contains("--answerer-address") && !text.contains("--cohort-address"),
+                "no installer flag is asked of a person: {text}"
+            );
+        }
     }
 
     /// No live answerer — never bound, or stopped — refuses a native
