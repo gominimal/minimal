@@ -2264,10 +2264,12 @@ pub(crate) fn live_answerer() -> Option<SocketAddr> {
 /// be refused because the table's carve-out is stale, and the words that say
 /// so: the recorded target is not the live answerer bind, no answerer is
 /// bound, or the table recorded no carve-out at all. The words name the
-/// cause, both values, and the one verb that re-renders the carve-out onto
-/// the live bind — `min finalize-install`, bare: the CLI reads the bind
-/// itself, so the remedy carries no flags a person would have to fill.
-/// `None` when the carve-out names the live answerer.
+/// cause, both values, and the remedy as it stands: `min finalize-install
+/// --undo`, then `min finalize-install`, re-renders the carve-out for the
+/// answerer's default port — the step reads no live bind, so a daemon whose
+/// answerer is bound elsewhere has no self-service remedy yet, and the words
+/// say so rather than name flags the verb does not take. `None` when the
+/// carve-out names the live answerer.
 pub(crate) fn stale_carve_out_refusal(
     recorded: Option<SocketAddrV4>,
     live: Option<SocketAddr>,
@@ -2284,17 +2286,16 @@ pub(crate) fn stale_carve_out_refusal(
         |target| target.to_string(),
     );
     let live_words = live.map_or_else(|| "no live answerer".to_string(), |bound| bound.to_string());
+    let install = sandbox2::classifier::install_hint();
+    let re_render = format!(
+        "{install} --undo, then {install} re-renders the carve-out for the answerer's \
+         default port; a daemon whose answerer is bound elsewhere has no self-service \
+         remedy yet"
+    );
     let remedy = match live_v4 {
-        Some(bound) => format!(
-            "re-render the carve-out onto the live bind {bound}: {}, which reads the \
-             answerer's address and port itself",
-            sandbox2::classifier::install_hint()
-        ),
+        Some(bound) => format!("re-render the carve-out onto the live bind {bound}: {re_render}"),
         None => format!(
-            "start the daemon's zone answerer on an IPv4 loopback address, then re-render \
-             the carve-out onto its bind: {}, which reads the answerer's address and port \
-             itself",
-            sandbox2::classifier::install_hint()
+            "start the daemon's zone answerer on an IPv4 loopback address, then {re_render}"
         ),
     };
     Some(format!(
@@ -5461,9 +5462,11 @@ mod tests {
 
     /// A native deny-all launch is refused when the table's carve-out is not
     /// the live answerer bind, or when the table recorded none: the words are
-    /// the table-not-effective cause, both values, and the bare verb that
-    /// re-renders onto the live bind — never the verb with flags it does not
-    /// take.
+    /// the table-not-effective cause, both values, and the remedy as it
+    /// stands — the undo-then-install that re-renders for the default port,
+    /// and that a bind elsewhere has no self-service remedy yet — never the
+    /// verb with flags it does not take, and never a claim the step reads
+    /// the live bind.
     #[test]
     fn native_deny_all_refused_when_carve_out_target_is_stale() {
         let recorded = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 7656);
@@ -5475,7 +5478,10 @@ mod tests {
             "stale carve-out",
             "127.0.0.1:7656",
             "127.0.0.1:7700",
-            "re-render the carve-out onto the live bind 127.0.0.1:7700: min finalize-install",
+            "re-render the carve-out onto the live bind 127.0.0.1:7700: min finalize-install \
+             --undo, then min finalize-install re-renders the carve-out for the answerer's \
+             default port",
+            "no self-service remedy yet",
         ] {
             assert!(
                 refusal.contains(needle),
@@ -5521,9 +5527,14 @@ mod tests {
             rendered.extend(cause.install_command());
         }
         for text in rendered {
+            let without_undo = text.replace("min finalize-install --undo", "");
             assert!(
-                !text.contains("min finalize-install --"),
-                "the verb takes none of the installer's flags: {text}"
+                !without_undo.contains("min finalize-install --"),
+                "the verb takes none of the installer's flags (only its own --undo): {text}"
+            );
+            assert!(
+                !text.contains("reads the answerer"),
+                "no claim that the step reads the live bind: {text}"
             );
             assert!(
                 !text.contains("install-host-classifier.sh") && !text.contains("curl"),

@@ -3037,6 +3037,18 @@ async fn listener_failure_reported_with_remedy() {
         activate_stderr.contains("run `min session activate` again to check"),
         "activate must name the command its warning rides on, got: {activate_stderr}"
     );
+    // NET-020 on the one host line: the cause replaces the resolution half,
+    // so the line never claims a route through a proxy that is not serving.
+    assert!(
+        activate_stderr.contains(&format!(
+            "names: the hostname proxy is not serving — {reason}"
+        )),
+        "the host line must carry the cause in place of the resolution, got: {activate_stderr}"
+    );
+    assert!(
+        !activate_stderr.contains("via 127.0.0.1"),
+        "a down proxy is never named as the route, got: {activate_stderr}"
+    );
 
     drop(held);
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), retry).await;
