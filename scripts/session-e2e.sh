@@ -4947,11 +4947,12 @@ echo "::endgroup::"
 #     refused from inside the box, fast, and a public host is
 #     unreachable too. The stock posture (host_ip, the default) completes
 #     an outbound request (NET-107).
-#   * from the fresh install, `--network own_ip --ingress 8080:8080`
-#     answers ON THE HOST at the box's own loopback address with the box's
-#     own server's response (NET-040, NET-010) — and that box completes an
-#     outbound request through the switch the installer shipped (NET-107's
-#     switch half).
+#   * from the fresh install, `--network own_ip --allow-subnets 0.0.0.0/0
+#     --ingress 8080:8080` answers ON THE HOST at the box's own loopback
+#     address with the box's own server's response (NET-040, NET-010) — and
+#     that box completes an outbound request through the switch the
+#     installer shipped (NET-107's switch half). The egress is declared
+#     because a bare own-address box is deny-all by NET-074.
 #
 # Lane gating, decided by where the proof's pieces actually run:
 #   * Native Linux only: the install pair lives host-side on a VM lane
@@ -5520,8 +5521,12 @@ exit' E2E_PTY_ANSWER=keep python3 "$ROOT/scripts/e2e-attach-pty.py" - \
       mkdir -p "$np_ownip_seed"
       hook_seed_preamble >"$np_ownip_seed/minimal.toml"
       mkdir "$np_ownip_seed/.git"
+      # The box declares its egress: a bare own-address box is deny-all by
+      # NET-074 and reaches nothing outside itself, and this half proves the
+      # own-IP posture's outbound request (NET-107) beside its ingress.
       np_own_sid="$(cd "$np_ownip_seed" && mnl session activate . --no-prompt \
-        --name e2e-posture-ownip --network own_ip --ingress "$np_hport2":8080 \
+        --name e2e-posture-ownip --network own_ip --allow-subnets 0.0.0.0/0 \
+        --ingress "$np_hport2":8080 \
         2>"$np_own_err")" || {
         echo "::error::the installed pair failed to activate an own-IP session with an ingress mapping"
         echo "--- stderr ---"
@@ -5529,7 +5534,7 @@ exit' E2E_PTY_ANSWER=keep python3 "$ROOT/scripts/e2e-attach-pty.py" - \
         exit 1
       }
       np_own_sid="$(printf '%s\n' "$np_own_sid" | tail -n1 | tr -d '\r')"
-      echo "step: min session activate --network own_ip --ingress $np_hport2:8080 → exit 0, session $np_own_sid"
+      echo "step: min session activate --network own_ip --allow-subnets 0.0.0.0/0 --ingress $np_hport2:8080 → exit 0, session $np_own_sid"
       if grep -q -- 'note: --network' "$np_own_err"; then
         echo "::error::the current spelling --network own_ip printed a legacy hint"
         echo "--- stderr ---"
