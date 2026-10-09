@@ -668,7 +668,8 @@ type CreateFuture<'c> = std::pin::Pin<
 
 /// The dashboard's `CreateSession` with an own-address box's registration
 /// around it, as `min session activate` makes them (T66): on a VM-backed
-/// host — one with the VM host daemon's control socket beside `sock` — the
+/// host — `sock` in a VM host's provider dir, with its control socket
+/// beside it ([`vm_host_control_sock`](minimal_client::box_registration::vm_host_control_sock)) — the
 /// box registers first, through the client library the CLI registers
 /// through, and the create carries the addresses the registration handed
 /// back, since the in-VM daemon refuses an own-address box with none. A
@@ -686,12 +687,11 @@ async fn create_registering<C: Send>(
     mut create: impl for<'c> FnMut(&'c mut C, SessionConfig) -> CreateFuture<'c>,
 ) -> anyhow::Result<(minimald_rpc::CreateSessionResponse, BoxRow)> {
     use minimal_client::box_registration::{
-        control_sock_beside, register_box_beside_reminting_autogen,
+        control_sock_beside, register_box_beside_reminting_autogen, vm_host_control_sock,
     };
     use minimal_client::session_name::{autogen_session_name, random_hex4, should_retry_autogen};
     let control_sock = control_sock_beside(sock);
-    let registers =
-        config.network == NetworkMode::OwnIp && control_sock.as_deref().is_some_and(Path::exists);
+    let registers = config.network == NetworkMode::OwnIp && vm_host_control_sock(sock).is_some();
     let project_dir = config.project_path.as_utf8_path().to_path_buf();
     let mint = || autogen_session_name(&project_dir, &random_hex4());
     let autogen = registers && config.name.is_none();
@@ -856,6 +856,14 @@ mod tests {
         })
     }
 
+    /// A VM host's provider dir inside `dir` — the dir a dashboard's ssh
+    /// socket and the VM host daemon's control socket share.
+    fn vm_provider_dir(dir: &tempfile::TempDir) -> std::path::PathBuf {
+        let provider = dir.path().join("providers").join("local-minvmd0");
+        std::fs::create_dir_all(&provider).unwrap();
+        provider
+    }
+
     /// The dashboard's create config for an own-address box in `dir`.
     fn own_ip_config(dir: &Path, name: Option<&str>) -> SessionConfig {
         SessionConfig {
@@ -888,7 +896,8 @@ mod tests {
     #[tokio::test]
     async fn tui_own_ip_create_registers_and_hands_addresses() {
         let dir = tempfile::TempDir::new().unwrap();
-        let ssh_sock = dir.path().join("ssh.sock");
+        let provider = vm_provider_dir(&dir);
+        let ssh_sock = provider.join("ssh.sock");
         let box_id = minimald_rpc::BoxId::from_bytes([7; 16]);
         let handed = minimald_rpc::RegisteredBox {
             switch_address: std::net::Ipv4Addr::new(100, 64, 0, 2),
@@ -897,8 +906,7 @@ mod tests {
             task_addresses: Vec::new(),
         };
         let server = fake_vm_host(
-            &dir.path()
-                .join(minimal_client::attach::VM_HOST_CONTROL_SOCK_FILE),
+            &provider.join(minimal_client::attach::VM_HOST_CONTROL_SOCK_FILE),
             vec![minimald_rpc::BoxControlReply::Registered(handed.clone())],
         );
         let mut sent = Vec::new();
@@ -959,14 +967,14 @@ mod tests {
     #[tokio::test]
     async fn tui_activation_registers_task_slots_for_own_ip_box() {
         let dir = tempfile::TempDir::new().unwrap();
-        let ssh_sock = dir.path().join("ssh.sock");
+        let provider = vm_provider_dir(&dir);
+        let ssh_sock = provider.join("ssh.sock");
         let task_addresses = vec![
             std::net::Ipv4Addr::new(100, 64, 0, 3),
             std::net::Ipv4Addr::new(100, 64, 0, 4),
         ];
         let server = fake_vm_host(
-            &dir.path()
-                .join(minimal_client::attach::VM_HOST_CONTROL_SOCK_FILE),
+            &provider.join(minimal_client::attach::VM_HOST_CONTROL_SOCK_FILE),
             vec![minimald_rpc::BoxControlReply::Registered(
                 minimald_rpc::RegisteredBox {
                     switch_address: std::net::Ipv4Addr::new(100, 64, 0, 2),
@@ -1015,15 +1023,15 @@ mod tests {
     #[tokio::test]
     async fn tui_own_ip_create_failure_withdraws_the_row() {
         let dir = tempfile::TempDir::new().unwrap();
-        let ssh_sock = dir.path().join("ssh.sock");
+        let provider = vm_provider_dir(&dir);
+        let ssh_sock = provider.join("ssh.sock");
         let box_id = minimald_rpc::BoxId::from_bytes([9; 16]);
         let addresses = sessions::BoxAddresses {
             switch_address: std::net::Ipv4Addr::new(100, 64, 0, 3),
             loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 1),
         };
         let server = fake_vm_host(
-            &dir.path()
-                .join(minimal_client::attach::VM_HOST_CONTROL_SOCK_FILE),
+            &provider.join(minimal_client::attach::VM_HOST_CONTROL_SOCK_FILE),
             vec![
                 minimald_rpc::BoxControlReply::Registered(minimald_rpc::RegisteredBox {
                     switch_address: addresses.switch_address,
@@ -1075,10 +1083,10 @@ mod tests {
     #[tokio::test]
     async fn tui_own_ip_create_refused_registration_creates_nothing() {
         let dir = tempfile::TempDir::new().unwrap();
-        let ssh_sock = dir.path().join("ssh.sock");
+        let provider = vm_provider_dir(&dir);
+        let ssh_sock = provider.join("ssh.sock");
         let server = fake_vm_host(
-            &dir.path()
-                .join(minimal_client::attach::VM_HOST_CONTROL_SOCK_FILE),
+            &provider.join(minimal_client::attach::VM_HOST_CONTROL_SOCK_FILE),
             vec![minimald_rpc::BoxControlReply::Error {
                 error: "the switch's address plan is exhausted".to_string(),
             }],
@@ -1104,16 +1112,23 @@ mod tests {
         assert_eq!(server.join().unwrap().len(), 1);
     }
 
-    /// On a native host — no VM host daemon's control socket beside the
-    /// ssh socket — an own-address create is the plain create it always
+    /// On a native host an own-address create is the plain create it always
     /// was: nothing registers, the name stays as the form gave it, and the
-    /// create carries no addresses.
+    /// create carries no addresses — even though native minimald's answerer
+    /// door sits beside its ssh socket under the VM host's control socket
+    /// name, which a registration must never be sent to.
     #[tokio::test]
     async fn tui_own_ip_create_on_a_native_host_registers_nothing() {
         let dir = tempfile::TempDir::new().unwrap();
+        let provider = dir.path().join("providers").join("local-minimald0");
+        std::fs::create_dir_all(&provider).unwrap();
+        let _answerer_door = std::os::unix::net::UnixListener::bind(
+            provider.join(minimal_client::attach::VM_HOST_CONTROL_SOCK_FILE),
+        )
+        .unwrap();
         let mut sent = Vec::new();
         let (_, row) = create_registering(
-            &dir.path().join("ssh.sock"),
+            &provider.join("ssh.sock"),
             own_ip_config(dir.path(), None),
             &mut sent,
             |sent, config| {

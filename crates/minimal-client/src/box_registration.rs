@@ -484,11 +484,12 @@ pub async fn register_box_for_activation(
 
 /// Registers an own-address box under `name` with the VM host daemon whose
 /// control socket a dashboard reached the daemon beside (T66): the
-/// dashboard's half of [`register_box_for_activation`], keyed on the socket
-/// it already holds rather than on the provider kind. A daemon with no
-/// control socket beside its ssh socket is a native host, which keeps its
-/// own allocator, and a box that is not own-address has no row to register:
-/// both answer `Ok(None)`, and the create goes ahead as it always has.
+/// dashboard's half of [`register_box_for_activation`], keyed on the
+/// provider kind of the socket it already holds ([`vm_host_control_sock`]).
+/// A native host keeps its own allocator — the `control.sock` beside its
+/// ssh socket is its answerer door, which refuses a registration — and a
+/// box that is not own-address has no row to register: both answer
+/// `Ok(None)`, and the create goes ahead as it always has.
 pub async fn register_box_beside(
     ssh_sock: &Path,
     network: sessions::NetworkMode,
@@ -498,10 +499,34 @@ pub async fn register_box_beside(
     if network != sessions::NetworkMode::OwnIp {
         return Ok(None);
     }
-    let Some(sock_path) = control_sock_beside(ssh_sock).filter(|sock| sock.exists()) else {
+    let Some(sock_path) = vm_host_control_sock(ssh_sock) else {
         return Ok(None);
     };
     register_box_at(&sock_path, name, policy).await.map(Some)
+}
+
+/// The VM host daemon's control socket beside `ssh_sock`, when `ssh_sock`
+/// is a VM host's — its provider dir, or the default VM's dir a named VM
+/// nests in, is a `local-minvmd<N>` dir — and the socket exists. Keyed on
+/// the provider kind, as the CLI keys its registration: a native minimald
+/// binds its answerer door under the same file name in its own
+/// `local-minimald<N>` dir, so the socket's existence alone cannot tell the
+/// two apart.
+pub fn vm_host_control_sock(ssh_sock: &Path) -> Option<PathBuf> {
+    let minvmd = format!("local-{}", paths::ProviderKind::Minvmd.tag());
+    let is_minvmd_dir = |dir: &Path| {
+        dir.file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix(minvmd.as_str()))
+            .is_some_and(|instance| {
+                !instance.is_empty() && instance.bytes().all(|b| b.is_ascii_digit())
+            })
+    };
+    let dir = ssh_sock.parent()?;
+    if !(is_minvmd_dir(dir) || dir.parent().is_some_and(is_minvmd_dir)) {
+        return None;
+    }
+    control_sock_beside(ssh_sock).filter(|sock| sock.exists())
 }
 
 /// The control socket beside an ssh socket a client already resolved (T66's
@@ -700,6 +725,67 @@ async fn reminting_autogen(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A dashboard finds the VM host daemon's control socket by the
+    /// provider kind of the ssh socket it holds: a `local-minvmd<N>` dir,
+    /// default or named VM, has one; a native `local-minimald<N>` dir's
+    /// `control.sock` is the answerer door and never reads as one.
+    #[test]
+    fn vm_host_control_sock_keys_on_the_provider_kind() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let providers = dir.path().join("providers");
+        let at = |rel: &str| {
+            let provider = providers.join(rel);
+            std::fs::create_dir_all(&provider).unwrap();
+            std::fs::write(provider.join(crate::attach::VM_HOST_CONTROL_SOCK_FILE), "").unwrap();
+            provider.join(paths::SSH_SOCK_FILE)
+        };
+        let native = at("local-minimald0");
+        assert_eq!(
+            vm_host_control_sock(&native),
+            None,
+            "a native host's answerer door is not a VM host's control socket"
+        );
+        let vm = at("local-minvmd0");
+        assert_eq!(
+            vm_host_control_sock(&vm),
+            Some(providers.join("local-minvmd0").join("control.sock"))
+        );
+        let named = at("local-minvmd0/dev");
+        assert_eq!(
+            vm_host_control_sock(&named),
+            Some(providers.join("local-minvmd0/dev").join("control.sock")),
+            "a named VM nests in the VM host's provider dir"
+        );
+        let missing = providers.join("local-minvmd1").join(paths::SSH_SOCK_FILE);
+        assert_eq!(
+            vm_host_control_sock(&missing),
+            None,
+            "no socket, nothing to register with"
+        );
+    }
+
+    /// A dashboard own-address create on a native host is the plain create:
+    /// nothing is sent to the answerer door beside its ssh socket.
+    #[tokio::test]
+    async fn register_box_beside_skips_a_native_host() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let provider = dir.path().join("providers").join("local-minimald0");
+        std::fs::create_dir_all(&provider).unwrap();
+        let _door = std::os::unix::net::UnixListener::bind(
+            provider.join(crate::attach::VM_HOST_CONTROL_SOCK_FILE),
+        )
+        .unwrap();
+        let registered = register_box_beside(
+            &provider.join(paths::SSH_SOCK_FILE),
+            sessions::NetworkMode::OwnIp,
+            "web",
+            &sessions::SessionPolicy::default(),
+        )
+        .await
+        .expect("a native host registers nothing");
+        assert!(registered.is_none());
+    }
 
     /// The registration's lease is held across the finalize — the daemon
     /// sees neither a byte nor a close while it runs — and committed only
