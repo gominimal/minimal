@@ -1521,8 +1521,6 @@ mod tests {
             "--pid",
             "--cohort-address",
             "--node-plane-address",
-            "<cohort address>",
-            "<node-plane address>",
             "curl",
             "raw.githubusercontent.com",
         ] {
