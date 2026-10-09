@@ -3163,7 +3163,7 @@ async fn min_prints_discovered_proxy_port() {
 /// configuration no host process consults), the daemon's answerer bound,
 /// and the reserved local range present on this host's loopback. With the
 /// answerer bound and no hook (this host), both verbs must name the
-/// *proxy* as the live surface and point at `min net setup` on that line,
+/// *proxy* as the live surface and point at `min finalize-install` on that line,
 /// with no advisory beside it (NET-122 is opt-in); with the hook and the
 /// range present too, the same decision says native and the pointer goes.
 ///
@@ -3236,7 +3236,7 @@ async fn activate_and_ls_report_native_surface() {
     // inside a VM-backed host's guest cannot speak for the host's resolver,
     // and this host's own reads say nothing routes the zone to the answerer
     // — so both verbs name the proxy as the live surface, with where it
-    // serves, points at `min net setup`, and neither prints the native words.
+    // serves, points at `min finalize-install`, and neither prints the native words.
     let out = run_min(&args, &["ls"]).await;
     let ls_stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     assert!(
@@ -3248,8 +3248,8 @@ async fn activate_and_ls_report_native_surface() {
         "the surface line must name where the proxy serves: {ls_stdout}"
     );
     assert!(
-        ls_stdout.contains("run `min net setup`"),
-        "the proxy surface line must point at `min net setup`: {ls_stdout}"
+        ls_stdout.contains("run `min finalize-install`"),
+        "the proxy surface line must point at `min finalize-install`: {ls_stdout}"
     );
     assert!(
         !ls_stdout.contains("native DNS is the live name surface"),
@@ -3260,7 +3260,7 @@ async fn activate_and_ls_report_native_surface() {
     // names — and before the upload and the loadout, so the line is not lost
     // above a failed activate's output. Host DNS is opt-in (NET-122): this
     // host cannot resolve the zone natively, so the surface line points at
-    // `min net setup`, and the session start prints no advisory and no part
+    // `min finalize-install`, and the session start prints no advisory and no part
     // of the privileged script — and never a prompt.
     let project = tempfile::TempDir::new().unwrap();
     std::fs::create_dir(project.path().join(".git")).unwrap();
@@ -3296,8 +3296,8 @@ async fn activate_and_ls_report_native_surface() {
         "a host with no hook must not be told native DNS is live: {activate_stderr}"
     );
     assert!(
-        activate_stderr.contains("run `min net setup`"),
-        "activate's surface line must point at `min net setup`, got: {activate_stderr}"
+        activate_stderr.contains("run `min finalize-install`"),
+        "activate's surface line must point at `min finalize-install`, got: {activate_stderr}"
     );
     assert!(
         !activate_stderr.contains("note:") && !activate_stderr.contains("#!/bin/sh"),
@@ -3338,7 +3338,7 @@ async fn activate_and_ls_report_native_surface() {
     assert!(
         !native_ls.contains("note:")
             && !native_ls.contains("Configure the host's resolver")
-            && !native_ls.contains("min net setup"),
+            && !native_ls.contains("min finalize-install"),
         "a host the verdict calls native is a configured one: no advisory rides its list, \
          got: {native_ls}"
     );

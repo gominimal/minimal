@@ -381,7 +381,7 @@ TEST_SHELL=
 USERNS_SYSCTL=
 APPARMOR_DIR=
 
-# Root the installer looks under for the host paths `min net setup` installs.
+# Root the installer looks under for the host paths `min finalize-install` installs.
 # Empty points it at a nonexistent directory, so this host's own setup never
 # leaks into a scenario; scenarios seed a fake root to drive the offer.
 NET_SETUP_ROOT=
@@ -582,10 +582,10 @@ case_apparmor_uninstall() {
         test -e "$HAA_U/xdg-data/minimal/apparmor/install-apparmor-profile.sh"
 }
 
-case_net_setup_uninstall() {
-    # --- Uninstall: advise removing the host DNS setup (min net setup) ----------
-    # A non-interactive uninstall on a host where `min net setup` ran advises
-    # `min net setup --undo` and the root commands that stay valid once `min` is
+case_finalize_install_uninstall() {
+    # --- Uninstall: advise removing the host DNS setup (min finalize-install) ----------
+    # A non-interactive uninstall on a host where `min finalize-install` ran advises
+    # `min finalize-install --undo` and the root commands that stay valid once `min` is
     # gone, and never elevates: the seeded host files survive. A host that never
     # ran the step sees nothing.
     HNS="$root/hns"; mkdir -p "$HNS"
@@ -603,8 +603,8 @@ case_net_setup_uninstall() {
     NET_SETUP_ROOT=
     check 0 "$rc" "uninstall with the host DNS setup present exits 0"
     want_ok "uninstall advises the host DNS setup is still installed" \
-        grep -q "host DNS setup from min net setup is still installed" "$OUT"
-    want_ok "advisory names min net setup --undo" grep -q "min net setup --undo" "$OUT"
+        grep -q "host DNS setup from min finalize-install is still installed" "$OUT"
+    want_ok "advisory names min finalize-install --undo" grep -q "min finalize-install --undo" "$OUT"
     want_ok "advisory gives the root removal commands" grep -q "sudo " "$OUT"
     want_ok "non-interactive uninstall never elevates (host file survives)" \
         test -f "$ns_file"
@@ -613,8 +613,8 @@ case_net_setup_uninstall() {
     run ns2_seed "$HNS2"
     run ns2_run "$HNS2" --uninstall
     check 0 "$rc" "uninstall on a host without the setup exits 0"
-    want_err "a host that never ran min net setup sees no advisory" \
-        grep -q "min net setup" "$OUT"
+    want_err "a host that never ran min finalize-install sees no advisory" \
+        grep -q "min finalize-install" "$OUT"
 }
 
 case_checksum_mismatch() {
@@ -2184,7 +2184,7 @@ case_for() {
         install)                            case_install ;;
         apparmor)                           case_apparmor ;;
         apparmor_uninstall)                 case_apparmor_uninstall ;;
-        net_setup_uninstall)                case_net_setup_uninstall ;;
+        finalize_install_uninstall)                case_finalize_install_uninstall ;;
         checksum_mismatch)                  case_checksum_mismatch ;;
         target_validation)                  case_target_validation ;;
         prefix_resolution)                  case_prefix_resolution ;;
@@ -2207,7 +2207,7 @@ case_for() {
 }
 case "${1:-}" in
     "")
-        for _c in install apparmor apparmor_uninstall net_setup_uninstall checksum_mismatch \
+        for _c in install apparmor apparmor_uninstall finalize_install_uninstall checksum_mismatch \
             target_validation prefix_resolution install_record daemon_stop \
             shell_integration darwin_dequarantine uninstall \
             gvproxy_rename_migration installer_switch_binary_executable \

@@ -1030,7 +1030,7 @@ pub(crate) const ANSWERER_PROGRAM_NAME: &str = "minzoned";
 /// the uid the process carries — never root by choice, and empty only
 /// when no name reads at all, a unit the manager refuses to load rather
 /// than a service run as the wrong user.
-fn operator_name() -> String {
+pub(crate) fn operator_name() -> String {
     std::env::var("USER")
         .or_else(|_| std::env::var("LOGNAME"))
         .ok()
@@ -1081,7 +1081,7 @@ fn answerer_source() -> Option<String> {
 pub(crate) const TEST_ANSWERER_SOURCE: &str = "/opt/minimal-test/bin/minzoned";
 
 /// The control sockets the answerer step asks to release the hook port,
-/// set by the `min net setup` run that renders the advisory (its own state dir's
+/// set by the `min finalize-install` run that renders the advisory (its own state dir's
 /// daemons: the VM host daemons, default VM and named VMs alike, or the
 /// native daemon).
 static HANDOVER_CONTROLS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
@@ -2136,18 +2136,25 @@ async fn host_hook() -> Hook {
 /// a host it half-configured. `set -u` stops it at the first variable it
 /// reads unset. Every variable the scripts read is one the script itself
 /// set.
-fn script_header(what: &str, verb: &str) -> String {
+pub(crate) fn script_header(what: &str, shown_by: &str) -> String {
     format!(
         "#!/bin/sh\n\
          # {what}.\n\
-         # Printed by `{verb} --print`; it must run as root: sudo sh <this file>\n\
+         # Printed by `{shown_by}`; it must run as root: sudo sh <this file>\n\
          set -eu\n"
     )
 }
 
+/// The verb whose `--show --script` prints the install script, the one
+/// [`script_header`] names.
+pub(crate) const FINALIZE_SHOWN_BY: &str = "min finalize-install --show --script";
+
+/// The verb whose `--show --script` prints the removal script.
+pub(crate) const UNDO_SHOWN_BY: &str = "min finalize-install --undo --show --script";
+
 /// The exact script that points macOS's resolver at the answerer *and*
 /// installs the range unit that reserves the local range at boot — the one
-/// privileged step `min net setup` runs (NET-122), carrying the range step
+/// privileged step `min finalize-install` runs (NET-122), carrying the range step
 /// NET-123's interim ends with (design §7.1: one script, one privilege
 /// elevation, for one host's configuration).
 ///
@@ -2172,17 +2179,28 @@ fn script_header(what: &str, verb: &str) -> String {
 /// re-runs the program rather than dying on a label collision.
 #[cfg(any(test, target_os = "macos"))]
 pub(crate) fn macos_command(port: u16, install: Option<&AnswererInstall>) -> String {
-    let program = range_program();
     let what = if install.is_some() {
         "Configure the host's resolver, reserve the local range, and install the Minimal \
          box-name service (DNS and addresses for boxes)"
     } else {
         "Configure the host's resolver and reserve the local range"
     };
+    format!(
+        "{}\n{}",
+        script_header(what, FINALIZE_SHOWN_BY),
+        macos_names_steps(port, install)
+    )
+}
+
+/// The steps of [`macos_command`] without its header: the block the
+/// finalize-install script carries for the names item, under the one
+/// header that script renders for every item.
+#[cfg(any(test, target_os = "macos"))]
+pub(crate) fn macos_names_steps(port: u16, install: Option<&AnswererInstall>) -> String {
+    let program = range_program();
     let range = range_text();
     let mut script = format!(
-        "{header}\n\
-         # The resolver: send *.{ZONE} lookups to the box-zone answerer on 127.0.0.1:{port}.\n\
+        "# The resolver: send *.{ZONE} lookups to the box-zone answerer on 127.0.0.1:{port}.\n\
          mkdir -p /etc/resolver {RANGE_PROGRAM_DIR} {RANGE_PLIST_DIR}\n\
          printf \"nameserver 127.0.0.1\\nport {port}\\n\" > {RESOLVER_FILE}\n\
          \n\
@@ -2199,7 +2217,6 @@ pub(crate) fn macos_command(port: u16, install: Option<&AnswererInstall>) -> Str
          chmod 0644 {RANGE_PLIST_PATH}\n\
          (launchctl bootout system/{RANGE_UNIT_LABEL} 2>/dev/null || true)\n\
          launchctl bootstrap system {RANGE_PLIST_PATH}\n",
-        header = script_header(what, "min net setup"),
     );
     if let Some(install) = install {
         script.push_str(&macos_answerer_steps(install));
@@ -2279,7 +2296,7 @@ fn answerer_fail_block(
 /// 2. `install` copies the source, root's and mode 0755, to an exclusive
 ///    `mktemp` name inside `dir`.
 /// 3. The temp copy is hashed (`shasum -a 256` on macOS, `sha256sum` on
-///    Linux) and compared with the SHA-256 `min net setup` pinned when it
+///    Linux) and compared with the SHA-256 `min finalize-install` pinned when it
 ///    verified the source; a mismatch removes the temp copy and exits
 ///    non-zero naming both hashes.
 /// 4. On macOS, when the install carries a requirement, `codesign --verify
@@ -2331,7 +2348,7 @@ fn verified_copy_steps(install: &AnswererInstall, dir: &str, dest: &str, macos: 
          h=$({hash} < \"$t\" || true)\n\
          h=${{h%% *}}\n\
          case \"$h\" in {sha}) ;; *) rm -f \"$t\" ; echo \"minimal: the answerer copy hashes \
-         $h, not the {sha} min net setup verified: the source changed after it was checked; \
+         $h, not the {sha} min finalize-install verified: the source changed after it was checked; \
          the answerer service was not installed\" >&2 ; exit 1 ;; esac\n\
          {codesign}\
          mv -f \"$t\" \"{dest}\"\n",
@@ -2502,9 +2519,19 @@ pub(crate) fn linux_command(port: u16, install: Option<&AnswererInstall>) -> Str
     } else {
         "Configure the host's resolver for the zone"
     };
+    format!(
+        "{}\n{}",
+        script_header(what, FINALIZE_SHOWN_BY),
+        linux_names_steps(port, install)
+    )
+}
+
+/// The steps of [`linux_command`] without its header: the block the
+/// finalize-install script carries for the names item.
+#[cfg(any(test, not(target_os = "macos")))]
+pub(crate) fn linux_names_steps(port: u16, install: Option<&AnswererInstall>) -> String {
     let mut script = format!(
-        "{header}\n\
-         # The resolver: a dummy link, {ZONE_LINK}, whose only job is to route\n\
+        "# The resolver: a dummy link, {ZONE_LINK}, whose only job is to route\n\
          # *.{ZONE} lookups to the box-zone answerer on 127.0.0.1:{port}.\n\
          [ -e /sys/class/net/{ZONE_LINK} ] || ip link add {ZONE_LINK} type dummy\n\
          ip link set {ZONE_LINK} up\n\
@@ -2512,7 +2539,6 @@ pub(crate) fn linux_command(port: u16, install: Option<&AnswererInstall>) -> Str
          resolvectl default-route {ZONE_LINK} false\n\
          resolvectl dns {ZONE_LINK} 127.0.0.1:{port}\n\
          resolvectl domain {ZONE_LINK} '~{ZONE}'\n",
-        header = script_header(what, "min net setup"),
     );
     if let Some(install) = install {
         script.push_str(&linux_answerer_steps(install));
@@ -2613,7 +2639,7 @@ fn linux_answerer_steps(install: &AnswererInstall) -> String {
 }
 
 /// The exact script that configures this host's resolver for [`ZONE`] at
-/// `port` — the script `min net setup` runs and `min net setup --print`
+/// `port` — the script `min finalize-install` runs and `min finalize-install --show --script`
 /// prints. `install` is the answerer step's inputs when the step is
 /// offered and this machine has a `minzoned` to copy; `None` renders the
 /// resolver (and, on macOS, the range) alone.
@@ -2627,9 +2653,86 @@ pub(crate) fn command(port: u16, install: Option<&AnswererInstall>) -> String {
     linux_command(port, install)
 }
 
-/// The lead-in sentence of the removal script, the same on both platforms.
-const UNDO_WHAT: &str = "Remove what `min net setup` installed on this host: the resolver's \
-     hook for the zone, the local range unit, and the Minimal box-name service";
+/// The names item's steps for this host, without a header: what the
+/// finalize-install script carries for the item, under its one header.
+#[cfg(target_os = "macos")]
+pub(crate) fn names_steps(port: u16, install: Option<&AnswererInstall>) -> String {
+    macos_names_steps(port, install)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn names_steps(port: u16, install: Option<&AnswererInstall>) -> String {
+    linux_names_steps(port, install)
+}
+
+/// The lead-in sentence of the removal script on macOS.
+#[cfg(any(test, target_os = "macos"))]
+const MACOS_UNDO_WHAT: &str = "Remove what `min finalize-install` installed on this host: the \
+     resolver's hook for the zone, the local range unit, and the Minimal box-name service";
+
+/// The lead-in sentence of the removal script on Linux.
+#[cfg(any(test, not(target_os = "macos")))]
+const LINUX_UNDO_WHAT: &str = "Remove what `min finalize-install` installed on this host: the \
+     resolver's hook for the zone, the Minimal box-name service, the user-namespace profile, \
+     the classifier tree, and the kvm group membership the step added";
+
+/// The AppArmor profile directory the user-namespace profile installs under.
+#[cfg(any(test, not(target_os = "macos")))]
+pub(crate) const APPARMOR_DIR: &str = "/etc/apparmor.d";
+
+/// The classifier tree the privileged step lays out
+/// (`sandbox2::classifier::TREE_ROOT`, spelled here because the CLI does
+/// not build the sandbox crate on every host).
+#[cfg(any(test, not(target_os = "macos")))]
+pub(crate) const CLASSIFIER_TREE_ROOT: &str = "/sys/fs/cgroup/minimald.slice";
+
+/// The record the step leaves when it adds the operator to the `kvm`
+/// group, naming the user it added, so the removal takes back only the
+/// membership the step gave.
+#[cfg(any(test, not(target_os = "macos")))]
+pub(crate) const KVM_GROUP_RECORD: &str = "/var/lib/minimal/finalize-install-kvm-group";
+
+/// The heredoc delimiter the classifier's installer rides under in a
+/// script.
+#[cfg(any(test, not(target_os = "macos")))]
+const CLASSIFIER_SCRIPT_HEREDOC: &str = "MINIMAL_CLASSIFIER_SCRIPT_EOF";
+
+/// The classifier's privileged step, the very file the native lane runs:
+/// the removal script carries it whole and runs its `--uninstall`.
+#[cfg(any(test, not(target_os = "macos")))]
+const CLASSIFIER_SCRIPT: &str = include_str!("../../../scripts/install-host-classifier.sh");
+
+/// The lines that remove the Linux items beyond the names: the
+/// user-namespace profile (unloaded, then its files), the classifier tree
+/// (the step's own `--uninstall`, run only while the tree exists), and the
+/// `kvm` membership the step recorded adding. Every line tolerates what
+/// is already gone.
+#[cfg(any(test, not(target_os = "macos")))]
+fn linux_host_items_removal() -> String {
+    format!(
+        "\n\
+         # The user-namespace profile: unload it, then remove its files.\n\
+         if [ -f {APPARMOR_DIR}/minimald ] ; then\n\
+         \x20 apparmor_parser --remove {APPARMOR_DIR}/minimald 2>/dev/null || true\n\
+         fi\n\
+         rm -f {APPARMOR_DIR}/minimald {APPARMOR_DIR}/tunables/minimald \
+         {APPARMOR_DIR}/tunables/minimald.d/local\n\
+         rmdir {APPARMOR_DIR}/tunables/minimald.d 2>/dev/null || true\n\
+         \n\
+         # The classifier tree: the step's own removal, while the tree is there.\n\
+         if [ -d {CLASSIFIER_TREE_ROOT} ] ; then\n\
+         \x20 bash -s -- --uninstall <<\\{CLASSIFIER_SCRIPT_HEREDOC}\n\
+         {CLASSIFIER_SCRIPT}\
+         {CLASSIFIER_SCRIPT_HEREDOC}\n\
+         fi\n\
+         \n\
+         # The kvm group membership the step added, by its record.\n\
+         if [ -f {KVM_GROUP_RECORD} ] ; then\n\
+         \x20 gpasswd -d \"$(cat {KVM_GROUP_RECORD})\" kvm 2>/dev/null || true\n\
+         \x20 rm -f {KVM_GROUP_RECORD}\n\
+         fi\n"
+    )
+}
 
 /// The lines that remove the answerer channel's directories when nothing
 /// else is in them: `channel_dir` itself, then its parent when that is
@@ -2664,7 +2767,7 @@ fn channel_dir_removal(channel: &str) -> String {
 /// empty — then the range unit, booted out and its two files removed, then
 /// the resolver file. Every step tolerates what is already gone — a job
 /// that is not loaded, a file that is not there — so the script succeeds
-/// on a host it already cleaned, or on one `min net setup` never touched.
+/// on a host it already cleaned, or on one `min finalize-install` never touched.
 /// `channel` is the machine-global channel path the step's plist names.
 ///
 /// The range's loopback aliases are left as they are: the unit that adds
@@ -2685,7 +2788,7 @@ pub(crate) fn macos_undo_command(channel: &str) -> String {
          \n\
          # The resolver file.\n\
          rm -f {RESOLVER_FILE}\n",
-        header = script_header(UNDO_WHAT, "min net setup --undo"),
+        header = script_header(MACOS_UNDO_WHAT, UNDO_SHOWN_BY),
         service = macos_service_removal(channel, ""),
         channel_dirs = channel_dir_removal(channel),
     )
@@ -2699,7 +2802,7 @@ pub(crate) fn macos_undo_command(channel: &str) -> String {
 /// empty, then the dedicated link: its DNS configuration reverted and the
 /// link deleted, when the host has it. Every step tolerates what is
 /// already gone, so the script succeeds on a host it already cleaned, or
-/// on one `min net setup` never touched. `channel` is the machine-global
+/// on one `min finalize-install` never touched. `channel` is the machine-global
 /// channel path the step's socket unit names.
 #[cfg(any(test, not(target_os = "macos")))]
 pub(crate) fn linux_undo_command(channel: &str) -> String {
@@ -2718,14 +2821,16 @@ pub(crate) fn linux_undo_command(channel: &str) -> String {
          if [ -e /sys/class/net/{ZONE_LINK} ] ; then\n\
          \x20 resolvectl revert {ZONE_LINK} 2>/dev/null || true\n\
          \x20 ip link del {ZONE_LINK}\n\
-         fi\n",
-        header = script_header(UNDO_WHAT, "min net setup --undo"),
+         fi\n\
+         {host_items}",
+        header = script_header(LINUX_UNDO_WHAT, UNDO_SHOWN_BY),
         service = linux_service_removal(""),
         channel_dirs = channel_dir_removal(channel),
+        host_items = linux_host_items_removal(),
     )
 }
 
-/// The script that removes what `min net setup` installs on this host
+/// The script that removes what `min finalize-install` installs on this host
 /// ([`macos_undo_command`] or [`linux_undo_command`]), for the
 /// machine-global channel this build's daemons resolve. It reads nothing
 /// from a daemon: removal works with nothing running.
@@ -2769,7 +2874,7 @@ pub(crate) fn service_user(text: &str) -> Option<&str> {
         .map(str::trim)
 }
 
-/// The refusal `min net setup` prints before it runs anything, when the
+/// The refusal `min finalize-install` prints before it runs anything, when the
 /// box-name service this host already has is another user's: `unit_text`
 /// is the installed unit that names the operator (the plist on macOS, the
 /// service unit on Linux), `None` when there is none, and `me` the user
@@ -2804,7 +2909,7 @@ pub(crate) fn other_operator_refusal_on_this_host() -> Option<String> {
 }
 
 /// The command [`command`] renders for this host with the answerer step
-/// carried, from the same reads `min net setup` makes — so a
+/// carried, from the same reads `min finalize-install` makes — so a
 /// test can run the exact privileged command without starting a daemon.
 /// An error when the step cannot be carried (no `minzoned` beside this
 /// `min` or on `PATH`, or a path the command cannot quote): a test must
@@ -2878,7 +2983,7 @@ fn answerer_fact(answerer: &AnswererStep, carried: bool) -> Option<String> {
     }
 }
 
-/// The advisory `min net setup` renders, as a function of the hook state, the
+/// The advisory `min finalize-install` renders, as a function of the hook state, the
 /// daemon's interim verdict, whether the reserved local range read present
 /// on this host's own loopback, the range step and the answerer step this
 /// host's detection read beside the hook, and whether anything blocks the
@@ -2955,6 +3060,10 @@ fn answerer_fact(answerer: &AnswererStep, carried: bool) -> Option<String> {
 /// bypass leaves the configured hook as dead as an unconfigured one, so
 /// the blocker is still said (and is then the whole of the note, no fact
 /// being missing — a hook that routes is not a fact the note can lean on).
+///
+/// `min finalize-install` renders the verdict itself (its names item);
+/// this is the note-and-script form the table tests assert it through.
+#[cfg(test)]
 pub(crate) fn advisory_at(
     hook: &Hook,
     port: u16,
@@ -2964,6 +3073,61 @@ pub(crate) fn advisory_at(
     answerer: &AnswererStep,
     blocker: Option<&str>,
 ) -> Option<String> {
+    match names_verdict_at(
+        hook,
+        port,
+        interim,
+        range_present,
+        range_step,
+        answerer,
+        blocker,
+    ) {
+        NamesVerdict::Done => None,
+        NamesVerdict::Blocked { note } => Some(note),
+        NamesVerdict::Missing { facts, install } => {
+            // The note's facts, then the script itself: the sentence that
+            // says what the script does is the first comment of its header,
+            // so the script `min finalize-install --show --script` prints carries it too.
+            let command = command(port, install.as_ref());
+            Some(format!("note: {facts}.\n{command}"))
+        }
+    }
+}
+
+/// The names item's state on this host, as [`advisory_at`] decides it: done
+/// (the hook routes, the range and the service hold), missing (the facts
+/// that say what is missing, and the service step's inputs when the step
+/// is carried), or blocked by a host fact no script changes (the note that
+/// says so, with no script to name).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NamesVerdict {
+    /// Nothing to do: `*.{ZONE}` resolves natively on this host.
+    Done,
+    /// The names step is wanted: `facts` says what is missing, `install`
+    /// the service step's inputs when the step is carried.
+    Missing {
+        /// What is missing, as the note says it (no trailing period).
+        facts: String,
+        /// The answerer step's inputs, when the command carries it.
+        install: Option<AnswererInstall>,
+    },
+    /// A host fact no script changes blocks every names script.
+    Blocked {
+        /// The full note, `note: …`.
+        note: String,
+    },
+}
+
+/// [`advisory_at`]'s decision, before it is rendered: see [`NamesVerdict`].
+pub(crate) fn names_verdict_at(
+    hook: &Hook,
+    port: u16,
+    interim: bool,
+    range_present: Option<bool>,
+    range_step: &RangeStep,
+    answerer: &AnswererStep,
+    blocker: Option<&str>,
+) -> NamesVerdict {
     // A hook routing this answerer's port is configured, but only on a
     // host whose lookups reach the resolver it points at. A blocker says
     // they do not, so it outranks the quiet arm: staying silent there
@@ -2987,7 +3151,7 @@ pub(crate) fn advisory_at(
         && range_step.custody_holds()
         && answerer.holds()
     {
-        return None;
+        return NamesVerdict::Done;
     }
     let mut facts = Vec::new();
     if interim {
@@ -3101,15 +3265,13 @@ pub(crate) fn advisory_at(
         // The note is built from the parts that are there. A blocker can be
         // the whole of it — the hook routes, so no fact is missing — and a
         // missing fact must not print as a dangling `; ` after the colon.
-        Some(blocker) if facts.is_empty() => Some(format!("note: {blocker}.")),
-        Some(blocker) => Some(format!("note: {facts}; {blocker}.")),
-        None => {
-            // The note's facts, then the script itself: the sentence that
-            // says what the script does is the first comment of its header,
-            // so the script `min net setup --print` prints carries it too.
-            let command = command(port, install.as_ref());
-            Some(format!("note: {facts}.\n{command}"))
-        }
+        Some(blocker) if facts.is_empty() => NamesVerdict::Blocked {
+            note: format!("note: {blocker}."),
+        },
+        Some(blocker) => NamesVerdict::Blocked {
+            note: format!("note: {facts}; {blocker}."),
+        },
+        None => NamesVerdict::Missing { facts, install },
     }
 }
 
@@ -3143,8 +3305,9 @@ pub(crate) fn advisory_at(
 /// re-surfaces until the service is installed and speaks this daemon's
 /// channel protocol (see [`advisory_at`]).
 ///
-/// `min net setup` prints its note to stderr and runs (or, with
-/// `--print`, prints) its script; a session start prints none of it.
+/// `min finalize-install` prints its note to stderr and runs (or, with
+/// `--show --script`, prints) its script; a session start prints none of it.
+#[cfg(test)]
 pub(crate) fn session_advisory_at(
     detection: &(Hook, Option<String>, RangeStep),
     zone_answerer_port: Option<u16>,
@@ -3769,13 +3932,13 @@ async fn range_present_on_host() -> bool {
 /// What the proxy's surface line ends with (NET-122): the opt-in step that
 /// makes `*.{ZONE}` names resolve for every host program, named and never
 /// run.
-pub const NET_SETUP_POINTER: &str =
-    "; for these names in a browser or other host programs, run `min net setup`";
+pub const FINALIZE_INSTALL_POINTER: &str =
+    "; for these names in a browser or other host programs, run `min finalize-install`";
 
 /// The name-surface line a session start prints (NET-018, NET-122): the
 /// verdict's surface, or, with no verdict (the answerer not bound yet), the
 /// proxy's, which is the live surface then and whose line points at
-/// `min net setup`. A start with an answerer port never goes without the
+/// `min finalize-install`. A start with an answerer port never goes without the
 /// pointer.
 pub fn start_name_surface_line(verdict: Option<LiveSurface>, proxy_port: Option<u16>) -> String {
     name_surface_line(verdict.unwrap_or(LiveSurface::Proxy), proxy_port)
@@ -3807,7 +3970,7 @@ pub fn name_surface_line(surface: LiveSurface, proxy_port: Option<u16>) -> Strin
         LiveSurface::Proxy => match proxy_port {
             Some(port) => format!(
                 "the hostname proxy is the live name surface · <name>.min.internal \
-                 routes through it on 127.0.0.1:{port}{NET_SETUP_POINTER}"
+                 routes through it on 127.0.0.1:{port}{FINALIZE_INSTALL_POINTER}"
             ),
             None => "the hostname proxy is the live name surface; it is not serving".to_string(),
         },
@@ -4352,13 +4515,13 @@ mod tests {
         RangeStep::not_needed()
     }
 
-    // NET-122's test name. The advisory `min net setup` prints names the
+    // NET-122's test name. The advisory `min finalize-install` prints names the
     // exact script and nothing in its path prompts: every builder here is
     // pure over strings and the reads behind `detect` are read-only — no
     // reader is ever opened, so the "no privilege prompt" clause holds by
     // construction and the assertions below pin the text it produces.
     #[test]
-    fn net_setup_names_resolver_script_without_prompt() {
+    fn finalize_install_names_missing_items_and_runs_the_script() {
         let port = 15353;
         // An unconfigured host is advised, with the exact command to run.
         let unconfigured = Hook::absent("test", "no hook for the zone");
@@ -4521,16 +4684,16 @@ mod tests {
     /// NET-122's opt-in: a session start never prints the privileged step.
     /// While the host is not set up for native names the proxy is the live
     /// surface, and its line — the one both verbs print — points at `min
-    /// net setup`, on one line. A host whose native surface is live is set
+    /// finalize-install`, on one line. A host whose native surface is live is set
     /// up, and its line carries no pointer; neither does a proxy that is
     /// down, whose line names what to free instead.
     #[test]
-    fn session_start_points_at_net_setup_without_the_advisory() {
+    fn session_start_points_at_finalize_install_without_the_advisory() {
         let proxy = name_surface_line(LiveSurface::Proxy, Some(15390));
         assert!(
             proxy.ends_with(
                 "routes through it on 127.0.0.1:15390; for these names in a browser or \
-                 other host programs, run `min net setup`"
+                 other host programs, run `min finalize-install`"
             ),
             "{proxy}"
         );
@@ -4551,32 +4714,32 @@ mod tests {
                 None,
             ),
         ] {
-            assert!(!line.contains("min net setup"), "{line}");
+            assert!(!line.contains("min finalize-install"), "{line}");
         }
     }
 
-    /// NET-122's removal: `min net setup --undo` renders one annotated
+    /// NET-122's removal: `min finalize-install --undo` renders one annotated
     /// script per OS that removes everything the setup step installs, and
     /// every step of it tolerates what is already gone — a job or unit
     /// that is not loaded, a file or link that is not there — so it
     /// succeeds on a host it already cleaned.
     #[test]
-    fn net_setup_undo_removes_what_setup_installs() {
+    fn finalize_install_undo_removes_what_the_step_installs() {
         let channel = "/Library/Application Support/minimal/run/answerer.sock";
         let mac = macos_undo_command(channel);
         let linux = linux_undo_command("/run/minimal/answerer.sock");
         for script in [&mac, &linux] {
             let lines: Vec<&str> = script.lines().collect();
             assert_eq!(lines[0], "#!/bin/sh", "{script}");
-            assert!(lines[1].starts_with("# Remove what `min net setup` installed"));
+            assert!(lines[1].starts_with("# Remove what `min finalize-install` installed"));
             assert!(
-                lines[2].contains("min net setup --undo --print")
+                lines[2].contains("min finalize-install --undo --show --script")
                     && lines[2].contains("sudo sh <this file>"),
                 "{script}"
             );
             assert_eq!(lines[3], "set -eu", "{script}");
             assert!(sh_parses(script), "{script}");
-            for statement in script_statements(script) {
+            for statement in script_statements(&without_heredoc_bodies(script)) {
                 assert!(
                     !statement.contains("sh -c") && !statement.contains("sudo"),
                     "{statement}"
@@ -4641,6 +4804,42 @@ mod tests {
         }
         assert!(!linux.contains("rmdir \"/run\""), "{linux}");
         assert!(linux.contains(&linux_service_removal("")), "{linux}");
+        // Linux: the other items the step installs come away too — the
+        // user-namespace profile unloaded and its files removed, the
+        // classifier tree by the step's own `--uninstall` (the script
+        // carried whole, run only while the tree exists), and the kvm
+        // membership the step recorded adding.
+        for step in [
+            format!("if [ -f {APPARMOR_DIR}/minimald ] ; then"),
+            format!("  apparmor_parser --remove {APPARMOR_DIR}/minimald 2>/dev/null || true"),
+            format!(
+                "rm -f {APPARMOR_DIR}/minimald {APPARMOR_DIR}/tunables/minimald \
+                 {APPARMOR_DIR}/tunables/minimald.d/local"
+            ),
+            format!("if [ -d {CLASSIFIER_TREE_ROOT} ] ; then"),
+            format!("  bash -s -- --uninstall <<\\{CLASSIFIER_SCRIPT_HEREDOC}"),
+            format!("if [ -f {KVM_GROUP_RECORD} ] ; then"),
+            format!("  gpasswd -d \"$(cat {KVM_GROUP_RECORD})\" kvm 2>/dev/null || true"),
+        ] {
+            assert!(
+                linux.contains(&step),
+                "the Linux removal runs {step:?}: {linux}"
+            );
+        }
+        assert!(
+            linux.contains(&format!("{CLASSIFIER_SCRIPT}{CLASSIFIER_SCRIPT_HEREDOC}\n")),
+            "the classifier's own step rides whole under its delimiter"
+        );
+        assert!(
+            !CLASSIFIER_SCRIPT
+                .lines()
+                .any(|line| line == CLASSIFIER_SCRIPT_HEREDOC),
+            "the delimiter never occurs in the script it delimits"
+        );
+        assert!(
+            !mac.contains("apparmor_parser") && !mac.contains("gpasswd"),
+            "{mac}"
+        );
         assert!(
             linux_command(15353, Some(&test_install())).contains(&linux_service_removal("  ")),
             "the setup's failure block removes the same files"
@@ -4653,7 +4852,7 @@ mod tests {
     /// 0. The stand-ins record what ran; nothing outside the temp dir is
     /// touched, because `rm` and `rmdir` are stand-ins too.
     #[test]
-    fn net_setup_undo_succeeds_on_a_clean_host() {
+    fn finalize_install_undo_succeeds_on_a_clean_host() {
         use std::os::unix::fs::PermissionsExt as _;
         let stubs = tempfile::tempdir().expect("a temp dir");
         for tool in ["launchctl", "systemctl", "resolvectl", "rmdir", "ip"] {
@@ -4685,8 +4884,17 @@ exit 0
             linux_undo_command("/nonexistent/minimal/answerer.sock"),
         ] {
             // The link test reads `/sys/class/net`; on a clean host the
-            // link is absent, so `ip` is never reached.
-            let script = script.replace("/sys/class/net/", "/nonexistent/sys/class/net/");
+            // link is absent, so `ip` is never reached. The profile, the
+            // tree and the record are read the same way, so a host the
+            // suite runs on that has any of them is still a clean one here.
+            let script = script
+                .replace("/sys/class/net/", "/nonexistent/sys/class/net/")
+                .replace(APPARMOR_DIR, "/nonexistent/etc/apparmor.d")
+                .replace(
+                    CLASSIFIER_TREE_ROOT,
+                    "/nonexistent/sys/fs/cgroup/minimald.slice",
+                )
+                .replace(KVM_GROUP_RECORD, "/nonexistent/var/lib/minimal/kvm-group");
             let output = std::process::Command::new("/bin/sh")
                 .args(["-c", &script])
                 .env("PATH", stubs.path())
@@ -4697,9 +4905,14 @@ exit 0
                 "the removal succeeds on a clean host: {}\n{script}",
                 String::from_utf8_lossy(&output.stderr)
             );
+            let stderr = String::from_utf8_lossy(&output.stderr);
             assert!(
-                !String::from_utf8_lossy(&output.stderr).contains("/ip "),
+                !stderr.contains("/ip "),
                 "no link to delete on a clean host"
+            );
+            assert!(
+                !stderr.contains("apparmor_parser") && !stderr.contains("gpasswd"),
+                "no profile to unload and no membership to take back on a clean host: {stderr}"
             );
         }
     }
@@ -4710,7 +4923,7 @@ exit 0
     /// over none at all. The parse reads the unit's own bytes, so the
     /// decision is tested without a root-owned path.
     #[test]
-    fn net_setup_refuses_another_users_service() {
+    fn finalize_install_refuses_another_users_service() {
         let install = AnswererInstall {
             operator: "alice".to_string(),
             ..test_install()
@@ -4992,7 +5205,7 @@ exit 0
     fn a_start_with_an_unbound_answerer_names_the_proxy_and_points_at_setup() {
         let line = start_name_surface_line(None, Some(15390));
         assert_eq!(line, name_surface_line(LiveSurface::Proxy, Some(15390)));
-        assert!(line.ends_with(NET_SETUP_POINTER), "{line}");
+        assert!(line.ends_with(FINALIZE_INSTALL_POINTER), "{line}");
         assert_eq!(
             start_name_surface_line(Some(LiveSurface::Native), Some(15390)),
             name_surface_line(LiveSurface::Native, Some(15390))
@@ -5785,6 +5998,28 @@ exit 0
         );
     }
 
+    /// `script` with every quoted heredoc's body removed: the bytes between
+    /// a `<<\\DELIM` line and its `DELIM` line are a file's contents, not
+    /// statements the shell runs.
+    fn without_heredoc_bodies(script: &str) -> String {
+        let mut out = String::new();
+        let mut delimiter: Option<String> = None;
+        for line in script.lines() {
+            match &delimiter {
+                Some(end) if line == end => delimiter = None,
+                Some(_) => {}
+                None => {
+                    if let Some((_, end)) = line.split_once("<<\\") {
+                        delimiter = Some(end.trim().to_string());
+                    }
+                    out.push_str(line);
+                    out.push('\n');
+                }
+            }
+        }
+        out
+    }
+
     /// The lines of `script` a shell runs: every line that is not a
     /// comment.
     fn script_statements(script: &str) -> Vec<&str> {
@@ -5801,7 +6036,7 @@ exit 0
     /// inside it escalates on its own: the one elevation is the `sudo sh`
     /// that runs the file, however many files the script writes.
     #[test]
-    fn setup_script_is_an_annotated_posix_script() {
+    fn finalize_install_show_script_is_an_annotated_posix_script() {
         let mac = macos_command(15353, Some(&test_install()));
         let linux = linux_command(15353, Some(&test_install()));
         for (script, steps) in [

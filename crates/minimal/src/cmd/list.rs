@@ -341,7 +341,7 @@ pub(crate) async fn ls_listings(global: &GlobalArgs) -> Result<Vec<VmListing>, a
 }
 
 /// [`ls_listings`] for a reader that needs any one listing, not the
-/// selected VM's: `min net setup` looks for a VM that reports an answerer
+/// selected VM's: `min finalize-install` looks for a VM that reports an answerer
 /// port, so a selected VM that fails is skipped with a debug line instead
 /// of discarding the listings already read and the VMs not yet reached.
 pub(crate) async fn ls_listings_best_effort(global: &GlobalArgs) -> Vec<VmListing> {

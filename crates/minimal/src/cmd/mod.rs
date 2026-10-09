@@ -18,6 +18,7 @@ use minimal_client::{ensure_version_match, ensure_version_reported, version_asse
 use crate::*;
 
 mod admin;
+mod finalize_install;
 mod list;
 mod net;
 mod project;
@@ -29,6 +30,7 @@ mod session;
 use session::{daemon_provider_kind, vm_host_control_sock, withdraw_box_row};
 
 pub use admin::*;
+pub use finalize_install::*;
 pub use list::*;
 pub use net::*;
 pub use project::*;
@@ -82,9 +84,7 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
         Some(Command::Net(NetArgs {
             command: NetCommand::Forward(args),
         })) => cmd_net_forward(&cli.global_args, args).await,
-        Some(Command::Net(NetArgs {
-            command: NetCommand::Setup(args),
-        })) => cmd_net_setup(&cli.global_args, args).await,
+        Some(Command::FinalizeInstall(args)) => cmd_finalize_install(&cli.global_args, args).await,
         Some(Command::Dirs) => dirs::cmd_dirs(&cli.global_args),
         Some(Command::Bug(args)) => diag::cmd_bug(&cli.global_args, args).await,
         Some(Command::Diag(diag::DiagArgs { command })) => match command {

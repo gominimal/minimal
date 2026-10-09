@@ -456,17 +456,17 @@ maybe_remove_apparmor_profile() {
     say "      sudo apparmor_parser -R \"$_aa_profile\" && sudo rm -f \"$_aa_profile\" \"$_aa_tunable\""
 }
 
-# Offer to also remove the host DNS setup on uninstall. `min net setup` (opt-in,
+# Offer to also remove the host DNS setup on uninstall. `min finalize-install` (opt-in,
 # with root) points the host's resolver at the box zone and installs the
 # Minimal box-name service — and, on macOS, the boot unit that reserves the
 # local range; none of it is in the install record, and all of it outlives
 # `min`. Same shape as the AppArmor offer above: gated on any of those host
 # paths being present, so a host that never ran the step sees nothing; on an
-# interactive terminal, prompt and, on yes, run the shipped `min net setup
+# interactive terminal, prompt and, on yes, run the shipped `min finalize-install
 # --undo` (here, before the record walk deletes `min`); piped, non-interactive,
 # or dry-run, advise the root commands instead, which stay valid after the
 # walk. The root is overridable for install_test.sh.
-maybe_remove_net_setup() {
+maybe_remove_finalize_install() {
     _ns_root="${MINIMAL_OVERRIDE_NET_SETUP_ROOT:-}"
     if [ "$os" = darwin ]; then
         _ns_paths="/etc/resolver/min.internal /Library/LaunchDaemons/dev.gominimal.zone.plist /Library/PrivilegedHelperTools/minzoned /Library/LaunchDaemons/dev.minimal.local-range.plist /Library/PrivilegedHelperTools/dev.minimal.local-range"
@@ -485,18 +485,18 @@ maybe_remove_net_setup() {
     [ -n "$_ns_found" ] || return 0
 
     if [ "$dry_run" -eq 1 ]; then
-        say "  would offer to remove the host DNS setup (min net setup), found at $_ns_found"
+        say "  would offer to remove the host DNS setup (min finalize-install), found at $_ns_found"
         return 0
     fi
 
     _ns_min="$bindir/min"
     if [ -t 0 ] && [ -x "$_ns_min" ]; then
-        printf 'Also remove the host DNS setup that min net setup installed (needs root)? [y/N] ' >&2
+        printf 'Also remove the host DNS setup that min finalize-install installed (needs root)? [y/N] ' >&2
         _ns_ans=
         read -r _ns_ans || _ns_ans=
         case "$_ns_ans" in
             [Yy]*)
-                if "$_ns_min" net setup --undo; then
+                if "$_ns_min" finalize-install --undo; then
                     return 0
                 fi
                 say "  warning: could not remove it automatically; do it manually (root):"
@@ -508,8 +508,8 @@ maybe_remove_net_setup() {
     fi
 
     say ""
-    say "note: the host DNS setup from min net setup is still installed ($_ns_found)."
-    say "  it was installed separately with root; \`min net setup --undo\` removes it while min"
+    say "note: the host DNS setup from min finalize-install is still installed ($_ns_found)."
+    say "  it was installed separately with root; \`min finalize-install --undo\` removes it while min"
     say "  is installed. With min gone, remove it with:"
     say "      $_ns_undo"
 }
@@ -542,7 +542,7 @@ do_uninstall() {
     # separately-installed system AppArmor profile too.
     maybe_remove_apparmor_profile
     # The host DNS setup too, for the same reason: `min` runs its removal.
-    maybe_remove_net_setup
+    maybe_remove_finalize_install
 
     # Tab, computed once, so rows are split on tab alone: a dest under a
     # $HOME containing spaces must still parse as one field.
