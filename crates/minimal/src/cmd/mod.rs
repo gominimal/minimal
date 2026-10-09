@@ -732,8 +732,12 @@ pub(crate) async fn upload_and_finalize(
             }
             Ok(())
         }
+        // The stage in the client's words, the cause in the daemon's: a
+        // refusal here can be a bare OS string from the record write or
+        // the composition check, which says nothing about where the
+        // activation stopped.
         minimald_rpc::Errorable::Err { error } => {
-            bail!("{error}");
+            bail!("could not finish activating the session: {error}");
         }
     }
 }

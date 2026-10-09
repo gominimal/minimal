@@ -2416,7 +2416,7 @@ impl Session {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidInput,
                             "patches upload never completed; cannot finalize \
-                             (upload patches, then retry FinalizeSession)",
+                             (upload patches, then retry the activation)",
                         ));
                     }
                 }
@@ -2451,7 +2451,7 @@ impl Session {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidInput,
                             "hook-script upload never completed; cannot finalize \
-                             (upload hook scripts, then retry FinalizeSession)",
+                             (upload hook scripts, then retry the activation)",
                         ));
                     }
                 }

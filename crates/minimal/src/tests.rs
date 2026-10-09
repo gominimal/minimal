@@ -1774,6 +1774,21 @@ fn daemon_refusals_print_without_rpc_names() {
             );
         }
     }
+
+    // The daemon's side of the same surface: the finalize refusals it
+    // hands `upload_and_finalize` are printed verbatim, so their retry
+    // hint names the activation, not the RPC the client retries.
+    let daemon = std::fs::read_to_string(manifest.join("../minimald/src/session.rs"))
+        .expect("readable daemon source");
+    assert_eq!(
+        daemon.matches("then retry the activation)").count(),
+        2,
+        "the daemon's two upload-marker finalize refusals must name the activation"
+    );
+    assert!(
+        !daemon.contains("retry FinalizeSession"),
+        "a daemon finalize refusal still names the RPC"
+    );
 }
 
 /// A project outside a VCS root that declares lifecycle hooks must be
