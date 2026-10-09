@@ -4320,6 +4320,15 @@ impl Session {
             None => (None, spawn.await),
         };
         let (host, task, host_ip_enforcement) = spawned.map_err(AttachError::SpawnFailed)?;
+        // The confirmation was a read, not a reservation: the VM host daemon
+        // may have withdrawn the row at its grace's end between that read
+        // and this launch (NET-138). Read it again now the new host is up,
+        // before the slot is marked as holding it; a row gone in between
+        // ends the launch as the read before it would have.
+        if rejoins_row && !self.host_row_stands(&record).await {
+            let _ = host.kill(false).await;
+            return Err(AttachError::BoxHostRowEnded);
+        }
         // Whatever this launch replaces, the slot it goes into no longer
         // holds the launch that bound the box's host-side row; only the
         // binding launch itself, below, sets this again — or a relaunch the
@@ -4395,25 +4404,29 @@ impl Session {
             &self.inner,
             SessionInner::Active { host: Some((h, _)), .. } if h.is_alive()
         );
-        let Some(addresses) = record.box_addresses else {
-            return false;
-        };
-        if !record.host_row_bound || (self.slot_holds_row && slot_alive) {
+        if record.box_addresses.is_none()
+            || !record.host_row_bound
+            || (self.slot_holds_row && slot_alive)
+        {
             return false;
         }
-        // A registered box whose record names no box id cannot be told
-        // from another box handed its address: no row, fail-closed.
-        let Some(box_id) = record.box_id else {
-            self.relaunch_row_confirmed = false;
-            return true;
-        };
-        let control = self.switch_control().await;
-        let standing =
-            crate::net::listeners::host_row_standing(&control, addresses.switch_address, box_id)
-                .await
-                == Some(true);
+        let standing = self.host_row_stands(record).await;
         self.relaunch_row_confirmed = standing && !slot_alive;
         !standing
+    }
+
+    /// Whether the VM host daemon says this registered box's row stands
+    /// ([`crate::net::listeners::host_row_standing`]), read for the box id
+    /// the record names. A record naming no box id cannot be told from
+    /// another box handed its address, so it reads as no row without
+    /// asking: fail-closed. A host that cannot be asked reads as no row.
+    async fn host_row_stands(&mut self, record: &Record) -> bool {
+        let (Some(addresses), Some(box_id)) = (record.box_addresses, record.box_id) else {
+            return false;
+        };
+        let control = self.switch_control().await;
+        crate::net::listeners::host_row_standing(&control, addresses.switch_address, box_id).await
+            == Some(true)
     }
 
     /// Records the launch's own placement outcome on this session's record
