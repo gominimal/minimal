@@ -134,9 +134,13 @@ To give such a box reach, declare it with the allow flags, such as
 `--allow-dns-hosts github.com` or `--allow-subnets 0.0.0.0/0`, or with an
 `egress` section in `minimal.toml`. To keep the earlier allow-all default for
 every undeclared box on a host, the operator opts out. A native Linux host
-opts out with `minimald run --egress-deny-all-opt-out`. A VM-backed host opts
-out with `MINVMD_EGRESS_DENY_ALL_OPT_OUT=1` in the environment that starts
-`minvmd` (see [minvmd](./cli-minvmd.md)). A host-address box with no section
+opts out with `minimald run --egress-deny-all-opt-out`, or with
+`MINIMALD_EGRESS_DENY_ALL_OPT_OUT=1` in the environment that starts
+`minimald`. `min` starts the daemon without the flag when it is not running,
+so export the variable to keep the opt-out after such a restart (see
+[minimald](./cli-minimald.md)). A VM-backed host opts out with
+`MINVMD_EGRESS_DENY_ALL_OPT_OUT=1` in the environment that starts `minvmd`
+(see [minvmd](./cli-minvmd.md)). A host-address box with no section
 keeps allow-all either way.
 
 Activating a path that already has a session is allowed, but warns: `min` names

@@ -279,8 +279,28 @@ pub struct ListenArgs {
     /// to keep the prior default — a deployment that cannot carry the change
     /// yet — and retire the flag once yours declares its boxes' egress. A
     /// box that declares its own egress section is unaffected either way.
+    /// `MINIMALD_EGRESS_DENY_ALL_OPT_OUT=1` in the environment opts out too,
+    /// and survives the restarts `min` makes without the flag.
     #[arg(long, default_value_t = false)]
     egress_deny_all_opt_out: bool,
+}
+
+/// The environment fallback for `run --egress-deny-all-opt-out` (NET-077).
+/// `min` auto-starts the native daemon with no flags of its own, and the
+/// spawned daemon inherits the environment it was started from, so an
+/// operator who exports this keeps the opt-out across every restart `min`
+/// makes — the native counterpart of `MINVMD_EGRESS_DENY_ALL_OPT_OUT`. The
+/// spelling is the boot token a VM host hands its guest daemon
+/// ([`minimald::guest::HANDED_EGRESS_DENY_ALL_OPT_OUT_TOKEN`]), so the one name means
+/// the one thing on either side.
+const EGRESS_DENY_ALL_OPT_OUT_ENV: &str = minimald::guest::HANDED_EGRESS_DENY_ALL_OPT_OUT_TOKEN;
+
+/// The daemon's deny-all opt-out (NET-077): the `run` flag, or the
+/// [`EGRESS_DENY_ALL_OPT_OUT_ENV`] value `env` read through the one parse
+/// every opt-out reader shares — `1`, `true`, `yes` or `on`; anything else,
+/// or unset, keeps the deny-all default.
+fn egress_deny_all_opt_out(flag: bool, env: Option<&str>) -> bool {
+    flag || sessions::egress_deny_all_opt_out_from_raw(env)
 }
 
 /// An error at the top level of minimald.
@@ -1024,11 +1044,14 @@ async fn async_main() -> Result<(), MainError> {
         // its own identity and with it its own /24 across restarts.
         daemon_identity_dir: Some(cli.client_instance_dir()),
         // NET-077: the deployment's opt-out of the deny-all egress default —
-        // the one daemon-side knob the default has.
-        deny_all_opt_out: cli
-            .listen_args()
-            .expect("the daemon path is `run`, which carries listen args")
-            .egress_deny_all_opt_out,
+        // the one daemon-side knob the default has: the flag, or its
+        // environment fallback, which a daemon `min` auto-starts inherits.
+        deny_all_opt_out: egress_deny_all_opt_out(
+            cli.listen_args()
+                .expect("the daemon path is `run`, which carries listen args")
+                .egress_deny_all_opt_out,
+            std::env::var(EGRESS_DENY_ALL_OPT_OUT_ENV).ok().as_deref(),
+        ),
     };
     // Ensure the SSH host key is accessible in a instance-specific known_hosts file.
     // R1.2: load once and reuse in the vsock beacon so there is no redundant disk read.
@@ -1312,6 +1335,23 @@ mod tests {
                 num_parallel_builds: None,
             },
         }
+    }
+
+    /// NET-077: a native daemon `min` auto-starts with no flag keeps an
+    /// opt-out the operator exported, through the shared parse; the flag
+    /// alone still opts out, and any other value keeps the default.
+    #[test]
+    fn egress_opt_out_falls_back_to_the_environment() {
+        assert_eq!(
+            EGRESS_DENY_ALL_OPT_OUT_ENV,
+            "MINIMALD_EGRESS_DENY_ALL_OPT_OUT"
+        );
+        assert!(egress_deny_all_opt_out(true, None));
+        assert!(egress_deny_all_opt_out(false, Some("1")));
+        assert!(egress_deny_all_opt_out(false, Some(" On ")));
+        assert!(!egress_deny_all_opt_out(false, None));
+        assert!(!egress_deny_all_opt_out(false, Some("0")));
+        assert!(!egress_deny_all_opt_out(false, Some("off")));
     }
 
     #[test]
