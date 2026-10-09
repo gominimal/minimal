@@ -134,6 +134,8 @@ pub enum Msg {
         id: SessionId,
         /// The daemon's package check stepped aside at finalize.
         package_check_skipped: bool,
+        /// The deny-all egress default binds the new box (NET-074).
+        egress_deny_all_default: bool,
     },
 }
 
@@ -530,19 +532,40 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
             provider,
             id,
             package_check_skipped,
+            egress_deny_all_default,
         } => {
-            model.status = Some(if package_check_skipped {
-                "session created; warning: the package check was skipped, so unknown \
-                 package names will surface at first exec"
-                    .to_string()
-            } else {
-                "session created".to_string()
-            });
+            model.status = Some(created_status(
+                package_check_skipped,
+                egress_deny_all_default,
+            ));
             model.pending_focus = Some((provider, id));
             vec![Effect::Refresh]
         }
         Msg::Key(key) => update_key(model, key),
     }
+}
+
+/// The status line a create ends with: the package check's warning when it
+/// stepped aside, and the note `min session activate` prints when the
+/// deny-all egress default binds the new box (NET-074) — the dashboard has
+/// no egress fields, so a bare own-address box it creates reaches nothing
+/// outside itself until it is re-created with declared reach.
+fn created_status(package_check_skipped: bool, egress_deny_all_default: bool) -> String {
+    let mut status = "session created".to_string();
+    if package_check_skipped {
+        status.push_str(
+            "; warning: the package check was skipped, so unknown package names will \
+             surface at first exec",
+        );
+    }
+    if egress_deny_all_default {
+        status.push_str(
+            "; egress: deny-all (default for an own-ip box with no egress section); \
+             declare reach with `min session activate --allow-subnets`, \
+             --allow-dns-hosts or --allow-protocols",
+        );
+    }
+    status
 }
 
 fn update_key(model: &mut Model, key: KeyEvent) -> Vec<Effect> {
@@ -1026,10 +1049,12 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
                                 Ok(rpc::Activated {
                                     id,
                                     package_check_skipped,
+                                    egress_deny_all_default,
                                 }) => Msg::Created {
                                     provider,
                                     id,
                                     package_check_skipped,
+                                    egress_deny_all_default,
                                 },
                                 Err(e) => Msg::ActionDone(Err(format!("{e:#}"))),
                             };
@@ -1360,6 +1385,38 @@ mod tests {
 
     fn key(code: KeyCode) -> Msg {
         Msg::Key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    /// NET-074 from the dashboard: a create the deny-all default binds ends
+    /// with the in-force note on the status line, as `min session activate`
+    /// prints it; one it does not bind says only that the session was made.
+    #[test]
+    fn created_status_notes_the_deny_all_default() {
+        let mut model = model_with(Vec::new());
+        update(
+            &mut model,
+            Msg::Created {
+                provider: "host".to_string(),
+                id: id(1),
+                package_check_skipped: false,
+                egress_deny_all_default: true,
+            },
+        );
+        let status = model.status.clone().unwrap_or_default();
+        assert!(
+            status.contains("egress: deny-all (default for an own-ip box with no egress section)"),
+            "{status}"
+        );
+        update(
+            &mut model,
+            Msg::Created {
+                provider: "host".to_string(),
+                id: id(2),
+                package_check_skipped: false,
+                egress_deny_all_default: false,
+            },
+        );
+        assert_eq!(model.status.as_deref(), Some("session created"));
     }
 
     fn two_providers() -> Model {

@@ -497,6 +497,7 @@ pub async fn activate(
         hooks_enabled: true,
         attrs: Default::default(),
     };
+    let undeclared_own_ip = config.network == NetworkMode::OwnIp && config.policy.egress.is_none();
     let (created, mut row) = create_registering(sock, config, &mut client, |client, config| {
         Box::pin(async move {
             client
@@ -522,6 +523,7 @@ pub async fn activate(
         return Err(error);
     }
     let id = created.id;
+    let egress_deny_all_default = undeclared_own_ip && deny_all_default_binds(&created);
 
     // The registration's lease is held across the flow and committed only
     // once the session is active: until then a dashboard that dies leaves
@@ -608,6 +610,7 @@ pub async fn activate(
             Ok(Activated {
                 id,
                 package_check_skipped,
+                egress_deny_all_default,
             })
         }
         Err(e) => {
@@ -761,6 +764,23 @@ pub struct Activated {
     /// The daemon's package check stepped aside at finalize, so unknown
     /// package names surface at first exec; the status line says so.
     pub package_check_skipped: bool,
+    /// The box is own-address with no egress section, on a daemon that
+    /// has not opted out, so the deny-all default binds it (NET-074): it
+    /// reaches nothing outside itself, and the status line says so, as
+    /// `min session activate` prints its one-line note.
+    pub egress_deny_all_default: bool,
+}
+
+/// Whether the deny-all egress default binds an own-address box with no
+/// egress section that `created` answered the create of (NET-074): the
+/// build's phase has it in force, and the daemon, the side that knows,
+/// did not report its opt-out (NET-077) — the check `min session
+/// activate` makes before its note.
+fn deny_all_default_binds(created: &minimald_rpc::CreateSessionResponse) -> bool {
+    match sessions::EGRESS_DEFAULT_PHASE {
+        sessions::EgressDefaultPhase::Announced => false,
+        sessions::EgressDefaultPhase::InForce => created.deny_all_opt_out != Some(true),
+    }
 }
 
 /// Resolves the directory whose tree should be uploaded as the session
@@ -863,6 +883,23 @@ mod tests {
         let provider = dir.path().join("providers").join("local-minvmd0");
         std::fs::create_dir_all(&provider).unwrap();
         provider
+    }
+
+    /// NET-074 from the dashboard: the deny-all default binds a bare
+    /// own-address box unless the daemon reports its opt-out (NET-077); a
+    /// daemon that predates the field is read as not opted out, as the CLI
+    /// reads it.
+    #[test]
+    fn deny_all_default_binds_unless_the_daemon_opted_out() {
+        let mut reply = created();
+        assert!(
+            deny_all_default_binds(&reply),
+            "no field: the default binds"
+        );
+        reply.deny_all_opt_out = Some(false);
+        assert!(deny_all_default_binds(&reply));
+        reply.deny_all_opt_out = Some(true);
+        assert!(!deny_all_default_binds(&reply), "an opted-out daemon");
     }
 
     /// The dashboard's create config for an own-address box in `dir`.
