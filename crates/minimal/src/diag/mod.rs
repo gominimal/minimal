@@ -43,10 +43,16 @@ pub enum DiagCommand {
     Collect(BugArgs),
     /// Send a bundle collected earlier to the diag portal
     ///
-    /// Prints where the diagnosis will appear. Use this for a bundle someone
-    /// handed you, or one collected before the portal was reachable;
-    /// `min diag collect --upload` does both steps in one.
+    /// Prints the report URL and the command that deletes the bundle. Use
+    /// this for a bundle someone handed you, or one collected before the
+    /// portal was reachable; `min diag collect --upload` does both steps in
+    /// one.
     Upload(UploadArgs),
+    /// Delete an uploaded bundle before it expires
+    ///
+    /// Takes the id and delete token an upload printed. The portal deletes
+    /// the bundle and any diagnosis made from it.
+    Delete(DeleteArgs),
 }
 
 #[derive(Debug, Args)]
@@ -57,11 +63,23 @@ pub struct UploadArgs {
     pub portal: PortalArgs,
 }
 
-/// How to reach the portal, shared by the two commands that do.
+#[derive(Debug, Args)]
+pub struct DeleteArgs {
+    /// The diagnosis id the upload printed
+    pub id: String,
+    /// The delete token the upload printed
+    pub token: String,
+    /// The portal's base URL
+    #[arg(long, default_value = DEFAULT_ENDPOINT)]
+    pub endpoint: String,
+}
+
+/// How to reach the portal, shared by the two commands that upload.
 ///
 /// Flattened rather than repeated so that `min diag collect --upload` and
-/// `min diag upload` cannot drift into spelling the same three things
-/// differently.
+/// `min diag upload` cannot drift into spelling the same things differently.
+/// The upload sends no credential: the portal stores the bundle, and a
+/// person signs in on the report page to start its diagnosis.
 #[derive(Debug, Args)]
 pub struct PortalArgs {
     /// What went wrong, in a sentence; shown beside the report and given to
@@ -71,19 +89,6 @@ pub struct PortalArgs {
     /// you were doing when it stopped working.
     #[arg(long)]
     pub context: Option<String>,
-    /// GitHub user token to upload with
-    ///
-    /// Defaults to `$GITHUB_TOKEN`, then `$GH_TOKEN`, then whatever
-    /// `gh auth token` prints. The portal uses it once to ask GitHub which
-    /// account it belongs to — that account is what its daily quota counts —
-    /// and never stores it.
-    ///
-    /// It must be a *user* token. The `GITHUB_TOKEN` a GitHub Actions job is
-    /// handed automatically is an app installation token, which names no
-    /// user, so a workflow that uploads needs a personal access token in the
-    /// environment instead.
-    #[arg(long)]
-    pub token: Option<String>,
     /// The portal's base URL
     #[arg(long, default_value = DEFAULT_ENDPOINT)]
     pub endpoint: String,
@@ -109,12 +114,14 @@ pub struct BugArgs {
     /// start well after the incident.
     #[arg(long, default_value_t = LOG_TAIL_CAP, value_parser = parse_log_tail_bytes)]
     pub log_tail_bytes: u64,
-    /// Send the bundle to the diag portal and print where its diagnosis will
-    /// appear
+    /// Send the bundle to the diag portal and print its report URL
     ///
     /// The bundle leaves this machine. It is the same archive either way —
     /// secret-shaped values redacted, file contents never included — but
-    /// collecting one is local and this is not.
+    /// collecting one is local and this is not. The portal stores it for the
+    /// minimal team for 7 days and does not diagnose it until someone signs
+    /// in at the report URL and starts the diagnosis. The upload also prints
+    /// the `min diag delete` command that removes it sooner.
     #[arg(long)]
     pub upload: bool,
     #[command(flatten)]
@@ -317,12 +324,13 @@ pub async fn cmd_bug(global: &GlobalArgs, args: BugArgs) -> Result<(), anyhow::E
         return Ok(());
     }
     // After the bundle is on disk, never instead of it. An upload that fails
-    // — no token, a spent allowance, no network from a machine broken enough
-    // to be worth diagnosing — must still leave the archive behind, because
-    // collecting it again is the expensive half.
+    // — a refusal, no network from a machine broken enough to be worth
+    // diagnosing — must still leave the archive behind, because collecting
+    // it again is the expensive half.
     let sent = send(&out_path, &args.portal).await?;
-    println!("Report:  {}", sent.report_url);
-    println!("Status:  {}", sent.status_url);
+    for line in sent.receipt() {
+        println!("{line}");
+    }
     Ok(())
 }
 
@@ -330,21 +338,27 @@ pub async fn cmd_bug(global: &GlobalArgs, args: BugArgs) -> Result<(), anyhow::E
 pub async fn cmd_diag_upload(args: UploadArgs) -> Result<(), anyhow::Error> {
     let sent = send(&args.path, &args.portal).await?;
     println!("Sent {}", args.path.display());
-    println!("Report:  {}", sent.report_url);
-    println!("Status:  {}", sent.status_url);
+    for line in sent.receipt() {
+        println!("{line}");
+    }
     Ok(())
 }
 
-/// The upload both commands do: find a token, then send.
+/// `min diag delete` — take an uploaded bundle back before it expires.
+pub async fn cmd_diag_delete(args: DeleteArgs) -> Result<(), anyhow::Error> {
+    upload::delete(&args.endpoint, &args.id, &args.token).await?;
+    println!("Deleted {}", args.id);
+    Ok(())
+}
+
+/// The upload both commands do.
 async fn send(
     path: &std::path::Path,
     portal: &PortalArgs,
 ) -> Result<upload::Uploaded, anyhow::Error> {
-    let token = upload::resolve_token(portal.token.as_deref()).await?;
     upload::upload(
         path,
         &portal.endpoint,
-        &token,
         portal.context.as_deref().unwrap_or_default(),
     )
     .await
@@ -576,17 +590,66 @@ mod tests {
         use crate::cli::{Cli, Command};
         let Some(Command::Diag(DiagArgs {
             command: DiagCommand::Upload(args),
-        })) = Cli::try_parse_from(["min", "diag", "upload", "b.tar.zst", "--token", "t"])
+        })) = Cli::try_parse_from(["min", "diag", "upload", "b.tar.zst"])
             .unwrap()
             .command
         else {
             panic!("`min diag upload <path>` must parse");
         };
         assert_eq!(args.path, PathBuf::from("b.tar.zst"));
-        assert_eq!(args.portal.token.as_deref(), Some("t"));
         // A path is not optional: uploading "whatever is lying around" is a
         // guess, and the bundle is named after the minute it was collected.
         assert!(Cli::try_parse_from(["min", "diag", "upload"]).is_err());
+    }
+
+    /// The upload sends no credential, so there is no flag to hand it one:
+    /// a script that still passes `--token` fails loudly rather than
+    /// believing its token went somewhere.
+    #[test]
+    fn there_is_no_token_flag() {
+        use crate::cli::Cli;
+        for argv in [
+            &["min", "bug", "--upload", "--token", "t"][..],
+            &["min", "diag", "collect", "--upload", "--token", "t"],
+            &["min", "diag", "upload", "b.tar.zst", "--token", "t"],
+        ] {
+            assert!(Cli::try_parse_from(argv).is_err(), "{argv:?}");
+        }
+    }
+
+    /// `min diag delete <id> <token>` takes both positionals the upload
+    /// printed, and the portal's address like the upload does.
+    #[test]
+    fn deleting_takes_the_id_and_token_the_upload_printed() {
+        use crate::cli::{Cli, Command};
+        let parsed = |argv: &[&str]| {
+            let Some(Command::Diag(DiagArgs {
+                command: DiagCommand::Delete(args),
+            })) = Cli::try_parse_from(argv).unwrap().command
+            else {
+                panic!("`min diag delete <id> <token>` must parse: {argv:?}");
+            };
+            args
+        };
+        let args = parsed(&["min", "diag", "delete", "d-123", "tok-xyz"]);
+        assert_eq!(
+            (args.id.as_str(), args.token.as_str()),
+            ("d-123", "tok-xyz")
+        );
+        assert_eq!(args.endpoint, DEFAULT_ENDPOINT);
+        let args = parsed(&[
+            "min",
+            "diag",
+            "delete",
+            "d-123",
+            "tok-xyz",
+            "--endpoint",
+            "http://localhost:8787",
+        ]);
+        assert_eq!(args.endpoint, "http://localhost:8787");
+        // Both are required: a delete without its token would be refused
+        // by the portal, so it is refused here first.
+        assert!(Cli::try_parse_from(["min", "diag", "delete", "d-123"]).is_err());
     }
 
     #[test]
@@ -647,7 +710,6 @@ mod tests {
             upload: false,
             portal: PortalArgs {
                 context: None,
-                token: None,
                 endpoint: DEFAULT_ENDPOINT.to_string(),
             },
         };
@@ -706,7 +768,6 @@ mod tests {
             upload: false,
             portal: PortalArgs {
                 context: None,
-                token: None,
                 endpoint: DEFAULT_ENDPOINT.to_string(),
             },
         };
@@ -756,7 +817,6 @@ mod tests {
             upload: false,
             portal: PortalArgs {
                 context: None,
-                token: None,
                 endpoint: DEFAULT_ENDPOINT.to_string(),
             },
         };
@@ -801,7 +861,6 @@ mod tests {
             upload: false,
             portal: PortalArgs {
                 context: None,
-                token: None,
                 endpoint: DEFAULT_ENDPOINT.to_string(),
             },
         };
@@ -858,7 +917,6 @@ mod tests {
             upload: false,
             portal: PortalArgs {
                 context: None,
-                token: None,
                 endpoint: DEFAULT_ENDPOINT.to_string(),
             },
         };
@@ -898,7 +956,6 @@ mod tests {
             upload: false,
             portal: PortalArgs {
                 context: None,
-                token: None,
                 endpoint: DEFAULT_ENDPOINT.to_string(),
             },
         };
@@ -940,7 +997,6 @@ mod tests {
             upload: false,
             portal: PortalArgs {
                 context: None,
-                token: None,
                 endpoint: DEFAULT_ENDPOINT.to_string(),
             },
         };
@@ -989,7 +1045,6 @@ mod tests {
             upload: false,
             portal: PortalArgs {
                 context: None,
-                token: None,
                 endpoint: DEFAULT_ENDPOINT.to_string(),
             },
         };
@@ -1055,7 +1110,6 @@ mod tests {
             upload: false,
             portal: PortalArgs {
                 context: None,
-                token: None,
                 endpoint: DEFAULT_ENDPOINT.to_string(),
             },
         };
@@ -1098,7 +1152,6 @@ mod tests {
             upload: false,
             portal: PortalArgs {
                 context: None,
-                token: None,
                 endpoint: DEFAULT_ENDPOINT.to_string(),
             },
         };
@@ -1138,7 +1191,6 @@ mod tests {
             upload: false,
             portal: PortalArgs {
                 context: None,
-                token: None,
                 endpoint: DEFAULT_ENDPOINT.to_string(),
             },
         };
@@ -1179,7 +1231,6 @@ mod tests {
             upload: false,
             portal: PortalArgs {
                 context: None,
-                token: None,
                 endpoint: DEFAULT_ENDPOINT.to_string(),
             },
         };
@@ -1232,7 +1283,6 @@ mod tests {
             upload: false,
             portal: PortalArgs {
                 context: None,
-                token: None,
                 endpoint: DEFAULT_ENDPOINT.to_string(),
             },
         };

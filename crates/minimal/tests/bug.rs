@@ -97,7 +97,6 @@ fn bug_args(out: &Path) -> BugArgs {
         upload: false,
         portal: PortalArgs {
             context: None,
-            token: None,
             endpoint: DEFAULT_ENDPOINT.to_string(),
         },
     }
