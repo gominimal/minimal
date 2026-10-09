@@ -553,11 +553,12 @@ pub async fn activate(
             .await
             .context("uploading project files")?;
         // Collect the upload pairs before the contribution moves into the
-        // ConfigureLoadout RPC — the same collection `min session
-        // activate` makes: these land in the final composition whether
+        // ConfigureLoadout RPC, through the collection `min session
+        // activate` uses: these land in the final composition whether
         // the response is `Materialized` or `Pending`, so the client is
         // authoritative for them.
-        let patches = collected_patches(&contribution);
+        let mut patches = minimal_client::contribution_patch_uploads(&contribution);
+        minimal_client::dedup_patch_uploads(&mut patches);
         // Drop hooks whose scripts live in a file. The dashboard has no
         // hook-script upload — that staging lives in the `minimal` crate,
         // which sits above this one — and the daemon refuses to finalize a
@@ -589,9 +590,10 @@ pub async fn activate(
         // never completed, and the dashboard — unlike the CLI — never sent
         // them, so every patch-bearing loadout faulted at the finalize and
         // left a `Materializing` record behind. An empty list is a no-op in
-        // the client, so a patchless loadout is unchanged.
+        // the client, so a patchless loadout is unchanged. Quiet: the
+        // dashboard owns the screen, and a progress bar would corrupt it.
         client
-            .upload_patches(id, &patches)
+            .upload_patches_quiet(id, &patches)
             .await
             .context("uploading composition patches")?;
         match client
@@ -861,31 +863,6 @@ fn without_external_hook_scripts(
             || h.on_detach.is_some()
     });
     contribution
-}
-
-/// The composition's patch files as `(host path, sandbox destination)`
-/// upload pairs, sorted and deduplicated by destination — the same
-/// collection `min session activate` makes before its contribution
-/// moves into `ConfigureLoadout` (the composer's post-gate check
-/// guarantees duplicates are exact matches, so collapsing is safe).
-/// Dedup by destination, not host path: two loadouts may name the
-/// same destination, and the daemon's finalize gate counts pairs.
-fn collected_patches(
-    contribution: &sessions::wire::request::WireContribution,
-) -> Vec<(std::path::PathBuf, paths::SandboxRelPath)> {
-    let mut patches: Vec<(std::path::PathBuf, paths::SandboxRelPath)> = contribution
-        .patches
-        .iter()
-        .map(|p| {
-            (
-                p.patch.host_path.as_utf8_path().as_std_path().to_path_buf(),
-                p.patch.destination.clone(),
-            )
-        })
-        .collect();
-    patches.sort_by(|a, b| a.1.as_str().cmp(b.1.as_str()));
-    patches.dedup_by(|a, b| a.1.as_str() == b.1.as_str());
-    patches
 }
 #[cfg(test)]
 mod tests {
@@ -1495,58 +1472,6 @@ mod tests {
             "every candidate keeps a label no other candidate carries — the \
              label is the identity `connect_missing` and the dashboard resolve \
              providers by: {candidates:?}"
-        );
-    }
-
-    /// A wire patch from a user loadout, as `compose_user_contribution`
-    /// emits one.
-    fn wire_patch(host: &str, dest: &str) -> sessions::wire::primitives::WireSessionPatch {
-        sessions::wire::primitives::WireSessionPatch {
-            patch: sessions::wire::primitives::WireResolvedPatch {
-                host_path: paths::HostAbsPath::try_new(host).unwrap(),
-                destination: paths::SandboxRelPath::try_new(dest).unwrap(),
-            },
-            source: sessions::wire::primitives::WireSource::UserLoadout {
-                name: "dev".to_string(),
-            },
-        }
-    }
-
-    /// The dashboard's create must upload the composition's patches or the
-    /// daemon's finalize gate refuses the session, so the collection
-    /// mirrors the CLI's: map each wire patch to its `(host path, sandbox
-    /// destination)` pair, sort by destination, and collapse
-    /// same-destination duplicates (the composer's post-gate check
-    /// guarantees they are exact matches). A composition without patches
-    /// collects nothing — the upload is a no-op there, so a patchless
-    /// loadout is unchanged.
-    #[test]
-    fn collected_patches_sort_dedup_and_map_the_wire_patches() {
-        let contribution = sessions::wire::request::WireContribution {
-            patches: vec![
-                wire_patch("/tmp/first.patch", "zeta/first.patch"),
-                wire_patch("/tmp/second.patch", "alpha/second.patch"),
-                wire_patch("/tmp/third.patch", "alpha/second.patch"),
-            ],
-            ..Default::default()
-        };
-        assert_eq!(
-            collected_patches(&contribution),
-            vec![
-                (
-                    std::path::PathBuf::from("/tmp/second.patch"),
-                    paths::SandboxRelPath::try_new("alpha/second.patch").unwrap(),
-                ),
-                (
-                    std::path::PathBuf::from("/tmp/first.patch"),
-                    paths::SandboxRelPath::try_new("zeta/first.patch").unwrap(),
-                ),
-            ],
-            "sorted by destination, duplicates collapsed"
-        );
-        assert!(
-            collected_patches(&sessions::wire::request::WireContribution::default()).is_empty(),
-            "a patchless composition uploads nothing"
         );
     }
 }
