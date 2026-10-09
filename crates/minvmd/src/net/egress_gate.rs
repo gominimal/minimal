@@ -344,9 +344,8 @@ const DROP_WARN_MIN_INTERVAL: Duration = Duration::from_secs(60);
 const DROP_WARN_MAX_TRACKED_PAIRS: usize = 1024;
 
 /// The rule name for NET-081's failure case: a frame whose source address no
-/// published namespace holds and the phase leaves nothing to admit — an
-/// address outside the plan's lease block while the interim is announced, and
-/// any address at all once the per-box default binds. Its own rule, not the
+/// published namespace holds — an address outside the plan's lease block (an
+/// in-plan one takes [`UNREGISTERED_SOURCE_RULE`]). Its own rule, not the
 /// lease check's, because the host table has no lease to name — the address
 /// simply is not one the host published.
 const UNKNOWN_SOURCE_RULE: &str = "egress-unknown-source";
