@@ -1370,7 +1370,7 @@ offer_finalize_install() {
             fi
             ;;
     esac
-    say "run this when you're ready:"
+    say "run \`min finalize-install\` when you're ready, or without a terminal:"
     say "$fi_pointer"
 }
 offer_finalize_install

@@ -708,7 +708,9 @@ case_installer_prints_the_pointer_when_declined_or_without_tty() {
     TTY_FILE=
     check 0 "$rc" "a declined offer exits 0"
     want_ok "the offer was made" grep -qF "$fi_prompt" "$OUT"
-    want_ok "declining prints the pointer, exactly, on its own line" \
+    want_ok "declining prints the spec's pointer text" \
+        grep -qF "run \`min finalize-install\` when you're ready" "$OUT"
+    want_ok "declining prints the file route, exactly, on its own line" \
         grep -qxF "$fi_pointer" "$OUT"
     check "$fi_shown" "$(cat "$HF5/finalize.calls")" "declining runs nothing but the probe and the summary"
     want_card_last "the card follows the pointer (R10.4)"
@@ -722,7 +724,9 @@ case_installer_prints_the_pointer_when_declined_or_without_tty() {
     want_ok "without a terminal the summary is still shown" \
         grep -q "install status on this machine" "$OUT"
     want_err "nothing is asked without a terminal" grep -qF "Finish setup now?" "$OUT"
-    want_ok "without a terminal the pointer is printed, exactly" \
+    want_ok "without a terminal the spec's pointer text is printed" \
+        grep -qF "run \`min finalize-install\` when you're ready" "$OUT"
+    want_ok "without a terminal the file route is printed, exactly" \
         grep -qxF "$fi_pointer" "$OUT"
     check 1 "$(grep -cF "$fi_pointer" "$OUT")" "the pointer is printed once"
     check "$fi_shown" "$(cat "$HF6/finalize.calls")" \
