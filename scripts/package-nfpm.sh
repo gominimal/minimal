@@ -335,18 +335,21 @@ postinstall_dir="$ROOT/.scratch/package-nfpm"
 mkdir -p "$postinstall_dir"
 cat > "$postinstall_dir/postinstall.sh" <<'EOF'
 #!/bin/sh
-# minimal postinstall: load the minimald AppArmor profile when this host has
-# AppArmor. Never hard-fails: most rpm/apk targets have no AppArmor at all,
-# and the package must install cleanly there — the daemon warns at runtime
-# instead (see docs/reference/linux-host-setup.md).
-loader=/usr/share/minimal/apparmor/install-apparmor-profile.sh
-if ! command -v apparmor_parser >/dev/null 2>&1; then
-    echo "minimal: AppArmor is not available on this host; skipping the minimald profile" >&2
-    exit 0
+# minimal postinstall: finish the host the way `min finalize-install` does,
+# as root and never prompting. The probe prints the one script a run would
+# execute, only while something is missing (the user-namespace profile on a
+# host that restricts them, the classifier tree, ...), and root runs it
+# directly: no sudo, no terminal. Never hard-fails: a host that needs nothing
+# prints no script, and a step that fails is reported — the package must
+# install cleanly, and `min finalize-install` retries the step later.
+script="$(mktemp)" || exit 0
+if /usr/bin/min finalize-install --show --script >"$script" 2>/dev/null \
+    && [ -s "$script" ]; then
+    if ! sh "$script"; then
+        echo "minimal: WARNING: finishing the host setup failed; run \`min finalize-install\` to retry (\`--show\` names what is missing)" >&2
+    fi
 fi
-if ! "$loader"; then
-    echo "minimal: WARNING: loading the minimald AppArmor profile failed; on restricted hosts minimald sessions may fail to start until this is fixed (see docs/reference/linux-host-setup.md)" >&2
-fi
+rm -f "$script"
 exit 0
 EOF
 

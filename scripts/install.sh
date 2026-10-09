@@ -23,6 +23,13 @@
 # ending them; --force-stop (or a non-empty MINIMAL_INSTALL_FORCE_STOP) skips the
 # question, for scripted upgrades that must not block.
 #
+# The install never elevates. At its end the installed `min` probes what the
+# host still lacks (`min finalize-install --show`); when something is missing
+# and a terminal is attached the installer shows the summary and offers to run
+# `min finalize-install` (one sudo command, default yes); declined or without a
+# terminal it points at the command and never blocks. A finished host sees no
+# offer.
+#
 # Uninstall walks the local install record (no network) and removes each file
 # whose on-disk bytes still match what the installer recorded writing; it accepts
 # --force (remove modified files too), --purge (also delete the minimal data/
@@ -1309,48 +1316,64 @@ say ""
 say "  $b$installed installed$rst $sep $skipped current$elapsed"
 say "  ${dim}record: $(tilde "$prev_record")$rst"
 
-# --- Linux host advisory: unprivileged user namespaces ---------------------
+# --- Finish the host: offer `min finalize-install` -------------------------
 
-# Ubuntu 24.04+ defaults kernel.apparmor_restrict_unprivileged_userns=1, under
-# which minimald cannot create the user namespace every session sandbox needs —
-# sessions then die at uid_map with an opaque EPERM, far from here. Detect the
-# restriction at install time (Linux only) and point at the AppArmor loader we
-# just shipped. Advice only: installing the profile needs root, and this
-# installer never elevates. Silent on hosts that do not need it, AND on a host
-# already remediated — but "remediated" depends on the bin prefix: the stock
-# tunable attaches only /usr/bin, /usr/local/bin, and ~/.local/bin, so for a
-# custom MINIMAL_BIN the advised command carries --path, and a loaded profile
-# counts as remediation only if the tunables actually name this binary
-# (otherwise sessions still die and a reinstall must keep saying so). The
-# sysctl and apparmor.d paths are overridable for install_test.sh.
-userns_sysctl="${MINIMAL_OVERRIDE_USERNS_SYSCTL:-/proc/sys/kernel/apparmor_restrict_unprivileged_userns}"
-apparmor_dir="${MINIMAL_OVERRIDE_APPARMOR_DIR:-/etc/apparmor.d}"
-if [ "$os" = linux ] && [ -r "$userns_sysctl" ] \
-    && [ "$(cat "$userns_sysctl" 2>/dev/null)" = 1 ]; then
-    apparmor_loader="$(resolve_prefix data)/apparmor/install-apparmor-profile.sh"
-    aa_loader_args=""
-    aa_remediated=0
-    case "$bindir" in
-        /usr/bin|/usr/local/bin|"$HOME/.local/bin")
-            [ -e "$apparmor_dir/minimald" ] && aa_remediated=1
-            ;;
-        *)
-            aa_loader_args=" --path \"$bindir/minimald\""
-            if [ -e "$apparmor_dir/minimald" ] \
-                && grep -rqs "$bindir/minimald" "$apparmor_dir/tunables" 2>/dev/null; then
-                aa_remediated=1
+# The install itself never elevates, so a host may still lack a privileged
+# part: the user-namespace profile on Ubuntu 24.04+, the box-name resolver
+# link and answerer (every host, macOS included), the classifier tree, KVM
+# group membership. The just-installed `min` probes all of them
+# (`finalize-install --show --json`): exit 0 on a finished host, non-zero
+# while any item is not done, each item carrying its state — `missing` (the
+# step installs it), `cannot` (no script can), or `waiting` (the names item
+# until a daemon runs, which on a fresh install is always). A finished host,
+# or a `min` too old to know the command, adds nothing to the output above.
+# Otherwise show the summary (`--show`), and while some item is `missing` —
+# the only state the step changes — offer it, default yes: it is
+# non-destructive and undoable, and sudo's own password prompt is a second
+# consent. The answer comes from the controlling terminal (overridable for
+# install_test.sh), never stdin, which under `curl … | sh` is the script
+# itself. Declined, nothing runnable yet, or no terminal to ask on: print the
+# file route instead, the one line `min finalize-install` itself points at.
+# A failed step is reported and the installer still exits 0: Minimal is
+# installed either way.
+# shellcheck disable=SC2016 # the line is printed for the user to run, not expanded here
+fi_pointer='f=$(mktemp) && min finalize-install --show --script > "$f" && sudo sh "$f"'
+offer_finalize_install() {
+    [ -x "$bindir/min" ] || return 0
+    if _fi_report="$("$bindir/min" finalize-install --show --json </dev/null 2>/dev/null)"; then
+        return 0
+    fi
+    # A non-zero exit with no report is a `min` that cannot probe, not a host
+    # that needs something: say nothing rather than guess.
+    case "$_fi_report" in
+        *'"state":'*) ;;
+        *) return 0 ;;
+    esac
+    say ""
+    "$bindir/min" finalize-install --show </dev/null >&2 || true
+    _fi_tty="${MINIMAL_OVERRIDE_TTY:-/dev/tty}"
+    case "$_fi_report" in
+        *'"state":"missing"'*)
+            if (exec <"$_fi_tty") 2>/dev/null; then
+                printf 'Finish setup now? This runs one sudo command. [Y/n] ' >&2
+                _fi_ans=
+                read -r _fi_ans <"$_fi_tty" || _fi_ans=
+                case "$_fi_ans" in
+                    ""|[Yy]*)
+                        if "$bindir/min" finalize-install <"$_fi_tty"; then
+                            return 0
+                        fi
+                        say "  ✗ setup did not finish; retry with \`min finalize-install\`"
+                        return 0
+                        ;;
+                esac
             fi
             ;;
     esac
-    if [ "$aa_remediated" -eq 0 ] && [ -f "$apparmor_loader" ]; then
-        say ""
-        say "note: this host restricts unprivileged user namespaces (Ubuntu 24.04+);"
-        say "  minimald's session sandbox cannot start until you install its AppArmor"
-        say "  profile — a one-time step that needs root:"
-        say "      sudo bash \"$apparmor_loader\"$aa_loader_args"
-        say "  details: https://docs.minimal.dev/reference/linux-host-setup"
-    fi
-fi
+    say "run this when you're ready:"
+    say "$fi_pointer"
+}
+offer_finalize_install
 
 # --- The closing card ------------------------------------------------------
 

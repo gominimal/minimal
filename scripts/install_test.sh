@@ -146,6 +146,53 @@ case "${1:-}" in
             exit 1
         fi
         ;;
+    finalize-install)
+        # Every invocation is recorded, arguments and all, in $HOME/finalize.calls.
+        # The probe (`--show --json`) answers like the real command: the report
+        # on stdout, exit 0 on a finished host and 1 while any item is not done,
+        # each item carrying its state. $HOME/finalize.summary marks a host with
+        # a `missing` item and $HOME/finalize.waiting one whose names item waits
+        # on a daemon; either holds the summary `--show` prints.
+        # $HOME/finalize.show.status makes the probe exit with that status and
+        # print nothing (a `min` too old to know the command);
+        # $HOME/finalize.run.status is the plain run's exit status (default 0).
+        printf '%s\n' "$*" >>"$HOME/finalize.calls"
+        if [ -f "$HOME/finalize.show.status" ] && [ "${2:-}" = --show ]; then
+            echo "mock min: unrecognized subcommand 'finalize-install'" >&2
+            exit "$(cat "$HOME/finalize.show.status")"
+        fi
+        case "${2:-} ${3:-}" in
+            "--show --json")
+                _items='{"id":"userns-profile","state":"done"}'
+                _rc=0
+                if [ -f "$HOME/finalize.summary" ]; then
+                    _items="$_items,{\"id\":\"classifier\",\"state\":\"missing\"}"
+                    _rc=1
+                fi
+                if [ -f "$HOME/finalize.waiting" ]; then
+                    _items="$_items,{\"id\":\"names\",\"state\":\"waiting\"}"
+                    _rc=1
+                fi
+                printf '{"schema":"min/v1/finalize-install","finished":%s,"items":[%s]}\n' \
+                    "$([ "$_rc" -eq 0 ] && echo true || echo false)" "$_items"
+                exit "$_rc"
+                ;;
+            "--show ")
+                if [ -f "$HOME/finalize.summary" ]; then
+                    cat "$HOME/finalize.summary"
+                elif [ -f "$HOME/finalize.waiting" ]; then
+                    cat "$HOME/finalize.waiting"
+                else
+                    echo "Every part of the install is finished on this machine; there is nothing to run."
+                fi
+                ;;
+            " ")
+                if [ -f "$HOME/finalize.run.status" ]; then
+                    exit "$(cat "$HOME/finalize.run.status")"
+                fi
+                ;;
+        esac
+        ;;
 esac
 MOCKEOF
     chmod +x "$1"
@@ -373,12 +420,10 @@ PLAT_M=x86_64
 # unknown-shell fallback branch).
 TEST_SHELL=
 
-# Host userns state the installer sees. Empty leaves both overrides pointing at
-# nonexistent paths (a host without the restriction and without a system
-# profile), so the AppArmor advisory/prompt stays silent; scenarios point these
-# at fixtures to drive it. USERNS_SYSCTL is a file whose contents are the sysctl
-# value; APPARMOR_DIR stands in for /etc/apparmor.d.
-USERNS_SYSCTL=
+# Stand-in for /etc/apparmor.d, where uninstall looks for the system profile.
+# Empty points the override at a nonexistent path (a host without a system
+# profile), so the uninstall prompt stays silent; scenarios point it at a
+# fixture to drive it.
 APPARMOR_DIR=
 
 # Root the installer looks under for the host paths `min finalize-install` installs.
@@ -386,17 +431,12 @@ APPARMOR_DIR=
 # leaks into a scenario; scenarios seed a fake root to drive the offer.
 NET_SETUP_ROOT=
 
-# Bin prefix the installer sees. Empty means the harness default ($hp/bin — a
-# custom MINIMAL_BIN, NOT one of the AppArmor tunable's stock attachment
-# paths); scenarios set it to $hp/.local/bin to exercise the default-prefix
-# branch of the userns advisory.
-BIN_OVERRIDE=
-
-# Stand-in for /dev/tty, where the active-sessions prompt reads its answer
-# (R5.5). Empty points the installer at a path that cannot be opened — the
-# harness's own terminal must never be read, and every scenario that does not
-# stage an answer must behave like a non-interactive run. Scenarios point it at
-# a file holding the keystroke. FORCE_STOP fills MINIMAL_INSTALL_FORCE_STOP.
+# Stand-in for /dev/tty, where the active-sessions prompt (R5.5) and the
+# finalize-install offer (NET-122) read their answers. Empty points the
+# installer at a path that cannot be opened — the harness's own terminal must
+# never be read, and every scenario that does not stage an answer must behave
+# like a non-interactive run. Scenarios point it at a file holding the
+# keystroke. FORCE_STOP fills MINIMAL_INSTALL_FORCE_STOP.
 TTY_FILE=
 FORCE_STOP=
 
@@ -411,7 +451,7 @@ run() {
         TERM=xterm-256color \
         HOME="$hp" \
         SHELL="${TEST_SHELL:-/bin/sh}" \
-        MINIMAL_BIN="${BIN_OVERRIDE:-$hp/bin}" \
+        MINIMAL_BIN="$hp/bin" \
         XDG_DATA_HOME="$hp/xdg-data" \
         XDG_STATE_HOME="$hp/xdg-state" \
         XDG_CACHE_HOME="$hp/xdg-cache" \
@@ -419,7 +459,6 @@ run() {
         MINIMAL_OVERRIDE_INSTALLER_BUCKET="$BUCKET_HOST" \
         STUB_UNAME_S="$PLAT_S" \
         STUB_UNAME_M="$PLAT_M" \
-        MINIMAL_OVERRIDE_USERNS_SYSCTL="${USERNS_SYSCTL:-$root/no-such-sysctl}" \
         MINIMAL_OVERRIDE_APPARMOR_DIR="${APPARMOR_DIR:-$root/no-such-apparmor.d}" \
         MINIMAL_OVERRIDE_NET_SETUP_ROOT="${NET_SETUP_ROOT:-$root/no-such-net-setup-root}" \
         MINIMAL_OVERRIDE_TTY="${TTY_FILE:-$root/no-such-tty}" \
@@ -482,9 +521,13 @@ case_install() {
 }
 
 case_apparmor() {
-    # --- AppArmor components + Ubuntu 24.04+ advisory --------------------------
-    # The components and the advisory both assert over a home holding a completed
-    # install, so this case seeds its own instead of inheriting another case's.
+    # --- AppArmor components ---------------------------------------------------
+    # The components assert over a home holding a completed install, so this
+    # case seeds its own instead of inheriting another case's. The installer
+    # ships them and says nothing about them: the Ubuntu 24.04+ user-namespace
+    # restriction is one of the items `min finalize-install` probes and offers
+    # (the installer_offers_finalize_install_on_a_tty case), not an installer
+    # note of its own.
     H_A="$root/ha"; mkdir -p "$H_A"
     run aa_seed "$H_A"
     check 0 "$rc" "apparmor seed install exits 0"
@@ -493,59 +536,8 @@ case_apparmor() {
     want_ok "apparmor profile installed under data prefix"  test -f "$aa_root/minimald"
     want_ok "apparmor tunable installed under data prefix"  test -f "$aa_root/tunables/minimald"
     want_ok "apparmor loader installed under data prefix"   test -f "$aa_root/install-apparmor-profile.sh"
-
-    # The advisory fires only when the userns restriction is active (sysctl reads 1),
-    # points at the shipped loader, and never elevates — install still exits 0.
-    printf '1\n' >"$root/sysctl-on"
-    printf '0\n' >"$root/sysctl-off"
-
-    USERNS_SYSCTL="$root/sysctl-on"
-    run aa_restricted "$H_A"
-    USERNS_SYSCTL=
-    check 0 "$rc" "install on a restricted host still exits 0 (advice only)"
-    want_ok "advisory names the userns restriction" \
+    want_err "the installer carries no AppArmor-only note of its own" \
         grep -q "restricts unprivileged user namespaces" "$OUT"
-    want_ok "advisory points at the shipped loader with sudo bash" \
-        grep -q "sudo bash .*apparmor/install-apparmor-profile.sh" "$OUT"
-    # The harness bindir is a custom MINIMAL_BIN, outside the tunable's stock
-    # attachment set, so the advised command must attach it explicitly.
-    want_ok "advisory carries --path for a custom MINIMAL_BIN" \
-        grep -q -- "--path \"$H_A/bin/minimald\"" "$OUT"
-    # The card is the parting block even when the AppArmor advisory is the last note.
-    want_card_last "the card follows the AppArmor advisory (R10.4)"
-
-    USERNS_SYSCTL="$root/sysctl-off"
-    run aa_unrestricted "$H_A"
-    USERNS_SYSCTL=
-    want_err "no advisory when the restriction is off (sysctl 0)" \
-        grep -q "restricts unprivileged user namespaces" "$OUT"
-
-    # A loaded system profile alone is NOT remediation for a custom MINIMAL_BIN:
-    # the stock tunable does not attach it, so sessions still die and the advisory
-    # must keep firing (with --path) until the tunables name this binary.
-    mkdir -p "$root/aa-present"; printf 'profile\n' >"$root/aa-present/minimald"
-    USERNS_SYSCTL="$root/sysctl-on"; APPARMOR_DIR="$root/aa-present"
-    run aa_present_unattached "$H_A"
-    want_ok "advisory still fires when the profile is loaded but MINIMAL_BIN unattached" \
-        grep -q -- "--path \"$H_A/bin/minimald\"" "$OUT"
-
-    # ...and is suppressed once the tunables do name it (what the loader's --path
-    # records under tunables/minimald.d).
-    mkdir -p "$root/aa-present/tunables/minimald.d"
-    printf '@{minimald_bin} += %s/bin/minimald\n' "$H_A" \
-        >"$root/aa-present/tunables/minimald.d/paths"
-    run aa_attached "$H_A"
-    want_err "no advisory when the tunables attach this MINIMAL_BIN" \
-        grep -q "restricts unprivileged user namespaces" "$OUT"
-
-    # For the stock prefix (~/.local/bin) the profile's own tunable already
-    # attaches the binary, so the profile file existing IS remediation.
-    BIN_OVERRIDE="$H_A/.local/bin"
-    run aa_already_default_bin "$H_A"
-    BIN_OVERRIDE=
-    want_err "no advisory for the default prefix when the system profile is installed" \
-        grep -q "restricts unprivileged user namespaces" "$OUT"
-    USERNS_SYSCTL=; APPARMOR_DIR=
 
     # Darwin hosts never receive the apparmor components (linux-only manifest rows).
     HAA_D="$root/haa_d"; mkdir -p "$HAA_D"
@@ -615,6 +607,170 @@ case_finalize_install_uninstall() {
     check 0 "$rc" "uninstall on a host without the setup exits 0"
     want_err "a host that never ran min finalize-install sees no advisory" \
         grep -q "min finalize-install" "$OUT"
+}
+
+# --- The finalize-install offer (NET-122) -------------------------------------
+# At the end of an install the installer runs the just-installed `min`'s probe
+# (`finalize-install --show --json`) and, unless the host is finished, shows
+# the summary (`--show`) and, while some item is missing, offers the step. The
+# stub `min` the mock bucket ships answers both from files under the home (see
+# write_min_stub) and records every invocation in $HOME/finalize.calls, so each
+# case asserts what ran and with which arguments. The probe is the first
+# `finalize-install` call every run makes, so the calls file is the whole story
+# of a run.
+
+fi_probe="finalize-install --show --json"
+fi_shown="$fi_probe
+finalize-install --show"
+fi_prompt="Finish setup now? This runs one sudo command. [Y/n]"
+# shellcheck disable=SC2016 # the line is printed for the user to run, not expanded here
+fi_pointer='f=$(mktemp) && min finalize-install --show --script > "$f" && sudo sh "$f"'
+
+# fi_summary <home> [label] — mark <home>'s stub as a host with a missing item,
+# with the summary the real command prints for one: a ✗ line and its facts.
+fi_summary() {
+    printf 'install status on this machine:\n  ✗ %s\n      today: %s\n      this step: %s\n' \
+        "${2:-the private sandbox every box runs in}" \
+        "no box can start on this machine" \
+        "installs a profile for minimald alone" >"$1/finalize.summary"
+}
+
+case_installer_offers_finalize_install_on_a_tty() {
+    # On a terminal, a host that lacks a step sees the summary and the offer,
+    # and Enter — the default — runs `min finalize-install` once, with no
+    # arguments: the real command probes again and runs its one sudo command.
+    HF1="$root/hf1"; mkdir -p "$HF1"
+    fi_summary "$HF1"
+    printf '\n' >"$root/tty-enter"
+    TTY_FILE="$root/tty-enter"
+    run fi_enter "$HF1"
+    TTY_FILE=
+    check 0 "$rc" "an install that offers the step exits 0"
+    want_ok "the --show summary is shown before the question" \
+        grep -q "install status on this machine" "$OUT"
+    want_ok "the missing item is shown as the real command prints it" \
+        grep -q "✗ the private sandbox every box runs in" "$OUT"
+    want_ok "the offer names what a yes costs" grep -qF "$fi_prompt" "$OUT"
+    check "$fi_shown
+finalize-install" "$(cat "$HF1/finalize.calls")" \
+        "the probe and the summary run once each, and Enter runs the step once, with no arguments"
+    want_err "no pointer when the step ran" grep -qF "when you're ready" "$OUT"
+    want_card_last "the card follows the offer (R10.4)"
+
+    # An explicit yes is the same as Enter.
+    HF2="$root/hf2"; mkdir -p "$HF2"
+    fi_summary "$HF2"
+    printf 'y\n' >"$root/tty-y"
+    TTY_FILE="$root/tty-y"
+    run fi_yes "$HF2"
+    TTY_FILE=
+    check 0 "$rc" "a confirmed offer exits 0"
+    want_ok "y runs the step" grep -qx "finalize-install" "$HF2/finalize.calls"
+
+    # macOS is a first-class host: every daemon there is VM-backed, and the
+    # probe reports the names item (resolver link, answerer unit, reserved
+    # range). The offer works the same way.
+    HF3="$root/hf3"; mkdir -p "$HF3"
+    fi_summary "$HF3" "box names for every host program"
+    PLAT_S=Darwin; PLAT_M=arm64
+    TTY_FILE="$root/tty-enter"
+    run fi_darwin "$HF3"
+    TTY_FILE=
+    PLAT_S=Linux; PLAT_M=x86_64
+    check 0 "$rc" "darwin: an install that offers the step exits 0"
+    want_ok "darwin: the names item is shown" \
+        grep -q "✗ box names for every host program" "$OUT"
+    want_ok "darwin: the offer is made" grep -qF "$fi_prompt" "$OUT"
+    want_ok "darwin: Enter runs the step" grep -qx "finalize-install" "$HF3/finalize.calls"
+
+    # A step that fails is reported with a retry pointer, and the installer
+    # still exits 0: Minimal is installed either way.
+    HF4="$root/hf4"; mkdir -p "$HF4"
+    fi_summary "$HF4"
+    printf '1\n' >"$HF4/finalize.run.status"
+    TTY_FILE="$root/tty-enter"
+    run fi_failed "$HF4"
+    TTY_FILE=
+    check 0 "$rc" "a failed step does not fail the install"
+    want_ok "a failed step is shown as ✗" grep -q "✗ setup did not finish" "$OUT"
+    want_ok "a failed step points at the retry" \
+        grep -q "retry with \`min finalize-install\`" "$OUT"
+    want_card_last "the card follows a failed step (R10.4)"
+}
+
+case_installer_prints_the_pointer_when_declined_or_without_tty() {
+    # Declining leaves the host as it is and prints the pointer, exactly.
+    HF5="$root/hf5"; mkdir -p "$HF5"
+    fi_summary "$HF5"
+    printf 'n\n' >"$root/tty-n"
+    TTY_FILE="$root/tty-n"
+    run fi_declined "$HF5"
+    TTY_FILE=
+    check 0 "$rc" "a declined offer exits 0"
+    want_ok "the offer was made" grep -qF "$fi_prompt" "$OUT"
+    want_ok "declining prints the pointer, exactly, on its own line" \
+        grep -qxF "$fi_pointer" "$OUT"
+    check "$fi_shown" "$(cat "$HF5/finalize.calls")" "declining runs nothing but the probe and the summary"
+    want_card_last "the card follows the pointer (R10.4)"
+
+    # No terminal to ask on (`curl … | sh` in CI, a non-interactive shell):
+    # the summary and the pointer, no question, no wait.
+    HF6="$root/hf6"; mkdir -p "$HF6"
+    fi_summary "$HF6"
+    run fi_notty "$HF6"
+    check 0 "$rc" "an install without a terminal exits 0"
+    want_ok "without a terminal the summary is still shown" \
+        grep -q "install status on this machine" "$OUT"
+    want_err "nothing is asked without a terminal" grep -qF "Finish setup now?" "$OUT"
+    want_ok "without a terminal the pointer is printed, exactly" \
+        grep -qxF "$fi_pointer" "$OUT"
+    check 1 "$(grep -cF "$fi_pointer" "$OUT")" "the pointer is printed once"
+    check "$fi_shown" "$(cat "$HF6/finalize.calls")" \
+        "without a terminal nothing but the probe and the summary runs"
+    want_card_last "the card follows the pointer without a terminal (R10.4)"
+}
+
+case_installer_does_not_prompt_on_a_finished_host() {
+    # A host that needs nothing completes without the offer, the summary or
+    # the pointer: the receipt and the card, as before. Even with a terminal
+    # to ask on.
+    HF7="$root/hf7"; mkdir -p "$HF7"
+    TTY_FILE="$root/tty-enter"
+    run fi_finished "$HF7"
+    TTY_FILE=
+    check 0 "$rc" "a finished host exits 0"
+    want_err "a finished host is not asked" grep -qF "Finish setup now?" "$OUT"
+    want_err "a finished host sees no summary" grep -q "install status on this machine" "$OUT"
+    want_err "a finished host sees no pointer" grep -qF "when you're ready" "$OUT"
+    check "$fi_probe" "$(cat "$HF7/finalize.calls")" "a finished host runs only the probe"
+    want_card_last "the card is the parting block on a finished host (R10.4)"
+
+    # A host whose only open item waits on a daemon (the names item, on every
+    # fresh install) has nothing the step can run yet: the summary says so and
+    # the pointer follows, but no question is asked, even with a terminal.
+    HF8="$root/hf8"; mkdir -p "$HF8"
+    printf 'install status on this machine:\n  ✓ the private sandbox every box runs in\n  … box names for every host program (waiting for a daemon)\n' \
+        >"$HF8/finalize.waiting"
+    TTY_FILE="$root/tty-enter"
+    run fi_waiting "$HF8"
+    TTY_FILE=
+    check 0 "$rc" "a waiting host exits 0"
+    want_ok "a waiting host sees the summary" grep -q "waiting for a daemon" "$OUT"
+    want_err "a waiting host is not asked" grep -qF "Finish setup now?" "$OUT"
+    want_ok "a waiting host gets the pointer" grep -qxF "$fi_pointer" "$OUT"
+    check "$fi_shown" "$(cat "$HF8/finalize.calls")" "a waiting host runs nothing but the probe and the summary"
+
+    # A `min` that cannot answer the probe (too old to know the command) adds
+    # nothing either: the installer stays silent rather than guess.
+    HF9="$root/hf9"; mkdir -p "$HF9"
+    fi_summary "$HF9"
+    printf '2\n' >"$HF9/finalize.show.status"
+    run fi_oldmin "$HF9"
+    check 0 "$rc" "a min that cannot probe does not fail the install"
+    want_err "a failed probe asks nothing" grep -qF "Finish setup now?" "$OUT"
+    want_err "a failed probe prints no pointer" grep -qF "$fi_pointer" "$OUT"
+    want_err "a failed probe's stderr is hidden" grep -q "unrecognized subcommand" "$OUT"
+    check "$fi_probe" "$(cat "$HF9/finalize.calls")" "a failed probe is the run's only call"
 }
 
 case_checksum_mismatch() {
@@ -2185,6 +2341,10 @@ case_for() {
         apparmor)                           case_apparmor ;;
         apparmor_uninstall)                 case_apparmor_uninstall ;;
         finalize_install_uninstall)                case_finalize_install_uninstall ;;
+        installer_offers_finalize_install_on_a_tty) case_installer_offers_finalize_install_on_a_tty ;;
+        installer_prints_the_pointer_when_declined_or_without_tty)
+            case_installer_prints_the_pointer_when_declined_or_without_tty ;;
+        installer_does_not_prompt_on_a_finished_host) case_installer_does_not_prompt_on_a_finished_host ;;
         checksum_mismatch)                  case_checksum_mismatch ;;
         target_validation)                  case_target_validation ;;
         prefix_resolution)                  case_prefix_resolution ;;
@@ -2207,7 +2367,10 @@ case_for() {
 }
 case "${1:-}" in
     "")
-        for _c in install apparmor apparmor_uninstall finalize_install_uninstall checksum_mismatch \
+        for _c in install apparmor apparmor_uninstall finalize_install_uninstall \
+            installer_offers_finalize_install_on_a_tty \
+            installer_prints_the_pointer_when_declined_or_without_tty \
+            installer_does_not_prompt_on_a_finished_host checksum_mismatch \
             target_validation prefix_resolution install_record daemon_stop \
             shell_integration darwin_dequarantine uninstall \
             gvproxy_rename_migration installer_switch_binary_executable \

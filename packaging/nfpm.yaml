@@ -78,7 +78,9 @@ contents:
     # minzoned, the box-zone answerer binary NET-122's session advisory
     # finds beside `min` and copies into its root-owned service path. The
     # package ships the binary and nothing else: it installs and enables no
-    # answerer service — no systemd unit file, no postinstall step — so the
+    # answerer service — no systemd unit file, and the postinstall's
+    # `min finalize-install` step finds no daemon to take the answerer port
+    # from, so the names item is never in the script it runs — so the
     # advisory's one privileged command stays the one privileged step, run
     # deliberately by the operator, never as a package's side effect.
     # Optional until release.yml builds it (temporary, gominimal/inbox#899):
@@ -135,9 +137,10 @@ contents:
 scripts:
     # One postinstall reaches all three formats: deb DEBIAN/postinst,
     # rpm %post, and apk .post-install (nfpm maps the same field to each).
-    # It runs the installed loader and never hard-fails: hosts without
-    # AppArmor (most rpm/apk targets) warn and exit 0, so the package always
-    # installs.
+    # It runs the script `min finalize-install --show --script` prints, as
+    # root and never prompting, and never hard-fails: a host that needs
+    # nothing prints no script, a failed step warns and exits 0, so the
+    # package always installs.
     postinstall: .scratch/package-nfpm/postinstall.sh
 
 overrides:
