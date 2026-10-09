@@ -3097,7 +3097,7 @@ proof_host_ip_deny_all() {
   fi
   case "$hida_un_cause" in
     "the classifier's privileged step is not installed on this host")
-      if [[ "$hida_un_activate_err" != *"install-host-classifier.sh"* ]]; then
+      if [[ "$hida_un_activate_err" != *"min finalize-install"* ]]; then
         echo "::error::the advisory names the missing step but not the command that installs it"
         printf '%s\n' "$hida_un_activate_err"
         fail
@@ -3105,7 +3105,7 @@ proof_host_ip_deny_all() {
       echo "advisory: the cause is the missing step, and the advisory ends with the exact command that installs it"
       ;;
     *)
-      if [[ "$hida_un_activate_err" == *"install-host-classifier.sh"* ]]; then
+      if [[ "$hida_un_activate_err" == *"min finalize-install"* ]]; then
         echo "::error::the advisory names an install command for a host that cannot confine a box: installing the step over that tree would leave the cause standing"
         printf '%s\n' "$hida_un_activate_err"
         fail

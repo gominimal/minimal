@@ -216,7 +216,7 @@ pub(crate) const ANSWERER_PROGRAM_PATH: &str = LINUX_ANSWERER_PROGRAM_PATH;
 /// The directory [`LINUX_ANSWERER_PROGRAM_PATH`] lives in, which the command
 /// makes before it copies.
 #[cfg(any(test, not(target_os = "macos")))]
-const ANSWERER_PROGRAM_DIR: &str = "/usr/local/lib/minimal";
+pub(crate) const ANSWERER_PROGRAM_DIR: &str = "/usr/local/lib/minimal";
 
 /// The systemd socket unit the answerer step installs: the unit that
 /// holds both of the answerer's sockets for the machine — the datagram
@@ -2695,18 +2695,39 @@ pub(crate) const KVM_GROUP_RECORD: &str = "/var/lib/minimal/finalize-install-kvm
 /// The heredoc delimiter the classifier's installer rides under in a
 /// script.
 #[cfg(any(test, not(target_os = "macos")))]
-const CLASSIFIER_SCRIPT_HEREDOC: &str = "MINIMAL_CLASSIFIER_SCRIPT_EOF";
+pub(crate) const CLASSIFIER_SCRIPT_HEREDOC: &str = "MINIMAL_CLASSIFIER_SCRIPT_EOF";
 
 /// The classifier's privileged step, the very file the native lane runs:
-/// the removal script carries it whole and runs its `--uninstall`.
+/// the install step writes it to [`CLASSIFIER_PROGRAM_PATH`] and runs it,
+/// and the removal script carries it whole and runs its `--uninstall`.
+/// This binary is its one source: nothing is fetched.
 #[cfg(any(test, not(target_os = "macos")))]
-const CLASSIFIER_SCRIPT: &str = include_str!("../../../scripts/install-host-classifier.sh");
+pub(crate) const CLASSIFIER_SCRIPT: &str =
+    include_str!("../../../scripts/install-host-classifier.sh");
+
+/// The root-owned copy of the classifier's step the install step leaves,
+/// which the placement unit runs on every daemon start.
+#[cfg(any(test, not(target_os = "macos")))]
+pub(crate) const CLASSIFIER_PROGRAM_PATH: &str =
+    "/usr/local/lib/minimal/install-host-classifier.sh";
+
+/// The systemd unit pair that places the daemon's listener in its leaf on
+/// every daemon start: the path unit watches the daemon's socket, and the
+/// oneshot service it starts runs the step's `--place-listener`. The pair
+/// is why no daemon restart needs a root step of its own.
+#[cfg(any(test, not(target_os = "macos")))]
+pub(crate) const PLACE_SYSTEMD_UNIT: &str = "minimald-place";
+#[cfg(any(test, not(target_os = "macos")))]
+pub(crate) const PLACE_UNIT_PATH_PATH: &str = "/etc/systemd/system/minimald-place.path";
+#[cfg(any(test, not(target_os = "macos")))]
+pub(crate) const PLACE_UNIT_SERVICE_PATH: &str = "/etc/systemd/system/minimald-place.service";
 
 /// The lines that remove the Linux items beyond the names: the
 /// user-namespace profile (unloaded, then its files), the classifier tree
-/// (the step's own `--uninstall`, run only while the tree exists), and the
-/// `kvm` membership the step recorded adding. Every line tolerates what
-/// is already gone.
+/// (the step's own `--uninstall`, run only while the tree exists) with its
+/// placement units and the root-owned copy of the step, and the `kvm`
+/// membership the step recorded adding. Every line tolerates what is
+/// already gone.
 #[cfg(any(test, not(target_os = "macos")))]
 fn linux_host_items_removal() -> String {
     format!(
@@ -2725,6 +2746,11 @@ fn linux_host_items_removal() -> String {
          {CLASSIFIER_SCRIPT}\
          {CLASSIFIER_SCRIPT_HEREDOC}\n\
          fi\n\
+         systemctl disable --now {PLACE_SYSTEMD_UNIT}.path {PLACE_SYSTEMD_UNIT}.service \
+         2>/dev/null || true\n\
+         rm -f {PLACE_UNIT_PATH_PATH} {PLACE_UNIT_SERVICE_PATH} {CLASSIFIER_PROGRAM_PATH}\n\
+         systemctl daemon-reload 2>/dev/null || true\n\
+         rmdir \"{ANSWERER_PROGRAM_DIR}\" 2>/dev/null || true\n\
          \n\
          # The kvm group membership the step added, by its record.\n\
          if [ -f {KVM_GROUP_RECORD} ] ; then\n\
@@ -4818,6 +4844,13 @@ mod tests {
             ),
             format!("if [ -d {CLASSIFIER_TREE_ROOT} ] ; then"),
             format!("  bash -s -- --uninstall <<\\{CLASSIFIER_SCRIPT_HEREDOC}"),
+            format!(
+                "systemctl disable --now {PLACE_SYSTEMD_UNIT}.path {PLACE_SYSTEMD_UNIT}.service \
+                 2>/dev/null || true"
+            ),
+            format!(
+                "rm -f {PLACE_UNIT_PATH_PATH} {PLACE_UNIT_SERVICE_PATH} {CLASSIFIER_PROGRAM_PATH}"
+            ),
             format!("if [ -f {KVM_GROUP_RECORD} ] ; then"),
             format!("  gpasswd -d \"$(cat {KVM_GROUP_RECORD})\" kvm 2>/dev/null || true"),
         ] {

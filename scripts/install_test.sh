@@ -1654,6 +1654,7 @@ STUB
             NFT_FAIL="${NFT_FAIL:-0}" \
             NFT_RULESET="${NFT_RULESET:-}" \
             MINIMAL_OVERRIDE_CGROUP_MOUNTINFO="$mi" \
+            MINIMAL_OVERRIDE_PROC="${HC_PROC:-/proc}" \
             bash "$hc" --root "$tree" "$@" </dev/null >"$OUT" 2>&1
         rc=$?
         set -e
@@ -1673,10 +1674,10 @@ STUB
     check 1 "$rc" "check exits 1 before the tree exists"
     want_ok "check names the tree it cannot find" grep -q "does not exist" "$OUT"
     want_ok "check advises the install, not a re-check" grep -q "install it: sudo" "$OUT"
-    want_ok "the pre-install hint names the cohort's identity flag" \
-        grep -q -- "--cohort-address <cohort address>" "$OUT"
-    want_ok "the pre-install hint names the node plane's identity flag too" \
-        grep -q -- "--node-plane-address <node-plane address>" "$OUT"
+    want_err "the pre-install hint carries no placeholder: an install told no identity is the un-enrolled host's own" \
+        grep -q -- "<cohort address>" "$OUT"
+    want_err "the pre-install hint carries no node-plane placeholder either" \
+        grep -q -- "<node-plane address>" "$OUT"
     want_err "check creates nothing" test -e "$tree"
 
     # --- Refusals: every one of them dies before a directory is made.
@@ -1711,22 +1712,46 @@ STUB
     want_ok "the refusal names the account" grep -q "no such account" "$OUT"
     want_err "a bad account still creates nothing" test -e "$tree"
 
-    # --- The two source identities are required, together: a table that
-    # refuses a deny-all box's connections while its cohort keeps the host's
-    # own source identity is half of the classification, so the step refuses
-    # to render half of it — with either missing, and with both missing.
-    run_hc no_identity "$root/mi-on" --user "$me"
-    check 1 "$rc" "install dies without the two source identities"
-    want_ok "the refusal names the flag it needs" \
-        grep -q -- "--cohort-address ADDR" "$OUT"
-    want_ok "the refusal names the other flag too" \
-        grep -q -- "--node-plane-address ADDR" "$OUT"
-    want_err "no identities, no tree" test -e "$tree"
-
+    # --- The two source identities go together: a table that translates its
+    # cohort while the rest of the slice keeps the host's own source identity
+    # is half of the classification, so the step refuses to render half of
+    # it. Neither given is whole: the un-enrolled host (NET-078), whose two
+    # identities are the classify chain's cgroup matches with no source
+    # translation, and whose postrouting chain stands empty for an
+    # association to fill without a reinstall.
     run_hc half_identity "$root/mi-on" --user "$me" --cohort-address 100.72.0.9
     check 1 "$rc" "install dies with one of the two identities missing"
-    want_ok "the refusal says they go together" grep -q "both source identities" "$OUT"
+    want_ok "the refusal says they go together" grep -q "both source identities or neither" "$OUT"
     want_err "half an identity still creates nothing" test -e "$tree"
+
+    run_hc unenrolled_print "$root/mi-on" --print-ruleset
+    check 0 "$rc" "--print-ruleset renders with no source identity"
+    want_err "no identity renders no source translation" grep -q "snat" "$OUT"
+    want_ok "the postrouting chain stands, empty, for an association to fill" \
+        grep -q "chain postrouting" "$OUT"
+    want_ok "the cohort is still its cgroup subtree's match" \
+        grep -q 'socket cgroupv2 level 2 "minimald.slice/boxes"' "$OUT"
+    want_ok "the node plane is still the slice's remaining match" \
+        grep -q 'ct mark and 0x30000000 == 0 socket cgroupv2 level 1 "minimald.slice"' "$OUT"
+
+    run_hc unenrolled "$root/mi-on" --user "$me"
+    check 0 "$rc" "install exits 0 with neither identity"
+    want_ok "the un-enrolled install lays out the tree" test -d "$tree/boxes/deny"
+    want_ok "the un-enrolled install writes the marker" test -d "$tree/classifier-table"
+    want_err "the un-enrolled transaction carries no SNAT rule" grep -q "snat" "$nft_input"
+    want_ok "the un-enrolled install says nothing is translated" \
+        grep -q "nothing is translated" "$OUT"
+    want_ok "the un-enrolled install names the placement unit, not a per-restart root step alone" \
+        grep -q "min finalize-install" "$OUT"
+    want_err "the un-enrolled install prints no placeholder" grep -q "<cohort address>" "$OUT"
+    # Taken down again so the enrolled install below starts from nothing, and
+    # the recorders emptied so its transaction is the only one they hold.
+    for _cg in "$tree" "$tree/daemon" "$tree/boxes" "$tree/boxes/deny" "$tree/boxes/allow"; do
+        drop_cgroup_files "$_cg"
+    done
+    run_hc unenrolled_uninstall "$root/mi-on" --uninstall
+    check 0 "$rc" "the un-enrolled tree uninstalls"
+    : >"$nft_input"; : >"$nft_calls"; : >"$chown_calls"
 
     # --- The install: the slice, its daemon leaf, the cohort's two subtrees,
     # and the whole v2 contract delegated to the account minimald runs as.
@@ -2006,6 +2031,48 @@ still vouches for the table it loaded" \
     want_ok "the refusal asks for a numeric process id" \
         grep -q "numeric process id" "$OUT"
 
+    # --- --place-listener: the same placement, found from the daemon's own
+    # listener so a manager-held path unit can make it at every start the
+    # socket announces (no per-restart --pid). Over a stand-in process table:
+    # the holder of the socket that runs as the delegated account is placed,
+    # a holder of another uid and a holder of another socket are left alone,
+    # a second run is idempotent, and a socket nobody holds is nothing to
+    # place rather than a failure.
+    fproc="$root/proc"; rm -rf "$fproc"
+    lsock="$root/state/providers/local-minimald0/ssh.sock"
+    mkdir -p "$fproc/net" "$fproc/4242/fd" "$fproc/4243/fd" "$fproc/4244/fd"
+    {
+        printf 'Num       RefCount Protocol Flags    Type St Inode Path\n'
+        printf '0000 00000002 00000000 00010000 0001 01 777 %s\n' "$lsock"
+        printf '0000 00000002 00000000 00010000 0001 01 778 /run/other.sock\n'
+    } >"$fproc/net/unix"
+    ln -s 'socket:[777]' "$fproc/4242/fd/5"
+    printf 'Name:\tminimald\nUid:\t%s\t%s\t%s\t%s\n' "$me" "$me" "$me" "$me" >"$fproc/4242/status"
+    ln -s 'socket:[777]' "$fproc/4243/fd/3"
+    printf 'Name:\tother\nUid:\t0\t0\t0\t0\n' >"$fproc/4243/status"
+    ln -s 'socket:[778]' "$fproc/4244/fd/3"
+    printf 'Name:\tother\nUid:\t%s\t%s\t%s\t%s\n' "$me" "$me" "$me" "$me" >"$fproc/4244/status"
+    : >"$tree/daemon/cgroup.procs"
+    HC_PROC="$fproc"
+    run_hc place_listener "$root/mi-on" --user "$me" --place-listener "$lsock"
+    check 0 "$rc" "--place-listener exits 0"
+    want_ok "the delegated account's holder of the socket is placed" \
+        grep -qx 4242 "$tree/daemon/cgroup.procs"
+    want_err "a holder of another uid is left alone" grep -qx 4243 "$tree/daemon/cgroup.procs"
+    want_ok "the placement says what it left alone and why" grep -q "left 4243 alone" "$OUT"
+    want_err "a holder of another socket is not placed" grep -qx 4244 "$tree/daemon/cgroup.procs"
+    run_hc place_listener_again "$root/mi-on" --user "$me" --place-listener "$lsock"
+    check 0 "$rc" "a second --place-listener exits 0"
+    want_ok "the second run finds the daemon already placed" grep -q "already in" "$OUT"
+    want_ok "the second run writes the pid no second time" \
+        [ "$(grep -cx 4242 "$tree/daemon/cgroup.procs")" -eq 1 ]
+    printf 'Num       RefCount Protocol Flags    Type St Inode Path\n' >"$fproc/net/unix"
+    run_hc place_listener_nobody "$root/mi-on" --user "$me" --place-listener "$lsock"
+    check 0 "$rc" "--place-listener over a socket nobody holds exits 0"
+    want_ok "nobody holding it is nothing to place, said so" grep -q "nothing to place" "$OUT"
+    HC_PROC=
+    : >"$tree/daemon/cgroup.procs"
+
     drop_cgroup_files "$tree"
     drop_cgroup_files "$tree/daemon"
     drop_cgroup_files "$tree/boxes"
@@ -2031,6 +2098,7 @@ still vouches for the table it loaded" \
     want_ok "usage shows the unprivileged --check" grep -q -- "--check" "$OUT"
     want_ok "usage shows the unprivileged --print-ruleset" grep -q -- "--print-ruleset" "$OUT"
     want_ok "usage shows the --pid step" grep -q -- "--pid PID" "$OUT"
+    want_ok "usage shows the --place-listener step" grep -q -- "--place-listener SOCK" "$OUT"
     want_ok "usage shows the ct-mark mask override" grep -q -- "--ct-mark-mask" "$OUT"
 
     # --- Without the rehearsal seam the script demands root, like the other

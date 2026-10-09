@@ -2349,6 +2349,23 @@ fn step_command_over(
     cohort: &str,
     node_plane: &str,
 ) -> std::process::Command {
+    let mut step = step_command_unenrolled(mount, mode, nft_dir);
+    step.arg("--cohort-address")
+        .arg(cohort)
+        .arg("--node-plane-address")
+        .arg(node_plane);
+    step
+}
+
+/// [`step_command`] with no source identity at all: the un-enrolled
+/// host's install (NET-078), which classifies the two identities and
+/// translates nothing.
+#[cfg(test)]
+fn step_command_unenrolled(
+    mount: &StandinMount,
+    mode: &[&str],
+    nft_dir: Option<&Path>,
+) -> std::process::Command {
     let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../scripts/install-host-classifier.sh");
     let mut step = std::process::Command::new("bash");
@@ -2363,14 +2380,7 @@ fn step_command_over(
             std::env::join_paths(path).expect("the stub's directory joins the PATH"),
         );
     }
-    step.arg(script)
-        .arg("--root")
-        .arg(&mount.root)
-        .args(mode)
-        .arg("--cohort-address")
-        .arg(cohort)
-        .arg("--node-plane-address")
-        .arg(node_plane);
+    step.arg(script).arg("--root").arg(&mount.root).args(mode);
     step
 }
 
@@ -2745,6 +2755,103 @@ mod tests {
             std::fs::write(dir.join(file), "")
                 .unwrap_or_else(|e| panic!("modeling {file} in {}: {e}", dir.display()));
         }
+    }
+
+    /// NET-078: an un-enrolled native host's install knows no source
+    /// address and needs none: the two identities are still two distinct
+    /// classifier matches — the boxes subtree for the host-address cohort,
+    /// the slice outside it for the node plane — and nothing is
+    /// translated: the postrouting chain is present and empty, so an
+    /// association can add the reserved addresses to it later without
+    /// touching the matches.
+    #[test]
+    fn unenrolled_native_identities_are_cgroup_matches_without_snat() {
+        let mount = standin_mount();
+        let printed = step_command_unenrolled(&mount, &["--print-ruleset"], None)
+            .output()
+            .expect("running the privileged step over the stand-in mount");
+        assert!(
+            printed.status.success(),
+            "the step renders with no identity given: {}",
+            String::from_utf8_lossy(&printed.stderr),
+        );
+        let ruleset = String::from_utf8(printed.stdout).expect("the rendered ruleset is text");
+        let rel = tree_root_name();
+        let cohort_path = format!("{}/{}", rel, sandbox2::classifier::BOXES_DIR);
+        let classify = chain_rules(&ruleset, "classify");
+        assert_eq!(
+            classify.len(),
+            2,
+            "two identities, two matches: {classify:?}"
+        );
+        assert!(
+            classify[0].contains(&format!(
+                "socket cgroupv2 level {} \"{cohort_path}\"",
+                cohort_path.split('/').count()
+            )),
+            "the cohort is the boxes subtree: {classify:?}"
+        );
+        assert!(
+            classify[1].contains(&format!(
+                "socket cgroupv2 level {} \"{rel}\"",
+                rel.split('/').count()
+            )) && classify[1].contains("== 0"),
+            "the node plane is the slice outside the cohort, guarded by the mask: {classify:?}"
+        );
+        assert!(
+            ruleset.contains("chain postrouting"),
+            "the postrouting chain is present for a later association: {ruleset}"
+        );
+        assert!(
+            chain_rules(&ruleset, "postrouting").is_empty(),
+            "an un-enrolled host translates nothing: {ruleset}"
+        );
+        assert!(!ruleset.contains("snat"), "no SNAT anywhere: {ruleset}");
+    }
+
+    /// NET-078: an association adds the reserved SNAT addresses to the
+    /// un-enrolled install without a reinstall of the classifier: the
+    /// render with the pair differs from the render without it only in the
+    /// postrouting chain's rules — the tree, the classify matches, the
+    /// deny chain and every other byte are the same — so what the
+    /// association loads is the translation and nothing else.
+    #[test]
+    fn association_applies_reserved_snat_without_classifier_reinstall() {
+        let mount = standin_mount();
+        let unenrolled = step_command_unenrolled(&mount, &["--print-ruleset"], None)
+            .output()
+            .expect("running the privileged step over the stand-in mount");
+        let associated = step_command(&mount, &["--print-ruleset"], None)
+            .output()
+            .expect("running the privileged step over the stand-in mount");
+        assert!(unenrolled.status.success() && associated.status.success());
+        let unenrolled = String::from_utf8(unenrolled.stdout).unwrap();
+        let associated = String::from_utf8(associated.stdout).unwrap();
+        assert_eq!(
+            chain_rules(&unenrolled, "classify"),
+            chain_rules(&associated, "classify"),
+            "the association leaves the classifier's matches as they were"
+        );
+        let postrouting = chain_rules(&associated, "postrouting");
+        assert_eq!(postrouting.len(), 2, "{postrouting:?}");
+        assert!(
+            postrouting[0].contains(&format!("snat ip to {TEST_COHORT_ADDRESS}"))
+                && postrouting[1].contains(&format!("snat ip to {TEST_NODE_PLANE_ADDRESS}")),
+            "the association's two reserved addresses are the translation: {postrouting:?}"
+        );
+        // Every line but the postrouting rules is byte-identical.
+        let strip = |ruleset: &str| -> Vec<String> {
+            ruleset
+                .lines()
+                .filter(|line| !line.trim_start().contains("snat ip to"))
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            strip(&unenrolled),
+            strip(&associated),
+            "nothing but the translation changes between the two renders"
+        );
     }
 
     /// NET-078: the node plane and the host-address cohort are classified
@@ -4394,12 +4501,12 @@ mod tests {
             .install_command()
             .expect("the step's cause is the one a command ends");
         assert!(
-            command.contains("install-host-classifier.sh"),
-            "the command is the privileged step's install: {command}"
+            command.contains("min finalize-install"),
+            "the command is the privileged step's install, the installed CLI's own verb: {command}"
         );
         assert!(
-            command.contains("sudo bash ./install-host-classifier.sh"),
-            "the command is the one a person runs, spelled exactly: {command}"
+            !command.contains('<') && !command.contains("raw.githubusercontent.com"),
+            "the command is the one a person runs, with no placeholder and no fetch: {command}"
         );
 
         // The same shape in a guest names its own image's half instead:
@@ -4575,7 +4682,7 @@ mod tests {
             .install_command()
             .expect("reloading the table is the command that ends it");
         assert!(
-            command.contains("install-host-classifier.sh"),
+            command.contains("min finalize-install"),
             "the command is the one thing that reloads the table: {command}"
         );
 

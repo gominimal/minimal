@@ -5007,11 +5007,7 @@ mod tests {
                  per box: the classifier's privileged step is not installed on this \
                  host. While it cannot, its host-address boxes run unenforced — \
                  whatever the boxes' declarations say. Install the classifier's \
-                 privileged step with:\n  run: curl -fsSLO \
-                 https://raw.githubusercontent.com/gominimal/minimal/main/scripts/\
-                 install-host-classifier.sh && sudo bash ./install-host-classifier.sh \
-                 --user runner --cohort-address 10.0.0.0/16 --node-plane-address \
-                 10.0.1.0/24",
+                 privileged step with:\n  run: min finalize-install",
             ),
             Some("none"),
         );
@@ -5029,12 +5025,7 @@ mod tests {
              reply, and the terminal cannot disagree, got: {rendered}"
         );
         assert!(
-            rendered.ends_with(
-                "  run: curl -fsSLO https://raw.githubusercontent.com/gominimal/\
-                 minimal/main/scripts/install-host-classifier.sh && sudo bash \
-                 ./install-host-classifier.sh --user runner --cohort-address \
-                 10.0.0.0/16 --node-plane-address 10.0.1.0/24\n"
-            ),
+            rendered.ends_with("  run: min finalize-install\n"),
             "the missing privileged step is the cause, so the render carries \
              the exact command that installs it, on the last line with \
              nothing after it: {rendered}"
