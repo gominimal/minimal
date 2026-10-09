@@ -2702,21 +2702,24 @@ fn policy_shows_baseline_set() {
     );
 }
 
-/// While the deny-all egress default is announced but not yet in force,
-/// `min session activate` prints the coming change (NET-076) — what turns
-/// for a bare own-address box, and how to keep the shipped default. Driven
+/// With the deny-all egress default in force, `min session activate` prints
+/// one line for a bare own-address box (NET-074): the default it now has and
+/// the flags that declare its reach, once per activate. The announcement
+/// that preceded it (NET-076) is retired: no "Heads-up" line prints. Driven
 /// through the compiled binary so the assertion is on what the user actually
-/// sees; the phase this build ships is announced, so the notice is the
-/// shipped path, and its scoping is exercised with it: a bare own-address
-/// activate prints, a host-address one (a box the change does not reach)
-/// does not, and a daemon that opted out (NET-077 — a deployment the change
-/// is not coming for, and one that has already taken the remedy the notice
-/// names) is not announced at either. The other phase is gated by
-/// construction — once the default is in force the change is no longer
-/// coming, and the notice is `None`.
+/// sees, with the scoping exercised alongside: a box that declares egress is
+/// not noted, a host-address box (which owns no address to deny from) is
+/// not, and a daemon that opted out (NET-077), whose box keeps allow-all, is
+/// not either.
 #[cfg(target_os = "linux")]
 #[tokio::test]
-async fn deny_all_announcement_printed() {
+async fn deny_all_in_force_note_printed() {
+    const NOTE: &str = "egress: deny-all (default for an own-ip box with no egress section)";
+    assert_eq!(
+        sessions::EGRESS_DEFAULT_PHASE,
+        sessions::EgressDefaultPhase::InForce,
+        "this build ships the deny-all default in force"
+    );
     let (_daemon, args) = setup().await;
     let project = tempfile::TempDir::new().unwrap();
     std::fs::create_dir(project.path().join(".git")).unwrap();
@@ -2725,26 +2728,24 @@ async fn deny_all_announcement_printed() {
         "# test minimal.toml\n[stack]\nuse = \"shell\"\n",
     )
     .unwrap();
-
-    // The shipped path: activating a bare own-address box succeeds and
-    // prints the notice — the change, its scope, and the way to keep the
-    // default.
-    let own_ip = run_min(
-        &args,
-        &[
+    let activate = |name: &'static str, extra: &'static [&'static str]| {
+        let mut argv = vec![
             "session",
             "activate",
             project.path().to_str().unwrap(),
             "--name",
-            "notice-own-ip",
-            "--network",
-            "own_ip",
+            name,
             "--sync",
             "tarball",
             "--no-prompt",
-        ],
-    )
-    .await;
+        ];
+        argv.extend_from_slice(extra);
+        argv
+    };
+
+    // The shipped path: a bare own-address box activates and is told, on
+    // one line, what it has and how to declare reach.
+    let own_ip = run_min(&args, &activate("note-own-ip", &["--network", "own_ip"])).await;
     assert!(
         own_ip.status.success(),
         "activating a bare own-address box must succeed, but the binary \
@@ -2753,108 +2754,81 @@ async fn deny_all_announcement_printed() {
         String::from_utf8_lossy(&own_ip.stderr),
     );
     let own_ip_stderr = String::from_utf8_lossy(&own_ip.stderr).into_owned();
+    assert_eq!(
+        own_ip_stderr.matches(NOTE).count(),
+        1,
+        "a bare own-address activate prints the in-force note once:\n{own_ip_stderr}"
+    );
+    let line = own_ip_stderr
+        .lines()
+        .find(|line| line.contains(NOTE))
+        .expect("the note is on one line");
     assert!(
-        own_ip_stderr.contains("Heads-up: the next release denies all external reach"),
-        "activating a bare own-address box must print the coming change:\n{own_ip_stderr}"
+        line.contains("--allow-subnets") && line.contains("--allow-dns-hosts"),
+        "the note names the flags that declare reach: {line}"
     );
     assert!(
-        own_ip_stderr.contains("own-address"),
-        "the notice must scope the change to own-address sessions:\n{own_ip_stderr}"
-    );
-    assert!(
-        own_ip_stderr.contains("--egress-deny-all-opt-out"),
-        "the notice must say how to keep the shipped default:\n{own_ip_stderr}"
+        !own_ip_stderr.contains("Heads-up"),
+        "the announcement is retired once the default is in force:\n{own_ip_stderr}"
     );
 
-    // Scoped to the boxes the change would reach: a host-address box
-    // shares its host's namespace and owns no address to deny from, so
-    // its activate announces nothing.
-    let host_net_stderr = run_min_stderr(
+    // A box that declared egress has the section it declared: no note.
+    let declared_stderr = run_min_stderr(
         &args,
-        &[
-            "session",
-            "activate",
-            project.path().to_str().unwrap(),
-            "--name",
-            "notice-host-net",
-            "--network",
-            "host_ip",
-            "--sync",
-            "tarball",
-            "--no-prompt",
-        ],
+        &activate(
+            "note-declared",
+            &["--network", "own_ip", "--allow-subnets", "10.0.0.0/8"],
+        ),
     )
     .await;
     assert!(
-        !host_net_stderr.contains("Heads-up"),
-        "a host-address box the change does not reach must not be announced \
-         at:\n{host_net_stderr}"
+        !declared_stderr.contains(NOTE),
+        "a box that declared egress is not noted:\n{declared_stderr}"
     );
 
-    // And scoped to the daemons the change is coming for: an opted-out
-    // daemon (NET-077) has already chosen to keep the shipped default —
-    // the exact remedy this notice names — so announcing at it would tell
-    // it to do what it has done. The opt-out is the daemon's own fact, so
-    // this half runs against a second daemon started with the flag.
+    // A host-address box shares its host's namespace and owns no address
+    // to deny from, so the default does not bind it.
+    let host_net_stderr =
+        run_min_stderr(&args, &activate("note-host-net", &["--network", "host_ip"])).await;
+    assert!(
+        !host_net_stderr.contains(NOTE),
+        "a host-address box the default does not bind is not noted:\n{host_net_stderr}"
+    );
+
+    // And an opted-out daemon (NET-077) keeps allow-all for the same bare
+    // box, so the note would be false there. The opt-out is the daemon's
+    // own fact, so this half runs against a second daemon started with it.
     let (_opted_out, opted_out_args, _opted_out_dir) = setup_opted_out().await;
     let opted_out = run_min(
         &opted_out_args,
-        &[
-            "session",
-            "activate",
-            project.path().to_str().unwrap(),
-            "--name",
-            "notice-opted-out",
-            "--network",
-            "own_ip",
-            "--sync",
-            "tarball",
-            "--no-prompt",
-        ],
+        &activate("note-opted-out", &["--network", "own_ip"]),
     )
     .await;
     assert!(
         opted_out.status.success(),
-        "activating a bare own-address box must still succeed on an opted-out \
+        "activating a bare own-address box must succeed on an opted-out \
          daemon, but the binary exited {}:\n{}",
         opted_out.status,
         String::from_utf8_lossy(&opted_out.stderr),
     );
     let opted_out_stderr = String::from_utf8_lossy(&opted_out.stderr).into_owned();
     assert!(
-        !opted_out_stderr.contains("Heads-up"),
-        "a daemon that has already taken the notice's remedy must not be \
-         told to take it:\n{opted_out_stderr}"
+        !opted_out_stderr.contains(NOTE),
+        "an opted-out daemon's bare box keeps allow-all and is not noted:\n{opted_out_stderr}"
     );
 
-    // The other phase, gated by construction: once the default is in
-    // force the change is no longer coming, and nothing prints.
+    // The announced phase prints nothing: its announcement is retired.
     assert!(
-        deny_all_default_notice(sessions::EgressDefaultPhase::InForce, false).is_none()
-            && deny_all_default_notice(sessions::EgressDefaultPhase::InForce, true).is_none(),
-        "the notice must not print once the default is in force"
-    );
-
-    // On a VM-backed host the daemon is the VM's pid-1 and reads no flags:
-    // the remedy the notice names is the VM host daemon's variable, and the
-    // native flag is not offered there.
-    let vm_notice = deny_all_default_notice(sessions::EgressDefaultPhase::Announced, true)
-        .expect("the notice prints on a VM-backed host while announced");
-    assert!(
-        vm_notice.contains("MINVMD_EGRESS_DENY_ALL_OPT_OUT=1"),
-        "a VM-backed host's notice must name the variable that opts it out: {vm_notice}"
-    );
-    assert!(
-        !vm_notice.contains("--egress-deny-all-opt-out"),
-        "a VM-backed host's notice must not name the native daemon's flag: {vm_notice}"
+        deny_all_default_notice(sessions::EgressDefaultPhase::Announced).is_none(),
+        "the retired announcement must not print"
     );
 }
 
 /// [`setup`] on a daemon that opted out of the deny-all egress default
 /// (NET-077): the same UDS-listening harness server, but one whose boxes
 /// with no `egress` section keep the shipped allow-all. Only the
-/// announcement test needs a daemon with the other rollout posture, so the
-/// builder stays here beside it rather than in the shared harness.
+/// in-force note's test needs a daemon with the other rollout posture, so
+/// the builder stays here beside it rather than in the shared harness.
 ///
 /// The caller must keep both returned values alive for as long as it talks
 /// to the daemon: the server owns the daemon's state, the tempdir the
@@ -3966,6 +3940,8 @@ async fn create_pending_session(daemon: &common::TestDaemon, name: &str) -> Sess
         project_path: paths::HostAbsPath::try_new(project_path).unwrap(),
         network: sessions::NetworkMode::NoNet,
         policy: Default::default(),
+        task_addresses: Vec::new(),
+        box_id: None,
         box_addresses: None,
         hooks_enabled: true,
         attrs: Default::default(),
@@ -4040,6 +4016,8 @@ async fn create_session_with(
         project_path,
         network,
         policy,
+        task_addresses: Vec::new(),
+        box_id: None,
         box_addresses: None,
         hooks_enabled: true,
         attrs: Default::default(),
@@ -4501,5 +4479,142 @@ async fn task_run_exits_with_held_open_stdin_pipe() {
         String::from_utf8_lossy(&stdout).contains("TASK_RUN_STDIN_OK"),
         "task output must stream back: stdout={}",
         String::from_utf8_lossy(&stdout)
+    );
+}
+
+// --- fail closed on an unreachable VM host (#1790) ---
+//
+// An own-address activation on a VM-backed host registers its box with the
+// VM host daemon first; under the in-force gate a box with no host row
+// reaches nothing, so a registration that cannot be made ends the
+// activation with the architecture's reserved code: 7 when the host cannot
+// be reached, 8 when it refused for want of addresses, and 1 for any other
+// refusal. Driven through the compiled binary: the contract is the exit
+// status.
+
+/// Runs `min session activate --network own_ip` against a VM host state
+/// dir — its daemon recorded Running with the alive lock held, so the
+/// activation spawns nothing, and a real daemon on its ssh socket, so the
+/// create is one registration away from succeeding — whose box control
+/// socket `stand_up` puts in place, or not. The value `stand_up` returns is
+/// held until the binary exits.
+async fn activate_own_ip_on_vm_host<G>(
+    stand_up: impl FnOnce(&std::path::Path) -> G,
+) -> std::process::Output {
+    let state = tempfile::TempDir::new().unwrap();
+    let provider_dir = state.path().join("providers").join("local-minvmd0");
+    let state_dir = minvmd::state::StateDir::new(provider_dir.clone()).unwrap();
+    state_dir
+        .write_state(&minvmd::state::State {
+            lifecycle: minvmd::lifecycle::Lifecycle::Running,
+            ..minvmd::state::State::stopped()
+        })
+        .unwrap();
+    let _alive = state_dir.try_acquire_alive_lock().unwrap();
+    let server = minimald::test_harness::TestServer::new().await;
+    server.listen_on_uds(&provider_dir.join("ssh.sock")).await;
+    let _control = stand_up(&provider_dir.join("control.sock"));
+
+    let project = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir(project.path().join(".git")).unwrap();
+    let config_dir = tempfile::TempDir::new().unwrap();
+    tokio::process::Command::new(env!("CARGO_BIN_EXE_min"))
+        .args(["--minimal-dir".as_ref(), state.path().as_os_str()])
+        .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
+        .args(["--provider", "local-minvmd", "--no-input"])
+        .args(["session", "activate"])
+        .arg(project.path())
+        .args(["--name", "web", "--network", "own_ip", "--no-prompt"])
+        .output()
+        .await
+        .expect("the min binary should be invocable")
+}
+
+/// A box control socket that answers every request with `reply`, one line
+/// per connection.
+fn answering_control_sock(path: &std::path::Path, reply: &'static str) {
+    let listener = tokio::net::UnixListener::bind(path).unwrap();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let mut lines = tokio::io::BufReader::new(stream);
+            let mut line = String::new();
+            if lines.read_line(&mut line).await.is_err() {
+                return;
+            }
+            let mut writer = lines.into_inner();
+            let _ = writer.write_all(format!("{reply}\n").as_bytes()).await;
+        }
+    });
+}
+
+/// No control socket beside the VM host's ssh socket: the registration
+/// cannot connect, so the activation fails closed with 7, naming the
+/// socket it could not reach.
+#[tokio::test]
+async fn activate_exits_7_when_the_vm_host_is_unreachable() {
+    let out = activate_own_ip_on_vm_host(|_| ()).await;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(7), "stderr: {stderr}");
+    assert!(
+        stderr.contains("control socket") && stderr.contains("control.sock"),
+        "the error names the socket it could not reach: {stderr}"
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "no session id for an activation that failed"
+    );
+}
+
+/// A control socket that accepts the registration and never answers: the
+/// bound passes, and the activation fails closed with 7 rather than
+/// hanging or starting the box unregistered.
+#[tokio::test]
+async fn activate_exits_7_when_the_vm_host_does_not_answer_in_time() {
+    let out = activate_own_ip_on_vm_host(|path| {
+        // Bound and never accepted: the connect lands in the backlog and
+        // the request's reply never comes.
+        std::os::unix::net::UnixListener::bind(path).unwrap()
+    })
+    .await;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(7), "stderr: {stderr}");
+    assert!(
+        stderr.contains("did not answer the box registration"),
+        "the error names the deadline: {stderr}"
+    );
+}
+
+/// A refusal the VM host answers is not an unreachable host: the host was
+/// reached. A refusal of the declaration is the unspecified error, 1.
+#[tokio::test]
+async fn activate_exits_1_when_the_vm_host_refuses_the_box() {
+    let out = activate_own_ip_on_vm_host(|path| {
+        answering_control_sock(path, r#"{"error":"the declaration names no box"}"#);
+    })
+    .await;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "stderr: {stderr}");
+    assert!(
+        stderr.contains("refused the box registration: the declaration names no box"),
+        "the error carries the daemon's reason: {stderr}"
+    );
+}
+
+/// A refusal for want of addresses is the host unable to hold one more
+/// box: insufficient resources, 8.
+#[tokio::test]
+async fn activate_exits_8_when_the_vm_host_is_out_of_addresses() {
+    let out = activate_own_ip_on_vm_host(|path| {
+        answering_control_sock(
+            path,
+            r#"{"error":"the switch's address plan is exhausted: 0 live, 0 quarantined, 0 capacity"}"#,
+        );
+    })
+    .await;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(8), "stderr: {stderr}");
+    assert!(
+        stderr.contains("address plan is exhausted"),
+        "the error carries the daemon's reason: {stderr}"
     );
 }

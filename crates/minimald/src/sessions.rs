@@ -106,12 +106,17 @@ fn build_record(
         // included — reuses the address the host table still holds instead
         // of drawing a new one the row would not match.
         box_addresses: config.box_addresses,
+        // Task runs attach at these, one run per address, so the in-VM
+        // daemon draws nothing for a task either (NET-138).
+        task_addresses: config.task_addresses,
         status,
         hooks_enabled: config.hooks_enabled,
         // Daemon-owned from its first line: a create holds no launch's
         // outcome to record, and the key a client might assert in `attrs`
         // is stripped above, so only a launch ever writes this field.
         host_ip_enforcement: None,
+        // The id the host's row of the box holds, beside its addresses.
+        box_id: config.box_id,
         // Daemon-owned as well: only a launch binds the box's host-side row.
         host_row_bound: false,
         attrs: config.attrs,
@@ -1989,6 +1994,8 @@ pub(crate) mod tests {
             project_path: HostAbsPath::try_new("/proj").unwrap(),
             network: sessions::NetworkMode::default(),
             policy: Default::default(),
+            task_addresses: Vec::new(),
+            box_id: None,
             box_addresses: None,
             hooks_enabled: true,
             attrs: Default::default(),

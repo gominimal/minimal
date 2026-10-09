@@ -703,9 +703,10 @@ pub struct ActivateArgs {
     /// and empty, nothing denied on top (`sessions::EgressPolicy::deny_all()`)
     /// — a declaration, not the default: on a host-address box the host's
     /// classifier decides it per box (NET-079), while a box that declares no
-    /// egress at all keeps the default the rollout phase resolves
-    /// (NET-074). Valid wherever the egress rule flags are; conflicts with
-    /// every one of them, because deny-all admits no exceptions.
+    /// egress at all gets the default NET-074 sets: deny-all for an own-ip
+    /// box, unless the host opts out. Valid wherever the egress rule flags
+    /// are; conflicts with every one of them, because deny-all admits no
+    /// exceptions.
     #[arg(long = "deny-all-egress", conflicts_with = "egress-rules")]
     pub deny_all_egress: bool,
     /// Declare a credentialed upstream for this box (NET-134): the Box

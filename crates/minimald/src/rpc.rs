@@ -921,7 +921,9 @@ async fn serve_answerer_control(
                 | BoxControlRequest::ReadRow(_)
                 | BoxControlRequest::AdmitAsk(_)
                 | BoxControlRequest::RecordAskAnswer(_)
-                | BoxControlRequest::SubscribeAsks(_) => BoxControlReply::Error {
+                | BoxControlRequest::SubscribeAsks(_)
+                | BoxControlRequest::ResumeBox(_)
+                | BoxControlRequest::RowStanding(_) => BoxControlReply::Error {
                     error: "the native daemon's control socket answers only the answerer \
                             verbs; boxes register over the daemon's RPC channels"
                         .to_string(),
@@ -1348,12 +1350,10 @@ async fn serve_get_session_policy(
 /// here: it answers beside this reply, over `GetSessionRuntimeFacts`, so an
 /// older client keeps reading the rules.
 ///
-/// `phase` is the rollout
-/// phase to resolve under — the handler serves
-/// [`sessions::EGRESS_DEFAULT_PHASE`], the phase this build ships, while the
-/// tests pass [`sessions::EgressDefaultPhase::InForce`] so the deny-all
-/// posture the rollout ends at stays proven while the default is only
-/// announced (NET-076).
+/// `phase` is the rollout phase to resolve under — the handler serves
+/// [`sessions::EGRESS_DEFAULT_PHASE`], the phase this build ships, and the
+/// tests name [`sessions::EgressDefaultPhase::InForce`] so the deny-all
+/// posture they prove does not hang on that constant.
 pub(crate) fn effective_policy_reply(
     policy: &sessions::SessionPolicy,
     network: sessions::NetworkMode,
@@ -1374,9 +1374,9 @@ pub(crate) fn effective_policy_reply(
 /// Resolved here rather than in the client because the inputs are this
 /// daemon's own facts: the rollout phase its build ships
 /// ([`sessions::EGRESS_DEFAULT_PHASE`]) and its opt-out flag (NET-077). An
-/// own-address box with no `egress` section answers `deny_all` once the
-/// default is in force (NET-074) and `allow_all` behind the opt-out or while
-/// the default is only announced; a declared section answers verbatim; the
+/// own-address box with no `egress` section answers `deny_all` with the
+/// default in force (NET-074) and `allow_all` behind the opt-out; a declared
+/// section answers verbatim; the
 /// strict declaration the record holds is never rewritten to say any of
 /// this.
 async fn serve_get_effective_session_policy(
@@ -5670,6 +5670,8 @@ mod tests {
                     project_path: HostAbsPath::try_new("/uwu").unwrap(),
                     network: NetworkMode::OwnIp,
                     policy: SessionPolicy::new(Some(egress.clone()), None),
+                    task_addresses: Vec::new(),
+                    box_id: None,
                     box_addresses: None,
                     hooks_enabled: true,
                     attrs: Default::default(),
@@ -5706,6 +5708,8 @@ mod tests {
                     project_path: HostAbsPath::try_new("/uwu").unwrap(),
                     network: NetworkMode::OwnIp,
                     policy,
+                    task_addresses: Vec::new(),
+                    box_id: None,
                     box_addresses: None,
                     hooks_enabled: true,
                     attrs: Default::default(),
@@ -5727,10 +5731,9 @@ mod tests {
     }
 
     /// NET-074/NET-075: `GetEffectiveSessionPolicy` answers, over the real
-    /// SSH wire, what the gate enforces. This build ships the deny-all
-    /// default as announced (NET-076), so the wire half asserts the reply
-    /// the shipped phase resolves, while the in-force posture the rollout
-    /// ends at is proven by passing the phase explicitly to the same
+    /// SSH wire, what the gate enforces. The wire half asserts the reply the
+    /// shipped phase resolves — in force, so `deny_all` — and the in-force
+    /// posture is also proven by passing the phase explicitly to the same
     /// resolver the handler serves. In force, an own-address box with no
     /// `egress` section answers `deny_all` — reported as the posture, not as
     /// a materialized section — and that reply survives the wire codec it
@@ -5828,6 +5831,11 @@ mod tests {
             ),
             "the wire must answer the shipped phase's resolution for a bare box",
         );
+        assert_eq!(
+            bare.egress,
+            EffectiveEgress::DenyAll,
+            "with the default in force the wire answers deny-all for a bare box",
+        );
 
         // The strict reply is unchanged: the declaration the box was
         // launched with, absent section still absent.
@@ -5884,11 +5892,10 @@ mod tests {
         );
     }
 
-    /// NET-077: a daemon started with the deny-all opt-out keeps the shipped
+    /// NET-077: a daemon started with the deny-all opt-out keeps the earlier
     /// allow-all default — an own-address box with no `egress` section
     /// answers `allow_all` where the same box on an opted-in daemon answers
-    /// `deny_all` once the default is in force (that half passes the phase
-    /// explicitly, since this build ships the default as announced) — and
+    /// `deny_all` with the default in force — and
     /// its gate resolves no section, so nothing is enforced. A box that
     /// declared its own egress keeps it either way.
     #[tokio::test]
@@ -5919,13 +5926,13 @@ mod tests {
                 ingress: None,
                 credentialed_upstream: None,
             },
-            "behind the opt-out, an absent egress section keeps the shipped allow-all",
+            "behind the opt-out, an absent egress section keeps the earlier allow-all",
         );
 
         // The report and the gate agree, even in force: the same resolution
         // the launcher applies materializes no section to enforce. The phase
-        // is passed explicitly so the opt-out is proven against the posture
-        // it exists to defer, not only against the announced build.
+        // is passed explicitly so the opt-out stays proven against the
+        // posture it exists to defer whatever the shipped constant says.
         assert_eq!(
             crate::session::effective_egress_section(
                 &sessions::SessionPolicy::default(),
@@ -6120,6 +6127,8 @@ mod tests {
                     project_path: HostAbsPath::try_new("/uwu").unwrap(),
                     network: NetworkMode::NoNet,
                     policy: SessionPolicy::new(Some(egress), None),
+                    task_addresses: Vec::new(),
+                    box_id: None,
                     box_addresses: None,
                     hooks_enabled: true,
                     attrs: Default::default(),
@@ -6168,6 +6177,8 @@ mod tests {
                     project_path: HostAbsPath::try_new("/uwu").unwrap(),
                     network: NetworkMode::HostNet,
                     policy: SessionPolicy::new(None, Some(ingress)),
+                    task_addresses: Vec::new(),
+                    box_id: None,
                     box_addresses: None,
                     hooks_enabled: true,
                     attrs: Default::default(),

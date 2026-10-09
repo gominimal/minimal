@@ -107,7 +107,7 @@ use minimald_rpc::{
     WithdrawBoxRequest, WithdrawPortRequest,
 };
 
-use crate::box_registry::{BoxRegistry, ClientBoxSpec};
+use crate::box_registry::{AllocationError, BoxRegistry, ClientBoxSpec};
 use crate::net::answerer::AnswererStatus;
 
 /// The control socket's file name inside the provider-instance dir, beside
@@ -921,6 +921,32 @@ fn serve_request(
             let reply = order.apply(|| withdraw_box(boxes, answerer, request));
             write_reply(stream, &reply)
         }
+        (BoxControlRequest::ResumeBox(request), ControlDoor::Host) => {
+            let reply = resume_reply(boxes, answerer, order, request);
+            write_reply(stream, &reply)
+        }
+        // A read of the host's own table, like the row read: no ticket.
+        // The table is this supervisor's, and a supervisor runs one VM and
+        // binds this door for that VM's vsock bridge alone, so the answer
+        // is only ever about the asking VM's own rows. A map lookup: it
+        // changes no row, no liveness and no attribution. The read is
+        // answered for the box id it names alone: a row another box was
+        // handed the address under is not the asking box's row, and a read
+        // that names no id is answered as no row, fail-closed.
+        (BoxControlRequest::RowStanding(request), ControlDoor::GuestReports) => {
+            let reply = BoxControlReply::RowStanding {
+                switch_address: request.switch_address,
+                row_standing: boxes
+                    .table()
+                    .by_source(request.switch_address.octets())
+                    .is_some_and(|record| {
+                        request.box_id.is_some_and(|asked| {
+                            !record.is_task_row() && asked.to_bytes() == record.box_id()
+                        })
+                    }),
+            };
+            write_reply(stream, &reply)
+        }
         // The hold and its release take a ticket like the verbs they
         // bracket: each changes the table the answerer answers from, so
         // each publishes in its own turn, never mid-fold.
@@ -1027,6 +1053,82 @@ fn registration_reply(
     }
 }
 
+/// Resume a box's row for its creator ([`BoxRegistry::resume_client_box`],
+/// NET-138) and build the reply: the shape of a registration. A row that
+/// stands is answered at once, with no ticket and nothing asked of the
+/// answerer: the resume changes nothing about it. A resume whose row was
+/// withdrawn is a registration — counted in flight under the creation's
+/// own name, which a rename does not change, and its published address
+/// asked of the answerer before the ticket, which hands the name back the
+/// address it holds for it. A refusal hands that address back unless
+/// something else owns it, as a refused registration does.
+fn resume_reply(
+    boxes: &BoxRegistry,
+    answerer: &AnswererStatus,
+    order: &Arc<ApplyOrder>,
+    request: minimald_rpc::ResumeBoxRequest,
+) -> BoxControlReply {
+    let refused = |error: crate::box_registry::ResumeError| {
+        tracing::info!(box = %request.name, error = %error, "box row resume refused");
+        BoxControlReply::Error {
+            error: error.to_string(),
+        }
+    };
+    let name = match boxes.resumable(
+        &request.name,
+        request.switch_address,
+        request.loopback_address,
+        request.box_id.map(minimald_rpc::BoxId::to_bytes),
+    ) {
+        Ok(crate::box_registry::Resumable::Standing(record)) => {
+            return BoxControlReply::Registered(RegisteredBox {
+                switch_address: record.switch_addr(),
+                loopback_address: record.loopback_addr(),
+                box_id: minimald_rpc::BoxId::from_bytes(record.box_id()),
+                task_addresses: record.task_addrs().to_vec(),
+            });
+        }
+        Ok(crate::box_registry::Resumable::Dormant { name }) => name,
+        Err(error) => return refused(error),
+    };
+    let claim = boxes.begin_registration(&name);
+    let allocated = match allocate_box_address(answerer, &name) {
+        Ok(allocated) => allocated,
+        Err(reply) => return reply,
+    };
+    order.apply(move || {
+        match boxes.resume_client_box(
+            &name,
+            request.switch_address,
+            request.loopback_address,
+            request.box_id.map(minimald_rpc::BoxId::to_bytes),
+            allocated,
+            claim.generation(),
+        ) {
+            Ok(record) => BoxControlReply::Registered(RegisteredBox {
+                switch_address: record.switch_addr(),
+                loopback_address: record.loopback_addr(),
+                box_id: minimald_rpc::BoxId::from_bytes(record.box_id()),
+                task_addresses: record.task_addrs().to_vec(),
+            }),
+            Err(error) => {
+                let released = boxes.release_unless_owned(&claim, || {
+                    answerer.release_address(&name);
+                });
+                tracing::info!(
+                    address_released = released,
+                    box = %name,
+                    error = %error,
+                    "box row resume refused"
+                );
+                BoxControlReply::Error {
+                    error: error.to_string(),
+                }
+            }
+        }
+    })
+}
+
 /// Serve a held registration ([`RegisterBoxRequest::hold`]): register the
 /// box, then hand the connection to a thread of its own that writes the
 /// reply and holds the connection as the row's lease until its client
@@ -1049,10 +1151,13 @@ fn serve_held_registration(
     let BoxControlReply::Registered(registered) = &reply else {
         return write_reply(&mut stream, &reply);
     };
+    // The lease's withdrawal names the id the registration minted, so a
+    // lease that ends late never removes a newer row under the same pair.
     let withdrawal = WithdrawBoxRequest {
         name,
         switch_address: registered.switch_address,
         loopback_address: registered.loopback_address,
+        box_id: Some(registered.box_id),
     };
     let not_held = |stream: &mut UnixStream, error: std::io::Error| {
         order.apply(|| withdraw_box(boxes, answerer, withdrawal.clone()));
@@ -1207,6 +1312,8 @@ fn request_verb(request: &BoxControlRequest) -> &'static str {
         BoxControlRequest::AdmitAsk(_) => "admit_ask",
         BoxControlRequest::RecordAskAnswer(_) => "record_ask_answer",
         BoxControlRequest::SubscribeAsks(_) => "subscribe_asks",
+        BoxControlRequest::ResumeBox(_) => "resume_box",
+        BoxControlRequest::RowStanding(_) => "row_standing",
     }
 }
 
@@ -1377,13 +1484,21 @@ fn register_box(
         dynamic_ingress: request.dynamic_ingress,
         dynamic_allowed_range: request.dynamic_allowed_range,
     };
-    match boxes.register_client_box_since(spec, loopback_addr, claim.generation()) {
+    // The box's task addresses are filed with it (NET-138), so the in-VM
+    // daemon draws nothing for a task run either.
+    match boxes.register_client_box_since(
+        spec,
+        loopback_addr,
+        request.task_slots,
+        claim.generation(),
+    ) {
         Ok(record) => {
             tracing::info!(
                 box = %record.name(),
                 box_id = %crate::bep_attach::BoxIdText(&record.box_id()),
                 switch_address = %record.switch_addr(),
                 loopback_address = %record.loopback_addr(),
+                task_addresses = ?record.task_addrs(),
                 egress = %declared_egress,
                 "registered box with the VM host daemon; addresses allocated"
             );
@@ -1391,6 +1506,7 @@ fn register_box(
                 switch_address: record.switch_addr(),
                 loopback_address: record.loopback_addr(),
                 box_id: minimald_rpc::BoxId::from_bytes(record.box_id()),
+                task_addresses: record.task_addrs().to_vec(),
             })
         }
         Err(error) => {
@@ -1400,12 +1516,25 @@ fn register_box(
             let released = boxes.release_unless_owned(&claim, || {
                 answerer.release_address(&request.name);
             });
-            tracing::debug!(
-                address_released = released,
-                box = %request.name,
-                error = %error,
-                "box registration refused"
-            );
+            // An exhausted hand-out run is a capacity refusal an operator
+            // has to see — the activation fails on it — so it is a warn
+            // line naming the counts; every other refusal is the asking
+            // client's own to read from the reply.
+            if matches!(error, AllocationError::SwitchExhausted(_)) {
+                tracing::warn!(
+                    address_released = released,
+                    box = %request.name,
+                    error = %error,
+                    "box registration refused: the switch's address plan is exhausted"
+                );
+            } else {
+                tracing::debug!(
+                    address_released = released,
+                    box = %request.name,
+                    error = %error,
+                    "box registration refused"
+                );
+            }
             BoxControlReply::Error {
                 error: error.to_string(),
             }
@@ -1448,6 +1577,7 @@ fn withdraw_box(
         &request.name,
         request.switch_address,
         request.loopback_address,
+        request.box_id.map(minimald_rpc::BoxId::to_bytes),
     ) {
         Ok(withdrawn) => {
             // The box is gone, so its published address returns to the
@@ -2586,7 +2716,7 @@ mod tests {
     };
     use switch::SwitchSubnet;
 
-    use crate::box_registry::{AllocationError, PENDING_ASKS_PER_ROW};
+    use crate::box_registry::PENDING_ASKS_PER_ROW;
     use crate::net::egress_gate::test_support::CaptureWriter;
 
     use super::*;
@@ -2742,6 +2872,9 @@ mod tests {
                      reply for {port}/{proto:?}"
                 )
             }
+            other @ BoxControlReply::RowStanding { .. } => {
+                panic!("a box verb is never answered with a row-standing read, got {other:?}")
+            }
             BoxControlReply::AnswererRelease { detail, .. } => {
                 panic!("a box verb is never answered with a release reply, got {detail}")
             }
@@ -2752,6 +2885,68 @@ mod tests {
                 )
             }
         }
+    }
+
+    /// NET-138 over the control socket: a registration that asks for task
+    /// slots is handed one task address per slot — capped at
+    /// [`minimald_rpc::TASK_SLOTS_PER_BOX`] — each from the hand-out run and
+    /// each a published row of the box's, carrying its id; the creator's
+    /// withdrawal of the box takes them with it.
+    #[test]
+    fn task_addresses_registered_with_box_and_handed() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (sock_path, _server, registry, _answerer, _proxy_publish) =
+            spawn_server(dir.path()).expect("server binds");
+        let web = handed(
+            register(
+                &sock_path,
+                &RegisterBoxRequest {
+                    name: "web".to_string(),
+                    ingress_ports: Vec::new(),
+                    egress: None,
+                    credentialed_upstream: None,
+                    dynamic_ingress: None,
+                    dynamic_allowed_range: None,
+                    hold: false,
+                    task_slots: u8::MAX,
+                },
+            )
+            .expect("the registration is answered"),
+        );
+        assert_eq!(
+            web.task_addresses.len(),
+            usize::from(minimald_rpc::TASK_SLOTS_PER_BOX),
+            "one task address per slot, capped host-side"
+        );
+        let table = registry.table();
+        for &task in &web.task_addresses {
+            assert_ne!(task, web.switch_address);
+            assert!(
+                u32::from(task) > u32::from(Ipv4Addr::new(100, 64, 127, 254)),
+                "a task address comes from the hand-out run, never the reserve: {task}"
+            );
+            let row = table
+                .by_source(task.octets())
+                .expect("each task address is a published row");
+            assert_eq!(row.task_row_of(), Some(web.switch_address));
+            assert_eq!(minimald_rpc::BoxId::from_bytes(row.box_id()), web.box_id);
+        }
+
+        let withdrawn = registry
+            .withdraw_client_box(
+                "web",
+                web.switch_address,
+                web.loopback_address,
+                Some(web.box_id.to_bytes()),
+            )
+            .expect("the creator withdraws its box");
+        assert!(withdrawn.is_some());
+        assert!(
+            web.task_addresses
+                .iter()
+                .all(|task| table.by_source(task.octets()).is_none()),
+            "the task rows go with the box"
+        );
     }
 
     /// The end-to-end shape of the layer: the activating client registers
@@ -2788,6 +2983,7 @@ mod tests {
                     dynamic_ingress: None,
                     dynamic_allowed_range: None,
                     hold: false,
+                    task_slots: 0,
                 },
             )
             .expect("first registration is answered"),
@@ -2858,6 +3054,7 @@ mod tests {
                     dynamic_ingress: None,
                     dynamic_allowed_range: None,
                     hold: false,
+                    task_slots: 0,
                 },
             )
             .expect("second registration is answered"),
@@ -2902,6 +3099,7 @@ mod tests {
                     dynamic_ingress: None,
                     dynamic_allowed_range: None,
                     hold: false,
+                    task_slots: 0,
                 },
             )
             .expect("server still serves after a refused request"),
@@ -2997,6 +3195,68 @@ mod tests {
         );
     }
 
+    /// The withdrawal's box id reaches the registry: one naming another
+    /// id than the row's — a stale creator's, after a newer box was handed
+    /// the same name and addresses — is refused over the socket and the
+    /// row stays; the row's own id withdraws it.
+    #[tokio::test]
+    async fn a_withdrawal_naming_another_box_id_leaves_the_row() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (sock_path, _server, registry, _answerer, _proxy_publish) =
+            spawn_server(dir.path()).expect("server binds");
+        let web = handed(
+            register(
+                &sock_path,
+                &RegisterBoxRequest {
+                    name: "web".to_string(),
+                    ingress_ports: Vec::new(),
+                    egress: None,
+                    credentialed_upstream: None,
+                    dynamic_ingress: None,
+                    dynamic_allowed_range: None,
+                    hold: false,
+                    task_slots: 0,
+                },
+            )
+            .expect("the registration is answered"),
+        );
+        let withdrawal = |box_id| {
+            BoxControlRequest::Withdraw(WithdrawBoxRequest {
+                name: "web".to_string(),
+                switch_address: web.switch_address,
+                loopback_address: web.loopback_address,
+                box_id: Some(box_id),
+            })
+        };
+
+        let stale = minimald_rpc::BoxId::from_bytes([7; 16]);
+        let refused = control(&sock_path, &withdrawal(stale)).expect("the withdrawal is answered");
+        assert!(
+            matches!(&refused, BoxControlReply::Error { error } if error.contains("newer box")),
+            "a withdrawal naming another id is refused, got {refused:?}"
+        );
+        assert!(
+            registry
+                .table()
+                .by_source(web.switch_address.octets())
+                .is_some(),
+            "the refused withdrawal left the row"
+        );
+
+        let withdrawn =
+            control(&sock_path, &withdrawal(web.box_id)).expect("the withdrawal is answered");
+        assert!(
+            matches!(withdrawn, BoxControlReply::Addresses(_)),
+            "the row's own id withdraws it, got {withdrawn:?}"
+        );
+        assert!(
+            registry
+                .table()
+                .by_source(web.switch_address.octets())
+                .is_none()
+        );
+    }
+
     /// The withdrawal round-trip the destroyed session's client drives
     /// (T66): it registers the box, presents the pair the registration
     /// handed back to prove it is the row's creator, and the daemon removes
@@ -3031,6 +3291,7 @@ mod tests {
                     dynamic_ingress: None,
                     dynamic_allowed_range: None,
                     hold: false,
+                    task_slots: 0,
                 },
             )
             .expect("the registration is answered"),
@@ -3049,6 +3310,7 @@ mod tests {
                 name: "web".to_string(),
                 switch_address: web.switch_address,
                 loopback_address: web.loopback_address,
+                box_id: None,
             }),
         )
         .expect("the withdrawal is answered");
@@ -3085,6 +3347,9 @@ mod tests {
             }
             BoxControlReply::PortRecorded { .. } => {
                 panic!("a withdrawal echoes the pair it went by, never a port report")
+            }
+            other @ BoxControlReply::RowStanding { .. } => {
+                panic!("a box verb is never answered with a row-standing read, got {other:?}")
             }
             BoxControlReply::AnswererRelease { detail, .. } => {
                 panic!("a box verb is never answered with a release reply, got {detail}")
@@ -3128,18 +3393,27 @@ mod tests {
         // A row is its creator's to withdraw, so a live row whose proof
         // does not match is refused with the reason and stays published:
         // another box's name at this row's address, and the right name with
-        // a loopback the registration did not hand back.
+        // a loopback the registration did not hand back. Its egress admits
+        // the destination the gate's marker frame below is sent to: a box
+        // with no egress section has the deny-all default (NET-074), so it
+        // could not carry the marker.
         let db = handed(
             register(
                 &sock_path,
                 &RegisterBoxRequest {
                     name: "db".to_string(),
                     ingress_ports: Vec::new(),
-                    egress: None,
+                    egress: Some(sessions::EgressPolicy {
+                        allow_protocols: Some(vec![sessions::IpProto::Tcp]),
+                        allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
+                        allow_dns_hosts: None,
+                        deny_subnets: None,
+                    }),
                     credentialed_upstream: None,
                     dynamic_ingress: None,
                     dynamic_allowed_range: None,
                     hold: false,
+                    task_slots: 0,
                 },
             )
             .expect("the marker box is registered"),
@@ -3154,6 +3428,7 @@ mod tests {
                     name: name.to_string(),
                     switch_address: db.switch_address,
                     loopback_address: loopback,
+                    box_id: None,
                 }),
             )
             .expect("the withdrawal is answered");
@@ -3190,6 +3465,9 @@ mod tests {
                 BoxControlReply::PortRecorded { .. } => {
                     panic!("a foreign pair's withdrawal must be refused, got a port report")
                 }
+                other @ BoxControlReply::RowStanding { .. } => {
+                    panic!("a box verb is never answered with a row-standing read, got {other:?}")
+                }
                 BoxControlReply::AnswererRelease { detail, .. } => {
                     panic!("a box verb is never answered with a release reply, got {detail}")
                 }
@@ -3217,6 +3495,7 @@ mod tests {
                 name: "web".to_string(),
                 switch_address: web.switch_address,
                 loopback_address: web.loopback_address,
+                box_id: None,
             }),
         )
         .expect("the repeat withdrawal is answered");
@@ -3253,6 +3532,9 @@ mod tests {
             }
             BoxControlReply::PortRecorded { .. } => {
                 panic!("a repeat withdrawal echoes the pair, never a port report")
+            }
+            other @ BoxControlReply::RowStanding { .. } => {
+                panic!("a box verb is never answered with a row-standing read, got {other:?}")
             }
             BoxControlReply::AnswererRelease { detail, .. } => {
                 panic!("a box verb is never answered with a release reply, got {detail}")
@@ -3383,6 +3665,7 @@ mod tests {
                     dynamic_ingress: None,
                     dynamic_allowed_range: None,
                     hold: false,
+                    task_slots: 0,
                 },
             )
             .expect("a registration still answers around the read"),
@@ -3833,6 +4116,7 @@ mod tests {
                     dynamic_ingress: Some(sessions::DynamicIngress::Allow),
                     dynamic_allowed_range: Some((3000, 3999)),
                     hold: false,
+                    task_slots: 0,
                 },
             )
             .expect("the registration is answered"),
@@ -3952,6 +4236,153 @@ mod tests {
         assert_eq!(mode, 0o600, "the audit copy is owner-only, got {mode:o}");
     }
 
+    /// NET-138: the guest door's row-standing read answers from the asking
+    /// VM's own supervisor's table only — a second supervisor, another
+    /// VM's, does not know the box — and reading changes nothing: the row
+    /// stays awaiting, unattributed, its address still out.
+    #[test]
+    fn row_standing_answers_only_for_the_asking_node() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (sock_path, _server, registry, _answerer, _proxy_publish) =
+            spawn_server(dir.path()).expect("server binds");
+        let other_dir = tempfile::TempDir::new().expect("temp dir");
+        let (other_sock_path, _other_server, _other_registry, _, _) =
+            spawn_server(other_dir.path()).expect("the other VM's server binds");
+        let web = handed(
+            register(
+                &sock_path,
+                &RegisterBoxRequest {
+                    name: "web".to_string(),
+                    ingress_ports: Vec::new(),
+                    egress: None,
+                    credentialed_upstream: None,
+                    dynamic_ingress: None,
+                    dynamic_allowed_range: None,
+                    hold: false,
+                    task_slots: 0,
+                },
+            )
+            .expect("the registration is answered"),
+        );
+        let standing = |sock: &std::path::Path, switch_address, box_id| match control(
+            &sock.with_file_name(GUEST_CONTROL_SOCK_FILE),
+            &BoxControlRequest::RowStanding(minimald_rpc::RowStandingRequest {
+                switch_address,
+                box_id,
+            }),
+        )
+        .expect("the read is answered")
+        {
+            BoxControlReply::RowStanding { row_standing, .. } => row_standing,
+            other => panic!("expected a row-standing answer, got {other:?}"),
+        };
+        assert!(
+            standing(&sock_path, web.switch_address, Some(web.box_id)),
+            "its own VM's row stands"
+        );
+        assert!(
+            !standing(&other_sock_path, web.switch_address, Some(web.box_id)),
+            "another VM's door knows nothing of the box"
+        );
+        assert!(
+            !standing(&sock_path, Ipv4Addr::new(100, 64, 0, 200), Some(web.box_id)),
+            "an address no row holds does not stand"
+        );
+        assert!(
+            !standing(
+                &sock_path,
+                web.switch_address,
+                Some(minimald_rpc::BoxId::from_bytes([0xee; 16]))
+            ),
+            "a row of another box at the address does not stand for this one"
+        );
+        assert!(
+            !standing(&sock_path, web.switch_address, None),
+            "a read naming no box is answered fail-closed"
+        );
+        let row = registry.row_by_name("web").expect("the row stands");
+        assert!(!row.was_attributed(), "the read attributes nothing");
+        assert!(!row.is_detached(), "the read detaches nothing");
+        assert_eq!(registry.live_switch_addrs(), 1, "the read frees nothing");
+    }
+
+    /// NET-138: a resume of a row that stands is answered from the row
+    /// alone — no published address is asked of the answerer for it — so a
+    /// slow answerer never holds a standing box's attach or exec.
+    #[test]
+    fn a_standing_resume_asks_the_answerer_nothing() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let sock_path = dir.path().join(CONTROL_SOCK_FILE);
+        let boxes = BoxRegistry::new(SUBNET);
+        // The registration's allocation is answered; every later one is
+        // held for the test's life.
+        let allocations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&allocations);
+        let mut gates = Vec::new();
+        let answerer = AnswererStatus::allocating_for_tests_with(
+            "control-test-node",
+            move || {
+                if counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    return None;
+                }
+                let (gate, held) = std::sync::mpsc::channel();
+                gates.push(gate);
+                Some(held)
+            },
+            |_, _| {},
+        );
+        let _server = spawn(
+            sock_path.clone(),
+            boxes.clone(),
+            answerer,
+            ProxyPublishStatus::new(),
+        )
+        .expect("server binds");
+        for _ in 0..500 {
+            if TestStream::connect(&sock_path).is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let web = handed(
+            register(
+                &sock_path,
+                &RegisterBoxRequest {
+                    name: "web".to_string(),
+                    ingress_ports: Vec::new(),
+                    egress: None,
+                    credentialed_upstream: None,
+                    dynamic_ingress: None,
+                    dynamic_allowed_range: None,
+                    hold: false,
+                    task_slots: 0,
+                },
+            )
+            .expect("the registration is answered"),
+        );
+
+        let (answered, answer) = std::sync::mpsc::channel();
+        let resume = BoxControlRequest::ResumeBox(minimald_rpc::ResumeBoxRequest {
+            name: "web".to_string(),
+            switch_address: web.switch_address,
+            loopback_address: web.loopback_address,
+            box_id: Some(web.box_id),
+        });
+        std::thread::spawn(move || {
+            let _ = answered.send(control(&sock_path, &resume));
+        });
+        let reply = answer
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the standing resume is answered while the answerer holds")
+            .expect("the resume is answered");
+        assert_eq!(handed(reply), web, "the standing row as it stands");
+        assert_eq!(
+            allocations.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "only the registration asked the answerer"
+        );
+    }
+
     /// The doors are the verb's access control (NET-138): the read-only row
     /// verb is refused on the in-VM daemon's channel and an admit report is
     /// refused on the host's socket — each refusal naming the door that
@@ -3976,6 +4407,7 @@ mod tests {
                     dynamic_ingress: Some(sessions::DynamicIngress::Allow),
                     dynamic_allowed_range: Some((3000, 3999)),
                     hold: false,
+                    task_slots: 0,
                 },
             )
             .expect("the registration is answered"),
@@ -4066,6 +4498,7 @@ mod tests {
                     dynamic_ingress: None,
                     dynamic_allowed_range: None,
                     hold: false,
+                    task_slots: 0,
                 },
             )
             .expect("the registration is answered"),
@@ -4090,6 +4523,7 @@ mod tests {
                 name: "web".to_string(),
                 switch_address: web.switch_address,
                 loopback_address: web.loopback_address,
+                box_id: None,
             }),
         )
         .expect("the withdrawal is answered");
@@ -4187,6 +4621,7 @@ mod tests {
                         dynamic_ingress: Some(sessions::DynamicIngress::Ask),
                         dynamic_allowed_range: Some((ASK_PORT, ASK_PORT + 999)),
                         hold: false,
+                        task_slots: 0,
                     },
                 )
                 .expect("the registration is answered"),
@@ -4623,6 +5058,7 @@ mod tests {
                 name: "web".to_string(),
                 switch_address: web.switch_address,
                 loopback_address: web.loopback_address,
+                box_id: None,
             }),
         )
         .expect("the withdrawal is answered");
@@ -4978,6 +5414,7 @@ mod tests {
                 dynamic_ingress: None,
                 dynamic_allowed_range: None,
                 hold: false,
+                task_slots: 0,
             },
         )
         .expect("the second connection is served");
@@ -5096,6 +5533,7 @@ mod tests {
                     dynamic_ingress: Some(sessions::DynamicIngress::Allow),
                     dynamic_allowed_range: Some((3000, 3999)),
                     hold: false,
+                    task_slots: 0,
                 },
             )
             .expect("the registration is answered"),
@@ -5337,6 +5775,7 @@ mod tests {
                     name: name.to_string(),
                     switch_address,
                     loopback_address,
+                    box_id: None,
                 }),
             )
             .expect("the withdrawal is answered without waiting on the allocation");
@@ -5393,6 +5832,7 @@ mod tests {
             dynamic_ingress: None,
             dynamic_allowed_range: None,
             hold: false,
+            task_slots: 0,
         }
     }
 
@@ -5623,6 +6063,7 @@ mod tests {
         let mut stream = TestStream::connect(sock_path).expect("the door accepts");
         let request = BoxControlRequest::Register(RegisterBoxRequest {
             hold: true,
+            task_slots: 0,
             ..box_request(name)
         });
         let mut line = serde_json_lenient::to_string(&request).expect("the request serializes");

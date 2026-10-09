@@ -27,9 +27,10 @@
 //!   announced interim a publish at an address inside the plan's lease
 //!   block is applied — the reach the box's own daemon had before the gate
 //!   existed, which the in-guest relay still bounds — and everything
-//!   outside the block is refused under either phase. Once the per-box
-//!   default is in force (T66, #1711, the creator-side registration that
-//!   supplies the rows), only row-held addresses publish at all.
+//!   outside the block is refused under either phase. With the per-box
+//!   default in force, as this build ships it (the creator-side
+//!   registration, T66, #1711, supplies the rows), only row-held addresses
+//!   publish at all.
 //! * **A retract is decided by the row at its own address, against what the
 //!   row's runtime published** — the address a retraction's summary carries
 //!   is the publication's own: the gate attributes each retraction to the
@@ -370,12 +371,11 @@ pub fn applied(
             let addr = request.switch_addr();
             let Some(row) = table.row_at(addr) else {
                 // No row holds the address. Inside the plan's lease block
-                // the announced interim applies the publish — an
-                // own-address box's lease is minted inside the VM, and the
-                // creator-side registration that will publish its row (T66,
-                // #1711) is the only thing that ever will. Outside that
-                // block, or once the default binds, the failure case: an
-                // address no namespace holds never gains a publication.
+                // the announced interim applied the publish, before the
+                // creator-side registration (T66, #1711) published each
+                // box's row. Outside that block, or with the default in
+                // force, the failure case: an address no namespace holds
+                // never gains a publication.
                 if phase == EgressDefaultPhase::Announced && table.in_plan(addr) {
                     return Ok(Applied::Interim);
                 }

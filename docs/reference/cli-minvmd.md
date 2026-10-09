@@ -51,7 +51,9 @@ Starts the microVM supervisor (foreground by default).
 
 The VM's hostname proxy takes port `7654` when no other process or VM holds it, and a free port otherwise. To pin the port, set `MINVMD_NODE_PROXY_PORT` for `minvmd run` or for the `min` command that starts it. If another process holds a pinned port, the start fails.
 
-To keep the allow-all egress default for a box that declares no `egress` section, set `MINVMD_EGRESS_DENY_ALL_OPT_OUT=1` for `minvmd run` or for the `min` command that starts it. This is the VM counterpart of `minimald run --egress-deny-all-opt-out`. Only `1`, `true`, `yes`, or `on` opt out, in any letter case. Any other value, or leaving it unset, applies this build's egress default. That default is deny-all for own-IP boxes once it is in force. The guest reads the setting once at boot.
+An own-IP box that declares no `egress` section gets the deny-all egress default: it reaches no external address. To keep the earlier allow-all default for such boxes, set `MINVMD_EGRESS_DENY_ALL_OPT_OUT=1`. This is the VM counterpart of `minimald run --egress-deny-all-opt-out`. Only `1`, `true`, `yes`, or `on` opt out, in any letter case. Any other value, or leaving it unset, keeps the deny-all default.
+
+`minvmd` reads the variable only when it starts, and hands it to the guest at boot. Set it in the environment of the process that starts `minvmd`: `minvmd run`, or the first `min` command that starts the VM for you. Setting it for a later `min` command against a running VM changes nothing. To apply a change, stop `minvmd` (`minvmd stop`) and start it again with the new environment.
 
 ### `status`
 

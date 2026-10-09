@@ -6,7 +6,9 @@
 
 pub mod ask_dialog;
 pub mod attach;
+pub mod box_registration;
 pub mod file_upload;
+pub mod session_name;
 pub mod tty_relay;
 
 use std::path::Path;

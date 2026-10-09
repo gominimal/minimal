@@ -2678,11 +2678,11 @@ fn ipv4_frame(proto: u8, dst: [u8; 4], dst_port: u16) -> Vec<u8> {
 }
 
 /// NET-074: an own-address box created with no `egress` section reaches
-/// nothing outside itself, once the deny-all default is in force. The phase
-/// is passed explicitly — this build ships the default as announced
-/// (NET-076), so the in-force posture is proven by name, not by whatever
-/// the shipped constant happens to be — and the launcher's gate policy under
-/// it is the deny-all section, whose compiled rules drop every external
+/// nothing outside itself, and this build ships the deny-all default in
+/// force (asserted first, so the constant cannot slip back unnoticed). The
+/// phase is also passed explicitly to the resolver, so the in-force posture
+/// is proven by name, and the launcher's gate policy under it is the
+/// deny-all section, whose compiled rules drop every external
 /// destination in every transport, while the resolver Minimal owns for the
 /// box still answers, at its address *and* its port (NET-079). The
 /// session-start line names the phase, the opt-out, and the posture this
@@ -2702,6 +2702,12 @@ async fn own_ip_default_deny_all() {
     // verdicts below turn on the egress dimension alone. The lease check
     // itself (NET-084) is proven in `sessions::core::egress`.
     let lease = [10, 0, 0, 5];
+
+    assert_eq!(
+        sessions::EGRESS_DEFAULT_PHASE,
+        sessions::EgressDefaultPhase::InForce,
+        "this build ships the deny-all default in force (NET-074)",
+    );
 
     // The launcher's resolution for an own-address box that declared
     // nothing, once the default is in force: the deny-all section, egress
@@ -2768,6 +2774,8 @@ async fn own_ip_default_deny_all() {
                 project_path: paths::HostAbsPath::try_new("/uwu").unwrap(),
                 network: sessions::NetworkMode::OwnIp,
                 policy: sessions::SessionPolicy::default(),
+                task_addresses: Vec::new(),
+                box_id: None,
                 box_addresses: None,
                 hooks_enabled: true,
                 attrs: Default::default(),
@@ -2826,6 +2834,8 @@ fn own_ip_session_req(name: &str) -> minimald_rpc::CreateSessionRequest {
                 }),
                 credentialed_upstream: None,
             },
+            task_addresses: Vec::new(),
+            box_id: None,
             box_addresses: None,
             hooks_enabled: true,
             attrs: Default::default(),
@@ -2849,8 +2859,12 @@ fn own_ip_handed_session_req(
         switch_address: switch,
         loopback_address: loopback,
     });
+    request.config.box_id = Some(HANDED_BOX_ID);
     request
 }
+
+/// The box id every handed session in these tests was registered as.
+const HANDED_BOX_ID: minimald_rpc::BoxId = minimald_rpc::BoxId::from_bytes([0x42; 16]);
 
 /// Drives Create → ConfigureLoadout → FinalizeSession for an own-address box
 /// and returns its id. No attach ever happens along the way: the box is
@@ -3441,13 +3455,16 @@ async fn an_activate_hook_launch_finds_the_box_s_address_already_published() {
 
 /// A box whose record carries host-handed addresses (T66) has a host-side
 /// row keyed on that address. When its host loop ends — the shell exited —
-/// the ended loop already withdrew the row (NET-138), so re-minting a fresh
-/// host here would re-attach "rowless": the host gate silently drops the
-/// box's frames from an unregistered source. The attach must refuse with the
-/// typed `BoxHostRowEnded` refusal (surfaced to the client on the channel)
-/// instead of re-minting, and no second host may launch — the hands are the
+/// the row ends with it (NET-138), and only the box's creator resumes it. No
+/// VM host daemon answers here that the row stands — as for a client that
+/// does not resume, or a resume that failed — so re-minting a fresh host
+/// would re-attach "rowless": the host gate silently drops the box's frames
+/// from an unregistered source. The attach must refuse with the typed
+/// `BoxHostRowEnded` refusal (surfaced to the client on the channel) instead
+/// of re-minting, and no second host may launch — the hands are the
 /// host-side creator's, and re-registering a row is exactly what a daemon
-/// must never do.
+/// must never do. The standing-row relaunch is
+/// `ensure_host_relaunches_a_registered_box_while_its_host_row_stands`.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_box_holding_a_host_row_refuses_remint_after_its_host_loop_ends() {
@@ -3489,6 +3506,10 @@ async fn a_box_holding_a_host_row_refuses_remint_after_its_host_loop_ends() {
     assert!(
         refusal.contains("min session activate"),
         "the refusal must name the step that registers a box again; got: {refusal:?}"
+    );
+    assert!(
+        refusal.contains("run the attach or exec again"),
+        "the refusal must name the re-run that resumes the row; got: {refusal:?}"
     );
     assert_eq!(
         super::launch_publish_seam::observed(id).len(),
@@ -3587,6 +3608,313 @@ async fn ensure_host_refuses_a_registered_box_whose_host_ended() {
         Err(other) => panic!("refused for another reason: {other}"),
         Ok(_) => panic!("a registered box was relaunched rowless"),
     }
+}
+
+/// NET-138: the VM host daemon detaches a box's row at the end of its
+/// attachment and withdraws it only after a grace, and the box's creator may
+/// resume a withdrawn one, so a registered box whose host ended is
+/// relaunched while the host says its row stands — the host's own table,
+/// read over the report door — and refused once the host says it does not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ensure_host_relaunches_a_registered_box_while_its_host_row_stands() {
+    let switch_address = std::net::Ipv4Addr::new(100, 64, 128, 28);
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = finalize_handed_own_ip_session(
+        &mut client,
+        "exec-resumed",
+        switch_address,
+        std::net::Ipv4Addr::new(127, 0, 64, 28),
+    )
+    .await;
+    let manager = server.state.sessions_manager().await;
+    let handle = manager
+        .get_session(crate::sessions::SessionKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the box resolves");
+    let host = handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("the box's first launch binds its row");
+    let sock = handle
+        .net_switch()
+        .await
+        .unwrap()
+        .lock()
+        .await
+        .control_socket();
+    let door_sock = sock.with_file_name("row-door.sock");
+    let (door, mut reads, replies) = fake_report_door(&door_sock).await;
+    crate::net::listeners::seed_vm_report_door_for_tests(&sock, &door_sock);
+
+    host.kill(false).await.expect("the box's host ends");
+    soon(|| !host.is_alive()).await;
+    // Once before the relaunch, and again once its host is up.
+    for _ in 0..2 {
+        replies
+            .send(minimald_rpc::BoxControlReply::RowStanding {
+                switch_address,
+                row_standing: true,
+            })
+            .expect("the report door stand-in lives");
+    }
+    let relaunched = handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("a box whose host row stands is relaunched");
+    assert!(
+        !relaunched.same_host(&host),
+        "a fresh host, not the ended one"
+    );
+    let read = tokio::time::timeout(Duration::from_secs(5), reads.recv())
+        .await
+        .expect("the relaunch asked the VM host daemon first")
+        .expect("the report door stand-in lives");
+    assert_eq!(
+        read,
+        minimald_rpc::BoxControlRequest::RowStanding(minimald_rpc::RowStandingRequest {
+            switch_address,
+            box_id: Some(HANDED_BOX_ID),
+        }),
+        "the read names the row's own key and the box's id, nothing else"
+    );
+
+    relaunched
+        .kill(false)
+        .await
+        .expect("the relaunched host ends");
+    soon(|| !relaunched.is_alive()).await;
+    replies
+        .send(minimald_rpc::BoxControlReply::RowStanding {
+            switch_address,
+            row_standing: false,
+        })
+        .expect("the report door stand-in lives");
+    match handle.ensure_host("tester".to_string()).await {
+        Err(crate::session::AttachError::BoxHostRowEnded) => {}
+        Err(other) => panic!("refused for another reason: {other}"),
+        Ok(_) => panic!("a box the host holds no row for was relaunched rowless"),
+    }
+    crate::net::listeners::clear_vm_report_door_for_tests(&sock);
+    door.abort();
+}
+
+/// NET-138: the row-standing read is not a reservation. A row the VM host
+/// daemon withdraws at its grace's end between the read that confirmed it
+/// and the relaunch's host coming up is read again before the slot is
+/// marked as holding it: the relaunch is refused and its host ended, and
+/// the slot is not left marked, so the next exec asks again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ensure_host_refuses_a_relaunch_whose_row_ended_while_it_launched() {
+    let switch_address = std::net::Ipv4Addr::new(100, 64, 128, 31);
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = finalize_handed_own_ip_session(
+        &mut client,
+        "exec-row-expired",
+        switch_address,
+        std::net::Ipv4Addr::new(127, 0, 64, 31),
+    )
+    .await;
+    let manager = server.state.sessions_manager().await;
+    let handle = manager
+        .get_session(crate::sessions::SessionKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the box resolves");
+    let host = handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("the box's first launch binds its row");
+    let sock = handle
+        .net_switch()
+        .await
+        .unwrap()
+        .lock()
+        .await
+        .control_socket();
+    let door_sock = sock.with_file_name("row-door.sock");
+    let (door, mut reads, replies) = fake_report_door(&door_sock).await;
+    crate::net::listeners::seed_vm_report_door_for_tests(&sock, &door_sock);
+
+    host.kill(false).await.expect("the box's host ends");
+    soon(|| !host.is_alive()).await;
+    // Standing when the relaunch asks first; withdrawn by the time its
+    // host is up.
+    for row_standing in [true, false] {
+        replies
+            .send(minimald_rpc::BoxControlReply::RowStanding {
+                switch_address,
+                row_standing,
+            })
+            .expect("the report door stand-in lives");
+    }
+    match handle.ensure_host("tester".to_string()).await {
+        Err(crate::session::AttachError::BoxHostRowEnded) => {}
+        Err(other) => panic!("refused for another reason: {other}"),
+        Ok(_) => panic!("a relaunch whose row ended while it launched was kept rowless"),
+    }
+    for _ in 0..2 {
+        tokio::time::timeout(Duration::from_secs(5), reads.recv())
+            .await
+            .expect("the relaunch read the row before and after its launch")
+            .expect("the report door stand-in lives");
+    }
+
+    // The slot was not marked as holding a row: the next exec asks again.
+    replies
+        .send(minimald_rpc::BoxControlReply::RowStanding {
+            switch_address,
+            row_standing: false,
+        })
+        .expect("the report door stand-in lives");
+    match handle.ensure_host("tester".to_string()).await {
+        Err(crate::session::AttachError::BoxHostRowEnded) => {}
+        Err(other) => panic!("refused for another reason: {other}"),
+        Ok(_) => panic!("the refused relaunch's host was reused as holding a row"),
+    }
+    tokio::time::timeout(Duration::from_secs(5), reads.recv())
+        .await
+        .expect("the next exec asked the VM host daemon again")
+        .expect("the report door stand-in lives");
+    crate::net::listeners::clear_vm_report_door_for_tests(&sock);
+    door.abort();
+}
+
+/// NET-138: a registered box whose record names no box id cannot be told
+/// from another box the host handed its address, so its ended host is not
+/// relaunched even while the host would say a row stands at the address:
+/// the read is never asked, and the box is refused as rowless.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ensure_host_refuses_a_registered_box_whose_record_names_no_box_id() {
+    let switch_address = std::net::Ipv4Addr::new(100, 64, 128, 30);
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let mut request = own_ip_handed_session_req(
+        "exec-unnamed-id",
+        switch_address,
+        std::net::Ipv4Addr::new(127, 0, 64, 30),
+    );
+    request.config.box_id = None;
+    use minimald_rpc::{ConfigureLoadout, ConfigureLoadoutRequest, CreateSession};
+    let id = client.call::<CreateSession>(&request).await.unwrap().id;
+    crate::test_harness::unwrap_ready(
+        client
+            .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
+                session_id: id,
+                contribution: Default::default(),
+            })
+            .await
+            .unwrap(),
+    );
+    finalize_session(&mut client, id).await;
+    let manager = server.state.sessions_manager().await;
+    let handle = manager
+        .get_session(crate::sessions::SessionKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the box resolves");
+    let host = handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("the box's first launch binds its row");
+    let sock = handle
+        .net_switch()
+        .await
+        .unwrap()
+        .lock()
+        .await
+        .control_socket();
+    let door_sock = sock.with_file_name("row-door.sock");
+    let (door, mut reads, replies) = fake_report_door(&door_sock).await;
+    crate::net::listeners::seed_vm_report_door_for_tests(&sock, &door_sock);
+
+    host.kill(false).await.expect("the box's host ends");
+    soon(|| !host.is_alive()).await;
+    replies
+        .send(minimald_rpc::BoxControlReply::RowStanding {
+            switch_address,
+            row_standing: true,
+        })
+        .expect("the report door stand-in lives");
+    match handle.ensure_host("tester".to_string()).await {
+        Err(crate::session::AttachError::BoxHostRowEnded) => {}
+        Err(other) => panic!("refused for another reason: {other}"),
+        Ok(_) => panic!("a box with no id was relaunched on an address-only read"),
+    }
+    assert!(
+        reads.try_recv().is_err(),
+        "no row read was asked without a box id"
+    );
+    crate::net::listeners::clear_vm_report_door_for_tests(&sock);
+    door.abort();
+}
+
+/// NET-138: a relaunch the VM host daemon confirmed a standing row for
+/// rejoins that row, so the slot marks its host as holding it. A later exec
+/// reuses that live host without asking the host again, and so still runs
+/// when the report door no longer answers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ensure_host_reuses_a_relaunched_host_without_the_report_door() {
+    let switch_address = std::net::Ipv4Addr::new(100, 64, 128, 29);
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = finalize_handed_own_ip_session(
+        &mut client,
+        "exec-rejoined",
+        switch_address,
+        std::net::Ipv4Addr::new(127, 0, 64, 29),
+    )
+    .await;
+    let manager = server.state.sessions_manager().await;
+    let handle = manager
+        .get_session(crate::sessions::SessionKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the box resolves");
+    let host = handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("the box's first launch binds its row");
+    let sock = handle
+        .net_switch()
+        .await
+        .unwrap()
+        .lock()
+        .await
+        .control_socket();
+    let door_sock = sock.with_file_name("row-door.sock");
+    let (door, _reads, replies) = fake_report_door(&door_sock).await;
+    crate::net::listeners::seed_vm_report_door_for_tests(&sock, &door_sock);
+
+    host.kill(false).await.expect("the box's host ends");
+    soon(|| !host.is_alive()).await;
+    for _ in 0..2 {
+        replies
+            .send(minimald_rpc::BoxControlReply::RowStanding {
+                switch_address,
+                row_standing: true,
+            })
+            .expect("the report door stand-in lives");
+    }
+    let relaunched = handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("a box whose host row stands is relaunched");
+
+    // The report door goes away: a read now answers nothing, which reads
+    // as no row. The live relaunched host holds its row all the same.
+    crate::net::listeners::clear_vm_report_door_for_tests(&sock);
+    door.abort();
+    let again = handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("the live relaunched host is reused without a read");
+    assert!(
+        again.same_host(&relaunched),
+        "the relaunched host is the one reused"
+    );
 }
 
 /// A daemon restart ends every PTask, and with them the host-side rows. The
@@ -6491,6 +6819,8 @@ async fn create_logs_dynamic_ingress() {
                 project_path: paths::HostAbsPath::try_new("/uwu").unwrap(),
                 network: sessions::NetworkMode::OwnIp,
                 policy: sessions::SessionPolicy::default(),
+                task_addresses: Vec::new(),
+                box_id: None,
                 box_addresses: None,
                 hooks_enabled: true,
                 attrs: Default::default(),

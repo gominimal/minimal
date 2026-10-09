@@ -460,6 +460,17 @@ pub struct SessionConfig {
     /// has.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub box_addresses: Option<BoxAddresses>,
+    /// The task addresses the same registration handed (NET-138): the
+    /// switch addresses the box's task runs attach at, each filed on the
+    /// host under the box's own row. Empty for every activation that
+    /// handed no box addresses.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub task_addresses: Vec<std::net::Ipv4Addr>,
+    /// The box id the same registration handed back
+    /// ([`sessions::Record::box_id`]): the id the host's row of the box
+    /// holds. `None` for every activation that handed no box addresses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub box_id: Option<BoxId>,
     /// Whether the session runs the lifecycle hooks composed into it.
     /// Cleared by `min session activate --no-hooks`, and persisted onto
     /// the session record so the later attach/detach/destroy
@@ -488,81 +499,10 @@ fn default_hooks_enabled() -> bool {
     true
 }
 
-/// A box's identity on its host: 16 bytes — one UUIDv7, 32 lowercase hex
-/// digits on the wire — minted once per box by the host-side creator
-/// outside the VM, with its random fields from the host's OS CSPRNG
-/// (BEP-070): never a counter, never a digest of the box's facts, never
-/// anything a process inside the VM could predict or arrange. The
-/// registration that publishes the box's row mints it — a client never
-/// presents one — the row and the proxy's attachment hold it, and the
-/// reply hands it back so the client records the id its box was created
-/// as.
-///
-/// Unique per creation by construction: a box recreated with the same
-/// name and the same addresses is a new box, and its id says so. Ids are
-/// never reused — no registration can present one, and the host refuses a
-/// mint that collides with a record it holds — so a revocation scoped to
-/// an id stays scoped forever. The all-zero id is not
-/// a mint's output and never names a box: the delivery header carried it
-/// for "no box named" before ids were the box's own, and the acceptor
-/// that reads a delivered header refuses it like any other id the
-/// source's attachment does not hold.
-///
-/// On the wire it is one hex string, the same 32 lowercase digits a
-/// diagnostic names a box id by — so a log line, a transcript and a
-/// socket capture all read the same spelling.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct BoxId([u8; 16]);
-
-impl BoxId {
-    /// Wraps `bytes` as a box id — the shape [`RegisteredBox::box_id`]
-    /// carries and a delivery header fills from the box's attachment.
-    #[must_use]
-    pub fn from_bytes(bytes: [u8; 16]) -> Self {
-        Self(bytes)
-    }
-
-    /// The id's own 16 bytes.
-    #[must_use]
-    pub fn to_bytes(self) -> [u8; 16] {
-        self.0
-    }
-}
-
-impl std::fmt::Display for BoxId {
-    /// 32 lowercase hex digits — the one fixed form every diagnostic that
-    /// names a box id uses, so a tail can compare two lines for the same
-    /// box.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for byte in self.0 {
-            write!(f, "{byte:02x}")?;
-        }
-        Ok(())
-    }
-}
-
-impl Serialize for BoxId {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&hex::encode(self.0))
-    }
-}
-
-impl<'de> Deserialize<'de> for BoxId {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let text: &str = Deserialize::deserialize(deserializer)?;
-        let bytes = hex::decode(text).map_err(serde::de::Error::custom)?;
-        let bytes: [u8; 16] = match bytes.try_into() {
-            Ok(bytes) => bytes,
-            Err(bytes) => {
-                return Err(serde::de::Error::custom(format!(
-                    "a box id is 32 hex digits (16 bytes); got {} bytes",
-                    bytes.len()
-                )));
-            }
-        };
-        Ok(Self(bytes))
-    }
-}
+/// A box's identity on its host ([`sessions::BoxId`]): defined beside the
+/// session record that carries it and re-exported under the path its
+/// clients spell, so no wire form changes.
+pub use sessions::BoxId;
 
 /// What a successful registration hands back: the allocated addresses —
 /// the pair [`BoxAddresses`] has always carried — and the box id the
@@ -575,7 +515,7 @@ impl<'de> Deserialize<'de> for BoxId {
 /// the id it is handed, and the client's record, the sealed member's
 /// claims and the proxy's attachment name the box by the same id. A
 /// re-registration is a new creation and is handed a new id.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RegisteredBox {
     /// The box's address on the switch ([`BoxAddresses::switch_address`]).
     pub switch_address: std::net::Ipv4Addr,
@@ -585,7 +525,22 @@ pub struct RegisteredBox {
     /// The box id the published row holds: the box's own UUIDv7, handed
     /// back to the registering client.
     pub box_id: BoxId,
+    /// The task addresses filed with the box ([`RegisterBoxRequest::task_slots`]):
+    /// one switch address per task slot, each a row of its own carrying
+    /// the box's id and egress. Empty from a host that predates them, or
+    /// for a registration that asked for none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub task_addresses: Vec<std::net::Ipv4Addr>,
 }
+
+/// How many task addresses an activation registers with its box: the
+/// number of task runs (`min run` from inside the box, or a task run over
+/// exec) one session holds an address for at once. Task runs are
+/// interactive, so concurrency beyond a handful is rare, and the cost is
+/// four addresses of a hand-out run of thousands on the default switch
+/// (126 on a carved /24) — small enough that every own-address box can
+/// pay it up front rather than draw inside the VM.
+pub const TASK_SLOTS_PER_BOX: u8 = 4;
 
 /// The wire types of the VM host daemon's box control socket (T66): the
 /// one door a client has to the host-side box table (NET-138).
@@ -660,12 +615,47 @@ pub struct RegisterBoxRequest {
     /// creator withdraws it.
     #[serde(default)]
     pub hold: bool,
+    /// How many task addresses to register with the box (NET-138): the
+    /// host draws one switch address per slot and files each as a row
+    /// carrying the box's id and egress, withdrawn with the box. Zero —
+    /// the default, and what a client that predates the field sends —
+    /// registers none.
+    #[serde(default)]
+    pub task_slots: u8,
 }
 
 /// The one line a held registration's client writes on the lease
 /// connection once its session is active ([`RegisterBoxRequest::hold`]):
 /// from then on the row stays when the connection closes.
 pub const REGISTRATION_COMMIT_LINE: &str = "commit";
+
+/// How each of the VM host daemon's address-capacity refusals of a
+/// registration opens: the switch's hand-out run, the loopback slice, and
+/// the machine's zone answerer, each with nothing left to hand out. The
+/// refusal travels as a [`BoxControlReply::Error`] sentence; the daemon
+/// spells these openings from here and the client classifies a refusal by
+/// them ([`is_address_capacity_refusal`]), so the two cannot drift.
+pub const SWITCH_PLAN_EXHAUSTED: &str = "the switch's address plan is exhausted";
+/// See [`SWITCH_PLAN_EXHAUSTED`].
+pub const LOOPBACK_SLICE_EXHAUSTED: &str = "the host's loopback slice is exhausted";
+/// See [`SWITCH_PLAN_EXHAUSTED`]: the answerer's refusal, which names the
+/// run after it.
+pub const BOX_ADDRESSES_EXHAUSTED: &str = "every box address in";
+
+/// Whether a registration refusal is the host running out of addresses
+/// for a box — the host cannot hold one more — rather than a refusal of
+/// this box's declaration. Matched anywhere in the sentence: the control
+/// socket prefixes the answerer's reason with its own.
+#[must_use]
+pub fn is_address_capacity_refusal(error: &str) -> bool {
+    [
+        SWITCH_PLAN_EXHAUSTED,
+        LOOPBACK_SLICE_EXHAUSTED,
+        BOX_ADDRESSES_EXHAUSTED,
+    ]
+    .iter()
+    .any(|opening| error.contains(opening))
+}
 
 /// The withdrawal a destroyed session's client sends for the row its
 /// activation registered: the name the row went by and the pair the
@@ -682,9 +672,13 @@ pub const REGISTRATION_COMMIT_LINE: &str = "commit";
 /// is refused with [`BoxControlReply::Error`]: the requesting client is not
 /// its creator, and no client may remove another box's row.
 ///
-/// The addresses themselves are spent for good by design — the host's
-/// allocation cursors never regress — so a withdrawal ends a row's
-/// admissions without ever returning its addresses to the plan.
+/// A withdrawal ends the row's admissions and returns its addresses: the
+/// switch address to the host's hand-out run, handed again only after its
+/// reuse quarantine (or at once for a row no frame ever crossed the gate
+/// under), and the published loopback address to the machine's answerer.
+/// Because an address can be handed again, the withdrawal may name the
+/// row's [`BoxId`] — the epoch the pair was handed under — so a stale
+/// creator never removes a newer row holding the same name and addresses.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WithdrawBoxRequest {
     /// The name the row to withdraw was registered under.
@@ -695,6 +689,63 @@ pub struct WithdrawBoxRequest {
     /// The loopback address the registration handed back, which the pair
     /// proof checks against the row's own.
     pub loopback_address: std::net::Ipv4Addr,
+    /// The box id the registration handed back with the pair, when the
+    /// withdrawing client holds it: a row at the pair under another id is
+    /// a newer box, and the withdrawal is refused with
+    /// [`BoxControlReply::Error`] rather than removing it. `None` from a
+    /// client that predates the field, or one that no longer holds the id
+    /// (a destroy reads the pair from the session record, which carries
+    /// none): the pair proof alone decides, as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub box_id: Option<BoxId>,
+}
+
+/// A creator's request for its box's row back
+/// ([`BoxControlRequest::ResumeBox`], NET-138): the session that registered
+/// the box presenting the pair — and the id, when it holds one — the
+/// registration handed back, before it attaches to or runs in a box whose
+/// row may have been withdrawn while nothing carried its frames: the box's
+/// host ended and stayed down past the host's detach grace, or the VM host
+/// daemon restarted under it.
+///
+/// The pair is the proof and the lookup key, as for a withdrawal
+/// ([`WithdrawBoxRequest`]); every fact the reinstated row holds comes from
+/// the host's own record of the registration, never from this request.
+/// Answered with [`BoxControlReply::Registered`] — the row's addresses and
+/// box id — whether the row stood or was reinstated, or with
+/// [`BoxControlReply::Error`] when the host holds no registration of the
+/// box the pair proves.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResumeBoxRequest {
+    /// The name the box was registered under.
+    pub name: String,
+    /// The switch address the registration handed back.
+    pub switch_address: std::net::Ipv4Addr,
+    /// The loopback address the registration handed back.
+    pub loopback_address: std::net::Ipv4Addr,
+    /// The box id the registration handed back, when the resuming client
+    /// holds it: a registration of the name under another id is a newer
+    /// box, and the resume is refused. `None` when the client holds no id
+    /// (the session record carries none): the pair proof alone decides.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub box_id: Option<BoxId>,
+}
+
+/// The in-VM daemon's read of whether the host still holds a row at its
+/// box's switch address ([`BoxControlRequest::RowStanding`], NET-138):
+/// asked before the daemon relaunches a box's host after the host it ran
+/// ended, so the box rejoins the switch only while the host's row stands
+/// for it. A read, never a report: the answer is the host's own table,
+/// and the request changes nothing in it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RowStandingRequest {
+    /// The switch address the host-side registration handed the box.
+    pub switch_address: std::net::Ipv4Addr,
+    /// The box id the same registration handed back: the row is answered
+    /// as standing only when it is this box's own row. `None`, from a
+    /// record that carries no id, is never answered as standing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub box_id: Option<BoxId>,
 }
 
 /// A name to hold in the host's zone without a row behind it
@@ -1194,6 +1245,14 @@ pub enum BoxControlRequest {
     /// Cancel a release: the daemon re-binds its interim answerer at once.
     /// A daemon with no release pending answers a no-op.
     ReleaseAnswererCancel,
+    /// A creator's request for its box's row back ([`ResumeBoxRequest`],
+    /// NET-138): served on the host's control socket only, answered with
+    /// [`BoxControlReply::Registered`].
+    ResumeBox(ResumeBoxRequest),
+    /// The in-VM daemon's read of whether its box's row stands
+    /// ([`RowStandingRequest`]): carried on the daemon's own control
+    /// channel, answered with [`BoxControlReply::RowStanding`].
+    RowStanding(RowStandingRequest),
 }
 
 /// The VM host daemon's answerer status: the state of the machine's
@@ -1552,6 +1611,15 @@ pub enum BoxControlReply {
         /// What the daemon did, as its log line said it.
         detail: String,
     },
+    /// The row-standing read's answer: whether the host holds a row at the
+    /// switch address asked about. `row_standing` is required — the marker
+    /// that keeps this document from decoding as any other reply.
+    RowStanding {
+        /// The switch address that was asked about.
+        switch_address: std::net::Ipv4Addr,
+        /// Whether a row stands at it.
+        row_standing: bool,
+    },
 }
 
 /// The request for a [`CreateSession`] RPC.
@@ -1641,14 +1709,15 @@ pub struct CreateSessionResponse {
     /// own build: the phase is a build-time constant both sides share
     /// ([`sessions::EGRESS_DEFAULT_PHASE`]), but the opt-out is set on the
     /// daemon alone. Carried here — on the reply the activation path
-    /// already holds — so `min session activate` can keep its coming-change
-    /// notice (NET-076) off a deployment that has already chosen to keep
-    /// the shipped default: the notice's remedy names the very flag an
-    /// opted-out daemon runs, and would tell it to do what it has done.
+    /// already holds — so `min session activate` can keep its in-force note
+    /// (NET-074) off a deployment that opted out: its bare boxes keep
+    /// allow-all, and a note saying deny-all would be false there. (The
+    /// field first carried the announcement, NET-076, now retired; it stays
+    /// for client and daemon skew.)
     ///
     /// `None` from a daemon that predates the field — and a daemon that
     /// predates it cannot have the opt-out flag either, so a client reading
-    /// `None` prints the notice exactly as this reply's older readers did.
+    /// `None` reads it as not opted out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deny_all_opt_out: Option<bool>,
     /// Whether this daemon's box-zone answerer is bound in its own namespace
@@ -3102,6 +3171,8 @@ mod tests {
                 // The non-`None` shape of the handed addresses: a fixture
                 // leaving it `None` would round-trip green even if the
                 // field never reached the wire.
+                task_addresses: Vec::new(),
+                box_id: None,
                 box_addresses: Some(BoxAddresses {
                     switch_address: std::net::Ipv4Addr::new(100, 64, 0, 2),
                     loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 0),
@@ -3811,6 +3882,35 @@ mod tests {
     /// reply shape — the discrimination the untagged reply depends on, since
     /// a report the grant refused is answered as `Error` and a publish that
     /// unwinds must be able to tell which it got.
+    /// A withdrawal's box id is optional on the wire: a client that
+    /// predates it sends none and decodes as `None`, and `None` is not
+    /// written, so a daemon that predates it reads the line it always did.
+    #[test]
+    fn withdraw_box_id_is_optional_on_the_wire() {
+        let old_client: WithdrawBoxRequest = serde_json_lenient::from_str(
+            r#"{"name":"web","switch_address":"100.64.127.255","loopback_address":"127.0.64.2"}"#,
+        )
+        .expect("a pre-epoch withdrawal decodes");
+        assert_eq!(old_client.box_id, None);
+        let wire = serde_json_lenient::to_string(&old_client).expect("serialize");
+        assert!(
+            !wire.contains("box_id"),
+            "an absent id is not written: {wire}"
+        );
+
+        let with_id = WithdrawBoxRequest {
+            box_id: Some(BoxId::from_bytes([7; 16])),
+            ..old_client
+        };
+        let wire = serde_json_lenient::to_string(&with_id).expect("serialize");
+        assert!(
+            wire.contains(r#""box_id":"07070707070707070707070707070707""#),
+            "the id crosses as its hex spelling: {wire}"
+        );
+        let decoded: WithdrawBoxRequest = serde_json_lenient::from_str(&wire).expect("decode");
+        assert_eq!(decoded, with_id);
+    }
+
     #[test]
     fn box_control_admit_and_withdraw_round_trip() {
         let admit = BoxControlRequest::AdmitPort(AdmitPortRequest {

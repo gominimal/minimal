@@ -301,16 +301,71 @@ async fn hold_box_name(sock: &Path, name: &str, id: SessionId, hold: bool) {
     }
 }
 
+/// Withdraws a box's host row (T66) on the VM host daemon beside `sock`,
+/// off the async workers: the control exchange is a blocking socket call.
+/// The pair comes off the session record, which carries no box id, so the
+/// pair is the withdrawal's proof.
+async fn withdraw_box_row(sock: &Path, name: &str, addresses: sessions::BoxAddresses) {
+    let (sock, name) = (sock.to_path_buf(), name.to_string());
+    if let Err(error) = tokio::task::spawn_blocking(move || {
+        minimal_client::attach::withdraw_box_row_beside(&sock, &name, addresses, None);
+    })
+    .await
+    {
+        tracing::warn!(%error, "the box row withdrawal's thread failed");
+    }
+}
+
 /// The session's record, best-effort: `None` when it cannot be read.
-async fn record_of(provider: &mut Provider, id: SessionId) -> Option<sessions::Record> {
+pub async fn record_of(provider: &mut Provider, id: SessionId) -> Option<sessions::Record> {
     timed::<GetSessionRecord>(&mut provider.client, GetSessionRecordRequest::Id(id))
         .await
         .ok()
         .and_then(|resp| resp.record)
 }
 
-/// Destroys the session, then releases the zone hold its name kept when it
-/// is a `host_ip` box, the release `min session destroy` makes too.
+/// What an attach from the dashboard settles before it starts, from the
+/// session's `record` as [`record_of`] read it: the box's host row is
+/// asked back on the VM host daemon beside `sock` first (NET-138), as `min
+/// session attach` asks — the box's host may have ended and stayed down past
+/// the daemon's detach grace, and the in-VM daemon relaunches it only while
+/// its row stands. Returns the pair the row was registered with: an attach
+/// that ends in the shell-exit prompt's Delete leaves no record to read it
+/// from, and [`release_held_name_after_attach`] still owes the row's
+/// withdrawal. `None` when the record cannot be read or holds no row.
+///
+/// # Errors
+///
+/// The VM host daemon cannot be reached (#1790): the attach does not go
+/// ahead, and the status line shows the message `min session attach`
+/// fails with. A daemon that answers late or refuses the resume is a warn
+/// line, and the attach goes on (NET-138), as `min session attach` does.
+pub async fn prepare_attach(
+    sock: &Path,
+    record: Option<sessions::Record>,
+) -> anyhow::Result<Option<sessions::BoxAddresses>> {
+    minimal_client::box_registration::resume_box_row(sock, record.as_ref()).await?;
+    Ok(record.and_then(|record| record.box_addresses))
+}
+
+/// Settles what destroyed session `id` held on the VM host daemon beside
+/// `sock`, as `min session destroy` settles it: the row an own-address box
+/// registered is withdrawn with the pair off its record, and a `host_ip`
+/// box's zone hold is released. A session that held neither owes nothing.
+async fn settle_destroyed_box(sock: &Path, id: SessionId, record: &sessions::Record) {
+    let Some(name) = record.name.as_deref() else {
+        return;
+    };
+    if let Some(addresses) = record.box_addresses {
+        withdraw_box_row(sock, name, addresses).await;
+    } else if holds_name(record) {
+        hold_box_name(sock, name, id, false).await;
+    }
+}
+
+/// Destroys the session, then withdraws the row its box registered or
+/// releases the zone hold a `host_ip` box's name kept, as `min session
+/// destroy` does.
 pub async fn destroy(provider: &mut Provider, id: SessionId) -> Result<(), anyhow::Error> {
     let record = record_of(provider, id).await;
     match timed::<DestroySession>(&mut provider.client, DestroySessionRequest { id })
@@ -318,8 +373,8 @@ pub async fn destroy(provider: &mut Provider, id: SessionId) -> Result<(), anyho
         .context("DestroySession RPC failed")?
     {
         Errorable::Ok(_) => {
-            if let Some(name) = record.filter(holds_name).and_then(|record| record.name) {
-                hold_box_name(&provider.sock, &name, id, false).await;
+            if let Some(record) = record {
+                settle_destroyed_box(&provider.sock, id, &record).await;
             }
             Ok(())
         }
@@ -358,18 +413,29 @@ pub async fn rename(
     }
 }
 
-/// Releases session `id`'s zone hold once an attach from the dashboard has
+/// Settles what session `id` held once an attach from the dashboard has
 /// ended with the session gone: the shell-exit prompt's Delete destroys the
-/// session daemon-side, past [`destroy`]. A lookup that fails releases
-/// nothing; a session still there keeps its hold, and the release names
-/// the session, so a newer session under `name` keeps its own.
-pub async fn release_held_name_after_attach(provider: &mut Provider, id: SessionId, name: &str) {
+/// session daemon-side, past [`destroy`]. The row its box registered is
+/// withdrawn with `box_addresses`, the pair [`prepare_attach`] read
+/// before the attach; with none, the name's zone hold is released. A lookup
+/// that fails settles nothing; a session still there keeps its row and its
+/// hold, and the release names the session, so a newer session under
+/// `name` keeps its own.
+pub async fn release_held_name_after_attach(
+    provider: &mut Provider,
+    id: SessionId,
+    name: &str,
+    box_addresses: Option<sessions::BoxAddresses>,
+) {
     let lookup =
         timed::<GetSessionRecord>(&mut provider.client, GetSessionRecordRequest::Id(id)).await;
     if let Ok(resp) = lookup
         && resp.record.is_none()
     {
-        hold_box_name(&provider.sock, name, id, false).await;
+        match box_addresses {
+            Some(addresses) => withdraw_box_row(&provider.sock, name, addresses).await,
+            None => hold_box_name(&provider.sock, name, id, false).await,
+        }
     }
 }
 
@@ -384,6 +450,12 @@ pub async fn release_held_name_after_attach(provider: &mut Provider, id: Session
 /// `Pending` (items needing interactive policy gating) aborts the session
 /// and tells the user to run `min session activate` instead — the TUI has
 /// no gating wizard yet.
+///
+/// An own-address box on a VM-backed host registers its host row before the
+/// create, holds the registration's lease until the session is active, and
+/// withdraws the row on any failure after it exists — the registration
+/// `min session activate` makes, through the same client library
+/// ([`create_registering`]).
 ///
 /// The upload root is resolved like the CLI's: walk up from the form's path
 /// to the nearest `minimal.toml` repo root, and refuse the upload when that
@@ -409,39 +481,55 @@ pub async fn activate(
     // the reply echoes back — not a `GetVersion` ahead of them. Activation is
     // the one path where an extra round trip is felt, and the create can carry
     // the check for free.
-    let created = match client
-        .oneshot_rpc::<CreateSession>(CreateSessionRequest {
-            config: SessionConfig {
-                name,
-                project_path: project_path.clone(),
-                network,
-                policy: SessionPolicy::default(),
-                box_addresses: None,
-                // Same default as an activate with no flags: the dashboard
-                // has no `--no-hooks` of its own, and a session created here
-                // is attachable later like any other.
-                hooks_enabled: true,
-                attrs: Default::default(),
-            },
-            // A daemon of another build refuses this before it allocates
-            // anything; `None` under the skew override, which is how an
-            // operator still gets through.
-            must_match_version: minimal_client::version_assertion(),
-        })
-        .await
-        .context("CreateSession RPC failed")?
-    {
-        Errorable::Ok(resp) => resp,
-        Errorable::Err { error } => return Err(anyhow::anyhow!(error)),
+    let config = SessionConfig {
+        name,
+        project_path: project_path.clone(),
+        network,
+        policy: SessionPolicy::default(),
+        // An own-address box on a VM-backed host is handed its addresses by
+        // the registration [`create_registering`] makes first.
+        task_addresses: Vec::new(),
+        box_id: None,
+        box_addresses: None,
+        // Same default as an activate with no flags: the dashboard
+        // has no `--no-hooks` of its own, and a session created here
+        // is attachable later like any other.
+        hooks_enabled: true,
+        attrs: Default::default(),
     };
+    let undeclared_own_ip = config.network == NetworkMode::OwnIp && config.policy.egress.is_none();
+    let (created, mut row) = create_registering(sock, config, &mut client, |client, config| {
+        Box::pin(async move {
+            client
+                .oneshot_rpc::<CreateSession>(CreateSessionRequest {
+                    config,
+                    // A daemon of another build refuses this before it
+                    // allocates anything; `None` under the skew override,
+                    // which is how an operator still gets through.
+                    must_match_version: minimal_client::version_assertion(),
+                })
+                .await
+                .context("CreateSession RPC failed")
+        })
+    })
+    .await?;
     // A daemon that predates the field ignored the assertion and echoes no
     // version; that silence is itself the skew. Refuse now — before the
     // upload and the finalize — leaving an unfinalized record the daemon
-    // reaps when this connection drops.
-    minimal_client::ensure_version_reported(created.daemon_version.as_deref())?;
+    // reaps when this connection drops, and withdrawing the row its
+    // registration bought.
+    if let Err(error) = minimal_client::ensure_version_reported(created.daemon_version.as_deref()) {
+        row.withdraw().await;
+        return Err(error);
+    }
     let id = created.id;
+    let egress_deny_all_default = undeclared_own_ip && deny_all_default_binds(&created);
 
-    let flow = async {
+    // The registration's lease is held across the flow and committed only
+    // once the session is active: until then a dashboard that dies leaves
+    // the VM host daemon to withdraw the row on the lease's close.
+    let lease = row.take_lease();
+    let flow = minimal_client::box_registration::finalize_holding_lease(lease, async {
         // The upload-root walk and VCS-root stat are blocking filesystem
         // traversals; run them off the async worker so a stalled mount
         // can't stall the runtime.
@@ -501,7 +589,7 @@ pub async fn activate(
             Errorable::Ok(ok) => Ok(ok.package_check_skipped),
             Errorable::Err { error } => anyhow::bail!("{error}"),
         }
-    }
+    })
     .await;
 
     // A failed flow must not orphan the record: a `Pending` stub would hold
@@ -522,14 +610,150 @@ pub async fn activate(
             Ok(Activated {
                 id,
                 package_check_skipped,
+                egress_deny_all_default,
             })
         }
         Err(e) => {
             let _ = client
                 .oneshot_rpc::<minimald_rpc::AbortSession>(minimald_rpc::AbortSessionRequest { id })
                 .await;
+            row.withdraw().await;
             Err(e)
         }
+    }
+}
+
+/// The host row an own-address box's dashboard create registered with the
+/// VM host daemon (T66): its creator owes it a withdrawal on every failure
+/// after it exists, by the id the registration handed back, so a late
+/// withdrawal never removes a newer box. Empty for a box that registered
+/// nothing — a native host, a `host_ip` or `none` box.
+struct BoxRow {
+    control_sock: Option<PathBuf>,
+    name: Option<String>,
+    registration: Option<minimal_client::box_registration::RegisteredWithVmHost>,
+}
+
+impl BoxRow {
+    /// Withdraws the row, best-effort, as `min session activate` withdraws
+    /// it when its activation fails; nothing for a box that registered none.
+    async fn withdraw(&self) {
+        minimal_client::box_registration::withdraw_box_row(
+            self.control_sock.clone(),
+            self.name.as_deref(),
+            self.registration
+                .as_ref()
+                .map(|registration| registration.addresses),
+            self.registration
+                .as_ref()
+                .and_then(|registration| registration.box_id),
+        )
+        .await;
+    }
+
+    /// The registration's lease, to hold across the flow that makes the
+    /// session active.
+    fn take_lease(&mut self) -> Option<minimal_client::box_registration::BoxLease> {
+        self.registration
+            .as_mut()
+            .and_then(|registration| registration.lease.take())
+    }
+}
+
+/// One `CreateSession` exchange, as [`create_registering`] sends it.
+type CreateFuture<'c> = std::pin::Pin<
+    Box<
+        dyn std::future::Future<
+                Output = anyhow::Result<Errorable<minimald_rpc::CreateSessionResponse>>,
+            > + Send
+            + 'c,
+    >,
+>;
+
+/// The dashboard's `CreateSession` with an own-address box's registration
+/// around it, as `min session activate` makes them (T66): on a VM-backed
+/// host — `sock` in a VM host's provider dir, with its control socket
+/// beside it ([`vm_host_control_sock`](minimal_client::box_registration::vm_host_control_sock)) — the
+/// box registers first, through the client library the CLI registers
+/// through, and the create carries the addresses the registration handed
+/// back, since the in-VM daemon refuses an own-address box with none. A
+/// box the form left unnamed is named first the way the CLI names one,
+/// because the row is registered under the name, and an autogen name that
+/// collides with a live row or session is re-minted within the CLI's
+/// budget. Every failure after the row exists withdraws it, with its id.
+/// On a native host, or for a box that is not own-address, this is the
+/// plain create it always was. `create` sends the create request on
+/// `client`.
+async fn create_registering<C: Send>(
+    sock: &Path,
+    mut config: SessionConfig,
+    client: &mut C,
+    mut create: impl for<'c> FnMut(&'c mut C, SessionConfig) -> CreateFuture<'c>,
+) -> anyhow::Result<(minimald_rpc::CreateSessionResponse, BoxRow)> {
+    use minimal_client::box_registration::{
+        control_sock_beside, register_box_beside_reminting_autogen, vm_host_control_sock,
+    };
+    use minimal_client::session_name::{autogen_session_name, random_hex4, should_retry_autogen};
+    let control_sock = control_sock_beside(sock);
+    let registers = config.network == NetworkMode::OwnIp && vm_host_control_sock(sock).is_some();
+    let project_dir = config.project_path.as_utf8_path().to_path_buf();
+    let mint = || autogen_session_name(&project_dir, &random_hex4());
+    let autogen = registers && config.name.is_none();
+    if autogen {
+        config.name = Some(mint());
+    }
+    let mut attempts = 0u32;
+    let mut row = BoxRow {
+        control_sock,
+        name: None,
+        registration: None,
+    };
+    loop {
+        if let Some(name) = config.name.as_mut() {
+            row.registration = register_box_beside_reminting_autogen(
+                sock,
+                config.network,
+                name,
+                &config.policy,
+                autogen,
+                &mut attempts,
+                &mint,
+            )
+            .await?;
+        }
+        row.name.clone_from(&config.name);
+        config.box_addresses = row
+            .registration
+            .as_ref()
+            .map(|registration| registration.addresses);
+        config.task_addresses = row
+            .registration
+            .as_ref()
+            .map(|registration| registration.task_addresses.clone())
+            .unwrap_or_default();
+        config.box_id = row
+            .registration
+            .as_ref()
+            .and_then(|registration| registration.box_id);
+        let error = match create(client, config.clone()).await {
+            Ok(Errorable::Ok(created)) => return Ok((created, row)),
+            Ok(Errorable::Err { error }) => error,
+            // A transport failure abandons the create and the row its
+            // registration bought: no session holds the pair.
+            Err(error) => {
+                row.withdraw().await;
+                return Err(error);
+            }
+        };
+        // The row the attempt bought is left behind with it: its creator
+        // withdraws it, and a retry re-registers under the re-minted name.
+        row.withdraw().await;
+        if !should_retry_autogen(autogen, attempts, &error) {
+            return Err(anyhow::anyhow!(error));
+        }
+        attempts += 1;
+        row.registration = None;
+        config.name = Some(mint());
     }
 }
 
@@ -540,6 +764,23 @@ pub struct Activated {
     /// The daemon's package check stepped aside at finalize, so unknown
     /// package names surface at first exec; the status line says so.
     pub package_check_skipped: bool,
+    /// The box is own-address with no egress section, on a daemon that
+    /// has not opted out, so the deny-all default binds it (NET-074): it
+    /// reaches nothing outside itself, and the status line says so, as
+    /// `min session activate` prints its one-line note.
+    pub egress_deny_all_default: bool,
+}
+
+/// Whether the deny-all egress default binds an own-address box with no
+/// egress section that `created` answered the create of (NET-074): the
+/// build's phase has it in force, and the daemon, the side that knows,
+/// did not report its opt-out (NET-077) — the check `min session
+/// activate` makes before its note.
+fn deny_all_default_binds(created: &minimald_rpc::CreateSessionResponse) -> bool {
+    match sessions::EGRESS_DEFAULT_PHASE {
+        sessions::EgressDefaultPhase::Announced => false,
+        sessions::EgressDefaultPhase::InForce => created.deny_all_opt_out != Some(true),
+    }
 }
 
 /// Resolves the directory whose tree should be uploaded as the session
@@ -606,6 +847,470 @@ fn without_external_hook_scripts(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stand-in VM host daemon on the control socket `control_sock`
+    /// beside a dashboard's ssh socket: it answers one connection per reply
+    /// in `replies`, in order — one request line in, the reply line out —
+    /// and hands back the request lines it read. Each connection is held
+    /// open until the last one is answered, as a registration's lease is.
+    fn fake_vm_host(
+        control_sock: &Path,
+        replies: Vec<minimald_rpc::BoxControlReply>,
+    ) -> std::thread::JoinHandle<Vec<String>> {
+        use std::io::{BufRead as _, Write as _};
+        let listener = std::os::unix::net::UnixListener::bind(control_sock).unwrap();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            let mut lines = Vec::new();
+            for reply in replies {
+                let (stream, _) = listener.accept().unwrap();
+                let mut reader = std::io::BufReader::new(stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let mut reply = serde_json_lenient::to_string(&reply).unwrap();
+                reply.push('\n');
+                reader.get_mut().write_all(reply.as_bytes()).unwrap();
+                lines.push(line);
+                held.push(reader);
+            }
+            lines
+        })
+    }
+
+    /// A VM host's provider dir inside `dir` — the dir a dashboard's ssh
+    /// socket and the VM host daemon's control socket share.
+    fn vm_provider_dir(dir: &tempfile::TempDir) -> std::path::PathBuf {
+        let provider = dir.path().join("providers").join("local-minvmd0");
+        std::fs::create_dir_all(&provider).unwrap();
+        provider
+    }
+
+    /// NET-074 from the dashboard: the deny-all default binds a bare
+    /// own-address box unless the daemon reports its opt-out (NET-077); a
+    /// daemon that predates the field is read as not opted out, as the CLI
+    /// reads it.
+    #[test]
+    fn deny_all_default_binds_unless_the_daemon_opted_out() {
+        let mut reply = created();
+        assert!(
+            deny_all_default_binds(&reply),
+            "no field: the default binds"
+        );
+        reply.deny_all_opt_out = Some(false);
+        assert!(deny_all_default_binds(&reply));
+        reply.deny_all_opt_out = Some(true);
+        assert!(!deny_all_default_binds(&reply), "an opted-out daemon");
+    }
+
+    /// The dashboard's create config for an own-address box in `dir`.
+    fn own_ip_config(dir: &Path, name: Option<&str>) -> SessionConfig {
+        SessionConfig {
+            name: name.map(str::to_string),
+            project_path: paths::HostAbsPath::try_new(
+                camino::Utf8PathBuf::from_path_buf(dir.join("web-app")).unwrap(),
+            )
+            .unwrap(),
+            network: NetworkMode::OwnIp,
+            policy: SessionPolicy::default(),
+            task_addresses: Vec::new(),
+            box_id: None,
+            box_addresses: None,
+            hooks_enabled: true,
+            attrs: Default::default(),
+        }
+    }
+
+    fn created() -> minimald_rpc::CreateSessionResponse {
+        serde_json_lenient::from_str(r#"{"id":"00000000-0000-0000-0000-000000000000"}"#)
+            .expect("a create reply")
+    }
+
+    /// T66 from the dashboard: an own-address create on a VM-backed host
+    /// registers the box first, through the client library the CLI
+    /// registers through — under a name minted the CLI's way, since the form
+    /// left it unnamed and the row is registered under the name — and the
+    /// create carries the addresses the registration handed back, never
+    /// none (the in-VM daemon refuses an own-address box with none).
+    #[tokio::test]
+    async fn tui_own_ip_create_registers_and_hands_addresses() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let provider = vm_provider_dir(&dir);
+        let ssh_sock = provider.join("ssh.sock");
+        let box_id = minimald_rpc::BoxId::from_bytes([7; 16]);
+        let handed = minimald_rpc::RegisteredBox {
+            switch_address: std::net::Ipv4Addr::new(100, 64, 0, 2),
+            loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 0),
+            box_id,
+            task_addresses: Vec::new(),
+        };
+        let server = fake_vm_host(
+            &provider.join(minimal_client::attach::VM_HOST_CONTROL_SOCK_FILE),
+            vec![minimald_rpc::BoxControlReply::Registered(handed.clone())],
+        );
+        let mut sent = Vec::new();
+        let (_, row) = create_registering(
+            &ssh_sock,
+            own_ip_config(dir.path(), None),
+            &mut sent,
+            |sent, config| {
+                sent.push(config);
+                Box::pin(async { Ok(Errorable::Ok(created())) })
+            },
+        )
+        .await
+        .expect("the registered box is created");
+        let lines = server.join().unwrap();
+
+        assert_eq!(lines.len(), 1, "one registration, one request");
+        let request: minimald_rpc::BoxControlRequest =
+            serde_json_lenient::from_str(lines[0].trim()).expect("the request is the wire type");
+        let minimald_rpc::BoxControlRequest::Register(request) = request else {
+            panic!("a registration is carried by the register verb");
+        };
+        assert!(request.hold, "the create holds its registration as a lease");
+        assert!(
+            request.name.starts_with("web-app-"),
+            "an unnamed box is registered under the CLI's autogen name: {}",
+            request.name
+        );
+
+        let [config] = sent.as_slice() else {
+            panic!("one create, got {}", sent.len());
+        };
+        assert_eq!(
+            config.name.as_deref(),
+            Some(request.name.as_str()),
+            "the create names the session the row was registered under"
+        );
+        assert_eq!(
+            config.box_addresses,
+            Some(sessions::BoxAddresses {
+                switch_address: handed.switch_address,
+                loopback_address: handed.loopback_address,
+            }),
+            "the create carries the handed addresses"
+        );
+        let registration = row.registration.as_ref().expect("the row is the create's");
+        assert_eq!(registration.box_id, Some(box_id));
+        assert!(
+            registration.lease.is_some(),
+            "the lease is held for the flow"
+        );
+    }
+
+    /// NET-138 from the dashboard: an own-address create asks the host for
+    /// the box's task addresses with its registration, and the create
+    /// carries the ones handed back, so the in-VM daemon draws nothing for a
+    /// task run either.
+    #[tokio::test]
+    async fn tui_activation_registers_task_slots_for_own_ip_box() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let provider = vm_provider_dir(&dir);
+        let ssh_sock = provider.join("ssh.sock");
+        let task_addresses = vec![
+            std::net::Ipv4Addr::new(100, 64, 0, 3),
+            std::net::Ipv4Addr::new(100, 64, 0, 4),
+        ];
+        let server = fake_vm_host(
+            &provider.join(minimal_client::attach::VM_HOST_CONTROL_SOCK_FILE),
+            vec![minimald_rpc::BoxControlReply::Registered(
+                minimald_rpc::RegisteredBox {
+                    switch_address: std::net::Ipv4Addr::new(100, 64, 0, 2),
+                    loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 0),
+                    box_id: minimald_rpc::BoxId::from_bytes([7; 16]),
+                    task_addresses: task_addresses.clone(),
+                },
+            )],
+        );
+        let mut sent = Vec::new();
+        create_registering(
+            &ssh_sock,
+            own_ip_config(dir.path(), Some("web")),
+            &mut sent,
+            |sent, config| {
+                sent.push(config);
+                Box::pin(async { Ok(Errorable::Ok(created())) })
+            },
+        )
+        .await
+        .expect("the registered box is created");
+        let lines = server.join().unwrap();
+        let request: minimald_rpc::BoxControlRequest =
+            serde_json_lenient::from_str(lines[0].trim()).expect("the request is the wire type");
+        let minimald_rpc::BoxControlRequest::Register(request) = request else {
+            panic!("a registration is carried by the register verb");
+        };
+        assert_eq!(
+            request.task_slots,
+            minimald_rpc::TASK_SLOTS_PER_BOX,
+            "the registration asks for the box's task addresses"
+        );
+        let [config] = sent.as_slice() else {
+            panic!("one create, got {}", sent.len());
+        };
+        assert_eq!(
+            config.task_addresses, task_addresses,
+            "the create carries the task addresses the host handed"
+        );
+    }
+
+    /// A dashboard create that fails after its box registered withdraws the
+    /// row — its creator presenting the name, the pair and the id the
+    /// registration handed back — and surfaces the create's own error, not
+    /// a raw transport one.
+    #[tokio::test]
+    async fn tui_own_ip_create_failure_withdraws_the_row() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let provider = vm_provider_dir(&dir);
+        let ssh_sock = provider.join("ssh.sock");
+        let box_id = minimald_rpc::BoxId::from_bytes([9; 16]);
+        let addresses = sessions::BoxAddresses {
+            switch_address: std::net::Ipv4Addr::new(100, 64, 0, 3),
+            loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 1),
+        };
+        let server = fake_vm_host(
+            &provider.join(minimal_client::attach::VM_HOST_CONTROL_SOCK_FILE),
+            vec![
+                minimald_rpc::BoxControlReply::Registered(minimald_rpc::RegisteredBox {
+                    switch_address: addresses.switch_address,
+                    loopback_address: addresses.loopback_address,
+                    box_id,
+                    task_addresses: Vec::new(),
+                }),
+                minimald_rpc::BoxControlReply::Addresses(addresses),
+            ],
+        );
+        let failed = create_registering(
+            &ssh_sock,
+            own_ip_config(dir.path(), Some("web")),
+            &mut (),
+            |(), _config| {
+                Box::pin(async {
+                    Ok(Errorable::Err {
+                        error: "the project path is not a directory".to_string(),
+                    })
+                })
+            },
+        )
+        .await;
+        let error = match failed {
+            Ok(_) => panic!("the refused create is the dashboard's error"),
+            Err(error) => format!("{error:#}"),
+        };
+        assert_eq!(error, "the project path is not a directory");
+        let lines = server.join().unwrap();
+
+        assert_eq!(lines.len(), 2, "a registration, then its withdrawal");
+        let request: minimald_rpc::BoxControlRequest =
+            serde_json_lenient::from_str(lines[1].trim()).expect("the request is the wire type");
+        let minimald_rpc::BoxControlRequest::Withdraw(request) = request else {
+            panic!("the abandoned row goes by the withdraw verb");
+        };
+        assert_eq!(request.name, "web");
+        assert_eq!(request.switch_address, addresses.switch_address);
+        assert_eq!(request.loopback_address, addresses.loopback_address);
+        assert_eq!(
+            request.box_id,
+            Some(box_id),
+            "the withdrawal names the id the registration handed back"
+        );
+    }
+
+    /// A registration the VM host daemon refuses ends the dashboard's create
+    /// before any create is sent, with the registration's cause in words.
+    #[tokio::test]
+    async fn tui_own_ip_create_refused_registration_creates_nothing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let provider = vm_provider_dir(&dir);
+        let ssh_sock = provider.join("ssh.sock");
+        let server = fake_vm_host(
+            &provider.join(minimal_client::attach::VM_HOST_CONTROL_SOCK_FILE),
+            vec![minimald_rpc::BoxControlReply::Error {
+                error: "the switch's address plan is exhausted".to_string(),
+            }],
+        );
+        let failed = create_registering(
+            &ssh_sock,
+            own_ip_config(dir.path(), Some("web")),
+            &mut (),
+            |(), _config| -> CreateFuture<'_> {
+                panic!("no create is sent for a box that did not register")
+            },
+        )
+        .await;
+        let error = match failed {
+            Ok(_) => panic!("the refused registration is the dashboard's error"),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(
+            error.starts_with("registering the box with the VM host daemon failed")
+                && error.contains("address plan is exhausted"),
+            "the refusal surfaces with its reason: {error}"
+        );
+        assert_eq!(server.join().unwrap().len(), 1);
+    }
+
+    /// On a native host an own-address create is the plain create it always
+    /// was: nothing registers, the name stays as the form gave it, and the
+    /// create carries no addresses — even though native minimald's answerer
+    /// door sits beside its ssh socket under the VM host's control socket
+    /// name, which a registration must never be sent to.
+    #[tokio::test]
+    async fn tui_own_ip_create_on_a_native_host_registers_nothing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let provider = dir.path().join("providers").join("local-minimald0");
+        std::fs::create_dir_all(&provider).unwrap();
+        let _answerer_door = std::os::unix::net::UnixListener::bind(
+            provider.join(minimal_client::attach::VM_HOST_CONTROL_SOCK_FILE),
+        )
+        .unwrap();
+        let mut sent = Vec::new();
+        let (_, row) = create_registering(
+            &provider.join("ssh.sock"),
+            own_ip_config(dir.path(), None),
+            &mut sent,
+            |sent, config| {
+                sent.push(config);
+                Box::pin(async { Ok(Errorable::Ok(created())) })
+            },
+        )
+        .await
+        .expect("the native create goes ahead");
+        assert!(row.registration.is_none());
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].name, None);
+        assert_eq!(sent[0].box_addresses, None);
+    }
+
+    /// NET-138 from the dashboard: an attach asks the VM host daemon for
+    /// the box's row back before it starts, as `min session attach` does —
+    /// one resume line naming the box and the pair off its record — and
+    /// still hands back the pair the after-attach withdrawal needs.
+    #[tokio::test]
+    async fn tui_attach_resumes_the_box_first() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ssh_sock = dir.path().join("ssh.sock");
+        let addresses = sessions::BoxAddresses {
+            switch_address: std::net::Ipv4Addr::new(100, 64, 0, 4),
+            loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 2),
+        };
+        let server = fake_vm_host(
+            &dir.path()
+                .join(minimal_client::attach::VM_HOST_CONTROL_SOCK_FILE),
+            vec![minimald_rpc::BoxControlReply::Registered(
+                minimald_rpc::RegisteredBox {
+                    switch_address: addresses.switch_address,
+                    loopback_address: addresses.loopback_address,
+                    box_id: minimald_rpc::BoxId::from_bytes([3; 16]),
+                    task_addresses: Vec::new(),
+                },
+            )],
+        );
+        let mut record = own_ip_record(Some(addresses));
+        record.name = Some("web".to_string());
+        let pair = prepare_attach(&ssh_sock, Some(record))
+            .await
+            .expect("the VM host answers the resume");
+        assert_eq!(pair, Some(addresses), "the attach keeps the pair it read");
+        let lines = server.join().unwrap();
+        assert_eq!(lines.len(), 1, "one resume before the attach");
+        let request: minimald_rpc::BoxControlRequest =
+            serde_json_lenient::from_str(lines[0].trim()).expect("the request is the wire type");
+        let minimald_rpc::BoxControlRequest::ResumeBox(request) = request else {
+            panic!("the row is asked back by the resume verb");
+        };
+        assert_eq!(request.name, "web");
+        assert_eq!(request.switch_address, addresses.switch_address);
+        assert_eq!(request.loopback_address, addresses.loopback_address);
+    }
+
+    /// An own-address record holding `box_addresses`.
+    fn own_ip_record(box_addresses: Option<sessions::BoxAddresses>) -> sessions::Record {
+        sessions::Record {
+            id: SessionId::nil(),
+            name: None,
+            username: None,
+            project_path: paths::HostAbsPath::try_new("/p").unwrap(),
+            network: NetworkMode::OwnIp,
+            policy: SessionPolicy {
+                egress: None,
+                ingress: None,
+                credentialed_upstream: None,
+            },
+            status: sessions::SessionStatus::default(),
+            hooks_enabled: true,
+            box_addresses,
+            task_addresses: Vec::new(),
+            host_ip_enforcement: None,
+            box_id: None,
+            host_row_bound: false,
+            attrs: Default::default(),
+        }
+    }
+
+    /// T66's dashboard destroy: a destroyed own-address box's row is
+    /// withdrawn on the control socket beside the daemon's ssh socket — one
+    /// withdraw line naming the box and the pair off its record, with no
+    /// box id, which the record does not carry.
+    #[tokio::test]
+    async fn tui_destroy_withdraws_box_row() {
+        use std::io::{BufRead as _, Write as _};
+        let dir = tempfile::TempDir::new().unwrap();
+        let ssh_sock = dir.path().join("ssh.sock");
+        let listener = std::os::unix::net::UnixListener::bind(
+            dir.path()
+                .join(minimal_client::attach::VM_HOST_CONTROL_SOCK_FILE),
+        )
+        .unwrap();
+        let handed = sessions::BoxAddresses {
+            switch_address: std::net::Ipv4Addr::new(100, 64, 0, 2),
+            loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 0),
+        };
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            reader
+                .get_mut()
+                .write_all(
+                    b"{\"switch_address\":\"100.64.0.2\",\"loopback_address\":\"127.0.64.0\"}\n",
+                )
+                .unwrap();
+            line
+        });
+        let record = sessions::Record {
+            id: SessionId::nil(),
+            name: Some("web".to_string()),
+            username: None,
+            project_path: paths::HostAbsPath::try_new("/p").unwrap(),
+            network: NetworkMode::OwnIp,
+            policy: SessionPolicy {
+                egress: None,
+                ingress: None,
+                credentialed_upstream: None,
+            },
+            status: sessions::SessionStatus::default(),
+            hooks_enabled: true,
+            task_addresses: Vec::new(),
+            box_addresses: Some(handed),
+            host_ip_enforcement: None,
+            box_id: None,
+            host_row_bound: false,
+            attrs: Default::default(),
+        };
+        settle_destroyed_box(&ssh_sock, record.id, &record).await;
+        let line = server.join().unwrap();
+        let request: minimald_rpc::BoxControlRequest =
+            serde_json_lenient::from_str(line.trim()).expect("the request is the wire type");
+        let minimald_rpc::BoxControlRequest::Withdraw(request) = request else {
+            panic!("a destroyed box's row goes by the withdraw verb");
+        };
+        assert_eq!(request.name, "web");
+        assert_eq!(request.switch_address, handed.switch_address);
+        assert_eq!(request.loopback_address, handed.loopback_address);
+        assert_eq!(request.box_id, None, "the record carries no box id");
+    }
 
     /// With no mfile anywhere up the tree, `resolve_upload_root` returns the
     /// input unchanged.

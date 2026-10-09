@@ -182,8 +182,8 @@ impl Exec for TaskExec {
 /// The network a task gets: the provider for its session's mode (017-005),
 /// carrying the session's *effective* egress (NET-074) — a task in an
 /// own-address session runs under whatever the session's own gate enforces:
-/// the deny-all default once it is in force, the shipped allow-all while it
-/// is only announced — and none of its ingress. Shared by the two ways a
+/// the deny-all default in force, allow-all behind the opt-out — and none of
+/// its ingress. Shared by the two ways a
 /// task starts — over an exec channel here, and from inside the session
 /// (`env::SessionChannel::run_task`).
 ///
@@ -194,9 +194,8 @@ impl Exec for TaskExec {
 /// handle either: a task owns no proxy route of its own, so no lease is ever
 /// reported for it. `phase` is the rollout phase to resolve the egress under
 /// — both callers pass [`sessions::EGRESS_DEFAULT_PHASE`], the phase this
-/// build ships, while the tests pass the phase by name so the posture the
-/// rollout ends at stays proven while the default is only announced
-/// (NET-076) — and `deny_all_opt_out` is the daemon's opt-out (NET-077),
+/// build ships, while the tests pass the phase by name so each arm's posture
+/// stays proven — and `deny_all_opt_out` is the daemon's opt-out (NET-077),
 /// read through the session handle so a task resolves its egress exactly as
 /// the launcher did. It carries no classifier decision either (NET-079):
 /// a task places no leaf in the cohort's subtrees, so no per-box verdict
@@ -205,11 +204,11 @@ impl Exec for TaskExec {
 /// A gate is attached only where that egress has rules to enforce: the
 /// deny-all section the in-force default resolves an absent declaration to,
 /// or the box's own declaration. An absent section — the allow-all the
-/// announced phase and the opt-out both leave in place — passes `None`, as
+/// opt-out (or the announced phase) leaves in place — passes `None`, as
 /// every task did before the deny-all default: a gate with no ingress
 /// declaration blocks a task's *inbound* too (`allowed`/`udp_allowed` empty),
-/// so attaching one where nothing needs gating would change behaviour an
-/// announcement is not allowed to.
+/// so attaching one where nothing needs gating would change behaviour the
+/// opt-out exists to keep.
 pub(crate) fn task_network(
     record: &sessions::Record,
     switch: &std::sync::Arc<tokio::sync::Mutex<crate::net::SwitchClient>>,
@@ -224,33 +223,61 @@ pub(crate) fn task_network(
         phase,
         deny_all_opt_out,
     );
-    crate::net::provider::network_for(
+    crate::net::provider::task_network_for(
         record.network,
         switch,
         &format!("{session}-task"),
         egress.map(|section| sessions::SessionPolicy::new(Some(section), None)),
-        None,
-        // Deliberately not the record's handed addresses (T66): the task's
-        // sandbox is not the box the registration named — attaching it at the
+        // Never the record's handed box addresses (T66): the task's sandbox
+        // is not the box the registration named — attaching it at the
         // session box's address would key its frames to the session's row.
-        // A task's sandbox self-allocates, as it always has.
-        //
-        // The interim, stated plainly: task sandboxes self-allocate from the
-        // daemon's reserve — the plan run's lower half
-        // (`crate::net::self_allocation_run`) — until the task registering
-        // every live box host-side (NET-138) retires self-allocation, after
-        // which no daemon-side draw happens once a control socket exists.
-        // The VM host daemon hands registered boxes only from the run above
-        // the reserve, so the two allocators cannot meet; the daemon-side
-        // refusals (`IpAllocator::hand`) stay the guard against a pair that
-        // disagrees about the split.
-        None,
-        // Deliberately no classifier decision (NET-079): a task places no
-        // leaf in the cohort's subtrees, so there is no per-box verdict for
-        // a task's plan to follow — the session's own launch carries the
-        // decision its reader read, and this one has none to carry.
-        None,
+        // A task attaches at one of the task addresses the same
+        // registration filed with the box (NET-138), each a host-side row
+        // carrying the box's id and egress, so no daemon-side draw happens
+        // once a control socket exists. A native daemon, whose record holds
+        // none, draws from its reserve (`crate::net::self_allocation_run`);
+        // an in-VM one refuses the draw (`SwitchClient::attach`). There is
+        // no classifier decision to carry (NET-079): a task places no leaf
+        // in the cohort's subtrees.
+        record.task_addresses.clone(),
     )
+}
+
+/// Refuses a task run of a registered box whose host-side row is not its
+/// own any more (NET-138): a task attaches at one of the task addresses
+/// filed with the box's row, and those task rows stand exactly as long as
+/// the box's row, so the run asks the VM host daemon whether the row of
+/// the box's id still stands at its switch address before it attaches. A
+/// row the host handed another box at that address answers no, so the run
+/// never attaches under another box's row. A record that names no box id,
+/// and a host that cannot be asked, read as no row: fail-closed. A box the
+/// host registered nothing for (a native host, a `host_ip` or `none` box)
+/// asks nothing.
+async fn ensure_task_rows_stand(
+    record: &sessions::Record,
+    switch: &tokio::sync::Mutex<crate::net::SwitchClient>,
+) -> io::Result<()> {
+    let Some(addresses) = record.box_addresses else {
+        return Ok(());
+    };
+    let standing = match record.box_id {
+        Some(box_id) => {
+            let control = crate::session::switch_control_of(switch).await;
+            crate::net::listeners::host_row_standing(&control, addresses.switch_address, box_id)
+                .await
+                == Some(true)
+        }
+        None => false,
+    };
+    if standing {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "box {}'s row on the VM host has ended, so a task run in it would reach \
+             nothing; destroy and re-activate the session",
+            record.name.as_deref().unwrap_or("(unnamed)")
+        )))
+    }
 }
 
 /// The slice of `hakoniwa::Child` the attach-failure arm needs, so the arm can
@@ -387,9 +414,12 @@ async fn task_producer(
             task.vars
                 .insert(name.clone(), mfile::EnvVarValue::Value(value.clone()));
         }
+        let record = session.record().await?;
+        let switch = session.net_switch().await?;
+        ensure_task_rows_stand(&record, &switch).await?;
         let network = task_network(
-            &session.record().await?,
-            &session.net_switch().await?,
+            &record,
+            &switch,
             sessions::EGRESS_DEFAULT_PHASE,
             session.deny_all_opt_out().await?,
         );
@@ -2669,15 +2699,52 @@ mod tests {
             project_path: paths::HostAbsPath::try_new("/tmp/project").unwrap(),
             network: mode,
             policy: sessions::SessionPolicy::default(),
+            task_addresses: Vec::new(),
             box_addresses: None,
             status: sessions::SessionStatus::Active,
             hooks_enabled: true,
             // No launch ever minted these records, so none has recorded its
             // outcome on one.
             host_ip_enforcement: None,
+            box_id: None,
             host_row_bound: false,
             attrs: Default::default(),
         }
+    }
+
+    /// NET-138: a task run of a registered box whose record names no box
+    /// id is refused before anything attaches — the host cannot be asked
+    /// for that box's row, and an address-only answer could be another
+    /// box's — while a box the host registered nothing for asks nothing.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_task_run_of_a_registered_box_with_no_box_id_is_refused() {
+        let switch = tokio::sync::Mutex::new(
+            crate::net::SwitchClient::new("/usr/bin/gvproxy", "/run/minimal/gvproxy")
+                .with_transport(crate::net::SwitchTransport::HostShuttle {
+                    cid: crate::net::VSOCK_HOST_CID,
+                    port: crate::net::VSOCK_GVPROXY_SHUTTLE_PORT,
+                }),
+        );
+        let unregistered = record_with(sessions::NetworkMode::OwnIp);
+        super::ensure_task_rows_stand(&unregistered, &switch)
+            .await
+            .expect("a box with no host registration asks nothing");
+
+        let mut registered = record_with(sessions::NetworkMode::OwnIp);
+        registered.name = Some("web".to_string());
+        registered.box_addresses = Some(sessions::BoxAddresses {
+            switch_address: std::net::Ipv4Addr::new(100, 64, 128, 1),
+            loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 2),
+        });
+        registered.task_addresses = vec![std::net::Ipv4Addr::new(100, 64, 128, 2)];
+        let refused = super::ensure_task_rows_stand(&registered, &switch)
+            .await
+            .expect_err("a registered box with no id is never answered as standing");
+        assert!(
+            refused.to_string().contains("row on the VM host has ended"),
+            "{refused}"
+        );
     }
 
     /// 017-005. A task's sandbox is planned for its session's mode; `OwnIp`
@@ -2716,6 +2783,9 @@ mod tests {
         let mut record = record_with(sessions::NetworkMode::OwnIp);
         record.name = Some("web".to_string());
         record.policy.ingress = Some(sessions::IngressPolicy::default());
+        // A VM host's switch draws nothing (NET-138): the task attaches at a
+        // task address its box's registration filed.
+        record.task_addresses = vec![std::net::Ipv4Addr::new(100, 64, 128, 2)];
         let own_ip = super::task_network(&record, &switch, sessions::EGRESS_DEFAULT_PHASE, false);
         let plan = own_ip.plan().await.unwrap();
         assert!(
@@ -2758,27 +2828,100 @@ mod tests {
         assert!(format!("{unnamed:?}").contains(&sessions::SessionId::nil().to_string()));
     }
 
+    /// A VM host's switch, which hands every address and draws none
+    /// (NET-138).
+    #[cfg(target_os = "linux")]
+    fn vm_host_switch() -> std::sync::Arc<tokio::sync::Mutex<crate::net::SwitchClient>> {
+        std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::net::SwitchClient::new("/usr/bin/gvproxy", "/run/minimal/gvproxy")
+                .with_transport(crate::net::SwitchTransport::HostShuttle {
+                    cid: crate::net::VSOCK_HOST_CID,
+                    port: crate::net::VSOCK_GVPROXY_SHUTTLE_PORT,
+                }),
+        ))
+    }
+
+    /// NET-138 for a task run, whichever door started it — `min run` from
+    /// inside the box and a task run over exec both plan through
+    /// [`super::task_network`]: the task's sandbox attaches at a task
+    /// address its box's registration filed, the first one no run holds,
+    /// and never draws one of its own.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn in_box_run_task_draws_a_task_slot() {
+        let switch = vm_host_switch();
+        let mut record = record_with(sessions::NetworkMode::OwnIp);
+        record.task_addresses = vec![
+            std::net::Ipv4Addr::new(100, 64, 128, 2),
+            std::net::Ipv4Addr::new(100, 64, 128, 3),
+        ];
+        let first = super::task_network(&record, &switch, sessions::EGRESS_DEFAULT_PHASE, false);
+        first.plan().await.expect("a free task address");
+        let second = super::task_network(&record, &switch, sessions::EGRESS_DEFAULT_PHASE, false);
+        second.plan().await.expect("a second free task address");
+        let held: Vec<_> = switch
+            .lock()
+            .await
+            .leases()
+            .iter()
+            .map(|lease| lease.ip)
+            .collect();
+        assert_eq!(
+            held, record.task_addresses,
+            "each run holds one task address"
+        );
+
+        let third = super::task_network(&record, &switch, sessions::EGRESS_DEFAULT_PHASE, false);
+        let err = third.plan().await.expect_err("every task address is held");
+        assert!(
+            err.to_string()
+                .contains("2 task runs already in progress for this session"),
+            "{err}"
+        );
+        first.abandon().await;
+        third
+            .plan()
+            .await
+            .expect("the address the first run held is free again");
+    }
+
+    /// A VM session record from before task addresses were registered
+    /// carries none: its task run is refused, naming the remedy, rather
+    /// than drawn an address no host row is keyed by.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn legacy_unregistered_vm_record_refused_with_reactivate_message() {
+        let switch = vm_host_switch();
+        let record = record_with(sessions::NetworkMode::OwnIp);
+        let task = super::task_network(&record, &switch, sessions::EGRESS_DEFAULT_PHASE, false);
+        let err = task.plan().await.expect_err("nothing is drawn");
+        assert!(
+            err.to_string()
+                .contains("destroy the session and re-activate it"),
+            "{err}"
+        );
+        assert!(switch.lock().await.leases().is_empty());
+    }
+
     /// NET-074/NET-076/NET-077 for the task path: a task runs under the same
     /// egress default its session does, and nothing else changes with it. A
     /// gate is attached only where the effective egress has rules to enforce,
     /// because a gate with no ingress declaration blocks a task's *inbound*
-    /// too — so under Announced, with no opt-out, a bare own-address task
-    /// attaches ungated exactly as every task did before the deny-all
-    /// default: the announcement may change nothing yet. Under InForce the
-    /// same bare box's task carries the deny-all gate.
+    /// too. Under InForce, the shipped phase, a bare own-address task with no
+    /// opt-out carries the deny-all gate. The retired announced arm, pinned
+    /// here by name, attaches the same task ungated, as every task did before
+    /// the deny-all default.
     ///
-    /// What the announcement defers is the *default* for a box that declared
-    /// nothing. A box that declared an `egress` section is enforced on its
-    /// session's own PTask in every phase, so a task in such a session
-    /// carries that declaration's gate even now, under the phase this build
-    /// ships — the same inbound posture the in-force case below already
-    /// accepts: a task PTask holds no ingress of its own, so its gate
-    /// default-blocks unsolicited inbound.
+    /// The phase decides only the *default* for a box that declared nothing.
+    /// A box that declared an `egress` section is enforced on its session's
+    /// own PTask in every phase, so a task in such a session carries that
+    /// declaration's gate under either phase — the same inbound posture the
+    /// in-force case below accepts: a task PTask holds no ingress of its own,
+    /// so its gate default-blocks unsolicited inbound.
     ///
     /// The phase is passed by name, not read from the shipped constant, so
-    /// the in-force posture stays proven while the default is only
-    /// announced. `own_ip_default_deny_all` proves what the deny-all section
-    /// itself enforces.
+    /// both arms stay proven whichever one ships. `own_ip_default_deny_all`
+    /// proves what the deny-all section itself enforces.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn a_task_gate_follows_the_egress_default() {
@@ -2847,7 +2990,7 @@ mod tests {
         // it: the declaration is enforced on the session's own PTask in every
         // phase, so a task in that session resolves the same section its
         // session's gate did — the declaration verbatim, not the deny-all
-        // section and not nothing — even under the phase this build ships.
+        // section and not nothing — under either phase.
         let section = sessions::EgressPolicy {
             allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
             ..sessions::EgressPolicy::default()

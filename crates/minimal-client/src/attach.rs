@@ -420,23 +420,62 @@ fn host_control(
     ),
     anyhow::Error,
 > {
+    host_control_within(control_sock, request, HOST_ASK_CONTROL_TIMEOUT)
+}
+
+/// The bound on a box row exchange the async front-ends run on a blocking
+/// thread under [`crate::box_registration::BOX_CONTROL_TIMEOUT`]: one second
+/// past it, so the caller's own deadline is the one that answers, and the
+/// thread ends soon after the caller gives up on it rather than holding the
+/// runtime's shutdown — and the process's exit — for the ask bound.
+const BOX_CONTROL_THREAD_BOUND: std::time::Duration =
+    std::time::Duration::from_secs(crate::box_registration::BOX_CONTROL_TIMEOUT.as_secs() + 1);
+
+/// [`host_control`] bounded by `timeout` instead ([`BOX_CONTROL_THREAD_BOUND`]).
+fn host_control_within(
+    control_sock: &Path,
+    request: &minimald_rpc::BoxControlRequest,
+    timeout: std::time::Duration,
+) -> Result<
+    (
+        minimald_rpc::BoxControlReply,
+        std::io::BufReader<std::os::unix::net::UnixStream>,
+    ),
+    anyhow::Error,
+> {
     use std::io::{BufRead as _, Write as _};
-    let mut stream = std::os::unix::net::UnixStream::connect(control_sock).with_context(|| {
-        format!(
-            "connecting to the VM host daemon's control socket at {}",
-            control_sock.display()
+
+    use crate::box_registration::HostUnreachable;
+    // Every failure short of a reply is the host unreached
+    // ([`HostUnreachable`]); a reply that does not parse is a host that
+    // answered.
+    let mut stream = std::os::unix::net::UnixStream::connect(control_sock).map_err(|error| {
+        HostUnreachable::over(
+            error,
+            format!(
+                "connecting to the VM host daemon's control socket at {}",
+                control_sock.display()
+            ),
         )
     })?;
-    stream.set_read_timeout(Some(HOST_ASK_CONTROL_TIMEOUT))?;
-    stream.set_write_timeout(Some(HOST_ASK_CONTROL_TIMEOUT))?;
+    stream
+        .set_read_timeout(Some(timeout))
+        .and_then(|()| stream.set_write_timeout(Some(timeout)))
+        .map_err(|error| HostUnreachable::over(error, "bounding the control exchange"))?;
     let mut line = serde_json_lenient::to_string(request).context("serializing the request")?;
     line.push('\n');
-    stream.write_all(line.as_bytes())?;
+    stream
+        .write_all(line.as_bytes())
+        .map_err(|error| HostUnreachable::over(error, "writing the control request"))?;
     let mut reader = std::io::BufReader::new(stream);
     let mut reply = String::new();
-    reader.read_line(&mut reply)?;
+    reader
+        .read_line(&mut reply)
+        .map_err(|error| HostUnreachable::over(error, "reading the control reply"))?;
     if reply.trim().is_empty() {
-        anyhow::bail!("the VM host daemon closed its control socket without answering");
+        return Err(HostUnreachable::error(
+            "the VM host daemon closed its control socket without answering",
+        ));
     }
     let reply = serde_json_lenient::from_str(reply.trim())
         .with_context(|| format!("the VM host daemon's reply did not parse: {reply}"))?;
@@ -492,6 +531,149 @@ pub fn hold_box_name_beside(
         operation,
         "the box name {operation} could not be made ({failure}); the name answers as it did before"
     );
+}
+
+/// Withdraws a box's host row (T66) on the VM host daemon whose control
+/// socket is `control_sock`, once the session that registered it is gone:
+/// the creator presents the name and the pair the registration handed back,
+/// and the daemon stops the pair's addresses admitting anything and returns
+/// them to its hand-out books. `box_id` is the id the registration handed
+/// back beside the pair, where the caller still holds it: the daemon then
+/// withdraws only that box, never a newer one handed the same name and pair
+/// after the quarantine. `None` — a session record carries no id — is the
+/// pair proof alone.
+///
+/// Best-effort and blocking: a withdrawal that cannot be made — the socket
+/// unreachable, a daemon that refuses the line, no answer in time — leaves
+/// the row published and warns rather than failing the destroy or the
+/// activation error it rides on. A daemon answering with a pair that is not
+/// the pair asked is answering something else, and says the row stays too.
+pub fn withdraw_box_row_at(
+    control_sock: &Path,
+    box_name: &str,
+    addresses: sessions::BoxAddresses,
+    box_id: Option<minimald_rpc::BoxId>,
+) {
+    let request = minimald_rpc::BoxControlRequest::Withdraw(minimald_rpc::WithdrawBoxRequest {
+        name: box_name.to_string(),
+        switch_address: addresses.switch_address,
+        loopback_address: addresses.loopback_address,
+        box_id,
+    });
+    let failure = match host_control_within(control_sock, &request, BOX_CONTROL_THREAD_BOUND) {
+        Ok((minimald_rpc::BoxControlReply::Addresses(handed), _)) if handed == addresses => {
+            tracing::info!(
+                box = %box_name,
+                switch_address = %handed.switch_address,
+                loopback_address = %handed.loopback_address,
+                "withdrew the box's host row; its addresses admit nothing"
+            );
+            return;
+        }
+        Ok((minimald_rpc::BoxControlReply::Addresses(handed), _)) => format!(
+            "the daemon answered with a different address pair, switch address {}",
+            handed.switch_address
+        ),
+        Ok((minimald_rpc::BoxControlReply::Error { error }, _)) => {
+            format!("the daemon refused it: {error}")
+        }
+        Ok((other, _)) => format!("another verb's reply: {other:?}"),
+        Err(error) => format!("{error:#}"),
+    };
+    tracing::warn!(
+        box = %box_name,
+        "the box row withdrawal could not be made ({failure}); the row stays published"
+    );
+}
+
+/// [`withdraw_box_row_at`] on the control socket beside the daemon's ssh
+/// socket `ssh_sock`, for a caller that does not know whether the daemon is
+/// VM-backed: no control socket beside it is a native host, which holds no
+/// rows, and nothing to do.
+pub fn withdraw_box_row_beside(
+    ssh_sock: &Path,
+    box_name: &str,
+    addresses: sessions::BoxAddresses,
+    box_id: Option<minimald_rpc::BoxId>,
+) {
+    let Some(control_sock) = ssh_sock
+        .parent()
+        .map(|dir| dir.join(VM_HOST_CONTROL_SOCK_FILE))
+    else {
+        return;
+    };
+    if !control_sock.exists() {
+        return;
+    }
+    withdraw_box_row_at(&control_sock, box_name, addresses, box_id);
+}
+
+/// Asks the VM host daemon whose control socket is `control_sock` for box
+/// `box_name`'s host row back (NET-138), before an attach or an exec runs
+/// in a box whose row may have been withdrawn while nothing carried its
+/// frames — its host ended and stayed down past the daemon's detach grace,
+/// or the daemon restarted under it. The creator presents the name and the
+/// pair its registration handed back, the proof a withdrawal presents; the
+/// daemon reinstates the row from its own record of the registration, or
+/// keeps the one that stands. `box_id` narrows the proof to one creation,
+/// where the caller holds it.
+///
+/// Blocking. A resume the daemon answers without the row — a daemon that
+/// predates the verb or holds no registration of the box — is a warn
+/// line, and the attach goes ahead: the in-VM daemon still refuses to
+/// relaunch a box whose row is gone. Returns whether the daemon answered
+/// with the row.
+///
+/// # Errors
+///
+/// [`crate::box_registration::HostUnreachable`] when the daemon cannot be
+/// reached at all (#1790): the caller fails closed on it.
+pub fn resume_box_row_at(
+    control_sock: &Path,
+    box_name: &str,
+    addresses: sessions::BoxAddresses,
+    box_id: Option<minimald_rpc::BoxId>,
+) -> anyhow::Result<bool> {
+    let request = minimald_rpc::BoxControlRequest::ResumeBox(minimald_rpc::ResumeBoxRequest {
+        name: box_name.to_string(),
+        switch_address: addresses.switch_address,
+        loopback_address: addresses.loopback_address,
+        box_id,
+    });
+    let failure = match host_control_within(control_sock, &request, BOX_CONTROL_THREAD_BOUND) {
+        Ok((minimald_rpc::BoxControlReply::Registered(row), _))
+            if row.switch_address == addresses.switch_address
+                && row.loopback_address == addresses.loopback_address =>
+        {
+            tracing::debug!(
+                box = %box_name,
+                switch_address = %row.switch_address,
+                "the box's host row stands"
+            );
+            return Ok(true);
+        }
+        Ok((minimald_rpc::BoxControlReply::Registered(row), _)) => format!(
+            "the daemon answered with a different address pair, switch address {}",
+            row.switch_address
+        ),
+        Ok((minimald_rpc::BoxControlReply::Error { error }, _)) => {
+            format!("the daemon refused it: {error}")
+        }
+        Ok((other, _)) => format!("another verb's reply: {other:?}"),
+        Err(error)
+            if error
+                .downcast_ref::<crate::box_registration::HostUnreachable>()
+                .is_some() =>
+        {
+            return Err(error);
+        }
+        Err(error) => format!("{error:#}"),
+    };
+    tracing::warn!(
+        box = %box_name,
+        "the box's host row could not be resumed ({failure})"
+    );
+    Ok(false)
 }
 
 impl HostAsks {

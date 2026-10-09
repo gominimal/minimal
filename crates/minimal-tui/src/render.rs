@@ -1037,8 +1037,10 @@ mod tests {
             policy: policy.clone(),
             status: sessions::SessionStatus::Active,
             hooks_enabled: true,
+            task_addresses: Vec::new(),
             box_addresses: None,
             host_ip_enforcement: None,
+            box_id: None,
             host_row_bound: false,
             attrs: std::collections::BTreeMap::new(),
         };

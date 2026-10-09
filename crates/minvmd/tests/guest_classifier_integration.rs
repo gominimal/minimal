@@ -584,6 +584,8 @@ impl BoxSession {
                     policy,
                     // No registration happened on this path: the box attaches
                     // as an unregistered one always has.
+                    task_addresses: Vec::new(),
+                    box_id: None,
                     box_addresses: None,
                     // The serde default; this session only runs execs, so it
                     // declares no hooks either way.

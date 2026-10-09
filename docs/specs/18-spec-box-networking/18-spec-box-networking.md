@@ -523,6 +523,10 @@ included, with every refusal logged (NET-001 to NET-004).
   tier:     T0
   verify:   cargo nextest run -p minimald own_ip_default_deny_all
   <!-- S9a/AC1; prose 47; feature+event; supersedes the shipped 03-spec R2.1 default of allow-all for absent `egress` fields; NET-076 binds the announcement window and NET-077 the opt-out -->
+  - WHERE the opt-out flag is not set, WHEN the user activates an own-address box with no `egress` section THE SYSTEM SHALL print one line that names the deny-all default and the flags that declare reach.
+    tier:   T0
+    verify: cargo nextest run -p minimal deny_all_in_force_note_printed
+    <!-- S9a/AC2; prose 48; optional-feature+event; the in-force note that replaces NET-076's announcement; the verify test is Linux-only (`#[cfg(target_os = "linux")]`), as it drives the compiled binary against a local daemon -->
 
 - **NET-075** WHERE the deny-all default is in force and the opt-out flag is not set, WHILE an own-address box has no `egress` section THE SYSTEM SHALL show `deny-all` in `min session policy`.
   tier:     T0
@@ -531,8 +535,8 @@ included, with every refusal logged (NET-001 to NET-004).
 
 - **NET-076** WHILE the deny-all default is announced but not yet in force THE SYSTEM SHALL print the coming change at activate.
   tier:     T0
-  verify:   cargo nextest run -p minimal deny_all_announcement_printed
-  <!-- S9a/AC2; prose 48; state-driven; interview decision -->
+  verify:   cargo nextest run -p minimald own_ip_default_deny_all
+  <!-- S9a/AC2; prose 48; state-driven; interview decision; window ended: the default is in force as of the change that flips both phase constants, so this requirement's condition no longer holds; the verify test proves that, asserting the shipped phase is `InForce`; the note printed in force is NET-074's child requirement -->
 
 - **NET-077** WHERE the deny-all opt-out flag is set THE SYSTEM SHALL keep the shipped allow-all default for a box with no `egress` section.
   tier:     T0
@@ -614,7 +618,7 @@ included, with every refusal logged (NET-001 to NET-004).
   - WHEN a box is created on a VM-backed host THE SYSTEM SHALL allocate its switch address and its host loopback address in the host-side helper and hand them to the in-VM daemon before the box's first connection.
     tier:   T0
     verify: cargo nextest run -p minvmd box_addresses_allocated_on_host_and_handed_to_daemon
-    <!-- S10a/AC1; prose 51; event-driven; the helper hands the lease and the gate admits only that address (design §4.2, un-enrolled self-allocation); the in-VM daemon configures the tap with the address it was handed and selects none; a native host has no helper and its daemon is the creator (NET-010's allocator, unchanged) -->
+    <!-- S10a/AC1; prose 51; event-driven; the helper hands the lease and the gate admits only that address (design §4.2, un-enrolled self-allocation); the in-VM daemon configures the tap with the address it was handed and selects none; a box's task addresses are registered with it: the helper allocates up to one per task slot (`TASK_SLOTS_PER_BOX`, 4) after the box's own, best-effort: it stops while its hand-out run is at `TASK_SLOT_FLOOR` (16) so task addresses never starve a new box's own, and never refuses a box for want of them (`a_box_registers_with_fewer_task_slots_when_the_book_is_short`, `task_slots_never_starve_a_new_box`); it files each as a task row carrying the box's id and egress and no ingress, names or credentialed lane, so a task run attaches at a free one and the in-VM daemon draws nothing once a control socket exists (`task_addresses_registered_with_box_and_handed`); a native host has no helper and its daemon is the creator (NET-010's allocator, unchanged) -->
   - WHEN the VM boots THE SYSTEM SHALL assign the hostname-proxy port in the host-side helper, hand it to the in-VM daemon before it listens, and bind the daemon's hostname proxy to that port and no other.
     tier:   T0
     verify: cargo nextest run -p minvmd node_port_assigned_on_host_and_handed_to_daemon
@@ -643,7 +647,7 @@ included, with every refusal logged (NET-001 to NET-004).
   - WHEN a box's attachment to the switch ends or its creator destroys it THE SYSTEM SHALL withdraw its row within 60 seconds.
     tier:   T0
     verify: cargo nextest run -p minvmd host_table_row_withdrawn_within_60s_of_box_end
-    <!-- S10a/AC1; prose 51; event-driven; liveness is read at the host's end of the box's attachment, never from a daemon report; NET-133's withdrawal reads this row -->
+    <!-- S10a/AC1; prose 51; event-driven; liveness is read at the host's end of the box's attachment, never from a daemon report; NET-133's withdrawal reads this row; the attachment's end detaches the row and the row is withdrawn after a grace (`DETACH_GRACE`, 45 s, swept every second) unless the box's shuttle carries a frame from its address again first — while detached the row decides frames as before and keeps its addresses; the creator's registrations persist host-side in the VM host daemon's state dir (`box-registry.json`, mode 0600, written by rename, versioned) and reload detached at start — a minvmd restart is a VM restart and a reloaded row rarely outlives a cold boot, so survival across it rides the creator's resume, and the reload's job is to keep the creator's records so a resume can be checked; a creator resumes a row withdrawn after its grace from that host-side record, never from a guest report, found by its box id so a renamed session still resumes it (`a_resume_by_box_id_survives_a_rename`); a resume never extends a row that stands: a detached row's grace keeps running from its attachment's end, so a resume never holds it past 60 s from that end (`NET_138_WITHDRAWAL_BOUND`, asserted at compile time against the grace and the sweep; `a_standing_resume_leaves_the_detached_rows_grace`), and a resume racing the grace's end reinstates the row rather than answering with one about to go; only a reinstated row, which has no attachment left to end, takes `RESUME_ATTACH_BOUND` (5 min, a cold boot plus a box host's launch) and is withdrawn as at the grace's end when no relay carries its unit (its box row or a task row) within it, its record kept; a relay already carrying the source re-attributes a reinstated row on its next frame; a creation keeps its addresses reserved while dormant, its switch and task addresses across a reload too and its published loopback address with the answerer, and holds its name, so no other box is handed them, until its creator's destroy releases them; an exhausted hand-out run stays an explicit refusal; the row-standing read and a task run's attach check the box id, so a row of another box at the address never stands for this one, and a record naming no box id is answered as not standing; a registry file this build cannot read, parse or version is set aside under an `.unusable-<seconds>` suffix and said as an error line, never written over; a box and its task rows are one liveness unit: the box row detaches only once no relay carries its own address nor any task address, a relay carrying either re-attaches it, and the grace's end withdraws the unit (`a_running_task_keeps_its_box_row_past_the_grace`); a task row is withdrawn with its box's row on every path that removes it, never alone, and is persisted, reloaded and resumed with it (`task_rows_withdrawn_with_their_box`) -->
   - WHILE a host-address box is published THE SYSTEM SHALL admit the node's mirrored binds for it at the node's address at any port.
     tier:   T0
     verify: cargo nextest run -p minvmd host_address_mirrored_binds_admitted_unfiltered
@@ -705,7 +709,7 @@ included, with every refusal logged (NET-001 to NET-004).
 - **NET-133** WHEN a box is created on a host running a node-local Box Egress Proxy THE SYSTEM SHALL give the proxy, from the host-side creator outside the VM and before the box's first connection, an attachment naming the box by its box id, with its addressing and the source address it arrives from.
   tier:     T0
   verify:   cargo nextest run -p minvmd proxy_attachment_given_before_first_connection
-  <!-- event-driven; design §7.1 (v0.8.3) and Gatehouse §6.10 (v1.24): the local analogue of the feed's `bep` audience, a v1 conformance requirement; the facts come from outside the VM escape boundary and never from the in-VM daemon, which an escapee controls; the proxy attributes a connection only to a live box it holds an attachment for; host-address boxes share one attachment as their cohort (NET-078); on a VM-backed host the attachment is the box's NET-138 row, withdrawn with it -->
+  <!-- event-driven; design §7.1 (v0.8.3) and Gatehouse §6.10 (v1.24): the local analogue of the feed's `bep` audience, a v1 conformance requirement; the facts come from outside the VM escape boundary and never from the in-VM daemon, which an escapee controls; the proxy attributes a connection only to a live box it holds an attachment for; host-address boxes share one attachment as their cohort (NET-078); on a VM-backed host the attachment is the box's NET-138 row, withdrawn with it; a task row carries its box's id and gets no attachment of its own, since it declares no credentialed lane -->
   - IF the in-VM daemon reports an address-to-box fact THEN THE SYSTEM SHALL keep it out of the proxy's attachments.
     tier:   T0
     verify: cargo nextest run -p minvmd proxy_attachment_never_sourced_from_guest
@@ -727,7 +731,7 @@ included, with every refusal logged (NET-001 to NET-004).
 - **NET-102** WHERE the host is un-enrolled THE SYSTEM SHALL self-allocate box addresses from the default plan.
   tier:     T0
   verify:   cargo nextest run -p switch unenrolled_self_allocates_default_plan
-  <!-- S17/AC1, its un-enrolled clause; prose 64; optional-feature; the enrolled clauses are EHE's (formerly NET-100, NET-101, NET-103) -->
+  <!-- S17/AC1, its un-enrolled clause; prose 64; optional-feature; the enrolled clauses are EHE's (formerly NET-100, NET-101, NET-103); native and un-enrolled hosts only: on a VM-backed host the helper allocates every box and task address and the in-VM daemon self-allocates none (NET-138) -->
 
 - **NET-104** WHEN `min net forward <box> <local>:<port>` is run THE SYSTEM SHALL open a local listener relayed over the session's SSH channel so that a request to `localhost:<local>` returns the in-box server's response.
   tier:     T0
@@ -1052,8 +1056,8 @@ both are observable; recording the window only in the plan was considered and
 rejected as leaving the opt-out flag unbound. Precedence: before the default is
 in force, and whenever the opt-out flag is set, an absent `egress` section
 keeps the shipped allow-all default of 03-spec R2.1; once in force without the
-opt-out, NET-074 and NET-075 apply. The release that brings it into force is a
-plan fact.
+opt-out, NET-074 and NET-075 apply. The default is now in force, so the
+announcement window NET-076 bound is over.
 
 **Bounds that were chosen here.** "Local-only" for `*.min.internal` means the
 zone is answered only to lookups that originate on the machine (NET-006);
