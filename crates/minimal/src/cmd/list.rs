@@ -1051,6 +1051,7 @@ pub fn format_ls_across_vms_on(
             },
             None,
             None,
+            host,
         );
     }
 
