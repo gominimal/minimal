@@ -100,7 +100,7 @@ the current directory).
 |------|-------|-------------|
 | `--name <NAME>` | `-n` | Optional session name |
 | `--sync <MODE>` | | How to load project files into the session: `tarball` (default: stream a tarball of your project and unpack it) or `none` (do not populate the worktree. The session starts from a default project configuration and does not apply the project's `minimal.toml`) |
-| `--network <none\|host_ip\|own_ip>` | | Network mode for the session: `none` gives it no network (every socket it opens to a destination outside itself fails), `host_ip` shares the host's network namespace (the default), and `own_ip` gives it an IP of its own on the host's switch so `--ingress` can publish ports. The old hyphenated spellings `no-net`, `host-net`, and `own-ip` still work for one release, with a one-line hint naming the current spelling. On a VM-backed host an `own_ip` box registers with the VM host daemon before it is created: an activation that cannot reach the daemon exits 7, and one the daemon refuses for want of addresses exits 8 |
+| `--network <none\|host_ip\|own_ip>` | | Network mode for the session: `none` gives it no network (every socket it opens to a destination outside itself fails), `host_ip` shares the host's network namespace (the default), and `own_ip` gives it an IP of its own on the host's switch so `--ingress` can publish ports. The old hyphenated spellings `no-net`, `host-net`, and `own-ip` still work for one release, with a one-line hint naming the current spelling. On a VM-backed host an `own_ip` box registers with the VM host daemon before the daemon creates the box. An activation that cannot reach the VM host daemon exits 7. One that daemon refuses because it has no free addresses exits 8 |
 | `--ingress <EXT:INT[/PROTO]>` | | Static ingress port mapping `EXT:INT[/PROTO]` (PROTO = tcp or udp, default tcp). Repeatable. Requires `--network own_ip` |
 | `--dynamic-ingress <allow\|ask\|deny>` | | Sets the stance that decides the box's own requests to publish a port (`min net expose`, or a listen inside `--dynamic-range`). `allow` publishes them, `ask` asks the attached person, and `deny` refuses every one, the same as leaving the flag unset. Setting it declares ingress even with no `--ingress` mapping. Requires `--network own_ip`. A VM-backed host refuses `allow` and `ask` before it creates the box, until the host side can admit a publish the box requests ([gominimal/minimal#1897](https://github.com/gominimal/minimal/issues/1897)). Every macOS host is VM-backed |
 | `--dynamic-range <LO-HI>` | | Inclusive host port range, such as `8000-8443`, inside which `--dynamic-ingress allow` publishes. A port outside it gets the out-of-range refusal. Requires `--dynamic-ingress`. Setting it declares ingress even with no `--ingress` mapping. The flag refuses a range that starts below 1024, a privileged port |
@@ -113,12 +113,31 @@ the current directory).
 | `--allow-dns-hosts <HOST>` | | Destination DNS hostname the box may resolve and reach (e.g. `github.com`). Repeatable; unset means allow all |
 | `--allow-protocols <PROTO>` | | Outbound transport protocol the box may use: `tcp`, `udp`, or `icmp`. Repeatable; unset means allow all |
 | `--deny-subnets <CIDR>` | | Destination subnet the box may not reach, in CIDR form — subtracted from what the allow flags admit. Repeatable; unset means nothing is denied |
-| `--deny-all-egress` | | Declare deny-all egress: the box reaches no external address. Writes the deny-all `egress` section, every allow list present and empty. A box declared by flag reads in the record exactly like one whose `minimal.toml` carries the section. On a host-address box the host's classifier decides a declared deny-all per box. An undeclared box keeps the default the rollout phase resolves. Conflicts with every `--allow-*`/`--deny-*` rule flag |
+| `--deny-all-egress` | | Declare deny-all egress: the box reaches no external address. Writes the deny-all `egress` section, every allow list present and empty. A box declared by flag reads in the record exactly like one whose `minimal.toml` carries the section. On a host-address box the host's classifier decides a declared deny-all per box. An own-address box without egress flags already gets deny-all by default (see below). Conflicts with every `--allow-*`/`--deny-*` rule flag |
 
 Together the four `--allow-*`/`--deny-*` rule flags form the box's `egress`
 declaration. Naming one of them stores it on the session, and `min session
 policy` shows what the session ended up with. `--deny-all-egress` declares
 the whole section in one flag and cannot combine with them.
+
+"Unset means allow all" applies to one flag inside a declaration. An
+own-address box (`--network own_ip`) without these flags, and without an
+`egress` section in its `minimal.toml`, gets the deny-all default: it
+reaches no external address. It can still resolve names in the box zone,
+`host.min.internal` included. Activate prints one line saying so:
+
+```
+egress: deny-all (default for an own-ip box with no egress section); declare reach with the --allow-subnets, --allow-dns-hosts and --allow-protocols flags
+```
+
+To give such a box reach, declare it with the allow flags, such as
+`--allow-dns-hosts github.com` or `--allow-subnets 0.0.0.0/0`, or with an
+`egress` section in `minimal.toml`. To keep the earlier allow-all default for
+every undeclared box on a host, the operator opts out. A native Linux host
+opts out with `minimald run --egress-deny-all-opt-out`. A VM-backed host opts
+out with `MINVMD_EGRESS_DENY_ALL_OPT_OUT=1` in the environment that starts
+`minvmd` (see [minvmd](./cli-minvmd.md)). A host-address box with no section
+keeps allow-all either way.
 
 Activating a path that already has a session is allowed, but warns: `min` names
 the existing session and creates a second one anyway. With two sessions on one
@@ -300,9 +319,9 @@ declaration denies nothing. A deny-all declaration, the `egress` section
 with every allow list present and empty, prints as the one row `deny-all`.
 A box without an `egress` section prints the default the daemon resolved
 the absence to, by name and marked as what it is. `deny-all (default)`
-marks an own-address box once the deny-all default is in force.
-`allow-all (default)` marks a box behind the opt-out or one that shares
-its host's network namespace. The `(default)` mark distinguishes a verdict
+marks an own-address box, which gets the deny-all default.
+`allow-all (default)` marks a box on a host that opted out of that default,
+or one that shares its host's network namespace. The `(default)` mark distinguishes a verdict
 the box declared from the same verdict the default gave it.
 
 A box activated with `--credentialed-upstream` prints one more row in
