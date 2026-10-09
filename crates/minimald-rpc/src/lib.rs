@@ -3351,8 +3351,8 @@ mod tests {
                  installed on this host. While it cannot, its host-address \
                  boxes run unenforced — whatever the boxes' declarations \
                  say; only a host-address box with an egress section is \
-                 affected, and a box with none behaves the same with or \
-                 without the step. Install the classifier's privileged \
+                 affected, and a box with none keeps its allow-all verdict \
+                 either way. Install the classifier's privileged \
                  step with:\n  \
                  run: curl -fsSLO https://raw.githubusercontent.com/gominimal/\
                  minimal/main/scripts/install-host-classifier.sh && sudo bash \
@@ -3390,7 +3390,7 @@ mod tests {
                  leaf. While it cannot, its host-address boxes run \
                  unenforced — whatever the boxes' declarations say; only a \
                  host-address box with an egress section is affected, and \
-                 a box with none behaves the same with or without the step."
+                 a box with none keeps its allow-all verdict either way."
                     .to_string(),
             ),
             host_ip_enforcement: Some("none".into()),

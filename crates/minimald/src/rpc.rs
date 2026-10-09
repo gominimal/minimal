@@ -519,8 +519,8 @@ const HOST_IP_ENFORCEMENT_ATTR: &str = "host_ip_enforcement";
 /// declarations say" over a refusal would deny the refusal a person is about
 /// to hit — and in the guest every cause refuses. The clause carries the
 /// scoping sentence with it on the same condition: only a host-address box
-/// with an egress section is affected, and a box with none behaves the
-/// same with or without the step.
+/// with an egress section is affected, and a box with none keeps its
+/// allow-all verdict either way.
 fn classifier_advisory_text(cause: classifier::Cause, guest: bool) -> String {
     let mut advisory = format!(
         "note: this host cannot decide a host-address box's egress verdict \
@@ -544,15 +544,20 @@ fn classifier_advisory_text(cause: classifier::Cause, guest: bool) -> String {
         // The scoping sentence a person at a first activate needs, on the
         // same arm: the note matters only to a host-address box that
         // declares egress, and a box with no egress section is allow-all —
-        // it needs no verdict enforced, so it runs the same with or
-        // without the step (NET-079's sub-requirement names the section
-        // itself as the thing that runs unenforced). Over a refusal the
+        // `classifier::verdict_of` gives it the allow verdict whether or not
+        // the host decides per box (NET-079's sub-requirement names the
+        // section itself as the thing that runs unenforced). The sentence
+        // names the verdict, not the box's whole behaviour: on a deciding
+        // host the box's traffic still leaves as the cohort's identity
+        // (NET-078), which the step is what installs, and the mount's
+        // cause is not ended by the step, so "either way" names neither.
+        // Over a refusal the
         // sentence would be false — a deny-all declaration is the one
         // thing the probe causes do refuse — so it rides only here.
         advisory.push_str(
             " — whatever the boxes' declarations say; only a host-address \
              box with an egress section is affected, and a box with none \
-             behaves the same with or without the step",
+             keeps its allow-all verdict either way",
         );
     }
     if let Some(command) = cause.install_command() {
@@ -5265,6 +5270,38 @@ mod tests {
             "a guest refuses a deny-all box on every cause, so its advisory \
              must not claim the declarations do not matter, got: {guest}"
         );
+    }
+
+    /// The scoping sentence rides with the "whatever the boxes'
+    /// declarations say" clause and nowhere else: a native cause that
+    /// leaves every box unenforced names who is affected, and a cause that
+    /// refuses a deny-all box (a probe cause, or any guest cause) does not
+    /// claim a box without a section keeps the same verdict.
+    #[test]
+    fn advisory_scoping_sentence_rides_only_with_the_unenforced_clause() {
+        const SCOPE: &str = "only a host-address box with an egress section is \
+                             affected, and a box with none keeps its allow-all \
+                             verdict either way";
+        for cause in [
+            classifier::Cause::StepNotInstalled,
+            classifier::Cause::CannotConfine,
+        ] {
+            let native = super::classifier_advisory_text(cause, false);
+            assert!(
+                native.contains(&format!("whatever the boxes' declarations say; {SCOPE}")),
+                "{cause:?} leaves every box unenforced, so the advisory scopes \
+                 it, got: {native}"
+            );
+            let guest = super::classifier_advisory_text(cause, true);
+            assert!(!guest.contains(SCOPE), "guest {cause:?}, got: {guest}");
+        }
+        for cause in [
+            classifier::Cause::TableNotEffective,
+            classifier::Cause::ProbeUnreadable,
+        ] {
+            let native = super::classifier_advisory_text(cause, false);
+            assert!(!native.contains(SCOPE), "{cause:?}, got: {native}");
+        }
     }
 
     /// The version gate, made by the RPC the activation path already sends

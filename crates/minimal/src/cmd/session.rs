@@ -5007,8 +5007,8 @@ mod tests {
                  per box: the classifier's privileged step is not installed on this \
                  host. While it cannot, its host-address boxes run unenforced — \
                  whatever the boxes' declarations say; only a host-address box with \
-                 an egress section is affected, and a box with none behaves the \
-                 same with or without the step. Install the classifier's \
+                 an egress section is affected, and a box with none keeps its \
+                 allow-all verdict either way. Install the classifier's \
                  privileged step with:\n  run: curl -fsSLO \
                  https://raw.githubusercontent.com/gominimal/minimal/main/scripts/\
                  install-host-classifier.sh && sudo bash ./install-host-classifier.sh \
@@ -5026,8 +5026,8 @@ mod tests {
                  per box: the classifier's privileged step is not installed on this \
                  host. While it cannot, its host-address boxes run unenforced — \
                  whatever the boxes' declarations say; only a host-address box with \
-                 an egress section is affected, and a box with none behaves the \
-                 same with or without the step."
+                 an egress section is affected, and a box with none keeps its \
+                 allow-all verdict either way."
             ),
             "the start prints the daemon's spelling verbatim, so the log, the \
              reply, and the terminal cannot disagree, got: {rendered}"
@@ -5057,8 +5057,8 @@ mod tests {
                  tree, so a box could migrate out of its leaf. While it cannot, \
                  its host-address boxes run unenforced — whatever the boxes' \
                  declarations say; only a host-address box with an egress section \
-                 is affected, and a box with none behaves the same with or \
-                 without the step.",
+                 is affected, and a box with none keeps its allow-all verdict \
+                 either way.",
             ),
             Some("none"),
         );
@@ -5070,7 +5070,7 @@ mod tests {
             "the advisory must name this cause in words too: {rendered}"
         );
         assert!(
-            rendered.ends_with("without the step.\n"),
+            rendered.ends_with("allow-all verdict either way.\n"),
             "no command ends this cause, so the advisory must end with the \
              state it named: {rendered}"
         );
