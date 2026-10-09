@@ -1120,16 +1120,15 @@ async fn activate_prints_no_session_id_when_composition_fails() {
     );
 }
 
-/// A host whose user-namespace verdict refuses the sandbox fails the
-/// activation before any session exists (NET-141): the daemon refuses the
-/// create on its verdict, and `min session activate` prints that refusal
-/// verbatim — the cause, and `min finalize-install` with its `--show`
-/// preview as the remedy, never a sysctl — exits 1, and leaves no session
-/// behind. Driven through the compiled binary because the exact stderr and
-/// the exit status are the contract; the daemon is this process's harness,
-/// so its verdict is set here and cleared on the way out.
-#[tokio::test]
-async fn activate_refuses_unconfinable_sandbox_before_session_creation() {
+/// Drives `min session activate` through the compiled binary against this
+/// process's harness daemon while its user-namespace verdict is `verdict`
+/// (NET-141), and returns the refusal: the `error:` block on stderr, exactly
+/// — the activation's own progress lines (`Applying loadouts: ...`) precede
+/// it. Asserts the contract every cause shares on the way: exit 1, nothing
+/// on stdout, and no session left behind. The binary is used because the
+/// exact stderr and the exit status are the contract; the verdict is set on
+/// the harness server alone and cleared before the asserts.
+async fn refused_activation(verdict: minimald::server::UsernsRestriction) -> String {
     let (daemon, args) = setup().await;
     let minimal_dir = args.minimal_dir.clone().expect("setup points at a tempdir");
 
@@ -1146,9 +1145,7 @@ async fn activate_refuses_unconfinable_sandbox_before_session_creation() {
     daemon
         .server
         .state
-        .set_user_namespace_verdict(Some(
-            minimald::server::UsernsRestriction::ApparmorUnconfined,
-        ))
+        .set_user_namespace_verdict(Some(verdict))
         .await;
     let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_min"))
         .args(["--minimal-dir".as_ref(), minimal_dir.as_os_str()])
@@ -1174,23 +1171,6 @@ async fn activate_refuses_unconfinable_sandbox_before_session_creation() {
         stdout.trim().is_empty(),
         "a refused activation puts nothing on stdout, got: {stdout}"
     );
-    // The refusal is the error block itself, exactly: the activation's own
-    // progress lines (`Applying loadouts: ...`) precede it on stderr.
-    let refusal = stderr
-        .find("error: ")
-        .map(|at| stderr[at..].trim_end())
-        .unwrap_or_else(|| panic!("no error block on stderr: {stderr}"));
-    assert_eq!(
-        refusal,
-        "error: this machine blocks the private sandbox every box runs in (Ubuntu restricts \
-         unprivileged user namespaces), so no box can start here yet.\n\
-         Finish the install to allow it for Minimal only: min finalize-install   \
-         (see what it changes first: min finalize-install --show)"
-    );
-    assert!(
-        !stderr.contains("sysctl"),
-        "nothing on this path suggests a sysctl: {stderr}"
-    );
 
     // Nothing was created for the refusal to leave behind.
     let mut client = daemon.server.connect().await;
@@ -1199,6 +1179,69 @@ async fn activate_refuses_unconfinable_sandbox_before_session_creation() {
         resp.sessions.is_empty(),
         "a refused activation must leave no session behind, got: {:?}",
         resp.sessions
+    );
+
+    stderr
+        .find("error: ")
+        .map(|at| stderr[at..].trim_end().to_string())
+        .unwrap_or_else(|| panic!("no error block on stderr: {stderr}"))
+}
+
+/// A host whose user-namespace verdict refuses the sandbox fails the
+/// activation before any session exists (NET-141): the daemon refuses the
+/// create on its verdict, `min session activate` prints that refusal as its
+/// error, exits 1, and leaves no session behind. The cause-specific texts
+/// are the two tests below; this one holds the shape they share.
+#[tokio::test]
+async fn activate_refuses_unconfinable_sandbox_before_session_creation() {
+    let refusal = refused_activation(minimald::server::UsernsRestriction::ApparmorUnconfined).await;
+    assert!(
+        refusal.starts_with("error: this machine blocks the private sandbox every box runs in ("),
+        "the refusal is the error block: {refusal}"
+    );
+    assert!(
+        refusal.contains("so no box can start here yet."),
+        "the refusal says no box can start: {refusal}"
+    );
+}
+
+/// The AppArmor restriction (stock Ubuntu 24.04+, unconfined daemon) names
+/// `min finalize-install` as the remedy, with `--show` for the step it runs,
+/// and never a sysctl, which would lift the protection for every program.
+#[tokio::test]
+async fn activate_refusal_names_finalize_install_for_apparmor_restriction() {
+    let refusal = refused_activation(minimald::server::UsernsRestriction::ApparmorUnconfined).await;
+    assert_eq!(
+        refusal,
+        "error: this machine blocks the private sandbox every box runs in (Ubuntu restricts \
+         unprivileged user namespaces), so no box can start here yet.\n\
+         Finish the install to allow it for Minimal only: min finalize-install   \
+         (see what it changes first: min finalize-install --show)"
+    );
+    assert!(
+        !refusal.contains("sysctl"),
+        "the AppArmor remedy never suggests a sysctl: {refusal}"
+    );
+}
+
+/// `user.max_user_namespaces=0` (or a kernel without `CONFIG_USER_NS`) names
+/// the sysctl key and the persistent change — a sysctl.d drop-in, or a
+/// kernel built with the namespace — and not `min finalize-install`, whose
+/// profile cannot lift it.
+#[tokio::test]
+async fn activate_refusal_names_sysctl_for_max_user_namespaces_zero() {
+    let refusal = refused_activation(minimald::server::UsernsRestriction::Disabled).await;
+    assert_eq!(
+        refusal,
+        "error: this machine blocks the private sandbox every box runs in (user namespaces are \
+         switched off (user.max_user_namespaces=0 or no kernel support)), so no box can start \
+         here yet.\n\
+         Set user.max_user_namespaces above 0 persistently (a /etc/sysctl.d drop-in) or use a \
+         kernel with CONFIG_USER_NS."
+    );
+    assert!(
+        !refusal.contains("finalize-install"),
+        "the install step cannot lift a disabled namespace: {refusal}"
     );
 }
 
