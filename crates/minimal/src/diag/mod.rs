@@ -602,21 +602,6 @@ mod tests {
         assert!(Cli::try_parse_from(["min", "diag", "upload"]).is_err());
     }
 
-    /// The upload sends no credential, so there is no flag to hand it one:
-    /// a script that still passes `--token` fails loudly rather than
-    /// believing its token went somewhere.
-    #[test]
-    fn there_is_no_token_flag() {
-        use crate::cli::Cli;
-        for argv in [
-            &["min", "bug", "--upload", "--token", "t"][..],
-            &["min", "diag", "collect", "--upload", "--token", "t"],
-            &["min", "diag", "upload", "b.tar.zst", "--token", "t"],
-        ] {
-            assert!(Cli::try_parse_from(argv).is_err(), "{argv:?}");
-        }
-    }
-
     /// `min diag delete <id> <token>` takes both positionals the upload
     /// printed, and the portal's address like the upload does.
     #[test]

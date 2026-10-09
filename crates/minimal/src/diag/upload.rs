@@ -55,8 +55,8 @@ pub struct Uploaded {
 impl Uploaded {
     /// The lines printed after an upload, in order.
     ///
-    /// Plain about where the bundle went and what happens to it next, because
-    /// the upload no longer asks for anything that would make that obvious.
+    /// Plain about where the bundle went, what happens to it next, and how
+    /// to take it back.
     pub fn receipt(&self) -> Vec<String> {
         let mut lines = vec![
             format!("Report:  {}", self.report_url),
