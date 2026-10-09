@@ -543,22 +543,25 @@ The script holds only what this host is missing from:
 - membership of the `kvm` group, only when the configured provider is the
   Linux VM provider
 
-`min finalize-install` prints the summary of what is missing to stderr. It
-writes the script to a temporary file that only you can read (mode `0600`)
-and runs it with `sudo sh`, so `sudo` asks for your password once. It then
-removes the file and exits with the script's status. The last line of a
-completed run is
-`Running boxes pick this up on their next start.`. On a host that needs
-nothing it prints
+`min finalize-install` prints the summary of what is missing. It writes the
+script to a temporary file that only you can read (mode `0600`) and runs it
+with `sudo sh`, so `sudo` asks for your password once. It then removes the
+file and exits with the script's status. A completed run that installed
+anything other than the `kvm` group membership ends with
+`Running boxes pick this up on their next start.`. A run that added you to
+the `kvm` group ends with
+`KVM group membership starts at your next login: log out and back in, or restart the daemon from a new login.`
+instead. On a host that needs nothing it prints
 `Every part of the install is finished on this machine; there is nothing to run.`
 and exits 0. It lists a fact that no script can change, such as cgroup2
 mounted without `nsdelegate`, under `can't do on this machine:`. The other
-items still run.
+items still run. When a host fact blocks every missing item, it runs
+nothing and exits non-zero.
 
 Without a terminal, it tries `sudo -n`. If `sudo -n` cannot run the script
 without a prompt, it prints the summary and
-`min finalize-install --show --script > f && sudo sh f`, runs nothing, and
-exits 1.
+`f=$(mktemp) && min finalize-install --show --script > "$f" && sudo sh "$f"`,
+runs nothing, and exits 1.
 
 The script is plain POSIX `sh` and stops at the first statement that fails.
 Its header says what it configures and that it must run as root. A comment
@@ -566,15 +569,15 @@ introduces each step.
 
 | Flag | Description |
 |---|---|
-| `--show` | Print the summary of what this host is missing, with no privilege prompt, and run nothing. |
-| `--show --script` | Print the script to stdout and the summary to stderr, with no privilege prompt. Run it later with `sudo sh <file>`. |
-| `--show --json` | Print the summary as one JSON document under the schema `min/v1/finalize-install`. Each item has a stable id. Exits non-zero while any item is missing. |
-| `--undo` | Remove everything the step installed on this host. With `--show --script`, print the removal script instead. |
+| `--show` | Print the summary of what this host is missing, with no privilege prompt, and run nothing. Exits 0 whatever the items' states. |
+| `--show --script` | Print the script to stdout and the summary to stderr, with no privilege prompt. Run it later with `sudo sh <file>`. Exits 0 whatever the items' states. |
+| `--show --json` | Print the summary as one JSON document under the schema `min/v1/finalize-install`. Each item has a stable id and a state: `done`, `missing`, `waiting`, or `cannot`. Exits non-zero while any item is not `done`. |
+| `--undo` | Remove everything the step installed on this host. It accepts only `--show --script`, which prints the removal script instead. |
 
 The names step points at the port the daemon's zone answerer listens on, so
 it needs a running daemon that has bound its answerer. It does not start one.
-With no daemon reachable, it prints an error and exits 1. Start a session
-first to bring the daemon up.
+With no daemon reachable, it lists the names item as `waiting on a daemon`
+under the summary and runs the remaining items.
 
 The box-name service runs as one user for the whole machine. If another user
 already installed it, the command refuses before running anything, names
@@ -583,8 +586,8 @@ that user, and exits 1. `--show` still prints.
 `--undo` works without a daemon, and it succeeds on a host that holds none of
 the install. It removes the user-namespace profile, the classifier tree, and
 the group membership the step added. It also removes the box-name service and
-its program copy, the resolver hook, and on macOS the local range unit. The local range
-addresses on macOS stay on the loopback until the next boot.
+its program copy, the resolver hook, and on macOS the local range unit.
+The local range addresses on macOS stay on the loopback until the next boot.
 `install.sh --uninstall` points at `min finalize-install --undo` while any of
 these host files remain.
 
