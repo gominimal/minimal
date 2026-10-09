@@ -4321,7 +4321,7 @@ async fn expose_ask_human_deny_refused() {
         .expect_err("the human's deny refuses the publish");
     match refused {
         crate::net::policy::ExposeFailure::Refused(
-            crate::net::policy::ExposeRefusal::DeniedByPolicy,
+            crate::net::policy::ExposeRefusal::DeniedByHuman,
         ) => {}
         other => panic!("the denial is the typed deny error: {other:?}"),
     }
@@ -6570,7 +6570,7 @@ async fn native_ask_prompt_still_renders() {
         matches!(
             refused,
             Err(crate::net::policy::ExposeFailure::Refused(
-                crate::net::policy::ExposeRefusal::DeniedByPolicy
+                crate::net::policy::ExposeRefusal::DeniedByHuman
             ))
         ),
         "the human's deny refuses the request: {refused:?}"
@@ -6603,11 +6603,11 @@ async fn ask_no_or_no_tty_records_nothing() {
     for (reason, expected) in [
         (
             minimald_rpc::AskRefused::Denied,
-            crate::net::policy::ExposeRefusal::DeniedByPolicy,
+            crate::net::policy::ExposeRefusal::DeniedByHuman,
         ),
         (
             minimald_rpc::AskRefused::NoTty,
-            crate::net::policy::ExposeRefusal::DeniedByPolicy,
+            crate::net::policy::ExposeRefusal::AskNoTerminal,
         ),
     ] {
         let asking = handle.clone();
@@ -6738,7 +6738,7 @@ async fn vm_ask_no_tty_is_denied() {
         matches!(
             result,
             Err(crate::net::policy::ExposeFailure::Refused(
-                crate::net::policy::ExposeRefusal::DeniedByPolicy
+                crate::net::policy::ExposeRefusal::AskNoTerminal
             ))
         ),
         "{result:?}"

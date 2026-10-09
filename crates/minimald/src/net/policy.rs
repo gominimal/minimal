@@ -554,6 +554,15 @@ pub enum ExposeRefusal {
     /// with nobody attached — or until that prompt path exists — the request
     /// fails closed rather than publishing unasked.
     AskNeedsAnswer,
+    /// `dynamic_ingress` is `ask` and the attached human answered no — or
+    /// keyed a cancel, which means the same (NET-045): the box's own deny
+    /// answer, now in the human's hand. The log and the audit record say it
+    /// with the deny's words; the caller's line says who declined.
+    DeniedByHuman,
+    /// `dynamic_ingress` is `ask` and the VM host's attached client could
+    /// not show the dialog — no terminal to draw it on — so the ask ended
+    /// in the deny an unanswerable dialog defaults to.
+    AskNoTerminal,
     /// `dynamic_ingress` allows, but the box declares no
     /// `dynamic_allowed_range`: no port was opted in.
     NoDynamicRange,
@@ -591,32 +600,50 @@ pub enum ExposeRefusal {
 impl ExposeRefusal {
     /// The line the in-box `min net expose` prints for this refusal: the
     /// verdict and, where a way forward exists, the way forward, named with
-    /// the host-side box name and the port the request asked for, so a
-    /// detached agent reading it has its next command. The verdict alone
-    /// (`Display`) is what the log line and the audit record carry.
+    /// the box's current host-side name and the port the request asked for,
+    /// so a detached agent reading it has its next command. `network` is the
+    /// box's mode: a `--network none` box carries no dynamic ingress at all,
+    /// so re-activating with it is no way forward there, and the host-side
+    /// forward — which dials inside the box's own namespace — is the one
+    /// offered. The verdict alone (`Display`) is what the log line and the
+    /// audit record carry.
     #[must_use]
-    pub fn for_caller(&self, box_name: &str, port: u16) -> String {
+    pub fn for_caller(&self, box_name: &str, network: sessions::NetworkMode, port: u16) -> String {
+        let forward = format!("min net forward {box_name} <local>:{port}");
         match self {
-            Self::DeniedByPolicy => format!(
-                "{self} (the default). Re-activate with --dynamic-ingress ask \
-                 --dynamic-range <lo>-<hi> to allow it, or forward it from the \
-                 host now: min net forward {box_name} <local>:{port}"
+            Self::DeniedByPolicy => match network {
+                sessions::NetworkMode::NoNet => format!(
+                    "{self}: a --network none box has no address to publish at. Forward it \
+                     from the host instead: {forward}"
+                ),
+                sessions::NetworkMode::HostNet | sessions::NetworkMode::OwnIp => format!(
+                    "{self}. Re-activate with --network own_ip and --dynamic-ingress allow \
+                     --dynamic-range <lo>-<hi> (or --dynamic-ingress ask) to allow it, or \
+                     forward it from the host now: {forward}"
+                ),
+            },
+            Self::DeniedByHuman => format!(
+                "{self}: your operator declined it. Ask again, or forward it from the \
+                 host: {forward}"
+            ),
+            Self::AskNoTerminal => format!(
+                "{self}: no terminal was attached to answer. Attach one and retry, or \
+                 forward it from the host: {forward}"
             ),
             Self::AskNeedsAnswer => format!(
-                "{self}: attach a terminal (min session attach {box_name}) and \
-                 retry, or have the host forward it (min net forward {box_name} \
-                 <local>:{port})"
+                "{self}: attach a terminal (min session attach {box_name}) and retry, or \
+                 have the host forward it ({forward})"
             ),
             Self::NeedsNoExposing {
-                port,
                 host_loopback: true,
+                ..
             } => format!(
                 "{self}, so it already answers at {box_name}.min.internal:{port} \
                  (and localhost:{port})"
             ),
             Self::NeedsNoExposing {
-                port,
                 host_loopback: false,
+                ..
             } => format!("{self}, so it already answers at {box_name}.min.internal:{port}"),
             _ => self.to_string(),
         }
@@ -626,7 +653,11 @@ impl ExposeRefusal {
 impl fmt::Display for ExposeRefusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::DeniedByPolicy => {
+            // One verdict for the three denies: the policy's, the human's
+            // and the one an unshowable dialog defaults to. The log and the
+            // audit record pin these words; the caller's line tells them
+            // apart.
+            Self::DeniedByPolicy | Self::DeniedByHuman | Self::AskNoTerminal => {
                 write!(f, "dynamic ingress is denied for this box")
             }
             Self::AskNeedsAnswer => write!(
@@ -1468,17 +1499,47 @@ mod tests {
 
     #[test]
     fn refusals_name_the_way_forward_for_the_caller() {
+        use sessions::NetworkMode;
+
         // The in-box line carries the verdict and the next command, named
         // with the host-side box name and the port asked for; the verdict
         // alone is what the log and the audit record keep.
         assert_eq!(
-            ExposeRefusal::DeniedByPolicy.for_caller("web", 3001),
-            "dynamic ingress is denied for this box (the default). Re-activate with \
-             --dynamic-ingress ask --dynamic-range <lo>-<hi> to allow it, or forward \
-             it from the host now: min net forward web <local>:3001"
+            ExposeRefusal::DeniedByPolicy.for_caller("web", NetworkMode::OwnIp, 3001),
+            "dynamic ingress is denied for this box. Re-activate with --network own_ip and \
+             --dynamic-ingress allow --dynamic-range <lo>-<hi> (or --dynamic-ingress ask) \
+             to allow it, or forward it from the host now: min net forward web <local>:3001"
+        );
+        // A `--network none` box cannot carry dynamic ingress, so the only
+        // way forward is the host's forward, which dials inside the box.
+        assert_eq!(
+            ExposeRefusal::DeniedByPolicy.for_caller("web", NetworkMode::NoNet, 3001),
+            "dynamic ingress is denied for this box: a --network none box has no address \
+             to publish at. Forward it from the host instead: min net forward web \
+             <local>:3001"
+        );
+        // The three denies share the verdict and differ in the way forward.
+        assert_eq!(
+            ExposeRefusal::DeniedByHuman.to_string(),
+            ExposeRefusal::DeniedByPolicy.to_string()
         );
         assert_eq!(
-            ExposeRefusal::AskNeedsAnswer.for_caller("web", 3001),
+            ExposeRefusal::AskNoTerminal.to_string(),
+            ExposeRefusal::DeniedByPolicy.to_string()
+        );
+        assert_eq!(
+            ExposeRefusal::DeniedByHuman.for_caller("web", NetworkMode::OwnIp, 3001),
+            "dynamic ingress is denied for this box: your operator declined it. Ask again, \
+             or forward it from the host: min net forward web <local>:3001"
+        );
+        assert_eq!(
+            ExposeRefusal::AskNoTerminal.for_caller("web", NetworkMode::OwnIp, 3001),
+            "dynamic ingress is denied for this box: no terminal was attached to answer. \
+             Attach one and retry, or forward it from the host: min net forward web \
+             <local>:3001"
+        );
+        assert_eq!(
+            ExposeRefusal::AskNeedsAnswer.for_caller("web", NetworkMode::OwnIp, 3001),
             "dynamic ingress is set to ask and nobody is attached to answer: attach a \
              terminal (min session attach web) and retry, or have the host forward it \
              (min net forward web <local>:3001)"
@@ -1490,7 +1551,7 @@ mod tests {
                 port: 3001,
                 host_loopback: true
             }
-            .for_caller("web", 3001),
+            .for_caller("web", NetworkMode::HostNet, 3001),
             "port 3001 needs no exposing: this box shares the host's network, so it \
              already answers at web.min.internal:3001 (and localhost:3001)"
         );
@@ -1499,13 +1560,13 @@ mod tests {
                 port: 3001,
                 host_loopback: false
             }
-            .for_caller("web", 3001),
+            .for_caller("web", NetworkMode::HostNet, 3001),
             "port 3001 needs no exposing: this box shares the host's network, so it \
              already answers at web.min.internal:3001"
         );
         // A refusal with no way forward beyond its own words is its verdict.
         assert_eq!(
-            ExposeRefusal::NoDynamicRange.for_caller("web", 3001),
+            ExposeRefusal::NoDynamicRange.for_caller("web", NetworkMode::OwnIp, 3001),
             ExposeRefusal::NoDynamicRange.to_string()
         );
     }

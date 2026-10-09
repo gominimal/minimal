@@ -3041,7 +3041,7 @@ impl Session {
             // went away did not answer — so it lands on the `None` below.
             AskEnd::Answered(session_host::AskAnswer::Refused) => {
                 Err(crate::net::policy::ExposeFailure::Refused(
-                    crate::net::policy::ExposeRefusal::DeniedByPolicy,
+                    crate::net::policy::ExposeRefusal::DeniedByHuman,
                 ))
             }
             // Nobody was attached to answer (NET-045's unwanted branch) — no
@@ -3063,7 +3063,7 @@ impl Session {
                     "the VM host daemon's ask ended without a prompt"
                 );
                 Err(crate::net::policy::ExposeFailure::Refused(
-                    crate::net::policy::ExposeRefusal::DeniedByPolicy,
+                    crate::net::policy::ExposeRefusal::AskNoTerminal,
                 ))
             }
             // Cancelled at the host before an answer: nothing was recorded
