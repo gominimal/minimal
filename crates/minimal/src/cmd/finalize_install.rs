@@ -783,19 +783,42 @@ pub(crate) mod linux {
     }
 
     /// The classifier item over its facts: done once the tree's marker is
-    /// there; blocked by the mount the tree needs; otherwise missing, with
+    /// there and the root-owned copy of the step is this binary's own
+    /// bytes; blocked by the mount the tree needs; otherwise missing, with
     /// the step that installs the classifier for `operator`'s daemon,
     /// whose listener lives at `socket`. An un-enrolled host has no source
     /// identity, and needs none: the step classifies the two identities as
     /// two cgroup matches and translates nothing, and an association later
     /// adds the reserved addresses to the same matches without a reinstall.
+    ///
+    /// `copy_current` is whether the copy at [`CLASSIFIER_PROGRAM_PATH`]
+    /// reads as [`CLASSIFIER_SCRIPT`] byte for byte: the copy outlives an
+    /// upgrade of this binary and the placement unit runs it, so a copy
+    /// that differs is a stale step, and the item reads as missing until
+    /// the block below writes the current one. `other_owner` is the uid the
+    /// tree is delegated to when that is not this process's own: the tree
+    /// is one account's, and another account's run must not read it as its
+    /// own install, nor replace it.
     pub(crate) fn classifier_item_over(
         marker_present: bool,
+        copy_current: bool,
+        other_owner: Option<u32>,
         mount: Cgroup2Mount,
         operator: &str,
         socket: &str,
     ) -> Item {
-        if marker_present {
+        if let Some(uid) = other_owner {
+            return Item::cannot(
+                CLASSIFIER_ID,
+                CLASSIFIER_LABEL,
+                format!(
+                    "the classifier tree at {CLASSIFIER_TREE_ROOT} is installed for another \
+                     account (uid {uid}); running this step would replace their delegation, \
+                     so that account removes it with `min finalize-install --undo` first"
+                ),
+            );
+        }
+        if marker_present && copy_current {
             return Item::done(CLASSIFIER_ID, CLASSIFIER_LABEL);
         }
         let cause = match mount {
@@ -807,20 +830,39 @@ pub(crate) mod linux {
                 "cgroup2 is mounted without nsdelegate, so a box's cgroup is no boundary it \
                  cannot leave"
             }
+            // The two names ride in a shell single-quoted word and in a
+            // unit file, where systemd expands `%` specifiers and, in
+            // `ExecStart=`, `$` variables, and `\\` escapes; and the step
+            // matches the socket path as one whitespace-delimited field of
+            // /proc/net/unix. A name any of them could reach is one the
+            // block cannot spell safely, and the item says so rather than
+            // installing a unit that never finds the daemon.
             Cgroup2Mount::Delegated => {
-                if operator.is_empty() || operator.contains(['\'', '\n', ' ']) {
+                if operator.is_empty() {
                     "this process's user name did not read, so there is no account to \
                      delegate the classifier tree to"
-                } else if socket.is_empty() || socket.contains(['\'', '\n']) {
+                } else if operator.contains(UNQUOTABLE) {
+                    "this process's user name cannot be quoted into the step's shell word \
+                     and unit file (it carries a quote, whitespace, %, $ or a backslash)"
+                } else if socket.is_empty() {
                     "this host's daemon socket path did not resolve, so there is nothing \
                      for the placement unit to watch"
+                } else if socket.contains(UNQUOTABLE) {
+                    "this host's daemon socket path cannot be quoted into the step's shell \
+                     word and unit file (it carries a quote, whitespace, %, $ or a backslash)"
                 } else {
                     return Item::missing(
                         CLASSIFIER_ID,
                         CLASSIFIER_LABEL,
-                        "host-address boxes run unenforced: the classifier's privileged step \
-                         is not installed, so no box's egress verdict is decided per box"
-                            .to_string(),
+                        if marker_present {
+                            "the root-owned copy of the classifier's privileged step is not \
+                             this build's, so the placement unit runs a stale step"
+                        } else {
+                            "host-address boxes run unenforced: the classifier's privileged \
+                             step is not installed, so no box's egress verdict is decided per \
+                             box"
+                        }
+                        .to_string(),
                         format!(
                             "installs the classifier's cgroup tree and packet filter for \
                              {operator}'s daemon, and a systemd path unit that places the \
@@ -833,6 +875,14 @@ pub(crate) mod linux {
         };
         Item::cannot(CLASSIFIER_ID, CLASSIFIER_LABEL, cause.to_string())
     }
+
+    /// The characters neither the operator name nor the socket path may
+    /// carry into the block: a shell quote and a newline (the single-quoted
+    /// words), a space or tab (the step reads the socket path as one field
+    /// of `/proc/net/unix`, and the account as one word), `%` (a systemd
+    /// specifier in every unit line), `$` (a variable in `ExecStart=`), and
+    /// a backslash (an escape in both).
+    const UNQUOTABLE: [char; 7] = ['\'', '\n', ' ', '\t', '%', '$', '\\'];
 
     /// The step's block: the classifier's step written from the bytes this
     /// binary carries to its root-owned copy and run with no source
@@ -852,7 +902,13 @@ pub(crate) mod linux {
              {CLASSIFIER_PROGRAM_PATH} --user '{operator}'\n\
              # The placement pair: the path unit fires when the daemon's socket appears,\n\
              # and the service puts the listener in the daemon's leaf, so every daemon\n\
-             # start is placed without a root step of its own.\n\
+             # start is placed without a root step of its own. A socket that flaps past\n\
+             # systemd's trigger limit leaves the path unit failed until\n\
+             # `systemctl reset-failed {PLACE_SYSTEMD_UNIT}.path`. Without systemd the\n\
+             # pair is skipped, and each daemon start is placed by hand with the step.\n\
+             if ! command -v systemctl >/dev/null 2>&1 ; then\n\
+             \x20 echo 'note: no systemctl on this host: the placement unit is not installed, so place each daemon start by hand with the step'\n\
+             else\n\
              cat > {PLACE_UNIT_SERVICE_PATH} <<\\MINIMAL_PLACE_SERVICE_EOF\n\
              [Unit]\n\
              Description=Place minimald's listener in its classifier leaf\n\
@@ -875,21 +931,36 @@ pub(crate) mod linux {
              chmod 0644 {PLACE_UNIT_SERVICE_PATH} {PLACE_UNIT_PATH_PATH}\n\
              systemctl daemon-reload\n\
              systemctl enable --now {PLACE_SYSTEMD_UNIT}.path\n\
-             systemctl start {PLACE_SYSTEMD_UNIT}.service\n"
+             systemctl start {PLACE_SYSTEMD_UNIT}.service\n\
+             fi\n"
         )
     }
 
     /// [`classifier_item_over`] this host's reads: the tree's marker, the
-    /// cgroup2 mount, this process's account, and the native daemon's
-    /// socket path for this `--minimal-dir`.
+    /// root-owned copy's bytes against this binary's, the cgroup2 mount,
+    /// this process's account, and the native daemon's socket path for
+    /// this `--minimal-dir`.
     pub(crate) fn classifier_item_on_this_host(global: &GlobalArgs) -> Item {
+        use std::os::unix::fs::MetadataExt as _;
         let marker = std::path::Path::new(CLASSIFIER_TREE_ROOT).join("classifier-table");
+        let copy_current = std::fs::read(CLASSIFIER_PROGRAM_PATH)
+            .is_ok_and(|bytes| bytes == CLASSIFIER_SCRIPT.as_bytes());
+        // The tree is delegated to one account: the step chowns the boxes
+        // subtree to it, so its owner is the account the install is for.
+        let me = nix::unistd::geteuid().as_raw();
+        let other_owner =
+            std::fs::metadata(std::path::Path::new(CLASSIFIER_TREE_ROOT).join("boxes"))
+                .ok()
+                .map(|meta| meta.uid())
+                .filter(|uid| *uid != me);
         let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
         let socket = crate::client::resolve_socket_path(global.minimal_dir.as_deref(), false)
             .map(|path| path.display().to_string())
             .unwrap_or_default();
         classifier_item_over(
             marker.is_dir(),
+            copy_current,
+            other_owner,
             cgroup2_mount_from(&mountinfo),
             &crate::resolver::operator_name(),
             &socket,
@@ -1414,9 +1485,12 @@ mod tests {
         }
     }
 
-    /// The classifier item's table: done on the marker; blocked by the
-    /// mount, or by an account or socket path the step cannot quote;
-    /// otherwise missing, with its step.
+    /// The classifier item's table: done on the marker with a current
+    /// copy of the step; blocked by the mount, or by an account or socket
+    /// path the step cannot quote into a shell word and a unit file;
+    /// otherwise missing, with its step — a marker over a stale copy
+    /// included, so an upgrade's next run refreshes what the placement
+    /// unit runs.
     #[test]
     fn classifier_item_table() {
         use linux::{Cgroup2Mount, cgroup2_mount_from, classifier_item_over};
@@ -1439,10 +1513,14 @@ mod tests {
             Cgroup2Mount::Absent
         );
         let sock = "/home/alice/.local/state/minimal/providers/local-minimald0/ssh.sock";
+        let over = |marker: bool, current: bool, mount, operator: &str, socket: &str| {
+            classifier_item_over(marker, current, None, mount, operator, socket)
+        };
         assert_eq!(
-            classifier_item_over(true, Cgroup2Mount::Absent, "alice", sock).state,
+            over(true, true, Cgroup2Mount::Absent, "alice", sock).state,
             ItemState::Done
         );
+        let unquotable = "cannot be quoted";
         for (mount, operator, socket, word) in [
             (Cgroup2Mount::Absent, "alice", sock, "no cgroup2 filesystem"),
             (
@@ -1452,12 +1530,11 @@ mod tests {
                 "without nsdelegate",
             ),
             (Cgroup2Mount::Delegated, "", sock, "user name did not read"),
-            (
-                Cgroup2Mount::Delegated,
-                "al ice",
-                sock,
-                "user name did not read",
-            ),
+            (Cgroup2Mount::Delegated, "al ice", sock, unquotable),
+            (Cgroup2Mount::Delegated, "al'ice", sock, unquotable),
+            (Cgroup2Mount::Delegated, "al%ice", sock, unquotable),
+            (Cgroup2Mount::Delegated, "al$ice", sock, unquotable),
+            (Cgroup2Mount::Delegated, "al\\ice", sock, unquotable),
             (
                 Cgroup2Mount::Delegated,
                 "alice",
@@ -1468,18 +1545,83 @@ mod tests {
                 Cgroup2Mount::Delegated,
                 "alice",
                 "/run/it's.sock",
-                "socket path did not resolve",
+                unquotable,
+            ),
+            (
+                Cgroup2Mount::Delegated,
+                "alice",
+                "/run/my dir/ssh.sock",
+                unquotable,
+            ),
+            (
+                Cgroup2Mount::Delegated,
+                "alice",
+                "/run/my\tdir/ssh.sock",
+                unquotable,
+            ),
+            (
+                Cgroup2Mount::Delegated,
+                "alice",
+                "/run/%h/ssh.sock",
+                unquotable,
+            ),
+            (
+                Cgroup2Mount::Delegated,
+                "alice",
+                "/run/$HOME/ssh.sock",
+                unquotable,
+            ),
+            (
+                Cgroup2Mount::Delegated,
+                "alice",
+                "/run/a\\b/ssh.sock",
+                unquotable,
             ),
         ] {
-            let item = classifier_item_over(false, mount, operator, socket);
+            let item = over(false, false, mount, operator, socket);
             assert_eq!(item.state, ItemState::Cannot, "{item:?}");
             assert_eq!(item.id, "classifier");
             assert!(item.cause.as_deref().unwrap().contains(word), "{item:?}");
         }
-        let item = classifier_item_over(false, Cgroup2Mount::Delegated, "alice", sock);
+        let item = over(false, false, Cgroup2Mount::Delegated, "alice", sock);
         assert_eq!(item.state, ItemState::Missing, "{item:?}");
         assert!(item.today.as_deref().unwrap().contains("unenforced"));
         assert!(item.step.as_deref().unwrap().contains("every daemon start"));
+        // The marker over a stale copy: the step is there, but the one the
+        // placement unit runs is not this build's, so it is missing again
+        // and the block (the same block) refreshes it.
+        let stale = over(true, false, Cgroup2Mount::Delegated, "alice", sock);
+        assert_eq!(stale.state, ItemState::Missing, "{stale:?}");
+        assert!(
+            stale.today.as_deref().unwrap().contains("stale step"),
+            "{stale:?}"
+        );
+        assert_eq!(
+            stale.script, item.script,
+            "one block installs and refreshes"
+        );
+        // A stale copy on a mount the tree cannot live in is still the mount's fault.
+        assert_eq!(
+            over(true, false, Cgroup2Mount::Absent, "alice", sock).state,
+            ItemState::Cannot
+        );
+        // A tree delegated to another account is that account's install:
+        // never Done for this one, never replaced by this one, whatever
+        // else the host looks like.
+        for (marker, current, mount) in [
+            (true, true, Cgroup2Mount::Delegated),
+            (false, false, Cgroup2Mount::Delegated),
+            (true, false, Cgroup2Mount::Absent),
+        ] {
+            let theirs = classifier_item_over(marker, current, Some(1001), mount, "alice", sock);
+            assert_eq!(theirs.state, ItemState::Cannot, "{theirs:?}");
+            let cause = theirs.cause.as_deref().unwrap();
+            assert!(
+                cause.contains("installed for another account (uid 1001)")
+                    && cause.contains("--undo"),
+                "{cause}"
+            );
+        }
     }
 
     /// The classifier step leaves the daemon placed on every start without
@@ -1496,7 +1638,7 @@ mod tests {
         };
         use linux::{Cgroup2Mount, classifier_item_over};
         let sock = "/home/alice/.local/state/minimal/providers/local-minimald0/ssh.sock";
-        let item = classifier_item_over(false, Cgroup2Mount::Delegated, "alice", sock);
+        let item = classifier_item_over(false, false, None, Cgroup2Mount::Delegated, "alice", sock);
         let script = item.script.expect("a missing item carries its block");
         for line in [
             format!("cat > {CLASSIFIER_PROGRAM_PATH} <<\\{CLASSIFIER_SCRIPT_HEREDOC}\n"),
@@ -1514,9 +1656,21 @@ mod tests {
             "systemctl daemon-reload\n".to_string(),
             "systemctl enable --now minimald-place.path\n".to_string(),
             "systemctl start minimald-place.service\n".to_string(),
+            "if ! command -v systemctl >/dev/null 2>&1 ; then\n".to_string(),
+            "systemctl reset-failed minimald-place.path".to_string(),
         ] {
             assert!(script.contains(&line), "the block runs {line:?}: {script}");
         }
+        // The step's own run is unconditional; only the unit pair waits on
+        // systemd, so a host without it still gets the tree and the table.
+        let (step_part, unit_part) = script
+            .split_once("if ! command -v systemctl")
+            .expect("the unit guard splits the block");
+        assert!(
+            step_part.contains("--user 'alice'\n") && !step_part.contains("systemctl"),
+            "the step runs before and outside the systemd guard: {step_part}"
+        );
+        assert!(unit_part.trim_end().ends_with("fi"), "{unit_part}");
         for absent in [
             "--pid",
             "--cohort-address",

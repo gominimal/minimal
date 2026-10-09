@@ -2815,6 +2815,12 @@ mod tests {
     /// postrouting chain's rules — the tree, the classify matches, the
     /// deny chain and every other byte are the same — so what the
     /// association loads is the translation and nothing else.
+    ///
+    /// This pins the *shape* of the two rulesets, not the act of loading
+    /// the second over the first: no association code exists yet, so the
+    /// test proves that the step's render with a pair is the un-enrolled
+    /// render plus two postrouting rules, which is what lets a later
+    /// association load the translation without touching the matches.
     #[test]
     fn association_applies_reserved_snat_without_classifier_reinstall() {
         let mount = standin_mount();
@@ -2851,6 +2857,54 @@ mod tests {
             strip(&unenrolled),
             strip(&associated),
             "nothing but the translation changes between the two renders"
+        );
+    }
+
+    /// The launch-before-placement window: a native daemon starts in its
+    /// starter's cgroup, outside the slice, and the placement unit moves it
+    /// in only once its socket is up. A host-address launch made in that
+    /// window must not record `per_box`: the probe's child cannot be placed
+    /// in the tree from outside it (the migration's common ancestor is the
+    /// hierarchy root this account cannot write), so the leg reads as
+    /// unplaced, the reading is inconclusive, and the decision the record
+    /// is written from is undecidable with the probe as its cause — never
+    /// `decided`. Modeled over a stand-in tree whose deny subtree refuses
+    /// the probe its leaf, the same refusal the kernel makes at the
+    /// ancestor; and NET-080's record reads the daemon's leaf live, so a
+    /// fetch in the window names no node-plane leaf either.
+    #[test]
+    fn launch_before_placement_reads_not_per_box() {
+        use std::os::unix::fs::PermissionsExt as _;
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping: root is not refused the probe's leaf by mode bits");
+            return;
+        }
+        let tree = tempfile::tempdir().expect("a temp dir standing in for the tree");
+        let root = tree.path();
+        installed_cohort(root);
+        let deny = root
+            .join(sandbox2::classifier::BOXES_DIR)
+            .join(Verdict::Deny.dir_name());
+        std::fs::set_permissions(&deny, std::fs::Permissions::from_mode(0o555))
+            .expect("the deny subtree refuses the probe its leaf");
+        let decision = decide(root, Some(&mountinfo(root, true)), false, || {
+            read_filter(root)
+        });
+        std::fs::set_permissions(&deny, std::fs::Permissions::from_mode(0o755))
+            .expect("the subtree is writable again for the temp dir's removal");
+        assert!(
+            !decision.can_decide_per_box(),
+            "a launch before the placement never reads per_box: {decision:?}"
+        );
+        assert_eq!(
+            decision.cause(),
+            Some(Cause::ProbeUnreadable),
+            "the unplaced probe is the cause the record carries: {decision:?}"
+        );
+        assert_eq!(
+            daemon_fetch_leaf(root),
+            None,
+            "a fetch in the window records no node-plane leaf for a daemon outside the tree"
         );
     }
 

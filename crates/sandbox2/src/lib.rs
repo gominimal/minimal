@@ -1039,7 +1039,7 @@ pub mod classifier {
     #[cfg(target_os = "linux")]
     #[must_use]
     pub fn install_hint() -> String {
-        "run: min finalize-install".to_string()
+        "min finalize-install".to_string()
     }
 
     /// Makes one level of the classifier layout, taking `AlreadyExists` as

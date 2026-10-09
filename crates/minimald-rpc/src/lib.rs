@@ -3351,7 +3351,7 @@ mod tests {
                  installed on this host. While it cannot, its host-address \
                  boxes run unenforced — whatever the boxes' declarations \
                  say. Install the classifier's privileged step with:\n  \
-                 run: min finalize-install"
+                 min finalize-install"
                     .to_string(),
             ),
             host_ip_enforcement: Some("none".into()),
@@ -3366,7 +3366,7 @@ mod tests {
             "the advisory names its cause in words, got: {json}",
         );
         assert!(
-            json.contains("run: min finalize-install"),
+            json.contains("min finalize-install"),
             "the step's cause names the exact command that installs it, got: {json}",
         );
         assert_eq!(round_trip(&step_missing), step_missing);

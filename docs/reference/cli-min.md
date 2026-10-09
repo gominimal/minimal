@@ -590,8 +590,9 @@ that user, and exits 1. `--show` still prints.
 
 `--undo` works without a daemon, and it succeeds on a host that holds none of
 the install. It removes the user-namespace profile, the classifier tree with
-its placement unit and step copy, and the group membership the step added. It also removes the box-name service and
-its program copy, the resolver hook, and on macOS the local range unit.
+its placement unit and step copy, and the group membership the step added.
+It also removes the box-name service and its program copy, the resolver
+hook, and on macOS the local range unit.
 The local range addresses on macOS stay on the loopback until the next boot.
 `install.sh --uninstall` points at `min finalize-install --undo` while any of
 these host files remain.

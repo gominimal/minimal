@@ -9,6 +9,10 @@
 //! `crates/` and fails on any of the retired spellings, wherever they are —
 //! a remedy string, a fixture that pins one, or a doc comment that
 //! recommends one.
+//!
+//! The `common` crate is outside the darwin-native scope `just test` runs,
+//! so on macOS this gate runs only through `just test-cross`; the Linux
+//! lanes run it natively.
 
 use std::path::{Path, PathBuf};
 

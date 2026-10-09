@@ -485,11 +485,18 @@ readonly PROC=${MINIMAL_OVERRIDE_PROC:-/proc}
 # could write any pid into. Only the delegated account's own processes are
 # placed: root moving a process of uid U into a cgroup delegated to U gives
 # U nothing it does not already own, and nothing of anyone else's is ever
-# moved. A socket nobody holds is nothing to place and exits 0: the unit
-# fires on the socket's removal too, and that is not a failure.
+# moved. And only a process standing OUTSIDE the slice is moved: a box runs
+# as the same account and could bind a socket spelled like the listener,
+# so a holder already anywhere under the slice — a box in its leaf first of
+# all — is left where it is, because moving it into the daemon's leaf would
+# lift it out of its verdict (design §4.1: a box's placement is
+# inescapable, by root's hand as much as its own). A socket nobody holds is
+# nothing to place and exits 0: the unit fires on the socket's removal too,
+# and that is not a failure.
 place_listener() {
     verify_mount
     resolve_owner
+    compute_cgroup_paths
     procs="$tree_root/$DAEMON_LEAF/cgroup.procs"
     [ -e "$procs" ] ||
         die "$tree_root/$DAEMON_LEAF is not installed (run: sudo $0 --user <the account minimald runs as>)"
@@ -503,21 +510,24 @@ place_listener() {
         note "nobody holds $listener: nothing to place"
         return 0
     fi
+    # The holders, one pass over every fd table per inode (find walks it
+    # without a fork per descriptor; the unit runs this as root on every
+    # start, so the scan must be cheap). A daemon that restarts while the
+    # scan runs is a holder that vanishes under it, and the manager does
+    # not watch the path while the oneshot is active, so a vanished holder
+    # is noted, never fatal, and a socket whose holder was not found is
+    # looked for once more after a moment before it reads as unheld.
+    holders="$(listener_holders)"
+    if [ -z "$holders" ]; then
+        sleep 1
+        holders="$(listener_holders)"
+        note "no holder of $listener was found on the first pass; scanned again"
+    fi
     placed=0
-    for dir in "$PROC"/[0-9]*; do
-        [ -d "$dir/fd" ] || continue
-        holder_pid=${dir##*/}
-        holds=
-        for fd in "$dir"/fd/*; do
-            target="$(readlink "$fd" 2>/dev/null)" || continue
-            for inode in $inodes; do
-                [ "$target" = "socket:[$inode]" ] && holds=1
-            done
-            [ -n "$holds" ] && break
-        done
-        [ -n "$holds" ] || continue
+    for holder_pid in $holders; do
+        dir="$PROC/$holder_pid"
         # The real uid, the first of the four status reports.
-        holder_uid="$(awk '$1 == "Uid:" { print $2 }' "$dir/status" 2>/dev/null)"
+        holder_uid="$(awk '$1 == "Uid:" { print $2 }' "$dir/status" 2>/dev/null || true)"
         if [ "$holder_uid" != "$owner_uid" ]; then
             note "left $holder_pid alone: it holds $listener but runs as uid ${holder_uid:-?}, not the delegated account $owner_uid"
             continue
@@ -527,12 +537,43 @@ place_listener() {
             placed=$((placed + 1))
             continue
         fi
-        printf '%s\n' "$holder_pid" >"$procs" ||
-            die "cannot place $holder_pid in $procs"
-        note "placed $holder_pid in $tree_root/$DAEMON_LEAF (it holds $listener)"
-        placed=$((placed + 1))
+        # Where the holder stands now, as the kernel states it (the unified
+        # hierarchy's one "0::" line). Unreadable is unknown, and unknown
+        # is not moved.
+        holder_cgroup="$(awk -F: '$1 == "0" { print $3 }' "$dir/cgroup" 2>/dev/null || true)"
+        if [ -z "$holder_cgroup" ]; then
+            note "left $holder_pid alone: it holds $listener but its cgroup could not be read"
+            continue
+        fi
+        case "$holder_cgroup" in
+        "/$rel" | "/$rel/"*)
+            note "left $holder_pid alone: it holds $listener but already stands inside the slice at $holder_cgroup, and nothing under $rel is ever moved"
+            continue
+            ;;
+        esac
+        if printf '%s\n' "$holder_pid" >"$procs" 2>/dev/null; then
+            note "placed $holder_pid in $tree_root/$DAEMON_LEAF (it holds $listener)"
+            placed=$((placed + 1))
+        else
+            note "could not place $holder_pid in $procs: it has gone, or is not a process root may move"
+        fi
     done
     [ "$placed" -gt 0 ] || note "no process of uid $owner_uid holds $listener: nothing to place"
+}
+
+# listener_holders — the pids whose fd tables carry one of $inodes, found by
+# one find per inode over every process's fd directory (the pid is the path
+# component after $PROC), each printed once. The brackets are escaped: a
+# find -lname pattern is a glob.
+listener_holders() {
+    for inode in $inodes; do
+        find "$PROC"/[0-9]*/fd -lname "socket:\\[$inode\\]" 2>/dev/null
+    done | awk -v proc="$PROC/" '
+        index($0, proc) == 1 {
+            rest = substr($0, length(proc) + 1)
+            split(rest, part, "/")
+            if (!(part[1] in seen)) { seen[part[1]] = 1; print part[1] }
+        }'
 }
 
 # The cgroups' paths as the packet filter spells them: relative to the

@@ -2034,13 +2034,17 @@ still vouches for the table it loaded" \
     # --- --place-listener: the same placement, found from the daemon's own
     # listener so a manager-held path unit can make it at every start the
     # socket announces (no per-restart --pid). Over a stand-in process table:
-    # the holder of the socket that runs as the delegated account is placed,
-    # a holder of another uid and a holder of another socket are left alone,
-    # a second run is idempotent, and a socket nobody holds is nothing to
-    # place rather than a failure.
+    # the holder of the socket that runs as the delegated account outside
+    # the slice is placed; a holder of another uid, a holder of another
+    # socket, a same-uid holder already inside the slice (a box in
+    # boxes/deny that bound a socket spelled like the listener), and a
+    # holder whose cgroup cannot be read are left alone; a second run is
+    # idempotent; and a socket nobody holds is nothing to place rather than
+    # a failure.
     fproc="$root/proc"; rm -rf "$fproc"
     lsock="$root/state/providers/local-minimald0/ssh.sock"
-    mkdir -p "$fproc/net" "$fproc/4242/fd" "$fproc/4243/fd" "$fproc/4244/fd"
+    mkdir -p "$fproc/net" "$fproc/4242/fd" "$fproc/4243/fd" "$fproc/4244/fd" \
+        "$fproc/4245/fd" "$fproc/4246/fd"
     {
         printf 'Num       RefCount Protocol Flags    Type St Inode Path\n'
         printf '0000 00000002 00000000 00010000 0001 01 777 %s\n' "$lsock"
@@ -2052,6 +2056,17 @@ still vouches for the table it loaded" \
     printf 'Name:\tother\nUid:\t0\t0\t0\t0\n' >"$fproc/4243/status"
     ln -s 'socket:[778]' "$fproc/4244/fd/3"
     printf 'Name:\tother\nUid:\t%s\t%s\t%s\t%s\n' "$me" "$me" "$me" "$me" >"$fproc/4244/status"
+    for p in 4242 4243 4244; do
+        printf '0::/user.slice/user-%s.slice/session-1.scope\n' "$me" >"$fproc/$p/cgroup"
+    done
+    # A box: the delegated account, the listener's own path string, but
+    # already placed in a deny leaf under the slice.
+    ln -s 'socket:[777]' "$fproc/4245/fd/7"
+    printf 'Name:\tbash\nUid:\t%s\t%s\t%s\t%s\n' "$me" "$me" "$me" "$me" >"$fproc/4245/status"
+    printf '0::/minimald.slice/boxes/deny/box-1\n' >"$fproc/4245/cgroup"
+    # A holder whose cgroup cannot be read: unknown, so not moved.
+    ln -s 'socket:[777]' "$fproc/4246/fd/7"
+    printf 'Name:\tminimald\nUid:\t%s\t%s\t%s\t%s\n' "$me" "$me" "$me" "$me" >"$fproc/4246/status"
     : >"$tree/daemon/cgroup.procs"
     HC_PROC="$fproc"
     run_hc place_listener "$root/mi-on" --user "$me" --place-listener "$lsock"
@@ -2061,6 +2076,16 @@ still vouches for the table it loaded" \
     want_err "a holder of another uid is left alone" grep -qx 4243 "$tree/daemon/cgroup.procs"
     want_ok "the placement says what it left alone and why" grep -q "left 4243 alone" "$OUT"
     want_err "a holder of another socket is not placed" grep -qx 4244 "$tree/daemon/cgroup.procs"
+    want_err "a same-uid holder inside boxes/deny is never moved" \
+        grep -qx 4245 "$tree/daemon/cgroup.procs"
+    want_ok "the placement says the box stands inside the slice" \
+        grep -q "left 4245 alone: .*inside the slice at /minimald.slice/boxes/deny/box-1" "$OUT"
+    want_err "a holder whose cgroup cannot be read is not moved" \
+        grep -qx 4246 "$tree/daemon/cgroup.procs"
+    want_ok "the placement says the cgroup could not be read" \
+        grep -q "left 4246 alone: .*cgroup could not be read" "$OUT"
+    want_ok "exactly one holder was placed" \
+        [ "$(grep -c . "$tree/daemon/cgroup.procs")" -eq 1 ]
     run_hc place_listener_again "$root/mi-on" --user "$me" --place-listener "$lsock"
     check 0 "$rc" "a second --place-listener exits 0"
     want_ok "the second run finds the daemon already placed" grep -q "already in" "$OUT"
@@ -2070,6 +2095,18 @@ still vouches for the table it loaded" \
     run_hc place_listener_nobody "$root/mi-on" --user "$me" --place-listener "$lsock"
     check 0 "$rc" "--place-listener over a socket nobody holds exits 0"
     want_ok "nobody holding it is nothing to place, said so" grep -q "nothing to place" "$OUT"
+    want_err "an unbound socket is not scanned twice" grep -q "scanned again" "$OUT"
+    # A listed inode whose holder is not in any fd table (it vanished under
+    # the scan): one more pass after a moment, then nothing to place, and
+    # still not a failure.
+    {
+        printf 'Num       RefCount Protocol Flags    Type St Inode Path\n'
+        printf '0000 00000002 00000000 00010000 0001 01 779 %s\n' "$lsock"
+    } >"$fproc/net/unix"
+    run_hc place_listener_vanished "$root/mi-on" --user "$me" --place-listener "$lsock"
+    check 0 "$rc" "--place-listener over a socket whose holder vanished exits 0"
+    want_ok "the vanished holder is looked for once more" grep -q "scanned again" "$OUT"
+    want_ok "and then it is nothing to place" grep -q "nothing to place" "$OUT"
     HC_PROC=
     : >"$tree/daemon/cgroup.procs"
 
