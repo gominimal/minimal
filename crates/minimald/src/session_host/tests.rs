@@ -3990,7 +3990,7 @@ async fn a_guests_refused_host_address_box_is_refused_and_not_advised() {
 /// No lane that builds this crate can produce that tree: the kernel alone
 /// makes a cgroup's `cgroup.procs` appear at a `mkdir`, and over a stand-in
 /// tree the placement probe fails on exactly that file by design (pinned in
-/// sandbox's own proof), so a launch-driven placed-guest box exists only on
+/// `sandbox`'s own proof), so a launch-driven placed-guest box exists only on
 /// a microVM image that built its tree and skipped its table. Rather than
 /// skip on every lane, this proof runs the placed box's assertions where the
 /// launch decides them, on every host: the outcome its placed leaf records,

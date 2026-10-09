@@ -39,15 +39,18 @@ this information stays current.
 
 ## Naming: box, Box Type, sandbox
 
-Use these terms in code, comments, docs and commit messages:
+Use these terms in code, comments, docs and commit messages. The BOX spec
+([docs/specs/29-spec-box-local-first](docs/specs/29-spec-box-local-first/29-spec-box-local-first.md))
+plans the box model they describe. That spec defines the Box Types and the
+spec settings. Today the tree has `BoxId` and `BoxRecord`, and `minimald`
+still branches on session or task. The rest of this section is the target
+for new code.
 
 - A **box** is the thing itself: its record, id, state, lifecycle, events,
-  spec and processes. Code about the box says box: `BoxId`, `BoxRecord`,
-  `BoxState`, `BoxSpec`.
-- **session**, **task**, **agent**, **service**, **build** and
-  **container-build** are **Box Type** names. Each names a kind of box, never
-  the box itself. `min session` and `min task` are type-filtered forms of the
-  box commands.
+  spec and processes. Code about the box says box, as `BoxId` and
+  `BoxRecord` do.
+- A **Box Type** names a kind of box, never the box itself. session and task
+  are Box Types. The BOX spec lists the rest.
 - A **sandbox** is the operating-system isolation (namespaces, mounts,
   cgroups) that boxes and package builds both run in: the `sandbox` crate.
 - A **Box Host** is the machine that hosts boxes. Give a module or type that
@@ -62,10 +65,11 @@ Rules that follow from these:
   printed and environment names say session because a spec keeps them for
   compatibility. Those keep their serialised name, and the Rust name says box
   with a serde `rename` or `alias`.
-- A box's behaviour follows the settings in its spec (`lifetime`,
-  `pty_enabled`, `timeout`, the network mode), never its Box Type name. Only
-  the code that resolves Box Types reads a type name. A new type, built in or
-  declared by a project, then works with the code paths that exist.
+- Under the BOX spec, a box's behaviour follows the settings in its spec:
+  its lifetime, PTY, timeout and network mode. It never follows the Box Type
+  name. Only the code that resolves Box Types reads a type name. Until
+  then, do not add new branching on session versus task where a setting can
+  carry the difference.
 - New files, modules and types about the box take box names from the start.
   Rename code that still says session for the box in a pull request of its
   own. Never mix a rename into a move or a feature change.

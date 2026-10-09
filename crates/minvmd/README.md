@@ -24,7 +24,7 @@ Prereqs:
 - `brew install slp/krun/libkrun` — third-party tap; required by minvmd.
 - The `minimal` shim on `PATH` (`~/.minimal/shim/bin/minimal`). On macOS,
   `materialize` runs `minimal` inside a Linux VM; a from-source macOS build
-  cannot run the build pipeline (sandbox is Linux-only).
+  cannot run the build pipeline (the `sandbox` crate is Linux-only).
 
 ```sh
 # 1. Materialize the kernel + GENERIC guest rootfs INTO THE REPO.

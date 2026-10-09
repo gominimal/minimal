@@ -35,7 +35,7 @@ pub enum Error {
         code: i32,
         reason: String,
         stderr: String,
-        /// Last ~4 KiB of stdout (captured by sandbox alongside stderr).
+        /// Last ~4 KiB of stdout (captured by `sandbox` alongside stderr).
         /// Useful when build scripts redirect stderr away (e.g.
         /// `pip install ... 2>/dev/null || true`) and the real
         /// diagnostic only appears on stdout.

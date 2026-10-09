@@ -377,7 +377,7 @@ impl EnvChannel<'_> {
                     Some(&task.vars),
                     task.packages.clone(),
                     // A nested `min task` inside a bound-dir sandbox: paths
-                    // are mirrored one-for-one and sandbox gave this process
+                    // are mirrored one-for-one and `sandbox` gave this process
                     // the outer environment's `HOME`, so the ambient home is
                     // the outer home, which is the one `~/` meant all along.
                     PatchHome::Ambient,
@@ -765,7 +765,7 @@ pub enum PatchHome {
     ///
     /// The right answer for `mip` run by a developer: the sandbox mirrors
     /// host paths one-for-one (`WdSetup::BoundDir`), so the home a package
-    /// means by `~` *is* the invoking user's, and sandbox synthesizes the
+    /// means by `~` *is* the invoking user's, and `sandbox` synthesizes the
     /// same home into the sandbox's passwd. An unset `HOME` leaves no home at
     /// all, which is an error for a `~/`-rooted mapping and fine for anything
     /// else.
@@ -860,7 +860,7 @@ impl<'a> Env<'a> {
                 declared_by(&fs_mapping_packages, &e.declared, args.name)
             ))
         })?;
-        // Expanded path → the declaration(s) behind it. sandbox only ever
+        // Expanded path → the declaration(s) behind it. `sandbox` only ever
         // sees the expanded form, so its fs-mapping failures name a path
         // nobody wrote down; this puts the `~/`-rooted declaration back
         // into the message. A path can carry more than one declaration (a
@@ -1225,7 +1225,7 @@ mod tests {
     }
 
     /// A task's `patch` table still applies under the session layout: every
-    /// mapping reaches sandbox with its declared mode, a mapping inside the
+    /// mapping reaches `sandbox` with its declared mode, a mapping inside the
     /// session home or tree is retargeted under `/home` or `/workbench`, and
     /// any other absolute path (a host socket) keeps its own path.
     #[test]
