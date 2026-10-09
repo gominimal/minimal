@@ -831,6 +831,13 @@ pub(crate) async fn activate_session(
                         .and_then(|registration| registration.box_id),
                 )
                 .await;
+                // The host's user-namespace refusal (NET-141) is the
+                // daemon's verdict on this machine, not an RPC failure: it
+                // already names the cause and the remedy, so it is printed
+                // verbatim, with no session created for it to leave behind.
+                if minimald_rpc::is_user_namespace_refusal(&error) {
+                    bail!("{error}");
+                }
                 bail!("CreateSession failed: {error}");
             }
         }

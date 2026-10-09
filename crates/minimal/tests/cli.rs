@@ -1120,6 +1120,74 @@ async fn activate_prints_no_session_id_when_composition_fails() {
     );
 }
 
+/// A host whose user-namespace verdict refuses the sandbox fails the
+/// activation before any session exists (NET-141): the daemon refuses the
+/// create on its verdict, and `min session activate` prints that refusal
+/// verbatim — the cause, and `min finalize-install` with its `--show`
+/// preview as the remedy, never a sysctl — exits 1, and leaves no session
+/// behind. Driven through the compiled binary because the exact stderr and
+/// the exit status are the contract; the daemon is this process's harness,
+/// so its verdict is set here and cleared on the way out.
+#[tokio::test]
+async fn activate_refuses_unconfinable_sandbox_before_session_creation() {
+    let (daemon, args) = setup().await;
+    let minimal_dir = args.minimal_dir.clone().expect("setup points at a tempdir");
+
+    let project = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir(project.path().join(".git")).unwrap();
+    std::fs::write(
+        project.path().join("minimal.toml"),
+        "# test minimal.toml\n[stack]\nuse = \"shell\"\n",
+    )
+    .unwrap();
+    let project_canon = project.path().canonicalize().unwrap();
+    let config_dir = tempfile::TempDir::new().unwrap();
+
+    minimald::session_host::set_user_namespace_verdict(Some(
+        minimald::session_host::UsernsRestriction::ApparmorUnconfined,
+    ));
+    let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_min"))
+        .args(["--minimal-dir".as_ref(), minimal_dir.as_os_str()])
+        .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
+        .arg("--no-input")
+        .args(["session", "activate"])
+        .arg(&project_canon)
+        .args(["--name", "refused-sandbox", "--sync", "tarball"])
+        .arg("--no-prompt")
+        .output()
+        .await
+        .expect("the min binary should be invocable");
+    minimald::session_host::set_user_namespace_verdict(None);
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a refused activation exits 1: stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        stdout.trim().is_empty(),
+        "a refused activation puts nothing on stdout, got: {stdout}"
+    );
+    assert_eq!(
+        stderr.trim_end(),
+        "error: this machine blocks the private sandbox every box runs in (Ubuntu restricts \
+         unprivileged user namespaces), so no box can start here yet.\n\
+         Finish the install to allow it for Minimal only: min finalize-install   \
+         (see what it changes first: min finalize-install --show)"
+    );
+
+    // Nothing was created for the refusal to leave behind.
+    let mut client = daemon.server.connect().await;
+    let resp = client.call::<minimald_rpc::ListSessions>(&()).await;
+    assert!(
+        resp.sessions.is_empty(),
+        "a refused activation must leave no session behind, got: {:?}",
+        resp.sessions
+    );
+}
+
 /// Plain-mode tracing warnings must land on stderr, never stdout: a script
 /// piping `min loadout list` captures the table on stdout, and a `warning:`
 /// line mixed into it would corrupt that output. Driven through the compiled

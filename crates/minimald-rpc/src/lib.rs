@@ -141,6 +141,42 @@ pub fn version_skew_message(cli: &str, daemon: &str) -> Option<String> {
     })
 }
 
+/// The remedy every user-namespace refusal names (NET-141): the install
+/// step that loads the profile allowing the namespace for Minimal alone.
+/// Never `sudo sysctl`: a sysctl typed by hand turns the protection off for
+/// every program, is lost at boot, and leaves the install's record unchanged,
+/// so the next start would advise it again.
+pub const USER_NAMESPACE_REMEDY: &str = "Finish the install to allow it for Minimal only: \
+    min finalize-install   (see what it changes first: min finalize-install --show)";
+
+/// How a user-namespace refusal opens — the lead the client recognises a
+/// refused create by, so it prints the refusal verbatim instead of wrapping
+/// it as an RPC failure.
+const USER_NAMESPACE_REFUSAL_LEAD: &str =
+    "this machine blocks the private sandbox every box runs in (";
+
+/// The operator-facing refusal a create answers when the host's
+/// user-namespace verdict refuses the sandbox (NET-141): the cause clause,
+/// then the remedy on its own line.
+///
+/// Lives in the wire crate because the daemon spells it — it is the side
+/// that read the host — and the client decides by its lead
+/// ([`is_user_namespace_refusal`]) that the reply is this refusal rather
+/// than any other create failure.
+#[must_use]
+pub fn user_namespace_refusal(cause: &str) -> String {
+    format!(
+        "{USER_NAMESPACE_REFUSAL_LEAD}{cause}), so no box can start here yet.\n\
+         {USER_NAMESPACE_REMEDY}"
+    )
+}
+
+/// Whether a create's error is a [`user_namespace_refusal`].
+#[must_use]
+pub fn is_user_namespace_refusal(error: &str) -> bool {
+    error.starts_with(USER_NAMESPACE_REFUSAL_LEAD)
+}
+
 /// An RPC to list sessions managed by this minimald.
 pub struct ListSessions;
 
@@ -3238,6 +3274,29 @@ mod tests {
             msg.contains(SKEW_OVERRIDE_VAR),
             "missing the override: {msg}"
         );
+    }
+
+    /// A user-namespace refusal names its cause, ends on the install step
+    /// and its `--show` preview, and never the sysctl that would switch the
+    /// protection off for every program (NET-141).
+    #[test]
+    fn user_namespace_refusal_names_the_cause_and_the_install_step() {
+        let msg = user_namespace_refusal("Ubuntu restricts unprivileged user namespaces");
+        assert_eq!(
+            msg,
+            "this machine blocks the private sandbox every box runs in (Ubuntu restricts \
+             unprivileged user namespaces), so no box can start here yet.\n\
+             Finish the install to allow it for Minimal only: min finalize-install   \
+             (see what it changes first: min finalize-install --show)"
+        );
+        assert!(
+            !msg.contains("sysctl"),
+            "the remedy must never be a sysctl: {msg}"
+        );
+        assert!(is_user_namespace_refusal(&msg));
+        assert!(!is_user_namespace_refusal(
+            "A session with that name already exists"
+        ));
     }
 
     /// A `SessionConfig` from a client that predates `hooks_enabled`

@@ -3262,6 +3262,38 @@ pub(crate) fn clear_host_ip_enforcement_fact() {
     fact.cause = None;
 }
 
+/// The host's verdict on the unprivileged user namespace every session
+/// sandbox starts by unsharing, as [`sandbox2::user_namespaces_restriction`]
+/// read it from the daemon's own process at start-up (NET-141). Re-exported
+/// so the crates that set it name the verdict without a `sandbox2`
+/// dependency of their own.
+pub use sandbox2::UsernsRestriction;
+
+/// The verdict cell: `None`, the state of a daemon that found no restriction
+/// (or has not read its host yet), lets a create through; a restriction
+/// refuses every create before anything is allocated. Seeded by the daemon
+/// binary's start-up read, the one place the probe is meaningful — the
+/// sandbox child is forked from this process, so this process's own label
+/// is what the kernel checks — and by a test that stands in for it.
+static USER_NAMESPACE_VERDICT: std::sync::Mutex<Option<UsernsRestriction>> =
+    std::sync::Mutex::new(None);
+
+/// Sets the host's user-namespace verdict. `pub` because the start-up read
+/// is the daemon binary's (`main`), and because the CLI's integration tests
+/// drive an in-process daemon through it.
+pub fn set_user_namespace_verdict(verdict: Option<UsernsRestriction>) {
+    *USER_NAMESPACE_VERDICT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = verdict;
+}
+
+/// The verdict as it stands, copied out for the create that decides on it.
+pub(crate) fn user_namespace_verdict() -> Option<UsernsRestriction> {
+    *USER_NAMESPACE_VERDICT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// The per-box egress enforcement a session's display surfaces show
 /// (NET-079): the box's own launch record — what the launch that produced
 /// this box decided about it, `per_box` if it placed the box in a classifier

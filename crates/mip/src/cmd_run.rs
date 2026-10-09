@@ -250,30 +250,14 @@ pub async fn run_task(
     // an unconfined mip) that denial otherwise surfaces only when the first
     // spawn dies writing /proc/self/uid_map, with nothing useful in the log.
     // Warn once at the start of the first task run instead, with the fix.
+    // The fix is the install step that allows the namespace for Minimal
+    // alone — never a sysctl, which would switch the protection off for
+    // every program and be lost at boot.
     if let Some(restriction) = sandbox2::user_namespaces_restriction() {
-        let fix = match restriction {
-            sandbox2::UsernsRestriction::ApparmorUnconfined => {
-                let bin = std::env::current_exe()
-                    .ok()
-                    .and_then(|p| p.to_str().map(str::to_owned))
-                    .unwrap_or_else(|| "<path to this mip binary>".to_string());
-                format!(
-                    "attach the minimald AppArmor profile to mip (one-time, needs root): \
-                     sudo scripts/install-apparmor-profile.sh --path {bin} \
-                     (from a checkout; or use the sysctl workaround)"
-                )
-            }
-            sandbox2::UsernsRestriction::Disabled => {
-                "re-enable user namespaces, e.g. sudo sysctl -w user.max_user_namespaces=15000"
-                    .to_string()
-            }
-            // `UsernsRestriction` is #[non_exhaustive]; future variants get
-            // the docs pointer until a matching remediation lands here.
-            _ => "see the linux-host-setup doc".to_string(),
-        };
         warn!(
             reason = %restriction,
-            fix,
+            fix = "finish the install to allow it for Minimal only: min finalize-install \
+                   (see what it changes first: min finalize-install --show)",
             docs = "https://docs.minimal.dev/reference/linux-host-setup",
             "builds will fail to start: this host refuses the unprivileged user \
              namespace every build sandbox needs"

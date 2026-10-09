@@ -331,6 +331,25 @@ async fn serve_create_session(
                 return Ok(Errorable::Err { error: message });
             }
 
+            // The user-namespace gate (NET-141): a host that refuses the
+            // unprivileged user namespace every session sandbox starts by
+            // unsharing would otherwise mint a session whose first attach
+            // dies writing /proc/self/uid_map, with the cause in this log
+            // alone. Refused here, before the manager allocates anything,
+            // so the activation fails on a reply that names the cause and
+            // the remedy, and nothing is left behind for its caller to tear
+            // down.
+            if let Some(restriction) = crate::session_host::user_namespace_verdict() {
+                tracing::warn!(
+                    reason = %restriction,
+                    "session create refused: this host refuses the unprivileged user \
+                     namespace every session sandbox needs"
+                );
+                return Ok(Errorable::Err {
+                    error: minimald_rpc::user_namespace_refusal(user_namespace_cause(restriction)),
+                });
+            }
+
             let mngr = s.sessions_manager().await;
             // Read the name off the config before it is handed to the
             // manager: the success record below needs it, and the reply
@@ -501,6 +520,22 @@ async fn serve_create_session(
 /// removed whatever the session's network mode, and whatever value it
 /// carries.
 const HOST_IP_ENFORCEMENT_ATTR: &str = "host_ip_enforcement";
+
+/// The cause clause a user-namespace refusal carries (NET-141): the host's
+/// restriction in the words the person reads, never the sysctl that would
+/// lift it for every program.
+fn user_namespace_cause(restriction: crate::session_host::UsernsRestriction) -> &'static str {
+    use crate::session_host::UsernsRestriction;
+    match restriction {
+        UsernsRestriction::ApparmorUnconfined => "Ubuntu restricts unprivileged user namespaces",
+        UsernsRestriction::Disabled => {
+            "user namespaces are switched off: user.max_user_namespaces=0"
+        }
+        // `UsernsRestriction` is #[non_exhaustive]; a future variant is
+        // still a refusal, named as such until its own clause lands here.
+        _ => "this host restricts unprivileged user namespaces",
+    }
+}
 
 /// The advisory a cause yields for the reply (NET-079): the cause in words,
 /// the state it leaves the box in, and — only when the cause is one the
@@ -5250,6 +5285,67 @@ mod tests {
             "a guest refuses a deny-all box on every cause, so its advisory \
              must not claim the declarations do not matter, got: {guest}"
         );
+    }
+
+    /// The user-namespace gate (NET-141): a host whose verdict refuses the
+    /// sandbox refuses the create itself, and the reply carries the verdict
+    /// — the cause in words and `min finalize-install` as the remedy, never
+    /// a sysctl — with nothing allocated for a caller to tear down. The
+    /// guard is held across the awaited creates because the verdict is
+    /// process-global: under libtest a create driven by another test would
+    /// be refused over a verdict this test set.
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "the verdict is process-global, so the guard must span the awaited \
+                  creates it is held for"
+    )]
+    #[tokio::test]
+    async fn create_reply_carries_user_namespace_verdict() {
+        let _verdict_window = PROBE_TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+
+        for (verdict, cause) in [
+            (
+                crate::session_host::UsernsRestriction::ApparmorUnconfined,
+                "Ubuntu restricts unprivileged user namespaces",
+            ),
+            (
+                crate::session_host::UsernsRestriction::Disabled,
+                "user.max_user_namespaces=0",
+            ),
+        ] {
+            crate::session_host::set_user_namespace_verdict(Some(verdict));
+            let refused = client.call::<CreateSession>(&req("refused", "/uwu")).await;
+            crate::session_host::set_user_namespace_verdict(None);
+            let error = refused
+                .err()
+                .expect("a create under a refusing verdict must be refused");
+            assert!(
+                minimald_rpc::is_user_namespace_refusal(&error),
+                "the refusal must be the user-namespace one, got: {error}"
+            );
+            assert!(error.contains(cause), "missing the cause: {error}");
+            assert!(
+                error.contains("min finalize-install --show"),
+                "missing the remedy and its preview: {error}"
+            );
+            assert!(
+                !error.contains("sysctl"),
+                "a sysctl is never the remedy: {error}"
+            );
+            assert!(
+                client.call::<ListSessions>(&()).await.sessions.is_empty(),
+                "a refused create must not have allocated a session"
+            );
+        }
+
+        // With no restriction the create goes through as it always did.
+        client
+            .call::<CreateSession>(&req("allowed", "/uwu"))
+            .await
+            .ok()
+            .expect("an unrestricted host must create");
     }
 
     /// The version gate, made by the RPC the activation path already sends
