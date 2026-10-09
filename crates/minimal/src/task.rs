@@ -727,7 +727,7 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
                     config.name = Some(task_session_name(&args.task, &crate::random_hex4()));
                     continue;
                 }
-                bail!("CreateSession failed: {error}");
+                bail!("{error}");
             }
         }
     };

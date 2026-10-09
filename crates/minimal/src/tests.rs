@@ -1742,6 +1742,40 @@ fn both_creators_share_the_composition_failure_message() {
     }
 }
 
+/// A daemon refusal is printed in the daemon's own words. The RPC's name
+/// is the wire's vocabulary, not the person's, so no creator, verdict
+/// submitter, finalizer or renamer may prefix the daemon's error with
+/// it. Asserted over the function bodies, the way the composition
+/// message is, because the prefix had crept into five sites across three
+/// files before anyone noticed it on a terminal.
+#[test]
+fn daemon_refusals_print_without_rpc_names() {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    for (file, func) in [
+        ("src/cmd/session.rs", "activate_session"),
+        ("src/cmd/session.rs", "cmd_rename"),
+        ("src/task.rs", "cmd_task_run"),
+        ("src/cmd/mod.rs", "submit_verdict_and_wait"),
+        ("src/cmd/mod.rs", "upload_and_finalize"),
+    ] {
+        let text = std::fs::read_to_string(manifest.join(file)).expect("readable source");
+        let body =
+            function_body(&text, func).unwrap_or_else(|| panic!("{file} no longer defines {func}"));
+        for bare in [
+            "CreateSession failed",
+            "RenameSession failed",
+            "SubmitVerdict failed",
+            "SubmitVerdict faulted",
+            "FinalizeSession failed",
+        ] {
+            assert!(
+                !body.contains(bare),
+                "{func} still prefixes the daemon's refusal with an RPC name ({bare})"
+            );
+        }
+    }
+}
+
 /// A project outside a VCS root that declares lifecycle hooks must be
 /// detected as hook-carrying, so the headless activation path refuses
 /// rather than silently dropping the hooks with the skipped tree
