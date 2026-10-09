@@ -1170,12 +1170,22 @@ async fn activate_refuses_unconfinable_sandbox_before_session_creation() {
         stdout.trim().is_empty(),
         "a refused activation puts nothing on stdout, got: {stdout}"
     );
+    // The refusal is the error block itself, exactly: the activation's own
+    // progress lines (`Applying loadouts: ...`) precede it on stderr.
+    let refusal = stderr
+        .find("error: ")
+        .map(|at| stderr[at..].trim_end())
+        .unwrap_or_else(|| panic!("no error block on stderr: {stderr}"));
     assert_eq!(
-        stderr.trim_end(),
+        refusal,
         "error: this machine blocks the private sandbox every box runs in (Ubuntu restricts \
          unprivileged user namespaces), so no box can start here yet.\n\
          Finish the install to allow it for Minimal only: min finalize-install   \
          (see what it changes first: min finalize-install --show)"
+    );
+    assert!(
+        !stderr.contains("sysctl"),
+        "nothing on this path suggests a sysctl: {stderr}"
     );
 
     // Nothing was created for the refusal to leave behind.
