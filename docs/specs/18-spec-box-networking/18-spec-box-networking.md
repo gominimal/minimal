@@ -523,6 +523,10 @@ included, with every refusal logged (NET-001 to NET-004).
   tier:     T0
   verify:   cargo nextest run -p minimald own_ip_default_deny_all
   <!-- S9a/AC1; prose 47; feature+event; supersedes the shipped 03-spec R2.1 default of allow-all for absent `egress` fields; NET-076 binds the announcement window and NET-077 the opt-out -->
+  - WHERE the opt-out flag is not set, WHEN the user activates an own-address box with no `egress` section THE SYSTEM SHALL print one line that names the deny-all default and the flags that declare reach.
+    tier:   T0
+    verify: cargo nextest run -p minimal deny_all_in_force_note_printed
+    <!-- S9a/AC2; prose 48; optional-feature+event; the in-force note that replaces NET-076's announcement; the verify test is Linux-only (`#[cfg(target_os = "linux")]`), as it drives the compiled binary against a local daemon -->
 
 - **NET-075** WHERE the deny-all default is in force and the opt-out flag is not set, WHILE an own-address box has no `egress` section THE SYSTEM SHALL show `deny-all` in `min session policy`.
   tier:     T0
@@ -531,8 +535,8 @@ included, with every refusal logged (NET-001 to NET-004).
 
 - **NET-076** WHILE the deny-all default is announced but not yet in force THE SYSTEM SHALL print the coming change at activate.
   tier:     T0
-  verify:   cargo nextest run -p minimal deny_all_in_force_note_printed
-  <!-- S9a/AC2; prose 48; state-driven; interview decision; window ended: the default is in force as of the change that flips both phase constants, so the announcement is retired and the verify test pins that it no longer prints -->
+  verify:   cargo nextest run -p minimald own_ip_default_deny_all
+  <!-- S9a/AC2; prose 48; state-driven; interview decision; window ended: the default is in force as of the change that flips both phase constants, so this requirement's condition no longer holds; the verify test proves that, asserting the shipped phase is `InForce`; the note printed in force is NET-074's child requirement -->
 
 - **NET-077** WHERE the deny-all opt-out flag is set THE SYSTEM SHALL keep the shipped allow-all default for a box with no `egress` section.
   tier:     T0
