@@ -6655,7 +6655,11 @@ mod tests {
             },
             "the unit is withdrawn once its grace passes",
         );
-        assert_eq!(registry.live_switch_addrs(), 0);
+        // The drainer returns the addresses after it removes the rows.
+        wait_until(
+            || registry.live_switch_addrs() == 0,
+            "every address goes back once the grace passes",
+        );
     }
 
     fn register_carved_with_task_slots(
@@ -6777,7 +6781,11 @@ mod tests {
             || registry.table().is_empty(),
             "the box's row and its task rows go at its grace's end",
         );
-        assert_eq!(registry.live_switch_addrs(), 0);
+        // The drainer returns the addresses after it removes the rows.
+        wait_until(
+            || registry.live_switch_addrs() == 0,
+            "every address goes back at the grace's end",
+        );
     }
 
     /// NET-138: a box's task rows persist with it — reloaded with its row,
