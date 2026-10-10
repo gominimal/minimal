@@ -2015,8 +2015,9 @@ pub(crate) struct WorkspaceUploadInFlight(Option<crate::session::SessionHandle>)
 
 impl WorkspaceUploadInFlight {
     /// Marks the upload in flight. Refused, marking nothing, when the
-    /// session has already left `Draft`: an upload belongs to the create
-    /// flow, and one into a configured session's tree is not part of it.
+    /// session is no longer unconfigured: an upload belongs to the create
+    /// flow, ahead of the configure, and one into a composed or configured
+    /// session's tree is not part of it.
     pub(crate) async fn begin(handle: crate::session::SessionHandle) -> Result<Self, String> {
         handle
             .set_workspace_upload_in_flight(true)

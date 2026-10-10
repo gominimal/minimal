@@ -579,10 +579,12 @@ enum SessionMessage {
     /// [`Session::workspace_uploads_in_flight`]. The ack fires once the
     /// actor has applied the change, so a Begin is visible to an attach
     /// before the upload pulls its first byte. It carries whether the
-    /// change was applied: a Begin into a session that has left `Draft` is
-    /// refused, since an upload is part of the create flow only. `Draft`
-    /// here includes a session already composed and awaiting its verdict
-    /// (`Draft { pending: Some(_) }`), not only an unconfigured one.
+    /// change was applied: a Begin is refused unless the session is still
+    /// unconfigured (`Draft { pending: None }`), since an upload comes
+    /// before the configure in the create flow. One already composed and
+    /// awaiting its verdict is refused too: the upload would change the
+    /// tree under a composition already computed. `configure_loadout`
+    /// holds the other side, refusing while any upload is in flight.
     SetWorkspaceUploadInFlight(bool, oneshot::Sender<bool>),
     /// Register a live direct-tcpip forward relay as belonging to this
     /// session, so teardown takes it down too: a session that goes away
@@ -2098,7 +2100,7 @@ impl Session {
                     self.workspace_uploads_in_flight =
                         self.workspace_uploads_in_flight.saturating_sub(1);
                     true
-                } else if matches!(self.inner, SessionInner::Draft { .. }) {
+                } else if matches!(self.inner, SessionInner::Draft { pending: None }) {
                     self.workspace_uploads_in_flight += 1;
                     true
                 } else {
@@ -2239,6 +2241,16 @@ impl Session {
                 ));
             }
             SessionInner::Draft { pending: None } => {}
+        }
+        // Composing mid-upload would scaffold and resolve against a
+        // half-populated tree, and the session could then go `Active` with
+        // the upload still streaming into it.
+        if self.workspace_uploads_in_flight > 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::ResourceBusy,
+                "session is still receiving its workspace upload; retry once \
+                 the upload completes",
+            ));
         }
         let object = self.record.object().await?;
         let workspace_path = object.workspace_path();
@@ -5508,7 +5520,7 @@ impl SessionHandle {
     /// exactly one `false`. The reply is awaited — the actor's ack fires
     /// once the change is applied, so a `true` returns only once an attach
     /// racing the upload will see it. A dead actor maps to `NotConnected`;
-    /// a `true` into a session that has left `Draft` maps to
+    /// a `true` into a session that is no longer unconfigured maps to
     /// `PermissionDenied` and marks nothing.
     pub async fn set_workspace_upload_in_flight(
         &self,

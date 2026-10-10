@@ -610,6 +610,59 @@ async fn attach_while_a_real_workspace_upload_is_half_sent_is_refused_then_lands
     await_hello_echo(&mut channel, "an attach after the upload").await;
 }
 
+/// `ConfigureLoadout` is refused while a workspace upload streams, the same
+/// as the attach shortcut that runs it: composing mid-upload would scaffold
+/// against a half-populated tree and let the session go `Active` with the
+/// upload still landing. Once the upload has ended the same configure lands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn configure_while_a_workspace_upload_streams_is_refused() {
+    use crate::test_harness::{create_session_req, unwrap_ready};
+    use minimald_rpc::{ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, Errorable};
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let session_id = client
+        .call::<CreateSession>(&create_session_req("configure-mid-upload", "/uwu"))
+        .await
+        .unwrap()
+        .id;
+    let handle = server
+        .state
+        .sessions_manager()
+        .await
+        .get_session(crate::sessions::SessionKeyPredicate::Id(session_id))
+        .await
+        .unwrap()
+        .expect("session should resolve");
+    let paths = handle.paths().await.expect("paths should resolve");
+    let upload = crate::rpc::WorkspaceUploadInFlight::begin(handle)
+        .await
+        .expect("upload mark should land");
+
+    let request = ConfigureLoadoutRequest {
+        session_id,
+        contribution: Default::default(),
+    };
+    match client.call::<ConfigureLoadout>(&request).await {
+        Errorable::Err { error } => assert!(
+            error.contains("session is still receiving its workspace upload"),
+            "expected the in-flight-upload refusal, got: {error:?}"
+        ),
+        Errorable::Ok(_) => panic!("a configure mid-upload must be refused"),
+    }
+    assert!(
+        !paths
+            .working
+            .as_utf8_path()
+            .join(mfile::MFILE_NAME)
+            .exists(),
+        "a refused configure must not scaffold the workspace"
+    );
+
+    upload.finish().await.expect("upload mark should clear");
+    unwrap_ready(client.call::<ConfigureLoadout>(&request).await.unwrap());
+}
+
 /// Drives the full SSH path into the session host with the mock launcher:
 /// create a session, request a pty + shell, feed stdin, observe the echoed
 /// stdout, then confirm the host tears down when the process exits.
