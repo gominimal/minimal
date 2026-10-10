@@ -506,14 +506,14 @@ pub(crate) async fn submit_verdict_and_wait(
         minimald_rpc::Errorable::Ok(s) => s,
         minimald_rpc::Errorable::Err { error } => {
             send_abort(client, session_id).await;
-            bail!("SubmitVerdict failed: {error}");
+            bail!("{error}");
         }
     };
     match step {
         SessionStep::Materialized { id } => Ok(id),
         SessionStep::Fault { error } => {
             send_abort(client, session_id).await;
-            bail!("SubmitVerdict faulted: {error}");
+            bail!("{error}");
         }
     }
 }
@@ -734,8 +734,12 @@ pub(crate) async fn upload_and_finalize(
             }
             Ok(())
         }
+        // The stage in the client's words, the cause in the daemon's: a
+        // refusal here can be a bare OS string from the record write or
+        // the composition check, which says nothing about where the
+        // activation stopped.
         minimald_rpc::Errorable::Err { error } => {
-            bail!("FinalizeSession failed: {error}");
+            bail!("could not finish activating the session: {error}");
         }
     }
 }
