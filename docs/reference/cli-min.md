@@ -539,8 +539,12 @@ The script holds only what this host is missing from:
 - the AppArmor profile that allows user namespaces for the sandbox
 - names: the resolver link and the box-name service, plus the reserved local
   range on macOS
-- the classifier tree that enforces a host-address box's egress declaration:
-  today the step reports it, and the step that installs it follows
+- the classifier tree that enforces a host-address box's egress declaration.
+  The step keeps a root-owned copy of itself under `/usr/local/lib/minimal`.
+  A systemd boot unit re-installs the tree after a reboot. A path unit places
+  the daemon's listener in its leaf on every daemon start. An un-enrolled
+  host does not need a source identity for it. The classifier translates
+  nothing until an association adds the reserved addresses
 - membership of the `kvm` group, only when the configured provider is the
   Linux VM provider
 
@@ -585,10 +589,11 @@ already installed it, the command refuses before running anything, names
 that user, and exits 1. `--show` still prints.
 
 `--undo` works without a daemon, and it succeeds on a host that holds none of
-the install. It removes the user-namespace profile, the classifier tree, and
-the group membership the step added. A profile installed another way stays,
-with a note. It also removes the box-name service and
-its program copy, the resolver hook, and on macOS the local range unit.
+the install. It removes the user-namespace profile, the classifier tree with
+its units and step copy, and the group membership the step added. A profile
+or a classifier tree installed another way stays, with a note. It also removes the box-name
+service and its program copy, the resolver hook, and on macOS the local range
+unit.
 The local range addresses on macOS stay on the loopback until the next boot.
 `install.sh --uninstall` points at `min finalize-install --undo` while any of
 these host files remain.
