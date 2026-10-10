@@ -535,8 +535,9 @@ the hostname proxy serves box names. The host line that
 names, or `names: <box>.min.internal resolves in any browser on this machine`
 once this host resolves the zone natively. While any item is not done, the
 line ends with `; finish setup: min finalize-install`. When the proxy failed
-to bind, the cause replaces the resolution: `names: the hostname proxy is not
-serving — <cause>`, with the same clause after it when it applies. A session
+to bind, the cause replaces the resolution and the box stays named:
+`names: <box>.min.internal: the hostname proxy is not serving — <cause>`, with
+the same clause after it when it applies. A session
 start never prints or runs the privileged step.
 
 The script holds only what this host is missing from:

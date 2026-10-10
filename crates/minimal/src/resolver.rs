@@ -3988,10 +3988,11 @@ pub fn host_line(
 /// [`host_line`] beside a proxy-down cause (NET-020), in both of the
 /// line's forms: when the hostname proxy failed to bind — the VM host
 /// daemon's sibling cause, or a native daemon's own report — the cause
-/// replaces the resolution half, `names: the hostname proxy is not serving
-/// — <cause>`, whatever the surface verdict says, because a name the line
-/// claims resolves while the proxy is down is the claim a failing lookup
-/// contradicts first. The install clause is still the verdict's: a host
+/// replaces the resolution half, `names: <box>.min.internal: the hostname
+/// proxy is not serving — <cause>`, whatever the surface verdict says — the
+/// box stays named, the cause says why its name is not routed — because a
+/// name the line claims resolves while the proxy is down is the claim a
+/// failing lookup contradicts first. The install clause is still the verdict's: a host
 /// whose native DNS is deployed and whose every item is done has nothing
 /// to finish, proxy down or not.
 #[must_use]
@@ -4003,18 +4004,21 @@ pub fn host_line_beside(
     proxy_cause: Option<&str>,
 ) -> String {
     let name = format!("{box_name}.{ZONE}");
+    // The not-serving arms keep the box named: the line's contract is one
+    // host line naming the box, and a reader whose proxy is down is the one
+    // who most needs to know which name the cause is about.
     let names = match (proxy_cause, surface) {
-        (Some(cause), _) => format!("the hostname proxy is not serving — {cause}"),
+        (Some(cause), _) => format!("{name}: the hostname proxy is not serving — {cause}"),
         (None, LiveSurface::Native) => {
             format!("{name} resolves in any browser on this machine")
         }
         (None, LiveSurface::Proxy) => match proxy_port {
             Some(port) => format!("{name} via 127.0.0.1:{port}"),
-            None => "the hostname proxy is not serving".to_string(),
+            None => format!("{name}: the hostname proxy is not serving"),
         },
         (None, LiveSurface::ProxyNotServing { port, cause }) => {
             format!(
-                "the hostname proxy is not serving — {}",
+                "{name}: the hostname proxy is not serving — {}",
                 proxy_down_detail(*port, cause)
             )
         }
@@ -4905,8 +4909,8 @@ mod tests {
         );
         assert_eq!(
             down,
-            "names: the hostname proxy is not serving — another process on the host holds \
-             127.0.0.1:7654; finish setup: min finalize-install"
+            "names: web.min.internal: the hostname proxy is not serving — another process on \
+             the host holds 127.0.0.1:7654; finish setup: min finalize-install"
         );
         // NET-020 in both forms: the cause the start reads beside its
         // verdict replaces the resolution half whether the verdict was the
@@ -4928,8 +4932,8 @@ mod tests {
         );
         assert_eq!(
             native_down,
-            "names: the hostname proxy is not serving — another process on the host holds \
-             127.0.0.1:7654"
+            "names: web.min.internal: the hostname proxy is not serving — another process on \
+             the host holds 127.0.0.1:7654"
         );
         let native_down_open = host_line_beside(
             "web",
@@ -4940,8 +4944,8 @@ mod tests {
         );
         assert_eq!(
             native_down_open,
-            "names: the hostname proxy is not serving — another process on the host holds \
-             127.0.0.1:7654; finish setup: min finalize-install"
+            "names: web.min.internal: the hostname proxy is not serving — another process on \
+             the host holds 127.0.0.1:7654; finish setup: min finalize-install"
         );
         // A native daemon's own report — no VM sibling — is the cause in the
         // daemon's words, and a Proxy verdict beside it never claims a port.
@@ -4959,8 +4963,9 @@ mod tests {
         );
         assert_eq!(
             proxy_down_native_daemon,
-            "names: the hostname proxy is not serving — could not bind 127.0.0.1:7654: \
-             address in use. Remedy: free the port; finish setup: min finalize-install"
+            "names: web.min.internal: the hostname proxy is not serving — could not bind \
+             127.0.0.1:7654: address in use. Remedy: free the port; finish setup: min \
+             finalize-install"
         );
         assert!(
             !proxy_down_native_daemon.contains("via 127.0.0.1"),

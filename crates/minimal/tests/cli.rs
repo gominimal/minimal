@@ -3079,7 +3079,7 @@ async fn listener_failure_reported_with_remedy() {
     // so the line never claims a route through a proxy that is not serving.
     assert!(
         activate_stderr.contains(&format!(
-            "names: the hostname proxy is not serving — {reason}"
+            "names: remedy-report.min.internal: the hostname proxy is not serving — {reason}"
         )),
         "the host line must carry the cause in place of the resolution, got: {activate_stderr}"
     );
