@@ -202,7 +202,8 @@ pub(crate) struct SessionConfig {
 /// The egress *section* the gate compiles for a session: the materialized
 /// form of [`sessions::effective_egress`]'s answer — `None` for the
 /// allow-all default, the deny-all section for an absent declaration under the
-/// in-force default (NET-074), and a declaration verbatim. `phase` is the
+/// in-force default (NET-074), and a declaration with the destination lists
+/// it left absent resolved as that function documents. `phase` is the
 /// rollout phase to resolve under — the launcher and the task path pass
 /// [`sessions::EGRESS_DEFAULT_PHASE`], the phase this build ships, and the
 /// tests name [`sessions::EgressDefaultPhase::InForce`] so the posture they
@@ -230,10 +231,10 @@ pub(crate) fn effective_egress_section(
 /// deny-all section for an own-address box with no `egress` section once the
 /// default is in force (NET-074), the allow-all default for everything an
 /// opt-out (NET-077) or an earlier phase leaves in place, and a declaration
-/// verbatim. `phase` resolves under, exactly as [`effective_egress_section`]
-/// documents. The declaration on the record is left untouched: the strict
-/// `SessionPolicy` a client reads back stays exactly what the box was
-/// launched with.
+/// with the destination lists it left absent resolved. `phase` resolves
+/// under, exactly as [`effective_egress_section`] documents. The
+/// declaration on the record is left untouched: the strict `SessionPolicy`
+/// a client reads back stays exactly what the box was launched with.
 pub(crate) fn effective_session_policy(
     policy: &sessions::SessionPolicy,
     network: sessions::NetworkMode,

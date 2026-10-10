@@ -1371,9 +1371,12 @@ pub(crate) fn effective_policy_reply(
 /// ([`sessions::EGRESS_DEFAULT_PHASE`]) and its opt-out flag (NET-077). An
 /// own-address box with no `egress` section answers `deny_all` with the
 /// default in force (NET-074) and `allow_all` behind the opt-out; a declared
-/// section answers verbatim; the
-/// strict declaration the record holds is never rewritten to say any of
-/// this.
+/// section answers as the gate resolves it — the lists it declared
+/// verbatim, and under the in-force default, on a box of any network mode,
+/// a destination list it left absent present and empty, the wire meaning
+/// being "what this box is held to", never "what it wrote"; the strict
+/// declaration the record holds is never rewritten to say any of this, and
+/// `GetSessionPolicy` is the reply that echoes it.
 async fn serve_get_effective_session_policy(
     s: ServerStateHandle,
     c: RuChannel<Msg>,
@@ -6048,12 +6051,23 @@ mod tests {
             "the strict policy reply must keep the declaration as launched",
         );
 
-        // A declared section round-trips verbatim, ingress beside it.
+        // A declared section round-trips as the gate resolves it, ingress
+        // beside it: the effective reply is what the box is held to, so the
+        // names list the declaration left absent comes back present and
+        // empty (NET-074, in force on an own-address box), while the
+        // declared lists ride verbatim. The strict reply above is the one
+        // that echoes the declaration.
         let declared = client
             .call::<GetEffectiveSessionPolicy>(&GetEffectiveSessionPolicyRequest::Id(declared_id))
             .await
             .unwrap();
-        assert_eq!(declared.egress, EffectiveEgress::Declared(egress));
+        assert_eq!(
+            declared.egress,
+            EffectiveEgress::Declared(EgressPolicy {
+                allow_dns_hosts: Some(Vec::new()),
+                ..egress
+            }),
+        );
         assert_eq!(declared.ingress, None);
 
         // A declared lane round-trips too: the reply answers it as `Some`
