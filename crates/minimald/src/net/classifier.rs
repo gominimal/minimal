@@ -384,16 +384,17 @@ impl Cause {
     /// the step over that tree would leave the cause standing, or for a
     /// guest whose table its own image never loaded, because the person to
     /// tell is the image's builder and no installer exists there. A table
-    /// the marker vouches for but the probe does not ends with the same
-    /// command — the install is the one thing that reloads it — while a
-    /// probe that could not read the table names nothing: no command is
-    /// known to make a probe run.
+    /// the marker vouches for but the probe does not names nothing either:
+    /// the marker is what the install's item reads, so with it present the
+    /// install is a no-op, not a reload. A probe that could not read the
+    /// table names nothing: no command is known to make a probe run.
     pub fn install_command(self) -> Option<String> {
         match self {
-            Self::StepNotInstalled | Self::TableNotEffective => {
-                Some(sandbox2::classifier::install_hint())
-            }
-            Self::CannotConfine | Self::GuestTableNotLoaded | Self::ProbeUnreadable => None,
+            Self::StepNotInstalled => Some(sandbox2::classifier::install_hint()),
+            Self::CannotConfine
+            | Self::GuestTableNotLoaded
+            | Self::TableNotEffective
+            | Self::ProbeUnreadable => None,
         }
     }
 }
@@ -407,18 +408,30 @@ impl Cause {
 /// session activate` prints verbatim, the daemon's log line for that create
 /// and the banner the launch writes into the box's pty agree by
 /// construction. A declaration that admits nothing asked for "no network
-/// access"; any other declaration asked for "limited" access. The two probe
-/// causes refuse a deny-all box at placement rather than run it unenforced
-/// ([`Cause::host_ip_box_outcome`]), so over those the line says the box is
-/// refused instead of claiming it runs. A cause no install ends names the
-/// own-address start alone and says why the install cannot help, so the
-/// advisory never hands a person a command that leaves the cause standing.
-/// It is never a prompt: it names what a person may run, and running it is
-/// the person's act, never the session start's.
-pub fn advisory_text(cause: Cause, verdict: sandbox2::config::Verdict) -> String {
-    let asked = match verdict {
-        sandbox2::config::Verdict::Deny => "no network access",
-        sandbox2::config::Verdict::Allow => "limited network access",
+/// access"; one with a rule the classifier has no subtree for
+/// ([`unenforceable_rules`]) asked for "limited" access; a section that
+/// lists nothing asked for nothing restrictive, so the line says only that
+/// the box declares egress. The two probe causes refuse a deny-all box at
+/// placement rather than run it unenforced ([`Cause::host_ip_box_outcome`]),
+/// so over those the line says the box is refused instead of claiming it
+/// runs. The install is named only where running it enforces the
+/// declaration: a cause no install ends names the own-address start alone
+/// and says why the install cannot help, and a declaration the classifier
+/// cannot enforce on a host address names the own-address start alone too,
+/// because a host that finished its install refuses such a box
+/// ([`refuses_unenforceable_declaration`]) rather than enforce it. So the
+/// advisory never hands a person a command that leaves the cause standing
+/// or gets the box refused. It is never a prompt: it names what a person
+/// may run, and running it is the person's act, never the session start's.
+pub fn advisory_text(cause: Cause, declaration: &sessions::EgressPolicy) -> String {
+    let verdict = verdict_of(Some(declaration));
+    let unenforceable = !unenforceable_rules(Some(declaration)).is_empty();
+    let asked = if verdict == sandbox2::config::Verdict::Deny {
+        "you asked this box for no network access"
+    } else if unenforceable {
+        "you asked this box for limited network access"
+    } else {
+        "this box declares egress"
     };
     let refuses = verdict == sandbox2::config::Verdict::Deny
         && matches!(cause, Cause::TableNotEffective | Cause::ProbeUnreadable);
@@ -427,22 +440,26 @@ pub fn advisory_text(cause: Cause, verdict: sandbox2::config::Verdict) -> String
     } else {
         "so the box can still reach the network"
     };
-    let enforce = match cause.install_command() {
-        Some(command) => format!(
-            "Enforce it: {command}   (or start the box with --network own_ip, which \
-             enforces it now)"
-        ),
-        None => format!(
-            "Enforce it: start the box with --network own_ip, which enforces it now   \
-             ({} can't fix this: {})",
-            sandbox2::classifier::install_hint(),
-            cause.detail()
-        ),
+    let enforce = if unenforceable {
+        "Enforce it: start the box with --network own_ip, which enforces it now   (on a \
+         host address the classifier enforces only a deny-all declaration, so a host \
+         that finished its install refuses this box rather than enforce its rules)"
+            .to_string()
+    } else {
+        match cause.install_command() {
+            Some(command) => format!(
+                "Enforce it: {command}   (or start the box with --network own_ip, which \
+                 enforces it now)"
+            ),
+            None => format!(
+                "Enforce it: start the box with --network own_ip, which enforces it now   \
+                 ({} can't fix this: {})",
+                sandbox2::classifier::install_hint(),
+                cause.detail()
+            ),
+        }
     };
-    format!(
-        "note: you asked this box for {asked}, but this machine can't enforce it yet, \
-         {outcome}.\n  {enforce}"
-    )
+    format!("note: {asked}, but this machine can't enforce it yet, {outcome}.\n  {enforce}")
 }
 
 /// Whether this host can decide a host-address box's egress verdict per box
@@ -4618,12 +4635,10 @@ mod tests {
             detail.contains("marked loaded") && detail.contains("was not refused"),
             "the cause names what the marker said and what the probe read: {detail}"
         );
-        let command = cause
-            .install_command()
-            .expect("reloading the table is the command that ends it");
-        assert_eq!(
-            command, "min finalize-install",
-            "the command is the one thing that reloads the table: {command}"
+        assert!(
+            cause.install_command().is_none(),
+            "the marker the install's item reads is present, so the install is a \
+             no-op here, not a reload: no command is named"
         );
 
         // And a probe that could not read the table at all claims nothing:
@@ -5518,11 +5533,15 @@ mod tests {
             Cause::TableNotEffective,
             Cause::ProbeUnreadable,
         ] {
-            for verdict in [
-                sandbox2::config::Verdict::Deny,
-                sandbox2::config::Verdict::Allow,
+            for declaration in [
+                sessions::EgressPolicy::deny_all(),
+                sessions::EgressPolicy::default(),
+                sessions::EgressPolicy {
+                    allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
+                    ..sessions::EgressPolicy::default()
+                },
             ] {
-                rendered.push(advisory_text(cause, verdict));
+                rendered.push(advisory_text(cause, &declaration));
             }
             rendered.extend(cause.install_command());
         }

@@ -555,8 +555,8 @@ fn create_classifier_advisory(
     if in_microvm || network != minimald_rpc::NetworkMode::HostNet {
         return None;
     }
-    egress?;
-    cause.map(|cause| classifier::advisory_text(cause, classifier::verdict_of(egress)))
+    let egress = egress?;
+    cause.map(|cause| classifier::advisory_text(cause, egress))
 }
 
 /// The bind probe over the reserved local range, on the blocking pool —
@@ -5130,8 +5130,11 @@ mod tests {
     /// cannot decide per box tells it nothing — the fact still rides the
     /// reply for `min session policy` — while a deny-all declaration gets
     /// the requirement's two lines verbatim, an allow-list declaration the
-    /// same two lines naming "limited" access, and a VM-backed daemon
-    /// nothing even over a declaring box.
+    /// same first line naming "limited" access over a second that names the
+    /// own-address start alone (a finished install refuses an allow-list
+    /// box rather than enforce it), a section that lists nothing a first
+    /// line that claims no limit, and a VM-backed daemon nothing even over
+    /// a declaring box.
     #[test]
     fn classifier_advisory_prints_only_while_box_declares_egress() {
         let cause = Some(classifier::Cause::StepNotInstalled);
@@ -5167,10 +5170,30 @@ mod tests {
             Some(
                 "note: you asked this box for limited network access, but this machine \
                  can't enforce it yet, so the box can still reach the network.\n  Enforce \
-                 it: min finalize-install   (or start the box with --network own_ip, which \
-                 enforces it now)"
+                 it: start the box with --network own_ip, which enforces it now   (on a \
+                 host address the classifier enforces only a deny-all declaration, so a \
+                 host that finished its install refuses this box rather than enforce its \
+                 rules)"
             ),
-            "an allow-list declaration asked for limited access"
+            "an allow-list declaration asked for limited access, and is not handed \
+             the install, which would get the box refused"
+        );
+        let lists_nothing = sessions::EgressPolicy::default();
+        assert_eq!(
+            super::create_classifier_advisory(
+                false,
+                NetworkMode::HostNet,
+                cause,
+                Some(&lists_nothing)
+            )
+            .as_deref(),
+            Some(
+                "note: this box declares egress, but this machine can't enforce it yet, so \
+                 the box can still reach the network.\n  Enforce it: min finalize-install   \
+                 (or start the box with --network own_ip, which enforces it now)"
+            ),
+            "a section that lists nothing asked for nothing restrictive, so the line \
+             claims no limit"
         );
         assert_eq!(
             super::create_classifier_advisory(true, NetworkMode::HostNet, cause, Some(&deny_all)),
@@ -5229,14 +5252,15 @@ mod tests {
     /// could read. The two are the exception's one limit: natively a
     /// deny-all host-address box is refused at placement — so the advisory
     /// must not claim the box runs over a refusal a person is about to hit,
-    /// while a box the host does run says so. The table a reload would fix
-    /// still names the install; the probe no command can make run names the
-    /// own-address start alone.
+    /// while a box the host does run says so. Neither names the install: the
+    /// marker the install's item reads is present over the table it does not
+    /// vouch for, so the run would be a no-op, and no command makes a probe
+    /// run; both name the own-address start alone.
     #[test]
     fn advisory_over_a_probe_cause_names_the_refusal_not_a_blanket_unenforced() {
-        use sandbox2::config::Verdict;
+        let deny_all = sessions::EgressPolicy::deny_all();
         let not_effective =
-            classifier::advisory_text(classifier::Cause::TableNotEffective, Verdict::Deny);
+            classifier::advisory_text(classifier::Cause::TableNotEffective, &deny_all);
         assert!(
             not_effective.contains("so it refuses to start the box"),
             "the probe cause's advisory names the refusal, got: {not_effective}"
@@ -5246,24 +5270,26 @@ mod tests {
             "a refused box is not said to run, got: {not_effective}"
         );
         assert!(
-            not_effective.contains("Enforce it: min finalize-install"),
-            "a table the marker vouches for but the probe does not is the one \
-             the install reloads, so the advisory still carries the command, \
-             got: {not_effective}"
+            !not_effective.contains("Enforce it: min finalize-install")
+                && not_effective.contains("min finalize-install can't fix this:"),
+            "the marker is present, so the install is a no-op over this table: the \
+             advisory names the own-address start alone and says why, got: \
+             {not_effective}"
         );
         assert!(
             !not_effective.contains('?'),
             "the advisory names what a person may run; it never asks: {not_effective}"
         );
-        let allowed =
-            classifier::advisory_text(classifier::Cause::TableNotEffective, Verdict::Allow);
+        let allowed = classifier::advisory_text(
+            classifier::Cause::TableNotEffective,
+            &sessions::EgressPolicy::default(),
+        );
         assert!(
             allowed.contains("so the box can still reach the network"),
             "a box that needs no deny verdict still runs, and is told so: {allowed}"
         );
 
-        let unreadable =
-            classifier::advisory_text(classifier::Cause::ProbeUnreadable, Verdict::Deny);
+        let unreadable = classifier::advisory_text(classifier::Cause::ProbeUnreadable, &deny_all);
         assert!(
             unreadable.contains("so it refuses to start the box"),
             "an unreadable probe leaves the same refusal, got: {unreadable}"

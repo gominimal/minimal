@@ -3948,8 +3948,10 @@ fn refused_unenforced_host_address_box(
                  is not in force, so a deny-all box's connections would not be \
                  refused: the box's declaration promises a verdict nothing here \
                  enforces, and the box was refused rather than run unenforced \
-                 (the table's refusal is not in force — {} reloads it)",
-                sandbox2::classifier::install_hint()
+                 (the table's refusal is not in force — the marker says loaded, so \
+                 {install} alone is a no-op; {install} --undo, then {install}, \
+                 reloads it)",
+                install = sandbox2::classifier::install_hint()
             )),
             Some(crate::net::classifier::Cause::ProbeUnreadable) => Some(
                 "this host's classifier table's effect could not be read, so \
@@ -4326,17 +4328,28 @@ impl SessionLauncher for SandboxLauncher {
         // The banner is the advisory's in-box surface, and follows the
         // advisory's rule (NET-079): a native daemon only — per-box
         // enforcement is a native-host fact, and the guest's state is the
-        // interim's, said in the record above — and only while the box
-        // declares egress, because a box that declared nothing asked for no
-        // enforcement. Its text is the create reply's own, so the terminal
-        // the start printed into and the shell it opens say the same thing.
-        let banner = (advise && !guest && policy.egress.is_some()).then(|| {
-            let cause = decision
+        // interim's, said in the record above — only while the box declares
+        // egress, because a box that declared nothing asked for no
+        // enforcement, and only over a decision that names a cause: a box
+        // nothing placed on a host that decides per box runs unenforced for
+        // a reason the record above names (the placement's own failure),
+        // not one an install or an own-address start ends, so the advisory
+        // would hand out a command that changes nothing. Its text is the
+        // create reply's own, which carries none without a cause either, so
+        // the terminal the start printed into and the shell it opens say the
+        // same thing.
+        let banner = match (
+            advise && !guest,
+            policy.egress.as_ref(),
+            decision
                 .as_ref()
-                .and_then(crate::net::classifier::Decision::cause)
-                .unwrap_or(crate::net::classifier::Cause::StepNotInstalled);
-            crate::net::classifier::advisory_text(cause, classifier_verdict)
-        });
+                .and_then(crate::net::classifier::Decision::cause),
+        ) {
+            (true, Some(egress), Some(cause)) => {
+                Some(crate::net::classifier::advisory_text(cause, egress))
+            }
+            _ => None,
+        };
 
         // Step 1 (pre-spawn): the provider for this PTask's mode reserves what
         // the sandbox needs — for own-IP, a lease and a running gvproxy — and
