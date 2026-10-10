@@ -3862,7 +3862,7 @@ dependencies = [
  "ot",
  "paths",
  "rcache",
- "sandbox2",
+ "sandbox",
  "serial_test",
  "stdlib",
  "tempfile",
@@ -4130,7 +4130,7 @@ dependencies = [
  "rand_core 0.6.4",
  "russh",
  "russh-sftp",
- "sandbox2",
+ "sandbox",
  "serde",
  "serde_json_lenient",
  "serial_test",
@@ -4275,7 +4275,7 @@ dependencies = [
  "rayon",
  "rcache",
  "remote-client",
- "sandbox2",
+ "sandbox",
  "serde",
  "serde_json_lenient",
  "serial_test",
@@ -4773,7 +4773,7 @@ dependencies = [
  "ot",
  "rayon",
  "rcache",
- "sandbox2",
+ "sandbox",
  "serde",
  "serde_json_lenient",
  "sha2 0.11.0",
@@ -4861,7 +4861,7 @@ dependencies = [
  "op",
  "ot",
  "rcache",
- "sandbox2",
+ "sandbox",
  "thiserror 2.0.21",
  "tokio",
  "tokio-util",
@@ -6417,7 +6417,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "sandbox2"
+name = "sandbox"
 version = "0.0.1"
 dependencies = [
  "common",

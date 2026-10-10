@@ -37,6 +37,48 @@ crates and the product surface, and §3 adds which plane each crate belongs to
 When you change a crate's scope, update its `Cargo.toml` description too, so
 this information stays current.
 
+## Naming: box, Box Type, sandbox
+
+Use these terms in code, comments, docs and commit messages. The BOX spec
+([docs/specs/29-spec-box-local-first](docs/specs/29-spec-box-local-first/29-spec-box-local-first.md))
+plans the box model they describe. That spec defines the Box Types and the
+spec settings. Today the tree has `BoxId` and `BoxRecord`, and `minimald`
+still branches on session or task. The rest of this section is the target
+for new code.
+
+- A **box** is the thing itself: its record, id, state, lifecycle, events,
+  spec and processes. Code about the box says box, as `BoxId` and
+  `BoxRecord` do.
+- A **Box Type** names a kind of box, never the box itself. session and task
+  are Box Types. The BOX spec lists the rest.
+- A **sandbox** is the operating-system isolation (namespaces, mounts,
+  cgroups) that every box runs in: the `sandbox` crate. Package builds are
+  boxes of the `build` Box Type, though today `mip` runs them in the sandbox
+  directly, outside a box.
+- A **Box Host** is a running `minimald` that creates and hosts boxes, as
+  the architecture glossary defines it, not the machine it runs on. Gatehouse
+  calls an enrolled Box Host a node.
+
+Rules that follow from these:
+
+- `box` is a reserved word in Rust. A module about boxes is `boxes` or
+  `box_<noun>`, and a type is `Box<Noun>`. A bare `Box` shadows
+  `std::boxed::Box`.
+- Code never uses session or task to mean the box. Some wire, on-disk,
+  printed and environment names say session because a spec keeps them for
+  compatibility. Those keep their serialised name, and the Rust name says box
+  with a serde `rename` or `alias`.
+- Under the BOX spec, a box's behaviour follows the settings in its spec:
+  its lifetime, PTY, timeout and network mode. It never follows the Box Type
+  name. Besides type resolution, the Box Spec projection reads the type's
+  name, source and root, and admission checks a spec against the root's
+  constraints. Until then,
+  do not add new branching on session versus task where a setting can carry
+  the difference.
+- New files, modules and types about the box take box names from the start.
+  Rename code that still says session for the box in a pull request of its
+  own. Never mix a rename into a move or a feature change.
+
 ## Platform matrix
 
 | Platform | What you can build and test |

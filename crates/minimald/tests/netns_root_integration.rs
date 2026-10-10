@@ -29,7 +29,7 @@
 //!   grace period runs out.
 //!
 //! The sandbox-layer half of NET-083 is another crate's test binary,
-//! `crates/sandbox2/tests/caps_root_integration.rs`
+//! `crates/sandbox/tests/caps_root_integration.rs`
 //! (`boxes_lack_cap_net_raw`), pinning the same credentials for the box's own
 //! processes. Test binaries in separate crates cannot call each other's
 //! helpers, so the plumbing this file and that one share — the base-directory
@@ -41,7 +41,7 @@
 //!
 //! The own-IP proofs drive the **production** switch-attach wiring rather than a
 //! hand-rolled `ip netns` sequence: each task's namespace is created by the same
-//! `CLONE_NEWNET` `unshare` that `sandbox2::new_container` performs for own-IP
+//! `CLONE_NEWNET` `unshare` that `sandbox::new_container` performs for own-IP
 //! tasks, identified by the holder process's PID exactly as the live launcher
 //! identifies a sandbox child's netns, and the tap is moved+configured by the
 //! production [`minimald::net::switch::tap_netns_commands`]. Those commands
@@ -82,9 +82,9 @@
 //! the check run that every reader of the pull request can see.
 #![cfg(target_os = "linux")]
 
-use sandbox2::NetPlan;
-use sandbox2::Network as _;
-use sandbox2::config::{BOX_FORBIDDEN_CAPABILITIES, BOX_GID, BOX_UID, Config, SandboxMapped};
+use sandbox::NetPlan;
+use sandbox::Network as _;
+use sandbox::config::{BOX_FORBIDDEN_CAPABILITIES, BOX_GID, BOX_UID, Config, SandboxMapped};
 
 use std::collections::BTreeMap;
 use std::io::Write as _;
@@ -520,7 +520,7 @@ fn proc_session_and_tty(pid: u32) -> (u32, i32) {
 ///
 /// The plan comes from the production provider, not the `NetPlan::none()`
 /// constructor: `network_for(NetworkMode::NoNet)` maps every no-net consumer
-/// to `sandbox2::NoNet` — a `--network none` session's box and a no-net
+/// to `sandbox::NoNet` — a `--network none` session's box and a no-net
 /// task's sandbox alike, since `task_network` goes through the same mapping —
 /// so this proof runs the exact plan a no-net task's sandbox is built with
 /// and pins that the task path is sealed like the session path.
@@ -537,7 +537,7 @@ async fn network_none_blocks_all_outside_sockets() {
     let source = rootfs_tmp.path().join("rootfs-src");
     probe_rootfs(&source, &probe);
 
-    let no_net = sandbox2::NoNet
+    let no_net = sandbox::NoNet
         .plan()
         .await
         .expect("the production NoNet provider plans do not fail");
@@ -1120,7 +1120,7 @@ impl Drop for LiveBox {
 /// mount setup, no report) from one that did.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn injected_process_lacks_cap_net_raw() {
-    if let Some(reason) = sandbox2::user_namespaces_restriction() {
+    if let Some(reason) = sandbox::user_namespaces_restriction() {
         eprintln!(
             "skipping injected_process_lacks_cap_net_raw: this host denies the \
              unprivileged user namespace every sandbox starts by unsharing: \
@@ -1298,7 +1298,7 @@ const GROUP_KILL_MARKER: &str = "/tmp/group-kill-marker";
 /// `None` when the host denies the unprivileged user namespace every sandbox
 /// starts by unsharing; the caller skips.
 async fn group_kill_proof(name: &str, probe_args: &[&str]) -> Option<GroupKillOutcome> {
-    if let Some(reason) = sandbox2::user_namespaces_restriction() {
+    if let Some(reason) = sandbox::user_namespaces_restriction() {
         eprintln!(
             "skipping {name}: this host denies the unprivileged user namespace \
              every sandbox starts by unsharing: {reason}"
@@ -1560,7 +1560,7 @@ async fn a_group_member_that_ignores_sigterm_is_sigkilled_after_the_grace() {
 /// hakoniwa's mount setup, no report) from one that did.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn joined_process_refuses_namespace_bypass_families() {
-    if let Some(reason) = sandbox2::user_namespaces_restriction() {
+    if let Some(reason) = sandbox::user_namespaces_restriction() {
         eprintln!(
             "skipping joined_process_refuses_namespace_bypass_families: this \
              host denies the unprivileged user namespace every sandbox starts \
@@ -1724,7 +1724,7 @@ async fn joined_process_refuses_namespace_bypass_families() {
 /// A no-network task cannot reach the internet.
 ///
 /// Drives the egress attempt through `unshare --net`, which calls the same
-/// `CLONE_NEWNET` syscall that `sandbox2::new_container` calls for an
+/// `CLONE_NEWNET` syscall that `sandbox::new_container` calls for an
 /// isolating plan. If `new_container` stopped calling `CLONE_NEWNET`, the
 /// `isolates_netns` assertion would no longer match the actual namespacing
 /// behaviour; the `unshare --net` egress test guards the OS-level contract.
@@ -1738,10 +1738,10 @@ async fn netns_nonet_refuses_egress() {
 
     // The production decision under test: `NoNet` plans an isolated network
     // namespace, `HostNet` a shared one.
-    assert!(sandbox2::NoNet.plan().await.unwrap().isolates_netns());
-    assert!(!sandbox2::HostNet.plan().await.unwrap().isolates_netns());
+    assert!(sandbox::NoNet.plan().await.unwrap().isolates_netns());
+    assert!(!sandbox::HostNet.plan().await.unwrap().isolates_netns());
 
-    // Exercise the same OS primitive that sandbox2::new_container uses for NoNet
+    // Exercise the same OS primitive that sandbox::new_container uses for NoNet
     // (CLONE_NEWNET via unshare): enter a fresh, empty network namespace and
     // attempt egress. The namespace has only a down lo and no routes, so the
     // TCP connect must fail with ENETUNREACH — the same contract new_container
@@ -2021,7 +2021,7 @@ impl Ptask {
 
         // Create the PTask's network namespace the way the production path does:
         // a process that `unshare`s `CLONE_NEWNET` (the same syscall
-        // `sandbox2::new_container` issues for OwnIp) and then lingers, so its
+        // `sandbox::new_container` issues for OwnIp) and then lingers, so its
         // PID identifies `/proc/<pid>/ns/net` for the move/config below.
         let (netns_pid, holder) = spawn_netns_holder();
 
@@ -2111,7 +2111,7 @@ impl Ptask {
 }
 
 /// Spawns a long-lived process in a fresh network namespace (the same
-/// `CLONE_NEWNET` `sandbox2::new_container` unshares for `OwnIp`/`NoNet`) and
+/// `CLONE_NEWNET` `sandbox::new_container` unshares for `OwnIp`/`NoNet`) and
 /// returns its host PID plus the wrapper handle. `/proc/<pid>/ns/net` is the
 /// PTask netns the production launcher targets.
 fn spawn_netns_holder() -> (u32, std::process::Child) {

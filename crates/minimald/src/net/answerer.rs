@@ -1408,8 +1408,8 @@ async fn recheck_live_carve_outs(
     // asks of an async caller: this task keeps answering the control socket.
     let recorded = tokio::task::spawn_blocking(|| {
         crate::net::classifier::decide_now(
-            std::path::Path::new(sandbox2::classifier::TREE_ROOT),
-            sandbox2::classifier::own_mountinfo().as_deref(),
+            std::path::Path::new(sandbox::classifier::TREE_ROOT),
+            sandbox::classifier::own_mountinfo().as_deref(),
             false,
         )
         .carve_out()
@@ -1476,7 +1476,7 @@ async fn recheck_live_carve_outs_against(
                 if !placed
                     || record.network != sessions::NetworkMode::HostNet
                     || crate::net::classifier::verdict_of(record.policy.egress.as_ref())
-                        != sandbox2::config::Verdict::Deny
+                        != sandbox::config::Verdict::Deny
                 {
                     continue;
                 }

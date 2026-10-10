@@ -42,7 +42,7 @@ graph.workspace = true
 mfile.workspace = true
 ot.workspace = true
 rcache.workspace = true
-sandbox2.workspace = true
+sandbox.workspace = true
 
 [lints]
 workspace = true

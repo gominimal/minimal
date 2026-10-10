@@ -18,7 +18,7 @@ pub enum Error {
     Plan(Graph, #[source] PlanErr),
     /// An error occurred during the setup or execution of a sandbox.
     #[error("sandbox error: {0}")]
-    Sandbox(#[from] sandbox2::Error),
+    Sandbox(#[from] sandbox::Error),
     #[error("other: {0}")]
     Other(anyhow::Error),
 }

@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::io::BufRead;
 
 use mfile::{Task, TaskAction};
-use sandbox2::config::Invocation;
+use sandbox::config::Invocation;
 #[cfg(target_os = "linux")]
 use shlex::Shlex;
 
@@ -18,14 +18,14 @@ use crate::{Error, Options, Runnable};
 /// in the sandbox and its stdout parsed into the final command list.
 ///
 /// The caller receives `Vec<Invocation>` and can execute them on the sandbox.
-pub struct TaskEnv<'a, C: sandbox2::Channel> {
+pub struct TaskEnv<'a, C: sandbox::Channel> {
     /// The task definition.
     pub task: &'a Task,
     /// The sandbox to use for resolving [TaskAction::CmdCmd] meta-commands.
-    pub sandbox: &'a mut sandbox2::Sandbox<C>,
+    pub sandbox: &'a mut sandbox::Sandbox<C>,
 }
 
-impl<C: sandbox2::Channel> TaskEnv<'_, C> {
+impl<C: sandbox::Channel> TaskEnv<'_, C> {
     /// Resolves the invocations to run for this task.
     ///
     /// For [TaskAction::Exec] and [TaskAction::Bash], invocations are derived
@@ -49,7 +49,7 @@ impl<C: sandbox2::Channel> TaskEnv<'_, C> {
     }
 }
 
-impl<C: sandbox2::Channel> Runnable for TaskEnv<'_, C> {
+impl<C: sandbox::Channel> Runnable for TaskEnv<'_, C> {
     type Result = Vec<Invocation>;
 
     async fn run(&mut self, _opts: &Options<'_>) -> Result<Self::Result, Error> {
@@ -57,7 +57,7 @@ impl<C: sandbox2::Channel> Runnable for TaskEnv<'_, C> {
     }
 }
 
-impl<C: sandbox2::Channel> TaskEnv<'_, C> {
+impl<C: sandbox::Channel> TaskEnv<'_, C> {
     /// Runs the meta-command in the sandbox and parses its stdout into
     /// invocations.
     #[cfg(target_os = "linux")]

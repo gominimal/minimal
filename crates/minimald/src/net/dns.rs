@@ -2499,7 +2499,7 @@ mod tests {
         assert_eq!(HOSTNAME_SUFFIX, "min.internal");
         assert_eq!(HOSTNAME_SUFFIX, ZONE_APEX);
         assert_eq!(crate::net::switch::HOST_MIN_INTERNAL, "host.min.internal");
-        assert_eq!(sandbox2::HOST_MIN_INTERNAL, HOST_ROW_NAME);
+        assert_eq!(sandbox::HOST_MIN_INTERNAL, HOST_ROW_NAME);
         let yaml = ::switch::render_gvproxy_config(::switch::SwitchSubnet::default(), &[]);
         assert!(
             yaml.contains(&format!(

@@ -68,7 +68,7 @@ const BUILTIN_DEFAULT_NAME: &str = "default";
 /// mfile layouts, `minimal.toml` and `.minimal/minimal.toml` — which
 /// stays correct across skipped uploads, an in-session `min init`, and
 /// attaches from unrelated host directories. `/workbench` mirrors
-/// `sandbox2::SESSION_DEFAULT_WD`, the attach shell's initial cwd (a
+/// `sandbox::SESSION_DEFAULT_WD`, the attach shell's initial cwd (a
 /// literal here because this client crate doesn't depend on the sandbox
 /// crate; the daemon-side template derives it from the constant).
 const BUILTIN_DEFAULT_TOML: &str = r#"

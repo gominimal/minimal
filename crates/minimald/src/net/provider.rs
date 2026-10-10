@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
 use std::sync::{Arc, RwLock};
 
-use sandbox2::{
+use sandbox::{
     AbandonFuture, AttachFuture, NetGuard, NetPlan, Network, NetworkError, PlanFuture, Resolver,
     Spawned, TapSpec,
 };
@@ -332,7 +332,7 @@ pub(crate) fn network_for(
             task_slots: None,
             reserved: std::sync::Mutex::new(None),
         }),
-        _ => Arc::new(sandbox2::NoNet),
+        _ => Arc::new(sandbox::NoNet),
     }
 }
 
@@ -366,7 +366,7 @@ pub(crate) fn task_network_for(
 }
 
 /// A host-address box: it shares the daemon host's network namespace, so its
-/// plan is the sandbox layer's [`sandbox2::HostNet`] — except on a VM host,
+/// plan is the sandbox layer's [`sandbox::HostNet`] — except on a VM host,
 /// where the namespace it shares is the *guest's* and the host's own resolver
 /// is unreachable from it. There the plan points the resolver at the node's
 /// DNS layer — the switch gateway, whose static `min.internal.` zone carries
@@ -385,7 +385,7 @@ struct HostIpAddressNetwork {
     /// (NET-079) — the deny subtree when the declaration admits no
     /// destination. Decided before the box's first process exists, like the
     /// leaf itself, because the plan is built before the spawn.
-    verdict: sandbox2::config::Verdict,
+    verdict: sandbox::config::Verdict,
     /// The verdict decision this launch read before it reserved the plan
     /// (NET-079) — carried in by the launch that builds the plan, so the
     /// plan follows its own launch's reading and never a concurrent
@@ -411,7 +411,7 @@ impl std::fmt::Debug for HostIpAddressNetwork {
 ///
 /// Pure over the declaration, so the verdict a box's plan is built around is
 /// pinned beside the plan it decides.
-fn host_address_verdict(declaration: Option<&sessions::EgressPolicy>) -> sandbox2::config::Verdict {
+fn host_address_verdict(declaration: Option<&sessions::EgressPolicy>) -> sandbox::config::Verdict {
     crate::net::classifier::verdict_of(declaration)
 }
 
@@ -439,7 +439,7 @@ impl Network for HostIpAddressNetwork {
                 // one the rule admits and the host's resolver hook names
                 // with its `port` directive (NET-122, design §7.1), and it
                 // stays the answerer's own, not the plan's.
-                if self.verdict == sandbox2::config::Verdict::Deny {
+                if self.verdict == sandbox::config::Verdict::Deny {
                     // Over a table that decides per box, the carve-out it
                     // loaded must name the answerer actually serving: a
                     // stale target, or no answerer at all, refuses the box
@@ -466,7 +466,7 @@ impl Network for HostIpAddressNetwork {
                 // Native host: the namespace the box shares is the host's own,
                 // so the sandbox layer's plan answers `host.min.internal` from
                 // `/etc/hosts` at the host's loopback.
-                return sandbox2::HostNet.plan().await;
+                return sandbox::HostNet.plan().await;
             }
             // NET-003: on a VM host, 127.0.0.1 in the namespace a host-address
             // box shares is the guest's loopback, not the host's, and the host
@@ -691,7 +691,7 @@ impl Network for OwnIpNetwork {
                         // capability is missing separates a kernel-config
                         // problem from a policy one.
                         let tun = std::path::Path::new("/dev/net/tun").exists();
-                        let userns = sandbox2::user_namespaces_restriction()
+                        let userns = sandbox::user_namespaces_restriction()
                             .map_or_else(|| "available".to_string(), |r| r.to_string());
                         return Err(NetworkError::new(std::io::Error::other(format!(
                             "own-IP sandbox produced no in-namespace tap fd \
@@ -1347,19 +1347,19 @@ mod tests {
     fn host_ip_box_cannot_leave_its_cgroup() {
         let tree = tempfile::tempdir().expect("a temp dir standing in for the tree");
         let root = tree.path();
-        let cohort = root.join(sandbox2::classifier::BOXES_DIR);
-        let deny = cohort.join(sandbox2::config::DENY_DIR);
-        let allow = cohort.join(sandbox2::config::ALLOW_DIR);
+        let cohort = root.join(sandbox::classifier::BOXES_DIR);
+        let deny = cohort.join(sandbox::config::DENY_DIR);
+        let allow = cohort.join(sandbox::config::ALLOW_DIR);
 
         for (declaration, expected, why) in [
             (
                 Some(sessions::EgressPolicy::deny_all()),
-                sandbox2::config::Verdict::Deny,
+                sandbox::config::Verdict::Deny,
                 "a deny-all box",
             ),
             (
                 None,
-                sandbox2::config::Verdict::Allow,
+                sandbox::config::Verdict::Allow,
                 "a box with no egress section",
             ),
         ] {
@@ -1367,7 +1367,7 @@ mod tests {
             // in — the same selection the launch's own placement makes.
             let verdict = host_address_verdict(declaration.as_ref());
             assert_eq!(verdict, expected, "{why} is classified by its declaration");
-            let leaf = sandbox2::config::ClassifierLeaf::under(root, "a session", verdict);
+            let leaf = sandbox::config::ClassifierLeaf::under(root, "a session", verdict);
             assert_eq!(
                 leaf.dir().parent().and_then(std::path::Path::parent),
                 Some(cohort.as_path()),
@@ -1378,8 +1378,8 @@ mod tests {
             assert_eq!(
                 leaf.dir().parent(),
                 Some(match verdict {
-                    sandbox2::config::Verdict::Deny => deny.as_path(),
-                    sandbox2::config::Verdict::Allow => allow.as_path(),
+                    sandbox::config::Verdict::Deny => deny.as_path(),
+                    sandbox::config::Verdict::Allow => allow.as_path(),
                 }),
                 "{why}'s leaf is in the subtree its verdict picked"
             );
@@ -1396,16 +1396,16 @@ mod tests {
         // deny-all box's leaf is in the deny subtree and no other box's is in
         // it, the same arithmetic the refusing rule and the cohort's source
         // identity are keyed on.
-        let deny_all = sandbox2::config::ClassifierLeaf::under(
+        let deny_all = sandbox::config::ClassifierLeaf::under(
             root,
             "a session",
-            sandbox2::config::Verdict::Deny,
+            sandbox::config::Verdict::Deny,
         );
         assert_eq!(
             deny_all.relative_dir(),
-            std::path::PathBuf::from(sandbox2::classifier::BOXES_DIR)
-                .join(sandbox2::config::DENY_DIR)
-                .join(sandbox2::classifier::sanitize_box_id("a session")),
+            std::path::PathBuf::from(sandbox::classifier::BOXES_DIR)
+                .join(sandbox::config::DENY_DIR)
+                .join(sandbox::classifier::sanitize_box_id("a session")),
             "the leaf's in-box spelling keeps the whole subtree path"
         );
     }
@@ -1431,7 +1431,7 @@ mod tests {
         assert_eq!(plan.resolver(), &Resolver::Host);
         assert_eq!(plan.hosts().len(), 1, "one static entry for the host");
         let entry = &plan.hosts()[0];
-        assert_eq!(entry.name, sandbox2::HOST_MIN_INTERNAL);
+        assert_eq!(entry.name, sandbox::HOST_MIN_INTERNAL);
         assert_eq!(
             entry.address,
             std::net::Ipv4Addr::LOCALHOST,

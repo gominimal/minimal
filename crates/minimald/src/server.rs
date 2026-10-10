@@ -300,9 +300,9 @@ pub fn this_daemon_path() -> String {
 }
 
 /// The verdict [`UsernsGate::Fixed`] carries, re-exported so the daemon
-/// binary and the harness-driven tests name it without a `sandbox2`
+/// binary and the harness-driven tests name it without a `sandbox`
 /// dependency of their own.
-pub use sandbox2::UsernsRestriction;
+pub use sandbox::UsernsRestriction;
 
 /// Where the create gate's user-namespace verdict comes from (NET-141).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -807,7 +807,7 @@ impl ServerStateHandle {
         // match scrutinee would otherwise hold it across the `/proc` reads.
         let gate = self.0.lock().await.config.user_namespace_gate;
         match gate {
-            UsernsGate::Live => sandbox2::user_namespaces_restriction(),
+            UsernsGate::Live => sandbox::user_namespaces_restriction(),
             UsernsGate::Off => None,
             UsernsGate::Fixed(restriction) => Some(restriction),
         }

@@ -701,7 +701,7 @@ async fn async_main() -> Result<(), MainError> {
     // domain invalid (spike finding F). Each box then joins its own leaf in
     // the sandbox's pre-exec closure and unshares its cgroup namespace onto
     // it, which is what keeps a box out of every other leaf on the tree (see
-    // `sandbox2::classifier`).
+    // `sandbox::classifier`).
     //
     // In the guest this is pid 1, which mounts cgroup2 itself
     // (`guest::enter_rootfs`) and so builds the tree here; a tree it could
@@ -714,21 +714,21 @@ async fn async_main() -> Result<(), MainError> {
     // running and places no box — `create_session_leaf` decides that per
     // launch, by migrating a throwaway child, so no box is ever spawned into
     // a join it dies making.
-    let tree_root = std::path::Path::new(sandbox2::classifier::TREE_ROOT);
-    if let Err(e) = sandbox2::classifier::enter_daemon_leaf(tree_root) {
+    let tree_root = std::path::Path::new(sandbox::classifier::TREE_ROOT);
+    if let Err(e) = sandbox::classifier::enter_daemon_leaf(tree_root) {
         if guest::is_microvm_daemon() {
             tracing::error!(
                 error = %e,
-                tree = sandbox2::classifier::TREE_ROOT,
+                tree = sandbox::classifier::TREE_ROOT,
                 "entering the daemon's own classifier leaf: this guest image \
                  cannot decide per box, and host-address boxes will be refused"
             );
         } else {
             tracing::warn!(
                 error = %e,
-                tree = sandbox2::classifier::TREE_ROOT,
-                daemon_cgroup = ?sandbox2::classifier::own_cgroup_path(),
-                install = %sandbox2::classifier::install_hint(),
+                tree = sandbox::classifier::TREE_ROOT,
+                daemon_cgroup = ?sandbox::classifier::own_cgroup_path(),
+                install = %sandbox::classifier::install_hint(),
                 "entering the daemon's own classifier leaf failed, so every \
                  box launch now decides its placement by whether it can \
                  migrate into the tree: enter it with the installer's --pid \
@@ -742,7 +742,7 @@ async fn async_main() -> Result<(), MainError> {
     // a leftover its next launch could take: a fresh launch finding one
     // reports the collision. A leaf that still holds a session refuses its
     // own removal and stays, which is the emptiness the sweep tests by.
-    match sandbox2::classifier::sweep_box_leaves(tree_root) {
+    match sandbox::classifier::sweep_box_leaves(tree_root) {
         Ok(swept) if swept.is_empty() => {}
         Ok(swept) => tracing::info!(
             count = swept.len(),
@@ -828,7 +828,7 @@ async fn async_main() -> Result<(), MainError> {
     // is not a state to report.
     let classifier_decision = minimald::net::classifier::decide_now(
         tree_root,
-        sandbox2::classifier::own_mountinfo().as_deref(),
+        sandbox::classifier::own_mountinfo().as_deref(),
         guest::is_microvm_daemon(),
     );
     // The daemon's node half of per-box egress enforcement (NET-079): seeded
@@ -840,7 +840,7 @@ async fn async_main() -> Result<(), MainError> {
     minimald::session_host::set_host_ip_enforcement_fact(&classifier_decision);
     if let Some(cause) = classifier_decision.cause() {
         tracing::info!(
-            tree = sandbox2::classifier::TREE_ROOT,
+            tree = sandbox::classifier::TREE_ROOT,
             cause = cause.detail(),
             install = ?cause.install_command(),
             host_ip_enforcement = "none",
@@ -1104,7 +1104,7 @@ async fn async_main() -> Result<(), MainError> {
                 "user-namespace gate switched off: a session this host refuses the namespace \
                  for fails at its first attach instead of at create"
             );
-        } else if let Some(restriction) = sandbox2::user_namespaces_restriction() {
+        } else if let Some(restriction) = sandbox::user_namespaces_restriction() {
             tracing::warn!(
                 reason = %restriction,
                 fix = minimald::userns_restriction_fix(restriction),

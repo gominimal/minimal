@@ -543,7 +543,7 @@ fn user_namespace_refusal(restriction: crate::server::UsernsRestriction) -> Stri
         "{}{}), so no box can start here yet.\n{}",
         minimald_rpc::USER_NAMESPACE_REFUSAL_LEAD,
         restriction.cause(),
-        restriction.remedy(sandbox2::RemedyTarget::Daemon {
+        restriction.remedy(sandbox::RemedyTarget::Daemon {
             bin: &crate::server::this_daemon_path(),
         })
     )
@@ -3832,11 +3832,11 @@ mod tests {
         let tree = tempfile::tempdir().expect("a temp dir standing in for the classifier tree");
         let root = tree.path().to_path_buf();
         for verdict in [
-            sandbox2::config::Verdict::Deny,
-            sandbox2::config::Verdict::Allow,
+            sandbox::config::Verdict::Deny,
+            sandbox::config::Verdict::Allow,
         ] {
             let subtree = root
-                .join(sandbox2::classifier::BOXES_DIR)
+                .join(sandbox::classifier::BOXES_DIR)
                 .join(verdict.dir_name());
             std::fs::create_dir_all(&subtree).expect("the step makes the subtree");
             for file in ["cgroup.procs", "cgroup.threads", "cgroup.subtree_control"] {
@@ -3844,7 +3844,7 @@ mod tests {
                     .unwrap_or_else(|e| panic!("modeling {file} in {}: {e}", subtree.display()));
             }
         }
-        std::fs::create_dir_all(root.join(sandbox2::classifier::TABLE_MARKER))
+        std::fs::create_dir_all(root.join(sandbox::classifier::TABLE_MARKER))
             .expect("the step writes the table's marker");
         std::fs::create_dir_all(root.join("ct-mark-mask-0x30000000"))
             .expect("the step records the ct-mark mask beside the marker");
@@ -3925,7 +3925,7 @@ mod tests {
         // The command's spelling is the install hint's own, pinned in the
         // classifier crate; the pin here is that the advisory carries it
         // whole, whatever the hint currently says.
-        let install = sandbox2::classifier::install_hint();
+        let install = sandbox::classifier::install_hint();
         assert!(
             advisory.contains(&install),
             "a missing step is the cause the install command ends, so the \
@@ -4264,7 +4264,7 @@ mod tests {
             crate::session_host::displayed_host_ip_enforcement(
                 false,
                 NetworkMode::HostNet,
-                sandbox2::config::Verdict::Deny,
+                sandbox::config::Verdict::Deny,
                 &decided,
                 None,
             ),
@@ -4276,7 +4276,7 @@ mod tests {
             crate::session_host::displayed_host_ip_enforcement(
                 false,
                 NetworkMode::HostNet,
-                sandbox2::config::Verdict::Allow,
+                sandbox::config::Verdict::Allow,
                 &decided,
                 None,
             ),
@@ -4288,7 +4288,7 @@ mod tests {
             crate::session_host::displayed_host_ip_enforcement(
                 false,
                 NetworkMode::OwnIp,
-                sandbox2::config::Verdict::Deny,
+                sandbox::config::Verdict::Deny,
                 &decided,
                 None,
             ),
@@ -4300,7 +4300,7 @@ mod tests {
             crate::session_host::displayed_host_ip_enforcement(
                 false,
                 NetworkMode::HostNet,
-                sandbox2::config::Verdict::Deny,
+                sandbox::config::Verdict::Deny,
                 &ineffective,
                 None,
             ),
@@ -4312,7 +4312,7 @@ mod tests {
             crate::session_host::displayed_host_ip_enforcement(
                 false,
                 NetworkMode::HostNet,
-                sandbox2::config::Verdict::Allow,
+                sandbox::config::Verdict::Allow,
                 &ineffective,
                 None,
             ),
@@ -4324,7 +4324,7 @@ mod tests {
             crate::session_host::displayed_host_ip_enforcement(
                 false,
                 NetworkMode::HostNet,
-                sandbox2::config::Verdict::Deny,
+                sandbox::config::Verdict::Deny,
                 &step_missing,
                 None,
             ),
@@ -4342,7 +4342,7 @@ mod tests {
             crate::session_host::displayed_host_ip_enforcement(
                 false,
                 NetworkMode::HostNet,
-                sandbox2::config::Verdict::Allow,
+                sandbox::config::Verdict::Allow,
                 &decided,
                 Some(minimald_rpc::HostIpEnforcement::PerBox),
             ),
@@ -4354,7 +4354,7 @@ mod tests {
             crate::session_host::displayed_host_ip_enforcement(
                 false,
                 NetworkMode::HostNet,
-                sandbox2::config::Verdict::Allow,
+                sandbox::config::Verdict::Allow,
                 &ineffective,
                 Some(minimald_rpc::HostIpEnforcement::PerBox),
             ),
@@ -4366,7 +4366,7 @@ mod tests {
             crate::session_host::displayed_host_ip_enforcement(
                 false,
                 NetworkMode::HostNet,
-                sandbox2::config::Verdict::Allow,
+                sandbox::config::Verdict::Allow,
                 &decided,
                 Some(minimald_rpc::HostIpEnforcement::None),
             ),

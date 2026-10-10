@@ -196,7 +196,7 @@ impl CleanCache {
 /// Whether `name`'s trailing `-<owner>` marks work nobody is doing any more.
 ///
 /// The stamp is a pid, or — when the work ran under a daemon — that daemon's
-/// `daemon_id` in the pid's place (`sandbox2::Config::daemon_id`). So:
+/// `daemon_id` in the pid's place (`sandbox::Config::daemon_id`). So:
 ///
 /// - our own `daemon_id`: never. That is this daemon's live work, and the id is
 ///   a random alphanumeric that can come out all-digits and read as a perfectly
@@ -399,7 +399,7 @@ mod tests {
         assert_eq!(event.render(), "Cleaning up stale sandbox build-0");
     }
 
-    /// A daemon never sweeps its own work, even though `sandbox2` stamps its
+    /// A daemon never sweeps its own work, even though `sandbox` stamps its
     /// `daemon_id` where a pid would go — and even when that id is all digits
     /// and so reads as a perfectly plausible dead pid.
     #[cfg(target_os = "linux")]

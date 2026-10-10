@@ -27,7 +27,7 @@ members = [
     "crates/mlog",
     "crates/remote-client",
     "crates/remote-proto",
-    "crates/sandbox2",
+    "crates/sandbox",
     "crates/sessions",
     "crates/stdlib",
     "crates/switch",
@@ -267,7 +267,7 @@ orchestrator = { path = "crates/orchestrator" }
 paths = { path = "crates/paths" }
 remote-proto = { path = "crates/remote-proto" }
 remote-client = { path = "crates/remote-client" }
-sandbox2 = { path = "crates/sandbox2" }
+sandbox = { path = "crates/sandbox" }
 sessions = { path = "crates/sessions" }
 switch = { path = "crates/switch" }
 version = { path = "crates/version" }

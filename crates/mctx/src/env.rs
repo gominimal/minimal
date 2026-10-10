@@ -13,8 +13,8 @@ use mfile::{EnvPatches, EnvVarValue};
 use op::Runnable;
 use ot::OpTracker;
 #[cfg(target_os = "linux")]
-use sandbox2::Container;
-use sandbox2::config::{Invocation, SandboxMapped};
+use sandbox::Container;
+use sandbox::config::{Invocation, SandboxMapped};
 use tempfile::TempDir;
 
 struct EnvChannel<'a> {
@@ -377,7 +377,7 @@ impl EnvChannel<'_> {
                     Some(&task.vars),
                     task.packages.clone(),
                     // A nested `min task` inside a bound-dir sandbox: paths
-                    // are mirrored one-for-one and sandbox2 gave this process
+                    // are mirrored one-for-one and `sandbox` gave this process
                     // the outer environment's `HOME`, so the ambient home is
                     // the outer home, which is the one `~/` meant all along.
                     PatchHome::Ambient,
@@ -403,7 +403,7 @@ impl EnvChannel<'_> {
     }
 }
 
-impl sandbox2::Channel for EnvChannel<'_> {
+impl sandbox::Channel for EnvChannel<'_> {
     fn handle(&mut self, stream: &mut UnixStream, line: &str, rootfs: &Path) {
         // handle, eg: echo 'add-ephemeral%mermaid-ascii' | socat -,ignoreeof UNIX-CONNECT:/run/minenv_sock
 
@@ -527,7 +527,7 @@ impl sandbox2::Channel for EnvChannel<'_> {
 /// run by the daemon sees the same paths the interactive session does rather
 /// than the daemon's internal tree.
 ///
-/// [`WdSetup`]: sandbox2::config::WdSetup
+/// [`WdSetup`]: sandbox::config::WdSetup
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum WdLayout {
     /// Mirror host paths one-for-one; the working directory is [`EnvArgs::cwd`].
@@ -552,12 +552,12 @@ pub enum WdLayout {
 /// whose host path lies inside `home` or `working` is retargeted to the same
 /// place under `/home` or `/workbench` (see [`session_mapping`]).
 fn apply_wd_layout(
-    config: sandbox2::config::Config,
+    config: sandbox::config::Config,
     layout: &WdLayout,
     cwd: &Path,
     home: Option<&Path>,
     fs_mappings: Vec<common::FsMapping>,
-) -> sandbox2::config::Config {
+) -> sandbox::config::Config {
     match layout {
         WdLayout::BoundDir => config
             .with_wd(cwd.to_path_buf(), false, fs_mappings)
@@ -584,8 +584,8 @@ fn session_mapping(mut m: common::FsMapping, home: &Path, working: &Path) -> com
         return m;
     }
     let mut bases = [
-        (home, sandbox2::SESSION_HOME),
-        (working, sandbox2::SESSION_DEFAULT_WD),
+        (home, sandbox::SESSION_HOME),
+        (working, sandbox::SESSION_DEFAULT_WD),
     ];
     bases.sort_by_key(|(base, _)| std::cmp::Reverse(base.as_os_str().len()));
     let host = Path::new(&m.host_path);
@@ -628,8 +628,8 @@ pub struct EnvArgs<'a> {
 
     /// The sandbox's network provider. Decides the namespace, the tap and the
     /// resolver the sandbox gets, and does any post-spawn wiring; see
-    /// [`sandbox2::Network`].
-    pub network: std::sync::Arc<dyn sandbox2::Network>,
+    /// [`sandbox::Network`].
+    pub network: std::sync::Arc<dyn sandbox::Network>,
     /// The operation tracker to use downstream, if applicable.
     pub ot: Option<OpTracker>,
 }
@@ -715,12 +715,12 @@ struct DeclaredMapping<'a> {
 /// back to the first declaration when nothing narrows it (the common case:
 /// exactly one declaration at that path).
 fn attribute_fs_mapping_error(
-    e: &sandbox2::Error,
+    e: &sandbox::Error,
     declarations: &BTreeMap<String, Vec<DeclaredMapping<'_>>>,
     fs_mapping_packages: &BTreeMap<String, String>,
     task: &str,
 ) -> Option<Error> {
-    let sandbox2::Error::IO(op, path, io_err) = e else {
+    let sandbox::Error::IO(op, path, io_err) = e else {
         return None;
     };
     let candidates = path.to_str().and_then(|p| declarations.get(p))?;
@@ -765,7 +765,7 @@ pub enum PatchHome {
     ///
     /// The right answer for `mip` run by a developer: the sandbox mirrors
     /// host paths one-for-one (`WdSetup::BoundDir`), so the home a package
-    /// means by `~` *is* the invoking user's, and sandbox2 synthesizes the
+    /// means by `~` *is* the invoking user's, and `sandbox` synthesizes the
     /// same home into the sandbox's passwd. An unset `HOME` leaves no home at
     /// all, which is an error for a `~/`-rooted mapping and fine for anything
     /// else.
@@ -797,7 +797,7 @@ impl PatchHome {
 
 /// A successfully-configured runtime environment.
 pub struct Env<'a> {
-    sandbox: sandbox2::Sandbox<EnvChannel<'a>>,
+    sandbox: sandbox::Sandbox<EnvChannel<'a>>,
     temp_dirs: Vec<TempDir>,
 }
 
@@ -860,7 +860,7 @@ impl<'a> Env<'a> {
                 declared_by(&fs_mapping_packages, &e.declared, args.name)
             ))
         })?;
-        // Expanded path → the declaration(s) behind it. sandbox2 only ever
+        // Expanded path → the declaration(s) behind it. `sandbox` only ever
         // sees the expanded form, so its fs-mapping failures name a path
         // nobody wrote down; this puts the `~/`-rooted declaration back
         // into the message. A path can carry more than one declaration (a
@@ -895,7 +895,7 @@ impl<'a> Env<'a> {
             });
 
         let mut config = apply_wd_layout(
-            sandbox2::config::Config::new(args.name),
+            sandbox::config::Config::new(args.name),
             &args.wd_layout,
             &args.cwd,
             home.as_deref(),
@@ -993,11 +993,11 @@ impl<'a> Env<'a> {
     }
 
     /// Step 1 of a launch: the provider's plan, with its release owed. See
-    /// [`sandbox2::Sandbox::plan_launch`].
+    /// [`sandbox::Sandbox::plan_launch`].
     #[cfg(target_os = "linux")]
     pub fn plan_launch(
         &self,
-    ) -> impl std::future::Future<Output = Result<sandbox2::PlannedLaunch, Error>> + Send + 'static
+    ) -> impl std::future::Future<Output = Result<sandbox::PlannedLaunch, Error>> + Send + 'static
     {
         let planned = self.sandbox.plan_launch();
         async move { planned.await.map_err(Error::from) }
@@ -1007,7 +1007,7 @@ impl<'a> Env<'a> {
     /// `plan`. One *spawn* is what gets a namespace, so a caller running
     /// several invocations needs a container per plan.
     #[cfg(target_os = "linux")]
-    pub fn container(&mut self, plan: &sandbox2::NetPlan) -> Result<Container, Error> {
+    pub fn container(&mut self, plan: &sandbox::NetPlan) -> Result<Container, Error> {
         self.sandbox
             .new_container(plan)
             .map_err(|e| Error::Other(anyhow::anyhow!("{}", e)))
@@ -1019,7 +1019,7 @@ impl<'a> Env<'a> {
         container: &Container,
         program: &str,
         args: I,
-    ) -> Result<sandbox2::Command, Error>
+    ) -> Result<sandbox::Command, Error>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
@@ -1138,7 +1138,7 @@ impl tokio::io::AsyncWrite for StreamWriter {
 mod tests {
     use super::*;
     use crate::ConfigBuilder;
-    use sandbox2::Channel;
+    use sandbox::Channel;
     use std::io::{BufRead, BufReader};
     use tempfile::tempdir;
 
@@ -1198,7 +1198,7 @@ mod tests {
     #[test]
     fn wd_layout_selects_session_or_bound_dir() {
         let session = apply_wd_layout(
-            sandbox2::config::Config::new("task"),
+            sandbox::config::Config::new("task"),
             &WdLayout::Session {
                 home: PathBuf::from("/var/lib/minimal/sessions/s1/home"),
                 working: PathBuf::from("/var/lib/minimal/sessions/s1/tree"),
@@ -1211,7 +1211,7 @@ mod tests {
         assert_eq!(session.sandbox_home(), "/home");
 
         let bound = apply_wd_layout(
-            sandbox2::config::Config::new("task"),
+            sandbox::config::Config::new("task"),
             &WdLayout::BoundDir,
             Path::new("/var/lib/minimal/sessions/s1/tree"),
             Some(Path::new("/home/dev")),
@@ -1225,7 +1225,7 @@ mod tests {
     }
 
     /// A task's `patch` table still applies under the session layout: every
-    /// mapping reaches sandbox2 with its declared mode, a mapping inside the
+    /// mapping reaches `sandbox` with its declared mode, a mapping inside the
     /// session home or tree is retargeted under `/home` or `/workbench`, and
     /// any other absolute path (a host socket) keeps its own path.
     #[test]
@@ -1240,7 +1240,7 @@ mod tests {
         let home = "/var/lib/minimal/sessions/s1/home";
         let working = "/var/lib/minimal/sessions/s1/tree";
         let config = apply_wd_layout(
-            sandbox2::config::Config::new("task"),
+            sandbox::config::Config::new("task"),
             &WdLayout::Session {
                 home: PathBuf::from(home),
                 working: PathBuf::from(working),
@@ -1254,7 +1254,7 @@ mod tests {
                 mapping("/var/run/docker.sock", false, true),
             ],
         );
-        let sandbox2::config::WdSetup::Session { fs_mappings, .. } = &config.wd else {
+        let sandbox::config::WdSetup::Session { fs_mappings, .. } = &config.wd else {
             panic!("expected the session layout, got {:?}", config.wd);
         };
         let placed: Vec<(String, bool)> = fs_mappings
@@ -1290,7 +1290,7 @@ mod tests {
         )]);
         let packages = BTreeMap::new();
 
-        let missing = sandbox2::Error::IO(
+        let missing = sandbox::Error::IO(
             "fs mapping",
             PathBuf::from("/home/dev/.aws"),
             std::io::Error::from(std::io::ErrorKind::NotFound),
@@ -1309,7 +1309,7 @@ mod tests {
             "task-own patch entry must be attributed to the task, got: {msg}"
         );
 
-        let create = sandbox2::Error::IO(
+        let create = sandbox::Error::IO(
             "create mapped file",
             PathBuf::from("/home/dev/.aws"),
             std::io::Error::from(std::io::ErrorKind::ReadOnlyFilesystem),
@@ -1351,7 +1351,7 @@ mod tests {
         )]);
         let packages = BTreeMap::new();
 
-        let collision = sandbox2::Error::IO(
+        let collision = sandbox::Error::IO(
             "stat fs mapping",
             PathBuf::from("/home/dev/shared"),
             std::io::Error::new(
