@@ -562,7 +562,8 @@ pub(crate) async fn activate_session(
     // and the dashboard share it.
     let policy_path = config::user_policy_path(global);
     let selection = loadouts::LoadoutSelection::from_flags(&args.loadout, args.no_loadouts);
-    let inputs = loadouts::prepare_activation_inputs(global, &abs_path, selection, !args.no_hooks)?;
+    let inputs =
+        loadouts::prepare_activation_inputs(global, &abs_path, selection, !args.no_hooks, None)?;
 
     // Scaffold-offer a missing `minimal.toml` only after the loadouts resolve
     // and compose: a bad `--loadout` must error before anything prints, so the

@@ -587,11 +587,11 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
         path: paths::HostPath::try_new(utf8_path.clone()).context("Invalid project path")?,
     };
     let non_interactive = global.no_input || !crate::can_prompt_interactively();
-    // The policy amended by the task-env gating above is persisted to disk on
-    // the interactive path, and unchanged on the refuse path, so
-    // `prepare_activation_inputs` (which re-reads it) composes under the same
-    // rules.
-    let (task_env, _) = if non_interactive {
+    // The policy amended by the task-env gating above: persisted to disk on
+    // the interactive path, and carried into `prepare_activation_inputs`
+    // below as an override, so composition and the pending gate run under the
+    // approved rules even when that save failed.
+    let (task_env, amended_policy) = if non_interactive {
         let hooks = RefuseAndRecord::default();
         let task_env = resolve_task_env(
             &declared,
@@ -666,7 +666,13 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     // through the same shared helper an activate uses so the staged hook
     // scripts and the finalize budget match.
     let selection = crate::loadouts::LoadoutSelection::from_flags(&[], false);
-    let inputs = crate::loadouts::prepare_activation_inputs(global, &abs_path, selection, true)?;
+    let inputs = crate::loadouts::prepare_activation_inputs(
+        global,
+        &abs_path,
+        selection,
+        true,
+        Some(amended_policy),
+    )?;
     inputs.announce_loadouts();
 
     let initial_policy = inputs.initial_policy;

@@ -564,14 +564,23 @@ impl ActivationInputs {
 /// Run before the daemon connection: a missing loadout, a malformed config, or
 /// a mistyped hook script must fail on this machine, not after a session
 /// exists on the daemon.
+///
+/// `user_policy_override` short-circuits the policy read. A caller that has
+/// already read — and possibly amended — the policy passes it so composition
+/// and the later pending gate run under those rules even when persisting them
+/// failed.
 pub(crate) fn prepare_activation_inputs(
     global: &GlobalArgs,
     project: &paths::HostAbsPath,
     selection: LoadoutSelection,
     hooks_enabled: bool,
+    user_policy_override: Option<sessions::core::policy::UserPolicy>,
 ) -> Result<ActivationInputs, anyhow::Error> {
     let cfg = read_client_config(global)?;
-    let user_policy = read_user_policy(global)?;
+    let user_policy = match user_policy_override {
+        Some(policy) => policy,
+        None => read_user_policy(global)?,
+    };
     let initial_policy = user_policy.clone();
     let compose_options = compose_options_from_config(&cfg);
     let active = resolve_active_loadouts(selection, &cfg, global)?;

@@ -1161,29 +1161,37 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
                                 let abs = paths::HostAbsPath::try_new(utf8)
                                     .context("invalid project path")?;
                                 // Resolve the loadout contribution, stage its
-                                // hook scripts, and size the hook budget
-                                // against this project path, through the same
-                                // CLI helper `min session activate` uses — so
-                                // an external loadout hook works from the
-                                // dashboard too.
-                                let inputs = crate::loadouts::prepare_activation_inputs(
-                                    &global, &abs, loadouts, true,
-                                )?;
-                                // The resolve walk and the gate's stats are
-                                // blocking filesystem traversals; run them off
-                                // the async worker so a stalled mount can't
-                                // stall the runtime.
+                                // hook scripts, size the hook budget against
+                                // this project path, resolve the upload root,
+                                // and take the upload gate's stats — all
+                                // through the same CLI helpers `min session
+                                // activate` uses, so an external loadout hook
+                                // works from the dashboard too. Every one of
+                                // them is blocking filesystem work (config and
+                                // policy reads, loadout resolution, hook
+                                // staging, the resolve walk), so run the batch
+                                // off the async worker: a stalled mount must
+                                // not stall the runtime.
                                 let invoked_from = abs.as_utf8_path().to_path_buf();
-                                let (upload_root, decision) = {
+                                let (inputs, upload_root, decision) = {
                                     let dir = invoked_from.clone();
+                                    let abs_blocking = abs.clone();
+                                    let global_blocking = global.clone();
                                     tokio::task::spawn_blocking(move || {
+                                        let inputs = crate::loadouts::prepare_activation_inputs(
+                                            &global_blocking,
+                                            &abs_blocking,
+                                            loadouts,
+                                            true,
+                                            None,
+                                        )?;
                                         let root = crate::resolve_upload_root(&dir)?;
                                         let decision =
                                             crate::decide_workspace_upload(&root, false, false);
-                                        Ok::<_, anyhow::Error>((root, decision))
+                                        Ok::<_, anyhow::Error>((inputs, root, decision))
                                     })
                                     .await
-                                    .context("resolving the upload root")??
+                                    .context("preparing the session create")??
                                 };
                                 // The undeclared non-VCS root gets the CLI's
                                 // confirm here, through the TUI, before the

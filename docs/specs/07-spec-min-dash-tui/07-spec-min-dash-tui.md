@@ -405,8 +405,8 @@ VCS checkout or a root carrying `minimal.toml` uploads; an empty directory or
 confirmation ("<root> is not a repository root; upload it? y/n") before
 anything reaches the daemon. The create composes its activation inputs
 through the CLI's own helper against the session's project path, so
-`default_loadouts`, the user policy, and loadout hook scripts apply to
-dashboard-created sessions too.
+`default_loadouts`, the user policy, loadout hook scripts, and the
+composition's patches apply to dashboard-created sessions too.
 
 ### Unit 7 — Last-session memory
 
