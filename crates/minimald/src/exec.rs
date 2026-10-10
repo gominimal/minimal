@@ -1326,11 +1326,6 @@ where
     // Cleared once the client-loss sender is dropped without signalling:
     // `changed()` would then resolve `Err` on every poll and spin the loop.
     let mut client_watch_open = true;
-    // Mirror flags for the select gates below: the branch futures are
-    // built before the gates are evaluated, so a gate may not borrow
-    // anything a branch future holds.
-    let mut child_stdin_open = child_stdin.is_some();
-    let mut stdin_pending = false;
     // A stdin read parked behind a full child pipe. The bytes are copied
     // out of `stdin_buf` because the read branch borrows it on the next
     // iteration. Cleared by the write branch as it drains the slice.
@@ -1338,20 +1333,21 @@ where
 
     while (stdout_open || stderr_open) && !ssh_write_failed && child_exit.is_none() {
         tokio::select! {
-            // Gated on `child_stdin_open`: if the current child's stdin
-            // pipe broke mid-step (write failure below) we stop reading
-            // from `r` for the rest of this step, but leave `*stdin_open`
-            // set so the next child in the sequence picks up where we
-            // left off. Gated on a drained `stdin_pending` so the next
-            // read cannot overwrite bytes the child has not accepted.
-            read_res = r.read(&mut stdin_buf), if *stdin_open && child_stdin_open && !stdin_pending => {
+            // Gated on `child_stdin.is_some()`: if the current child's
+            // stdin pipe broke mid-step (write failure below) we stop
+            // reading from `r` for the rest of this step, but leave
+            // `*stdin_open` set so the next child in the sequence picks
+            // up where we left off. Gated on a drained `pending` so at
+            // most one chunk the child has not accepted is ever queued.
+            // `select!` evaluates every gate before it builds any branch
+            // future, so a gate may borrow what a future later holds.
+            read_res = r.read(&mut stdin_buf), if *stdin_open && child_stdin.is_some() && pending.is_none() => {
                 match read_res {
                     Ok(0) => {
                         *stdin_open = false;
                         // Dropping the write half closes the pipe so
                         // the child sees EOF on its stdin.
                         child_stdin = None;
-                        child_stdin_open = false;
                     }
                     Err(err) => {
                         tracing::warn!(
@@ -1360,11 +1356,9 @@ where
                         );
                         *stdin_open = false;
                         child_stdin = None;
-                        child_stdin_open = false;
                     }
                     Ok(n) => {
                         pending = Some((stdin_buf[..n].to_vec(), 0));
-                        stdin_pending = true;
                     }
                 }
             }
@@ -1378,7 +1372,7 @@ where
                     (Some(cs), Some((data, offset))) => cs.write(&data[*offset..]).await,
                     _ => std::future::pending::<io::Result<usize>>().await,
                 }
-            }, if stdin_pending && child_stdin_open => {
+            }, if pending.is_some() && child_stdin.is_some() => {
                 match write_res {
                     Ok(0) => {
                         tracing::warn!(
@@ -1386,9 +1380,7 @@ where
                             "exec: child accepted zero bytes of stdin; closing child stdin",
                         );
                         child_stdin = None;
-                        child_stdin_open = false;
                         pending = None;
-                        stdin_pending = false;
                     }
                     Err(err) => {
                         tracing::warn!(
@@ -1396,16 +1388,13 @@ where
                             "exec: failed to write stdin to child; closing child stdin",
                         );
                         child_stdin = None;
-                        child_stdin_open = false;
                         pending = None;
-                        stdin_pending = false;
                     }
                     Ok(n) => {
                         let (data, offset) = pending.as_mut().expect("gated on a pending write");
                         *offset += n;
                         if *offset >= data.len() {
                             pending = None;
-                            stdin_pending = false;
                         }
                     }
                 }
@@ -1475,6 +1464,8 @@ where
             }
         }
     }
+    // Stdin still in `pending` when the child exits or both output pipes
+    // close is dropped here, as bytes left unread in the child's pipe are.
 
     // Nobody is reading the child's output any more, so it would wedge
     // on a full pipe and never be reapable. Kill, then fall through to
@@ -3352,6 +3343,11 @@ mod tests {
 
     /// A child that exits with stdin still queued behind its full pipe
     /// drops the queued bytes and still reports its own exit status.
+    ///
+    /// Every pipe end stays open until the bridge returns, so the only
+    /// way out of the loop is the `wait` branch with a chunk still
+    /// queued: closing the child's stdin first would instead end the
+    /// parked write with `BrokenPipe` and take the write-failure path.
     #[tokio::test]
     async fn bridge_reports_exit_when_child_exits_with_stdin_queued() {
         use std::time::Duration;
@@ -3360,8 +3356,9 @@ mod tests {
         let (
             process,
             MockEndpoints {
-                // Never read: the child's stdin pipe fills and a chunk queues.
-                stdin_reader,
+                // Not read until the bridge returns: the child's stdin
+                // pipe fills and a chunk queues behind it.
+                mut stdin_reader,
                 stdout_writer,
                 stderr_writer,
                 ctrl,
@@ -3392,10 +3389,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(!bridge_task.is_finished());
 
-        // The child goes away, and its end of every pipe with it.
-        drop(stdin_reader);
-        drop(stdout_writer);
-        drop(stderr_writer);
+        // The child is reaped while every pipe end is still open.
         ctrl.signal_exit(3).await;
 
         let exit = timeout(Duration::from_secs(10), bridge_task)
@@ -3404,6 +3398,21 @@ mod tests {
             .unwrap();
         assert_eq!(exit, 3);
         assert!(!ctrl.was_killed());
+
+        // The child's stdin holds exactly what fit in its pipe, then EOF:
+        // the queued chunk was dropped, not delivered late.
+        let mut delivered = Vec::new();
+        timeout(
+            Duration::from_secs(10),
+            stdin_reader.read_to_end(&mut delivered),
+        )
+        .await
+        .expect("the bridge must close the child's stdin on return")
+        .unwrap();
+        assert_eq!(delivered.len(), 64 * 1024);
+
+        drop(stdout_writer);
+        drop(stderr_writer);
         feeder.abort();
     }
 
