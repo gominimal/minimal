@@ -118,23 +118,35 @@ pub const NET068_TOOLCHAIN_EGRESS_HOSTS: &[&str] = &[
     "production.cloudfront.docker.com",
 ];
 
-/// Effective egress policy for a session.
+/// Egress policy for a session: the `egress` section as declared, before
+/// [`effective_egress`] resolves it.
 ///
-/// Each `allow_*` field is `None` to mean allow-all for that dimension, and
-/// `deny_subnets` is `None` to mean nothing is denied. Absent `egress` config
-/// on a session is equivalent to all-`None` (allow-all). A `deny_subnets`
+/// `None` on a destination list (`allow_subnets`, `allow_dns_hosts`) is "no
+/// opinion" while the spec's layers merge — the list is left to another
+/// layer — and grants nothing once they have merged: on an own-address box
+/// under the in-force deny-all default (NET-074) the absent list reaches
+/// nothing in its dimension, and only the daemon's opt-out (NET-077) keeps
+/// the earlier allow-all reading of it. Allow-all is therefore written out,
+/// as `0.0.0.0/0` and `::/0` in `allow_subnets`; no absent list stands in for
+/// it. `allow_protocols` filters the reach the two destination lists grant
+/// rather than granting any, so `None` there narrows nothing: every
+/// protocol passes. `deny_subnets: None` denies nothing. A `deny_subnets`
 /// entry is subtractive: it carves a range out of what the `allow_*` fields
 /// admit, so a rule set is effective only where it is not also denied.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct EgressPolicy {
-    /// Allowed destination CIDR prefixes; `None` means allow-all subnets.
+    /// Allowed destination CIDR prefixes. `None` is no opinion while layers
+    /// merge and grants no destination once merged; allow-all is written
+    /// out as `0.0.0.0/0` (and `::/0`).
     pub allow_subnets: Option<Vec<String>>,
-    /// Allowed destination DNS hostnames; `None` means allow-all hosts.
+    /// Allowed destination DNS hostnames. `None` is no opinion while layers
+    /// merge and grants no name once merged.
     pub allow_dns_hosts: Option<Vec<String>>,
-    /// Allowed IP protocols; `None` means allow all protocols.
+    /// Allowed IP protocols, a filter over the reach the destination lists
+    /// grant; `None` lets every protocol through.
     pub allow_protocols: Option<Vec<IpProto>>,
     /// Denied destination CIDR prefixes, subtracted from the allowed set;
-    /// `None` means nothing is denied.
+    /// `None` denies nothing.
     pub deny_subnets: Option<Vec<String>>,
 }
 
@@ -463,7 +475,11 @@ pub enum EffectiveEgress {
     /// box without an address of its own, and under the announced phase.
     #[default]
     AllowAll,
-    /// The box declared its own egress section; carried verbatim.
+    /// The box declared its own egress section, carried as declared except
+    /// that under the in-force default on an own-address box (NET-074,
+    /// without the opt-out) a destination list the section leaves absent is
+    /// resolved to present and empty: absent grants nothing once the layers
+    /// have merged.
     Declared(EgressPolicy),
 }
 
@@ -525,15 +541,23 @@ pub struct EffectiveSessionPolicy {
     pub credentialed_upstream: Option<CredentialedUpstream>,
 }
 
-/// Resolves the effective egress of a box (NET-074/NET-077): a declared
-/// section is carried verbatim whatever the phase — a box that says what it
-/// wants gets what it said — and an absent `egress` section is the default's
-/// to decide. Deny-all once [`EgressDefaultPhase::InForce`], on an
-/// own-address box ([`NetworkMode::OwnIp`]) whose daemon has not opted out;
-/// the shipped allow-all of 03-spec R2.1 in every other case: before the
-/// default is in force, behind the opt-out, or for a box that shares its
-/// host's namespace (or has no network at all) and so owns no address of its
-/// own to deny from.
+/// Resolves the effective egress of a box (NET-074/NET-077). An absent
+/// `egress` section is the default's to decide: deny-all once
+/// [`EgressDefaultPhase::InForce`], on an own-address box
+/// ([`NetworkMode::OwnIp`]) whose daemon has not opted out; the shipped
+/// allow-all of 03-spec R2.1 in every other case: before the default is in
+/// force, behind the opt-out, or for a box that shares its host's namespace
+/// (or has no network at all) and so owns no address of its own to deny
+/// from. A declared section is the box's own — a box that says what it
+/// wants gets what it said — and the same default decides the destination
+/// lists it leaves absent: under the deny-all arm an absent `allow_subnets`
+/// or `allow_dns_hosts` is resolved to present and empty, so it grants
+/// nothing in its dimension (an absent list is no opinion while the spec's
+/// layers merge, and this is the policy after the merge); in every other
+/// arm the absent list keeps the allow-all reading the opt-out preserves.
+/// `allow_protocols` is left as declared in every arm: it filters the reach
+/// the destination lists grant and grants none itself, so `allow_subnets =
+/// ["0.0.0.0/0"]` alone is the written-out allow-all.
 ///
 /// `opt_out` is the daemon's deny-all opt-out flag (NET-077); the caller
 /// threads it in from the daemon's configuration, because it is the daemon —
@@ -546,14 +570,20 @@ pub fn effective_egress(
     phase: EgressDefaultPhase,
     opt_out: bool,
 ) -> EffectiveEgress {
+    let deny_all_default = matches!(
+        (phase, network),
+        (EgressDefaultPhase::InForce, NetworkMode::OwnIp)
+    ) && !opt_out;
     match declared {
+        Some(section) if deny_all_default => {
+            let mut section = section.clone();
+            section.allow_subnets.get_or_insert_with(Vec::new);
+            section.allow_dns_hosts.get_or_insert_with(Vec::new);
+            EffectiveEgress::Declared(section)
+        }
         Some(section) => EffectiveEgress::Declared(section.clone()),
-        None => match (phase, network) {
-            (EgressDefaultPhase::InForce, NetworkMode::OwnIp) if !opt_out => {
-                EffectiveEgress::DenyAll
-            }
-            _ => EffectiveEgress::AllowAll,
-        },
+        None if deny_all_default => EffectiveEgress::DenyAll,
+        None => EffectiveEgress::AllowAll,
     }
 }
 
@@ -1578,16 +1608,30 @@ mod tests {
             ..EgressPolicy::default()
         };
 
-        // A declared section is carried verbatim in every phase, opted out
-        // or not, on every mode: the default only fills an absent section.
+        // A declared section is carried verbatim in every arm but the
+        // deny-all one: there the default also decides the destination list
+        // the section left absent (`allow_dns_hosts` here), resolving it to
+        // present and empty, which `absent_destination_lists_grant_nothing_once_merged`
+        // proves in full.
         for phase in [EgressDefaultPhase::Announced, EgressDefaultPhase::InForce] {
             for opt_out in [false, true] {
                 for network in [NetworkMode::OwnIp, NetworkMode::HostNet, NetworkMode::NoNet] {
+                    let deny_all_arm = phase == EgressDefaultPhase::InForce
+                        && network == NetworkMode::OwnIp
+                        && !opt_out;
+                    let expected = if deny_all_arm {
+                        EgressPolicy {
+                            allow_dns_hosts: Some(Vec::new()),
+                            ..declared.clone()
+                        }
+                    } else {
+                        declared.clone()
+                    };
                     assert_eq!(
                         effective_egress(Some(&declared), network, phase, opt_out),
-                        EffectiveEgress::Declared(declared.clone()),
-                        "a declared egress section must survive phase {phase:?}, \
-                         opt_out {opt_out}, mode {network:?} untouched",
+                        EffectiveEgress::Declared(expected),
+                        "a declared egress section under phase {phase:?}, \
+                         opt_out {opt_out}, mode {network:?}",
                     );
                 }
             }
@@ -1643,12 +1687,117 @@ mod tests {
         );
     }
 
+    /// NET-074 per list, under the NET-077 opt-out: once the layers have
+    /// merged — the policy the daemon receives — a destination list the
+    /// section leaves absent grants nothing in its dimension, so a box with a
+    /// name allow list and no `allow_subnets` reaches no address directly;
+    /// the opt-out keeps the earlier allow-all reading of the absent list;
+    /// and allow-all is written out as `0.0.0.0/0`, which admits every
+    /// address.
+    #[test]
+    fn absent_destination_lists_grant_nothing_once_merged() {
+        use crate::core::egress::{DropReason, EgressRules, FrameVerdict, summarize, verdict};
+
+        let resolver = [100, 64, 0, 1];
+        let lease = [100, 64, 0, 9];
+        // A TCP SYN from the lease to a public address, port 443: the direct
+        // connection a name allow list does not grant.
+        let direct_to_ip = {
+            let mut frame = vec![0u8; 14 + 20 + 20];
+            frame[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+            frame[14] = 0x45;
+            frame[23] = 6;
+            frame[26..30].copy_from_slice(&lease);
+            frame[30..34].copy_from_slice(&[203, 0, 113, 7]);
+            frame[36..38].copy_from_slice(&443u16.to_be_bytes());
+            summarize(&frame)
+        };
+        let reach = |section: &EgressPolicy, opt_out: bool| {
+            let EffectiveEgress::Declared(merged) = effective_egress(
+                Some(section),
+                NetworkMode::OwnIp,
+                EgressDefaultPhase::InForce,
+                opt_out,
+            ) else {
+                panic!("a declared section stays declared");
+            };
+            let rules = EgressRules::from_policy(Some(&merged), resolver, lease);
+            (merged, verdict(&direct_to_ip, &rules))
+        };
+
+        // Names only: the absent `allow_subnets` resolves to present and
+        // empty, and the direct connection drops on the subnet dimension —
+        // the one drop a DNS pin lifts, so the name grant still works and
+        // nothing else does. `allow_protocols` is a filter, not a grant, and
+        // stays as declared.
+        let names_only = EgressPolicy {
+            allow_dns_hosts: Some(vec!["github.com".into()]),
+            ..EgressPolicy::default()
+        };
+        let (merged, direct) = reach(&names_only, false);
+        assert_eq!(
+            merged,
+            EgressPolicy {
+                allow_subnets: Some(Vec::new()),
+                allow_dns_hosts: Some(vec!["github.com".into()]),
+                allow_protocols: None,
+                deny_subnets: None,
+            },
+            "an absent destination list is present and empty once merged",
+        );
+        assert!(
+            matches!(
+                direct,
+                FrameVerdict::Drop(DropReason::UndeclaredSubnet {
+                    dst: [203, 0, 113, 7],
+                    ..
+                })
+            ),
+            "a name allow list grants no direct-to-address reach: {direct:?}",
+        );
+        assert!(
+            !merged.admits_nothing(),
+            "a section with a name allow list is not the deny-all shape",
+        );
+
+        // Behind the opt-out (NET-077) the absent list keeps its earlier
+        // allow-all reading, so the same section still reaches the address.
+        let (opted_out, direct) = reach(&names_only, true);
+        assert_eq!(
+            opted_out, names_only,
+            "the opt-out leaves the section as declared"
+        );
+        assert_eq!(direct, FrameVerdict::Admit, "the opt-out keeps allow-all");
+
+        // Allow-all is written out, and the written-out list admits every
+        // address, under the deny-all default and without the opt-out.
+        let written_out = EgressPolicy {
+            allow_subnets: Some(vec!["0.0.0.0/0".into(), "::/0".into()]),
+            ..EgressPolicy::default()
+        };
+        let (merged, direct) = reach(&written_out, false);
+        assert_eq!(
+            merged.allow_subnets, written_out.allow_subnets,
+            "a written-out list is carried as declared",
+        );
+        assert_eq!(
+            merged.allow_dns_hosts,
+            Some(Vec::new()),
+            "the names the written-out box did not list grant nothing",
+        );
+        assert_eq!(
+            direct,
+            FrameVerdict::Admit,
+            "`0.0.0.0/0` admits every address"
+        );
+    }
+
     #[test]
     fn admits_nothing_reads_the_deny_all_shape() {
         // The deny-all predicate is the one shape the egress gate refuses:
         // every `allow_*` dimension present and empty. An absent dimension
-        // is allow-all for that dimension, and one non-empty list admits
-        // something, so neither is deny-all.
+        // is not yet resolved (`effective_egress` decides what it grants),
+        // and one non-empty list admits something, so neither is deny-all.
         assert!(EgressPolicy::deny_all().admits_nothing());
         assert!(!EgressPolicy::default().admits_nothing());
         assert!(

@@ -202,7 +202,8 @@ pub(crate) struct SessionConfig {
 /// The egress *section* the gate compiles for a session: the materialized
 /// form of [`sessions::effective_egress`]'s answer — `None` for the
 /// allow-all default, the deny-all section for an absent declaration under the
-/// in-force default (NET-074), and a declaration verbatim. `phase` is the
+/// in-force default (NET-074), and a declaration with the destination lists
+/// it left absent resolved as that function documents. `phase` is the
 /// rollout phase to resolve under — the launcher and the task path pass
 /// [`sessions::EGRESS_DEFAULT_PHASE`], the phase this build ships, and the
 /// tests name [`sessions::EgressDefaultPhase::InForce`] so the posture they

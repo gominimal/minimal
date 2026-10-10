@@ -2989,17 +2989,26 @@ mod tests {
         // the task path attaches a gate, and the announcement does not defer
         // it: the declaration is enforced on the session's own PTask in every
         // phase, so a task in that session resolves the same section its
-        // session's gate did — the declaration verbatim, not the deny-all
-        // section and not nothing — under either phase.
+        // session's gate did — the declaration, not the deny-all section and
+        // not nothing — under either phase. In force, the default also
+        // decides the destination list the declaration left absent
+        // (`allow_dns_hosts`): present and empty, granting nothing
+        // (NET-074); announced, the section is carried as declared.
         let section = sessions::EgressPolicy {
             allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
             ..sessions::EgressPolicy::default()
         };
         let mut declared_record = record_with(sessions::NetworkMode::OwnIp);
         declared_record.policy.egress = Some(section.clone());
-        for phase in [
-            sessions::EgressDefaultPhase::Announced,
-            sessions::EgressDefaultPhase::InForce,
+        for (phase, expected) in [
+            (sessions::EgressDefaultPhase::Announced, section.clone()),
+            (
+                sessions::EgressDefaultPhase::InForce,
+                sessions::EgressPolicy {
+                    allow_dns_hosts: Some(Vec::new()),
+                    ..section.clone()
+                },
+            ),
         ] {
             assert_eq!(
                 crate::session::effective_egress_section(
@@ -3008,9 +3017,9 @@ mod tests {
                     phase,
                     false,
                 ),
-                Some(section.clone()),
-                "a declared egress section reaches the task's gate verbatim \
-                 while the default is {phase:?}",
+                Some(expected),
+                "a declared egress section reaches the task's gate as the \
+                 default resolves it while the default is {phase:?}",
             );
         }
         let declared = super::task_network(
