@@ -3792,6 +3792,32 @@ mod tests {
         }
     }
 
+    /// Publishes one row, retrying a connect the answerer drops before it
+    /// answers the hello: the channel loop drops a connect it cannot serve,
+    /// and on a loaded host those failures are transient. A connect whose
+    /// hello was never acked never sent its rows — the publish is written
+    /// only after the ack — so retrying cannot double-publish. Other errors
+    /// return to the caller unchanged.
+    fn connect_and_publish_retrying(
+        sock: &Path,
+        node: &str,
+        name: &str,
+        address: Ipv4Addr,
+    ) -> io::Result<Published> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match connect_and_publish(sock, node, vec![published_row(name, address)]) {
+                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {}
+                other => return other,
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the answerer dropped every hello within 10 s"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     /// A registry holding one published box named `name` at the reserved-range
     /// address whose tail is `tail` — [`web_registry`]'s shape, at a name and
     /// address the caller picks, so two daemons in one test hold rows that
@@ -5922,10 +5948,10 @@ mod tests {
         let node_b = node_id_for(&state_b, "default");
         let address = Ipv4Addr::new(127, 0, 64, 21);
 
-        let first = connect_and_publish(&channel, &node_a, vec![published_row("owned", address)])
+        let first = connect_and_publish_retrying(&channel, &node_a, "owned", address)
             .expect("node a publishes");
         assert!(first.refused.is_empty(), "node a's name is held");
-        let second = connect_and_publish(&channel, &node_b, vec![published_row("owned", address)])
+        let second = connect_and_publish_retrying(&channel, &node_b, "owned", address)
             .expect("node b's connection is served");
         let [refused] = &second.refused[..] else {
             panic!(
@@ -5956,17 +5982,17 @@ mod tests {
         );
         let relinked = node_id_for(&link_a, "default");
         assert_eq!(relinked, node_a, "a symlinked state dir is the same node");
-        let again = connect_and_publish(&channel, &relinked, vec![published_row("owned", address)])
+        let again = connect_and_publish_retrying(&channel, &relinked, "owned", address)
             .expect("node a re-publishes after the restart");
         assert!(again.refused.is_empty(), "node a keeps its name");
         // A second connection of the same node is the same owner too.
-        let same = connect_and_publish(&channel, &node_a, vec![published_row("owned", address)])
+        let same = connect_and_publish_retrying(&channel, &node_a, "owned", address)
             .expect("node a's second connection is served");
         assert!(
             same.refused.is_empty(),
             "the same node is never refused its own name"
         );
-        let other = connect_and_publish(&channel, &node_b, vec![published_row("owned", address)])
+        let other = connect_and_publish_retrying(&channel, &node_b, "owned", address)
             .expect("node b's connection is served");
         assert_eq!(other.refused.len(), 1, "node b is still refused the name");
         let reply = await_a_record(

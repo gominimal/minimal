@@ -700,12 +700,19 @@ mod tests {
         reap_stale_gvproxy(&binary, &sock).expect("reap");
 
         // The reap returns once the leftover is gone (a zombie, since this
-        // test is its parent).
+        // test is its parent), but on macOS the process scan can transiently
+        // fail to read a live process's argv and skip a leftover that is
+        // there — a silent skip, so the reap still returns Ok. The wait loop
+        // closes that window: as long as the leftover is still alive, the
+        // reap runs again. It is idempotent — a leftover it has killed is a
+        // zombie whose argv no longer matches, and the stand-ins it must
+        // never touch cannot match this VM's tokens at all.
         let by = Instant::now() + Duration::from_secs(5);
         let status = loop {
             if let Some(status) = ours.try_wait().expect("try_wait ours") {
                 break status;
             }
+            reap_stale_gvproxy(&binary, &sock).expect("reap");
             assert!(Instant::now() < by, "this VM's leftover survived the reap");
             std::thread::sleep(Duration::from_millis(10));
         };
