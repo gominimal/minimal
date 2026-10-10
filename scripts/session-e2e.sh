@@ -2474,12 +2474,14 @@ proof_host_ip_deny_all() {
     # the common ancestor of its starting cgroup and the slice is the
     # root-owned hierarchy root — the barrier that stops a box climbing out
     # is the same fact that stops the daemon climbing in. The installer's
-    # --pid step is the supported placement, and the placement probe is per
-    # launch, so the next box this daemon launches is decided on a leaf of
-    # its own. Found off /proc, keyed on comm (a cmdline match would take an
-    # editor holding a file under crates/minimald for the daemon itself)
-    # and on this account, so another account's daemon is never placed in
-    # this case's tree.
+    # --place-listener step is the placement the path unit `min
+    # finalize-install` installs makes at every daemon start: it finds the
+    # daemon by the socket it holds, never by a pid anyone names, and the
+    # placement probe is per launch, so the next box this daemon launches
+    # is decided on a leaf of its own. The pid is still read here, off
+    # /proc, keyed on comm (a cmdline match would take an editor holding a
+    # file under crates/minimald for the daemon itself) and on this account,
+    # to check the step placed THAT process and no other.
     hida_daemons=""
     for hida_proc in /proc/[0-9]*; do
       [ -r "$hida_proc/comm" ] || continue
@@ -2493,20 +2495,31 @@ proof_host_ip_deny_all() {
       echo "::error::expected exactly one $min_daemon under this account to place in its leaf, found: ${hida_daemons:-none}"
       fail
     fi
+    hida_sock="$XDG_STATE_HOME/minimal/providers/local-minimald0/ssh.sock"
+    if [ ! -S "$hida_sock" ]; then
+      echo "::error::the daemon's listener is not at $hida_sock, so the placement unit's step has nothing to find it by"
+      fail
+    fi
     # shellcheck disable=SC2024
-    if ! sudo -n "$ROOT/scripts/install-host-classifier.sh" --pid "$hida_pid" \
+    if ! sudo -n "$ROOT/scripts/install-host-classifier.sh" --user "$(id -un)" \
+        --place-listener "$hida_sock" \
         >"$WORK/hida-place.out" 2>"$WORK/hida-place.err"; then
-      echo "::error::the installer's --pid step could not place $min_daemon $hida_pid in its leaf"
+      echo "::error::the installer's --place-listener step could not place $min_daemon $hida_pid in its leaf"
       echo "--- installer stderr ---"; cat "$WORK/hida-place.err" 2>/dev/null || true
       fail
     fi
     hida_place_out="$(cat "$WORK/hida-place.out" 2>/dev/null || true)"
     if [[ "$hida_place_out" != *"placed $hida_pid in"* ]]; then
-      echo "::error::the --pid step did not report placing $min_daemon $hida_pid"
+      echo "::error::the --place-listener step did not report placing $min_daemon $hida_pid (the holder of $hida_sock)"
       echo "--- installer output ---"; printf '%s\n' "$hida_place_out"
       fail
     fi
-    echo "place: $min_daemon $hida_pid is inside the slice, so the box this case launches is decided on a leaf of its own"
+    if ! grep -qx "$hida_pid" /sys/fs/cgroup/minimald.slice/daemon/cgroup.procs 2>/dev/null; then
+      echo "::error::$min_daemon $hida_pid is not a member of /sys/fs/cgroup/minimald.slice/daemon after the --place-listener step"
+      echo "--- daemon leaf members ---"; cat /sys/fs/cgroup/minimald.slice/daemon/cgroup.procs 2>/dev/null || true
+      fail
+    fi
+    echo "place: $min_daemon $hida_pid, found as the holder of $hida_sock, is inside the slice's daemon leaf, so the box this case launches is decided on a leaf of its own"
 
     # ---- the daemon's own fact, turned the one way it is: a launch. A
     # create answers from the last read the host gave it — the start-up
@@ -3097,7 +3110,7 @@ proof_host_ip_deny_all() {
   fi
   case "$hida_un_cause" in
     "the classifier's privileged step is not installed on this host")
-      if [[ "$hida_un_activate_err" != *"install-host-classifier.sh"* ]]; then
+      if [[ "$hida_un_activate_err" != *"min finalize-install"* ]]; then
         echo "::error::the advisory names the missing step but not the command that installs it"
         printf '%s\n' "$hida_un_activate_err"
         fail
@@ -3105,7 +3118,7 @@ proof_host_ip_deny_all() {
       echo "advisory: the cause is the missing step, and the advisory ends with the exact command that installs it"
       ;;
     *)
-      if [[ "$hida_un_activate_err" == *"install-host-classifier.sh"* ]]; then
+      if [[ "$hida_un_activate_err" == *"min finalize-install"* ]]; then
         echo "::error::the advisory names an install command for a host that cannot confine a box: installing the step over that tree would leave the cause standing"
         printf '%s\n' "$hida_un_activate_err"
         fail
@@ -7166,10 +7179,10 @@ fi
 # Native host-OS resolution of a box name, with no proxy settings anywhere
 # (NET-009, with the client halves of NET-122 and NET-123).
 #
-# `min net setup --print` (NET-122) must print, on a host whose resolver is
+# `min finalize-install --show --script` (NET-122) must print, on a host whose resolver is
 # not configured for the zone, the EXACT script that points it at the
 # daemon's zone answerer — this case runs the file it printed, under one
-# `sudo sh`, not a reconstruction of it, so what `min net setup` would run is
+# `sudo sh`, not a reconstruction of it, so what `min finalize-install` would run is
 # what is proved. And session start must never prompt: this case drives `min session
 # activate` from a script with no answers to give, so the activate completing
 # at all is half the proof. The other half, where this host can run it: after
@@ -7210,14 +7223,14 @@ fi
 #     the quiet was right.
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
-# NET-123's macOS half: the one privileged script `min net setup` runs
+# NET-123's macOS half: the one privileged script `min finalize-install` runs
 # installs the boot-time unit that reserves the local range (design §7.1) —
 # the same script that writes the resolver file, so both halves of the
 # host's configuration land in one elevation, never two commands the user
 # runs separately.
 #
-# The proof runs the exact script `min net setup --print` printed — the
-# bytes `min net setup` runs under `sudo sh`, including the two files'
+# The proof runs the exact script `min finalize-install --show --script` printed — the
+# bytes `min finalize-install` runs under `sudo sh`, including the two files'
 # bodies riding inside it as quoted heredocs — and then asserts what the spec promises:
 # both files root-owned at their exact modes, the plist's ProgramArguments
 # naming the root-owned program, the whole reserved range present on this
@@ -7314,27 +7327,33 @@ proof_local_range_reserved_by_privileged_step() {
   }
   echo "activated $RANGE_NAME ($(printf '%s' "$range_sid" | tail -n1 | tr -d '\r')); answerer on 127.0.0.1:$range_port"
   # A session start prints no advisory (host DNS is opt-in, NET-122); the
-  # setup script is what `min net setup --print` prints on stdout, from the
+  # setup script is what `min finalize-install --show --script` prints on stdout, from the
   # same host reads, with its note on stderr.
-  range_setup="$WORK/range-net-setup.out"
-  mnl net setup --print >"$range_setup" 2>"$range_setup.note" || true
+  range_setup="$WORK/range-finalize-install.out"
+  mnl finalize-install --show --script >"$range_setup" 2>"$range_setup.note" || true
 
-  # The script `min net setup` runs, exactly as `--print` wrote it: the two
-  # files' bytes ride inside it as quoted heredocs, and its header says
-  # what it configures — on macOS the resolver and the local range together.
+  # The script `min finalize-install` runs, exactly as `--show --script` wrote
+  # it: the two files' bytes ride inside it as quoted heredocs, and its header
+  # names the names item it finishes — on macOS the resolver and the local
+  # range together, each step under its own comment.
   range_cmd="$(setup_script_from "$range_setup")"
   case "$range_cmd" in
     '#!/bin/sh'*) ;;
     *)
-      echo "::error::no setup script from 'min net setup --print' (got: '$range_cmd')"
+      echo "::error::no setup script from 'min finalize-install --show --script' (got: '$range_cmd')"
       echo "--- activate stderr ---"; cat "$range_err" 2>/dev/null || true
-      echo "--- min net setup --print ---"; cat "$range_setup" "$range_setup.note" 2>/dev/null || true
+      echo "--- min finalize-install --show --script ---"; cat "$range_setup" "$range_setup.note" 2>/dev/null || true
       fail
       ;;
   esac
-  if ! printf '%s\n' "$range_cmd" | sed -n 2p | grep -qF -- "# Configure the host's resolver, reserve the local range"; then
-    echo "::error::the setup script's header does not say it configures the resolver and reserves the range"
+  if ! printf '%s\n' "$range_cmd" | sed -n 2p | grep -qF -- "# Finish the Minimal install on this host: box names for every host program"; then
+    echo "::error::the setup script's header does not name the names item it finishes"
     echo "--- script (first lines) ---"; printf '%s\n' "$range_cmd" | sed -n '1,4p'
+    fail
+  fi
+  if ! printf '%s\n' "$range_cmd" | grep -qF -- "# The resolver: " || ! printf '%s\n' "$range_cmd" | grep -qF -- "# The local range: "; then
+    echo "::error::the setup script does not carry both the resolver step and the local-range step"
+    echo "--- script (first lines) ---"; printf '%s\n' "$range_cmd" | sed -n '1,12p'
     fail
   fi
   # The script the header promised: one elevation for the resolver and the
@@ -7660,11 +7679,11 @@ answerer_channel_of() {
     -e 's/^[[:space:]]*<string>\(\/.*\/answerer\.sock\)<\/string>$/\1/p' | head -n1
 }
 
-# The setup script `min net setup --print` wrote to $1 (its stdout), whole,
+# The setup script `min finalize-install --show --script` wrote to $1 (its stdout), whole,
 # when that is a script — its first line `#!/bin/sh` — and nothing otherwise
 # (a host with nothing to run, or a blocker, prints only its note on
 # stderr). The proof runs this file with one `sudo -n sh`, the way
-# `min net setup` itself runs it.
+# `min finalize-install` itself runs it.
 setup_script_from() {
   if [ "$(head -n1 "$1" 2>/dev/null)" = '#!/bin/sh' ]; then
     cat "$1"
@@ -7781,12 +7800,12 @@ proof_native_resolution_without_proxy_env() {
   native_sid="$(printf '%s\n' "$native_sid" | tail -n1 | tr -d '\r')"
   echo "activated $NATIVE_NAME ($native_sid); answerer on 127.0.0.1:$native_port"
   # A session start prints no advisory (host DNS is opt-in, NET-122); the
-  # setup script is what `min net setup --print` prints on stdout, from the
+  # setup script is what `min finalize-install --show --script` prints on stdout, from the
   # same host reads, with its note on stderr.
-  native_setup="$WORK/native-net-setup.out"
-  mnl net setup --print >"$native_setup" 2>"$native_setup.note" || true
+  native_setup="$WORK/native-finalize-install.out"
+  mnl finalize-install --show --script >"$native_setup" 2>"$native_setup.note" || true
 
-  # The script `min net setup` runs, whole, exactly as `--print` wrote it.
+  # The script `min finalize-install` runs, whole, exactly as `--show --script` wrote it.
   # On macOS it carries the range step NET-123 folds into it too.
   native_cmd="$(setup_script_from "$native_setup")"
 
@@ -7830,7 +7849,7 @@ proof_native_resolution_without_proxy_env() {
       echo "--- script ---"; printf '%s\n' "$native_cmd"
       fail
     fi
-    echo "min net setup --print named the setup script ($(printf '%s\n' "$native_cmd" | wc -l | tr -d ' ') lines)"
+    echo "min finalize-install --show --script named the setup script ($(printf '%s\n' "$native_cmd" | wc -l | tr -d ' ') lines)"
     native_proved="advised"
 
     # NET-123's present arm, client side: a probe that found the reserved
@@ -7867,8 +7886,8 @@ proof_native_resolution_without_proxy_env() {
     # daemon before. CI's fresh runners never see it, which is why it is an
     # error there.
     if [ -n "${CI:-}" ]; then
-      echo "::error::'min net setup --print' printed no script, and this lane's resolver is not configured for the zone (NET-122)"
-      echo "--- min net setup --print ---"; cat "$native_setup" "$native_setup.note" 2>/dev/null || true
+      echo "::error::'min finalize-install --show --script' printed no script, and this lane's resolver is not configured for the zone (NET-122)"
+      echo "--- min finalize-install --show --script ---"; cat "$native_setup" "$native_setup.note" 2>/dev/null || true
       fail
     fi
     echo "::warning::no advisory printed — this host's resolver already routes the zone to this answerer (NET-122's quiet state)"
@@ -8583,10 +8602,10 @@ proof_box_name_resolves_natively_without_proxy() {
   bn_sid="$(printf '%s\n' "$bn_sid" | tail -n1 | tr -d '\r')"
   echo "activated $BN_WEB_NAME ($bn_sid); answerer on 127.0.0.1:$bn_port"
   # A session start prints no advisory (host DNS is opt-in, NET-122); the
-  # setup script is what `min net setup --print` prints on stdout, from the
+  # setup script is what `min finalize-install --show --script` prints on stdout, from the
   # same host reads, with its note on stderr.
   bn_setup="$WORK/bn-net-setup.out"
-  mnl net setup --print >"$bn_setup" 2>"$bn_setup.note" || true
+  mnl finalize-install --show --script >"$bn_setup" 2>"$bn_setup.note" || true
   # The surface the activation reports — printed, not asserted: before the
   # advisory's command runs it is the proxy's surface, and the verdict the
   # command is about to move is the second box's to report (NET-018).
@@ -8638,7 +8657,7 @@ proof_box_name_resolves_natively_without_proxy() {
   echo "$BN_WEB_NAME's address: $bn_web_ip, leased at finalize (NET-010) — registered for its name there (NET-011)"
   echo "daemon log: $bn_box_reg"
 
-  # NET-122: the setup script `min net setup --print` prints — the exact
+  # NET-122: the setup script `min finalize-install --show --script` prints — the exact
   # script, no prompt anywhere in the path. It must name this platform's
   # mechanism and THIS daemon's answerer, and run whole under one sudo.
   bn_cmd="$(setup_script_from "$bn_setup")"
@@ -8664,7 +8683,7 @@ proof_box_name_resolves_natively_without_proxy() {
       echo "--- script ---"; printf '%s\n' "$bn_cmd"
       fail
     fi
-    echo "min net setup --print named the setup script ($(printf '%s\n' "$bn_cmd" | wc -l | tr -d ' ') lines)"
+    echo "min finalize-install --show --script named the setup script ($(printf '%s\n' "$bn_cmd" | wc -l | tr -d ' ') lines)"
   elif grep -q -- 'bypass systemd-resolved' "$bn_setup.note" 2>/dev/null; then
     # An advisory that names no command: this host's lookups never reach
     # systemd-resolved's stub, so the routing-domain command would configure
@@ -8686,8 +8705,8 @@ proof_box_name_resolves_natively_without_proxy() {
     # right. CI's fresh runners never see it, which is why it is an error
     # there.
     if [ -n "${CI:-}" ]; then
-      echo "::error::'min net setup --print' printed no script, and this lane's resolver is not configured for the zone (NET-122)"
-      echo "--- min net setup --print ---"; cat "$bn_setup" "$bn_setup.note" 2>/dev/null || true
+      echo "::error::'min finalize-install --show --script' printed no script, and this lane's resolver is not configured for the zone (NET-122)"
+      echo "--- min finalize-install --show --script ---"; cat "$bn_setup" "$bn_setup.note" 2>/dev/null || true
       fail
     fi
     echo "::warning::no advisory printed — this host's resolver already routes the zone to this answerer (NET-122's quiet state)"
@@ -9195,7 +9214,7 @@ proof_box_name_resolves_natively_without_proxy() {
 #
 #   1. Node A (this lane's state dir) starts with no service installed and
 #      hosts the interim on the hook port.
-#   2. `min net setup --print` prints the setup script; run as root, it
+#   2. `min finalize-install --show --script` prints the setup script; run as root, it
 #      asks A to release the port, installs the service, and starts it. A
 #      becomes a channel client of the manager-held service, and its box
 #      name still answers on the host.
@@ -9472,10 +9491,10 @@ for row in json.load(open(sys.argv[1])):
   local asr_a_sid asr_a_err="$WORK/asr-a-activate.err"
   asr_a_sid="$(asr_activate mnl e2e-asr-a "$asr_a_err")" || fail
   # A session start prints no advisory (host DNS is opt-in, NET-122); the
-  # setup script is what `min net setup --print` prints on stdout, from the
+  # setup script is what `min finalize-install --show --script` prints on stdout, from the
   # same host reads, with its note on stderr.
   local asr_a_setup="$WORK/asr-a-net-setup.out"
-  mnl net setup --print >"$asr_a_setup" 2>"$asr_a_setup.note" || true
+  mnl finalize-install --show --script >"$asr_a_setup" 2>"$asr_a_setup.note" || true
   local asr_a_ip
   asr_a_ip="$(asr_zone_address "$asr_base_a" e2e-asr-a.min.internal)"
   if [ -z "$asr_a_ip" ]; then
@@ -9534,7 +9553,7 @@ for row in json.load(open(sys.argv[1])):
     *)
       echo "::error::node A's session start printed no advisory carrying the answerer service step"
       echo "--- activate stderr ---"; cat "$asr_a_err" 2>/dev/null || true
-      echo "--- min net setup --print ---"; cat "$asr_a_setup" 2>/dev/null || true
+      echo "--- min finalize-install --show --script ---"; cat "$asr_a_setup" 2>/dev/null || true
       fail
       ;;
   esac
@@ -9820,7 +9839,7 @@ for row in json.load(open(sys.argv[1])):
 #
 #   1. Node A (this lane's state dir) starts with no service installed and
 #      hosts the interim on the hook port; its box name answers there.
-#   2. `min net setup --print` prints the setup script; run as root, it
+#   2. `min finalize-install --show --script` prints the setup script; run as root, it
 #      asks A's own control socket to release the port, installs the
 #      service and starts it. A becomes a client of the manager-held
 #      answerer, no minimald holds the port, and A's name keeps answering
@@ -9996,10 +10015,10 @@ proof_native_answerer_survives_session_stop() {
   local nasr_a_sid nasr_a_err="$WORK/nasr-a-activate.err" nasr_a_ip
   nasr_a_sid="$(nasr_activate mnl e2e-nasr-a "$nasr_a_err")" || fail
   # A session start prints no advisory (host DNS is opt-in, NET-122); the
-  # setup script is what `min net setup --print` prints on stdout, from the
+  # setup script is what `min finalize-install --show --script` prints on stdout, from the
   # same host reads, with its note on stderr.
   local nasr_a_setup="$WORK/nasr-a-net-setup.out"
-  mnl net setup --print >"$nasr_a_setup" 2>"$nasr_a_setup.note" || true
+  mnl finalize-install --show --script >"$nasr_a_setup" 2>"$nasr_a_setup.note" || true
   nasr_a_ip="$(nasr_address e2e-nasr-a.min.internal)"
   if [ -z "$nasr_a_ip" ]; then
     echo "::error::e2e-nasr-a.min.internal does not answer from node A's interim on 127.0.0.1:$nasr_port"
@@ -10016,7 +10035,7 @@ proof_native_answerer_survives_session_stop() {
     *)
       echo "::error::node A's native session start printed no advisory carrying the answerer service step"
       echo "--- activate stderr ---"; cat "$nasr_a_err" 2>/dev/null || true
-      echo "--- min net setup --print ---"; cat "$nasr_a_setup" 2>/dev/null || true
+      echo "--- min finalize-install --show --script ---"; cat "$nasr_a_setup" 2>/dev/null || true
       fail
       ;;
   esac

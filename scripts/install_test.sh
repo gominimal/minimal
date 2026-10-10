@@ -381,10 +381,10 @@ TEST_SHELL=
 USERNS_SYSCTL=
 APPARMOR_DIR=
 
-# Root the installer looks under for the host paths `min net setup` installs.
+# Root the installer looks under for the host paths `min finalize-install` installs.
 # Empty points it at a nonexistent directory, so this host's own setup never
 # leaks into a scenario; scenarios seed a fake root to drive the offer.
-NET_SETUP_ROOT=
+FINALIZE_INSTALL_ROOT=
 
 # Bin prefix the installer sees. Empty means the harness default ($hp/bin — a
 # custom MINIMAL_BIN, NOT one of the AppArmor tunable's stock attachment
@@ -421,7 +421,7 @@ run() {
         STUB_UNAME_M="$PLAT_M" \
         MINIMAL_OVERRIDE_USERNS_SYSCTL="${USERNS_SYSCTL:-$root/no-such-sysctl}" \
         MINIMAL_OVERRIDE_APPARMOR_DIR="${APPARMOR_DIR:-$root/no-such-apparmor.d}" \
-        MINIMAL_OVERRIDE_NET_SETUP_ROOT="${NET_SETUP_ROOT:-$root/no-such-net-setup-root}" \
+        MINIMAL_OVERRIDE_FINALIZE_INSTALL_ROOT="${FINALIZE_INSTALL_ROOT:-$root/no-such-finalize-install-root}" \
         MINIMAL_OVERRIDE_TTY="${TTY_FILE:-$root/no-such-tty}" \
         MINIMAL_INSTALL_FORCE_STOP="${FORCE_STOP:-}" \
         "$SH" "$installer" "$@" </dev/null >"$OUT" 2>&1
@@ -563,6 +563,8 @@ case_apparmor_uninstall() {
     # A non-interactive uninstall (stdin is /dev/null, not a tty) advises the root
     # removal command and never elevates: the seeded system profile survives, while
     # the shipped loader is removed by the record walk like any other component.
+    # Without the step's record the profile is not `min finalize-install`'s, so
+    # the advisory does not point at `--undo`.
     HAA_U="$root/haa_u"; mkdir -p "$HAA_U"
     run aa_u_seed "$HAA_U"
     check 0 "$rc" "uninstall-apparmor seed install exits 0"
@@ -573,21 +575,24 @@ case_apparmor_uninstall() {
     run aa_u_run "$HAA_U" --uninstall
     APPARMOR_DIR=
     check 0 "$rc" "uninstall with a loaded system profile exits 0"
-    want_ok "uninstall advises the system profile is still loaded" \
-        grep -q "system AppArmor profile is still loaded" "$OUT"
+    want_ok "uninstall advises the system profile is still installed" \
+        grep -q "still installed on this host.*system AppArmor profile" "$OUT"
     want_ok "advisory gives the root removal command" grep -q "apparmor_parser -R" "$OUT"
+    want_err "an unrecorded profile is not offered to min finalize-install --undo" \
+        grep -q "min finalize-install --undo" "$OUT"
     want_ok "non-interactive uninstall never elevates (profile survives)" \
         test -f "$fake_aa/minimald"
     want_err "uninstall removed the shipped apparmor loader" \
         test -e "$HAA_U/xdg-data/minimal/apparmor/install-apparmor-profile.sh"
 }
 
-case_net_setup_uninstall() {
-    # --- Uninstall: advise removing the host DNS setup (min net setup) ----------
-    # A non-interactive uninstall on a host where `min net setup` ran advises
-    # `min net setup --undo` and the root commands that stay valid once `min` is
-    # gone, and never elevates: the seeded host files survive. A host that never
-    # ran the step sees nothing.
+case_finalize_install_uninstall() {
+    # --- Uninstall: advise removing what min finalize-install installed ----------
+    # A non-interactive uninstall on a host where `min finalize-install` ran advises
+    # `min finalize-install --undo` and the root commands that stay valid once `min` is
+    # gone, and never elevates: the seeded host files survive. Every artifact the
+    # step owns is detected on its own, and everything found shares one advisory.
+    # A host that never ran the step sees nothing.
     HNS="$root/hns"; mkdir -p "$HNS"
     run ns_seed "$HNS"
     check 0 "$rc" "uninstall-net-setup seed install exits 0"
@@ -598,13 +603,13 @@ case_net_setup_uninstall() {
     esac
     mkdir -p "$(dirname "$ns_file")"
     printf 'unit\n' >"$ns_file"
-    NET_SETUP_ROOT="$fake_ns"
+    FINALIZE_INSTALL_ROOT="$fake_ns"
     run ns_run "$HNS" --uninstall
-    NET_SETUP_ROOT=
+    FINALIZE_INSTALL_ROOT=
     check 0 "$rc" "uninstall with the host DNS setup present exits 0"
     want_ok "uninstall advises the host DNS setup is still installed" \
-        grep -q "host DNS setup from min net setup is still installed" "$OUT"
-    want_ok "advisory names min net setup --undo" grep -q "min net setup --undo" "$OUT"
+        grep -q "still installed on this host.*host DNS setup" "$OUT"
+    want_ok "advisory names min finalize-install --undo" grep -q "min finalize-install --undo" "$OUT"
     want_ok "advisory gives the root removal commands" grep -q "sudo " "$OUT"
     want_ok "non-interactive uninstall never elevates (host file survives)" \
         test -f "$ns_file"
@@ -613,8 +618,86 @@ case_net_setup_uninstall() {
     run ns2_seed "$HNS2"
     run ns2_run "$HNS2" --uninstall
     check 0 "$rc" "uninstall on a host without the setup exits 0"
-    want_err "a host that never ran min net setup sees no advisory" \
-        grep -q "min net setup" "$OUT"
+    want_err "a host that never ran min finalize-install sees no advisory" \
+        grep -q "min finalize-install" "$OUT"
+
+    # The Linux-only items, each detected by what the step leaves for `--undo`.
+    [ "$PLAT_S" = Linux ] || return 0
+
+    # The user-namespace profile with the step's record: offered to --undo, with
+    # the record in the manual remedy.
+    HNS3="$root/hns3"; mkdir -p "$HNS3"
+    run ns3_seed "$HNS3"
+    fake_aa3="$root/fake-apparmor.d-3"; mkdir -p "$fake_aa3/tunables"
+    printf 'profile\n' >"$fake_aa3/minimald"
+    fake_ns3="$root/fake-net-setup-root-3"
+    mkdir -p "$fake_ns3/var/lib/minimal"
+    : >"$fake_ns3/var/lib/minimal/finalize-install-apparmor-profile"
+    APPARMOR_DIR="$fake_aa3"; FINALIZE_INSTALL_ROOT="$fake_ns3"
+    run ns3_run "$HNS3" --uninstall
+    APPARMOR_DIR=; FINALIZE_INSTALL_ROOT=
+    check 0 "$rc" "uninstall with a recorded profile exits 0"
+    want_ok "a recorded profile is advised as min finalize-install's" \
+        grep -q "still installed on this host.*user-namespace profile" "$OUT"
+    want_ok "a recorded profile points at min finalize-install --undo" \
+        grep -q "min finalize-install --undo" "$OUT"
+    want_ok "the remedy removes the profile and its record" \
+        grep -q "apparmor_parser -R.*finalize-install-apparmor-profile" "$OUT"
+    want_ok "the recorded profile survives a non-interactive uninstall" \
+        test -f "$fake_aa3/minimald"
+
+    # The classifier tree, by its marker.
+    HNS4="$root/hns4"; mkdir -p "$HNS4"
+    run ns4_seed "$HNS4"
+    fake_ns4="$root/fake-net-setup-root-4"
+    mkdir -p "$fake_ns4/sys/fs/cgroup/minimald.slice/classifier-table"
+    FINALIZE_INSTALL_ROOT="$fake_ns4"
+    run ns4_run "$HNS4" --uninstall
+    FINALIZE_INSTALL_ROOT=
+    check 0 "$rc" "uninstall with the classifier tree exits 0"
+    want_ok "the classifier tree is advised" \
+        grep -q "still installed on this host.*classifier tree" "$OUT"
+    want_ok "the remedy removes the classifier table" \
+        grep -q "nft delete table inet minimal_class" "$OUT"
+    want_ok "the remedy removes the tree it detected, under the same root" \
+        grep -qF "find \"$fake_ns4/sys/fs/cgroup/minimald.slice\" -depth" "$OUT"
+
+    # The kvm group membership, by its record.
+    HNS5="$root/hns5"; mkdir -p "$HNS5"
+    run ns5_seed "$HNS5"
+    fake_ns5="$root/fake-net-setup-root-5"
+    mkdir -p "$fake_ns5/var/lib/minimal"
+    printf 'alice\n' >"$fake_ns5/var/lib/minimal/finalize-install-kvm-group"
+    FINALIZE_INSTALL_ROOT="$fake_ns5"
+    run ns5_run "$HNS5" --uninstall
+    FINALIZE_INSTALL_ROOT=
+    check 0 "$rc" "uninstall with the kvm record exits 0"
+    want_ok "the kvm membership is advised" \
+        grep -q "still installed on this host.*kvm group membership" "$OUT"
+    want_ok "the remedy takes the membership back by the record" \
+        grep -q "gpasswd -d" "$OUT"
+
+    # Everything at once, an unrecorded profile included: one advisory, one list.
+    HNS6="$root/hns6"; mkdir -p "$HNS6"
+    run ns6_seed "$HNS6"
+    fake_aa6="$root/fake-apparmor.d-6"; mkdir -p "$fake_aa6/tunables"
+    printf 'profile\n' >"$fake_aa6/minimald"
+    fake_ns6="$root/fake-net-setup-root-6"
+    mkdir -p "$fake_ns6/etc/systemd/system" "$fake_ns6/var/lib/minimal" \
+        "$fake_ns6/sys/fs/cgroup/minimald.slice/classifier-table"
+    printf 'unit\n' >"$fake_ns6/etc/systemd/system/minzoned.service"
+    printf 'alice\n' >"$fake_ns6/var/lib/minimal/finalize-install-kvm-group"
+    APPARMOR_DIR="$fake_aa6"; FINALIZE_INSTALL_ROOT="$fake_ns6"
+    run ns6_run "$HNS6" --uninstall
+    APPARMOR_DIR=; FINALIZE_INSTALL_ROOT=
+    check 0 "$rc" "uninstall with every artifact exits 0"
+    check 1 "$(grep -c "still installed on this host" "$OUT")" "one advisory covers everything found"
+    for item in "host DNS setup" "system AppArmor profile" "classifier tree" "kvm group membership"; do
+        want_ok "the one advisory lists: $item" grep -q "still installed on this host.*$item" "$OUT"
+    done
+    for cmd in "systemctl disable --now minzoned" "apparmor_parser -R" "nft delete table" "gpasswd -d"; do
+        want_ok "the remedy covers: $cmd" grep -q "$cmd" "$OUT"
+    done
 }
 
 case_checksum_mismatch() {
@@ -1654,6 +1737,7 @@ STUB
             NFT_FAIL="${NFT_FAIL:-0}" \
             NFT_RULESET="${NFT_RULESET:-}" \
             MINIMAL_OVERRIDE_CGROUP_MOUNTINFO="$mi" \
+            MINIMAL_OVERRIDE_PROC="${HC_PROC:-/proc}" \
             bash "$hc" --root "$tree" "$@" </dev/null >"$OUT" 2>&1
         rc=$?
         set -e
@@ -1673,11 +1757,18 @@ STUB
     check 1 "$rc" "check exits 1 before the tree exists"
     want_ok "check names the tree it cannot find" grep -q "does not exist" "$OUT"
     want_ok "check advises the install, not a re-check" grep -q "install it: sudo" "$OUT"
-    want_ok "the pre-install hint names the cohort's identity flag" \
-        grep -q -- "--cohort-address <cohort address>" "$OUT"
-    want_ok "the pre-install hint names the node plane's identity flag too" \
-        grep -q -- "--node-plane-address <node-plane address>" "$OUT"
+    want_err "the pre-install hint carries no placeholder: an install told no identity is the un-enrolled host's own" \
+        grep -q -- "<cohort address>" "$OUT"
+    want_err "the pre-install hint carries no node-plane placeholder either" \
+        grep -q -- "<node-plane address>" "$OUT"
     want_err "check creates nothing" test -e "$tree"
+    # With one identity: the install would refuse it, so the hint drops it.
+    run_hc pre_check_lone "$root/mi-on" --check --user "$me" --cohort-address 100.72.0.9
+    check 1 "$rc" "check with a lone identity still exits 1 before the tree exists"
+    want_ok "the hint is still the install" grep -q "install it: sudo" "$OUT"
+    want_err "the hint carries no lone identity the install would refuse" \
+        grep -q -- "install it: sudo .*--cohort-address" "$OUT"
+    want_ok "the hint keeps the account asked about" grep -q -- "install it: sudo .*--user $me" "$OUT"
 
     # --- Refusals: every one of them dies before a directory is made.
     run_hc no_nsdelegate "$root/mi-off" --user "$me"
@@ -1711,22 +1802,46 @@ STUB
     want_ok "the refusal names the account" grep -q "no such account" "$OUT"
     want_err "a bad account still creates nothing" test -e "$tree"
 
-    # --- The two source identities are required, together: a table that
-    # refuses a deny-all box's connections while its cohort keeps the host's
-    # own source identity is half of the classification, so the step refuses
-    # to render half of it — with either missing, and with both missing.
-    run_hc no_identity "$root/mi-on" --user "$me"
-    check 1 "$rc" "install dies without the two source identities"
-    want_ok "the refusal names the flag it needs" \
-        grep -q -- "--cohort-address ADDR" "$OUT"
-    want_ok "the refusal names the other flag too" \
-        grep -q -- "--node-plane-address ADDR" "$OUT"
-    want_err "no identities, no tree" test -e "$tree"
-
+    # --- The two source identities go together: a table that translates its
+    # cohort while the rest of the slice keeps the host's own source identity
+    # is half of the classification, so the step refuses to render half of
+    # it. Neither given is whole: the un-enrolled host (NET-078), whose two
+    # identities are the classify chain's cgroup matches with no source
+    # translation, and whose postrouting chain stands empty for an
+    # association to fill without a reinstall.
     run_hc half_identity "$root/mi-on" --user "$me" --cohort-address 100.72.0.9
     check 1 "$rc" "install dies with one of the two identities missing"
-    want_ok "the refusal says they go together" grep -q "both source identities" "$OUT"
+    want_ok "the refusal says they go together" grep -q "both source identities or neither" "$OUT"
     want_err "half an identity still creates nothing" test -e "$tree"
+
+    run_hc unenrolled_print "$root/mi-on" --print-ruleset
+    check 0 "$rc" "--print-ruleset renders with no source identity"
+    want_err "no identity renders no source translation" grep -q "snat" "$OUT"
+    want_ok "the postrouting chain stands, empty, for an association to fill" \
+        grep -q "chain postrouting" "$OUT"
+    want_ok "the cohort is still its cgroup subtree's match" \
+        grep -q 'socket cgroupv2 level 2 "minimald.slice/boxes"' "$OUT"
+    want_ok "the node plane is still the slice's remaining match" \
+        grep -q 'ct mark and 0x30000000 == 0 socket cgroupv2 level 1 "minimald.slice"' "$OUT"
+
+    run_hc unenrolled "$root/mi-on" --user "$me"
+    check 0 "$rc" "install exits 0 with neither identity"
+    want_ok "the un-enrolled install lays out the tree" test -d "$tree/boxes/deny"
+    want_ok "the un-enrolled install writes the marker" test -d "$tree/classifier-table"
+    want_err "the un-enrolled transaction carries no SNAT rule" grep -q "snat" "$nft_input"
+    want_ok "the un-enrolled install says nothing is translated" \
+        grep -q "nothing is translated" "$OUT"
+    want_ok "the un-enrolled install names the placement unit, not a per-restart root step alone" \
+        grep -q "min finalize-install" "$OUT"
+    want_err "the un-enrolled install prints no placeholder" grep -q "<cohort address>" "$OUT"
+    # Taken down again so the enrolled install below starts from nothing, and
+    # the recorders emptied so its transaction is the only one they hold.
+    for _cg in "$tree" "$tree/daemon" "$tree/boxes" "$tree/boxes/deny" "$tree/boxes/allow"; do
+        drop_cgroup_files "$_cg"
+    done
+    run_hc unenrolled_uninstall "$root/mi-on" --uninstall
+    check 0 "$rc" "the un-enrolled tree uninstalls"
+    : >"$nft_input"; : >"$nft_calls"; : >"$chown_calls"
 
     # --- The install: the slice, its daemon leaf, the cohort's two subtrees,
     # and the whole v2 contract delegated to the account minimald runs as.
@@ -2006,6 +2121,95 @@ still vouches for the table it loaded" \
     want_ok "the refusal asks for a numeric process id" \
         grep -q "numeric process id" "$OUT"
 
+    # --- --place-listener: the same placement, found from the daemon's own
+    # listener so a manager-held path unit can make it at every start the
+    # socket announces (no per-restart --pid). Over a stand-in process table:
+    # the holder of the socket that runs as the delegated account outside
+    # the slice is placed; a holder of another uid, a holder of another
+    # socket, a same-uid holder already inside the slice (a box in
+    # boxes/deny that bound a socket spelled like the listener), and a
+    # holder whose cgroup cannot be read are left alone; a second run is
+    # idempotent; and a socket nobody holds is nothing to place rather than
+    # a failure.
+    fproc="$root/proc"; rm -rf "$fproc"
+    lsock="$root/state/providers/local-minimald0/ssh.sock"
+    mkdir -p "$fproc/net" "$fproc/4242/fd" "$fproc/4243/fd" "$fproc/4244/fd" \
+        "$fproc/4245/fd" "$fproc/4246/fd"
+    {
+        printf 'Num       RefCount Protocol Flags    Type St Inode Path\n'
+        printf '0000 00000002 00000000 00010000 0001 01 777 %s\n' "$lsock"
+        printf '0000 00000002 00000000 00010000 0001 01 778 /run/other.sock\n'
+    } >"$fproc/net/unix"
+    ln -s 'socket:[777]' "$fproc/4242/fd/5"
+    printf 'Name:\tminimald\nUid:\t%s\t%s\t%s\t%s\n' "$me" "$me" "$me" "$me" >"$fproc/4242/status"
+    ln -s 'socket:[777]' "$fproc/4243/fd/3"
+    printf 'Name:\tother\nUid:\t0\t0\t0\t0\n' >"$fproc/4243/status"
+    ln -s 'socket:[778]' "$fproc/4244/fd/3"
+    printf 'Name:\tother\nUid:\t%s\t%s\t%s\t%s\n' "$me" "$me" "$me" "$me" >"$fproc/4244/status"
+    for p in 4242 4243 4244; do
+        printf '0::/user.slice/user-%s.slice/session-1.scope\n' "$me" >"$fproc/$p/cgroup"
+    done
+    # A box: the delegated account, the listener's own path string, but
+    # already placed in a deny leaf under the slice.
+    ln -s 'socket:[777]' "$fproc/4245/fd/7"
+    printf 'Name:\tbash\nUid:\t%s\t%s\t%s\t%s\n' "$me" "$me" "$me" "$me" >"$fproc/4245/status"
+    printf '0::/minimald.slice/boxes/deny/box-1\n' >"$fproc/4245/cgroup"
+    # A holder whose cgroup cannot be read: unknown, so not moved.
+    ln -s 'socket:[777]' "$fproc/4246/fd/7"
+    printf 'Name:\tminimald\nUid:\t%s\t%s\t%s\t%s\n' "$me" "$me" "$me" "$me" >"$fproc/4246/status"
+    : >"$tree/daemon/cgroup.procs"
+    HC_PROC="$fproc"
+    run_hc place_listener "$root/mi-on" --user "$me" --place-listener "$lsock"
+    check 0 "$rc" "--place-listener exits 0"
+    want_ok "the delegated account's holder of the socket is placed" \
+        grep -qx 4242 "$tree/daemon/cgroup.procs"
+    want_err "a holder of another uid is left alone" grep -qx 4243 "$tree/daemon/cgroup.procs"
+    want_ok "the placement says what it left alone and why" grep -q "left 4243 alone" "$OUT"
+    want_err "a holder of another socket is not placed" grep -qx 4244 "$tree/daemon/cgroup.procs"
+    want_err "a same-uid holder inside boxes/deny is never moved" \
+        grep -qx 4245 "$tree/daemon/cgroup.procs"
+    want_ok "the placement says the box stands inside the slice" \
+        grep -q "left 4245 alone: .*inside the slice at /minimald.slice/boxes/deny/box-1" "$OUT"
+    want_err "a holder whose cgroup cannot be read is not moved" \
+        grep -qx 4246 "$tree/daemon/cgroup.procs"
+    want_ok "the placement says the cgroup could not be read" \
+        grep -q "left 4246 alone: .*cgroup could not be read" "$OUT"
+    want_ok "exactly one holder was placed" \
+        [ "$(grep -c . "$tree/daemon/cgroup.procs")" -eq 1 ]
+    run_hc place_listener_again "$root/mi-on" --user "$me" --place-listener "$lsock"
+    check 0 "$rc" "a second --place-listener exits 0"
+    want_ok "the second run finds the daemon already placed" grep -q "already in" "$OUT"
+    want_ok "the second run writes the pid no second time" \
+        [ "$(grep -cx 4242 "$tree/daemon/cgroup.procs")" -eq 1 ]
+    # Only holders that are left alone (the daemon gone, a box on the same
+    # path still there): the closing line says so, not that nobody holds it.
+    rm -rf "$fproc/4242"
+    : >"$tree/daemon/cgroup.procs"
+    run_hc place_listener_skipped "$root/mi-on" --user "$me" --place-listener "$lsock"
+    check 0 "$rc" "--place-listener over holders it leaves alone exits 0"
+    want_ok "the closing line says the holders were left where they stand" \
+        grep -q "every holder of .* was left where it stands" "$OUT"
+    want_err "and does not claim the socket is unheld" grep -q "no process holds" "$OUT"
+    want_err "and places nothing" [ -s "$tree/daemon/cgroup.procs" ]
+    printf 'Num       RefCount Protocol Flags    Type St Inode Path\n' >"$fproc/net/unix"
+    run_hc place_listener_nobody "$root/mi-on" --user "$me" --place-listener "$lsock"
+    check 0 "$rc" "--place-listener over a socket nobody holds exits 0"
+    want_ok "nobody holding it is nothing to place, said so" grep -q "no process holds .*: nothing to place" "$OUT"
+    want_err "an unbound socket is not scanned twice" grep -q "scanned again" "$OUT"
+    # A listed inode whose holder is not in any fd table (it vanished under
+    # the scan): one more pass after a moment, then nothing to place, and
+    # still not a failure.
+    {
+        printf 'Num       RefCount Protocol Flags    Type St Inode Path\n'
+        printf '0000 00000002 00000000 00010000 0001 01 779 %s\n' "$lsock"
+    } >"$fproc/net/unix"
+    run_hc place_listener_vanished "$root/mi-on" --user "$me" --place-listener "$lsock"
+    check 0 "$rc" "--place-listener over a socket whose holder vanished exits 0"
+    want_ok "the vanished holder is looked for once more" grep -q "scanned again" "$OUT"
+    want_ok "and then it is nothing to place" grep -q "nothing to place" "$OUT"
+    HC_PROC=
+    : >"$tree/daemon/cgroup.procs"
+
     drop_cgroup_files "$tree"
     drop_cgroup_files "$tree/daemon"
     drop_cgroup_files "$tree/boxes"
@@ -2031,6 +2235,9 @@ still vouches for the table it loaded" \
     want_ok "usage shows the unprivileged --check" grep -q -- "--check" "$OUT"
     want_ok "usage shows the unprivileged --print-ruleset" grep -q -- "--print-ruleset" "$OUT"
     want_ok "usage shows the --pid step" grep -q -- "--pid PID" "$OUT"
+    want_ok "usage shows the --place-listener step" grep -q -- "--place-listener SOCK" "$OUT"
+    want_err "the step's own remedies carry no placeholder a person must fill" \
+        grep -q "<the account" "$hc"
     want_ok "usage shows the ct-mark mask override" grep -q -- "--ct-mark-mask" "$OUT"
 
     # --- Without the rehearsal seam the script demands root, like the other
@@ -2184,7 +2391,7 @@ case_for() {
         install)                            case_install ;;
         apparmor)                           case_apparmor ;;
         apparmor_uninstall)                 case_apparmor_uninstall ;;
-        net_setup_uninstall)                case_net_setup_uninstall ;;
+        finalize_install_uninstall)         case_finalize_install_uninstall ;;
         checksum_mismatch)                  case_checksum_mismatch ;;
         target_validation)                  case_target_validation ;;
         prefix_resolution)                  case_prefix_resolution ;;
@@ -2207,7 +2414,7 @@ case_for() {
 }
 case "${1:-}" in
     "")
-        for _c in install apparmor apparmor_uninstall net_setup_uninstall checksum_mismatch \
+        for _c in install apparmor apparmor_uninstall finalize_install_uninstall checksum_mismatch \
             target_validation prefix_resolution install_record daemon_stop \
             shell_integration darwin_dequarantine uninstall \
             gvproxy_rename_migration installer_switch_binary_executable \

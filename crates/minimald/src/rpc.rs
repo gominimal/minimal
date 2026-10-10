@@ -3711,9 +3711,8 @@ mod tests {
         );
         // The command's spelling is the install hint's own, pinned in the
         // classifier crate; the pin here is that the advisory carries the
-        // whole of it, verbatim, whatever the hint currently says — a
-        // stock install ships no `scripts/` tree, so the hint names where
-        // the script lives in the repository instead.
+        // whole of it, verbatim, whatever the hint currently says — the
+        // installed CLI's own verb, which carries the step itself.
         let install = sandbox2::classifier::install_hint();
         assert!(
             advisory.contains(&install),
@@ -3746,7 +3745,7 @@ mod tests {
             "the advisory must name this cause in words too, got: {advisory}"
         );
         assert!(
-            !advisory.contains("install-host-classifier"),
+            !advisory.contains("min finalize-install"),
             "no command ends this cause, so the advisory must name none: {advisory}"
         );
         assert!(
@@ -5275,7 +5274,7 @@ mod tests {
             "the clause still does not apply, got: {unreadable}"
         );
         assert!(
-            !unreadable.contains("install-host-classifier"),
+            !unreadable.contains("min finalize-install"),
             "no command is known to make a probe run, so none is named, \
              got: {unreadable}"
         );
