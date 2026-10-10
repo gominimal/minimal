@@ -329,7 +329,8 @@ pub(crate) async fn release_held_name_after_attach(
 /// that lands after that lookup releases it itself. A live session that
 /// took the name over in between had its hold taken over by this one, so
 /// the undo hands the hold back to it rather than releasing the name; with
-/// no such session, the hold is released by the gone session's id. A hold the
+/// no such session, the hold is released by the gone session's id; a name
+/// lookup that fails tells neither, and the hold is left as made. A hold the
 /// VM host daemon did not make — one that predates the verbs, or did not
 /// answer — leaves nothing to undo, so neither the second lookup nor the
 /// release is made.
@@ -354,28 +355,41 @@ pub(crate) async fn rehold_held_name_before_attach(
         return;
     }
     if let Ok(None) = attached_session_record(sock, id).await {
-        let taken_over_by = session_record_by(
+        let by_name = session_record_by(
             sock,
             minimald_rpc::GetSessionRecordRequest::Name(name.to_string()),
         )
-        .await
-        .ok()
-        .flatten()
-        .filter(|other| {
-            other.id != id
-                && other.network == sessions::NetworkMode::HostNet
-                && other.box_addresses.is_none()
-        });
-        match taken_over_by {
-            Some(other) => {
-                hold_box_name_with_vm_host(control_sock_beside(sock), name, Some(other.id), true)
+        .await;
+        match rehold_undo(id, by_name) {
+            Some((holder, hold)) => {
+                hold_box_name_with_vm_host(control_sock_beside(sock), name, Some(holder), hold)
                     .await;
             }
-            None => {
-                hold_box_name_with_vm_host(control_sock_beside(sock), name, Some(id), false).await;
-            }
+            None => tracing::debug!(
+                box = %name,
+                "could not tell who answers to the name now; the re-hold stays"
+            ),
         }
     }
+}
+
+/// The undo of a re-hold made for session `id`, found gone since, from the
+/// lookup of its name (`by_name`): the session to send the verb for and
+/// whether the verb is a hold. A live `host_ip` session without a row that
+/// answers to the name now is handed the hold back; no such session, and
+/// the hold is released by `id`. A lookup that failed tells neither, so
+/// nothing is undone (`None`): a release there could take the name from a
+/// live session, and a hold left standing blocks nothing.
+fn rehold_undo(
+    id: sessions::SessionId,
+    by_name: anyhow::Result<Option<sessions::Record>>,
+) -> Option<(sessions::SessionId, bool)> {
+    let taken_over_by = by_name.ok()?.filter(|other| {
+        other.id != id
+            && other.network == sessions::NetworkMode::HostNet
+            && other.box_addresses.is_none()
+    });
+    Some(taken_over_by.map_or((id, false), |other| (other.id, true)))
 }
 
 /// Holds or releases a `host_ip` box's name on the VM host daemon, by
@@ -6936,6 +6950,21 @@ mod tests {
                 ("web".to_string(), Some(live)),
             ],
             "the gone session's re-hold, then the name handed back to the live one"
+        );
+    }
+
+    /// The undo of a gone session's re-hold, by what the lookup of its name
+    /// gave: a release by its id when no session answers to the name, and
+    /// nothing at all when the lookup failed — a release there could free
+    /// the name a live session holds.
+    #[test]
+    fn a_failed_name_lookup_undoes_no_rehold() {
+        let id = sessions::SessionId::nil();
+        assert_eq!(rehold_undo(id, Ok(None)), Some((id, false)));
+        assert_eq!(
+            rehold_undo(id, Err(anyhow::anyhow!("no answer"))),
+            None,
+            "a lookup that failed releases nothing"
         );
     }
 
