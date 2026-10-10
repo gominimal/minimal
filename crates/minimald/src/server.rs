@@ -284,6 +284,18 @@ pub struct Config {
     pub user_namespace_gate: UsernsGate,
 }
 
+/// This daemon's own binary path, for the user-namespace remedy that names
+/// it (the AppArmor profile attaches by path, so a source-built daemon needs
+/// the loader pointed at this path, not the installed one). A placeholder
+/// when the path cannot be read, so the remedy still shows its shape.
+#[must_use]
+pub fn this_daemon_path() -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.to_str().map(str::to_owned))
+        .unwrap_or_else(|| "<path to this minimald>".to_string())
+}
+
 /// The verdict [`UsernsGate::Fixed`] carries, re-exported so the daemon
 /// binary and the harness-driven tests name it without a `sandbox2`
 /// dependency of their own.

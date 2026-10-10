@@ -1274,13 +1274,21 @@ async fn activate_refuses_unconfinable_sandbox_before_session_creation() {
 #[tokio::test]
 async fn activate_refusal_names_finalize_install_for_apparmor_restriction() {
     let refusal = refused_activation(minimald::server::UsernsRestriction::ApparmorUnconfined).await;
+    // The harness daemon runs in this process, so the path the remedy names
+    // for a source-built daemon is this test binary's own.
+    let bin = minimald::server::this_daemon_path();
     assert_eq!(
         refusal,
-        "error: this machine blocks the private sandbox every box runs in (Ubuntu restricts \
-         unprivileged user namespaces), so no box can start here yet.\n\
-         Finish the install to allow it for Minimal only: min finalize-install   \
-         (see what it changes first: min finalize-install --show). The profile takes \
-         effect when the daemon next starts: run min stop, then your command again."
+        format!(
+            "error: this machine blocks the private sandbox every box runs in (Ubuntu restricts \
+             unprivileged user namespaces), so no box can start here yet.\n\
+             Finish the install to allow it for Minimal only: min finalize-install   \
+             (see what it changes first: min finalize-install --show). The profile takes \
+             effect when the daemon next starts: run min stop, then your command again.\n\
+             A daemon built from source is not covered: attach the profile to this binary \
+             instead, from a checkout: sudo scripts/install-apparmor-profile.sh --path {bin}, \
+             then the same restart."
+        )
     );
     assert!(
         !refusal.contains("sysctl"),
@@ -1394,13 +1402,19 @@ async fn refused_task_run(verdict: minimald::server::UsernsRestriction) -> Strin
 #[tokio::test]
 async fn task_run_prints_the_user_namespace_refusal_verbatim() {
     let refusal = refused_task_run(minimald::server::UsernsRestriction::ApparmorUnconfined).await;
+    let bin = minimald::server::this_daemon_path();
     assert_eq!(
         refusal,
-        "error: this machine blocks the private sandbox every box runs in (Ubuntu restricts \
-         unprivileged user namespaces), so no box can start here yet.\n\
-         Finish the install to allow it for Minimal only: min finalize-install   (see what it \
-         changes first: min finalize-install --show). The profile takes effect when the daemon \
-         next starts: run min stop, then your command again."
+        format!(
+            "error: this machine blocks the private sandbox every box runs in (Ubuntu restricts \
+             unprivileged user namespaces), so no box can start here yet.\n\
+             Finish the install to allow it for Minimal only: min finalize-install   (see what \
+             it changes first: min finalize-install --show). The profile takes effect when the \
+             daemon next starts: run min stop, then your command again.\n\
+             A daemon built from source is not covered: attach the profile to this binary \
+             instead, from a checkout: sudo scripts/install-apparmor-profile.sh --path {bin}, \
+             then the same restart."
+        )
     );
     assert!(
         !refusal.contains("CreateSession failed"),

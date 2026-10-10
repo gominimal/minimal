@@ -532,7 +532,9 @@ fn user_namespace_refusal(restriction: crate::server::UsernsRestriction) -> Stri
         "{}{}), so no box can start here yet.\n{}",
         minimald_rpc::USER_NAMESPACE_REFUSAL_LEAD,
         restriction.cause(),
-        restriction.remedy(sandbox2::RemedyTarget::Daemon)
+        restriction.remedy(sandbox2::RemedyTarget::Daemon {
+            bin: &crate::server::this_daemon_path(),
+        })
     )
 }
 
@@ -5300,14 +5302,23 @@ mod tests {
         // AppArmor restriction — and only for the daemon that next starts, so
         // the restart is named — while a switched-off namespace names the
         // persistent sysctl instead and never the install step.
+        // The harness daemon is this process, so the path the remedy names
+        // for a source-built daemon is this test binary's own.
+        let bin = crate::server::this_daemon_path();
         for (verdict, expected, never) in [
             (
                 crate::server::UsernsRestriction::ApparmorUnconfined,
-                "this machine blocks the private sandbox every box runs in (Ubuntu restricts \
-                 unprivileged user namespaces), so no box can start here yet.\n\
-                 Finish the install to allow it for Minimal only: min finalize-install   (see \
-                 what it changes first: min finalize-install --show). The profile takes effect \
-                 when the daemon next starts: run min stop, then your command again.",
+                format!(
+                    "this machine blocks the private sandbox every box runs in (Ubuntu restricts \
+                     unprivileged user namespaces), so no box can start here yet.\n\
+                     Finish the install to allow it for Minimal only: min finalize-install   (see \
+                     what it changes first: min finalize-install --show). The profile takes \
+                     effect when the daemon next starts: run min stop, then your command \
+                     again.\n\
+                     A daemon built from source is not covered: attach the profile to this \
+                     binary instead, from a checkout: sudo scripts/install-apparmor-profile.sh \
+                     --path {bin}, then the same restart."
+                ),
                 "sysctl",
             ),
             (

@@ -1107,7 +1107,9 @@ async fn async_main() -> Result<(), MainError> {
         } else if let Some(restriction) = sandbox2::user_namespaces_restriction() {
             tracing::warn!(
                 reason = %restriction,
-                fix = restriction.remedy(sandbox2::RemedyTarget::Daemon),
+                fix = restriction.remedy(sandbox2::RemedyTarget::Daemon {
+                    bin: &minimald::server::this_daemon_path(),
+                }),
                 docs = "https://docs.minimal.dev/reference/linux-host-setup",
                 "sessions will fail to start: this host refuses the unprivileged user \
                  namespace every session sandbox needs"

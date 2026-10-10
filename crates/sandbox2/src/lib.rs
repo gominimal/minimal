@@ -2866,10 +2866,14 @@ impl std::fmt::Display for UsernsRestriction {
 /// differs per binary; the sysctl remedy does not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RemedyTarget<'a> {
-    /// `minimald`, at the path the installer wrote: `min finalize-install`
-    /// loads the profile for it. A profile attaches at exec, so the daemon
-    /// that is running stays unconfined until it is restarted.
-    Daemon,
+    /// `minimald`. `min finalize-install` loads the profile for the daemon
+    /// at the path the installer wrote; a daemon built from source runs
+    /// elsewhere, so the remedy also names the loader with `--path` for
+    /// `bin`, this daemon's own path. No cheap check tells the two apart
+    /// here, so both forms are always printed. A profile attaches at exec,
+    /// so the daemon that is running stays unconfined until it is
+    /// restarted.
+    Daemon { bin: &'a str },
     /// A `mip` binary, which the installer's profile does not cover: the
     /// loader script is run with `--path` for it. `bin` is the binary's
     /// path; `data_dir` is the installer's data prefix, where the loader
@@ -2906,21 +2910,21 @@ impl UsernsRestriction {
                                     /etc/sysctl.d drop-in keeps it across reboots; or use a \
                                     kernel with CONFIG_USER_NS."
                 .to_string(),
-            (Self::ApparmorUnconfined, RemedyTarget::Daemon) => {
-                "Finish the install to allow it for Minimal only: min finalize-install   (see \
-                 what it changes first: min finalize-install --show). The profile takes effect \
-                 when the daemon next starts: run min stop, then your command again."
-                    .to_string()
+            (Self::ApparmorUnconfined, RemedyTarget::Daemon { bin }) => {
+                let bin = shell_word(bin);
+                format!(
+                    "Finish the install to allow it for Minimal only: min finalize-install   (see \
+                     what it changes first: min finalize-install --show). The profile takes effect \
+                     when the daemon next starts: run min stop, then your command again.\n\
+                     A daemon built from source is not covered: attach the profile to this \
+                     binary instead, from a checkout: sudo scripts/install-apparmor-profile.sh \
+                     --path {bin}, then the same restart."
+                )
             }
             (Self::ApparmorUnconfined, RemedyTarget::Mip { bin, data_dir }) => {
-                // The remedy is a command the operator pastes, so each path
-                // is one shell word even with spaces in it. A path with a
-                // NUL cannot be quoted for a shell at all; it is shown bare.
-                let quote = |path: &str| {
-                    shlex::try_quote(path).map_or_else(|_| path.to_string(), |q| q.into_owned())
-                };
-                let loader = quote(&format!("{data_dir}/apparmor/install-apparmor-profile.sh"));
-                let bin = quote(bin);
+                let loader =
+                    shell_word(&format!("{data_dir}/apparmor/install-apparmor-profile.sh"));
+                let bin = shell_word(bin);
                 format!(
                     "Attach the AppArmor profile to mip (one-time, needs root): sudo bash \
                      {loader} --path {bin} (from a checkout: \
@@ -2929,6 +2933,13 @@ impl UsernsRestriction {
             }
         }
     }
+}
+
+/// A path as one shell word for a remedy the operator pastes, so a space in
+/// it does not split the command. A path with a NUL cannot be quoted for a
+/// shell at all; it is shown bare.
+fn shell_word(path: &str) -> String {
+    shlex::try_quote(path).map_or_else(|_| path.to_string(), |q| q.into_owned())
 }
 
 /// Probe for whether this host will refuse the unprivileged user namespace
@@ -3740,6 +3751,33 @@ fn hosts_entry_present(body: &str, entry: &network::HostEntry) -> bool {
 mod tests {
     use super::*;
     use config::{Config, SandboxMapped};
+
+    /// The daemon's AppArmor remedy names the install step for the
+    /// installed daemon and, on its own line, the loader with `--path` for
+    /// this daemon's own path, so a source-built daemon is covered too
+    /// (NET-141).
+    #[test]
+    fn daemon_apparmor_remedy_names_finalize_install_and_this_binary() {
+        let remedy = UsernsRestriction::ApparmorUnconfined.remedy(RemedyTarget::Daemon {
+            bin: "/home/me/src/minimal/target/debug/minimald",
+        });
+        assert_eq!(
+            remedy,
+            "Finish the install to allow it for Minimal only: min finalize-install   (see what \
+             it changes first: min finalize-install --show). The profile takes effect when the \
+             daemon next starts: run min stop, then your command again.\n\
+             A daemon built from source is not covered: attach the profile to this binary \
+             instead, from a checkout: sudo scripts/install-apparmor-profile.sh --path \
+             /home/me/src/minimal/target/debug/minimald, then the same restart."
+        );
+        let spaced = UsernsRestriction::ApparmorUnconfined.remedy(RemedyTarget::Daemon {
+            bin: "/opt/my tools/minimald",
+        });
+        assert!(
+            spaced.contains("--path '/opt/my tools/minimald', then"),
+            "a path with a space is one shell word: {spaced}"
+        );
+    }
 
     /// The mip AppArmor remedy is a command the operator pastes, so a data
     /// dir or binary path with a space stays one shell word, while a plain
