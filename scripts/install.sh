@@ -169,6 +169,16 @@ human_size() {
     fi
 }
 
+# Shell-quote one word for a command line that is itself re-parsed by another
+# shell (the manual remedies maybe_remove_finalize_install composes are run
+# verbatim through `sh -c`, or pasted at a prompt). Double quotes do not
+# survive that second parse — $HOME and $(…) would expand again — so a
+# pathname with spaces or an embedded $ stays one literal word only when it
+# is single-quoted with each `'` doubled as '\''.
+shq() {
+    printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
 # $HOME-relative display path: the card and the table are meant to be read, and
 # an absolute /Users/... prefix on every line is noise.
 tilde() {
@@ -441,10 +451,10 @@ maybe_remove_finalize_install() {
     _cls_root=/sys/fs/cgroup/minimald.slice
     if [ "$os" = darwin ]; then
         _ns_paths="/etc/resolver/min.internal /Library/LaunchDaemons/dev.gominimal.zone.plist /Library/PrivilegedHelperTools/minzoned /Library/LaunchDaemons/dev.minimal.local-range.plist /Library/PrivilegedHelperTools/dev.minimal.local-range"
-        _ns_undo="sudo launchctl bootout system/dev.gominimal.zone; sudo launchctl bootout system/dev.minimal.local-range; sudo rm -f \"$_fi_root/etc/resolver/min.internal\" \"$_fi_root/Library/LaunchDaemons/dev.gominimal.zone.plist\" \"$_fi_root/Library/PrivilegedHelperTools/minzoned\" \"$_fi_root/Library/LaunchDaemons/dev.minimal.local-range.plist\" \"$_fi_root/Library/PrivilegedHelperTools/dev.minimal.local-range\""
+        _ns_undo="sudo launchctl bootout system/dev.gominimal.zone; sudo launchctl bootout system/dev.minimal.local-range; sudo rm -f $(shq "$_fi_root/etc/resolver/min.internal") $(shq "$_fi_root/Library/LaunchDaemons/dev.gominimal.zone.plist") $(shq "$_fi_root/Library/PrivilegedHelperTools/minzoned") $(shq "$_fi_root/Library/LaunchDaemons/dev.minimal.local-range.plist") $(shq "$_fi_root/Library/PrivilegedHelperTools/dev.minimal.local-range")"
     else
         _ns_paths="/etc/systemd/system/minzoned.socket /etc/systemd/system/minzoned.service /usr/local/lib/minimal/minzoned /sys/class/net/minzone0"
-        _ns_undo="sudo systemctl disable --now minzoned.socket minzoned.service; sudo rm -f \"$_fi_root/etc/systemd/system/minzoned.socket\" \"$_fi_root/etc/systemd/system/minzoned.service\" \"$_fi_root/usr/local/lib/minimal/minzoned\"; sudo systemctl daemon-reload; sudo ip link del minzone0"
+        _ns_undo="sudo systemctl disable --now minzoned.socket minzoned.service; sudo rm -f $(shq "$_fi_root/etc/systemd/system/minzoned.socket") $(shq "$_fi_root/etc/systemd/system/minzoned.service") $(shq "$_fi_root/usr/local/lib/minimal/minzoned"); sudo systemctl daemon-reload; sudo ip link del minzone0"
     fi
     # What is found, as a list for the prompt; what `min finalize-install
     # --undo` removes; the manual remedy, one root command line per item.
@@ -466,25 +476,25 @@ maybe_remove_finalize_install() {
                 _fi_list="$_fi_list${_fi_list:+, }the user-namespace profile ($_aa_profile)"
                 _fi_owned=1
                 _fi_undo="$_fi_undo${_fi_undo:+
-}      sudo apparmor_parser -R \"$_aa_profile\"; sudo rm -f \"$_aa_profile\" \"$_aa_tunable\" \"$_aa_dir/tunables/minimald.d/local\" \"$_aa_record\""
+}      sudo apparmor_parser -R $(shq "$_aa_profile"); sudo rm -f $(shq "$_aa_profile") $(shq "$_aa_tunable") $(shq "$_aa_dir/tunables/minimald.d/local") $(shq "$_aa_record")"
             else
                 _fi_list="$_fi_list${_fi_list:+, }the system AppArmor profile ($_aa_profile, not min finalize-install's)"
                 _aa_unowned=1
                 _fi_undo="$_fi_undo${_fi_undo:+
-}      sudo apparmor_parser -R \"$_aa_profile\"; sudo rm -f \"$_aa_profile\" \"$_aa_tunable\""
+}      sudo apparmor_parser -R $(shq "$_aa_profile"); sudo rm -f $(shq "$_aa_profile") $(shq "$_aa_tunable")"
             fi
         fi
         if [ -e "$_fi_root$_cls_root/classifier-table" ]; then
             _fi_list="$_fi_list${_fi_list:+, }the classifier tree ($_cls_root)"
             _fi_owned=1
             _fi_undo="$_fi_undo${_fi_undo:+
-}      sudo nft delete table inet minimal_class; sudo find \"$_fi_root$_cls_root\" -depth -type d -exec rmdir {} +"
+}      sudo nft delete table inet minimal_class; sudo find $(shq "$_fi_root$_cls_root") -depth -type d -exec rmdir {} +"
         fi
         if [ -e "$_kvm_record" ]; then
             _fi_list="$_fi_list${_fi_list:+, }the kvm group membership"
             _fi_owned=1
             _fi_undo="$_fi_undo${_fi_undo:+
-}      while IFS= read -r u; do sudo gpasswd -d \"\$u\" kvm; done < $_kvm_record; sudo rm -f $_kvm_record"
+}      while IFS= read -r u; do sudo gpasswd -d \"\$u\" kvm; done < $(shq "$_kvm_record"); sudo rm -f $(shq "$_kvm_record")"
         fi
     fi
     [ -n "$_fi_list" ] || return 0

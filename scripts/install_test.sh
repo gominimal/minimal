@@ -672,6 +672,29 @@ case_finalize_install_uninstall() {
     want_err "a host that never ran min finalize-install sees no advisory" \
         grep -q "min finalize-install" "$OUT"
 
+    # The remedy is a command line re-parsed by another shell (apply_remedies
+    # runs each printed line through `sh -c`; a pasted prompt is the same), so a
+    # fake root holding a space and a literal $HOME must come through quoted:
+    # double quotes would split the line and let $HOME expand again. The darwin
+    # remedy rides the same rule, flipped around its run like aa_darwin.
+    PLAT_S=Darwin; PLAT_M=arm64
+    HNSD="$root/hnsd"; mkdir -p "$HNSD"
+    run nsd_seed "$HNSD"
+    fake_nsd="$root/fake net root-d \$HOME"
+    nsd_file="$fake_nsd/etc/resolver/min.internal"
+    mkdir -p "$(dirname "$nsd_file")"
+    printf 'resolver\n' >"$nsd_file"
+    FINALIZE_INSTALL_ROOT="$fake_nsd"
+    run nsd_run "$HNSD" --uninstall
+    FINALIZE_INSTALL_ROOT=
+    PLAT_S=Linux; PLAT_M=x86_64
+    check 0 "$rc" "darwin uninstall with a spaced, \$HOME-bearing root exits 0"
+    want_ok "darwin advisory still names the host DNS setup" \
+        grep -q "still installed on this host.*host DNS setup" "$OUT"
+    apply_remedies 1
+    want_err "the darwin remedy removes the resolver file under a spaced root" \
+        test -e "$nsd_file"
+
     # The Linux-only items, each detected by what the step leaves for `--undo`.
     [ "$PLAT_S" = Linux ] || return 0
 
@@ -769,6 +792,42 @@ case_finalize_install_uninstall() {
         test -e "$fake_ns6/sys/fs/cgroup/minimald.slice"
     want_err "the printed remedies remove the kvm record" \
         test -e "$fake_ns6/var/lib/minimal/finalize-install-kvm-group"
+
+    # The same proof under a fake root holding a space and a literal $HOME: the
+    # remedies are re-parsed by another shell, so an unquoted or merely
+    # double-quoted path would split on the space and expand $HOME. The kvm
+    # record exercises the shell redirection too (`done < record`), where the
+    # quoting rule is the same single-quote escape shq() emits.
+    HNS7="$root/hns7"; mkdir -p "$HNS7"
+    run ns7_seed "$HNS7"
+    fake_ns7="$root/fake net root-7 \$HOME"
+    mkdir -p "$fake_ns7/var/lib/minimal"
+    printf 'alice\n' >"$fake_ns7/var/lib/minimal/finalize-install-kvm-group"
+    FINALIZE_INSTALL_ROOT="$fake_ns7"
+    run ns7_run "$HNS7" --uninstall
+    FINALIZE_INSTALL_ROOT=
+    check 0 "$rc" "uninstall with a spaced kvm record exits 0"
+    want_ok "the kvm membership is advised under a spaced root" \
+        grep -q "still installed on this host.*kvm group membership" "$OUT"
+    apply_remedies 1
+    want_err "the printed remedy removes the spaced kvm record" \
+        test -e "$fake_ns7/var/lib/minimal/finalize-install-kvm-group"
+
+    HNS8="$root/hns8"; mkdir -p "$HNS8"
+    run ns8_seed "$HNS8"
+    fake_ns8="$root/fake net root-8 \$HOME"
+    ns8_file="$fake_ns8/etc/systemd/system/minzoned.service"
+    mkdir -p "$(dirname "$ns8_file")"
+    printf 'unit\n' >"$ns8_file"
+    FINALIZE_INSTALL_ROOT="$fake_ns8"
+    run ns8_run "$HNS8" --uninstall
+    FINALIZE_INSTALL_ROOT=
+    check 0 "$rc" "uninstall with a spaced host DNS setup exits 0"
+    want_ok "the host DNS setup is advised under a spaced root" \
+        grep -q "still installed on this host.*host DNS setup" "$OUT"
+    apply_remedies 1
+    want_err "the printed remedy removes the spaced host DNS setup" \
+        test -e "$ns8_file"
 }
 
 # --- The finalize-install offer (NET-122) -------------------------------------
