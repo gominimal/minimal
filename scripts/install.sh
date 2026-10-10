@@ -441,10 +441,10 @@ maybe_remove_finalize_install() {
     _cls_root=/sys/fs/cgroup/minimald.slice
     if [ "$os" = darwin ]; then
         _ns_paths="/etc/resolver/min.internal /Library/LaunchDaemons/dev.gominimal.zone.plist /Library/PrivilegedHelperTools/minzoned /Library/LaunchDaemons/dev.minimal.local-range.plist /Library/PrivilegedHelperTools/dev.minimal.local-range"
-        _ns_undo="sudo launchctl bootout system/dev.gominimal.zone; sudo launchctl bootout system/dev.minimal.local-range; sudo rm -f $_ns_paths"
+        _ns_undo="sudo launchctl bootout system/dev.gominimal.zone; sudo launchctl bootout system/dev.minimal.local-range; sudo rm -f \"$_fi_root/etc/resolver/min.internal\" \"$_fi_root/Library/LaunchDaemons/dev.gominimal.zone.plist\" \"$_fi_root/Library/PrivilegedHelperTools/minzoned\" \"$_fi_root/Library/LaunchDaemons/dev.minimal.local-range.plist\" \"$_fi_root/Library/PrivilegedHelperTools/dev.minimal.local-range\""
     else
         _ns_paths="/etc/systemd/system/minzoned.socket /etc/systemd/system/minzoned.service /usr/local/lib/minimal/minzoned /sys/class/net/minzone0"
-        _ns_undo="sudo systemctl disable --now minzoned.socket minzoned.service; sudo rm -f /etc/systemd/system/minzoned.socket /etc/systemd/system/minzoned.service /usr/local/lib/minimal/minzoned; sudo systemctl daemon-reload; sudo ip link del minzone0"
+        _ns_undo="sudo systemctl disable --now minzoned.socket minzoned.service; sudo rm -f \"$_fi_root/etc/systemd/system/minzoned.socket\" \"$_fi_root/etc/systemd/system/minzoned.service\" \"$_fi_root/usr/local/lib/minimal/minzoned\"; sudo systemctl daemon-reload; sudo ip link del minzone0"
     fi
     # What is found, as a list for the prompt; what `min finalize-install
     # --undo` removes; the manual remedy, one root command line per item.
