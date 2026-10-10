@@ -3994,15 +3994,18 @@ dependencies = [
  "chrono",
  "clap",
  "clap_complete",
+ "common",
+ "crossterm",
  "diagnostics",
  "dirs",
+ "futures",
  "hex",
  "hickory-proto",
  "inquire",
+ "insta",
  "mctx",
  "mfile",
  "minimal-client",
- "minimal-tui",
  "minimald",
  "minimald-rpc",
  "minvmd",
@@ -4010,6 +4013,7 @@ dependencies = [
  "op",
  "ot",
  "paths",
+ "ratatui",
  "reqwest",
  "russh",
  "serde",
@@ -4024,6 +4028,7 @@ dependencies = [
  "toml_edit",
  "tracing",
  "tracing-subscriber",
+ "unicode-width 0.2.2",
  "url",
  "version",
 ]
@@ -4058,33 +4063,6 @@ name = "minimal-lexical"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
-
-[[package]]
-name = "minimal-tui"
-version = "0.7.0"
-dependencies = [
- "anyhow",
- "camino",
- "chrono",
- "common",
- "crossterm",
- "dirs",
- "futures",
- "insta",
- "mfile",
- "minimal-client",
- "minimald-rpc",
- "nix 0.31.3",
- "paths",
- "ratatui",
- "serde",
- "serde_json_lenient",
- "sessions",
- "tempfile",
- "tokio",
- "tracing",
- "unicode-width 0.2.2",
-]
 
 [[package]]
 name = "minimald"

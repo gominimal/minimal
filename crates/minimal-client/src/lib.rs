@@ -1209,10 +1209,9 @@ pub fn version_assertion() -> Option<String> {
 /// [`UNVERSIONED_DAEMON`] rather than waved through.
 ///
 /// Costs no round trip: every caller passes a version that came back on an RPC
-/// it had to make regardless. Lives in this crate, not in `minimal`, because
-/// the dashboard activates sessions too — `min dash` drives the same
-/// create/upload/configure/finalize sequence from `minimal-tui`, which cannot
-/// depend on the CLI crate.
+/// it had to make regardless. Lives in this crate, beside the transport it
+/// guards, so the CLI and the `min dash` dashboard — which drives the same
+/// create/upload/configure/finalize sequence — gate through one implementation.
 pub fn ensure_version_reported(daemon: Option<&str>) -> Result<(), anyhow::Error> {
     if let Some(warning) = version_gate(version::VERSION, daemon, skew_override_set())? {
         eprintln!("warning: {warning}");

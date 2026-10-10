@@ -1,5 +1,5 @@
 ---
-source: crates/minimal-tui/tests/snapshots.rs
+source: crates/minimal/tests/dash_snapshots.rs
 expression: "format!(\"{}\", terminal.backend())"
 ---
 "┌────────────────────────┐┌────────────────────────────────────────────────────┐"
