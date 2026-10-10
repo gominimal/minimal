@@ -384,7 +384,7 @@ APPARMOR_DIR=
 # Root the installer looks under for the host paths `min finalize-install` installs.
 # Empty points it at a nonexistent directory, so this host's own setup never
 # leaks into a scenario; scenarios seed a fake root to drive the offer.
-NET_SETUP_ROOT=
+FINALIZE_INSTALL_ROOT=
 
 # Bin prefix the installer sees. Empty means the harness default ($hp/bin — a
 # custom MINIMAL_BIN, NOT one of the AppArmor tunable's stock attachment
@@ -421,7 +421,7 @@ run() {
         STUB_UNAME_M="$PLAT_M" \
         MINIMAL_OVERRIDE_USERNS_SYSCTL="${USERNS_SYSCTL:-$root/no-such-sysctl}" \
         MINIMAL_OVERRIDE_APPARMOR_DIR="${APPARMOR_DIR:-$root/no-such-apparmor.d}" \
-        MINIMAL_OVERRIDE_NET_SETUP_ROOT="${NET_SETUP_ROOT:-$root/no-such-net-setup-root}" \
+        MINIMAL_OVERRIDE_FINALIZE_INSTALL_ROOT="${FINALIZE_INSTALL_ROOT:-$root/no-such-finalize-install-root}" \
         MINIMAL_OVERRIDE_TTY="${TTY_FILE:-$root/no-such-tty}" \
         MINIMAL_INSTALL_FORCE_STOP="${FORCE_STOP:-}" \
         "$SH" "$installer" "$@" </dev/null >"$OUT" 2>&1
@@ -603,9 +603,9 @@ case_finalize_install_uninstall() {
     esac
     mkdir -p "$(dirname "$ns_file")"
     printf 'unit\n' >"$ns_file"
-    NET_SETUP_ROOT="$fake_ns"
+    FINALIZE_INSTALL_ROOT="$fake_ns"
     run ns_run "$HNS" --uninstall
-    NET_SETUP_ROOT=
+    FINALIZE_INSTALL_ROOT=
     check 0 "$rc" "uninstall with the host DNS setup present exits 0"
     want_ok "uninstall advises the host DNS setup is still installed" \
         grep -q "still installed on this host.*host DNS setup" "$OUT"
@@ -633,9 +633,9 @@ case_finalize_install_uninstall() {
     fake_ns3="$root/fake-net-setup-root-3"
     mkdir -p "$fake_ns3/var/lib/minimal"
     : >"$fake_ns3/var/lib/minimal/finalize-install-apparmor-profile"
-    APPARMOR_DIR="$fake_aa3"; NET_SETUP_ROOT="$fake_ns3"
+    APPARMOR_DIR="$fake_aa3"; FINALIZE_INSTALL_ROOT="$fake_ns3"
     run ns3_run "$HNS3" --uninstall
-    APPARMOR_DIR=; NET_SETUP_ROOT=
+    APPARMOR_DIR=; FINALIZE_INSTALL_ROOT=
     check 0 "$rc" "uninstall with a recorded profile exits 0"
     want_ok "a recorded profile is advised as min finalize-install's" \
         grep -q "still installed on this host.*user-namespace profile" "$OUT"
@@ -651,9 +651,9 @@ case_finalize_install_uninstall() {
     run ns4_seed "$HNS4"
     fake_ns4="$root/fake-net-setup-root-4"
     mkdir -p "$fake_ns4/sys/fs/cgroup/minimald.slice/classifier-table"
-    NET_SETUP_ROOT="$fake_ns4"
+    FINALIZE_INSTALL_ROOT="$fake_ns4"
     run ns4_run "$HNS4" --uninstall
-    NET_SETUP_ROOT=
+    FINALIZE_INSTALL_ROOT=
     check 0 "$rc" "uninstall with the classifier tree exits 0"
     want_ok "the classifier tree is advised" \
         grep -q "still installed on this host.*classifier tree" "$OUT"
@@ -666,9 +666,9 @@ case_finalize_install_uninstall() {
     fake_ns5="$root/fake-net-setup-root-5"
     mkdir -p "$fake_ns5/var/lib/minimal"
     printf 'alice\n' >"$fake_ns5/var/lib/minimal/finalize-install-kvm-group"
-    NET_SETUP_ROOT="$fake_ns5"
+    FINALIZE_INSTALL_ROOT="$fake_ns5"
     run ns5_run "$HNS5" --uninstall
-    NET_SETUP_ROOT=
+    FINALIZE_INSTALL_ROOT=
     check 0 "$rc" "uninstall with the kvm record exits 0"
     want_ok "the kvm membership is advised" \
         grep -q "still installed on this host.*kvm group membership" "$OUT"
@@ -685,9 +685,9 @@ case_finalize_install_uninstall() {
         "$fake_ns6/sys/fs/cgroup/minimald.slice/classifier-table"
     printf 'unit\n' >"$fake_ns6/etc/systemd/system/minzoned.service"
     printf 'alice\n' >"$fake_ns6/var/lib/minimal/finalize-install-kvm-group"
-    APPARMOR_DIR="$fake_aa6"; NET_SETUP_ROOT="$fake_ns6"
+    APPARMOR_DIR="$fake_aa6"; FINALIZE_INSTALL_ROOT="$fake_ns6"
     run ns6_run "$HNS6" --uninstall
-    APPARMOR_DIR=; NET_SETUP_ROOT=
+    APPARMOR_DIR=; FINALIZE_INSTALL_ROOT=
     check 0 "$rc" "uninstall with every artifact exits 0"
     check 1 "$(grep -c "still installed on this host" "$OUT")" "one advisory covers everything found"
     for item in "host DNS setup" "system AppArmor profile" "classifier tree" "kvm group membership"; do
