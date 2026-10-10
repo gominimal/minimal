@@ -15,6 +15,7 @@ use tokio::{
     sync::{RwLock, RwLockReadGuard, Semaphore},
     task::{JoinSet, yield_now},
 };
+use tracing::Instrument;
 
 mod local_backend;
 pub use local_backend::{BuildEvent, BuildEventInner, LocalBackend};
@@ -146,7 +147,9 @@ impl<B: Backend> Orchestrator<B> {
                 let deliverable = s.get_mut(&dr).unwrap();
                 assert!(matches!(deliverable.state, DeliverableState::Pending));
 
-                // Spawn a task for the corresponding deliverable type
+                // Spawn a task for the corresponding deliverable type. `JoinSet::spawn`
+                // doesn't inherit the current span: without `in_current_span` every
+                // download and materialize in the task starts a new root trace.
                 let abort_handle = match &deliverable.inner {
                     state::DeliverableInner::Build {
                         bsr,
@@ -164,7 +167,8 @@ impl<B: Backend> Orchestrator<B> {
                             spec_hash: spec_hash.clone(),
                             dependencies: dependencies.clone(),
                         }
-                        .run(),
+                        .run()
+                        .in_current_span(),
                     ),
                     state::DeliverableInner::CacheFill { bsr, spec_hash } => pending.spawn(
                         OrchestratedCacheFill {
@@ -175,7 +179,8 @@ impl<B: Backend> Orchestrator<B> {
                             bsr: *bsr,
                             spec_hash: spec_hash.clone(),
                         }
-                        .run(),
+                        .run()
+                        .in_current_span(),
                     ),
                     state::DeliverableInner::Subset {
                         subset,
@@ -191,7 +196,8 @@ impl<B: Backend> Orchestrator<B> {
                             spec_hash: spec_hash.clone(),
                             build: *build,
                         }
-                        .run(),
+                        .run()
+                        .in_current_span(),
                     ),
                 };
                 deliverable.state = DeliverableState::InProgress(abort_handle);
