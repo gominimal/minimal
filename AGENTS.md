@@ -67,8 +67,8 @@ Rules that follow from these:
   with a serde `rename` or `alias`.
 - Under the BOX spec, a box's behaviour follows the settings in its spec:
   its lifetime, PTY, timeout and network mode. It never follows the Box Type
-  name. Only the code that resolves Box Types reads a type name. Until
-  then, do not add new branching on session versus task where a setting can
+  name. Only the code that resolves Box Types, or checks a spec against its
+  type's constraints at admission, reads the type. Until then, do not add new branching on session versus task where a setting can
   carry the difference.
 - New files, modules and types about the box take box names from the start.
   Rename code that still says session for the box in a pull request of its
