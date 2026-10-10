@@ -419,7 +419,8 @@ strip_rc_block() {
 # with root) points the host's resolver at the box zone and installs the
 # Minimal box-name service — on macOS, the boot unit that reserves the local
 # range too; on Linux, the user-namespace profile (recorded as the step's
-# own), the classifier tree and the kvm group membership. None of it is in
+# own), the classifier tree (recorded the same way) with the units that
+# rebuild it at boot, and the kvm group membership. None of it is in
 # the install record, and all of it outlives `min`. The profile may instead
 # have been installed separately, with root, by install-apparmor-profile.sh
 # (no record): it outlives minimald the same way, so it rides in the same
@@ -430,7 +431,13 @@ strip_rc_block() {
 # --undo` (here, before the walk deletes `min`) and the loader for an
 # unrecorded profile; piped (curl|sh), non-interactive, or dry-run, advise the
 # root commands for everything found instead, which stay valid after the
-# walk. The roots are overridable for install_test.sh.
+# walk. Those commands follow what `min finalize-install --undo` runs
+# (linux_undo_command and macos_undo_command in
+# crates/minimal/src/resolver.rs): install_test.sh executes them against a
+# fake root and fails when that file names a path this advice does not. The
+# profile and the classifier tree come away only by the step's record; one
+# without its record was installed another way. The roots are overridable
+# for install_test.sh.
 maybe_remove_finalize_install() {
     _fi_root="${MINIMAL_OVERRIDE_FINALIZE_INSTALL_ROOT:-}"
     _aa_dir="${MINIMAL_OVERRIDE_APPARMOR_DIR:-/etc/apparmor.d}"
@@ -438,13 +445,31 @@ maybe_remove_finalize_install() {
     _aa_tunable="$_aa_dir/tunables/minimald"
     _aa_record="$_fi_root/var/lib/minimal/finalize-install-apparmor-profile"
     _kvm_record="$_fi_root/var/lib/minimal/finalize-install-kvm-group"
+    _cls_record="$_fi_root/var/lib/minimal/finalize-install-classifier"
     _cls_root=/sys/fs/cgroup/minimald.slice
+    _lib_dir="$_fi_root/usr/local/lib/minimal"
+    # _ns_files are the files the DNS remedy removes; _ns_paths adds what else
+    # says the setup is there. _ns_chan is the answerer's channel socket, kept
+    # out of both lists because the macOS path has a space in it and its
+    # presence alone never says the service is installed.
     if [ "$os" = darwin ]; then
-        _ns_paths="/etc/resolver/min.internal /Library/LaunchDaemons/dev.gominimal.zone.plist /Library/PrivilegedHelperTools/minzoned /Library/LaunchDaemons/dev.minimal.local-range.plist /Library/PrivilegedHelperTools/dev.minimal.local-range"
-        _ns_undo="sudo launchctl bootout system/dev.gominimal.zone; sudo launchctl bootout system/dev.minimal.local-range; sudo rm -f \"$_fi_root/etc/resolver/min.internal\" \"$_fi_root/Library/LaunchDaemons/dev.gominimal.zone.plist\" \"$_fi_root/Library/PrivilegedHelperTools/minzoned\" \"$_fi_root/Library/LaunchDaemons/dev.minimal.local-range.plist\" \"$_fi_root/Library/PrivilegedHelperTools/dev.minimal.local-range\""
+        _ns_files="/etc/resolver/min.internal /Library/LaunchDaemons/dev.gominimal.zone.plist /Library/PrivilegedHelperTools/minzoned /Library/LaunchDaemons/dev.minimal.local-range.plist /Library/PrivilegedHelperTools/dev.minimal.local-range"
+        _ns_paths="$_ns_files"
+        _ns_chan="$_fi_root/Library/Application Support/minimal/run/answerer.sock"
     else
-        _ns_paths="/etc/systemd/system/minzoned.socket /etc/systemd/system/minzoned.service /usr/local/lib/minimal/minzoned /sys/class/net/minzone0"
-        _ns_undo="sudo systemctl disable --now minzoned.socket minzoned.service; sudo rm -f \"$_fi_root/etc/systemd/system/minzoned.socket\" \"$_fi_root/etc/systemd/system/minzoned.service\" \"$_fi_root/usr/local/lib/minimal/minzoned\"; sudo systemctl daemon-reload; sudo ip link del minzone0"
+        _ns_files="/etc/systemd/system/minzoned.socket /etc/systemd/system/minzoned.service /usr/local/lib/minimal/minzoned"
+        _ns_paths="$_ns_files /sys/class/net/minzone0"
+        _ns_chan="$_fi_root/run/minimal/answerer.sock"
+    fi
+    _ns_rm=
+    for _ns_p in $_ns_files; do
+        _ns_rm="$_ns_rm \"$_fi_root$_ns_p\""
+    done
+    _ns_rm="$_ns_rm \"$_ns_chan\""
+    if [ "$os" = darwin ]; then
+        _ns_undo="sudo launchctl bootout system/dev.gominimal.zone; sudo launchctl bootout system/dev.minimal.local-range; sudo rm -f$_ns_rm; sudo rmdir \"${_ns_chan%/*}\" \"$_fi_root/Library/Application Support/minimal\" 2>/dev/null || true"
+    else
+        _ns_undo="sudo systemctl disable --now minzoned.socket minzoned.service; sudo rm -f$_ns_rm; sudo systemctl daemon-reload; sudo systemctl reset-failed minzoned.socket minzoned.service; [ ! -e \"$_fi_root/sys/class/net/minzone0\" ] || { sudo resolvectl revert minzone0; sudo ip link del minzone0; }; sudo rmdir \"${_ns_chan%/*}\" \"$_lib_dir\" 2>/dev/null || true"
     fi
     # What is found, as a list for the prompt; what `min finalize-install
     # --undo` removes; the manual remedy, one root command line per item.
@@ -466,7 +491,7 @@ maybe_remove_finalize_install() {
                 _fi_list="$_fi_list${_fi_list:+, }the user-namespace profile ($_aa_profile)"
                 _fi_owned=1
                 _fi_undo="$_fi_undo${_fi_undo:+
-}      sudo apparmor_parser -R \"$_aa_profile\"; sudo rm -f \"$_aa_profile\" \"$_aa_tunable\" \"$_aa_dir/tunables/minimald.d/local\" \"$_aa_record\""
+}      sudo apparmor_parser -R \"$_aa_profile\"; sudo rm -f \"$_aa_profile\" \"$_aa_tunable\" \"$_aa_dir/tunables/minimald.d/local\"; sudo rmdir \"$_aa_dir/tunables/minimald.d\" 2>/dev/null; sudo rm -f \"$_aa_record\""
             else
                 _fi_list="$_fi_list${_fi_list:+, }the system AppArmor profile ($_aa_profile, not min finalize-install's)"
                 _aa_unowned=1
@@ -474,17 +499,36 @@ maybe_remove_finalize_install() {
 }      sudo apparmor_parser -R \"$_aa_profile\"; sudo rm -f \"$_aa_profile\" \"$_aa_tunable\""
             fi
         fi
-        if [ -e "$_fi_root$_cls_root/classifier-table" ]; then
+        # The classifier's units, the boot unit first: it re-runs the step at
+        # every boot, so left enabled it lays the tree and the table out again.
+        # They are disabled before their files go, and before the tree's line.
+        _cls_rm=
+        _cls_found=
+        for _cls_p in /etc/systemd/system/minimald-classifier.service /etc/systemd/system/minimald-place.path /etc/systemd/system/minimald-place.service /usr/local/lib/minimal/install-host-classifier.sh; do
+            _cls_rm="$_cls_rm \"$_fi_root$_cls_p\""
+            if [ -z "$_cls_found" ] && [ -e "$_fi_root$_cls_p" ]; then
+                _cls_found="$_cls_p"
+            fi
+        done
+        if [ -n "$_cls_found" ]; then
+            _fi_list="$_fi_list${_fi_list:+, }the classifier units ($_cls_found)"
+            _fi_owned=1
+            _fi_undo="$_fi_undo${_fi_undo:+
+}      sudo systemctl disable --now minimald-classifier.service minimald-place.path minimald-place.service; sudo rm -f$_cls_rm; sudo systemctl daemon-reload; sudo rmdir \"$_lib_dir\" 2>/dev/null || true"
+        fi
+        # The tree, by the step's record only: a tree without the record was
+        # installed another way and stays. The record goes once the tree has.
+        if [ -e "$_cls_record" ]; then
             _fi_list="$_fi_list${_fi_list:+, }the classifier tree ($_cls_root)"
             _fi_owned=1
             _fi_undo="$_fi_undo${_fi_undo:+
-}      sudo nft delete table inet minimal_class; sudo find \"$_fi_root$_cls_root\" -depth -type d -exec rmdir {} +"
+}      sudo nft delete table inet minimal_class; { [ ! -d \"$_fi_root$_cls_root\" ] || sudo find \"$_fi_root$_cls_root\" -depth -type d -exec rmdir {} +; } && sudo rm -f \"$_cls_record\""
         fi
         if [ -e "$_kvm_record" ]; then
             _fi_list="$_fi_list${_fi_list:+, }the kvm group membership"
             _fi_owned=1
             _fi_undo="$_fi_undo${_fi_undo:+
-}      while IFS= read -r u; do sudo gpasswd -d \"\$u\" kvm; done < $_kvm_record; sudo rm -f $_kvm_record"
+}      while IFS= read -r u; do sudo gpasswd -d \"\$u\" kvm; done < \"$_kvm_record\"; sudo rm -f \"$_kvm_record\""
         fi
     fi
     [ -n "$_fi_list" ] || return 0
