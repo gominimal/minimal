@@ -268,6 +268,10 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
   - IF `min session attach` runs with no address and no session box exists THEN THE SYSTEM SHALL fail with exit 4 and a hint naming `min session start`.
     tier:   T0
     verify: cargo nextest run -p minimal session_attach_without_address_none_exit4_hints_start
+  - IF `min session attach` runs with no address and a host cannot be reached while session boxes are looked up across hosts THEN THE SYSTEM SHALL fail with exit 7, naming each unreachable host, and attach to nothing.
+    <!-- unwanted; BCLI-002's rule for an incomplete cross-host lookup takes precedence over the project-root and only-session fallbacks, since an unreachable host may hold another match; this covers BCLI-042's bare alias too -->
+    tier:   T0
+    verify: cargo nextest run -p minimal session_attach_without_address_unreachable_host_exit7
 
 - **BCLI-033** THE SYSTEM SHALL emit `-o json` and `-o jsonl` output under the versioned schemas `min/v1/box`, `min/v1/event` and `min/v1/error`.
   <!-- was BOX-095 -->
