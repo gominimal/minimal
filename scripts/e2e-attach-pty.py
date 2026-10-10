@@ -120,7 +120,7 @@ if answer not in ANSWER_LABEL_PREFIX:
     sys.exit(2)
 
 # The runtime port-publish ask's own prompt (session_host.rs `ASK_PROMPT`), the
-# frame the answer below keys on: the lead-in ("... asks to publish port N.")
+# frame the answer below keys on: the lead-in ("... asks to publish port N/tcp.")
 # then the Select with Deny highlighted. The two answers are the keystrokes
 # the daemon's own test driver sends (`session_host/tests.rs` `answer_ask_on`):
 # Down lands on Allow, Enter takes the row; a bare Enter takes the highlighted

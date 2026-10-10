@@ -110,6 +110,53 @@ async fn finalize_install_show_json_reaches_a_piped_reader_before_exit() {
     assert_eq!(names["state"], "waiting", "{stdout}");
 }
 
+/// A daemon that accepts and never answers must not hang `--show`: the
+/// installer probes `min finalize-install --show --script` from a shell
+/// with no timeout of its own. The names item's daemon read is one bounded
+/// attempt, after which the item is `waiting`.
+#[tokio::test]
+async fn finalize_install_show_returns_within_its_deadline_on_a_wedged_daemon() {
+    let state = tempfile::TempDir::new().unwrap();
+    let config_dir = tempfile::TempDir::new().unwrap();
+    let sock = minimal_client::resolve_socket_path(Some(state.path()), false).unwrap();
+    std::fs::create_dir_all(sock.parent().unwrap()).unwrap();
+    let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+    // Accept every connection and hold it open, silent.
+    let wedged = tokio::spawn(async move {
+        let mut held = Vec::new();
+        loop {
+            if let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        }
+    });
+    let started = std::time::Instant::now();
+    let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_min"))
+        .args(["--minimal-dir".as_ref(), state.path().as_os_str()])
+        .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
+        .args(["--no-input", "finalize-install", "--show", "--json"])
+        .output()
+        .await
+        .expect("the min binary should be invocable");
+    let elapsed = started.elapsed();
+    wedged.abort();
+    assert!(
+        elapsed < std::time::Duration::from_secs(20),
+        "the daemon read is bounded (took {elapsed:?}): {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let report: Value = serde_json_lenient::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("the report is printed ({e}): {stdout:?}"));
+    let names = report["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["id"] == "names")
+        .expect("the names item is in every host's report");
+    assert_eq!(names["state"], "waiting", "{stdout}");
+}
+
 // --- ls ---
 
 #[test]
