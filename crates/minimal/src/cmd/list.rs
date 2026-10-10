@@ -427,7 +427,7 @@ async fn listings_across_vms(
 
 /// The VM-host control socket the fallback listing pairs with its one entry
 /// (NET-138), keyed on the backend the daemon connection resolves through —
-/// the same rule [`hostname_proxy_start_vm`] states — and never on
+/// the same rule [`hostname_proxy_vm`] states — and never on
 /// [`GlobalArgs::use_minvmd`]: the flag is how Linux asks for the VM host,
 /// while macOS reaches it with no flag at all, so a gate keyed on the flag
 /// would find no control socket for exactly the host whose every invocation
@@ -623,12 +623,22 @@ pub async fn cmd_ls(global: &GlobalArgs, args: LsArgs) -> Result<(), anyhow::Err
             *slot = crate::resolver::vm_host_name_surface(reply.clone()).await;
         }
     }
-    format_ls_across_vms(
+    // NET-018/NET-122: the install clause on each `NAME SURFACE` row reads
+    // the same host facts the session start's host line does, so the two
+    // verbs print the same pointer. Machine modes print no row, so they pay
+    // no probe.
+    let host_install = if args.json || args.raw {
+        crate::resolver::HostInstall::default()
+    } else {
+        crate::cmd::finalize_install::host_install_for_this_host(global)
+    };
+    format_ls_across_vms_on(
         &mut std::io::stdout(),
         &args,
         &listings,
         &surfaces,
         &vm_answerers,
+        host_install,
     )?;
     // NET-129: after the table, one stderr line per port a box yields at a
     // shared address. `--json` carries the same rows on each entry, so it
@@ -700,58 +710,15 @@ pub(crate) fn warn_if_hostname_routing_down(reason: Option<&str>, command: &str)
     }
 }
 
-/// The session-start twin of `min ls`'s routing line (NET-026 on the activate
-/// surface): one line telling the operator the port this daemon's
-/// `<name>.min.internal` names route through — the address a PAC file or an
-/// `HTTP(S)_PROXY` export has to point at, which is not a constant on a host
-/// where a port was taken.
-///
-/// That is the case the line exists for: a VM whose proposed host port the
-/// host already held walks to a host port of its own (NET-059) — a boot with
-/// no handed port, since a handed one is pinned and keeps proposing the port
-/// it was given — and a native daemon whose default is busy asks the OS for a
-/// free one (NET-025). Either way the port the recipes assume is not the one
-/// in use, so a walked port must never be a log line alone: the daemon
-/// reports the port it is *reachable* on, and the session that just started
-/// prints it here beside the routing line `min ls` prints for the same VM.
-///
-/// `vm` is the VM the line names: the selected one on the VM backend, where
-/// each VM publishes its own proxy on the host and the name is which port is
-/// whose on a two-VM host. `None` on the native backend, which hosts no VMs,
-/// so the line reads exactly as `min ls`'s single-daemon routing line does.
-#[must_use]
-pub fn hostname_proxy_start_line(vm: Option<&str>, port: u16) -> String {
-    match vm {
-        Some(vm) => format!(
-            "HOSTNAME PROXY:  VM {vm} listening on 127.0.0.1:{port} · \
-             <name>.min.internal routes through it"
-        ),
-        None => format!(
-            "HOSTNAME PROXY:  listening on 127.0.0.1:{port} · \
-             <name>.min.internal routes through it"
-        ),
-    }
-}
-
-/// The VM a session-start routing line names: the selected VM on the VM
-/// backend, where the session that just started landed on one VM of several
-/// and its proxy port is that VM's, and nothing on the native backend, whose
-/// one daemon hosts no VMs to name.
-///
-/// Keyed on the provider kind the daemon connection resolves through — the
-/// same rule [`super::session::daemon_provider_kind`] states — and never on
-/// `use_minvmd()`: the flag is how Linux asks for the VM host, while macOS
-/// reaches it with no flag at all, and a start line that keyed on the flag
-/// would name no VM for exactly the host whose every invocation is
-/// VM-backed.
-#[must_use]
-pub fn hostname_proxy_start_vm(global: &GlobalArgs) -> Option<&'static str> {
-    hostname_proxy_vm(super::session::daemon_provider_kind(global))
-}
-
-/// [`hostname_proxy_start_vm`]'s gate as a fact about the backend kind, so
-/// the tests can drive the macOS combination the flag cannot express:
-/// `Minvmd` with no provider flag at all.
+/// The VM a session-start line names, as a fact about the backend kind: the
+/// selected VM on the VM backend, where the session that just started landed
+/// on one VM of several, and nothing on the native backend, whose one daemon
+/// hosts no VMs to name. Keyed on the provider kind the daemon connection
+/// resolves through — the same rule [`super::session::daemon_provider_kind`]
+/// states — and never on `use_minvmd()`: the flag is how Linux asks for the
+/// VM host, while macOS reaches it with no flag at all, and a line that
+/// keyed on the flag would name no VM for exactly the host whose every
+/// invocation is VM-backed.
 #[must_use]
 pub fn hostname_proxy_vm(kind: paths::ProviderKind) -> Option<&'static str> {
     (kind == paths::ProviderKind::Minvmd).then(client::vm_name)
@@ -773,12 +740,38 @@ pub fn hostname_proxy_vm(kind: paths::ProviderKind) -> Option<&'static str> {
 /// prints from it instead, saying the zone is answered by the VM host
 /// daemon and naming the holder. `None`, the native shape, prints the
 /// daemon's own line exactly as before.
+///
+/// The host's other install facts read as finished: the install clause on
+/// the `NAME SURFACE` row then rides on the surface alone. [`cmd_ls`]
+/// renders through [`format_ls_on`] with this host's own facts.
 pub fn format_ls(
     out: &mut impl std::io::Write,
     args: &LsArgs,
     resp: &minimald_rpc::ListSessionsResponse,
     surface: Option<crate::resolver::LiveSurface>,
     vm_answerer: Option<minimald_rpc::AnswererStatusReply>,
+) -> Result<(), anyhow::Error> {
+    format_ls_on(
+        out,
+        args,
+        resp,
+        surface,
+        vm_answerer,
+        crate::resolver::HostInstall::default(),
+    )
+}
+
+/// [`format_ls`] over this host's install facts (NET-018): `host` is what
+/// `min finalize-install` would find open on this host beyond the names
+/// item, and the `NAME SURFACE` row ends with the same install clause the
+/// session start's host line carries while anything is open.
+pub fn format_ls_on(
+    out: &mut impl std::io::Write,
+    args: &LsArgs,
+    resp: &minimald_rpc::ListSessionsResponse,
+    surface: Option<crate::resolver::LiveSurface>,
+    vm_answerer: Option<minimald_rpc::AnswererStatusReply>,
+    host: crate::resolver::HostInstall,
 ) -> Result<(), anyhow::Error> {
     if args.json {
         let json = serde_json_lenient::to_string_pretty(resp)
@@ -865,17 +858,21 @@ pub fn format_ls(
             writeln!(out, "HOSTNAME PROXY:  {line}")?;
         }
         // NET-018: say which of the two surfaces is live — the one verdict
-        // both verbs share ([`resolver::live_name_surfaces`]). `None` — the
-        // daemon's answerer not bound — prints nothing: the two port lines
-        // above already tell that story, and the advisory the activation
-        // path prints (NET-122) says how to get from one surface to the
-        // other. `--raw` and `--json` stay machine-readable-only, as for
-        // the ports.
+        // both verbs share ([`resolver::live_name_surfaces`]) — and end the
+        // row with the install clause the session start's host line
+        // carries while this host's install is unfinished (NET-122), so the
+        // two verbs print the same pointer. `None` — the daemon's answerer
+        // not bound — prints nothing: the two port lines above already tell
+        // that story. `--raw` and `--json` stay machine-readable-only, as
+        // for the ports.
         if let Some(surface) = surface {
             writeln!(
                 out,
-                "NAME SURFACE:    {}",
-                crate::resolver::name_surface_line(surface, serving_proxy_port)
+                "NAME SURFACE:    {}{}",
+                crate::resolver::name_surface_line(surface.clone(), serving_proxy_port),
+                crate::resolver::install_clause(crate::resolver::install_unfinished(
+                    &surface, host
+                )),
             )?;
         }
         if resp.hostname_proxy_port.is_some()
@@ -994,12 +991,37 @@ const VM_COLUMN_WIDTH: usize = 8;
 /// no answerer, as [`format_ls`] does for a single VM. A shorter slice than
 /// the listings — a machine mode reads nothing, and a caller that computed
 /// nothing — leaves the VMs it does not cover with no line.
+///
+/// The host's other install facts read as finished, as in [`format_ls`];
+/// [`cmd_ls`] renders through [`format_ls_across_vms_on`] with this host's
+/// own.
 pub fn format_ls_across_vms(
     out: &mut impl std::io::Write,
     args: &LsArgs,
     listings: &[VmListing],
     surfaces: &[Option<crate::resolver::LiveSurface>],
     vm_answerers: &[Option<minimald_rpc::AnswererStatusReply>],
+) -> Result<(), anyhow::Error> {
+    format_ls_across_vms_on(
+        out,
+        args,
+        listings,
+        surfaces,
+        vm_answerers,
+        crate::resolver::HostInstall::default(),
+    )
+}
+
+/// [`format_ls_across_vms`] over this host's install facts (NET-018), the
+/// way [`format_ls_on`] is [`format_ls`]'s: every VM's `NAME SURFACE` row
+/// ends with the install clause while anything is open on this host.
+pub fn format_ls_across_vms_on(
+    out: &mut impl std::io::Write,
+    args: &LsArgs,
+    listings: &[VmListing],
+    surfaces: &[Option<crate::resolver::LiveSurface>],
+    vm_answerers: &[Option<minimald_rpc::AnswererStatusReply>],
+    host: crate::resolver::HostInstall,
 ) -> Result<(), anyhow::Error> {
     // The verdict of the listing at `index`, `None` when the caller passed
     // none for it — a machine mode never prints the line, and a direct
@@ -1010,12 +1032,12 @@ pub fn format_ls_across_vms(
     // socket or daemon that did not answer keeps the same silence.
     let answerer_at = |index: usize| vm_answerers.get(index).cloned().flatten();
     if let [only] = listings {
-        return format_ls(out, args, &only.resp, surface_at(0), answerer_at(0));
+        return format_ls_on(out, args, &only.resp, surface_at(0), answerer_at(0), host);
     }
     if listings.is_empty() {
         // `cmd_ls` always lists the selected VM, so this is only reachable
         // from a direct caller; render it as the empty listing it is.
-        return format_ls(
+        return format_ls_on(
             out,
             args,
             &minimald_rpc::ListSessionsResponse {
@@ -1029,6 +1051,7 @@ pub fn format_ls_across_vms(
             },
             None,
             None,
+            host,
         );
     }
 
@@ -1172,8 +1195,11 @@ pub fn format_ls_across_vms(
             if let Some(surface) = surface {
                 writeln!(
                     out,
-                    "NAME SURFACE:    {vm:<width$} {}",
-                    crate::resolver::name_surface_line(surface, serving_proxy_port),
+                    "NAME SURFACE:    {vm:<width$} {}{}",
+                    crate::resolver::name_surface_line(surface.clone(), serving_proxy_port),
+                    crate::resolver::install_clause(crate::resolver::install_unfinished(
+                        &surface, host
+                    )),
                     vm = listing.vm,
                     width = VM_COLUMN_WIDTH,
                 )?;

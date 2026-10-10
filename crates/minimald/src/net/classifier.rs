@@ -384,18 +384,82 @@ impl Cause {
     /// the step over that tree would leave the cause standing, or for a
     /// guest whose table its own image never loaded, because the person to
     /// tell is the image's builder and no installer exists there. A table
-    /// the marker vouches for but the probe does not ends with the same
-    /// command — the install is the one thing that reloads it — while a
-    /// probe that could not read the table names nothing: no command is
-    /// known to make a probe run.
+    /// the marker vouches for but the probe does not names nothing either:
+    /// the marker is what the install's item reads, so with it present the
+    /// install is a no-op, not a reload. A probe that could not read the
+    /// table names nothing: no command is known to make a probe run.
     pub fn install_command(self) -> Option<String> {
         match self {
-            Self::StepNotInstalled | Self::TableNotEffective => {
-                Some(sandbox2::classifier::install_hint())
-            }
-            Self::CannotConfine | Self::GuestTableNotLoaded | Self::ProbeUnreadable => None,
+            Self::StepNotInstalled => Some(sandbox2::classifier::install_hint()),
+            Self::CannotConfine
+            | Self::GuestTableNotLoaded
+            | Self::TableNotEffective
+            | Self::ProbeUnreadable => None,
         }
     }
+}
+
+/// The advisory a native host that cannot decide per box owes a session
+/// start whose box declares egress (NET-079): what the person asked the box
+/// for, that this machine cannot enforce it yet, what the box does instead,
+/// and the two ways to enforce it — `min finalize-install`, which finishes
+/// this host's install, or an own-address start, which enforces now. Two
+/// lines, the second indented, spelled once here so the create reply `min
+/// session activate` prints verbatim, the daemon's log line for that create
+/// and the banner the launch writes into the box's pty agree by
+/// construction. A declaration that admits nothing asked for "no network
+/// access"; one with a rule the classifier has no subtree for
+/// ([`unenforceable_rules`]) asked for "limited" access; a section that
+/// lists nothing asked for nothing restrictive, so the line says only that
+/// the box declares egress. The two probe causes refuse a deny-all box at
+/// placement rather than run it unenforced ([`Cause::host_ip_box_outcome`]),
+/// so over those the line says the box is refused instead of claiming it
+/// runs. The install is named only where running it enforces the
+/// declaration: a cause no install ends names the own-address start alone
+/// and says why the install cannot help, and a declaration the classifier
+/// cannot enforce on a host address names the own-address start alone too,
+/// because a host that finished its install refuses such a box
+/// ([`refuses_unenforceable_declaration`]) rather than enforce it. So the
+/// advisory never hands a person a command that leaves the cause standing
+/// or gets the box refused. It is never a prompt: it names what a person
+/// may run, and running it is the person's act, never the session start's.
+pub fn advisory_text(cause: Cause, declaration: &sessions::EgressPolicy) -> String {
+    let verdict = verdict_of(Some(declaration));
+    let unenforceable = !unenforceable_rules(Some(declaration)).is_empty();
+    let asked = if verdict == sandbox2::config::Verdict::Deny {
+        "you asked this box for no network access"
+    } else if unenforceable {
+        "you asked this box for limited network access"
+    } else {
+        "this box declares egress"
+    };
+    let refuses = verdict == sandbox2::config::Verdict::Deny
+        && matches!(cause, Cause::TableNotEffective | Cause::ProbeUnreadable);
+    let outcome = if refuses {
+        "so it refuses to start the box"
+    } else {
+        "so the box can still reach the network"
+    };
+    let enforce = if unenforceable {
+        "Enforce it: start the box with --network own_ip, which enforces it now   (on a \
+         host address the classifier enforces only a deny-all declaration, so a host \
+         that finished its install refuses this box rather than enforce its rules)"
+            .to_string()
+    } else {
+        match cause.install_command() {
+            Some(command) => format!(
+                "Enforce it: {command}   (or start the box with --network own_ip, which \
+                 enforces it now)"
+            ),
+            None => format!(
+                "Enforce it: start the box with --network own_ip, which enforces it now   \
+                 ({} can't fix this: {})",
+                sandbox2::classifier::install_hint(),
+                cause.detail()
+            ),
+        }
+    };
+    format!("note: {asked}, but this machine can't enforce it yet, {outcome}.\n  {enforce}")
 }
 
 /// Whether this host can decide a host-address box's egress verdict per box
@@ -2217,8 +2281,12 @@ pub(crate) fn live_answerer() -> Option<SocketAddr> {
 /// be refused because the table's carve-out is stale, and the words that say
 /// so: the recorded target is not the live answerer bind, no answerer is
 /// bound, or the table recorded no carve-out at all. The words name the
-/// cause, both values, and the install that re-renders the carve-out onto
-/// the live bind. `None` when the carve-out names the live answerer.
+/// cause, both values, and the remedy as it stands: `min finalize-install
+/// --undo`, then `min finalize-install`, re-renders the carve-out for the
+/// answerer's default port — the step reads no live bind, so a daemon whose
+/// answerer is bound elsewhere has no self-service remedy yet, and the words
+/// say so rather than name flags the verb does not take. `None` when the
+/// carve-out names the live answerer.
 pub(crate) fn stale_carve_out_refusal(
     recorded: Option<SocketAddrV4>,
     live: Option<SocketAddr>,
@@ -2235,17 +2303,17 @@ pub(crate) fn stale_carve_out_refusal(
         |target| target.to_string(),
     );
     let live_words = live.map_or_else(|| "no live answerer".to_string(), |bound| bound.to_string());
+    let install = sandbox2::classifier::install_hint();
+    let re_render = format!(
+        "{install} --undo, then {install} re-renders the carve-out for the answerer's \
+         default port; a daemon whose answerer is bound elsewhere has no self-service \
+         remedy yet"
+    );
     let remedy = match live_v4 {
-        Some(bound) => format!(
-            "{} --answerer-address {} --answerer-port {}",
-            sandbox2::classifier::install_hint(),
-            bound.ip(),
-            bound.port()
+        Some(bound) => format!("re-render the carve-out onto the live bind {bound}: {re_render}"),
+        None => format!(
+            "start the daemon's zone answerer on an IPv4 loopback address, then {re_render}"
         ),
-        None => "start the daemon's zone answerer on an IPv4 loopback address, then re-run \
-                 the classifier install with --answerer-address and --answerer-port set to \
-                 its bind"
-            .to_string(),
     };
     Some(format!(
         "{}: stale carve-out: the table admits {recorded_words} and the zone answerer is \
@@ -4554,13 +4622,9 @@ mod tests {
         let command = cause
             .install_command()
             .expect("the step's cause is the one a command ends");
-        assert!(
-            command.contains("min finalize-install"),
-            "the command is the privileged step's install, the installed CLI's own verb: {command}"
-        );
-        assert!(
-            !command.contains('<') && !command.contains("raw.githubusercontent.com"),
-            "the command is the one a person runs, with no placeholder and no fetch: {command}"
+        assert_eq!(
+            command, "min finalize-install",
+            "the command is the one a person runs, spelled exactly: {command}"
         );
 
         // The same shape in a guest names its own image's half instead:
@@ -4732,12 +4796,10 @@ mod tests {
             detail.contains("marked loaded") && detail.contains("was not refused"),
             "the cause names what the marker said and what the probe read: {detail}"
         );
-        let command = cause
-            .install_command()
-            .expect("reloading the table is the command that ends it");
         assert!(
-            command.contains("min finalize-install"),
-            "the command is the one thing that reloads the table: {command}"
+            cause.install_command().is_none(),
+            "the marker the install's item reads is present, so the install is a \
+             no-op here, not a reload: no command is named"
         );
 
         // And a probe that could not read the table at all claims nothing:
@@ -5576,8 +5638,11 @@ mod tests {
 
     /// A native deny-all launch is refused when the table's carve-out is not
     /// the live answerer bind, or when the table recorded none: the words are
-    /// the table-not-effective cause, both values, and the install that
-    /// re-renders onto the live bind.
+    /// the table-not-effective cause, both values, and the remedy as it
+    /// stands — the undo-then-install that re-renders for the default port,
+    /// and that a bind elsewhere has no self-service remedy yet — never the
+    /// verb with flags it does not take, and never a claim the step reads
+    /// the live bind.
     #[test]
     fn native_deny_all_refused_when_carve_out_target_is_stale() {
         let recorded = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 7656);
@@ -5589,7 +5654,10 @@ mod tests {
             "stale carve-out",
             "127.0.0.1:7656",
             "127.0.0.1:7700",
-            "--answerer-address 127.0.0.1 --answerer-port 7700",
+            "re-render the carve-out onto the live bind 127.0.0.1:7700: min finalize-install \
+             --undo, then min finalize-install re-renders the carve-out for the answerer's \
+             default port",
+            "no self-service remedy yet",
         ] {
             assert!(
                 refusal.contains(needle),
@@ -5602,6 +5670,61 @@ mod tests {
             unrecorded.contains("no recorded carve-out") && unrecorded.contains("127.0.0.1:7700"),
             "the refusal names the missing record and the live bind: {unrecorded}"
         );
+    }
+
+    /// Every remedy the daemon renders for a person names a command that
+    /// exists: `min finalize-install` bare — the CLI reads the answerer bind
+    /// and the source identities itself — never with flags of the installer
+    /// script appended, and never the script or a fetch of it. Over every
+    /// cause and verdict the advisory takes, both arms of the stale
+    /// carve-out refusal, and the cause's own command.
+    #[test]
+    fn rendered_remedies_never_append_flags_to_the_install_verb() {
+        let live = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7700);
+        let recorded = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 7656);
+        let mut rendered = vec![
+            stale_carve_out_refusal(Some(recorded), Some(live)).expect("stale"),
+            stale_carve_out_refusal(Some(recorded), None).expect("no live answerer"),
+            stale_carve_out_refusal(None, Some(live)).expect("no record"),
+        ];
+        for cause in [
+            Cause::StepNotInstalled,
+            Cause::CannotConfine,
+            Cause::GuestTableNotLoaded,
+            Cause::TableNotEffective,
+            Cause::ProbeUnreadable,
+        ] {
+            for declaration in [
+                sessions::EgressPolicy::deny_all(),
+                sessions::EgressPolicy::default(),
+                sessions::EgressPolicy {
+                    allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
+                    ..sessions::EgressPolicy::default()
+                },
+            ] {
+                rendered.push(advisory_text(cause, &declaration));
+            }
+            rendered.extend(cause.install_command());
+        }
+        for text in rendered {
+            let without_undo = text.replace("min finalize-install --undo", "");
+            assert!(
+                !without_undo.contains("min finalize-install --"),
+                "the verb takes none of the installer's flags (only its own --undo): {text}"
+            );
+            assert!(
+                !text.contains("reads the answerer"),
+                "no claim that the step reads the live bind: {text}"
+            );
+            assert!(
+                !text.contains("install-host-classifier.sh") && !text.contains("curl"),
+                "the remedy is the verb, never the script or a fetch: {text}"
+            );
+            assert!(
+                !text.contains("--answerer-address") && !text.contains("--cohort-address"),
+                "no installer flag is asked of a person: {text}"
+            );
+        }
     }
 
     /// No live answerer — never bound, or stopped — refuses a native

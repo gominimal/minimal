@@ -335,18 +335,40 @@ postinstall_dir="$ROOT/.scratch/package-nfpm"
 mkdir -p "$postinstall_dir"
 cat > "$postinstall_dir/postinstall.sh" <<'EOF'
 #!/bin/sh
-# minimal postinstall: load the minimald AppArmor profile when this host has
-# AppArmor. Never hard-fails: most rpm/apk targets have no AppArmor at all,
-# and the package must install cleanly there — the daemon warns at runtime
-# instead (see docs/reference/linux-host-setup.md).
+# minimal postinstall, as root and never prompting. Never hard-fails: the
+# package must install cleanly, and `min finalize-install` retries later.
+#
+# 1. Load the shipped minimald AppArmor profile wherever apparmor_parser is,
+#    on every install AND upgrade: the loader installs the packaged profile
+#    and `apparmor_parser --replace`s it, so an upgrade that ships a new
+#    profile refreshes the one in /etc and in the kernel, and a host that
+#    does not restrict user namespaces today (22.04) still holds the profile
+#    for the release upgrade that will (24.04). `min finalize-install` does
+#    neither: its item is done once /etc/apparmor.d/minimald exists, and it
+#    skips the profile while the sysctl is 0. Most rpm/apk targets have no
+#    AppArmor at all and skip this.
 loader=/usr/share/minimal/apparmor/install-apparmor-profile.sh
-if ! command -v apparmor_parser >/dev/null 2>&1; then
-    echo "minimal: AppArmor is not available on this host; skipping the minimald profile" >&2
-    exit 0
+if command -v apparmor_parser >/dev/null 2>&1; then
+    if ! "$loader"; then
+        echo "minimal: WARNING: loading the minimald AppArmor profile failed; on restricted hosts minimald sessions may fail to start until this is fixed (see docs/reference/linux-host-setup.md)" >&2
+    fi
 fi
-if ! "$loader"; then
-    echo "minimal: WARNING: loading the minimald AppArmor profile failed; on restricted hosts minimald sessions may fail to start until this is fixed (see docs/reference/linux-host-setup.md)" >&2
+# 2. Finish the rest the way `min finalize-install` does: the probe prints the
+#    one script a run would execute, only while something is missing (the
+#    classifier tree, ...), and root runs it directly: no sudo, no terminal.
+#    The probe runs under a pinned root environment, not the package
+#    manager's: under `sudo -E` the operator's HOME/XDG would point it at
+#    THEIR daemon socket, turn the names item `missing`, and install the
+#    resolver link and answerer service as a package side effect.
+script="$(mktemp)" || exit 0
+if env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root \
+    /usr/bin/min finalize-install --show --script >"$script" 2>/dev/null \
+    && [ -s "$script" ]; then
+    if ! env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root sh "$script"; then
+        echo "minimal: WARNING: finishing the host setup failed; run \`min finalize-install\` to retry (\`--show\` names what is missing)" >&2
+    fi
 fi
+rm -f "$script"
 exit 0
 EOF
 

@@ -5422,7 +5422,8 @@ ff02::2\tip6-allrouters
     #[test]
     fn the_install_hint_names_the_installed_verb() {
         let hint = classifier::install_hint();
-        assert!(hint.contains("min finalize-install"), "{hint}");
+        assert_eq!(hint, "min finalize-install");
+        assert!(!hint.contains("install-host-classifier.sh"), "{hint}");
         for absent in ["<", ">", "curl", "raw.githubusercontent.com", "sudo"] {
             assert!(!hint.contains(absent), "{absent:?} in {hint}");
         }
