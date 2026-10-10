@@ -6,9 +6,9 @@
 //! `<node-plane address>` by hand (#2128). Every remedy now names the
 //! installed CLI's own verb, `min finalize-install`, which carries the step
 //! itself. This test keeps it that way: it reads every `.rs` file under
-//! `crates/` and fails on any of the retired spellings, wherever they are —
-//! a remedy string, a fixture that pins one, or a doc comment that
-//! recommends one.
+//! `crates/` and every `.sh` file under `scripts/` and fails on any of the
+//! retired spellings, wherever they are — a remedy string, a fixture that
+//! pins one, or a doc comment that recommends one.
 //!
 //! The `common` crate is outside the darwin-native scope `just test` runs,
 //! so on macOS this gate runs only through `just test-cross`; the Linux
@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 const RETIRED: &[&str] = &[
     "<cohort address>",
     "<node-plane address>",
+    "<the account minimald runs as>",
     "raw.githubusercontent.com/gominimal/minimal",
 ];
 
@@ -32,15 +33,15 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
-fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
+fn sources_with(dir: &Path, extension: &str, out: &mut Vec<PathBuf>) {
     for entry in std::fs::read_dir(dir).expect("a readable directory") {
         let path = entry.expect("a readable entry").path();
         if path.is_dir() {
             if path.file_name().is_some_and(|name| name == "target") {
                 continue;
             }
-            rust_sources(&path, out);
-        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            sources_with(&path, extension, out);
+        } else if path.extension().is_some_and(|ext| ext == extension) {
             out.push(path);
         }
     }
@@ -49,8 +50,9 @@ fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
 #[test]
 fn no_rust_remedy_carries_a_placeholder_or_a_remote_fetch() {
     let mut sources = Vec::new();
-    rust_sources(&repo_root().join("crates"), &mut sources);
+    sources_with(&repo_root().join("crates"), "rs", &mut sources);
     assert!(sources.len() > 10, "the walk found the workspace's sources");
+    sources_with(&repo_root().join("scripts"), "sh", &mut sources);
     let this = Path::new(file!())
         .file_name()
         .expect("this file has a name")

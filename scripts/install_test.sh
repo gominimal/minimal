@@ -2136,6 +2136,8 @@ still vouches for the table it loaded" \
     want_ok "usage shows the unprivileged --print-ruleset" grep -q -- "--print-ruleset" "$OUT"
     want_ok "usage shows the --pid step" grep -q -- "--pid PID" "$OUT"
     want_ok "usage shows the --place-listener step" grep -q -- "--place-listener SOCK" "$OUT"
+    want_err "the step's own remedies carry no placeholder a person must fill" \
+        grep -q "<the account" "$hc"
     want_ok "usage shows the ct-mark mask override" grep -q -- "--ct-mark-mask" "$OUT"
 
     # --- Without the rehearsal seam the script demands root, like the other

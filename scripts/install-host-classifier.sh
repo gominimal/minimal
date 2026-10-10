@@ -458,7 +458,7 @@ place_daemon() {
     verify_mount
     procs="$tree_root/$DAEMON_LEAF/cgroup.procs"
     if [ ! -e "$procs" ]; then
-        die "$tree_root/$DAEMON_LEAF is not installed (run: sudo $0 --user <the account minimald runs as>)"
+        die "$tree_root/$DAEMON_LEAF is not installed (run: min finalize-install)"
     fi
     kill -0 "$pid" 2>/dev/null ||
         die "no process $pid: pass the pid of the running minimald (its startup line names the tree it is outside)"
@@ -499,7 +499,7 @@ place_listener() {
     compute_cgroup_paths
     procs="$tree_root/$DAEMON_LEAF/cgroup.procs"
     [ -e "$procs" ] ||
-        die "$tree_root/$DAEMON_LEAF is not installed (run: sudo $0 --user <the account minimald runs as>)"
+        die "$tree_root/$DAEMON_LEAF is not installed (run: min finalize-install)"
     [ -r "$PROC/net/unix" ] || die "cannot read the unix socket table at $PROC/net/unix"
     # net/unix: "Num RefCount Protocol Flags Type St Inode Path"; the
     # listener's path may be bound more than once over a daemon's life (a

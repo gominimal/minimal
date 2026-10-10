@@ -2722,6 +2722,17 @@ pub(crate) const PLACE_UNIT_PATH_PATH: &str = "/etc/systemd/system/minimald-plac
 #[cfg(any(test, not(target_os = "macos")))]
 pub(crate) const PLACE_UNIT_SERVICE_PATH: &str = "/etc/systemd/system/minimald-place.service";
 
+/// The boot unit: a oneshot that re-runs the classifier's step from the
+/// root-owned copy at every boot, ordered before the path unit. The tree
+/// lives in cgroupfs and the table in the kernel, so neither survives a
+/// reboot on its own; without this unit the first socket event after a
+/// boot would find no tree to place the daemon in.
+#[cfg(any(test, not(target_os = "macos")))]
+pub(crate) const CLASSIFIER_SYSTEMD_UNIT: &str = "minimald-classifier";
+#[cfg(any(test, not(target_os = "macos")))]
+pub(crate) const CLASSIFIER_UNIT_SERVICE_PATH: &str =
+    "/etc/systemd/system/minimald-classifier.service";
+
 /// The lines that remove the Linux items beyond the names: the
 /// user-namespace profile (unloaded, then its files), the classifier tree
 /// (the step's own `--uninstall`, run only while the tree exists) with its
@@ -2747,8 +2758,9 @@ fn linux_host_items_removal() -> String {
          {CLASSIFIER_SCRIPT_HEREDOC}\n\
          fi\n\
          systemctl disable --now {PLACE_SYSTEMD_UNIT}.path {PLACE_SYSTEMD_UNIT}.service \
-         2>/dev/null || true\n\
-         rm -f {PLACE_UNIT_PATH_PATH} {PLACE_UNIT_SERVICE_PATH} {CLASSIFIER_PROGRAM_PATH}\n\
+         {CLASSIFIER_SYSTEMD_UNIT}.service 2>/dev/null || true\n\
+         rm -f {PLACE_UNIT_PATH_PATH} {PLACE_UNIT_SERVICE_PATH} {CLASSIFIER_UNIT_SERVICE_PATH} \
+         {CLASSIFIER_PROGRAM_PATH}\n\
          systemctl daemon-reload 2>/dev/null || true\n\
          rmdir \"{ANSWERER_PROGRAM_DIR}\" 2>/dev/null || true\n\
          \n\
@@ -4846,10 +4858,11 @@ mod tests {
             format!("  bash -s -- --uninstall <<\\{CLASSIFIER_SCRIPT_HEREDOC}"),
             format!(
                 "systemctl disable --now {PLACE_SYSTEMD_UNIT}.path {PLACE_SYSTEMD_UNIT}.service \
-                 2>/dev/null || true"
+                 {CLASSIFIER_SYSTEMD_UNIT}.service 2>/dev/null || true"
             ),
             format!(
-                "rm -f {PLACE_UNIT_PATH_PATH} {PLACE_UNIT_SERVICE_PATH} {CLASSIFIER_PROGRAM_PATH}"
+                "rm -f {PLACE_UNIT_PATH_PATH} {PLACE_UNIT_SERVICE_PATH} \
+                 {CLASSIFIER_UNIT_SERVICE_PATH} {CLASSIFIER_PROGRAM_PATH}"
             ),
             format!("if [ -f {KVM_GROUP_RECORD} ] ; then"),
             format!("  gpasswd -d \"$(cat {KVM_GROUP_RECORD})\" kvm 2>/dev/null || true"),
