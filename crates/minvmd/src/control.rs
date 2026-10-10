@@ -3746,6 +3746,135 @@ mod tests {
         }
     }
 
+    /// The name hold and its release are the host door's alone: the in-VM
+    /// daemon's channel refuses both, naming the host's control socket, so
+    /// a guest can neither make a hold, take one over, nor release one. A
+    /// hold made over the host door stands, with its owner, after the
+    /// guest's refused attempts at it, and a name only the guest asked for
+    /// is never in the zone.
+    #[test]
+    fn the_guest_door_refuses_the_name_hold_and_its_release() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (sock_path, _server, registry, _answerer, _proxy_publish) =
+            spawn_server(dir.path()).expect("server binds");
+        let guest = sock_path.with_file_name(GUEST_CONTROL_SOCK_FILE);
+        let owner = sessions::SessionId::parse_str("00000000-0000-4000-8000-000000000001")
+            .expect("a session id");
+        let other = sessions::SessionId::parse_str("00000000-0000-4000-8000-000000000002")
+            .expect("a session id");
+        let in_zone = |name: &str| {
+            registry
+                .zone_view()
+                .rows()
+                .any(|(held, _)| held == format!("{name}.min.internal"))
+        };
+        let hold = |name: &str, session_id| HoldBoxNameRequest {
+            name: name.to_string(),
+            session_id: Some(session_id),
+        };
+
+        let reply = control(
+            &sock_path,
+            &BoxControlRequest::HoldBoxName(hold("web", owner)),
+        )
+        .expect("the host door's hold is answered");
+        assert_eq!(
+            reply,
+            BoxControlReply::NameHeld {
+                name: "web".to_string(),
+                held: true,
+            }
+        );
+
+        for request in [
+            BoxControlRequest::HoldBoxName(hold("mine", other)),
+            BoxControlRequest::HoldBoxName(hold("web", other)),
+            BoxControlRequest::ReleaseBoxName(hold("web", owner)),
+            BoxControlRequest::ReleaseBoxName(HoldBoxNameRequest {
+                name: "web".to_string(),
+                session_id: None,
+            }),
+        ] {
+            let refused =
+                control(&guest, &request).expect("the wrong-door request is still answered");
+            assert!(
+                matches!(
+                    &refused,
+                    BoxControlReply::Error { error } if error.contains("the host's control socket")
+                ),
+                "the guest channel refuses {request:?} naming the door that serves it, \
+                 got {refused:?}"
+            );
+        }
+        assert!(!in_zone("mine"), "a hold the guest asked for is not made");
+        assert!(in_zone("web"), "the host's hold outlives a guest's release");
+        assert!(
+            registry.release_held_name("web", Some(owner)),
+            "and is still its first owner's: the guest's takeover did not land"
+        );
+    }
+
+    /// A hold reloaded from the held-names file stands only while a host
+    /// client asks for it again: the one a `hold_box_name` over the host
+    /// door re-makes stays past the bound, and the one no client re-makes
+    /// is gone at the bound. Nothing else re-makes a hold, so this is what
+    /// clears the hold of a session that ended with no release.
+    #[test]
+    fn a_reloaded_hold_stays_only_when_the_host_door_remakes_it() {
+        use crate::box_registry::{HELD_NAME_RECONFIRM_BOUND, REGISTRY_FILE};
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let registry_file = dir.path().join(REGISTRY_FILE);
+        let gone = sessions::SessionId::parse_str("00000000-0000-4000-8000-000000000001")
+            .expect("a session id");
+        let live = sessions::SessionId::parse_str("00000000-0000-4000-8000-000000000002")
+            .expect("a session id");
+        let before = BoxRegistry::new(SUBNET).persisting_to(registry_file.clone());
+        assert!(before.hold_box_name("old", Some(gone)));
+        assert!(before.hold_box_name("web", Some(live)));
+
+        let registry = BoxRegistry::new(SUBNET).persisting_to(registry_file);
+        let sock_path = dir.path().join(CONTROL_SOCK_FILE);
+        let _server = spawn(
+            sock_path.clone(),
+            registry.clone(),
+            AnswererStatus::allocating_for_tests("control-test-node"),
+            ProxyPublishStatus::new(),
+        )
+        .expect("server binds");
+        let in_zone = |name: &str| {
+            registry
+                .zone_view()
+                .rows()
+                .any(|(held, _)| held == format!("{name}.min.internal"))
+        };
+        assert!(in_zone("old") && in_zone("web"), "both holds are reloaded");
+
+        let reply = control(
+            &sock_path,
+            &BoxControlRequest::HoldBoxName(HoldBoxNameRequest {
+                name: "web".to_string(),
+                session_id: Some(live),
+            }),
+        )
+        .expect("the hold is answered");
+        assert_eq!(
+            reply,
+            BoxControlReply::NameHeld {
+                name: "web".to_string(),
+                held: true,
+            }
+        );
+
+        registry.advance_clock(HELD_NAME_RECONFIRM_BOUND);
+        assert_eq!(
+            registry.expire_unconfirmed_holds(),
+            1,
+            "the hold no host client re-made is dropped at the bound"
+        );
+        assert!(!in_zone("old"), "the dropped name answers nothing");
+        assert!(in_zone("web"), "the hold the host door re-made stands");
+    }
+
     /// The drawn port's story (T93): a guest that reports its publish was
     /// refused for address-in-use redraws the port under the reservation
     /// while tries remain, the tries are the constant's (the first boot

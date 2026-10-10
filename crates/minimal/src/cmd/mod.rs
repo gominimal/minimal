@@ -27,7 +27,7 @@ mod session;
 // The Ctrl-C cleanup (`arm_activation_interrupt`) withdraws the row the
 // activation registered with the VM host daemon; the withdrawal lives with
 // the session commands, as does the provider-kind rule its gate keys on.
-use session::{daemon_provider_kind, vm_host_control_sock, withdraw_box_row};
+pub(crate) use session::{daemon_provider_kind, vm_host_control_sock, withdraw_box_row};
 
 pub use admin::*;
 pub use finalize_install::*;

@@ -161,6 +161,32 @@ pub const REGISTRY_FILE: &str = "box-registry.json";
 /// the fail-closed reading of a file this build cannot vouch for.
 const REGISTRY_FILE_VERSION: u32 = 1;
 
+/// The file the registry persists its held box names to
+/// ([`BoxRegistry::hold_box_name`]), beside [`REGISTRY_FILE`]. A file of
+/// its own, so the registry file stays the format a daemon that predates
+/// held-name persistence reads ([`RegistryFile`] denies unknown fields),
+/// and a held-names file this build cannot use costs the holds alone,
+/// never a creation.
+pub const HELD_NAMES_FILE: &str = "box-held-names.json";
+
+/// The persisted held names' format version. A file of any other version
+/// is set aside and reloads no hold, like one that does not parse.
+const HELD_NAMES_FILE_VERSION: u32 = 1;
+
+/// How long a hold reloaded from [`HELD_NAMES_FILE`] stands unconfirmed
+/// before it is dropped ([`BoxRegistry::expire_unconfirmed_holds`]). Only
+/// a host client re-makes a hold, over the host's control socket: the
+/// creating client's attach or exec re-sends its session's own. The
+/// in-VM daemon cannot, because the hold verbs are not served on its
+/// door, so the expiry is the one thing that clears a hold whose session
+/// ended with no release from the host, and dropping it gives the name
+/// back to NXDOMAIN (NET-012). It also drops the hold of a live session
+/// that nobody attaches to or execs into within the bound; that
+/// session's next attach or exec makes the hold again. The bound is
+/// [`RESUME_ATTACH_BOUND`]'s, long enough for a client that follows a
+/// restart with an attach to get there through a slow boot.
+pub const HELD_NAME_RECONFIRM_BOUND: Duration = RESUME_ATTACH_BOUND;
+
 /// One relay's end, as the host reports it: the switch addresses whose
 /// relayed traffic that connection carried, each with the id of the box
 /// whose row it attributed them to, for the registry to detach by. The id
@@ -1050,13 +1076,26 @@ struct RegistryFile {
     boxes: Vec<Creation>,
 }
 
-/// Writes `file` to `path` the one way the registry's file is ever
-/// written: to a sibling temporary file created afresh with mode 0600 —
-/// the registry names every box and its policy, which is no other user's
-/// to read — synced, then renamed over `path`, and the directory synced,
-/// so a crash at any point leaves either the old file or the new one,
-/// whole, and never a partial one.
-fn write_registry_file(path: &std::path::Path, file: &RegistryFile) -> std::io::Result<()> {
+/// The persisted held box names ([`HELD_NAMES_FILE`]): its format
+/// version, then every held name mapped to the session that holds it.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HeldNamesFile {
+    version: u32,
+    held_names: BTreeMap<String, Option<sessions::SessionId>>,
+}
+
+/// Writes `file` to `path` the one way any of the registry's persisted
+/// files — the box registry ([`REGISTRY_FILE`]) and its held names
+/// ([`HELD_NAMES_FILE`]) — is ever written: to a sibling temporary file
+/// created afresh with mode 0600 — what they hold names this user's boxes
+/// and sessions, which is no other user's to read — synced, then renamed
+/// over `path`, and the directory synced, so a crash at any point leaves
+/// either the old file or the new one, whole, and never a partial one.
+fn write_registry_file(
+    path: &std::path::Path,
+    file: &impl serde::Serialize,
+) -> std::io::Result<()> {
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt as _;
     let bytes = serde_json_lenient::to_vec_pretty(file).map_err(std::io::Error::other)?;
@@ -1149,6 +1188,74 @@ fn set_aside_registry_file(path: &std::path::Path, why: &str) -> Option<Vec<Crea
             None
         }
     }
+}
+
+/// Reads the held box names persisted at `path`, each keyed by its
+/// [`canonical_box_name`] form whatever spelling the file holds it under:
+/// none when there is no file yet. Two spellings that fold to one name
+/// reload as one hold: the spelling that sorts first by its bytes
+/// (`WEB` before `web`), because the file's names parse into a sorted
+/// map and the file's own order is lost. The other is said as a warn
+/// line and dropped. A file that cannot be read, does not
+/// parse, or is of another version than [`HELD_NAMES_FILE_VERSION`]
+/// reloads no hold and is renamed aside under the same `.unusable-<unix
+/// seconds>` suffix as an unusable registry file, said as an error line;
+/// a rename that fails is a second error line, and the next hold writes
+/// over it — the holds are an interim every session's attach re-makes,
+/// never a record a resume is checked against.
+fn read_held_names_file(path: &std::path::Path) -> BTreeMap<String, Option<sessions::SessionId>> {
+    let why = match std::fs::read(path) {
+        Ok(bytes) => match serde_json_lenient::from_slice::<HeldNamesFile>(&bytes) {
+            Ok(file) if file.version == HELD_NAMES_FILE_VERSION => {
+                let mut held = BTreeMap::new();
+                for (name, owner) in file.held_names {
+                    match held.entry(canonical_box_name(&name)) {
+                        std::collections::btree_map::Entry::Vacant(entry) => {
+                            entry.insert(owner);
+                        }
+                        std::collections::btree_map::Entry::Occupied(entry) => {
+                            tracing::warn!(
+                                box = %name,
+                                canonical = %entry.key(),
+                                "the persisted held box names hold one name under two \
+                                 spellings; reloading the one that sorts first only"
+                            );
+                        }
+                    }
+                }
+                return held;
+            }
+            Ok(file) => format!(
+                "version {}, this build reads {HELD_NAMES_FILE_VERSION}",
+                file.version
+            ),
+            Err(error) => error.to_string(),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return BTreeMap::new(),
+        Err(error) => error.to_string(),
+    };
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs());
+    let mut aside = path.as_os_str().to_owned();
+    aside.push(format!(".unusable-{stamp}"));
+    let aside = std::path::PathBuf::from(aside);
+    match std::fs::rename(path, &aside) {
+        Ok(()) => tracing::error!(
+            path = %path.display(),
+            aside = %aside.display(),
+            why,
+            "the persisted held box names are unusable; they are set aside and no hold is reloaded"
+        ),
+        Err(error) => tracing::error!(
+            path = %path.display(),
+            why,
+            %error,
+            "the persisted held box names are unusable and could not be set aside; \
+             no hold is reloaded and the next hold writes over them"
+        ),
+    }
+    BTreeMap::new()
 }
 
 /// The run of `subnet`'s address plan the host hands registered boxes from:
@@ -2666,6 +2773,13 @@ pub struct BoxRegistry {
     /// frees only that session's hold, never a newer session's under the
     /// same name.
     held_names: Arc<RwLock<BTreeMap<String, Option<sessions::SessionId>>>>,
+    /// The held names reloaded from [`HELD_NAMES_FILE`] that no hold has
+    /// re-made since, each with when it was reloaded: dropped once
+    /// [`HELD_NAME_RECONFIRM_BOUND`] has passed
+    /// ([`Self::expire_unconfirmed_holds`]). Changed only under the write
+    /// of [`Self::held_names`], so a hold that re-confirms a name and the
+    /// expiry that would drop it never interleave.
+    unconfirmed_holds: Arc<Mutex<BTreeMap<String, Instant>>>,
     /// The table's change pings: one `()` to every live subscriber whenever
     /// a row lands, goes, or is marked stopped. The host answerer
     /// ([`crate::net::answerer`]) subscribes — a daemon that does not hold
@@ -2781,6 +2895,7 @@ impl Clone for BoxRegistry {
             rows: self.rows.clone(),
             stopped: Arc::clone(&self.stopped),
             held_names: Arc::clone(&self.held_names),
+            unconfirmed_holds: Arc::clone(&self.unconfirmed_holds),
             table_pings: Arc::clone(&self.table_pings),
             withdrawal_reports: self.withdrawal_reports.clone(),
             withdrawal_reports_rx: Mutex::new(None),
@@ -2820,6 +2935,7 @@ impl BoxRegistry {
             rows: Arc::new(RwLock::new(BTreeMap::new())),
             stopped: Arc::new(RwLock::new(BTreeSet::new())),
             held_names: Arc::new(RwLock::new(BTreeMap::new())),
+            unconfirmed_holds: Arc::new(Mutex::new(BTreeMap::new())),
             table_pings: Arc::new(Mutex::new(Vec::new())),
             withdrawal_reports: reports,
             withdrawal_reports_rx: Mutex::new(Some(reports_rx)),
@@ -3016,13 +3132,29 @@ impl BoxRegistry {
     /// outlives the process. A file found unusable is set aside, never
     /// written over ([`read_registry_file`]); when it cannot be, this
     /// registry persists nothing.
+    ///
+    /// The held box names ([`Self::hold_box_name`]) persist the same way
+    /// to [`HELD_NAMES_FILE`] beside `path`, written after every change to
+    /// them, and are reloaded from it here ([`read_held_names_file`]), so
+    /// a restarted daemon still knows which session holds which name. A
+    /// reloaded hold stands unconfirmed until a hold re-makes it, and one
+    /// nothing re-makes within [`HELD_NAME_RECONFIRM_BOUND`] is dropped
+    /// ([`Self::expire_unconfirmed_holds`]): a session that ended without
+    /// its release does not keep its name answering NODATA for good.
     #[must_use]
     pub fn persisting_to(mut self, path: std::path::PathBuf) -> Self {
         let Some(loaded) = read_registry_file(&path) else {
             return self;
         };
-        self.persisted_at = Some(Arc::new(path));
         let now = self.now();
+        {
+            let mut held = self.held_names.write().expect(
+                "the held names' lock is never held across a panic, so it cannot be poisoned",
+            );
+            *held = read_held_names_file(&path.with_file_name(HELD_NAMES_FILE));
+            *self.unconfirmed_holds() = held.keys().map(|name| (name.clone(), now)).collect();
+        }
+        self.persisted_at = Some(Arc::new(path));
         for mut creation in loaded {
             let key = canonical_box_name(&creation.name);
             if self.creations().contains_key(&key) {
@@ -3143,6 +3275,41 @@ impl BoxRegistry {
                 path = %path.display(),
                 %error,
                 "could not persist the box registry; its rows will not survive this process"
+            );
+        }
+    }
+
+    /// Writes the held box names to [`HELD_NAMES_FILE`] beside the
+    /// persisted registry, when this registry persists
+    /// ([`Self::persisting_to`]). Called after every change to them, with
+    /// the held names' lock released; the snapshot is taken inside the
+    /// write's turn, so the last write to land holds the newest holds. A
+    /// write that fails is a warn line, and the holds stay in this
+    /// process.
+    fn persist_held_names(&self) {
+        let Some(path) = &self.persisted_at else {
+            return;
+        };
+        let path = path.with_file_name(HELD_NAMES_FILE);
+        let _turn = self
+            .persist_turn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let file = HeldNamesFile {
+            version: HELD_NAMES_FILE_VERSION,
+            held_names: self
+                .held_names
+                .read()
+                .expect(
+                    "the held names' lock is never held across a panic, so it cannot be poisoned",
+                )
+                .clone(),
+        };
+        if let Err(error) = write_registry_file(&path, &file) {
+            tracing::warn!(
+                path = %path.display(),
+                %error,
+                "could not persist the held box names; they will not survive this process"
             );
         }
     }
@@ -4747,13 +4914,24 @@ impl BoxRegistry {
     /// `owner` is the session the hold is for: a later hold of the name
     /// takes it over. Returns whether the table did not hold the name
     /// already.
+    ///
+    /// The hold is persisted ([`Self::persisting_to`]), so it survives a
+    /// daemon restart.
     pub fn hold_box_name(&self, name: &str, owner: Option<sessions::SessionId>) -> bool {
-        let inserted = self
-            .held_names
-            .write()
-            .expect("the held names' lock is never held across a panic, so it cannot be poisoned")
-            .insert(canonical_box_name(name), owner)
-            .is_none();
+        let old = {
+            let mut held = self.held_names.write().expect(
+                "the held names' lock is never held across a panic, so it cannot be poisoned",
+            );
+            let canonical = canonical_box_name(name);
+            // A hold re-confirms a reloaded one: the name has a live
+            // session again, whichever session holds it now.
+            self.unconfirmed_holds().remove(&canonical);
+            held.insert(canonical, owner)
+        };
+        if old != Some(owner) {
+            self.persist_held_names();
+        }
+        let inserted = old.is_none();
         if inserted {
             tracing::info!(
                 box = %name,
@@ -4768,6 +4946,9 @@ impl BoxRegistry {
     /// nothing again — NXDOMAIN, the pre-box state. A name no hold kept
     /// is the goal state already holding. Returns whether a hold was
     /// actually released.
+    ///
+    /// The release is persisted ([`Self::persisting_to`]), so it
+    /// survives a daemon restart.
     ///
     /// With an `owner`, the release frees every hold that session made,
     /// under whatever name it holds now (a rename moved it), plus `name`'s
@@ -4790,8 +4971,13 @@ impl BoxRegistry {
             }
         }
         let removed = held.len() != before;
+        if removed {
+            self.unconfirmed_holds()
+                .retain(|unconfirmed, _| held.contains_key(unconfirmed));
+        }
         drop(held);
         if removed {
+            self.persist_held_names();
             tracing::info!(
                 box = %name,
                 "released a held box name; it answers nothing again"
@@ -4799,6 +4985,60 @@ impl BoxRegistry {
             self.ping();
         }
         removed
+    }
+
+    /// Drops every hold reloaded from [`HELD_NAMES_FILE`] that no hold has
+    /// re-made within [`HELD_NAME_RECONFIRM_BOUND`] of its reload, and
+    /// returns how many it dropped. No host client has asked for such a
+    /// hold since the restart, so its name answers NXDOMAIN again
+    /// (NET-012) rather than NODATA for good: a session that ended with no
+    /// release is cleared this way, and a live session nobody attached to
+    /// or exec'd into loses its hold until its next attach or exec makes
+    /// it again. Each drop is
+    /// decided again under the held names' write, so a hold re-made since
+    /// the scan stays. Run on the withdrawal drainer's sweep
+    /// ([`Self::spawn_withdrawal_drainer`]).
+    pub fn expire_unconfirmed_holds(&self) -> usize {
+        let now = self.now();
+        let due =
+            |since: &Instant| now.saturating_duration_since(*since) >= HELD_NAME_RECONFIRM_BOUND;
+        if !self.unconfirmed_holds().values().any(due) {
+            return 0;
+        }
+        let mut held = self
+            .held_names
+            .write()
+            .expect("the held names' lock is never held across a panic, so it cannot be poisoned");
+        let mut dropped = Vec::new();
+        self.unconfirmed_holds().retain(|name, since| {
+            if !due(since) {
+                return true;
+            }
+            if held.remove(name).is_some() {
+                dropped.push(name.clone());
+            }
+            false
+        });
+        drop(held);
+        if !dropped.is_empty() {
+            self.persist_held_names();
+            tracing::info!(
+                boxes = ?dropped,
+                bound = ?HELD_NAME_RECONFIRM_BOUND,
+                "dropped held box names reloaded from the last run that nothing held \
+                 again; they answer nothing again"
+            );
+            self.ping();
+        }
+        dropped.len()
+    }
+
+    /// The reloaded holds no hold has re-made yet
+    /// ([`Self::unconfirmed_holds`]'s field), locked.
+    fn unconfirmed_holds(&self) -> MutexGuard<'_, BTreeMap<String, Instant>> {
+        self.unconfirmed_holds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Subscribes to the table's change pings: one `()` per registration,
@@ -5032,6 +5272,7 @@ impl BoxRegistry {
                             release_address(record.name());
                         });
                     }
+                    registry.expire_unconfirmed_holds();
                 }
             });
         if let Err(error) = spawned {
@@ -6664,6 +6905,256 @@ mod tests {
             persisted_registry(&dir).row_by_name("web").is_none(),
             "a file of another version reloads no row"
         );
+    }
+
+    /// A held box name is persisted and reloaded, so it survives a VM host
+    /// daemon restart: a hold, an owner's takeover, and a release all land
+    /// in the held-names file, and the registry the restarted daemon builds
+    /// from it holds exactly the names the file says.
+    #[test]
+    fn held_box_names_persist_and_reload() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let owner = sessions::SessionId::parse_str("00000000-0000-4000-8000-000000000001")
+            .expect("a session id");
+        let other = sessions::SessionId::parse_str("00000000-0000-4000-8000-000000000002")
+            .expect("a session id");
+
+        let registry = persisted_registry(&dir);
+        assert!(
+            registry.hold_box_name("web", Some(owner)),
+            "a name nothing holds is held"
+        );
+        assert!(
+            !registry.hold_box_name("web", Some(owner)),
+            "the same owner's hold is idempotent"
+        );
+
+        let after = persisted_registry(&dir);
+        assert!(
+            !after.hold_box_name("web", Some(owner)),
+            "the hold is reloaded, so it is not new to the restarted daemon"
+        );
+        assert!(
+            !after.hold_box_name("web", Some(other)),
+            "and another session's hold takes it over"
+        );
+
+        let third = persisted_registry(&dir);
+        let file: HeldNamesFile = serde_json_lenient::from_slice(
+            &std::fs::read(dir.path().join(HELD_NAMES_FILE)).expect("the file reads"),
+        )
+        .expect("the file parses whole");
+        assert_eq!(
+            file.held_names.get("web"),
+            Some(&Some(other)),
+            "the takeover is what the file holds"
+        );
+        assert!(third.release_held_name("web", Some(other)));
+        assert!(
+            persisted_registry(&dir).hold_box_name("web", Some(owner)),
+            "the release is persisted, so the name is free again after a restart"
+        );
+    }
+
+    /// A hold never changes the registry file's format: a daemon that
+    /// predates held-name persistence still reads the file a hold was made
+    /// beside (its [`RegistryFile`] denies unknown fields), so rolling back
+    /// costs the holds, never a creation.
+    #[test]
+    fn a_hold_leaves_the_registry_file_in_its_older_format() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let registry = persisted_registry(&dir);
+        registry
+            .register_client_box(client_spec("db"))
+            .expect("the plan has an address for the box");
+        let owner = sessions::SessionId::parse_str("00000000-0000-4000-8000-000000000001")
+            .expect("a session id");
+        assert!(registry.hold_box_name("web", Some(owner)));
+
+        let bytes = std::fs::read(dir.path().join(REGISTRY_FILE)).expect("the file reads");
+        assert_eq!(
+            serde_json_lenient::from_slice::<serde_json_lenient::Value>(&bytes)
+                .expect("the file parses")
+                .as_object()
+                .expect("the file is an object")
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["boxes", "version"]),
+            "the registry file carries exactly the older format's keys"
+        );
+        let file: RegistryFile =
+            serde_json_lenient::from_slice(&bytes).expect("the file parses whole");
+        assert_eq!(file.boxes.len(), 1, "and its creation");
+    }
+
+    /// The held-names file is read by each name's canonical form, so a hold
+    /// the file spells another way is still the hold a release frees.
+    #[test]
+    fn held_box_names_reload_by_their_canonical_form() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        std::fs::write(
+            dir.path().join(HELD_NAMES_FILE),
+            br#"{"version": 1, "held_names": {"WEB": null}}"#,
+        )
+        .expect("a held-names file");
+
+        let registry = persisted_registry(&dir);
+        assert!(
+            !registry.hold_box_name("web", None),
+            "the reloaded hold is the canonical name's"
+        );
+        assert!(registry.release_held_name("web", None));
+    }
+
+    /// Two spellings in the held-names file that fold to one canonical name
+    /// reload as one hold — the spelling that sorts first by its bytes,
+    /// whatever order the file lists them in — so one release frees the
+    /// name, and the next write holds it once.
+    #[test]
+    fn held_box_names_that_fold_together_reload_once() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        std::fs::write(
+            dir.path().join(HELD_NAMES_FILE),
+            br#"{"version": 1, "held_names": {
+                "web": "00000000-0000-4000-8000-000000000002",
+                "WEB": "00000000-0000-4000-8000-000000000001"
+            }}"#,
+        )
+        .expect("a held-names file");
+        let first = sessions::SessionId::parse_str("00000000-0000-4000-8000-000000000001")
+            .expect("a session id");
+
+        let registry = persisted_registry(&dir);
+        assert_eq!(
+            registry
+                .held_names
+                .read()
+                .expect("the held names read")
+                .clone(),
+            BTreeMap::from([("web".to_string(), Some(first))]),
+            "one hold, the spelling's that sorts first, though the file lists it last"
+        );
+        assert!(registry.release_held_name("Web", Some(first)));
+        let file: HeldNamesFile = serde_json_lenient::from_slice(
+            &std::fs::read(dir.path().join(HELD_NAMES_FILE)).expect("the file reads"),
+        )
+        .expect("the file parses whole");
+        assert!(file.held_names.is_empty(), "the one release freed the name");
+    }
+
+    /// A reloaded hold nothing re-makes is dropped once
+    /// [`HELD_NAME_RECONFIRM_BOUND`] has passed, in memory and in the file,
+    /// so a session destroyed without its release does not keep its name
+    /// answering NODATA for good; a reloaded hold a session re-makes in time
+    /// stays, past the bound too.
+    #[test]
+    fn an_unconfirmed_reloaded_hold_expires_and_a_reconfirmed_one_stays() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let gone = sessions::SessionId::parse_str("00000000-0000-4000-8000-000000000001")
+            .expect("a session id");
+        let live = sessions::SessionId::parse_str("00000000-0000-4000-8000-000000000002")
+            .expect("a session id");
+        let before = persisted_registry(&dir);
+        assert!(before.hold_box_name("old", Some(gone)));
+        assert!(before.hold_box_name("web", Some(live)));
+
+        let registry = persisted_registry(&dir);
+        registry.advance_clock(HELD_NAME_RECONFIRM_BOUND.saturating_sub(Duration::from_secs(10)));
+        assert_eq!(
+            registry.expire_unconfirmed_holds(),
+            0,
+            "nothing is dropped inside the bound"
+        );
+        assert!(
+            !registry.hold_box_name("web", Some(live)),
+            "the live session re-makes its reloaded hold"
+        );
+        registry.advance_clock(Duration::from_secs(10));
+        assert_eq!(
+            registry.expire_unconfirmed_holds(),
+            1,
+            "the hold nothing re-made is dropped at the bound"
+        );
+        let held = |registry: &BoxRegistry, name: &str| {
+            registry
+                .zone_view()
+                .rows()
+                .any(|(held, _)| held == zone_name(name))
+        };
+        assert!(!held(&registry, "old"), "the dropped name answers nothing");
+        assert!(held(&registry, "web"), "the re-made hold stands");
+        registry.advance_clock(HELD_NAME_RECONFIRM_BOUND);
+        assert_eq!(
+            registry.expire_unconfirmed_holds(),
+            0,
+            "a re-made hold has no bound"
+        );
+
+        let file: HeldNamesFile = serde_json_lenient::from_slice(
+            &std::fs::read(dir.path().join(HELD_NAMES_FILE)).expect("the file reads"),
+        )
+        .expect("the file parses whole");
+        assert_eq!(
+            file.held_names,
+            BTreeMap::from([("web".to_string(), Some(live))]),
+            "the drop is persisted"
+        );
+    }
+
+    /// A held-names file this build cannot use — of another version, or not
+    /// parsing — is set aside like an unusable registry file and reloads no
+    /// hold, and it costs the holds alone: the registry file's creations
+    /// reload as they would without it, and the next hold writes a new one.
+    #[test]
+    fn an_unusable_held_names_file_is_set_aside_and_keeps_the_creations() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let held = dir.path().join(HELD_NAMES_FILE);
+        persisted_registry(&dir)
+            .register_client_box(client_spec("db"))
+            .expect("the plan has an address for the box");
+        for unusable in [
+            &br#"{"version": 99, "held_names": {}}"#[..],
+            b"{\"version\": 1, \"held_na",
+        ] {
+            std::fs::write(&held, unusable).expect("an unusable file");
+
+            let registry = persisted_registry(&dir);
+            assert!(
+                registry.row_by_name("db").is_some(),
+                "the registry file's creation reloads"
+            );
+            assert!(
+                registry.hold_box_name("web", None),
+                "the unusable file reloads no hold"
+            );
+
+            let aside: Vec<_> = std::fs::read_dir(dir.path())
+                .expect("the dir lists")
+                .map(|entry| entry.expect("an entry").path())
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .is_some_and(|name| name.to_string_lossy().starts_with(HELD_NAMES_FILE))
+                        && entry.to_string_lossy().contains(".unusable-")
+                })
+                .collect();
+            assert_eq!(aside.len(), 1, "the unusable file is set aside");
+            assert_eq!(
+                std::fs::read(&aside[0]).expect("the set-aside file reads"),
+                unusable,
+                "as it was"
+            );
+            std::fs::remove_file(&aside[0]).expect("the set-aside file removed");
+            let file: HeldNamesFile =
+                serde_json_lenient::from_slice(&std::fs::read(&held).expect("the file reads"))
+                    .expect("the new file parses whole");
+            assert_eq!(
+                file.held_names.len(),
+                1,
+                "and a new file holds the new hold"
+            );
+        }
     }
 
     /// NET-138: a registry file this build cannot use — of another version,
