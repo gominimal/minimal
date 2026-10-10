@@ -476,19 +476,53 @@ fn run_as_root(script: &str, pointer: &str) -> Result<(), anyhow::Error> {
 
 /// Every item this host has, probed in the order the summary lists them.
 async fn plan_for_this_host(global: &GlobalArgs) -> Plan {
+    // The names item sits before the last of the other items (the `kvm`
+    // group or the classifier tree), after the user-namespace profile.
+    let mut items = other_items_for_this_host(global);
+    let last = items.pop();
+    items.push(names_item_on_this_host(global).await);
+    items.extend(last);
+    Plan { items }
+}
+
+/// Every item of this host's plan other than names, under the one per-host
+/// scoping both readers share: the user-namespace profile unless the
+/// configured provider is the Linux VM provider, then the `kvm` group
+/// membership for that provider or the classifier tree for the native one,
+/// in that order. [`plan_for_this_host`] slots the names item in among them
+/// and the host line ([`host_install_for_this_host`]) reads them whole, so
+/// the two read the same items by construction. Every item is Linux-only,
+/// so a macOS host reads none.
+fn other_items_for_this_host(global: &GlobalArgs) -> Vec<Item> {
     let mut items = Vec::new();
     #[cfg(target_os = "linux")]
-    if !global.use_minvmd() {
-        items.extend(linux::userns_item_on_this_host());
+    {
+        if !global.use_minvmd() {
+            items.extend(linux::userns_item_on_this_host());
+        }
+        if global.use_minvmd() {
+            items.push(linux::kvm_item_on_this_host());
+        } else {
+            items.push(linux::classifier_item_on_this_host(global));
+        }
     }
-    items.push(names_item_on_this_host(global).await);
-    #[cfg(target_os = "linux")]
-    if global.use_minvmd() {
-        items.push(linux::kvm_item_on_this_host());
-    } else {
-        items.push(linux::classifier_item_on_this_host(global));
+    #[cfg(not(target_os = "linux"))]
+    let _ = global;
+    items
+}
+
+/// The install facts the host line reads beyond the surface verdict
+/// (NET-018): whether any item of this host's plan other than names is not
+/// done — the items [`other_items_for_this_host`] scopes for this host, the
+/// same ones [`plan_for_this_host`] carries, probed from this host alone (no
+/// daemon read: the names item is the surface verdict the line already
+/// holds). Every item is Linux-only, so a macOS host reads `false`.
+pub(crate) fn host_install_for_this_host(global: &GlobalArgs) -> crate::resolver::HostInstall {
+    crate::resolver::HostInstall {
+        other_items_unfinished: other_items_for_this_host(global)
+            .iter()
+            .any(|item| item.state != ItemState::Done),
     }
-    Plan { items }
 }
 
 /// The names item's id and label.
