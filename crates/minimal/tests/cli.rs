@@ -714,6 +714,61 @@ async fn activate_uploads_project_files() {
     assert!(mfile.starts_with(b"# test"));
 }
 
+/// A dashboard create (`min dash`, the `n` form) whose loadout carries a
+/// patch comes up `Active`: the TUI's activate uploads the composition's
+/// patches between `ConfigureLoadout` and `FinalizeSession`, as `min session
+/// activate` does. Without that upload the daemon's finalize gate refuses
+/// the session ("patches upload never completed") and the create fails.
+#[tokio::test]
+async fn dashboard_activate_uploads_loadout_patches() {
+    let (daemon, args) = setup().await;
+
+    let project = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir(project.path().join(".git")).unwrap();
+    std::fs::write(
+        project.path().join("minimal.toml"),
+        "# test minimal.toml\n[stack]\nuse = \"shell\"\n",
+    )
+    .unwrap();
+    let loadout_dir = tempfile::TempDir::new().unwrap();
+    let patch_source = loadout_dir.path().join("gitconfig");
+    std::fs::write(&patch_source, "[user]\n\tname = dash\n").unwrap();
+
+    let contribution = sessions::wire::request::WireContribution {
+        patches: vec![sessions::wire::primitives::WireSessionPatch {
+            patch: sessions::wire::primitives::WireResolvedPatch {
+                host_path: paths::HostAbsPath::try_new(patch_source.to_str().unwrap()).unwrap(),
+                destination: paths::SandboxRelPath::try_new(".gitconfig").unwrap(),
+            },
+            source: sessions::wire::primitives::WireSource::UserLoadout {
+                name: "dev".to_string(),
+            },
+        }],
+        ..Default::default()
+    };
+    let sock = args
+        .minimal_dir
+        .as_ref()
+        .unwrap()
+        .join("providers/local-minimald0/ssh.sock");
+    let activated = minimal_tui::rpc::activate(
+        &sock,
+        Some("dash-patched".to_string()),
+        paths::HostAbsPath::try_new(project.path().to_str().unwrap()).unwrap(),
+        sessions::NetworkMode::NoNet,
+        contribution,
+    )
+    .await
+    .expect("a patch-carrying dashboard create finalizes");
+
+    let mut client = daemon.server.connect().await;
+    use minimald_rpc::ListSessions;
+    let resp = client.call::<ListSessions>(&()).await;
+    assert_eq!(resp.sessions.len(), 1);
+    assert_eq!(resp.sessions[0].id, activated.id);
+    assert_eq!(resp.sessions[0].name.as_deref(), Some("dash-patched"));
+}
+
 /// A workspace upload whose unpack fails on the daemon must surface as an
 /// `Err`, not a silent success. The daemon relays the failure on
 /// extended-data stream 1 and only then closes the channel; the client reads

@@ -1765,6 +1765,88 @@ fn both_creators_share_the_composition_failure_message() {
     }
 }
 
+/// A daemon refusal is printed in the daemon's own words. The RPC's name
+/// is the wire's vocabulary, not the person's, so no creator, verdict
+/// submitter, finalizer or renamer may prefix the daemon's error with
+/// it. Asserted over the function bodies, the way the composition
+/// message is, because the prefix had crept into five sites across three
+/// files before anyone noticed it on a terminal.
+#[test]
+fn daemon_refusals_print_without_rpc_names() {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    for (file, func) in [
+        ("src/cmd/session.rs", "activate_session"),
+        ("src/cmd/session.rs", "cmd_rename"),
+        ("src/task.rs", "cmd_task_run"),
+        ("src/cmd/mod.rs", "submit_verdict_and_wait"),
+        ("src/cmd/mod.rs", "upload_and_finalize"),
+    ] {
+        let text = std::fs::read_to_string(manifest.join(file)).expect("readable source");
+        let body =
+            function_body(&text, func).unwrap_or_else(|| panic!("{file} no longer defines {func}"));
+        for bare in [
+            "CreateSession failed",
+            "RenameSession failed",
+            "SubmitVerdict failed",
+            "SubmitVerdict faulted",
+            "FinalizeSession failed",
+        ] {
+            assert!(
+                !body.contains(bare),
+                "{func} still prefixes the daemon's refusal with an RPC name ({bare})"
+            );
+        }
+    }
+
+    // The daemon's side of the same surface: its refusals are printed
+    // verbatim, at finalize through `upload_and_finalize` and at attach,
+    // so none of them may name the RPC a person would have to retry. The
+    // scan is over the string literals of the daemon's session module,
+    // which covers the refusals and the log lines alike; the module has
+    // no log-only RPC name left to exempt. The RPC names stay legitimate
+    // in type paths and comments, which the scan does not read. A literal
+    // is tracked across lines — the refusals are wrapped with `\` — so a
+    // continuation line with no quote of its own is still read.
+    let daemon = std::fs::read_to_string(manifest.join("../minimald/src/session.rs"))
+        .expect("readable daemon source");
+    let mut in_literal = false;
+    for (number, line) in daemon.lines().enumerate() {
+        if !in_literal && line.trim_start().starts_with("//") {
+            continue;
+        }
+        let in_string = in_literal || line.contains('"');
+        // Toggle on every unescaped quote, so the state at the line's end
+        // says whether the next line continues a literal.
+        let mut chars = line.chars();
+        while let Some(c) = chars.next() {
+            match c {
+                '\\' => {
+                    chars.next();
+                }
+                '"' => in_literal = !in_literal,
+                _ => {}
+            }
+        }
+        if !in_string {
+            continue;
+        }
+        for rpc in [
+            "CreateSession",
+            "ConfigureLoadout",
+            "SubmitVerdict",
+            "FinalizeSession",
+            "RenameSession",
+            "WorkspacePatchesTarZst",
+        ] {
+            assert!(
+                !line.contains(rpc),
+                "minimald/src/session.rs:{}: a string names the {rpc} RPC: {line}",
+                number + 1
+            );
+        }
+    }
+}
+
 /// A project outside a VCS root that declares lifecycle hooks must be
 /// detected as hook-carrying, so the headless activation path refuses
 /// rather than silently dropping the hooks with the skipped tree
