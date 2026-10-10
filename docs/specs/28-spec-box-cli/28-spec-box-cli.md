@@ -143,6 +143,14 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
   - IF `<type>` is one BOX-063 refuses THEN THE SYSTEM SHALL fail with exit 3 as BOX-063 states and append nothing.
     tier:   T0
     verify: cargo nextest run -p minimal init_refused_type_exit3_appends_nothing
+  - WHEN `min init --session <n>`, `min init --task <n>`, `min init --agent <n>` or `min init --service <n>` runs THE SYSTEM SHALL append the entry exactly as `min init <n> --type <noun>` does for that noun.
+    <!-- event-driven; the architecture's `min init` reference: `min init --session dev` is exactly `min init dev --type session` -->
+    tier:   T0
+    verify: cargo nextest run -p minimal init_noun_flag_is_type_alias
+  - IF `min init` receives more than one of `--session`, `--task`, `--agent` and `--service`, or one of them together with `--type`, THEN THE SYSTEM SHALL fail with exit 2 and append nothing.
+    <!-- unwanted; the architecture makes the noun flags mutually exclusive with each other and with `--type` -->
+    tier:   T0
+    verify: cargo nextest run -p minimal init_noun_flags_exclusive_exit2_appends_nothing
 
 - **BCLI-019** WHEN `min type list` runs THE SYSTEM SHALL show every resolved type, the six built-in types and each type the project defines, with its source, `builtin`, `project` or `org`, naming each type as BOX-161 names the type that supplies a value.
   <!-- was BOX-057; `org` is reserved now, in the text and the `-o json` source enum, so organization types (gominimal/inbox#579, a BOX non-goal) need no schema change; no type carries it until then -->
@@ -220,10 +228,6 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
 - **BCLI-070** WHEN `min task run` or `min box run` runs, or `min box start` or `min session start` runs with `--new`, THE SYSTEM SHALL request a fresh instance, so BOX-163 names the box `<name>-<n>` and never refuses it for a held name.
   tier:     T0
   verify:   cargo nextest run -p minimal run_and_start_new_request_fresh_instance
-  - WHERE `min box run` targets an entry whose spec sets `pty_enabled` THE SYSTEM SHALL attach the caller's terminal to the box's PTY as `min box start --new` does, and return the entrypoint's exit code when it exits.
-    <!-- this spec's addition: the architecture's `min box run` does not say whether it allocates a PTY (gominimal/arch#127) -->
-    tier:   T0
-    verify: cargo nextest run -p minimal box_run_pty_entry_attaches_like_start_new
 
 - **BCLI-071** WHEN `min session start` runs with no entry THE SYSTEM SHALL start the session entry named `default`, else the project's only session entry, counting the implicit `default` entry BOX-165 expands.
   tier:     T0
@@ -254,12 +258,13 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
   - IF `min session attach` targets a box without `pty_enabled` THEN THE SYSTEM SHALL report BCLI-068's refusal for a box without a PTY.
     tier:   T0
     verify: cargo nextest run -p minimal session_attach_non_pty_reports_box_attach_refusal
-  - WHEN `min session attach` runs with no address THE SYSTEM SHALL attach, as BCLI-068 does, to the session box whose project root BOX-001 records is the current project's, else to the only session box on the reachable hosts.
+  - WHEN `min session attach` runs with no address, as BCLI-042's hidden alias, THE SYSTEM SHALL attach, as BCLI-068 does, to the session box whose project root BOX-001 records is the current project's, else to the only session box on the reachable hosts.
     tier:   T0
     verify: cargo nextest run -p minimal session_attach_without_address_picks_project_else_sole
-  - IF `min session attach` runs with no address and more than one session box matches THEN THE SYSTEM SHALL offer a picker of the candidates on a TTY, and otherwise, or under `--no-input`, fail with exit 2 listing them.
+  - IF `min session attach` runs with no address and more than one session box matches THEN THE SYSTEM SHALL fail with exit 2 listing them.
+    <!-- unwanted; design principle 3 admits a prompt only for destructive or file-access decisions, so no picker on a TTY either -->
     tier:   T0
-    verify: cargo nextest run -p minimal session_attach_without_address_ambiguous_picks_or_exit2_lists
+    verify: cargo nextest run -p minimal session_attach_without_address_ambiguous_exit2_lists
   - IF `min session attach` runs with no address and no session box exists THEN THE SYSTEM SHALL fail with exit 4 and a hint naming `min session start`.
     tier:   T0
     verify: cargo nextest run -p minimal session_attach_without_address_none_exit4_hints_start
@@ -365,7 +370,7 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
   tier:     T0
   verify:   cargo nextest run -p minimal box_cp_reads_stopped_box_as_box_017
 
-- **BCLI-042** THE SYSTEM SHALL accept, as hidden aliases for one release that print one stderr hint naming the replacement and leave `-o json` output unchanged, `session activate` as `session start` (bare `session activate` as bare `session start`, BCLI-071; a path mapping to the entry, `--name` to the box name, and `--network` and `--ingress` to BCLI-024's overrides), `session destroy` as `box rm --force`, `session exec` as `box exec`, `session rename` as `box rename`, `session policy` as `box show --network`, `session hooks` as `box show`, `task run --keep` as `task run` with `--keep` ignored, and bare `stop` as `host stop` on the local host.
+- **BCLI-042** THE SYSTEM SHALL accept, as hidden aliases for one release that print one stderr hint naming the replacement and leave `-o json` output unchanged, `session activate` as `session start` (bare `session activate` as bare `session start`, BCLI-071; a path mapping to the entry, `--name` to the box name, and `--network` and `--ingress` to BCLI-024's overrides), `session destroy` as `box rm --force`, `session exec` as `box exec`, `session rename` as `box rename`, bare `session attach` as `session attach <box>` for the box BCLI-032 resolves, `session policy` as `box show --network`, `session hooks` as `box show`, `task run --keep` as `task run` with `--keep` ignored, and bare `stop` as `host stop` on the local host.
   <!-- was BOX-107; the mapping follows epic S12. `session destroy` maps to the forced reap (BOX-019) so a live box is still stopped and removed and BEP-043's revoke-on-destroy fires; a bare `session rm` of a running box is refused (BCLI-004). -->
   tier:     T0
   verify:   cargo nextest run -p minimal legacy_session_verbs_alias_with_hint
@@ -442,7 +447,7 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
 
 **The listing's columns are a floor.** The owner decided on 2026-10-05 that the six columns BCLI-001 names are a minimum: banners and further columns, which today's listing prints, are unconstrained, while the `-o json` schema stays exact so scripts bind to it.
 
-**One way to name a type in `min init`.** The owner decided on 2026-10-05 that `min init` takes only `--type <type>` (BCLI-018), not per-type flag aliases, so a project-defined type is named the same way as a built-in one. For the same reason `min type list` shows the project's types beside the built-in ones, each with its source (BCLI-019).
+**`min init` names a type as the architecture does.** `--type <type>` is the general form and takes any type, a project-defined one included. `--session`, `--task`, `--agent` and `--service` are its aliases, and BCLI-018 keeps them mutually exclusive with each other and with `--type`, as the architecture's `min init` reference states. `min type list` shows the project's types beside the built-in ones, each with its source (BCLI-019).
 
 **A secret is never rendered, in any output mode.** The owner decided on 2026-10-05 that BCLI-063 is T1 with a property over every output mode and every secret-bearing field, because the invariant is a universal and one example test would leave an untested mode able to leak.
 
@@ -456,9 +461,9 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
 
 **`run` and `--new` make a fresh instance; a plain `start` refuses a held name.** The architecture's Addressing rule (gominimal/arch#117) has `start` create under the box's name and refuse one a running box on the host holds, while `run` and `start --new` create a fresh instance named `<name>-<n>`. BCLI-069 reports the refusal with a hint naming `--new` and `--name`, and BCLI-070 maps `run` and `--new` onto BOX-163's fresh instance. A second concurrent `min task run build` on one host therefore succeeds as `build-1`, which is the CI case. This spec's earlier text, which refused a held name for `min task run` too, was rejected in review because it refused that second run.
 
-**`run` on a PTY entry attaches: this spec's addition.** The architecture's `min box run` wires stdio for any entry and says nothing of a PTY. BCLI-070's sub-bullet attaches a `pty_enabled` entry as `start --new` does, so `run` and `start --new` differ only in what the type cannot explain away, and pipe-wired use of a PTY box stays with `min box exec`. The alternative, plain pipes and no terminal for a PTY entry, gives an interactive shell no terminal. The open question below cites gominimal/arch#127, which asks the architecture to state one or the other.
+**`run` follows the architecture's stdio contract.** The architecture's `min box run` wires the box's stdio to the command and writes only the payload to stdout (design principle 4). It says nothing of a PTY. This spec adds nothing to it. gominimal/arch#127 decides how `run` treats a `pty_enabled` entry, on a TTY and off one (Open questions). Interactive use of a PTY entry stays with `min box start --new` and `min box exec -t`.
 
-**A bare `min session attach` keeps today's behaviour, and an unreachable host refuses rather than guesses.** Today's `min session attach` with no address resolves the session from the current directory, else the only session, opens a picker when the choice is ambiguous, and errors under `--no-input`; the dashboard's enter path relies on it. BCLI-032 keeps that form for the session noun, where the type filter makes "the session here" meaningful, resolving by the project root BOX-001 records, and refuses with exit 4 when no session exists rather than creating one, as today. `min box attach` keeps its required address. The alternative, dropping the bare form as the architecture's tree does, would have broken the dashboard and the daily path with no alias to warn first. Resolving an unqualified name across hosts refuses with exit 7 when a host does not answer (BCLI-002), because a match found on the hosts that did answer may not be the only one, and picking it would bypass BOX-005's ambiguity refusal.
+**A bare `min session attach` is a one-release alias, and an unreachable host refuses rather than guesses.** The architecture writes `session attach <box>` with a required address, as `min box attach` has. Today's bare form resolves the session from the current directory, else the only session, and the dashboard's enter path relies on it. So BCLI-042 keeps it for one release as a hidden alias with a hint naming the address form. It resolves by the project root BOX-001 records (BCLI-032). An ambiguous match fails with exit 2 listing the candidates instead of opening a picker. Design principle 3 admits a prompt only for destructive or file-access decisions. The dashboard has to pass the box's address before the alias expires. Resolving an unqualified name across hosts refuses with exit 7 when a host does not answer (BCLI-002). A match on the hosts that answered is not known to be the only one, and picking it bypasses BOX-005's ambiguity refusal.
 
 **A bare `start` picks `default`, else the only entry.** Accepted on 2026-10-07 (gominimal/arch#124). `min session start` with no entry starts the session entry named `default`, else the only session entry (BCLI-071). `min box start` with no entry starts the entry named `default`, whatever its type, else the only entry (BCLI-072). Entry names are unique across a project (BOX-046), so at most one entry is named `default`. More than one candidate is exit 2 listing them. `min box start` picks by name and never by type, as design principle 8 requires, and the preference for sessions lives in the type noun. A project with no session entry has BOX-165's implicit `default`, so bare `min session start`, and through BCLI-042 bare `min session activate`, keeps working for every `[session]`-only project. A non-session entry named `default` blocks the implicit one, and bare `min session start` then fails with exit 2 naming the fix.
 
@@ -481,4 +486,4 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
 ## Open questions
 
 - [NEEDS CLARIFICATION (MEDIUM): NET-035 binds `--help` to `min session activate`, and NET-061 and the draft GWI-003 cite `min session policy`; both are BCLI-042 aliases for one release, and NET-035, NET-061 and GWI-003 should re-cite `min session start` and `min box show --network` (BCLI-025) before the aliases are removed.]
-- [NEEDS CLARIFICATION (LOW): the architecture's `min box run` wires stdio for any entry and does not say whether it allocates a PTY for an entry whose spec sets `pty_enabled`; BCLI-070's sub-bullet attaches it as `start --new` does, pending an architecture line (gominimal/arch#127).]
+- [NEEDS CLARIFICATION (LOW): the architecture's `min box run` wires stdio for any entry. It does not say whether it allocates a PTY for a `pty_enabled` entry, or what such a run does off a TTY. This spec specifies neither until gominimal/arch#127 rules.]
