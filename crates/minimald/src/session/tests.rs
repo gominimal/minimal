@@ -242,8 +242,10 @@ async fn attach_to_an_unconfigured_session_configures_it_rather_than_failing() {
 /// Draft shortcut scaffolds against it conflicts with the layout the
 /// upload is about to land — wedging the session behind a layout
 /// error no retry can clear. The refusal leaves the workspace
-/// untouched (nothing is scaffolded), and once the upload finishes
-/// the same attach goes through.
+/// untouched (nothing is scaffolded). Two overlapping uploads keep
+/// attaches refused until both have finished, and an upload whose guard
+/// is dropped without finishing (a panic, a torn-down task) still clears
+/// its mark, so the same attach then goes through.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn attach_while_a_workspace_upload_streams_is_refused_without_scaffolding() {
     use crate::test_harness::create_session_req;
@@ -259,19 +261,21 @@ async fn attach_while_a_workspace_upload_streams_is_refused_without_scaffolding(
         .unwrap()
         .id;
 
-    // Stand in for the in-flight upload: the RPC handler sets this flag
-    // before it pulls the first byte, and clears it once the unpack
-    // finishes on either arm.
+    // Stand in for two overlapping in-flight uploads: the RPC handler
+    // takes this guard before it pulls the first byte, and finishes it
+    // once the unpack ends on either arm.
     let manager = server.state.sessions_manager().await;
     let handle = manager
         .get_session(crate::sessions::SessionKeyPredicate::Id(session_id))
         .await
         .unwrap()
         .expect("session should resolve");
-    handle
-        .set_workspace_upload_in_flight(true)
+    let first = crate::rpc::WorkspaceUploadInFlight::begin(handle.clone())
         .await
-        .expect("flag should land");
+        .expect("first upload mark should land");
+    let second = crate::rpc::WorkspaceUploadInFlight::begin(handle.clone())
+        .await
+        .expect("second upload mark should land");
 
     // The attach is refused with the in-flight message, not shortcut
     // into a configure.
@@ -294,11 +298,23 @@ async fn attach_while_a_workspace_upload_streams_is_refused_without_scaffolding(
         "a refused attach must not scaffold the workspace"
     );
 
-    // Once the upload finishes, the same attach lands the session live.
-    handle
-        .set_workspace_upload_in_flight(false)
+    // One upload finishing does not re-admit attaches while the other
+    // is still unpacking.
+    first
+        .finish()
         .await
-        .expect("flag should clear");
+        .expect("first upload mark should clear");
+    let mut channel = client.open_shell(session_id).await;
+    let refusal = collect_to_close(&mut channel).await;
+    assert!(
+        refusal.contains("session is still receiving its workspace upload"),
+        "an attach must stay refused while any upload streams, got: {refusal:?}"
+    );
+
+    // The second upload never reaches its finish — dropping the guard
+    // stands in for a panic or a torn-down task — and the same attach
+    // then lands the session live.
+    drop(second);
     let mut channel = client.open_shell(session_id).await;
     channel.data_bytes(b"hello\n".to_vec()).await.unwrap();
     let mut stdout = Vec::new();

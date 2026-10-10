@@ -1938,6 +1938,42 @@ async fn upload_session_handle(
     Ok((session_handle, paths))
 }
 
+/// One `WorkspaceFilesTarZst` upload marked in flight on its session, so
+/// attaches are refused until the mark is cleared. [`Self::finish`] clears
+/// it and awaits the actor's ack; a guard dropped without finishing (a
+/// panic, or the upload task torn down mid-stream) enqueues the clear
+/// without awaiting it instead, so no exit path leaves the session refusing
+/// attaches forever.
+pub(crate) struct WorkspaceUploadInFlight(Option<crate::session::SessionHandle>);
+
+impl WorkspaceUploadInFlight {
+    pub(crate) async fn begin(handle: crate::session::SessionHandle) -> Result<Self, String> {
+        handle
+            .set_workspace_upload_in_flight(true)
+            .await
+            .map_err(|e| format!("session is gone: {e}"))?;
+        Ok(Self(Some(handle)))
+    }
+
+    pub(crate) async fn finish(mut self) -> Result<(), String> {
+        let Some(handle) = self.0.take() else {
+            return Ok(());
+        };
+        handle
+            .set_workspace_upload_in_flight(false)
+            .await
+            .map_err(|e| format!("session is gone: {e}"))
+    }
+}
+
+impl Drop for WorkspaceUploadInFlight {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.end_workspace_upload_detached();
+        }
+    }
+}
+
 /// Unpacks the zstd-compressed tarball streamed over `c` into the
 /// workspace directory of the session named by the channel environment,
 /// tallying the wire bytes it consumes into `received`.
@@ -1957,16 +1993,15 @@ async fn unpack_workspace_files(
     // record in the caller.
     tracing::info!("workspace upload started");
 
-    // Bracket the unpack with the in-flight flag, and await both acks: the
-    // Begin ack guarantees an attach that races the upload sees the flag
+    // Bracket the unpack with the in-flight mark, and await both acks: the
+    // Begin ack guarantees an attach that races the upload sees the mark
     // before the first byte lands, and the End ack fires before this
     // function reports, so the caller's outcome log never says complete
     // while an attach is still refused. Cleared on both arms — a failed
-    // upload must not wedge the session behind a flag nothing clears.
-    session_handle
-        .set_workspace_upload_in_flight(true)
-        .await
-        .map_err(|e| format!("session is gone: {e}"))?;
+    // upload must not wedge the session behind a mark nothing clears —
+    // and by the guard's drop if this future never reaches the clear (a
+    // panic in the unpack, or the task being torn down mid-stream).
+    let upload = WorkspaceUploadInFlight::begin(session_handle).await?;
     let unpacked = async_tar::Archive::new(async_compression::tokio::bufread::ZstdDecoder::new(
         tokio::io::BufReader::new(CountingReader {
             inner: c.make_reader(),
@@ -1975,10 +2010,7 @@ async fn unpack_workspace_files(
     ))
     .unpack(paths.working.as_utf8_path())
     .await;
-    session_handle
-        .set_workspace_upload_in_flight(false)
-        .await
-        .map_err(|e| format!("session is gone: {e}"))?;
+    upload.finish().await?;
     unpacked.map_err(|e| format!("unpack failed: {e}"))?;
 
     Ok(())
