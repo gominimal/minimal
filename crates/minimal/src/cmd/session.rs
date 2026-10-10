@@ -1641,9 +1641,10 @@ pub(crate) async fn activate_session(
     // an attach or exec ([`rehold_held_name_before_attach`]) does not tell
     // a task session apart, though: it holds the name of any named host_ip
     // session without a box row that a client attaches to or execs into.
-    // A task session held that way and then destroyed by task.rs's raw RPC
-    // is never released; its hold is dropped after the VM host daemon's
-    // next restart, when nothing re-makes it.
+    // A task run releases such a hold by its session's id once the run
+    // returns (`release_task_name_hold`); a run whose client is killed
+    // first releases nothing, and that hold is dropped after the VM host
+    // daemon's next restart, when nothing re-makes it.
     //
     // Every hold is made by a client over the host's control socket, as
     // this one and that re-hold are; the in-VM daemon makes none. So
@@ -6931,6 +6932,45 @@ mod tests {
         release_held_box_name(control_sock(), id, None, None).await;
         release_held_box_name(None, id, Some("web"), None).await;
         assert_eq!(requests.lock().unwrap().len(), 2, "nothing to release by");
+    }
+
+    /// A finished task run releases the hold an attach or exec into its
+    /// session may have re-made: one release naming the session and its
+    /// id, since the daemon ends that session with no client destroy to
+    /// release it. A kept session's hold is left for its destroy.
+    #[tokio::test]
+    async fn a_finished_task_run_releases_its_sessions_name_hold() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let provider_dir = dir.path().join("providers").join("local-minvmd0");
+        std::fs::create_dir_all(&provider_dir).unwrap();
+        let requests = fake_vm_host(
+            provider_dir.join("control.sock"),
+            r#"{"name":"task-build-9c1e","held":false}"#.to_string(),
+        )
+        .await;
+        let control_sock = || vm_host_control_sock(paths::ProviderKind::Minvmd, Some(dir.path()));
+        let id = sessions::SessionId::nil();
+
+        crate::task::release_task_name_hold(control_sock(), id, "task-build-9c1e", true).await;
+        assert!(
+            requests.lock().unwrap().is_empty(),
+            "a kept session keeps its hold"
+        );
+
+        crate::task::release_task_name_hold(control_sock(), id, "task-build-9c1e", false).await;
+        let seen = requests.lock().unwrap();
+        assert_eq!(seen.len(), 1, "one release, one request");
+        let minimald_rpc::BoxControlRequest::ReleaseBoxName(request) =
+            serde_json_lenient::from_str(&seen[0]).expect("the request is the wire type")
+        else {
+            panic!("the run's end is carried by the release verb");
+        };
+        assert_eq!(request.name, "task-build-9c1e");
+        assert_eq!(
+            request.session_id,
+            Some(id),
+            "the release names its session"
+        );
     }
 
     /// The `host_ip` hold's attach-exit side: the shell-exit prompt's

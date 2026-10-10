@@ -916,9 +916,40 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     if args.keep {
         eprintln!("Session {session_name} kept — attach with: min session attach {session_name}");
     }
+    release_task_name_hold(
+        crate::vm_host_control_sock(
+            crate::daemon_provider_kind(global),
+            global.minimal_dir.as_deref(),
+        ),
+        id,
+        &session_name,
+        args.keep,
+    )
+    .await;
     drop(run_guard);
 
     exit_outcome(outcome?)
+}
+
+/// Releases the name hold a finished run's session may carry on the VM
+/// host daemon, best-effort. A task run holds no name of its own, but a
+/// `min session attach` or `min exec` into its running session re-makes
+/// one (`rehold_held_name_before_attach` cannot tell a task session
+/// apart), and the daemon ends the session with the run, where no client
+/// destroy releases it. The release is by the session's `id`, so it frees
+/// only this session's hold, and a name nothing held is the goal state
+/// already holding. `keep` withholds it: a kept session lives on, and its
+/// destroy releases its hold.
+pub(crate) async fn release_task_name_hold(
+    control_sock: Option<std::path::PathBuf>,
+    id: sessions::SessionId,
+    name: &str,
+    keep: bool,
+) {
+    if keep {
+        return;
+    }
+    crate::release_held_box_name(control_sock, id, Some(name), None).await;
 }
 
 #[cfg(test)]
