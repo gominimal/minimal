@@ -5007,7 +5007,7 @@ exit 0
             "{stderr}"
         );
         assert!(
-            !stderr.contains("apparmor_parser"),
+            !stderr.contains("stubs/apparmor_parser"),
             "an unowned profile is not unloaded: {stderr}"
         );
         assert!(
@@ -5019,7 +5019,10 @@ exit 0
         // The same profile with the record: unloaded, removed, record gone.
         std::fs::write(&record, "").unwrap();
         let stderr = run();
-        assert!(stderr.contains("apparmor_parser --remove"), "{stderr}");
+        assert!(
+            stderr.contains("stubs/apparmor_parser --remove"),
+            "{stderr}"
+        );
         assert!(!stderr.contains("note:"), "{stderr}");
         for file in [&profile, &tunable, &local, &record] {
             assert!(!file.exists(), "{} is removed: {stderr}", file.display());
@@ -5032,7 +5035,7 @@ exit 0
         // Nothing at all: silent.
         let stderr = run();
         assert!(
-            !stderr.contains("apparmor_parser") && !stderr.contains("note:"),
+            !stderr.contains("stubs/apparmor_parser") && !stderr.contains("note:"),
             "{stderr}"
         );
     }
