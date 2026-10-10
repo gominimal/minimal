@@ -90,6 +90,7 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
         Some(Command::Diag(diag::DiagArgs { command })) => match command {
             diag::DiagCommand::Collect(args) => diag::cmd_bug(&cli.global_args, args).await,
             diag::DiagCommand::Upload(args) => diag::cmd_diag_upload(args).await,
+            diag::DiagCommand::Delete(args) => diag::cmd_diag_delete(args).await,
         },
         #[cfg(feature = "remote-access")]
         Some(Command::Mesh(MeshArgs { command })) => match command {
