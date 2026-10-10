@@ -641,7 +641,7 @@ Prints important directories and file paths for debugging.
 ### `bug`
 
 ```
-min bug [-o <OUTPUT>]
+min bug [-o <OUTPUT>] [--upload [--context <TEXT>] [--endpoint <URL>]]
 ```
 
 Collects a diagnostic bundle (logs, state, config) to send to the minimal
@@ -686,6 +686,52 @@ prefixes) have values captured verbatim (a sensitive-shaped
 name always loses to the allowlist), and every other env var is reported
 by name only. Session and project file contents are never included, only
 name/size listings. Review the archive before sharing.
+
+`--upload` sends the bundle to the diag portal after `bug` writes it to
+disk. A failed upload leaves the archive in place. The upload sends
+nothing to identify you: it sends the bundle and the `--context` text.
+`--context` is a sentence on what went wrong. The portal shows it beside
+the report and gives it to the agent that reads the bundle. `--endpoint`
+names another portal. It must be HTTPS, or plain HTTP to a loopback
+host. The portal takes bundles up to 64 MiB.
+
+After an upload, `bug` prints:
+
+```
+Report:  https://agents.minimal.farm/diag/<id>
+The bundle is stored for the minimal team for 7 days. It is not diagnosed until someone signs in at the report URL and starts the diagnosis.
+Expires: <date>
+Delete:  min diag delete <id> <token>
+```
+
+The portal keeps the bundle for 7 days and then deletes it. The portal
+starts a diagnosis only when someone signs in on the report page and
+starts it there. The report URL does not contain the delete token, so
+you can share the URL. To remove the bundle sooner, run the `Delete:`
+line. See [`diag`](#diag).
+
+### `diag`
+
+```
+min diag collect [<bug options>]
+min diag upload <PATH> [--context <TEXT>] [--endpoint <URL>]
+min diag delete <ID> <TOKEN> [--endpoint <URL>]
+```
+
+`diag collect` is [`bug`](#bug) under another name and takes the same
+options.
+
+`diag upload` sends a bundle that you collected earlier. Use it for a
+bundle someone gave you, or for one you collected while the portal was
+unreachable. It prints the same lines as `bug --upload`.
+
+`diag delete` deletes an uploaded bundle before it expires. Give it the
+id and the delete token that the upload printed. The portal deletes the
+bundle and any diagnosis made from it, and the command prints
+`Deleted <id>`. It fails with a plain error when the portal has no such
+bundle, or when the token does not match the bundle. A bundle is missing
+when nobody uploaded it, it expired, or someone already deleted it.
+`--endpoint` follows the same HTTPS rule as the upload.
 
 ### `init`, `add`, `update`
 
