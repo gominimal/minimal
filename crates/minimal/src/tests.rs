@@ -2119,6 +2119,52 @@ async fn stop_force_refuses_a_booting_vm() {
     );
 }
 
+/// Without `--force`, a VM that is still booting is not told to use `--force`,
+/// which refuses a booting VM: the hint names the retry, and the failure stays
+/// the typed host-unreachable one.
+#[tokio::test]
+async fn stop_without_force_on_a_booting_vm_names_the_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider_dir =
+        client::resolve_provider_dir(Some(dir.path()), true).expect("resolve provider dir");
+    let state_dir = minvmd::state::StateDir::new(provider_dir).expect("open state dir");
+    state_dir
+        .write_state(&minvmd::state::State {
+            lifecycle: minvmd::lifecycle::Lifecycle::Starting,
+            vmm_pid: None,
+            started_at: None,
+            ..minvmd::state::State::stopped()
+        })
+        .unwrap();
+    let _lock = state_dir
+        .try_acquire_alive_lock()
+        .unwrap()
+        .expect("acquire alive lock");
+
+    let global = GlobalArgs {
+        repo_dir: None,
+        minimal_dir: Some(dir.path().to_path_buf()),
+        config_dir: None,
+        provider: Some(Provider::LocalMinvmd),
+        no_input: true,
+        vm: None,
+    };
+    let err = cmd_stop(&global, StopArgs { force: false })
+        .await
+        .expect_err("a booting VM that does not answer keeps failing");
+
+    let chain = format!("{err:#}");
+    assert!(
+        chain.contains("still booting") && !chain.contains("--force"),
+        "expected the retry hint and no --force, got: {chain}"
+    );
+    assert!(
+        err.downcast_ref::<client::box_registration::HostUnreachable>()
+            .is_some(),
+        "the refusal must carry the type `main` maps to exit 7, got: {chain}"
+    );
+}
+
 /// The wait a host-side stop ends on is the alive lock, not the lifecycle
 /// file: it fails while a minvmd still holds the lock, even over a `Stopped`
 /// state, and passes once the lock is released.
@@ -2137,7 +2183,7 @@ fn host_stop_waits_for_the_alive_lock_not_the_lifecycle() {
     let err = wait_for_alive_lock_released(&state_dir, std::time::Duration::from_millis(300))
         .expect_err("a held alive lock is not a finished stop");
     assert!(
-        format!("{err:#}").contains("still holds its alive lock"),
+        format!("{err:#}").contains("still holds the VM's alive lock"),
         "got: {err:#}"
     );
 

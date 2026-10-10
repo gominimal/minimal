@@ -3844,14 +3844,32 @@ pub async fn cmd_stop(global: &GlobalArgs, args: StopArgs) -> Result<(), anyhow:
             return if args.force {
                 stop_wedged_vm_from_host(global.minimal_dir.clone(), true).await
             } else {
-                Err(wedged_vm_unreachable(connect_err))
+                Err(wedged_vm_unreachable(
+                    connect_err,
+                    global.minimal_dir.as_deref(),
+                ))
             };
         }
     };
 
+    // The guest acknowledges Shutdown only after it has drained every session
+    // and quiesced its volume, which is unbounded real work. On a VM backend a
+    // failed RPC can end in a host-side kill, so the guest gets the same
+    // budget `minvmd stop` gives it before signalling the VMM: a healthy guest
+    // still draining past the generic RPC deadline must not be killed sooner
+    // than minvmd itself would kill it. A native daemon keeps the generic
+    // deadline (a zero extra budget).
+    let drain_budget = if daemon_provider_kind(global) == paths::ProviderKind::Minvmd {
+        minvmd::cmd::stop::GUEST_SHUTDOWN_TIMEOUT.saturating_sub(client::RPC_TIMEOUT)
+    } else {
+        std::time::Duration::ZERO
+    };
     use minimald_rpc::{Shutdown, ShutdownRequest};
     let resp = client
-        .oneshot_rpc::<Shutdown>(ShutdownRequest { force: args.force })
+        .oneshot_rpc_with_hook_budget::<Shutdown>(
+            ShutdownRequest { force: args.force },
+            drain_budget,
+        )
         .await
         .context("Shutdown RPC failed");
 
@@ -3867,11 +3885,14 @@ pub async fn cmd_stop(global: &GlobalArgs, args: StopArgs) -> Result<(), anyhow:
                     .await =>
         {
             if !args.force {
-                return Err(wedged_vm_unreachable(rpc_err));
+                return Err(wedged_vm_unreachable(
+                    rpc_err,
+                    global.minimal_dir.as_deref(),
+                ));
             }
-            // The guest has just been asked to shut down and did not answer:
-            // asking again would only add up to two more minutes of waiting
-            // before the host-side stop.
+            // The guest has just been asked to shut down and was given the
+            // full drain budget to acknowledge. Asking again would only add
+            // up to two more minutes of waiting before the host-side stop.
             return stop_wedged_vm_from_host(global.minimal_dir.clone(), false).await;
         }
         resp => resp,
@@ -3920,6 +3941,11 @@ pub async fn cmd_stop(global: &GlobalArgs, args: StopArgs) -> Result<(), anyhow:
 /// about 30 s — or, for a guest that completes the handshake and then hangs,
 /// the 120 s Shutdown deadline on top of that, about 150 s.
 ///
+/// The CLI's own attempt comes first. A guest that accepts the connection and
+/// then never acknowledges holds `min stop --force` for the 120 s drain
+/// budget, then the 20 s wait for the VM to stop on its own, then the 25 s
+/// above: about 165 s from start to finish.
+///
 /// Only reached on a minvmd backend with `--force`, once the guest is proven
 /// unreachable; a native minimald is not a VM and keeps its own error.
 /// `quiesce_guest` is false when the CLI's own Shutdown RPC has just failed,
@@ -3944,6 +3970,12 @@ async fn stop_wedged_vm_from_host(
         let state = state_dir
             .effective_state()
             .context("reading the VM's state for a host-side stop")?;
+        // Checked first: the VM going down on its own (or a dead supervisor's
+        // stale state being repaired by the read above) since the caller's
+        // liveness probe is the goal state, not a boot to wait out.
+        if !state.lifecycle.is_active() {
+            return Ok(minvmd::cmd::stop::HostStop::NothingSignalled);
+        }
         if state.lifecycle == minvmd::lifecycle::Lifecycle::Starting || state.vmm_pid.is_none() {
             anyhow::bail!(
                 "the VM is still booting; retry `{}` once it is up",
@@ -4000,7 +4032,7 @@ pub(crate) fn wait_for_alive_lock_released(
     {
         if std::time::Instant::now() >= deadline {
             bail!(
-                "the VM was signalled, but minvmd still holds its alive lock after {timeout:?}; \
+                "minvmd still holds the VM's alive lock after {timeout:?}; \
                  starting it again will fail until that minvmd exits"
             );
         }
@@ -4021,14 +4053,32 @@ fn stop_command() -> String {
 /// The failure `min stop` ends with when the VM's guest does not answer and
 /// `--force` was not given: `cause` under the recovery, typed so the run exits
 /// with the reserved host-unreachable code (7) rather than the unspecified 1.
-fn wedged_vm_unreachable(cause: anyhow::Error) -> anyhow::Error {
-    client::box_registration::HostUnreachable::over(
-        cause,
+///
+/// A VM that is still booting is not answering either, but `--force` refuses
+/// it, so the hint names the retry instead of a recovery that would not work.
+fn wedged_vm_unreachable(
+    cause: anyhow::Error,
+    minimal_dir: Option<&std::path::Path>,
+) -> anyhow::Error {
+    // Same cheap state-file read as `cmd_stop`'s liveness probe; a state that
+    // cannot be read leaves the `--force` hint.
+    let booting = client::resolve_provider_dir(minimal_dir, true)
+        .ok()
+        .and_then(|dir| minvmd::state::StateDir::new(dir).ok())
+        .and_then(|state_dir| state_dir.read_state().ok())
+        .is_some_and(|state| state.lifecycle == minvmd::lifecycle::Lifecycle::Starting);
+    let hint = if booting {
+        format!(
+            "the VM is still booting; retry `{}` once it is up",
+            stop_command()
+        )
+    } else {
         format!(
             "the VM is not answering; `{} --force` stops it from the host",
             stop_command()
-        ),
-    )
+        )
+    };
+    client::box_registration::HostUnreachable::over(cause, hint)
 }
 
 /// Whether the daemon can be *observed* to have stopped — the question the

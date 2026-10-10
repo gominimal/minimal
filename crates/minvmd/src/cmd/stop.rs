@@ -29,11 +29,19 @@ pub enum HostStop {
     /// The guest acknowledged the Shutdown RPC, so its sessions were drained
     /// and its volume quiesced before the VMM was signalled.
     GuestAcknowledged,
-    /// The VMM was signalled with no acknowledgement from the guest: it was
-    /// not asked, or did not answer. Sessions were killed without their stop
-    /// path, and data the guest had not flushed can be lost.
+    /// The VM was stopped with no acknowledgement from the guest: it was not
+    /// asked, or did not answer. Sessions ended without their stop path, and
+    /// data the guest had not flushed can be lost.
     GuestUnacknowledged,
 }
+
+/// How long a stop waits for the guest to acknowledge Shutdown before the VMM
+/// is signalled. Long, because the handler force-drains every session
+/// (sandbox teardown, process kills — unbounded real work) and then quiesces
+/// (10 s guest-side ceiling) before it acknowledges; giving up mid-drain
+/// would SIGTERM the VMM with a dirty journal. Public so a caller that asks
+/// the guest itself, then falls back to [`stop_at`], gives it no less.
+pub const GUEST_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Stop the VM whose provider dir is `provider_dir`, exactly as `minvmd stop`
 /// would: best-effort guest Shutdown over the bridge socket in that dir, then
@@ -127,13 +135,9 @@ fn shutdown_guest_best_effort(state_dir: &StateDir) -> bool {
     // deadline is short: libkrun accepts the bridge UDS connect even when the
     // guest is wedged, so a completed SSH handshake is the only proof of a
     // live daemon — a broken VM must not stall the user's recovery command.
-    // The RPC deadline is long: the handler force-drains every session
-    // (sandbox teardown, process kills — unbounded real work) and then
-    // quiesces (10 s guest-side ceiling) before it acknowledges; giving up
-    // mid-drain would SIGTERM the VMM with a dirty journal, defeating the
-    // point of the call.
+    // The RPC deadline, `GUEST_SHUTDOWN_TIMEOUT`, is long: giving up
+    // mid-drain would defeat the point of the call.
     const GUEST_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-    const GUEST_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
     // The bridge socket is resolved from THIS state dir, never minvmd's
     // process-global provider dir: in the CLI process that global is unset
