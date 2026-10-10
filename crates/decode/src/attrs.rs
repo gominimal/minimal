@@ -497,4 +497,102 @@ mod tests {
 
         assert!(res.is_ok());
     }
+
+    /// Evaluates `attrs | Attrs` and reports whether it was accepted.
+    fn attrs_accepted(attrs: &str) -> bool {
+        let src = format!("let {{Attrs, ..}} = import \"minimal.ncl\" in {attrs} | Attrs");
+        Loader::new(&src, None, &LoadOptions::for_test())
+            .unwrap_or_else(|e| {
+                e.report_to_stderr();
+                panic!("load failed");
+            })
+            .finish()
+            .is_ok()
+    }
+
+    const SHA: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    /// An attrs record with an upstream_version, plus `rest`.
+    fn versioned(rest: &str) -> String {
+        format!("{{upstream_version = \"1.0\", {rest}}}")
+    }
+
+    fn security_entry() -> String {
+        format!(
+            "{{ file = \"CVE-2026-1234.patch\", kind = 'security, cve = \"CVE-2026-1234\", \
+             sha256 = \"{SHA}\", origin = \"https://example.org/advisory\", upstream_commit = \"deadbeef0\" }}"
+        )
+    }
+
+    /// REV-001: the advisory-matching key never carries our revision suffix.
+    #[test]
+    fn attrs_upstream_version_rejects_revision_suffix() {
+        assert!(attrs_accepted("{upstream_version = \"1.25.0\"}"));
+        assert!(!attrs_accepted("{upstream_version = \"1.25.0-r1\"}"));
+        assert!(!attrs_accepted("{upstream_version = \"2026.9.3-r12\"}"));
+    }
+
+    /// REV-003: an entry's shape follows its kind, and nothing is left blank.
+    #[test]
+    fn patch_ledger_entries_fail_closed() {
+        let ok = |entry: &str| {
+            attrs_accepted(&format!(
+                "{{upstream_version = \"1.0\", revision = 1, patches = [{entry}]}}"
+            ))
+        };
+        let e = security_entry();
+        assert!(ok(&e));
+        assert!(ok(&format!(
+            "{{ file = \"aarch64-build.patch\", kind = 'build, sha256 = \"{SHA}\", origin = \"https://example.org/bug/1\" }}"
+        )));
+        assert!(ok(&format!(
+            "{{ file = \"pins.patch\", kind = 'vendor, sha256 = \"{SHA}\", origin = \"https://example.org/mr/2\", upstream_commit = \"0123456\" }}"
+        )));
+        // Not a record; no kind, an unknown kind, or a kind that does not
+        // match its fields.
+        assert!(!ok("42"));
+        assert!(!ok(&e.replace("kind = 'security, ", "")));
+        assert!(!ok(&e.replace("'security", "'hotfix")));
+        assert!(!ok(&e.replace("'security", "'build")));
+        // A security fix without its CVE or commit, or with a blank one.
+        assert!(!ok(&e.replace("cve = \"CVE-2026-1234\", ", "")));
+        assert!(!ok(&e.replace("CVE-2026-1234\"", "\"")));
+        assert!(!ok(&e.replace(", upstream_commit = \"deadbeef0\"", "")));
+        assert!(!ok(&e.replace("deadbeef0", "not-a-commit")));
+        // A blank origin, a misshapen digest, a missing file.
+        assert!(!ok(&e.replace("https://example.org/advisory", " ")));
+        assert!(!ok(&e.replace(SHA, "abc123")));
+        assert!(!ok(&e.replace("file = \"CVE-2026-1234.patch\", ", "")));
+    }
+
+    /// REV-002: the revision is a non-negative integer, never a string.
+    #[test]
+    fn revision_is_a_non_negative_integer() {
+        let rev = |v: &str| attrs_accepted(&versioned(&format!("revision = {v}")));
+        assert!(rev("0"));
+        assert!(rev("3"));
+        assert!(!rev("-1"));
+        assert!(!rev("1.5"));
+        assert!(!rev("\"1\""));
+    }
+
+    /// A ledger with entries counts as at least one revision.
+    #[test]
+    fn a_patch_ledger_implies_a_revision() {
+        let with = |rest: &str| attrs_accepted(&versioned(rest));
+        let entry = security_entry();
+        assert!(with(&format!("revision = 1, patches = [{entry}]")));
+        assert!(with("revision = 0, patches = []"));
+        assert!(!with(&format!("patches = [{entry}]")));
+        assert!(!with(&format!("revision = 0, patches = [{entry}]")));
+    }
+
+    /// REV-011: a label with no upstream half is not a label.
+    #[test]
+    fn versionless_recipes_carry_no_revision() {
+        assert!(!attrs_accepted("{revision = 1}"));
+        assert!(!attrs_accepted("{revision = 0}"));
+        assert!(!attrs_accepted("{patches = []}"));
+        assert!(attrs_accepted("{license_spdx = \"MIT\"}"));
+    }
 }

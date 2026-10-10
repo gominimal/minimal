@@ -1,6 +1,19 @@
 let Tys = [| 'Builder, 'OutputLib, 'OutputBin, 'OutputData, 'Source, 'Local, 'Subset, 'Profile, 'Layer, 'Upstream, 'Test, 'Stack, 'Container |]
 in
 let attrs_schema = import "attr_classes.ncl" in
+# Rules that span attributes (inbox#511): a ledger entry implies a revision,
+# and both need an upstream_version to qualify.
+let attrs_consistent = fun attrs =>
+    let has = fun field => std.record.has_field field attrs in
+    let revision = if has "revision" then attrs.revision else 0 in
+    let patched = has "patches" && std.array.length attrs.patches > 0 in
+    if (has "revision" || has "patches") && !(has "upstream_version") then
+        'Error { message = "revision and patches need an upstream_version to qualify" }
+    else if patched && revision == 0 then
+        'Error { message = "a non-empty patches ledger needs revision >= 1" }
+    else
+        'Ok attrs
+in
 let needs_schema = import "need_classes.ncl" in
 let CmdSpec = std.contract.any_of [
   String,
@@ -231,14 +244,16 @@ let EnvVars = std.contract.custom (fun label record_value =>
                 std.contract.check attrs_schema."%{field}".validate label value
                 |> match {
                     'Ok wrapped_value => 'Ok (acc @ [{ include field, value = wrapped_value }]),
-                    'Error e => 'Error { message = "failed to validate %{field}", blame_location = e.blame_location }
+                    'Error e =>
+                        let why = if std.record.has_field "message" e then ": %{e.message}" else "" in
+                        'Error { message = "failed to validate %{field}%{why}", blame_location = e.blame_location }
                 }
                 else
                 'Error { message = "`%{field}` is not a valid attribute" }
             )
             []
             |> match {
-            'Ok array => 'Ok (std.record.from_array array),
+            'Ok array => attrs_consistent (std.record.from_array array),
             'Error e => 'Error e,
             }
         ),
