@@ -2195,9 +2195,9 @@ extern "C" fn on_stop_signal(signum: libc::c_int) {
 /// [`die_by_signal`] when that cannot finish, so the process always
 /// terminates by the signal. A signal during the boot aborts it: the VMM
 /// child is signalled without a guest ask. Only a crash and SIGKILL stay
-/// outside this path. The graceful VM stop applies to a signal sent to the supervisor
-/// alone: a terminal Ctrl-C also reaches the foreground VMM child, which
-/// shares the terminal's process group, and ends it directly.
+/// outside this path. The graceful VM stop applies to a signal sent to the
+/// supervisor alone: a terminal Ctrl-C also reaches the foreground VMM
+/// child, which shares the terminal's process group, and ends it directly.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 pub(crate) fn watch_stop_signals(
     boxes: BoxRegistry,
