@@ -217,7 +217,8 @@ impl EgressPolicy {
     /// it is not read — a section that grants no destination reaches
     /// nothing whatever protocols it lists, which is the shape
     /// [`effective_egress`] resolves a declaration with no destination
-    /// list (protocols only, denies only) to. `deny_subnets` is not read
+    /// list (protocols only, denies only) to on an own-address box under the
+    /// in-force default without the opt-out. `deny_subnets` is not read
     /// either — it subtracts from what the `allow_*` fields admit, and
     /// there is nothing there to subtract from. The one predicate the
     /// in-VM classifier, the host-side registry and `min session policy`
@@ -562,7 +563,7 @@ pub struct EffectiveSessionPolicy {
 /// arm the absent list keeps the allow-all reading the opt-out preserves.
 /// `allow_protocols` is left as declared in every arm: it filters the reach
 /// the destination lists grant and grants none itself, so `allow_subnets =
-/// ["0.0.0.0/0"]` alone is the written-out allow-all.
+/// ["0.0.0.0/0"]` alone is the written-out IPv4 allow-all.
 ///
 /// `opt_out` is the daemon's deny-all opt-out flag (NET-077); the caller
 /// threads it in from the daemon's configuration, because it is the daemon —

@@ -3257,7 +3257,12 @@ fn normalize_subnets(entries: &[String]) -> Vec<String> {
 }
 
 /// One egress rule row: the CIDR or hostname list, or the default the policy
-/// resolves to when the dimension is unset.
+/// resolves to when the dimension is unset. Writes comma-separated entries
+/// to `out`, using `default` for an unset list and `(none)` for an empty list.
+///
+/// # Errors
+///
+/// Propagates errors from writing the row to `out`.
 fn write_rules(
     out: &mut impl std::io::Write,
     label: &str,
