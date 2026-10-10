@@ -4953,6 +4953,9 @@ exit 0
         let host = tempfile::tempdir().expect("a temp dir");
         let stubs = host.path().join("stubs");
         std::fs::create_dir(&stubs).unwrap();
+        // The stubs log their calls to a file: the script sends
+        // `apparmor_parser`'s stderr to /dev/null, so stderr cannot tell.
+        let calls = host.path().join("calls");
         for (tool, code) in [
             ("apparmor_parser", 0),
             ("systemctl", 1),
@@ -4963,7 +4966,10 @@ exit 0
             let path = stubs.join(tool);
             std::fs::write(
                 &path,
-                format!("#!/bin/sh\necho \"$0 $*\" >&2\nexit {code}\n"),
+                format!(
+                    "#!/bin/sh\necho \"{tool} $*\" >> {}\nexit {code}\n",
+                    calls.display()
+                ),
             )
             .unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -4982,7 +4988,9 @@ exit 0
             .replace(KVM_GROUP_RECORD, "/nonexistent/var/lib/minimal/kvm-group")
             .replace(APPARMOR_PROFILE_RECORD, record.to_str().unwrap())
             .replace(APPARMOR_DIR, apparmor_dir.to_str().unwrap());
+        // Runs the removal; gives back the stubs' calls and the stderr.
         let run = || {
+            let _ = std::fs::remove_file(&calls);
             let output = std::process::Command::new("/bin/sh")
                 .args(["-c", &script])
                 .env("PATH", format!("{}:/usr/bin:/bin", stubs.display()))
@@ -4993,7 +5001,10 @@ exit 0
                 "the removal succeeds: {}\n{script}",
                 String::from_utf8_lossy(&output.stderr)
             );
-            String::from_utf8_lossy(&output.stderr).into_owned()
+            (
+                std::fs::read_to_string(&calls).unwrap_or_default(),
+                String::from_utf8_lossy(&output.stderr).into_owned(),
+            )
         };
 
         // A profile the step did not record: it stays, with the note.
@@ -5001,14 +5012,14 @@ exit 0
         for file in [&profile, &tunable, &local] {
             std::fs::write(file, "x").unwrap();
         }
-        let stderr = run();
+        let (calls, stderr) = run();
         assert!(
             profile.is_file() && tunable.is_file() && local.is_file(),
             "{stderr}"
         );
         assert!(
-            !stderr.contains("stubs/apparmor_parser"),
-            "an unowned profile is not unloaded: {stderr}"
+            !calls.contains("apparmor_parser"),
+            "an unowned profile is not unloaded: {calls}"
         );
         assert!(
             stderr.contains("was not installed by min finalize-install")
@@ -5018,11 +5029,8 @@ exit 0
 
         // The same profile with the record: unloaded, removed, record gone.
         std::fs::write(&record, "").unwrap();
-        let stderr = run();
-        assert!(
-            stderr.contains("stubs/apparmor_parser --remove"),
-            "{stderr}"
-        );
+        let (calls, stderr) = run();
+        assert!(calls.contains("apparmor_parser --remove"), "{calls}");
         assert!(!stderr.contains("note:"), "{stderr}");
         for file in [&profile, &tunable, &local, &record] {
             assert!(!file.exists(), "{} is removed: {stderr}", file.display());
@@ -5033,10 +5041,10 @@ exit 0
         );
 
         // Nothing at all: silent.
-        let stderr = run();
+        let (calls, stderr) = run();
         assert!(
-            !stderr.contains("stubs/apparmor_parser") && !stderr.contains("note:"),
-            "{stderr}"
+            !calls.contains("apparmor_parser") && !stderr.contains("note:"),
+            "{calls}\n{stderr}"
         );
     }
 
