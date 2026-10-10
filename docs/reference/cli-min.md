@@ -552,7 +552,7 @@ anything other than the `kvm` group membership ends with
 `Running boxes pick this up on their next start.`. A run that added you to
 the `kvm` group ends with
 `KVM group membership starts at your next login: log out and back in, or restart the daemon from a new login.`
-instead. On a host that needs nothing it prints
+When both apply, both lines print, the login line last. On a host that needs nothing it prints
 `Every part of the install is finished on this machine; there is nothing to run.`
 and exits 0. It lists a fact that no script can change, such as cgroup2
 mounted without `nsdelegate`, under `can't do on this machine:`. The other

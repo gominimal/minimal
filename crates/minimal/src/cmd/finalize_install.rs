@@ -40,6 +40,12 @@ pub(crate) const SCHEMA: &str = "min/v1/finalize-install";
 /// point the resolver at.
 const NO_PORT: &str = "no daemon is reachable to report its answerer port";
 
+/// How long the names item waits on the daemons for a port before it
+/// reports itself waiting: one bounded read, so a probe from the installer
+/// (`--show --script` in a shell with no timeout of its own) never hangs
+/// on a daemon that accepts and does not answer.
+const DAEMON_READ_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// The KVM item's id, read by the run to pick its closing line.
 pub(crate) const KVM_ID: &str = "kvm-group";
 
@@ -178,6 +184,12 @@ impl Plan {
     /// decides the closing line: a membership is read at login.
     pub(crate) fn adds_kvm_group(&self) -> bool {
         self.missing().any(|item| item.id == KVM_ID)
+    }
+
+    /// Whether the script installs an item other than the `kvm` group:
+    /// one a running box picks up at its next start.
+    pub(crate) fn installs_other_items(&self) -> bool {
+        self.missing().any(|item| item.id != KVM_ID)
     }
 
     /// The one script a run executes and `--show --script` prints: one
@@ -349,18 +361,28 @@ pub async fn cmd_finalize_install(
         exit(1);
     }
     run_as_root(&script, SCRIPT_POINTER)?;
-    println!("{}", closing_line(plan.adds_kvm_group()));
+    print!(
+        "{}",
+        closing_lines(plan.installs_other_items(), plan.adds_kvm_group())
+    );
     Ok(())
 }
 
-/// The line a completed run ends with: [`NEEDS_LOGIN`] when the script
-/// added the operator to the `kvm` group, else [`PICKED_UP`].
-pub(crate) fn closing_line(added_kvm_group: bool) -> &'static str {
-    if added_kvm_group {
-        NEEDS_LOGIN
-    } else {
-        PICKED_UP
+/// The lines a completed run ends with: [`PICKED_UP`] when the script
+/// installed items other than the `kvm` group, [`NEEDS_LOGIN`] when it
+/// added the operator to that group, both — items line first, the login
+/// line last — when both apply.
+pub(crate) fn closing_lines(installed_other_items: bool, added_kvm_group: bool) -> String {
+    let mut out = String::new();
+    if installed_other_items {
+        out.push_str(PICKED_UP);
+        out.push('\n');
     }
+    if added_kvm_group {
+        out.push_str(NEEDS_LOGIN);
+        out.push('\n');
+    }
+    out
 }
 
 /// Why `--undo` refuses its flags, when it does: `--undo` runs the removal
@@ -516,8 +538,57 @@ pub(crate) fn names_item(verdict: crate::resolver::NamesVerdict, port: u16) -> I
 /// the answerer port `min ls` reads — each listed VM's own state from its
 /// VM host daemon's control socket (NET-138), else the daemon's listing.
 /// It never starts a daemon: with none reachable, or none that reports a
-/// port, there is no port to point a script at, and the item says so.
+/// port, there is no port to point a script at, and the item says so. The
+/// daemon reads are one bounded attempt ([`DAEMON_READ_DEADLINE`]): a
+/// daemon that does not answer in time is one that is not reachable.
 async fn names_item_on_this_host(global: &GlobalArgs) -> Item {
+    let read = tokio::time::timeout(DAEMON_READ_DEADLINE, answerer_port_from_daemons(global)).await;
+    let (answerer, held_no_channel) = match read {
+        Ok(found) => found,
+        Err(_) => {
+            return Item::waiting(
+                NAMES_ID,
+                NAMES_LABEL,
+                format!(
+                    "no daemon answered within {}s",
+                    DAEMON_READ_DEADLINE.as_secs()
+                ),
+            );
+        }
+    };
+    let Some((port, bound)) = answerer else {
+        // No port to point a script at yet: the item waits on a daemon,
+        // and never blocks the items the script can carry without one.
+        let cause = match held_no_channel {
+            Some(port) => crate::resolver::port_held_no_channel_warning(port),
+            None => NO_PORT.to_string(),
+        };
+        return Item::waiting(NAMES_ID, NAMES_LABEL, cause);
+    };
+    let (detection, answerer_step) = crate::cmd::session::advisory_host_reads(global).await;
+    // The range read the live-surface verdict makes, so the item names the
+    // same missing facts the surface line reports.
+    let range_present =
+        crate::resolver::live_name_surface_with_range_at(&detection, Some(port), bound)
+            .await
+            .and_then(|verdict| verdict.range_present);
+    let (hook, blocker, range_step) = &detection;
+    let verdict = crate::resolver::names_verdict_at(
+        hook,
+        port,
+        false,
+        range_present,
+        range_step,
+        &answerer_step,
+        blocker.as_deref(),
+    );
+    names_item(verdict, port)
+}
+
+/// The answerer port the daemons report (with whether it is bound), and
+/// the port a listing holds with no channel behind it, over every VM's
+/// listing (`min ls`'s read).
+async fn answerer_port_from_daemons(global: &GlobalArgs) -> (Option<(u16, bool)>, Option<u16>) {
     let listings = ls_listings_best_effort(global).await;
     let mut answerer = None;
     let mut held_no_channel = None;
@@ -548,33 +619,7 @@ async fn names_item_on_this_host(global: &GlobalArgs) -> Item {
             None => {}
         }
     }
-    let Some((port, bound)) = answerer else {
-        // No port to point a script at yet: the item waits on a daemon,
-        // and never blocks the items the script can carry without one.
-        let cause = match held_no_channel {
-            Some(port) => crate::resolver::port_held_no_channel_warning(port),
-            None => NO_PORT.to_string(),
-        };
-        return Item::waiting(NAMES_ID, NAMES_LABEL, cause);
-    };
-    let (detection, answerer_step) = crate::cmd::session::advisory_host_reads(global).await;
-    // The range read the live-surface verdict makes, so the item names the
-    // same missing facts the surface line reports.
-    let range_present =
-        crate::resolver::live_name_surface_with_range_at(&detection, Some(port), bound)
-            .await
-            .and_then(|verdict| verdict.range_present);
-    let (hook, blocker, range_step) = &detection;
-    let verdict = crate::resolver::names_verdict_at(
-        hook,
-        port,
-        false,
-        range_present,
-        range_step,
-        &answerer_step,
-        blocker.as_deref(),
-    );
-    names_item(verdict, port)
+    (answerer, held_no_channel)
 }
 
 /// The Linux-only items: the user-namespace profile, the classifier tree
@@ -1092,21 +1137,31 @@ mod tests {
     /// pick-up line.
     #[test]
     fn finalize_install_kvm_group_closing_line_names_a_new_login() {
-        let with_kvm = Plan {
-            items: vec![missing("names", "names"), missing(KVM_ID, "kvm")],
+        let closing =
+            |plan: &Plan| closing_lines(plan.installs_other_items(), plan.adds_kvm_group());
+        // The kvm group alone: the login line only.
+        let kvm_only = Plan {
+            items: vec![done("names"), missing(KVM_ID, "kvm")],
         };
-        assert!(with_kvm.adds_kvm_group());
-        assert_eq!(closing_line(with_kvm.adds_kvm_group()), NEEDS_LOGIN);
+        assert!(kvm_only.adds_kvm_group() && !kvm_only.installs_other_items());
+        assert_eq!(closing(&kvm_only), format!("{NEEDS_LOGIN}\n"));
         assert_eq!(
             NEEDS_LOGIN,
             "KVM group membership starts at your next login: log out and back in, or restart \
              the daemon from a new login."
         );
+        // Other items alone: the pick-up line only.
         let without = Plan {
             items: vec![missing("names", "names"), done(KVM_ID)],
         };
-        assert!(!without.adds_kvm_group());
-        assert_eq!(closing_line(without.adds_kvm_group()), PICKED_UP);
+        assert!(!without.adds_kvm_group() && without.installs_other_items());
+        assert_eq!(closing(&without), format!("{PICKED_UP}\n"));
+        // Both: both lines, the items line first and the login line last.
+        let both = Plan {
+            items: vec![missing("names", "names"), missing(KVM_ID, "kvm")],
+        };
+        assert!(both.adds_kvm_group() && both.installs_other_items());
+        assert_eq!(closing(&both), format!("{PICKED_UP}\n{NEEDS_LOGIN}\n"));
     }
 
     /// `--undo` takes `--show` only with `--script`: `--undo --show` alone
