@@ -35,8 +35,11 @@
 //! class of frame: a DNS reply the switch returned toward a box, which the
 //! host-side DNS admission table ([`crate::net::dns_pins`]) pins from, so the
 //! answers that decide a DNS box's undeclared destinations are the ones the
-//! box's own lookups received. Every frame still flows onward verbatim;
-//! observation is a read, never a hold.
+//! box's own lookups received. Every frame still flows onward verbatim,
+//! and observation is a read, never a hold — with one exception a host
+//! can count: a frame whose far end has stopped reading is dropped at
+//! the relay's bounded queue rather than allowed to wedge the VM
+//! ([`QueueDirection`]).
 //!
 //! The socket is not the shuttle's alone. gvproxy's switch socket is one
 //! listener carrying two protocols, and the guest daemon uses both over the
@@ -165,6 +168,7 @@ use switch::{DEFAULT_MTU, RESERVED_LOCAL_RANGE, SwitchSubnet};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::box_registry::{BoxRecord, BoxTable, RowWithdrawal};
@@ -319,6 +323,86 @@ const MAX_LIVE_RELAYS: usize = 64;
 /// halves of the path agree on what a frame may weigh.
 const fn max_frame() -> usize {
     DEFAULT_MTU as usize + 14 + 4
+}
+
+/// How many frames each relay direction may hold between its reader and its
+/// writer. Every leg of [`relay_frames`] reads its side on the socket and
+/// hands the frames it admits to a writer task through a channel of this
+/// many frames — the queue that keeps a leg reading while its far end
+/// stalls. At [`max_frame`] bytes each, plus each frame's two-byte length
+/// prefix, a full queue holds 512 × 1520 = 778,240 bytes, so the gate's
+/// worst case is [`MAX_LIVE_RELAYS`] relays × 2 directions × ~778 KB ≈
+/// 100 MB of queued frames. Past the bound the frame is dropped under its
+/// direction's backpressure rule ([`QueueDirection`]): a stall at either
+/// end of the relay wedged the whole VM through the shared switch-side and
+/// vsock paths, and a dropped raw-Ethernet frame is a drop TCP recovers,
+/// while a blocked write is a wedge no one recovers.
+const RELAY_QUEUE_FRAMES: usize = 512;
+
+/// How long a relay's teardown lets a writer finish its queue once the leg
+/// feeding it ended on its peer's clean close. The frames that leg read
+/// before the close were admitted and are owed to the far end — a box's
+/// closing segments, sent just before its shuttle went away — and a far end
+/// that is reading takes a whole queue in far less than this. One that has
+/// stopped reading holds the teardown no longer than this, and the rest of
+/// its queue is discarded with the writer.
+const RELAY_FLUSH_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// How a relay's race ended, for its teardown ([`relay_frames`]): which
+/// writer still owes its queue to a far end, and which writer's handle the
+/// race already spent.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RelayEnd {
+    /// The guest closed its side: what it sent before closing is still owed
+    /// to the switch.
+    GuestClosed,
+    /// The switch closed its side: what it sent before closing is still
+    /// owed to the guest.
+    SwitchClosed,
+    /// The switch writer's own exit won the race, and its result was taken.
+    SwitchWriter,
+    /// The guest writer's own exit won the race, and its result was taken.
+    GuestWriter,
+    /// A leg ended on an error: nothing is owed, and both writers go at
+    /// once.
+    Failed,
+}
+
+/// Which of a relay's two queues dropped a frame because the far end of its
+/// direction stopped reading: the leg's reader keeps draining its side —
+/// the reader is what keeps the shared paths of the VM free — and the frame
+/// is the cost, said once per address per direction per interval so a
+/// stalled peer is a readable line in the log, not a wedge in the VM. Each
+/// direction is its own rule with its own window, so a box whose two ends
+/// both stall says so for each, and the line names which end stopped
+/// reading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueueDirection {
+    /// guest → switch: the switch stopped reading the box's egress. The
+    /// line names the frame's source, the box that sent it.
+    TowardSwitch,
+    /// switch → guest: the guest stopped reading the box's inbound traffic.
+    /// The line names the frame's destination, the box it was headed to.
+    TowardGuest,
+}
+
+impl QueueDirection {
+    /// The rule a drop at this direction's queue is said and rate-limited
+    /// under.
+    const fn rule(self) -> &'static str {
+        match self {
+            Self::TowardSwitch => "egress-backpressure",
+            Self::TowardGuest => "ingress-backpressure",
+        }
+    }
+
+    /// The end of the relay that stopped reading.
+    const fn toward(self) -> &'static str {
+        match self {
+            Self::TowardSwitch => "switch",
+            Self::TowardGuest => "guest",
+        }
+    }
 }
 
 /// One drop warning per source address per rule per interval — the cadence the
@@ -1370,7 +1454,7 @@ fn refuse_head(limiter: &DropLimiter, refused: &RefusedHead) {
 )]
 async fn relay_frames(
     mut guest: Prefixed<OwnedReadHalf>,
-    mut switch_tx: OwnedWriteHalf,
+    switch_tx: OwnedWriteHalf,
     switch_rx: OwnedReadHalf,
     guest_tx: OwnedWriteHalf,
     table: BoxTable,
@@ -1380,15 +1464,42 @@ async fn relay_frames(
     limiter: Arc<DropLimiter>,
     forwards: Arc<PublishedForwards>,
 ) {
+    // The two bounded frame queues — one per direction — that keep both
+    // legs reading while their far ends stall: a leg that blocks on its
+    // peer's socket is the wedge this relay must not become, because the
+    // peer it blocks on holds paths the whole VM shares (the vsock
+    // bridge's proxy under its mutex, the switch's write lock). Each
+    // queue holds [RELAY_QUEUE_FRAMES] frames; a full queue drops the
+    // frame under its direction's rule and keeps reading — a raw-Ethernet
+    // drop TCP recovers, a blocked write nothing does.
+    let (switch_queue, switch_drain) = mpsc::channel::<Vec<u8>>(RELAY_QUEUE_FRAMES);
+    let (guest_queue, guest_drain) = mpsc::channel::<Vec<u8>>(RELAY_QUEUE_FRAMES);
+    // The writers: one task per direction, owning that direction's write
+    // half, draining its queue to the peer. Their exit is one of the ways
+    // the relay ends — a write failing is the same event it was when the
+    // legs wrote inline — so the select below races them with the readers.
+    let mut switch_writer = tokio::spawn(drain_frames(switch_drain, switch_tx));
+    let mut guest_writer = tokio::spawn(drain_frames(guest_drain, guest_tx));
     let mut ingress = tokio::spawn(relay_switch_frames_to_guest(
         switch_rx,
-        guest_tx,
+        guest_queue,
         table.clone(),
         pins.clone(),
         replies.clone(),
         Arc::clone(&limiter),
         Arc::clone(&forwards),
     ));
+    // The children go with the relay however it goes: a relay aborted from
+    // outside — the gate's drop, or the accept loop's JoinSet aborting its
+    // relays — never reaches the teardown below, and a dropped JoinHandle
+    // detaches its task rather than ending it. This guard aborts all three
+    // on the relay future's drop; on the normal path they are already
+    // finished or aborted by then, and the abort is a no-op.
+    let _children = AbortOnDrop([
+        ingress.abort_handle(),
+        switch_writer.abort_handle(),
+        guest_writer.abort_handle(),
+    ]);
     // Every admitted frame's source, deduplicated: the attribution this relay
     // files at its end. Filled by the egress leg's loop below but owned here,
     // so it outlives whichever leg loses the race and is filed on every exit.
@@ -1401,10 +1512,10 @@ async fn relay_frames(
     // reports at its end, so the registry detaches the boxes this
     // connection carried and no newer box handed one of their addresses.
     let mut carried = crate::box_registry::RelayCarry::default();
-    {
+    let end = {
         let egress = relay_frames_to_switch(
             &mut guest,
-            &mut switch_tx,
+            &switch_queue,
             &table,
             &pins,
             &replies,
@@ -1415,23 +1526,27 @@ async fn relay_frames(
             &mut carried,
         );
         tokio::pin!(egress);
-        // The two legs race, because neither can see the other's end. The
-        // egress leg blocks on the guest, which has no reason to speak while
-        // it is idle, so it has no way to learn the switch hung up this one
-        // connection's end — the per-connection close a switch makes without
-        // the process exit the supervisor catches — and would otherwise hold
-        // the relay task, the gate's dial, and the switch write half open
-        // until the guest's next frame came and failed to write. The ingress
-        // leg ending is the only thing on this side that knows, so whichever
-        // leg ends first takes the relay down with it.
+        // The legs and the writers race, because neither can see another's
+        // end. The egress leg blocks on the guest, which has no reason to
+        // speak while it is idle, so it has no way to learn the switch hung
+        // up this one connection's end — the per-connection close a switch
+        // makes without the process exit the supervisor catches — and would
+        // otherwise hold the relay task, the gate's dial, and the switch
+        // write half open until the guest's next frame came and failed to
+        // write. The ingress leg ending is the only thing on this side that
+        // knows, so whichever of the four ends first takes the relay down
+        // with it.
         tokio::select! {
             result = &mut egress => match result {
                 // The guest closed its side: the shuttle reconnects per boot
                 // and drops the connection at teardown.
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {}
+                Ok(()) => RelayEnd::GuestClosed,
+                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
+                    RelayEnd::GuestClosed
+                }
                 Err(error) => {
                     tracing::warn!(%error, "egress gate relay ended on an error");
+                    RelayEnd::Failed
                 }
             },
             result = &mut ingress => match result {
@@ -1439,20 +1554,77 @@ async fn relay_frames(
                 // guest was still on it: the guest's egress is down, so say
                 // so — the guest has nothing else to tell it why — before the
                 // relay comes off.
-                Ok(Ok(())) => tracing::warn!(
-                    "the switch closed its side of the connection; the egress gate \
-                     relay is down for it"
-                ),
-                Ok(Err(error)) if error.kind() == io::ErrorKind::UnexpectedEof => {}
+                Ok(Ok(())) => {
+                    tracing::warn!(
+                        "the switch closed its side of the connection; the egress gate \
+                         relay is down for it"
+                    );
+                    RelayEnd::SwitchClosed
+                }
+                Ok(Err(error)) if error.kind() == io::ErrorKind::UnexpectedEof => {
+                    RelayEnd::SwitchClosed
+                }
                 Ok(Err(error)) => {
                     tracing::warn!(%error, "egress gate ingress leg ended on an error");
+                    RelayEnd::Failed
                 }
                 Err(error) => {
                     tracing::warn!(%error, "egress gate ingress leg ended");
+                    RelayEnd::Failed
                 }
             },
+            // A writer's clean exit is its queue closing — and a queue
+            // closes only when the leg that feeds it ended, so a writer's
+            // `Ok` is that leg's exit retold and the leg's own arm says the
+            // line. The select never chose the leg's arm when it chose the
+            // writer's, so re-awaiting the leg here is its first completed
+            // poll, never a re-poll of a finished future. The switch writer
+            // cannot exit this way at all — its queue's sender outlives the
+            // select, held by the relay itself for the egress leg — so that
+            // arm's `Ok` is unreachable by ownership. A writer's *error* is
+            // the write failure the legs used to report inline: the switch
+            // or the guest end of the connection refused the bytes, and the
+            // relay is down for it exactly as it was.
+            result = &mut switch_writer => {
+                match result {
+                    Ok(Ok(())) => {
+                        unreachable!("the switch writer's queue cannot close while the relay lives")
+                    }
+                    Ok(Err(error)) => {
+                        tracing::warn!(%error, "{SWITCH_WRITER_FAILED}");
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "egress gate switch writer ended");
+                    }
+                }
+                RelayEnd::SwitchWriter
+            },
+            result = &mut guest_writer => {
+                match result {
+                    Ok(Ok(())) => match (&mut ingress).await {
+                        Ok(Ok(())) => tracing::warn!(
+                            "the switch closed its side of the connection; the egress gate \
+                             relay is down for it"
+                        ),
+                        Ok(Err(error)) if error.kind() == io::ErrorKind::UnexpectedEof => {}
+                        Ok(Err(error)) => {
+                            tracing::warn!(%error, "egress gate ingress leg ended on an error");
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "egress gate ingress leg ended");
+                        }
+                    },
+                    Ok(Err(error)) => {
+                        tracing::warn!(%error, "{GUEST_WRITER_FAILED}");
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "egress gate guest writer ended");
+                    }
+                }
+                RelayEnd::GuestWriter
+            },
         }
-    }
+    };
     // The relay is over, whichever way it ended — the guest's clean close, an
     // error on either end, a frame claim the gate refused, or the switch
     // closing its side while the guest was still on it. What it relayed is
@@ -1484,14 +1656,111 @@ async fn relay_frames(
     // left running could still pin a DNS reply or record a reply flow for a
     // source the retires below have already cleared. Awaiting it makes it
     // gone first. A leg that already finished has had its output taken (or
-    // is done with nothing left to pin), so it is not polled again.
+    // is done with nothing left to pin), so it is not polled again. The
+    // writers go the same way, before the retires for the same reason: a
+    // writer still holding a queued frame could still write it onto a peer
+    // after the retire, and a torn write after the relay's end is the same
+    // torn write it was when the legs wrote inline.
+    //
+    // What a writer's queue still holds depends on how the relay ended. A
+    // side's clean close leaves the frames it sent before closing owed to
+    // the far end, as they were when the legs wrote inline — every frame
+    // read before the close had been written — so that direction's writer
+    // is given [`RELAY_FLUSH_TIMEOUT`] to finish its queue, which is closed
+    // by then: the switch-bound queue's sender is dropped here, the
+    // guest-bound one's went with the ingress leg. Every other writer —
+    // the other direction's, and both on an error — is aborted at once,
+    // and a frame still queued is discarded, never written: what the legs
+    // observed when they queued it — a DNS query or pin, a reply-flow
+    // record — is cleared by the retires right after. A far end that has
+    // stopped reading never holds the teardown past the bound.
     if !ingress.is_finished() {
         ingress.abort();
         let _ = (&mut ingress).await;
     }
+    drop(switch_queue);
+    if end != RelayEnd::SwitchWriter {
+        end_writer(
+            &mut switch_writer,
+            end == RelayEnd::GuestClosed,
+            SWITCH_WRITER_FAILED,
+        )
+        .await;
+    }
+    if end != RelayEnd::GuestWriter {
+        end_writer(
+            &mut guest_writer,
+            end == RelayEnd::SwitchClosed,
+            GUEST_WRITER_FAILED,
+        )
+        .await;
+    }
     pins.retire(&attributed);
     replies.retire(&attributed);
     table.report_withdrawals(carried.into_report());
+}
+
+/// One relay direction's writer: drain the frames a reader leg admitted to
+/// the peer it owns, one whole framed frame per write. The queue closing —
+/// its reader leg ending — is this task's clean exit; a write failing is
+/// the relay's write failure, reported by whichever select arm wins with
+/// it. No observation happens here: the reader legs observe, the writer
+/// only writes.
+async fn drain_frames(
+    mut queue: mpsc::Receiver<Vec<u8>>,
+    mut peer: OwnedWriteHalf,
+) -> io::Result<()> {
+    while let Some(framed) = queue.recv().await {
+        peer.write_all(&framed).await?;
+    }
+    Ok(())
+}
+
+/// The line a relay says when its switch-bound writer's write failed.
+const SWITCH_WRITER_FAILED: &str = "egress gate switch writer ended on an error";
+/// The line a relay says when its guest-bound writer's write failed.
+const GUEST_WRITER_FAILED: &str = "egress gate guest writer ended on an error";
+
+/// Ends one of a relay's writers at the relay's teardown, when the relay's
+/// race did not already take its result. With `flush`, the writer's queue is
+/// closed and it gets [`RELAY_FLUSH_TIMEOUT`] to write what the queue still
+/// holds; without it, or past the bound, the writer is aborted. Either way
+/// the writer is gone when this returns. A writer that had already failed
+/// says so here, under `failed`: the leg feeding it can notice the closed
+/// queue and end the relay on its own stand-in error first, and the write's
+/// real error — the one that names why the far end refused the bytes — would
+/// otherwise go unsaid. Aborting a finished task leaves its result in place.
+async fn end_writer(writer: &mut JoinHandle<io::Result<()>>, flush: bool, failed: &'static str) {
+    let flushed = if flush {
+        tokio::time::timeout(RELAY_FLUSH_TIMEOUT, &mut *writer)
+            .await
+            .ok()
+    } else {
+        None
+    };
+    let result = match flushed {
+        Some(result) => result,
+        None => {
+            writer.abort();
+            writer.await
+        }
+    };
+    if let Ok(Err(error)) = result {
+        tracing::warn!(%error, "{failed}");
+    }
+}
+
+/// Aborts the tasks it holds when it is dropped: the tie that makes a
+/// relay's child tasks end with the relay's own future, however that future
+/// ends — including an abort from outside, which skips its teardown.
+struct AbortOnDrop([tokio::task::AbortHandle; 3]);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        for task in &self.0 {
+            task.abort();
+        }
+    }
 }
 
 /// One control request on a connection, decided before any of it is written
@@ -3134,6 +3403,11 @@ fn status_code(head: &[u8]) -> Option<u16> {
 /// the answers its own lookups received. The read never holds: a reply that
 /// pins nothing — not from the box's resolver, not a name the row declared,
 /// refused by the rebinding intersection — still reaches the box in full.
+/// The frame is handed to the relay's guest-bound writer through the
+/// direction's bounded queue, so a guest that stops reading stalls no shared
+/// path with it: the queue fills, the frame is dropped under the
+/// `ingress-backpressure` rule ([`QueueDirection::TowardGuest`]), and the
+/// leg keeps draining the switch.
 ///
 /// One class is *written*, not only read: the reply-flow records
 /// ([`ReplyTables`], NET-040's answer half). A frame this leg delivers toward
@@ -3157,7 +3431,7 @@ fn status_code(head: &[u8]) -> Option<u16> {
 )]
 async fn relay_switch_frames_to_guest(
     mut switch: OwnedReadHalf,
-    mut guest: OwnedWriteHalf,
+    guest: mpsc::Sender<Vec<u8>>,
     table: BoxTable,
     pins: dns_pins::DnsPins,
     replies: ReplyTables,
@@ -3188,6 +3462,38 @@ async fn relay_switch_frames_to_guest(
             ));
         }
         switch.read_exact(&mut frame[..n]).await?;
+        // The queue's room is taken before anything below observes the
+        // frame, because a frame the queue has no room for is never
+        // delivered — and nothing that was not delivered may be observed as
+        // though it had been: no pin from an answer the box never saw, no
+        // reply-flow record spending a slot under the box's cap. A full
+        // queue keeps this leg reading when the guest stops reading: the
+        // frame is dropped under the backpressure rule, said once per
+        // destination per interval, and the leg goes on draining the switch.
+        // The address the line keys by is the box the frame was headed to,
+        // read off the frame itself — the destination is the per-connection
+        // identity this direction has; a frame with no IPv4 header (an ARP)
+        // names none rather than a made-up address. A refusal below (the
+        // proxy's opening packet, a flow at the box's cap) drops the permit
+        // unused, which hands its room back. The frame's L4 addressing is
+        // parsed once, here, for both the line and the observations below.
+        let l4 = dns_pins::parse_ipv4_l4(&frame[..n]);
+        let permit = match guest.try_reserve() {
+            Ok(permit) => permit,
+            Err(mpsc::error::TrySendError::Full(())) => {
+                limiter.warn_backpressure(
+                    QueueDirection::TowardGuest,
+                    l4.as_ref().map(|pkt| pkt.dst.ip().octets()),
+                );
+                continue;
+            }
+            Err(mpsc::error::TrySendError::Closed(())) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "the relay's guest writer is gone",
+                ));
+            }
+        };
         // NET-040's answer half, this gate's recording half: one frame this
         // leg is about to deliver toward a registered box, at the inside
         // port one of the box's applied publishes dials, is the one thing
@@ -3229,7 +3535,7 @@ async fn relay_switch_frames_to_guest(
         // as refusable, so the reset that decision answers it with reaches
         // the client whatever the box's egress rules say (NET-014,
         // [`ReplyTables::observe_refusable`]).
-        let delivered = dns_pins::parse_ipv4_l4(&frame[..n]).and_then(|pkt| {
+        let delivered = l4.and_then(|pkt| {
             let record = table.by_source(pkt.dst.ip().octets())?;
             let published =
                 forwards.inside_published(record.switch_addr().octets(), pkt.dst.port());
@@ -3279,19 +3585,21 @@ async fn relay_switch_frames_to_guest(
             pins.observe_reply(&table, &pkt, datagram, &limiter, Instant::now());
         }
         // One combined write keeps the length prefix and the frame together
-        // even if the guest closes between two writes.
+        // even if the guest closes between two writes; the permit taken
+        // above guarantees the queue has room for it.
         let mut framed = Vec::with_capacity(2 + n);
         framed.extend_from_slice(&(n as u16).to_le_bytes());
         framed.extend_from_slice(&frame[..n]);
-        guest.write_all(&framed).await?;
+        permit.send(framed);
     }
 }
 
 /// guest → switch: the frame relay's loop, fed by the relay's attribution,
 /// which its caller ([`relay_frames`]) files after whichever relay leg ends
 /// first: read one length-framed Ethernet frame, decide it against the
-/// host-side table ([`gate_verdict`]), and write the frame on only when it is
-/// admitted. A dropped frame is simply not written on — nothing is sent back
+/// host-side table ([`gate_verdict`]), and hand the frame to the relay's
+/// switch-bound writer only when it is admitted. A dropped frame is simply
+/// not written on — nothing is sent back
 /// toward the guest either; a drop is not a reset (NET-062) — and its class
 /// says so once per source address per rule per interval, so a flood inside
 /// the VM produces a steady, readable account of what the host is dropping
@@ -3309,7 +3617,7 @@ async fn relay_switch_frames_to_guest(
 )]
 async fn relay_frames_to_switch(
     guest: &mut Prefixed<OwnedReadHalf>,
-    switch: &mut OwnedWriteHalf,
+    switch: &mpsc::Sender<Vec<u8>>,
     table: &BoxTable,
     pins: &dns_pins::DnsPins,
     replies: &ReplyTables,
@@ -3466,11 +3774,33 @@ async fn relay_frames_to_switch(
             continue;
         }
         // One combined write keeps the length prefix and the frame together
-        // even if the switch closes between two writes.
+        // even if the switch closes between two writes — and the queue keeps
+        // this leg reading when the switch stops reading: a frame the queue
+        // has no room for is dropped under the backpressure rule, said once
+        // per source per interval, and the leg goes on draining the guest.
+        // The observations below — the forwarded flow's sequence and the
+        // DNS query — still happen only for a frame the queue took: a
+        // dropped frame never reaches the switch, so no reply comes back
+        // for it and neither may be recorded as though one could. The
+        // source's attribution above is kept on purpose: policy admitted
+        // the frame, so the address was live on this connection, and this
+        // connection's end retires it either way.
         let mut framed = Vec::with_capacity(2 + n);
         framed.extend_from_slice(&(n as u16).to_le_bytes());
         framed.extend_from_slice(&frame[..n]);
-        switch.write_all(&framed).await?;
+        match switch.try_send(framed) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                limiter.warn_backpressure(QueueDirection::TowardSwitch, summary.source());
+                continue;
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "the relay's switch writer is gone",
+                ));
+            }
+        }
         // A box's segment on a connection one of its forwards carries moves
         // the sequence number a reset at its end is built at. The table
         // updates only a connection the switch's side opened, so any other
@@ -3489,8 +3819,8 @@ async fn relay_frames_to_switch(
         // from — [`dns_pins::DnsPins::observe_query`]). The pre-check is the
         // ingress leg's own shape: UDP is most of a box's traffic and DNS a
         // sliver of it, so the datagram is read only for a frame headed to
-        // the resolver's port — and only for a frame the gate admitted, which
-        // is why this sits after the write.
+        // the resolver's port — and only for a frame the queue took, which
+        // is why this sits after the enqueue.
         if let Some((query, datagram)) = dns {
             pins.observe_query(table, &query, datagram, Instant::now());
         }
@@ -4767,6 +5097,60 @@ impl DropLimiter {
                     "dropped frames to the switch's own address from more distinct source \
                      addresses than the gate keeps a window per source for; one line per \
                      rule covers the rest",
+                );
+                true
+            }
+        }
+    }
+
+    /// Emits the warning for one frame the relay dropped at its queue because
+    /// the far end of the direction fell behind or stopped reading: the same
+    /// rate limit a drop's line answers to, keyed by the box's address and the
+    /// direction's rule, so a stalled peer says one line per direction per
+    /// interval rather than one line per dropped frame. `addr` is the box
+    /// the frame belongs to — the source of a frame toward the switch, the
+    /// destination of one toward the guest — and `none` when the frame
+    /// carries no IPv4 address to read. Returns whether a line was written.
+    fn warn_backpressure(&self, direction: QueueDirection, addr: Option<[u8; 4]>) -> bool {
+        let rule = direction.rule();
+        let toward = direction.toward();
+        match self.should_warn_at(addr, rule, Instant::now()) {
+            WarnDecision::Silent => false,
+            WarnDecision::Named => {
+                let addr = addr.map_or_else(
+                    || "none".to_string(),
+                    |addr| Ipv4Addr::from(addr).to_string(),
+                );
+                // The queue fills behind a far end that reads slower than
+                // frames arrive as surely as behind one that stopped, and
+                // the gate cannot tell the two apart, so the line names
+                // both rather than send its reader after a dead peer.
+                let message = "dropped a frame at the egress gate relay's queue; the far end of \
+                               its direction is reading slower than frames arrive, or not at \
+                               all, and the relay keeps draining rather than wedge the VM on it";
+                match direction {
+                    QueueDirection::TowardSwitch => tracing::warn!(
+                        source = %addr,
+                        toward,
+                        rule_matched = rule,
+                        "{message}",
+                    ),
+                    QueueDirection::TowardGuest => tracing::warn!(
+                        destination = %addr,
+                        toward,
+                        rule_matched = rule,
+                        "{message}",
+                    ),
+                }
+                true
+            }
+            WarnDecision::Overflow => {
+                tracing::warn!(
+                    toward,
+                    rule_matched = rule,
+                    "dropped frames at the egress gate relay's queue for more distinct \
+                     addresses than the gate keeps a window per address for; one line \
+                     per rule covers the rest",
                 );
                 true
             }
@@ -14875,6 +15259,776 @@ mod tests {
                 expect_frame(&mut h.switch).await,
                 query,
                 "an allow-list row's lookup of {name} is forwarded"
+            );
+        }
+    }
+
+    /// A relay whose guest side never reads must keep draining its switch
+    /// side: the reader and the writer of a direction are split by a bounded
+    /// queue, so a stalled far end is a dropped frame said once per
+    /// destination, not a leg blocked on a write that holds the shared paths
+    /// of the VM with it. The switch side keeps accepting frames for the
+    /// whole push.
+    ///
+    /// This is the wedge of the reported incident run at the socket level:
+    /// before the split, the ingress leg blocked on its `write_all` toward
+    /// the guest, stopped reading the switch, and the pusher's socket filled
+    /// until the whole relay — and with it the gate — wedged.
+    #[tokio::test]
+    async fn stalled_guest_keeps_switch_side_draining() {
+        let registry = BoxRegistry::new(SUBNET);
+        tcp_lan_box(&registry, LEASE);
+        let mut h = gate_over(registry).await;
+
+        // The guest side is never read: the box the frames are headed to has
+        // stopped reading. The frames are a box's inbound traffic — a full
+        // TCP segment from an outside address to the box's published port,
+        // the shape the flow retention reads — and their destination is the
+        // box's lease.
+        let inbound = dns_pins::tests::tcp_frame(
+            Ipv4Addr::new(10, 1, 2, 3),
+            40000,
+            Ipv4Addr::from(LEASE),
+            8080,
+            sessions::core::egress::TCP_SYN,
+        );
+        // ~10 MB of frames — far past the queue's budget — pushed from the
+        // switch side. The push must complete: the relay's reader keeps
+        // draining its side whatever its writer is stalled on, and the
+        // excess is dropped at the queue, said once per destination.
+        let rounds = 10 * 1024 * 1024 / (inbound.len() + 2);
+        let pushed = tokio::time::timeout(DEADLINE, async {
+            for _ in 0..rounds {
+                send_frame(&mut h.switch, &inbound).await;
+            }
+        })
+        .await;
+        assert!(
+            pushed.is_ok(),
+            "the switch side keeps draining; it does not wedge"
+        );
+
+        // The drops said so: one rate-limited line per destination address,
+        // keyed by the box the frames were headed to and naming the guest as
+        // the end that stopped reading.
+        wait_for_log(&h.log, "ingress-backpressure").await;
+        let logged = h.log.contents();
+        assert!(
+            logged.contains("destination=100.64.0.9")
+                && logged.contains("toward=\"guest\"")
+                && logged.contains("rule_matched=\"ingress-backpressure\""),
+            "the drop line carries the box's address, the stalled end and the rule, \
+             got: {logged}"
+        );
+        assert!(
+            !logged.contains("egress-backpressure"),
+            "only the guest-bound queue dropped, got: {logged}"
+        );
+    }
+
+    /// The mirror of [`stalled_guest_keeps_switch_side_draining`]: a relay
+    /// whose switch side never reads keeps draining its guest side. The
+    /// egress leg admits the frames and hands them to its queue whatever the
+    /// switch writer is stalled on; the excess is dropped at the queue, said
+    /// once per source, and the guest's push completes.
+    #[tokio::test]
+    async fn stalled_switch_keeps_guest_side_draining() {
+        let registry = BoxRegistry::new(SUBNET);
+        tcp_lan_box(&registry, LEASE);
+        let mut h = gate_over(registry).await;
+
+        // The switch side is never read: the far end of the egress direction
+        // has stopped reading. The frames are the box's declared egress — TCP
+        // inside the allowed subnet — so every one of them is admitted and
+        // handed to the queue.
+        let declared = ipv4_frame(LEASE, 6, [10, 1, 2, 3], 80);
+        let rounds = 10 * 1024 * 1024 / (declared.len() + 2);
+        let pushed = tokio::time::timeout(DEADLINE, async {
+            for _ in 0..rounds {
+                send_frame(&mut h.guest, &declared).await;
+            }
+        })
+        .await;
+        assert!(
+            pushed.is_ok(),
+            "the guest side keeps draining; it does not wedge"
+        );
+
+        // The drops said so, keyed by the source the frames came from.
+        wait_for_log(&h.log, "egress-backpressure").await;
+        let logged = h.log.contents();
+        assert!(
+            logged.contains("source=100.64.0.9")
+                && logged.contains("toward=\"switch\"")
+                && logged.contains("rule_matched=\"egress-backpressure\""),
+            "the drop line carries the source address, the stalled end and the rule, \
+             got: {logged}"
+        );
+        assert!(
+            !logged.contains("ingress-backpressure"),
+            "only the switch-bound queue dropped, got: {logged}"
+        );
+    }
+
+    /// The fast path is unchanged by the queue: with neither side stalled,
+    /// every frame arrives intact and in order on both legs, and the queue
+    /// drops nothing — the split must cost a flowing relay its exactness,
+    /// not its frames.
+    #[tokio::test]
+    async fn fast_path_delivers_every_frame_in_order() {
+        let registry = BoxRegistry::new(SUBNET);
+        tcp_lan_box(&registry, LEASE);
+        let mut h = gate_over(registry).await;
+
+        // Guest → switch: a run of distinct declared frames, each read back
+        // from the switch before the next is sent, so order and integrity
+        // are asserted per frame, not by luck of the queue's depth.
+        for round in 0u16..64 {
+            let frame = ipv4_frame(LEASE, 6, [10, 1, 2, round.rem_euclid(200) as u8], 80);
+            send_frame(&mut h.guest, &frame).await;
+            assert_eq!(
+                expect_frame(&mut h.switch).await,
+                frame,
+                "frame {round} reaches the switch intact and in order"
+            );
+        }
+
+        // Switch → guest: the mirror, a run of inbound frames each read back
+        // from the guest before the next is sent.
+        for round in 0u16..64 {
+            let frame = dns_pins::tests::tcp_frame(
+                Ipv4Addr::new(10, 1, 2, 3),
+                40000,
+                Ipv4Addr::from(LEASE),
+                8080 + round % 7,
+                sessions::core::egress::TCP_SYN,
+            );
+            send_frame(&mut h.switch, &frame).await;
+            assert_eq!(
+                expect_frame(&mut h.guest).await,
+                frame,
+                "frame {round} reaches the guest intact and in order"
+            );
+        }
+
+        // Nothing was dropped on the way through: the backpressure rule said
+        // nothing, because no queue was ever full.
+        assert!(
+            !h.log.contents().contains("backpressure"),
+            "a flowing relay drops nothing, got: {}",
+            h.log.contents()
+        );
+    }
+
+    /// Pushes `rounds` copies of `frame` into `stream` and says
+    /// whether the push completed within the deadline.
+    async fn push_frames(stream: &mut UnixStream, frame: &[u8], rounds: usize) -> bool {
+        tokio::time::timeout(DEADLINE, async {
+            for _ in 0..rounds {
+                send_frame(stream, frame).await;
+            }
+        })
+        .await
+        .is_ok()
+    }
+
+    /// Reads whole frames off `stream` until it stays silent for
+    /// [`QUIET`](super::test_support::QUIET), returning what was read: the
+    /// un-stall of a stalled end, emptying the relay's queue and the socket
+    /// behind it so the next frame read is the next frame sent.
+    async fn drain_until_quiet(stream: &mut UnixStream) -> Vec<Vec<u8>> {
+        let mut drained = Vec::new();
+        let mut len = [0u8; 2];
+        while tokio::time::timeout(super::test_support::QUIET, stream.read_exact(&mut len))
+            .await
+            .is_ok_and(|read| read.is_ok())
+        {
+            let mut frame = vec![0u8; u16::from_le_bytes(len) as usize];
+            read_within(stream, &mut frame).await;
+            drained.push(frame);
+        }
+        drained
+    }
+
+    /// A frame the guest-bound queue drops is not observed: a DNS reply that
+    /// arrives while the guest has stopped reading never reaches the box, so
+    /// it pins nothing, and the destination its answer named stays the
+    /// host's drop. The ingress leg takes the queue's room before it records
+    /// anything about a frame, so a dropped reply leaves the gate's state as
+    /// it found it.
+    #[tokio::test]
+    async fn a_reply_dropped_at_the_queue_pins_nothing() {
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register(
+            BoxRegistration::new("weather", Ipv4Addr::from(LEASE), Ipv4Addr::LOCALHOST)
+                .with_admitted_ports([8080])
+                .with_egress_policy(EgressPolicy {
+                    allow_protocols: Some(vec![sessions::IpProto::Tcp]),
+                    allow_subnets: Some(vec!["203.0.113.0/24".to_string()]),
+                    allow_dns_hosts: Some(vec!["example.com".to_string()]),
+                    deny_subnets: None,
+                }),
+        );
+        let mut h = gate_over(registry).await;
+
+        // The box's own lookup: the reply that answers it is one that would
+        // pin, were it delivered.
+        let query = dns_pins::tests::udp_payload_frame(
+            Ipv4Addr::from(LEASE),
+            40000,
+            SUBNET.dns_server(),
+            53,
+            &dns_pins::tests::dns_query("example.com"),
+        );
+        send_frame(&mut h.guest, &query).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            query,
+            "the box's own query reaches the switch, byte for byte"
+        );
+
+        // The guest stops reading, and the switch fills the guest-bound
+        // queue past its bound, so every frame from here on is dropped.
+        let filler = dns_pins::tests::tcp_frame(
+            Ipv4Addr::new(10, 1, 2, 3),
+            40000,
+            Ipv4Addr::from(LEASE),
+            8080,
+            sessions::core::egress::TCP_SYN,
+        );
+        let rounds = 10 * 1024 * 1024 / (filler.len() + 2);
+        assert!(
+            push_frames(&mut h.switch, &filler, rounds).await,
+            "the switch side keeps draining; it does not wedge"
+        );
+        wait_for_log(&h.log, "ingress-backpressure").await;
+
+        // The reply, while the queue is full — then more than any socket
+        // buffer holds behind it, so the ingress leg has read past it by the
+        // time the push completes.
+        let answer = Ipv4Addr::new(93, 184, 216, 34);
+        let reply = dns_pins::tests::udp_payload_frame(
+            SUBNET.dns_server(),
+            53,
+            Ipv4Addr::from(LEASE),
+            40000,
+            &dns_pins::tests::dns_response("example.com", &[answer]),
+        );
+        send_frame(&mut h.switch, &reply).await;
+        assert!(
+            push_frames(&mut h.switch, &filler, rounds / 2).await,
+            "the switch side keeps draining past the reply"
+        );
+
+        // The dropped reply pinned nothing: the address it named is still
+        // the host's drop, and the marker behind it is what reaches the
+        // switch.
+        let to_answer = ipv4_frame(LEASE, 6, answer.octets(), 443);
+        send_frame(&mut h.guest, &to_answer).await;
+        let marker = ipv4_frame(LEASE, 6, [203, 0, 113, 7], 443);
+        send_frame(&mut h.guest, &marker).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            marker,
+            "the answer a dropped reply named stays the host's drop; the marker did"
+        );
+        assert!(
+            !h.log
+                .contents()
+                .contains("filled the box's host-side DNS admission table"),
+            "a reply the box never received pins nothing, got: {}",
+            h.log.contents()
+        );
+    }
+
+    /// The egress mirror of [`a_reply_dropped_at_the_queue_pins_nothing`]: a
+    /// DNS query the switch-bound queue drops is not observed, so the reply
+    /// the switch later sends for it pins nothing. The egress leg observes a
+    /// query only after the queue took it; a query that never reached the
+    /// switch is no lookup of the box's, whatever reply claims to answer it.
+    #[tokio::test]
+    async fn a_query_dropped_at_the_queue_is_not_observed() {
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register(
+            BoxRegistration::new("weather", Ipv4Addr::from(LEASE), Ipv4Addr::LOCALHOST)
+                .with_admitted_ports([8080])
+                .with_egress_policy(EgressPolicy {
+                    allow_protocols: Some(vec![sessions::IpProto::Tcp]),
+                    allow_subnets: Some(vec!["203.0.113.0/24".to_string()]),
+                    allow_dns_hosts: Some(vec!["example.com".to_string()]),
+                    deny_subnets: None,
+                }),
+        );
+        let mut h = gate_over(registry).await;
+
+        // The switch stops reading, and the guest fills the switch-bound
+        // queue past its bound with declared frames, so every frame from
+        // here on is dropped.
+        let marker = ipv4_frame(LEASE, 6, [203, 0, 113, 7], 443);
+        let rounds = 10 * 1024 * 1024 / (marker.len() + 2);
+        assert!(
+            push_frames(&mut h.guest, &marker, rounds).await,
+            "the guest side keeps draining; it does not wedge"
+        );
+        wait_for_log(&h.log, "egress-backpressure").await;
+
+        // The box's lookup, while the queue is full — then more than any
+        // socket buffer holds behind it, so the egress leg has read past it
+        // by the time the push completes.
+        let query = dns_pins::tests::udp_payload_frame(
+            Ipv4Addr::from(LEASE),
+            40000,
+            SUBNET.dns_server(),
+            53,
+            &dns_pins::tests::dns_query("example.com"),
+        );
+        send_frame(&mut h.guest, &query).await;
+        assert!(
+            push_frames(&mut h.guest, &marker, rounds / 2).await,
+            "the guest side keeps draining past the query"
+        );
+
+        // The switch reads again: what the queue held reaches it, and the
+        // dropped query is not among it.
+        let drained = drain_until_quiet(&mut h.switch).await;
+        assert!(
+            !drained.contains(&query),
+            "the query was dropped at the full queue, so it never reached the switch"
+        );
+
+        // A reply matching the dropped query reaches the box — ingress is
+        // not the gate's to refuse — but pins nothing: the address it named
+        // stays the host's drop, and the marker behind it is what reaches
+        // the switch.
+        let answer = Ipv4Addr::new(93, 184, 216, 34);
+        let reply = dns_pins::tests::udp_payload_frame(
+            SUBNET.dns_server(),
+            53,
+            Ipv4Addr::from(LEASE),
+            40000,
+            &dns_pins::tests::dns_response("example.com", &[answer]),
+        );
+        send_frame(&mut h.switch, &reply).await;
+        assert_eq!(
+            expect_frame(&mut h.guest).await,
+            reply,
+            "the reply reaches the box in full"
+        );
+        send_frame(&mut h.guest, &ipv4_frame(LEASE, 6, answer.octets(), 443)).await;
+        send_frame(&mut h.guest, &marker).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            marker,
+            "a reply to a query the switch never saw pins nothing; the marker did"
+        );
+    }
+
+    /// A published port's opening packet the guest-bound queue drops opens
+    /// no reply-flow record: the ingress leg takes the queue's room before it
+    /// records a flow, so a dial the box never received spends no slot under
+    /// the box's cap. The same dial, once the guest reads again, records as
+    /// it always did — the publish was live all along.
+    #[tokio::test]
+    async fn a_dial_dropped_at_the_queue_records_no_reply_flow() {
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register(
+            BoxRegistration::new("web", Ipv4Addr::from(LEASE), Ipv4Addr::LOCALHOST)
+                .with_admitted_ports([8080])
+                .with_egress_policy(EgressPolicy {
+                    allow_protocols: None,
+                    allow_subnets: Some(vec![]),
+                    allow_dns_hosts: None,
+                    deny_subnets: None,
+                }),
+        );
+        let h = gate_over_control(
+            registry,
+            expose_request("127.0.0.1:8080", "100.64.0.9:18080", "tcp"),
+        )
+        .await;
+        let (mut guest, mut switch) = connect_over(&h).await;
+
+        // The guest stops reading, and the switch fills the guest-bound
+        // queue with mid-stream segments at a port no publish dials — frames
+        // that open nothing whether delivered or not.
+        let filler = dns_pins::tests::tcp_frame(
+            Ipv4Addr::new(10, 1, 2, 3),
+            40000,
+            Ipv4Addr::from(LEASE),
+            9999,
+            sessions::core::egress::TCP_ACK,
+        );
+        let rounds = 10 * 1024 * 1024 / (filler.len() + 2);
+        assert!(
+            push_frames(&mut switch, &filler, rounds).await,
+            "the switch side keeps draining; it does not wedge"
+        );
+        wait_for_log(&h.log, "ingress-backpressure").await;
+
+        // The forwarder's dial at the published inside port, while the
+        // queue is full, and more behind it than any socket buffer holds.
+        let dial = dns_pins::tests::tcp_frame(
+            SUBNET.gateway(),
+            40000,
+            Ipv4Addr::from(LEASE),
+            18080,
+            sessions::core::egress::TCP_SYN,
+        );
+        send_frame(&mut switch, &dial).await;
+        assert!(
+            push_frames(&mut switch, &filler, rounds / 2).await,
+            "the switch side keeps draining past the dial"
+        );
+        assert!(
+            matches!(h.replies.record_count_of(LEASE), None | Some(0)),
+            "a dial the box never received records no flow, got {:?}",
+            h.replies.record_count_of(LEASE)
+        );
+
+        // The guest reads again: the dropped dial is not among what the
+        // queue held, and the same dial sent now is delivered and recorded.
+        let drained = drain_until_quiet(&mut guest).await;
+        assert!(
+            !drained.contains(&dial),
+            "the dial was dropped at the full queue, so it never reached the box"
+        );
+        assert!(
+            matches!(h.replies.record_count_of(LEASE), None | Some(0)),
+            "nothing the queue held recorded a flow either"
+        );
+        send_frame(&mut switch, &dial).await;
+        assert_eq!(
+            expect_frame(&mut guest).await,
+            dial,
+            "the dial reaches the box once the guest reads again"
+        );
+        wait_for_log(
+            &h.log,
+            "recorded the box's first inbound flow at its published port",
+        )
+        .await;
+        assert_eq!(
+            h.replies.record_count_of(LEASE),
+            Some(1),
+            "the delivered dial is the one flow the box holds a record for"
+        );
+    }
+
+    /// One relay's stalled guest leaves the gate's other relays flowing:
+    /// two boxes on two connections through one gate, the first box's guest
+    /// end never read while its switch side floods it, and the second box's
+    /// frames still cross the gate both ways, in full. The backpressure
+    /// line names the stalled box, never the flowing one.
+    #[tokio::test]
+    async fn a_stalled_relay_leaves_another_relay_flowing() {
+        const OTHER: [u8; 4] = [100, 64, 0, 10];
+        let registry = BoxRegistry::new(SUBNET);
+        tcp_lan_box(&registry, LEASE);
+        registry.register(
+            BoxRegistration::new("api", Ipv4Addr::from(OTHER), Ipv4Addr::LOCALHOST)
+                .with_admitted_ports([8081])
+                .with_egress_policy(EgressPolicy {
+                    allow_protocols: Some(vec![sessions::IpProto::Tcp]),
+                    allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
+                    allow_dns_hosts: None,
+                    deny_subnets: None,
+                }),
+        );
+        let mut h = gate_over(registry).await;
+        let (mut other_guest, mut other_switch) = connect_over(&h).await;
+
+        // The first box stops reading; its switch side floods it.
+        let inbound = dns_pins::tests::tcp_frame(
+            Ipv4Addr::new(10, 1, 2, 3),
+            40000,
+            Ipv4Addr::from(LEASE),
+            8080,
+            sessions::core::egress::TCP_ACK,
+        );
+        let rounds = 10 * 1024 * 1024 / (inbound.len() + 2);
+        assert!(
+            push_frames(&mut h.switch, &inbound, rounds).await,
+            "the stalled box's switch side keeps draining; it does not wedge"
+        );
+        wait_for_log(&h.log, "ingress-backpressure").await;
+
+        // The second box flows both ways while the first stays stalled.
+        for round in 0u8..32 {
+            let egress = ipv4_frame(OTHER, 6, [10, 1, 2, round], 80);
+            send_frame(&mut other_guest, &egress).await;
+            assert_eq!(
+                expect_frame(&mut other_switch).await,
+                egress,
+                "the flowing box's frame {round} reaches the switch"
+            );
+            let ingress = dns_pins::tests::tcp_frame(
+                Ipv4Addr::new(10, 1, 2, round),
+                40000,
+                Ipv4Addr::from(OTHER),
+                8081,
+                sessions::core::egress::TCP_ACK,
+            );
+            send_frame(&mut other_switch, &ingress).await;
+            assert_eq!(
+                expect_frame(&mut other_guest).await,
+                ingress,
+                "the flowing box's inbound frame {round} reaches it"
+            );
+        }
+
+        let logged = h.log.contents();
+        assert!(
+            logged.contains("destination=100.64.0.9")
+                && !logged.contains("destination=100.64.0.10")
+                && !logged.contains("source=100.64.0.10"),
+            "the backpressure line names the stalled box only, got: {logged}"
+        );
+    }
+
+    /// A relay writer's clean exit: every frame its queue held is written to
+    /// the peer, whole and in order, and the queue closing ends the writer
+    /// without error — the arm a reader leg's end is retold through.
+    #[tokio::test]
+    async fn drain_frames_writes_its_queue_then_exits_when_the_queue_closes() {
+        let (ours, mut theirs) = UnixStream::pair().expect("a socket pair");
+        let (_read, write) = ours.into_split();
+        let (queue, drain) = mpsc::channel(4);
+        queue
+            .send(b"one".to_vec())
+            .await
+            .expect("the queue is open");
+        queue
+            .send(b"two".to_vec())
+            .await
+            .expect("the queue is open");
+        drop(queue);
+        let result = tokio::time::timeout(DEADLINE, super::drain_frames(drain, write))
+            .await
+            .expect("the writer exits once its queue closes");
+        assert!(result.is_ok(), "a closed queue is a clean exit: {result:?}");
+        let mut written = [0u8; 6];
+        read_within(&mut theirs, &mut written).await;
+        assert_eq!(
+            &written, b"onetwo",
+            "every queued frame is written, in order"
+        );
+    }
+
+    /// A relay writer's error exit: a peer that is gone refuses the write,
+    /// and the writer returns the error — the write failure the relay's
+    /// select reports and ends on.
+    #[tokio::test]
+    async fn drain_frames_reports_a_write_the_peer_refuses() {
+        let (ours, theirs) = UnixStream::pair().expect("a socket pair");
+        drop(theirs);
+        let (_read, write) = ours.into_split();
+        let (queue, drain) = mpsc::channel(4);
+        queue.send(vec![0u8; 64]).await.expect("the queue is open");
+        let result = tokio::time::timeout(DEADLINE, super::drain_frames(drain, write))
+            .await
+            .expect("the writer exits on the refused write");
+        assert!(result.is_err(), "a refused write is the writer's error");
+        drop(queue);
+    }
+
+    /// How many full-size frames the clean-close proofs send into a far end
+    /// that is not reading yet: more bytes than a socket buffer holds, so
+    /// most of them are still in the relay's queue when the sender closes,
+    /// and fewer frames than [`RELAY_QUEUE_FRAMES`](super::RELAY_QUEUE_FRAMES),
+    /// so the queue drops none of them.
+    const CLOSING_FRAMES: u16 = 400;
+
+    /// `frame` padded to the largest frame the gate relays, so a run of them
+    /// outgrows a socket buffer quickly.
+    fn full_size(mut frame: Vec<u8>) -> Vec<u8> {
+        frame.resize(super::max_frame(), 0);
+        frame
+    }
+
+    /// A guest's clean close loses nothing it sent first. The switch is not
+    /// reading while the guest sends, so its socket fills and the rest of
+    /// the frames the egress leg admitted wait in the switch-bound queue;
+    /// the guest then closes, and only then does the switch read. Every
+    /// frame arrives, in order: the relay's teardown lets the writer finish
+    /// its queue before it goes — the box's closing segments, sent just
+    /// before its shuttle went away, reach the switch as they did when the
+    /// leg wrote inline.
+    #[tokio::test]
+    async fn a_guest_close_still_delivers_what_it_sent_first() {
+        let registry = BoxRegistry::new(SUBNET);
+        tcp_lan_box(&registry, LEASE);
+        let mut h = gate_over(registry).await;
+
+        let frames: Vec<Vec<u8>> = (0..CLOSING_FRAMES)
+            .map(|round| {
+                let [high, low] = round.to_be_bytes();
+                full_size(ipv4_frame(LEASE, 6, [10, 1, high, low], 80))
+            })
+            .collect();
+        for frame in &frames {
+            send_frame(&mut h.guest, frame).await;
+        }
+        // The close and the reads below stay sequential on purpose; a review
+        // proposed running `shutdown` and the receive loop concurrently
+        // (`tokio::join!`) so the writer's flush deadline could not lapse
+        // before the peer starts reading. It does not apply: on this
+        // current-thread runtime `UnixStream::shutdown` resolves on its first
+        // poll without yielding, so the relay task cannot observe the close
+        // until the test first yields — inside the first `expect_frame` below
+        // — and the receive is already in progress when the flush bound
+        // starts, exactly the schedule a join would run. The sequential form
+        // also keeps the property this test exists for: the peer reads
+        // nothing until the sender has closed, so the frames are provably
+        // still in the relay's queue at the close. CodeRabbit withdrew the
+        // finding after review (gominimal/minimal#2158); the switch-side
+        // mirror below shares this reasoning.
+        h.guest
+            .shutdown()
+            .await
+            .expect("the guest closes its sending side");
+        for (round, frame) in frames.iter().enumerate() {
+            assert_eq!(
+                &expect_frame(&mut h.switch).await,
+                frame,
+                "frame {round}, sent before the close, reaches the switch"
+            );
+        }
+        assert!(
+            !h.log.contents().contains("backpressure"),
+            "the queue held every frame, got: {}",
+            h.log.contents()
+        );
+    }
+
+    /// The mirror of [`a_guest_close_still_delivers_what_it_sent_first`]:
+    /// the frames the switch sent a guest that was not reading yet, before
+    /// closing its side, still reach the guest.
+    #[tokio::test]
+    async fn a_switch_close_still_delivers_what_it_sent_first() {
+        let registry = BoxRegistry::new(SUBNET);
+        tcp_lan_box(&registry, LEASE);
+        let mut h = gate_over(registry).await;
+
+        let frames: Vec<Vec<u8>> = (0..CLOSING_FRAMES)
+            .map(|round| {
+                let [high, low] = round.to_be_bytes();
+                full_size(dns_pins::tests::tcp_frame(
+                    Ipv4Addr::new(10, 1, high, low),
+                    40000,
+                    Ipv4Addr::from(LEASE),
+                    8080,
+                    sessions::core::egress::TCP_ACK,
+                ))
+            })
+            .collect();
+        for frame in &frames {
+            send_frame(&mut h.switch, frame).await;
+        }
+        h.switch
+            .shutdown()
+            .await
+            .expect("the switch closes its sending side");
+        for (round, frame) in frames.iter().enumerate() {
+            assert_eq!(
+                &expect_frame(&mut h.guest).await,
+                frame,
+                "frame {round}, sent before the close, reaches the guest"
+            );
+        }
+        assert!(
+            !h.log.contents().contains("backpressure"),
+            "the queue held every frame, got: {}",
+            h.log.contents()
+        );
+    }
+
+    /// A stalled switch never holds a relay's teardown: the guest floods a
+    /// switch that has stopped reading, then closes, and the relay still
+    /// comes down — the flush its clean close earns is bounded, and the
+    /// writer is aborted past the bound. The guest sees the relay's end as
+    /// the close of its own connection.
+    #[tokio::test]
+    async fn a_stalled_switch_does_not_hold_the_relay_past_a_guest_close() {
+        let registry = BoxRegistry::new(SUBNET);
+        tcp_lan_box(&registry, LEASE);
+        let mut h = gate_over(registry).await;
+
+        let declared = ipv4_frame(LEASE, 6, [10, 1, 2, 3], 80);
+        let rounds = 10 * 1024 * 1024 / (declared.len() + 2);
+        assert!(
+            push_frames(&mut h.guest, &declared, rounds).await,
+            "the guest side keeps draining; it does not wedge"
+        );
+        h.guest
+            .shutdown()
+            .await
+            .expect("the guest closes its sending side");
+        let mut rest = Vec::new();
+        let closed = tokio::time::timeout(DEADLINE, h.guest.read_to_end(&mut rest)).await;
+        assert!(
+            closed.is_ok_and(|read| read.is_ok()),
+            "the relay ends, and closes the guest's connection, while the switch stays stalled"
+        );
+    }
+
+    /// A writer that failed before the relay's teardown reached it says its
+    /// own error there: the leg feeding it can end the relay first, on the
+    /// closed queue, and the write's real error would otherwise go unsaid.
+    /// An aborted writer says nothing — its end is the relay's own doing.
+    #[tokio::test]
+    async fn end_writer_says_the_error_of_a_writer_that_already_failed() {
+        let (log, _guard) = super::test_support::capture_log();
+        let mut failed = tokio::spawn(async {
+            Err::<(), _>(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "the peer refused the bytes",
+            ))
+        });
+        while !failed.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        super::end_writer(&mut failed, false, super::SWITCH_WRITER_FAILED).await;
+        let logged = log.contents();
+        assert!(
+            logged.contains(super::SWITCH_WRITER_FAILED)
+                && logged.contains("the peer refused the bytes"),
+            "the failed writer's own error is said, got: {logged}"
+        );
+
+        let mut stalled = tokio::spawn(std::future::pending::<io::Result<()>>());
+        tokio::time::timeout(
+            DEADLINE,
+            super::end_writer(&mut stalled, true, super::GUEST_WRITER_FAILED),
+        )
+        .await
+        .expect("a writer that never finishes is aborted past the flush bound");
+        assert!(stalled.is_finished(), "the stalled writer is gone");
+        assert!(
+            !log.contents().contains(super::GUEST_WRITER_FAILED),
+            "an aborted writer is not a failed write, got: {}",
+            log.contents()
+        );
+    }
+
+    /// The relay's children end with the relay: dropping the guard aborts
+    /// the tasks it holds, so a relay aborted from outside — which never
+    /// reaches its own teardown — detaches none of them.
+    #[tokio::test]
+    async fn abort_on_drop_ends_the_tasks_it_holds() {
+        let tasks = [
+            tokio::spawn(std::future::pending::<()>()),
+            tokio::spawn(std::future::pending::<()>()),
+            tokio::spawn(std::future::pending::<()>()),
+        ];
+        let guard = super::AbortOnDrop(tasks.each_ref().map(tokio::task::JoinHandle::abort_handle));
+        drop(guard);
+        for task in tasks {
+            let ended = tokio::time::timeout(DEADLINE, task)
+                .await
+                .expect("an aborted task ends");
+            assert!(
+                ended.is_err_and(|error| error.is_cancelled()),
+                "the guard's drop cancelled the task"
             );
         }
     }
