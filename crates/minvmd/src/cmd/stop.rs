@@ -201,6 +201,19 @@ fn signal_and_wait(pid: u32) -> Result<()> {
     Ok(())
 }
 
+/// How a signal stop ended ([`graceful_stop_from_signal`]).
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SignalStop {
+    /// The VM was running: the supervisor's main thread reaped the VMM and
+    /// wrote `Stopped`, and it ends the process once its teardown returns.
+    TeardownFinished,
+    /// The VM was still booting: the VMM is signalled and `Stopped` is
+    /// written here, because the main thread is still inside its READY wait
+    /// and will not return in time. The caller ends the process.
+    BootAborted,
+}
+
 /// Graceful stop as the `run` supervisor's signal watcher runs it: quiesce
 /// the guest over the bridge UDS, signal the recorded VMM child, then wait
 /// for the supervisor's own teardown to write the `Stopped` state.
@@ -213,31 +226,42 @@ fn signal_and_wait(pid: u32) -> Result<()> {
 /// caller falls back to dying by the signal as before, so the process
 /// still terminates.
 ///
+/// A signal during `Starting` (a cold boot spends tens of seconds there)
+/// aborts the boot instead: there is no guest daemon to ask yet, so the
+/// recorded VMM child is signalled without a quiesce and `Stopped` is
+/// written here. The main thread is inside its READY wait then, where it
+/// neither reaps the child nor returns before the deadline; without this
+/// the supervisor would die by the signal and orphan the VMM, which holds
+/// the inherited alive lock.
+///
 /// Everything runs against `deadline` (the signal's arrival plus
 /// [`SIGNAL_STOP_BOUND`] in production): the guest ask gets what is left
 /// after [`SIGNAL_STOP_TEARDOWN_RESERVE`], so a wedged or slow guest cannot
 /// hold the stop past the service manager's timeout, and the `Stopped`
 /// wait ends at the deadline.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
-pub(crate) fn graceful_stop_from_signal(state_dir_path: PathBuf, deadline: Instant) -> Result<()> {
+pub(crate) fn graceful_stop_from_signal(
+    state_dir_path: PathBuf,
+    deadline: Instant,
+) -> Result<SignalStop> {
     let state_dir = StateDir::new(state_dir_path.clone())
         .with_context(|| format!("opening state dir: {}", state_dir_path.display()))?;
 
     // Snapshot the lifecycle under the write lock, as `stop` does, so no
     // concurrent `stop` or transition interleaves with the decision; the
     // quiesce, the signal, and the Stopped wait all run without it, exactly
-    // as `stop` releases the lock during its waits. A `Running` state with a
-    // pid is the only case this path owns — every other transition belongs
-    // to `stop` — and the pid guard keeps a recycled pid from being
-    // signalled.
-    let vmm_pid = {
+    // as `stop` releases the lock during its waits. A `Running` or
+    // `Starting` state with a pid is all this path owns — every other
+    // transition belongs to `stop` — and the pid guard keeps a recycled pid
+    // from being signalled.
+    let (lifecycle, vmm_pid) = {
         let mut lock = state_dir
             .lifecycle_lock()
             .context("opening lifecycle lock")?;
         let _guard = lock.write().context("acquiring lifecycle write lock")?;
         let state = state_dir.read_state().context("reading state")?;
         match (state.lifecycle, state.vmm_pid) {
-            (Lifecycle::Running, Some(pid)) => pid,
+            (lifecycle @ (Lifecycle::Running | Lifecycle::Starting), Some(pid)) => (lifecycle, pid),
             _ => bail!(
                 "refusing signal stop: lifecycle is {:?}, vmm pid is {:?}",
                 state.lifecycle,
@@ -245,6 +269,10 @@ pub(crate) fn graceful_stop_from_signal(state_dir_path: PathBuf, deadline: Insta
             ),
         }
     };
+
+    if lifecycle == Lifecycle::Starting {
+        return abort_boot_from_signal(&state_dir, vmm_pid, deadline);
+    }
 
     // Same best-effort quiesce as `stop`: a failure here logs and falls
     // through to the signal, so a wedged guest cannot stall termination.
@@ -275,7 +303,62 @@ pub(crate) fn graceful_stop_from_signal(state_dir_path: PathBuf, deadline: Insta
         let state = state_dir.read_state().context("reading state")?;
         if matches!(state.lifecycle, Lifecycle::Stopped) {
             tracing::info!("supervisor teardown finished; signal stop complete");
-            return Ok(());
+            return Ok(SignalStop::TeardownFinished);
+        }
+        if Instant::now() >= deadline {
+            bail!("supervisor did not write Stopped before the signal-stop deadline");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// The `Starting` half of [`graceful_stop_from_signal`]: signal the booting
+/// VMM child, then write `Stopped`.
+///
+/// A boot may respawn the VMM while the lifecycle stays `Starting` (the
+/// publish-port redraw), so the recorded pid is read again under the write
+/// lock after each signal, and a child recorded meanwhile is signalled too.
+/// Once `Stopped` is written under that lock the main thread's own
+/// lifecycle check kills any child it spawns later. A boot that reached
+/// `Running` meanwhile has had its VMM signalled, so the main thread's
+/// teardown writes `Stopped`; that record is waited for until `deadline`.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn abort_boot_from_signal(
+    state_dir: &StateDir,
+    mut pid: u32,
+    deadline: Instant,
+) -> Result<SignalStop> {
+    loop {
+        tracing::info!(pid, "stop signal during boot; signalling the VMM child");
+        quiesce_then_signal(None, pid).context("stopping the booting VMM after signal")?;
+
+        let mut lock = state_dir
+            .lifecycle_lock()
+            .context("opening lifecycle lock")?;
+        let _guard = lock.write().context("acquiring lifecycle write lock")?;
+        let state = state_dir.read_state().context("reading state")?;
+        match (state.lifecycle, state.vmm_pid) {
+            (Lifecycle::Starting, Some(respawned)) if respawned != pid => {
+                if Instant::now() >= deadline {
+                    bail!("the boot kept respawning the VMM past the signal-stop deadline");
+                }
+                pid = respawned;
+            }
+            (Lifecycle::Starting, _) => {
+                state_dir
+                    .write_state(&State::stopped())
+                    .context("writing Stopped state after aborting the boot")?;
+                tracing::info!("boot aborted; signal stop complete");
+                return Ok(SignalStop::BootAborted);
+            }
+            (Lifecycle::Stopped, _) => return Ok(SignalStop::BootAborted),
+            _ => break,
+        }
+    }
+    loop {
+        let state = state_dir.read_state().context("reading state")?;
+        if matches!(state.lifecycle, Lifecycle::Stopped) {
+            return Ok(SignalStop::TeardownFinished);
         }
         if Instant::now() >= deadline {
             bail!("supervisor did not write Stopped before the signal-stop deadline");
@@ -462,6 +545,57 @@ mod tests {
             graceful_stop_from_signal(tmp.path().to_path_buf(), Instant::now() + SIGNAL_STOP_BOUND)
                 .expect_err("must refuse a Running state with no pid");
         assert!(err.to_string().contains("refusing signal stop"));
+
+        // Starting before the VMM is spawned: no child to signal either.
+        sd.write_state(&State {
+            lifecycle: Lifecycle::Starting,
+            ..State::stopped()
+        })
+        .unwrap();
+        let err =
+            graceful_stop_from_signal(tmp.path().to_path_buf(), Instant::now() + SIGNAL_STOP_BOUND)
+                .expect_err("must refuse a Starting state with no pid");
+        assert!(err.to_string().contains("refusing signal stop"));
+    }
+
+    #[test]
+    fn signal_stop_during_boot_signals_the_vmm_and_writes_stopped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sd = make_state_dir(&tmp);
+
+        // The booting "VMM child". The supervisor's main thread is inside
+        // its READY wait at this point: it writes no `Stopped` record, so
+        // the signal stop has to. The reaper only keeps the signalled child
+        // from lingering as a zombie through the whole SIGTERM grace.
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        sd.write_state(&State {
+            lifecycle: Lifecycle::Starting,
+            vmm_pid: Some(child.id()),
+            ..State::stopped()
+        })
+        .unwrap();
+        let reaper = std::thread::spawn(move || child.wait().expect("wait for signalled child"));
+
+        let outcome =
+            graceful_stop_from_signal(tmp.path().to_path_buf(), Instant::now() + SIGNAL_STOP_BOUND)
+                .expect("signal stop during boot");
+        assert_eq!(outcome, SignalStop::BootAborted);
+
+        let status = reaper.join().expect("reaper thread");
+        {
+            use std::os::unix::process::ExitStatusExt as _;
+            assert_eq!(
+                status.signal(),
+                Some(libc::SIGTERM),
+                "the booting VMM must be ended by the stop's signal; got {status:?}"
+            );
+        }
+        let state = sd.read_state().unwrap();
+        assert_eq!(state.lifecycle, Lifecycle::Stopped);
+        assert_eq!(state.vmm_pid, None);
     }
 
     #[test]

@@ -544,7 +544,11 @@ fn run_foreground() -> Result<()> {
     // `SIGNAL_STOP_BOUND` from the signal's arrival; when it cannot run,
     // fails, or the teardown overruns that deadline, the watcher dies by
     // the signal itself. A second signal meanwhile ends the process at
-    // once.
+    // once. A signal during the boot, before `Running`, aborts the boot:
+    // the VMM child is signalled without a guest ask (no guest daemon is
+    // up to take one), the watcher writes `Stopped`, and it ends the
+    // process by the signal, since the main thread is still in its READY
+    // wait.
     //
     // Not covered: a terminal Ctrl-C on a foreground run. The VMM child
     // shares the terminal's foreground process group, so the tty delivers
@@ -559,11 +563,18 @@ fn run_foreground() -> Result<()> {
             .map_or_else(std::time::Instant::now, |(_, at)| at)
             + crate::cmd::stop::SIGNAL_STOP_BOUND;
         match crate::cmd::stop::graceful_stop_from_signal(signal_state_dir, deadline) {
-            Ok(()) => {
+            Ok(crate::cmd::stop::SignalStop::TeardownFinished) => {
                 // The main thread normally ends the process by the signal
                 // once its teardown returns; this is the backstop.
                 tracing::info!(signum, "graceful stop after signal complete");
                 std::thread::sleep(deadline.saturating_duration_since(std::time::Instant::now()));
+                crate::control::die_by_signal(signum);
+            }
+            Ok(crate::cmd::stop::SignalStop::BootAborted) => {
+                // The main thread is still waiting for READY and would not
+                // return before the deadline, so the watcher ends the
+                // process.
+                tracing::info!(signum, "boot aborted after signal; dying by signal");
                 crate::control::die_by_signal(signum);
             }
             Err(e) => {
