@@ -4012,19 +4012,157 @@ async fn range_present_on_host() -> bool {
         })
 }
 
-/// What the proxy's surface line ends with (NET-122): the opt-in step that
-/// makes `*.{ZONE}` names resolve for every host program, named and never
-/// run.
-pub const FINALIZE_INSTALL_POINTER: &str =
-    "; for these names in a browser or other host programs, run `min finalize-install`";
+/// The command the install clause points at (NET-122): the installed CLI's
+/// own verb, named and never run.
+pub const FINALIZE_INSTALL: &str = "min finalize-install";
 
-/// The name-surface line a session start prints (NET-018, NET-122): the
-/// verdict's surface, or, with no verdict (the answerer not bound yet), the
-/// proxy's, which is the live surface then and whose line points at
-/// `min finalize-install`. A start with an answerer port never goes without the
-/// pointer.
-pub fn start_name_surface_line(verdict: Option<LiveSurface>, proxy_port: Option<u16>) -> String {
-    name_surface_line(verdict.unwrap_or(LiveSurface::Proxy), proxy_port)
+/// The install facts the host line reads beyond the surface verdict
+/// (NET-018): the names item is the surface verdict itself, so only the
+/// other items' state travels here.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HostInstall {
+    /// A finalize-install item other than names is not done on this host —
+    /// the ones `min finalize-install --show` lists for it, under the same
+    /// scoping the plan applies (a VM-backed daemon carries no classifier
+    /// item, a native one no KVM item).
+    pub other_items_unfinished: bool,
+}
+
+/// Whether this host's install is unfinished (NET-018, NET-122): the names
+/// item is done exactly when the surface is native, and any other item
+/// not done counts the same.
+#[must_use]
+pub fn install_unfinished(surface: &LiveSurface, host: HostInstall) -> bool {
+    *surface != LiveSurface::Native || host.other_items_unfinished
+}
+
+/// The install clause both verbs end their surface line with while this
+/// host's install is unfinished (NET-018, NET-122): the one command that
+/// finishes it. Empty on a finished host, so the line carries no pointer
+/// then.
+#[must_use]
+pub fn install_clause(unfinished: bool) -> &'static str {
+    if unfinished {
+        "; finish setup: min finalize-install"
+    } else {
+        ""
+    }
+}
+
+/// The one host line a session start prints (NET-018), naming the box:
+/// `names: <box>.min.internal resolves in any browser on this machine`
+/// where native DNS is deployed, `names: <box>.min.internal via
+/// 127.0.0.1:<port>` where it is not, and — independently — the clause
+/// `; finish setup: min finalize-install` while any finalize-install item
+/// is not done. One line, never a block, so the activation's own output
+/// stays what the operator reads. Pure, so tests assert the words without
+/// capturing stderr. [`host_line_beside`] is the same line with a
+/// proxy-down cause (NET-020) in place of the resolution half.
+#[must_use]
+pub fn host_line(
+    box_name: &str,
+    surface: &LiveSurface,
+    proxy_port: Option<u16>,
+    host: HostInstall,
+) -> String {
+    host_line_beside(box_name, surface, proxy_port, host, None)
+}
+
+/// [`host_line`] beside a proxy-down cause (NET-020), in both of the
+/// line's forms: when the hostname proxy failed to bind — the VM host
+/// daemon's sibling cause, or a native daemon's own report — the cause
+/// replaces the resolution half, `names: <box>.min.internal: the hostname
+/// proxy is not serving — <cause>`, whatever the surface verdict says — the
+/// box stays named, the cause says why its name is not routed — because a
+/// name the line claims resolves while the proxy is down is the claim a
+/// failing lookup contradicts first. The install clause is still the verdict's: a host
+/// whose native DNS is deployed and whose every item is done has nothing
+/// to finish, proxy down or not.
+#[must_use]
+pub fn host_line_beside(
+    box_name: &str,
+    surface: &LiveSurface,
+    proxy_port: Option<u16>,
+    host: HostInstall,
+    proxy_cause: Option<&str>,
+) -> String {
+    let name = format!("{box_name}.{ZONE}");
+    // The not-serving arms keep the box named: the line's contract is one
+    // host line naming the box, and a reader whose proxy is down is the one
+    // who most needs to know which name the cause is about.
+    let names = match (proxy_cause, surface) {
+        (Some(cause), _) => format!("{name}: the hostname proxy is not serving — {cause}"),
+        (None, LiveSurface::Native) => {
+            format!("{name} resolves in any browser on this machine")
+        }
+        (None, LiveSurface::Proxy) => match proxy_port {
+            Some(port) => format!("{name} via 127.0.0.1:{port}"),
+            None => format!("{name}: the hostname proxy is not serving"),
+        },
+        (None, LiveSurface::ProxyNotServing { port, cause }) => {
+            format!(
+                "{name}: the hostname proxy is not serving — {}",
+                proxy_down_detail(*port, cause)
+            )
+        }
+    };
+    format!(
+        "names: {names}{}",
+        install_clause(install_unfinished(surface, host))
+    )
+}
+
+/// The proxy-down cause a session start's host line names (NET-020), from
+/// either report the create reply can carry: the VM host daemon's sibling
+/// cause, in the words [`name_surface_line`]'s folded arm uses, or a native
+/// daemon's own reason for its hostname proxy not serving. `None` while the
+/// proxy serves. The sibling wins where both are present: it names the
+/// port the host reserved, which the daemon inside the VM cannot see.
+#[must_use]
+pub fn host_line_proxy_cause(
+    proxy_down: Option<&ProxyDown>,
+    routing_unavailable: Option<&str>,
+) -> Option<String> {
+    proxy_down
+        .map(|down| proxy_down_detail(down.port, &down.cause))
+        .or_else(|| routing_unavailable.map(str::to_string))
+}
+
+/// The named cause of a proxy that is not serving (T93), the words both
+/// verbs' lines carry after their own prefix: the port the failure is
+/// about and the thing to free — another process on the host, or a redraw
+/// that ran out of tries — because a user who cannot resolve a name needs
+/// which port to check, not the fact that something failed.
+fn proxy_down_detail(port: u16, cause: &ProxyDownCause) -> String {
+    match cause {
+        ProxyDownCause::PortHeld => {
+            format!("another process on the host holds 127.0.0.1:{port}")
+        }
+        ProxyDownCause::RedrawsRanOut => format!(
+            "its publication was redrawn and the redraws ran out; the last \
+             port was 127.0.0.1:{port}"
+        ),
+        // The VM is up, but the VM host daemon never saw the publish land:
+        // no report from the guest, and no listener on the port it could
+        // attribute to this VM. Said as unconfirmed, never as serving,
+        // until the guest's report clears it.
+        ProxyDownCause::PublishUnconfirmed => format!(
+            "the VM is up, but the VM host daemon has not seen the hostname \
+             proxy publish on 127.0.0.1:{port}; names may not route through it \
+             until the guest reports the publish"
+        ),
+        // The guest's late report refused the port after the VM came up:
+        // the VM keeps running with no hostname proxy, so this is said as a
+        // running VM's state, never in the start failure's words — the
+        // port, who holds it, and that the VM is up.
+        ProxyDownCause::PortHeldAfterStart { holder } => {
+            let holder = holder.as_deref().unwrap_or("another process on the host");
+            format!(
+                "the VM is up without a hostname proxy: {holder} holds 127.0.0.1:{port}; \
+                 free the port and restart the VM to publish it"
+            )
+        }
+    }
 }
 
 /// NET-018's report: the line `min ls` and `min session activate` print,
@@ -4048,55 +4186,34 @@ pub fn name_surface_line(surface: LiveSurface, proxy_port: Option<u16>) -> Strin
              the zone answerer and each box's own reserved-range address{proxy_half}"
         ),
         // The proxy as the live surface is the host not set up for native
-        // names (NET-122's opt-in): the line names the step that is, and
-        // nothing on the start's path prints or runs it.
+        // names (NET-122's opt-in): the install clause `min ls` appends to
+        // this row names the step that is, and nothing on either verb's
+        // path prints or runs it.
         LiveSurface::Proxy => match proxy_port {
             Some(port) => format!(
                 "the hostname proxy is the live name surface · <name>.min.internal \
-                 routes through it on 127.0.0.1:{port}{FINALIZE_INSTALL_POINTER}"
+                 routes through it on 127.0.0.1:{port}"
             ),
             None => "the hostname proxy is the live name surface; it is not serving".to_string(),
         },
-        // The named cause replaces the bare "not serving": the port the
-        // failure is about and the thing to free — another process on the
-        // host, or a redraw that ran out of tries — because a user who
-        // cannot resolve a name needs which port to check, not the fact
-        // that something failed (T93). The port comes from the verdict,
-        // not `proxy_port`: a reply whose proxy never published carries
-        // no serving port to name.
-        LiveSurface::ProxyNotServing { port, cause } => match cause {
-            ProxyDownCause::PortHeld => format!(
-                "the hostname proxy is the live name surface; it is not serving — \
-                 another process on the host holds 127.0.0.1:{port}"
-            ),
-            ProxyDownCause::RedrawsRanOut => format!(
-                "the hostname proxy is the live name surface; it is not serving — \
-                 its publication was redrawn and the redraws ran out; the last \
-                 port was 127.0.0.1:{port}"
-            ),
-            // The VM is up, but the VM host daemon never saw the publish
-            // land: no report from the guest, and no listener on the port
-            // it could attribute to this VM. Said as unconfirmed, never as
-            // serving, until the guest's report clears it.
-            ProxyDownCause::PublishUnconfirmed => format!(
-                "hostname proxy publish unconfirmed · the VM is up, but the VM \
-                 host daemon has not seen the hostname proxy publish on \
-                 127.0.0.1:{port}; names may not route through it until the \
-                 guest reports the publish"
-            ),
-            // The guest's late report refused the port after the VM came
-            // up: the VM keeps running with no hostname proxy, so this is
-            // said as a running VM's state, never in the start failure's
-            // words — the port, who holds it, and that the VM is up.
-            ProxyDownCause::PortHeldAfterStart { holder } => {
-                let holder = holder.as_deref().unwrap_or("another process on the host");
-                format!(
-                    "the hostname proxy is not serving · the VM is up without a hostname \
-                     proxy: {holder} holds 127.0.0.1:{port}; free the port and restart \
-                     the VM to publish it"
-                )
+        // The named cause replaces the bare "not serving" (T93), in the
+        // words [`proxy_down_detail`] spells for both verbs. The port comes
+        // from the verdict, not `proxy_port`: a reply whose proxy never
+        // published carries no serving port to name.
+        LiveSurface::ProxyNotServing { port, cause } => {
+            let detail = proxy_down_detail(port, &cause);
+            match cause {
+                ProxyDownCause::PortHeld | ProxyDownCause::RedrawsRanOut => format!(
+                    "the hostname proxy is the live name surface; it is not serving — {detail}"
+                ),
+                ProxyDownCause::PublishUnconfirmed => {
+                    format!("hostname proxy publish unconfirmed · {detail}")
+                }
+                ProxyDownCause::PortHeldAfterStart { .. } => {
+                    format!("the hostname proxy is not serving · {detail}")
+                }
             }
-        },
+        }
     }
 }
 
@@ -4765,29 +4882,41 @@ mod tests {
     }
 
     /// NET-122's opt-in: a session start never prints the privileged step.
-    /// While the host is not set up for native names the proxy is the live
-    /// surface, and its line — the one both verbs print — points at `min
-    /// finalize-install`, on one line. A host whose native surface is live is set
-    /// up, and its line carries no pointer; neither does a proxy that is
-    /// down, whose line names what to free instead.
+    /// While the host is not set up for native names the one host line the
+    /// start prints ends with the `min finalize-install` pointer — one line,
+    /// never a block, no script and no advisory. A host whose install is
+    /// finished carries no pointer; `min ls`'s own surface row carries the
+    /// pointer only as the same install clause, never on its own words.
     #[test]
     fn session_start_points_at_finalize_install_without_the_advisory() {
-        let proxy = name_surface_line(LiveSurface::Proxy, Some(15390));
-        assert!(
-            proxy.ends_with(
-                "routes through it on 127.0.0.1:15390; for these names in a browser or \
-                 other host programs, run `min finalize-install`"
-            ),
-            "{proxy}"
+        let unfinished = host_line(
+            "web",
+            &LiveSurface::Proxy,
+            Some(15390),
+            HostInstall::default(),
         );
-        assert_eq!(proxy.lines().count(), 1, "{proxy}");
         assert!(
-            !proxy.contains("#!/bin/sh") && !proxy.contains("sudo") && !proxy.contains("note:"),
-            "the line names the step, never the step's script: {proxy}"
+            unfinished.ends_with("; finish setup: min finalize-install"),
+            "{unfinished}"
         );
+        assert_eq!(unfinished.lines().count(), 1, "{unfinished}");
+        assert!(
+            !unfinished.contains("#!/bin/sh")
+                && !unfinished.contains("sudo")
+                && !unfinished.contains("note:"),
+            "the line names the step, never the step's script: {unfinished}"
+        );
+        let finished = host_line(
+            "web",
+            &LiveSurface::Native,
+            Some(15390),
+            HostInstall::default(),
+        );
+        assert!(!finished.contains("min finalize-install"), "{finished}");
         for line in [
             name_surface_line(LiveSurface::Native, Some(15390)),
             name_surface_line(LiveSurface::Native, None),
+            name_surface_line(LiveSurface::Proxy, Some(15390)),
             name_surface_line(LiveSurface::Proxy, None),
             name_surface_line(
                 LiveSurface::ProxyNotServing {
@@ -4797,7 +4926,228 @@ mod tests {
                 None,
             ),
         ] {
-            assert!(!line.contains("min finalize-install"), "{line}");
+            assert!(
+                !line.contains("min finalize-install"),
+                "the surface row's own words carry no pointer; the install clause does: {line}"
+            );
+        }
+    }
+
+    /// NET-018: the start prints one host line naming the box. Its name
+    /// half is keyed on the host-DNS state — native DNS deployed, the name
+    /// resolves in any browser; not deployed, it routes via the proxy's
+    /// port — and, independently, the line carries `; finish setup: min
+    /// finalize-install` while any finalize-install item is not done. A
+    /// proxy-down cause (NET-020) replaces the resolution half in both
+    /// forms, with the clause as it was.
+    #[test]
+    fn activate_prints_one_host_line_per_install_state() {
+        let others_open = HostInstall {
+            other_items_unfinished: true,
+        };
+        let unfinished = host_line("web", &LiveSurface::Proxy, Some(7654), others_open);
+        assert_eq!(
+            unfinished,
+            "names: web.min.internal via 127.0.0.1:7654; finish setup: min finalize-install"
+        );
+        // Names alone open: the names item is the surface verdict itself,
+        // so the clause rides without any other item.
+        assert_eq!(
+            host_line(
+                "web",
+                &LiveSurface::Proxy,
+                Some(7654),
+                HostInstall::default()
+            ),
+            unfinished
+        );
+        // Native names with another item still open: the resolution half is
+        // the finished one, the clause rides.
+        let names_done = host_line("web", &LiveSurface::Native, Some(7654), others_open);
+        assert_eq!(
+            names_done,
+            "names: web.min.internal resolves in any browser on this machine; finish setup: \
+             min finalize-install"
+        );
+        let finished = host_line(
+            "web",
+            &LiveSurface::Native,
+            Some(7654),
+            HostInstall::default(),
+        );
+        assert_eq!(
+            finished,
+            "names: web.min.internal resolves in any browser on this machine"
+        );
+        // NET-020: a proxy-down cause replaces the resolution half, and the
+        // rest of the line is unchanged.
+        let down = host_line(
+            "web",
+            &LiveSurface::ProxyNotServing {
+                port: 7654,
+                cause: ProxyDownCause::PortHeld,
+            },
+            None,
+            others_open,
+        );
+        assert_eq!(
+            down,
+            "names: web.min.internal: the hostname proxy is not serving — another process on \
+             the host holds 127.0.0.1:7654; finish setup: min finalize-install"
+        );
+        // NET-020 in both forms: the cause the start reads beside its
+        // verdict replaces the resolution half whether the verdict was the
+        // proxy's or native DNS — a line that said the name resolves while
+        // the proxy is down is the claim a failing lookup contradicts first
+        // — and the clause stays the pre-fold verdict's: a finished native
+        // host grows none, an unfinished one keeps it.
+        let sibling = ProxyDown {
+            port: 7654,
+            cause: ProxyDownCause::PortHeld,
+        };
+        let cause = host_line_proxy_cause(Some(&sibling), None).expect("the sibling's cause");
+        let native_down = host_line_beside(
+            "web",
+            &LiveSurface::Native,
+            Some(7654),
+            HostInstall::default(),
+            Some(&cause),
+        );
+        assert_eq!(
+            native_down,
+            "names: web.min.internal: the hostname proxy is not serving — another process on \
+             the host holds 127.0.0.1:7654"
+        );
+        let native_down_open = host_line_beside(
+            "web",
+            &LiveSurface::Native,
+            Some(7654),
+            others_open,
+            Some(&cause),
+        );
+        assert_eq!(
+            native_down_open,
+            "names: web.min.internal: the hostname proxy is not serving — another process on \
+             the host holds 127.0.0.1:7654; finish setup: min finalize-install"
+        );
+        // A native daemon's own report — no VM sibling — is the cause in the
+        // daemon's words, and a Proxy verdict beside it never claims a port.
+        let daemon_cause = host_line_proxy_cause(
+            None,
+            Some("could not bind 127.0.0.1:7654: address in use. Remedy: free the port"),
+        )
+        .expect("the daemon's reason");
+        let proxy_down_native_daemon = host_line_beside(
+            "web",
+            &LiveSurface::Proxy,
+            Some(7654),
+            HostInstall::default(),
+            Some(&daemon_cause),
+        );
+        assert_eq!(
+            proxy_down_native_daemon,
+            "names: web.min.internal: the hostname proxy is not serving — could not bind \
+             127.0.0.1:7654: address in use. Remedy: free the port; finish setup: min \
+             finalize-install"
+        );
+        assert!(
+            !proxy_down_native_daemon.contains("via 127.0.0.1"),
+            "a down proxy is never named as the route: {proxy_down_native_daemon}"
+        );
+        // The sibling wins where both are present, and nothing is a cause
+        // while the proxy serves.
+        assert_eq!(
+            host_line_proxy_cause(Some(&sibling), Some("stale")).as_deref(),
+            Some("another process on the host holds 127.0.0.1:7654")
+        );
+        assert_eq!(host_line_proxy_cause(None, None), None);
+        assert_eq!(
+            host_line_beside("web", &LiveSurface::Native, Some(7654), others_open, None),
+            names_done,
+            "no cause: the same line host_line prints"
+        );
+        for line in [
+            &unfinished,
+            &names_done,
+            &finished,
+            &down,
+            &native_down,
+            &native_down_open,
+            &proxy_down_native_daemon,
+        ] {
+            assert_eq!(line.lines().count(), 1, "one line, never a block: {line}");
+            assert!(line.starts_with("names: "), "{line}");
+            assert!(
+                !line.contains("HOSTNAME PROXY") && !line.contains("live name surface"),
+                "the two old lines are gone from the start: {line}"
+            );
+        }
+    }
+
+    /// NET-142: the resolution clause is keyed on the host-DNS state alone.
+    /// Native DNS deployed, the box name resolves in any browser on this
+    /// machine, whatever else is open; not deployed, the name routes via the
+    /// proxy's port, and the native words never print.
+    #[test]
+    fn activate_host_line_names_native_dns_when_deployed() {
+        for host in [
+            HostInstall::default(),
+            HostInstall {
+                other_items_unfinished: true,
+            },
+        ] {
+            let native = host_line("api", &LiveSurface::Native, Some(7654), host);
+            assert!(
+                native
+                    .starts_with("names: api.min.internal resolves in any browser on this machine"),
+                "{native}"
+            );
+            assert!(!native.contains("via 127.0.0.1"), "{native}");
+            let proxy = host_line("api", &LiveSurface::Proxy, Some(7654), host);
+            assert!(
+                proxy.starts_with("names: api.min.internal via 127.0.0.1:7654"),
+                "{proxy}"
+            );
+            assert!(!proxy.contains("resolves in any browser"), "{proxy}");
+        }
+    }
+
+    /// NET-142: the install clause `; finish setup: min finalize-install`
+    /// rides the line while any finalize-install item is not done —
+    /// names (the surface not native) or any other item, in whichever
+    /// state short of done — and is absent once every item is done.
+    #[test]
+    fn activate_host_line_carries_finish_setup_clause_while_items_missing() {
+        const CLAUSE: &str = "; finish setup: min finalize-install";
+        let others_open = HostInstall {
+            other_items_unfinished: true,
+        };
+        let cases = [
+            (LiveSurface::Proxy, HostInstall::default(), true),
+            (LiveSurface::Proxy, others_open, true),
+            (LiveSurface::Native, others_open, true),
+            (LiveSurface::Native, HostInstall::default(), false),
+            (
+                LiveSurface::ProxyNotServing {
+                    port: 7654,
+                    cause: ProxyDownCause::RedrawsRanOut,
+                },
+                HostInstall::default(),
+                true,
+            ),
+        ];
+        for (surface, host, expected) in cases {
+            let line = host_line("web", &surface, Some(7654), host);
+            assert_eq!(
+                line.ends_with(CLAUSE),
+                expected,
+                "clause expected={expected} for {surface:?} {host:?}: {line}"
+            );
+            assert_eq!(
+                line.matches("min finalize-install").count(),
+                usize::from(expected),
+                "the pointer prints once or not at all: {line}"
+            );
         }
     }
 
@@ -5594,14 +5944,24 @@ exit 0
         );
     }
 
+    /// The install clause is the same words on both verbs: `min ls` appends
+    /// [`install_clause`] to its surface row, and the host line ends with
+    /// it, so the two cannot drift apart.
     #[test]
-    fn a_start_with_an_unbound_answerer_names_the_proxy_and_points_at_setup() {
-        let line = start_name_surface_line(None, Some(15390));
-        assert_eq!(line, name_surface_line(LiveSurface::Proxy, Some(15390)));
-        assert!(line.ends_with(FINALIZE_INSTALL_POINTER), "{line}");
-        assert_eq!(
-            start_name_surface_line(Some(LiveSurface::Native), Some(15390)),
-            name_surface_line(LiveSurface::Native, Some(15390))
+    fn both_verbs_end_with_the_same_install_clause() {
+        let host = HostInstall {
+            other_items_unfinished: true,
+        };
+        let clause = install_clause(install_unfinished(&LiveSurface::Proxy, host));
+        assert_eq!(clause, "; finish setup: min finalize-install");
+        assert!(
+            host_line("web", &LiveSurface::Proxy, Some(15390), host).ends_with(clause),
+            "the host line ends with the clause"
+        );
+        assert!(
+            !install_unfinished(&LiveSurface::Native, HostInstall::default())
+                && install_clause(false).is_empty(),
+            "a finished host has no clause"
         );
     }
 

@@ -2555,7 +2555,7 @@ proof_host_ip_deny_all() {
     }
     hida_warm_sid="$(printf '%s\n' "$hida_warm_sid" | tail -n1 | tr -d '\r')"
     hida_warm_activate_err="$(cat "$WORK/hida-warm-activate.err" 2>/dev/null || true)"
-    if [[ "$hida_warm_activate_err" == *"cannot decide a host-address box's"* ]]; then
+    if [[ "$hida_warm_activate_err" == *"can't enforce it yet"* ]]; then
       echo "warm create: the throwaway box's start printed the advisory the start-up read left the fact carrying — the placement above clears the cause for reads after it, and the launch that turns the fact is the next beat:"
       printf '%s\n' "$hida_warm_activate_err" | sed 's/^/  /'
     fi
@@ -2616,7 +2616,7 @@ proof_host_ip_deny_all() {
     }
     hida_sid="$(printf '%s\n' "$hida_sid" | tail -n1 | tr -d '\r')"
     hida_activate_err="$(cat "$WORK/hida-activate.err" 2>/dev/null || true)"
-    if [[ "$hida_activate_err" == *"cannot decide a host-address box's"* ]]; then
+    if [[ "$hida_activate_err" == *"can't enforce it yet"* ]]; then
       echo "::error::the activation on a decided host printed the classifier advisory anyway: the create reply carried a cause the refresh launch above just ruled out of the fact"
       printf '%s\n' "$hida_activate_err"
       fail
@@ -3058,18 +3058,18 @@ proof_host_ip_deny_all() {
   }
   hida_un_sid="$(printf '%s\n' "$hida_un_sid" | tail -n1 | tr -d '\r')"
   hida_un_activate_err="$(cat "$WORK/hida-un-activate.err" 2>/dev/null || true)"
-  if [[ "$hida_un_activate_err" != *"note: this host cannot decide a host-address box's egress verdict per box:"* ]]; then
-    echo "::error::the activation's stderr carries no classifier advisory: a native host that cannot decide per box owes the session start the cause in words"
+  if [[ "$hida_un_activate_err" != *"note: you asked this box for no network access, but this machine can't enforce it yet, so the box can still reach the network."* ]]; then
+    echo "::error::the activation's stderr carries no classifier advisory: a native host that cannot decide per box owes a session start that declared egress the first line (what was asked, that it is not enforced, what the box does instead)"
     printf '%s\n' "$hida_un_activate_err"
     fail
   fi
-  if [[ "$hida_un_activate_err" != *"While it cannot, its host-address boxes run unenforced"* ]]; then
-    echo "::error::the advisory does not say the boxes run unenforced — the outcome a native host's advisory owes"
+  if [[ "$hida_un_activate_err" != *"  Enforce it: "* ]]; then
+    echo "::error::the advisory does not carry its second line naming how to enforce the declaration"
     printf '%s\n' "$hida_un_activate_err"
     fail
   fi
-  if [[ "$hida_un_activate_err" != *"whatever the boxes' declarations say"* ]]; then
-    echo "::error::the advisory does not carry the clause that says the declaration is not what is running here"
+  if [[ "$hida_un_activate_err" != *"--network own_ip, which enforces it now"* ]]; then
+    echo "::error::the advisory does not name the own-address start that enforces the declaration now"
     printf '%s\n' "$hida_un_activate_err"
     fail
   fi
@@ -3095,10 +3095,10 @@ proof_host_ip_deny_all() {
   fi
   # The cause, from the record's own field — the two a native host's start
   # can carry, each with its own rule for the install command: the missing
-  # step names the one command that ends it, a mount that cannot confine a
-  # box names none (installing the step over that tree would leave the
-  # cause standing). The stderr advisory must name the same cause, and its
-  # install command must follow the same rule.
+  # step names `min finalize-install` as the remedy, a mount that cannot
+  # confine a box names the own-address start alone and says why the
+  # install cannot help (installing the step over that tree would leave the
+  # cause standing). The stderr advisory must follow the same rule.
   hida_un_cause=""
   case "$hida_un_create" in
     *"the classifier's privileged step is not installed on this host"*)
@@ -3112,27 +3112,32 @@ proof_host_ip_deny_all() {
       fail
       ;;
   esac
-  if [[ "$hida_un_activate_err" != *"$hida_un_cause"* ]]; then
-    echo "::error::the advisory's cause does not match the create record's own (expected: $hida_un_cause)"
-    printf '%s\n' "$hida_un_activate_err"
-    fail
-  fi
   case "$hida_un_cause" in
     "the classifier's privileged step is not installed on this host")
-      if [[ "$hida_un_activate_err" != *"min finalize-install"* ]]; then
-        echo "::error::the advisory names the missing step but not the command that installs it"
+      if [[ "$hida_un_activate_err" != *"Enforce it: min finalize-install"* ]]; then
+        echo "::error::the advisory's cause is the missing step but it does not name min finalize-install as the remedy"
         printf '%s\n' "$hida_un_activate_err"
         fail
       fi
-      echo "advisory: the cause is the missing step, and the advisory ends with the exact command that installs it"
+      if [[ "$hida_un_activate_err" == *"curl"* || "$hida_un_activate_err" == *"install-host-classifier.sh"* ]]; then
+        echo "::error::the advisory names a script or a fetch instead of min finalize-install"
+        printf '%s\n' "$hida_un_activate_err"
+        fail
+      fi
+      echo "advisory: the cause is the missing step, and the advisory names min finalize-install as the remedy"
       ;;
     *)
-      if [[ "$hida_un_activate_err" == *"min finalize-install"* ]]; then
-        echo "::error::the advisory names an install command for a host that cannot confine a box: installing the step over that tree would leave the cause standing"
+      if [[ "$hida_un_activate_err" == *"Enforce it: min finalize-install"* ]]; then
+        echo "::error::the advisory hands out the install for a host that cannot confine a box: installing the step over that tree would leave the cause standing"
         printf '%s\n' "$hida_un_activate_err"
         fail
       fi
-      echo "advisory: the cause is the mount that cannot confine a box, and the advisory names no command — none would end it"
+      if [[ "$hida_un_activate_err" != *"min finalize-install can't fix this: $hida_un_cause"* ]]; then
+        echo "::error::the advisory does not say why the install cannot help, in the create record's own cause words (expected: $hida_un_cause)"
+        printf '%s\n' "$hida_un_activate_err"
+        fail
+      fi
+      echo "advisory: the cause is the mount that cannot confine a box, and the advisory names the own-address start alone and says why the install cannot help"
       ;;
   esac
   printf '%s\n' "$hida_un_activate_err" | sed 's/^/  /'
@@ -7495,7 +7500,7 @@ proof_local_range_reserved_by_privileged_step() {
     echo "--- second activate stderr ---"; cat "$range2_err" 2>/dev/null || true
     fail
   fi
-  if ! grep -q -- 'native DNS is the live name surface' "$range2_err"; then
+  if ! grep -q -- 'resolves in any browser on this machine' "$range2_err"; then
     echo "::error::a session started after the range step does not read native DNS as its live surface (the host probe must read present)"
     echo "--- second activate stderr ---"; cat "$range2_err" 2>/dev/null || true
     fail
@@ -8678,7 +8683,7 @@ proof_box_name_resolves_natively_without_proxy() {
   # The surface the activation reports — printed, not asserted: before the
   # advisory's command runs it is the proxy's surface, and the verdict the
   # command is about to move is the second box's to report (NET-018).
-  bn_surface="$(grep -F -- 'live name surface' "$bn_err" 2>/dev/null | head -n1 || true)"
+  bn_surface="$(grep -F -- 'names: ' "$bn_err" 2>/dev/null | head -n1 || true)"
   echo "activate reported the surface: ${bn_surface:-<none>}"
 
   # Polls the pair of records that own a box's address — the finalize lease
@@ -8963,7 +8968,7 @@ proof_box_name_resolves_natively_without_proxy() {
 
   # ---- NET-018: the second box's activate reports the verdict -------------
   bn_second_box
-  bn_api_surface="$(grep -F -- 'native DNS is the live name surface' \
+  bn_api_surface="$(grep -F -- 'resolves in any browser on this machine' \
     "$bn_api_err" 2>/dev/null | head -n1 || true)"
   if [ -z "$bn_api_surface" ]; then
     echo "::error::the second box's activate does not report native DNS as the live name surface (NET-018) — the command ran, so the verdict must have moved"
@@ -8971,10 +8976,13 @@ proof_box_name_resolves_natively_without_proxy() {
     fail
   fi
   echo "activate reported the surface (NET-018): $bn_api_surface"
+  # The activate line is the one host line, naming the box (NET-142). That
+  # the hostname proxy still serves beside native DNS (NET-019) is `min
+  # ls`'s to say, on its NAME SURFACE row, asserted below.
   case "$bn_api_surface" in
-    *"the hostname proxy still serves on 127.0.0.1:"*) ;;
+    "names: $BN_API_NAME.min.internal resolves in any browser on this machine"*) ;;
     *)
-      echo "::error::the native surface line does not say the hostname proxy still serves (NET-019)"
+      echo "::error::the second box's activate line is not the one host line naming the box (NET-142)"
       echo "--- surface line ---"; printf '%s\n' "$bn_api_surface"
       fail
       ;;

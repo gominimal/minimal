@@ -359,7 +359,7 @@ async fn hold_box_name_with_vm_host(
 /// show for its own boxes.
 ///
 /// `vm` is the VM host the line names, by the same rule
-/// [`hostname_proxy_start_line`] names the proxy's: the selected VM on the VM
+/// [`hostname_proxy_vm`] names the proxy's: the selected VM on the VM
 /// backend, `None` on a backend that hosts no VMs. A registered box only ever
 /// exists on the former, so the `None` shape is the defensive one, mirroring
 /// the sibling start line's.
@@ -922,35 +922,28 @@ pub(crate) async fn activate_session(
                 None,
             ),
         };
-    // The proxy and surface lines below never name the reported port as
-    // serving while the reply carries a proxy-down sibling, and its cause
-    // prints exactly once: folded into a Proxy verdict's NAME SURFACE line
-    // (`ProxyNotServing`), or on a line of its own beside a Native verdict
-    // or no verdict — never both, and never beside a "still serves" or
-    // "routes through it".
+    // The host line below never names the reported port as serving while
+    // the reply carries a proxy-down sibling, and the cause — the sibling's,
+    // or a native daemon's own report — prints exactly once, in place of
+    // the line's resolution half whatever the verdict (NET-020), never
+    // beside a `via 127.0.0.1:<port>` and never as a line of its own.
     let proxy_down_sibling = vm_answerer
         .as_ref()
         .and_then(|reply| reply.proxy_down.as_ref());
+    let proxy_cause = crate::resolver::host_line_proxy_cause(
+        proxy_down_sibling,
+        created.hostname_routing_unavailable.as_deref(),
+    );
+    // The port this daemon's hostnames route through (NET-026's discovery on
+    // this surface) is the `via 127.0.0.1:<port>` of the one host line
+    // below: a VM whose host port the host already held walked to one of
+    // its own (NET-059), a native daemon whose default was busy asked the OS
+    // for a free one (NET-025), so a walked port is never a log line alone.
+    // Absent while the proxy is still coming up, or from a daemon that
+    // predates the field, and beside a proxy-down sibling, whose cause
+    // names itself in the line instead.
     let serving_proxy_port =
         crate::resolver::serving_proxy_port(created.hostname_proxy_port, proxy_down_sibling);
-    // The other routing fact the create reply carries: the port this daemon's
-    // hostnames route through, printed where the session started — the same
-    // fact `min ls` prints on its routing line. NET-026's discovery on this
-    // surface; and the report a port has to carry when it is *not* the one the
-    // recipes assume — a VM whose host port the host already held walked to
-    // one of its own (NET-059), a native daemon whose default was busy asked
-    // the OS for a free one (NET-025) — so a walked port is never a log line
-    // alone. Absent while the proxy is still coming up, or from a daemon that
-    // predates the field: nothing to print for it then, exactly as in `min
-    // ls`. Not printed beside a proxy-down sibling either: the VM host
-    // daemon's verdict is that the proxy is not serving, and the cause
-    // names itself below.
-    if let Some(port) = serving_proxy_port {
-        eprintln!(
-            "{}",
-            hostname_proxy_start_line(hostname_proxy_start_vm(global), port)
-        );
-    }
     // The interim itself, named at every session start on a VM-backed host
     // — TTY and non-TTY, ahead of the warning, the advisory and the verdict
     // below — because who answers the zone is the machine fact the names
@@ -967,7 +960,18 @@ pub(crate) async fn activate_session(
     {
         eprintln!("{line}");
     }
-    if held_no_channel && let Some(answerer_port) = answerer_port {
+    // NET-018: the one host line, naming the box, at the moment the user is
+    // about to rely on the names. Its surface half is decided in the one
+    // function both verbs share (`resolver`) and its install clause lists
+    // this host's missing finalize-install items — names while the surface
+    // is not native, the classifier while a native daemon's host says so
+    // (`host_install_for_this_host`, the same scoping `min finalize-install`
+    // applies) — so the two verbs print the same words (NET-122's pointer
+    // is the line's tail). Host DNS is opt-in: the start never prints the
+    // privileged step, only the command that runs it. The host's items are
+    // probed only once a line is going to print: a start with no surface to
+    // name has no clause to end it with.
+    let surface = if held_no_channel && let Some(answerer_port) = answerer_port {
         // NET-138's warning, at every session start — TTY and non-TTY: it
         // rides stderr unconditionally, because the first lookup that
         // fails is the one it explains, and a piped activate is as owed
@@ -982,24 +986,17 @@ pub(crate) async fn activate_session(
         // user is the proxy's (NET-019 keeps it serving). Logged as the
         // same session-start record the native arm logs, with the fact
         // that decided it.
-        let surface = crate::resolver::surface_beside_proxy_down(
-            crate::resolver::LiveSurface::Proxy,
-            proxy_down_sibling,
-        );
+        let surface = crate::resolver::LiveSurface::Proxy;
         tracing::info!(
             surface = ?surface,
             held_no_channel = true,
             answerer_bound = false,
             answerer_port = answerer_port,
+            hostname_proxy_down = ?proxy_down,
             "session start decided the live name surface for this host"
         );
-        eprintln!(
-            "{}",
-            crate::resolver::name_surface_line(surface, serving_proxy_port)
-        );
-    } else if answerer_port.is_none()
-        && let Some((port, cause)) = proxy_down
-    {
+        Some(surface)
+    } else if answerer_port.is_none() && proxy_down.is_some() {
         // T93: the VM host daemon's own verdict on the hostname proxy's
         // publication — a terminal publish failure, named with the port it
         // is about and its cause instead of a bare "not serving" — printed
@@ -1014,111 +1011,101 @@ pub(crate) async fn activate_session(
         // answerer verdict and the sibling cause has its surface decided
         // by the answerer arm below: the cause has already named the
         // proxy's half on the line of its own above, and the answerer's
-        // half is the detection's to read.
-        let surface = crate::resolver::LiveSurface::ProxyNotServing { port, cause };
+        // half is the detection's to read. The verdict is the proxy's; the
+        // cause rides the host line in place of its resolution half.
+        let surface = crate::resolver::LiveSurface::Proxy;
         tracing::info!(
             surface = ?surface,
+            hostname_proxy_down = ?proxy_down,
             "session start decided the live name surface for this host"
         );
-        eprintln!(
-            "{}",
-            crate::resolver::name_surface_line(surface, created.hostname_proxy_port)
-        );
+        Some(surface)
     } else if let Some(answerer_port) = answerer_port {
-        // NET-018: name the live surface at the moment the user is about to
-        // rely on the names — decided in the one function both verbs share
-        // (`resolver`), from this host's detection: its hook (and the
-        // stub-bypass blocker that says whether its lookups consult what the
-        // hook configures), the answerer-bound proof this start holds — the
-        // daemon's report on a native host, this CLI's own query on a
-        // VM-backed one — and the reserved range on this host's own
-        // loopback. `None` — the answerer not bound — prints the proxy's
-        // line: there is no native surface to name. A proxy-down sibling
-        // folds into a Proxy surface (`ProxyNotServing`) and otherwise
-        // prints on a line of its own, ahead of the surface's. The proxy's
-        // half is said with the native arm either way (NET-019): the
-        // `HTTP(S)_PROXY` recipes this activation prints keep working beside
-        // native DNS, so nothing already captured goes stale.
-        //
-        // Host DNS is opt-in (NET-122): the start never prints the
-        // privileged step. While the host is not set up the proxy is the
-        // live surface, and its line names `min finalize-install`, which prints or
-        // runs the step from its own reads of the host.
+        // The surface half, decided from this host's detection: its hook
+        // (and the stub-bypass blocker that says whether its lookups
+        // consult what the hook configures), the answerer-bound proof this
+        // start holds — the daemon's report on a native host, this CLI's
+        // own query on a VM-backed one — and the reserved range on this
+        // host's own loopback. `None` — the answerer not bound — is the
+        // proxy's surface: there is no native surface to name. A
+        // proxy-down cause never moves the verdict — it replaces the host
+        // line's resolution half beside whichever verdict this read
+        // decides. The proxy keeps serving beside native DNS (NET-019): the
+        // `HTTP(S)_PROXY` recipes this activation prints keep working, so
+        // nothing already captured goes stale.
         let detection = crate::resolver::session_detection().await;
         let surface_verdict = crate::resolver::live_name_surface_with_range_at(
             &detection,
             Some(answerer_port),
             answerer_bound,
         )
-        .await
-        .map(|verdict| crate::resolver::LiveSurfaceVerdict {
-            surface: crate::resolver::surface_beside_proxy_down(
-                verdict.surface,
-                proxy_down_sibling,
-            ),
-            ..verdict
-        });
-        // With no verdict the proxy is the live surface, folded with the
-        // sibling the same way, so the cause still prints exactly once.
-        let unbound_surface = crate::resolver::surface_beside_proxy_down(
-            crate::resolver::LiveSurface::Proxy,
-            proxy_down_sibling,
+        .await;
+        // With no verdict the proxy is the live surface.
+        let unbound_surface = crate::resolver::LiveSurface::Proxy;
+        match surface_verdict {
+            Some(verdict) => {
+                // The host-side record of that verdict, the half the
+                // daemon's own log cannot make: a daemon can name only the
+                // answerer *it* binds (see the daemon's
+                // `log_live_name_surface`), so the surface this host's own
+                // reads decided — and the three facts behind it, with the
+                // range as the one fact only this read holds — is logged
+                // here, at the start that printed it, beside the daemon's
+                // line. `min` filters at `warn` unless `RUST_LOG` is set, so
+                // the line is visible under `RUST_LOG=info`. Logged, never
+                // printed: the line below is the user's. `min ls` does not
+                // log its verdict — a list re-reads the host every run, and
+                // the record that matters is the one at the starts that
+                // rely on the names.
+                tracing::info!(
+                    surface = ?verdict.surface,
+                    hook_routes = detection.0.routes(answerer_port),
+                    blocker = ?detection.1,
+                    answerer_bound = answerer_bound,
+                    range_present = ?verdict.range_present,
+                    range_unit_state = ?detection.2.state,
+                    range_unit_check = ?detection.2.failed_check,
+                    hostname_proxy_down = ?proxy_down,
+                    "session start decided the live name surface for this host, \
+                     with the range unit's state beside it"
+                );
+                Some(verdict.surface)
+            }
+            None => {
+                // The answerer is reported but not bound yet: no native
+                // surface to name, so the proxy is the live one.
+                tracing::info!(
+                    surface = ?unbound_surface,
+                    answerer_bound = false,
+                    answerer_port = answerer_port,
+                    hostname_proxy_down = ?proxy_down,
+                    "session start decided the live name surface for this host"
+                );
+                Some(unbound_surface)
+            }
+        }
+    } else {
+        // No answerer reported and no VM sibling — a daemon that predates
+        // the field, or the VM-backed pre-acquisition state: the proxy is
+        // the surface the names route through while it serves, or the
+        // daemon's own report says why it does not, and nothing is said
+        // while nothing serves yet and nothing is reported.
+        (serving_proxy_port.is_some() || proxy_cause.is_some())
+            .then_some(crate::resolver::LiveSurface::Proxy)
+    };
+    if let Some(surface) = surface {
+        let host_install = crate::cmd::finalize_install::host_install_for_this_host(global);
+        let box_name = config.name.as_deref().unwrap_or("-");
+        eprintln!(
+            "{}",
+            crate::resolver::host_line_beside(
+                box_name,
+                &surface,
+                serving_proxy_port,
+                host_install,
+                proxy_cause.as_deref(),
+            )
         );
-        if let Some(line) = crate::resolver::proxy_down_line_beside(
-            Some(
-                surface_verdict
-                    .as_ref()
-                    .map_or(&unbound_surface, |verdict| &verdict.surface),
-            ),
-            proxy_down_sibling,
-        ) {
-            eprintln!("{line}");
-        }
-        if let Some(verdict) = surface_verdict {
-            // The host-side record of that verdict, the half the daemon's own
-            // log cannot make: a daemon can name only the answerer *it* binds
-            // (see the daemon's `log_live_name_surface`), so the surface this
-            // host's own reads decided — and the three facts behind it, with
-            // the range as the one fact only this read holds — is logged here,
-            // at the start that printed it, beside the daemon's line. `min`
-            // filters at `warn` unless `RUST_LOG` is set, so the line is visible
-            // under `RUST_LOG=info`. Logged, never printed: the line
-            // below is the user's. `min ls` does not log its verdict — a list
-            // re-reads the host every run, and the record that matters is the
-            // one at the starts that rely on the names.
-            tracing::info!(
-                surface = ?verdict.surface,
-                hook_routes = detection.0.routes(answerer_port),
-                blocker = ?detection.1,
-                answerer_bound = answerer_bound,
-                range_present = ?verdict.range_present,
-                range_unit_state = ?detection.2.state,
-                range_unit_check = ?detection.2.failed_check,
-                hostname_proxy_down = ?proxy_down,
-                "session start decided the live name surface for this host, \
-                 with the range unit's state beside it"
-            );
-            eprintln!(
-                "{}",
-                crate::resolver::start_name_surface_line(Some(verdict.surface), serving_proxy_port)
-            );
-        } else {
-            // The answerer is reported but not bound yet: no native surface
-            // to name, so the proxy is the live one, and its line carries the
-            // `min finalize-install` pointer NET-122 owes every start on a host not
-            // set up — or, beside a proxy-down sibling, the cause instead.
-            tracing::info!(
-                surface = ?unbound_surface,
-                answerer_bound = false,
-                answerer_port = answerer_port,
-                hostname_proxy_down = ?proxy_down,
-                "session start decided the live name surface for this host"
-            );
-            eprintln!(
-                "{}",
-                crate::resolver::start_name_surface_line(Some(unbound_surface), serving_proxy_port)
-            );
-        }
     }
     let id = created.id;
 
@@ -5069,11 +5056,10 @@ mod tests {
         // is the command, verbatim.
         let step_missing = create_reply(
             Some(
-                "note: this host cannot decide a host-address box's egress verdict \
-                 per box: the classifier's privileged step is not installed on this \
-                 host. While it cannot, its host-address boxes run unenforced — \
-                 whatever the boxes' declarations say. Install the classifier's \
-                 privileged step with:\n  min finalize-install",
+                "note: you asked this box for no network access, but this machine \
+                 can't enforce it yet, so the box can still reach the network.\n  \
+                 Enforce it: min finalize-install   (or start the box with --network \
+                 own_ip, which enforces it now)",
             ),
             Some("none"),
         );
@@ -5082,19 +5068,20 @@ mod tests {
         let rendered = String::from_utf8(out).unwrap();
         assert!(
             rendered.starts_with(
-                "note: this host cannot decide a host-address box's egress verdict \
-                 per box: the classifier's privileged step is not installed on this \
-                 host. While it cannot, its host-address boxes run unenforced — \
-                 whatever the boxes' declarations say."
+                "note: you asked this box for no network access, but this machine \
+                 can't enforce it yet, so the box can still reach the network.\n"
             ),
             "the start prints the daemon's spelling verbatim, so the log, the \
              reply, and the terminal cannot disagree, got: {rendered}"
         );
         assert!(
-            rendered.ends_with("  min finalize-install\n"),
+            rendered.ends_with(
+                "  Enforce it: min finalize-install   (or start the box with --network \
+                 own_ip, which enforces it now)\n"
+            ),
             "the missing privileged step is the cause, so the render carries \
-             the exact command that installs it, on the last line with \
-             nothing after it: {rendered}"
+             the remedy that installs it, on the last line with nothing after \
+             it: {rendered}"
         );
         assert!(
             !rendered.contains('?'),
@@ -5102,14 +5089,16 @@ mod tests {
         );
 
         // A host that cannot confine: the cause is still named, and no
-        // install can end it, so the line names none.
+        // install can end it, so the line hands out the own-address start
+        // alone and says why.
         let cannot_confine = create_reply(
             Some(
-                "note: this host cannot decide a host-address box's egress verdict \
-                 per box: no cgroup2 mount with nsdelegate covers the classifier \
-                 tree, so a box could migrate out of its leaf. While it cannot, \
-                 its host-address boxes run unenforced — whatever the boxes' \
-                 declarations say.",
+                "note: you asked this box for no network access, but this machine \
+                 can't enforce it yet, so the box can still reach the network.\n  \
+                 Enforce it: start the box with --network own_ip, which enforces it \
+                 now   (min finalize-install can't fix this: no cgroup2 mount with \
+                 nsdelegate covers the classifier tree, so a box could migrate out \
+                 of its leaf)",
             ),
             Some("none"),
         );
@@ -5121,13 +5110,13 @@ mod tests {
             "the advisory must name this cause in words too: {rendered}"
         );
         assert!(
-            rendered.ends_with("declarations say.\n"),
-            "no command ends this cause, so the advisory must end with the \
-             state it named: {rendered}"
+            rendered.ends_with("out of its leaf)\n"),
+            "the render ends where the daemon's text ends, with the newline \
+             that closes the last line: {rendered}"
         );
         assert!(
-            !rendered.contains("install-host-classifier"),
-            "no command ends this cause, so the advisory must name none: {rendered}"
+            !rendered.contains("Enforce it: min finalize-install"),
+            "no install ends this cause, so the advisory must not hand it out: {rendered}"
         );
         assert!(
             !rendered.contains('?'),
@@ -5183,9 +5172,10 @@ mod tests {
     fn classifier_advisory_print_is_best_effort() {
         let step_missing = create_reply(
             Some(
-                "note: this host cannot decide a host-address box's egress verdict \
-                 per box: the classifier's privileged step is not installed on this \
-                 host. While it cannot, its host-address boxes run unenforced.",
+                "note: you asked this box for no network access, but this machine \
+                 can't enforce it yet, so the box can still reach the network.\n  \
+                 Enforce it: min finalize-install   (or start the box with --network \
+                 own_ip, which enforces it now)",
             ),
             Some("none"),
         );
