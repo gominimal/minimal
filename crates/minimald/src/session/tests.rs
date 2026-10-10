@@ -316,23 +316,7 @@ async fn attach_while_a_workspace_upload_streams_is_refused_without_scaffolding(
     // then lands the session live.
     drop(second);
     let mut channel = client.open_shell(session_id).await;
-    channel.data_bytes(b"hello\n".to_vec()).await.unwrap();
-    let mut stdout = Vec::new();
-    loop {
-        match channel.wait().await {
-            Some(ChannelMsg::Data { data }) => {
-                stdout.extend_from_slice(&data);
-                if String::from_utf8_lossy(&stdout).contains("got:hello") {
-                    break;
-                }
-            }
-            Some(_) => {}
-            None => {
-                let stdout = String::from_utf8_lossy(&stdout);
-                panic!("attach after the upload should mint a shell; got: {stdout:?}");
-            }
-        }
-    }
+    await_hello_echo(&mut channel, "attach after the upload").await;
 
     // The attach that landed ran the Draft shortcut, which scaffolds the
     // root `minimal.toml` in this harness — so its absence after the
