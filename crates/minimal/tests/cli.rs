@@ -751,12 +751,25 @@ async fn dashboard_activate_uploads_loadout_patches() {
         .as_ref()
         .unwrap()
         .join("providers/local-minimald0/ssh.sock");
+    let project_path = paths::HostAbsPath::try_new(project.path().to_str().unwrap()).unwrap();
+    let upload_root = project_path.as_utf8_path().to_path_buf();
+    let inputs = minimal::loadouts::ActivationInputs {
+        contribution,
+        hook_scripts: Vec::new(),
+        hook_budget: std::time::Duration::from_secs(30),
+        user_policy: Default::default(),
+        initial_policy: Default::default(),
+        compose_options: Default::default(),
+        loadout_names: Vec::new(),
+    };
     let activated = minimal::dash::rpc::activate(
         &sock,
         Some("dash-patched".to_string()),
-        paths::HostAbsPath::try_new(project.path().to_str().unwrap()).unwrap(),
+        project_path,
+        upload_root,
         sessions::NetworkMode::NoNet,
-        contribution,
+        minimal::UploadDecision::Upload,
+        inputs,
     )
     .await
     .expect("a patch-carrying dashboard create finalizes");

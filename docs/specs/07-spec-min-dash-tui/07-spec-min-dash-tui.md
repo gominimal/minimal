@@ -399,11 +399,14 @@ targets the provider the cursor points at (the focused session's provider,
 or the provider whose group header is selected). On confirm, call
 `CreateSession` with a `sessions::Record`. On success, refresh the list and
 focus the new session. The upload root resolves like the CLI's (walk up to
-the nearest `minimal.toml` repo root); a root that is not a VCS checkout is
-refused with a pointer to `min session activate` (the CLI's #770
-confirmation has no TUI form). The create sends the loadout contribution the
-CLI composed at `min dash` startup, so `default_loadouts` and the user
-policy apply to dashboard-created sessions too.
+the nearest `minimal.toml` repo root) and follows the CLI's upload gate: a
+VCS checkout or a root carrying `minimal.toml` uploads; an empty directory or
+`$HOME` is skipped; an undeclared non-VCS root prompts through a footer
+confirmation ("<root> is not a repository root; upload it? y/n") before
+anything reaches the daemon. The create composes its activation inputs
+through the CLI's own helper against the session's project path, so
+`default_loadouts`, the user policy, loadout hook scripts, and the
+composition's patches apply to dashboard-created sessions too.
 
 ### Unit 7 — Last-session memory
 

@@ -1686,6 +1686,58 @@ fn resolve_upload_root_errors_on_malformed_mfile() {
     assert!(resolve_upload_root(path).is_err());
 }
 
+/// The pure upload decision over its whole domain: the empty/`$HOME`
+/// carve-out, the explicit-sync escape hatch, and the VCS / blueprint /
+/// headless gate, with no TTY and no daemon in sight.
+#[test]
+fn decide_workspace_upload_covers_empty_vcs_blueprint_and_headless() {
+    // An empty directory skips silently — unless the caller passed an
+    // explicit `--sync tarball`, which uploads it anyway.
+    let empty = tempfile::tempdir().unwrap();
+    let empty = camino::Utf8Path::from_path(empty.path()).expect("temp path is UTF-8");
+    assert_eq!(
+        decide_workspace_upload(empty, false, false),
+        UploadDecision::SkipEmptyOrHome
+    );
+    assert_eq!(
+        decide_workspace_upload(empty, true, false),
+        UploadDecision::Upload
+    );
+
+    // A non-empty, undeclared, non-VCS root: a headless caller skips with
+    // the shared warning, an interactive one is asked first.
+    let plain = tempfile::tempdir().unwrap();
+    std::fs::write(plain.path().join("notes.txt"), "x").unwrap();
+    let plain = camino::Utf8Path::from_path(plain.path()).expect("temp path is UTF-8");
+    assert_eq!(
+        decide_workspace_upload(plain, false, true),
+        UploadDecision::SkipUndeclared
+    );
+    assert_eq!(
+        decide_workspace_upload(plain, false, false),
+        UploadDecision::Confirm
+    );
+
+    // A VCS root or a declared project uploads unconditionally.
+    let repo = tempfile::tempdir().unwrap();
+    std::fs::write(repo.path().join("notes.txt"), "x").unwrap();
+    std::fs::create_dir(repo.path().join(".git")).unwrap();
+    let repo = camino::Utf8Path::from_path(repo.path()).expect("temp path is UTF-8");
+    assert_eq!(
+        decide_workspace_upload(repo, false, true),
+        UploadDecision::Upload
+    );
+
+    let declared = tempfile::tempdir().unwrap();
+    std::fs::write(declared.path().join("notes.txt"), "x").unwrap();
+    std::fs::write(declared.path().join(mfile::MFILE_NAME), "[upstream]\n").unwrap();
+    let declared = camino::Utf8Path::from_path(declared.path()).expect("temp path is UTF-8");
+    assert_eq!(
+        decide_workspace_upload(declared, false, true),
+        UploadDecision::Upload
+    );
+}
+
 /// A refused composition is reported in the user's terms — the
 /// directory the activation ran from — with the daemon's own text kept
 /// as subordinate detail rather than as the headline (#581).

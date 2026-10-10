@@ -285,24 +285,15 @@ pub async fn cmd_dash(global: &GlobalArgs) -> Result<(), anyhow::Error> {
     if !host_up && !vm_up {
         ensure_daemon(global)?;
     }
-    // Compose the default loadout contribution up front, mirroring
-    // cmd_activate: the dash module takes a pre-composed contribution so its
-    // `run` stays free of this crate's config/loadout plumbing, and an empty
-    // contribution would silently skip `default_loadouts` and the user policy
-    // for sessions created from the dashboard.
-    let cfg = config::read_client_config(global)?;
-    let user_policy = config::read_user_policy(global)?;
-    let compose_options = loadouts::compose_options_from_config(&cfg);
-    let active =
-        loadouts::resolve_active_loadouts(loadouts::LoadoutSelection::Defaults, &cfg, global)?;
-    // `true`: the dashboard has no `--no-hooks`, matching the `hooks_enabled`
-    // the TUI sends on `CreateSession`.
-    let (contribution, _user_policy) =
-        loadouts::compose_user_contribution(active, user_policy, compose_options, true)?;
+    // The dashboard's creates resolve their activation inputs through the
+    // same helper `min session activate` uses, against the created session's
+    // own project path (so a loadout with an external hook, or one whose
+    // scripts sit beside the project, works from the dashboard too). Pass the
+    // default loadout selection here; the composition happens per create.
     crate::dash::run(crate::dash::DashOptions {
         minimal_dir: global.minimal_dir.clone(),
         config_dir: global.config_dir.clone(),
-        contribution,
+        loadouts: loadouts::LoadoutSelection::Defaults,
     })
     .await
 }

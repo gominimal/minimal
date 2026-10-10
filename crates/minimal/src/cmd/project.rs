@@ -141,6 +141,168 @@ pub(crate) fn project_lifecycle_hook_count(root: &camino::Utf8Path) -> usize {
     }
 }
 
+/// What [`decide_workspace_upload`] decided to do about the workspace upload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UploadDecision {
+    /// Upload from the resolved root.
+    Upload,
+    /// Empty dir or `$HOME`: skip silently.
+    SkipEmptyOrHome,
+    /// Non-VCS, no `minimal.toml`, headless: skip with the shared warning.
+    SkipUndeclared,
+    /// Non-VCS, no `minimal.toml`, interactive: confirm before uploading.
+    Confirm,
+}
+
+/// The upload decision, resolved from inputs that need no TTY. [`resolve_upload_root`]
+/// already ran, so this folds the empty/`$HOME` carve-out and
+/// [`file_upload::upload_gate`] into one value the callers can act on: the
+/// interactive `Confirm` case is resolved by the caller (the CLI prompts, the
+/// dashboard asks its own UI), and nothing here touches the daemon.
+pub(crate) fn decide_workspace_upload(
+    root: &camino::Utf8Path,
+    sync_explicit: bool,
+    headless: bool,
+) -> UploadDecision {
+    // An empty box has nothing to sync, and `$HOME` — even when non-empty or
+    // itself a VCS root — is far too much to bulk-upload on a stray keystroke.
+    // A deliberate `--sync tarball` (`sync_explicit`) is the escape hatch that
+    // still uploads both.
+    if !sync_explicit
+        && file_upload::is_empty_or_home(root.as_std_path(), std::env::home_dir().as_deref())
+    {
+        return UploadDecision::SkipEmptyOrHome;
+    }
+    match file_upload::upload_gate(
+        file_upload::is_vcs_root(root.as_std_path()),
+        sync_explicit,
+        project_has_mfile(root),
+        headless,
+    ) {
+        file_upload::UploadGate::Upload => UploadDecision::Upload,
+        file_upload::UploadGate::SkipHeadless => UploadDecision::SkipUndeclared,
+        file_upload::UploadGate::Prompt => UploadDecision::Confirm,
+    }
+}
+
+/// Which upload progress presentation the caller wants: the CLI's spinner bar,
+/// or the quiet path the `min dash` TUI owns its screen with. Under `Quiet`
+/// the shared notices are suppressed too, so a background create never writes
+/// over the TUI frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UploadProgress {
+    Bar,
+    Quiet,
+}
+
+/// What [`run_workspace_upload`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkspaceUpload {
+    /// The workspace tree was streamed to the daemon.
+    Uploaded,
+    /// The upload was skipped without asking (empty/`$HOME`, or headless on
+    /// an undeclared non-VCS root).
+    Skipped,
+    /// The interactive confirm was declined.
+    Declined,
+}
+
+/// Runs [`UploadDecision`] against the daemon: prints the shared notices,
+/// prompts through `ask` only for [`UploadDecision::Confirm`], refuses when
+/// `refuse_on_dropped_hooks` and a skip would drop project hooks, and uploads
+/// via `client`. `progress` picks the bar or the quiet path.
+///
+/// The upload's failure is returned to the caller, which owns the teardown
+/// (`withdraw_box_row` for the CLI, `AbortSession` for the dashboard) — the
+/// session exists on the daemon by the time this runs.
+#[allow(clippy::too_many_arguments)] // one home for a sequence three callers share; splitting the args would hide the flow
+pub(crate) async fn run_workspace_upload(
+    client: &mut client::Client,
+    id: sessions::SessionId,
+    invoked_from: &camino::Utf8Path,
+    root: &camino::Utf8Path,
+    decision: UploadDecision,
+    ask: impl FnOnce() -> Result<bool, anyhow::Error>,
+    refuse_on_dropped_hooks: bool,
+    progress: UploadProgress,
+) -> Result<WorkspaceUpload, anyhow::Error> {
+    // The TUI owns its own screen, so only the CLI's bar mode prints the
+    // notices; the wording still has one home here.
+    let say = |line: &str| {
+        if progress == UploadProgress::Bar {
+            eprintln!("{line}");
+        }
+    };
+    if decision == UploadDecision::SkipEmptyOrHome {
+        say("Starting with an empty box (nothing here to sync)");
+        return Ok(WorkspaceUpload::Skipped);
+    }
+    // Upload from the project root — the directory the mfile lives in — rather
+    // than wherever the user invoked us, so `min activate ./subdir` still
+    // uploads the whole project.
+    if root != invoked_from {
+        say(&format!(
+            "Uploading from project root {root} (resolved from {invoked_from})"
+        ));
+    }
+    match decision {
+        UploadDecision::SkipUndeclared => {
+            // Skipping the upload means the project's `minimal.toml` never
+            // reaches the daemon, so any lifecycle hooks it declares are
+            // discarded and never run. When the caller asked us to, refuse
+            // loudly instead of exiting 0 on a session silently missing them.
+            if refuse_on_dropped_hooks {
+                let dropped_hooks = project_lifecycle_hook_count(root);
+                if dropped_hooks > 0 {
+                    bail!(
+                        "{root} is not a version control repository root, so its \
+                         file upload is being skipped — but its {name} declares \
+                         {dropped_hooks} lifecycle hook(s) that reach the session only \
+                         through that upload. They would be silently dropped and never \
+                         run. Pass `--sync tarball` to upload the project (hooks \
+                         included), or `--sync none` to start without them deliberately.",
+                        name = mfile::MFILE_NAME,
+                    );
+                }
+            }
+            say(&file_upload::skipped_upload_warning(root.as_std_path()));
+            Ok(WorkspaceUpload::Skipped)
+        }
+        UploadDecision::Confirm => {
+            if ask()? {
+                upload_workspace(client, id, root, progress).await
+            } else {
+                say("Skipping file upload; the session will start with an \
+                     empty workspace.");
+                Ok(WorkspaceUpload::Declined)
+            }
+        }
+        UploadDecision::Upload => upload_workspace(client, id, root, progress).await,
+        UploadDecision::SkipEmptyOrHome => unreachable!("handled above"),
+    }
+}
+
+/// Streams the workspace tree, mapped onto [`WorkspaceUpload`] with the shared
+/// failure context.
+async fn upload_workspace(
+    client: &mut client::Client,
+    id: sessions::SessionId,
+    root: &camino::Utf8Path,
+    progress: UploadProgress,
+) -> Result<WorkspaceUpload, anyhow::Error> {
+    let result = match progress {
+        UploadProgress::Bar => client.upload_workspace_files(id, root.as_std_path()).await,
+        UploadProgress::Quiet => {
+            client
+                .upload_workspace_files_quiet(id, root.as_std_path())
+                .await
+        }
+    };
+    result
+        .map(|()| WorkspaceUpload::Uploaded)
+        .context("Failed to upload project files")
+}
+
 /// Build an `mctx::Config` from the shared global args.
 pub fn build_config(global: &GlobalArgs) -> Result<mctx::Config, mctx::Error> {
     let mut builder = mctx::ConfigBuilder::new();

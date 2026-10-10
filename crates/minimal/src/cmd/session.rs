@@ -203,6 +203,14 @@ pub(crate) fn vm_host_answerer_start_line(
     crate::resolver::vm_host_answerer_line(status).map(|line| format!("zone answerer: {line}"))
 }
 
+/// Whether a session holds its name in the VM host's zone in place of a
+/// row: a `host_ip` box shares the node's own row, so `min session
+/// activate` and `min dash` hold its name (NODATA) instead of registering
+/// one. `box_addresses` is `None` exactly when no row was registered.
+pub(crate) fn holds_name(record: &sessions::Record) -> bool {
+    record.network == sessions::NetworkMode::HostNet && record.box_addresses.is_none()
+}
+
 /// Releases the zone hold a destroyed session's activation made, when the
 /// session registered no row (`box_addresses` is `None` — a `host_ip` box
 /// holds its name in place of a row): the destroy-side twin of the hold
@@ -305,7 +313,7 @@ pub(crate) async fn release_held_name_after_attach(
 /// the name answers NXDOMAIN there, which is never a state a session
 /// fails over. Both carry the session `id` the hold is for, so a release
 /// frees only that session's hold.
-async fn hold_box_name_with_vm_host(
+pub(crate) async fn hold_box_name_with_vm_host(
     control_sock: Option<std::path::PathBuf>,
     name: &str,
     id: Option<sessions::SessionId>,
@@ -549,18 +557,17 @@ pub(crate) async fn activate_session(
     // Resolve and compose the loadouts BEFORE opening the daemon
     // connection: a missing loadout file or a malformed one should
     // fail loudly on the client side without ever touching the
-    // daemon.
-    let cfg = config::read_client_config(global)?;
+    // daemon. The same sequence stages the loadout hook scripts and sizes
+    // the finalize hook budget, so `min session activate`, `min task run`,
+    // and the dashboard share it.
     let policy_path = config::user_policy_path(global);
-    let user_policy = config::read_user_policy(global)?;
-    let initial_policy = user_policy.clone();
-    let compose_options = loadouts::compose_options_from_config(&cfg);
     let selection = loadouts::LoadoutSelection::from_flags(&args.loadout, args.no_loadouts);
-    let active = loadouts::resolve_active_loadouts(selection, &cfg, global)?;
+    let inputs =
+        loadouts::prepare_activation_inputs(global, &abs_path, selection, !args.no_hooks, None)?;
 
-    // Scaffold-offer a missing `minimal.toml` only after loadouts resolve:
-    // a bad `--loadout` must error before anything prints, so the user is
-    // never told the session is proceeding and then that it is not.
+    // Scaffold-offer a missing `minimal.toml` only after the loadouts resolve
+    // and compose: a bad `--loadout` must error before anything prints, so the
+    // user is never told the session is proceeding and then that it is not.
     // `--sync none` never sends a `minimal.toml`, so offering to create
     // one there would only write a file the session then ignores.
     if offer_scaffold && !matches!(args.sync, Some(SyncMode::None)) {
@@ -574,37 +581,21 @@ pub(crate) async fn activate_session(
         )?;
     }
 
-    if !active.loadouts.is_empty() {
-        let names: Vec<&str> = active.loadouts.iter().map(|l| l.name().as_ref()).collect();
-        eprintln!("Applying loadouts: {}", names.join(", "));
-    }
+    inputs.announce_loadouts();
+
     // The contribution carries the banner's loadout display list as a
     // first-class orientation field (the daemon seeds MINIMAL_LOADOUTS
     // from it in the launcher baseline). The banner's other dynamic
     // clause — blueprint presence — is a session-filesystem fact,
     // tested by the templates in-shell when they print.
-    // Resolve the loadouts' external hook scripts before anything
-    // touches the daemon: a mistyped path, a symlinked script, or a
-    // missing loadout script directory should fail here, on this
-    // machine, rather than after a session exists on the daemon.
-    let hook_scripts = loadouts::stage_loadout_hook_scripts(&active, &abs_path, !args.no_hooks)?;
-
-    // Same idea for the *project's* hooks, which the daemon composes from
-    // the uploaded mfile and which therefore never pass through the
-    // staging above. Nothing here is uploaded — the project tree carries
-    // its own scripts — but the checks a staging pass would have made are
-    // still worth making on this machine, before a session exists.
-    if !args.no_hooks {
-        loadouts::check_project_hooks(&abs_path)?;
-    }
-
+    let hook_scripts = inputs.hook_scripts;
     // The daemon runs the composition's `on_activate` hooks inside
-    // `FinalizeSession`; size that call's deadline to their summed declared
-    // timeouts, computed here while the loadouts are still in hand.
-    let finalize_hook_budget = loadouts::activate_hook_budget(&active, &utf8_path, !args.no_hooks);
-
-    let (contribution, user_policy) =
-        loadouts::compose_user_contribution(active, user_policy, compose_options, !args.no_hooks)?;
+    // `FinalizeSession`; this deadline is their summed declared timeouts.
+    let finalize_hook_budget = inputs.hook_budget;
+    let contribution = inputs.contribution;
+    let user_policy = inputs.user_policy;
+    let initial_policy = inputs.initial_policy;
+    let compose_options = inputs.compose_options;
 
     // `--sync` defaults to tarball; `sync_explicit` records whether the
     // user actually typed the flag, which distinguishes a deliberate
@@ -622,14 +613,6 @@ pub(crate) async fn activate_session(
         SyncMode::None => None,
         SyncMode::Tarball => Some(resolve_upload_root(&utf8_path)?),
     };
-
-    // Skip the upload without prompting when the resolved root is an
-    // empty directory or `$HOME` — unless the user asked for it with an
-    // explicit `--sync tarball`, the escape hatch.
-    let skip_empty_or_home = !sync_explicit
-        && upload_root.as_ref().is_some_and(|root| {
-            file_upload::is_empty_or_home(root.as_std_path(), std::env::home_dir().as_deref())
-        });
 
     // Deliberately not `connect_daemon`: this path's version gate travels on
     // the `CreateSession` below rather than on a `GetVersion` sent ahead of it.
@@ -1191,99 +1174,42 @@ pub(crate) async fn activate_session(
                 eprintln!("{notice}");
             }
         }
-        SyncMode::Tarball if skip_empty_or_home => {
-            // An empty directory has nothing to sync, and `$HOME` is far
-            // too much to ship on a stray confirmation keypress — and if
-            // `$HOME` is itself a VCS root the old gate uploaded it with
-            // no prompt at all. Skip both silently by default; a
-            // deliberate `--sync tarball` (via `sync_explicit`) is the
-            // escape hatch that still uploads them.
-            eprintln!("Starting with an empty box (nothing here to sync)");
-        }
         SyncMode::Tarball => {
-            // Upload from the project root — the directory the mfile
-            // lives in — rather than wherever the user invoked us. This
-            // matches the CLI's config-discovery walk: a user running
-            // `minimal activate ./subdir` still uploads the whole
-            // project. Falls back to `utf8_path` when no mfile is found
-            // anywhere up the tree (#770).
             let upload_root = upload_root.expect("upload_root is set for SyncMode::Tarball above");
-            if upload_root != utf8_path {
-                eprintln!("Uploading from project root {upload_root} (resolved from {utf8_path})");
-            }
-            // Guard against accidentally uploading a non-VCS directory
-            // (e.g. `~`). A VCS root, or a directory carrying a
-            // `minimal.toml` (a declared project), uploads unconditionally.
-            // For an undeclared non-VCS root an interactive caller gets the
-            // confirm (default No); a headless caller (CI, pipes, agents,
-            // `--no-prompt`, `--no-input`) can't be asked, so it skips the
-            // upload with a warning rather than silently shipping a directory
-            // nobody confirmed — `--sync tarball` (via `sync_explicit`) is the
-            // escape hatch that force-uploads it anyway (#770).
             let headless = args.no_prompt || global.no_input || !can_prompt_interactively();
-            let should_upload = match file_upload::upload_gate(
-                file_upload::is_vcs_root(upload_root.as_std_path()),
-                sync_explicit,
-                project_has_mfile(&upload_root),
-                headless,
-            ) {
-                file_upload::UploadGate::Upload => true,
-                file_upload::UploadGate::SkipHeadless => {
-                    // Skipping the upload means the project's minimal.toml
-                    // never reaches the daemon, so any lifecycle hooks it
-                    // declares are discarded and never run. Refuse loudly
-                    // instead of exiting 0 on a session silently missing
-                    // them; the caller can force the upload or opt out on
-                    // purpose.
-                    let dropped_hooks = project_lifecycle_hook_count(&upload_root);
-                    if dropped_hooks > 0 {
-                        bail!(
-                            "{upload_root} is not a version control repository root, so its \
-                             file upload is being skipped — but its {name} declares \
-                             {dropped_hooks} lifecycle hook(s) that reach the session only \
-                             through that upload. They would be silently dropped and never \
-                             run. Pass `--sync tarball` to upload the project (hooks \
-                             included), or `--sync none` to start without them deliberately.",
-                            name = mfile::MFILE_NAME,
-                        );
-                    }
-                    eprintln!(
-                        "{}",
-                        file_upload::skipped_upload_warning(upload_root.as_std_path())
-                    );
-                    false
-                }
-                file_upload::UploadGate::Prompt => confirm(
-                    &format!(
-                        "{upload_root} is not a version control repository root. \
-                         Upload all files from this directory?"
-                    ),
-                    false,
-                )?,
-            };
-            if should_upload {
-                let uploaded = client
-                    .upload_workspace_files(id, upload_root.as_std_path())
-                    .await;
-                if let Err(error) = uploaded {
-                    // The upload failed: the activation is abandoned, and the
-                    // row its registration bought goes with it (T66).
-                    withdraw_box_row(
-                        control_sock.clone(),
-                        config.name.as_deref(),
-                        config.box_addresses,
-                        registered
-                            .as_ref()
-                            .and_then(|registration| registration.box_id),
+            let decision = decide_workspace_upload(&upload_root, sync_explicit, headless);
+            let uploaded = run_workspace_upload(
+                &mut client,
+                id,
+                &utf8_path,
+                &upload_root,
+                decision,
+                || {
+                    confirm(
+                        &format!(
+                            "{upload_root} is not a version control repository root. \
+                             Upload all files from this directory?"
+                        ),
+                        false,
                     )
-                    .await;
-                    return Err(error.context("Failed to upload project files"));
-                }
-            } else if !headless {
-                eprintln!(
-                    "Skipping file upload; the session will start with an \
-                     empty workspace."
-                );
+                },
+                true,
+                UploadProgress::Bar,
+            )
+            .await;
+            if let Err(error) = uploaded {
+                // The upload failed: the activation is abandoned, and the
+                // row its registration bought goes with it (T66).
+                withdraw_box_row(
+                    control_sock.clone(),
+                    config.name.as_deref(),
+                    config.box_addresses,
+                    registered
+                        .as_ref()
+                        .and_then(|registration| registration.box_id),
+                )
+                .await;
+                return Err(error);
             }
         }
     };
@@ -3965,7 +3891,7 @@ pub async fn cmd_rename(global: &GlobalArgs, args: RenameArgs) -> Result<(), any
             // of a row: the hold moves with the name, so the old name no box
             // owns answers NXDOMAIN again and the new one is the one the
             // destroy releases.
-            if record.network == sessions::NetworkMode::HostNet && record.box_addresses.is_none() {
+            if holds_name(&record) {
                 let control_sock = vm_host_control_sock(
                     daemon_provider_kind(global),
                     global.minimal_dir.as_deref(),

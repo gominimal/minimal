@@ -280,25 +280,12 @@ pub async fn fetch_screen(
     Ok(resp.ok())
 }
 
-/// Whether a session holds its name in the VM host's zone in place of a
-/// row: a `host_ip` box shares the node's own row, so `min session
-/// activate` and [`activate`] hold its name (NODATA) instead of
-/// registering one.
-fn holds_name(record: &sessions::Record) -> bool {
-    record.network == NetworkMode::HostNet && record.box_addresses.is_none()
-}
-
-/// Holds or releases a name on the VM host daemon beside `sock`, off the
-/// async workers: the control exchange is a blocking socket call.
+/// Holds or releases a name on the VM host daemon beside `sock`, via the
+/// CLI's own control exchange: the shared helper derives the control socket,
+/// applies [`crate::cmd::session`]'s `BOX_CONTROL_TIMEOUT`, and warns on
+/// failure just as `min session activate` does.
 async fn hold_box_name(sock: &Path, name: &str, id: SessionId, hold: bool) {
-    let (sock, name) = (sock.to_path_buf(), name.to_string());
-    if let Err(error) = tokio::task::spawn_blocking(move || {
-        minimal_client::attach::hold_box_name_beside(&sock, &name, Some(id), hold);
-    })
-    .await
-    {
-        tracing::warn!(%error, "the box name hold's thread failed");
-    }
+    crate::hold_box_name_with_vm_host(crate::control_sock_beside(sock), name, Some(id), hold).await;
 }
 
 /// Withdraws a box's host row (T66) on the VM host daemon beside `sock`,
@@ -331,7 +318,7 @@ pub async fn record_of(provider: &mut Provider, id: SessionId) -> Option<session
 /// the daemon's detach grace, and the in-VM daemon relaunches it only while
 /// its row stands. Returns the pair the row was registered with: an attach
 /// that ends in the shell-exit prompt's Delete leaves no record to read it
-/// from, and [`release_held_name_after_attach`] still owes the row's
+/// from, and [`crate::release_held_name_after_attach`] still owes the row's
 /// withdrawal. `None` when the record cannot be read or holds no row.
 ///
 /// # Errors
@@ -358,7 +345,7 @@ async fn settle_destroyed_box(sock: &Path, id: SessionId, record: &sessions::Rec
     };
     if let Some(addresses) = record.box_addresses {
         withdraw_box_row(sock, name, addresses).await;
-    } else if holds_name(record) {
+    } else if crate::holds_name(record) {
         hold_box_name(sock, name, id, false).await;
     }
 }
@@ -401,7 +388,7 @@ pub async fn rename(
     .context("RenameSession RPC failed")?
     {
         Errorable::Ok(_) => {
-            if let Some(record) = record.filter(holds_name) {
+            if let Some(record) = record.filter(crate::holds_name) {
                 if let Some(old_name) = record.name.as_deref() {
                     hold_box_name(&provider.sock, old_name, id, false).await;
                 }
@@ -413,37 +400,12 @@ pub async fn rename(
     }
 }
 
-/// Settles what session `id` held once an attach from the dashboard has
-/// ended with the session gone: the shell-exit prompt's Delete destroys the
-/// session daemon-side, past [`destroy`]. The row its box registered is
-/// withdrawn with `box_addresses`, the pair [`prepare_attach`] read
-/// before the attach; with none, the name's zone hold is released. A lookup
-/// that fails settles nothing; a session still there keeps its row and its
-/// hold, and the release names the session, so a newer session under
-/// `name` keeps its own.
-pub async fn release_held_name_after_attach(
-    provider: &mut Provider,
-    id: SessionId,
-    name: &str,
-    box_addresses: Option<sessions::BoxAddresses>,
-) {
-    let lookup =
-        timed::<GetSessionRecord>(&mut provider.client, GetSessionRecordRequest::Id(id)).await;
-    if let Ok(resp) = lookup
-        && resp.record.is_none()
-    {
-        match box_addresses {
-            Some(addresses) => withdraw_box_row(&provider.sock, name, addresses).await,
-            None => hold_box_name(&provider.sock, name, id, false).await,
-        }
-    }
-}
-
 /// The full activate flow behind the create form: create the record, upload
-/// the project tree, compose the loadout contribution the CLI composed at
-/// startup, upload the composition's patch files, and finalize — so the new
-/// session comes up `Active`, attachable, and restart-persistent rather than
-/// dying as an unresumable `Pending` stub on the next daemon restart.
+/// the project tree and the loadouts' staged hook scripts, send the
+/// contribution the caller composed, upload the composition's patch files,
+/// and finalize — so the new session comes up `Active`, attachable, and
+/// restart-persistent rather than dying as an unresumable `Pending` stub on
+/// the next daemon restart.
 ///
 /// Connects its own client so it can run as a background task without
 /// borrowing the provider's connection. A `ConfigureLoadout` that comes back
@@ -457,20 +419,21 @@ pub async fn release_held_name_after_attach(
 /// `min session activate` makes, through the same client library
 /// ([`create_registering`]).
 ///
-/// The upload root is resolved like the CLI's: walk up from the form's path
-/// to the nearest `minimal.toml` repo root, and refuse the upload when that
-/// root isn't a VCS checkout — the CLI asks for confirmation there (#770),
-/// and a TUI form pre-filled with the current directory must not stream a
-/// home directory to the daemon on three Enters.
-///
-/// Loadout hooks that name an external script are dropped on the way — see
-/// [`without_external_hook_scripts`].
+/// The upload root and its [`crate::UploadDecision`] are resolved by the
+/// caller — the create task — so the TUI could ask its own confirm before
+/// anything reached the daemon. Only [`crate::UploadDecision::Upload`] and the
+/// skip decisions arrive here; `Confirm` is resolved against the create form's
+/// modal first. The loadout composition, staged hook scripts, and hook budget
+/// arrive as [`crate::loadouts::ActivationInputs`], resolved against the same
+/// project path, so an external loadout hook works from the dashboard.
 pub async fn activate(
     sock: &Path,
     name: Option<String>,
     project_path: paths::HostAbsPath,
+    upload_root: camino::Utf8PathBuf,
     network: NetworkMode,
-    contribution: sessions::wire::request::WireContribution,
+    decision: crate::UploadDecision,
+    inputs: crate::loadouts::ActivationInputs,
 ) -> Result<Activated, anyhow::Error> {
     let mut client = Client::connect(sock).await?;
     // The dashboard's own copy of the create/upload/configure/finalize
@@ -530,46 +493,37 @@ pub async fn activate(
     // the VM host daemon to withdraw the row on the lease's close.
     let lease = row.take_lease();
     let flow = minimal_client::box_registration::finalize_holding_lease(lease, async {
-        // The upload-root walk and VCS-root stat are blocking filesystem
-        // traversals; run them off the async worker so a stalled mount
-        // can't stall the runtime.
-        let dir = project_path.as_utf8_path().to_path_buf();
-        let (upload_root, is_repo) = tokio::task::spawn_blocking(move || {
-            let root = resolve_upload_root(&dir)?;
-            let repo = minimal_client::file_upload::is_vcs_root(root.as_std_path());
-            Ok::<_, anyhow::Error>((root, repo))
-        })
-        .await
-        .context("resolving the upload root")??;
-        if !is_repo {
-            anyhow::bail!(
-                "refusing to upload '{upload_root}': not a repository root (no .git, .hg, or .jj). \
-                 Run `min session activate` to upload a non-repo directory with confirmation"
-            );
-        }
+        // The caller resolved the root and the decision; the upload is the
+        // shared CLI path (quiet: the TUI owns the screen).
+        crate::run_workspace_upload(
+            &mut client,
+            id,
+            project_path.as_utf8_path(),
+            &upload_root,
+            decision,
+            || Ok(false),
+            false,
+            crate::UploadProgress::Quiet,
+        )
+        .await?;
+        // Upload the loadouts' external hook scripts before the configure:
+        // the daemon gates `FinalizeSession` on the upload's ready-marker, and
+        // a composition naming a script that never arrived cannot finalize.
         client
-            .upload_workspace_files_quiet(id, upload_root.as_std_path())
+            .upload_hook_scripts(id, &inputs.hook_scripts)
             .await
-            .context("uploading project files")?;
+            .context("Failed to upload lifecycle hook scripts")?;
         // Collect the upload pairs before the contribution moves into the
         // ConfigureLoadout RPC, through the collection `min session
         // activate` uses: they land in the final composition of a
         // `Materialized` response (the only one the dashboard accepts), so
         // the client is authoritative for them.
-        let mut patches = minimal_client::contribution_patch_uploads(&contribution);
+        let mut patches = minimal_client::contribution_patch_uploads(&inputs.contribution);
         minimal_client::dedup_patch_uploads(&mut patches);
-        // Drop hooks whose scripts live in a file. The dashboard has no
-        // hook-script upload — that staging lives in the `minimal` crate,
-        // which sits above this one — and the daemon refuses to finalize a
-        // session whose composition names a staged script that never
-        // arrived. Sending them would fail every dashboard activation for a
-        // user whose loadout happens to use an external hook. Inline hooks
-        // carry their body in the composition and are kept.
-        let contribution = without_external_hook_scripts(contribution);
         let configured = client
             .oneshot_rpc::<minimald_rpc::ConfigureLoadout>(minimald_rpc::ConfigureLoadoutRequest {
                 session_id: id,
-                contribution,
+                contribution: inputs.contribution,
             })
             .await
             .context("ConfigureLoadout RPC failed")?;
@@ -593,12 +547,15 @@ pub async fn activate(
             .await
             .context("uploading composition patches")?;
         match client
-            .oneshot_rpc::<minimald_rpc::FinalizeSession>(minimald_rpc::FinalizeSessionRequest {
-                session_id: id,
-                // The dashboard's status line does not render the yielded
-                // ports, so it does not ask for them.
-                report_shared_port_collisions: false,
-            })
+            .oneshot_rpc_with_hook_budget::<minimald_rpc::FinalizeSession>(
+                minimald_rpc::FinalizeSessionRequest {
+                    session_id: id,
+                    // The dashboard's status line does not render the yielded
+                    // ports, so it does not ask for them.
+                    report_shared_port_collisions: false,
+                },
+                inputs.hook_budget,
+            )
             .await
             .context("FinalizeSession RPC failed")?
         {
@@ -618,7 +575,7 @@ pub async fn activate(
             if let Ok(resp) = client
                 .oneshot_rpc::<GetSessionRecord>(GetSessionRecordRequest::Id(id))
                 .await
-                && let Some(record) = resp.record.filter(holds_name)
+                && let Some(record) = resp.record.filter(crate::holds_name)
                 && let Some(name) = record.name.as_deref()
             {
                 hold_box_name(sock, name, id, true).await;
@@ -799,67 +756,6 @@ fn deny_all_default_binds(created: &minimald_rpc::CreateSessionResponse) -> bool
     }
 }
 
-/// Resolves the directory whose tree should be uploaded as the session
-/// workspace, walking up from `dir` to the nearest `minimal.toml` and using
-/// its repo root. Falls back to `dir` itself when no mfile is found. Any
-/// other mfile error (malformed TOML, I/O) propagates: a broken config in
-/// an ancestor should fail loudly rather than silently uploading a subdir
-/// with no config. Mirrors the CLI's `resolve_upload_root`.
-fn resolve_upload_root(dir: &camino::Utf8Path) -> Result<camino::Utf8PathBuf, anyhow::Error> {
-    match mfile::File::from_dir_recursive(dir.as_std_path()) {
-        Ok(f) => match f.repo_path() {
-            Some(root) => Ok(camino::Utf8PathBuf::from_path_buf(root.to_path_buf())
-                .unwrap_or_else(|_| dir.to_path_buf())),
-            None => Ok(dir.to_path_buf()),
-        },
-        Err(mfile::Error::NotFound) => Ok(dir.to_path_buf()),
-        Err(e) => Err(anyhow::anyhow!(
-            "found a broken {name} while walking up from {dir}: {e}",
-            name = mfile::MFILE_NAME,
-        )),
-    }
-}
-
-/// Strip hooks whose scripts are files rather than inline bodies.
-///
-/// The daemon gates `FinalizeSession` on a marker the hook-script upload
-/// writes, and the dashboard has no such upload — the staging that produces
-/// it lives in the `minimal` crate, above this one. A composition naming a
-/// script that never arrives cannot finalize, so a user whose loadout uses
-/// an external hook could not create a session from the dashboard at all.
-///
-/// Dropping is the conservative half of that trade: an inline hook still
-/// runs, and an external one silently does not rather than failing the
-/// activation. A hook left with no scripts at all is removed entirely,
-/// since an empty one is not constructible.
-fn without_external_hook_scripts(
-    mut contribution: sessions::wire::request::WireContribution,
-) -> sessions::wire::request::WireContribution {
-    use sessions::wire::primitives::WireHookScript;
-    let is_inline =
-        |s: &Option<WireHookScript>| !matches!(s, Some(WireHookScript::External { .. }));
-    for ph in &mut contribution.lifecycle_hooks {
-        let h = &mut ph.hook;
-        for slot in [
-            &mut h.on_activate,
-            &mut h.on_destroy,
-            &mut h.on_attach,
-            &mut h.on_detach,
-        ] {
-            if !is_inline(slot) {
-                *slot = None;
-            }
-        }
-    }
-    contribution.lifecycle_hooks.retain(|ph| {
-        let h = &ph.hook;
-        h.on_activate.is_some()
-            || h.on_destroy.is_some()
-            || h.on_attach.is_some()
-            || h.on_detach.is_some()
-    });
-    contribution
-}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1328,58 +1224,6 @@ mod tests {
         assert_eq!(request.box_id, None, "the record carries no box id");
     }
 
-    /// With no mfile anywhere up the tree, `resolve_upload_root` returns the
-    /// input unchanged.
-    #[test]
-    fn resolve_upload_root_returns_input_when_no_mfile() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = camino::Utf8PathBuf::from_path_buf(dir.path().join("sub")).unwrap();
-        assert_eq!(resolve_upload_root(&path).unwrap(), path);
-    }
-
-    /// `resolve_upload_root` walks up to the nearest mfile and returns its
-    /// repo root (root layout: `minimal.toml` at the repo root).
-    #[test]
-    fn resolve_upload_root_walks_up_to_mfile_root_layout() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join(mfile::MFILE_NAME),
-            "[upstream]\nrepo = \"https://github.com/gominimal/pkgs\"\n",
-        )
-        .unwrap();
-        let root = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
-        let subdir = root.join("crates").join("foo");
-        std::fs::create_dir_all(&subdir).unwrap();
-        assert_eq!(resolve_upload_root(&subdir).unwrap(), root);
-    }
-
-    /// Dot-minimal layout: `minimal.toml` lives in `.minimal/`, and the repo
-    /// root is its parent.
-    #[test]
-    fn resolve_upload_root_walks_up_to_mfile_dot_minimal_layout() {
-        let dir = tempfile::tempdir().unwrap();
-        let mfile_dir = dir.path().join(".minimal");
-        std::fs::create_dir(&mfile_dir).unwrap();
-        std::fs::write(
-            mfile_dir.join(mfile::MFILE_NAME),
-            "[upstream]\nrepo = \"https://github.com/gominimal/pkgs\"\n",
-        )
-        .unwrap();
-        let root = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
-        let subdir = root.join("crates").join("foo");
-        std::fs::create_dir_all(&subdir).unwrap();
-        assert_eq!(resolve_upload_root(&subdir).unwrap(), root);
-    }
-
-    /// A malformed mfile up the tree fails loudly instead of falling back.
-    #[test]
-    fn resolve_upload_root_errors_on_malformed_mfile() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join(mfile::MFILE_NAME), "not valid toml = =").unwrap();
-        let path = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
-        assert!(resolve_upload_root(&path).is_err());
-    }
-
     /// NET-057's TUI half: the probe list covers every VM — the default one
     /// under its historic `vm` label, every named VM under its own name and
     /// socket — beside the host daemon's probe. And no socket is ever probed
@@ -1532,7 +1376,10 @@ mod version_gate_tests {
             .enumerate()
             .filter_map(|(i, l)| {
                 let t = l.trim_start();
-                let t = t.strip_prefix("pub ").unwrap_or(t);
+                let t = t
+                    .strip_prefix("pub(crate) ")
+                    .or_else(|| t.strip_prefix("pub "))
+                    .unwrap_or(t);
                 let t = t.strip_prefix("async ").unwrap_or(t);
                 t.strip_prefix("fn ")
                     .map(|rest| (i, rest.split(['(', '<']).next().unwrap_or("").to_string()))

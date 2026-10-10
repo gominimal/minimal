@@ -587,7 +587,11 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
         path: paths::HostPath::try_new(utf8_path.clone()).context("Invalid project path")?,
     };
     let non_interactive = global.no_input || !crate::can_prompt_interactively();
-    let (task_env, user_policy) = if non_interactive {
+    // The policy amended by the task-env gating above: persisted to disk on
+    // the interactive path, and carried into `prepare_activation_inputs`
+    // below as an override, so composition and the pending gate run under the
+    // approved rules even when that save failed.
+    let (task_env, amended_policy) = if non_interactive {
         let hooks = RefuseAndRecord::default();
         let task_env = resolve_task_env(
             &declared,
@@ -658,29 +662,25 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
 
     // Loadouts and user policy: the same defaults as an activate with no
     // loadout flags — the config's `default_loadouts` apply. Resolved before
-    // the daemon connection so a broken loadout fails loudly client-side.
-    let cfg = crate::config::read_client_config(global)?;
-    let initial_policy = user_policy.clone();
-    let compose_options = crate::loadouts::compose_options_from_config(&cfg);
+    // the daemon connection so a broken loadout fails loudly client-side, and
+    // through the same shared helper an activate uses so the staged hook
+    // scripts and the finalize budget match.
     let selection = crate::loadouts::LoadoutSelection::from_flags(&[], false);
-    let active = crate::loadouts::resolve_active_loadouts(selection, &cfg, global)?;
-    if !active.loadouts.is_empty() {
-        let names: Vec<&str> = active.loadouts.iter().map(|l| l.name().as_ref()).collect();
-        eprintln!("Applying loadouts: {}", names.join(", "));
-    }
-    // Same pre-daemon staging as an activate, so a broken hook script
-    // path fails here rather than after the ephemeral session exists.
-    let hook_scripts = crate::loadouts::stage_loadout_hook_scripts(&active, &abs_path, true)?;
+    let inputs = crate::loadouts::prepare_activation_inputs(
+        global,
+        &abs_path,
+        selection,
+        true,
+        Some(amended_policy),
+    )?;
+    inputs.announce_loadouts();
 
-    // Same first-class orientation field as an activate: a `--keep`
-    // task session is attachable later, and its banner should orient
-    // too.
-    // Size the later `FinalizeSession` deadline to the composition's
-    // `on_activate` hook timeouts, read while the loadouts are still in hand.
-    let finalize_hook_budget = crate::loadouts::activate_hook_budget(&active, &utf8_path, true);
-
-    let (contribution, user_policy) =
-        crate::loadouts::compose_user_contribution(active, user_policy, compose_options, true)?;
+    let initial_policy = inputs.initial_policy;
+    let compose_options = inputs.compose_options;
+    let hook_scripts = inputs.hook_scripts;
+    let finalize_hook_budget = inputs.hook_budget;
+    let contribution = inputs.contribution;
+    let user_policy = inputs.user_policy;
 
     // Upload per the normal activate rules: tarball sync (the default), the
     // same empty/`$HOME` and non-VCS-root gates, no `--sync` escape hatch.
@@ -692,10 +692,6 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     } else {
         String::new()
     };
-    let skip_empty_or_home = crate::file_upload::is_empty_or_home(
-        upload_root.as_std_path(),
-        std::env::home_dir().as_deref(),
-    );
 
     // Not `connect_daemon`: like `min session activate`, this creates a session
     // and the version gate rides on that `CreateSession` rather than on a
@@ -745,44 +741,27 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     // session exactly as during an activate.
     let interrupt_guard = crate::arm_activation_interrupt(global, id);
 
-    if skip_empty_or_home {
-        eprintln!("Starting with an empty box (nothing here to sync)");
-    } else {
-        if upload_root != utf8_path {
-            eprintln!("Uploading from project root {upload_root} (resolved from {utf8_path})");
-        }
-        let headless = global.no_input || !crate::can_prompt_interactively();
-        let should_upload = match crate::file_upload::upload_gate(
-            crate::file_upload::is_vcs_root(upload_root.as_std_path()),
-            false,
-            crate::project_has_mfile(&upload_root),
-            headless,
-        ) {
-            crate::file_upload::UploadGate::Upload => true,
-            crate::file_upload::UploadGate::SkipHeadless => {
-                eprintln!(
-                    "{}",
-                    crate::file_upload::skipped_upload_warning(upload_root.as_std_path())
-                );
-                false
-            }
-            crate::file_upload::UploadGate::Prompt => crate::confirm(
+    let headless = global.no_input || !crate::can_prompt_interactively();
+    let decision = crate::decide_workspace_upload(&upload_root, false, headless);
+    crate::run_workspace_upload(
+        &mut client,
+        id,
+        &utf8_path,
+        &upload_root,
+        decision,
+        || {
+            crate::confirm(
                 &format!(
                     "{upload_root} is not a version control repository root. \
                      Upload all files from this directory?"
                 ),
                 false,
-            )?,
-        };
-        if should_upload {
-            client
-                .upload_workspace_files(id, upload_root.as_std_path())
-                .await
-                .context("Failed to upload project files")?;
-        } else if !headless {
-            eprintln!("Skipping file upload; the session will start with an empty workspace.");
-        }
-    }
+            )
+        },
+        false,
+        crate::UploadProgress::Bar,
+    )
+    .await?;
 
     // Client-side loadout patches land in the composition whether the
     // configure response is Materialized or Pending; daemon-side patches
