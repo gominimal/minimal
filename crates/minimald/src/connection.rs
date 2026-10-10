@@ -130,6 +130,15 @@ pub struct Connection {
     /// here.
     created_sessions: Vec<SessionId>,
 
+    /// Held while this connection is live; every session created over it
+    /// keeps a weak reference (see [`ConnectionHandle::liveness`]).
+    /// While the reference still upgrades, the session's activation belongs
+    /// to this connection, so an attach from elsewhere is refused rather
+    /// than configuring a half-activated session behind the creator's back.
+    /// Released at teardown ([`ConnectionHandle::take_created_sessions`])
+    /// and, on any other exit, when the connection itself drops.
+    liveness: Option<Arc<()>>,
+
     serv: ServerStateHandle,
 }
 
@@ -155,6 +164,7 @@ impl Connection {
             ssh_username: None,
             channels: BTreeMap::new(),
             created_sessions: Vec::new(),
+            liveness: Some(Arc::new(())),
             serv,
         })));
 
@@ -214,7 +224,20 @@ impl ConnectionHandle {
     /// connection. Called once at connection teardown to decide which
     /// half-built sessions to reap.
     pub async fn take_created_sessions(&self) -> Vec<SessionId> {
-        std::mem::take(&mut self.0.lock().await.created_sessions)
+        let mut conn = self.0.lock().await;
+        // The connection is going away: its sessions stop counting it as a
+        // live creator from here on, even if a stray handle clone outlives
+        // this teardown.
+        conn.liveness = None;
+        std::mem::take(&mut conn.created_sessions)
+    }
+
+    /// A weak reference to this connection's liveness: handed to each
+    /// session created over it, and with each attach, so a session can tell
+    /// its creator's attach from anyone else's. It stops upgrading once the
+    /// connection is torn down; `None` once teardown has already begun.
+    pub async fn liveness(&self) -> Option<std::sync::Weak<()>> {
+        self.0.lock().await.liveness.as_ref().map(Arc::downgrade)
     }
 }
 
@@ -401,10 +424,16 @@ impl russh::server::Handler for ConnectionHandler {
             }
         };
 
+        // Who is attaching, so a session still mid-activation can let its
+        // creator's own attach through and refuse everyone else's.
+        let attacher = conn.liveness().await;
         session.channel_success(id)?;
         let hnd = session.handle();
         tokio::spawn(async move {
-            if let Err(e) = session_handle.attach(conn_username, channel, config).await {
+            if let Err(e) = session_handle
+                .attach(conn_username, channel, config, attacher)
+                .await
+            {
                 let _ = hnd
                     .data(id, format!("Error attaching to session: {e}\r\n"))
                     .await;

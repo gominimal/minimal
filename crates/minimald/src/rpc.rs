@@ -396,7 +396,14 @@ async fn serve_create_session(
             );
             req.config.attrs.remove(HOST_IP_ENFORCEMENT_ATTR);
 
-            Ok(match mngr.create_session(req.config, ssh_username).await {
+            // The session remembers its creator, so an attach from another
+            // connection cannot run the Draft shortcut while this one is
+            // still mid-activation (uploading, then configuring).
+            let creator = conn.liveness().await;
+            Ok(match mngr
+                .create_session_by(req.config, ssh_username, creator)
+                .await
+            {
                 Ok(id) => {
                     // Tag the session to this connection so it is reaped if
                     // the client drops before finalizing it (e.g. Ctrl-C at
@@ -1864,6 +1871,68 @@ impl<R: AsyncRead + Unpin> AsyncRead for CountingReader<R> {
     }
 }
 
+/// How long a `WorkspaceFilesTarZst` upload may deliver no bytes before the
+/// daemon gives up on it. A peer that stalls half-open would otherwise hold
+/// the upload — and the attach refusal its in-flight mark carries — until
+/// SSH keepalive notices, which takes up to an hour and a half. Generous,
+/// because the client compresses as it reads and a large, highly
+/// compressible file can leave the wire quiet for a while.
+const WORKSPACE_UPLOAD_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Fails a read with `TimedOut` once the peer has kept it waiting for
+/// `limit`. The clock starts when a read first finds no data and stops when
+/// one completes, so only a stall counts — never the length of the whole
+/// transfer, nor time the consumer spent busy between reads.
+struct IdleDeadline<R> {
+    inner: R,
+    limit: std::time::Duration,
+    deadline: Pin<Box<tokio::time::Sleep>>,
+    /// Whether the last poll found no data, i.e. `deadline` is armed for the
+    /// current wait.
+    waiting: bool,
+}
+
+impl<R> IdleDeadline<R> {
+    fn new(inner: R, limit: std::time::Duration) -> Self {
+        Self {
+            inner,
+            limit,
+            deadline: Box::pin(tokio::time::sleep(limit)),
+            waiting: false,
+        }
+    }
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for IdleDeadline<R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = &mut *self;
+        match Pin::new(&mut this.inner).poll_read(cx, buf) {
+            Poll::Ready(read) => {
+                this.waiting = false;
+                Poll::Ready(read)
+            }
+            Poll::Pending => {
+                if !this.waiting {
+                    this.waiting = true;
+                    let until = tokio::time::Instant::now() + this.limit;
+                    this.deadline.as_mut().reset(until);
+                }
+                match this.deadline.as_mut().poll(cx) {
+                    Poll::Ready(()) => Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!("no upload data for {:?}", this.limit),
+                    ))),
+                    Poll::Pending => Poll::Pending,
+                }
+            }
+        }
+    }
+}
+
 async fn serve_stream_workspace_files(
     s: ServerStateHandle,
     config: ChannelConfig,
@@ -1947,11 +2016,17 @@ async fn upload_session_handle(
 pub(crate) struct WorkspaceUploadInFlight(Option<crate::session::SessionHandle>);
 
 impl WorkspaceUploadInFlight {
+    /// Marks the upload in flight. Refused, marking nothing, when the
+    /// session has already left `Draft`: an upload belongs to the create
+    /// flow, and one into a configured session's tree is not part of it.
     pub(crate) async fn begin(handle: crate::session::SessionHandle) -> Result<Self, String> {
         handle
             .set_workspace_upload_in_flight(true)
             .await
-            .map_err(|e| format!("session is gone: {e}"))?;
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::NotConnected => format!("session is gone: {e}"),
+                _ => e.to_string(),
+            })?;
         Ok(Self(Some(handle)))
     }
 
@@ -2003,15 +2078,22 @@ async fn unpack_workspace_files(
     // panic in the unpack, or the task being torn down mid-stream).
     let upload = WorkspaceUploadInFlight::begin(session_handle).await?;
     let unpacked = async_tar::Archive::new(async_compression::tokio::bufread::ZstdDecoder::new(
-        tokio::io::BufReader::new(CountingReader {
-            inner: c.make_reader(),
-            count: Arc::clone(received),
-        }),
+        tokio::io::BufReader::new(IdleDeadline::new(
+            CountingReader {
+                inner: c.make_reader(),
+                count: Arc::clone(received),
+            },
+            WORKSPACE_UPLOAD_IDLE_TIMEOUT,
+        )),
     ))
     .unpack(paths.working.as_utf8_path())
     .await;
-    upload.finish().await?;
+    // The unpack error wins when both fail: a session destroyed mid-upload
+    // fails the clear too, and "session is gone" would hide why the
+    // unpack stopped.
+    let cleared = upload.finish().await;
     unpacked.map_err(|e| format!("unpack failed: {e}"))?;
+    cleared?;
 
     Ok(())
 }
@@ -2714,7 +2796,13 @@ mod tests {
     async fn stream_workspace_files_unpacks_tarball_into_workspace() {
         let server = TestServer::new().await;
         let mut client = server.connect().await;
-        let session_id = fresh_session(&mut client).await;
+        // Bare `CreateSession`: the workspace upload belongs to the create
+        // flow, between the create and the `ConfigureLoadout`.
+        let session_id = client
+            .call::<CreateSession>(&req("stream-test", "/tmp"))
+            .await
+            .unwrap()
+            .id;
 
         let payload = tar_zst(&[
             ("hello.txt", b"hello world\n"),
@@ -2882,6 +2970,66 @@ mod tests {
             "expected an unknown-session error on stderr, got {:?}",
             String::from_utf8_lossy(&stderr),
         );
+    }
+
+    /// A workspace upload belongs to the create flow: one into a session
+    /// that has already been configured and finalized is refused, and
+    /// nothing it carries lands in the live tree.
+    #[tokio::test]
+    async fn stream_workspace_files_refuses_a_configured_session() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = fresh_session(&mut client).await;
+
+        let payload = tar_zst(&[("late.txt", b"too late\n")]).await;
+        let stderr =
+            upload_and_collect_stderr(&mut client, STREAM_WORKSPACE_FILES, session_id, &payload)
+                .await;
+        assert!(
+            stderr
+                .contains("a workspace upload is accepted only while the session is being created"),
+            "expected the configured-session refusal, got {stderr:?}"
+        );
+
+        let paths = server
+            .state
+            .sessions_manager()
+            .await
+            .get_session(SessionKeyPredicate::Id(session_id))
+            .await
+            .unwrap()
+            .expect("the session should resolve")
+            .paths()
+            .await
+            .unwrap();
+        assert!(
+            !paths.working.as_utf8_path().join("late.txt").exists(),
+            "a refused upload must not land in the workspace"
+        );
+    }
+
+    /// The upload reader's idle deadline counts only a stall: reads that
+    /// keep arriving inside the limit run past it in total, time the
+    /// consumer spends between reads is not counted, and the peer's silence
+    /// longer than the limit fails the read with `TimedOut`.
+    #[tokio::test(start_paused = true)]
+    async fn idle_deadline_fails_a_stalled_read_but_not_a_slow_one() {
+        let limit = std::time::Duration::from_secs(10);
+        let (mut writer, reader) = tokio::io::duplex(64);
+        let mut reader = IdleDeadline::new(reader, limit);
+        let mut buf = [0u8; 8];
+        for _ in 0..3 {
+            tokio::time::advance(limit * 6 / 10).await;
+            writer.write_all(b"x").await.unwrap();
+            assert_eq!(reader.read(&mut buf).await.unwrap(), 1);
+        }
+        // Time the consumer spends between reads is not the peer's stall.
+        writer.write_all(b"y").await.unwrap();
+        tokio::time::advance(limit * 2).await;
+        assert_eq!(reader.read(&mut buf).await.unwrap(), 1);
+        // `writer` is still open, so this read can only end on the deadline.
+        let err = reader.read(&mut buf).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
     }
 
     /// The upload's `bytes_received` field is only worth logging if it is
