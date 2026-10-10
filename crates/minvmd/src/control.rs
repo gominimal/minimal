@@ -3774,13 +3774,29 @@ mod tests {
     /// daemon re-makes its live sessions' holds when it starts and
     /// releases a reaped session's, so a hold over the guest door holds
     /// the name, and a release by the reaped session's id takes it out of
-    /// the zone and leaves another session's hold standing.
+    /// the zone and leaves another session's hold standing. The registry
+    /// persists, so the held-names file follows each verb: the release
+    /// takes the reaped session's name out of the file too.
     #[test]
     fn the_guest_door_holds_and_releases_names() {
         let dir = tempfile::TempDir::new().expect("temp dir");
-        let (sock_path, _server, registry, _answerer, _proxy_publish) =
-            spawn_server(dir.path()).expect("server binds");
+        let sock_path = dir.path().join(CONTROL_SOCK_FILE);
+        let registry = BoxRegistry::new(SUBNET)
+            .persisting_to(dir.path().join(crate::box_registry::REGISTRY_FILE));
+        spawn_guest_door(
+            &sock_path,
+            &registry,
+            &AnswererStatus::allocating_for_tests("control-test-node"),
+            &ProxyPublishStatus::new(),
+        )
+        .expect("the guest door binds");
         let guest = sock_path.with_file_name(GUEST_CONTROL_SOCK_FILE);
+        let in_file = |name: &str| {
+            let file =
+                std::fs::read_to_string(dir.path().join(crate::box_registry::HELD_NAMES_FILE))
+                    .expect("the held-names file reads");
+            file.contains(&format!("\"{name}\""))
+        };
         let reaped = sessions::SessionId::parse_str("00000000-0000-4000-8000-000000000001")
             .expect("a session id");
         let live = sessions::SessionId::parse_str("00000000-0000-4000-8000-000000000002")
@@ -3810,6 +3826,7 @@ mod tests {
             );
         }
         assert!(in_zone("old") && in_zone("web"));
+        assert!(in_file("old") && in_file("web"), "both holds are persisted");
 
         let reply = control(
             &guest,
@@ -3828,6 +3845,10 @@ mod tests {
         );
         assert!(!in_zone("old"), "the reaped session's hold is gone");
         assert!(in_zone("web"), "another session's hold stands");
+        assert!(
+            !in_file("old") && in_file("web"),
+            "and the held-names file holds the same"
+        );
     }
 
     /// The drawn port's story (T93): a guest that reports its publish was

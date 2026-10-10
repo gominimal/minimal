@@ -1641,13 +1641,20 @@ pub(crate) async fn activate_session(
     // the session is active, so an activation that dies or fails earlier
     // — its unfinalized session reaped with the connection — leaves no
     // hold behind; the destroy releases it ([`release_held_box_name`]).
-    // Only this activate/destroy pair holds: `min task run` (task.rs) mints
-    // an ephemeral, auto-generated host_ip session through raw
-    // `CreateSession`/`DestroySession` RPCs and never passes through here,
-    // so its name is neither held nor released — a task box's name is not
-    // meant to be reached, and widening the interim to that path is a
-    // design ruling for the name-registry work, not a change a review
-    // pass may make in passing.
+    // Only this activate/destroy pair holds on the client's own account:
+    // `min task run` (task.rs) mints an ephemeral, auto-generated host_ip
+    // session through raw `CreateSession`/`DestroySession` RPCs and never
+    // passes through here, so its run neither holds nor releases its name
+    // — a task box's name is not meant to be reached, and widening the
+    // interim to that path is a design ruling for the name-registry work,
+    // not a change a review pass may make in passing. The two re-holds do
+    // not tell a task session apart, though: the guest daemon's start pass
+    // and the re-hold before an attach or exec
+    // ([`rehold_held_name_before_attach`]) hold the name of any active
+    // named host_ip session without a box row. A task session held that
+    // way and then destroyed by task.rs's raw RPC is never released; its
+    // hold is dropped after the VM host daemon's next restart, when
+    // nothing re-makes it.
     if kind == paths::ProviderKind::Minvmd
         && config.network == sessions::NetworkMode::HostNet
         && let Some(name) = config.name.as_deref()
