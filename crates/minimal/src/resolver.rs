@@ -2740,9 +2740,11 @@ fn linux_host_items_removal() -> String {
          {APPARMOR_DIR}/minimald {APPARMOR_DIR}/tunables/minimald' >&2\n\
          fi\n\
          \n\
-         # The kvm group membership the step added, by its record.\n\
+         # The kvm group memberships the step added, one user per line of its record.\n\
          if [ -f {KVM_GROUP_RECORD} ] ; then\n\
-         \x20 gpasswd -d \"$(cat {KVM_GROUP_RECORD})\" kvm 2>/dev/null || true\n\
+         \x20 while IFS= read -r kvm_user ; do\n\
+         \x20   [ -z \"$kvm_user\" ] || gpasswd -d \"$kvm_user\" kvm 2>/dev/null || true\n\
+         \x20 done < {KVM_GROUP_RECORD}\n\
          \x20 rm -f {KVM_GROUP_RECORD}\n\
          fi\n\
          \n\
@@ -5206,7 +5208,10 @@ mod tests {
                 "  bash -s -- --uninstall <<\\{CLASSIFIER_SCRIPT_HEREDOC} || classifier_held=1"
             ),
             format!("if [ -f {KVM_GROUP_RECORD} ] ; then"),
-            format!("  gpasswd -d \"$(cat {KVM_GROUP_RECORD})\" kvm 2>/dev/null || true"),
+            "  while IFS= read -r kvm_user ; do".to_string(),
+            "    [ -z \"$kvm_user\" ] || gpasswd -d \"$kvm_user\" kvm 2>/dev/null || true"
+                .to_string(),
+            format!("  done < {KVM_GROUP_RECORD}"),
         ] {
             assert!(
                 linux.contains(&step),
@@ -5456,7 +5461,8 @@ exit 0
         let tree = host.path().join("minimald.slice");
         std::fs::create_dir(&tree).unwrap();
         let record = host.path().join("finalize-install-kvm-group");
-        std::fs::write(&record, "alice\n").unwrap();
+        // Two users ran the step: both memberships come away.
+        std::fs::write(&record, "alice\nbob\n").unwrap();
         let script = linux_undo_command("/nonexistent/minimal/answerer.sock")
             .replace("/sys/class/net/", "/nonexistent/sys/class/net/")
             .replace(
@@ -5479,8 +5485,8 @@ exit 0
             "a held tree ends the script non-zero: {stderr}"
         );
         assert!(
-            calls.contains("gpasswd -d alice kvm"),
-            "the membership comes away before the classifier runs: {calls}"
+            calls.contains("gpasswd -d alice kvm\n") && calls.contains("gpasswd -d bob kvm\n"),
+            "every recorded membership comes away before the classifier runs: {calls}"
         );
         assert!(!record.exists(), "its record goes with it");
         assert!(calls.contains("bash -s -- --uninstall"), "{calls}");
