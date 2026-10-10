@@ -5104,8 +5104,8 @@ impl DropLimiter {
     }
 
     /// Emits the warning for one frame the relay dropped at its queue because
-    /// the far end of the direction stopped reading: the same rate limit a
-    /// drop's line answers to, keyed by the box's address and the
+    /// the far end of the direction fell behind or stopped reading: the same
+    /// rate limit a drop's line answers to, keyed by the box's address and the
     /// direction's rule, so a stalled peer says one line per direction per
     /// interval rather than one line per dropped frame. `addr` is the box
     /// the frame belongs to — the source of a frame toward the switch, the
@@ -5121,9 +5121,13 @@ impl DropLimiter {
                     || "none".to_string(),
                     |addr| Ipv4Addr::from(addr).to_string(),
                 );
+                // The queue fills behind a far end that reads slower than
+                // frames arrive as surely as behind one that stopped, and
+                // the gate cannot tell the two apart, so the line names
+                // both rather than send its reader after a dead peer.
                 let message = "dropped a frame at the egress gate relay's queue; the far end of \
-                               its direction stopped reading, and the relay keeps draining \
-                               rather than wedge the VM on it";
+                               its direction is reading slower than frames arrive, or not at \
+                               all, and the relay keeps draining rather than wedge the VM on it";
                 match direction {
                     QueueDirection::TowardSwitch => tracing::warn!(
                         source = %addr,
