@@ -233,11 +233,20 @@ async fn attached_session_record(
     sock: &std::path::Path,
     id: sessions::SessionId,
 ) -> anyhow::Result<Option<sessions::Record>> {
-    use minimald_rpc::{GetSessionRecord, GetSessionRecordRequest};
+    session_record_by(sock, minimald_rpc::GetSessionRecordRequest::Id(id)).await
+}
+
+/// A session's record by `request`, bounded by [`BOX_CONTROL_TIMEOUT`]:
+/// `None` when no session answers to it.
+async fn session_record_by(
+    sock: &std::path::Path,
+    request: minimald_rpc::GetSessionRecordRequest,
+) -> anyhow::Result<Option<sessions::Record>> {
+    use minimald_rpc::GetSessionRecord;
     tokio::time::timeout(BOX_CONTROL_TIMEOUT, async {
         let mut client = client::Client::connect(sock).await?;
         let resp = client
-            .oneshot_rpc::<GetSessionRecord>(GetSessionRecordRequest::Id(id))
+            .oneshot_rpc::<GetSessionRecord>(request)
             .await
             .context("GetSessionRecord RPC failed")?;
         anyhow::Ok(resp.record)
@@ -316,8 +325,11 @@ pub(crate) async fn release_held_name_after_attach(
 /// this one standing for a session that is gone — until the VM host
 /// daemon's next restart, which drops a reloaded hold nothing re-makes.
 /// The session is looked up again once the hold
-/// is made, and a session gone by then has the hold released by its id:
-/// a destroy that lands after that lookup releases it itself. A hold the
+/// is made, and a session gone by then has the hold undone: a destroy
+/// that lands after that lookup releases it itself. A live session that
+/// took the name over in between had its hold taken over by this one, so
+/// the undo hands the hold back to it rather than releasing the name; with
+/// no such session, the hold is released by the gone session's id. A hold the
 /// VM host daemon did not make — one that predates the verbs, or did not
 /// answer — leaves nothing to undo, so neither the second lookup nor the
 /// release is made.
@@ -342,7 +354,27 @@ pub(crate) async fn rehold_held_name_before_attach(
         return;
     }
     if let Ok(None) = attached_session_record(sock, id).await {
-        hold_box_name_with_vm_host(control_sock_beside(sock), name, Some(id), false).await;
+        let taken_over_by = session_record_by(
+            sock,
+            minimald_rpc::GetSessionRecordRequest::Name(name.to_string()),
+        )
+        .await
+        .ok()
+        .flatten()
+        .filter(|other| {
+            other.id != id
+                && other.network == sessions::NetworkMode::HostNet
+                && other.box_addresses.is_none()
+        });
+        match taken_over_by {
+            Some(other) => {
+                hold_box_name_with_vm_host(control_sock_beside(sock), name, Some(other.id), true)
+                    .await;
+            }
+            None => {
+                hold_box_name_with_vm_host(control_sock_beside(sock), name, Some(id), false).await;
+            }
+        }
     }
 }
 
@@ -6773,6 +6805,72 @@ mod tests {
         };
         assert_eq!(request.name, "web");
         assert_eq!(request.session_id, Some(id));
+    }
+
+    /// A destroy, then a new session under the same name, both landing
+    /// between the record's read and the re-hold: the gone session's hold
+    /// took the name over from the live one, so the undo hands it back to
+    /// the live session by its id rather than releasing the name.
+    #[tokio::test]
+    async fn a_gone_sessions_rehold_hands_the_name_back_to_its_new_holder() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ssh_sock = dir.path().join("ssh.sock");
+        let requests = fake_vm_host(
+            dir.path().join(minvmd::control::CONTROL_SOCK_FILE),
+            r#"{"name":"web","held":true}"#.to_string(),
+        )
+        .await;
+        let server = minimald::test_harness::TestServer::new().await;
+        server.listen_on_uds(&ssh_sock).await;
+        let project = tempfile::TempDir::new().unwrap();
+        let mut daemon = server.connect().await;
+        let gone = minimald::test_harness::create_configured_session(
+            &mut daemon,
+            "web",
+            project.path().to_str().unwrap(),
+        )
+        .await;
+        let record = attached_session_record(&ssh_sock, gone)
+            .await
+            .expect("the lookup does not fail")
+            .expect("the session's record is read");
+        match daemon
+            .call::<minimald_rpc::DestroySession>(&minimald_rpc::DestroySessionRequest { id: gone })
+            .await
+        {
+            minimald_rpc::Errorable::Ok(_) => {}
+            minimald_rpc::Errorable::Err { error } => panic!("the destroy failed: {error}"),
+        }
+        let live = minimald::test_harness::create_configured_session(
+            &mut daemon,
+            "web",
+            project.path().to_str().unwrap(),
+        )
+        .await;
+
+        rehold_held_name_before_attach(&ssh_sock, gone, Some(&record)).await;
+        let seen = requests.lock().unwrap();
+        let holds: Vec<_> = seen
+            .iter()
+            .map(|line| {
+                match serde_json_lenient::from_str::<minimald_rpc::BoxControlRequest>(line)
+                    .expect("the request is the wire type")
+                {
+                    minimald_rpc::BoxControlRequest::HoldBoxName(request) => {
+                        (request.name, request.session_id)
+                    }
+                    other => panic!("only holds are sent: {other:?}"),
+                }
+            })
+            .collect();
+        assert_eq!(
+            holds,
+            vec![
+                ("web".to_string(), Some(gone)),
+                ("web".to_string(), Some(live)),
+            ],
+            "the gone session's re-hold, then the name handed back to the live one"
+        );
     }
 
     /// A re-hold the VM host daemon does not make — one that predates the
