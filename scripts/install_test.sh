@@ -563,6 +563,8 @@ case_apparmor_uninstall() {
     # A non-interactive uninstall (stdin is /dev/null, not a tty) advises the root
     # removal command and never elevates: the seeded system profile survives, while
     # the shipped loader is removed by the record walk like any other component.
+    # Without the step's record the profile is not `min finalize-install`'s, so
+    # the advisory does not point at `--undo`.
     HAA_U="$root/haa_u"; mkdir -p "$HAA_U"
     run aa_u_seed "$HAA_U"
     check 0 "$rc" "uninstall-apparmor seed install exits 0"
@@ -573,9 +575,11 @@ case_apparmor_uninstall() {
     run aa_u_run "$HAA_U" --uninstall
     APPARMOR_DIR=
     check 0 "$rc" "uninstall with a loaded system profile exits 0"
-    want_ok "uninstall advises the system profile is still loaded" \
-        grep -q "system AppArmor profile is still loaded" "$OUT"
+    want_ok "uninstall advises the system profile is still installed" \
+        grep -q "still installed on this host.*system AppArmor profile" "$OUT"
     want_ok "advisory gives the root removal command" grep -q "apparmor_parser -R" "$OUT"
+    want_err "an unrecorded profile is not offered to min finalize-install --undo" \
+        grep -q "min finalize-install --undo" "$OUT"
     want_ok "non-interactive uninstall never elevates (profile survives)" \
         test -f "$fake_aa/minimald"
     want_err "uninstall removed the shipped apparmor loader" \
@@ -583,11 +587,12 @@ case_apparmor_uninstall() {
 }
 
 case_finalize_install_uninstall() {
-    # --- Uninstall: advise removing the host DNS setup (min finalize-install) ----------
+    # --- Uninstall: advise removing what min finalize-install installed ----------
     # A non-interactive uninstall on a host where `min finalize-install` ran advises
     # `min finalize-install --undo` and the root commands that stay valid once `min` is
-    # gone, and never elevates: the seeded host files survive. A host that never
-    # ran the step sees nothing.
+    # gone, and never elevates: the seeded host files survive. Every artifact the
+    # step owns is detected on its own, and everything found shares one advisory.
+    # A host that never ran the step sees nothing.
     HNS="$root/hns"; mkdir -p "$HNS"
     run ns_seed "$HNS"
     check 0 "$rc" "uninstall-net-setup seed install exits 0"
@@ -603,7 +608,7 @@ case_finalize_install_uninstall() {
     NET_SETUP_ROOT=
     check 0 "$rc" "uninstall with the host DNS setup present exits 0"
     want_ok "uninstall advises the host DNS setup is still installed" \
-        grep -q "host DNS setup from min finalize-install is still installed" "$OUT"
+        grep -q "still installed on this host.*host DNS setup" "$OUT"
     want_ok "advisory names min finalize-install --undo" grep -q "min finalize-install --undo" "$OUT"
     want_ok "advisory gives the root removal commands" grep -q "sudo " "$OUT"
     want_ok "non-interactive uninstall never elevates (host file survives)" \
@@ -615,6 +620,82 @@ case_finalize_install_uninstall() {
     check 0 "$rc" "uninstall on a host without the setup exits 0"
     want_err "a host that never ran min finalize-install sees no advisory" \
         grep -q "min finalize-install" "$OUT"
+
+    # The Linux-only items, each detected by what the step leaves for `--undo`.
+    [ "$PLAT_S" = Linux ] || return 0
+
+    # The user-namespace profile with the step's record: offered to --undo, with
+    # the record in the manual remedy.
+    HNS3="$root/hns3"; mkdir -p "$HNS3"
+    run ns3_seed "$HNS3"
+    fake_aa3="$root/fake-apparmor.d-3"; mkdir -p "$fake_aa3/tunables"
+    printf 'profile\n' >"$fake_aa3/minimald"
+    fake_ns3="$root/fake-net-setup-root-3"
+    mkdir -p "$fake_ns3/var/lib/minimal"
+    : >"$fake_ns3/var/lib/minimal/finalize-install-apparmor-profile"
+    APPARMOR_DIR="$fake_aa3"; NET_SETUP_ROOT="$fake_ns3"
+    run ns3_run "$HNS3" --uninstall
+    APPARMOR_DIR=; NET_SETUP_ROOT=
+    check 0 "$rc" "uninstall with a recorded profile exits 0"
+    want_ok "a recorded profile is advised as min finalize-install's" \
+        grep -q "still installed on this host.*user-namespace profile" "$OUT"
+    want_ok "a recorded profile points at min finalize-install --undo" \
+        grep -q "min finalize-install --undo" "$OUT"
+    want_ok "the remedy removes the profile and its record" \
+        grep -q "apparmor_parser -R.*finalize-install-apparmor-profile" "$OUT"
+    want_ok "the recorded profile survives a non-interactive uninstall" \
+        test -f "$fake_aa3/minimald"
+
+    # The classifier tree, by its marker.
+    HNS4="$root/hns4"; mkdir -p "$HNS4"
+    run ns4_seed "$HNS4"
+    fake_ns4="$root/fake-net-setup-root-4"
+    mkdir -p "$fake_ns4/sys/fs/cgroup/minimald.slice/classifier-table"
+    NET_SETUP_ROOT="$fake_ns4"
+    run ns4_run "$HNS4" --uninstall
+    NET_SETUP_ROOT=
+    check 0 "$rc" "uninstall with the classifier tree exits 0"
+    want_ok "the classifier tree is advised" \
+        grep -q "still installed on this host.*classifier tree" "$OUT"
+    want_ok "the remedy removes the classifier table" \
+        grep -q "nft delete table inet minimal_class" "$OUT"
+
+    # The kvm group membership, by its record.
+    HNS5="$root/hns5"; mkdir -p "$HNS5"
+    run ns5_seed "$HNS5"
+    fake_ns5="$root/fake-net-setup-root-5"
+    mkdir -p "$fake_ns5/var/lib/minimal"
+    printf 'alice\n' >"$fake_ns5/var/lib/minimal/finalize-install-kvm-group"
+    NET_SETUP_ROOT="$fake_ns5"
+    run ns5_run "$HNS5" --uninstall
+    NET_SETUP_ROOT=
+    check 0 "$rc" "uninstall with the kvm record exits 0"
+    want_ok "the kvm membership is advised" \
+        grep -q "still installed on this host.*kvm group membership" "$OUT"
+    want_ok "the remedy takes the membership back by the record" \
+        grep -q "gpasswd -d" "$OUT"
+
+    # Everything at once, an unrecorded profile included: one advisory, one list.
+    HNS6="$root/hns6"; mkdir -p "$HNS6"
+    run ns6_seed "$HNS6"
+    fake_aa6="$root/fake-apparmor.d-6"; mkdir -p "$fake_aa6/tunables"
+    printf 'profile\n' >"$fake_aa6/minimald"
+    fake_ns6="$root/fake-net-setup-root-6"
+    mkdir -p "$fake_ns6/etc/systemd/system" "$fake_ns6/var/lib/minimal" \
+        "$fake_ns6/sys/fs/cgroup/minimald.slice/classifier-table"
+    printf 'unit\n' >"$fake_ns6/etc/systemd/system/minzoned.service"
+    printf 'alice\n' >"$fake_ns6/var/lib/minimal/finalize-install-kvm-group"
+    APPARMOR_DIR="$fake_aa6"; NET_SETUP_ROOT="$fake_ns6"
+    run ns6_run "$HNS6" --uninstall
+    APPARMOR_DIR=; NET_SETUP_ROOT=
+    check 0 "$rc" "uninstall with every artifact exits 0"
+    check 1 "$(grep -c "still installed on this host" "$OUT")" "one advisory covers everything found"
+    for item in "host DNS setup" "system AppArmor profile" "classifier tree" "kvm group membership"; do
+        want_ok "the one advisory lists: $item" grep -q "still installed on this host.*$item" "$OUT"
+    done
+    for cmd in "systemctl disable --now minzoned" "apparmor_parser -R" "nft delete table" "gpasswd -d"; do
+        want_ok "the remedy covers: $cmd" grep -q "$cmd" "$OUT"
+    done
 }
 
 case_checksum_mismatch() {
