@@ -1321,57 +1321,64 @@ say "  ${dim}record: $(tilde "$prev_record")$rst"
 # The install itself never elevates, so a host may still lack a privileged
 # part: the user-namespace profile on Ubuntu 24.04+, the box-name resolver
 # link and answerer (every host, macOS included), the classifier tree, KVM
-# group membership. The just-installed `min` probes all of them
-# (`finalize-install --show --json`): exit 0 on a finished host, non-zero
-# while any item is not done, each item carrying its state — `missing` (the
-# step installs it), `cannot` (no script can), or `waiting` (the names item
-# until a daemon runs, which on a fresh install is always). A finished host,
-# or a `min` too old to know the command, adds nothing to the output above.
-# Otherwise show the summary (`--show`), and while some item is `missing` —
-# the only state the step changes — offer it, default yes: it is
-# non-destructive and undoable, and sudo's own password prompt is a second
-# consent. The answer comes from the controlling terminal (overridable for
-# install_test.sh), never stdin, which under `curl … | sh` is the script
-# itself. Declined, nothing runnable yet, or no terminal to ask on: print the
-# file route instead, the one line `min finalize-install` itself points at.
-# A failed step is reported and the installer still exits 0: Minimal is
-# installed either way.
-# shellcheck disable=SC2016 # the line is printed for the user to run, not expanded here
-fi_pointer='f=$(mktemp) && min finalize-install --show --script > "$f" && sudo sh "$f"'
+# group membership. The just-installed `min` probes all of them in ONE call
+# (`finalize-install --show --script`, exit 0 whatever it finds): the summary
+# on stderr — a ✓/✗ line per item — and on stdout the one script a run
+# executes, printed only while some item is `missing`, the only state the
+# step changes. One call, because each probe reads the daemon and, with none
+# running (a fresh install, always), waits out its connect retries. A finished
+# host (no ✗ in the summary), or a `min` too old to know the command, adds
+# nothing to the output above. With something missing, show the summary and
+# offer the step, default yes: it is non-destructive and undoable, and sudo's
+# own password prompt is a second consent. The answer comes from the
+# controlling terminal (overridable for install_test.sh), never stdin, which
+# under `curl … | sh` is the script itself. Declined, or no terminal to ask
+# on: point at the command. The run prints the same summary again on its
+# stdout before it elevates, so that stream is dropped; its prompt is on the
+# terminal and its outcome on stderr. A ✗ item no script can run — the names
+# item `waiting on a daemon` until the first `min` starts one, or a `cannot`
+# — gets the summary and no offer: there is nothing to run yet. A failed step
+# is reported and the installer still exits 0: Minimal is installed either
+# way. Every printed command names `min` as this shell can resolve it: bare
+# only once $bindir is on PATH, which on a fresh install it is not yet.
 offer_finalize_install() {
     [ -x "$bindir/min" ] || return 0
-    if _fi_report="$("$bindir/min" finalize-install --show --json </dev/null 2>/dev/null)"; then
-        return 0
-    fi
-    # A non-zero exit with no report is a `min` that cannot probe, not a host
-    # that needs something: say nothing rather than guess.
-    case "$_fi_report" in
-        *'"state":'*) ;;
-        *) return 0 ;;
+    _fi_summary="$tmpdir/finalize-summary"
+    _fi_script="$tmpdir/finalize-script"
+    "$bindir/min" finalize-install --show --script </dev/null \
+        >"$_fi_script" 2>"$_fi_summary" || return 0
+    grep -q '✗' "$_fi_summary" || return 0
+    case ":${PATH:-}:" in
+        *":$bindir:"*) _fi_min=min ;;
+        *)             _fi_min="\"$bindir/min\"" ;;
     esac
     say ""
-    "$bindir/min" finalize-install --show </dev/null >&2 || true
+    # The probe's own warnings (a broken named VM it skipped) are not the
+    # summary; the installer prints the status lines and nothing else.
+    grep -v '^warning: ' "$_fi_summary" >&2 || true
+    if ! [ -s "$_fi_script" ]; then
+        if grep -q 'waiting on a daemon' "$_fi_summary"; then
+            say "  box names finish once a daemon runs: after your first \`min\`, run \`$_fi_min finalize-install\`."
+        fi
+        return 0
+    fi
     _fi_tty="${MINIMAL_OVERRIDE_TTY:-/dev/tty}"
-    case "$_fi_report" in
-        *'"state":"missing"'*)
-            if (exec <"$_fi_tty") 2>/dev/null; then
-                printf 'Finish setup now? This runs one sudo command. [Y/n] ' >&2
-                _fi_ans=
-                read -r _fi_ans <"$_fi_tty" || _fi_ans=
-                case "$_fi_ans" in
-                    ""|[Yy]*)
-                        if "$bindir/min" finalize-install <"$_fi_tty"; then
-                            return 0
-                        fi
-                        say "  ✗ setup did not finish; retry with \`min finalize-install\`"
-                        return 0
-                        ;;
-                esac
-            fi
-            ;;
-    esac
-    say "run \`min finalize-install\` when you're ready, or without a terminal:"
-    say "$fi_pointer"
+    if (exec <"$_fi_tty") 2>/dev/null; then
+        printf 'Finish setup now? This runs one sudo command. [Y/n] ' >&2
+        _fi_ans=
+        read -r _fi_ans <"$_fi_tty" || _fi_ans=
+        case "$_fi_ans" in
+            ""|[Yy]*)
+                if "$bindir/min" finalize-install <"$_fi_tty" >/dev/null; then
+                    return 0
+                fi
+                say "  ✗ setup did not finish; retry with \`$_fi_min finalize-install\`"
+                return 0
+                ;;
+        esac
+    fi
+    say "run \`$_fi_min finalize-install\` when you're ready, or without a terminal:"
+    say "f=\$(mktemp) && $_fi_min finalize-install --show --script > \"\$f\" && sudo sh \"\$f\""
 }
 offer_finalize_install
 
