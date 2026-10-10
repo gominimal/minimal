@@ -141,22 +141,16 @@ pub fn version_skew_message(cli: &str, daemon: &str) -> Option<String> {
     })
 }
 
-/// How a user-namespace refusal opens (NET-141): the daemon writes a create
-/// refused on the host's user-namespace verdict as this lead, the cause
-/// (`sandbox2::UsernsRestriction::cause`) closing the parenthesis, and the
-/// cause's remedy for the daemon on a second line; the client recognises
-/// the refusal by this lead ([`is_user_namespace_refusal`]) and prints it
-/// verbatim instead of wrapping it as an RPC failure. Only the lead lives
-/// here: the cause and remedy texts are `sandbox2`'s, where the restriction
-/// is diagnosed and both binaries that probe it already look.
+/// How a user-namespace refusal opens (NET-141): the daemon formats a
+/// create refused on the host's user-namespace verdict as this lead, the
+/// cause (`sandbox2::UsernsRestriction::cause`) closing the parenthesis,
+/// and the cause's remedy for the daemon on a second line. Clients print
+/// the daemon's text verbatim, as they do every create refusal, so nothing
+/// on their side matches on the lead. Only the lead lives here: the cause
+/// and remedy texts are `sandbox2`'s, where the restriction is diagnosed
+/// and both binaries that probe it already look.
 pub const USER_NAMESPACE_REFUSAL_LEAD: &str =
     "this machine blocks the private sandbox every box runs in (";
-
-/// Whether a create's error is a user-namespace refusal, of either cause.
-#[must_use]
-pub fn is_user_namespace_refusal(error: &str) -> bool {
-    error.starts_with(USER_NAMESPACE_REFUSAL_LEAD)
-}
 
 /// An RPC to list sessions managed by this minimald.
 pub struct ListSessions;
@@ -3255,24 +3249,6 @@ mod tests {
             msg.contains(SKEW_OVERRIDE_VAR),
             "missing the override: {msg}"
         );
-    }
-
-    /// The client recognises a user-namespace refusal by its lead alone
-    /// (NET-141), whichever cause and remedy the daemon spelled after it,
-    /// and no other create failure by it.
-    #[test]
-    fn user_namespace_refusal_is_recognised_by_its_lead() {
-        assert!(is_user_namespace_refusal(&format!(
-            "{USER_NAMESPACE_REFUSAL_LEAD}Ubuntu restricts unprivileged user namespaces), \
-             so no box can start here yet.\nFinish the install ..."
-        )));
-        assert!(is_user_namespace_refusal(USER_NAMESPACE_REFUSAL_LEAD));
-        assert!(!is_user_namespace_refusal(
-            "A session with that name already exists"
-        ));
-        assert!(!is_user_namespace_refusal(
-            " this machine blocks the private sandbox every box runs in ("
-        ));
     }
 
     /// A `SessionConfig` from a client that predates `hooks_enabled`

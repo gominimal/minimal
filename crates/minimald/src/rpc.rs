@@ -5334,7 +5334,7 @@ mod tests {
                 .err()
                 .expect("a create under a refusing verdict must be refused");
             assert!(
-                minimald_rpc::is_user_namespace_refusal(&error),
+                error.starts_with(minimald_rpc::USER_NAMESPACE_REFUSAL_LEAD),
                 "the refusal must be the user-namespace one, got: {error}"
             );
             assert_eq!(error, expected);
