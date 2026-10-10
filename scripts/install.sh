@@ -432,7 +432,7 @@ strip_rc_block() {
 # root commands for everything found instead, which stay valid after the
 # walk. The roots are overridable for install_test.sh.
 maybe_remove_finalize_install() {
-    _fi_root="${MINIMAL_OVERRIDE_NET_SETUP_ROOT:-}"
+    _fi_root="${MINIMAL_OVERRIDE_FINALIZE_INSTALL_ROOT:-}"
     _aa_dir="${MINIMAL_OVERRIDE_APPARMOR_DIR:-/etc/apparmor.d}"
     _aa_profile="$_aa_dir/minimald"
     _aa_tunable="$_aa_dir/tunables/minimald"
@@ -484,7 +484,7 @@ maybe_remove_finalize_install() {
             _fi_list="$_fi_list${_fi_list:+, }the kvm group membership"
             _fi_owned=1
             _fi_undo="$_fi_undo${_fi_undo:+
-}      sudo gpasswd -d \"\$(cat $_kvm_record)\" kvm; sudo rm -f $_kvm_record"
+}      while IFS= read -r u; do sudo gpasswd -d \"\$u\" kvm; done < $_kvm_record; sudo rm -f $_kvm_record"
         fi
     fi
     [ -n "$_fi_list" ] || return 0

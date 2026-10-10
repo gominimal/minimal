@@ -966,10 +966,12 @@ pub(crate) mod linux {
                     ),
                     format!(
                         "# KVM access: the Linux VM provider drives KVM, which the kvm group may\n\
-                         # open. The record names who was added, so --undo takes back only that.\n\
+                         # open. The record names who was added, one per line, so --undo takes\n\
+                         # back only those, and one user's run never drops another's name.\n\
                          usermod -aG kvm '{operator}'\n\
                          mkdir -p /var/lib/minimal\n\
-                         printf '%s\\n' '{operator}' > {KVM_GROUP_RECORD}\n"
+                         grep -qxF '{operator}' {KVM_GROUP_RECORD} 2>/dev/null || \
+                         printf '%s\\n' '{operator}' >> {KVM_GROUP_RECORD}\n"
                     ),
                 )
             }
@@ -1595,9 +1597,11 @@ mod tests {
         let script = missing.script.unwrap();
         assert!(script.contains("usermod -aG kvm 'alice'\n"), "{script}");
         assert!(
-            script
-                .contains("printf '%s\\n' 'alice' > /var/lib/minimal/finalize-install-kvm-group\n"),
-            "{script}"
+            script.contains(
+                "grep -qxF 'alice' /var/lib/minimal/finalize-install-kvm-group 2>/dev/null || \
+                 printf '%s\\n' 'alice' >> /var/lib/minimal/finalize-install-kvm-group\n"
+            ),
+            "the record is appended, never replaced: {script}"
         );
         assert!(missing.step.unwrap().contains("next login"));
         let absent = kvm_item_over(Err(Error::from(ErrorKind::NotFound)), "alice", false);
