@@ -2804,7 +2804,7 @@ fn linux_host_items_removal() -> String {
          \x20 [ -n \"$classifier_held\" ] || rm -f {CLASSIFIER_TREE_RECORD}\n\
          elif [ -d {CLASSIFIER_TREE_ROOT} ] ; then\n\
          \x20 echo 'note: the classifier tree at {CLASSIFIER_TREE_ROOT} was not installed by min \
-         finalize-install and stays; remove it with: sudo {CLASSIFIER_PROGRAM_PATH} --uninstall \
+         finalize-install and stays; remove it as root with: {CLASSIFIER_PROGRAM_PATH} --uninstall \
          (or the same script from a checkout)' >&2\n\
          fi\n\
          if [ -n \"$classifier_held\" ] ; then\n\
