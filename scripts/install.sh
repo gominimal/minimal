@@ -478,7 +478,7 @@ maybe_remove_finalize_install() {
             _fi_list="$_fi_list${_fi_list:+, }the classifier tree ($_cls_root)"
             _fi_owned=1
             _fi_undo="$_fi_undo${_fi_undo:+
-}      sudo nft delete table inet minimal_class; sudo find $_cls_root -depth -type d -exec rmdir {} +"
+}      sudo nft delete table inet minimal_class; sudo find \"$_fi_root$_cls_root\" -depth -type d -exec rmdir {} +"
         fi
         if [ -e "$_kvm_record" ]; then
             _fi_list="$_fi_list${_fi_list:+, }the kvm group membership"
