@@ -110,6 +110,12 @@ pub enum AttachError {
     /// client still owes a patches upload + `FinalizeSession`
     /// before a shell can be minted.
     SessionPending,
+    /// The session's `WorkspaceFilesTarZst` upload is still streaming, so
+    /// the workspace the attach would configure against is incomplete:
+    /// the Draft shortcut would scaffold a default against a half-empty
+    /// tree and later conflict with the uploaded layout. The client
+    /// should retry once the upload has landed.
+    WorkspaceUploadInFlight,
     /// The session host is alive but busy (its mailbox stayed full past the
     /// attach deadline). The client should retry.
     SessionBusy,
@@ -156,6 +162,11 @@ impl fmt::Display for AttachError {
                 f,
                 "session isn't attachable yet (still being activated; retry \
                  after the activation finishes)"
+            ),
+            AttachError::WorkspaceUploadInFlight => write!(
+                f,
+                "session is still receiving its workspace upload; retry the \
+                 attach once the upload completes"
             ),
             AttachError::SessionBusy => {
                 write!(f, "session host is busy; retry the attach once it drains")
@@ -243,6 +254,10 @@ pub(crate) struct SessionConfig {
     /// it so a diagnostics bundle can name the posture without the daemon's
     /// flags.
     pub deny_all_opt_out: bool,
+    /// The liveness of the connection that created this session over
+    /// `CreateSession`, or `None` for a session brought up any other way
+    /// (from disk, or by an in-process caller). See `Session::creator`.
+    pub creator: Option<std::sync::Weak<()>>,
 }
 
 /// The egress *section* the gate compiles for a session: the materialized
@@ -521,6 +536,8 @@ enum SessionMessage {
         String,
         Channel<Msg>,
         ChannelConfig,
+        /// The attaching connection's liveness, see [`Session::creator`].
+        Option<std::sync::Weak<()>>,
     ),
     GetHostAttrs(oneshot::Sender<Option<HostAttrs>>),
     /// Hand back this session's host, minting one — with no channel bound to
@@ -603,6 +620,18 @@ enum SessionMessage {
     /// Hand back an `Arc` clone of this session's hook-scripts-upload lock,
     /// see [`Session::hook_scripts_upload_lock`].
     GetHookScriptsUploadLock(oneshot::Sender<Arc<Mutex<()>>>),
+    /// Mark one `WorkspaceFilesTarZst` upload into this session as
+    /// started (true) or finished (false), see
+    /// [`Session::workspace_uploads_in_flight`]. The ack fires once the
+    /// actor has applied the change, so a Begin is visible to an attach
+    /// before the upload pulls its first byte. It carries whether the
+    /// change was applied: a Begin is refused unless the session is still
+    /// unconfigured (`Draft { pending: None }`), since an upload comes
+    /// before the configure in the create flow. One already composed and
+    /// awaiting its verdict is refused too: the upload would change the
+    /// tree under a composition already computed. `configure_loadout`
+    /// holds the other side, refusing while any upload is in flight.
+    SetWorkspaceUploadInFlight(bool, oneshot::Sender<bool>),
     /// Register a live direct-tcpip forward relay as belonging to this
     /// session, so teardown takes it down too: a session that goes away
     /// aborts its forwards rather than leaving relays pointing into a box
@@ -919,6 +948,36 @@ pub struct Session {
     /// reason.
     hook_scripts_upload_lock: Arc<Mutex<()>>,
 
+    /// How many `WorkspaceFilesTarZst` uploads are currently streaming into
+    /// the workspace. A count rather than a flag so one upload finishing
+    /// cannot re-admit attaches while another into the same session is
+    /// still unpacking. While non-zero, an attach would run its Draft shortcut
+    /// (`configure_loadout` with an empty contribution) against a
+    /// half-populated tree, scaffolding a default `minimal.toml` that
+    /// conflicts with the layout the upload is about to land — so the
+    /// attach is refused instead, and the client retries once the upload
+    /// completes.
+    workspace_uploads_in_flight: usize,
+
+    /// The liveness of the connection that created this session, while it
+    /// is still open. That connection owns the activation — upload,
+    /// `ConfigureLoadout`, `FinalizeSession` — from `CreateSession` until
+    /// the session leaves `Draft`, so an attach from any other connection
+    /// that finds the session unconfigured while its creator is live is
+    /// refused rather than configured: the Draft shortcut would compose
+    /// against a workspace the creator has not finished uploading (or has
+    /// uploaded but not yet configured), and the creator's own
+    /// `ConfigureLoadout` would then be refused. The creator's own attach
+    /// is let through: it knows where its activation stands. This
+    /// keeps upgrading after the creator's connection closes, until that
+    /// connection's teardown has reaped the sessions it left unfinalized:
+    /// the gate holds over a dying creator's `Draft` until the `Draft` is
+    /// gone, and only then stops upgrading. So the shortcut is
+    /// open to the creator's own connection, and otherwise only for a
+    /// session with no live creator: one restored from disk or created
+    /// in-process (`None`).
+    creator: Option<std::sync::Weak<()>>,
+
     /// A non-owning handle to the [`Manager`](crate::sessions::Manager), used to
     /// build the [`SessionControl`] handed to each [`Binding`] so a shell-exit
     /// "delete" tears this session down through the manager (record removal and
@@ -1040,6 +1099,7 @@ impl Session {
             net_switch,
             manager,
             deny_all_opt_out,
+            creator,
             #[cfg(target_os = "linux")]
             hostnames,
             #[cfg(target_os = "linux")]
@@ -1058,6 +1118,8 @@ impl Session {
             workspace_baseline: WorkspaceBaseline::Unarmed,
             patches_upload_lock: Arc::new(Mutex::new(())),
             hook_scripts_upload_lock: Arc::new(Mutex::new(())),
+            workspace_uploads_in_flight: 0,
+            creator,
             manager,
             weak_self,
             // No host yet; the first launch sets this. `Interactive` is the
@@ -1868,9 +1930,9 @@ impl Session {
             SessionMessage::MakeContext(r) => {
                 let _ = r.send(self.context(false).await);
             }
-            SessionMessage::Attach(r, session_hnd, conn_username, channel, config) => {
+            SessionMessage::Attach(r, session_hnd, conn_username, channel, config, attacher) => {
                 let _ = r.send(
-                    self.attach(session_hnd, conn_username, channel, config)
+                    self.attach(session_hnd, conn_username, channel, config, attacher)
                         .await,
                 );
             }
@@ -2081,6 +2143,19 @@ impl Session {
             SessionMessage::GetHookScriptsUploadLock(r) => {
                 let _ = r.send(Arc::clone(&self.hook_scripts_upload_lock));
             }
+            SessionMessage::SetWorkspaceUploadInFlight(in_flight, r) => {
+                let applied = if !in_flight {
+                    self.workspace_uploads_in_flight =
+                        self.workspace_uploads_in_flight.saturating_sub(1);
+                    true
+                } else if matches!(self.inner, SessionInner::Draft { pending: None }) {
+                    self.workspace_uploads_in_flight += 1;
+                    true
+                } else {
+                    false
+                };
+                let _ = r.send(applied);
+            }
             SessionMessage::TrackForward(forward) => {
                 // Prune the ones that have finished on their own, so the
                 // list holds the live forwards and nothing else.
@@ -2214,6 +2289,16 @@ impl Session {
                 ));
             }
             SessionInner::Draft { pending: None } => {}
+        }
+        // Composing mid-upload would scaffold and resolve against a
+        // half-populated tree, and the session could then go `Active` with
+        // the upload still streaming into it.
+        if self.workspace_uploads_in_flight > 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::ResourceBusy,
+                "session is still receiving its workspace upload; retry once \
+                 the upload completes",
+            ));
         }
         let object = self.record.object().await?;
         let workspace_path = object.workspace_path();
@@ -4038,6 +4123,7 @@ impl Session {
         conn_username: String,
         channel: Channel<Msg>,
         config: ChannelConfig,
+        attacher: Option<std::sync::Weak<()>>,
     ) -> Result<(), AttachError> {
         let sz = WinSize::from(match config.pty.as_ref() {
             Some(pty) => pty,
@@ -4127,6 +4213,29 @@ impl Session {
         // reachable for `DestroySession`) and refuse the attach with
         // an actionable error naming the required explicit flow.
         if let SessionInner::Draft { pending: None } = &self.inner {
+            // Refuse the shortcut while the workspace upload is still
+            // streaming: it configures against whatever the tree holds
+            // right now, and mid-upload that is a half-populated workspace
+            // whose scaffolded default would conflict with the layout the
+            // upload is about to land. The client retries once the upload
+            // completes.
+            if self.workspace_uploads_in_flight > 0 {
+                return Err(AttachError::WorkspaceUploadInFlight);
+            }
+            // Refuse it too while the creating connection is live, unless
+            // that connection is the one attaching: it is mid-activation —
+            // before its upload, or after it and before its
+            // `ConfigureLoadout` — and configuring the session from elsewhere
+            // would compose an empty contribution against a workspace it has
+            // not finished with, then refuse the creator's own configure.
+            if self.creator.as_ref().is_some_and(|creator| {
+                creator.strong_count() > 0
+                    && !attacher
+                        .as_ref()
+                        .is_some_and(|attacher| std::sync::Weak::ptr_eq(attacher, creator))
+            }) {
+                return Err(AttachError::SessionPending);
+            }
             // Hooks are forced off on this path regardless of the
             // record. The shortcut composes with no client in the loop,
             // and a project hook needs a client-side policy decision it
@@ -5456,6 +5565,55 @@ impl SessionHandle {
         })
     }
 
+    /// Marks one `WorkspaceFilesTarZst` upload into the session as started
+    /// (true) or finished (false); every accepted `true` must be paired with
+    /// exactly one `false`. The reply is awaited — the actor's ack fires
+    /// once the change is applied, so a `true` returns only once an attach
+    /// racing the upload will see it. A dead actor maps to `NotConnected`;
+    /// a `true` into a session that is no longer unconfigured maps to
+    /// `PermissionDenied` and marks nothing.
+    pub async fn set_workspace_upload_in_flight(
+        &self,
+        in_flight: bool,
+    ) -> Result<(), std::io::Error> {
+        let (send, recv) = oneshot::channel();
+        // Ignore send errors - the recv will also fail.
+        let _ = self
+            .0
+            .send(SessionMessage::SetWorkspaceUploadInFlight(in_flight, send))
+            .await;
+        match recv.await {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "session is already configured; a workspace upload is accepted \
+                 only while the session is being created",
+            )),
+            Err(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "session actor is gone",
+            )),
+        }
+    }
+
+    /// The `false` half of [`Self::set_workspace_upload_in_flight`] for a
+    /// caller that cannot await, such as a `Drop`. The message is enqueued
+    /// synchronously when the mailbox has room, so it is ordered ahead of
+    /// anything sent after this returns; a full mailbox hands it to a
+    /// detached task instead. A dead actor needs no clear and is ignored.
+    pub fn end_workspace_upload_detached(&self) {
+        let (send, _) = oneshot::channel();
+        let msg = SessionMessage::SetWorkspaceUploadInFlight(false, send);
+        if let Err(mpsc::error::TrySendError::Full(msg)) = self.0.try_send(msg)
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            let sender = self.0.clone();
+            runtime.spawn(async move {
+                let _ = sender.send(msg).await;
+            });
+        }
+    }
+
     /// Kicks off a background package build as a session side-op, returning the
     /// receiver end of the build's event stream. Events flow until the build
     /// finishes (success or cancellation), at which point the channel closes.
@@ -5957,11 +6115,14 @@ impl SessionHandle {
         let _ = self.0.send(SessionMessage::TrackForward(forward)).await;
     }
 
+    /// `attacher` is the attaching connection's liveness: while the session
+    /// is still unconfigured, only its creating connection may attach.
     pub async fn attach(
         &self,
         conn_username: String,
         channel: Channel<Msg>,
         config: ChannelConfig,
+        attacher: Option<std::sync::Weak<()>>,
     ) -> Result<(), AttachError> {
         let (send, recv) = oneshot::channel();
         // Ignore send errors - the recv will also fail.
@@ -5973,6 +6134,7 @@ impl SessionHandle {
                 conn_username,
                 channel,
                 config,
+                attacher,
             ))
             .await;
         // A dead session actor (it panicked or was dropped mid-attach) drops the

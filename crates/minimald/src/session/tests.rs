@@ -281,6 +281,417 @@ async fn attach_to_an_unconfigured_session_configures_it_rather_than_failing() {
     );
 }
 
+/// Attaching while the session's `WorkspaceFilesTarZst` upload is still
+/// streaming must be refused, not shortcut into `configure_loadout`:
+/// mid-upload the workspace is half-populated, and the default the
+/// Draft shortcut scaffolds against it conflicts with the layout the
+/// upload is about to land — wedging the session behind a layout
+/// error no retry can clear. The refusal leaves the workspace
+/// untouched (nothing is scaffolded). Two overlapping uploads keep
+/// attaches refused until both have finished, and an upload whose guard
+/// is dropped without finishing (a panic, a torn-down task) still clears
+/// its mark, so the same attach then goes through.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attach_while_a_workspace_upload_streams_is_refused_without_scaffolding() {
+    use crate::test_harness::create_session_req;
+    use minimald_rpc::CreateSession;
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    // Bare `CreateSession` — the actor stays `Draft`, exactly the state
+    // a client is in while it streams the workspace upload.
+    let session_id = client
+        .call::<CreateSession>(&create_session_req("uploading-session", "/uwu"))
+        .await
+        .unwrap()
+        .id;
+
+    // Stand in for two overlapping in-flight uploads: the RPC handler
+    // takes this guard before it pulls the first byte, and finishes it
+    // once the unpack ends on either arm.
+    let manager = server.state.sessions_manager().await;
+    let handle = manager
+        .get_session(crate::sessions::SessionKeyPredicate::Id(session_id))
+        .await
+        .unwrap()
+        .expect("session should resolve");
+    let first = crate::rpc::WorkspaceUploadInFlight::begin(handle.clone())
+        .await
+        .expect("first upload mark should land");
+    let second = crate::rpc::WorkspaceUploadInFlight::begin(handle.clone())
+        .await
+        .expect("second upload mark should land");
+
+    // The attach is refused with the in-flight message, not shortcut
+    // into a configure.
+    let mut channel = client.open_shell(session_id).await;
+    let refusal = collect_to_close(&mut channel).await;
+    assert!(
+        refusal.contains("Error attaching to session:"),
+        "expected an attach refusal, got: {refusal:?}"
+    );
+    assert!(
+        refusal.contains("session is still receiving its workspace upload"),
+        "expected the in-flight-upload refusal, got: {refusal:?}"
+    );
+
+    // The refusal happened before the Draft shortcut, so the workspace
+    // holds no scaffolded root `minimal.toml`.
+    let paths = handle.paths().await.expect("paths should resolve");
+    assert!(
+        !paths.working.as_utf8_path().join("minimal.toml").exists(),
+        "a refused attach must not scaffold the workspace"
+    );
+
+    // One upload finishing does not re-admit attaches while the other
+    // is still unpacking.
+    first
+        .finish()
+        .await
+        .expect("first upload mark should clear");
+    let mut channel = client.open_shell(session_id).await;
+    let refusal = collect_to_close(&mut channel).await;
+    assert!(
+        refusal.contains("session is still receiving its workspace upload"),
+        "an attach must stay refused while any upload streams, got: {refusal:?}"
+    );
+
+    // The second upload never reaches its finish — dropping the guard
+    // stands in for a panic or a torn-down task — and the same attach
+    // then lands the session live.
+    drop(second);
+    let mut channel = client.open_shell(session_id).await;
+    await_hello_echo(&mut channel, "attach after the upload").await;
+
+    // The attach that landed ran the Draft shortcut, which scaffolds the
+    // root `minimal.toml` in this harness — so its absence after the
+    // refusals above is the refusal's doing, not the harness's.
+    assert!(
+        paths
+            .working
+            .as_utf8_path()
+            .join(mfile::MFILE_NAME)
+            .exists(),
+        "the attach that landed should have scaffolded the workspace"
+    );
+}
+
+/// Serializes `(path, contents)` entries into the zstd-compressed tarball a
+/// client streams over `WorkspaceFilesTarZst`.
+async fn workspace_tar_zst(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    use tokio::io::AsyncWriteExt as _;
+    let mut tar = async_tar::Builder::new(Vec::new());
+    for (path, contents) in entries {
+        let mut header = async_tar::Header::new_gnu();
+        header.set_size(contents.len() as u64);
+        header.set_mode(0o644);
+        tar.append_data(&mut header, path, *contents).await.unwrap();
+    }
+    let tar_bytes = tar.into_inner().await.unwrap();
+    let mut encoder = async_compression::tokio::write::ZstdEncoder::new(Vec::new());
+    encoder.write_all(&tar_bytes).await.unwrap();
+    encoder.shutdown().await.unwrap();
+    encoder.into_inner()
+}
+
+/// Streams `payload` through the real `WorkspaceFilesTarZst` subsystem on
+/// `client`, waits for the daemon to close the channel (the unpack, and the
+/// clear of its in-flight mark, are done by then), and returns its stderr.
+async fn upload_workspace(
+    client: &mut TestClient,
+    session_id: SessionId,
+    payload: &[u8],
+) -> String {
+    let mut channel = client
+        .open_subsystem(
+            crate::rpc::STREAM_WORKSPACE_FILES,
+            &[(crate::MINIMAL_SESSION_ID_ENV, &session_id.to_string())],
+        )
+        .await;
+    channel.data(payload).await.unwrap();
+    channel.eof().await.unwrap();
+    let mut stderr = Vec::new();
+    while let Some(msg) = channel.wait().await {
+        if let ChannelMsg::ExtendedData { data, ext: 1 } = msg {
+            stderr.extend_from_slice(&data);
+        }
+    }
+    String::from_utf8_lossy(&stderr).into_owned()
+}
+
+/// Reads `channel` until the mock shell echoes `got:hello`, panicking if it
+/// closes first.
+async fn await_hello_echo(channel: &mut russh::Channel<russh::client::Msg>, what: &str) {
+    channel.data_bytes(b"hello\n".to_vec()).await.unwrap();
+    let mut stdout = Vec::new();
+    loop {
+        match channel.wait().await {
+            Some(ChannelMsg::Data { data }) => {
+                stdout.extend_from_slice(&data);
+                if String::from_utf8_lossy(&stdout).contains("got:hello") {
+                    return;
+                }
+            }
+            Some(_) => {}
+            None => {
+                let stdout = String::from_utf8_lossy(&stdout);
+                panic!("{what} should mint a shell; got: {stdout:?}");
+            }
+        }
+    }
+}
+
+/// While the creating connection is still mid-activation, an attach from
+/// any other connection is refused, not shortcut into `configure_loadout`
+/// — before the workspace upload, and after it but before the creator's
+/// `ConfigureLoadout`. Either shortcut would compose an empty contribution
+/// against a workspace the creator has not finished with and then refuse the
+/// creator's own configure. Once the creator has configured and finalized,
+/// the same attach lands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attach_from_elsewhere_during_activation_is_refused_until_the_creator_finishes() {
+    use crate::test_harness::{create_session_req, unwrap_ready};
+    use minimald_rpc::{
+        ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, FinalizeSession,
+        FinalizeSessionRequest,
+    };
+
+    let server = TestServer::new().await;
+    let mut creator = server.connect().await;
+    let mut other = server.connect().await;
+    let session_id = creator
+        .call::<CreateSession>(&create_session_req("activating", "/uwu"))
+        .await
+        .unwrap()
+        .id;
+    let paths = server
+        .state
+        .sessions_manager()
+        .await
+        .get_session(crate::sessions::SessionKeyPredicate::Id(session_id))
+        .await
+        .unwrap()
+        .expect("session should resolve")
+        .paths()
+        .await
+        .expect("paths should resolve");
+    let scaffolded = paths.working.as_utf8_path().join(mfile::MFILE_NAME);
+
+    // Before the upload.
+    let mut channel = other.open_shell(session_id).await;
+    let refusal = collect_to_close(&mut channel).await;
+    assert!(
+        refusal.contains("session isn't attachable yet"),
+        "an attach before the creator's upload must be refused, got: {refusal:?}"
+    );
+    assert!(!scaffolded.exists(), "a refused attach must not scaffold");
+
+    // The creator's upload, through the real subsystem.
+    let payload = workspace_tar_zst(&[("hello.txt", b"hello\n")]).await;
+    let stderr = upload_workspace(&mut creator, session_id, &payload).await;
+    assert!(stderr.is_empty(), "the upload should land, got: {stderr:?}");
+    assert!(paths.working.as_utf8_path().join("hello.txt").exists());
+
+    // After the upload, before the creator's `ConfigureLoadout`.
+    let mut channel = other.open_shell(session_id).await;
+    let refusal = collect_to_close(&mut channel).await;
+    assert!(
+        refusal.contains("session isn't attachable yet"),
+        "an attach between the upload and the configure must be refused, got: {refusal:?}"
+    );
+    assert!(!scaffolded.exists(), "a refused attach must not scaffold");
+
+    // The creator finishes its activation; nothing refused it.
+    unwrap_ready(
+        creator
+            .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
+                session_id,
+                contribution: Default::default(),
+            })
+            .await
+            .unwrap(),
+    );
+    match creator
+        .call::<FinalizeSession>(&FinalizeSessionRequest {
+            session_id,
+            report_shared_port_collisions: false,
+        })
+        .await
+    {
+        minimald_rpc::Errorable::Ok(_) => {}
+        minimald_rpc::Errorable::Err { error } => panic!("FinalizeSession failed: {error}"),
+    }
+
+    let mut channel = other.open_shell(session_id).await;
+    await_hello_echo(&mut channel, "an attach after the activation").await;
+}
+
+/// An upload that fails mid-stream, sent through the real
+/// `WorkspaceFilesTarZst` subsystem, clears its in-flight mark on the way
+/// out: the next attach lands rather than being refused forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_workspace_upload_does_not_leave_attaches_refused() {
+    use crate::test_harness::create_session_req;
+    use minimald_rpc::CreateSession;
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let session_id = client
+        .call::<CreateSession>(&create_session_req("failed-upload", "/uwu"))
+        .await
+        .unwrap()
+        .id;
+
+    // A truncated archive: the head of a real one, cut off mid-stream.
+    let noise: Vec<u8> = (0..64 * 1024u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect();
+    let payload = workspace_tar_zst(&[("big.bin", noise.as_slice())]).await;
+    let stderr = upload_workspace(&mut client, session_id, &payload[..payload.len() / 2]).await;
+    assert!(
+        stderr.contains("unpack failed"),
+        "the truncated upload should fail its unpack, got: {stderr:?}"
+    );
+
+    let mut channel = client.open_shell(session_id).await;
+    await_hello_echo(&mut channel, "an attach after a failed upload").await;
+}
+
+/// An attach that arrives while a real `WorkspaceFilesTarZst` stream is
+/// half-sent is refused, and the same attach lands once the rest of the
+/// stream and its EOF have arrived: the subsystem itself marks the upload in
+/// flight before it unpacks the first byte, and clears the mark at the end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attach_while_a_real_workspace_upload_is_half_sent_is_refused_then_lands() {
+    use crate::test_harness::create_session_req;
+    use minimald_rpc::CreateSession;
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let session_id = client
+        .call::<CreateSession>(&create_session_req("half-sent-upload", "/uwu"))
+        .await
+        .unwrap()
+        .id;
+    let paths = server
+        .state
+        .sessions_manager()
+        .await
+        .get_session(crate::sessions::SessionKeyPredicate::Id(session_id))
+        .await
+        .unwrap()
+        .expect("session should resolve")
+        .paths()
+        .await
+        .expect("paths should resolve");
+    let working = paths.working.as_utf8_path();
+
+    // A small file ahead of incompressible noise several zstd blocks long,
+    // so the first half of the payload already carries the small file whole.
+    let noise: Vec<u8> = (0..512 * 1024u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect();
+    let payload =
+        workspace_tar_zst(&[("first.txt", b"first\n"), ("big.bin", noise.as_slice())]).await;
+    let (head, tail) = payload.split_at(payload.len() / 2);
+
+    let mut upload = client
+        .open_subsystem(
+            crate::rpc::STREAM_WORKSPACE_FILES,
+            &[(crate::MINIMAL_SESSION_ID_ENV, &session_id.to_string())],
+        )
+        .await;
+    upload.data(head).await.unwrap();
+    // The small file landing proves the unpack is underway, so the upload
+    // is marked in flight by now.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !working.join("first.txt").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the first half of the upload should start unpacking");
+
+    let mut channel = client.open_shell(session_id).await;
+    let refusal = collect_to_close(&mut channel).await;
+    assert!(
+        refusal.contains("session is still receiving its workspace upload"),
+        "an attach mid-stream must be refused, got: {refusal:?}"
+    );
+    assert!(
+        !working.join(mfile::MFILE_NAME).exists(),
+        "a refused attach must not scaffold the workspace"
+    );
+
+    upload.data(tail).await.unwrap();
+    upload.eof().await.unwrap();
+    let mut stderr = Vec::new();
+    while let Some(msg) = upload.wait().await {
+        if let ChannelMsg::ExtendedData { data, ext: 1 } = msg {
+            stderr.extend_from_slice(&data);
+        }
+    }
+    let stderr = String::from_utf8_lossy(&stderr);
+    assert!(stderr.is_empty(), "the upload should land, got: {stderr:?}");
+    assert!(working.join("big.bin").exists());
+
+    let mut channel = client.open_shell(session_id).await;
+    await_hello_echo(&mut channel, "an attach after the upload").await;
+}
+
+/// `ConfigureLoadout` is refused while a workspace upload streams, the same
+/// as the attach shortcut that runs it: composing mid-upload would scaffold
+/// against a half-populated tree and let the session go `Active` with the
+/// upload still landing. Once the upload has ended the same configure lands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn configure_while_a_workspace_upload_streams_is_refused() {
+    use crate::test_harness::{create_session_req, unwrap_ready};
+    use minimald_rpc::{ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, Errorable};
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let session_id = client
+        .call::<CreateSession>(&create_session_req("configure-mid-upload", "/uwu"))
+        .await
+        .unwrap()
+        .id;
+    let handle = server
+        .state
+        .sessions_manager()
+        .await
+        .get_session(crate::sessions::SessionKeyPredicate::Id(session_id))
+        .await
+        .unwrap()
+        .expect("session should resolve");
+    let paths = handle.paths().await.expect("paths should resolve");
+    let upload = crate::rpc::WorkspaceUploadInFlight::begin(handle)
+        .await
+        .expect("upload mark should land");
+
+    let request = ConfigureLoadoutRequest {
+        session_id,
+        contribution: Default::default(),
+    };
+    match client.call::<ConfigureLoadout>(&request).await {
+        Errorable::Err { error } => assert!(
+            error.contains("session is still receiving its workspace upload"),
+            "expected the in-flight-upload refusal, got: {error:?}"
+        ),
+        Errorable::Ok(_) => panic!("a configure mid-upload must be refused"),
+    }
+    assert!(
+        !paths
+            .working
+            .as_utf8_path()
+            .join(mfile::MFILE_NAME)
+            .exists(),
+        "a refused configure must not scaffold the workspace"
+    );
+
+    upload.finish().await.expect("upload mark should clear");
+    unwrap_ready(client.call::<ConfigureLoadout>(&request).await.unwrap());
+}
+
 /// Drives the full SSH path into the session host with the mock launcher:
 /// create a session, request a pty + shell, feed stdin, observe the echoed
 /// stdout, then confirm the host tears down when the process exits.

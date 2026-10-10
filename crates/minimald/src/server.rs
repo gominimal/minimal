@@ -175,7 +175,7 @@ fn resolve_switch_octet(lock_dir: Option<&std::path::Path>, identity: &str) -> u
     octet
 }
 
-use crate::connection::Connection;
+use crate::connection::{Connection, ConnectionHandle};
 use crate::sessions;
 
 /// The ed25519 host private key for the SSH server.
@@ -1236,12 +1236,7 @@ impl Server {
                             }
                         }
                     }
-                    // The connection is gone. Reap any session it created that
-                    // never reached `Active` — a client that dropped
-                    // mid-activation (Ctrl-C at the gating prompt, a crash, a
-                    // network blip) would otherwise strand a `Pending` /
-                    // `Materializing` session that holds its name hostage.
-                    reap_unfinalized_sessions(&state, conn_hnd.take_created_sessions().await).await;
+                    close_connection(&state, &conn_hnd).await;
                 }
                 .instrument(span),
             );
@@ -1307,6 +1302,75 @@ async fn build_russh_config(
         keepalive_max: KEEPALIVE_MAX,
         ..Default::default()
     }))
+}
+
+/// Finishes a connection that is gone. Reaps any session it created that
+/// never reached `Active` — a client that dropped mid-activation (Ctrl-C at
+/// the gating prompt, a crash, a network blip) would otherwise strand a
+/// `Pending` / `Materializing` session that holds its name hostage — and only
+/// then ends the connection's liveness.
+///
+/// The order is the point. A session's creator-only attach gate holds while
+/// its creator's liveness does, so ending it before the reap would open the
+/// gate on a `Draft` the reap is about to delete: an attach from another
+/// connection landing in between would configure the half-uploaded workspace
+/// and, if it reached `Active` before the reap read the status, leave the
+/// session alive behind a layout conflict no retry clears. Held until the
+/// reap is done, the gate refuses that attach, and what the reap leaves
+/// behind is either gone or was never the creator's to finish.
+async fn close_connection(state: &ServerStateHandle, conn: &ConnectionHandle) {
+    let created = conn.take_created_sessions().await;
+    #[cfg(test)]
+    reap_seam::park(&created).await;
+    reap_unfinalized_sessions(state, created).await;
+    conn.release_liveness().await;
+}
+
+/// The test seam for the window between a closed connection's teardown
+/// starting and its reap: a test holds one session id, and the teardown of
+/// the connection that created it parks just before the reap until the test
+/// lets it go. Keyed by session id, like the session actor's seams, so tests
+/// running beside each other in one process never park each other's
+/// teardowns.
+#[cfg(test)]
+mod reap_seam {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    use ::sessions::SessionId;
+    use tokio::sync::oneshot;
+
+    type Hold = (oneshot::Sender<()>, oneshot::Receiver<()>);
+
+    static HELD: Mutex<Option<HashMap<SessionId, Hold>>> = Mutex::new(None);
+
+    /// Makes the teardown that would reap `id` park before its reap. The
+    /// first half resolves once it has parked; sending on (or dropping) the
+    /// second lets it go on.
+    pub(super) fn hold(id: SessionId) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (parked, on_parked) = oneshot::channel();
+        let (release, on_release) = oneshot::channel();
+        HELD.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert_with(HashMap::new)
+            .insert(id, (parked, on_release));
+        (on_parked, release)
+    }
+
+    /// Parks for each of `ids` a test holds, until that test releases it.
+    pub(super) async fn park(ids: &[SessionId]) {
+        for id in ids {
+            let held = HELD
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_mut()
+                .and_then(|held| held.remove(id));
+            if let Some((parked, on_release)) = held {
+                let _ = parked.send(());
+                let _ = on_release.await;
+            }
+        }
+    }
 }
 
 /// Reap sessions a now-closed connection created but never finalized.
@@ -3194,6 +3258,162 @@ mod tests {
         );
 
         let _ = client
+            .call::<Shutdown>(&ShutdownRequest { force: false })
+            .await;
+        let _ = tokio::time::timeout(Duration::from_secs(5), run).await;
+    }
+
+    /// A creator that disconnects mid-upload leaves a half-populated `Draft`
+    /// for its teardown to reap. An attach from another connection that
+    /// lands after the creator is gone but before that reap is refused — the
+    /// creator-only gate holds until the reap is done — rather than running
+    /// the Draft shortcut, which would scaffold a root `minimal.toml` over
+    /// the half-uploaded tree and could carry the session to `Active` ahead
+    /// of the reap, alive behind a layout conflict. The teardown is parked
+    /// just before its reap, so the attach lands in exactly that window.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn attach_from_elsewhere_between_a_creators_close_and_its_reap_is_refused() {
+        use crate::test_harness::create_session_req;
+        use minimald_rpc::{CreateSession, GetSessionRecord, GetSessionRecordRequest};
+        use russh::ChannelMsg;
+        use tokio::io::AsyncWriteExt as _;
+
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("minimald.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let state = ServerStateHandle::new(test_config(&dir), None)
+            .await
+            .unwrap();
+        let run = tokio::spawn(Server::serve(state.clone(), listener));
+
+        let mut creator = connect_uds(&sock).await;
+        let mut other = connect_uds(&sock).await;
+        let id = creator
+            .call::<CreateSession>(&create_session_req("abandoned-mid-upload", "/tmp"))
+            .await
+            .ok()
+            .expect("create session")
+            .id;
+        let (parked, release) = reap_seam::hold(id);
+        let working = state
+            .sessions_manager()
+            .await
+            .get_session(sessions::SessionKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .expect("session should resolve")
+            .paths()
+            .await
+            .expect("paths should resolve")
+            .working
+            .as_utf8_path()
+            .to_owned();
+
+        // The creator streams the first half of its workspace: a small file
+        // ahead of incompressible noise several zstd blocks long, so that
+        // half already carries the small file whole.
+        let noise: Vec<u8> = (0..512 * 1024u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        let mut tar = async_tar::Builder::new(Vec::new());
+        for (path, contents) in [("first.txt", &b"first\n"[..]), ("big.bin", &noise[..])] {
+            let mut header = async_tar::Header::new_gnu();
+            header.set_size(contents.len() as u64);
+            header.set_mode(0o644);
+            tar.append_data(&mut header, path, contents).await.unwrap();
+        }
+        let mut encoder = async_compression::tokio::write::ZstdEncoder::new(Vec::new());
+        encoder
+            .write_all(&tar.into_inner().await.unwrap())
+            .await
+            .unwrap();
+        encoder.shutdown().await.unwrap();
+        let payload = encoder.into_inner();
+        let upload = creator
+            .open_subsystem(
+                crate::rpc::STREAM_WORKSPACE_FILES,
+                &[(crate::MINIMAL_SESSION_ID_ENV, &id.to_string())],
+            )
+            .await;
+        upload.data(&payload[..payload.len() / 2]).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !working.join("first.txt").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the first half of the upload should start unpacking");
+
+        // The creator goes away mid-upload, and its teardown parks before
+        // the reap.
+        drop(upload);
+        drop(creator);
+        tokio::time::timeout(Duration::from_secs(10), parked)
+            .await
+            .expect("the creator's teardown should reach its reap")
+            .expect("the teardown should park, not skip the seam");
+
+        // The window. The torn-down upload clears its own mark on the way
+        // out, and until it has the attach is refused for that instead; once
+        // it has, the creator-only gate is all that stands in the way.
+        let refusal = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let mut channel = other.open_shell(id).await;
+                let mut out = Vec::new();
+                while let Some(msg) = channel.wait().await {
+                    if let ChannelMsg::Data { data } = msg {
+                        out.extend_from_slice(&data);
+                    }
+                }
+                let out = String::from_utf8_lossy(&out).into_owned();
+                if !out.contains("session is still receiving its workspace upload") {
+                    break out;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("an attach in the window must be refused, not mint a shell");
+        assert!(
+            refusal.contains("session isn't attachable yet"),
+            "an attach before the creator's reap must be refused, got: {refusal:?}"
+        );
+        assert!(
+            !working.join(mfile::MFILE_NAME).exists(),
+            "a refused attach must not scaffold the half-uploaded workspace"
+        );
+        assert_eq!(
+            other
+                .call::<GetSessionRecord>(&GetSessionRecordRequest::Id(id))
+                .await
+                .record
+                .map(|record| record.status),
+            Some(::sessions::SessionStatus::Pending),
+            "the refused attach must leave the session unfinalized for the reap"
+        );
+
+        // Let the teardown go on: the reap finds the session still
+        // unfinalized and deletes it.
+        let _ = release.send(());
+        let mut reaped = false;
+        for _ in 0..500 {
+            if other
+                .call::<GetSessionRecord>(&GetSessionRecordRequest::Id(id))
+                .await
+                .record
+                .is_none()
+            {
+                reaped = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            reaped,
+            "the session a creator abandoned mid-upload must be reaped"
+        );
+
+        let _ = other
             .call::<Shutdown>(&ShutdownRequest { force: false })
             .await;
         let _ = tokio::time::timeout(Duration::from_secs(5), run).await;
