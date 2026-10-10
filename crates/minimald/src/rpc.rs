@@ -5328,7 +5328,8 @@ mod tests {
                  box can start here yet.\n\
                  Set user.max_user_namespaces above 0: sudo sysctl -w \
                  user.max_user_namespaces=15000 takes effect now, a /etc/sysctl.d drop-in \
-                 keeps it across reboots; or use a kernel with CONFIG_USER_NS.",
+                 keeps it across reboots; or use a kernel with CONFIG_USER_NS."
+                    .to_string(),
                 "finalize-install",
             ),
         ] {
