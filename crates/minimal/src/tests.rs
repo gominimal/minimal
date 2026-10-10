@@ -1778,33 +1778,33 @@ fn daemon_refusals_print_without_rpc_names() {
     // The daemon's side of the same surface: its refusals are printed
     // verbatim, at finalize through `upload_and_finalize` and at attach,
     // so none of them may name the RPC a person would have to retry. The
-    // scan is over the string literals of the daemon's session module —
-    // every non-comment line that carries a quote — which covers the
-    // refusals and the log lines alike; the module has no log-only RPC
-    // name left to exempt. The RPC names stay legitimate in type paths
-    // and comments, which the scan does not read.
+    // scan is over the string literals of the daemon's session module,
+    // which covers the refusals and the log lines alike; the module has
+    // no log-only RPC name left to exempt. The RPC names stay legitimate
+    // in type paths and comments, which the scan does not read. A literal
+    // is tracked across lines — the refusals are wrapped with `\` — so a
+    // continuation line with no quote of its own is still read.
     let daemon = std::fs::read_to_string(manifest.join("../minimald/src/session.rs"))
         .expect("readable daemon source");
-    let code = daemon
-        .lines()
-        .enumerate()
-        .filter(|(_, line)| !line.trim_start().starts_with("//"));
-    for (number, line) in code {
-        // The old phrasings, by name, so a continuation line of a
-        // multi-line literal (no quote on it) cannot slip past the scan.
-        for old in [
-            "retry FinalizeSession",
-            "SubmitVerdict or FinalizeSession",
-            "upload + FinalizeSession sequence",
-            "awaiting SubmitVerdict",
-        ] {
-            assert!(
-                !line.contains(old),
-                "minimald/src/session.rs:{}: the daemon still says {old:?}",
-                number + 1
-            );
+    let mut in_literal = false;
+    for (number, line) in daemon.lines().enumerate() {
+        if !in_literal && line.trim_start().starts_with("//") {
+            continue;
         }
-        if !line.contains('"') {
+        let in_string = in_literal || line.contains('"');
+        // Toggle on every unescaped quote, so the state at the line's end
+        // says whether the next line continues a literal.
+        let mut chars = line.chars();
+        while let Some(c) = chars.next() {
+            match c {
+                '\\' => {
+                    chars.next();
+                }
+                '"' => in_literal = !in_literal,
+                _ => {}
+            }
+        }
+        if !in_string {
             continue;
         }
         for rpc in [

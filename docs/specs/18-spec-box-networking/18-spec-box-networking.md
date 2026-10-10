@@ -454,7 +454,7 @@ included, with every refusal logged (NET-001 to NET-004).
   <!-- S8b/AC1; prose 42; event-driven -->
   - WHEN the user activates an own-address box that declares `allow_dns_hosts` and no `allow_subnets` THE SYSTEM SHALL print one line naming the allow-all subnets and `--allow-subnets`.
     tier:   T0
-    verify: cargo nextest run -p minimal half_open_name_allowlist_note
+    verify: cargo nextest run -p minimal half_open_name_allowlist_note_fires_only_for_names_without_subnets
     <!-- event-driven; an unset `allow_subnets` is allow-all, so the name allow list narrows nothing by itself and direct-to-IP traffic is still admitted; the note names the flag that closes it, once, at activation -->
 
 - **NET-067** IF an allowed name resolves into the box's `egress.deny_subnets` or the infrastructure deny set THEN THE SYSTEM SHALL refuse the connection.

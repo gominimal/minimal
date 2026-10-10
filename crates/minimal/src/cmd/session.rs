@@ -2309,8 +2309,8 @@ pub fn half_open_name_allowlist_note(
         .as_ref()
         .is_some_and(|hosts| !hosts.is_empty());
     (names_hosts && egress.allow_subnets.is_none()).then_some(
-        "note: allow-subnets is unset, so direct-to-IP traffic is admitted beside the \
-         dns-hosts list; add --allow-subnets to restrict it",
+        "note: allow-subnets is unset (allow-all), so direct-to-IP traffic is admitted \
+         beside the dns-hosts list; add --allow-subnets to restrict it",
     )
 }
 
@@ -4036,7 +4036,12 @@ mod tests {
         };
 
         let half_open = shape(None, names.clone());
-        assert!(half_open_name_allowlist_note(Some(&half_open)).is_some());
+        let note =
+            half_open_name_allowlist_note(Some(&half_open)).expect("half-open shape is noted");
+        // The NET-066 child requirement: the line names the allow-all
+        // subnets and the flag that closes them.
+        assert!(note.contains("allow-all"), "{note}");
+        assert!(note.contains("--allow-subnets"), "{note}");
         // A deny list carves ranges out of the allow-all; the rest of the
         // address space stays reachable by IP, so the note still fires.
         let denied_only = sessions::EgressPolicy {
