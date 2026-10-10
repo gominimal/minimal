@@ -683,6 +683,12 @@ mod tests {
         let started = std::time::Instant::now();
         signal_and_wait(pid, VMM_SIGTERM_GRACE).expect("signal_and_wait");
         reaper.join().expect("reaper thread");
+        // A reviewer suggested tightening this margin or joining the reaper
+        // before the assert. Neither applies: the bound exists to
+        // discriminate the poll's fast path from the SIGKILL escalation, and
+        // kill(pid, 0) succeeds on an unreaped zombie, so elapsed time is
+        // spent waiting for the reap, not the join — the reaper join above
+        // cannot loosen what a tighter margin could assert.
         // The reaped pid must have been observed gone well inside the 5s
         // grace — the poll's fast path, not the SIGKILL escalation.
         assert!(
