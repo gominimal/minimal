@@ -659,6 +659,11 @@ case_finalize_install_uninstall() {
         grep -q "still installed on this host.*classifier tree" "$OUT"
     want_ok "the remedy removes the classifier table" \
         grep -q "nft delete table inet minimal_class" "$OUT"
+    # The tree's removal is rooted under the same root its detection reads, so
+    # the advisory a developer runs (or a later test executes) targets the
+    # seeded tree, never the host's real one.
+    want_ok "the remedy removes the tree under the root it was detected in" \
+        grep -qF "sudo find \"$fake_ns4/sys/fs/cgroup/minimald.slice\"" "$OUT"
 
     # The kvm group membership, by its record.
     HNS5="$root/hns5"; mkdir -p "$HNS5"
