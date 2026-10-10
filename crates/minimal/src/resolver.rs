@@ -2714,7 +2714,12 @@ const CLASSIFIER_SCRIPT: &str = include_str!("../../../scripts/install-host-clas
 /// (the step's own `--uninstall`, run only while the tree exists), and the
 /// `kvm` membership the step recorded adding. The profile comes away only
 /// by the step's record: a profile without one was installed another way
-/// and stays, named in a note. Every line tolerates what is already gone.
+/// and stays, named in a note. The classifier's removal runs last and its
+/// failure is held to the end — the tree is still held while minimald or
+/// a box has a leaf, and the script is `set -e` — so every other item's
+/// removal runs whatever it does, and the script still exits non-zero
+/// with the note that names what to stop. Every other line tolerates what
+/// is already gone.
 #[cfg(any(test, not(target_os = "macos")))]
 fn linux_host_items_removal() -> String {
     format!(
@@ -2735,17 +2740,25 @@ fn linux_host_items_removal() -> String {
          {APPARMOR_DIR}/minimald {APPARMOR_DIR}/tunables/minimald' >&2\n\
          fi\n\
          \n\
-         # The classifier tree: the step's own removal, while the tree is there.\n\
-         if [ -d {CLASSIFIER_TREE_ROOT} ] ; then\n\
-         \x20 bash -s -- --uninstall <<\\{CLASSIFIER_SCRIPT_HEREDOC}\n\
-         {CLASSIFIER_SCRIPT}\
-         {CLASSIFIER_SCRIPT_HEREDOC}\n\
-         fi\n\
-         \n\
          # The kvm group membership the step added, by its record.\n\
          if [ -f {KVM_GROUP_RECORD} ] ; then\n\
          \x20 gpasswd -d \"$(cat {KVM_GROUP_RECORD})\" kvm 2>/dev/null || true\n\
          \x20 rm -f {KVM_GROUP_RECORD}\n\
+         fi\n\
+         \n\
+         # The classifier tree: the step's own removal, while the tree is there. Last,\n\
+         # and its failure held to the end: the tree stays held while minimald or a\n\
+         # box has a leaf, and nothing above should be skipped for that.\n\
+         classifier_held=\n\
+         if [ -d {CLASSIFIER_TREE_ROOT} ] ; then\n\
+         \x20 bash -s -- --uninstall <<\\{CLASSIFIER_SCRIPT_HEREDOC} || classifier_held=1\n\
+         {CLASSIFIER_SCRIPT}\
+         {CLASSIFIER_SCRIPT_HEREDOC}\n\
+         fi\n\
+         if [ -n \"$classifier_held\" ] ; then\n\
+         \x20 echo 'note: the classifier tree at {CLASSIFIER_TREE_ROOT} is still held: stop minimald \
+         and its boxes, then run min finalize-install --undo again' >&2\n\
+         \x20 exit 1\n\
          fi\n"
     )
 }
@@ -4839,7 +4852,9 @@ mod tests {
                 "  echo 'note: {APPARMOR_DIR}/minimald was not installed by min finalize-install"
             ),
             format!("if [ -d {CLASSIFIER_TREE_ROOT} ] ; then"),
-            format!("  bash -s -- --uninstall <<\\{CLASSIFIER_SCRIPT_HEREDOC}"),
+            format!(
+                "  bash -s -- --uninstall <<\\{CLASSIFIER_SCRIPT_HEREDOC} || classifier_held=1"
+            ),
             format!("if [ -f {KVM_GROUP_RECORD} ] ; then"),
             format!("  gpasswd -d \"$(cat {KVM_GROUP_RECORD})\" kvm 2>/dev/null || true"),
         ] {
@@ -4848,6 +4863,14 @@ mod tests {
                 "the Linux removal runs {step:?}: {linux}"
             );
         }
+        // The classifier's removal, the one that can fail while the tree
+        // is held, runs after every other item's.
+        assert!(
+            linux.find("gpasswd -d").unwrap() < linux.find("bash -s -- --uninstall").unwrap()
+                && linux.find("apparmor_parser --remove").unwrap()
+                    < linux.find("bash -s -- --uninstall").unwrap(),
+            "{linux}"
+        );
         assert!(
             linux.contains(&format!("{CLASSIFIER_SCRIPT}{CLASSIFIER_SCRIPT_HEREDOC}\n")),
             "the classifier's own step rides whole under its delimiter"
@@ -5045,6 +5068,75 @@ exit 0
         assert!(
             !calls.contains("apparmor_parser") && !stderr.contains("note:"),
             "{calls}\n{stderr}"
+        );
+    }
+
+    /// A classifier tree still held (minimald or a box has a leaf) fails
+    /// the step's own `--uninstall`, and the script is `set -e`: that
+    /// removal runs last, so the kvm membership and its record (and every
+    /// item before) still come away, and the script ends non-zero with
+    /// the note naming what to stop.
+    #[test]
+    fn finalize_install_undo_removes_the_other_items_before_a_held_classifier_tree() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let host = tempfile::tempdir().expect("a temp dir");
+        let stubs = host.path().join("stubs");
+        std::fs::create_dir(&stubs).unwrap();
+        let calls = host.path().join("calls");
+        // `bash` stands for the classifier's `--uninstall`, failing the way
+        // `die` does on a held tree; the service tools are absent-tolerant.
+        for (tool, code) in [
+            ("bash", 1),
+            ("gpasswd", 0),
+            ("systemctl", 1),
+            ("resolvectl", 1),
+            ("ip", 1),
+        ] {
+            let path = stubs.join(tool);
+            std::fs::write(
+                &path,
+                format!(
+                    "#!/bin/sh\necho \"{tool} $*\" >> {}\nexit {code}\n",
+                    calls.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let tree = host.path().join("minimald.slice");
+        std::fs::create_dir(&tree).unwrap();
+        let record = host.path().join("finalize-install-kvm-group");
+        std::fs::write(&record, "alice\n").unwrap();
+        let script = linux_undo_command("/nonexistent/minimal/answerer.sock")
+            .replace("/sys/class/net/", "/nonexistent/sys/class/net/")
+            .replace(
+                APPARMOR_PROFILE_RECORD,
+                "/nonexistent/var/lib/minimal/apparmor-profile",
+            )
+            .replace(APPARMOR_DIR, "/nonexistent/etc/apparmor.d")
+            .replace(KVM_GROUP_RECORD, record.to_str().unwrap())
+            .replace(CLASSIFIER_TREE_ROOT, tree.to_str().unwrap());
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", &script])
+            .env("PATH", format!("{}:/usr/bin:/bin", stubs.display()))
+            .output()
+            .expect("sh runs");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let calls = std::fs::read_to_string(&calls).unwrap_or_default();
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "a held tree ends the script non-zero: {stderr}"
+        );
+        assert!(
+            calls.contains("gpasswd -d alice kvm"),
+            "the membership comes away before the classifier runs: {calls}"
+        );
+        assert!(!record.exists(), "its record goes with it");
+        assert!(calls.contains("bash -s -- --uninstall"), "{calls}");
+        assert!(
+            stderr.contains("classifier tree") && stderr.contains("still held"),
+            "the note names what to stop: {stderr}"
         );
     }
 
@@ -6141,7 +6233,9 @@ exit 0
                 Some(_) => {}
                 None => {
                     if let Some((_, end)) = line.split_once("<<\\") {
-                        delimiter = Some(end.trim().to_string());
+                        // The delimiter is the word; what follows it on the
+                        // line (`|| held=1`) is the command's, not the body's.
+                        delimiter = end.split_whitespace().next().map(str::to_string);
                     }
                     out.push_str(line);
                     out.push('\n');
