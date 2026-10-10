@@ -1760,6 +1760,13 @@ STUB
     want_err "the pre-install hint carries no node-plane placeholder either" \
         grep -q -- "<node-plane address>" "$OUT"
     want_err "check creates nothing" test -e "$tree"
+    # With one identity: the install would refuse it, so the hint drops it.
+    run_hc pre_check_lone "$root/mi-on" --check --user "$me" --cohort-address 100.72.0.9
+    check 1 "$rc" "check with a lone identity still exits 1 before the tree exists"
+    want_ok "the hint is still the install" grep -q "install it: sudo" "$OUT"
+    want_err "the hint carries no lone identity the install would refuse" \
+        grep -q -- "install it: sudo .*--cohort-address" "$OUT"
+    want_ok "the hint keeps the account asked about" grep -q -- "install it: sudo .*--user $me" "$OUT"
 
     # --- Refusals: every one of them dies before a directory is made.
     run_hc no_nsdelegate "$root/mi-off" --user "$me"

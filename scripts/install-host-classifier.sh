@@ -367,9 +367,26 @@ do_check() {
     # and --user they asked about. Nothing is appended for it: an install
     # told no source identity is the un-enrolled host's own, so the hint is
     # a command the install accepts as it stands, never one with a
-    # placeholder the caller has no value for.
+    # placeholder the caller has no value for. A lone identity is one the
+    # install refuses, so the hint drops it too rather than hint a command
+    # that dies.
+    lone_identity=
+    if { [ -n "$cohort_address" ] && [ -z "$node_plane_address" ]; } ||
+        { [ -z "$cohort_address" ] && [ -n "$node_plane_address" ]; }; then
+        lone_identity=1
+    fi
     hint_args=()
-    for a in "${original_args[@]}"; do [ "$a" = --check ] || hint_args+=("$a"); done
+    skip_value=
+    for a in "${original_args[@]}"; do
+        if [ -n "$skip_value" ]; then skip_value=; continue; fi
+        case "$a" in
+        --check) continue ;;
+        --cohort-address | --node-plane-address)
+            if [ -n "$lone_identity" ]; then skip_value=1; continue; fi
+            ;;
+        esac
+        hint_args+=("$a")
+    done
     hint="sudo $0${hint_args[0]+ }${hint_args[*]-}"
     if covering="$(covering_mount "$tree_root")"; then
         read -r covering_point nsdel nsroot <<<"$covering"
