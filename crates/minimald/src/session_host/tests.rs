@@ -3846,7 +3846,7 @@ fn the_guests_unenforced_host_address_box_advises_with_the_interim() {
         "the notice carries the machine spelling of the state: {notice}"
     );
     assert!(
-        !notice.contains("sudo") && !notice.contains("install-host-classifier.sh"),
+        !notice.contains("sudo") && !notice.contains("min finalize-install"),
         "the guest's notice names no installer: {notice}"
     );
     // Whatever its leaf looks like: the guest's state is the table's
@@ -4107,7 +4107,7 @@ fn a_guests_placed_unenforced_host_address_box_advises_at_its_start() {
     assert!(
         notice.contains("guest-side classifier enforcement is not available yet")
             && notice.contains("host_ip_enforcement=none")
-            && !notice.contains("install-host-classifier.sh"),
+            && !notice.contains("min finalize-install"),
         "the start-up record is the interim's words, not a command: {notice}"
     );
 

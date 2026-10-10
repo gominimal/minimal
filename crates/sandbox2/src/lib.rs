@@ -1029,13 +1029,13 @@ pub mod classifier {
     }
 
     /// The command a person runs on this host to give this daemon a
-    /// classifier tree: `min finalize-install`, the one verb that finishes
-    /// this host's install. The CLI knows the account the daemon runs as
-    /// and the two source identities the classification rests on
-    /// (NET-078), so the hint names no placeholder for a person to fill
-    /// and no script to fetch; every advisory that carries it — the
-    /// daemon's start-up warn line, the native unenforced notice,
-    /// `Cause::StepNotInstalled`'s command — points at the same verb.
+    /// classifier tree: the installed CLI's own verb, `min finalize-install`
+    /// (NET-122), which carries the privileged step itself and installs it
+    /// for the account this daemon runs as. The hint spells the whole
+    /// command: no placeholder — an un-enrolled host has no source identity
+    /// to be told (NET-078: its two identities are the classifier's own
+    /// cgroup matches, translated to nothing) — and no remote fetch, because
+    /// the step the CLI carries is the step of the release it came from.
     #[cfg(target_os = "linux")]
     #[must_use]
     pub fn install_hint() -> String {
@@ -5257,18 +5257,18 @@ ff02::2\tip6-allrouters
     // NET-079: each host-address box in its own classifier leaf, kept there.
     // ---------------------------------------------------------------------
 
-    /// The hint names `min finalize-install` — the verb that finishes this
-    /// host's install — not a script to fetch or a placeholder a person
-    /// fills in: a stock install does not ship the classifier installer,
-    /// and the CLI knows every argument the privileged step takes.
+    /// NET-122: the hint is the installed CLI's own verb, spelled whole —
+    /// no placeholder a person cannot fill, and no fetch from the
+    /// repository's `main`, which is not the release they installed.
     #[cfg(target_os = "linux")]
     #[test]
     fn the_install_hint_names_the_installed_verb() {
         let hint = classifier::install_hint();
         assert_eq!(hint, "min finalize-install");
-        assert!(!hint.contains("curl"), "{hint}");
         assert!(!hint.contains("install-host-classifier.sh"), "{hint}");
-        assert!(!hint.contains('<'), "no placeholder: {hint}");
+        for absent in ["<", ">", "curl", "raw.githubusercontent.com", "sudo"] {
+            assert!(!hint.contains(absent), "{absent:?} in {hint}");
+        }
     }
 
     /// The mount-table half of the confinement: which cgroup2 mounts a host's
@@ -5362,28 +5362,6 @@ ff02::2\tip6-allrouters
             !classifier::tree_is_real(tree, None, false),
             "a host whose mount table cannot be read has no tree to check"
         );
-    }
-
-    /// The hint asks nothing of a person that the CLI already knows
-    /// (NET-078): the account the daemon runs as and the two source
-    /// identities are the installer's to find, so the hint carries none of
-    /// the installer's flags. Pinned as data: the daemon's start-up warn
-    /// line, the native unenforced notice and `Cause::StepNotInstalled`'s
-    /// command all carry this string.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn install_hint_names_the_installers_required_identities() {
-        let hint = classifier::install_hint();
-        assert!(
-            hint.starts_with("min finalize-install"),
-            "the hint names the verb that finishes the install: {hint}"
-        );
-        for flag in ["--user", "--cohort-address", "--node-plane-address"] {
-            assert!(
-                !hint.contains(flag),
-                "the hint asks nothing for {flag}: {hint}"
-            );
-        }
     }
 
     /// The files the kernel makes when a cgroup is created, modelled over a

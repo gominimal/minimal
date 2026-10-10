@@ -216,7 +216,7 @@ pub(crate) const ANSWERER_PROGRAM_PATH: &str = LINUX_ANSWERER_PROGRAM_PATH;
 /// The directory [`LINUX_ANSWERER_PROGRAM_PATH`] lives in, which the command
 /// makes before it copies.
 #[cfg(any(test, not(target_os = "macos")))]
-const ANSWERER_PROGRAM_DIR: &str = "/usr/local/lib/minimal";
+pub(crate) const ANSWERER_PROGRAM_DIR: &str = "/usr/local/lib/minimal";
 
 /// The systemd socket unit the answerer step installs: the unit that
 /// holds both of the answerer's sockets for the machine — the datagram
@@ -2699,22 +2699,60 @@ pub(crate) const KVM_GROUP_RECORD: &str = "/var/lib/minimal/finalize-install-kvm
 pub(crate) const APPARMOR_PROFILE_RECORD: &str =
     "/var/lib/minimal/finalize-install-apparmor-profile";
 
+/// The record the step leaves when it installs the classifier tree, so
+/// the removal takes away only a tree the step put there; one installed
+/// another way (the script by hand) stays.
+#[cfg(any(test, not(target_os = "macos")))]
+pub(crate) const CLASSIFIER_TREE_RECORD: &str = "/var/lib/minimal/finalize-install-classifier";
+
 /// The heredoc delimiter the classifier's installer rides under in a
 /// script.
 #[cfg(any(test, not(target_os = "macos")))]
-const CLASSIFIER_SCRIPT_HEREDOC: &str = "MINIMAL_CLASSIFIER_SCRIPT_EOF";
+pub(crate) const CLASSIFIER_SCRIPT_HEREDOC: &str = "MINIMAL_CLASSIFIER_SCRIPT_EOF";
 
 /// The classifier's privileged step, the very file the native lane runs:
-/// the removal script carries it whole and runs its `--uninstall`.
+/// the install step writes it to [`CLASSIFIER_PROGRAM_PATH`] and runs it,
+/// and the removal script carries it whole and runs its `--uninstall`.
+/// This binary is its one source: nothing is fetched.
 #[cfg(any(test, not(target_os = "macos")))]
-const CLASSIFIER_SCRIPT: &str = include_str!("../../../scripts/install-host-classifier.sh");
+pub(crate) const CLASSIFIER_SCRIPT: &str =
+    include_str!("../../../scripts/install-host-classifier.sh");
+
+/// The root-owned copy of the classifier's step the install step leaves,
+/// which the placement unit runs on every daemon start.
+#[cfg(any(test, not(target_os = "macos")))]
+pub(crate) const CLASSIFIER_PROGRAM_PATH: &str =
+    "/usr/local/lib/minimal/install-host-classifier.sh";
+
+/// The systemd unit pair that places the daemon's listener in its leaf on
+/// every daemon start: the path unit watches the daemon's socket, and the
+/// oneshot service it starts runs the step's `--place-listener`. The pair
+/// is why no daemon restart needs a root step of its own.
+#[cfg(any(test, not(target_os = "macos")))]
+pub(crate) const PLACE_SYSTEMD_UNIT: &str = "minimald-place";
+#[cfg(any(test, not(target_os = "macos")))]
+pub(crate) const PLACE_UNIT_PATH_PATH: &str = "/etc/systemd/system/minimald-place.path";
+#[cfg(any(test, not(target_os = "macos")))]
+pub(crate) const PLACE_UNIT_SERVICE_PATH: &str = "/etc/systemd/system/minimald-place.service";
+
+/// The boot unit: a oneshot that re-runs the classifier's step from the
+/// root-owned copy at every boot, ordered before the path unit. The tree
+/// lives in cgroupfs and the table in the kernel, so neither survives a
+/// reboot on its own; without this unit the first socket event after a
+/// boot would find no tree to place the daemon in.
+#[cfg(any(test, not(target_os = "macos")))]
+pub(crate) const CLASSIFIER_SYSTEMD_UNIT: &str = "minimald-classifier";
+#[cfg(any(test, not(target_os = "macos")))]
+pub(crate) const CLASSIFIER_UNIT_SERVICE_PATH: &str =
+    "/etc/systemd/system/minimald-classifier.service";
 
 /// The lines that remove the Linux items beyond the names: the
 /// user-namespace profile (unloaded, then its files), the classifier tree
-/// (the step's own `--uninstall`, run only while the tree exists), and the
-/// `kvm` membership the step recorded adding. The profile comes away only
-/// by the step's record: a profile without one was installed another way
-/// and stays, named in a note. The classifier's removal runs last and its
+/// (the step's own `--uninstall`, run only while the tree exists) with its
+/// units and the root-owned copy of the step, and the
+/// `kvm` membership the step recorded adding. The profile and the tree
+/// come away only by the step's records: one without its record was
+/// installed another way and stays, named in a note. The classifier's removal runs last and its
 /// failure is held to the end — the tree is still held while minimald or
 /// a box has a leaf, and the script is `set -e` — so every other item's
 /// removal runs whatever it does, and the script still exits non-zero
@@ -2739,6 +2777,12 @@ fn linux_host_items_removal() -> String {
          stays; remove it with: apparmor_parser --remove {APPARMOR_DIR}/minimald && rm -f \
          {APPARMOR_DIR}/minimald {APPARMOR_DIR}/tunables/minimald' >&2\n\
          fi\n\
+         systemctl disable --now {PLACE_SYSTEMD_UNIT}.path {PLACE_SYSTEMD_UNIT}.service \
+         {CLASSIFIER_SYSTEMD_UNIT}.service 2>/dev/null || true\n\
+         rm -f {PLACE_UNIT_PATH_PATH} {PLACE_UNIT_SERVICE_PATH} {CLASSIFIER_UNIT_SERVICE_PATH} \
+         {CLASSIFIER_PROGRAM_PATH}\n\
+         systemctl daemon-reload 2>/dev/null || true\n\
+         rmdir \"{ANSWERER_PROGRAM_DIR}\" 2>/dev/null || true\n\
          \n\
          # The kvm group memberships the step added, one user per line of its record.\n\
          if [ -f {KVM_GROUP_RECORD} ] ; then\n\
@@ -2748,14 +2792,22 @@ fn linux_host_items_removal() -> String {
          \x20 rm -f {KVM_GROUP_RECORD}\n\
          fi\n\
          \n\
-         # The classifier tree: the step's own removal, while the tree is there. Last,\n\
-         # and its failure held to the end: the tree stays held while minimald or a\n\
-         # box has a leaf, and nothing above should be skipped for that.\n\
+         # The classifier tree: the step's own removal, by the step's record and while\n\
+         # the tree is there. A tree without the record was installed another way and\n\
+         # stays. Last, and its failure held to the end: the tree stays held while\n\
+         # minimald or a box has a leaf, and nothing above should be skipped for that.\n\
          classifier_held=\n\
-         if [ -d {CLASSIFIER_TREE_ROOT} ] ; then\n\
-         \x20 bash -s -- --uninstall <<\\{CLASSIFIER_SCRIPT_HEREDOC} || classifier_held=1\n\
+         if [ -f {CLASSIFIER_TREE_RECORD} ] ; then\n\
+         \x20 if [ -d {CLASSIFIER_TREE_ROOT} ] ; then\n\
+         \x20   bash -s -- --uninstall <<\\{CLASSIFIER_SCRIPT_HEREDOC} || classifier_held=1\n\
          {CLASSIFIER_SCRIPT}\
          {CLASSIFIER_SCRIPT_HEREDOC}\n\
+         \x20 fi\n\
+         \x20 [ -n \"$classifier_held\" ] || rm -f {CLASSIFIER_TREE_RECORD}\n\
+         elif [ -d {CLASSIFIER_TREE_ROOT} ] ; then\n\
+         \x20 echo 'note: the classifier tree at {CLASSIFIER_TREE_ROOT} was not installed by min \
+         finalize-install and stays; remove it as root with: {CLASSIFIER_PROGRAM_PATH} --uninstall \
+         (or the same script from a checkout)' >&2\n\
          fi\n\
          if [ -n \"$classifier_held\" ] ; then\n\
          \x20 echo 'note: the classifier tree at {CLASSIFIER_TREE_ROOT} is still held: stop minimald \
@@ -5203,9 +5255,20 @@ mod tests {
             format!(
                 "  echo 'note: {APPARMOR_DIR}/minimald was not installed by min finalize-install"
             ),
-            format!("if [ -d {CLASSIFIER_TREE_ROOT} ] ; then"),
+            format!("if [ -f {CLASSIFIER_TREE_RECORD} ] ; then"),
+            format!("  if [ -d {CLASSIFIER_TREE_ROOT} ] ; then"),
             format!(
-                "  bash -s -- --uninstall <<\\{CLASSIFIER_SCRIPT_HEREDOC} || classifier_held=1"
+                "    bash -s -- --uninstall <<\\{CLASSIFIER_SCRIPT_HEREDOC} || classifier_held=1"
+            ),
+            format!("  [ -n \"$classifier_held\" ] || rm -f {CLASSIFIER_TREE_RECORD}"),
+            format!("elif [ -d {CLASSIFIER_TREE_ROOT} ] ; then"),
+            format!(
+                "systemctl disable --now {PLACE_SYSTEMD_UNIT}.path {PLACE_SYSTEMD_UNIT}.service \
+                 {CLASSIFIER_SYSTEMD_UNIT}.service 2>/dev/null || true"
+            ),
+            format!(
+                "rm -f {PLACE_UNIT_PATH_PATH} {PLACE_UNIT_SERVICE_PATH} \
+                 {CLASSIFIER_UNIT_SERVICE_PATH} {CLASSIFIER_PROGRAM_PATH}"
             ),
             format!("if [ -f {KVM_GROUP_RECORD} ] ; then"),
             "  while IFS= read -r kvm_user ; do".to_string(),
@@ -5298,6 +5361,10 @@ exit 0
                 .replace(
                     APPARMOR_PROFILE_RECORD,
                     "/nonexistent/var/lib/minimal/apparmor-profile",
+                )
+                .replace(
+                    CLASSIFIER_TREE_RECORD,
+                    "/nonexistent/var/lib/minimal/classifier",
                 );
             let output = std::process::Command::new("/bin/sh")
                 .args(["-c", &script])
@@ -5460,6 +5527,8 @@ exit 0
         }
         let tree = host.path().join("minimald.slice");
         std::fs::create_dir(&tree).unwrap();
+        let tree_record = host.path().join("finalize-install-classifier");
+        std::fs::write(&tree_record, "").unwrap();
         let record = host.path().join("finalize-install-kvm-group");
         // Two users ran the step: both memberships come away.
         std::fs::write(&record, "alice\nbob\n").unwrap();
@@ -5471,6 +5540,7 @@ exit 0
             )
             .replace(APPARMOR_DIR, "/nonexistent/etc/apparmor.d")
             .replace(KVM_GROUP_RECORD, record.to_str().unwrap())
+            .replace(CLASSIFIER_TREE_RECORD, tree_record.to_str().unwrap())
             .replace(CLASSIFIER_TREE_ROOT, tree.to_str().unwrap());
         let output = std::process::Command::new("/bin/sh")
             .args(["-c", &script])
@@ -5494,6 +5564,100 @@ exit 0
             stderr.contains("classifier tree") && stderr.contains("still held"),
             "the note names what to stop: {stderr}"
         );
+        assert!(
+            tree_record.exists(),
+            "a held tree keeps its record, so the next --undo tries again"
+        );
+    }
+
+    /// The classifier tree comes away only when the step's record says
+    /// the step installed it: with the record, the step's own `--uninstall`
+    /// runs and the record goes; without, a tree that is there (the script
+    /// run by hand) stays, named in a note, and the script still exits 0.
+    #[test]
+    fn finalize_install_undo_removes_only_the_classifier_tree_it_recorded() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let host = tempfile::tempdir().expect("a temp dir");
+        let stubs = host.path().join("stubs");
+        std::fs::create_dir(&stubs).unwrap();
+        let calls = host.path().join("calls");
+        // `bash` stands for the classifier's `--uninstall`, succeeding.
+        for (tool, code) in [
+            ("bash", 0),
+            ("gpasswd", 0),
+            ("systemctl", 1),
+            ("resolvectl", 1),
+            ("ip", 1),
+        ] {
+            let path = stubs.join(tool);
+            std::fs::write(
+                &path,
+                format!(
+                    "#!/bin/sh\necho \"{tool} $*\" >> {}\nexit {code}\n",
+                    calls.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let tree = host.path().join("minimald.slice");
+        std::fs::create_dir(&tree).unwrap();
+        let tree_record = host.path().join("finalize-install-classifier");
+        let script = linux_undo_command("/nonexistent/minimal/answerer.sock")
+            .replace("/sys/class/net/", "/nonexistent/sys/class/net/")
+            .replace(
+                APPARMOR_PROFILE_RECORD,
+                "/nonexistent/var/lib/minimal/apparmor-profile",
+            )
+            .replace(APPARMOR_DIR, "/nonexistent/etc/apparmor.d")
+            .replace(KVM_GROUP_RECORD, "/nonexistent/var/lib/minimal/kvm-group")
+            .replace(CLASSIFIER_TREE_RECORD, tree_record.to_str().unwrap())
+            .replace(CLASSIFIER_TREE_ROOT, tree.to_str().unwrap());
+        let run = || {
+            let _ = std::fs::remove_file(&calls);
+            let output = std::process::Command::new("/bin/sh")
+                .args(["-c", &script])
+                .env("PATH", format!("{}:/usr/bin:/bin", stubs.display()))
+                .output()
+                .expect("sh runs");
+            assert!(
+                output.status.success(),
+                "the removal succeeds: {}\n{script}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            (
+                std::fs::read_to_string(&calls).unwrap_or_default(),
+                String::from_utf8_lossy(&output.stderr).into_owned(),
+            )
+        };
+
+        // A tree the step did not record: it stays, with the note.
+        let (calls, stderr) = run();
+        assert!(
+            !calls.contains("bash -s -- --uninstall"),
+            "an unowned tree is not uninstalled: {calls}"
+        );
+        assert!(
+            stderr.contains("classifier tree")
+                && stderr.contains("was not installed by min finalize-install")
+                && stderr.contains("--uninstall"),
+            "the note names the tree and how to remove it: {stderr}"
+        );
+
+        // The same tree with the record: uninstalled, record gone.
+        std::fs::write(&tree_record, "").unwrap();
+        let (calls, stderr) = run();
+        assert!(calls.contains("bash -s -- --uninstall"), "{calls}");
+        assert!(!stderr.contains("note:"), "{stderr}");
+        assert!(!tree_record.exists(), "the record goes with the tree");
+
+        // A record over no tree (the tree removed by hand): the record
+        // goes, nothing runs.
+        std::fs::write(&tree_record, "").unwrap();
+        std::fs::remove_dir(&tree).unwrap();
+        let (calls, _) = run();
+        assert!(!calls.contains("bash -s -- --uninstall"), "{calls}");
+        assert!(!tree_record.exists(), "a stale record is cleared");
     }
 
     /// The service is machine-wide and runs as one operator: `min net

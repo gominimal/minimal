@@ -2474,12 +2474,14 @@ proof_host_ip_deny_all() {
     # the common ancestor of its starting cgroup and the slice is the
     # root-owned hierarchy root — the barrier that stops a box climbing out
     # is the same fact that stops the daemon climbing in. The installer's
-    # --pid step is the supported placement, and the placement probe is per
-    # launch, so the next box this daemon launches is decided on a leaf of
-    # its own. Found off /proc, keyed on comm (a cmdline match would take an
-    # editor holding a file under crates/minimald for the daemon itself)
-    # and on this account, so another account's daemon is never placed in
-    # this case's tree.
+    # --place-listener step is the placement the path unit `min
+    # finalize-install` installs makes at every daemon start: it finds the
+    # daemon by the socket it holds, never by a pid anyone names, and the
+    # placement probe is per launch, so the next box this daemon launches
+    # is decided on a leaf of its own. The pid is still read here, off
+    # /proc, keyed on comm (a cmdline match would take an editor holding a
+    # file under crates/minimald for the daemon itself) and on this account,
+    # to check the step placed THAT process and no other.
     hida_daemons=""
     for hida_proc in /proc/[0-9]*; do
       [ -r "$hida_proc/comm" ] || continue
@@ -2493,20 +2495,31 @@ proof_host_ip_deny_all() {
       echo "::error::expected exactly one $min_daemon under this account to place in its leaf, found: ${hida_daemons:-none}"
       fail
     fi
+    hida_sock="$XDG_STATE_HOME/minimal/providers/local-minimald0/ssh.sock"
+    if [ ! -S "$hida_sock" ]; then
+      echo "::error::the daemon's listener is not at $hida_sock, so the placement unit's step has nothing to find it by"
+      fail
+    fi
     # shellcheck disable=SC2024
-    if ! sudo -n "$ROOT/scripts/install-host-classifier.sh" --pid "$hida_pid" \
+    if ! sudo -n "$ROOT/scripts/install-host-classifier.sh" --user "$(id -un)" \
+        --place-listener "$hida_sock" \
         >"$WORK/hida-place.out" 2>"$WORK/hida-place.err"; then
-      echo "::error::the installer's --pid step could not place $min_daemon $hida_pid in its leaf"
+      echo "::error::the installer's --place-listener step could not place $min_daemon $hida_pid in its leaf"
       echo "--- installer stderr ---"; cat "$WORK/hida-place.err" 2>/dev/null || true
       fail
     fi
     hida_place_out="$(cat "$WORK/hida-place.out" 2>/dev/null || true)"
     if [[ "$hida_place_out" != *"placed $hida_pid in"* ]]; then
-      echo "::error::the --pid step did not report placing $min_daemon $hida_pid"
+      echo "::error::the --place-listener step did not report placing $min_daemon $hida_pid (the holder of $hida_sock)"
       echo "--- installer output ---"; printf '%s\n' "$hida_place_out"
       fail
     fi
-    echo "place: $min_daemon $hida_pid is inside the slice, so the box this case launches is decided on a leaf of its own"
+    if ! grep -qx "$hida_pid" /sys/fs/cgroup/minimald.slice/daemon/cgroup.procs 2>/dev/null; then
+      echo "::error::$min_daemon $hida_pid is not a member of /sys/fs/cgroup/minimald.slice/daemon after the --place-listener step"
+      echo "--- daemon leaf members ---"; cat /sys/fs/cgroup/minimald.slice/daemon/cgroup.procs 2>/dev/null || true
+      fail
+    fi
+    echo "place: $min_daemon $hida_pid, found as the holder of $hida_sock, is inside the slice's daemon leaf, so the box this case launches is decided on a leaf of its own"
 
     # ---- the daemon's own fact, turned the one way it is: a launch. A
     # create answers from the last read the host gave it — the start-up
