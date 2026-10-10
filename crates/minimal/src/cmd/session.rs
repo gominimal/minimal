@@ -90,7 +90,7 @@ pub(crate) fn control_sock_beside(ssh_sock: &std::path::Path) -> Option<std::pat
         .map(|dir| dir.join(minvmd::control::CONTROL_SOCK_FILE))
 }
 
-/// The host reads `min net setup` decides its script from (NET-122): this
+/// The host reads `min finalize-install` decides its script from (NET-122): this
 /// host's resolver detection and its answerer service step, read together,
 /// with the control sockets the step asks to release the hook port recorded
 /// for the render.
@@ -831,7 +831,7 @@ pub(crate) async fn activate_session(
                         .and_then(|registration| registration.box_id),
                 )
                 .await;
-                bail!("CreateSession failed: {error}");
+                bail!("{error}");
             }
         }
     };
@@ -1042,7 +1042,7 @@ pub(crate) async fn activate_session(
         //
         // Host DNS is opt-in (NET-122): the start never prints the
         // privileged step. While the host is not set up the proxy is the
-        // live surface, and its line names `min net setup`, which prints or
+        // live surface, and its line names `min finalize-install`, which prints or
         // runs the step from its own reads of the host.
         let detection = crate::resolver::session_detection().await;
         let surface_verdict = crate::resolver::live_name_surface_with_range_at(
@@ -1105,7 +1105,7 @@ pub(crate) async fn activate_session(
         } else {
             // The answerer is reported but not bound yet: no native surface
             // to name, so the proxy is the live one, and its line carries the
-            // `min net setup` pointer NET-122 owes every start on a host not
+            // `min finalize-install` pointer NET-122 owes every start on a host not
             // set up — or, beside a proxy-down sibling, the cause instead.
             tracing::info!(
                 surface = ?unbound_surface,
@@ -1147,6 +1147,17 @@ pub(crate) async fn activate_session(
         && config.policy.egress.is_none()
         && created.deny_all_opt_out != Some(true)
         && let Some(note) = deny_all_default_notice(sessions::EGRESS_DEFAULT_PHASE)
+    {
+        eprintln!("{note}");
+    }
+
+    // The half-open note: an own-address box that names hosts but leaves
+    // subnets unset keeps allow-all subnets, so direct-to-IP traffic is
+    // still admitted beside the name allow list. One line at activation,
+    // naming the flag that closes it; printed here and not per in-box
+    // start, so it is said once.
+    if config.network == minimald_rpc::NetworkMode::OwnIp
+        && let Some(note) = half_open_name_allowlist_note(config.policy.egress.as_ref())
     {
         eprintln!("{note}");
     }
@@ -1297,16 +1308,7 @@ pub(crate) async fn activate_session(
     // client is authoritative for them. Any daemon-side patches
     // that come back through a `Pending` response's `SubmitVerdict`
     // get appended below.
-    let mut collected_patches: Vec<(std::path::PathBuf, paths::SandboxRelPath)> = contribution
-        .patches
-        .iter()
-        .map(|p| {
-            (
-                p.patch.host_path.as_utf8_path().as_std_path().to_path_buf(),
-                p.patch.destination.clone(),
-            )
-        })
-        .collect();
+    let mut collected_patches = minimal_client::contribution_patch_uploads(&contribution);
 
     // The session exists but has no loadout yet; composing it is a
     // second round-trip because the daemon's composer reads the
@@ -1505,8 +1507,7 @@ pub(crate) async fn activate_session(
     // from `<workspace>/patches/`. Dedup by sandbox destination:
     // the composer's post-gate check guarantees any duplicates
     // are exact matches (same source), so collapsing is safe.
-    collected_patches.sort_by(|a, b| a.1.as_str().cmp(b.1.as_str()));
-    collected_patches.dedup_by(|a, b| a.1.as_str() == b.1.as_str());
+    minimal_client::dedup_patch_uploads(&mut collected_patches);
     // The registration's lease is held across the finalize and committed
     // only once the session is active: until then an activation that dies
     // leaves the VM host daemon to withdraw the row on the lease's close.
@@ -2276,6 +2277,31 @@ pub fn deny_all_default_notice(phase: sessions::EgressDefaultPhase) -> Option<&'
              reach with the --allow-subnets, --allow-dns-hosts and --allow-protocols flags",
         ),
     }
+}
+
+/// The one-line note `min session activate` prints for an own-address box
+/// whose egress names hosts (`allow_dns_hosts`) but leaves `allow_subnets`
+/// unset: an unset subnets dimension is allow-all, so the gate admits
+/// direct-to-IP traffic beside the name allow list, while the policy view's
+/// `dns hosts` row reads as if the names were the box's whole reach. A
+/// `deny_subnets` list does not close it: it carves ranges out of the
+/// allow-all, and every other address stays reachable by IP, so the note
+/// still fires and is worded for that shape as well. `None` for every
+/// other shape — no egress section (NET-074's note covers it), no names, or
+/// subnets declared (empty or not), where the names are genuinely the
+/// reach.
+pub fn half_open_name_allowlist_note(
+    egress: Option<&sessions::EgressPolicy>,
+) -> Option<&'static str> {
+    let egress = egress?;
+    let names_hosts = egress
+        .allow_dns_hosts
+        .as_ref()
+        .is_some_and(|hosts| !hosts.is_empty());
+    (names_hosts && egress.allow_subnets.is_none()).then_some(
+        "note: allow-subnets is unset (allow-all), so direct-to-IP traffic is admitted \
+         beside the dns-hosts list; add --allow-subnets to restrict it",
+    )
 }
 
 /// The classifier advisory a create reply carries (NET-079), as the line
@@ -3986,7 +4012,7 @@ pub async fn cmd_rename(global: &GlobalArgs, args: RenameArgs) -> Result<(), any
             Ok(())
         }
         minimald_rpc::Errorable::Err { error } => {
-            bail!("RenameSession failed: {error}")
+            bail!("{error}")
         }
     }
 }
@@ -3998,6 +4024,46 @@ mod tests {
         CredentialedUpstream, DynamicIngress, EffectiveEgress, EffectiveSessionPolicy,
         IngressPolicy, IpProto, NetworkMode, PortMapping,
     };
+
+    #[test]
+    fn half_open_name_allowlist_note_fires_only_for_names_without_subnets() {
+        let names = Some(vec!["github.com".to_string()]);
+        let shape = |allow_subnets, allow_dns_hosts| sessions::EgressPolicy {
+            allow_subnets,
+            allow_dns_hosts,
+            allow_protocols: None,
+            deny_subnets: None,
+        };
+
+        let half_open = shape(None, names.clone());
+        let note =
+            half_open_name_allowlist_note(Some(&half_open)).expect("half-open shape is noted");
+        // The NET-066 child requirement: the line names the allow-all
+        // subnets and the flag that closes them.
+        assert!(note.contains("allow-all"), "{note}");
+        assert!(note.contains("--allow-subnets"), "{note}");
+        // A deny list carves ranges out of the allow-all; the rest of the
+        // address space stays reachable by IP, so the note still fires.
+        let denied_only = sessions::EgressPolicy {
+            deny_subnets: Some(vec!["10.0.0.0/8".to_string()]),
+            ..shape(None, names.clone())
+        };
+        assert!(half_open_name_allowlist_note(Some(&denied_only)).is_some());
+
+        for closed in [
+            shape(Some(vec![]), names.clone()),
+            shape(Some(vec!["140.82.112.0/20".to_string()]), names.clone()),
+            shape(None, None),
+            shape(None, Some(vec![])),
+            sessions::EgressPolicy::deny_all(),
+        ] {
+            assert!(
+                half_open_name_allowlist_note(Some(&closed)).is_none(),
+                "no note for {closed:?}"
+            );
+        }
+        assert!(half_open_name_allowlist_note(None).is_none());
+    }
 
     #[test]
     fn normalize_subnets_masks_host_bits_and_keeps_the_rest() {

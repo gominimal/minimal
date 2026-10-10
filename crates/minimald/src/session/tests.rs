@@ -1493,6 +1493,65 @@ async fn a_launch_whose_record_cannot_be_written_kills_its_box() {
     );
 }
 
+/// A mint whose host dies between launch and attach must not say the host
+/// "exited" out of a channel that never wedged: the death is a spawn
+/// failure, and the client reads it as one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_mint_whose_host_dies_before_attach_reports_a_spawn_failure() {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = create_configured_session(&mut client, "mint-died", "/tmp").await;
+    super::mint_attach_seam::seed(id, super::mint_attach_seam::Failure::HostDiedBeforeAttach);
+
+    let mut channel = client.open_shell(id).await;
+    let refusal = collect_to_close(&mut channel).await;
+    assert!(
+        refusal.contains("Error attaching to session:"),
+        "the refused attach should surface its error to the client, got: {refusal:?}"
+    );
+    assert!(
+        refusal.contains("session host exited before its channel could attach"),
+        "a host that died before its channel attached reads as a spawn failure, got: {refusal:?}"
+    );
+}
+
+/// A mint whose host wedges between launch and attach is alive but busy:
+/// calling it dead would mint a second host over a healthy, busy one. The
+/// refusal must name the wedged case, not the exited one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_mint_whose_host_wedges_reports_busy_instead_of_death() {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = create_configured_session(&mut client, "mint-wedged", "/tmp").await;
+    super::mint_attach_seam::seed(id, super::mint_attach_seam::Failure::HostWedged);
+
+    let mut channel = client.open_shell(id).await;
+    let refusal = collect_to_close(&mut channel).await;
+    assert!(
+        refusal.contains("Error attaching to session:"),
+        "the refused attach should surface its error to the client, got: {refusal:?}"
+    );
+    assert!(
+        refusal.contains("session host is busy; retry the attach once it drains"),
+        "a host that wedged before its channel attached reads as busy, not exited, got: {refusal:?}"
+    );
+    assert!(
+        !refusal.contains("exited before"),
+        "a wedged host must not be reported as exited, got: {refusal:?}"
+    );
+
+    // The busy refusal asks for a retry, so the retry must reach the wedged
+    // host: kept in the slot, it refuses busy again rather than a fresh host
+    // being minted over it (the seam is taken once, so a second mint would
+    // launch an ordinary host and the retry would attach).
+    let mut retry = client.open_shell(id).await;
+    let refusal = collect_to_close(&mut retry).await;
+    assert!(
+        refusal.contains("session host is busy; retry the attach once it drains"),
+        "a retry must reach the kept wedged host, not mint a second one, got: {refusal:?}"
+    );
+}
+
 // ---- lifecycle hooks -------------------------------------------------
 //
 // Hooks run inside the session, which under test means the host-side
