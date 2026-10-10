@@ -1987,6 +1987,99 @@ async fn stop_is_a_no_op_when_the_daemon_is_already_down() {
         .expect("an already-stopped daemon is the goal state, not an error");
 }
 
+/// The wedged-VM recovery: with a VM backend whose state says Running under a
+/// live alive-lock but no bridge socket to answer, `min stop --force` must
+/// stop the VM from the host — signal the VMM the state names, write
+/// `Stopped` — and exit 0, rather than failing on the refused connect and
+/// leaving the only recovery a hand-killed VMM.
+#[tokio::test]
+async fn stop_force_stops_a_wedged_vm_from_the_host() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider_dir =
+        client::resolve_provider_dir(Some(dir.path()), true).expect("resolve provider dir");
+    let state_dir = minvmd::state::StateDir::new(provider_dir).expect("open state dir");
+    let mut vmm = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleep");
+    state_dir
+        .write_state(&minvmd::state::State {
+            lifecycle: minvmd::lifecycle::Lifecycle::Running,
+            vmm_pid: Some(vmm.id()),
+            started_at: None,
+            ..minvmd::state::State::stopped()
+        })
+        .unwrap();
+    let _lock = state_dir
+        .try_acquire_alive_lock()
+        .unwrap()
+        .expect("acquire alive lock");
+
+    let global = GlobalArgs {
+        repo_dir: None,
+        minimal_dir: Some(dir.path().to_path_buf()),
+        config_dir: None,
+        provider: Some(Provider::LocalMinvmd),
+        no_input: true,
+        vm: None,
+    };
+    cmd_stop(&global, StopArgs { force: true })
+        .await
+        .expect("a wedged VM stopped from the host is the goal state");
+
+    assert_eq!(
+        state_dir.read_state().unwrap().lifecycle,
+        minvmd::lifecycle::Lifecycle::Stopped
+    );
+    // SIGTERM'd by the host-side stop; reaped here so the test leaves no stray.
+    let status = vmm.wait().unwrap();
+    assert!(
+        status.code().is_none(),
+        "expected a signalled VMM child, got {status:?}"
+    );
+}
+
+/// Without `--force` the wedged VM keeps its non-zero exit — force-stopping a
+/// VM that may still be draining is not the default behaviour — but the error
+/// now names the recovery instead of a bare connect failure.
+#[tokio::test]
+async fn stop_without_force_on_a_wedged_vm_names_the_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider_dir =
+        client::resolve_provider_dir(Some(dir.path()), true).expect("resolve provider dir");
+    let state_dir = minvmd::state::StateDir::new(provider_dir).expect("open state dir");
+    state_dir
+        .write_state(&minvmd::state::State {
+            lifecycle: minvmd::lifecycle::Lifecycle::Running,
+            vmm_pid: Some(std::process::id()),
+            started_at: None,
+            ..minvmd::state::State::stopped()
+        })
+        .unwrap();
+    let _lock = state_dir
+        .try_acquire_alive_lock()
+        .unwrap()
+        .expect("acquire alive lock");
+
+    let global = GlobalArgs {
+        repo_dir: None,
+        minimal_dir: Some(dir.path().to_path_buf()),
+        config_dir: None,
+        provider: Some(Provider::LocalMinvmd),
+        no_input: true,
+        vm: None,
+    };
+    let err = cmd_stop(&global, StopArgs { force: false })
+        .await
+        .expect_err("a wedged VM without --force must keep failing");
+
+    let chain = format!("{err:#}");
+    assert!(
+        chain.contains("the VM is not answering") && chain.contains("--force"),
+        "expected the recovery hint, got: {chain}"
+    );
+}
+
 /// A `min proxy` bridge must not outlive the daemon socket: when the daemon
 /// tears the connection down, the proxy exits even though its stdin — held
 /// open by the driving `ssh` — never closes. Otherwise the proxy, and the

@@ -19,6 +19,18 @@ pub fn run() -> Result<()> {
     run_with_state_dir(StateDir::default_path(), true)
 }
 
+/// Stop the VM whose provider dir is `provider_dir`, exactly as `minvmd stop`
+/// would: best-effort guest Shutdown over the bridge socket in that dir, then
+/// SIGTERM (SIGKILL after 5 s) to the VMM, then `Stopped`.
+///
+/// For the minvmd binary `provider_dir` is the process-global default
+/// ([`StateDir::default_path`]); the `minimal` CLI passes the provider dir it
+/// resolved for *its* VM, so `min stop --force` can stop a wedged VM from the
+/// host when the in-guest daemon cannot answer.
+pub fn stop_at(provider_dir: std::path::PathBuf) -> Result<()> {
+    run_with_state_dir(provider_dir, true)
+}
+
 /// `quiesce_guest` gates the Shutdown RPC (R2.3): production passes `true`;
 /// unit tests pass `false` so they never reach a live daemon's bridge socket.
 fn run_with_state_dir(dir: std::path::PathBuf, quiesce_guest: bool) -> Result<()> {
@@ -57,7 +69,7 @@ fn run_with_state_dir(dir: std::path::PathBuf, quiesce_guest: bool) -> Result<()
     match vmm_pid {
         Some(pid) => {
             if quiesce_guest {
-                shutdown_guest_best_effort();
+                shutdown_guest_best_effort(&state_dir);
             }
             signal_and_wait(pid)?
         }
@@ -86,7 +98,7 @@ fn run_with_state_dir(dir: std::path::PathBuf, quiesce_guest: bool) -> Result<()
 /// leaves a clean ext4 journal. Best-effort: on any failure — guest already
 /// gone, bridge down, timeout — SIGTERM proceeds and the journal replay
 /// backstop bounds the damage.
-fn shutdown_guest_best_effort() {
+fn shutdown_guest_best_effort(state_dir: &StateDir) {
     // Two deadlines, because they bound different things. The connect
     // deadline is short: libkrun accepts the bridge UDS connect even when the
     // guest is wedged, so a completed SSH handshake is the only proof of a
@@ -99,11 +111,13 @@ fn shutdown_guest_best_effort() {
     const GUEST_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
     const GUEST_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
-    match crate::sock::resolve_uds_path()
-        .map_err(anyhow::Error::from)
-        .and_then(|uds| {
-            crate::rpc_client::shutdown_guest(&uds, GUEST_CONNECT_TIMEOUT, GUEST_SHUTDOWN_TIMEOUT)
-        }) {
+    // The bridge socket is resolved from THIS state dir, never minvmd's
+    // process-global provider dir: in the CLI process that global is unset
+    // (the CLI sets the client crate's globals instead), and a wrong-VM
+    // resolution could shut a healthy sibling VM's guest down from under
+    // this stop.
+    let uds = state_dir.dir().join(paths::SSH_SOCK_FILE);
+    match crate::rpc_client::shutdown_guest(&uds, GUEST_CONNECT_TIMEOUT, GUEST_SHUTDOWN_TIMEOUT) {
         Ok(resp) => tracing::info!(?resp, "guest acknowledged Shutdown RPC"),
         Err(e) => {
             tracing::warn!(error = %e, "guest Shutdown RPC failed; proceeding with SIGTERM")
@@ -258,6 +272,45 @@ mod tests {
         .unwrap();
         let _lock = sd.try_acquire_alive_lock().unwrap().expect("acquire");
         assert!(run_with_state_dir(tmp.path().to_path_buf(), false).is_err());
+    }
+
+    /// `stop_at` is the CLI's host-side recovery entry point: given a provider
+    /// dir whose state says Running under a live alive-lock, with the VMM a
+    /// spawned process and no bridge socket to answer the guest RPC, it must
+    /// quiesce (missing socket fails fast), signal the process, and leave the
+    /// state Stopped — all within the guest-RPC connect deadline plus the
+    /// SIGTERM grace.
+    #[test]
+    fn stop_at_signals_vmm_and_stops() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sd = make_state_dir(&tmp);
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        sd.write_state(&State {
+            lifecycle: Lifecycle::Running,
+            vmm_pid: Some(child.id()),
+            started_at: None,
+            ..State::stopped()
+        })
+        .unwrap();
+        let _lock = sd.try_acquire_alive_lock().unwrap().expect("acquire");
+
+        let started = std::time::Instant::now();
+        stop_at(tmp.path().to_path_buf()).expect("host-side stop succeeds");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "a wedged VM must stop within the connect deadline plus the grace"
+        );
+
+        assert_eq!(sd.read_state().unwrap().lifecycle, Lifecycle::Stopped);
+        // SIGTERM'd: reaped here so the test leaves no stray child.
+        let status = child.wait().unwrap();
+        assert!(
+            status.code().is_none(),
+            "expected a signalled child, got {status:?}"
+        );
     }
 
     #[test]

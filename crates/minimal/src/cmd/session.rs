@@ -3831,16 +3831,53 @@ pub async fn cmd_stop(global: &GlobalArgs, args: StopArgs) -> Result<(), anyhow:
 
     // Racy by nature: the daemon may go down between the probe and this connect
     // (or `--provider` may point the probe and the client at different backends),
-    // so a connect failure is still a real error, not something to swallow.
+    // so a connect failure is still a real error for a native backend. On a VM
+    // backend the connect failing is the wedged-guest symptom itself, so
+    // `--force` falls back to stopping the VM from the host rather than leaving
+    // the only recovery a hand-killed VMM.
     // Unchecked: stopping a version-skewed daemon is exactly what the version
     // gate tells the operator to do, so this command must never be gated by it.
-    let mut client = connect_daemon_unchecked(global).await?;
+    let mut client = match connect_daemon_unchecked(global).await {
+        Ok(client) => client,
+        Err(connect_err) => {
+            if daemon_provider_kind(global) != paths::ProviderKind::Minvmd {
+                return Err(connect_err);
+            }
+            return if args.force {
+                stop_wedged_vm_from_host(global.minimal_dir.clone()).await
+            } else {
+                Err(connect_err
+                    .context("the VM is not answering; `min stop --force` stops it from the host"))
+            };
+        }
+    };
 
     use minimald_rpc::{Shutdown, ShutdownRequest};
     let resp = client
         .oneshot_rpc::<Shutdown>(ShutdownRequest { force: args.force })
         .await
         .context("Shutdown RPC failed");
+
+    // A wedged guest can fail the Shutdown RPC as surely as the connect, and
+    // `stop_outcome` only recovers a failed RPC when the daemon is observably
+    // down. On a VM backend with `--force`, a daemon that cannot be confirmed
+    // down is stopped from the host instead — the same fallback the connect
+    // error takes, reached by the same evidence.
+    let resp = match resp {
+        Err(rpc_err)
+            if daemon_provider_kind(global) == paths::ProviderKind::Minvmd
+                && !daemon_confirmed_stopped(global.use_minvmd(), global.minimal_dir.clone())
+                    .await =>
+        {
+            if !args.force {
+                return Err(rpc_err.context(
+                    "the VM is not answering; `min stop --force` stops it from the host",
+                ));
+            }
+            return stop_wedged_vm_from_host(global.minimal_dir.clone()).await;
+        }
+        resp => resp,
+    };
 
     // Drop our connection before waiting: the daemon holds the shutdown open
     // for its drain grace period while a client is still attached, and we are
@@ -3865,6 +3902,42 @@ pub async fn cmd_stop(global: &GlobalArgs, args: StopArgs) -> Result<(), anyhow:
         async move || daemon_confirmed_stopped(use_minvmd, probe_dir).await,
     )
     .await
+}
+
+/// Stop a VM whose guest cannot be asked to shut down: the in-guest daemon
+/// did not answer, so the host stops the VMM itself. This is `minvmd stop`'s
+/// own path — best-effort guest Shutdown over the bridge socket (5 s connect
+/// deadline, so a wedged guest cannot stall this recovery), then SIGTERM to
+/// the VMM, SIGKILL after the 5 s grace, then `Stopped` — run against the
+/// provider dir the CLI resolved for *this* VM, then waited on until the
+/// lifecycle observes the stop.
+///
+/// Only reached on a minvmd backend with `--force`, once the guest is proven
+/// unreachable; a native minimald is not a VM and keeps its own error.
+async fn stop_wedged_vm_from_host(minimal_dir: Option<PathBuf>) -> Result<(), anyhow::Error> {
+    let provider_dir = client::resolve_provider_dir(minimal_dir.as_deref(), true)
+        .context("resolving the VM's provider dir for a host-side stop")?;
+
+    // The stop sleep-polls the VMM's exit and the wait polls the lifecycle
+    // file, so both go on the blocking pool rather than stalling an async
+    // worker (rust-coding-standards: no blocking in an async context).
+    let wait_dir = minimal_dir;
+    tokio::task::spawn_blocking(move || {
+        minvmd::cmd::stop::stop_at(provider_dir).context("stopping the VM from the host")?;
+        autospawn::wait_for_daemon_stopped(true, wait_dir.as_deref())
+            .context("the VM did not reach the stopped state")
+    })
+    .await
+    .context("the host-side stop of the VM panicked")??;
+
+    // stderr, so it survives the `>/dev/null` every scripted caller wraps
+    // `stop` in; the journal-replay note is the one honest caveat about a
+    // guest that was killed rather than asked to quiesce.
+    eprintln!(
+        "the guest did not answer; the VM was stopped from the host \
+         (its volume may replay its journal on the next boot)"
+    );
+    Ok(())
 }
 
 /// Whether the daemon can be *observed* to have stopped — the question the
