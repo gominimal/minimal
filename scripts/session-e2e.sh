@@ -19706,7 +19706,7 @@ exit' E2E_PTY_ASK=allow E2E_PTY_ANSWER=keep \
   fi
   echo "--- the attached terminal (the ask dialog the request routed there, and its answer) ---"
   sed 's/^/  /' "$WORK/eib-yes-attach.out" 2>/dev/null || true
-  if ! grep -qF "asks to publish port $eib_port." "$WORK/eib-yes-attach.out" 2>/dev/null; then
+  if ! grep -qF "asks to publish port $eib_port/tcp." "$WORK/eib-yes-attach.out" 2>/dev/null; then
     echo "::error::the ask dialog never rendered on the attached terminal — the request was not routed to the attached human (NET-045)"
     eib_restore_log
     fail
@@ -19796,7 +19796,7 @@ exit' E2E_PTY_ASK=deny E2E_PTY_ANSWER=keep \
   fi
   echo "--- the attached terminal (the ask dialog the request routed there, and its answer) ---"
   sed 's/^/  /' "$WORK/eib-no-attach.out" 2>/dev/null || true
-  if ! grep -qF "asks to publish port $eib_port." "$WORK/eib-no-attach.out" 2>/dev/null; then
+  if ! grep -qF "asks to publish port $eib_port/tcp." "$WORK/eib-no-attach.out" 2>/dev/null; then
     echo "::error::the ask dialog never rendered on the second ask box's terminal — the request was not routed to the attached human (NET-045)"
     eib_restore_log
     fail

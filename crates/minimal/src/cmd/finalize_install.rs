@@ -23,6 +23,10 @@ pub(crate) const NEEDS_LOGIN: &str = "KVM group membership starts at your next l
 pub(crate) const SCRIPT_POINTER: &str =
     "f=$(mktemp) && min finalize-install --show --script > \"$f\" && sudo sh \"$f\"";
 
+/// The same route for `--undo`: the removal script, never the install's.
+pub(crate) const UNDO_SCRIPT_POINTER: &str =
+    "f=$(mktemp) && min finalize-install --undo --show --script > \"$f\" && sudo sh \"$f\"";
+
 /// The heading the items no script can fix are listed under.
 pub(crate) const CANNOT_HEADING: &str = "can't do on this machine:";
 
@@ -35,6 +39,12 @@ pub(crate) const SCHEMA: &str = "min/v1/finalize-install";
 /// The names item's cause when no daemon reports an answerer port to
 /// point the resolver at.
 const NO_PORT: &str = "no daemon is reachable to report its answerer port";
+
+/// How long the names item waits on the daemons for a port before it
+/// reports itself waiting: one bounded read, so a probe from the installer
+/// (`--show --script` in a shell with no timeout of its own) never hangs
+/// on a daemon that accepts and does not answer.
+const DAEMON_READ_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The KVM item's id, read by the run to pick its closing line.
 pub(crate) const KVM_ID: &str = "kvm-group";
@@ -176,6 +186,12 @@ impl Plan {
         self.missing().any(|item| item.id == KVM_ID)
     }
 
+    /// Whether the script installs an item other than the `kvm` group:
+    /// one a running box picks up at its next start.
+    pub(crate) fn installs_other_items(&self) -> bool {
+        self.missing().any(|item| item.id != KVM_ID)
+    }
+
     /// The one script a run executes and `--show --script` prints: one
     /// header over the missing items' blocks, in order. `None` while no
     /// item is missing — a finished host, or one whose every open item no
@@ -269,8 +285,13 @@ pub(crate) enum RunDecision {
 
 /// [`RunDecision`] for a run with (`stdin_is_tty`) or without a terminal;
 /// `sudo_runs_quietly` is whether `sudo -n true` succeeded, consulted only
-/// without one.
-pub(crate) fn run_decision(stdin_is_tty: bool, sudo_runs_quietly: bool) -> RunDecision {
+/// without one. `pointer` is the file route the refusal names: the
+/// install's or `--undo`'s, whichever the caller runs.
+pub(crate) fn run_decision(
+    stdin_is_tty: bool,
+    sudo_runs_quietly: bool,
+    pointer: &str,
+) -> RunDecision {
     if stdin_is_tty {
         RunDecision::Run(vec!["sudo", "sh"])
     } else if sudo_runs_quietly {
@@ -279,7 +300,7 @@ pub(crate) fn run_decision(stdin_is_tty: bool, sudo_runs_quietly: bool) -> RunDe
         RunDecision::Refuse {
             message: format!(
                 "sudo needs a password and no terminal is attached to ask on; run the \
-                 step yourself: {SCRIPT_POINTER}"
+                 step yourself: {pointer}"
             ),
             exit: 1,
         }
@@ -339,19 +360,29 @@ pub async fn cmd_finalize_install(
         eprintln!("min finalize-install: {refusal}");
         exit(1);
     }
-    run_as_root(&script)?;
-    println!("{}", closing_line(plan.adds_kvm_group()));
+    run_as_root(&script, SCRIPT_POINTER)?;
+    print!(
+        "{}",
+        closing_lines(plan.installs_other_items(), plan.adds_kvm_group())
+    );
     Ok(())
 }
 
-/// The line a completed run ends with: [`NEEDS_LOGIN`] when the script
-/// added the operator to the `kvm` group, else [`PICKED_UP`].
-pub(crate) fn closing_line(added_kvm_group: bool) -> &'static str {
-    if added_kvm_group {
-        NEEDS_LOGIN
-    } else {
-        PICKED_UP
+/// The lines a completed run ends with: [`PICKED_UP`] when the script
+/// installed items other than the `kvm` group, [`NEEDS_LOGIN`] when it
+/// added the operator to that group, both — items line first, the login
+/// line last — when both apply.
+pub(crate) fn closing_lines(installed_other_items: bool, added_kvm_group: bool) -> String {
+    let mut out = String::new();
+    if installed_other_items {
+        out.push_str(PICKED_UP);
+        out.push('\n');
     }
+    if added_kvm_group {
+        out.push_str(NEEDS_LOGIN);
+        out.push('\n');
+    }
+    out
 }
 
 /// Why `--undo` refuses its flags, when it does: `--undo` runs the removal
@@ -373,7 +404,7 @@ fn cmd_finalize_install_undo(show: bool) -> Result<(), anyhow::Error> {
         print!("{script}");
         return Ok(());
     }
-    run_as_root(&script)
+    run_as_root(&script, UNDO_SCRIPT_POINTER)
 }
 
 /// Exits with `code` once stdout and stderr are flushed: `std::process::exit`
@@ -408,7 +439,7 @@ pub(crate) fn write_private_script(script: &str) -> Result<tempfile::NamedTempFi
 /// one privilege prompt. The file is removed once the script exits, and
 /// the process exits with the script's status. The script is the one
 /// `--show --script` prints, byte for byte.
-fn run_as_root(script: &str) -> Result<(), anyhow::Error> {
+fn run_as_root(script: &str, pointer: &str) -> Result<(), anyhow::Error> {
     let stdin_is_tty = std::io::stdin().is_terminal();
     let sudo_runs_quietly = !stdin_is_tty
         && std::process::Command::new("sudo")
@@ -418,7 +449,7 @@ fn run_as_root(script: &str) -> Result<(), anyhow::Error> {
             .stderr(std::process::Stdio::null())
             .status()
             .is_ok_and(|status| status.success());
-    let argv = match run_decision(stdin_is_tty, sudo_runs_quietly) {
+    let argv = match run_decision(stdin_is_tty, sudo_runs_quietly, pointer) {
         RunDecision::Run(argv) => argv,
         RunDecision::Refuse {
             message,
@@ -535,8 +566,57 @@ pub(crate) fn names_item(verdict: crate::resolver::NamesVerdict, port: u16) -> I
 /// the answerer port `min ls` reads — each listed VM's own state from its
 /// VM host daemon's control socket (NET-138), else the daemon's listing.
 /// It never starts a daemon: with none reachable, or none that reports a
-/// port, there is no port to point a script at, and the item says so.
+/// port, there is no port to point a script at, and the item says so. The
+/// daemon reads are one bounded attempt ([`DAEMON_READ_DEADLINE`]): a
+/// daemon that does not answer in time is one that is not reachable.
 async fn names_item_on_this_host(global: &GlobalArgs) -> Item {
+    let read = tokio::time::timeout(DAEMON_READ_DEADLINE, answerer_port_from_daemons(global)).await;
+    let (answerer, held_no_channel) = match read {
+        Ok(found) => found,
+        Err(_) => {
+            return Item::waiting(
+                NAMES_ID,
+                NAMES_LABEL,
+                format!(
+                    "no daemon answered within {}s",
+                    DAEMON_READ_DEADLINE.as_secs()
+                ),
+            );
+        }
+    };
+    let Some((port, bound)) = answerer else {
+        // No port to point a script at yet: the item waits on a daemon,
+        // and never blocks the items the script can carry without one.
+        let cause = match held_no_channel {
+            Some(port) => crate::resolver::port_held_no_channel_warning(port),
+            None => NO_PORT.to_string(),
+        };
+        return Item::waiting(NAMES_ID, NAMES_LABEL, cause);
+    };
+    let (detection, answerer_step) = crate::cmd::session::advisory_host_reads(global).await;
+    // The range read the live-surface verdict makes, so the item names the
+    // same missing facts the surface line reports.
+    let range_present =
+        crate::resolver::live_name_surface_with_range_at(&detection, Some(port), bound)
+            .await
+            .and_then(|verdict| verdict.range_present);
+    let (hook, blocker, range_step) = &detection;
+    let verdict = crate::resolver::names_verdict_at(
+        hook,
+        port,
+        false,
+        range_present,
+        range_step,
+        &answerer_step,
+        blocker.as_deref(),
+    );
+    names_item(verdict, port)
+}
+
+/// The answerer port the daemons report (with whether it is bound), and
+/// the port a listing holds with no channel behind it, over every VM's
+/// listing (`min ls`'s read).
+async fn answerer_port_from_daemons(global: &GlobalArgs) -> (Option<(u16, bool)>, Option<u16>) {
     let listings = ls_listings_best_effort(global).await;
     let mut answerer = None;
     let mut held_no_channel = None;
@@ -567,33 +647,7 @@ async fn names_item_on_this_host(global: &GlobalArgs) -> Item {
             None => {}
         }
     }
-    let Some((port, bound)) = answerer else {
-        // No port to point a script at yet: the item waits on a daemon,
-        // and never blocks the items the script can carry without one.
-        let cause = match held_no_channel {
-            Some(port) => crate::resolver::port_held_no_channel_warning(port),
-            None => NO_PORT.to_string(),
-        };
-        return Item::waiting(NAMES_ID, NAMES_LABEL, cause);
-    };
-    let (detection, answerer_step) = crate::cmd::session::advisory_host_reads(global).await;
-    // The range read the live-surface verdict makes, so the item names the
-    // same missing facts the surface line reports.
-    let range_present =
-        crate::resolver::live_name_surface_with_range_at(&detection, Some(port), bound)
-            .await
-            .and_then(|verdict| verdict.range_present);
-    let (hook, blocker, range_step) = &detection;
-    let verdict = crate::resolver::names_verdict_at(
-        hook,
-        port,
-        false,
-        range_present,
-        range_step,
-        &answerer_step,
-        blocker.as_deref(),
-    );
-    names_item(verdict, port)
+    (answerer, held_no_channel)
 }
 
 /// The Linux-only items: the user-namespace profile, the classifier tree
@@ -602,7 +656,9 @@ async fn names_item_on_this_host(global: &GlobalArgs) -> Item {
 #[cfg(any(test, target_os = "linux"))]
 pub(crate) mod linux {
     use super::*;
-    use crate::resolver::{APPARMOR_DIR, CLASSIFIER_TREE_ROOT, KVM_GROUP_RECORD};
+    use crate::resolver::{
+        APPARMOR_DIR, APPARMOR_PROFILE_RECORD, CLASSIFIER_TREE_ROOT, KVM_GROUP_RECORD,
+    };
 
     pub(crate) const USERNS_ID: &str = "userns-profile";
     const USERNS_LABEL: &str = "the private sandbox every box runs in";
@@ -618,12 +674,27 @@ pub(crate) mod linux {
     const TUNABLE_HEREDOC: &str = "MINIMAL_APPARMOR_TUNABLE_EOF";
 
     /// The install locations the stock tunable already attaches the
-    /// profile to; a `minimald` elsewhere needs its path appended.
-    fn daemon_in_stock_path(daemon: &str) -> bool {
-        let home = std::env::var("HOME").unwrap_or_default();
+    /// profile to; a `minimald` elsewhere needs its path appended. The
+    /// tunable's `@{HOME}/.local/bin/minimald` reaches only the homes
+    /// AppArmor's `<tunables/home>` expands `@{HOME}` to: `/root/` and
+    /// `@{HOMEDIRS}/*/`, `/home/` by default. A home elsewhere (`/srv/home`,
+    /// an NFS mount) is not covered, so its daemon counts as any other path.
+    fn daemon_in_stock_path(daemon: &str, home: Option<&str>) -> bool {
         daemon == "/usr/bin/minimald"
             || daemon == "/usr/local/bin/minimald"
-            || (!home.is_empty() && daemon == format!("{home}/.local/bin/minimald"))
+            || home.is_some_and(|home| {
+                let home = home.trim_end_matches('/');
+                stock_home(home) && daemon == format!("{home}/.local/bin/minimald")
+            })
+    }
+
+    /// Whether `home` is one `@{HOME}` expands to on a stock host.
+    fn stock_home(home: &str) -> bool {
+        let home = home.trim_end_matches('/');
+        home == "/root"
+            || home
+                .strip_prefix("/home/")
+                .is_some_and(|user| !user.is_empty() && !user.contains('/'))
     }
 
     /// The facts the user-namespace item decides on.
@@ -642,6 +713,9 @@ pub(crate) mod linux {
         /// The `minimald` this host runs, absolute, when it is found beside
         /// this `min`.
         pub daemon: Option<String>,
+        /// This user's home (`$HOME`), which decides whether the stock
+        /// tunable's `@{HOME}` entry reaches a daemon under it.
+        pub home: Option<String>,
     }
 
     /// The user-namespace item over `facts`: `None` on a host whose kernel
@@ -672,7 +746,9 @@ pub(crate) mod linux {
             return None;
         }
         let daemon = facts.daemon.as_deref();
-        let attached = daemon.is_none_or(|d| daemon_in_stock_path(d) || facts.tunables_name_daemon);
+        let home = facts.home.as_deref();
+        let attached =
+            daemon.is_none_or(|d| daemon_in_stock_path(d, home) || facts.tunables_name_daemon);
         if facts.profile_installed && attached {
             return Some(Item::done(USERNS_ID, USERNS_LABEL));
         }
@@ -685,7 +761,7 @@ pub(crate) mod linux {
                     .to_string(),
             ));
         }
-        let extra = daemon.filter(|d| !daemon_in_stock_path(d));
+        let extra = daemon.filter(|d| !daemon_in_stock_path(d, home));
         // The path is written into an AppArmor tunable, whose values are
         // whitespace-separated and `#`-commented, and into a single-quoted
         // shell word: a path those cannot carry is a fact no script fixes.
@@ -739,7 +815,11 @@ pub(crate) mod linux {
             ));
         }
         script.push_str(&format!(
-            "apparmor_parser --replace {APPARMOR_DIR}/minimald\n"
+            "apparmor_parser --replace {APPARMOR_DIR}/minimald\n\
+             # The record marks the profile as this step's, so --undo removes it; one\n\
+             # installed another way is left alone.\n\
+             mkdir -p /var/lib/minimal\n\
+             : > {APPARMOR_PROFILE_RECORD}\n"
         ));
         script
     }
@@ -782,6 +862,7 @@ pub(crate) mod linux {
             tunables_name_daemon,
             parser_present,
             daemon,
+            home: std::env::var("HOME").ok(),
         })
     }
 
@@ -857,19 +938,48 @@ pub(crate) mod linux {
 
     /// The KVM item over the result of opening `/dev/kvm` for reading:
     /// done when it opens; missing — the step adds `operator` to the `kvm`
-    /// group — on `EACCES`; blocked when the device is not there, or on
-    /// any other error, named.
-    pub(crate) fn kvm_item_over(open: Result<(), std::io::Error>, operator: &str) -> Item {
+    /// group — on `EACCES`, unless `already_member` says the group database
+    /// lists the operator already, when only a new login is missing and
+    /// the step has nothing to add (and nothing to record for `--undo` to
+    /// take back); blocked when the device is not there, or on any other
+    /// error, named.
+    pub(crate) fn kvm_item_over(
+        open: Result<(), std::io::Error>,
+        operator: &str,
+        already_member: bool,
+    ) -> Item {
         match open {
             Ok(()) => Item::done(KVM_ID, KVM_LABEL),
             Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
-                if operator.is_empty() || operator.contains(['\'', '\n', ' ']) {
+                if operator.is_empty() {
                     return Item::cannot(
                         KVM_ID,
                         KVM_LABEL,
                         "this process's user name did not read, so there is no account to \
                          add to the kvm group"
                             .to_string(),
+                    );
+                }
+                if already_member {
+                    return Item::cannot(
+                        KVM_ID,
+                        KVM_LABEL,
+                        format!(
+                            "{operator} is in the kvm group already, but this login predates \
+                             it; log out and back in (or restart the daemon from a new login) \
+                             and /dev/kvm opens"
+                        ),
+                    );
+                }
+                if operator.contains(['\'', '\n', ' ']) {
+                    return Item::cannot(
+                        KVM_ID,
+                        KVM_LABEL,
+                        format!(
+                            "this process's user name ({operator:?}) holds a quote, a space or \
+                             a newline, which the script cannot quote; add the account to the \
+                             kvm group by hand"
+                        ),
                     );
                 }
                 Item::missing(
@@ -902,13 +1012,28 @@ pub(crate) mod linux {
         }
     }
 
-    /// [`kvm_item_over`] this host's read.
+    /// Whether `group` (the `/etc/group` text) lists `operator` as a member
+    /// of `kvm`: a membership the running login does not carry yet.
+    pub(crate) fn in_kvm_group(group: &str, operator: &str) -> bool {
+        !operator.is_empty()
+            && group.lines().any(|line| {
+                let mut fields = line.split(':');
+                fields.next() == Some("kvm")
+                    && fields
+                        .nth(2)
+                        .is_some_and(|members| members.split(',').any(|m| m == operator))
+            })
+    }
+
+    /// [`kvm_item_over`] this host's reads.
     pub(crate) fn kvm_item_on_this_host() -> Item {
         let open = std::fs::OpenOptions::new()
             .read(true)
             .open("/dev/kvm")
             .map(|_| ());
-        kvm_item_over(open, &crate::resolver::operator_name())
+        let operator = crate::resolver::operator_name();
+        let group = std::fs::read_to_string("/etc/group").unwrap_or_default();
+        kvm_item_over(open, &operator, in_kvm_group(&group, &operator))
     }
 }
 
@@ -1040,21 +1165,31 @@ mod tests {
     /// pick-up line.
     #[test]
     fn finalize_install_kvm_group_closing_line_names_a_new_login() {
-        let with_kvm = Plan {
-            items: vec![missing("names", "names"), missing(KVM_ID, "kvm")],
+        let closing =
+            |plan: &Plan| closing_lines(plan.installs_other_items(), plan.adds_kvm_group());
+        // The kvm group alone: the login line only.
+        let kvm_only = Plan {
+            items: vec![done("names"), missing(KVM_ID, "kvm")],
         };
-        assert!(with_kvm.adds_kvm_group());
-        assert_eq!(closing_line(with_kvm.adds_kvm_group()), NEEDS_LOGIN);
+        assert!(kvm_only.adds_kvm_group() && !kvm_only.installs_other_items());
+        assert_eq!(closing(&kvm_only), format!("{NEEDS_LOGIN}\n"));
         assert_eq!(
             NEEDS_LOGIN,
             "KVM group membership starts at your next login: log out and back in, or restart \
              the daemon from a new login."
         );
+        // Other items alone: the pick-up line only.
         let without = Plan {
             items: vec![missing("names", "names"), done(KVM_ID)],
         };
-        assert!(!without.adds_kvm_group());
-        assert_eq!(closing_line(without.adds_kvm_group()), PICKED_UP);
+        assert!(!without.adds_kvm_group() && without.installs_other_items());
+        assert_eq!(closing(&without), format!("{PICKED_UP}\n"));
+        // Both: both lines, the items line first and the login line last.
+        let both = Plan {
+            items: vec![missing("names", "names"), missing(KVM_ID, "kvm")],
+        };
+        assert!(both.adds_kvm_group() && both.installs_other_items());
+        assert_eq!(closing(&both), format!("{PICKED_UP}\n{NEEDS_LOGIN}\n"));
     }
 
     /// `--undo` takes `--show` only with `--script`: `--undo --show` alone
@@ -1080,14 +1215,15 @@ mod tests {
     #[test]
     fn finalize_install_without_tty_exits_one_with_script_pointer() {
         assert_eq!(
-            run_decision(true, false),
+            run_decision(true, false, SCRIPT_POINTER),
             RunDecision::Run(vec!["sudo", "sh"])
         );
         assert_eq!(
-            run_decision(false, true),
+            run_decision(false, true, SCRIPT_POINTER),
             RunDecision::Run(vec!["sudo", "-n", "sh"])
         );
-        let RunDecision::Refuse { message, exit } = run_decision(false, false) else {
+        let RunDecision::Refuse { message, exit } = run_decision(false, false, SCRIPT_POINTER)
+        else {
             panic!("a prompt with no terminal is refused");
         };
         assert_eq!(exit, 1);
@@ -1095,6 +1231,17 @@ mod tests {
         assert_eq!(
             SCRIPT_POINTER,
             "f=$(mktemp) && min finalize-install --show --script > \"$f\" && sudo sh \"$f\""
+        );
+        // `--undo` refused the same way points at its own script, never
+        // at the install's: following the pointer must remove, not install.
+        let RunDecision::Refuse { message, .. } = run_decision(false, false, UNDO_SCRIPT_POINTER)
+        else {
+            panic!("a prompt with no terminal is refused");
+        };
+        assert!(message.ends_with(UNDO_SCRIPT_POINTER), "{message}");
+        assert_eq!(
+            UNDO_SCRIPT_POINTER,
+            "f=$(mktemp) && min finalize-install --undo --show --script > \"$f\" && sudo sh \"$f\""
         );
     }
 
@@ -1183,7 +1330,7 @@ mod tests {
             0o600
         );
         assert_eq!(
-            run_decision(true, false),
+            run_decision(true, false, SCRIPT_POINTER),
             RunDecision::Run(vec!["sudo", "sh"])
         );
         assert_eq!(PICKED_UP, "Running boxes pick this up on their next start.");
@@ -1272,6 +1419,7 @@ mod tests {
             tunables_name_daemon: false,
             parser_present: true,
             daemon: Some("/usr/local/bin/minimald".to_string()),
+            home: Some("/home/alice".to_string()),
         };
         assert_eq!(
             userns_item_over(&UsernsFacts {
@@ -1317,6 +1465,7 @@ mod tests {
             "cat > /etc/apparmor.d/minimald <<\\MINIMAL_APPARMOR_PROFILE_EOF\n",
             "profile minimald @{minimald_bin} flags=(unconfined) {\n",
             "apparmor_parser --replace /etc/apparmor.d/minimald\n",
+            ": > /var/lib/minimal/finalize-install-apparmor-profile\n",
         ] {
             assert!(script.contains(step), "{step:?} in {script}");
         }
@@ -1354,6 +1503,50 @@ mod tests {
             .unwrap()
             .state,
             ItemState::Done
+        );
+
+        // `$HOME/.local/bin/minimald` is stock only where `@{HOME}` reaches:
+        // `/home/<user>` and `/root`. A home elsewhere is any other path,
+        // attached through the local tunable, and the profile alone does
+        // not count there.
+        for (home, stock) in [
+            ("/home/alice", true),
+            ("/root", true),
+            ("/home/alice/", true),
+            ("/srv/home/alice", false),
+            ("/home/alice/nested", false),
+            ("/home/", false),
+        ] {
+            let facts = UsernsFacts {
+                daemon: Some(format!(
+                    "{}/.local/bin/minimald",
+                    home.trim_end_matches('/')
+                )),
+                home: Some(home.to_string()),
+                profile_installed: true,
+                ..restricted.clone()
+            };
+            let item = userns_item_over(&facts).unwrap();
+            if stock {
+                assert_eq!(item.state, ItemState::Done, "{home}");
+            } else {
+                assert_eq!(item.state, ItemState::Missing, "{home}");
+                assert!(
+                    item.script.unwrap().contains("minimald.d/local"),
+                    "{home}: attached through the local tunable"
+                );
+            }
+        }
+        assert_eq!(
+            userns_item_over(&UsernsFacts {
+                daemon: Some("/home/bob/.local/bin/minimald".to_string()),
+                profile_installed: true,
+                ..restricted.clone()
+            })
+            .unwrap()
+            .state,
+            ItemState::Missing,
+            "another user's home is not this user's @{{HOME}}"
         );
 
         // A path an AppArmor tunable cannot name is a fact no script fixes,
@@ -1420,10 +1613,11 @@ mod tests {
     /// permission denied, blocked when the device is not there.
     #[test]
     fn kvm_item_table() {
-        use linux::kvm_item_over;
+        use linux::{in_kvm_group, kvm_item_over};
         use std::io::{Error, ErrorKind};
-        assert_eq!(kvm_item_over(Ok(()), "alice").state, ItemState::Done);
-        let missing = kvm_item_over(Err(Error::from(ErrorKind::PermissionDenied)), "alice");
+        let denied = || Err(Error::from(ErrorKind::PermissionDenied));
+        assert_eq!(kvm_item_over(Ok(()), "alice", false).state, ItemState::Done);
+        let missing = kvm_item_over(denied(), "alice", false);
         assert_eq!(missing.state, ItemState::Missing);
         assert_eq!(missing.id, "kvm-group");
         let script = missing.script.unwrap();
@@ -1434,12 +1628,36 @@ mod tests {
             "{script}"
         );
         assert!(missing.step.unwrap().contains("next login"));
-        let absent = kvm_item_over(Err(Error::from(ErrorKind::NotFound)), "alice");
+        let absent = kvm_item_over(Err(Error::from(ErrorKind::NotFound)), "alice", false);
         assert_eq!(absent.state, ItemState::Cannot);
         assert!(absent.cause.unwrap().contains("/dev/kvm is not there"));
-        assert_eq!(
-            kvm_item_over(Err(Error::from(ErrorKind::PermissionDenied)), "").state,
-            ItemState::Cannot
+        let unnamed = kvm_item_over(denied(), "", false);
+        assert_eq!(unnamed.state, ItemState::Cannot);
+        assert!(unnamed.cause.unwrap().contains("did not read"));
+        let unquotable = kvm_item_over(denied(), "al ice", false);
+        assert_eq!(unquotable.state, ItemState::Cannot);
+        assert!(
+            unquotable
+                .cause
+                .unwrap()
+                .contains("holds a quote, a space or a newline"),
+            "a name that read but cannot be quoted is told apart from none"
         );
+
+        // Already in the group, in a login that predates it: `/dev/kvm`
+        // refuses, but there is nothing to add, so no step and no record a
+        // later `--undo` would act on — a new login is what is missing.
+        let relogin = kvm_item_over(denied(), "alice", true);
+        assert_eq!(relogin.state, ItemState::Cannot);
+        assert!(relogin.script.is_none());
+        assert!(relogin.cause.unwrap().contains("log out and back in"));
+
+        let group = "root:x:0:\nkvm:x:108:bob,alice\nalice:x:1000:\n";
+        assert!(in_kvm_group(group, "alice"));
+        assert!(in_kvm_group(group, "bob"));
+        assert!(!in_kvm_group(group, "carol"));
+        assert!(!in_kvm_group(group, "ali"));
+        assert!(!in_kvm_group("kvm:x:108:\n", ""));
+        assert!(!in_kvm_group("", "alice"));
     }
 }
