@@ -6737,20 +6737,21 @@ mod tests {
 
         // The session's own hold, re-made before the attach.
         rehold_held_name_before_attach(&ssh_sock, id, Some(&record)).await;
-        let seen = requests.lock().unwrap();
-        assert_eq!(seen.len(), 1, "one hold, one request");
-        let minimald_rpc::BoxControlRequest::HoldBoxName(request) =
-            serde_json_lenient::from_str(&seen[0]).expect("the request is the wire type")
-        else {
-            panic!("the re-hold is carried by the hold verb");
-        };
-        assert_eq!(request.name, "web");
-        assert_eq!(
-            request.session_id,
-            Some(id),
-            "the re-hold names the session, so it frees only that session's hold"
-        );
-        drop(seen);
+        {
+            let seen = requests.lock().unwrap();
+            assert_eq!(seen.len(), 1, "one hold, one request");
+            let minimald_rpc::BoxControlRequest::HoldBoxName(request) =
+                serde_json_lenient::from_str(&seen[0]).expect("the request is the wire type")
+            else {
+                panic!("the re-hold is carried by the hold verb");
+            };
+            assert_eq!(request.name, "web");
+            assert_eq!(
+                request.session_id,
+                Some(id),
+                "the re-hold names the session, so it frees only that session's hold"
+            );
+        }
 
         // A destroy that lands between the record's read and the re-hold:
         // the hold is made for a session that is gone, and released again
