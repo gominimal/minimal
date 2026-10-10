@@ -8,7 +8,9 @@
 //! itself. This test keeps it that way: it reads every `.rs` file under
 //! `crates/` and every `.sh` file under `scripts/` and fails on any of the
 //! retired spellings, wherever they are — a remedy string, a fixture that
-//! pins one, or a doc comment that recommends one.
+//! pins one, or a doc comment that recommends one. The one file spared is
+//! the installer rehearsal, `scripts/install_test.sh`, which names the
+//! spellings to assert their absence from the step's output.
 //!
 //! The `common` crate is outside the darwin-native scope `just test` runs,
 //! so on macOS this gate runs only through `just test-cross`; the Linux
@@ -57,9 +59,10 @@ fn no_rust_remedy_carries_a_placeholder_or_a_remote_fetch() {
         .file_name()
         .expect("this file has a name")
         .to_owned();
+    let spared = [this.as_os_str(), "install_test.sh".as_ref()];
     let mut hits = Vec::new();
     for path in sources {
-        if path.file_name() == Some(this.as_os_str()) {
+        if path.file_name().is_some_and(|name| spared.contains(&name)) {
             continue;
         }
         let text = std::fs::read_to_string(&path).expect("a readable source");
