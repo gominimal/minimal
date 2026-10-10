@@ -191,9 +191,10 @@ impl EgressPolicy {
     }
 
     /// The deny-all section: `Some(vec![])` on every `allow_*` dimension —
-    /// the one [`crate::core::egress::EgressRules::from_policy`] shape that
-    /// admits nothing — with nothing denied, because there is nothing left
-    /// to subtract from. The materialized form of
+    /// the shape `--deny-all-egress` writes and
+    /// [`crate::core::egress::EgressRules::from_policy`] compiles to rules
+    /// admitting nothing — with nothing denied, because there is nothing
+    /// left to subtract from. The materialized form of
     /// [`EffectiveEgress::DenyAll`], built as a real section so the gate
     /// compiles the default through the same path a declared one takes.
     ///
@@ -210,17 +211,21 @@ impl EgressPolicy {
         }
     }
 
-    /// Whether this section is the deny-all shape: every `allow_*` dimension
-    /// present and empty. `deny_subnets` is not read — it subtracts from
-    /// what the `allow_*` fields admit, and there is nothing there to
-    /// subtract from. The one predicate the in-VM classifier and the
-    /// host-side registry share, so the box each treats as deny-all is one
-    /// shape.
+    /// Whether this section admits nothing: both destination lists,
+    /// `allow_subnets` and `allow_dns_hosts`, present and empty. Those two
+    /// are the grants; `allow_protocols` only filters what they grant, so
+    /// it is not read — a section that grants no destination reaches
+    /// nothing whatever protocols it lists, which is the shape
+    /// [`effective_egress`] resolves a declaration with no destination
+    /// list (protocols only, denies only) to. `deny_subnets` is not read
+    /// either — it subtracts from what the `allow_*` fields admit, and
+    /// there is nothing there to subtract from. The one predicate the
+    /// in-VM classifier, the host-side registry and `min session policy`
+    /// share, so the box each treats as deny-all is one shape.
     #[must_use]
     pub fn admits_nothing(&self) -> bool {
         self.allow_subnets.as_ref().is_some_and(Vec::is_empty)
             && self.allow_dns_hosts.as_ref().is_some_and(Vec::is_empty)
-            && self.allow_protocols.as_ref().is_some_and(Vec::is_empty)
     }
 }
 
@@ -1794,10 +1799,10 @@ mod tests {
 
     #[test]
     fn admits_nothing_reads_the_deny_all_shape() {
-        // The deny-all predicate is the one shape the egress gate refuses:
-        // every `allow_*` dimension present and empty. An absent dimension
-        // is not yet resolved (`effective_egress` decides what it grants),
-        // and one non-empty list admits something, so neither is deny-all.
+        // The deny-all predicate reads the two destination lists, present
+        // and empty. An absent list is not yet resolved (`effective_egress`
+        // decides what it grants), and one non-empty destination list
+        // admits something, so neither is deny-all.
         assert!(EgressPolicy::deny_all().admits_nothing());
         assert!(!EgressPolicy::default().admits_nothing());
         assert!(
@@ -1821,10 +1826,12 @@ mod tests {
             }
             .admits_nothing()
         );
-        // Two dimensions present and empty is not enough: the third, absent
-        // or non-empty, still admits something.
+        // Both destination lists present and empty is deny-all whatever
+        // `allow_protocols` says: protocols filter the granted reach and
+        // there is none to filter. This is the shape a protocols-only or
+        // denies-only declaration resolves to under the deny-all default.
         assert!(
-            !EgressPolicy {
+            EgressPolicy {
                 allow_subnets: Some(vec![]),
                 allow_dns_hosts: Some(vec![]),
                 ..EgressPolicy::default()
@@ -1832,13 +1839,33 @@ mod tests {
             .admits_nothing()
         );
         assert!(
-            !EgressPolicy {
+            EgressPolicy {
                 allow_subnets: Some(vec![]),
                 allow_dns_hosts: Some(vec![]),
                 allow_protocols: Some(vec![IpProto::Tcp]),
                 ..EgressPolicy::default()
             }
             .admits_nothing()
+        );
+        let protocols_only = EgressPolicy {
+            allow_protocols: Some(vec![IpProto::Tcp]),
+            ..EgressPolicy::default()
+        };
+        let EffectiveEgress::Declared(resolved) = effective_egress(
+            Some(&protocols_only),
+            NetworkMode::OwnIp,
+            EgressDefaultPhase::InForce,
+            false,
+        ) else {
+            panic!("a declared section stays declared");
+        };
+        assert!(
+            resolved.admits_nothing(),
+            "a protocols-only declaration grants no destination once resolved",
+        );
+        assert_eq!(
+            EffectiveEgress::Declared(resolved).summary_label(),
+            Some("deny-all")
         );
         // `deny_subnets` is not read: the deny-all shape stays deny-all
         // with a subtraction set.

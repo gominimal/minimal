@@ -5849,12 +5849,23 @@ mod tests {
             "the strict policy reply must keep the declaration as launched",
         );
 
-        // A declared section round-trips verbatim, ingress beside it.
+        // A declared section round-trips as the gate resolves it, ingress
+        // beside it: the effective reply is what the box is held to, so the
+        // names list the declaration left absent comes back present and
+        // empty (NET-074, in force on an own-address box), while the
+        // declared lists ride verbatim. The strict reply above is the one
+        // that echoes the declaration.
         let declared = client
             .call::<GetEffectiveSessionPolicy>(&GetEffectiveSessionPolicyRequest::Id(declared_id))
             .await
             .unwrap();
-        assert_eq!(declared.egress, EffectiveEgress::Declared(egress));
+        assert_eq!(
+            declared.egress,
+            EffectiveEgress::Declared(EgressPolicy {
+                allow_dns_hosts: Some(Vec::new()),
+                ..egress
+            }),
+        );
         assert_eq!(declared.ingress, None);
 
         // A declared lane round-trips too: the reply answers it as `Some`
