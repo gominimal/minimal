@@ -38,6 +38,52 @@ mod helpers;
 
 pub(crate) use helpers::*;
 
+/// Why this host refuses the unprivileged user namespace every session
+/// sandbox needs, with the fix to run — `None` when nothing is visible.
+///
+/// Probed at failure time rather than reused from the daemon's startup
+/// probe: the sysctls it reads take effect live (the host-setup doc's
+/// `sysctl -w` fix needs no daemon restart), so a startup verdict could
+/// name a restriction already lifted, or miss one set since. The probe is a
+/// handful of `/proc` reads on a path that has already failed.
+#[cfg(target_os = "linux")]
+fn userns_spawn_hint() -> Option<String> {
+    sandbox2::user_namespaces_restriction()
+        .map(|r| format!("{r} — fix: {}", crate::userns_restriction_fix(r)))
+}
+
+/// Off Linux no user namespace is involved, so there is nothing to name.
+#[cfg(not(target_os = "linux"))]
+fn userns_spawn_hint() -> Option<String> {
+    None
+}
+
+/// The error a failed host attach surfaces: the bare symptom, plus the
+/// userns diagnosis and fix when there is one (see [`userns_spawn_hint`]).
+/// A host that dies in the launch-to-attach window on a userns-restricted
+/// host (stock Ubuntu 24.04+) otherwise leaves the client with a symptom
+/// that names neither the restriction nor the fix.
+fn spawn_failed_error(userns_spawn_hint: Option<&str>) -> std::io::Error {
+    with_userns_hint(
+        std::io::Error::other("session host exited before its channel could attach"),
+        userns_spawn_hint,
+    )
+}
+
+/// `err` with the userns diagnosis and fix appended when there is one,
+/// keeping its kind. A launch that fails outright on a userns-restricted
+/// host (an own-ip session wiring the netns of a child that already died on
+/// its `uid_map` write) otherwise reaches the client with the same
+/// cause-less symptom as a host that dies before its attach. The probe
+/// sees the host, not this error, so the hint is labelled the likely cause
+/// and the error's own message stays first.
+fn with_userns_hint(err: std::io::Error, userns_spawn_hint: Option<&str>) -> std::io::Error {
+    match userns_spawn_hint {
+        Some(hint) => std::io::Error::new(err.kind(), format!("{err} — likely cause: {hint}")),
+        None => err,
+    }
+}
+
 /// An error that occurred when attaching to a running session/its-shell.
 #[derive(Debug)]
 pub enum AttachError {
@@ -4358,7 +4404,9 @@ impl Session {
             }
             None => (None, spawn.await),
         };
-        let (host, task, host_ip_enforcement) = spawned.map_err(AttachError::SpawnFailed)?;
+        let (host, task, host_ip_enforcement) = spawned.map_err(|e| {
+            AttachError::SpawnFailed(with_userns_hint(e, userns_spawn_hint().as_deref()))
+        })?;
         // The confirmation was a read, not a reservation: the VM host daemon
         // may have withdrawn the row at its grace's end between that read
         // and this launch (NET-138). Read it again now the new host is up,
@@ -4702,8 +4750,8 @@ impl Session {
             Ok(()) => Ok(()),
             // The host's loop ended before the attach could be delivered.
             Err(session_host::HostAttachError::Closed(..)) => {
-                return Err(AttachError::SpawnFailed(std::io::Error::other(
-                    "session host exited before its channel could attach",
+                return Err(AttachError::SpawnFailed(spawn_failed_error(
+                    userns_spawn_hint().as_deref(),
                 )));
             }
             // The host is alive but its mailbox stayed full past the attach
