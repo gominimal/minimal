@@ -1780,10 +1780,11 @@ fn serve_channel(
                 // unanswered. The connection's reads are bounded by their
                 // own timeouts, so it is put back in blocking mode first.
                 if let Err(error) = stream.set_nonblocking(false) {
-                    tracing::debug!(
+                    tracing::warn!(
                         component = COMPONENT,
                         %error,
-                        "could not put a channel connection into blocking mode"
+                        "could not put a channel connection into blocking mode; \
+                         dropped the connection"
                     );
                     continue;
                 }
@@ -1826,10 +1827,12 @@ fn serve_channel(
                         refuse_foreign_peer(stream, uid, expected_uid);
                     }
                     Err(error) => {
-                        tracing::debug!(
+                        // A dropped connect loses that node's publishes
+                        // until it reconnects, so the drop is a warn.
+                        tracing::warn!(
                             component = COMPONENT,
                             %error,
-                            "could not read a channel peer's uid"
+                            "could not read a channel peer's uid; dropped the connection"
                         );
                     }
                 }
