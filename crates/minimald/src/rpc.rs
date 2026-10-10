@@ -1911,18 +1911,9 @@ async fn serve_stream_workspace_patches(
 
 /// Look up the session for an upload channel: pulls the session id
 /// out of the channel env, resolves the live actor via the manager,
-/// and returns its paths. Shared by both `WorkspaceFilesTarZst` and
-/// `WorkspacePatchesTarZst`.
-async fn upload_session_paths(
-    s: &ServerStateHandle,
-    config: &ChannelConfig,
-) -> Result<crate::session::SessionPaths, String> {
-    Ok(upload_session_handle(s, config).await?.1)
-}
-
-/// Same lookup as [`upload_session_paths`] but returns the session
-/// handle too, so callers that need per-session serialization can
-/// grab a lock without a second manager round-trip.
+/// and returns its handle and paths. Shared by the `Workspace*TarZst`
+/// handlers — the ones that need per-session serialization or actor
+/// coordination keep the handle too.
 async fn upload_session_handle(
     s: &ServerStateHandle,
     config: &ChannelConfig,
@@ -1959,23 +1950,36 @@ async fn unpack_workspace_files(
     c: &mut RuChannel<Msg>,
     received: &Arc<AtomicU64>,
 ) -> Result<(), String> {
-    let paths = upload_session_paths(s, config).await?;
+    let (session_handle, paths) = upload_session_handle(s, config).await?;
     // Emitted once the upload has a destination and before a single byte is
     // pulled, so a transfer that wedges mid-stream still leaves a record
     // saying which session it was for. Its pair is the complete/failed
     // record in the caller.
     tracing::info!("workspace upload started");
 
-    let reader = async_compression::tokio::bufread::ZstdDecoder::new(tokio::io::BufReader::new(
-        CountingReader {
+    // Bracket the unpack with the in-flight flag, and await both acks: the
+    // Begin ack guarantees an attach that races the upload sees the flag
+    // before the first byte lands, and the End ack fires before this
+    // function reports, so the caller's outcome log never says complete
+    // while an attach is still refused. Cleared on both arms — a failed
+    // upload must not wedge the session behind a flag nothing clears.
+    session_handle
+        .set_workspace_upload_in_flight(true)
+        .await
+        .map_err(|e| format!("session is gone: {e}"))?;
+    let unpacked = async_tar::Archive::new(async_compression::tokio::bufread::ZstdDecoder::new(
+        tokio::io::BufReader::new(CountingReader {
             inner: c.make_reader(),
             count: Arc::clone(received),
-        },
-    ));
-    async_tar::Archive::new(reader)
-        .unpack(paths.working.as_utf8_path())
+        }),
+    ))
+    .unpack(paths.working.as_utf8_path())
+    .await;
+    session_handle
+        .set_workspace_upload_in_flight(false)
         .await
-        .map_err(|e| format!("unpack failed: {e}"))?;
+        .map_err(|e| format!("session is gone: {e}"))?;
+    unpacked.map_err(|e| format!("unpack failed: {e}"))?;
 
     Ok(())
 }

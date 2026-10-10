@@ -64,6 +64,12 @@ pub enum AttachError {
     /// client still owes a patches upload + `FinalizeSession`
     /// before a shell can be minted.
     SessionPending,
+    /// The session's `WorkspaceFilesTarZst` upload is still streaming, so
+    /// the workspace the attach would configure against is incomplete:
+    /// the Draft shortcut would scaffold a default against a half-empty
+    /// tree and later conflict with the uploaded layout. The client
+    /// should retry once the upload has landed.
+    WorkspaceUploadInFlight,
     /// The session host is alive but busy (its mailbox stayed full past the
     /// attach deadline). The client should retry.
     SessionBusy,
@@ -110,6 +116,11 @@ impl fmt::Display for AttachError {
                 f,
                 "session isn't attachable yet (still being activated; retry \
                  after the activation finishes)"
+            ),
+            AttachError::WorkspaceUploadInFlight => write!(
+                f,
+                "session is still receiving its workspace upload; retry the \
+                 attach once the upload completes"
             ),
             AttachError::SessionBusy => {
                 write!(f, "session host is busy; retry the attach once it drains")
@@ -556,6 +567,12 @@ enum SessionMessage {
     /// Hand back an `Arc` clone of this session's hook-scripts-upload lock,
     /// see [`Session::hook_scripts_upload_lock`].
     GetHookScriptsUploadLock(oneshot::Sender<Arc<Mutex<()>>>),
+    /// Mark this session's `WorkspaceFilesTarZst` upload as in flight
+    /// (true) or finished (false), see
+    /// [`Session::workspace_upload_in_flight`]. The ack fires once the
+    /// actor has applied the flag, so a Begin is visible to an attach
+    /// before the upload pulls its first byte.
+    SetWorkspaceUploadInFlight(bool, oneshot::Sender<()>),
     /// Register a live direct-tcpip forward relay as belonging to this
     /// session, so teardown takes it down too: a session that goes away
     /// aborts its forwards rather than leaving relays pointing into a box
@@ -872,6 +889,15 @@ pub struct Session {
     /// reason.
     hook_scripts_upload_lock: Arc<Mutex<()>>,
 
+    /// Whether a `WorkspaceFilesTarZst` upload is currently streaming into
+    /// the workspace. While true, an attach would run its Draft shortcut
+    /// (`configure_loadout` with an empty contribution) against a
+    /// half-populated tree, scaffolding a default `minimal.toml` that
+    /// conflicts with the layout the upload is about to land — so the
+    /// attach is refused instead, and the client retries once the upload
+    /// completes.
+    workspace_upload_in_flight: bool,
+
     /// A non-owning handle to the [`Manager`](crate::sessions::Manager), used to
     /// build the [`SessionControl`] handed to each [`Binding`] so a shell-exit
     /// "delete" tears this session down through the manager (record removal and
@@ -1011,6 +1037,7 @@ impl Session {
             workspace_baseline: WorkspaceBaseline::Unarmed,
             patches_upload_lock: Arc::new(Mutex::new(())),
             hook_scripts_upload_lock: Arc::new(Mutex::new(())),
+            workspace_upload_in_flight: false,
             manager,
             weak_self,
             // No host yet; the first launch sets this. `Interactive` is the
@@ -2033,6 +2060,10 @@ impl Session {
             }
             SessionMessage::GetHookScriptsUploadLock(r) => {
                 let _ = r.send(Arc::clone(&self.hook_scripts_upload_lock));
+            }
+            SessionMessage::SetWorkspaceUploadInFlight(in_flight, r) => {
+                self.workspace_upload_in_flight = in_flight;
+                let _ = r.send(());
             }
             SessionMessage::TrackForward(forward) => {
                 // Prune the ones that have finished on their own, so the
@@ -3997,6 +4028,17 @@ impl Session {
             None => return Err(AttachError::NoPty),
         });
 
+        // Refuse the attach while the workspace upload is still streaming:
+        // the Draft shortcut below configures against whatever the tree
+        // holds right now, and mid-upload that is a half-populated
+        // workspace whose scaffolded default would conflict with the
+        // layout the upload is about to land. The refusal is cheaper than
+        // the alternative the client already knows how to do: retry once
+        // the upload completes.
+        if self.workspace_upload_in_flight {
+            return Err(AttachError::WorkspaceUploadInFlight);
+        }
+
         // Capture the environment this attach contributes to the shell it may
         // mint: the locale/timezone vars the client forwarded (folded as
         // defaults below the composition) and the per-connection facts folded
@@ -5401,6 +5443,26 @@ impl SessionHandle {
         let _ = self
             .0
             .send(SessionMessage::GetHookScriptsUploadLock(send))
+            .await;
+        recv.await.map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::NotConnected, "session actor is gone")
+        })
+    }
+
+    /// Marks the session's `WorkspaceFilesTarZst` upload as in flight
+    /// (true) or finished (false). The reply is awaited — the actor's ack
+    /// fires once the flag is applied, so a `true` set returns only once
+    /// an attach racing the upload will see it. A dead actor maps to
+    /// `NotConnected`.
+    pub async fn set_workspace_upload_in_flight(
+        &self,
+        in_flight: bool,
+    ) -> Result<(), std::io::Error> {
+        let (send, recv) = oneshot::channel();
+        // Ignore send errors - the recv will also fail.
+        let _ = self
+            .0
+            .send(SessionMessage::SetWorkspaceUploadInFlight(in_flight, send))
             .await;
         recv.await.map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::NotConnected, "session actor is gone")

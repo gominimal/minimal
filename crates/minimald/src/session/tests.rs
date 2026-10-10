@@ -236,6 +236,89 @@ async fn attach_to_an_unconfigured_session_configures_it_rather_than_failing() {
     );
 }
 
+/// Attaching while the session's `WorkspaceFilesTarZst` upload is still
+/// streaming must be refused, not shortcut into `configure_loadout`:
+/// mid-upload the workspace is half-populated, and the default the
+/// Draft shortcut scaffolds against it conflicts with the layout the
+/// upload is about to land — wedging the session behind a layout
+/// error no retry can clear. The refusal leaves the workspace
+/// untouched (nothing is scaffolded), and once the upload finishes
+/// the same attach goes through.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attach_while_a_workspace_upload_streams_is_refused_without_scaffolding() {
+    use crate::test_harness::create_session_req;
+    use minimald_rpc::CreateSession;
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    // Bare `CreateSession` — the actor stays `Draft`, exactly the state
+    // a client is in while it streams the workspace upload.
+    let session_id = client
+        .call::<CreateSession>(&create_session_req("uploading-session", "/uwu"))
+        .await
+        .unwrap()
+        .id;
+
+    // Stand in for the in-flight upload: the RPC handler sets this flag
+    // before it pulls the first byte, and clears it once the unpack
+    // finishes on either arm.
+    let manager = server.state.sessions_manager().await;
+    let handle = manager
+        .get_session(crate::sessions::SessionKeyPredicate::Id(session_id))
+        .await
+        .unwrap()
+        .expect("session should resolve");
+    handle
+        .set_workspace_upload_in_flight(true)
+        .await
+        .expect("flag should land");
+
+    // The attach is refused with the in-flight message, not shortcut
+    // into a configure.
+    let mut channel = client.open_shell(session_id).await;
+    let refusal = collect_to_close(&mut channel).await;
+    assert!(
+        refusal.contains("Error attaching to session:"),
+        "expected an attach refusal, got: {refusal:?}"
+    );
+    assert!(
+        refusal.contains("session is still receiving its workspace upload"),
+        "expected the in-flight-upload refusal, got: {refusal:?}"
+    );
+
+    // The refusal happened before the Draft shortcut, so the workspace
+    // holds no scaffolded root `minimal.toml`.
+    let paths = handle.paths().await.expect("paths should resolve");
+    assert!(
+        !paths.working.as_utf8_path().join("minimal.toml").exists(),
+        "a refused attach must not scaffold the workspace"
+    );
+
+    // Once the upload finishes, the same attach lands the session live.
+    handle
+        .set_workspace_upload_in_flight(false)
+        .await
+        .expect("flag should clear");
+    let mut channel = client.open_shell(session_id).await;
+    channel.data_bytes(b"hello\n".to_vec()).await.unwrap();
+    let mut stdout = Vec::new();
+    loop {
+        match channel.wait().await {
+            Some(ChannelMsg::Data { data }) => {
+                stdout.extend_from_slice(&data);
+                if String::from_utf8_lossy(&stdout).contains("got:hello") {
+                    break;
+                }
+            }
+            Some(_) => {}
+            None => {
+                let stdout = String::from_utf8_lossy(&stdout);
+                panic!("attach after the upload should mint a shell; got: {stdout:?}");
+            }
+        }
+    }
+}
+
 /// Drives the full SSH path into the session host with the mock launcher:
 /// create a session, request a pty + shell, feed stdin, observe the echoed
 /// stdout, then confirm the host tears down when the process exits.
