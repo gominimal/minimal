@@ -242,6 +242,51 @@ pub(crate) fn seed_vm_report_door_for_tests(
         .insert(control_socket.to_path_buf(), door.into());
 }
 
+/// A stand-in report door at `door` that answers every request line with
+/// `reply` and hands each request it reads to the test, in order (tests
+/// only).
+#[cfg(test)]
+pub(crate) fn spawn_report_door_for_tests(
+    door: &Path,
+    reply: minimald_rpc::BoxControlReply,
+) -> (
+    tokio::task::JoinHandle<()>,
+    tokio::sync::mpsc::UnboundedReceiver<minimald_rpc::BoxControlRequest>,
+) {
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+    let listener = tokio::net::UnixListener::bind(door).expect("bind the report door stand-in");
+    let (seen_tx, seen) = tokio::sync::mpsc::unbounded_channel();
+    let mut reply_line = serde_json_lenient::to_string(&reply).expect("the reply serialises");
+    reply_line.push('\n');
+    let task = tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let (read, mut write) = stream.into_split();
+            let mut line = String::new();
+            if tokio::io::BufReader::new(read)
+                .read_line(&mut line)
+                .await
+                .is_err()
+            {
+                continue;
+            }
+            let request =
+                serde_json_lenient::from_str::<minimald_rpc::BoxControlRequest>(line.trim())
+                    .expect("the report door's request line parses");
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "the test may drop its receiver once it has its answer"
+            )]
+            let _ = seen_tx.send(request);
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "a reporter that already hung up needs no reply"
+            )]
+            let _ = write.write_all(reply_line.as_bytes()).await;
+        }
+    });
+    (task, seen)
+}
+
 /// Clear the stand-in report door seeded for `control_socket`, so a session
 /// a test has finished with reports nowhere again (tests only).
 #[cfg(test)]
@@ -420,6 +465,66 @@ pub(crate) async fn host_row_standing(
         }
     }
     None
+}
+
+/// Hold or release a `host_ip` session's box name with the VM host daemon
+/// (NET-138's `host_ip` interim), by `hold`: the daemon's start re-makes
+/// its live sessions' holds and releases the holds of the sessions it
+/// reaped, by the session's id, so a release frees only that session's
+/// hold. A reply that never arrives is retried within [`REPORT_ATTEMPTS`]
+/// under the one [`REPORT_DEADLINE`] — both verbs are idempotent. A native
+/// host holds no names: [`Ok`] without a round trip.
+///
+/// # Errors
+///
+/// The door refused the verb — a VM host daemon that predates the hold
+/// verbs on this door — answered with another verb's reply, or did not
+/// answer within the attempts.
+pub(crate) async fn report_name_hold(
+    control: &ControlChannel,
+    name: &str,
+    session_id: sessions::SessionId,
+    hold: bool,
+) -> io::Result<()> {
+    let Some(channel) = box_report_channel(control) else {
+        return Ok(());
+    };
+    let request = minimald_rpc::HoldBoxNameRequest {
+        name: name.to_string(),
+        session_id: Some(session_id),
+    };
+    let request = if hold {
+        minimald_rpc::BoxControlRequest::HoldBoxName(request)
+    } else {
+        minimald_rpc::BoxControlRequest::ReleaseBoxName(request)
+    };
+    let deadline = tokio::time::Instant::now() + REPORT_DEADLINE;
+    let mut unanswered = None;
+    for attempt in 1..=REPORT_ATTEMPTS {
+        let bound = attempt_deadline(deadline, REPORT_DEADLINE, REPORT_ATTEMPTS);
+        match report_exchange(&channel, &request, bound).await {
+            Ok(minimald_rpc::BoxControlReply::NameHeld { .. }) => return Ok(()),
+            Ok(minimald_rpc::BoxControlReply::Error { error }) => {
+                return Err(io::Error::other(format!(
+                    "the VM host daemon refused the name hold: {error}"
+                )));
+            }
+            Ok(other) => {
+                return Err(io::Error::other(format!(
+                    "the VM host daemon answered the name hold with another verb's reply: \
+                     {other:?}"
+                )));
+            }
+            Err(error) => unanswered = Some(error),
+        }
+        if attempt < REPORT_ATTEMPTS {
+            if tokio::time::Instant::now() + REPORT_BACKOFF >= deadline {
+                break;
+            }
+            tokio::time::sleep(REPORT_BACKOFF).await;
+        }
+    }
+    Err(unanswered.expect("the loop ran at least once without deciding"))
 }
 
 /// Raise one ask with the VM host daemon (NET-045): an expose decided `ask`
@@ -4989,6 +5094,72 @@ mod tests {
         assert!(
             elapsed < REPORT_DEADLINE + WITHDRAW_REPORT_DEADLINE,
             "the attempts stay under the report's deadline: {elapsed:?}"
+        );
+    }
+
+    /// A name hold over the report door carries the session's id and its
+    /// verb, answers `Ok` on the name-hold marker, and fails with the
+    /// door's reason when the door refuses it — a VM host daemon that
+    /// predates the hold verbs on the guest's door; a native host holds
+    /// nothing and asks nobody.
+    #[tokio::test]
+    async fn a_name_hold_rides_the_report_door() {
+        let session = sessions::SessionId::parse_str("00000000-0000-4000-8000-000000000001")
+            .expect("a session id");
+        for (reply, held) in [
+            (
+                minimald_rpc::BoxControlReply::NameHeld {
+                    name: "web".to_string(),
+                    held: true,
+                },
+                true,
+            ),
+            (
+                minimald_rpc::BoxControlReply::Error {
+                    error: "the hold_box_name verb is served on the host's control socket"
+                        .to_string(),
+                },
+                false,
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let control_sock = dir.path().join("control.sock");
+            let door = dir.path().join("report-door.sock");
+            let (task, mut seen) = spawn_report_door_for_tests(&door, reply);
+            seed_vm_report_door_for_tests(&control_sock, &door);
+
+            let reported = report_name_hold(
+                &ControlChannel::Unix(control_sock.clone()),
+                "web",
+                session,
+                true,
+            )
+            .await;
+            clear_vm_report_door_for_tests(&control_sock);
+            task.abort();
+
+            assert_eq!(reported.is_ok(), held, "{reported:?}");
+            match seen.try_recv() {
+                Ok(minimald_rpc::BoxControlRequest::HoldBoxName(request)) => {
+                    assert_eq!(request.name, "web");
+                    assert_eq!(request.session_id, Some(session));
+                }
+                other => panic!("the hold verb is what the door read: {other:?}"),
+            }
+            assert!(seen.try_recv().is_err(), "an answered verb is sent once");
+        }
+
+        let native = tempfile::tempdir().unwrap();
+        assert!(
+            report_name_hold(
+                &ControlChannel::Unix(native.path().join("control.sock")),
+                "web",
+                session,
+                false,
+            )
+            .await
+            .is_ok(),
+            "a native host has no names to hold"
         );
     }
 

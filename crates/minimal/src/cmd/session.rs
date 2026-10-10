@@ -261,13 +261,13 @@ async fn attached_session_record(
 /// nothing, and a session that held nothing (a `none` box) is the goal
 /// state already holding.
 ///
-/// A destroy no client of this host issues — the daemon's own reap — still
-/// leaves the hold, across VM host daemon restarts too, since holds are
-/// persisted: holds carry no liveness signal of their own. The hold blocks
-/// nothing — a registration under the name is checked against rows and
-/// creations, never holds, and a new session's hold of the name takes it
-/// over — so all it keeps is the name answering NODATA, not NXDOMAIN, until
-/// a session of that name holds it and releases it.
+/// A destroy no client of this host issues — the daemon's own reap — is
+/// released by the daemon at its start, and a hold whose release was lost
+/// otherwise is dropped by the VM host daemon after its restart unless a
+/// live session re-makes it. The hold blocks nothing meanwhile — a
+/// registration under the name is checked against rows and creations,
+/// never holds, and a new session's hold of the name takes it over — so
+/// all it keeps is the name answering NODATA, not NXDOMAIN.
 pub(crate) async fn release_held_name_after_attach(
     sock: &std::path::Path,
     id: sessions::SessionId,
@@ -313,10 +313,14 @@ pub(crate) async fn release_held_name_after_attach(
 ///
 /// The record was read before the hold, so a destroy another client
 /// issues in between can release the session's holds first and leave
-/// this one standing for a session that is gone — persisted, so it would
-/// outlive every restart. The session is looked up again once the hold
+/// this one standing for a session that is gone — until the VM host
+/// daemon's next restart, which drops a reloaded hold nothing re-makes.
+/// The session is looked up again once the hold
 /// is made, and a session gone by then has the hold released by its id:
-/// a destroy that lands after that lookup releases it itself.
+/// a destroy that lands after that lookup releases it itself. A hold the
+/// VM host daemon did not make — one that predates the verbs, or did not
+/// answer — leaves nothing to undo, so neither the second lookup nor the
+/// release is made.
 pub(crate) async fn rehold_held_name_before_attach(
     sock: &std::path::Path,
     id: sessions::SessionId,
@@ -334,7 +338,9 @@ pub(crate) async fn rehold_held_name_before_attach(
     let Some(name) = record.name.as_deref() else {
         return;
     };
-    hold_box_name_with_vm_host(control_sock_beside(sock), name, Some(id), true).await;
+    if !hold_box_name_with_vm_host(control_sock_beside(sock), name, Some(id), true).await {
+        return;
+    }
     if let Ok(None) = attached_session_record(sock, id).await {
         hold_box_name_with_vm_host(control_sock_beside(sock), name, Some(id), false).await;
     }
@@ -349,13 +355,15 @@ pub(crate) async fn rehold_held_name_before_attach(
 /// verbs refuses them and the session goes on exactly as it did before —
 /// the name answers NXDOMAIN there, which is never a state a session
 /// fails over. Both carry the session `id` the hold is for, so a release
-/// frees only that session's hold.
+/// frees only that session's hold. Returns whether the VM host daemon
+/// answered the verb: `false` for no VM host daemon to ask, a refusal, or
+/// no answer.
 async fn hold_box_name_with_vm_host(
     control_sock: Option<std::path::PathBuf>,
     name: &str,
     id: Option<sessions::SessionId>,
     hold: bool,
-) {
+) -> bool {
     let request = minimald_rpc::HoldBoxNameRequest {
         name: name.to_string(),
         session_id: id,
@@ -372,7 +380,7 @@ async fn hold_box_name_with_vm_host(
         )
     };
     let Some(sock_path) = control_sock else {
-        return;
+        return false;
     };
     let sent = tokio::time::timeout(
         BOX_CONTROL_TIMEOUT,
@@ -385,7 +393,7 @@ async fn hold_box_name_with_vm_host(
         Ok(Err(error)) => Some(error.to_string()),
         Err(_) => Some(format!("no answer within {BOX_CONTROL_TIMEOUT:?}")),
     };
-    if let Some(reason) = failure {
+    if let Some(reason) = &failure {
         tracing::warn!(
             box = %name,
             operation,
@@ -393,6 +401,7 @@ async fn hold_box_name_with_vm_host(
              answers as it did before"
         );
     }
+    failure.is_none()
 }
 
 /// The session-start line for a box the activation registered with the VM
@@ -6763,6 +6772,50 @@ mod tests {
         };
         assert_eq!(request.name, "web");
         assert_eq!(request.session_id, Some(id));
+    }
+
+    /// A re-hold the VM host daemon does not make — one that predates the
+    /// hold verbs and refuses them — leaves nothing to undo: no second
+    /// lookup and no release follow it, even for a session gone by then.
+    #[tokio::test]
+    async fn a_refused_rehold_is_not_undone() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ssh_sock = dir.path().join("ssh.sock");
+        let requests = fake_vm_host(
+            dir.path().join(minvmd::control::CONTROL_SOCK_FILE),
+            r#"{"error":"unknown verb"}"#.to_string(),
+        )
+        .await;
+        let server = minimald::test_harness::TestServer::new().await;
+        server.listen_on_uds(&ssh_sock).await;
+        let project = tempfile::TempDir::new().unwrap();
+        let mut daemon = server.connect().await;
+        let id = minimald::test_harness::create_configured_session(
+            &mut daemon,
+            "web",
+            project.path().to_str().unwrap(),
+        )
+        .await;
+        let record = attached_session_record(&ssh_sock, id)
+            .await
+            .expect("the lookup does not fail")
+            .expect("the session's record is read");
+        match daemon
+            .call::<minimald_rpc::DestroySession>(&minimald_rpc::DestroySessionRequest { id })
+            .await
+        {
+            minimald_rpc::Errorable::Ok(_) => {}
+            minimald_rpc::Errorable::Err { error } => panic!("the destroy failed: {error}"),
+        }
+
+        rehold_held_name_before_attach(&ssh_sock, id, Some(&record)).await;
+        let seen = requests.lock().unwrap();
+        assert_eq!(seen.len(), 1, "the refused hold, and nothing after it");
+        assert!(matches!(
+            serde_json_lenient::from_str::<minimald_rpc::BoxControlRequest>(&seen[0])
+                .expect("the request is the wire type"),
+            minimald_rpc::BoxControlRequest::HoldBoxName(_)
+        ));
     }
 
     /// T66's attach-exit side: an own-address box whose attach ended in the

@@ -59,6 +59,12 @@
 //! own, so a door's other connections never wait behind a human. Every ask
 //! event appends one line to the same audit log.
 //!
+//! The name hold and its release (`hold_box_name`, `release_box_name`)
+//! answer on both doors: the host's clients hold a `host_ip` session's
+//! name at its creation and release it at its destroy, and the in-VM
+//! daemon, which owns the session records, re-makes its live sessions'
+//! holds when it starts and releases the hold of a session it reaps.
+//!
 //! The socket lives beside the daemon's ssh socket in the provider-instance
 //! dir and is created with the same 0700-dir / 0600-socket posture the
 //! bridge socket gets ([`crate::sock`]): only the same user may reach the
@@ -891,7 +897,9 @@ fn root_may_ask(request: &BoxControlRequest) -> bool {
 /// withdrawals and both reads answer only on the host's socket, whose
 /// owner-only file mode is the row read's gate, and the port reports
 /// answer only on the in-VM daemon's channel, where the grant the row's
-/// registration holds decides. A verb on the wrong door is refused with
+/// registration holds decides; the name hold and its release answer on
+/// both, since the in-VM daemon owns the session records a hold is for.
+/// A verb on the wrong door is refused with
 /// its reason — never parsed into the other door's posture, because the
 /// peer a door serves is exactly what the verb decides what it may do.
 #[expect(
@@ -950,11 +958,27 @@ fn serve_request(
         // The hold and its release take a ticket like the verbs they
         // bracket: each changes the table the answerer answers from, so
         // each publishes in its own turn, never mid-fold.
-        (BoxControlRequest::HoldBoxName(request), ControlDoor::Host) => {
+        //
+        // Both doors serve them. The host's clients hold a name at a
+        // session's creation and release it at its destroy; the in-VM
+        // daemon owns the session records, so it is the one that re-makes
+        // its live sessions' holds when it starts and releases the hold of
+        // a session it reaps. A supervisor runs one VM, so whatever the
+        // guest holds or releases is a name in that VM's own zone, and a
+        // hold publishes no address and blocks no registration: the most
+        // a guest can do with it is make a name answer NODATA, not
+        // NXDOMAIN.
+        (
+            BoxControlRequest::HoldBoxName(request),
+            ControlDoor::Host | ControlDoor::GuestReports,
+        ) => {
             let reply = order.apply(|| hold_box_name(boxes, &request.name, request.session_id));
             write_reply(stream, &reply)
         }
-        (BoxControlRequest::ReleaseBoxName(request), ControlDoor::Host) => {
+        (
+            BoxControlRequest::ReleaseBoxName(request),
+            ControlDoor::Host | ControlDoor::GuestReports,
+        ) => {
             let reply = order.apply(|| release_box_name(boxes, &request.name, request.session_id));
             write_reply(stream, &reply)
         }
@@ -3744,6 +3768,66 @@ mod tests {
                 "a released name is out of the zone"
             );
         }
+    }
+
+    /// The in-VM daemon's door serves the hold verbs too: the guest
+    /// daemon re-makes its live sessions' holds when it starts and
+    /// releases a reaped session's, so a hold over the guest door holds
+    /// the name, and a release by the reaped session's id takes it out of
+    /// the zone and leaves another session's hold standing.
+    #[test]
+    fn the_guest_door_holds_and_releases_names() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (sock_path, _server, registry, _answerer, _proxy_publish) =
+            spawn_server(dir.path()).expect("server binds");
+        let guest = sock_path.with_file_name(GUEST_CONTROL_SOCK_FILE);
+        let reaped = sessions::SessionId::parse_str("00000000-0000-4000-8000-000000000001")
+            .expect("a session id");
+        let live = sessions::SessionId::parse_str("00000000-0000-4000-8000-000000000002")
+            .expect("a session id");
+        let in_zone = |name: &str| {
+            registry
+                .zone_view()
+                .rows()
+                .any(|(held, _)| held == format!("{name}.min.internal"))
+        };
+
+        for (name, session_id) in [("old", reaped), ("web", live)] {
+            let reply = control(
+                &guest,
+                &BoxControlRequest::HoldBoxName(HoldBoxNameRequest {
+                    name: name.to_string(),
+                    session_id: Some(session_id),
+                }),
+            )
+            .expect("the hold is answered");
+            assert_eq!(
+                reply,
+                BoxControlReply::NameHeld {
+                    name: name.to_string(),
+                    held: true,
+                }
+            );
+        }
+        assert!(in_zone("old") && in_zone("web"));
+
+        let reply = control(
+            &guest,
+            &BoxControlRequest::ReleaseBoxName(HoldBoxNameRequest {
+                name: "old".to_string(),
+                session_id: Some(reaped),
+            }),
+        )
+        .expect("the release is answered");
+        assert_eq!(
+            reply,
+            BoxControlReply::NameHeld {
+                name: "old".to_string(),
+                held: false,
+            }
+        );
+        assert!(!in_zone("old"), "the reaped session's hold is gone");
+        assert!(in_zone("web"), "another session's hold stands");
     }
 
     /// The drawn port's story (T93): a guest that reports its publish was
