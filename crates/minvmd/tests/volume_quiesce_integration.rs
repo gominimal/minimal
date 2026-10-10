@@ -205,6 +205,24 @@ fn stop_quiesces_volume_leaving_clean_ext4_journal() {
 #[serial]
 #[ignore = "gated MINVMD_E2E=1; requires Mac with libkrun, kernel, rootfs, initramfs"]
 fn sigterm_to_supervisor_quiesces_volume() {
+    signal_to_supervisor_quiesces_volume(libc::SIGTERM, "SIGTERM");
+}
+
+/// SIGINT sent to the supervisor alone (`kill -INT`) stops the VM the same
+/// way. This is not a terminal Ctrl-C: the tty delivers that to the whole
+/// foreground process group, the VMM child included, and the graceful stop
+/// does not cover it.
+#[test]
+#[serial]
+#[ignore = "gated MINVMD_E2E=1; requires Mac with libkrun, kernel, rootfs, initramfs"]
+fn sigint_to_supervisor_quiesces_volume() {
+    signal_to_supervisor_quiesces_volume(libc::SIGINT, "SIGINT");
+}
+
+/// Boot a foreground supervisor, send `signum` to it alone, and assert the
+/// clean stop: the supervisor ends by that signal inside the stop bound, the
+/// lifecycle record reads `Stopped`, and the volume's ext4 journal is clean.
+fn signal_to_supervisor_quiesces_volume(signum: libc::c_int, name: &str) {
     if !e2e_enabled("volume_quiesce_integration") {
         return;
     }
@@ -229,10 +247,11 @@ fn sigterm_to_supervisor_quiesces_volume() {
     let volume = env.volume_path();
     assert!(volume.exists(), "volume image must exist after boot");
 
-    // The service manager's stop: one SIGTERM to the supervisor process.
+    // The service manager's stop: one signal to the supervisor process,
+    // never to its process group.
     // SAFETY: kill(2) on the supervisor child this test spawned.
-    let r = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
-    assert_eq!(r, 0, "SIGTERM to supervisor pid {pid} must be deliverable");
+    let r = unsafe { libc::kill(pid as libc::pid_t, signum) };
+    assert_eq!(r, 0, "{name} to supervisor pid {pid} must be deliverable");
 
     // The supervisor's teardown reaps the VMM child and ends the process by
     // the signal, inside the signal-stop bound (15 s, under launchd's 20 s
@@ -246,7 +265,7 @@ fn sigterm_to_supervisor_quiesces_volume() {
             None => {
                 assert!(
                     Instant::now() < deadline,
-                    "supervisor did not exit within 60s of SIGTERM"
+                    "supervisor did not exit within 60s of {name}"
                 );
                 std::thread::sleep(Duration::from_millis(250));
             }
@@ -261,7 +280,7 @@ fn sigterm_to_supervisor_quiesces_volume() {
         use std::os::unix::process::ExitStatusExt as _;
         assert_eq!(
             status.signal(),
-            Some(libc::SIGTERM),
+            Some(signum),
             "the supervisor must end by the signal that stopped it; got {status:?}"
         );
     }
@@ -275,7 +294,7 @@ fn sigterm_to_supervisor_quiesces_volume() {
     let status = String::from_utf8_lossy(&out.stdout);
     assert!(
         status.contains("stopped"),
-        "state must be Stopped after SIGTERM; status: {status}"
+        "state must be Stopped after {name}; status: {status}"
     );
 
     // The proof the Shutdown RPC ran before the signal: a cleanly
@@ -289,13 +308,13 @@ fn sigterm_to_supervisor_quiesces_volume() {
     assert_ne!(
         s_state & EXT4_VALID_FS,
         0,
-        "s_state ({s_state:#06x}) must have EXT4_VALID_FS set after SIGTERM stop"
+        "s_state ({s_state:#06x}) must have EXT4_VALID_FS set after {name} stop"
     );
     let incompat = read_le_u32(&volume, EXT4_S_FEATURE_INCOMPAT_OFFSET);
     assert_eq!(
         incompat & EXT4_INCOMPAT_RECOVER,
         0,
-        "s_feature_incompat ({incompat:#010x}) must not need journal recovery after SIGTERM stop"
+        "s_feature_incompat ({incompat:#010x}) must not need journal recovery after {name} stop"
     );
 }
 

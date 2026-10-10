@@ -30,9 +30,12 @@ pub(crate) const GUEST_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 pub(crate) const SIGNAL_STOP_BOUND: Duration = Duration::from_secs(15);
 
+/// How long a signalled VMM child gets to exit on SIGTERM before SIGKILL.
+const VMM_SIGTERM_GRACE: Duration = Duration::from_secs(5);
+
 /// The part of a signal stop's budget kept back from the guest quiesce:
-/// [`signal_and_wait`]'s 5 s SIGTERM grace plus the supervisor's `Stopped`
-/// write after it reaps the VMM.
+/// the [`VMM_SIGTERM_GRACE`] plus the supervisor's `Stopped` write after it
+/// reaps the VMM.
 const SIGNAL_STOP_TEARDOWN_RESERVE: Duration = Duration::from_secs(6);
 
 /// Run the `stop` subcommand.
@@ -127,7 +130,7 @@ fn run_with_state_dir(dir: std::path::PathBuf, quiesce_guest: bool) -> Result<Ho
                 connect_timeout: GUEST_CONNECT_TIMEOUT,
                 rpc_deadline: None,
             });
-            quiesce_then_signal(quiesce, pid)?
+            quiesce_then_signal(quiesce, pid, VMM_SIGTERM_GRACE)?
         }
         None => {
             tracing::warn!("daemon is active but vmm_pid is absent; cleaning up state");
@@ -177,12 +180,12 @@ struct GuestQuiesce {
 /// The stop sequence `stop`, [`stop_at`] and the signal stop share: quiesce
 /// the guest (best-effort: on any failure — guest already gone, bridge down,
 /// timeout — SIGTERM proceeds and the journal replay backstop bounds the
-/// damage), then SIGTERM the VMM child, escalating to SIGKILL. `None` skips
-/// the quiesce.
+/// damage), then SIGTERM the VMM child, escalating to SIGKILL once `grace`
+/// has passed. `None` skips the quiesce.
 ///
 /// Returns whether the guest acknowledged the Shutdown RPC: `false` when it
 /// was not asked or did not answer.
-fn quiesce_then_signal(quiesce: Option<GuestQuiesce>, pid: u32) -> Result<bool> {
+fn quiesce_then_signal(quiesce: Option<GuestQuiesce>, pid: u32, grace: Duration) -> Result<bool> {
     let acknowledged = quiesce.is_some_and(|q| {
         match crate::rpc_client::shutdown_guest(
             &q.uds_path,
@@ -200,12 +203,13 @@ fn quiesce_then_signal(quiesce: Option<GuestQuiesce>, pid: u32) -> Result<bool> 
             }
         }
     });
-    signal_and_wait(pid)?;
+    signal_and_wait(pid, grace)?;
     Ok(acknowledged)
 }
 
-/// Send `SIGTERM` to `pid`; wait up to 5 s; escalate to `SIGKILL` on timeout.
-fn signal_and_wait(pid: u32) -> Result<()> {
+/// Send `SIGTERM` to `pid`; wait up to `grace`; escalate to `SIGKILL` on
+/// timeout.
+fn signal_and_wait(pid: u32, grace: Duration) -> Result<()> {
     let pid_t = libc::pid_t::try_from(pid)
         .map_err(|_| anyhow::anyhow!("invalid vmm_pid {pid} in state"))?;
     if pid_t <= 0 {
@@ -226,9 +230,9 @@ fn signal_and_wait(pid: u32) -> Result<()> {
         return Err(anyhow::anyhow!("SIGTERM to pid {pid}: {err}"));
     }
 
-    tracing::debug!(pid, "SIGTERM sent; waiting up to 5s");
+    tracing::debug!(pid, ?grace, "SIGTERM sent; waiting for the exit");
 
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + grace;
     loop {
         // SAFETY: kill(pid, 0) checks for process existence without delivering
         // a signal. Errors other than ESRCH are ignored as best-effort.
@@ -347,7 +351,8 @@ pub(crate) fn graceful_stop_from_signal(
             rpc_deadline: Some(quiesce_deadline),
         })
     };
-    quiesce_then_signal(quiesce, vmm_pid).context("stopping VMM after signal")?;
+    quiesce_then_signal(quiesce, vmm_pid, grace_until(deadline))
+        .context("stopping VMM after signal")?;
 
     // The supervisor's main thread watches the same child and writes
     // `Stopped` once it has reaped it; poll for that record, bounded.
@@ -362,6 +367,14 @@ pub(crate) fn graceful_stop_from_signal(
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// The SIGTERM grace of a stop that must end by `deadline`: the usual
+/// [`VMM_SIGTERM_GRACE`], cut to the time the deadline leaves, so no round of
+/// signalling runs past it.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn grace_until(deadline: Instant) -> Duration {
+    VMM_SIGTERM_GRACE.min(deadline.saturating_duration_since(Instant::now()))
 }
 
 /// The `Starting` half of [`graceful_stop_from_signal`]: signal the booting
@@ -382,7 +395,8 @@ fn abort_boot_from_signal(
 ) -> Result<SignalStop> {
     loop {
         tracing::info!(pid, "stop signal during boot; signalling the VMM child");
-        quiesce_then_signal(None, pid).context("stopping the booting VMM after signal")?;
+        quiesce_then_signal(None, pid, grace_until(deadline))
+            .context("stopping the booting VMM after signal")?;
 
         let mut lock = state_dir
             .lifecycle_lock()
@@ -647,7 +661,7 @@ mod tests {
             assert!(!status.success(), "sleep must not exit successfully");
         });
         let started = std::time::Instant::now();
-        signal_and_wait(pid).expect("signal_and_wait");
+        signal_and_wait(pid, VMM_SIGTERM_GRACE).expect("signal_and_wait");
         reaper.join().expect("reaper thread");
         // The reaped pid must have been observed gone well inside the 5s
         // grace — the poll's fast path, not the SIGKILL escalation.
@@ -740,6 +754,65 @@ mod tests {
         let state = sd.read_state().unwrap();
         assert_eq!(state.lifecycle, Lifecycle::Stopped);
         assert_eq!(state.vmm_pid, None);
+    }
+
+    #[test]
+    fn signal_stop_during_boot_cuts_the_grace_to_the_deadline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sd = make_state_dir(&tmp);
+
+        // A booting "VMM child" that ignores SIGTERM, so the stop has to
+        // wait out its grace and escalate. It reports once the signal is
+        // ignored, so the stop cannot race the trap.
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "trap '' TERM; echo ready; exec sleep 30"])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn a SIGTERM-ignoring child");
+        let mut ready = String::new();
+        std::io::BufRead::read_line(
+            &mut std::io::BufReader::new(child.stdout.take().expect("child stdout")),
+            &mut ready,
+        )
+        .expect("read the child's ready line");
+        assert_eq!(ready.trim(), "ready");
+        sd.write_state(&State {
+            lifecycle: Lifecycle::Starting,
+            vmm_pid: Some(child.id()),
+            ..State::stopped()
+        })
+        .unwrap();
+
+        // One second is left of the stop's budget: the grace round must end
+        // with it rather than run its whole 5 s past the deadline.
+        let bound = Duration::from_secs(1);
+        let started = Instant::now();
+        let outcome = graceful_stop_from_signal(tmp.path().to_path_buf(), started + bound)
+            .expect("signal stop during boot");
+        let elapsed = started.elapsed();
+        assert_eq!(outcome, SignalStop::BootAborted);
+        assert!(
+            elapsed >= bound,
+            "the grace was cut short of the deadline: {elapsed:?}"
+        );
+        assert!(
+            elapsed
+                < VMM_SIGTERM_GRACE
+                    .checked_sub(Duration::from_secs(2))
+                    .unwrap(),
+            "the grace round ran past the stop's deadline: {elapsed:?}"
+        );
+
+        let status = child.wait().expect("wait for the killed child");
+        {
+            use std::os::unix::process::ExitStatusExt as _;
+            assert_eq!(
+                status.signal(),
+                Some(libc::SIGKILL),
+                "a child that ignored SIGTERM must be killed at the deadline; got {status:?}"
+            );
+        }
+        assert_eq!(sd.read_state().unwrap().lifecycle, Lifecycle::Stopped);
     }
 
     #[test]
