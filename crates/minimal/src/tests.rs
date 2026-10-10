@@ -1998,10 +1998,18 @@ async fn stop_force_stops_a_wedged_vm_from_the_host() {
     let provider_dir =
         client::resolve_provider_dir(Some(dir.path()), true).expect("resolve provider dir");
     let state_dir = minvmd::state::StateDir::new(provider_dir).expect("open state dir");
-    let mut vmm = std::process::Command::new("sleep")
-        .arg("30")
-        .spawn()
-        .expect("spawn sleep");
+    // The alive lock is held the way a real VM holds it: by the VMM process,
+    // through the inherited fd, so it is released when that process dies and
+    // not before.
+    let lock = state_dir
+        .try_acquire_alive_lock()
+        .unwrap()
+        .expect("acquire alive lock");
+    let mut vmm_cmd = std::process::Command::new("sleep");
+    vmm_cmd.arg("30");
+    lock.inherit_into(&mut vmm_cmd);
+    let mut vmm = vmm_cmd.spawn().expect("spawn sleep");
+    drop(lock);
     state_dir
         .write_state(&minvmd::state::State {
             lifecycle: minvmd::lifecycle::Lifecycle::Running,
@@ -2010,10 +2018,10 @@ async fn stop_force_stops_a_wedged_vm_from_the_host() {
             ..minvmd::state::State::stopped()
         })
         .unwrap();
-    let _lock = state_dir
-        .try_acquire_alive_lock()
-        .unwrap()
-        .expect("acquire alive lock");
+    assert!(
+        state_dir.daemon_alive().unwrap(),
+        "the stand-in VMM must hold the alive lock"
+    );
 
     let global = GlobalArgs {
         repo_dir: None,
@@ -2030,6 +2038,10 @@ async fn stop_force_stops_a_wedged_vm_from_the_host() {
     assert_eq!(
         state_dir.read_state().unwrap().lifecycle,
         minvmd::lifecycle::Lifecycle::Stopped
+    );
+    assert!(
+        !state_dir.daemon_alive().unwrap(),
+        "the stop must not return while the alive lock is held: a `min start` would refuse"
     );
     // SIGTERM'd by the host-side stop; reaped here so the test leaves no stray.
     let status = vmm.wait().unwrap();
@@ -2084,9 +2096,37 @@ async fn stop_force_refuses_a_booting_vm() {
     );
 }
 
+/// The wait a host-side stop ends on is the alive lock, not the lifecycle
+/// file: it fails while a minvmd still holds the lock, even over a `Stopped`
+/// state, and passes once the lock is released.
+#[test]
+fn host_stop_waits_for_the_alive_lock_not_the_lifecycle() {
+    let dir = tempfile::tempdir().unwrap();
+    let state_dir = minvmd::state::StateDir::new(dir.path().to_path_buf()).expect("open state dir");
+    state_dir
+        .write_state(&minvmd::state::State::stopped())
+        .unwrap();
+    let lock = state_dir
+        .try_acquire_alive_lock()
+        .unwrap()
+        .expect("acquire alive lock");
+
+    let err = wait_for_alive_lock_released(&state_dir, std::time::Duration::from_millis(300))
+        .expect_err("a held alive lock is not a finished stop");
+    assert!(
+        format!("{err:#}").contains("still holds its alive lock"),
+        "got: {err:#}"
+    );
+
+    drop(lock);
+    wait_for_alive_lock_released(&state_dir, std::time::Duration::from_millis(300))
+        .expect("a released alive lock is a finished stop");
+}
+
 /// Without `--force` the wedged VM keeps its non-zero exit — force-stopping a
 /// VM that may still be draining is not the default behaviour — but the error
-/// now names the recovery instead of a bare connect failure.
+/// names the recovery instead of a bare connect failure, and is the typed
+/// host-unreachable failure the binary exits 7 on.
 #[tokio::test]
 async fn stop_without_force_on_a_wedged_vm_names_the_recovery() {
     let dir = tempfile::tempdir().unwrap();
@@ -2122,6 +2162,11 @@ async fn stop_without_force_on_a_wedged_vm_names_the_recovery() {
     assert!(
         chain.contains("the VM is not answering") && chain.contains("--force"),
         "expected the recovery hint, got: {chain}"
+    );
+    assert!(
+        err.downcast_ref::<client::box_registration::HostUnreachable>()
+            .is_some(),
+        "the refusal must carry the type `main` maps to exit 7, got: {chain}"
     );
 }
 

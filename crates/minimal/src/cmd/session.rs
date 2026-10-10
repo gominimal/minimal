@@ -3857,7 +3857,7 @@ pub async fn cmd_stop(global: &GlobalArgs, args: StopArgs) -> Result<(), anyhow:
             return if args.force {
                 stop_wedged_vm_from_host(global.minimal_dir.clone(), true).await
             } else {
-                Err(connect_err.context(wedged_vm_hint()))
+                Err(wedged_vm_unreachable(connect_err))
             };
         }
     };
@@ -3880,7 +3880,7 @@ pub async fn cmd_stop(global: &GlobalArgs, args: StopArgs) -> Result<(), anyhow:
                     .await =>
         {
             if !args.force {
-                return Err(rpc_err.context(wedged_vm_hint()));
+                return Err(wedged_vm_unreachable(rpc_err));
             }
             // The guest has just been asked to shut down and did not answer:
             // asking again would only add up to two more minutes of waiting
@@ -3920,8 +3920,18 @@ pub async fn cmd_stop(global: &GlobalArgs, args: StopArgs) -> Result<(), anyhow:
 /// own path — best-effort guest Shutdown over the bridge socket (5 s connect
 /// deadline, so a wedged guest cannot stall this recovery), then SIGTERM to
 /// the VMM, SIGKILL after the 5 s grace, then `Stopped` — run against the
-/// provider dir the CLI resolved for *this* VM, then waited on until the
-/// lifecycle observes the stop.
+/// provider dir the CLI resolved for *this* VM, then waited on until minvmd
+/// has released the VM's alive lock.
+///
+/// The lifecycle file cannot be that wait: the stop writes `Stopped` itself,
+/// before the supervisor has reaped the VMM and exited, and a `min start` in
+/// that window finds the alive lock still held and refuses to boot.
+///
+/// Worst case, after the CLI's own attempt on the guest has given up: the
+/// 5 s grace plus the [`HOST_STOP_RELEASE_WAIT`] when the guest is not asked
+/// again, about 25 s; and when it is asked, the 5 s connect deadline on top,
+/// about 30 s — or, for a guest that completes the handshake and then hangs,
+/// the 120 s Shutdown deadline on top of that, about 150 s.
 ///
 /// Only reached on a minvmd backend with `--force`, once the guest is proven
 /// unreachable; a native minimald is not a VM and keeps its own error.
@@ -3938,13 +3948,14 @@ async fn stop_wedged_vm_from_host(
     let provider_dir = client::resolve_provider_dir(minimal_dir.as_deref(), true)
         .context("resolving the VM's provider dir for a host-side stop")?;
 
-    // The stop sleep-polls the VMM's exit and the wait polls the lifecycle
-    // file, so both go on the blocking pool rather than stalling an async
-    // worker (rust-coding-standards: no blocking in an async context).
-    let wait_dir = minimal_dir;
-    tokio::task::spawn_blocking(move || {
-        let state = minvmd::state::StateDir::new(provider_dir.clone())
-            .and_then(|state_dir| state_dir.effective_state())
+    // The stop sleep-polls the VMM's exit and the wait polls the alive lock,
+    // so both go on the blocking pool rather than stalling an async worker
+    // (rust-coding-standards: no blocking in an async context).
+    let outcome = tokio::task::spawn_blocking(move || {
+        let state_dir = minvmd::state::StateDir::new(provider_dir.clone())
+            .context("opening the VM's state dir for a host-side stop")?;
+        let state = state_dir
+            .effective_state()
             .context("reading the VM's state for a host-side stop")?;
         if state.lifecycle == minvmd::lifecycle::Lifecycle::Starting || state.vmm_pid.is_none() {
             anyhow::bail!(
@@ -3952,21 +3963,62 @@ async fn stop_wedged_vm_from_host(
                 stop_command()
             );
         }
-        minvmd::cmd::stop::stop_at(provider_dir, quiesce_guest)
+        let outcome = minvmd::cmd::stop::stop_at(provider_dir, quiesce_guest)
             .context("stopping the VM from the host")?;
-        autospawn::wait_for_daemon_stopped(true, wait_dir.as_deref())
-            .context("the VM did not reach the stopped state")
+        wait_for_alive_lock_released(&state_dir, HOST_STOP_RELEASE_WAIT)?;
+        Ok(outcome)
     })
     .await
     .context("the host-side stop of the VM panicked")??;
 
     // stderr, so it survives the `>/dev/null` every scripted caller wraps
-    // `stop` in; the journal-replay note is the one honest caveat about a
-    // guest that was killed rather than asked to quiesce.
-    eprintln!(
-        "the guest did not answer; the VM was stopped from the host \
-         (its volume may replay its journal on the next boot)"
-    );
+    // `stop` in. The loss caveat is only true of a guest that was killed: one
+    // that acknowledged Shutdown drained its sessions and quiesced its volume
+    // first.
+    use minvmd::cmd::stop::HostStop;
+    match outcome {
+        HostStop::NothingSignalled => println!("Daemon is not running."),
+        HostStop::GuestAcknowledged => {
+            eprintln!("the VM was stopped from the host after its guest shut down cleanly");
+        }
+        HostStop::GuestUnacknowledged => eprintln!("{UNACKNOWLEDGED_STOP_CAVEAT}"),
+    }
+    Ok(())
+}
+
+/// What `min stop --force` says after killing a VM whose guest did not
+/// acknowledge Shutdown. The volume's journal keeps its filesystem metadata
+/// consistent across the kill; it does not keep the data.
+const UNACKNOWLEDGED_STOP_CAVEAT: &str = "the guest did not acknowledge shutdown; the VM was killed from the host. \
+     Running sessions were killed without their stop path, and data not yet flushed inside \
+     the VM can be lost (files truncated or empty). The volume's journal keeps its \
+     filesystem metadata consistent.";
+
+/// How long a host-side stop waits for minvmd to release the VM's alive lock
+/// once the VMM has been signalled: the supervisor has to reap the VMM child
+/// and exit. The same ceiling an acknowledged shutdown is given to reach
+/// `Stopped`.
+const HOST_STOP_RELEASE_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Wait until no minvmd (supervisor or VMM child) holds `state_dir`'s alive
+/// lock, so the next `min start` can take it.
+pub(crate) fn wait_for_alive_lock_released(
+    state_dir: &minvmd::state::StateDir,
+    timeout: std::time::Duration,
+) -> Result<(), anyhow::Error> {
+    let deadline = std::time::Instant::now() + timeout;
+    while state_dir
+        .daemon_alive()
+        .context("probing the VM's alive lock after a host-side stop")?
+    {
+        if std::time::Instant::now() >= deadline {
+            bail!(
+                "the VM was signalled, but minvmd still holds its alive lock after {timeout:?}; \
+                 starting it again will fail until that minvmd exits"
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
     Ok(())
 }
 
@@ -3979,11 +4031,16 @@ fn stop_command() -> String {
     }
 }
 
-/// The error context `min stop` adds when the VM's guest does not answer.
-fn wedged_vm_hint() -> String {
-    format!(
-        "the VM is not answering; `{} --force` stops it from the host",
-        stop_command()
+/// The failure `min stop` ends with when the VM's guest does not answer and
+/// `--force` was not given: `cause` under the recovery, typed so the run exits
+/// with the reserved host-unreachable code (7) rather than the unspecified 1.
+fn wedged_vm_unreachable(cause: anyhow::Error) -> anyhow::Error {
+    client::box_registration::HostUnreachable::over(
+        cause,
+        format!(
+            "the VM is not answering; `{} --force` stops it from the host",
+            stop_command()
+        ),
     )
 }
 
