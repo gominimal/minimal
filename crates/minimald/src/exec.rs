@@ -1329,7 +1329,7 @@ where
     // Mirror flags for the select gates below: the branch futures are
     // built before the gates are evaluated, so a gate may not borrow
     // anything a branch future holds.
-    let mut child_stdin_open = true;
+    let mut child_stdin_open = child_stdin.is_some();
     let mut stdin_pending = false;
     // A stdin read parked behind a full child pipe. The bytes are copied
     // out of `stdin_buf` because the read branch borrows it on the next
@@ -3283,6 +3283,128 @@ mod tests {
             .unwrap();
         assert_eq!(exit, 0);
         assert!(!ctrl.was_killed());
+    }
+
+    /// A real child that writes its output before it reads more input
+    /// (`cat`) gets several MB streamed through it in both directions at
+    /// once: every byte comes back in order, and the child sees EOF only
+    /// after the queued stdin has drained. With the stdin write parked
+    /// inside the loop's select, `cat` blocks on a full stdout pipe, stops
+    /// reading stdin, and the bridge never finishes.
+    #[tokio::test]
+    async fn bridge_streams_megabytes_through_cat() {
+        use std::process::Stdio;
+        use std::time::Duration;
+
+        use futures::stream;
+        use tokio::time::timeout;
+
+        use super::TokioProcess;
+
+        const LEN: usize = 4 * 1024 * 1024;
+
+        let child = tokio::process::Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawning cat");
+        let processes = stream::iter(vec![Ok::<_, std::io::Error>(TokioProcess::new(child))]);
+
+        let (mut client_stdin, mut bridge_stdin) = duplex(64 * 1024);
+        let (mut bridge_stdout, mut client_stdout) = duplex(64 * 1024);
+        let (_unused_stderr_peer, mut bridge_stderr) = duplex(64 * 1024);
+
+        let bridge_task = tokio::spawn(async move {
+            bridge(
+                "test",
+                processes,
+                &mut bridge_stdin,
+                &mut bridge_stdout,
+                &mut bridge_stderr,
+                client_lost(),
+            )
+            .await
+        });
+
+        let payload: Vec<u8> = (0..LEN).map(|i| (i % 251) as u8).collect();
+        let sent = payload.clone();
+        // Dropping the write half once the payload is in is the client's EOF.
+        let feeder = tokio::spawn(async move {
+            client_stdin.write_all(&sent).await.unwrap();
+        });
+        let reader = tokio::spawn(async move {
+            let mut received = Vec::with_capacity(LEN);
+            client_stdout.read_to_end(&mut received).await.unwrap();
+            received
+        });
+
+        let exit = timeout(Duration::from_secs(60), bridge_task)
+            .await
+            .expect("cat must finish while its stdin and stdout stream at once")
+            .unwrap();
+        assert_eq!(exit, 0);
+        feeder.await.unwrap();
+        let received = reader.await.unwrap();
+        assert_eq!(received.len(), LEN);
+        assert!(received == payload, "cat must echo the payload in order");
+    }
+
+    /// A child that exits with stdin still queued behind its full pipe
+    /// drops the queued bytes and still reports its own exit status.
+    #[tokio::test]
+    async fn bridge_reports_exit_when_child_exits_with_stdin_queued() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let (
+            process,
+            MockEndpoints {
+                // Never read: the child's stdin pipe fills and a chunk queues.
+                stdin_reader,
+                stdout_writer,
+                stderr_writer,
+                ctrl,
+            },
+        ) = build_mock();
+
+        let (mut client_stdin, mut bridge_stdin) = duplex(64 * 1024);
+        let (_unused_stdout_peer, mut bridge_stdout) = duplex(64 * 1024);
+        let (_unused_stderr_peer, mut bridge_stderr) = duplex(64 * 1024);
+
+        let feeder = tokio::spawn(async move {
+            let _ = client_stdin.write_all(&vec![b'x'; 512 * 1024]).await;
+        });
+
+        let bridge_task = tokio::spawn(async move {
+            bridge(
+                "test",
+                process,
+                &mut bridge_stdin,
+                &mut bridge_stdout,
+                &mut bridge_stderr,
+                client_lost(),
+            )
+            .await
+        });
+
+        // Let the bridge fill the child's stdin pipe and queue a chunk.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!bridge_task.is_finished());
+
+        // The child goes away, and its end of every pipe with it.
+        drop(stdin_reader);
+        drop(stdout_writer);
+        drop(stderr_writer);
+        ctrl.signal_exit(3).await;
+
+        let exit = timeout(Duration::from_secs(10), bridge_task)
+            .await
+            .expect("a child exiting with stdin queued must end the bridge")
+            .unwrap();
+        assert_eq!(exit, 3);
+        assert!(!ctrl.was_killed());
+        feeder.abort();
     }
 
     /// An exec the daemon's shutdown ends tells the client why on stderr,
