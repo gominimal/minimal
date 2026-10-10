@@ -3308,7 +3308,7 @@ fn status_code(head: &[u8]) -> Option<u16> {
 /// The frame is handed to the relay's guest-bound writer through the
 /// direction's bounded queue, so a guest that stops reading stalls no shared
 /// path with it: the queue fills, the frame is dropped under
-/// [`BACKPRESSURE_RULE`], and the leg keeps draining the switch.
+/// the `ingress-backpressure` rule ([`QueueDirection::TowardGuest`]), and the leg keeps draining the switch.
 ///
 /// One class is *written*, not only read: the reply-flow records
 /// ([`ReplyTables`], NET-040's answer half). A frame this leg delivers toward
