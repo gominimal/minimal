@@ -1165,11 +1165,14 @@ impl Binding {
             reason = "a client that cannot take the lead-in line cannot take the dialog either; \
                       the dialog's own result is the answer to relay"
         )]
+        // The same frame the VM-backed host's dialog draws
+        // (`minimal_client::ask_dialog`): the protocol on the lead-in — a
+        // runtime publish is TCP — and the `? ` the question leads with.
         let _ = w
-            .write_all(format!("\r\n{name} asks to publish port {port}.\r\n").as_bytes())
+            .write_all(format!("\r\n{name} asks to publish port {port}/tcp.\r\n").as_bytes())
             .await;
         let select = async_dialog::Select::new()
-            .with_prompt(ASK_PROMPT)
+            .with_prompt(format!("? {ASK_PROMPT}"))
             .items(["Deny", "Allow"])
             // Deny stands highlighted: the answer the box's own posture
             // would have given, so nothing publishes because someone held
