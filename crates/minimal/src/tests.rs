@@ -1775,20 +1775,53 @@ fn daemon_refusals_print_without_rpc_names() {
         }
     }
 
-    // The daemon's side of the same surface: the finalize refusals it
-    // hands `upload_and_finalize` are printed verbatim, so their retry
-    // hint names the activation, not the RPC the client retries.
+    // The daemon's side of the same surface: its refusals are printed
+    // verbatim, at finalize through `upload_and_finalize` and at attach,
+    // so none of them may name the RPC a person would have to retry. The
+    // scan is over the string literals of the daemon's session module —
+    // every non-comment line that carries a quote — which covers the
+    // refusals and the log lines alike; the module has no log-only RPC
+    // name left to exempt. The RPC names stay legitimate in type paths
+    // and comments, which the scan does not read.
     let daemon = std::fs::read_to_string(manifest.join("../minimald/src/session.rs"))
         .expect("readable daemon source");
-    assert_eq!(
-        daemon.matches("then retry the activation)").count(),
-        2,
-        "the daemon's two upload-marker finalize refusals must name the activation"
-    );
-    assert!(
-        !daemon.contains("retry FinalizeSession"),
-        "a daemon finalize refusal still names the RPC"
-    );
+    let code = daemon
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| !line.trim_start().starts_with("//"));
+    for (number, line) in code {
+        // The old phrasings, by name, so a continuation line of a
+        // multi-line literal (no quote on it) cannot slip past the scan.
+        for old in [
+            "retry FinalizeSession",
+            "SubmitVerdict or FinalizeSession",
+            "upload + FinalizeSession sequence",
+            "awaiting SubmitVerdict",
+        ] {
+            assert!(
+                !line.contains(old),
+                "minimald/src/session.rs:{}: the daemon still says {old:?}",
+                number + 1
+            );
+        }
+        if !line.contains('"') {
+            continue;
+        }
+        for rpc in [
+            "CreateSession",
+            "ConfigureLoadout",
+            "SubmitVerdict",
+            "FinalizeSession",
+            "RenameSession",
+            "WorkspacePatchesTarZst",
+        ] {
+            assert!(
+                !line.contains(rpc),
+                "minimald/src/session.rs:{}: a string names the {rpc} RPC: {line}",
+                number + 1
+            );
+        }
+    }
 }
 
 /// A project outside a VCS root that declares lifecycle hooks must be

@@ -108,8 +108,8 @@ impl fmt::Display for AttachError {
             ),
             AttachError::SessionPending => write!(
                 f,
-                "session isn't attachable yet (still awaiting either \
-                 SubmitVerdict or FinalizeSession)"
+                "session isn't attachable yet (still being activated; retry \
+                 after the activation finishes)"
             ),
             AttachError::SessionBusy => {
                 write!(f, "session host is busy; retry the attach once it drains")
@@ -2162,7 +2162,7 @@ impl Session {
             SessionInner::Draft { pending: Some(_) } => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::WouldBlock,
-                    "session already has a pending contribution awaiting SubmitVerdict; \
+                    "session already has a pending contribution awaiting its verdict; \
                      abort it and create a new session to retry",
                 ));
             }
@@ -4077,8 +4077,7 @@ impl Session {
                 // the full flow.
                 return Err(AttachError::LoadoutFailed(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
-                    "composition has patches that can only be uploaded via `min session activate` \
-                     (ConfigureLoadout → WorkspacePatchesTarZst → FinalizeSession); \
+                    "composition has patches that only `min session activate` can upload; \
                      the attach shortcut can't drive that sequence — destroy this session \
                      and re-activate through the CLI",
                 )));
@@ -5082,7 +5081,7 @@ impl Session {
         if record.status != SessionStatus::Active {
             return Err(format!(
                 "session isn't attachable yet (status is {:?}, need Active — \
-             finish the upload + FinalizeSession sequence first)",
+             finish the activation first)",
                 record.status,
             ));
         }
