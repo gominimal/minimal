@@ -1344,8 +1344,10 @@ say "  ${dim}record: $(tilde "$prev_record")$rst"
 # controlling terminal (overridable for install_test.sh), never stdin, which
 # under `curl … | sh` is the script itself. Declined, or no terminal to ask
 # on: point at the command. The run prints the same summary again on its
-# stdout before it elevates, so that stream is dropped; its prompt is on the
-# terminal and its outcome on stderr. A ✗ item no script can run — the names
+# stdout before it elevates, then its closing lines; only the lines the
+# probe's summary did not already show are printed, so a kvm-group join's
+# "starts at your next login" reaches the operator once. Its prompt is on
+# the terminal and its outcome on stderr. A ✗ item no script can run — the names
 # item `waiting on a daemon` until the first `min` starts one, or a `cannot`
 # — gets the summary and no offer: there is nothing to run yet. A failed step
 # is reported and the installer still exits 0: Minimal is installed either
@@ -1379,7 +1381,12 @@ offer_finalize_install() {
         read -r _fi_ans <"$_fi_tty" || _fi_ans=
         case "$_fi_ans" in
             ""|[Yy]*)
-                if "$bindir/min" finalize-install <"$_fi_tty" >/dev/null; then
+                _fi_run="$tmpdir/finalize-run"
+                if "$bindir/min" finalize-install <"$_fi_tty" >"$_fi_run"; then
+                    # The run's stdout is the summary again, then its closing
+                    # lines (what starts when: a kvm group joins at the next
+                    # login). Show only what the probe did not already.
+                    grep -vxF -f "$_fi_summary" "$_fi_run" >&2 || true
                     return 0
                 fi
                 say "  ✗ setup did not finish; retry with \`$_fi_min finalize-install\`"
@@ -1387,7 +1394,7 @@ offer_finalize_install() {
                 ;;
         esac
     fi
-    say "run \`$_fi_min finalize-install\` when you're ready, or without a terminal:"
+    say "run \`$_fi_min finalize-install\` when you're ready; without a terminal, use:"
     say "f=\$(mktemp) && $_fi_min finalize-install --show --script > \"\$f\" && sudo sh \"\$f\""
 }
 offer_finalize_install

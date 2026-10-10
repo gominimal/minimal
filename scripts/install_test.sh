@@ -157,7 +157,8 @@ case "${1:-}" in
         # it. $HOME/finalize.show.status makes the probe exit with that status
         # and print nothing (a `min` too old to know the command). The plain run
         # prints the summary on stdout, as the real command does before it
-        # elevates, and exits with $HOME/finalize.run.status (default 0).
+        # elevates, exits with $HOME/finalize.run.status (default 0), and on
+        # success ends with $HOME/finalize.closing's lines, its closing lines.
         printf '%s\n' "$*" >>"$HOME/finalize.calls"
         fi_summary_file=
         for _f in summary waiting cannot; do
@@ -186,6 +187,9 @@ case "${1:-}" in
                 if [ -f "$HOME/finalize.run.status" ]; then
                     exit "$(cat "$HOME/finalize.run.status")"
                 fi
+                # A completed run ends with its closing lines on stdout, as
+                # the real command does: $HOME/finalize.closing when present.
+                [ -f "$HOME/finalize.closing" ] && cat "$HOME/finalize.closing"
                 ;;
         esac
         ;;
@@ -706,6 +710,9 @@ case_finalize_install_uninstall() {
 fi_probe="finalize-install --show --script"
 fi_prompt="Finish setup now? This runs one sudo command. [Y/n]"
 fi_status="install status on this machine"
+# The real command's closing lines (finalize_install.rs PICKED_UP, NEEDS_LOGIN).
+fi_picked_up="Running boxes pick this up on their next start."
+fi_needs_login="KVM group membership starts at your next login: log out and back in, or restart the daemon from a new login."
 
 # The harness bindir is never on the installer's PATH unless BIN_ON_PATH says
 # so, so every printed command names the installed `min` by its quoted path:
@@ -730,11 +737,13 @@ case_installer_offers_finalize_install_on_a_tty() {
     # On a terminal, a host that lacks a step sees the summary and the offer,
     # and Enter — the default — runs `min finalize-install` once, with no
     # arguments. The run prints the summary again on its stdout before it
-    # elevates (the stub does too); the installer drops that stream, so the
-    # status block appears exactly once. The probe's own warnings are not the
-    # summary and never reach the output.
+    # elevates, then its closing lines (the stub does too); the installer
+    # shows only the lines the probe's summary did not, so the status block
+    # appears exactly once and the closing lines reach the operator. The
+    # probe's own warnings are not the summary and never reach the output.
     HF1="$root/hf1"; mkdir -p "$HF1"
     fi_summary "$HF1"
+    printf '%s\n' "$fi_picked_up" "$fi_needs_login" >"$HF1/finalize.closing"
     printf '\n' >"$root/tty-enter"
     TTY_FILE="$root/tty-enter"
     run fi_enter "$HF1"
@@ -744,6 +753,8 @@ case_installer_offers_finalize_install_on_a_tty() {
     want_ok "the missing item is shown as the real command prints it" \
         grep -q "✗ the private sandbox every box runs in" "$OUT"
     check 1 "$(grep -c "$fi_status" "$OUT")" "the summary appears once, not again from the run"
+    check 1 "$(grep -cF "$fi_picked_up" "$OUT")" "the run's closing line is shown, once"
+    check 1 "$(grep -cF "$fi_needs_login" "$OUT")" "a kvm group join's next-login line is shown, once"
     want_err "the probe's warnings are not shown" grep -q "skipping VM" "$OUT"
     want_ok "the offer names what a yes costs" grep -qF "$fi_prompt" "$OUT"
     check "$fi_probe
