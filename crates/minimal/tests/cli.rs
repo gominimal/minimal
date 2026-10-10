@@ -72,6 +72,91 @@ async fn version_reports_broken_pipe_when_output_is_closed() {
     }));
 }
 
+// --- finalize-install ---
+
+/// NET-122: `min finalize-install --show --json` with stdout piped (the
+/// way the installer's probe reads it) delivers the whole document and
+/// exits 1 on a host with an item not done — here a state dir with no
+/// daemon, so the names item waits on one. The exit must not lose the
+/// buffered report: `std::process::exit` flushes nothing.
+#[tokio::test]
+async fn finalize_install_show_json_reaches_a_piped_reader_before_exit() {
+    let state = tempfile::TempDir::new().unwrap();
+    let config_dir = tempfile::TempDir::new().unwrap();
+    let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_min"))
+        .args(["--minimal-dir".as_ref(), state.path().as_os_str()])
+        .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
+        .args(["--no-input", "finalize-install", "--show", "--json"])
+        .output()
+        .await
+        .expect("the min binary should be invocable");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "an unfinished host exits 1: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let report: Value = serde_json_lenient::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("the whole report reaches a piped stdout ({e}): {stdout:?}"));
+    assert_eq!(report["schema"], "min/v1/finalize-install");
+    assert_eq!(report["finished"], false);
+    let names = report["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["id"] == "names")
+        .expect("the names item is in every host's report");
+    assert_eq!(names["state"], "waiting", "{stdout}");
+}
+
+/// A daemon that accepts and never answers must not hang `--show`: the
+/// installer probes `min finalize-install --show --script` from a shell
+/// with no timeout of its own. The names item's daemon read is one bounded
+/// attempt, after which the item is `waiting`.
+#[tokio::test]
+async fn finalize_install_show_returns_within_its_deadline_on_a_wedged_daemon() {
+    let state = tempfile::TempDir::new().unwrap();
+    let config_dir = tempfile::TempDir::new().unwrap();
+    let sock = minimal_client::resolve_socket_path(Some(state.path()), false).unwrap();
+    std::fs::create_dir_all(sock.parent().unwrap()).unwrap();
+    let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+    // Accept every connection and hold it open, silent.
+    let wedged = tokio::spawn(async move {
+        let mut held = Vec::new();
+        loop {
+            if let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        }
+    });
+    let started = std::time::Instant::now();
+    let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_min"))
+        .args(["--minimal-dir".as_ref(), state.path().as_os_str()])
+        .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
+        .args(["--no-input", "finalize-install", "--show", "--json"])
+        .output()
+        .await
+        .expect("the min binary should be invocable");
+    let elapsed = started.elapsed();
+    wedged.abort();
+    assert!(
+        elapsed < std::time::Duration::from_secs(20),
+        "the daemon read is bounded (took {elapsed:?}): {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let report: Value = serde_json_lenient::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("the report is printed ({e}): {stdout:?}"));
+    let names = report["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["id"] == "names")
+        .expect("the names item is in every host's report");
+    assert_eq!(names["state"], "waiting", "{stdout}");
+}
+
 // --- ls ---
 
 #[test]
@@ -3465,7 +3550,7 @@ async fn min_prints_discovered_proxy_port() {
 /// configuration no host process consults), the daemon's answerer bound,
 /// and the reserved local range present on this host's loopback. With the
 /// answerer bound and no hook (this host), both verbs must name the
-/// *proxy* as the live surface and point at `min net setup` on that line,
+/// *proxy* as the live surface and point at `min finalize-install` on that line,
 /// with no advisory beside it (NET-122 is opt-in); with the hook and the
 /// range present too, the same decision says native and the pointer goes.
 ///
@@ -3538,7 +3623,7 @@ async fn activate_and_ls_report_native_surface() {
     // inside a VM-backed host's guest cannot speak for the host's resolver,
     // and this host's own reads say nothing routes the zone to the answerer
     // — so both verbs name the proxy as the live surface, with where it
-    // serves, points at `min net setup`, and neither prints the native words.
+    // serves, points at `min finalize-install`, and neither prints the native words.
     let out = run_min(&args, &["ls"]).await;
     let ls_stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     assert!(
@@ -3550,8 +3635,8 @@ async fn activate_and_ls_report_native_surface() {
         "the surface line must name where the proxy serves: {ls_stdout}"
     );
     assert!(
-        ls_stdout.contains("run `min net setup`"),
-        "the proxy surface line must point at `min net setup`: {ls_stdout}"
+        ls_stdout.contains("run `min finalize-install`"),
+        "the proxy surface line must point at `min finalize-install`: {ls_stdout}"
     );
     assert!(
         !ls_stdout.contains("native DNS is the live name surface"),
@@ -3562,7 +3647,7 @@ async fn activate_and_ls_report_native_surface() {
     // names — and before the upload and the loadout, so the line is not lost
     // above a failed activate's output. Host DNS is opt-in (NET-122): this
     // host cannot resolve the zone natively, so the surface line points at
-    // `min net setup`, and the session start prints no advisory and no part
+    // `min finalize-install`, and the session start prints no advisory and no part
     // of the privileged script — and never a prompt.
     let project = tempfile::TempDir::new().unwrap();
     std::fs::create_dir(project.path().join(".git")).unwrap();
@@ -3598,8 +3683,8 @@ async fn activate_and_ls_report_native_surface() {
         "a host with no hook must not be told native DNS is live: {activate_stderr}"
     );
     assert!(
-        activate_stderr.contains("run `min net setup`"),
-        "activate's surface line must point at `min net setup`, got: {activate_stderr}"
+        activate_stderr.contains("run `min finalize-install`"),
+        "activate's surface line must point at `min finalize-install`, got: {activate_stderr}"
     );
     assert!(
         !activate_stderr.contains("note:") && !activate_stderr.contains("#!/bin/sh"),
@@ -3640,7 +3725,7 @@ async fn activate_and_ls_report_native_surface() {
     assert!(
         !native_ls.contains("note:")
             && !native_ls.contains("Configure the host's resolver")
-            && !native_ls.contains("min net setup"),
+            && !native_ls.contains("min finalize-install"),
         "a host the verdict calls native is a configured one: no advisory rides its list, \
          got: {native_ls}"
     );

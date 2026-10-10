@@ -1039,38 +1039,61 @@ fn provider_local_minimald_is_the_host_backend() {
 }
 
 #[test]
-fn net_setup_parses_to_the_setup_command() {
+fn finalize_install_parses_its_flags() {
     use clap::Parser as _;
-    let cli = Cli::try_parse_from(["min", "net", "setup"]).unwrap();
+    let cli = Cli::try_parse_from(["min", "finalize-install"]).unwrap();
     assert!(matches!(
         cli.command,
-        Some(Command::Net(NetArgs {
-            command: NetCommand::Setup(NetSetupArgs {
-                print: false,
-                undo: false
-            })
+        Some(Command::FinalizeInstall(FinalizeInstallArgs {
+            show: false,
+            script: false,
+            json: false,
+            undo: false
         }))
     ));
-    let cli = Cli::try_parse_from(["min", "net", "setup", "--print"]).unwrap();
+    let cli = Cli::try_parse_from(["min", "finalize-install", "--show", "--script"]).unwrap();
     assert!(matches!(
         cli.command,
-        Some(Command::Net(NetArgs {
-            command: NetCommand::Setup(NetSetupArgs {
-                print: true,
-                undo: false
-            })
+        Some(Command::FinalizeInstall(FinalizeInstallArgs {
+            show: true,
+            script: true,
+            json: false,
+            undo: false
         }))
     ));
-    let cli = Cli::try_parse_from(["min", "net", "setup", "--undo", "--print"]).unwrap();
+    let cli = Cli::try_parse_from(["min", "finalize-install", "--show", "--json"]).unwrap();
     assert!(matches!(
         cli.command,
-        Some(Command::Net(NetArgs {
-            command: NetCommand::Setup(NetSetupArgs {
-                print: true,
-                undo: true
-            })
+        Some(Command::FinalizeInstall(FinalizeInstallArgs {
+            show: true,
+            script: false,
+            json: true,
+            undo: false
         }))
     ));
+    let cli =
+        Cli::try_parse_from(["min", "finalize-install", "--undo", "--show", "--script"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Some(Command::FinalizeInstall(FinalizeInstallArgs {
+            show: true,
+            script: true,
+            json: false,
+            undo: true
+        }))
+    ));
+    // `--script` and `--json` need `--show`; `--json` describes an install,
+    // not a removal; the two outputs exclude each other.
+    for args in [
+        &["min", "finalize-install", "--script"][..],
+        &["min", "finalize-install", "--json"],
+        &["min", "finalize-install", "--show", "--json", "--undo"],
+        &["min", "finalize-install", "--undo", "--show", "--json"],
+        &["min", "finalize-install", "--show", "--json", "--script"],
+        &["min", "net", "setup"],
+    ] {
+        assert!(Cli::try_parse_from(args).is_err(), "{args:?}");
+    }
 }
 
 #[test]

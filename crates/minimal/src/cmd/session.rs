@@ -90,7 +90,7 @@ pub(crate) fn control_sock_beside(ssh_sock: &std::path::Path) -> Option<std::pat
         .map(|dir| dir.join(minvmd::control::CONTROL_SOCK_FILE))
 }
 
-/// The host reads `min net setup` decides its script from (NET-122): this
+/// The host reads `min finalize-install` decides its script from (NET-122): this
 /// host's resolver detection and its answerer service step, read together,
 /// with the control sockets the step asks to release the hook port recorded
 /// for the render.
@@ -1042,7 +1042,7 @@ pub(crate) async fn activate_session(
         //
         // Host DNS is opt-in (NET-122): the start never prints the
         // privileged step. While the host is not set up the proxy is the
-        // live surface, and its line names `min net setup`, which prints or
+        // live surface, and its line names `min finalize-install`, which prints or
         // runs the step from its own reads of the host.
         let detection = crate::resolver::session_detection().await;
         let surface_verdict = crate::resolver::live_name_surface_with_range_at(
@@ -1105,7 +1105,7 @@ pub(crate) async fn activate_session(
         } else {
             // The answerer is reported but not bound yet: no native surface
             // to name, so the proxy is the live one, and its line carries the
-            // `min net setup` pointer NET-122 owes every start on a host not
+            // `min finalize-install` pointer NET-122 owes every start on a host not
             // set up — or, beside a proxy-down sibling, the cause instead.
             tracing::info!(
                 surface = ?unbound_surface,
@@ -5073,11 +5073,7 @@ mod tests {
                  per box: the classifier's privileged step is not installed on this \
                  host. While it cannot, its host-address boxes run unenforced — \
                  whatever the boxes' declarations say. Install the classifier's \
-                 privileged step with:\n  run: curl -fsSLO \
-                 https://raw.githubusercontent.com/gominimal/minimal/main/scripts/\
-                 install-host-classifier.sh && sudo bash ./install-host-classifier.sh \
-                 --user runner --cohort-address 10.0.0.0/16 --node-plane-address \
-                 10.0.1.0/24",
+                 privileged step with:\n  min finalize-install",
             ),
             Some("none"),
         );
@@ -5095,12 +5091,7 @@ mod tests {
              reply, and the terminal cannot disagree, got: {rendered}"
         );
         assert!(
-            rendered.ends_with(
-                "  run: curl -fsSLO https://raw.githubusercontent.com/gominimal/\
-                 minimal/main/scripts/install-host-classifier.sh && sudo bash \
-                 ./install-host-classifier.sh --user runner --cohort-address \
-                 10.0.0.0/16 --node-plane-address 10.0.1.0/24\n"
-            ),
+            rendered.ends_with("  min finalize-install\n"),
             "the missing privileged step is the cause, so the render carries \
              the exact command that installs it, on the last line with \
              nothing after it: {rendered}"
