@@ -15868,6 +15868,20 @@ mod tests {
         for frame in &frames {
             send_frame(&mut h.guest, frame).await;
         }
+        // The close and the reads below stay sequential on purpose; a review
+        // proposed running `shutdown` and the receive loop concurrently
+        // (`tokio::join!`) so the writer's flush deadline could not lapse
+        // before the peer starts reading. It does not apply: on this
+        // current-thread runtime `UnixStream::shutdown` resolves on its first
+        // poll without yielding, so the relay task cannot observe the close
+        // until the test first yields — inside the first `expect_frame` below
+        // — and the receive is already in progress when the flush bound
+        // starts, exactly the schedule a join would run. The sequential form
+        // also keeps the property this test exists for: the peer reads
+        // nothing until the sender has closed, so the frames are provably
+        // still in the relay's queue at the close. CodeRabbit withdrew the
+        // finding after review (gominimal/minimal#2158); the switch-side
+        // mirror below shares this reasoning.
         h.guest
             .shutdown()
             .await
