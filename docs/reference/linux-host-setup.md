@@ -111,4 +111,6 @@ $ sudo sh -c "echo 'user.max_user_namespaces=15000' > /etc/sysctl.d/60-minimal-u
 
 On a kernel built without `CONFIG_USER_NS`, use a kernel with user
 namespaces enabled. Debian-derived kernels that carry
-`kernel.unprivileged_userns_clone` also need it set to `1`.
+`kernel.unprivileged_userns_clone` need it set to `1` too. The daemon
+does not read that key, so it does not refuse the create. The session
+then fails at attach with the `uid_map` error above.

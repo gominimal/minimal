@@ -3780,6 +3780,20 @@ mod tests {
             plain.contains("--path /usr/local/bin/mip (from a checkout"),
             "a plain path is not quoted: {plain}"
         );
+
+        // The loader's path is built from the data dir, so a space there
+        // (a custom XDG_DATA_HOME) is quoted the same way.
+        let spaced_dir = UsernsRestriction::ApparmorUnconfined.remedy(RemedyTarget::Mip {
+            bin: "/usr/local/bin/mip",
+            data_dir: "/home/me/My Data/minimal",
+        });
+        assert!(
+            spaced_dir.contains(
+                "sudo bash '/home/me/My Data/minimal/apparmor/install-apparmor-profile.sh' \
+                 --path /usr/local/bin/mip (from a checkout"
+            ),
+            "a data dir with a space is one shell word: {spaced_dir}"
+        );
     }
 
     // /proc is mounted with nosuid,nodev on essentially every Linux distro;
