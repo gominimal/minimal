@@ -530,11 +530,28 @@ fn run_foreground() -> Result<()> {
         .try_register_node_namespace(node_port.port)
         .context("publishing the node namespace's row")?;
     // SIGTERM (a service manager's stop) and SIGINT cancel and audit every
-    // pending ask before the process ends by the signal as it always did
-    // (NET-045). A handler that cannot be installed leaves the default.
-    if let Err(error) =
-        crate::control::watch_stop_signals(boxes.clone(), crate::control::die_by_signal)
-    {
+    // pending ask (NET-045), then stop the VM the same way `minvmd stop`
+    // does: the guest gets the Shutdown RPC so the data volume's ext4
+    // journal stays clean (informed by #705), the VMM child is signalled
+    // and reaped, and the main thread's own teardown writes the `Stopped`
+    // state and returns — ending the process by exiting, not by the
+    // signal. Only when that graceful stop cannot run or does not finish
+    // does the watcher fall back to dying by the signal as before.
+    let signal_state_dir = state_dir.dir().to_path_buf();
+    if let Err(error) = crate::control::watch_stop_signals(boxes.clone(), move |signum| {
+        match crate::cmd::stop::graceful_stop_from_signal(
+            signal_state_dir,
+            crate::cmd::stop::SIGNAL_STOPPED_BOUND,
+        ) {
+            Ok(()) => {
+                tracing::info!(signum, "graceful stop after signal complete; exiting");
+            }
+            Err(e) => {
+                tracing::warn!(signum, error = %e, "graceful stop after signal failed; dying by signal");
+                crate::control::die_by_signal(signum);
+            }
+        }
+    }) {
         tracing::warn!(%error, "could not install the stop-signal handler");
     }
 

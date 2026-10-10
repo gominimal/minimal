@@ -9,10 +9,27 @@
 //! been provisioned), it returns successfully with no action. Stale active
 //! state from a dead daemon is repaired to `Stopped`.
 
-use anyhow::{Context as _, Result};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+use anyhow::{Context as _, Result, bail};
 
 use crate::lifecycle::Lifecycle;
 use crate::state::{State, StateDir};
+
+/// Bound on the connect half of a guest-shutdown ask: libkrun accepts the
+/// bridge UDS connect even when the guest is wedged, and a broken VM must
+/// not stall the stop.
+pub(crate) const GUEST_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Bound on the RPC half of a guest-shutdown ask: the handler force-drains
+/// every session and quiesces before it acknowledges.
+pub(crate) const GUEST_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// How long the signal-stop path waits for the supervisor's own teardown
+/// to write `Stopped` after the VMM child dies.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+pub(crate) const SIGNAL_STOPPED_BOUND: Duration = Duration::from_secs(10);
 
 /// Run the `stop` subcommand.
 pub fn run() -> Result<()> {
@@ -57,7 +74,14 @@ fn run_with_state_dir(dir: std::path::PathBuf, quiesce_guest: bool) -> Result<()
     match vmm_pid {
         Some(pid) => {
             if quiesce_guest {
-                shutdown_guest_best_effort();
+                let uds = crate::sock::resolve_uds_path().map_err(anyhow::Error::from);
+                match uds {
+                    Ok(uds) => shutdown_guest_best_effort(&uds),
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        "resolving bridge UDS path failed; proceeding with SIGTERM"
+                    ),
+                }
             }
             signal_and_wait(pid)?
         }
@@ -86,7 +110,7 @@ fn run_with_state_dir(dir: std::path::PathBuf, quiesce_guest: bool) -> Result<()
 /// leaves a clean ext4 journal. Best-effort: on any failure — guest already
 /// gone, bridge down, timeout — SIGTERM proceeds and the journal replay
 /// backstop bounds the damage.
-fn shutdown_guest_best_effort() {
+fn shutdown_guest_best_effort(uds_path: &Path) {
     // Two deadlines, because they bound different things. The connect
     // deadline is short: libkrun accepts the bridge UDS connect even when the
     // guest is wedged, so a completed SSH handshake is the only proof of a
@@ -96,14 +120,8 @@ fn shutdown_guest_best_effort() {
     // quiesces (10 s guest-side ceiling) before it acknowledges; giving up
     // mid-drain would SIGTERM the VMM with a dirty journal, defeating the
     // point of the call.
-    const GUEST_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-    const GUEST_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
-
-    match crate::sock::resolve_uds_path()
-        .map_err(anyhow::Error::from)
-        .and_then(|uds| {
-            crate::rpc_client::shutdown_guest(&uds, GUEST_CONNECT_TIMEOUT, GUEST_SHUTDOWN_TIMEOUT)
-        }) {
+    match crate::rpc_client::shutdown_guest(uds_path, GUEST_CONNECT_TIMEOUT, GUEST_SHUTDOWN_TIMEOUT)
+    {
         Ok(resp) => tracing::info!(?resp, "guest acknowledged Shutdown RPC"),
         Err(e) => {
             tracing::warn!(error = %e, "guest Shutdown RPC failed; proceeding with SIGTERM")
@@ -112,9 +130,7 @@ fn shutdown_guest_best_effort() {
 }
 
 /// Send `SIGTERM` to `pid`; wait up to 5 s; escalate to `SIGKILL` on timeout.
-fn signal_and_wait(pid: u32) -> Result<()> {
-    use std::time::{Duration, Instant};
-
+pub(crate) fn signal_and_wait(pid: u32) -> Result<()> {
     let pid_t = libc::pid_t::try_from(pid)
         .map_err(|_| anyhow::anyhow!("invalid vmm_pid {pid} in state"))?;
     if pid_t <= 0 {
@@ -160,6 +176,78 @@ fn signal_and_wait(pid: u32) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Graceful stop as the `run` supervisor's signal watcher runs it: quiesce
+/// the guest over the bridge UDS, signal the recorded VMM child, then wait
+/// for the supervisor's own teardown to write the `Stopped` state.
+///
+/// This is the signal-side twin of `run_with_state_dir`: the same quiesce
+/// (so the data volume's ext4 journal stays clean, informed by #705) and
+/// the same SIGTERM→SIGKILL escalation, but driven from the stop-signal
+/// thread where the main thread cannot be joined — the lifecycle record
+/// is the only shared witness that its teardown finished. On any error the
+/// caller falls back to dying by the signal as before, so the process
+/// still terminates.
+///
+/// `stopped_bound` bounds the final wait; tests pass tighter bounds than
+/// production's [`SIGNAL_STOPPED_BOUND`].
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+pub(crate) fn graceful_stop_from_signal(
+    state_dir_path: PathBuf,
+    stopped_bound: Duration,
+) -> Result<()> {
+    let state_dir = StateDir::new(state_dir_path.clone())
+        .with_context(|| format!("opening state dir: {}", state_dir_path.display()))?;
+
+    // Snapshot the lifecycle under the read lock only: the quiesce, the
+    // signal, and the Stopped wait all run without it, exactly as `stop`
+    // releases the lock during its waits. A `Running` state with a pid is
+    // the only case this path owns — every other transition belongs to
+    // `stop` — and the pid guard keeps a recycled pid from being
+    // signalled.
+    let vmm_pid = {
+        let lock = state_dir
+            .lifecycle_lock()
+            .context("opening lifecycle lock")?;
+        let _guard = lock.read().context("acquiring lifecycle read lock")?;
+        let state = state_dir.read_state().context("reading state")?;
+        match (state.lifecycle, state.vmm_pid) {
+            (Lifecycle::Running, Some(pid)) => pid,
+            _ => bail!(
+                "refusing signal stop: lifecycle is {:?}, vmm pid is {:?}",
+                state.lifecycle,
+                state.vmm_pid
+            ),
+        }
+    };
+
+    // Same best-effort quiesce as `stop`: a failure here logs and falls
+    // through to the signal, so a wedged guest cannot stall termination.
+    // The UDS is the same `<state dir>/ssh.sock` the CLI resolves for the
+    // default provider dir (R3.2), computed from the passed state dir.
+    let uds_path = state_dir_path.join(paths::SSH_SOCK_FILE);
+    shutdown_guest_best_effort(&uds_path);
+
+    signal_and_wait(vmm_pid).context("stopping VMM after signal")?;
+
+    // The supervisor's main thread watches the same child and writes
+    // `Stopped` once it has reaped it; poll for that record, bounded.
+    let deadline = Instant::now() + stopped_bound;
+    loop {
+        let state = state_dir.read_state().context("reading state")?;
+        if matches!(state.lifecycle, Lifecycle::Stopped) {
+            tracing::info!("supervisor teardown finished; signal stop complete");
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "supervisor did not write Stopped within {:?} of the VMM dying",
+                stopped_bound
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 #[cfg(test)]
@@ -278,5 +366,108 @@ mod tests {
         .unwrap();
         let _lock = sd.try_acquire_alive_lock().unwrap().expect("acquire");
         assert!(run_with_state_dir(tmp.path().to_path_buf(), false).is_err());
+    }
+
+    #[test]
+    fn signal_and_wait_reaps_a_spawned_process() {
+        // A real child that ignores nothing: SIGTERM must end it within the
+        // 5s grace, so signal_and_wait returns Ok without escalating. The
+        // reaper thread matters: an unreaped child stays a zombie, and
+        // kill(pid, 0) succeeds on a zombie — the poll would wait out the
+        // whole grace. Reaping is what makes the pid observably gone (the
+        // supervisor's main thread plays this role in production).
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        let reaper = std::thread::spawn(move || {
+            let status = child.wait().expect("wait");
+            assert!(!status.success(), "sleep must not exit successfully");
+        });
+        let started = std::time::Instant::now();
+        signal_and_wait(pid).expect("signal_and_wait");
+        reaper.join().expect("reaper thread");
+        // The reaped pid must have been observed gone well inside the 5s
+        // grace — the poll's fast path, not the SIGKILL escalation.
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "signal_and_wait should observe the reaped pid quickly, took {:?}",
+            started.elapsed()
+        );
+        // kill(pid, 0) must now report ESRCH.
+        let r = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        assert_eq!(r, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+    }
+
+    #[test]
+    fn signal_stop_refuses_when_not_running_with_pid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sd = make_state_dir(&tmp);
+        // Stopped: nothing to stop.
+        sd.write_state(&State::stopped()).unwrap();
+        let err = graceful_stop_from_signal(tmp.path().to_path_buf(), SIGNAL_STOPPED_BOUND)
+            .expect_err("must refuse a Stopped state");
+        assert!(err.to_string().contains("refusing signal stop"));
+
+        // Running but no pid: the signal path owns no child to signal.
+        sd.write_state(&State {
+            lifecycle: Lifecycle::Running,
+            vmm_pid: None,
+            started_at: None,
+            ..State::stopped()
+        })
+        .unwrap();
+        let err = graceful_stop_from_signal(tmp.path().to_path_buf(), SIGNAL_STOPPED_BOUND)
+            .expect_err("must refuse a Running state with no pid");
+        assert!(err.to_string().contains("refusing signal stop"));
+    }
+
+    #[test]
+    fn signal_stop_quiesces_signals_and_waits_for_stopped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sd = make_state_dir(&tmp);
+
+        // The "VMM child": a real process the helper will SIGTERM. Its
+        // death is what the supervisor's main thread would observe.
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+
+        sd.write_state(&State {
+            lifecycle: Lifecycle::Running,
+            vmm_pid: Some(pid),
+            started_at: Some(0),
+            ..State::stopped()
+        })
+        .unwrap();
+
+        // The "supervisor main thread": observes the child's death, then
+        // writes the Stopped state, exactly as run's teardown does after
+        // reaping the VMM child. (The bridge UDS is absent here, so the
+        // quiesce half fails fast and logs — proving the fall-through.)
+        let sd_dir = sd.dir().to_path_buf();
+        let watcher = std::thread::spawn(move || {
+            let status = child.wait().expect("wait for signalled child");
+            assert!(!status.success());
+            let sd = StateDir::new(sd_dir).expect("StateDir::new");
+            sd.write_state(&State::stopped()).expect("write Stopped");
+        });
+
+        // The bound must cover the quiesce attempt (fast: no socket), the
+        // 5s signal grace, and the teardown write — 30s is generous.
+        graceful_stop_from_signal(tmp.path().to_path_buf(), Duration::from_secs(30))
+            .expect("graceful stop");
+
+        let state = sd.read_state().unwrap();
+        assert_eq!(state.lifecycle, Lifecycle::Stopped);
+        assert_eq!(state.vmm_pid, None);
+        watcher.join().expect("watcher thread");
     }
 }

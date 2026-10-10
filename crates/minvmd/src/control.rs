@@ -2189,9 +2189,10 @@ extern "C" fn on_stop_signal(signum: libc::c_int) {
 /// `launchctl bootout`, logout and shutdown), and a foreground run is
 /// stopped with SIGINT. The handler only wakes a watcher thread, which
 /// runs [`stop_pending_asks`] (bounded at [`STOP_AUDIT_BOUND`]) and then
-/// hands the signal to `then`. The supervisor passes [`die_by_signal`], so
-/// after the asks are audited the process ends exactly as it did before
-/// the handler existed. Only a crash and SIGKILL stay outside this path.
+/// hands the signal to `then`. The supervisor stops the VM gracefully in
+/// `then` and falls back to [`die_by_signal`] when that cannot finish, so
+/// the process always terminates. Only a crash and SIGKILL stay outside
+/// this path.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 pub(crate) fn watch_stop_signals(
     boxes: BoxRegistry,
