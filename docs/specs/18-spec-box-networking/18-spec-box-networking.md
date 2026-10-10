@@ -269,10 +269,10 @@ included, with every refusal logged (NET-001 to NET-004).
   verify:   cargo nextest run -p minimald proxy_keeps_serving_after_supersession
   <!-- S1b-3; prose 12; optional-feature; interview decision; WHERE per design §7.1 v0.5 -->
 
-- **NET-020** IF the host-side hostname listener cannot bind or publish THEN THE SYSTEM SHALL print the reason and the remedy in `min session activate` and `min ls`, as `names: <cause>` in place of the host line's resolution clause, in both its forms, with the install clause after it when one applies.
+- **NET-020** IF the host-side hostname listener cannot bind or publish THEN THE SYSTEM SHALL print the reason and the remedy in `min session activate`, as `names: <cause>` in place of the activate host line's resolution clause, in both its forms, with the install clause after it when one applies, and in `min ls` on its `HOSTNAME PROXY:` row.
   tier:     T0
   verify:   cargo nextest run -p minimal listener_failure_reported_with_remedy
-  <!-- S2a/AC1; prose 13; unwanted; the activate surface stays one line (NET-142): the cause stands in for the resolution clause whether that clause named the proxy or native DNS, since native DNS answers through the same listener, and the install clause is decided on its own; `min ls` carries the cause on its `HOSTNAME PROXY:` row -->
+  <!-- S2a/AC1; prose 13; unwanted; the activate surface stays one line (NET-142): the cause stands in for the resolution clause whether that clause named the proxy or native DNS, since native DNS answers through the same listener, and the install clause is decided on its own; in `min ls` the cause takes the `HOSTNAME PROXY:` row, the row that names the listener, and the `NAME SURFACE:` row keeps its own wording (NET-142), since the surface is unchanged and only its listener is down -->
 
 - **NET-021** IF the host-side hostname listener cannot bind or publish THEN THE SYSTEM SHALL retry with backoff until it succeeds.
   tier:     T0
@@ -842,14 +842,14 @@ included, with every refusal logged (NET-001 to NET-004).
     tier:   T0
     verify: cargo nextest run -p minimal session_start_points_at_finalize_install_without_the_advisory
     <!-- state+event; the CLI test `activate_and_ls_report_native_surface` checks both verbs' output; the clause is `; finish setup: min finalize-install`, the tail of NET-142's one host line, so `min session activate` and `min ls` print the same words; a finished host has no clause; a scripted or agent start that repeats on every activation carries one clause, never a script block that buries the session's own errors -->
-  - WHEN the operator runs `min finalize-install` THE SYSTEM SHALL write the script for this host's current state to a file with mode `0600` that only the operator can read, run it as root with one privilege elevation, remove the file, exit with the script's status, and end a completed run that installed any item other than the KVM group with the line `Running boxes pick this up on their next start.`.
+  - WHEN the operator runs `min finalize-install` THE SYSTEM SHALL write the script for this host's current state to a file with mode `0600` that only the operator can read, run it as root with one privilege elevation, remove the file, exit with the script's status, and end a completed run that installed any item other than the KVM group with the line `Running boxes pick this up on their next start.`, before the KVM group line when that one prints too.
     tier:   T0
     verify: cargo nextest run -p minimal finalize_install_runs_the_script_with_one_elevation
     <!-- event-driven; `min finalize-install` runs `sudo sh <file>`; the operator's request is the consent, so that `sudo` is the only prompt; the summary of what is missing goes to stderr; the closing line tells the operator that no running box changes under them, since each picks the step up when it next starts -->
-  - WHEN a completed run added the operator to the KVM group THE SYSTEM SHALL end with the line `KVM group membership starts at your next login: log out and back in, or restart the daemon from a new login.`.
+  - WHEN a completed run added the operator to the KVM group THE SYSTEM SHALL end with the line `KVM group membership starts at your next login: log out and back in, or restart the daemon from a new login.`, as the last line, after the other items' line when that one prints too.
     tier:   T0
     verify: cargo nextest run -p minimal finalize_install_kvm_group_closing_line_names_a_new_login
-    <!-- event-driven; group membership reaches only the processes of a new login, so a daemon started from the current one keeps its old groups and no box start picks the change up; the other items' closing line is not true for this one -->
+    <!-- event-driven; a run that installed the classifier tree and the group prints both lines, each true of its own items, and the group line is last because it is the one that asks something of the operator; group membership reaches only the processes of a new login, so a daemon started from the current one keeps its old groups and no box start picks the change up; the other items' closing line is not true for this one -->
   - WHILE every part of the install is finished on this host, WHEN the operator runs `min finalize-install` THE SYSTEM SHALL print `Every part of the install is finished on this machine; there is nothing to run.`, run nothing, and exit zero.
     tier:   T0
     verify: cargo nextest run -p minimal finalize_install_finished_host_runs_nothing_and_exits_zero
