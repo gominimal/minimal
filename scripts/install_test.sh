@@ -664,6 +664,8 @@ case_finalize_install_uninstall() {
     # seeded tree, never the host's real one.
     want_ok "the remedy removes the tree under the root it was detected in" \
         grep -qF "sudo find \"$fake_ns4/sys/fs/cgroup/minimald.slice\"" "$OUT"
+    want_ok "the remedy removes the tree it detected, under the same root" \
+        grep -qF "find \"$fake_ns4/sys/fs/cgroup/minimald.slice\" -depth" "$OUT"
 
     # The kvm group membership, by its record.
     HNS5="$root/hns5"; mkdir -p "$HNS5"
