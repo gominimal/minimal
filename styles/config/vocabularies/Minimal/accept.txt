@@ -27,6 +27,7 @@ backports
 backpressure
 backtrace
 basename
+biconditional
 bindeps
 binutils
 bitrot
@@ -55,6 +56,8 @@ clippy
 CLIs
 cmdline
 codebase
+codec
+codecs
 codegen
 codepath
 Codesign
@@ -121,6 +124,7 @@ downloader
 dyn
 eg
 Embark
+encodable
 endian
 enum
 enums
@@ -178,6 +182,8 @@ impl
 impls
 indicatif
 Initramfs
+injective
+injectivity
 inode
 inspectable
 insta
@@ -192,6 +198,7 @@ Kbuild
 kexts
 keybind
 keypresses
+keyspace
 Known_hosts
 krun
 krunkit
@@ -272,12 +279,15 @@ Passthroughs
 pid
 pidfd
 pids
+pkgs
 pluggable
 pnpm
 Podman
 POSIX
 pre
 preallocation
+preimage
+preimages
 prepended
 prepends
 Prereqs
@@ -350,6 +360,7 @@ sideloaded
 Sideloading
 Sideloads
 SIGKILLs
+Sigstore
 SIGTERMs
 snake_case
 socat
@@ -442,6 +453,8 @@ uuid
 UUIDs
 uv
 validator
+varint
+varints
 vcpu
 vcpus
 Vec
