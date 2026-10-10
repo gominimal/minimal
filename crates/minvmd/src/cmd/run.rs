@@ -110,7 +110,14 @@ fn run_supervisor(detach: bool, timeout_secs: u64) -> Result<()> {
     if detach {
         return run_detach(timeout_secs);
     }
-    run_foreground()
+    let result = run_foreground();
+    // A supervisor stopped by SIGTERM/SIGINT ends by that signal once its
+    // teardown (the `Stopped` write, the guards' drops) has run, so its
+    // exit status still says what stopped it.
+    if let Some((signum, _)) = crate::control::stop_signal_received() {
+        crate::control::die_by_signal(signum);
+    }
+    result
 }
 
 /// Outcome of one poll of the `--detach` readiness loop, decided from the
@@ -534,17 +541,23 @@ fn run_foreground() -> Result<()> {
     // does: the guest gets the Shutdown RPC so the data volume's ext4
     // journal stays clean (informed by #705), the VMM child is signalled
     // and reaped, and the main thread's own teardown writes the `Stopped`
-    // state and returns — ending the process by exiting, not by the
-    // signal. Only when that graceful stop cannot run or does not finish
-    // does the watcher fall back to dying by the signal as before.
+    // state, then `run_supervisor` ends the process by the signal. The
+    // whole stop is bounded at `SIGNAL_STOP_BOUND` from the signal's
+    // arrival; when it cannot run, fails, or the teardown overruns that
+    // deadline, the watcher dies by the signal itself. A second signal
+    // meanwhile ends the process at once.
     let signal_state_dir = state_dir.dir().to_path_buf();
     if let Err(error) = crate::control::watch_stop_signals(boxes.clone(), move |signum| {
-        match crate::cmd::stop::graceful_stop_from_signal(
-            signal_state_dir,
-            crate::cmd::stop::SIGNAL_STOPPED_BOUND,
-        ) {
+        let deadline = crate::control::stop_signal_received()
+            .map_or_else(std::time::Instant::now, |(_, at)| at)
+            + crate::cmd::stop::SIGNAL_STOP_BOUND;
+        match crate::cmd::stop::graceful_stop_from_signal(signal_state_dir, deadline) {
             Ok(()) => {
-                tracing::info!(signum, "graceful stop after signal complete; exiting");
+                // The main thread normally ends the process by the signal
+                // once its teardown returns; this is the backstop.
+                tracing::info!(signum, "graceful stop after signal complete");
+                std::thread::sleep(deadline.saturating_duration_since(std::time::Instant::now()));
+                crate::control::die_by_signal(signum);
             }
             Err(e) => {
                 tracing::warn!(signum, error = %e, "graceful stop after signal failed; dying by signal");

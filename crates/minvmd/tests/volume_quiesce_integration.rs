@@ -230,26 +230,40 @@ fn sigterm_to_supervisor_quiesces_volume() {
     assert!(volume.exists(), "volume image must exist after boot");
 
     // The service manager's stop: one SIGTERM to the supervisor process.
+    // SAFETY: kill(2) on the supervisor child this test spawned.
     let r = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
     assert_eq!(r, 0, "SIGTERM to supervisor pid {pid} must be deliverable");
 
-    // The supervisor's teardown reaps the VMM child and exits; bound the
-    // wait so a wedged graceful stop fails the test rather than hanging
-    // it. The exit code is NOT asserted: the supervisor reports the
-    // signal-killed VMM as a failed boot (`code -1`) by design — the
-    // quiesced journal is the contract, not a zero exit.
-    let deadline = Instant::now() + Duration::from_secs(120);
-    loop {
+    // The supervisor's teardown reaps the VMM child and ends the process by
+    // the signal, inside the signal-stop bound (15 s, under launchd's 20 s
+    // ExitTimeOut); the wait is looser so a slow host fails on the
+    // assertion below rather than a hang.
+    let signalled_at = Instant::now();
+    let deadline = signalled_at + Duration::from_secs(60);
+    let status = loop {
         match supervisor.try_wait().expect("polling supervisor exit") {
-            Some(_) => break,
+            Some(status) => break status,
             None => {
                 assert!(
                     Instant::now() < deadline,
-                    "supervisor did not exit within 120s of SIGTERM"
+                    "supervisor did not exit within 60s of SIGTERM"
                 );
                 std::thread::sleep(Duration::from_millis(250));
             }
         }
+    };
+    assert!(
+        signalled_at.elapsed() < Duration::from_secs(20),
+        "the signal stop must finish inside a service manager's stop timeout; took {:?}",
+        signalled_at.elapsed()
+    );
+    {
+        use std::os::unix::process::ExitStatusExt as _;
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGTERM),
+            "the supervisor must end by the signal that stopped it; got {status:?}"
+        );
     }
 
     // The lifecycle record must show the supervisor's own teardown ran:

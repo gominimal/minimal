@@ -2189,10 +2189,12 @@ extern "C" fn on_stop_signal(signum: libc::c_int) {
 /// `launchctl bootout`, logout and shutdown), and a foreground run is
 /// stopped with SIGINT. The handler only wakes a watcher thread, which
 /// runs [`stop_pending_asks`] (bounded at [`STOP_AUDIT_BOUND`]) and then
-/// hands the signal to `then`. The supervisor stops the VM gracefully in
-/// `then` and falls back to [`die_by_signal`] when that cannot finish, so
-/// the process always terminates. Only a crash and SIGKILL stay outside
-/// this path.
+/// hands the signal to `then`. A second stop signal meanwhile ends the
+/// process at once by its default action. The supervisor stops the VM
+/// gracefully in `then`, bounded by its own deadline, and falls back to
+/// [`die_by_signal`] when that cannot finish, so the process always
+/// terminates by the signal. Only a crash and SIGKILL stay outside this
+/// path.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 pub(crate) fn watch_stop_signals(
     boxes: BoxRegistry,
@@ -2255,11 +2257,32 @@ pub(crate) fn watch_stop_signals(
                     _ => return,
                 }
             };
+            // The watcher reads the pipe once, so this is the only set.
+            STOP_SIGNAL.get_or_init(|| (signum, std::time::Instant::now()));
+            // One graceful stop per process: a second SIGTERM or SIGINT
+            // while this one runs ends the process at once, by the signal's
+            // default action, instead of landing in a pipe nobody reads.
+            for default in [libc::SIGTERM, libc::SIGINT] {
+                // SAFETY: restoring a default disposition touches no memory.
+                unsafe { libc::signal(default, libc::SIG_DFL) };
+            }
             tracing::info!(signal = signum, "stop signal received");
             stop_pending_asks(&boxes);
             then(signum);
         })?;
     Ok(())
+}
+
+/// The first stop signal and when it arrived, recorded by the watcher
+/// before anything else runs, so the supervisor's main thread can end the
+/// process by that signal once its own teardown has finished.
+static STOP_SIGNAL: std::sync::OnceLock<(libc::c_int, std::time::Instant)> =
+    std::sync::OnceLock::new();
+
+/// The stop signal the watcher received, and when, if one arrived.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+pub(crate) fn stop_signal_received() -> Option<(libc::c_int, std::time::Instant)> {
+    STOP_SIGNAL.get().copied()
 }
 
 /// End the process by `signum` with its default disposition, as it ended

@@ -26,10 +26,18 @@ pub(crate) const GUEST_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// every session and quiesces before it acknowledges.
 pub(crate) const GUEST_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// How long the signal-stop path waits for the supervisor's own teardown
-/// to write `Stopped` after the VMM child dies.
+/// Bound on the whole signal-stop path, counted from the signal's arrival:
+/// the pending-ask audit, the guest quiesce, the VMM signal, and the
+/// supervisor's teardown. It stays under launchd's default `ExitTimeOut`
+/// (20 s; systemd's default `TimeoutStopSec` is 90 s), so the supervisor
+/// ends by the signal itself rather than by the service manager's SIGKILL.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
-pub(crate) const SIGNAL_STOPPED_BOUND: Duration = Duration::from_secs(10);
+pub(crate) const SIGNAL_STOP_BOUND: Duration = Duration::from_secs(15);
+
+/// The part of a signal stop's budget kept back from the guest quiesce:
+/// [`signal_and_wait`]'s 5 s SIGTERM grace plus the supervisor's `Stopped`
+/// write after it reaps the VMM.
+const SIGNAL_STOP_TEARDOWN_RESERVE: Duration = Duration::from_secs(6);
 
 /// Run the `stop` subcommand.
 pub fn run() -> Result<()> {
@@ -190,13 +198,13 @@ pub(crate) fn signal_and_wait(pid: u32) -> Result<()> {
 /// caller falls back to dying by the signal as before, so the process
 /// still terminates.
 ///
-/// `stopped_bound` bounds the final wait; tests pass tighter bounds than
-/// production's [`SIGNAL_STOPPED_BOUND`].
+/// Everything runs against `deadline` (the signal's arrival plus
+/// [`SIGNAL_STOP_BOUND`] in production): the guest ask gets what is left
+/// after [`SIGNAL_STOP_TEARDOWN_RESERVE`], so a wedged or slow guest cannot
+/// hold the stop past the service manager's timeout, and the `Stopped`
+/// wait ends at the deadline.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
-pub(crate) fn graceful_stop_from_signal(
-    state_dir_path: PathBuf,
-    stopped_bound: Duration,
-) -> Result<()> {
+pub(crate) fn graceful_stop_from_signal(state_dir_path: PathBuf, deadline: Instant) -> Result<()> {
     let state_dir = StateDir::new(state_dir_path.clone())
         .with_context(|| format!("opening state dir: {}", state_dir_path.display()))?;
 
@@ -227,13 +235,27 @@ pub(crate) fn graceful_stop_from_signal(
     // The UDS is the same `<state dir>/ssh.sock` the CLI resolves for the
     // default provider dir (R3.2), computed from the passed state dir.
     let uds_path = state_dir_path.join(paths::SSH_SOCK_FILE);
-    shutdown_guest_best_effort(&uds_path);
+    let quiesce_budget = deadline
+        .saturating_duration_since(Instant::now())
+        .saturating_sub(SIGNAL_STOP_TEARDOWN_RESERVE);
+    if quiesce_budget.is_zero() {
+        tracing::warn!("no time left to quiesce the guest; proceeding with SIGTERM");
+    } else {
+        // Connect and RPC together stay inside the budget.
+        let connect = GUEST_CONNECT_TIMEOUT.min(quiesce_budget / 2);
+        let rpc = GUEST_SHUTDOWN_TIMEOUT.min(quiesce_budget.saturating_sub(connect));
+        match crate::rpc_client::shutdown_guest(&uds_path, connect, rpc) {
+            Ok(resp) => tracing::info!(?resp, "guest acknowledged Shutdown RPC"),
+            Err(e) => {
+                tracing::warn!(error = %e, "guest Shutdown RPC failed; proceeding with SIGTERM")
+            }
+        }
+    }
 
     signal_and_wait(vmm_pid).context("stopping VMM after signal")?;
 
     // The supervisor's main thread watches the same child and writes
     // `Stopped` once it has reaped it; poll for that record, bounded.
-    let deadline = Instant::now() + stopped_bound;
     loop {
         let state = state_dir.read_state().context("reading state")?;
         if matches!(state.lifecycle, Lifecycle::Stopped) {
@@ -241,10 +263,7 @@ pub(crate) fn graceful_stop_from_signal(
             return Ok(());
         }
         if Instant::now() >= deadline {
-            bail!(
-                "supervisor did not write Stopped within {:?} of the VMM dying",
-                stopped_bound
-            );
+            bail!("supervisor did not write Stopped before the signal-stop deadline");
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -396,6 +415,7 @@ mod tests {
             started.elapsed()
         );
         // kill(pid, 0) must now report ESRCH.
+        // SAFETY: kill(pid, 0) only probes for the process; no signal.
         let r = unsafe { libc::kill(pid as libc::pid_t, 0) };
         assert_eq!(r, -1);
         assert_eq!(
@@ -410,8 +430,9 @@ mod tests {
         let sd = make_state_dir(&tmp);
         // Stopped: nothing to stop.
         sd.write_state(&State::stopped()).unwrap();
-        let err = graceful_stop_from_signal(tmp.path().to_path_buf(), SIGNAL_STOPPED_BOUND)
-            .expect_err("must refuse a Stopped state");
+        let err =
+            graceful_stop_from_signal(tmp.path().to_path_buf(), Instant::now() + SIGNAL_STOP_BOUND)
+                .expect_err("must refuse a Stopped state");
         assert!(err.to_string().contains("refusing signal stop"));
 
         // Running but no pid: the signal path owns no child to signal.
@@ -422,8 +443,9 @@ mod tests {
             ..State::stopped()
         })
         .unwrap();
-        let err = graceful_stop_from_signal(tmp.path().to_path_buf(), SIGNAL_STOPPED_BOUND)
-            .expect_err("must refuse a Running state with no pid");
+        let err =
+            graceful_stop_from_signal(tmp.path().to_path_buf(), Instant::now() + SIGNAL_STOP_BOUND)
+                .expect_err("must refuse a Running state with no pid");
         assert!(err.to_string().contains("refusing signal stop"));
     }
 
@@ -462,12 +484,64 @@ mod tests {
 
         // The bound must cover the quiesce attempt (fast: no socket), the
         // 5s signal grace, and the teardown write — 30s is generous.
-        graceful_stop_from_signal(tmp.path().to_path_buf(), Duration::from_secs(30))
-            .expect("graceful stop");
+        graceful_stop_from_signal(
+            tmp.path().to_path_buf(),
+            Instant::now() + Duration::from_secs(30),
+        )
+        .expect("graceful stop");
 
         let state = sd.read_state().unwrap();
         assert_eq!(state.lifecycle, Lifecycle::Stopped);
         assert_eq!(state.vmm_pid, None);
+        watcher.join().expect("watcher thread");
+    }
+
+    #[test]
+    fn signal_stop_holds_its_deadline_against_a_wedged_guest() {
+        // A bridge socket that accepts but never speaks SSH: the guest ask
+        // would wait out its own timeouts (5 s + 120 s), so only the
+        // signal-stop deadline keeps the stop inside a service manager's
+        // stop timeout.
+        let tmp = tempfile::tempdir().unwrap();
+        let sd = make_state_dir(&tmp);
+        let listener =
+            std::os::unix::net::UnixListener::bind(tmp.path().join(paths::SSH_SOCK_FILE))
+                .expect("bind wedged bridge socket");
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for stream in listener.incoming() {
+                held.push(stream);
+            }
+        });
+
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        sd.write_state(&State {
+            lifecycle: Lifecycle::Running,
+            vmm_pid: Some(child.id()),
+            started_at: Some(0),
+            ..State::stopped()
+        })
+        .unwrap();
+        let sd_dir = sd.dir().to_path_buf();
+        let watcher = std::thread::spawn(move || {
+            child.wait().expect("wait for signalled child");
+            let sd = StateDir::new(sd_dir).expect("StateDir::new");
+            sd.write_state(&State::stopped()).expect("write Stopped");
+        });
+
+        let bound = Duration::from_secs(8);
+        let started = Instant::now();
+        graceful_stop_from_signal(tmp.path().to_path_buf(), started + bound)
+            .expect("graceful stop");
+        assert!(
+            started.elapsed() <= bound,
+            "the signal stop overran its deadline: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(sd.read_state().unwrap().lifecycle, Lifecycle::Stopped);
         watcher.join().expect("watcher thread");
     }
 }
