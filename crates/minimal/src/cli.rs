@@ -1046,7 +1046,9 @@ pub struct FinalizeInstallArgs {
 
 #[derive(Debug, Args)]
 pub struct StopArgs {
-    /// Force shutdown even if a session is mid-create or still holds a host handle (even a dead one)
+    /// Force shutdown even if a session is mid-create or still holds a host handle (even a dead one).
+    /// On a VM backend whose in-guest daemon does not answer, stops the VM from the host;
+    /// data not yet flushed inside the VM can then be lost
     #[arg(long, short, default_value_t = false)]
     pub force: bool,
 }

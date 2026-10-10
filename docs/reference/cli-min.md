@@ -628,7 +628,11 @@ min stop [-f|--force]
 ```
 
 Shuts down the `minimald` daemon. `--force` shuts down even if active
-sessions exist. This stops the daemon backend that hosts sessions, and the
+sessions exist. On a VM backend, `--force` also stops the VM from the host
+when the in-guest daemon does not answer. A guest that does not acknowledge the
+shutdown is killed: its running sessions get no clean stop, and data not yet
+flushed inside the VM can be lost. Without `--force`, an unanswering VM fails
+with exit code 7. This stops the daemon backend that hosts sessions, and the
 sessions themselves survive it (contrast
 [`session destroy`](#session-destroy), which removes one session and leaves the
 daemon running).
