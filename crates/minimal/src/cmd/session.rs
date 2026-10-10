@@ -295,6 +295,37 @@ pub(crate) async fn release_held_name_after_attach(
     }
 }
 
+/// Re-sends the name hold an interactive attach or exec on a VM-backed
+/// host depends on, best-effort, before the attach or the exec passes.
+/// A VM host daemon restarts quickly and holds lived only in its memory
+/// before they were persisted, so a hold this session bought — or a hold
+/// a persisted registry failed to carry, its write a warn line — may be
+/// gone by the time the attach lands; the re-hold is idempotent, so it
+/// remakes the hold and the name answers NODATA through the attach
+/// either way. Only a named `host_ip` session without a box row needs
+/// it: a box that registered a row owns its name through the row, which
+/// `resume_box_row` re-sends, and a `none` or `own_ip` session holds
+/// nothing.
+pub(crate) async fn rehold_held_name_before_attach(
+    sock: &std::path::Path,
+    id: sessions::SessionId,
+    record: Option<&sessions::Record>,
+) {
+    let Some(record) = record else {
+        return;
+    };
+    if record.network != sessions::NetworkMode::HostNet {
+        return;
+    }
+    if record.box_addresses.is_some() {
+        return;
+    }
+    let Some(name) = record.name.as_deref() else {
+        return;
+    };
+    hold_box_name_with_vm_host(control_sock_beside(sock), name, Some(id), true).await;
+}
+
 /// Holds or releases a `host_ip` box's name on the VM host daemon, by
 /// `hold`, best-effort: the hold is the interim that answers the name
 /// NODATA where an unheld name answers NXDOMAIN — the \[proposed\] pre-alias
@@ -1940,6 +1971,10 @@ pub(crate) async fn session_via_ssh(
     // closed (#1790); one that answers late or refuses is a warn line, and
     // the attach or the exec goes on (NET-138).
     resume_box_row(sock, record.as_ref()).await?;
+    // The name hold a `host_ip` session without a row depends on may not
+    // have survived a VM host daemon restart; re-make it before the
+    // attach or the exec, idempotently.
+    rehold_held_name_before_attach(sock, id, record.as_ref()).await;
 
     if wire.is_none() {
         let stdin_is_tty = std::io::stdin().is_terminal();
@@ -6633,6 +6668,63 @@ mod tests {
             request.session_id,
             Some(id),
             "the release names the session, so it frees only that session's hold"
+        );
+    }
+
+    /// The `host_ip` hold's attach side: a session's record is read before
+    /// the attach or the exec on a VM-backed host, and its name hold —
+    /// which a VM host daemon restart may have dropped — is re-made
+    /// idempotently first: one hold request naming it and its session. A
+    /// record the lookup did not give, or one that owns a row or holds no
+    /// name, sends nothing.
+    #[tokio::test]
+    async fn an_attach_reholds_its_held_name_first() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ssh_sock = dir.path().join("ssh.sock");
+        let requests = fake_vm_host(
+            dir.path().join(minvmd::control::CONTROL_SOCK_FILE),
+            r#"{"name":"web","held":false}"#.to_string(),
+        )
+        .await;
+        let server = minimald::test_harness::TestServer::new().await;
+        server.listen_on_uds(&ssh_sock).await;
+        let project = tempfile::TempDir::new().unwrap();
+        let mut daemon = server.connect().await;
+        let id = minimald::test_harness::create_configured_session(
+            &mut daemon,
+            "web",
+            project.path().to_str().unwrap(),
+        )
+        .await;
+        let record = attached_session_record(&ssh_sock, id)
+            .await
+            .expect("the lookup does not fail")
+            .expect("the session's record is read");
+        assert_eq!(record.name.as_deref(), Some("web"));
+        assert_eq!(record.network, sessions::NetworkMode::HostNet);
+        assert!(record.box_addresses.is_none());
+
+        // A record that is not there: nothing to re-hold by.
+        rehold_held_name_before_attach(&ssh_sock, id, None).await;
+        assert!(
+            requests.lock().unwrap().is_empty(),
+            "no record read, no hold re-made"
+        );
+
+        // The session's own hold, re-made before the attach.
+        rehold_held_name_before_attach(&ssh_sock, id, Some(&record)).await;
+        let seen = requests.lock().unwrap();
+        assert_eq!(seen.len(), 1, "one hold, one request");
+        let minimald_rpc::BoxControlRequest::HoldBoxName(request) =
+            serde_json_lenient::from_str(&seen[0]).expect("the request is the wire type")
+        else {
+            panic!("the re-hold is carried by the hold verb");
+        };
+        assert_eq!(request.name, "web");
+        assert_eq!(
+            request.session_id,
+            Some(id),
+            "the re-hold names the session, so it frees only that session's hold"
         );
     }
 

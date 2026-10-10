@@ -1042,12 +1042,18 @@ impl Creation {
 }
 
 /// The persisted registry ([`REGISTRY_FILE`]): its format version, then
-/// every creation the registry keeps.
+/// every creation the registry keeps, then the box names its sessions
+/// hold.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RegistryFile {
     version: u32,
     boxes: Vec<Creation>,
+    /// Held box names, mapped to the session that holds each one. Files
+    /// written before this field existed deserialize it as empty, so
+    /// they load exactly as they did.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    held_names: BTreeMap<String, Option<sessions::SessionId>>,
 }
 
 /// Writes `file` to `path` the one way the registry's file is ever
@@ -1082,7 +1088,7 @@ fn write_registry_file(path: &std::path::Path, file: &RegistryFile) -> std::io::
     Ok(())
 }
 
-/// Reads the creations persisted at `path`: none when there is no file
+/// Reads the registry persisted at `path`: none when there is no file
 /// yet. A file that cannot be read, does not parse, or is of another
 /// version than [`REGISTRY_FILE_VERSION`] reloads no row — its boxes are
 /// unregistered sources the gate drops (NET-085): fail-closed — and is set
@@ -1090,14 +1096,20 @@ fn write_registry_file(path: &std::path::Path, file: &RegistryFile) -> std::io::
 /// error line, so the creations it may still hold are there to recover.
 /// `None` when it could not be set aside: the caller then persists
 /// nothing, since the first write would replace it.
-fn read_registry_file(path: &std::path::Path) -> Option<Vec<Creation>> {
+fn read_registry_file(path: &std::path::Path) -> Option<RegistryFile> {
     #[derive(serde::Deserialize)]
     struct Version {
         version: u32,
     }
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Some(Vec::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Some(RegistryFile {
+                version: REGISTRY_FILE_VERSION,
+                boxes: Vec::new(),
+                held_names: BTreeMap::new(),
+            });
+        }
         Err(error) => return set_aside_registry_file(path, &error.to_string()),
     };
     match serde_json_lenient::from_slice::<Version>(&bytes) {
@@ -1111,17 +1123,17 @@ fn read_registry_file(path: &std::path::Path) -> Option<Vec<Creation>> {
         Err(error) => return set_aside_registry_file(path, &error.to_string()),
     }
     match serde_json_lenient::from_slice::<RegistryFile>(&bytes) {
-        Ok(file) => Some(file.boxes),
+        Ok(file) => Some(file),
         Err(error) => set_aside_registry_file(path, &error.to_string()),
     }
 }
 
 /// Renames the unusable registry file at `path` aside, to the same name
 /// with an `.unusable-<unix seconds>` suffix, and says so as an error line
-/// naming `why`. Returns no creations when it is set aside, and `None` —
-/// persistence off for this process, said as a second error line — when
-/// the rename fails.
-fn set_aside_registry_file(path: &std::path::Path, why: &str) -> Option<Vec<Creation>> {
+/// naming `why`. Returns an empty registry when it is set aside, and
+/// `None` — persistence off for this process, said as a second error line —
+/// when the rename fails.
+fn set_aside_registry_file(path: &std::path::Path, why: &str) -> Option<RegistryFile> {
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |since| since.as_secs());
@@ -1136,7 +1148,11 @@ fn set_aside_registry_file(path: &std::path::Path, why: &str) -> Option<Vec<Crea
                 why,
                 "the persisted box registry is unusable; it is set aside and no rows are reloaded"
             );
-            Some(Vec::new())
+            Some(RegistryFile {
+                version: REGISTRY_FILE_VERSION,
+                boxes: Vec::new(),
+                held_names: BTreeMap::new(),
+            })
         }
         Err(error) => {
             tracing::error!(
@@ -3008,14 +3024,19 @@ impl BoxRegistry {
     /// entry took — is dropped and said as a warn line; one whose row
     /// cannot be published is kept dormant, its addresses reserved.
     ///
-    /// The file is written after every change to the creations: mode 0600,
-    /// written to a temporary file and renamed over the last
-    /// ([`write_registry_file`]), versioned ([`REGISTRY_FILE_VERSION`]).
-    /// A write that fails is a warn line, and the creations stay held in
-    /// this process: the rows decide frames from memory, and the file only
-    /// outlives the process. A file found unusable is set aside, never
-    /// written over ([`read_registry_file`]); when it cannot be, this
-    /// registry persists nothing.
+    /// The file is written after every change to the creations or the
+    /// held box names: mode 0600, written to a temporary file and
+    /// renamed over the last ([`write_registry_file`]), versioned
+    /// ([`REGISTRY_FILE_VERSION`]). A write that fails is a warn line,
+    /// and the creations stay held in this process: the rows decide
+    /// frames from memory, and the file only outlives the process. A
+    /// file found unusable is set aside, never written over
+    /// ([`read_registry_file`]); when it cannot be, this registry
+    /// persists nothing.
+    ///
+    /// The held box names the file carries are reloaded into this
+    /// registry alongside its creations, so a restarted daemon still
+    /// knows which session holds which name.
     #[must_use]
     pub fn persisting_to(mut self, path: std::path::PathBuf) -> Self {
         let Some(loaded) = read_registry_file(&path) else {
@@ -3023,7 +3044,15 @@ impl BoxRegistry {
         };
         self.persisted_at = Some(Arc::new(path));
         let now = self.now();
-        for mut creation in loaded {
+        let RegistryFile {
+            held_names,
+            boxes: loaded_boxes,
+            ..
+        } = loaded;
+        *self.held_names.write().expect(
+            "the held names' lock is never held across a panic, so it cannot be poisoned",
+        ) = held_names;
+        for mut creation in loaded_boxes {
             let key = canonical_box_name(&creation.name);
             if self.creations().contains_key(&key) {
                 tracing::warn!(
@@ -3122,10 +3151,11 @@ impl BoxRegistry {
             .expect("the creations' lock is never held across a panic")
     }
 
-    /// Writes the creations to the persisted file, when this registry
-    /// persists ([`Self::persisting_to`]). Called after every change to
-    /// them, with no row lock held; the snapshot is taken inside the
-    /// write's turn, so the last write to land holds the newest creations.
+    /// Writes the creations and the held box names to the persisted file,
+    /// when this registry persists ([`Self::persisting_to`]). Called after
+    /// every change to them, with no row lock held; the snapshot is taken
+    /// inside the write's turn, so the last write to land holds the
+    /// newest rows.
     fn persist(&self) {
         let Some(path) = &self.persisted_at else {
             return;
@@ -3137,6 +3167,13 @@ impl BoxRegistry {
         let file = RegistryFile {
             version: REGISTRY_FILE_VERSION,
             boxes: self.creations().values().cloned().collect(),
+            held_names: self
+                .held_names
+                .read()
+                .expect(
+                    "the held names' lock is never held across a panic, so it cannot be poisoned",
+                )
+                .clone(),
         };
         if let Err(error) = write_registry_file(path, &file) {
             tracing::warn!(
@@ -4745,13 +4782,20 @@ impl BoxRegistry {
     /// `owner` is the session the hold is for: a later hold of the name
     /// takes it over. Returns whether the table did not hold the name
     /// already.
+    ///
+    /// The hold is persisted ([`Self::persisting_to`]), so it survives a
+    /// daemon restart.
     pub fn hold_box_name(&self, name: &str, owner: Option<sessions::SessionId>) -> bool {
-        let inserted = self
-            .held_names
-            .write()
-            .expect("the held names' lock is never held across a panic, so it cannot be poisoned")
-            .insert(canonical_box_name(name), owner)
-            .is_none();
+        let old = {
+            let mut held = self.held_names.write().expect(
+                "the held names' lock is never held across a panic, so it cannot be poisoned",
+            );
+            held.insert(canonical_box_name(name), owner)
+        };
+        if old != Some(owner) {
+            self.persist();
+        }
+        let inserted = old.is_none();
         if inserted {
             tracing::info!(
                 box = %name,
@@ -4766,6 +4810,9 @@ impl BoxRegistry {
     /// nothing again — NXDOMAIN, the pre-box state. A name no hold kept
     /// is the goal state already holding. Returns whether a hold was
     /// actually released.
+    ///
+    /// The release is persisted ([`Self::persisting_to`]), so it
+    /// survives a daemon restart.
     ///
     /// With an `owner`, the release frees every hold that session made,
     /// under whatever name it holds now (a rename moved it), plus `name`'s
@@ -4790,6 +4837,7 @@ impl BoxRegistry {
         let removed = held.len() != before;
         drop(held);
         if removed {
+            self.persist();
             tracing::info!(
                 box = %name,
                 "released a held box name; it answers nothing again"
@@ -6659,6 +6707,96 @@ mod tests {
         assert!(
             persisted_registry(&dir).row_by_name("web").is_none(),
             "a file of another version reloads no row"
+        );
+    }
+
+    /// A held box name is persisted and reloaded, so it survives a VM host
+    /// daemon restart: a hold, an owner's takeover, and a release all land
+    /// in the registry file, and the registry the restarted daemon builds
+    /// from it holds exactly the names the file says.
+    #[test]
+    fn held_box_names_persist_and_reload() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let owner = sessions::SessionId::parse_str("00000000-0000-4000-8000-000000000001")
+            .expect("a session id");
+        let other = sessions::SessionId::parse_str("00000000-0000-4000-8000-000000000002")
+            .expect("a session id");
+
+        let registry = persisted_registry(&dir);
+        assert!(
+            registry.hold_box_name("web", Some(owner)),
+            "a name nothing holds is held"
+        );
+        assert!(
+            !registry.hold_box_name("web", Some(owner)),
+            "the same owner's hold is idempotent"
+        );
+
+        let after = persisted_registry(&dir);
+        assert!(
+            !after.hold_box_name("web", Some(owner)),
+            "the hold is reloaded, so it is not new to the restarted daemon"
+        );
+        assert!(
+            !after.hold_box_name("web", Some(other)),
+            "and another session's hold takes it over"
+        );
+
+        let third = persisted_registry(&dir);
+        let file: RegistryFile = serde_json_lenient::from_slice(
+            &std::fs::read(dir.path().join(REGISTRY_FILE)).expect("the file reads"),
+        )
+        .expect("the file parses whole");
+        assert_eq!(
+            file.held_names.get("web"),
+            Some(&Some(other)),
+            "the takeover is what the file holds"
+        );
+        assert!(third.release_held_name("web", Some(other)));
+        assert!(
+            persisted_registry(&dir).hold_box_name("web", Some(owner)),
+            "the release is persisted, so the name is free again after a restart"
+        );
+    }
+
+    /// A registry file written before held names were persisted has no
+    /// `held_names` to reload, and loads exactly as it did: no hold, and
+    /// a hold made over it persists beside its creations.
+    #[test]
+    fn a_registry_file_without_held_names_loads() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        std::fs::write(
+            dir.path().join(REGISTRY_FILE),
+            br#"{"version": 1, "boxes": []}"#,
+        )
+        .expect("an older format's file");
+
+        let registry = persisted_registry(&dir);
+        let owner = sessions::SessionId::parse_str("00000000-0000-4000-8000-000000000001")
+            .expect("a session id");
+        assert!(
+            registry.hold_box_name("web", Some(owner)),
+            "the older file reloads no hold"
+        );
+        let file: RegistryFile = serde_json_lenient::from_slice(
+            &std::fs::read(dir.path().join(REGISTRY_FILE)).expect("the file reads"),
+        )
+        .expect("the file parses whole");
+        assert_eq!(
+            file.held_names.len(),
+            1,
+            "and the hold made over it persists"
+        );
+        assert!(
+            !dir.path()
+                .read_dir()
+                .expect("the dir reads")
+                .any(|entry| entry
+                    .expect("the entry reads")
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("box-registry.json.unusable")),
+            "the older file is not set aside"
         );
     }
 
