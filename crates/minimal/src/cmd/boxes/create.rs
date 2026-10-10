@@ -1927,10 +1927,16 @@ pub(crate) async fn activate_box(
             let upload_root = upload_root.expect("upload_root is set for SyncMode::Tarball above");
             let headless = args.no_prompt || global.no_input || !can_prompt_interactively();
             let decision = decide_workspace_upload(&upload_root, sync_explicit, headless);
-            let uploaded = run_workspace_upload(
+            // The resolved-root notice is CLI presentation, and precedes the
+            // upload bar it explains.
+            if decision != UploadDecision::SkipEmptyOrHome
+                && let Some(notice) = resolved_upload_root_notice(&utf8_path, &upload_root)
+            {
+                eprintln!("{notice}");
+            }
+            let outcome = run_workspace_upload(
                 &mut client,
                 id,
-                &utf8_path,
                 &upload_root,
                 decision,
                 || {
@@ -1942,13 +1948,14 @@ pub(crate) async fn activate_box(
                         false,
                     )
                 },
-                true,
                 UploadProgress::Bar,
             )
             .await;
-            if let Err(error) = uploaded {
-                // The upload failed: the activation is abandoned, and the
-                // row its registration bought goes with it (T66).
+            // A skip that would silently drop the project's lifecycle hooks
+            // refuses here (and any upload failure) — either abandons the
+            // activation, and the row its registration bought goes with it
+            // (T66).
+            if let Err(error) = report_upload_outcome(outcome, &upload_root, true) {
                 withdraw_box_row(
                     control_sock.clone(),
                     request.config.name.as_deref(),
