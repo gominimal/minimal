@@ -536,6 +536,96 @@ async fn finish_own_ip_attach(
     })
 }
 
+/// Rebinds one handed-back shared-address port (NET-129) on a *running*
+/// yielder's attach: the holder that held `mapping`'s external port at the
+/// yielder's shared address has been destroyed, and the yielder's own
+/// attach skipped this forward because of it — so this binds it at the
+/// box's published `published` address and its current `ptask_ip` lease,
+/// with the same single-mapping expose the attach path takes.
+///
+/// The forwarder is recorded in the attach's runtime-ingress cell — the one
+/// channel the yielder's session actor and its guard share — so both ends
+/// that end the spawn release it: the guard's teardown drains the cell
+/// beside the declared forwards, and the session's own stop takes it with
+/// `take_all`. A cell that refuses the record (the spawn ended mid-bind)
+/// unbinds the forward it could not keep, mirroring the publish path's
+/// stale arm.
+///
+/// Best-effort, like the yield it repairs: a bind the switch refuses says
+/// one warn line (NET-121's per-port shape) and leaves the port unbound —
+/// its next attach retries it. `None` means nothing stands recorded.
+pub(crate) async fn bind_handed_back_port(
+    control: &ControlChannel,
+    published: std::net::Ipv4Addr,
+    ptask_ip: std::net::Ipv4Addr,
+    mapping: &sessions::PortMapping,
+    gate: Option<&Arc<SessionGate>>,
+    runtime_ingress: Option<&crate::net::provider::RuntimeIngress>,
+    session_name: &str,
+) -> Option<()> {
+    let Some(runtime_ingress) = runtime_ingress else {
+        // No cell means no spawn to deliver to: a task has no runtime
+        // ingress, and its ports are not this path's to bind.
+        return None;
+    };
+    if runtime_ingress.is_detached() {
+        // The spawn the lease belongs to has ended; a forward bound now
+        // would deliver to a lease the switch may have handed elsewhere.
+        // The next attach binds the port on the new lease.
+        return None;
+    }
+    let forwarder = match crate::net::policy::expose_declared(
+        control, published, ptask_ip, mapping, gate,
+    )
+    .await
+    {
+        Ok(forwarder) => forwarder,
+        Err(e) => {
+            tracing::warn!(
+                port = mapping.external_port,
+                address = %published,
+                error = %e,
+                "rebinding a handed-back ingress port failed"
+            );
+            return None;
+        }
+    };
+    // One info line per bound forwarder, the attach path's own contract
+    // (NET-040, NET-121): `session-e2e.sh` reads the publish record out of
+    // the daemon log by exactly this phrase, so the rebind is said with it.
+    match forwarder.host_port() {
+        Some((host, port)) => tracing::info!(
+            host,
+            port,
+            session = session_name,
+            "exposed ingress port on the host loopback"
+        ),
+        None => tracing::info!(
+            local = %forwarder.local(),
+            session = session_name,
+            "exposed ingress port on the host loopback"
+        ),
+    }
+    let mapping_row = minimald_rpc::LiveMapping {
+        local: forwarder.local().to_string(),
+        internal_port: forwarder.internal_port(),
+        proto: mapping.proto,
+        // Never pending: the bind already stood when the row named it.
+        pending: Some(false),
+    };
+    if let Err(stale) = runtime_ingress.record(crate::net::provider::LiveIngressForward {
+        forwarder,
+        mapping: mapping_row,
+    }) {
+        // The spawn ended while the bind was in flight: the cell refuses the
+        // record, so the forward is unbound here rather than left standing
+        // against a lease that is no longer the box's.
+        crate::net::policy::remove_ingress(control, &[stale.forwarder]).await;
+        return None;
+    }
+    Some(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeSet, HashMap};
@@ -2167,6 +2257,138 @@ mod tests {
             locals_of(&unbound, "/services/forwarder/unexpose"),
             vec![format!("{SHARED}:9090")],
             "teardown unbinds only what the attach bound: {unbound:?}"
+        );
+        fake.abort();
+    }
+
+    /// NET-129's hand-back, delivered: the holder destroyed, the registry
+    /// hands the yielded port back, and the yielder's running attach — not
+    /// its next one — binds it, through the same single-mapping bind the
+    /// attach path takes. The forward lands in the runtime-ingress cell the
+    /// spawn's guard shares with the actor, so the spawn's own teardown
+    /// unbinds it beside the declared forward, in order.
+    #[tokio::test]
+    async fn a_destroyed_holders_port_is_rebound_on_the_yielders_running_attach() {
+        const LEASE: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 10);
+        const SHARED: Ipv4Addr = Ipv4Addr::LOCALHOST;
+        let dir = tempfile::TempDir::new().unwrap();
+        let scenario = attach_scenario(&dir, "gvproxy.sock");
+        let (events_tx, mut events_rx) = mpsc::channel(64);
+        let (handed_tx, _handed_rx) = mpsc::channel(4);
+        // The port is free once the holder is destroyed, so the forwarder
+        // answers every bind — the decider only stands in for one.
+        let fake = spawn_control_channel_deciding(
+            scenario.control_path.clone(),
+            |_, _| ok(),
+            events_tx,
+            handed_tx,
+        );
+        let switch = vm_host_switch();
+        let policy = declared_two_ports();
+
+        // Finalize has run for both boxes: the holder published 8080 first,
+        // and this box (the nil id) yields it.
+        let holder = sessions::SessionId::parse_str("00000000-0000-0000-0000-0000000000a1")
+            .expect("a valid id");
+        {
+            let mut reg = scenario.registry.write().expect("registry lock");
+            reg.publish_own_address(holder, "holder", SHARED, BTreeSet::from([8080]));
+            reg.register_own_ip(holder, "holder", BTreeSet::from([8080]));
+            let collisions = reg.publish_own_address(
+                sessions::SessionId::nil(),
+                "web",
+                SHARED,
+                BTreeSet::from([8080, 9090]),
+            );
+            assert_eq!(
+                collisions.iter().map(|c| c.port).collect::<Vec<_>>(),
+                vec![8080],
+                "the later box yields the held port"
+            );
+            reg.register_own_ip(
+                sessions::SessionId::nil(),
+                "web",
+                BTreeSet::from([8080, 9090]),
+            );
+        }
+
+        // The yielder's running attach: it skips 8080 and binds 9090. The
+        // bind precedes the name's registration (NET-121), so the first
+        // expose on the wire is the one to count.
+        let guard = crate::net::gvproxy_network::complete_own_ip_attach(
+            &switch,
+            scenario.tap_fd,
+            ControlChannel::Unix(scenario.control_path.clone()),
+            lease_at(LEASE),
+            "web",
+            Some(&policy),
+            Some(&scenario.reporter),
+            false,
+        )
+        .await
+        .expect("a yielded port does not fail the attach");
+        let bound = collect_until(&mut events_rx, "/services/forwarder/expose", 1).await;
+        assert_eq!(
+            locals_of(&bound, "/services/forwarder/expose"),
+            vec![format!("{SHARED}:9090")],
+            "the attach binds only the un-yielded forward: {bound:?}"
+        );
+
+        // The holder is destroyed: its withdrawal hands the port back, named
+        // with the yielder that wants it.
+        let handed_back = scenario
+            .registry
+            .write()
+            .expect("registry lock")
+            .unpublish_own_address(holder);
+        assert_eq!(
+            handed_back,
+            Some((SHARED, vec![(sessions::SessionId::nil(), 8080)])),
+            "the destroyed holder hands the port to its yielder"
+        );
+
+        // The manager's delivery, driven at the helper the actor's arm calls:
+        // the shared cell the attach's guard holds, the same bind the attach
+        // path takes, and the declared mapping for the handed-back port.
+        let runtime = scenario.reporter.runtime_ingress();
+        let mapping = policy
+            .ingress
+            .expect("declared_two_ports declares ingress")
+            .port_mappings[0]
+            .clone();
+        assert_eq!(mapping.external_port, 8080);
+        let control = ControlChannel::Unix(scenario.control_path.clone());
+        crate::net::gvproxy_network::bind_handed_back_port(
+            &control,
+            SHARED,
+            LEASE,
+            &mapping,
+            None,
+            Some(&runtime),
+            "web",
+        )
+        .await
+        .expect("the handed-back port binds on the running attach");
+        let rebound = collect_until(&mut events_rx, "/services/forwarder/expose", 1).await;
+        assert_eq!(
+            locals_of(&rebound, "/services/forwarder/expose"),
+            vec![format!("{SHARED}:8080")],
+            "the running attach rebinds the handed-back port: {rebound:?}"
+        );
+        assert_eq!(
+            runtime.snapshot().len(),
+            1,
+            "the rebind is recorded in the cell the guard shares"
+        );
+
+        // The spawn's own teardown unbinds the rebind with the declared
+        // forward — the declared one first, the runtime one after it.
+        Box::new(guard).teardown().await;
+        let unbound = collect_until(&mut events_rx, "/services/forwarder/unexpose", 2).await;
+        assert_eq!(
+            locals_of(&unbound, "/services/forwarder/unexpose"),
+            vec![format!("{SHARED}:9090"), format!("{SHARED}:8080")],
+            "teardown unbinds the declared forward and the rebind: {unbound:?}"
         );
         fake.abort();
     }

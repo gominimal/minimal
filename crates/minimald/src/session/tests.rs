@@ -6191,6 +6191,127 @@ async fn shared_address_port_collision_survives_a_daemon_restart() {
     );
 }
 
+/// NET-129's hand-back, end to end: the holder destroyed, the *running*
+/// yielder's port — the forward its attach skipped — is rebound right away,
+/// not left dead until the yielder's next attach. The yielder's actor holds
+/// a live host and a reported lease, so the rebind binds at its shared
+/// address and delivers to that lease; the request is the one a declared
+/// mapping at the pair takes, and the mapping is listed where `min session
+/// policy` reads it, because the box answers on the port from now on.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn destroying_the_holder_rebinds_the_yielded_port_on_the_running_yielder() {
+    let shared = std::net::Ipv4Addr::new(127, 0, 64, 9);
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let holder = finalize_handed_own_ip_session(
+        &mut client,
+        "holder",
+        std::net::Ipv4Addr::new(100, 64, 128, 9),
+        shared,
+    )
+    .await;
+    let yielder = finalize_handed_own_ip_session(
+        &mut client,
+        "yields",
+        std::net::Ipv4Addr::new(100, 64, 128, 10),
+        shared,
+    )
+    .await;
+
+    let manager = server.state.sessions_manager().await;
+    // The running-yielder half of the setup: a live host, a lease its
+    // running PTask reported, and a switch behind the publish verbs — the
+    // stand-in host's control socket, the channel every bind rides. No
+    // attach is driven here; the harness's host never attaches, which is
+    // exactly the box whose port would otherwise stay dead.
+    let handle = manager
+        .get_session(crate::sessions::SessionKeyPredicate::Id(yielder))
+        .await
+        .unwrap()
+        .expect("the yielding box resolves");
+    handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("the yielding box launches its host");
+    let yielder_lease = std::net::Ipv4Addr::new(100, 64, 128, 10);
+    manager
+        .hostnames()
+        .write()
+        .expect("registry lock")
+        .report_own_address(
+            yielder,
+            "yields",
+            yielder_lease,
+            std::collections::BTreeMap::new(),
+        );
+    let (forwarder, served) = fake_forwarder(
+        handle
+            .net_switch()
+            .await
+            .unwrap()
+            .lock()
+            .await
+            .control_socket(),
+        200,
+    )
+    .await;
+
+    // The holder's destroy: its withdrawal hands the port back, and the
+    // delivery drives the yielder's rebind — the RPC a client uses, so the
+    // hand-back rides the destroy's own path.
+    destroy_session(&mut client, holder).await;
+    soon(|| !served.lock().expect("served lock").is_empty()).await;
+
+    // The rebind is the request a declared mapping at the pair takes: bound
+    // at the shared address, delivered to the yielder's own lease.
+    let served = served.lock().expect("served lock").clone();
+    forwarder.abort();
+    assert_eq!(
+        served.len(),
+        1,
+        "one handed-back port is one request: {served:?}"
+    );
+    let (line, body) = served[0]
+        .split_once('\n')
+        .expect("the served request carries its request line and body");
+    assert!(
+        line.starts_with("POST /services/forwarder/expose "),
+        "the rebind rides the forwarder's expose verb: {served:?}"
+    );
+    let declared = crate::net::policy::expose_request(
+        &sessions::PortMapping {
+            external_port: 18080,
+            internal_port: 80,
+            proto: sessions::IpProto::Tcp,
+        },
+        shared,
+        yielder_lease,
+    );
+    assert_eq!(
+        body,
+        String::from_utf8(serde_json_lenient::to_vec(&declared).unwrap()).unwrap(),
+        "the running yielder rebinds the handed-back port at the shared address"
+    );
+
+    // The mapping is listed where `min session policy` reads it — the box
+    // answers on the port from now on, so the row is live beside the
+    // declaration.
+    let live: minimald_rpc::Errorable<Vec<minimald_rpc::LiveMapping>> = client
+        .call::<minimald_rpc::GetLiveIngress>(&minimald_rpc::GetLiveIngressRequest::Id(yielder))
+        .await;
+    assert_eq!(
+        live,
+        minimald_rpc::Errorable::Ok(vec![minimald_rpc::LiveMapping {
+            local: format!("{shared}:18080"),
+            internal_port: 80,
+            proto: sessions::IpProto::Tcp,
+            pending: Some(false),
+        }]),
+        "the rebound port is a live mapping of the running yielder"
+    );
+}
+
 /// The write-lock promotion `register_hostname` runs after its wait, driven
 /// directly with no timers: a registration that took the `127.0.0.1` interim
 /// moves to its hand once the verdict vouches for it — whether the name is

@@ -1190,17 +1190,43 @@ impl HostnameRegistry {
     /// withdrawn by [`Self::deregister`] in the same deregister. The box's
     /// recorded hand goes with the publish: a landing's sweep must not find
     /// a hand for a box that no longer exists. The ports it held are
-    /// handed back with it: a yield stands only on its holder's publish
-    /// ([`Self::yield_stands`]), so every box still yielding one of them to
-    /// this box holds that port of record again — the collision a third box
-    /// publishing it reads is against the yielder, and the yielder's next
-    /// attach binds the port instead of skipping it.
-    pub fn unpublish_own_address(&mut self, session_id: SessionId) -> Option<Ipv4Addr> {
+    /// handed back with it, each named beside the box that yielded it: a
+    /// yield stands only on its holder's publish ([`Self::yield_stands`]),
+    /// so every box still yielding one of them to this box holds that port
+    /// of record again — the collision a third box publishing it reads is
+    /// against the yielder, and the yielder's next attach binds the port
+    /// instead of skipping it. The hand-back lets the session layer rebind
+    /// a *running* yielder's port right away (NET-129: its attach skipped
+    /// the forward, so without it the port stays dead until that attach).
+    ///
+    /// Answers the address the publish held and the hand-backs beside it:
+    /// one `(yielder, port)` pair per port this box held at its address
+    /// that a still-published other box yields to it. `None` when the box
+    /// had no publish, with no hand-backs either.
+    pub fn unpublish_own_address(
+        &mut self,
+        session_id: SessionId,
+    ) -> Option<(Ipv4Addr, Vec<(SessionId, u16)>)> {
         self.stopped.remove(&session_id);
         self.hands.remove(&session_id);
-        self.own_published
-            .remove(&session_id)
-            .map(|own| own.address)
+        let own = self.own_published.remove(&session_id)?;
+        // Every port this box held that another box at the same address
+        // still yields to it: with the holder's publish gone each yield
+        // stops standing, so the yielder holds the port of record again —
+        // the hand-back names exactly the boxes the session layer must tell.
+        let handed_back = self
+            .own_published
+            .iter()
+            .filter(|(other, other_own)| **other != session_id && other_own.address == own.address)
+            .flat_map(|(other, other_own)| {
+                other_own
+                    .yielded
+                    .iter()
+                    .filter(|y| y.holder == session_id && other_own.ports.contains(&y.port))
+                    .map(move |y| (*other, y.port))
+            })
+            .collect();
+        Some((own.address, handed_back))
     }
 
     /// Marks a box's host as running: its name answers at its address — the
@@ -2678,7 +2704,7 @@ mod tests {
         // name: nothing of the destroyed box's routes or addresses survives.
         assert_eq!(
             reg.unpublish_own_address(SessionId::nil()),
-            Some(own),
+            Some((own, Vec::new())),
             "the destroy path gets the address back to release into the allocator"
         );
         reg.forget_own_address(SessionId::nil());
@@ -3206,6 +3232,64 @@ mod tests {
                 other: "second.min.internal".to_string(),
             }],
             "the moved holder's stale yield does not mask the live claim"
+        );
+    }
+
+    /// The hand-back half of [`Self::unpublish_own_address`]: a destroyed
+    /// holder answers each port it held with the box that yielded it, so
+    /// the session layer can rebind a *running* yielder's port right away
+    /// (NET-129) rather than leaving it dead until the yielder's next
+    /// attach. A yield at another address, or on another port, is not
+    /// this holder's to hand back, and a holder nobody yielded to hands
+    /// nothing back.
+    #[test]
+    fn a_destroyed_holder_names_each_yielder_its_handed_back_port() {
+        let node = Ipv4Addr::new(127, 0, 64, 200);
+        let mut reg = HostnameRegistry::new("dev", false).with_node_address(node);
+        let holder = id("1");
+        let yielder = id("2");
+        let elsewhere = id("3");
+
+        // The holder holds 8080 at the shared address; the yielder yields
+        // it. A box at another address yields 8080 to the same holder too —
+        // not this address's hand-back — and nobody yields 7070.
+        reg.publish_own_address(holder, "holder", node, BTreeSet::from([8080u16]));
+        reg.register_own_ip(holder, "holder", BTreeSet::from([8080u16]));
+        assert_eq!(
+            reg.publish_own_address(yielder, "yielder", node, BTreeSet::from([8080u16, 7070])),
+            vec![SharedPortCollision {
+                port: 8080,
+                other: "holder.min.internal".to_string(),
+            }],
+            "the later box yields the held port"
+        );
+        reg.register_own_ip(yielder, "yielder", BTreeSet::from([8080u16, 7070]));
+        let other_address = Ipv4Addr::new(127, 0, 64, 201);
+        assert!(
+            reg.publish_own_address(
+                elsewhere,
+                "elsewhere",
+                other_address,
+                BTreeSet::from([8080u16])
+            )
+            .is_empty(),
+            "a box at an address of its own collides with nothing"
+        );
+
+        // The holder's destroy hands the shared address's yielded port back
+        // to the box that yielded it, and nothing else: not the yield at the
+        // other address, not a port nobody yielded.
+        assert_eq!(
+            reg.unpublish_own_address(holder),
+            Some((node, vec![(yielder, 8080)])),
+            "the destroy names each yielder its handed-back port"
+        );
+
+        // A yielder's own destroy hands nothing back: nobody yields to it.
+        assert_eq!(
+            reg.unpublish_own_address(yielder),
+            Some((node, Vec::new())),
+            "a box nobody yielded to hands nothing back"
         );
     }
 

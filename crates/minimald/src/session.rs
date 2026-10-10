@@ -639,6 +639,14 @@ enum SessionMessage {
     /// so a finalize sent after the ack sees it.
     #[cfg(test)]
     CheckPackagesAtFinalize(std::time::Duration, oneshot::Sender<()>),
+    /// Rebind one handed-back shared-address port (NET-129): the holder that
+    /// held `port` at this box's shared address has been destroyed, and this
+    /// box's own attach skipped the forward because of it — the manager
+    /// sends this so the *running* box answers on the port right away, not
+    /// at its next attach. Fire-and-forget: no reply, because a failed bind
+    /// says its own warn line and leaves the port to the next attach.
+    #[cfg(target_os = "linux")]
+    BindHandedBackPort(u16),
 }
 
 /// The key an ask parks under (NET-045): minted per request the session
@@ -1763,16 +1771,36 @@ impl Session {
             // grant it held returns to the host's pool — the grant the
             // finalize made, released here so the next box may publish on it.
             // NET-012: the name goes with the publish, so every later lookup
-            // answers NXDOMAIN rather than a stale address.
-            {
+            // answers NXDOMAIN rather than a stale address. NET-129: the
+            // publish's withdrawal hands each port it held back to the box
+            // that yielded it, beside the address — the list the manager
+            // delivery below reads, taken under the same write lock so no
+            // publish lands between the withdrawal and the hand-back it
+            // reads from.
+            let handed_back = {
                 let mut reg = self
                     .hostnames
                     .write()
                     .expect("hostname registry lock poisoned");
-                reg.unpublish_own_address(record.id);
+                let handed_back = reg
+                    .unpublish_own_address(record.id)
+                    .map(|(_, handed_back)| handed_back)
+                    .unwrap_or_default();
                 reg.forget_own_address(record.id);
-            }
+                handed_back
+            };
             self.release_loopback_address(&record, &registry_name(&record));
+            // NET-129's hand-back, delivered: each *running* yielder's actor
+            // is told to rebind the port its attach skipped, so the port
+            // does not stay dead on a live box until its next attach.
+            // Best-effort after the registry's lock is dropped — the destroy
+            // is never held hostage to a yielder's bind, and the manager's
+            // own lock order never meets this registry's.
+            if !handed_back.is_empty()
+                && let Some(manager) = self.manager.upgrade()
+            {
+                manager.hand_back_ports(handed_back);
+            }
         }
         if !self.owns_hostname_route(&record) {
             return;
@@ -2030,6 +2058,10 @@ impl Session {
             }
             SessionMessage::GetPatchesUploadLock(r) => {
                 let _ = r.send(Arc::clone(&self.patches_upload_lock));
+            }
+            #[cfg(target_os = "linux")]
+            SessionMessage::BindHandedBackPort(port) => {
+                self.bind_handed_back_port(port).await;
             }
             SessionMessage::GetHookScriptsUploadLock(r) => {
                 let _ = r.send(Arc::clone(&self.hook_scripts_upload_lock));
@@ -3745,6 +3777,74 @@ impl Session {
     /// feeds.
     async fn switch_control(&self) -> crate::net::policy::ControlChannel {
         switch_control_of(&self.net_switch).await
+    }
+
+    /// Rebinds one handed-back shared-address port (NET-129): the holder
+    /// that held `port` at this box's shared address has been destroyed, and
+    /// this box's running attach skipped the forward because of it. The
+    /// port is this box's of record again, so the running box answers on
+    /// it right away, not at its next attach. Every check here is the
+    /// state a bind needs to be honest — a live host, a live spawn, a
+    /// published address, a lease, and a declared mapping for the port;
+    /// anything missing is the next attach's to bind, silently.
+    ///
+    /// The bind is [`crate::net::gvproxy_network::bind_handed_back_port`],
+    /// recorded in the runtime-ingress cell so both the spawn's guard and
+    /// this actor's stop release it. Failure says its own warn line there;
+    /// this arm adds nothing, because no caller waits on the outcome.
+    #[cfg(target_os = "linux")]
+    async fn bind_handed_back_port(&self, port: u16) {
+        if !self.has_live_host() || self.live_ingress.is_detached() {
+            return;
+        }
+        let Ok(record) = self.record.record().await else {
+            return;
+        };
+        let (published, switch_address) = {
+            let registry = self
+                .hostnames
+                .read()
+                .expect("hostname registry lock poisoned");
+            let Some(published) = registry.published_own_address(record.id) else {
+                return;
+            };
+            let switch_address = match record.box_addresses {
+                Some(addresses) => addresses.switch_address,
+                None => {
+                    let Some(lease) = registry.own_lease(record.id) else {
+                        return;
+                    };
+                    lease
+                }
+            };
+            (published, switch_address)
+        };
+        let Some(mapping) = record
+            .policy
+            .ingress
+            .as_ref()
+            .and_then(|ingress| {
+                ingress
+                    .port_mappings
+                    .iter()
+                    .find(|mapping| mapping.external_port == port)
+            })
+            .cloned()
+        else {
+            return;
+        };
+        let control = self.switch_control().await;
+        let gate = crate::net::switch::live_gate(switch_address);
+        crate::net::gvproxy_network::bind_handed_back_port(
+            &control,
+            published,
+            switch_address,
+            &mapping,
+            gate.as_ref(),
+            Some(&self.live_ingress),
+            &registry_name(&record),
+        )
+        .await;
     }
 
     /// The live dynamic-ingress mappings — the rows `min session policy`
@@ -5585,6 +5685,20 @@ impl SessionHandle {
             Ok(reply) => reply,
             Err(_) => Err(crate::net::policy::ExposeFailure::ActorGone { port }),
         }
+    }
+
+    /// Rebind one handed-back shared-address port on this box (NET-129):
+    /// the manager's delivery of a holder's destroy, sent to the running
+    /// yielder whose attach skipped the forward. Fire-and-forget like the
+    /// ask continuation — the manager does not wait on it, and a session
+    /// already gone simply does not bind, its next attach doing it instead.
+    #[cfg(target_os = "linux")]
+    pub(crate) async fn bind_handed_back_port(&self, port: u16) {
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "the actor may already be gone; the bind is best-effort with no reply"
+        )]
+        let _ = self.0.send(SessionMessage::BindHandedBackPort(port)).await;
     }
 
     /// Continues a parked runtime port-publish ask (NET-045) with the attached

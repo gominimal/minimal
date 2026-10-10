@@ -358,17 +358,9 @@ pub async fn apply_ingress(
             );
             continue;
         }
-        let req = expose_request(mapping, published, ptask_ip);
-        match post_json(control, "/services/forwarder/expose", &req).await {
-            Ok(()) => bound.push(PortForwarder {
-                mapping: ExposedMapping {
-                    local: req.local,
-                    protocol: req.protocol,
-                },
-                internal_port: mapping.internal_port,
-                gate: gate.cloned(),
-                revoked: Arc::new(AtomicBool::new(false)),
-            }),
+        let req_src = expose_request(mapping, published, ptask_ip);
+        match expose_declared(control, published, ptask_ip, mapping, gate).await {
+            Ok(forwarder) => bound.push(forwarder),
             Err(e) => {
                 // The failed bind is the failure's own fact, said where it
                 // happened: the declared port, the address it tried to bind
@@ -377,8 +369,8 @@ pub async fn apply_ingress(
                 // the log beside the name that was never registered.
                 tracing::warn!(
                     port = mapping.external_port,
-                    local = %req.local,
-                    error = %e,
+                    local = %req_src.local,
+                    reason = %e,
                     "binding declared ingress port failed"
                 );
                 // Roll back what we managed to expose so a half-applied policy
@@ -389,6 +381,38 @@ pub async fn apply_ingress(
         }
     }
     Ok(bound)
+}
+
+/// Binds one declared `mapping` — the single-mapping half of
+/// [`apply_ingress`]'s loop, for the one path that binds a mapping outside
+/// a whole-policy apply: a handed-back shared-address port's rebind
+/// (NET-129), on a yielder's running attach. The caller owns the failure
+/// line: a bind inside an apply is one line of a policy's story, a rebind
+/// is its own.
+///
+/// # Errors
+///
+/// Returns the I/O error from the failing `expose` call.
+pub async fn expose_declared(
+    control: &ControlChannel,
+    published: Ipv4Addr,
+    ptask_ip: Ipv4Addr,
+    mapping: &PortMapping,
+    gate: Option<&Arc<super::switch::SessionGate>>,
+) -> io::Result<PortForwarder> {
+    let req = expose_request(mapping, published, ptask_ip);
+    match post_json(control, "/services/forwarder/expose", &req).await {
+        Ok(()) => Ok(PortForwarder {
+            mapping: ExposedMapping {
+                local: req.local,
+                protocol: req.protocol,
+            },
+            internal_port: mapping.internal_port,
+            gate: gate.cloned(),
+            revoked: Arc::new(AtomicBool::new(false)),
+        }),
+        Err(e) => Err(e),
+    }
 }
 
 /// Removes every forward in `bound` from the switch's `control_sock` (R2.3

@@ -199,6 +199,15 @@ enum ManagerMessage {
     /// A no-op for an id already removed; ids are never reused, so a stale
     /// evict can't remove a fresh actor.
     Evict(SessionId),
+    /// Fire-and-forget (NET-129): tell each *running* yielder in `handed_back`
+    /// to rebind a port its attach skipped because the holder held it — the
+    /// holder has just been destroyed, so the port is the yielder's of
+    /// record again and its running box should answer on it right away.
+    /// Never awaits a reply, so the destroy is not held hostage to a
+    /// yielder's bind; a yielder with no live actor is skipped, its next
+    /// attach binding the port.
+    #[cfg(target_os = "linux")]
+    HandBackPorts(Vec<(SessionId, u16)>),
 }
 
 /// Routes session operations to per-session [`Session`] actors, spawning
@@ -1446,6 +1455,20 @@ impl Manager {
             ManagerMessage::Evict(id) => {
                 self.running.remove(&id);
             }
+            // NET-129's hand-back, delivered: each running yielder's actor
+            // is told to rebind the port the destroyed holder handed back.
+            // The holder's destroy does not wait on this arm, and this arm
+            // does not wait on the yielders' binds, so a slow or stopped
+            // yielder holds up neither the manager nor the destroy that
+            // freed the port.
+            #[cfg(target_os = "linux")]
+            ManagerMessage::HandBackPorts(handed_back) => {
+                for (yielder, port) in handed_back {
+                    if let Some(hnd) = self.running.get(&yielder) {
+                        hnd.bind_handed_back_port(port).await;
+                    }
+                }
+            }
         }
     }
 }
@@ -1861,6 +1884,27 @@ impl ManagerHandle {
     /// any risk of a cycle with a manager that might be awaiting the actor.
     pub(crate) async fn evict(&self, id: SessionId) {
         let _ = self.sender.send(ManagerMessage::Evict(id)).await;
+    }
+
+    /// Tell each running yielder to rebind a port a destroyed holder handed
+    /// back to it (NET-129). Best-effort with `try_send`, not awaited: the
+    /// holder's actor sends this from inside the destroy the manager's own
+    /// `DeleteSession` arm is blocked awaiting, so a blocking send against a
+    /// full mailbox would cycle the three (manager → actor → mailbox →
+    /// manager) — and the delivery is droppable, since a yielder's next
+    /// attach binds the port anyway. The warn is the operator's trail for a
+    /// port that waits for that attach.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn hand_back_ports(&self, handed_back: Vec<(SessionId, u16)>) {
+        if let Err(e) = self
+            .sender
+            .try_send(ManagerMessage::HandBackPorts(handed_back))
+        {
+            tracing::warn!(
+                error = %e,
+                "dropping a destroyed box's port hand-back; its yielders rebind at their next attach"
+            );
+        }
     }
 }
 
