@@ -445,6 +445,10 @@ jobs:
       # runs); a called reusable workflow cannot request a permission the caller
       # withheld, so grant it here too. Unused on this non-PR call.
       pull-requests: read
+      # ci-macos.yml also declares checks: read (its await-kvm job reads the
+      # KVM lane's check run on PR runs). Same rule: withheld here, the whole
+      # run is rejected at startup. Unused on this non-PR call.
+      checks: read
     uses: ./.github/workflows/ci-macos.yml
 
   notify:

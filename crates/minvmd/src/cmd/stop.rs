@@ -22,10 +22,6 @@ use crate::state::{State, StateDir};
 /// not stall the stop.
 pub(crate) const GUEST_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Bound on the RPC half of a guest-shutdown ask: the handler force-drains
-/// every session and quiesces before it acknowledges.
-pub(crate) const GUEST_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(120);
-
 /// Bound on the whole signal-stop path, counted from the signal's arrival:
 /// the pending-ask audit, the guest quiesce, the VMM signal, and the
 /// supervisor's teardown. It stays under launchd's default `ExitTimeOut`
@@ -41,12 +37,52 @@ const SIGNAL_STOP_TEARDOWN_RESERVE: Duration = Duration::from_secs(6);
 
 /// Run the `stop` subcommand.
 pub fn run() -> Result<()> {
-    run_with_state_dir(StateDir::default_path(), true)
+    run_with_state_dir(StateDir::default_path(), true).map(|_| ())
+}
+
+/// What a host-side stop did to the VM, so a caller can say how the guest was
+/// left.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostStop {
+    /// No VMM was signalled: the VM was not running, a dead daemon's stale
+    /// state was repaired, or a stop was already in progress.
+    NothingSignalled,
+    /// The guest acknowledged the Shutdown RPC, so its sessions were drained
+    /// and its volume quiesced before the VMM was signalled.
+    GuestAcknowledged,
+    /// The VM was stopped with no acknowledgement from the guest: it was not
+    /// asked, or did not answer. Sessions ended without their stop path, and
+    /// data the guest had not flushed can be lost.
+    GuestUnacknowledged,
+}
+
+/// How long a stop waits for the guest to acknowledge Shutdown before the VMM
+/// is signalled. Long, because the handler force-drains every session
+/// (sandbox teardown, process kills — unbounded real work) and then quiesces
+/// (10 s guest-side ceiling) before it acknowledges; giving up mid-drain
+/// would SIGTERM the VMM with a dirty journal. Public so a caller that asks
+/// the guest itself, then falls back to [`stop_at`], gives it no less.
+pub const GUEST_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Stop the VM whose provider dir is `provider_dir`, exactly as `minvmd stop`
+/// would: best-effort guest Shutdown over the bridge socket in that dir, then
+/// SIGTERM (SIGKILL after 5 s) to the VMM, then `Stopped`. The returned
+/// [`HostStop`] says whether the guest acknowledged that Shutdown.
+///
+/// `quiesce_guest` false skips the guest Shutdown, for a caller whose own
+/// Shutdown RPC to that guest has just failed.
+///
+/// For the minvmd binary `provider_dir` is the process-global default
+/// ([`StateDir::default_path`]); the `minimal` CLI passes the provider dir it
+/// resolved for *its* VM, so `min stop --force` can stop a wedged VM from the
+/// host when the in-guest daemon cannot answer.
+pub fn stop_at(provider_dir: std::path::PathBuf, quiesce_guest: bool) -> Result<HostStop> {
+    run_with_state_dir(provider_dir, quiesce_guest)
 }
 
 /// `quiesce_guest` gates the Shutdown RPC (R2.3): production passes `true`;
 /// unit tests pass `false` so they never reach a live daemon's bridge socket.
-fn run_with_state_dir(dir: std::path::PathBuf, quiesce_guest: bool) -> Result<()> {
+fn run_with_state_dir(dir: std::path::PathBuf, quiesce_guest: bool) -> Result<HostStop> {
     let state_dir = StateDir::new(dir).context("opening state dir")?;
 
     // ── Phase 1: read current state under lock ───────────────────────────────
@@ -59,7 +95,7 @@ fn run_with_state_dir(dir: std::path::PathBuf, quiesce_guest: bool) -> Result<()
 
         if !state.lifecycle.is_active() {
             tracing::info!("minvmd is not running");
-            return Ok(()); // idempotent: already stopped
+            return Ok(HostStop::NothingSignalled); // idempotent: already stopped
         }
         if !state_dir.daemon_alive().context("probing alive lock")? {
             // Dead daemon left active state behind; nothing to signal.
@@ -67,11 +103,11 @@ fn run_with_state_dir(dir: std::path::PathBuf, quiesce_guest: bool) -> Result<()
                 .write_state(&State::stopped())
                 .context("repairing stale state")?;
             tracing::info!("minvmd was not running; cleared stale state");
-            return Ok(());
+            return Ok(HostStop::NothingSignalled);
         }
         if state.lifecycle == Lifecycle::Stopping {
             tracing::info!("minvmd is already stopping");
-            return Ok(()); // idempotent: stop already in progress
+            return Ok(HostStop::NothingSignalled); // idempotent: stop already in progress
         }
 
         state.vmm_pid // may be None during Starting before pid is written
@@ -79,11 +115,13 @@ fn run_with_state_dir(dir: std::path::PathBuf, quiesce_guest: bool) -> Result<()
 
     // ── Phase 2: quiesce the guest, then signal the VMM child (lock NOT held) ─
     // Releasing the lock during the wait allows concurrent `status` reads.
-    match vmm_pid {
+    let acknowledged = match vmm_pid {
         Some(pid) => {
-            // The bridge UDS is derived from the state dir this stop acts on,
-            // never from the process-global resolution, so a stop aimed at
-            // one VM's state dir cannot reach another VM's socket.
+            // The bridge socket is resolved from THIS state dir, never
+            // minvmd's process-global provider dir: in the CLI process that
+            // global is unset (the CLI sets the client crate's globals
+            // instead), and a wrong-VM resolution could shut a healthy
+            // sibling VM's guest down from under this stop.
             let quiesce = quiesce_guest.then(|| GuestQuiesce {
                 uds_path: state_dir.dir().join(paths::SSH_SOCK_FILE),
                 connect_timeout: GUEST_CONNECT_TIMEOUT,
@@ -93,8 +131,9 @@ fn run_with_state_dir(dir: std::path::PathBuf, quiesce_guest: bool) -> Result<()
         }
         None => {
             tracing::warn!("daemon is active but vmm_pid is absent; cleaning up state");
+            false
         }
-    }
+    };
 
     // ── Phase 3: reset state to Stopped (under lock) ─────────────────────────
     {
@@ -108,7 +147,11 @@ fn run_with_state_dir(dir: std::path::PathBuf, quiesce_guest: bool) -> Result<()
     }
 
     tracing::info!("minvmd stopped");
-    Ok(())
+    Ok(if acknowledged {
+        HostStop::GuestAcknowledged
+    } else {
+        HostStop::GuestUnacknowledged
+    })
 }
 
 /// R2.3: how to ask the in-VM minimald (over the vsock bridge UDS) to drain
@@ -131,25 +174,34 @@ struct GuestQuiesce {
     rpc_deadline: Option<Instant>,
 }
 
-/// The stop sequence `stop` and the signal stop share: quiesce the guest
-/// (best-effort: on any failure — guest already gone, bridge down, timeout —
-/// SIGTERM proceeds and the journal replay backstop bounds the damage), then
-/// SIGTERM the VMM child, escalating to SIGKILL. `None` skips the quiesce.
-fn quiesce_then_signal(quiesce: Option<GuestQuiesce>, pid: u32) -> Result<()> {
-    if let Some(q) = quiesce {
+/// The stop sequence `stop`, [`stop_at`] and the signal stop share: quiesce
+/// the guest (best-effort: on any failure — guest already gone, bridge down,
+/// timeout — SIGTERM proceeds and the journal replay backstop bounds the
+/// damage), then SIGTERM the VMM child, escalating to SIGKILL. `None` skips
+/// the quiesce.
+///
+/// Returns whether the guest acknowledged the Shutdown RPC: `false` when it
+/// was not asked or did not answer.
+fn quiesce_then_signal(quiesce: Option<GuestQuiesce>, pid: u32) -> Result<bool> {
+    let acknowledged = quiesce.is_some_and(|q| {
         match crate::rpc_client::shutdown_guest(
             &q.uds_path,
             q.connect_timeout,
             GUEST_SHUTDOWN_TIMEOUT,
             q.rpc_deadline,
         ) {
-            Ok(resp) => tracing::info!(?resp, "guest acknowledged Shutdown RPC"),
+            Ok(resp) => {
+                tracing::info!(?resp, "guest acknowledged Shutdown RPC");
+                true
+            }
             Err(e) => {
-                tracing::warn!(error = %e, "guest Shutdown RPC failed; proceeding with SIGTERM")
+                tracing::warn!(error = %e, "guest Shutdown RPC failed; proceeding with SIGTERM");
+                false
             }
         }
-    }
-    signal_and_wait(pid)
+    });
+    signal_and_wait(pid)?;
+    Ok(acknowledged)
 }
 
 /// Send `SIGTERM` to `pid`; wait up to 5 s; escalate to `SIGKILL` on timeout.
@@ -290,7 +342,7 @@ pub(crate) fn graceful_stop_from_signal(
         None
     } else {
         Some(GuestQuiesce {
-            uds_path: state_dir_path.join(paths::SSH_SOCK_FILE),
+            uds_path: state_dir.dir().join(paths::SSH_SOCK_FILE),
             connect_timeout: GUEST_CONNECT_TIMEOUT.min(quiesce_budget / 2),
             rpc_deadline: Some(quiesce_deadline),
         })
@@ -463,6 +515,98 @@ mod tests {
         .unwrap();
         let _lock = sd.try_acquire_alive_lock().unwrap().expect("acquire");
         assert!(run_with_state_dir(tmp.path().to_path_buf(), false).is_err());
+    }
+
+    /// `stop_at` is the CLI's host-side recovery entry point: given a provider
+    /// dir whose state says Running under a live alive-lock, with the VMM a
+    /// spawned process and no bridge socket to answer the guest RPC, it must
+    /// quiesce (missing socket fails fast), signal the process, and leave the
+    /// state Stopped — all within the guest-RPC connect deadline plus the
+    /// SIGTERM grace.
+    #[test]
+    fn stop_at_signals_vmm_and_stops() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sd = make_state_dir(&tmp);
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        sd.write_state(&State {
+            lifecycle: Lifecycle::Running,
+            vmm_pid: Some(child.id()),
+            started_at: None,
+            ..State::stopped()
+        })
+        .unwrap();
+        let _lock = sd.try_acquire_alive_lock().unwrap().expect("acquire");
+
+        let started = std::time::Instant::now();
+        let outcome = stop_at(tmp.path().to_path_buf(), true).expect("host-side stop succeeds");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "a wedged VM must stop within the connect deadline plus the grace"
+        );
+        assert_eq!(
+            outcome,
+            HostStop::GuestUnacknowledged,
+            "no guest answered, so the stop must not claim a quiesced volume"
+        );
+
+        assert_eq!(sd.read_state().unwrap().lifecycle, Lifecycle::Stopped);
+        // SIGTERM'd: reaped here so the test leaves no stray child.
+        let status = child.wait().unwrap();
+        assert!(
+            status.code().is_none(),
+            "expected a signalled child, got {status:?}"
+        );
+    }
+
+    /// The guest Shutdown goes to the bridge socket in the provider dir
+    /// `stop_at` was given, never to minvmd's process-global one: resolving
+    /// through that global from the CLI process could shut a healthy sibling
+    /// VM's guest down. A listener at `<passed dir>/ssh.sock` must therefore
+    /// see the connection. It never speaks SSH — libkrun's bridge accepts for
+    /// a wedged guest too — so the stop reports no acknowledgement.
+    #[test]
+    fn stop_at_asks_the_guest_on_the_passed_dirs_socket() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sd = make_state_dir(&tmp);
+        let listener =
+            std::os::unix::net::UnixListener::bind(tmp.path().join(paths::SSH_SOCK_FILE)).unwrap();
+        let (connected_tx, connected_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let stream = listener.accept();
+            let _ = connected_tx.send(stream.is_ok());
+            // Hold the accepted stream open until the test is done, so the
+            // client meets a mute peer rather than a reset.
+            let _ = done_rx.recv();
+            drop(stream);
+        });
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        sd.write_state(&State {
+            lifecycle: Lifecycle::Running,
+            vmm_pid: Some(child.id()),
+            started_at: None,
+            ..State::stopped()
+        })
+        .unwrap();
+        let _lock = sd.try_acquire_alive_lock().unwrap().expect("acquire");
+
+        let outcome = stop_at(tmp.path().to_path_buf(), true).expect("host-side stop succeeds");
+
+        assert_eq!(
+            connected_rx.try_recv(),
+            Ok(true),
+            "the guest Shutdown must connect to the passed dir's bridge socket"
+        );
+        assert_eq!(outcome, HostStop::GuestUnacknowledged);
+        assert_eq!(sd.read_state().unwrap().lifecycle, Lifecycle::Stopped);
+        drop(done_tx);
+        child.wait().unwrap();
     }
 
     #[test]

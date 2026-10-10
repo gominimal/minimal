@@ -1138,17 +1138,6 @@ pub(crate) async fn activate_session(
         eprintln!("{note}");
     }
 
-    // The half-open note: an own-address box that names hosts but leaves
-    // subnets unset keeps allow-all subnets, so direct-to-IP traffic is
-    // still admitted beside the name allow list. One line at activation,
-    // naming the flag that closes it; printed here and not per in-box
-    // start, so it is said once.
-    if config.network == minimald_rpc::NetworkMode::OwnIp
-        && let Some(note) = half_open_name_allowlist_note(config.policy.egress.as_ref())
-    {
-        eprintln!("{note}");
-    }
-
     // When a subnet flag carries host bits (e.g. `--deny-subnets 10.0.0.1/8`),
     // the enforcement layer reads it as the masked network (`10.0.0.0/8`).
     // Print a one-line notice naming the normalized form so the user knows
@@ -2266,31 +2255,6 @@ pub fn deny_all_default_notice(phase: sessions::EgressDefaultPhase) -> Option<&'
     }
 }
 
-/// The one-line note `min session activate` prints for an own-address box
-/// whose egress names hosts (`allow_dns_hosts`) but leaves `allow_subnets`
-/// unset: an unset subnets dimension is allow-all, so the gate admits
-/// direct-to-IP traffic beside the name allow list, while the policy view's
-/// `dns hosts` row reads as if the names were the box's whole reach. A
-/// `deny_subnets` list does not close it: it carves ranges out of the
-/// allow-all, and every other address stays reachable by IP, so the note
-/// still fires and is worded for that shape as well. `None` for every
-/// other shape — no egress section (NET-074's note covers it), no names, or
-/// subnets declared (empty or not), where the names are genuinely the
-/// reach.
-pub fn half_open_name_allowlist_note(
-    egress: Option<&sessions::EgressPolicy>,
-) -> Option<&'static str> {
-    let egress = egress?;
-    let names_hosts = egress
-        .allow_dns_hosts
-        .as_ref()
-        .is_some_and(|hosts| !hosts.is_empty());
-    (names_hosts && egress.allow_subnets.is_none()).then_some(
-        "note: allow-subnets is unset (allow-all), so direct-to-IP traffic is admitted \
-         beside the dns-hosts list; add --allow-subnets to restrict it",
-    )
-}
-
 /// The classifier advisory a create reply carries (NET-079), as the line
 /// the activation prints: this host's cause in words for why it cannot
 /// decide a host-address box's egress verdict per box, the state that
@@ -3270,7 +3234,12 @@ fn normalize_subnets(entries: &[String]) -> Vec<String> {
 }
 
 /// One egress rule row: the CIDR or hostname list, or the default the policy
-/// resolves to when the dimension is unset.
+/// resolves to when the dimension is unset. Writes comma-separated entries
+/// to `out`, using `default` for an unset list and `(none)` for an empty list.
+///
+/// # Errors
+///
+/// Propagates errors from writing the row to `out`.
 fn write_rules(
     out: &mut impl std::io::Write,
     label: &str,
@@ -3279,6 +3248,11 @@ fn write_rules(
 ) -> Result<(), anyhow::Error> {
     match rules {
         None => writeln!(out, "  {label}  {default}")?,
+        // A list that is present and empty grants nothing in its dimension
+        // — the shape an absent destination list resolves to on a box of
+        // any network mode (NET-074) — and is spelled out, never printed as
+        // a blank value in the egress display.
+        Some(rules) if rules.is_empty() => writeln!(out, "  {label}  (none)")?,
         Some(rules) => writeln!(out, "  {label}  {}", rules.join(", "))?,
     }
     Ok(())
@@ -3818,16 +3792,85 @@ pub async fn cmd_stop(global: &GlobalArgs, args: StopArgs) -> Result<(), anyhow:
 
     // Racy by nature: the daemon may go down between the probe and this connect
     // (or `--provider` may point the probe and the client at different backends),
-    // so a connect failure is still a real error, not something to swallow.
+    // so a connect failure is still a real error for a native backend. On a VM
+    // backend the connect failing is the wedged-guest symptom itself, so
+    // `--force` falls back to stopping the VM from the host rather than leaving
+    // the only recovery a hand-killed VMM.
     // Unchecked: stopping a version-skewed daemon is exactly what the version
     // gate tells the operator to do, so this command must never be gated by it.
-    let mut client = connect_daemon_unchecked(global).await?;
+    let mut client = match connect_daemon_unchecked(global).await {
+        Ok(client) => client,
+        Err(connect_err) => {
+            if daemon_provider_kind(global) != paths::ProviderKind::Minvmd {
+                return Err(connect_err);
+            }
+            // The VM may have gone down between the probe and the connect:
+            // that is the goal state, not a wedged guest to stop from the
+            // host. Same cheap state-file read as the probe above.
+            if !autospawn::is_daemon_running(global.use_minvmd(), global.minimal_dir.as_deref())
+                .unwrap_or(true)
+            {
+                println!("Daemon is not running.");
+                return Ok(());
+            }
+            // The CLI never reached the guest, so `minvmd stop`'s own guest
+            // Shutdown is still worth its bounded 5 s connect attempt.
+            return if args.force {
+                stop_wedged_vm_from_host(global.minimal_dir.clone(), true).await
+            } else {
+                Err(wedged_vm_unreachable(
+                    connect_err,
+                    global.minimal_dir.as_deref(),
+                ))
+            };
+        }
+    };
 
+    // The guest acknowledges Shutdown only after it has drained every session
+    // and quiesced its volume, which is unbounded real work. On a VM backend a
+    // failed RPC can end in a host-side kill, so the guest gets the same
+    // budget `minvmd stop` gives it before signalling the VMM: a healthy guest
+    // still draining past the generic RPC deadline must not be killed sooner
+    // than minvmd itself would kill it. A native daemon keeps the generic
+    // deadline (a zero extra budget).
+    let drain_budget = if daemon_provider_kind(global) == paths::ProviderKind::Minvmd {
+        minvmd::cmd::stop::GUEST_SHUTDOWN_TIMEOUT.saturating_sub(client::RPC_TIMEOUT)
+    } else {
+        std::time::Duration::ZERO
+    };
     use minimald_rpc::{Shutdown, ShutdownRequest};
     let resp = client
-        .oneshot_rpc::<Shutdown>(ShutdownRequest { force: args.force })
+        .oneshot_rpc_with_hook_budget::<Shutdown>(
+            ShutdownRequest { force: args.force },
+            drain_budget,
+        )
         .await
         .context("Shutdown RPC failed");
+
+    // A wedged guest can fail the Shutdown RPC as surely as the connect, and
+    // `stop_outcome` only recovers a failed RPC when the daemon is observably
+    // down. On a VM backend with `--force`, a daemon that cannot be confirmed
+    // down is stopped from the host instead — the same fallback the connect
+    // error takes, reached by the same evidence.
+    let resp = match resp {
+        Err(rpc_err)
+            if daemon_provider_kind(global) == paths::ProviderKind::Minvmd
+                && !daemon_confirmed_stopped(global.use_minvmd(), global.minimal_dir.clone())
+                    .await =>
+        {
+            if !args.force {
+                return Err(wedged_vm_unreachable(
+                    rpc_err,
+                    global.minimal_dir.as_deref(),
+                ));
+            }
+            // The guest has just been asked to shut down and was given the
+            // full drain budget to acknowledge. Asking again would only add
+            // up to two more minutes of waiting before the host-side stop.
+            return stop_wedged_vm_from_host(global.minimal_dir.clone(), false).await;
+        }
+        resp => resp,
+    };
 
     // Drop our connection before waiting: the daemon holds the shutdown open
     // for its drain grace period while a client is still attached, and we are
@@ -3852,6 +3895,164 @@ pub async fn cmd_stop(global: &GlobalArgs, args: StopArgs) -> Result<(), anyhow:
         async move || daemon_confirmed_stopped(use_minvmd, probe_dir).await,
     )
     .await
+}
+
+/// Stop a VM whose guest cannot be asked to shut down: the in-guest daemon
+/// did not answer, so the host stops the VMM itself. This is `minvmd stop`'s
+/// own path — best-effort guest Shutdown over the bridge socket (5 s connect
+/// deadline, so a wedged guest cannot stall this recovery), then SIGTERM to
+/// the VMM, SIGKILL after the 5 s grace, then `Stopped` — run against the
+/// provider dir the CLI resolved for *this* VM, then waited on until minvmd
+/// has released the VM's alive lock.
+///
+/// The lifecycle file cannot be that wait: the stop writes `Stopped` itself,
+/// before the supervisor has reaped the VMM and exited, and a `min start` in
+/// that window finds the alive lock still held and refuses to boot.
+///
+/// Worst case, after the CLI's own attempt on the guest has given up: the
+/// 5 s grace plus the [`HOST_STOP_RELEASE_WAIT`] when the guest is not asked
+/// again, about 25 s; and when it is asked, the 5 s connect deadline on top,
+/// about 30 s — or, for a guest that completes the handshake and then hangs,
+/// the 120 s Shutdown deadline on top of that, about 150 s.
+///
+/// The CLI's own attempt comes first. A guest that accepts the connection and
+/// then never acknowledges holds `min stop --force` for the 120 s drain
+/// budget, then the 20 s wait for the VM to stop on its own, then the 25 s
+/// above: about 165 s from start to finish.
+///
+/// Only reached on a minvmd backend with `--force`, once the guest is proven
+/// unreachable; a native minimald is not a VM and keeps its own error.
+/// `quiesce_guest` is false when the CLI's own Shutdown RPC has just failed,
+/// so the guest is not asked a second time.
+///
+/// A VM that is still booting has no VMM pid the host could signal, and its
+/// supervisor would write `Running` over a `Stopped` this wrote, so that case
+/// is refused rather than reported as a host-side stop.
+async fn stop_wedged_vm_from_host(
+    minimal_dir: Option<PathBuf>,
+    quiesce_guest: bool,
+) -> Result<(), anyhow::Error> {
+    let provider_dir = client::resolve_provider_dir(minimal_dir.as_deref(), true)
+        .context("resolving the VM's provider dir for a host-side stop")?;
+
+    // The stop sleep-polls the VMM's exit and the wait polls the alive lock,
+    // so both go on the blocking pool rather than stalling an async worker
+    // (rust-coding-standards: no blocking in an async context).
+    let outcome = tokio::task::spawn_blocking(move || {
+        let state_dir = minvmd::state::StateDir::new(provider_dir.clone())
+            .context("opening the VM's state dir for a host-side stop")?;
+        let state = state_dir
+            .effective_state()
+            .context("reading the VM's state for a host-side stop")?;
+        // Checked first: the VM going down on its own (or a dead supervisor's
+        // stale state being repaired by the read above) since the caller's
+        // liveness probe is the goal state, not a boot to wait out.
+        if !state.lifecycle.is_active() {
+            return Ok(minvmd::cmd::stop::HostStop::NothingSignalled);
+        }
+        if state.lifecycle == minvmd::lifecycle::Lifecycle::Starting || state.vmm_pid.is_none() {
+            anyhow::bail!(
+                "the VM is still booting; retry `{}` once it is up",
+                stop_command()
+            );
+        }
+        let outcome = minvmd::cmd::stop::stop_at(provider_dir, quiesce_guest)
+            .context("stopping the VM from the host")?;
+        wait_for_alive_lock_released(&state_dir, HOST_STOP_RELEASE_WAIT)?;
+        Ok(outcome)
+    })
+    .await
+    .context("the host-side stop of the VM panicked")??;
+
+    // stderr, so it survives the `>/dev/null` every scripted caller wraps
+    // `stop` in. The loss caveat is only true of a guest that was killed: one
+    // that acknowledged Shutdown drained its sessions and quiesced its volume
+    // first.
+    use minvmd::cmd::stop::HostStop;
+    match outcome {
+        HostStop::NothingSignalled => println!("Daemon is not running."),
+        HostStop::GuestAcknowledged => {
+            eprintln!("the VM was stopped from the host after its guest shut down cleanly");
+        }
+        HostStop::GuestUnacknowledged => eprintln!("{UNACKNOWLEDGED_STOP_CAVEAT}"),
+    }
+    Ok(())
+}
+
+/// What `min stop --force` says after killing a VM whose guest did not
+/// acknowledge Shutdown. The volume's journal keeps its filesystem metadata
+/// consistent across the kill; it does not keep the data.
+const UNACKNOWLEDGED_STOP_CAVEAT: &str = "the guest did not acknowledge shutdown; the VM was killed from the host. \
+     Running sessions were killed without their stop path, and data not yet flushed inside \
+     the VM can be lost (files truncated or empty). The volume's journal keeps its \
+     filesystem metadata consistent.";
+
+/// How long a host-side stop waits for minvmd to release the VM's alive lock
+/// once the VMM has been signalled: the supervisor has to reap the VMM child
+/// and exit. The same ceiling an acknowledged shutdown is given to reach
+/// `Stopped`.
+const HOST_STOP_RELEASE_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Wait until no minvmd (supervisor or VMM child) holds `state_dir`'s alive
+/// lock, so the next `min start` can take it.
+pub(crate) fn wait_for_alive_lock_released(
+    state_dir: &minvmd::state::StateDir,
+    timeout: std::time::Duration,
+) -> Result<(), anyhow::Error> {
+    let deadline = std::time::Instant::now() + timeout;
+    while state_dir
+        .daemon_alive()
+        .context("probing the VM's alive lock after a host-side stop")?
+    {
+        if std::time::Instant::now() >= deadline {
+            bail!(
+                "minvmd still holds the VM's alive lock after {timeout:?}; \
+                 starting it again will fail until that minvmd exits"
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    Ok(())
+}
+
+/// `min stop` for the VM this command drives: a bare `min stop` targets the
+/// default VM, so a named one must carry its `--vm` (NET-052).
+fn stop_command() -> String {
+    match client::vm_name() {
+        paths::DEFAULT_VM_NAME => "min stop".to_owned(),
+        vm => format!("min --vm {vm} stop"),
+    }
+}
+
+/// The failure `min stop` ends with when the VM's guest does not answer and
+/// `--force` was not given: `cause` under the recovery, typed so the run exits
+/// with the reserved host-unreachable code (7) rather than the unspecified 1.
+///
+/// A VM that is still booting is not answering either, but `--force` refuses
+/// it, so the hint names the retry instead of a recovery that would not work.
+fn wedged_vm_unreachable(
+    cause: anyhow::Error,
+    minimal_dir: Option<&std::path::Path>,
+) -> anyhow::Error {
+    // Same cheap state-file read as `cmd_stop`'s liveness probe; a state that
+    // cannot be read leaves the `--force` hint.
+    let booting = client::resolve_provider_dir(minimal_dir, true)
+        .ok()
+        .and_then(|dir| minvmd::state::StateDir::new(dir).ok())
+        .and_then(|state_dir| state_dir.read_state().ok())
+        .is_some_and(|state| state.lifecycle == minvmd::lifecycle::Lifecycle::Starting);
+    let hint = if booting {
+        format!(
+            "the VM is still booting; retry `{}` once it is up",
+            stop_command()
+        )
+    } else {
+        format!(
+            "the VM is not answering; `{} --force` stops it from the host",
+            stop_command()
+        )
+    };
+    client::box_registration::HostUnreachable::over(cause, hint)
 }
 
 /// Whether the daemon can be *observed* to have stopped — the question the
@@ -4001,46 +4202,6 @@ mod tests {
         CredentialedUpstream, DynamicIngress, EffectiveEgress, EffectiveSessionPolicy,
         IngressPolicy, IpProto, NetworkMode, PortMapping,
     };
-
-    #[test]
-    fn half_open_name_allowlist_note_fires_only_for_names_without_subnets() {
-        let names = Some(vec!["github.com".to_string()]);
-        let shape = |allow_subnets, allow_dns_hosts| sessions::EgressPolicy {
-            allow_subnets,
-            allow_dns_hosts,
-            allow_protocols: None,
-            deny_subnets: None,
-        };
-
-        let half_open = shape(None, names.clone());
-        let note =
-            half_open_name_allowlist_note(Some(&half_open)).expect("half-open shape is noted");
-        // The NET-066 child requirement: the line names the allow-all
-        // subnets and the flag that closes them.
-        assert!(note.contains("allow-all"), "{note}");
-        assert!(note.contains("--allow-subnets"), "{note}");
-        // A deny list carves ranges out of the allow-all; the rest of the
-        // address space stays reachable by IP, so the note still fires.
-        let denied_only = sessions::EgressPolicy {
-            deny_subnets: Some(vec!["10.0.0.0/8".to_string()]),
-            ..shape(None, names.clone())
-        };
-        assert!(half_open_name_allowlist_note(Some(&denied_only)).is_some());
-
-        for closed in [
-            shape(Some(vec![]), names.clone()),
-            shape(Some(vec!["140.82.112.0/20".to_string()]), names.clone()),
-            shape(None, None),
-            shape(None, Some(vec![])),
-            sessions::EgressPolicy::deny_all(),
-        ] {
-            assert!(
-                half_open_name_allowlist_note(Some(&closed)).is_none(),
-                "no note for {closed:?}"
-            );
-        }
-        assert!(half_open_name_allowlist_note(None).is_none());
-    }
 
     #[test]
     fn normalize_subnets_masks_host_bits_and_keeps_the_rest() {
@@ -4774,6 +4935,33 @@ mod tests {
         assert_eq!(
             not_deny_all_json["rules"]["allow_subnets"][0], "10.0.0.0/8",
             "the named subnet rides the declared section: {not_deny_all_json}"
+        );
+
+        // A names-only declaration on an own-address box resolves its
+        // absent `allow_subnets` to present and empty (NET-074): the row is
+        // spelled out as `(none)`, never printed blank, and the section is
+        // not deny-all, since its names grant reach.
+        let names_only = EffectiveSessionPolicy {
+            egress: EffectiveEgress::Declared(sessions::EgressPolicy {
+                allow_subnets: Some(vec![]),
+                allow_dns_hosts: Some(vec!["github.com".to_string()]),
+                allow_protocols: None,
+                deny_subnets: None,
+            }),
+            ingress: None,
+            credentialed_upstream: None,
+        };
+        let mut out = Vec::new();
+        format_policy(&mut out, &names_only, NetworkMode::OwnIp, None, &[], None).unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(
+            rendered.contains("  subnets  (none)\n")
+                && rendered.contains("  dns hosts  github.com\n"),
+            "a resolved-empty list is spelled out beside the names: {rendered}"
+        );
+        assert!(
+            !rendered.contains("egress\n  deny-all\n"),
+            "a names-only section grants reach and is not deny-all: {rendered}"
         );
     }
 

@@ -190,7 +190,7 @@ pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// libkrun's always-accepting bridge), where the reply wait would block
 /// forever. Generous — a healthy daemon answers in milliseconds, so this
 /// only bounds the pathological case.
-const RPC_TIMEOUT: Duration = Duration::from_secs(60);
+pub const RPC_TIMEOUT: Duration = Duration::from_secs(60);
 /// The leash a caller is expected to run a [`Client::probe`] under: the
 /// probe's connect, its handshake, and the one RPC the caller makes on it,
 /// end to end. The retry ([`CONNECT_RETRIES`]), the handshake deadline and
