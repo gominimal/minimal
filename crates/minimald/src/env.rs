@@ -1680,7 +1680,7 @@ impl SessionChannel {
                 // failure already left its line in the actor, which saw the
                 // record; logging here too would make two lines for one
                 // request.
-                match &failure {
+                let line = match &failure {
                     crate::net::policy::ExposeFailure::RecordUnreadable { .. }
                     | crate::net::policy::ExposeFailure::ActorGone { .. } => {
                         tracing::info!(
@@ -1690,15 +1690,45 @@ impl SessionChannel {
                             reason = %failure,
                             "dynamic ingress expose"
                         );
+                        format!("error: {failure}")
                     }
-                    _ => {}
-                }
+                    // A refusal names its way forward with the box's name
+                    // and the port asked for. The name is the record's, read
+                    // now: this channel's own copy is the creation-time one,
+                    // and `min session rename` has moved on from it by the
+                    // time a later request lands. The record's network mode
+                    // decides which way forward is open. A host-address
+                    // box's port needs no exposing at all, which is the goal
+                    // met rather than an error, so it is a plain message and
+                    // the helper exits 0.
+                    crate::net::policy::ExposeFailure::Refused(refusal) => {
+                        let (box_name, network) = match session.record().await {
+                            Ok(record) => (
+                                record.name.unwrap_or_else(|| self.name.clone()),
+                                record.network,
+                            ),
+                            Err(_) => (self.name.clone(), sessions::NetworkMode::OwnIp),
+                        };
+                        let text = refusal.for_caller(&box_name, network, port_number);
+                        if matches!(
+                            refusal,
+                            crate::net::policy::ExposeRefusal::NeedsNoExposing { .. }
+                        ) {
+                            format!("msg:{text}")
+                        } else {
+                            format!("error: {text}")
+                        }
+                    }
+                    crate::net::policy::ExposeFailure::Publish { .. } => {
+                        format!("error: {failure}")
+                    }
+                };
                 #[expect(
                     clippy::let_underscore_must_use,
                     reason = "the reply channel is best-effort: a peer may be gone before \
                               the reply lands, and there is nowhere to report that to"
                 )]
-                let _ = writeln!(stream, "error: {failure}");
+                let _ = writeln!(stream, "{line}");
             }
         }
     }
@@ -2820,6 +2850,209 @@ exit $rc
             served.lock().expect("served lock").len(),
             2,
             "one mapping is one request, and both publishes reached the switch"
+        );
+    }
+
+    /// Drives one in-box `min net expose <port>` against the session that
+    /// owns the channel and returns the reply lines, for the refusal tests
+    /// below: each pins the line the box's caller reads, which is where a
+    /// refusal names its way forward.
+    async fn expose_reply(
+        handle: &crate::session::SessionHandle,
+        name: &str,
+        port: u16,
+    ) -> Vec<String> {
+        let (_state, _rootfs, _cwd, mut chan) = setup_channel_with(handle.downgrade(), name);
+        let (mut ours, theirs) = UnixStream::pair().unwrap();
+        #[expect(
+            clippy::large_futures,
+            reason = "the handle future carries the harness's whole channel; the test awaits \
+                      it to completion"
+        )]
+        chan.handle(&format!("net-expose%{port}"), &mut ours).await;
+        drop(ours);
+        read_lines(&theirs)
+    }
+
+    /// The deny refusal names the way forward: the setting that allows a
+    /// publish, and the host-side forward that needs no policy change, with
+    /// the box's name and the port asked for filled in by the daemon. Still
+    /// an `error:` line, so the helper exits 1.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn expose_deny_reply_names_the_way_forward() {
+        let server = crate::test_harness::TestServer::new().await;
+        let mut client = server.connect().await;
+        let id = crate::session::tests::finalize_dynamic_ingress_session(
+            &mut client,
+            "web",
+            std::net::Ipv4Addr::new(100, 64, 128, 52),
+            std::net::Ipv4Addr::new(127, 0, 64, 52),
+            None,
+            None,
+        )
+        .await;
+        let manager = server.state.sessions_manager().await;
+        let handle = manager
+            .get_session(crate::sessions::SessionKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .expect("the box resolves");
+        assert_eq!(
+            expose_reply(&handle, "web", 3001).await,
+            vec![
+                "error: dynamic ingress is denied for this box. Re-activate with --network \
+                 own_ip and --dynamic-ingress allow --dynamic-range <lo>-<hi> (or \
+                 --dynamic-ingress ask) to allow it, or forward it from the host now: min \
+                 net forward web <local>:3001"
+            ],
+        );
+    }
+
+    /// The way forward names the box as it is called now, not as it was
+    /// created: the channel's own copy of the name is the creation-time one,
+    /// so a box renamed since would otherwise be pointed at a name no
+    /// command resolves. The line is built from the record the request is
+    /// decided against.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn expose_reply_names_the_renamed_box() {
+        let server = crate::test_harness::TestServer::new().await;
+        let mut client = server.connect().await;
+        let id = crate::session::tests::finalize_dynamic_ingress_session(
+            &mut client,
+            "web",
+            std::net::Ipv4Addr::new(100, 64, 128, 54),
+            std::net::Ipv4Addr::new(127, 0, 64, 54),
+            None,
+            None,
+        )
+        .await;
+        let manager = server.state.sessions_manager().await;
+        let handle = manager
+            .get_session(crate::sessions::SessionKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .expect("the box resolves");
+        handle
+            .rename("api".to_string())
+            .await
+            .expect("the box renames");
+        // The channel still carries the name the environment was built with.
+        let lines = expose_reply(&handle, "web", 3001).await;
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].ends_with("min net forward api <local>:3001"),
+            "the way forward names the box as it is called now: {}",
+            lines[0]
+        );
+        assert!(
+            !lines[0].contains("web"),
+            "the creation-time name is not the one offered: {}",
+            lines[0]
+        );
+    }
+
+    /// A `--network none` box cannot carry dynamic ingress — the activation
+    /// refuses the flags off `own_ip` — so re-activating with them is no way
+    /// forward for it. The host-side forward is: it dials inside the box's
+    /// own namespace, so it reaches a port a `none` box listens on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn expose_deny_reply_on_a_none_box_offers_only_the_forward() {
+        use minimald_rpc::{
+            ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, FinalizeSession,
+            FinalizeSessionRequest,
+        };
+        let server = crate::test_harness::TestServer::new().await;
+        let mut client = server.connect().await;
+        let mut request = crate::test_harness::create_session_req("web", "/uwu");
+        request.config.network = sessions::NetworkMode::NoNet;
+        let id = client.call::<CreateSession>(&request).await.unwrap().id;
+        crate::test_harness::unwrap_ready(
+            client
+                .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
+                    session_id: id,
+                    contribution: Default::default(),
+                })
+                .await
+                .unwrap(),
+        );
+        client
+            .call::<FinalizeSession>(&FinalizeSessionRequest {
+                session_id: id,
+                report_shared_port_collisions: false,
+            })
+            .await
+            .unwrap();
+        let manager = server.state.sessions_manager().await;
+        let handle = manager
+            .get_session(crate::sessions::SessionKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .expect("the box resolves");
+        assert_eq!(
+            expose_reply(&handle, "web", 3001).await,
+            vec![
+                "error: dynamic ingress is denied for this box: a --network none box has no \
+                 address to publish at. Forward it from the host instead: min net forward \
+                 web <local>:3001"
+            ],
+        );
+    }
+
+    /// An `ask` with nobody attached names the two ways forward: attach a
+    /// terminal and retry, or have the host forward the port. Still an
+    /// `error:` line, so the helper exits 1.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn expose_ask_unattended_reply_names_the_way_forward() {
+        let server = crate::test_harness::TestServer::new().await;
+        let mut client = server.connect().await;
+        let id = crate::session::tests::finalize_dynamic_ingress_session(
+            &mut client,
+            "web",
+            std::net::Ipv4Addr::new(100, 64, 128, 53),
+            std::net::Ipv4Addr::new(127, 0, 64, 53),
+            Some(sessions::DynamicIngress::Ask),
+            Some((3000, 3999)),
+        )
+        .await;
+        let manager = server.state.sessions_manager().await;
+        let handle = manager
+            .get_session(crate::sessions::SessionKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .expect("the box resolves");
+        // No host is running, so nobody is attached to answer.
+        assert_eq!(
+            expose_reply(&handle, "web", 3001).await,
+            vec![
+                "error: dynamic ingress is set to ask and nobody is attached to answer: \
+                 attach a terminal (min session attach web) and retry, or have the host \
+                 forward it (min net forward web <local>:3001)"
+            ],
+        );
+    }
+
+    /// A host-address box's port needs no exposing: the reply says where it
+    /// already answers, as a plain `msg:` line, so the helper exits 0 — the
+    /// goal is met, and an error would read as a failure. The harness daemon
+    /// is native, so the host's loopback is named beside the name; the
+    /// VM-backed rendering, without it, is pinned in `net::policy`'s tests.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn expose_host_address_reply_is_a_plain_message() {
+        let server = crate::test_harness::TestServer::new().await;
+        let mut client = server.connect().await;
+        let id = crate::test_harness::create_configured_session(&mut client, "web", "/uwu").await;
+        let manager = server.state.sessions_manager().await;
+        let handle = manager
+            .get_session(crate::sessions::SessionKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .expect("the box resolves");
+        assert_eq!(
+            expose_reply(&handle, "web", 3001).await,
+            vec![
+                "msg:port 3001 needs no exposing: this box shares the host's network, so it \
+                 already answers at web.min.internal:3001 (and localhost:3001)"
+            ],
         );
     }
 
