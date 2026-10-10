@@ -631,8 +631,8 @@ pub(crate) mod linux {
     use crate::resolver::{
         ANSWERER_PROGRAM_DIR, APPARMOR_DIR, APPARMOR_PROFILE_RECORD, CLASSIFIER_PROGRAM_PATH,
         CLASSIFIER_SCRIPT, CLASSIFIER_SCRIPT_HEREDOC, CLASSIFIER_SYSTEMD_UNIT,
-        CLASSIFIER_TREE_ROOT, CLASSIFIER_UNIT_SERVICE_PATH, KVM_GROUP_RECORD, PLACE_SYSTEMD_UNIT,
-        PLACE_UNIT_PATH_PATH, PLACE_UNIT_SERVICE_PATH,
+        CLASSIFIER_TREE_RECORD, CLASSIFIER_TREE_ROOT, CLASSIFIER_UNIT_SERVICE_PATH,
+        KVM_GROUP_RECORD, PLACE_SYSTEMD_UNIT, PLACE_UNIT_PATH_PATH, PLACE_UNIT_SERVICE_PATH,
     };
 
     pub(crate) const USERNS_ID: &str = "userns-profile";
@@ -881,8 +881,12 @@ pub(crate) mod linux {
     /// over.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(crate) struct ClassifierFacts {
-        /// The tree's table marker is there.
-        pub(crate) marker_present: bool,
+        /// The table's presence marker is there with exactly one well-formed
+        /// `ct-mark-mask-0x…` record beside it ([`table_present`]): the
+        /// reading minimald's `table_marker_present` makes, so the item and
+        /// the daemon agree on what installed means. A marker without its
+        /// record is a step that did not finish.
+        pub(crate) table_present: bool,
         /// The copy at [`CLASSIFIER_PROGRAM_PATH`] reads as
         /// [`CLASSIFIER_SCRIPT`] byte for byte: the copy outlives an
         /// upgrade of this binary and the units run it, so one that differs
@@ -936,7 +940,7 @@ pub(crate) mod linux {
                     .to_string(),
             );
         }
-        if facts.marker_present && facts.copy_current && facts.units_enabled != Some(false) {
+        if facts.table_present && facts.copy_current && facts.units_enabled != Some(false) {
             return Item::done(CLASSIFIER_ID, CLASSIFIER_LABEL);
         }
         let cause = match facts.mount {
@@ -980,10 +984,10 @@ pub(crate) mod linux {
                     return Item::missing(
                         CLASSIFIER_ID,
                         CLASSIFIER_LABEL,
-                        if !facts.marker_present {
+                        if !facts.table_present {
                             "host-address boxes run unenforced: the classifier's privileged \
-                             step is not installed, so no box's egress verdict is decided per \
-                             box"
+                             step is not installed, or did not finish, so no box's egress \
+                             verdict is decided per box"
                         } else if !facts.copy_current {
                             "the root-owned copy of the classifier's privileged step is not \
                              this build's, so the placement unit runs a stale step"
@@ -1024,6 +1028,10 @@ pub(crate) mod linux {
              chmod 0755 {CLASSIFIER_PROGRAM_PATH}.new\n\
              mv -f {CLASSIFIER_PROGRAM_PATH}.new {CLASSIFIER_PROGRAM_PATH}\n\
              {CLASSIFIER_PROGRAM_PATH} --user '{operator}'\n\
+             # The record marks the tree as this step's, so --undo removes it; one\n\
+             # installed another way is left alone.\n\
+             mkdir -p /var/lib/minimal\n\
+             : > {CLASSIFIER_TREE_RECORD}\n\
              # The units: a boot oneshot re-runs the step from the copy (the tree lives\n\
              # in cgroupfs and the table in the kernel, so neither survives a reboot),\n\
              # then the placement pair: the path unit fires when the daemon's socket\n\
@@ -1077,7 +1085,40 @@ pub(crate) mod linux {
         )
     }
 
-    /// [`classifier_item_over`] this host's reads: the tree's marker, the
+    /// The table's presence, as minimald's `table_marker_present` reads
+    /// it: the marker directory under `root`, and beside it exactly one
+    /// well-formed `ct-mark-mask-0x…` record naming the bits the loaded
+    /// table classifies with (the step writes both in one install). A
+    /// marker alone, a record that does not parse, or two that disagree
+    /// is a step that did not finish, and reads as not installed.
+    pub(crate) fn table_present(root: &std::path::Path) -> bool {
+        if !root.join("classifier-table").is_dir() {
+            return false;
+        }
+        let Ok(entries) = std::fs::read_dir(root) else {
+            return false;
+        };
+        let mut mask = None;
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(value) = name.to_str().and_then(|n| n.strip_prefix("ct-mark-mask-")) else {
+                continue;
+            };
+            let Some(bits) = value
+                .strip_prefix("0x")
+                .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+            else {
+                return false;
+            };
+            if mask.is_some_and(|other| other != bits) {
+                return false;
+            }
+            mask = Some(bits);
+        }
+        mask.is_some()
+    }
+
+    /// [`classifier_item_over`] this host's reads: the table's presence, the
     /// root-owned copy's bytes against this binary's, the units and their
     /// `multi-user.target` links where the host has systemctl, the tree's
     /// owner, this process's uid and account, the cgroup2 mount, and the
@@ -1115,7 +1156,7 @@ pub(crate) mod linux {
             .unwrap_or_default();
         classifier_item_over(
             &ClassifierFacts {
-                marker_present: root.join("classifier-table").is_dir(),
+                table_present: table_present(root),
                 copy_current,
                 units_enabled,
                 other_owner,
@@ -1756,6 +1797,33 @@ mod tests {
         }
     }
 
+    /// The table's presence reads the way minimald reads it: the marker
+    /// with exactly one well-formed mask record beside it. A marker alone
+    /// (a failed re-install), a malformed record, or two records that
+    /// disagree is not installed; one record, or two that agree, is.
+    #[test]
+    fn classifier_table_presence_needs_the_marker_and_one_mask_record() {
+        use linux::table_present;
+        let root = tempfile::tempdir().expect("a temp dir");
+        let root = root.path();
+        assert!(!table_present(root), "an empty root");
+        std::fs::create_dir(root.join("classifier-table")).unwrap();
+        assert!(
+            !table_present(root),
+            "the marker alone is a step that did not finish"
+        );
+        std::fs::create_dir(root.join("ct-mark-mask-not-a-mask")).unwrap();
+        assert!(!table_present(root), "a record that does not parse");
+        std::fs::remove_dir(root.join("ct-mark-mask-not-a-mask")).unwrap();
+        std::fs::create_dir(root.join("ct-mark-mask-0x30000000")).unwrap();
+        assert!(table_present(root), "the marker and one record");
+        std::fs::create_dir(root.join("ct-mark-mask-0x0000c000")).unwrap();
+        assert!(!table_present(root), "two records that disagree");
+        std::fs::remove_dir(root.join("ct-mark-mask-0x0000c000")).unwrap();
+        std::fs::remove_dir(root.join("classifier-table")).unwrap();
+        assert!(!table_present(root), "a record without the marker");
+    }
+
     /// The classifier item's table: done on the marker with a current copy
     /// of the step and enabled units (or no systemctl to owe them to);
     /// blocked by another account's tree, by root, by the mount, or by an
@@ -1786,7 +1854,7 @@ mod tests {
         );
         let sock = "/home/alice/.local/state/minimal/providers/local-minimald0/ssh.sock";
         let installed = ClassifierFacts {
-            marker_present: true,
+            table_present: true,
             copy_current: true,
             units_enabled: Some(true),
             other_owner: None,
@@ -1794,7 +1862,7 @@ mod tests {
             mount: Cgroup2Mount::Delegated,
         };
         let bare = ClassifierFacts {
-            marker_present: false,
+            table_present: false,
             copy_current: false,
             units_enabled: Some(false),
             ..installed
@@ -1867,7 +1935,7 @@ mod tests {
         // copy, and reads the same.
         let stale = classifier_item_over(
             &ClassifierFacts {
-                marker_present: true,
+                table_present: true,
                 ..bare
             },
             "alice",
@@ -1901,7 +1969,7 @@ mod tests {
         assert_eq!(
             classifier_item_over(
                 &ClassifierFacts {
-                    marker_present: true,
+                    table_present: true,
                     mount: Cgroup2Mount::Absent,
                     ..bare
                 },
@@ -1918,7 +1986,7 @@ mod tests {
             installed,
             bare,
             ClassifierFacts {
-                marker_present: true,
+                table_present: true,
                 mount: Cgroup2Mount::Absent,
                 ..bare
             },
@@ -1972,13 +2040,14 @@ mod tests {
     fn classifier_step_places_the_daemon_on_every_start() {
         use crate::resolver::{
             CLASSIFIER_PROGRAM_PATH, CLASSIFIER_SCRIPT, CLASSIFIER_SCRIPT_HEREDOC,
-            CLASSIFIER_UNIT_SERVICE_PATH, PLACE_UNIT_PATH_PATH, PLACE_UNIT_SERVICE_PATH,
+            CLASSIFIER_TREE_RECORD, CLASSIFIER_UNIT_SERVICE_PATH, PLACE_UNIT_PATH_PATH,
+            PLACE_UNIT_SERVICE_PATH,
         };
         use linux::{Cgroup2Mount, ClassifierFacts, classifier_item_over};
         let sock = "/home/alice/.local/state/minimal/providers/local-minimald0/ssh.sock";
         let item = classifier_item_over(
             &ClassifierFacts {
-                marker_present: false,
+                table_present: false,
                 copy_current: false,
                 units_enabled: Some(false),
                 other_owner: None,
@@ -1995,6 +2064,7 @@ mod tests {
             format!("chmod 0755 {CLASSIFIER_PROGRAM_PATH}.new\n"),
             format!("mv -f {CLASSIFIER_PROGRAM_PATH}.new {CLASSIFIER_PROGRAM_PATH}\n"),
             format!("{CLASSIFIER_PROGRAM_PATH} --user 'alice'\n"),
+            format!(": > {CLASSIFIER_TREE_RECORD}\n"),
             format!("cat > {CLASSIFIER_UNIT_SERVICE_PATH} <<"),
             format!("ExecStart={CLASSIFIER_PROGRAM_PATH} --user 'alice'\n"),
             "Before=minimald-place.path\n".to_string(),
