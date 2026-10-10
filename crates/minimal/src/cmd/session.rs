@@ -1138,17 +1138,6 @@ pub(crate) async fn activate_session(
         eprintln!("{note}");
     }
 
-    // The half-open note: an own-address box that names hosts but leaves
-    // subnets unset keeps allow-all subnets, so direct-to-IP traffic is
-    // still admitted beside the name allow list. One line at activation,
-    // naming the flag that closes it; printed here and not per in-box
-    // start, so it is said once.
-    if config.network == minimald_rpc::NetworkMode::OwnIp
-        && let Some(note) = half_open_name_allowlist_note(config.policy.egress.as_ref())
-    {
-        eprintln!("{note}");
-    }
-
     // When a subnet flag carries host bits (e.g. `--deny-subnets 10.0.0.1/8`),
     // the enforcement layer reads it as the masked network (`10.0.0.0/8`).
     // Print a one-line notice naming the normalized form so the user knows
@@ -2266,31 +2255,6 @@ pub fn deny_all_default_notice(phase: sessions::EgressDefaultPhase) -> Option<&'
     }
 }
 
-/// The one-line note `min session activate` prints for an own-address box
-/// whose egress names hosts (`allow_dns_hosts`) but leaves `allow_subnets`
-/// unset: an unset subnets dimension is allow-all, so the gate admits
-/// direct-to-IP traffic beside the name allow list, while the policy view's
-/// `dns hosts` row reads as if the names were the box's whole reach. A
-/// `deny_subnets` list does not close it: it carves ranges out of the
-/// allow-all, and every other address stays reachable by IP, so the note
-/// still fires and is worded for that shape as well. `None` for every
-/// other shape — no egress section (NET-074's note covers it), no names, or
-/// subnets declared (empty or not), where the names are genuinely the
-/// reach.
-pub fn half_open_name_allowlist_note(
-    egress: Option<&sessions::EgressPolicy>,
-) -> Option<&'static str> {
-    let egress = egress?;
-    let names_hosts = egress
-        .allow_dns_hosts
-        .as_ref()
-        .is_some_and(|hosts| !hosts.is_empty());
-    (names_hosts && egress.allow_subnets.is_none()).then_some(
-        "note: allow-subnets is unset (allow-all), so direct-to-IP traffic is admitted \
-         beside the dns-hosts list; add --allow-subnets to restrict it",
-    )
-}
-
 /// The classifier advisory a create reply carries (NET-079), as the line
 /// the activation prints: this host's cause in words for why it cannot
 /// decide a host-address box's egress verdict per box, the state that
@@ -3270,7 +3234,12 @@ fn normalize_subnets(entries: &[String]) -> Vec<String> {
 }
 
 /// One egress rule row: the CIDR or hostname list, or the default the policy
-/// resolves to when the dimension is unset.
+/// resolves to when the dimension is unset. Writes comma-separated entries
+/// to `out`, using `default` for an unset list and `(none)` for an empty list.
+///
+/// # Errors
+///
+/// Propagates errors from writing the row to `out`.
 fn write_rules(
     out: &mut impl std::io::Write,
     label: &str,
@@ -3279,6 +3248,11 @@ fn write_rules(
 ) -> Result<(), anyhow::Error> {
     match rules {
         None => writeln!(out, "  {label}  {default}")?,
+        // A list that is present and empty grants nothing in its dimension
+        // — the shape an absent destination list resolves to on a box of
+        // any network mode (NET-074) — and is spelled out, never printed as
+        // a blank value in the egress display.
+        Some(rules) if rules.is_empty() => writeln!(out, "  {label}  (none)")?,
         Some(rules) => writeln!(out, "  {label}  {}", rules.join(", "))?,
     }
     Ok(())
@@ -4001,46 +3975,6 @@ mod tests {
         CredentialedUpstream, DynamicIngress, EffectiveEgress, EffectiveSessionPolicy,
         IngressPolicy, IpProto, NetworkMode, PortMapping,
     };
-
-    #[test]
-    fn half_open_name_allowlist_note_fires_only_for_names_without_subnets() {
-        let names = Some(vec!["github.com".to_string()]);
-        let shape = |allow_subnets, allow_dns_hosts| sessions::EgressPolicy {
-            allow_subnets,
-            allow_dns_hosts,
-            allow_protocols: None,
-            deny_subnets: None,
-        };
-
-        let half_open = shape(None, names.clone());
-        let note =
-            half_open_name_allowlist_note(Some(&half_open)).expect("half-open shape is noted");
-        // The NET-066 child requirement: the line names the allow-all
-        // subnets and the flag that closes them.
-        assert!(note.contains("allow-all"), "{note}");
-        assert!(note.contains("--allow-subnets"), "{note}");
-        // A deny list carves ranges out of the allow-all; the rest of the
-        // address space stays reachable by IP, so the note still fires.
-        let denied_only = sessions::EgressPolicy {
-            deny_subnets: Some(vec!["10.0.0.0/8".to_string()]),
-            ..shape(None, names.clone())
-        };
-        assert!(half_open_name_allowlist_note(Some(&denied_only)).is_some());
-
-        for closed in [
-            shape(Some(vec![]), names.clone()),
-            shape(Some(vec!["140.82.112.0/20".to_string()]), names.clone()),
-            shape(None, None),
-            shape(None, Some(vec![])),
-            sessions::EgressPolicy::deny_all(),
-        ] {
-            assert!(
-                half_open_name_allowlist_note(Some(&closed)).is_none(),
-                "no note for {closed:?}"
-            );
-        }
-        assert!(half_open_name_allowlist_note(None).is_none());
-    }
 
     #[test]
     fn normalize_subnets_masks_host_bits_and_keeps_the_rest() {
@@ -4774,6 +4708,33 @@ mod tests {
         assert_eq!(
             not_deny_all_json["rules"]["allow_subnets"][0], "10.0.0.0/8",
             "the named subnet rides the declared section: {not_deny_all_json}"
+        );
+
+        // A names-only declaration on an own-address box resolves its
+        // absent `allow_subnets` to present and empty (NET-074): the row is
+        // spelled out as `(none)`, never printed blank, and the section is
+        // not deny-all, since its names grant reach.
+        let names_only = EffectiveSessionPolicy {
+            egress: EffectiveEgress::Declared(sessions::EgressPolicy {
+                allow_subnets: Some(vec![]),
+                allow_dns_hosts: Some(vec!["github.com".to_string()]),
+                allow_protocols: None,
+                deny_subnets: None,
+            }),
+            ingress: None,
+            credentialed_upstream: None,
+        };
+        let mut out = Vec::new();
+        format_policy(&mut out, &names_only, NetworkMode::OwnIp, None, &[], None).unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(
+            rendered.contains("  subnets  (none)\n")
+                && rendered.contains("  dns hosts  github.com\n"),
+            "a resolved-empty list is spelled out beside the names: {rendered}"
+        );
+        assert!(
+            !rendered.contains("egress\n  deny-all\n"),
+            "a names-only section grants reach and is not deny-all: {rendered}"
         );
     }
 
