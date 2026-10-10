@@ -232,9 +232,9 @@ pub(crate) fn effective_egress_section(
 /// default is in force (NET-074), the allow-all default for everything an
 /// opt-out (NET-077) or an earlier phase leaves in place, and a declaration
 /// with the destination lists it left absent resolved. `phase` resolves
-/// under, exactly as [`effective_egress_section`] documents. The declaration on the record is left untouched: the strict
-/// `SessionPolicy` a client reads back stays exactly what the box was
-/// launched with.
+/// under, exactly as [`effective_egress_section`] documents. The
+/// declaration on the record is left untouched: the strict `SessionPolicy`
+/// a client reads back stays exactly what the box was launched with.
 pub(crate) fn effective_session_policy(
     policy: &sessions::SessionPolicy,
     network: sessions::NetworkMode,
