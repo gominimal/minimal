@@ -79,16 +79,29 @@ fn reap_with(procs: &impl ProcessLookup, binary: &Path, switch_sock: &Path) -> a
     // SAFETY: getppid(2) takes no arguments and cannot fail.
     let my_parent = unsafe { libc::getppid() } as u32;
     // Collect the candidates first, then signal each after a fresh check.
+    // A pid whose argv cannot be read is skipped, not retried: a real
+    // leftover is long past its exec and reads stably. The skipped pids are
+    // logged, so a leftover ever skipped this way leaves a trace.
+    let mut unreadable = Vec::new();
     let candidates: Vec<u32> = procs
         .all_pids()
         .into_iter()
         .filter(|&pid| pid != me && pid != my_parent)
-        .filter(|&pid| {
-            procs
-                .argv(pid)
-                .is_some_and(|argv| argv_is_stale_gvproxy(&argv, binary, switch_sock))
+        .filter(|&pid| match procs.argv(pid) {
+            Some(argv) => argv_is_stale_gvproxy(&argv, binary, switch_sock),
+            None => {
+                unreadable.push(pid);
+                false
+            }
         })
         .collect();
+    if !unreadable.is_empty() {
+        tracing::debug!(
+            count = unreadable.len(),
+            pids = ?unreadable,
+            "stale gvproxy scan skipped processes whose argv could not be read"
+        );
+    }
     // Fail closed before killing anything: a live minvmd owning this VM's
     // switch means the alive-lock invariant is broken, and spawning would
     // bind a second switch beside it.
@@ -667,11 +680,19 @@ mod tests {
 
         // The reap returns once the leftover is gone (a zombie, here, since
         // this test is its parent), so the exit is reapable without a wait.
+        // A stand-in spawned moments earlier may not have finished its exec,
+        // though: macOS's /bin/sh re-execs a shell, and while that exec is in
+        // flight the stand-in's argv (KERN_PROCARGS2) is unreadable or still
+        // the parent's, so a scan in that window skips it and the reap still
+        // returns Ok. While the leftover lives, the reap runs again; it is
+        // idempotent, since a killed leftover is a zombie the scan no longer
+        // matches.
         let by = Instant::now() + Duration::from_secs(5);
         let status = loop {
             if let Some(status) = child.try_wait().expect("try_wait stand-in") {
                 break status;
             }
+            reap_stale_gvproxy(&binary, &sock).expect("reap");
             assert!(
                 Instant::now() < by,
                 "stale gvproxy stand-in survived the reap"
@@ -700,12 +721,15 @@ mod tests {
         reap_stale_gvproxy(&binary, &sock).expect("reap");
 
         // The reap returns once the leftover is gone (a zombie, since this
-        // test is its parent).
+        // test is its parent). The leftover is re-reaped while it lives, as
+        // in `reap_kills_this_vms_leftover`; the other stand-ins can never
+        // match this VM's tokens, so the repeats cannot touch them.
         let by = Instant::now() + Duration::from_secs(5);
         let status = loop {
             if let Some(status) = ours.try_wait().expect("try_wait ours") {
                 break status;
             }
+            reap_stale_gvproxy(&binary, &sock).expect("reap");
             assert!(Instant::now() < by, "this VM's leftover survived the reap");
             std::thread::sleep(Duration::from_millis(10));
         };
