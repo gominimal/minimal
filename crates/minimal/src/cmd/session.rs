@@ -2293,10 +2293,13 @@ pub fn deny_all_default_notice(phase: sessions::EgressDefaultPhase) -> Option<&'
 /// whose egress names hosts (`allow_dns_hosts`) but leaves `allow_subnets`
 /// unset: an unset subnets dimension is allow-all, so the gate admits
 /// direct-to-IP traffic beside the name allow list, while the policy view's
-/// `dns hosts` row reads as if the names were the box's whole reach. `None`
-/// for every other shape — no egress section (NET-074's note covers it),
-/// no names, or subnets declared (empty or not), where the names are
-/// genuinely the reach.
+/// `dns hosts` row reads as if the names were the box's whole reach. A
+/// `deny_subnets` list does not close it: it carves ranges out of the
+/// allow-all, and every other address stays reachable by IP, so the note
+/// still fires and is worded for that shape as well. `None` for every
+/// other shape — no egress section (NET-074's note covers it), no names, or
+/// subnets declared (empty or not), where the names are genuinely the
+/// reach.
 pub fn half_open_name_allowlist_note(
     egress: Option<&sessions::EgressPolicy>,
 ) -> Option<&'static str> {
@@ -2306,8 +2309,8 @@ pub fn half_open_name_allowlist_note(
         .as_ref()
         .is_some_and(|hosts| !hosts.is_empty());
     (names_hosts && egress.allow_subnets.is_none()).then_some(
-        "note: subnets is still allow-all; add --allow-subnets to restrict direct-to-IP \
-         traffic too",
+        "note: allow-subnets is unset, so direct-to-IP traffic is admitted beside the \
+         dns-hosts list; add --allow-subnets to restrict it",
     )
 }
 
@@ -4034,6 +4037,13 @@ mod tests {
 
         let half_open = shape(None, names.clone());
         assert!(half_open_name_allowlist_note(Some(&half_open)).is_some());
+        // A deny list carves ranges out of the allow-all; the rest of the
+        // address space stays reachable by IP, so the note still fires.
+        let denied_only = sessions::EgressPolicy {
+            deny_subnets: Some(vec!["10.0.0.0/8".to_string()]),
+            ..shape(None, names.clone())
+        };
+        assert!(half_open_name_allowlist_note(Some(&denied_only)).is_some());
 
         for closed in [
             shape(Some(vec![]), names.clone()),
