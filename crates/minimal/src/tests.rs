@@ -2039,6 +2039,51 @@ async fn stop_force_stops_a_wedged_vm_from_the_host() {
     );
 }
 
+/// A VM that is still booting has no VMM pid to signal, so `min stop --force`
+/// must not report a host-side stop it did not make: it refuses with the
+/// retry, and leaves the boot's `Starting` state for the supervisor to finish.
+#[tokio::test]
+async fn stop_force_refuses_a_booting_vm() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider_dir =
+        client::resolve_provider_dir(Some(dir.path()), true).expect("resolve provider dir");
+    let state_dir = minvmd::state::StateDir::new(provider_dir).expect("open state dir");
+    state_dir
+        .write_state(&minvmd::state::State {
+            lifecycle: minvmd::lifecycle::Lifecycle::Starting,
+            vmm_pid: None,
+            started_at: None,
+            ..minvmd::state::State::stopped()
+        })
+        .unwrap();
+    let _lock = state_dir
+        .try_acquire_alive_lock()
+        .unwrap()
+        .expect("acquire alive lock");
+
+    let global = GlobalArgs {
+        repo_dir: None,
+        minimal_dir: Some(dir.path().to_path_buf()),
+        config_dir: None,
+        provider: Some(Provider::LocalMinvmd),
+        no_input: true,
+        vm: None,
+    };
+    let err = cmd_stop(&global, StopArgs { force: true })
+        .await
+        .expect_err("a booting VM was not stopped from the host");
+
+    let chain = format!("{err:#}");
+    assert!(
+        chain.contains("still booting") && chain.contains("`min stop`"),
+        "expected the retry hint, got: {chain}"
+    );
+    assert_eq!(
+        state_dir.read_state().unwrap().lifecycle,
+        minvmd::lifecycle::Lifecycle::Starting
+    );
+}
+
 /// Without `--force` the wedged VM keeps its non-zero exit — force-stopping a
 /// VM that may still be draining is not the default behaviour — but the error
 /// now names the recovery instead of a bare connect failure.

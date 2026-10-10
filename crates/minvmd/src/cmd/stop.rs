@@ -23,12 +23,15 @@ pub fn run() -> Result<()> {
 /// would: best-effort guest Shutdown over the bridge socket in that dir, then
 /// SIGTERM (SIGKILL after 5 s) to the VMM, then `Stopped`.
 ///
+/// `quiesce_guest` false skips the guest Shutdown, for a caller whose own
+/// Shutdown RPC to that guest has just failed.
+///
 /// For the minvmd binary `provider_dir` is the process-global default
 /// ([`StateDir::default_path`]); the `minimal` CLI passes the provider dir it
 /// resolved for *its* VM, so `min stop --force` can stop a wedged VM from the
 /// host when the in-guest daemon cannot answer.
-pub fn stop_at(provider_dir: std::path::PathBuf) -> Result<()> {
-    run_with_state_dir(provider_dir, true)
+pub fn stop_at(provider_dir: std::path::PathBuf, quiesce_guest: bool) -> Result<()> {
+    run_with_state_dir(provider_dir, quiesce_guest)
 }
 
 /// `quiesce_guest` gates the Shutdown RPC (R2.3): production passes `true`;
@@ -298,7 +301,7 @@ mod tests {
         let _lock = sd.try_acquire_alive_lock().unwrap().expect("acquire");
 
         let started = std::time::Instant::now();
-        stop_at(tmp.path().to_path_buf()).expect("host-side stop succeeds");
+        stop_at(tmp.path().to_path_buf(), true).expect("host-side stop succeeds");
         assert!(
             started.elapsed() < std::time::Duration::from_secs(10),
             "a wedged VM must stop within the connect deadline plus the grace"

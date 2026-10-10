@@ -3852,11 +3852,12 @@ pub async fn cmd_stop(global: &GlobalArgs, args: StopArgs) -> Result<(), anyhow:
                 println!("Daemon is not running.");
                 return Ok(());
             }
+            // The CLI never reached the guest, so `minvmd stop`'s own guest
+            // Shutdown is still worth its bounded 5 s connect attempt.
             return if args.force {
-                stop_wedged_vm_from_host(global.minimal_dir.clone()).await
+                stop_wedged_vm_from_host(global.minimal_dir.clone(), true).await
             } else {
-                Err(connect_err
-                    .context("the VM is not answering; `min stop --force` stops it from the host"))
+                Err(connect_err.context(wedged_vm_hint()))
             };
         }
     };
@@ -3879,11 +3880,12 @@ pub async fn cmd_stop(global: &GlobalArgs, args: StopArgs) -> Result<(), anyhow:
                     .await =>
         {
             if !args.force {
-                return Err(rpc_err.context(
-                    "the VM is not answering; `min stop --force` stops it from the host",
-                ));
+                return Err(rpc_err.context(wedged_vm_hint()));
             }
-            return stop_wedged_vm_from_host(global.minimal_dir.clone()).await;
+            // The guest has just been asked to shut down and did not answer:
+            // asking again would only add up to two more minutes of waiting
+            // before the host-side stop.
+            return stop_wedged_vm_from_host(global.minimal_dir.clone(), false).await;
         }
         resp => resp,
     };
@@ -3923,7 +3925,16 @@ pub async fn cmd_stop(global: &GlobalArgs, args: StopArgs) -> Result<(), anyhow:
 ///
 /// Only reached on a minvmd backend with `--force`, once the guest is proven
 /// unreachable; a native minimald is not a VM and keeps its own error.
-async fn stop_wedged_vm_from_host(minimal_dir: Option<PathBuf>) -> Result<(), anyhow::Error> {
+/// `quiesce_guest` is false when the CLI's own Shutdown RPC has just failed,
+/// so the guest is not asked a second time.
+///
+/// A VM that is still booting has no VMM pid the host could signal, and its
+/// supervisor would write `Running` over a `Stopped` this wrote, so that case
+/// is refused rather than reported as a host-side stop.
+async fn stop_wedged_vm_from_host(
+    minimal_dir: Option<PathBuf>,
+    quiesce_guest: bool,
+) -> Result<(), anyhow::Error> {
     let provider_dir = client::resolve_provider_dir(minimal_dir.as_deref(), true)
         .context("resolving the VM's provider dir for a host-side stop")?;
 
@@ -3932,7 +3943,17 @@ async fn stop_wedged_vm_from_host(minimal_dir: Option<PathBuf>) -> Result<(), an
     // worker (rust-coding-standards: no blocking in an async context).
     let wait_dir = minimal_dir;
     tokio::task::spawn_blocking(move || {
-        minvmd::cmd::stop::stop_at(provider_dir).context("stopping the VM from the host")?;
+        let state = minvmd::state::StateDir::new(provider_dir.clone())
+            .and_then(|state_dir| state_dir.effective_state())
+            .context("reading the VM's state for a host-side stop")?;
+        if state.lifecycle == minvmd::lifecycle::Lifecycle::Starting || state.vmm_pid.is_none() {
+            anyhow::bail!(
+                "the VM is still booting; retry `{}` once it is up",
+                stop_command()
+            );
+        }
+        minvmd::cmd::stop::stop_at(provider_dir, quiesce_guest)
+            .context("stopping the VM from the host")?;
         autospawn::wait_for_daemon_stopped(true, wait_dir.as_deref())
             .context("the VM did not reach the stopped state")
     })
@@ -3947,6 +3968,23 @@ async fn stop_wedged_vm_from_host(minimal_dir: Option<PathBuf>) -> Result<(), an
          (its volume may replay its journal on the next boot)"
     );
     Ok(())
+}
+
+/// `min stop` for the VM this command drives: a bare `min stop` targets the
+/// default VM, so a named one must carry its `--vm` (NET-052).
+fn stop_command() -> String {
+    match client::vm_name() {
+        paths::DEFAULT_VM_NAME => "min stop".to_owned(),
+        vm => format!("min --vm {vm} stop"),
+    }
+}
+
+/// The error context `min stop` adds when the VM's guest does not answer.
+fn wedged_vm_hint() -> String {
+    format!(
+        "the VM is not answering; `{} --force` stops it from the host",
+        stop_command()
+    )
 }
 
 /// Whether the daemon can be *observed* to have stopped — the question the
