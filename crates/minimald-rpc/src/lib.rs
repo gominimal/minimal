@@ -141,6 +141,17 @@ pub fn version_skew_message(cli: &str, daemon: &str) -> Option<String> {
     })
 }
 
+/// How a user-namespace refusal opens (NET-141): the daemon formats a
+/// create refused on the host's user-namespace verdict as this lead, the
+/// cause (`sandbox2::UsernsRestriction::cause`) closing the parenthesis,
+/// and the cause's remedy for the daemon on a second line. Clients print
+/// the daemon's text verbatim, as they do every create refusal, so nothing
+/// on their side matches on the lead. Only the lead lives here: the cause
+/// and remedy texts are `sandbox2`'s, where the restriction is diagnosed
+/// and both binaries that probe it already look.
+pub const USER_NAMESPACE_REFUSAL_LEAD: &str =
+    "this machine blocks the private sandbox every box runs in (";
+
 /// An RPC to list sessions managed by this minimald.
 pub struct ListSessions;
 
@@ -3351,11 +3362,7 @@ mod tests {
                  installed on this host. While it cannot, its host-address \
                  boxes run unenforced — whatever the boxes' declarations \
                  say. Install the classifier's privileged step with:\n  \
-                 run: curl -fsSLO https://raw.githubusercontent.com/gominimal/\
-                 minimal/main/scripts/install-host-classifier.sh && sudo bash \
-                 ./install-host-classifier.sh --user <the account this \
-                 daemon runs as> --cohort-address <cohort address> \
-                 --node-plane-address <node-plane address>"
+                 min finalize-install"
                     .to_string(),
             ),
             host_ip_enforcement: Some("none".into()),
@@ -3370,7 +3377,7 @@ mod tests {
             "the advisory names its cause in words, got: {json}",
         );
         assert!(
-            json.contains("sudo bash ./install-host-classifier.sh"),
+            json.contains("min finalize-install"),
             "the step's cause names the exact command that installs it, got: {json}",
         );
         assert_eq!(round_trip(&step_missing), step_missing);
@@ -3392,7 +3399,7 @@ mod tests {
         };
         let json = serde_json_lenient::to_string(&cannot_confine).expect("serializes");
         assert!(
-            !json.contains("install-host-classifier"),
+            !json.contains("min finalize-install"),
             "a cause no command clears names no command, got: {json}",
         );
         assert_eq!(round_trip(&cannot_confine), cannot_confine);

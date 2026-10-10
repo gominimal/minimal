@@ -458,6 +458,13 @@ NET080_SEED_DIR="" # seeded by the daemon-fetch proof below; removed on teardown
 # not leave a host's packet filter deciding behind it, so the teardown unloads
 # whatever this flag says is ours.
 NET080_CLASSIFIER_INSTALLED=""
+# The classifier install a native case's setup script made: on a host with no
+# classifier, the script `min finalize-install --show --script` prints carries
+# the classifier's block beside the names', so a case that runs it whole also
+# installs the tree, the table, the step's copy and its systemd units. The case
+# removes them before it returns (setup_classifier_teardown), and the teardown
+# does for a run that died first.
+SETUP_CLASSIFIER_INSTALLED=""
 # The same three for the host_ip_deny_all proof: the two project seeds its two
 # halves activate against (removed on teardown like every other seed), and the
 # classifier tree+table its decided half installs (its own, removed before the
@@ -933,6 +940,8 @@ teardown() {
   # Every proof that runs the advisory as root also installs the answerer
   # host service; a run that died after that must not leave it behind.
   answerer_service_teardown
+  # Nor the classifier install the same script made on a host with none.
+  setup_classifier_teardown || true
   # The native-resolution proof points the HOST resolver at the daemon's
   # answerer; a run that died between that and its own revert must not leave
   # the change behind. `resolvectl revert` restores the link's DNS state and
@@ -2474,12 +2483,14 @@ proof_host_ip_deny_all() {
     # the common ancestor of its starting cgroup and the slice is the
     # root-owned hierarchy root — the barrier that stops a box climbing out
     # is the same fact that stops the daemon climbing in. The installer's
-    # --pid step is the supported placement, and the placement probe is per
-    # launch, so the next box this daemon launches is decided on a leaf of
-    # its own. Found off /proc, keyed on comm (a cmdline match would take an
-    # editor holding a file under crates/minimald for the daemon itself)
-    # and on this account, so another account's daemon is never placed in
-    # this case's tree.
+    # --place-listener step is the placement the path unit `min
+    # finalize-install` installs makes at every daemon start: it finds the
+    # daemon by the socket it holds, never by a pid anyone names, and the
+    # placement probe is per launch, so the next box this daemon launches
+    # is decided on a leaf of its own. The pid is still read here, off
+    # /proc, keyed on comm (a cmdline match would take an editor holding a
+    # file under crates/minimald for the daemon itself) and on this account,
+    # to check the step placed THAT process and no other.
     hida_daemons=""
     for hida_proc in /proc/[0-9]*; do
       [ -r "$hida_proc/comm" ] || continue
@@ -2493,20 +2504,31 @@ proof_host_ip_deny_all() {
       echo "::error::expected exactly one $min_daemon under this account to place in its leaf, found: ${hida_daemons:-none}"
       fail
     fi
+    hida_sock="$XDG_STATE_HOME/minimal/providers/local-minimald0/ssh.sock"
+    if [ ! -S "$hida_sock" ]; then
+      echo "::error::the daemon's listener is not at $hida_sock, so the placement unit's step has nothing to find it by"
+      fail
+    fi
     # shellcheck disable=SC2024
-    if ! sudo -n "$ROOT/scripts/install-host-classifier.sh" --pid "$hida_pid" \
+    if ! sudo -n "$ROOT/scripts/install-host-classifier.sh" --user "$(id -un)" \
+        --place-listener "$hida_sock" \
         >"$WORK/hida-place.out" 2>"$WORK/hida-place.err"; then
-      echo "::error::the installer's --pid step could not place $min_daemon $hida_pid in its leaf"
+      echo "::error::the installer's --place-listener step could not place $min_daemon $hida_pid in its leaf"
       echo "--- installer stderr ---"; cat "$WORK/hida-place.err" 2>/dev/null || true
       fail
     fi
     hida_place_out="$(cat "$WORK/hida-place.out" 2>/dev/null || true)"
     if [[ "$hida_place_out" != *"placed $hida_pid in"* ]]; then
-      echo "::error::the --pid step did not report placing $min_daemon $hida_pid"
+      echo "::error::the --place-listener step did not report placing $min_daemon $hida_pid (the holder of $hida_sock)"
       echo "--- installer output ---"; printf '%s\n' "$hida_place_out"
       fail
     fi
-    echo "place: $min_daemon $hida_pid is inside the slice, so the box this case launches is decided on a leaf of its own"
+    if ! grep -qx "$hida_pid" /sys/fs/cgroup/minimald.slice/daemon/cgroup.procs 2>/dev/null; then
+      echo "::error::$min_daemon $hida_pid is not a member of /sys/fs/cgroup/minimald.slice/daemon after the --place-listener step"
+      echo "--- daemon leaf members ---"; cat /sys/fs/cgroup/minimald.slice/daemon/cgroup.procs 2>/dev/null || true
+      fail
+    fi
+    echo "place: $min_daemon $hida_pid, found as the holder of $hida_sock, is inside the slice's daemon leaf, so the box this case launches is decided on a leaf of its own"
 
     # ---- the daemon's own fact, turned the one way it is: a launch. A
     # create answers from the last read the host gave it — the start-up
@@ -3097,7 +3119,7 @@ proof_host_ip_deny_all() {
   fi
   case "$hida_un_cause" in
     "the classifier's privileged step is not installed on this host")
-      if [[ "$hida_un_activate_err" != *"install-host-classifier.sh"* ]]; then
+      if [[ "$hida_un_activate_err" != *"min finalize-install"* ]]; then
         echo "::error::the advisory names the missing step but not the command that installs it"
         printf '%s\n' "$hida_un_activate_err"
         fail
@@ -3105,7 +3127,7 @@ proof_host_ip_deny_all() {
       echo "advisory: the cause is the missing step, and the advisory ends with the exact command that installs it"
       ;;
     *)
-      if [[ "$hida_un_activate_err" == *"install-host-classifier.sh"* ]]; then
+      if [[ "$hida_un_activate_err" == *"min finalize-install"* ]]; then
         echo "::error::the advisory names an install command for a host that cannot confine a box: installing the step over that tree would leave the cause standing"
         printf '%s\n' "$hida_un_activate_err"
         fail
@@ -7666,6 +7688,59 @@ answerer_channel_of() {
     -e 's/^[[:space:]]*<string>\(\/.*\/answerer\.sock\)<\/string>$/\1/p' | head -n1
 }
 
+# Called on the setup script file $1 just before a case runs it as root:
+# records that the run is about to install the classifier, when the script
+# carries the classifier's block (its ownership-record line) and this host
+# has no classifier yet. A host that already carries one — its tree, or the
+# record of an earlier install — is the host's own: the block only refreshes
+# it, and nothing here removes it afterwards.
+setup_classifier_note() {
+  grep -q '^: > /var/lib/minimal/finalize-install-classifier$' "$1" 2>/dev/null || return 0
+  if [ -e /sys/fs/cgroup/minimald.slice ] \
+     || [ -e /var/lib/minimal/finalize-install-classifier ]; then
+    return 0
+  fi
+  SETUP_CLASSIFIER_INSTALLED=1
+}
+
+# Removes the classifier install a setup script made (see
+# SETUP_CLASSIFIER_INSTALLED): the cases that run the script are about names,
+# and the two classifier proofs later in the lane install their own and refuse
+# a host that already carries one, so the host must be as the case found it.
+# The order is the installer's: the daemon stops first (the path unit placed
+# it in the tree's daemon leaf, and the uninstall refuses while a process or
+# a live leaf holds the tree), the units go before the tree so no later
+# daemon start is placed and no boot re-installs it, then the step's own
+# --uninstall, then the files the block wrote. A no-op until a case recorded
+# an install. Returns non-zero when the tree is still there.
+setup_classifier_teardown() {
+  [ -n "${SETUP_CLASSIFIER_INSTALLED:-}" ] || return 0
+  mnl stop --force >/dev/null 2>&1 || true
+  sudo -n systemctl disable --now minimald-place.path minimald-place.service \
+    minimald-classifier.service >/dev/null 2>&1 || true
+  # A box's leaf can outlive the stop by a moment; the uninstall is retried
+  # over a bounded wait rather than failed on the first refusal.
+  for _ in $(seq 1 20); do
+    [ -e /sys/fs/cgroup/minimald.slice ] || break
+    sudo -n "$ROOT/scripts/install-host-classifier.sh" --uninstall >/dev/null 2>&1 && break
+    sleep 0.5
+  done
+  sudo -n rm -f /etc/systemd/system/minimald-place.path \
+    /etc/systemd/system/minimald-place.service \
+    /etc/systemd/system/minimald-classifier.service \
+    /usr/local/lib/minimal/install-host-classifier.sh \
+    /usr/local/lib/minimal/install-host-classifier.sh.new >/dev/null 2>&1 || true
+  sudo -n rmdir /usr/local/lib/minimal >/dev/null 2>&1 || true
+  sudo -n systemctl daemon-reload >/dev/null 2>&1 || true
+  sudo -n systemctl reset-failed minimald-place.path minimald-place.service \
+    minimald-classifier.service >/dev/null 2>&1 || true
+  if [ -e /sys/fs/cgroup/minimald.slice ]; then
+    return 1
+  fi
+  sudo -n rm -f /var/lib/minimal/finalize-install-classifier >/dev/null 2>&1 || true
+  SETUP_CLASSIFIER_INSTALLED=""
+}
+
 # The setup script `min finalize-install --show --script` wrote to $1 (its stdout), whole,
 # when that is a script — its first line `#!/bin/sh` — and nothing otherwise
 # (a host with nothing to run, or a blocker, prints only its note on
@@ -7957,6 +8032,7 @@ proof_native_resolution_without_proxy_env() {
       esac
       # Run the exact command the advisory printed — verbatim, as the user
       # would have. Passwordless sudo is the gate above, so it cannot prompt.
+      setup_classifier_note "$native_setup"
       # shellcheck disable=SC2024 # the output files are this user's, not root's
       if ! sudo -n sh "$native_setup" >"$WORK/native-cmd.out" 2>"$WORK/native-cmd.err"; then
         echo "::error::the advisory's command did not run (are resolvectl and ip usable here?)"
@@ -8058,6 +8134,12 @@ proof_native_resolution_without_proxy_env() {
   fi
 
   mnl session destroy --force "$native_sid" >/dev/null 2>&1 || true
+  # The classifier the same script installed on a host that had none: removed
+  # here, so the lane's classifier proofs find the host as this case did.
+  if ! setup_classifier_teardown; then
+    echo "::error::the classifier install the setup script made could not be removed — a live leaf or process still holds /sys/fs/cgroup/minimald.slice"
+    fail
+  fi
   echo "native min.internal resolution with no proxy settings OK (${native_proved:-advisory race} — each printed)"
   echo "::endgroup::"
 }
@@ -8868,6 +8950,7 @@ proof_box_name_resolves_natively_without_proxy() {
         fi
         ;;
     esac
+    setup_classifier_note "$bn_setup"
     # shellcheck disable=SC2024 # the output files are this user's, not root's
     if ! sudo -n sh "$bn_setup" >"$WORK/bn-cmd.out" 2>"$WORK/bn-cmd.err"; then
       echo "::error::the advisory's command did not run (are resolvectl and ip usable here?)"
@@ -9186,6 +9269,12 @@ proof_box_name_resolves_natively_without_proxy() {
 
   rm -rf "$BN_SEED_DIR" "$BN_API_SEED_DIR"
   BN_SEED_DIR=""; BN_API_SEED_DIR=""
+  # The classifier the same script installed on a host that had none: removed
+  # here, so the lane's classifier proofs find the host as this case did.
+  if ! setup_classifier_teardown; then
+    echo "::error::the classifier install the setup script made could not be removed — a live leaf or process still holds /sys/fs/cgroup/minimald.slice"
+    fail
+  fi
   echo "box names resolve natively in any browser OK (each lookup with its answer, each record, and the surface — printed)"
   echo "::endgroup::"
 }
@@ -10051,6 +10140,7 @@ proof_native_answerer_survives_session_stop() {
   local nasr_released_before nasr_service_before
   nasr_released_before="$(nasr_count "$nasr_base_a" 'released the interim answerer')"
   nasr_service_before="$(nasr_count "$nasr_base_a" 'the manager-held answerer service')"
+  setup_classifier_note "$nasr_a_setup"
   # shellcheck disable=SC2024 # the output files are this user's, not root's
   if ! sudo -n sh "$nasr_a_setup" >"$WORK/nasr-cmd.out" 2>"$WORK/nasr-cmd.err"; then
     echo "::error::the advisory's command did not run"
@@ -10137,6 +10227,12 @@ proof_native_answerer_survives_session_stop() {
     echo "::warning::could not remove the dedicated link $NASR_REVERT_LINK"
   fi
   rm -rf "$NASR_SEED_DIR"; NASR_SEED_DIR=""
+  # The classifier the same script installed on a host that had none: removed
+  # here, so the lane's classifier proofs find the host as this case did.
+  if ! setup_classifier_teardown; then
+    echo "::error::the classifier install the setup script made could not be removed — a live leaf or process still holds /sys/fs/cgroup/minimald.slice"
+    fail
+  fi
   echo "native answerer survives session stop OK (interim, handover, second node, session and daemon stop — each printed)"
   echo "::endgroup::"
 }
