@@ -5315,8 +5315,9 @@ mod tests {
                 "this machine blocks the private sandbox every box runs in (user namespaces \
                  are switched off (user.max_user_namespaces=0 or no kernel support)), so no \
                  box can start here yet.\n\
-                 Set user.max_user_namespaces above 0 persistently (a /etc/sysctl.d drop-in) \
-                 or use a kernel with CONFIG_USER_NS.",
+                 Set user.max_user_namespaces above 0: sudo sysctl -w \
+                 user.max_user_namespaces=15000 takes effect now, a /etc/sysctl.d drop-in \
+                 keeps it across reboots; or use a kernel with CONFIG_USER_NS.",
                 "finalize-install",
             ),
         ] {

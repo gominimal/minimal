@@ -1234,9 +1234,10 @@ async fn activate_refusal_names_finalize_install_for_apparmor_restriction() {
 }
 
 /// `user.max_user_namespaces=0` (or a kernel without `CONFIG_USER_NS`) names
-/// the sysctl key and the persistent change — a sysctl.d drop-in, or a
-/// kernel built with the namespace — and not `min finalize-install`, whose
-/// profile cannot lift it.
+/// the sysctl key, the immediate `sysctl -w` the live gate picks up on the
+/// next create, and the persistent change — a sysctl.d drop-in, or a kernel
+/// built with the namespace — and not `min finalize-install`, whose profile
+/// cannot lift it.
 #[tokio::test]
 async fn activate_refusal_names_sysctl_for_max_user_namespaces_zero() {
     let refusal = refused_activation(minimald::server::UsernsRestriction::Disabled).await;
@@ -1245,8 +1246,9 @@ async fn activate_refusal_names_sysctl_for_max_user_namespaces_zero() {
         "error: this machine blocks the private sandbox every box runs in (user namespaces are \
          switched off (user.max_user_namespaces=0 or no kernel support)), so no box can start \
          here yet.\n\
-         Set user.max_user_namespaces above 0 persistently (a /etc/sysctl.d drop-in) or use a \
-         kernel with CONFIG_USER_NS."
+         Set user.max_user_namespaces above 0: sudo sysctl -w user.max_user_namespaces=15000 \
+         takes effect now, a /etc/sysctl.d drop-in keeps it across reboots; or use a kernel \
+         with CONFIG_USER_NS."
     );
     assert!(
         !refusal.contains("finalize-install"),

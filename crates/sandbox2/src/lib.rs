@@ -2895,13 +2895,16 @@ impl UsernsRestriction {
     /// install step for the daemon, the loader with `--path` for `mip` —
     /// never by `sudo sysctl`, which switches the protection off for every
     /// program, is lost at boot, and leaves the install's record unchanged.
-    /// Switched-off namespaces no profile can lift: the sysctl made
-    /// persistent, or a kernel built with them.
+    /// Switched-off namespaces no profile can lift: the sysctl set now (the
+    /// gate re-reads it on the next create) and made persistent, or a kernel
+    /// built with them.
     #[must_use]
     pub fn remedy(self, target: RemedyTarget<'_>) -> String {
         match (self, target) {
-            (Self::Disabled, _) => "Set user.max_user_namespaces above 0 persistently (a \
-                                    /etc/sysctl.d drop-in) or use a kernel with CONFIG_USER_NS."
+            (Self::Disabled, _) => "Set user.max_user_namespaces above 0: sudo sysctl -w \
+                                    user.max_user_namespaces=15000 takes effect now, a \
+                                    /etc/sysctl.d drop-in keeps it across reboots; or use a \
+                                    kernel with CONFIG_USER_NS."
                 .to_string(),
             (Self::ApparmorUnconfined, RemedyTarget::Daemon) => {
                 "Finish the install to allow it for Minimal only: min finalize-install   (see \
