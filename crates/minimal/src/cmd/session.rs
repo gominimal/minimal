@@ -262,8 +262,12 @@ async fn attached_session_record(
 /// state already holding.
 ///
 /// A destroy no client of this host issues — the daemon's own reap — still
-/// leaves the hold until the VM host daemon restarts: holds carry no
-/// liveness signal of their own.
+/// leaves the hold, across VM host daemon restarts too, since holds are
+/// persisted: holds carry no liveness signal of their own. The hold blocks
+/// nothing — a registration under the name is checked against rows and
+/// creations, never holds, and a new session's hold of the name takes it
+/// over — so all it keeps is the name answering NODATA, not NXDOMAIN, until
+/// a session of that name holds it and releases it.
 pub(crate) async fn release_held_name_after_attach(
     sock: &std::path::Path,
     id: sessions::SessionId,
@@ -306,6 +310,13 @@ pub(crate) async fn release_held_name_after_attach(
 /// it: a box that registered a row owns its name through the row, which
 /// `resume_box_row` re-sends, and a `none` or `own_ip` session holds
 /// nothing.
+///
+/// The record was read before the hold, so a destroy another client
+/// issues in between can release the session's holds first and leave
+/// this one standing for a session that is gone — persisted, so it would
+/// outlive every restart. The session is looked up again once the hold
+/// is made, and a session gone by then has the hold released by its id:
+/// a destroy that lands after that lookup releases it itself.
 pub(crate) async fn rehold_held_name_before_attach(
     sock: &std::path::Path,
     id: sessions::SessionId,
@@ -324,6 +335,9 @@ pub(crate) async fn rehold_held_name_before_attach(
         return;
     };
     hold_box_name_with_vm_host(control_sock_beside(sock), name, Some(id), true).await;
+    if let Ok(None) = attached_session_record(sock, id).await {
+        hold_box_name_with_vm_host(control_sock_beside(sock), name, Some(id), false).await;
+    }
 }
 
 /// Holds or releases a `host_ip` box's name on the VM host daemon, by
@@ -6676,7 +6690,8 @@ mod tests {
     /// which a VM host daemon restart may have dropped — is re-made
     /// idempotently first: one hold request naming it and its session. A
     /// record the lookup did not give, or one that owns a row or holds no
-    /// name, sends nothing.
+    /// name, sends nothing; a session destroyed between the record's read
+    /// and the hold has the hold released again.
     #[tokio::test]
     async fn an_attach_reholds_its_held_name_first() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -6726,6 +6741,28 @@ mod tests {
             Some(id),
             "the re-hold names the session, so it frees only that session's hold"
         );
+        drop(seen);
+
+        // A destroy that lands between the record's read and the re-hold:
+        // the hold is made for a session that is gone, and released again
+        // by its id once the second lookup finds no session.
+        match daemon
+            .call::<minimald_rpc::DestroySession>(&minimald_rpc::DestroySessionRequest { id })
+            .await
+        {
+            minimald_rpc::Errorable::Ok(_) => {}
+            minimald_rpc::Errorable::Err { error } => panic!("the destroy failed: {error}"),
+        }
+        rehold_held_name_before_attach(&ssh_sock, id, Some(&record)).await;
+        let seen = requests.lock().unwrap();
+        assert_eq!(seen.len(), 3, "a hold, then its release");
+        let minimald_rpc::BoxControlRequest::ReleaseBoxName(request) =
+            serde_json_lenient::from_str(&seen[2]).expect("the request is the wire type")
+        else {
+            panic!("a gone session's re-hold is undone by the release verb");
+        };
+        assert_eq!(request.name, "web");
+        assert_eq!(request.session_id, Some(id));
     }
 
     /// T66's attach-exit side: an own-address box whose attach ended in the
