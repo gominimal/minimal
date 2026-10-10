@@ -458,6 +458,13 @@ NET080_SEED_DIR="" # seeded by the daemon-fetch proof below; removed on teardown
 # not leave a host's packet filter deciding behind it, so the teardown unloads
 # whatever this flag says is ours.
 NET080_CLASSIFIER_INSTALLED=""
+# The classifier install a native case's setup script made: on a host with no
+# classifier, the script `min finalize-install --show --script` prints carries
+# the classifier's block beside the names', so a case that runs it whole also
+# installs the tree, the table, the step's copy and its systemd units. The case
+# removes them before it returns (setup_classifier_teardown), and the teardown
+# does for a run that died first.
+SETUP_CLASSIFIER_INSTALLED=""
 # The same three for the host_ip_deny_all proof: the two project seeds its two
 # halves activate against (removed on teardown like every other seed), and the
 # classifier tree+table its decided half installs (its own, removed before the
@@ -933,6 +940,8 @@ teardown() {
   # Every proof that runs the advisory as root also installs the answerer
   # host service; a run that died after that must not leave it behind.
   answerer_service_teardown
+  # Nor the classifier install the same script made on a host with none.
+  setup_classifier_teardown || true
   # The native-resolution proof points the HOST resolver at the daemon's
   # answerer; a run that died between that and its own revert must not leave
   # the change behind. `resolvectl revert` restores the link's DNS state and
@@ -7679,6 +7688,59 @@ answerer_channel_of() {
     -e 's/^[[:space:]]*<string>\(\/.*\/answerer\.sock\)<\/string>$/\1/p' | head -n1
 }
 
+# Called on the setup script file $1 just before a case runs it as root:
+# records that the run is about to install the classifier, when the script
+# carries the classifier's block (its ownership-record line) and this host
+# has no classifier yet. A host that already carries one — its tree, or the
+# record of an earlier install — is the host's own: the block only refreshes
+# it, and nothing here removes it afterwards.
+setup_classifier_note() {
+  grep -q '^: > /var/lib/minimal/finalize-install-classifier$' "$1" 2>/dev/null || return 0
+  if [ -e /sys/fs/cgroup/minimald.slice ] \
+     || [ -e /var/lib/minimal/finalize-install-classifier ]; then
+    return 0
+  fi
+  SETUP_CLASSIFIER_INSTALLED=1
+}
+
+# Removes the classifier install a setup script made (see
+# SETUP_CLASSIFIER_INSTALLED): the cases that run the script are about names,
+# and the two classifier proofs later in the lane install their own and refuse
+# a host that already carries one, so the host must be as the case found it.
+# The order is the installer's: the daemon stops first (the path unit placed
+# it in the tree's daemon leaf, and the uninstall refuses while a process or
+# a live leaf holds the tree), the units go before the tree so no later
+# daemon start is placed and no boot re-installs it, then the step's own
+# --uninstall, then the files the block wrote. A no-op until a case recorded
+# an install. Returns non-zero when the tree is still there.
+setup_classifier_teardown() {
+  [ -n "${SETUP_CLASSIFIER_INSTALLED:-}" ] || return 0
+  mnl stop --force >/dev/null 2>&1 || true
+  sudo -n systemctl disable --now minimald-place.path minimald-place.service \
+    minimald-classifier.service >/dev/null 2>&1 || true
+  # A box's leaf can outlive the stop by a moment; the uninstall is retried
+  # over a bounded wait rather than failed on the first refusal.
+  for _ in $(seq 1 20); do
+    [ -e /sys/fs/cgroup/minimald.slice ] || break
+    sudo -n "$ROOT/scripts/install-host-classifier.sh" --uninstall >/dev/null 2>&1 && break
+    sleep 0.5
+  done
+  sudo -n rm -f /etc/systemd/system/minimald-place.path \
+    /etc/systemd/system/minimald-place.service \
+    /etc/systemd/system/minimald-classifier.service \
+    /usr/local/lib/minimal/install-host-classifier.sh \
+    /usr/local/lib/minimal/install-host-classifier.sh.new >/dev/null 2>&1 || true
+  sudo -n rmdir /usr/local/lib/minimal >/dev/null 2>&1 || true
+  sudo -n systemctl daemon-reload >/dev/null 2>&1 || true
+  sudo -n systemctl reset-failed minimald-place.path minimald-place.service \
+    minimald-classifier.service >/dev/null 2>&1 || true
+  if [ -e /sys/fs/cgroup/minimald.slice ]; then
+    return 1
+  fi
+  sudo -n rm -f /var/lib/minimal/finalize-install-classifier >/dev/null 2>&1 || true
+  SETUP_CLASSIFIER_INSTALLED=""
+}
+
 # The setup script `min finalize-install --show --script` wrote to $1 (its stdout), whole,
 # when that is a script — its first line `#!/bin/sh` — and nothing otherwise
 # (a host with nothing to run, or a blocker, prints only its note on
@@ -7970,6 +8032,7 @@ proof_native_resolution_without_proxy_env() {
       esac
       # Run the exact command the advisory printed — verbatim, as the user
       # would have. Passwordless sudo is the gate above, so it cannot prompt.
+      setup_classifier_note "$native_setup"
       # shellcheck disable=SC2024 # the output files are this user's, not root's
       if ! sudo -n sh "$native_setup" >"$WORK/native-cmd.out" 2>"$WORK/native-cmd.err"; then
         echo "::error::the advisory's command did not run (are resolvectl and ip usable here?)"
@@ -8071,6 +8134,12 @@ proof_native_resolution_without_proxy_env() {
   fi
 
   mnl session destroy --force "$native_sid" >/dev/null 2>&1 || true
+  # The classifier the same script installed on a host that had none: removed
+  # here, so the lane's classifier proofs find the host as this case did.
+  if ! setup_classifier_teardown; then
+    echo "::error::the classifier install the setup script made could not be removed — a live leaf or process still holds /sys/fs/cgroup/minimald.slice"
+    fail
+  fi
   echo "native min.internal resolution with no proxy settings OK (${native_proved:-advisory race} — each printed)"
   echo "::endgroup::"
 }
@@ -8881,6 +8950,7 @@ proof_box_name_resolves_natively_without_proxy() {
         fi
         ;;
     esac
+    setup_classifier_note "$bn_setup"
     # shellcheck disable=SC2024 # the output files are this user's, not root's
     if ! sudo -n sh "$bn_setup" >"$WORK/bn-cmd.out" 2>"$WORK/bn-cmd.err"; then
       echo "::error::the advisory's command did not run (are resolvectl and ip usable here?)"
@@ -9199,6 +9269,12 @@ proof_box_name_resolves_natively_without_proxy() {
 
   rm -rf "$BN_SEED_DIR" "$BN_API_SEED_DIR"
   BN_SEED_DIR=""; BN_API_SEED_DIR=""
+  # The classifier the same script installed on a host that had none: removed
+  # here, so the lane's classifier proofs find the host as this case did.
+  if ! setup_classifier_teardown; then
+    echo "::error::the classifier install the setup script made could not be removed — a live leaf or process still holds /sys/fs/cgroup/minimald.slice"
+    fail
+  fi
   echo "box names resolve natively in any browser OK (each lookup with its answer, each record, and the surface — printed)"
   echo "::endgroup::"
 }
@@ -10064,6 +10140,7 @@ proof_native_answerer_survives_session_stop() {
   local nasr_released_before nasr_service_before
   nasr_released_before="$(nasr_count "$nasr_base_a" 'released the interim answerer')"
   nasr_service_before="$(nasr_count "$nasr_base_a" 'the manager-held answerer service')"
+  setup_classifier_note "$nasr_a_setup"
   # shellcheck disable=SC2024 # the output files are this user's, not root's
   if ! sudo -n sh "$nasr_a_setup" >"$WORK/nasr-cmd.out" 2>"$WORK/nasr-cmd.err"; then
     echo "::error::the advisory's command did not run"
@@ -10150,6 +10227,12 @@ proof_native_answerer_survives_session_stop() {
     echo "::warning::could not remove the dedicated link $NASR_REVERT_LINK"
   fi
   rm -rf "$NASR_SEED_DIR"; NASR_SEED_DIR=""
+  # The classifier the same script installed on a host that had none: removed
+  # here, so the lane's classifier proofs find the host as this case did.
+  if ! setup_classifier_teardown; then
+    echo "::error::the classifier install the setup script made could not be removed — a live leaf or process still holds /sys/fs/cgroup/minimald.slice"
+    fail
+  fi
   echo "native answerer survives session stop OK (interim, handover, second node, session and daemon stop — each printed)"
   echo "::endgroup::"
 }
