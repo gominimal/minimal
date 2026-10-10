@@ -2324,17 +2324,26 @@ pub fn die_by_received_stop_signal() {
 /// container ignores a default-action signal it sends itself), it exits
 /// with the shell's code for a death by that signal instead: a caller may
 /// hold the lifecycle lock until the process ends, and a process that
-/// lived on would hold it for good.
+/// lived on would hold it for good. In that case a supervisor sees exit
+/// code 128 + `signum`, not a death by signal, so systemd's
+/// `Restart=on-failure` reads the stop as a failure unless
+/// `SuccessExitStatus` names the code.
+///
+/// The exit is `_exit`, which runs no exit handlers or destructors: this
+/// can run on the watcher thread while the main thread is parked on the
+/// lifecycle lock, and a handler that waited on that thread would hang
+/// the one path that must end the process. The log is already flushed.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 pub(crate) fn die_by_signal(signum: libc::c_int) -> ! {
     flush_log();
-    // SAFETY: restoring the default disposition and signalling this process
-    // touch no memory; the default action of SIGTERM and SIGINT ends it.
+    // SAFETY: restoring the default disposition, signalling this process and
+    // exiting it touch no memory; the default action of SIGTERM and SIGINT
+    // ends it, and `_exit` ends it where the signal is ignored.
     unsafe {
         libc::signal(signum, libc::SIG_DFL);
         libc::kill(libc::getpid(), signum);
+        libc::_exit(128 + signum)
     }
-    std::process::exit(128 + signum);
 }
 
 /// When the last queue-full warn line was written: the line is rate-limited
