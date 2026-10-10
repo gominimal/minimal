@@ -922,9 +922,11 @@ pub struct Session {
     /// against a workspace the creator has not finished uploading (or has
     /// uploaded but not yet configured), and the creator's own
     /// `ConfigureLoadout` would then be refused. The creator's own attach
-    /// is let through: it knows where its activation stands. Once the
-    /// creator's connection closes this stops upgrading, and the session,
-    /// if still unfinalized, is normally reaped with it. So the shortcut is
+    /// is let through: it knows where its activation stands. This
+    /// keeps upgrading after the creator's connection closes, until that
+    /// connection's teardown has reaped the sessions it left unfinalized:
+    /// the gate holds over a dying creator's `Draft` until the `Draft` is
+    /// gone, and only then stops upgrading. So the shortcut is
     /// open to the creator's own connection, and otherwise only for a
     /// session with no live creator: one restored from disk or created
     /// in-process (`None`).

@@ -135,8 +135,9 @@ pub struct Connection {
     /// While the reference still upgrades, the session's activation belongs
     /// to this connection, so an attach from elsewhere is refused rather
     /// than configuring a half-activated session behind the creator's back.
-    /// Released at teardown ([`ConnectionHandle::take_created_sessions`])
-    /// and, on any other exit, when the connection itself drops.
+    /// Released at the end of teardown, after the reap of the sessions it
+    /// left unfinalized ([`ConnectionHandle::release_liveness`]), and, on
+    /// any other exit, when the connection itself drops.
     liveness: Option<Arc<()>>,
 
     serv: ServerStateHandle,
@@ -223,19 +224,29 @@ impl ConnectionHandle {
     /// Drain and return the ids of every session created over this
     /// connection. Called once at connection teardown to decide which
     /// half-built sessions to reap.
+    ///
+    /// The liveness is deliberately left held here: the sessions this
+    /// returns are still unreaped, and one that stopped counting its creator
+    /// as live now would let an attach from elsewhere configure a half-built
+    /// `Draft` before the reap deletes it. [`Self::release_liveness`] ends
+    /// it, after the reap.
     pub async fn take_created_sessions(&self) -> Vec<SessionId> {
-        let mut conn = self.0.lock().await;
-        // The connection is going away: its sessions stop counting it as a
-        // live creator from here on, even if a stray handle clone outlives
-        // this teardown.
-        conn.liveness = None;
-        std::mem::take(&mut conn.created_sessions)
+        std::mem::take(&mut self.0.lock().await.created_sessions)
+    }
+
+    /// Ends this connection's liveness: its sessions stop counting it as a
+    /// live creator from here on, even if a stray handle clone outlives the
+    /// teardown. Called last at connection teardown, once the unfinalized
+    /// sessions it created have been reaped, so the creator-only attach gate
+    /// holds over a dying connection's `Draft` until that `Draft` is gone.
+    pub async fn release_liveness(&self) {
+        self.0.lock().await.liveness = None;
     }
 
     /// A weak reference to this connection's liveness: handed to each
     /// session created over it, and with each attach, so a session can tell
     /// its creator's attach from anyone else's. It stops upgrading once the
-    /// connection is torn down; `None` once teardown has already begun.
+    /// connection is torn down; `None` once teardown has finished.
     pub async fn liveness(&self) -> Option<std::sync::Weak<()>> {
         self.0.lock().await.liveness.as_ref().map(Arc::downgrade)
     }

@@ -3007,6 +3007,66 @@ mod tests {
         );
     }
 
+    /// A session whose loadout has composed and is parked awaiting its
+    /// verdict (`Draft { pending: Some(..) }`) is past the upload's place in
+    /// the create flow too: an upload would change the tree under a
+    /// composition already computed, so it is refused and lands nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stream_workspace_files_refuses_a_session_awaiting_its_verdict() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = client
+            .call::<CreateSession>(&req("stream-test", "/tmp"))
+            .await
+            .unwrap()
+            .id;
+        // A daemon-collected var must be gated by the client, so the
+        // configure parks the session instead of finalizing it.
+        server
+            .seed_workspace_mfile(session_id, "[session.vars]\nRUST_LOG = \"info\"\n")
+            .await;
+        let configured = client
+            .call::<minimald_rpc::ConfigureLoadout>(&minimald_rpc::ConfigureLoadoutRequest {
+                session_id,
+                contribution: Default::default(),
+            })
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                configured,
+                minimald_rpc::ConfigureLoadoutResponse::Pending { .. }
+            ),
+            "the configure should park awaiting a verdict, got {configured:?}"
+        );
+
+        let payload = tar_zst(&[("late.txt", b"too late\n")]).await;
+        let stderr =
+            upload_and_collect_stderr(&mut client, STREAM_WORKSPACE_FILES, session_id, &payload)
+                .await;
+        assert!(
+            stderr
+                .contains("a workspace upload is accepted only while the session is being created"),
+            "expected the upload refusal, got {stderr:?}"
+        );
+
+        let paths = server
+            .state
+            .sessions_manager()
+            .await
+            .get_session(SessionKeyPredicate::Id(session_id))
+            .await
+            .unwrap()
+            .expect("the session should resolve")
+            .paths()
+            .await
+            .unwrap();
+        assert!(
+            !paths.working.as_utf8_path().join("late.txt").exists(),
+            "a refused upload must not land in the workspace"
+        );
+    }
+
     /// The upload reader's idle deadline counts only a stall: reads that
     /// keep arriving inside the limit run past it in total, time the
     /// consumer spends between reads is not counted, and the peer's silence
