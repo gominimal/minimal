@@ -1297,16 +1297,7 @@ pub(crate) async fn activate_session(
     // client is authoritative for them. Any daemon-side patches
     // that come back through a `Pending` response's `SubmitVerdict`
     // get appended below.
-    let mut collected_patches: Vec<(std::path::PathBuf, paths::SandboxRelPath)> = contribution
-        .patches
-        .iter()
-        .map(|p| {
-            (
-                p.patch.host_path.as_utf8_path().as_std_path().to_path_buf(),
-                p.patch.destination.clone(),
-            )
-        })
-        .collect();
+    let mut collected_patches = minimal_client::contribution_patch_uploads(&contribution);
 
     // The session exists but has no loadout yet; composing it is a
     // second round-trip because the daemon's composer reads the
@@ -1505,8 +1496,7 @@ pub(crate) async fn activate_session(
     // from `<workspace>/patches/`. Dedup by sandbox destination:
     // the composer's post-gate check guarantees any duplicates
     // are exact matches (same source), so collapsing is safe.
-    collected_patches.sort_by(|a, b| a.1.as_str().cmp(b.1.as_str()));
-    collected_patches.dedup_by(|a, b| a.1.as_str() == b.1.as_str());
+    minimal_client::dedup_patch_uploads(&mut collected_patches);
     // The registration's lease is held across the finalize and committed
     // only once the session is active: until then an activation that dies
     // leaves the VM host daemon to withdraw the row on the lease's close.
