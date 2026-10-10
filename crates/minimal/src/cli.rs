@@ -182,6 +182,9 @@ pub enum Command {
     /// sessions across every running provider on the host (native minimald
     /// and the minvmd microVM). Requires a terminal.
     Dash,
+    /// Serve the Model Context Protocol over stdio, exposing sessions as a
+    /// sandboxed shell-execution surface for an agent harness.
+    Mcp(McpArgs),
     /// Print or install the shell tab-completion integration
     #[command(
         visible_alias = "completion",
@@ -750,6 +753,65 @@ pub struct ActivateArgs {
     /// Automatically attach after creation
     #[arg(long)]
     pub attach: bool,
+}
+
+/// Transport `min mcp` serves the Model Context Protocol over.
+///
+/// `stdio` is the default: the JSON-RPC channel is the process's stdout, and
+/// only the process that spawned `min mcp` can reach it. `http` instead
+/// listens on `--bind` and speaks the MCP streamable-HTTP transport, so a
+/// client connects over the network rather than inheriting the pipes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum McpTransport {
+    /// JSON-RPC over stdin/stdout (the default).
+    Stdio,
+    /// MCP streamable HTTP, listening on `--bind`.
+    Http,
+}
+
+/// Flags for `min mcp`.
+///
+/// The global flags (`--provider`, `--vm`, `--minimal-dir`) choose which
+/// daemon hosts the sandboxes the server creates; the flags here shape the
+/// sessions it creates from them.
+#[derive(Debug, Args)]
+pub struct McpArgs {
+    /// Transport the server listens on.
+    #[arg(long, value_enum, default_value_t = McpTransport::Stdio)]
+    pub transport: McpTransport,
+    /// Address the HTTP transport listens on. Ignored by `stdio`.
+    ///
+    /// Defaults to loopback because the server exposes unrestricted shell
+    /// execution in the sandboxes it creates: anything that can reach a
+    /// non-loopback address can run commands there.
+    #[arg(long, value_name = "ADDR:PORT", default_value = "127.0.0.1:3000")]
+    pub bind: std::net::SocketAddr,
+    /// Directory uploaded into the lazily-created default session. Used for
+    /// the first `exec`/file call that names no session; without it that call
+    /// uses the current directory.
+    #[arg(long, value_name = "DIR")]
+    pub workdir: Option<PathBuf>,
+    /// Network mode for sessions created by tools.
+    #[arg(
+        long,
+        value_name = "none|host_ip|own_ip",
+        value_parser = parse_network_mode,
+        default_value = "host_ip"
+    )]
+    pub network: CliNetworkMode,
+    /// Apply the named loadout to sessions created by tools. Repeatable.
+    #[arg(long = "loadout", value_name = "NAME")]
+    pub loadout: Vec<String>,
+    /// Apply no loadouts to sessions created by tools (also skips the
+    /// config's `default_loadouts`).
+    #[arg(long, conflicts_with = "loadout")]
+    pub no_loadouts: bool,
+    /// Run none of the lifecycle hooks of sessions created by tools.
+    #[arg(long)]
+    pub no_hooks: bool,
+    /// Default seconds an `exec` tool call may run before it is killed.
+    #[arg(long, default_value_t = 120)]
+    pub timeout: u64,
 }
 
 /// Which daemon backend ("provider") hosts sessions.
