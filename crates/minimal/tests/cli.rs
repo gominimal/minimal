@@ -72,6 +72,91 @@ async fn version_reports_broken_pipe_when_output_is_closed() {
     }));
 }
 
+// --- finalize-install ---
+
+/// NET-122: `min finalize-install --show --json` with stdout piped (the
+/// way the installer's probe reads it) delivers the whole document and
+/// exits 1 on a host with an item not done — here a state dir with no
+/// daemon, so the names item waits on one. The exit must not lose the
+/// buffered report: `std::process::exit` flushes nothing.
+#[tokio::test]
+async fn finalize_install_show_json_reaches_a_piped_reader_before_exit() {
+    let state = tempfile::TempDir::new().unwrap();
+    let config_dir = tempfile::TempDir::new().unwrap();
+    let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_min"))
+        .args(["--minimal-dir".as_ref(), state.path().as_os_str()])
+        .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
+        .args(["--no-input", "finalize-install", "--show", "--json"])
+        .output()
+        .await
+        .expect("the min binary should be invocable");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "an unfinished host exits 1: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let report: Value = serde_json_lenient::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("the whole report reaches a piped stdout ({e}): {stdout:?}"));
+    assert_eq!(report["schema"], "min/v1/finalize-install");
+    assert_eq!(report["finished"], false);
+    let names = report["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["id"] == "names")
+        .expect("the names item is in every host's report");
+    assert_eq!(names["state"], "waiting", "{stdout}");
+}
+
+/// A daemon that accepts and never answers must not hang `--show`: the
+/// installer probes `min finalize-install --show --script` from a shell
+/// with no timeout of its own. The names item's daemon read is one bounded
+/// attempt, after which the item is `waiting`.
+#[tokio::test]
+async fn finalize_install_show_returns_within_its_deadline_on_a_wedged_daemon() {
+    let state = tempfile::TempDir::new().unwrap();
+    let config_dir = tempfile::TempDir::new().unwrap();
+    let sock = minimal_client::resolve_socket_path(Some(state.path()), false).unwrap();
+    std::fs::create_dir_all(sock.parent().unwrap()).unwrap();
+    let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+    // Accept every connection and hold it open, silent.
+    let wedged = tokio::spawn(async move {
+        let mut held = Vec::new();
+        loop {
+            if let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        }
+    });
+    let started = std::time::Instant::now();
+    let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_min"))
+        .args(["--minimal-dir".as_ref(), state.path().as_os_str()])
+        .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
+        .args(["--no-input", "finalize-install", "--show", "--json"])
+        .output()
+        .await
+        .expect("the min binary should be invocable");
+    let elapsed = started.elapsed();
+    wedged.abort();
+    assert!(
+        elapsed < std::time::Duration::from_secs(20),
+        "the daemon read is bounded (took {elapsed:?}): {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let report: Value = serde_json_lenient::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("the report is printed ({e}): {stdout:?}"));
+    let names = report["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["id"] == "names")
+        .expect("the names item is in every host's report");
+    assert_eq!(names["state"], "waiting", "{stdout}");
+}
+
 // --- ls ---
 
 #[test]
@@ -1172,6 +1257,253 @@ async fn activate_prints_no_session_id_when_composition_fails() {
     assert!(
         stderr.contains(project_canon.to_str().unwrap()),
         "the error must name the directory the activation ran from: {stderr}"
+    );
+}
+
+/// Drives `min session activate` through the compiled binary against this
+/// process's harness daemon while its user-namespace verdict is `verdict`
+/// (NET-141), and returns the refusal: the `error:` block on stderr, exactly
+/// — the activation's own progress lines (`Applying loadouts: ...`) precede
+/// it. Asserts the contract every cause shares on the way: exit 1, nothing
+/// on stdout, and no session left behind. The binary is used because the
+/// exact stderr and the exit status are the contract; the verdict is set on
+/// the harness server alone and switched back off before the asserts.
+async fn refused_activation(verdict: minimald::server::UsernsRestriction) -> String {
+    let (daemon, args) = setup().await;
+    let minimal_dir = args.minimal_dir.clone().expect("setup points at a tempdir");
+
+    let project = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir(project.path().join(".git")).unwrap();
+    std::fs::write(
+        project.path().join("minimal.toml"),
+        "# test minimal.toml\n[stack]\nuse = \"shell\"\n",
+    )
+    .unwrap();
+    let project_canon = project.path().canonicalize().unwrap();
+    let config_dir = tempfile::TempDir::new().unwrap();
+
+    daemon
+        .server
+        .state
+        .set_user_namespace_gate(minimald::server::UsernsGate::Fixed(verdict))
+        .await;
+    let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_min"))
+        .args(["--minimal-dir".as_ref(), minimal_dir.as_os_str()])
+        .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
+        .arg("--no-input")
+        .args(["session", "activate"])
+        .arg(&project_canon)
+        .args(["--name", "refused-sandbox", "--sync", "tarball"])
+        .arg("--no-prompt")
+        .output()
+        .await
+        .expect("the min binary should be invocable");
+    daemon
+        .server
+        .state
+        .set_user_namespace_gate(minimald::server::UsernsGate::Off)
+        .await;
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a refused activation exits 1: stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        stdout.trim().is_empty(),
+        "a refused activation puts nothing on stdout, got: {stdout}"
+    );
+
+    // Nothing was created for the refusal to leave behind.
+    let mut client = daemon.server.connect().await;
+    let resp = client.call::<minimald_rpc::ListSessions>(&()).await;
+    assert!(
+        resp.sessions.is_empty(),
+        "a refused activation must leave no session behind, got: {:?}",
+        resp.sessions
+    );
+
+    // The block starts at the last line that opens with `error: `, so a
+    // progress line that happened to contain the words is never taken.
+    let at = stderr
+        .rfind("\nerror: ")
+        .map(|at| at + 1)
+        .or_else(|| stderr.starts_with("error: ").then_some(0))
+        .unwrap_or_else(|| panic!("no error block on stderr: {stderr}"));
+    stderr[at..].trim_end().to_string()
+}
+
+/// A host whose user-namespace verdict refuses the sandbox fails the
+/// activation before any session exists (NET-141): the daemon refuses the
+/// create on its verdict, `min session activate` prints that refusal as its
+/// error, exits 1, and leaves no session behind. The cause-specific texts
+/// are the two tests below; this one holds the shape they share.
+#[tokio::test]
+async fn activate_refuses_unconfinable_sandbox_before_session_creation() {
+    let refusal = refused_activation(minimald::server::UsernsRestriction::ApparmorUnconfined).await;
+    assert!(
+        refusal.starts_with("error: this machine blocks the private sandbox every box runs in ("),
+        "the refusal is the error block: {refusal}"
+    );
+    assert!(
+        refusal.contains("so no box can start here yet."),
+        "the refusal says no box can start: {refusal}"
+    );
+}
+
+/// The AppArmor restriction (stock Ubuntu 24.04+, unconfined daemon) names
+/// `min finalize-install` as the remedy, with `--show` for the step it runs,
+/// and never a sysctl, which would lift the protection for every program.
+#[tokio::test]
+async fn activate_refusal_names_finalize_install_for_apparmor_restriction() {
+    let refusal = refused_activation(minimald::server::UsernsRestriction::ApparmorUnconfined).await;
+    // The harness daemon runs in this process, so the path the remedy names
+    // for a source-built daemon is this test binary's own.
+    let bin = minimald::server::this_daemon_path();
+    assert_eq!(
+        refusal,
+        format!(
+            "error: this machine blocks the private sandbox every box runs in (Ubuntu restricts \
+             unprivileged user namespaces), so no box can start here yet.\n\
+             Finish the install to allow it for Minimal only: min finalize-install   \
+             (see what it changes first: min finalize-install --show). The profile takes \
+             effect when the daemon next starts: run min stop, then your command again.\n\
+             A daemon built from source is not covered: attach the profile to this binary \
+             instead, from a checkout: sudo scripts/install-apparmor-profile.sh --path {bin}, \
+             then the same restart."
+        )
+    );
+    assert!(
+        !refusal.contains("sysctl"),
+        "the AppArmor remedy never suggests a sysctl: {refusal}"
+    );
+}
+
+/// `user.max_user_namespaces=0` (or a kernel without `CONFIG_USER_NS`) names
+/// the sysctl key, the immediate `sysctl -w` the live gate picks up on the
+/// next create, and the persistent change — a sysctl.d drop-in, or a kernel
+/// built with the namespace — and not `min finalize-install`, whose profile
+/// cannot lift it.
+#[tokio::test]
+async fn activate_refusal_names_sysctl_for_max_user_namespaces_zero() {
+    let refusal = refused_activation(minimald::server::UsernsRestriction::Disabled).await;
+    assert_eq!(
+        refusal,
+        "error: this machine blocks the private sandbox every box runs in (user namespaces are \
+         switched off (user.max_user_namespaces=0 or no kernel support)), so no box can start \
+         here yet.\n\
+         Set user.max_user_namespaces above 0: sudo sysctl -w user.max_user_namespaces=15000 \
+         takes effect now, a /etc/sysctl.d drop-in keeps it across reboots; or use a kernel \
+         with CONFIG_USER_NS."
+    );
+    assert!(
+        !refusal.contains("finalize-install"),
+        "the install step cannot lift a disabled namespace: {refusal}"
+    );
+}
+
+/// Drives `min task run` through the compiled binary against this process's
+/// harness daemon while its user-namespace verdict is `verdict` (NET-141),
+/// and returns the refusal: the `error:` block on stderr, exactly. A task
+/// run creates its ephemeral session through the same create the daemon
+/// refuses, so the refusal must reach the user as the daemon's verdict —
+/// not wrapped as `CreateSession failed: ...`, which would mislabel a
+/// machine verdict as an RPC failure. Asserts the shared contract on the
+/// way: exit 1, nothing on stdout, and no session left behind.
+async fn refused_task_run(verdict: minimald::server::UsernsRestriction) -> String {
+    let (daemon, args) = setup().await;
+    let minimal_dir = args.minimal_dir.clone().expect("setup points at a tempdir");
+
+    // A VCS root so the headless upload gate passes, and one declared task
+    // the run never reaches: the create is refused first.
+    let project = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir(project.path().join(".git")).unwrap();
+    std::fs::write(
+        project.path().join("minimal.toml"),
+        "[tasks.e2e-echo]\necho = \"TASK_RUN_REFUSAL_UNREACHED\"\n",
+    )
+    .unwrap();
+    let project_canon = project.path().canonicalize().unwrap();
+    let config_dir = tempfile::TempDir::new().unwrap();
+
+    daemon
+        .server
+        .state
+        .set_user_namespace_gate(minimald::server::UsernsGate::Fixed(verdict))
+        .await;
+    let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_min"))
+        .args(["--minimal-dir".as_ref(), minimal_dir.as_os_str()])
+        .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
+        .arg("--no-input")
+        .args(["task", "run", "e2e-echo"])
+        .args(["--path".as_ref(), project_canon.as_os_str()])
+        .output()
+        .await
+        .expect("the min binary should be invocable");
+    daemon
+        .server
+        .state
+        .set_user_namespace_gate(minimald::server::UsernsGate::Off)
+        .await;
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a refused task run exits 1: stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        stdout.trim().is_empty(),
+        "a refused task run puts nothing on stdout, got: {stdout}"
+    );
+
+    // Nothing was created for the refusal to leave behind.
+    let mut client = daemon.server.connect().await;
+    let resp = client.call::<minimald_rpc::ListSessions>(&()).await;
+    assert!(
+        resp.sessions.is_empty(),
+        "a refused task run must leave no session behind, got: {:?}",
+        resp.sessions
+    );
+
+    // The block starts at the last line that opens with `error: `, so a
+    // progress line that happened to contain the words is never taken.
+    let at = stderr
+        .rfind("\nerror: ")
+        .map(|at| at + 1)
+        .or_else(|| stderr.starts_with("error: ").then_some(0))
+        .unwrap_or_else(|| panic!("no error block on stderr: {stderr}"));
+    stderr[at..].trim_end().to_string()
+}
+
+/// A refused host reaches `min task run` through the same create as an
+/// activate, so the refusal is the machine verdict there too (NET-141):
+/// printed verbatim, never wrapped as `CreateSession failed: ...` — a
+/// wrapper that called the daemon's verdict an RPC failure would mislabel
+/// it and bury the remedy's shape under a generic prefix.
+#[tokio::test]
+async fn task_run_prints_the_user_namespace_refusal_verbatim() {
+    let refusal = refused_task_run(minimald::server::UsernsRestriction::ApparmorUnconfined).await;
+    let bin = minimald::server::this_daemon_path();
+    assert_eq!(
+        refusal,
+        format!(
+            "error: this machine blocks the private sandbox every box runs in (Ubuntu restricts \
+             unprivileged user namespaces), so no box can start here yet.\n\
+             Finish the install to allow it for Minimal only: min finalize-install   (see what \
+             it changes first: min finalize-install --show). The profile takes effect when the \
+             daemon next starts: run min stop, then your command again.\n\
+             A daemon built from source is not covered: attach the profile to this binary \
+             instead, from a checkout: sudo scripts/install-apparmor-profile.sh --path {bin}, \
+             then the same restart."
+        )
+    );
+    assert!(
+        !refusal.contains("CreateSession failed"),
+        "a machine verdict is not an RPC failure: {refusal}"
     );
 }
 
@@ -3092,6 +3424,18 @@ async fn listener_failure_reported_with_remedy() {
         activate_stderr.contains("run `min session activate` again to check"),
         "activate must name the command its warning rides on, got: {activate_stderr}"
     );
+    // NET-020 on the one host line: the cause replaces the resolution half,
+    // so the line never claims a route through a proxy that is not serving.
+    assert!(
+        activate_stderr.contains(&format!(
+            "names: remedy-report.min.internal: the hostname proxy is not serving — {reason}"
+        )),
+        "the host line must carry the cause in place of the resolution, got: {activate_stderr}"
+    );
+    assert!(
+        !activate_stderr.contains("via 127.0.0.1"),
+        "a down proxy is never named as the route, got: {activate_stderr}"
+    );
 
     drop(held);
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), retry).await;
@@ -3218,7 +3562,7 @@ async fn min_prints_discovered_proxy_port() {
 /// configuration no host process consults), the daemon's answerer bound,
 /// and the reserved local range present on this host's loopback. With the
 /// answerer bound and no hook (this host), both verbs must name the
-/// *proxy* as the live surface and point at `min net setup` on that line,
+/// *proxy* as the live surface and point at `min finalize-install` on that line,
 /// with no advisory beside it (NET-122 is opt-in); with the hook and the
 /// range present too, the same decision says native and the pointer goes.
 ///
@@ -3291,7 +3635,8 @@ async fn activate_and_ls_report_native_surface() {
     // inside a VM-backed host's guest cannot speak for the host's resolver,
     // and this host's own reads say nothing routes the zone to the answerer
     // — so both verbs name the proxy as the live surface, with where it
-    // serves, points at `min net setup`, and neither prints the native words.
+    // serves, end with the install clause that points at `min
+    // finalize-install`, and neither prints the native words.
     let out = run_min(&args, &["ls"]).await;
     let ls_stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     assert!(
@@ -3299,12 +3644,11 @@ async fn activate_and_ls_report_native_surface() {
         "`min ls` must report the proxy as the live surface on a hook-less host, got: {ls_stdout}"
     );
     assert!(
-        ls_stdout.contains(&format!("routes through it on 127.0.0.1:{port}")),
-        "the surface line must name where the proxy serves: {ls_stdout}"
-    );
-    assert!(
-        ls_stdout.contains("run `min net setup`"),
-        "the proxy surface line must point at `min net setup`: {ls_stdout}"
+        ls_stdout.contains(&format!(
+            "routes through it on 127.0.0.1:{port}; finish setup: min finalize-install"
+        )),
+        "the surface row must name where the proxy serves and end with the install clause: \
+         {ls_stdout}"
     );
     assert!(
         !ls_stdout.contains("native DNS is the live name surface"),
@@ -3313,10 +3657,11 @@ async fn activate_and_ls_report_native_surface() {
 
     // `min session activate`, at the moment the user is about to rely on the
     // names — and before the upload and the loadout, so the line is not lost
-    // above a failed activate's output. Host DNS is opt-in (NET-122): this
-    // host cannot resolve the zone natively, so the surface line points at
-    // `min net setup`, and the session start prints no advisory and no part
-    // of the privileged script — and never a prompt.
+    // above a failed activate's output. One host line naming the box
+    // (NET-018): host DNS is opt-in (NET-122), so this host's name routes via
+    // the proxy's port and the line ends with the install clause; the
+    // session start prints no advisory and no part of the privileged script
+    // — and never a prompt. The two old lines are gone.
     let project = tempfile::TempDir::new().unwrap();
     std::fs::create_dir(project.path().join(".git")).unwrap();
     std::fs::write(
@@ -3339,20 +3684,29 @@ async fn activate_and_ls_report_native_surface() {
     )
     .await;
     assert!(
-        activate_stderr.contains("the hostname proxy is the live name surface"),
-        "activate must report the proxy as the live surface on a hook-less host, got: {activate_stderr}"
+        activate_stderr.contains(&format!(
+            "names: native-surface.min.internal via 127.0.0.1:{port}; finish setup: \
+             min finalize-install"
+        )),
+        "activate must print the one host line naming the box, the proxy's port and the \
+         install clause, got: {activate_stderr}"
+    );
+    assert_eq!(
+        activate_stderr
+            .lines()
+            .filter(|line| line.starts_with("names: "))
+            .count(),
+        1,
+        "a default start prints exactly one host line, got: {activate_stderr}"
     );
     assert!(
-        activate_stderr.contains(&format!("routes through it on 127.0.0.1:{port}")),
-        "activate's line must name where the proxy serves: {activate_stderr}"
-    );
-    assert!(
-        !activate_stderr.contains("native DNS is the live name surface"),
+        !activate_stderr.contains("resolves in any browser"),
         "a host with no hook must not be told native DNS is live: {activate_stderr}"
     );
     assert!(
-        activate_stderr.contains("run `min net setup`"),
-        "activate's surface line must point at `min net setup`, got: {activate_stderr}"
+        !activate_stderr.contains("HOSTNAME PROXY:")
+            && !activate_stderr.contains("live name surface"),
+        "the two old lines are gone from the start, got: {activate_stderr}"
     );
     assert!(
         !activate_stderr.contains("note:") && !activate_stderr.contains("#!/bin/sh"),
@@ -3393,17 +3747,102 @@ async fn activate_and_ls_report_native_surface() {
     assert!(
         !native_ls.contains("note:")
             && !native_ls.contains("Configure the host's resolver")
-            && !native_ls.contains("min net setup"),
-        "a host the verdict calls native is a configured one: no advisory rides its list, \
-         got: {native_ls}"
+            && !native_ls.contains("min finalize-install"),
+        "a host the verdict calls native is a finished one: no advisory and no install \
+         clause rides its list, got: {native_ls}"
     );
-    // And the words are activate's: one function renders the line for both
-    // verbs, so the native words `min ls` printed are the words the session
-    // start prints at the moment the user relies on the names.
-    let activate_words = resolver::name_surface_line(resolver::LiveSurface::Native, Some(port));
+    // And the install clause is activate's: the row ends with the same
+    // words the session start's host line ends with, so the two verbs point
+    // at the same step while anything is open, and at nothing once done.
+    let finished = resolver::host_line(
+        "native-surface",
+        &resolver::LiveSurface::Native,
+        Some(port),
+        resolver::HostInstall::default(),
+    );
+    assert_eq!(
+        finished, "names: native-surface.min.internal resolves in any browser on this machine",
+        "a finished host's start line carries no clause"
+    );
+}
+
+/// NET-018: `min ls` keeps its detail rows — `HOSTNAME PROXY:` with the
+/// port, `ZONE ANSWERER:` with the answerer's — and its `NAME SURFACE:` row
+/// ends with the same install clause the session start's host line carries
+/// while this host's install is unfinished. Driven through the compiled
+/// binary against a daemon whose two listeners serve, on a host whose
+/// resolver is not configured for the zone, so what is asserted is what the
+/// user sees.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn ls_keeps_detail_rows_and_name_surface_clause() {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    use minimald::server::{
+        RetryBackoff, retry_hostname_proxy_until_serving, retry_zone_answerer_until_serving,
+    };
+    use minimald_rpc::ListSessions;
+
+    let (daemon, args) = setup().await;
+    let compressed = RetryBackoff::new(
+        std::time::Duration::from_millis(5),
+        std::time::Duration::from_millis(40),
+    );
+    tokio::join!(
+        retry_hostname_proxy_until_serving(
+            daemon.server.state.clone(),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            compressed,
+        ),
+        retry_zone_answerer_until_serving(
+            daemon.server.state.clone(),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            compressed,
+        ),
+    );
+    let mut client = connect_daemon(&args).await.unwrap();
+    let resp = client.oneshot_rpc::<ListSessions>(()).await.unwrap();
+    let port = resp.hostname_proxy_port.expect("the proxy's port");
+    let answerer_port = resp.zone_answerer_port.expect("the answerer's port");
+
+    let out = run_min(&args, &["ls"]).await;
+    let ls_stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let row = |prefix: &str| {
+        ls_stdout
+            .lines()
+            .find(|line| line.starts_with(prefix))
+            .unwrap_or_else(|| panic!("a `{prefix}` row in:\n{ls_stdout}"))
+            .to_string()
+    };
     assert!(
-        native_ls.contains(&activate_words),
-        "`min ls` and activate print the same native words: {native_ls} vs {activate_words}"
+        row("HOSTNAME PROXY:").contains(&format!("listening on 127.0.0.1:{port}")),
+        "the proxy detail row stays, with the port: {ls_stdout}"
+    );
+    assert!(
+        row("ZONE ANSWERER:").contains(&format!("listening on 127.0.0.1:{answerer_port} (UDP)")),
+        "the answerer detail row stays, with the port: {ls_stdout}"
+    );
+    let surface = row("NAME SURFACE:");
+    assert!(
+        surface.ends_with("; finish setup: min finalize-install"),
+        "the surface row ends with the install clause while the install is unfinished: \
+         {surface}"
+    );
+    assert_eq!(
+        ls_stdout.matches("min finalize-install").count(),
+        1,
+        "the pointer prints once, on the surface row alone: {ls_stdout}"
+    );
+    // The same clause the session start's host line ends with.
+    let start = resolver::host_line(
+        "web",
+        &resolver::LiveSurface::Proxy,
+        Some(port),
+        resolver::HostInstall::default(),
+    );
+    assert!(
+        start.ends_with("; finish setup: min finalize-install"),
+        "both verbs end with the same install clause: {start}"
     );
 }
 

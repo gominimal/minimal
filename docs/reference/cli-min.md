@@ -521,49 +521,94 @@ the box's namespaces — is exercised by the daemon's harness test with a
 host-side stand-in relay rather than a real box; a root-integration proof of
 that leg (`just test-root-integration`) is still owed to the root lane.
 
-### `net setup`
+### `finalize-install`
 
 ```
-min net setup [--print] [--undo]
+min finalize-install [--show [--script | --json]] [--undo]
 ```
 
-Host DNS is opt-in. Until you run this command, the hostname proxy serves box
-names. The name-surface line that `min session activate` and `min ls` print
-ends with a pointer here. A session start never prints or runs the
-privileged step.
+The installer runs without privilege. Anything on this host that needs root
+is left for this command, which runs it in one `sudo` call. Until it runs,
+the hostname proxy serves box names. The host line that
+`min session activate` prints says where the box name resolves:
+`names: <box>.min.internal via 127.0.0.1:<port>` while the proxy serves the
+names, or `names: <box>.min.internal resolves in any browser on this machine`
+once this host resolves the zone natively. While any item is not done, the
+line ends with `; finish setup: min finalize-install`. When the proxy failed
+to bind, the cause replaces the resolution and the box stays named:
+`names: <box>.min.internal: the hostname proxy is not serving — <cause>`, with
+the same clause after it when it applies. A session
+start never prints or runs the privileged step.
 
-`min net setup` sets this host up to resolve and reach boxes by name, for
-this host's current state. It prints what is missing to stderr. It then
-writes a setup script to a private temporary file and runs it with
-`sudo sh`, so `sudo` asks for your password once. It removes the file
-afterwards and exits with the script's status. On a host that is already set
-up, it runs nothing and says so.
+The script holds only what this host is missing from:
+
+- the AppArmor profile that allows user namespaces for the sandbox
+- names: the resolver link and the box-name service, plus the reserved local
+  range on macOS
+- the classifier tree that enforces a host-address box's egress declaration.
+  The step keeps a root-owned copy of itself under `/usr/local/lib/minimal`.
+  A systemd boot unit re-installs the tree after a reboot. A path unit places
+  the daemon's listener in its leaf on every daemon start. An un-enrolled
+  host does not need a source identity for it. The classifier translates
+  nothing until an association adds the reserved addresses
+- membership of the `kvm` group, only when the configured provider is the
+  Linux VM provider
+
+`min finalize-install` prints the summary of what is missing. It writes the
+script to a temporary file that only you can read (mode `0600`) and runs it
+with `sudo sh`, so `sudo` asks for your password once. It then removes the
+file and exits with the script's status. A completed run that installed
+anything other than the `kvm` group membership ends with
+`Running boxes pick this up on their next start.`. A run that added you to
+the `kvm` group ends with
+`KVM group membership starts at your next login: log out and back in, or restart the daemon from a new login.`
+When both apply, both lines print, the login line last. On a host that needs nothing it prints
+`Every part of the install is finished on this machine; there is nothing to run.`
+and exits 0. It lists a fact that no script can change, such as cgroup2
+mounted without `nsdelegate`, under `can't do on this machine:`. The other
+items still run. When a host fact blocks every missing item, it runs
+nothing and exits non-zero.
+
+Without a terminal, it tries `sudo -n`. If `sudo -n` cannot run the script
+without a prompt, it prints the summary and
+`f=$(mktemp) && min finalize-install --show --script > "$f" && sudo sh "$f"`,
+runs nothing, and exits 1.
 
 The script is plain POSIX `sh` and stops at the first statement that fails.
 Its header says what it configures and that it must run as root. A comment
-introduces each step. The steps install the resolver hook and the Minimal
-box-name service, plus the local range on macOS.
+introduces each step.
 
 | Flag | Description |
 |---|---|
-| `--print` | Print the script to stdout instead of running it, with no privilege prompt. Run it later with `sudo sh <file>`. |
-| `--undo` | Remove everything the setup step installs on this host. With `--print`, print the removal script instead. |
+| `--show` | Print the summary of what this host is missing, with no privilege prompt, and run nothing. Exits 0 whatever the items' states. |
+| `--show --script` | Print the script to stdout and the summary to stderr, with no privilege prompt. Run it later with `sudo sh <file>`. Exits 0 whatever the items' states. |
+| `--show --json` | Print the summary as one JSON document under the schema `min/v1/finalize-install`. Each item has a stable id and a state: `done`, `missing`, `waiting`, or `cannot`. Exits non-zero while any item is not `done`. |
+| `--undo` | Remove everything the step installed on this host. It accepts only `--show --script`, which prints the removal script instead. |
 
-Setup points at the port the daemon's zone answerer listens on, so it needs a
-running daemon that has bound its answerer. It does not start one. With no
-daemon reachable, it prints an error and exits 1. Start a session first to
-bring the daemon up. On a host where no script can make box names
-resolve, it prints why and exits 1.
+The names step points at the port the daemon's zone answerer listens on, so
+it needs a running daemon that has bound its answerer. It does not start one.
+With no daemon reachable, it lists the names item as `waiting on a daemon`
+under the summary and runs the remaining items.
 
 The box-name service runs as one user for the whole machine. If another user
-already installed it, setup refuses before running anything, names that user,
-and exits 1. `--print` still prints the script.
+already installed it, the command refuses before running anything, names
+that user, and exits 1. `--show` still prints.
 
 `--undo` works without a daemon, and it succeeds on a host that holds none of
-the setup. It removes the box-name service and its program copy, the resolver
-hook, and on macOS the local range unit. The local range addresses on macOS
-stay on the loopback until the next boot. `install.sh --uninstall` points at
-`min net setup --undo` while any of these host files remain.
+the install. It removes the user-namespace profile, the classifier tree with
+its units and step copy, and the group membership the step added. A profile
+or a classifier tree installed another way stays, with a note. It also removes the box-name
+service and its program copy, the resolver hook, and on macOS the local range
+unit.
+The local range addresses on macOS stay on the loopback until the next boot.
+`install.sh --uninstall` points at `min finalize-install --undo` while any of
+these host files remain.
+
+When the installer finishes on a terminal and the host lacks a step, it shows
+the summary and asks `Finish setup now? This runs one sudo command. [Y/n]`.
+The default is yes. It does not ask on a host that needs nothing. If you
+decline, or there is no terminal, it prints
+``run `min finalize-install` when you're ready``.
 
 ### `stop`
 
