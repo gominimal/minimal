@@ -431,7 +431,14 @@ STUB
     chmod +x "$remedybin/$_rb_cmd"
 done
 for _rb_cmd in rm rmdir find; do
-    ln -s "$(command -v "$_rb_cmd")" "$remedybin/$_rb_cmd"
+    _rb_real="$(command -v "$_rb_cmd")"
+    # A builtin or an alias comes back as a bare name, and the link would
+    # point at itself.
+    case "$_rb_real" in
+        /*) ;;
+        *) echo "remedy-bin: no real $_rb_cmd on PATH" >&2; exit 1 ;;
+    esac
+    ln -s "$_rb_real" "$remedybin/$_rb_cmd"
 done
 # The shell the remedies run in, resolved now: the remedy PATH has no shell.
 remedy_sh="$(command -v "$SH")"
@@ -515,7 +522,9 @@ run() {
 # under $root (the bare tokens the remedies use are allow-listed), which
 # covers an advisory printed without the root override and a stray indented
 # line from other installer output. And the line runs with the remedy-bin as
-# its whole PATH, so a command with no stub there fails. Keep the indent in
+# its whole PATH, so a command with no stub there fails. It also runs from
+# $root with $root as its HOME, so a relative or `~` operand, which the first
+# guard does not see, stays inside the fake root too. Keep the indent in
 # sync with the advisory lines maybe_remove_finalize_install() embeds in
 # scripts/install.sh.
 apply_remedies() {
@@ -547,7 +556,7 @@ apply_remedies() {
             bad "a printed remedy names a path outside the fake root: $_ar_line"
             continue
         fi
-        if PATH="$remedybin" "$remedy_sh" -c "$_ar_line"; then
+        if (cd "$root" && HOME="$root" PATH="$remedybin" "$remedy_sh" -c "$_ar_line"); then
             _ar_ok=$((_ar_ok + 1))
         else
             bad "a printed remedy failed to run: $_ar_line"
@@ -696,9 +705,28 @@ case_finalize_install_uninstall() {
     check 1 "$_g_counted" "the remedy runner counts no refused line as run"
 
     # The advice and `min finalize-install --undo` name the same paths: every
-    # absolute path constant in the undo's source appears in install.sh, apart
-    # from the ones that are not the step's to remove. A path added to the undo
-    # and not to the advice fails here.
+    # absolute path constant in the undo's source appears in the code of
+    # maybe_remove_finalize_install, apart from the ones that are not the
+    # step's to remove. A path added to the undo and not to the advice fails
+    # here. The path has to stand as a whole word in a line that is not a
+    # comment, so a mention in a comment or a longer path that starts with it
+    # does not count. This shows the function names the path, not that a
+    # remedy removes it: the seeded scenarios below are the proof of removal.
+    _advice="$root/advice.body"
+    sed -n '/^maybe_remove_finalize_install()/,/^}$/p' "$installer" \
+        | grep -v '^ *#' >"$_advice" || true
+    advice_names() {
+        awk -v p="$1" '{
+            s = $0
+            while ((i = index(s, p)) > 0) {
+                c = substr(s, i + length(p), 1)
+                if (c == "" || index(" \"\047;}", c) > 0) found = 1
+                s = substr(s, i + 1)
+            }
+        } END { exit !found }' "$_advice"
+    }
+    want_err "a path that only starts a longer one is not named by the advice" \
+        advice_names /usr/local/lib/min
     _src="$here/../crates"
     _undo_paths="$({
         awk '/const [A-Z_]+: &str =/ { want = 2 } want > 0 { print; want-- }' \
@@ -718,7 +746,7 @@ case_finalize_install_uninstall() {
         esac
         _undo_n=$((_undo_n + 1))
         want_ok "the uninstall advice names the undo's path $_undo_p" \
-            grep -qF "$_undo_p" "$installer"
+            advice_names "$_undo_p"
     done <<EOF
 $_undo_paths
 EOF
