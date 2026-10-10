@@ -169,6 +169,16 @@ human_size() {
     fi
 }
 
+# Shell-quote one word for a command line that is itself re-parsed by another
+# shell (the manual remedies maybe_remove_finalize_install composes are run
+# verbatim through `sh -c`, or pasted at a prompt). Double quotes do not
+# survive that second parse — $HOME and $(…) would expand again — so a
+# pathname with spaces or an embedded $ stays one literal word only when it
+# is single-quoted with each `'` doubled as '\''.
+shq() {
+    printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
 # $HOME-relative display path: the card and the table are meant to be read, and
 # an absolute /Users/... prefix on every line is noise.
 tilde() {
@@ -463,13 +473,13 @@ maybe_remove_finalize_install() {
     fi
     _ns_rm=
     for _ns_p in $_ns_files; do
-        _ns_rm="$_ns_rm \"$_fi_root$_ns_p\""
+        _ns_rm="$_ns_rm $(shq "$_fi_root$_ns_p")"
     done
-    _ns_rm="$_ns_rm \"$_ns_chan\""
+    _ns_rm="$_ns_rm $(shq "$_ns_chan")"
     if [ "$os" = darwin ]; then
-        _ns_undo="sudo launchctl bootout system/dev.gominimal.zone; sudo launchctl bootout system/dev.minimal.local-range; sudo rm -f$_ns_rm; sudo rmdir \"${_ns_chan%/*}\" \"$_fi_root/Library/Application Support/minimal\" 2>/dev/null || true"
+        _ns_undo="sudo launchctl bootout system/dev.gominimal.zone; sudo launchctl bootout system/dev.minimal.local-range; sudo rm -f$_ns_rm; sudo rmdir $(shq "${_ns_chan%/*}") $(shq "$_fi_root/Library/Application Support/minimal") 2>/dev/null || true"
     else
-        _ns_undo="sudo systemctl disable --now minzoned.socket minzoned.service; sudo rm -f$_ns_rm; sudo systemctl daemon-reload; sudo systemctl reset-failed minzoned.socket minzoned.service; [ ! -e \"$_fi_root/sys/class/net/minzone0\" ] || { sudo resolvectl revert minzone0; sudo ip link del minzone0; }; sudo rmdir \"${_ns_chan%/*}\" \"$_lib_dir\" 2>/dev/null || true"
+        _ns_undo="sudo systemctl disable --now minzoned.socket minzoned.service; sudo rm -f$_ns_rm; sudo systemctl daemon-reload; sudo systemctl reset-failed minzoned.socket minzoned.service; [ ! -e $(shq "$_fi_root/sys/class/net/minzone0") ] || { sudo resolvectl revert minzone0; sudo ip link del minzone0; }; sudo rmdir $(shq "${_ns_chan%/*}") $(shq "$_lib_dir") 2>/dev/null || true"
     fi
     # What is found, as a list for the prompt; what `min finalize-install
     # --undo` removes; the manual remedy, one root command line per item.
@@ -491,12 +501,12 @@ maybe_remove_finalize_install() {
                 _fi_list="$_fi_list${_fi_list:+, }the user-namespace profile ($_aa_profile)"
                 _fi_owned=1
                 _fi_undo="$_fi_undo${_fi_undo:+
-}      sudo apparmor_parser -R \"$_aa_profile\"; sudo rm -f \"$_aa_profile\" \"$_aa_tunable\" \"$_aa_dir/tunables/minimald.d/local\"; sudo rmdir \"$_aa_dir/tunables/minimald.d\" 2>/dev/null; sudo rm -f \"$_aa_record\""
+}      sudo apparmor_parser -R $(shq "$_aa_profile"); sudo rm -f $(shq "$_aa_profile") $(shq "$_aa_tunable") $(shq "$_aa_dir/tunables/minimald.d/local"); sudo rmdir $(shq "$_aa_dir/tunables/minimald.d") 2>/dev/null; sudo rm -f $(shq "$_aa_record")"
             else
                 _fi_list="$_fi_list${_fi_list:+, }the system AppArmor profile ($_aa_profile, not min finalize-install's)"
                 _aa_unowned=1
                 _fi_undo="$_fi_undo${_fi_undo:+
-}      sudo apparmor_parser -R \"$_aa_profile\"; sudo rm -f \"$_aa_profile\" \"$_aa_tunable\""
+}      sudo apparmor_parser -R $(shq "$_aa_profile"); sudo rm -f $(shq "$_aa_profile") $(shq "$_aa_tunable")"
             fi
         fi
         # The classifier's units, the boot unit first: it re-runs the step at
@@ -505,7 +515,7 @@ maybe_remove_finalize_install() {
         _cls_rm=
         _cls_found=
         for _cls_p in /etc/systemd/system/minimald-classifier.service /etc/systemd/system/minimald-place.path /etc/systemd/system/minimald-place.service /usr/local/lib/minimal/install-host-classifier.sh; do
-            _cls_rm="$_cls_rm \"$_fi_root$_cls_p\""
+            _cls_rm="$_cls_rm $(shq "$_fi_root$_cls_p")"
             if [ -z "$_cls_found" ] && [ -e "$_fi_root$_cls_p" ]; then
                 _cls_found="$_cls_p"
             fi
@@ -514,7 +524,7 @@ maybe_remove_finalize_install() {
             _fi_list="$_fi_list${_fi_list:+, }the classifier units ($_cls_found)"
             _fi_owned=1
             _fi_undo="$_fi_undo${_fi_undo:+
-}      sudo systemctl disable --now minimald-classifier.service minimald-place.path minimald-place.service; sudo rm -f$_cls_rm; sudo systemctl daemon-reload; sudo rmdir \"$_lib_dir\" 2>/dev/null || true"
+}      sudo systemctl disable --now minimald-classifier.service minimald-place.path minimald-place.service; sudo rm -f$_cls_rm; sudo systemctl daemon-reload; sudo rmdir $(shq "$_lib_dir") 2>/dev/null || true"
         fi
         # The tree, by the step's record only: a tree without the record was
         # installed another way and stays. The record goes once the tree has.
@@ -522,13 +532,13 @@ maybe_remove_finalize_install() {
             _fi_list="$_fi_list${_fi_list:+, }the classifier tree ($_cls_root)"
             _fi_owned=1
             _fi_undo="$_fi_undo${_fi_undo:+
-}      sudo nft delete table inet minimal_class; { [ ! -d \"$_fi_root$_cls_root\" ] || sudo find \"$_fi_root$_cls_root\" -depth -type d -exec rmdir {} +; } && sudo rm -f \"$_cls_record\""
+}      sudo nft delete table inet minimal_class; { [ ! -d $(shq "$_fi_root$_cls_root") ] || sudo find $(shq "$_fi_root$_cls_root") -depth -type d -exec rmdir {} +; } && sudo rm -f $(shq "$_cls_record")"
         fi
         if [ -e "$_kvm_record" ]; then
             _fi_list="$_fi_list${_fi_list:+, }the kvm group membership"
             _fi_owned=1
             _fi_undo="$_fi_undo${_fi_undo:+
-}      while IFS= read -r u; do sudo gpasswd -d \"\$u\" kvm; done < \"$_kvm_record\"; sudo rm -f \"$_kvm_record\""
+}      while IFS= read -r u; do sudo gpasswd -d \"\$u\" kvm; done < $(shq "$_kvm_record"); sudo rm -f $(shq "$_kvm_record")"
         fi
     fi
     [ -n "$_fi_list" ] || return 0

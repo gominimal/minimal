@@ -511,7 +511,7 @@ run() {
 # so the artifacts the advisory named are actually removed from the seeded
 # fake root; the scenario then asserts each one is gone. `rm`, `rmdir` and
 # `find` are real, so two guards keep a line from reaching the host. A line
-# is refused before it runs unless every path in it is a double-quoted one
+# is refused before it runs unless every path in it is a single-quoted one
 # under $root (the bare tokens the remedies use are allow-listed), which
 # covers an advisory printed without the root override and a stray indented
 # line from other installer output. And the line runs with the remedy-bin as
@@ -526,12 +526,12 @@ apply_remedies() {
         # What is left of the line once every quoted path under $root and
         # every allow-listed token is taken out: a slash still there is a
         # path somewhere else.
-        _ar_rest="$(printf '%s\n' "$_ar_line" | awk -v r="\"$root/" '{
+        _ar_rest="$(printf '%s\n' "$_ar_line" | awk -v r="'$root/" -v q="'" '{
             s = $0; out = ""
             while ((i = index(s, r)) > 0) {
                 out = out substr(s, 1, i - 1)
                 s = substr(s, i + length(r))
-                j = index(s, "\"")
+                j = index(s, q)
                 if (j == 0) { out = out "/"; s = ""; break }
                 s = substr(s, j + 1)
             }
@@ -687,12 +687,12 @@ case_finalize_install_uninstall() {
     # counted here and then taken back out of the tally.
     _g_pass=$pass; _g_fail=$fail
     OUT="$root/out.remedy_guard"
-    printf '      sudo rm -f "/no-such-minimal-dir/guard-probe"\n      sudo rm -f "%s/../guard-probe"\n      sudo uname\n' \
-        "$root" >"$OUT"
+    printf "      sudo rm -f '/no-such-minimal-dir/guard-probe'\n      sudo rm -f '%s/../guard-probe'\n      sudo rm -f \"%s/guard-probe\"\n      sudo uname\n" \
+        "$root" "$root" >"$OUT"
     apply_remedies 0 >/dev/null 2>&1
     _g_refused=$((fail - _g_fail)); _g_counted=$((pass - _g_pass))
     pass=$_g_pass; fail=$_g_fail
-    check 3 "$_g_refused" "the remedy runner refuses an unrooted path, a .. path and an unstubbed command"
+    check 4 "$_g_refused" "the remedy runner refuses an unrooted path, a .. path, a path not single-quoted and an unstubbed command"
     check 1 "$_g_counted" "the remedy runner counts no refused line as run"
 
     # The advice and `min finalize-install --undo` name the same paths: every
@@ -729,7 +729,11 @@ EOF
     HNS="$root/hns"; mkdir -p "$HNS"
     run ns_seed "$HNS"
     check 0 "$rc" "uninstall-net-setup seed install exits 0"
-    fake_ns="$root/fake-net-setup-root"
+    # The fake root holds a space and a literal $HOME: a remedy is a command
+    # line another shell parses again (apply_remedies runs it through `sh -c`;
+    # a pasted prompt is the same), so every path has to come through as one
+    # single-quoted word, never split and never expanded.
+    fake_ns="$root/fake net root \$HOME"
     ns_files="etc/systemd/system/minzoned.socket etc/systemd/system/minzoned.service usr/local/lib/minimal/minzoned run/minimal/answerer.sock"
     for f in $ns_files sys/class/net/minzone0; do
         mkdir -p "$fake_ns/$(dirname "$f")"
@@ -761,7 +765,7 @@ EOF
     PLAT_S=Darwin; PLAT_M=arm64
     run nsd_seed "$HNSD"
     check 0 "$rc" "darwin: uninstall-net-setup seed install exits 0"
-    fake_nsd="$root/fake-net-setup-root-darwin"
+    fake_nsd="$root/fake net root-d \$HOME"
     for f in etc/resolver/min.internal Library/LaunchDaemons/dev.gominimal.zone.plist \
         Library/PrivilegedHelperTools/minzoned Library/LaunchDaemons/dev.minimal.local-range.plist \
         Library/PrivilegedHelperTools/dev.minimal.local-range \
@@ -804,7 +808,7 @@ EOF
     # the record in the manual remedy.
     HNS3="$root/hns3"; mkdir -p "$HNS3"
     run ns3_seed "$HNS3"
-    fake_aa3="$root/fake-apparmor.d-3"; mkdir -p "$fake_aa3/tunables/minimald.d"
+    fake_aa3="$root/fake apparmor.d-3 \$HOME"; mkdir -p "$fake_aa3/tunables/minimald.d"
     printf 'profile\n' >"$fake_aa3/minimald"
     printf 'tunable\n' >"$fake_aa3/tunables/minimald"
     printf 'local\n' >"$fake_aa3/tunables/minimald.d/local"
@@ -836,7 +840,7 @@ EOF
     # the tree goes.
     HNS4="$root/hns4"; mkdir -p "$HNS4"
     run ns4_seed "$HNS4"
-    fake_ns4="$root/fake-net-setup-root-4"
+    fake_ns4="$root/fake net root-4 \$HOME"
     cls_tree="sys/fs/cgroup/minimald.slice"
     cls_files="etc/systemd/system/minimald-classifier.service etc/systemd/system/minimald-place.path etc/systemd/system/minimald-place.service usr/local/lib/minimal/install-host-classifier.sh var/lib/minimal/finalize-install-classifier"
     mkdir -p "$fake_ns4/$cls_tree/classifier-table" "$fake_ns4/$cls_tree/daemon" \
@@ -902,7 +906,7 @@ EOF
     # The kvm group membership, by its record.
     HNS5="$root/hns5"; mkdir -p "$HNS5"
     run ns5_seed "$HNS5"
-    fake_ns5="$root/fake-net-setup-root-5"
+    fake_ns5="$root/fake net root-5 \$HOME"
     mkdir -p "$fake_ns5/var/lib/minimal"
     printf 'alice\n' >"$fake_ns5/var/lib/minimal/finalize-install-kvm-group"
     FINALIZE_INSTALL_ROOT="$fake_ns5"
