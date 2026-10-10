@@ -2126,8 +2126,8 @@ async fn host_hook() -> Hook {
 /// sentence that says what the script does, how to run it, and `set -eu`.
 /// `what` is that sentence, without its final period: the lead-in
 /// [`macos_command`] and [`linux_command`] pick for the steps they carry,
-/// or the removal [`undo_command`] renders. `verb` is the `min` invocation
-/// that prints the script.
+/// or the removal [`undo_command`] renders. `shown_by` is the complete
+/// `min` invocation, including flags, that prints the script.
 ///
 /// `set -e` stops the script at the first step that fails, and every step
 /// is its own statement — never part of an `&&` list, where POSIX ignores
@@ -2660,6 +2660,9 @@ pub(crate) fn names_steps(port: u16, install: Option<&AnswererInstall>) -> Strin
     macos_names_steps(port, install)
 }
 
+/// The names item's resolver and optional answerer-service steps for this
+/// host, without a script header. `port` is the answerer's loopback DNS port;
+/// `None` for `install` leaves out the service installation.
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn names_steps(port: u16, install: Option<&AnswererInstall>) -> String {
     linux_names_steps(port, install)
@@ -2720,6 +2723,8 @@ const CLASSIFIER_SCRIPT: &str = include_str!("../../../scripts/install-host-clas
 /// removal runs whatever it does, and the script still exits non-zero
 /// with the note that names what to stop. Every other line tolerates what
 /// is already gone.
+/// Failures unloading the profile or removing group membership are ignored;
+/// file-removal failures can stop the enclosing script.
 #[cfg(any(test, not(target_os = "macos")))]
 fn linux_host_items_removal() -> String {
     format!(
@@ -2833,6 +2838,10 @@ pub(crate) fn macos_undo_command(channel: &str) -> String {
 /// already gone, so the script succeeds on a host it already cleaned, or
 /// on one `min finalize-install` never touched. `channel` is the machine-global
 /// channel path the step's socket unit names.
+///
+/// Also removes the AppArmor profile and KVM membership recorded by
+/// finalize-install, and runs the classifier's `--uninstall` when its tree
+/// exists. An AppArmor profile without the ownership record stays in place.
 #[cfg(any(test, not(target_os = "macos")))]
 pub(crate) fn linux_undo_command(channel: &str) -> String {
     format!(
@@ -3147,7 +3156,16 @@ pub(crate) enum NamesVerdict {
     },
 }
 
-/// [`advisory_at`]'s decision, before it is rendered: see [`NamesVerdict`].
+/// Return a [`NamesVerdict`] describing which names setup is missing,
+/// using the supplied host facts.
+/// `port` is the answerer's loopback DNS port; `interim` means the session
+/// uses the shared address because the reserved range was unavailable.
+/// `range_present: None` supplies no evidence of a missing range, but the
+/// range unit must still pass its custody checks for the verdict to be done.
+///
+/// `blocker` takes precedence over an otherwise complete setup. An unavailable,
+/// refused, or unquotable answerer source instead yields a missing verdict
+/// whose facts explain why the service installation is omitted.
 pub(crate) fn names_verdict_at(
     hook: &Hook,
     port: u16,

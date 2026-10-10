@@ -49,6 +49,9 @@ pub async fn run(cli: Cli) -> Result<(), anyhow::Error> {
     Box::pin(run_command(cli)).instrument(root).await
 }
 
+/// Migrate legacy provider directories, then dispatch the selected command
+/// or the bare `min` flow. Returns the command's success or error; commands
+/// that exit the process do not return through this dispatcher.
 pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
     // Adopt any pre-split `providers/local-<N>` dirs into the kind-tagged scheme
     // once per invocation, before any command resolves a provider dir, so an

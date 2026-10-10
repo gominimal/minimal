@@ -78,6 +78,7 @@ pub(crate) struct Item {
 }
 
 impl Item {
+    /// An installed item with no remaining work or script block.
     fn done(id: &'static str, label: &'static str) -> Self {
         Item {
             id,
@@ -90,6 +91,8 @@ impl Item {
         }
     }
 
+    /// An actionable item: `today` describes its absence, `step` the remedy,
+    /// and `script` the shell block to include under the plan's shared header.
     fn missing(
         id: &'static str,
         label: &'static str,
@@ -108,6 +111,7 @@ impl Item {
         }
     }
 
+    /// An item blocked by `cause`, with no script the plan can run for it.
     fn cannot(id: &'static str, label: &'static str, cause: String) -> Self {
         Item {
             id,
@@ -120,6 +124,8 @@ impl Item {
         }
     }
 
+    /// An item awaiting daemon information, with `cause` explaining what
+    /// is unavailable and no script block until that information is known.
     fn waiting(id: &'static str, label: &'static str, cause: String) -> Self {
         Item {
             id,
@@ -155,12 +161,14 @@ impl Plan {
         self.items.iter().all(|item| item.state == ItemState::Done)
     }
 
+    /// Items whose steps can run now, in plan order; excludes waiting items.
     fn missing(&self) -> impl Iterator<Item = &Item> {
         self.items
             .iter()
             .filter(|item| item.state == ItemState::Missing)
     }
 
+    /// Blocked items, in plan order, for the summary's separate heading.
     fn cannot(&self) -> impl Iterator<Item = &Item> {
         self.items
             .iter()
@@ -301,6 +309,18 @@ pub(crate) fn run_decision(
 /// and runs nothing; `--show --script` adds the script on stdout; `--show
 /// --json` prints the report and exits non-zero while anything is
 /// missing; `--undo` removes everything the step installed.
+///
+/// Without JSON, show modes return successfully even for an unfinished
+/// host. A run with nothing actionable exits 1 unless all items are done;
+/// a successful script returns `Ok(())` even if blocked or waiting items
+/// remain. Replacing another operator's service is refused with exit 1.
+/// `--undo --show` without `--script` exits with a clap usage error.
+///
+/// # Errors
+///
+/// Propagates temporary-file and sudo execution errors from `run_as_root`.
+/// An unsuccessful script or unavailable noninteractive elevation exits
+/// the process as described there instead of returning an error.
 pub async fn cmd_finalize_install(
     global: &GlobalArgs,
     args: FinalizeInstallArgs,
@@ -376,6 +396,9 @@ pub(crate) fn undo_flags_refusal(args: &FinalizeInstallArgs) -> Option<&'static 
 /// with nothing running, and every step of it tolerates what is already
 /// gone, so it succeeds on a clean host. With `--show --script` it prints
 /// the script and runs nothing.
+///
+/// `show` selects printing; the caller must first validate the CLI flags.
+/// Execution errors and process exits follow [`run_as_root`].
 fn cmd_finalize_install_undo(show: bool) -> Result<(), anyhow::Error> {
     let script = crate::resolver::undo_command();
     if show {
@@ -385,7 +408,8 @@ fn cmd_finalize_install_undo(show: bool) -> Result<(), anyhow::Error> {
     run_as_root(&script, UNDO_SCRIPT_POINTER)
 }
 
-/// Exits with `code` once stdout and stderr are flushed: `std::process::exit`
+/// Exits with `code` after attempting to flush stdout and stderr, ignoring
+/// flush errors: `std::process::exit`
 /// runs no destructor, and a piped stdout is block-buffered, so the report
 /// or summary printed just before it would otherwise never reach its reader
 /// (`min finalize-install --show --json > report.json` on an unfinished
@@ -397,8 +421,12 @@ fn exit(code: i32) -> ! {
     std::process::exit(code)
 }
 
-/// Writes `script` to a private temp file — created exclusively, mode
-/// 0600, so no other user can read or swap it.
+/// Writes and flushes `script` to an exclusively created, mode-0600 temp
+/// file. Returns the open file; closing or dropping it attempts to remove it.
+///
+/// # Errors
+///
+/// Returns an error if creating, writing, or flushing the file fails.
 pub(crate) fn write_private_script(script: &str) -> Result<tempfile::NamedTempFile, anyhow::Error> {
     use std::io::Write as _;
     let mut file = tempfile::Builder::new()
@@ -414,9 +442,17 @@ pub(crate) fn write_private_script(script: &str) -> Result<tempfile::NamedTempFi
 
 /// Runs a host-setup script as root: written by [`write_private_script`]
 /// and run under the elevation [`run_decision`] picks, whose prompt is the
-/// one privilege prompt. The file is removed once the script exits, and
-/// the process exits with the script's status. The script is the one
-/// `--show --script` prints, byte for byte.
+/// one privilege prompt. After removing the file, returns `Ok(())` on
+/// success or exits with sudo's nonzero status (1 if terminated by a
+/// signal). The script is the one `--show --script` prints, byte for byte.
+///
+/// Without a terminal, a failed `sudo -n true` probe, including failure to
+/// start it, prints `pointer` (the install or undo script route) and exits 1.
+///
+/// # Errors
+///
+/// Propagates script-file creation, write, and flush errors; also returns
+/// errors from starting or waiting for sudo and removing the script file.
 fn run_as_root(script: &str, pointer: &str) -> Result<(), anyhow::Error> {
     let stdin_is_tty = std::io::stdin().is_terminal();
     let sudo_runs_quietly = !stdin_is_tty
@@ -516,7 +552,8 @@ pub(crate) fn names_item(verdict: crate::resolver::NamesVerdict, port: u16) -> I
 /// the answerer port `min ls` reads — each listed VM's own state from its
 /// VM host daemon's control socket (NET-138), else the daemon's listing.
 /// It never starts a daemon: with none reachable, or none that reports a
-/// port, there is no port to point a script at, and the item says so.
+/// usable port, the item is waiting. A port held without a reachable
+/// channel is also waiting unless another listing supplies a usable port.
 async fn names_item_on_this_host(global: &GlobalArgs) -> Item {
     let listings = ls_listings_best_effort(global).await;
     let mut answerer = None;
@@ -644,11 +681,13 @@ pub(crate) mod linux {
         pub home: Option<String>,
     }
 
-    /// The user-namespace item over `facts`: `None` on a host whose kernel
-    /// does not restrict unprivileged user namespaces (nothing to install),
-    /// done when the profile is loaded and attaches this host's daemon,
-    /// and blocked where user namespaces are off altogether or no parser
-    /// can load a profile.
+    /// Classify the user-namespace setup from the supplied host facts.
+    /// A zero, missing, or invalid namespace limit blocks the item. Otherwise,
+    /// a zero, missing, or invalid AppArmor restriction omits it (`None`).
+    /// An existing profile is done when the daemon is unknown, in a stock
+    /// path, or named by the tunables; this does not verify a loaded profile.
+    /// Otherwise, offer installation unless the parser is absent or an extra
+    /// daemon path contains a single quote, `#`, or whitespace.
     pub(crate) fn userns_item_over(facts: &UsernsFacts) -> Option<Item> {
         let max = facts
             .max_user_namespaces
@@ -718,6 +757,8 @@ pub(crate) mod linux {
     /// The step's block: the tunable and the profile written from the bytes
     /// this script carries, the daemon's path appended where the stock
     /// tunable does not name it, and the profile loaded.
+    /// `extra_daemon_path` must already be checked by [`userns_item_over`];
+    /// it is inserted without escaping and replaces the local attachment set.
     fn userns_steps(extra_daemon_path: Option<&str>) -> String {
         let mut script = format!(
             "# The user-namespace profile: lets minimald create the user namespace every\n\
@@ -750,7 +791,8 @@ pub(crate) mod linux {
         script
     }
 
-    /// [`userns_item_over`] this host's reads.
+    /// [`userns_item_over`] this host's reads. Unreadable sysctls become
+    /// absent facts; unreadable tunables do not count as naming the daemon.
     pub(crate) fn userns_item_on_this_host() -> Option<Item> {
         let daemon = std::env::current_exe()
             .ok()
@@ -855,7 +897,8 @@ pub(crate) mod linux {
         ))
     }
 
-    /// [`classifier_item_over`] this host's reads.
+    /// [`classifier_item_over`] this host's reads. An unreadable mount table
+    /// is treated as an absent cgroup2 mount.
     pub(crate) fn classifier_item_on_this_host() -> Option<Item> {
         let marker = std::path::Path::new(CLASSIFIER_TREE_ROOT).join("classifier-table");
         let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
@@ -869,6 +912,8 @@ pub(crate) mod linux {
     /// the step has nothing to add (and nothing to record for `--undo` to
     /// take back); blocked when the device is not there, or on any other
     /// error, named.
+    /// A permission denial is also blocked if `operator` is empty or contains
+    /// a single quote, newline, or space. No device error is propagated.
     pub(crate) fn kvm_item_over(
         open: Result<(), std::io::Error>,
         operator: &str,
@@ -938,8 +983,9 @@ pub(crate) mod linux {
         }
     }
 
-    /// Whether `group` (the `/etc/group` text) lists `operator` as a member
-    /// of `kvm`: a membership the running login does not carry yet.
+    /// Whether `group` (the `/etc/group` text) explicitly lists the nonempty
+    /// `operator` in `kvm`'s member field. Does not check the login's groups
+    /// or the account's primary group.
     pub(crate) fn in_kvm_group(group: &str, operator: &str) -> bool {
         !operator.is_empty()
             && group.lines().any(|line| {
@@ -951,7 +997,8 @@ pub(crate) mod linux {
             })
     }
 
-    /// [`kvm_item_over`] this host's reads.
+    /// [`kvm_item_over`] this host's reads. An unreadable `/etc/group` is
+    /// treated as containing no recorded membership.
     pub(crate) fn kvm_item_on_this_host() -> Item {
         let open = std::fs::OpenOptions::new()
             .read(true)

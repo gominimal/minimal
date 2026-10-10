@@ -421,9 +421,11 @@ strip_rc_block() {
 # paths being present, so a host that never set up sees nothing. On an
 # interactive terminal, prompt once and, on yes, run `min finalize-install
 # --undo` (here, before the walk deletes `min`) and the loader for an
-# unrecorded profile; piped (curl|sh), non-interactive, or dry-run, advise the
+# unrecorded profile; piped (curl|sh) or non-interactive, advise the
 # root commands for everything found instead, which stay valid after the
-# walk. The roots are overridable for install_test.sh.
+# walk. Dry-run only reports what removal it would offer. Failed automatic
+# removal prints the manual commands and returns success so uninstall can
+# continue. The roots are overridable for install_test.sh.
 maybe_remove_finalize_install() {
     _fi_root="${MINIMAL_OVERRIDE_NET_SETUP_ROOT:-}"
     _aa_dir="${MINIMAL_OVERRIDE_APPARMOR_DIR:-/etc/apparmor.d}"
@@ -537,6 +539,9 @@ maybe_remove_finalize_install() {
 # only if it is still byte-for-byte what we recorded writing, so a
 # user's edited or replaced file is kept unless --force. Runs entirely on local
 # state: no network, manifest, or bucket.
+# Before removing recorded files, offers to remove privileged host setup via
+# maybe_remove_finalize_install. With no install record, returns success
+# without offering host cleanup.
 do_uninstall() {
     state_dir="$(resolve_prefix state)"
     record="$state_dir/installed"
