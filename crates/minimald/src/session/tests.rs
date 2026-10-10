@@ -7904,6 +7904,67 @@ async fn expose_deny_typed_error() {
     }
 }
 
+/// A host-address box is answered before its stance is read: its record can
+/// carry no `dynamic_ingress`, so the stance check alone would deny every
+/// request — true of the setting, and wrong about the port, which already
+/// answers on the host's network. The answer is the typed needs-no-exposing
+/// refusal, not the deny; it makes no decision, so nothing is audited
+/// (NET-046), and the request's one info line says what became of it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expose_host_address_answers_before_the_stance() {
+    let capture = crate::test_harness::captured_log();
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    // The harness default: a host-address box that declared nothing.
+    let id = create_configured_session(&mut client, "hostweb", "/uwu").await;
+    let manager = server.state.sessions_manager().await;
+    let handle = manager
+        .get_session(crate::sessions::SessionKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the host-address box resolves");
+    let record = handle.record().await.expect("the record reads");
+    assert_eq!(record.network, sessions::NetworkMode::HostNet);
+
+    match handle.expose_dynamic(3001).await {
+        Err(crate::net::policy::ExposeFailure::Refused(
+            crate::net::policy::ExposeRefusal::NeedsNoExposing {
+                port: 3001,
+                // The harness daemon is native, so the host's loopback
+                // answers too.
+                host_loopback: true,
+            },
+        )) => {}
+        other => panic!("a host-address box's port needs no exposing: {other:?}"),
+    }
+
+    let logged = capture.contents();
+    let lines: Vec<&str> = logged
+        .lines()
+        .filter(|line| line.contains("dynamic ingress expose") && line.contains("name=hostweb"))
+        .collect();
+    assert_eq!(lines.len(), 1, "one line per request, got: {logged}");
+    assert!(
+        lines[0].contains("port=3001")
+            && lines[0].contains("outcome=\"needs no exposing\"")
+            && !lines[0].contains("denied"),
+        "the line says the port needs no exposing, not that it was denied: {}",
+        lines[0]
+    );
+    let audit = crate::audit::log_path(
+        server
+            .state
+            .minimal_state_dir()
+            .await
+            .as_utf8_path()
+            .as_std_path(),
+    );
+    assert!(
+        tokio::fs::metadata(&audit).await.is_err(),
+        "no decision was made, so none is audited"
+    );
+}
+
 /// NET-047: a request that does not end in a publish leaves nothing behind —
 /// no half-bound port, no row the policy surfaces would lie about. The two
 /// ways a request fails: refused before the switch is asked (the port outside
