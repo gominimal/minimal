@@ -52,9 +52,12 @@ for new code.
 - A **Box Type** names a kind of box, never the box itself. session and task
   are Box Types. The BOX spec lists the rest.
 - A **sandbox** is the operating-system isolation (namespaces, mounts,
-  cgroups) that boxes and package builds both run in: the `sandbox` crate.
-- A **Box Host** is the machine that hosts boxes. Give a module or type that
-  name only when it models that machine.
+  cgroups) that every box runs in: the `sandbox` crate. Package builds are
+  boxes of the `build` Box Type, though today `mip` runs them in the sandbox
+  directly, outside a box.
+- A **Box Host** is a running `minimald` that creates and hosts boxes, as
+  the architecture glossary defines it, not the machine it runs on. Gatehouse
+  calls an enrolled Box Host a node.
 
 Rules that follow from these:
 
@@ -67,9 +70,11 @@ Rules that follow from these:
   with a serde `rename` or `alias`.
 - Under the BOX spec, a box's behaviour follows the settings in its spec:
   its lifetime, PTY, timeout and network mode. It never follows the Box Type
-  name. Only the code that resolves Box Types, or checks a spec against its
-  type's constraints at admission, reads the type. Until then, do not add new branching on session versus task where a setting can
-  carry the difference.
+  name. Besides type resolution, the Box Spec projection reads the type's
+  name, source and root, and admission checks a spec against the root's
+  constraints. Until then,
+  do not add new branching on session versus task where a setting can carry
+  the difference.
 - New files, modules and types about the box take box names from the start.
   Rename code that still says session for the box in a pull request of its
   own. Never mix a rename into a move or a feature change.
