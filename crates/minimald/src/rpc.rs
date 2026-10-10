@@ -331,6 +331,25 @@ async fn serve_create_session(
                 return Ok(Errorable::Err { error: message });
             }
 
+            // The user-namespace gate (NET-141): a host that refuses the
+            // unprivileged user namespace every session sandbox starts by
+            // unsharing would otherwise mint a session whose first attach
+            // dies writing /proc/self/uid_map, with the cause in this log
+            // alone. Refused here, before the manager allocates anything,
+            // so the activation fails on a reply that names the cause and
+            // the remedy, and nothing is left behind for its caller to tear
+            // down.
+            if let Some(restriction) = s.user_namespace_verdict().await {
+                tracing::warn!(
+                    reason = %restriction,
+                    "session create refused: this host refuses the unprivileged user \
+                     namespace every session sandbox needs"
+                );
+                return Ok(Errorable::Err {
+                    error: user_namespace_refusal(restriction),
+                });
+            }
+
             let mngr = s.sessions_manager().await;
             // Read the name off the config before it is handed to the
             // manager: the success record below needs it, and the reply
@@ -501,6 +520,23 @@ async fn serve_create_session(
 /// removed whatever the session's network mode, and whatever value it
 /// carries.
 const HOST_IP_ENFORCEMENT_ATTR: &str = "host_ip_enforcement";
+
+/// The refusal a host's user-namespace restriction yields (NET-141): the
+/// wire crate's lead — what the client recognises the refusal by — around
+/// the cause in the words the person reads, then that cause's own remedy
+/// for the daemon on its own line: the install step and the restart it
+/// needs for the AppArmor restriction, the persistent sysctl (or a kernel
+/// with the namespace) when it is switched off.
+fn user_namespace_refusal(restriction: crate::server::UsernsRestriction) -> String {
+    format!(
+        "{}{}), so no box can start here yet.\n{}",
+        minimald_rpc::USER_NAMESPACE_REFUSAL_LEAD,
+        restriction.cause(),
+        restriction.remedy(sandbox2::RemedyTarget::Daemon {
+            bin: &crate::server::this_daemon_path(),
+        })
+    )
+}
 
 /// The advisory a cause yields for the reply (NET-079): the cause in words,
 /// the state it leaves the box in, and — only when the cause is one the
@@ -3678,9 +3714,8 @@ mod tests {
         );
         // The command's spelling is the install hint's own, pinned in the
         // classifier crate; the pin here is that the advisory carries the
-        // whole of it, verbatim, whatever the hint currently says — a
-        // stock install ships no `scripts/` tree, so the hint names where
-        // the script lives in the repository instead.
+        // whole of it, verbatim, whatever the hint currently says — the
+        // installed CLI's own verb, which carries the step itself.
         let install = sandbox2::classifier::install_hint();
         assert!(
             advisory.contains(&install),
@@ -3713,7 +3748,7 @@ mod tests {
             "the advisory must name this cause in words too, got: {advisory}"
         );
         assert!(
-            !advisory.contains("install-host-classifier"),
+            !advisory.contains("min finalize-install"),
             "no command ends this cause, so the advisory must name none: {advisory}"
         );
         assert!(
@@ -5242,7 +5277,7 @@ mod tests {
             "the clause still does not apply, got: {unreadable}"
         );
         assert!(
-            !unreadable.contains("install-host-classifier"),
+            !unreadable.contains("min finalize-install"),
             "no command is known to make a probe run, so none is named, \
              got: {unreadable}"
         );
@@ -5253,6 +5288,114 @@ mod tests {
             "a guest refuses a deny-all box on every cause, so its advisory \
              must not claim the declarations do not matter, got: {guest}"
         );
+    }
+
+    /// The user-namespace gate (NET-141): a host whose verdict refuses the
+    /// sandbox refuses the create itself, and the reply carries the verdict
+    /// — the cause in words and that cause's own remedy — with nothing
+    /// allocated for a caller to tear down. The gate is this server's own
+    /// state, so no other test's create sees the fixed verdict.
+    #[tokio::test]
+    async fn create_reply_carries_user_namespace_verdict() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+
+        // Each cause carries its own remedy: the install step lifts only the
+        // AppArmor restriction — and only for the daemon that next starts, so
+        // the restart is named — while a switched-off namespace names the
+        // persistent sysctl instead and never the install step.
+        // The harness daemon is this process, so the path the remedy names
+        // for a source-built daemon is this test binary's own.
+        let bin = crate::server::this_daemon_path();
+        for (verdict, expected, never) in [
+            (
+                crate::server::UsernsRestriction::ApparmorUnconfined,
+                format!(
+                    "this machine blocks the private sandbox every box runs in (Ubuntu restricts \
+                     unprivileged user namespaces), so no box can start here yet.\n\
+                     Finish the install to allow it for Minimal only: min finalize-install   (see \
+                     what it changes first: min finalize-install --show). The profile takes \
+                     effect when the daemon next starts: run min stop, then your command \
+                     again.\n\
+                     A daemon built from source is not covered: attach the profile to this \
+                     binary instead, from a checkout: sudo scripts/install-apparmor-profile.sh \
+                     --path {bin}, then the same restart."
+                ),
+                "sysctl",
+            ),
+            (
+                crate::server::UsernsRestriction::Disabled,
+                "this machine blocks the private sandbox every box runs in (user namespaces \
+                 are switched off (user.max_user_namespaces=0 or no kernel support)), so no \
+                 box can start here yet.\n\
+                 Set user.max_user_namespaces above 0: sudo sysctl -w \
+                 user.max_user_namespaces=15000 takes effect now, a /etc/sysctl.d drop-in \
+                 keeps it across reboots; or use a kernel with CONFIG_USER_NS."
+                    .to_string(),
+                "finalize-install",
+            ),
+        ] {
+            server
+                .state
+                .set_user_namespace_gate(crate::server::UsernsGate::Fixed(verdict))
+                .await;
+            let refused = client.call::<CreateSession>(&req("refused", "/uwu")).await;
+            server
+                .state
+                .set_user_namespace_gate(crate::server::UsernsGate::Off)
+                .await;
+            let error = refused
+                .err()
+                .expect("a create under a refusing verdict must be refused");
+            assert!(
+                error.starts_with(minimald_rpc::USER_NAMESPACE_REFUSAL_LEAD),
+                "the refusal must be the user-namespace one, got: {error}"
+            );
+            assert_eq!(error, expected);
+            assert!(
+                !error.contains(never),
+                "the other cause's remedy must not be named: {error}"
+            );
+            assert!(
+                client.call::<ListSessions>(&()).await.sessions.is_empty(),
+                "a refused create must not have allocated a session"
+            );
+        }
+    }
+
+    /// The gate reads the verdict on every create, never once at start: a
+    /// create refused under a verdict goes through once the verdict clears,
+    /// on the same running server, with no restart between. The live gate
+    /// re-probes `/proc` the same way; a fixed verdict stands in for the
+    /// host here because the harness's own host may be restricted.
+    #[tokio::test]
+    async fn create_succeeds_once_the_user_namespace_verdict_clears() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+
+        server
+            .state
+            .set_user_namespace_gate(crate::server::UsernsGate::Fixed(
+                crate::server::UsernsRestriction::Disabled,
+            ))
+            .await;
+        let refused = client.call::<CreateSession>(&req("remedied", "/uwu")).await;
+        assert!(
+            refused.err().is_some(),
+            "the create before the remedy must be refused"
+        );
+
+        // The remedy applied: the same server, the same connection, no
+        // restart — the next create goes through.
+        server
+            .state
+            .set_user_namespace_gate(crate::server::UsernsGate::Off)
+            .await;
+        client
+            .call::<CreateSession>(&req("remedied", "/uwu"))
+            .await
+            .ok()
+            .expect("a create after the verdict clears must succeed without a restart");
     }
 
     /// The version gate, made by the RPC the activation path already sends

@@ -1260,6 +1260,253 @@ async fn activate_prints_no_session_id_when_composition_fails() {
     );
 }
 
+/// Drives `min session activate` through the compiled binary against this
+/// process's harness daemon while its user-namespace verdict is `verdict`
+/// (NET-141), and returns the refusal: the `error:` block on stderr, exactly
+/// — the activation's own progress lines (`Applying loadouts: ...`) precede
+/// it. Asserts the contract every cause shares on the way: exit 1, nothing
+/// on stdout, and no session left behind. The binary is used because the
+/// exact stderr and the exit status are the contract; the verdict is set on
+/// the harness server alone and switched back off before the asserts.
+async fn refused_activation(verdict: minimald::server::UsernsRestriction) -> String {
+    let (daemon, args) = setup().await;
+    let minimal_dir = args.minimal_dir.clone().expect("setup points at a tempdir");
+
+    let project = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir(project.path().join(".git")).unwrap();
+    std::fs::write(
+        project.path().join("minimal.toml"),
+        "# test minimal.toml\n[stack]\nuse = \"shell\"\n",
+    )
+    .unwrap();
+    let project_canon = project.path().canonicalize().unwrap();
+    let config_dir = tempfile::TempDir::new().unwrap();
+
+    daemon
+        .server
+        .state
+        .set_user_namespace_gate(minimald::server::UsernsGate::Fixed(verdict))
+        .await;
+    let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_min"))
+        .args(["--minimal-dir".as_ref(), minimal_dir.as_os_str()])
+        .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
+        .arg("--no-input")
+        .args(["session", "activate"])
+        .arg(&project_canon)
+        .args(["--name", "refused-sandbox", "--sync", "tarball"])
+        .arg("--no-prompt")
+        .output()
+        .await
+        .expect("the min binary should be invocable");
+    daemon
+        .server
+        .state
+        .set_user_namespace_gate(minimald::server::UsernsGate::Off)
+        .await;
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a refused activation exits 1: stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        stdout.trim().is_empty(),
+        "a refused activation puts nothing on stdout, got: {stdout}"
+    );
+
+    // Nothing was created for the refusal to leave behind.
+    let mut client = daemon.server.connect().await;
+    let resp = client.call::<minimald_rpc::ListSessions>(&()).await;
+    assert!(
+        resp.sessions.is_empty(),
+        "a refused activation must leave no session behind, got: {:?}",
+        resp.sessions
+    );
+
+    // The block starts at the last line that opens with `error: `, so a
+    // progress line that happened to contain the words is never taken.
+    let at = stderr
+        .rfind("\nerror: ")
+        .map(|at| at + 1)
+        .or_else(|| stderr.starts_with("error: ").then_some(0))
+        .unwrap_or_else(|| panic!("no error block on stderr: {stderr}"));
+    stderr[at..].trim_end().to_string()
+}
+
+/// A host whose user-namespace verdict refuses the sandbox fails the
+/// activation before any session exists (NET-141): the daemon refuses the
+/// create on its verdict, `min session activate` prints that refusal as its
+/// error, exits 1, and leaves no session behind. The cause-specific texts
+/// are the two tests below; this one holds the shape they share.
+#[tokio::test]
+async fn activate_refuses_unconfinable_sandbox_before_session_creation() {
+    let refusal = refused_activation(minimald::server::UsernsRestriction::ApparmorUnconfined).await;
+    assert!(
+        refusal.starts_with("error: this machine blocks the private sandbox every box runs in ("),
+        "the refusal is the error block: {refusal}"
+    );
+    assert!(
+        refusal.contains("so no box can start here yet."),
+        "the refusal says no box can start: {refusal}"
+    );
+}
+
+/// The AppArmor restriction (stock Ubuntu 24.04+, unconfined daemon) names
+/// `min finalize-install` as the remedy, with `--show` for the step it runs,
+/// and never a sysctl, which would lift the protection for every program.
+#[tokio::test]
+async fn activate_refusal_names_finalize_install_for_apparmor_restriction() {
+    let refusal = refused_activation(minimald::server::UsernsRestriction::ApparmorUnconfined).await;
+    // The harness daemon runs in this process, so the path the remedy names
+    // for a source-built daemon is this test binary's own.
+    let bin = minimald::server::this_daemon_path();
+    assert_eq!(
+        refusal,
+        format!(
+            "error: this machine blocks the private sandbox every box runs in (Ubuntu restricts \
+             unprivileged user namespaces), so no box can start here yet.\n\
+             Finish the install to allow it for Minimal only: min finalize-install   \
+             (see what it changes first: min finalize-install --show). The profile takes \
+             effect when the daemon next starts: run min stop, then your command again.\n\
+             A daemon built from source is not covered: attach the profile to this binary \
+             instead, from a checkout: sudo scripts/install-apparmor-profile.sh --path {bin}, \
+             then the same restart."
+        )
+    );
+    assert!(
+        !refusal.contains("sysctl"),
+        "the AppArmor remedy never suggests a sysctl: {refusal}"
+    );
+}
+
+/// `user.max_user_namespaces=0` (or a kernel without `CONFIG_USER_NS`) names
+/// the sysctl key, the immediate `sysctl -w` the live gate picks up on the
+/// next create, and the persistent change — a sysctl.d drop-in, or a kernel
+/// built with the namespace — and not `min finalize-install`, whose profile
+/// cannot lift it.
+#[tokio::test]
+async fn activate_refusal_names_sysctl_for_max_user_namespaces_zero() {
+    let refusal = refused_activation(minimald::server::UsernsRestriction::Disabled).await;
+    assert_eq!(
+        refusal,
+        "error: this machine blocks the private sandbox every box runs in (user namespaces are \
+         switched off (user.max_user_namespaces=0 or no kernel support)), so no box can start \
+         here yet.\n\
+         Set user.max_user_namespaces above 0: sudo sysctl -w user.max_user_namespaces=15000 \
+         takes effect now, a /etc/sysctl.d drop-in keeps it across reboots; or use a kernel \
+         with CONFIG_USER_NS."
+    );
+    assert!(
+        !refusal.contains("finalize-install"),
+        "the install step cannot lift a disabled namespace: {refusal}"
+    );
+}
+
+/// Drives `min task run` through the compiled binary against this process's
+/// harness daemon while its user-namespace verdict is `verdict` (NET-141),
+/// and returns the refusal: the `error:` block on stderr, exactly. A task
+/// run creates its ephemeral session through the same create the daemon
+/// refuses, so the refusal must reach the user as the daemon's verdict —
+/// not wrapped as `CreateSession failed: ...`, which would mislabel a
+/// machine verdict as an RPC failure. Asserts the shared contract on the
+/// way: exit 1, nothing on stdout, and no session left behind.
+async fn refused_task_run(verdict: minimald::server::UsernsRestriction) -> String {
+    let (daemon, args) = setup().await;
+    let minimal_dir = args.minimal_dir.clone().expect("setup points at a tempdir");
+
+    // A VCS root so the headless upload gate passes, and one declared task
+    // the run never reaches: the create is refused first.
+    let project = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir(project.path().join(".git")).unwrap();
+    std::fs::write(
+        project.path().join("minimal.toml"),
+        "[tasks.e2e-echo]\necho = \"TASK_RUN_REFUSAL_UNREACHED\"\n",
+    )
+    .unwrap();
+    let project_canon = project.path().canonicalize().unwrap();
+    let config_dir = tempfile::TempDir::new().unwrap();
+
+    daemon
+        .server
+        .state
+        .set_user_namespace_gate(minimald::server::UsernsGate::Fixed(verdict))
+        .await;
+    let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_min"))
+        .args(["--minimal-dir".as_ref(), minimal_dir.as_os_str()])
+        .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
+        .arg("--no-input")
+        .args(["task", "run", "e2e-echo"])
+        .args(["--path".as_ref(), project_canon.as_os_str()])
+        .output()
+        .await
+        .expect("the min binary should be invocable");
+    daemon
+        .server
+        .state
+        .set_user_namespace_gate(minimald::server::UsernsGate::Off)
+        .await;
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a refused task run exits 1: stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        stdout.trim().is_empty(),
+        "a refused task run puts nothing on stdout, got: {stdout}"
+    );
+
+    // Nothing was created for the refusal to leave behind.
+    let mut client = daemon.server.connect().await;
+    let resp = client.call::<minimald_rpc::ListSessions>(&()).await;
+    assert!(
+        resp.sessions.is_empty(),
+        "a refused task run must leave no session behind, got: {:?}",
+        resp.sessions
+    );
+
+    // The block starts at the last line that opens with `error: `, so a
+    // progress line that happened to contain the words is never taken.
+    let at = stderr
+        .rfind("\nerror: ")
+        .map(|at| at + 1)
+        .or_else(|| stderr.starts_with("error: ").then_some(0))
+        .unwrap_or_else(|| panic!("no error block on stderr: {stderr}"));
+    stderr[at..].trim_end().to_string()
+}
+
+/// A refused host reaches `min task run` through the same create as an
+/// activate, so the refusal is the machine verdict there too (NET-141):
+/// printed verbatim, never wrapped as `CreateSession failed: ...` — a
+/// wrapper that called the daemon's verdict an RPC failure would mislabel
+/// it and bury the remedy's shape under a generic prefix.
+#[tokio::test]
+async fn task_run_prints_the_user_namespace_refusal_verbatim() {
+    let refusal = refused_task_run(minimald::server::UsernsRestriction::ApparmorUnconfined).await;
+    let bin = minimald::server::this_daemon_path();
+    assert_eq!(
+        refusal,
+        format!(
+            "error: this machine blocks the private sandbox every box runs in (Ubuntu restricts \
+             unprivileged user namespaces), so no box can start here yet.\n\
+             Finish the install to allow it for Minimal only: min finalize-install   (see what \
+             it changes first: min finalize-install --show). The profile takes effect when the \
+             daemon next starts: run min stop, then your command again.\n\
+             A daemon built from source is not covered: attach the profile to this binary \
+             instead, from a checkout: sudo scripts/install-apparmor-profile.sh --path {bin}, \
+             then the same restart."
+        )
+    );
+    assert!(
+        !refusal.contains("CreateSession failed"),
+        "a machine verdict is not an RPC failure: {refusal}"
+    );
+}
+
 /// Plain-mode tracing warnings must land on stderr, never stdout: a script
 /// piping `min loadout list` captures the table on stdout, and a `warning:`
 /// line mixed into it would corrupt that output. Driven through the compiled
