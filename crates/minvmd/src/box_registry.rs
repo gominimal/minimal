@@ -3353,8 +3353,10 @@ impl BoxRegistry {
             .box_id
             .unwrap_or_else(crate::bep_attach::mint_box_id);
         // The row's derived allow-list: the declaration's `allow_subnets`
-        // dimension in its own spelling — `None`, the absent dimension, is
-        // allow-all, the same meaning the compiled rules carry.
+        // dimension in its own spelling. `None` reaches this row only from
+        // the opt-out or the announced arm (`sessions::effective_egress`
+        // resolves it to present and empty in force), and there it is
+        // allow-all, the meaning the compiled rules give `None`.
         let egress_allow_list = registration
             .egress
             .as_ref()
@@ -8456,7 +8458,8 @@ mod tests {
         assert_eq!(
             db.egress_allow_list(),
             ["0.0.0.0/0"],
-            "an absent allow_subnets dimension is allow-all, the compiled rules' own meaning"
+            "an allow_subnets dimension still absent at registration (the opt-out or announced \
+             arm hands one) is allow-all, the compiled rules' meaning of None"
         );
 
         // A report within the grant records, and answers the row it

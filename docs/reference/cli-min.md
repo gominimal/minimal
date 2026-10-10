@@ -109,10 +109,10 @@ the current directory).
 | `--no-hooks` | | Run none of the session's [lifecycle hooks](./loadouts.md#lifecycle_hooks---scripts-at-session-transition-points), from either the loadouts or the project's `minimal.toml`. Recorded on the session, so it applies to the later attach, detach, and destroy transitions too |
 | `--no-prompt` | | Fail instead of prompting when the daemon surfaces items user policy can't auto-decide; implied when stdin/stderr isn't a TTY |
 | `--attach` | | Automatically attach after creation |
-| `--allow-subnets <CIDR>` | | Destination subnet the box may reach, in CIDR form (e.g. `10.0.0.0/8`). Repeatable. On an own-address box, an unset flag grants nothing once the daemon resolves the policy: write allow-all out as `0.0.0.0/0` and `::/0`. The opt-out below keeps the old allow-all meaning of an unset flag. Valid on an own-address (`--network own_ip`) or host-address (`--network host_ip`) box; a `--network none` box rejects the whole egress declaration |
-| `--allow-dns-hosts <HOST>` | | Destination DNS hostname the box may resolve and reach (e.g. `github.com`). Repeatable. On an own-address box, an unset flag grants nothing once the daemon resolves the policy. The opt-out below keeps the old allow-all meaning of an unset flag |
+| `--allow-subnets <CIDR>` | | Destination subnet the box may reach, in CIDR form (e.g. `10.0.0.0/8`). Repeatable. Inside a declaration, an unset flag grants nothing once the daemon resolves the policy: write allow-all out as `0.0.0.0/0` and `::/0`. Boxes have no IPv6 path yet, so `::/0` is the forward-compatible spelling and grants nothing today. The opt-out below keeps the old allow-all meaning of an unset flag. Valid on an own-address (`--network own_ip`) or host-address (`--network host_ip`) box; a `--network none` box rejects the whole egress declaration |
+| `--allow-dns-hosts <HOST>` | | Destination DNS hostname the box may resolve and reach (e.g. `github.com`). Repeatable. Inside a declaration, an unset flag grants nothing once the daemon resolves the policy. The opt-out below keeps the old allow-all meaning of an unset flag |
 | `--allow-protocols <PROTO>` | | Outbound transport protocol the box may use: `tcp`, `udp`, or `icmp`. Repeatable. Unset lets every protocol through: the flag filters the reach the two allow lists grant |
-| `--deny-subnets <CIDR>` | | Destination subnet the box may not reach, in CIDR form — subtracted from what the allow flags admit. Repeatable; unset means nothing is denied. On an own-address box a declaration with only deny flags admits nothing: there is no allow list to subtract from. Add `--allow-subnets 0.0.0.0/0 --allow-subnets ::/0` to deny a range out of allow-all |
+| `--deny-subnets <CIDR>` | | Destination subnet the box may not reach, in CIDR form — subtracted from what the allow flags admit. Repeatable; unset means nothing is denied. A declaration with only deny flags admits nothing: there is no allow list to subtract from. Add `--allow-subnets 0.0.0.0/0 --allow-subnets ::/0` to deny a range out of allow-all |
 | `--deny-all-egress` | | Declare deny-all egress: the box reaches no external address. Writes the deny-all `egress` section, every allow list present and empty. A box declared by flag reads in the record exactly like one whose `minimal.toml` carries the section. On a host-address box the host's classifier decides a declared deny-all per box. An own-address box without egress flags already gets deny-all by default (see below). Conflicts with every `--allow-*`/`--deny-*` rule flag |
 
 Together the four `--allow-*`/`--deny-*` rule flags form the box's `egress`
@@ -120,8 +120,8 @@ declaration. Naming one of them stores it on the session, and `min session
 policy` shows what the session ended up with. `--deny-all-egress` declares
 the whole section in one flag and cannot combine with them.
 
-An unset `--allow-subnets` or `--allow-dns-hosts` grants nothing on an
-own-address box, inside a declaration as much as without one. This changes
+An unset `--allow-subnets` or `--allow-dns-hosts` inside a declaration
+grants nothing, whatever the box's network mode. This changes
 what a declaration with no allow list does. `--allow-dns-hosts github.com`
 alone reaches `github.com` and no address directly. `--deny-subnets` alone
 reaches nothing. Both used to reach every address the deny left, and the

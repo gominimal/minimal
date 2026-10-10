@@ -271,8 +271,11 @@ pub struct Config {
     /// outside itself (NET-074) and shows `deny-all (default)` in
     /// `min session policy` (NET-075). A deployment that cannot carry that
     /// yet opts out, and its boxes keep the earlier allow-all default of
-    /// 03-spec R2.1. Set by `minimald run --egress-deny-all-opt-out`; a box that
-    /// declares its own egress section is unaffected either way.
+    /// 03-spec R2.1. Set by `minimald run --egress-deny-all-opt-out`. A box
+    /// that declares its own egress section keeps its declared lists either
+    /// way; the opt-out also keeps the earlier allow-all reading of a
+    /// destination list the section left absent, which in force resolves to
+    /// present and empty (`sessions::effective_egress`).
     #[serde(default)]
     pub deny_all_opt_out: bool,
 }
