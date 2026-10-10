@@ -3515,8 +3515,10 @@ impl BoxRegistry {
             .box_id
             .unwrap_or_else(crate::bep_attach::mint_box_id);
         // The row's derived allow-list: the declaration's `allow_subnets`
-        // dimension in its own spelling — `None`, the absent dimension, is
-        // allow-all, the same meaning the compiled rules carry.
+        // dimension in its own spelling. `None` reaches this row only from
+        // the opt-out or the announced arm (`sessions::effective_egress`
+        // resolves it to present and empty in force), and there it is
+        // allow-all, the meaning the compiled rules give `None`.
         let egress_allow_list = registration
             .egress
             .as_ref()
@@ -5970,7 +5972,9 @@ mod tests {
     /// so an opted-out VM host never denies at the host what the guest
     /// allows. Announced, it allows all; in force, it denies all unless the
     /// opt-out is set, when it keeps the earlier allow-all. A declared
-    /// section is carried verbatim in every arm.
+    /// section's own lists are carried in every arm; in force without the
+    /// opt-out, the destination list it left absent is resolved to present
+    /// and empty (NET-074), which does not touch the address rules below.
     #[test]
     fn undeclared_row_default_follows_phase_and_opt_out() {
         use sessions::EgressDefaultPhase::{Announced, InForce};
@@ -8936,7 +8940,8 @@ mod tests {
         assert_eq!(
             db.egress_allow_list(),
             ["0.0.0.0/0"],
-            "an absent allow_subnets dimension is allow-all, the compiled rules' own meaning"
+            "an allow_subnets dimension still absent at registration (the opt-out or announced \
+             arm hands one) is allow-all, the compiled rules' meaning of None"
         );
 
         // A report within the grant records, and answers the row it
