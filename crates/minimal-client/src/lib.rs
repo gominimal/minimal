@@ -716,66 +716,91 @@ impl Client {
         // fully queued into the encoder at that point, even if it
         // hasn't been fully compressed or shipped yet.
         let bar = add_patches_bar(patches.len() as u64);
-        let bar_for_loop = bar.clone();
-        let result = self
-            .stream_upload(
-                session_id,
-                constcat::concat!(minimald_rpc::RPC_SUBSYSTEM_PREFIX, "WorkspacePatchesTarZst"),
-                "composition patch",
-                async |writer| {
-                    // Route through the pipe helper because SSH channel
-                    // writers aren't Sync but `TarZstArchive` requires
-                    // Sync. The pipe's tx (a `DuplexStream`) is Sync;
-                    // its rx pumps into the channel writer on the same
-                    // task.
-                    crate::file_upload::stream_via_pipe(writer, async |tx| {
-                        let mut archive = crate::file_upload::TarZstArchive::new(tx);
-                        // Always finalize the archive, even on
-                        // build error: `async_tar::Builder` panics
-                        // from its `Drop` impl if dropped without
-                        // `finish()` (async-tar 0.6 builder.rs:668),
-                        // and `?`-propagation isn't a panic-unwind
-                        // so the Drop guard fires. If both branches
-                        // fail, prefer the build error — it's
-                        // usually the root cause (encoder writes
-                        // then error with "broken pipe" once the
-                        // upstream file read has already failed).
-                        let build_result: Result<(), anyhow::Error> = async {
-                            for (host_path, dest) in patches {
-                                archive
-                                    .add_file(
-                                        host_path,
-                                        dest.as_str(),
-                                        // Default options: the source's own
-                                        // mode rides the tar header. See the
-                                        // method docs.
-                                        crate::file_upload::AddFileOptions::default(),
-                                    )
-                                    .await
-                                    .with_context(|| {
-                                        format!(
-                                            "adding patch {} → {}",
-                                            host_path.display(),
-                                            dest.as_str()
-                                        )
-                                    })?;
-                                bar_for_loop.inc(1);
-                            }
-                            Ok(())
-                        }
-                        .await;
-                        let finish_result = archive.finish().await;
-                        match (build_result, finish_result) {
-                            (Err(build), _) => Err(build),
-                            (Ok(()), r) => r,
-                        }
-                    })
-                    .await
-                },
-            )
-            .await;
+        let result = self.upload_patches_with(session_id, patches, &bar).await;
         bar.finish_and_clear();
         result
+    }
+
+    /// [`Self::upload_patches`] without terminal progress output.
+    /// For callers that own the screen themselves (the `min dash` TUI),
+    /// where a progress bar would corrupt the frame.
+    pub async fn upload_patches_quiet(
+        &mut self,
+        session_id: sessions::SessionId,
+        patches: &[(std::path::PathBuf, paths::SandboxRelPath)],
+    ) -> Result<(), anyhow::Error> {
+        if patches.is_empty() {
+            return Ok(());
+        }
+        // A hidden bar that is never added to the global MultiProgress
+        // renders nowhere; the upload loop still gets its counter.
+        let bar = indicatif::ProgressBar::hidden();
+        self.upload_patches_with(session_id, patches, &bar).await
+    }
+
+    async fn upload_patches_with(
+        &mut self,
+        session_id: sessions::SessionId,
+        patches: &[(std::path::PathBuf, paths::SandboxRelPath)],
+        bar: &indicatif::ProgressBar,
+    ) -> Result<(), anyhow::Error> {
+        let bar_for_loop = bar.clone();
+        self.stream_upload(
+            session_id,
+            constcat::concat!(minimald_rpc::RPC_SUBSYSTEM_PREFIX, "WorkspacePatchesTarZst"),
+            "composition patch",
+            async |writer| {
+                // Route through the pipe helper because SSH channel
+                // writers aren't Sync but `TarZstArchive` requires
+                // Sync. The pipe's tx (a `DuplexStream`) is Sync;
+                // its rx pumps into the channel writer on the same
+                // task.
+                crate::file_upload::stream_via_pipe(writer, async |tx| {
+                    let mut archive = crate::file_upload::TarZstArchive::new(tx);
+                    // Always finalize the archive, even on
+                    // build error: `async_tar::Builder` panics
+                    // from its `Drop` impl if dropped without
+                    // `finish()` (async-tar 0.6 builder.rs:668),
+                    // and `?`-propagation isn't a panic-unwind
+                    // so the Drop guard fires. If both branches
+                    // fail, prefer the build error — it's
+                    // usually the root cause (encoder writes
+                    // then error with "broken pipe" once the
+                    // upstream file read has already failed).
+                    let build_result: Result<(), anyhow::Error> = async {
+                        for (host_path, dest) in patches {
+                            archive
+                                .add_file(
+                                    host_path,
+                                    dest.as_str(),
+                                    // Default options: the source's own
+                                    // mode rides the tar header. See the
+                                    // method docs.
+                                    crate::file_upload::AddFileOptions::default(),
+                                )
+                                .await
+                                .with_context(|| {
+                                    format!(
+                                        "adding patch {} → {}",
+                                        host_path.display(),
+                                        dest.as_str()
+                                    )
+                                })?;
+                            bar_for_loop.inc(1);
+                        }
+                        Ok(())
+                    }
+                    .await;
+                    let finish_result = archive.finish().await;
+                    match (build_result, finish_result) {
+                        (Err(build), _) => Err(build),
+                        (Ok(()), r) => r,
+                    }
+                })
+                .await
+            },
+        )
+        .await
     }
 
     /// Stream a zstd-compressed tarball of external lifecycle-hook
@@ -1118,6 +1143,42 @@ pub use minimald_rpc::{SKEW_OVERRIDE_VAR, UNVERSIONED_DAEMON, version_skew_messa
 /// Whether the operator asked for a skewed pair to be driven anyway.
 fn skew_override_set() -> bool {
     std::env::var_os(SKEW_OVERRIDE_VAR).is_some_and(|v| !v.is_empty())
+}
+
+/// The client-side patches of a loadout contribution as
+/// `(host path, sandbox destination)` upload pairs, for
+/// [`Client::upload_patches`].
+///
+/// Collect them *before* the contribution moves into the
+/// `ConfigureLoadout` RPC: they land in the final composition whether
+/// the response is `Materialized` or `Pending`, so the client is
+/// authoritative for them. Every activate path — `min session
+/// activate`, `min task run`, the `min dash` create — collects through
+/// this one function, then [`dedup_patch_uploads`] before the upload.
+#[must_use]
+pub fn contribution_patch_uploads(
+    contribution: &sessions::wire::request::WireContribution,
+) -> Vec<(std::path::PathBuf, paths::SandboxRelPath)> {
+    contribution
+        .patches
+        .iter()
+        .map(|p| {
+            (
+                p.patch.host_path.as_utf8_path().as_std_path().to_path_buf(),
+                p.patch.destination.clone(),
+            )
+        })
+        .collect()
+}
+
+/// Sort patch upload pairs by sandbox destination and collapse
+/// same-destination duplicates. Dedup by destination, not host path:
+/// two loadouts may name the same destination, and the composer's
+/// post-gate check guarantees such duplicates are exact matches (same
+/// source), so collapsing is safe.
+pub fn dedup_patch_uploads(patches: &mut Vec<(std::path::PathBuf, paths::SandboxRelPath)>) {
+    patches.sort_by(|a, b| a.1.as_str().cmp(b.1.as_str()));
+    patches.dedup_by(|a, b| a.1.as_str() == b.1.as_str());
 }
 
 /// This CLI's build, to be asserted by an RPC that acts before it replies —
@@ -1992,6 +2053,58 @@ mod tests {
         assert_eq!(
             std::fs::canonicalize(&info.repo_root).unwrap(),
             std::fs::canonicalize(repo.path()).unwrap()
+        );
+    }
+
+    /// A wire patch from a user loadout, as `compose_user_contribution`
+    /// emits one.
+    fn wire_patch(host: &str, dest: &str) -> sessions::wire::primitives::WireSessionPatch {
+        sessions::wire::primitives::WireSessionPatch {
+            patch: sessions::wire::primitives::WireResolvedPatch {
+                host_path: paths::HostAbsPath::try_new(host).unwrap(),
+                destination: paths::SandboxRelPath::try_new(dest).unwrap(),
+            },
+            source: sessions::wire::primitives::WireSource::UserLoadout {
+                name: "dev".to_string(),
+            },
+        }
+    }
+
+    /// The shared collection every activate path uploads from: each wire
+    /// patch maps to its `(host path, sandbox destination)` pair, the pairs
+    /// sort by destination, and same-destination duplicates collapse. A
+    /// composition without patches collects nothing, so its upload is a
+    /// no-op.
+    #[test]
+    fn patch_uploads_map_sort_and_dedup_by_destination() {
+        let contribution = sessions::wire::request::WireContribution {
+            patches: vec![
+                wire_patch("/tmp/first.patch", "zeta/first.patch"),
+                wire_patch("/tmp/second.patch", "alpha/second.patch"),
+                wire_patch("/tmp/third.patch", "alpha/second.patch"),
+            ],
+            ..Default::default()
+        };
+        let mut patches = super::contribution_patch_uploads(&contribution);
+        super::dedup_patch_uploads(&mut patches);
+        assert_eq!(
+            patches,
+            vec![
+                (
+                    std::path::PathBuf::from("/tmp/second.patch"),
+                    paths::SandboxRelPath::try_new("alpha/second.patch").unwrap(),
+                ),
+                (
+                    std::path::PathBuf::from("/tmp/first.patch"),
+                    paths::SandboxRelPath::try_new("zeta/first.patch").unwrap(),
+                ),
+            ],
+            "sorted by destination, duplicates collapsed"
+        );
+        assert!(
+            super::contribution_patch_uploads(&sessions::wire::request::WireContribution::default())
+                .is_empty(),
+            "a patchless composition uploads nothing"
         );
     }
 }
