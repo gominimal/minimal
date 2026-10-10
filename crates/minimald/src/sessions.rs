@@ -288,9 +288,7 @@ impl Manager {
         // to a working state. Delete them here rather than let
         // them linger and confuse `min ls` / hold their names
         // hostage.
-        let name_holds = reap_unresumable_records(&store).await?;
-        #[cfg(not(target_os = "linux"))]
-        drop(name_holds);
+        reap_unresumable_records(&store).await?;
 
         let running = BTreeMap::new();
         let (sender, receiver) = mpsc::channel(8);
@@ -462,17 +460,6 @@ impl Manager {
             let hostnames: Arc<RwLock<crate::net::dns::HostnameRegistry>> =
                 Arc::new(RwLock::new(registry));
             let loopback = Arc::new(book);
-            if let Some((cid, port)) = shuttle {
-                // The `host_ip` name holds the VM host daemon keeps for this
-                // daemon's sessions, set right from the records: the reaped
-                // sessions' released, the live ones' re-made. Spawned, so
-                // the accept never waits on the host's door.
-                tokio::spawn(reassert_name_holds(
-                    crate::net::policy::ControlChannel::Vsock { cid, port },
-                    store.clone(),
-                    name_holds,
-                ));
-            }
             if let Some((cid, port)) = shuttle {
                 // Spawned after the sweep above, so the node's grant cannot
                 // race the daemon-start liveness pass that frees dead boxes'
@@ -897,133 +884,13 @@ async fn live_session_ids(
     Ok(live)
 }
 
-/// The `host_ip` name holds a daemon's start owes the VM host daemon
-/// (NET-138's `host_ip` interim), read off the session records by
-/// [`reap_unresumable_records`]: each a session's name and id. A named
-/// `host_ip` session that owns no box row holds its name on the VM host
-/// daemon, so the name answers NODATA, not NXDOMAIN.
-#[derive(Debug, Default, PartialEq, Eq)]
-struct NameHolds {
-    /// The reaped sessions' holds, to release by the session's id: no
-    /// client destroyed them, so no client releases them.
-    release: Vec<(String, SessionId)>,
-    /// The live sessions' holds, to re-make: the VM host daemon drops a
-    /// hold it reloaded that nothing re-makes, and a session nobody
-    /// attaches to has no other client to re-make it.
-    hold: Vec<(String, SessionId)>,
-}
-
-/// The name a `host_ip` session holds on the VM host daemon, when it
-/// holds one: a named `host_ip` session that owns no box row. A session
-/// with a row owns its name through the row.
-fn held_name(record: &sessions::Record) -> Option<&str> {
-    record.name.as_deref().filter(|_| {
-        record.network == sessions::NetworkMode::HostNet && record.box_addresses.is_none()
-    })
-}
-
-/// Sets the VM host daemon's `host_ip` name holds right from `holds`,
-/// best-effort: every reaped session's hold is released by its id, then
-/// every live session's is re-made. A verb the door does not answer, or
-/// refuses — a VM host daemon that predates the hold verbs on this door
-/// — is a warn line, and the name answers as it did before.
-///
-/// `holds` was read before the daemon accepted, so a destroy can land
-/// between that read and a hold made here: the client releases the
-/// session's hold first, and this one then stands for a session that is
-/// gone. Each session is therefore looked up in `store` again once its
-/// hold is made, and a hold whose session is gone by then is undone
-/// ([`name_hold_undo`]); a destroy that lands after that lookup releases
-/// the hold itself.
-#[cfg(target_os = "linux")]
-async fn reassert_name_holds(
-    control: crate::net::policy::ControlChannel,
-    store: StoreHandle,
-    holds: NameHolds,
-) {
-    for (name, id) in &holds.release {
-        send_name_hold(&control, name, *id, false).await;
-    }
-    for (name, id) in &holds.hold {
-        if send_name_hold(&control, name, *id, true).await
-            && let Some((holder, hold)) = name_hold_undo(&store, name, *id).await
-        {
-            send_name_hold(&control, name, holder, hold).await;
-        }
-    }
-}
-
-/// Sends one hold or release for [`reassert_name_holds`] and says whether
-/// the VM host daemon answered it; a verb it did not answer is a warn line.
-#[cfg(target_os = "linux")]
-async fn send_name_hold(
-    control: &crate::net::policy::ControlChannel,
-    name: &str,
-    id: SessionId,
-    hold: bool,
-) -> bool {
-    match crate::net::listeners::report_name_hold(control, name, id, hold).await {
-        Ok(()) => true,
-        Err(error) => {
-            tracing::warn!(
-                box = %name,
-                session_id = %id,
-                hold,
-                %error,
-                "could not set a session's box name hold on the VM host daemon at start; \
-                 the name answers as it did before",
-            );
-            false
-        }
-    }
-}
-
-/// The undo of a hold [`reassert_name_holds`] made for session `id` under
-/// `name`, when that session is gone from `store` since: the session to
-/// send the verb for and whether the verb is a hold. A live session that
-/// holds the name now ([`held_name`]) had its hold taken over, so it is
-/// handed the hold back; with no such session the hold is released by
-/// `id`. A session still in the store, or a lookup that fails, undoes
-/// nothing (`None`): a release there could take the name from a live
-/// session, and a hold left standing blocks nothing.
-#[cfg(target_os = "linux")]
-async fn name_hold_undo(
-    store: &StoreHandle,
-    name: &str,
-    id: SessionId,
-) -> Option<(SessionId, bool)> {
-    if store.find(RecordPredicate::Id(id)).await.ok()?.is_some() {
-        return None;
-    }
-    let Some(other) = store
-        .find(RecordPredicate::Name(name.to_string()))
-        .await
-        .ok()?
-    else {
-        return Some((id, false));
-    };
-    let record = other.record().await.ok()?;
-    Some(if held_name(&record).is_some() {
-        (*other.id(), true)
-    } else {
-        (id, false)
-    })
-}
-
 /// Delete on-disk records whose status is unresumable after a
 /// daemon restart. See [`Manager::init`] for why `Pending` and
 /// `Materializing` records fall into this category. A delete
 /// failure is logged and skipped — a leftover record wastes a
 /// name until it's cleaned up manually but shouldn't block
 /// startup.
-///
-/// Returns the `host_ip` name holds the start owes the VM host daemon
-/// ([`NameHolds`]): a deleted record's to release, a kept `Active`
-/// record's to re-make.
-async fn reap_unresumable_records(
-    store: &crate::store::StoreHandle,
-) -> Result<NameHolds, std::io::Error> {
-    let mut holds = NameHolds::default();
+async fn reap_unresumable_records(store: &crate::store::StoreHandle) -> Result<(), std::io::Error> {
     let handles = store.handles().await?;
     for handle in handles {
         let record = match handle.record().await {
@@ -1054,19 +921,12 @@ async fn reap_unresumable_records(
                         ?status,
                         "reap: deleted unresumable record left over from a prior daemon lifetime",
                     );
-                    if let Some(name) = held_name(&record) {
-                        holds.release.push((name.to_string(), id));
-                    }
                 }
             }
-            sessions::SessionStatus::Active => {
-                if let Some(name) = held_name(&record) {
-                    holds.hold.push((name.to_string(), *handle.id()));
-                }
-            }
+            sessions::SessionStatus::Active => {}
         }
     }
-    Ok(holds)
+    Ok(())
 }
 
 /// Per-session deadline for the host probes this manager makes — the
@@ -3445,189 +3305,5 @@ pub(crate) mod tests {
             err.to_string().contains("no-such-output"),
             "the error must name the output that was asked for, got {err}"
         );
-    }
-
-    /// The `host_ip` name holds a daemon's start owes the VM host daemon
-    /// (NET-138): a reaped named `host_ip` session's hold is released by
-    /// its id, a live one's is re-made, release first, and an `own_ip`
-    /// session — which holds its name through its row — is asked about
-    /// neither way.
-    #[cfg(target_os = "linux")]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_start_releases_reaped_holds_and_remakes_live_ones() {
-        let state = TempDir::new().unwrap();
-        let store = crate::store::Store::init(
-            DaemonAbsPath::try_new(state.path().to_str().unwrap()).unwrap(),
-        )
-        .await
-        .unwrap();
-        let record = named_record;
-        let reaped = *store
-            .create(record(
-                "old",
-                sessions::NetworkMode::HostNet,
-                sessions::SessionStatus::Pending,
-            ))
-            .await
-            .unwrap()
-            .id();
-        let live = *store
-            .create(record(
-                "web",
-                sessions::NetworkMode::HostNet,
-                sessions::SessionStatus::Active,
-            ))
-            .await
-            .unwrap()
-            .id();
-        for (name, status) in [
-            ("own", sessions::SessionStatus::Active),
-            ("gone", sessions::SessionStatus::Materializing),
-        ] {
-            store
-                .create(record(name, sessions::NetworkMode::OwnIp, status))
-                .await
-                .unwrap();
-        }
-
-        let holds = reap_unresumable_records(&store).await.unwrap();
-        assert_eq!(
-            holds,
-            NameHolds {
-                release: vec![("old".to_string(), reaped)],
-                hold: vec![("web".to_string(), live)],
-            }
-        );
-
-        let control_sock = state.path().join("control.sock");
-        let door = state.path().join("report-door.sock");
-        let (task, mut seen) = crate::net::listeners::spawn_report_door_for_tests(
-            &door,
-            minimald_rpc::BoxControlReply::NameHeld {
-                name: String::new(),
-                held: true,
-            },
-        );
-        crate::net::listeners::seed_vm_report_door_for_tests(&control_sock, &door);
-        reassert_name_holds(
-            crate::net::policy::ControlChannel::Unix(control_sock.clone()),
-            store.clone(),
-            holds,
-        )
-        .await;
-        crate::net::listeners::clear_vm_report_door_for_tests(&control_sock);
-        task.abort();
-
-        match seen.try_recv() {
-            Ok(minimald_rpc::BoxControlRequest::ReleaseBoxName(request)) => {
-                assert_eq!(request.name, "old");
-                assert_eq!(request.session_id, Some(reaped));
-            }
-            other => panic!("the reaped session's hold is released first: {other:?}"),
-        }
-        match seen.try_recv() {
-            Ok(minimald_rpc::BoxControlRequest::HoldBoxName(request)) => {
-                assert_eq!(request.name, "web");
-                assert_eq!(request.session_id, Some(live));
-            }
-            other => panic!("the live session's hold is re-made: {other:?}"),
-        }
-        assert!(seen.try_recv().is_err(), "and nothing else is asked");
-    }
-
-    /// A named session record with no box row, as a session store is
-    /// handed one: the store assigns the id.
-    #[cfg(target_os = "linux")]
-    fn named_record(
-        name: &str,
-        network: sessions::NetworkMode,
-        status: sessions::SessionStatus,
-    ) -> sessions::Record {
-        sessions::Record {
-            id: SessionId::nil(),
-            name: Some(name.to_string()),
-            username: None,
-            project_path: declared_path(),
-            network,
-            policy: Default::default(),
-            task_addresses: Vec::new(),
-            box_addresses: None,
-            hooks_enabled: true,
-            status,
-            host_ip_enforcement: None,
-            box_id: None,
-            host_row_bound: false,
-            attrs: Default::default(),
-        }
-    }
-
-    /// A destroy that lands between the start's read of the records and
-    /// the hold it re-makes leaves no hold for the gone session: the hold
-    /// is released by that session's id, or, when a live `host_ip` session
-    /// answers to the name by then, handed back to it.
-    #[cfg(target_os = "linux")]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_start_undoes_the_hold_of_a_session_destroyed_since() {
-        for succeeded in [false, true] {
-            let state = TempDir::new().unwrap();
-            let store = crate::store::Store::init(
-                DaemonAbsPath::try_new(state.path().to_str().unwrap()).unwrap(),
-            )
-            .await
-            .unwrap();
-            let active = || {
-                named_record(
-                    "web",
-                    sessions::NetworkMode::HostNet,
-                    sessions::SessionStatus::Active,
-                )
-            };
-            let gone = store.create(active()).await.unwrap();
-            let gone_id = *gone.id();
-            let holds = reap_unresumable_records(&store).await.unwrap();
-            assert_eq!(holds.hold, vec![("web".to_string(), gone_id)]);
-
-            gone.delete().await.unwrap();
-            let (undone_for, undone_by_hold) = if succeeded {
-                (*store.create(active()).await.unwrap().id(), true)
-            } else {
-                (gone_id, false)
-            };
-
-            let control_sock = state.path().join("control.sock");
-            let door = state.path().join("report-door.sock");
-            let (task, mut seen) = crate::net::listeners::spawn_report_door_for_tests(
-                &door,
-                minimald_rpc::BoxControlReply::NameHeld {
-                    name: String::new(),
-                    held: true,
-                },
-            );
-            crate::net::listeners::seed_vm_report_door_for_tests(&control_sock, &door);
-            reassert_name_holds(
-                crate::net::policy::ControlChannel::Unix(control_sock.clone()),
-                store.clone(),
-                holds,
-            )
-            .await;
-            crate::net::listeners::clear_vm_report_door_for_tests(&control_sock);
-            task.abort();
-
-            match seen.try_recv() {
-                Ok(minimald_rpc::BoxControlRequest::HoldBoxName(request)) => {
-                    assert_eq!(request.session_id, Some(gone_id));
-                }
-                other => panic!("the hold read off the records is made first: {other:?}"),
-            }
-            match (seen.try_recv(), undone_by_hold) {
-                (Ok(minimald_rpc::BoxControlRequest::HoldBoxName(request)), true)
-                | (Ok(minimald_rpc::BoxControlRequest::ReleaseBoxName(request)), false) => {
-                    assert_eq!(request.name, "web");
-                    assert_eq!(request.session_id, Some(undone_for));
-                }
-                (other, _) => panic!("the hold is undone (succeeded: {succeeded}): {other:?}"),
-            }
-            assert!(seen.try_recv().is_err(), "and nothing else is asked");
-        }
     }
 }

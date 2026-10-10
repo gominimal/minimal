@@ -270,10 +270,11 @@ async fn session_record_by(
 /// nothing, and a session that held nothing (a `none` box) is the goal
 /// state already holding.
 ///
-/// A destroy no client of this host issues — the daemon's own reap — is
-/// released by the daemon at its start, and a hold whose release was lost
-/// otherwise is dropped by the VM host daemon after its restart unless a
-/// live session re-makes it. The hold blocks nothing meanwhile — a
+/// A destroy no client of this host issues — the daemon's own reap —
+/// releases nothing: the in-VM daemon sends no hold verb. That hold, like
+/// one whose release was lost, stands until the VM host daemon's next
+/// restart, after which it is dropped unless a client's attach or exec
+/// re-makes it. The hold blocks nothing meanwhile — a
 /// registration under the name is checked against rows and creations,
 /// never holds, and a new session's hold of the name takes it over — so
 /// all it keeps is the name answering NODATA, not NXDOMAIN.
@@ -1636,14 +1637,20 @@ pub(crate) async fn activate_session(
     // passes through here, so its run neither holds nor releases its name
     // — a task box's name is not meant to be reached, and widening the
     // interim to that path is a design ruling for the name-registry work,
-    // not a change a review pass may make in passing. The two re-holds do
-    // not tell a task session apart, though: the guest daemon's start pass
-    // and the re-hold before an attach or exec
-    // ([`rehold_held_name_before_attach`]) hold the name of any active
-    // named host_ip session without a box row. A task session held that
-    // way and then destroyed by task.rs's raw RPC is never released; its
-    // hold is dropped after the VM host daemon's next restart, when
-    // nothing re-makes it.
+    // not a change a review pass may make in passing. The re-hold before
+    // an attach or exec ([`rehold_held_name_before_attach`]) does not tell
+    // a task session apart, though: it holds the name of any named host_ip
+    // session without a box row that a client attaches to or execs into.
+    // A task session held that way and then destroyed by task.rs's raw RPC
+    // is never released; its hold is dropped after the VM host daemon's
+    // next restart, when nothing re-makes it.
+    //
+    // Every hold is made by a client over the host's control socket, as
+    // this one and that re-hold are; the in-VM daemon makes none. So
+    // after a VM host daemon restart, the hold of a session nobody
+    // attaches to or execs into is dropped once the daemon's reconfirm
+    // bound passes, and the name answers NXDOMAIN until the session's
+    // next attach or exec.
     if kind == paths::ProviderKind::Minvmd
         && config.network == sessions::NetworkMode::HostNet
         && let Some(name) = config.name.as_deref()

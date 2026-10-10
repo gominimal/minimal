@@ -174,14 +174,17 @@ pub const HELD_NAMES_FILE: &str = "box-held-names.json";
 const HELD_NAMES_FILE_VERSION: u32 = 1;
 
 /// How long a hold reloaded from [`HELD_NAMES_FILE`] stands unconfirmed
-/// before it is dropped ([`BoxRegistry::expire_unconfirmed_holds`]). A
-/// hold nothing re-makes in that time belongs to a session that is gone —
-/// destroyed by a client that never released it — and dropping it gives
-/// its name back to NXDOMAIN (NET-012). The guest daemon re-makes every
-/// live session's hold when it starts, which after a VM host daemon
-/// restart is a VM cold boot away, and every attach or exec re-makes its
-/// session's own, so the bound is [`RESUME_ATTACH_BOUND`]'s for the same
-/// reason: several times a slow boot.
+/// before it is dropped ([`BoxRegistry::expire_unconfirmed_holds`]). Only
+/// a host client re-makes a hold, over the host's control socket: the
+/// creating client's attach or exec re-sends its session's own. The
+/// in-VM daemon cannot, because the hold verbs are not served on its
+/// door, so the expiry is the one thing that clears a hold whose session
+/// ended with no release from the host, and dropping it gives the name
+/// back to NXDOMAIN (NET-012). It also drops the hold of a live session
+/// that nobody attaches to or execs into within the bound; that
+/// session's next attach or exec makes the hold again. The bound is
+/// [`RESUME_ATTACH_BOUND`]'s, long enough for a client that follows a
+/// restart with an attach to get there through a slow boot.
 pub const HELD_NAME_RECONFIRM_BOUND: Duration = RESUME_ATTACH_BOUND;
 
 /// One relay's end, as the host reports it: the switch addresses whose
@@ -1190,7 +1193,9 @@ fn set_aside_registry_file(path: &std::path::Path, why: &str) -> Option<Vec<Crea
 /// Reads the held box names persisted at `path`, each keyed by its
 /// [`canonical_box_name`] form whatever spelling the file holds it under:
 /// none when there is no file yet. Two spellings that fold to one name
-/// reload the first in the file's order, and the other is said as a warn
+/// reload as one hold: the spelling that sorts first by its bytes
+/// (`WEB` before `web`), because the file's names parse into a sorted
+/// map and the file's own order is lost. The other is said as a warn
 /// line and dropped. A file that cannot be read, does not
 /// parse, or is of another version than [`HELD_NAMES_FILE_VERSION`]
 /// reloads no hold and is renamed aside under the same `.unusable-<unix
@@ -1213,7 +1218,7 @@ fn read_held_names_file(path: &std::path::Path) -> BTreeMap<String, Option<sessi
                                 box = %name,
                                 canonical = %entry.key(),
                                 "the persisted held box names hold one name under two \
-                                 spellings; reloading the first only"
+                                 spellings; reloading the one that sorts first only"
                             );
                         }
                     }
@@ -3134,7 +3139,7 @@ impl BoxRegistry {
     /// a restarted daemon still knows which session holds which name. A
     /// reloaded hold stands unconfirmed until a hold re-makes it, and one
     /// nothing re-makes within [`HELD_NAME_RECONFIRM_BOUND`] is dropped
-    /// ([`Self::expire_unconfirmed_holds`]): a session destroyed without
+    /// ([`Self::expire_unconfirmed_holds`]): a session that ended without
     /// its release does not keep its name answering NODATA for good.
     #[must_use]
     pub fn persisting_to(mut self, path: std::path::PathBuf) -> Self {
@@ -4984,9 +4989,12 @@ impl BoxRegistry {
 
     /// Drops every hold reloaded from [`HELD_NAMES_FILE`] that no hold has
     /// re-made within [`HELD_NAME_RECONFIRM_BOUND`] of its reload, and
-    /// returns how many it dropped. Such a hold's session is gone — it was
-    /// destroyed by a client that never released it — so its name answers
-    /// NXDOMAIN again (NET-012) rather than NODATA for good. Each drop is
+    /// returns how many it dropped. No host client has asked for such a
+    /// hold since the restart, so its name answers NXDOMAIN again
+    /// (NET-012) rather than NODATA for good: a session that ended with no
+    /// release is cleared this way, and a live session nobody attached to
+    /// or exec'd into loses its hold until its next attach or exec makes
+    /// it again. Each drop is
     /// decided again under the held names' write, so a hold re-made since
     /// the scan stays. Run on the withdrawal drainer's sweep
     /// ([`Self::spawn_withdrawal_drainer`]).
@@ -7000,16 +7008,17 @@ mod tests {
     }
 
     /// Two spellings in the held-names file that fold to one canonical name
-    /// reload as one hold — the first in the file's order — so one release
-    /// frees the name, and the next write holds it once.
+    /// reload as one hold — the spelling that sorts first by its bytes,
+    /// whatever order the file lists them in — so one release frees the
+    /// name, and the next write holds it once.
     #[test]
     fn held_box_names_that_fold_together_reload_once() {
         let dir = tempfile::tempdir().expect("a temp dir");
         std::fs::write(
             dir.path().join(HELD_NAMES_FILE),
             br#"{"version": 1, "held_names": {
-                "WEB": "00000000-0000-4000-8000-000000000001",
-                "web": "00000000-0000-4000-8000-000000000002"
+                "web": "00000000-0000-4000-8000-000000000002",
+                "WEB": "00000000-0000-4000-8000-000000000001"
             }}"#,
         )
         .expect("a held-names file");
@@ -7024,7 +7033,7 @@ mod tests {
                 .expect("the held names read")
                 .clone(),
             BTreeMap::from([("web".to_string(), Some(first))]),
-            "one hold, the first spelling's"
+            "one hold, the spelling's that sorts first, though the file lists it last"
         );
         assert!(registry.release_held_name("Web", Some(first)));
         let file: HeldNamesFile = serde_json_lenient::from_slice(
