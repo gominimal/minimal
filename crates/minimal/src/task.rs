@@ -727,6 +727,14 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
                     config.name = Some(task_session_name(&args.task, &crate::random_hex4()));
                     continue;
                 }
+                // The host's user-namespace refusal (NET-141) is the daemon's
+                // verdict on this machine, not an RPC failure — the same
+                // special-case as an activate's create loop: the text already
+                // names the cause and the remedy, so it is printed verbatim,
+                // with no session created for it to leave behind.
+                if minimald_rpc::is_user_namespace_refusal(&error) {
+                    bail!("{error}");
+                }
                 bail!("CreateSession failed: {error}");
             }
         }

@@ -1256,6 +1256,103 @@ async fn activate_refusal_names_sysctl_for_max_user_namespaces_zero() {
     );
 }
 
+/// Drives `min task run` through the compiled binary against this process's
+/// harness daemon while its user-namespace verdict is `verdict` (NET-141),
+/// and returns the refusal: the `error:` block on stderr, exactly. A task
+/// run creates its ephemeral session through the same create the daemon
+/// refuses, so the refusal must reach the user as the daemon's verdict —
+/// not wrapped as `CreateSession failed: ...`, which would mislabel a
+/// machine verdict as an RPC failure. Asserts the shared contract on the
+/// way: exit 1, nothing on stdout, and no session left behind.
+async fn refused_task_run(verdict: minimald::server::UsernsRestriction) -> String {
+    let (daemon, args) = setup().await;
+    let minimal_dir = args.minimal_dir.clone().expect("setup points at a tempdir");
+
+    // A VCS root so the headless upload gate passes, and one declared task
+    // the run never reaches: the create is refused first.
+    let project = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir(project.path().join(".git")).unwrap();
+    std::fs::write(
+        project.path().join("minimal.toml"),
+        "[tasks.e2e-echo]\necho = \"TASK_RUN_REFUSAL_UNREACHED\"\n",
+    )
+    .unwrap();
+    let project_canon = project.path().canonicalize().unwrap();
+    let config_dir = tempfile::TempDir::new().unwrap();
+
+    daemon
+        .server
+        .state
+        .set_user_namespace_gate(minimald::server::UsernsGate::Fixed(verdict))
+        .await;
+    let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_min"))
+        .args(["--minimal-dir".as_ref(), minimal_dir.as_os_str()])
+        .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
+        .arg("--no-input")
+        .args(["task", "run", "e2e-echo"])
+        .args(["--path".as_ref(), project_canon.as_os_str()])
+        .output()
+        .await
+        .expect("the min binary should be invocable");
+    daemon
+        .server
+        .state
+        .set_user_namespace_gate(minimald::server::UsernsGate::Off)
+        .await;
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a refused task run exits 1: stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        stdout.trim().is_empty(),
+        "a refused task run puts nothing on stdout, got: {stdout}"
+    );
+
+    // Nothing was created for the refusal to leave behind.
+    let mut client = daemon.server.connect().await;
+    let resp = client.call::<minimald_rpc::ListSessions>(&()).await;
+    assert!(
+        resp.sessions.is_empty(),
+        "a refused task run must leave no session behind, got: {:?}",
+        resp.sessions
+    );
+
+    // The block starts at the last line that opens with `error: `, so a
+    // progress line that happened to contain the words is never taken.
+    let at = stderr
+        .rfind("\nerror: ")
+        .map(|at| at + 1)
+        .or_else(|| stderr.starts_with("error: ").then_some(0))
+        .unwrap_or_else(|| panic!("no error block on stderr: {stderr}"));
+    stderr[at..].trim_end().to_string()
+}
+
+/// A refused host reaches `min task run` through the same create as an
+/// activate, so the refusal is the machine verdict there too (NET-141):
+/// printed verbatim, never wrapped as `CreateSession failed: ...` — a
+/// wrapper that called the daemon's verdict an RPC failure would mislabel
+/// it and bury the remedy's shape under a generic prefix.
+#[tokio::test]
+async fn task_run_prints_the_user_namespace_refusal_verbatim() {
+    let refusal = refused_task_run(minimald::server::UsernsRestriction::ApparmorUnconfined).await;
+    assert_eq!(
+        refusal,
+        "error: this machine blocks the private sandbox every box runs in (Ubuntu restricts \
+         unprivileged user namespaces), so no box can start here yet.\n\
+         Finish the install to allow it for Minimal only: min finalize-install   (see what it \
+         changes first: min finalize-install --show). The profile takes effect when the daemon \
+         next starts: run min stop, then your command again."
+    );
+    assert!(
+        !refusal.contains("CreateSession failed"),
+        "a machine verdict is not an RPC failure: {refusal}"
+    );
+}
+
 /// Plain-mode tracing warnings must land on stderr, never stdout: a script
 /// piping `min loadout list` captures the table on stdout, and a `warning:`
 /// line mixed into it would corrupt that output. Driven through the compiled
