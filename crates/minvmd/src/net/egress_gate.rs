@@ -3306,6 +3306,35 @@ async fn relay_switch_frames_to_guest(
             ));
         }
         switch.read_exact(&mut frame[..n]).await?;
+        // The queue's room is taken before anything below observes the
+        // frame, because a frame the queue has no room for is never
+        // delivered — and nothing that was not delivered may be observed as
+        // though it had been: no pin from an answer the box never saw, no
+        // reply-flow record spending a slot under the box's cap. A full
+        // queue keeps this leg reading when the guest stops reading: the
+        // frame is dropped under the backpressure rule, said once per
+        // destination per interval, and the leg goes on draining the switch.
+        // The address the line keys by is the box the frame was headed to,
+        // read off the frame itself — the destination is the per-connection
+        // identity this direction has. A refusal below (the proxy's opening
+        // packet, a flow at the box's cap) drops the permit unused, which
+        // hands its room back.
+        let permit = match guest.try_reserve() {
+            Ok(permit) => permit,
+            Err(mpsc::error::TrySendError::Full(())) => {
+                let dst = dns_pins::parse_ipv4_l4(&frame[..n])
+                    .map(|pkt| pkt.dst.ip().octets())
+                    .unwrap_or_default();
+                limiter.warn_backpressure(dst);
+                continue;
+            }
+            Err(mpsc::error::TrySendError::Closed(())) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "the relay's guest writer is gone",
+                ));
+            }
+        };
         // NET-040's answer half, this gate's recording half: one frame this
         // leg is about to deliver toward a registered box, at the inside
         // port one of the box's applied publishes dials, is the one thing
@@ -3397,32 +3426,12 @@ async fn relay_switch_frames_to_guest(
             pins.observe_reply(&table, &pkt, datagram, &limiter, Instant::now());
         }
         // One combined write keeps the length prefix and the frame together
-        // even if the guest closes between two writes — and the queue keeps
-        // this leg reading when the guest stops reading: a frame the queue
-        // has no room for is dropped under the backpressure rule, said once
-        // per destination per interval, and the leg goes on draining the
-        // switch. The address the line keys by is the box the frame was
-        // headed to, read off the frame itself — the destination is the
-        // per-connection identity this direction has.
-        let dst = dns_pins::parse_ipv4_l4(&frame[..n])
-            .map(|pkt| pkt.dst.ip().octets())
-            .unwrap_or_default();
+        // even if the guest closes between two writes; the permit taken
+        // above guarantees the queue has room for it.
         let mut framed = Vec::with_capacity(2 + n);
         framed.extend_from_slice(&(n as u16).to_le_bytes());
         framed.extend_from_slice(&frame[..n]);
-        match guest.try_send(framed) {
-            Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                limiter.warn_backpressure(dst);
-                continue;
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::ConnectionAborted,
-                    "the relay's guest writer is gone",
-                ));
-            }
-        }
+        permit.send(framed);
     }
 }
 
@@ -15208,6 +15217,109 @@ mod tests {
         assert!(
             !h.log.contents().contains("egress-backpressure"),
             "a flowing relay drops nothing, got: {}",
+            h.log.contents()
+        );
+    }
+
+    /// Pushes `rounds` copies of `frame` from the switch side and says
+    /// whether the push completed within the deadline.
+    async fn push_from_switch(switch: &mut UnixStream, frame: &[u8], rounds: usize) -> bool {
+        tokio::time::timeout(DEADLINE, async {
+            for _ in 0..rounds {
+                send_frame(switch, frame).await;
+            }
+        })
+        .await
+        .is_ok()
+    }
+
+    /// A frame the guest-bound queue drops is not observed: a DNS reply that
+    /// arrives while the guest has stopped reading never reaches the box, so
+    /// it pins nothing, and the destination its answer named stays the
+    /// host's drop. The ingress leg takes the queue's room before it records
+    /// anything about a frame, so a dropped reply leaves the gate's state as
+    /// it found it.
+    #[tokio::test]
+    async fn a_reply_dropped_at_the_queue_pins_nothing() {
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register(
+            BoxRegistration::new("weather", Ipv4Addr::from(LEASE), Ipv4Addr::LOCALHOST)
+                .with_admitted_ports([8080])
+                .with_egress_policy(EgressPolicy {
+                    allow_protocols: Some(vec![sessions::IpProto::Tcp]),
+                    allow_subnets: Some(vec!["203.0.113.0/24".to_string()]),
+                    allow_dns_hosts: Some(vec!["example.com".to_string()]),
+                    deny_subnets: None,
+                }),
+        );
+        let mut h = gate_over(registry).await;
+
+        // The box's own lookup: the reply that answers it is one that would
+        // pin, were it delivered.
+        let query = dns_pins::tests::udp_payload_frame(
+            Ipv4Addr::from(LEASE),
+            40000,
+            SUBNET.dns_server(),
+            53,
+            &dns_pins::tests::dns_query("example.com"),
+        );
+        send_frame(&mut h.guest, &query).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            query,
+            "the box's own query reaches the switch, byte for byte"
+        );
+
+        // The guest stops reading, and the switch fills the guest-bound
+        // queue past its bound, so every frame from here on is dropped.
+        let filler = dns_pins::tests::tcp_frame(
+            Ipv4Addr::new(10, 1, 2, 3),
+            40000,
+            Ipv4Addr::from(LEASE),
+            8080,
+            sessions::core::egress::TCP_SYN,
+        );
+        let rounds = 10 * 1024 * 1024 / (filler.len() + 2);
+        assert!(
+            push_from_switch(&mut h.switch, &filler, rounds).await,
+            "the switch side keeps draining; it does not wedge"
+        );
+        wait_for_log(&h.log, "egress-backpressure").await;
+
+        // The reply, while the queue is full — then more than any socket
+        // buffer holds behind it, so the ingress leg has read past it by the
+        // time the push completes.
+        let answer = Ipv4Addr::new(93, 184, 216, 34);
+        let reply = dns_pins::tests::udp_payload_frame(
+            SUBNET.dns_server(),
+            53,
+            Ipv4Addr::from(LEASE),
+            40000,
+            &dns_pins::tests::dns_response("example.com", &[answer]),
+        );
+        send_frame(&mut h.switch, &reply).await;
+        assert!(
+            push_from_switch(&mut h.switch, &filler, rounds / 2).await,
+            "the switch side keeps draining past the reply"
+        );
+
+        // The dropped reply pinned nothing: the address it named is still
+        // the host's drop, and the marker behind it is what reaches the
+        // switch.
+        let to_answer = ipv4_frame(LEASE, 6, answer.octets(), 443);
+        send_frame(&mut h.guest, &to_answer).await;
+        let marker = ipv4_frame(LEASE, 6, [203, 0, 113, 7], 443);
+        send_frame(&mut h.guest, &marker).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            marker,
+            "the answer a dropped reply named stays the host's drop; the marker did"
+        );
+        assert!(
+            !h.log
+                .contents()
+                .contains("filled the box's host-side DNS admission table"),
+            "a reply the box never received pins nothing, got: {}",
             h.log.contents()
         );
     }
