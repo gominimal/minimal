@@ -610,6 +610,7 @@ pub(crate) mod linux {
         daemon == "/usr/bin/minimald"
             || daemon == "/usr/local/bin/minimald"
             || home.is_some_and(|home| {
+                let home = home.trim_end_matches('/');
                 stock_home(home) && daemon == format!("{home}/.local/bin/minimald")
             })
     }
