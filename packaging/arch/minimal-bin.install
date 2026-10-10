@@ -1,17 +1,43 @@
-# pacman hook for minimal-bin: finish the host the way `min finalize-install`
-# does when the package lands, as root and never prompting. The probe prints
-# the one script a run would execute, only while something is missing (the
-# minimald AppArmor profile on a host that restricts user namespaces, the
-# classifier tree, ...), and root runs it directly: no sudo, no terminal. A
-# miss here must never fail the pacman transaction: warn on stderr and return
-# 0; `min finalize-install` retries the step later.
+# pacman hook for minimal-bin, run as root and never prompting. A miss here
+# must never fail the pacman transaction: warn on stderr and return 0;
+# `min finalize-install` retries later.
+#
+# 1. Load the minimald AppArmor profile on every install AND upgrade. The
+#    loader ships under /usr/share/minimal/apparmor/ (profile, tunable, and
+#    script side by side, the layout it expects) and needs apparmor_parser
+#    plus root; it installs the packaged profile and `apparmor_parser
+#    --replace`s it, so an upgrade refreshes the one in /etc and in the
+#    kernel, and a host that does not restrict user namespaces today still
+#    holds the profile for the kernel that will. `min finalize-install` does
+#    neither: its item is done once /etc/apparmor.d/minimald exists, and it
+#    skips the profile while the sysctl is 0. AppArmor is optional, so a miss
+#    only warns.
+_install_apparmor_profile() {
+    /usr/share/minimal/apparmor/install-apparmor-profile.sh ||
+        printf '%s\n' \
+            "warning: could not load the minimald AppArmor profile" \
+            "(AppArmor unavailable or disabled on this host?)." \
+            "minimald still works; on hosts with" \
+            "kernel.apparmor_restrict_unprivileged_userns=1, re-run" \
+            "sudo /usr/share/minimal/apparmor/install-apparmor-profile.sh" \
+            "once AppArmor is installed and enabled." >&2
+    return 0
+}
 
+# 2. Finish the rest the way `min finalize-install` does: the probe prints
+#    the one script a run would execute, only while something is missing (the
+#    classifier tree, ...), and root runs it directly: no sudo, no terminal.
+#    The probe runs under a pinned root environment, not the caller's: under
+#    `sudo -E pacman` the operator's HOME/XDG would point it at THEIR daemon
+#    socket, turn the names item missing, and install the resolver link and
+#    answerer service as a package side effect.
 _finalize_install() {
     local script
     script="$(mktemp)" || return 0
-    if /usr/bin/min finalize-install --show --script >"$script" 2>/dev/null &&
+    if env -i PATH=/usr/bin:/bin HOME=/root \
+        /usr/bin/min finalize-install --show --script >"$script" 2>/dev/null &&
         [ -s "$script" ]; then
-        sh "$script" ||
+        env -i PATH=/usr/bin:/bin HOME=/root sh "$script" ||
             printf '%s\n' \
                 "warning: finishing the host setup failed." \
                 "minimal is installed; run \`min finalize-install\` to retry" \
@@ -22,9 +48,11 @@ _finalize_install() {
 }
 
 post_install() {
+    _install_apparmor_profile
     _finalize_install
 }
 
 post_upgrade() {
+    _install_apparmor_profile
     _finalize_install
 }
