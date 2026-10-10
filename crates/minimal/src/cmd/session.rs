@@ -968,9 +968,9 @@ pub(crate) async fn activate_session(
     // (`host_install_for_this_host`, the same scoping `min finalize-install`
     // applies) — so the two verbs print the same words (NET-122's pointer
     // is the line's tail). Host DNS is opt-in: the start never prints the
-    // privileged step, only the command that runs it.
-    let host_install = crate::cmd::finalize_install::host_install_for_this_host(global);
-    let box_name = config.name.as_deref().unwrap_or("-");
+    // privileged step, only the command that runs it. The host's items are
+    // probed only once a line is going to print: a start with no surface to
+    // name has no clause to end it with.
     let surface = if held_no_channel && let Some(answerer_port) = answerer_port {
         // NET-138's warning, at every session start — TTY and non-TTY: it
         // rides stderr unconditionally, because the first lookup that
@@ -1094,6 +1094,8 @@ pub(crate) async fn activate_session(
             .then_some(crate::resolver::LiveSurface::Proxy)
     };
     if let Some(surface) = surface {
+        let host_install = crate::cmd::finalize_install::host_install_for_this_host(global);
+        let box_name = config.name.as_deref().unwrap_or("-");
         eprintln!(
             "{}",
             crate::resolver::host_line_beside(
