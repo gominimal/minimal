@@ -86,6 +86,8 @@ pub enum Command {
     Task(TaskArgs),
     /// Network subcommands: bring a box's services to the laptop
     Net(NetArgs),
+    /// Finish the install on this host: every privileged step it still needs, in one run (`--show` names them, `--show --script` prints the script, `--undo` removes them)
+    FinalizeInstall(FinalizeInstallArgs),
     /// Muscle-memory catch for the in-box `min run <task>`: always errors,
     /// naming the canonical `min task run <task>` (host) and
     /// `min session attach --command 'min task run <task>'` (in-box) forms.
@@ -1012,8 +1014,6 @@ pub enum NetCommand {
     /// installed or configured on the remote side. Stays in the foreground
     /// and closes with the session.
     Forward(NetForwardArgs),
-    /// Set this host up to resolve and reach boxes by name (runs one privileged script; `--print` only prints it, `--undo` removes it)
-    Setup(NetSetupArgs),
 }
 
 #[derive(Debug, Args)]
@@ -1029,11 +1029,17 @@ pub struct NetForwardArgs {
 }
 
 #[derive(Debug, Args)]
-pub struct NetSetupArgs {
-    /// Print the setup script instead of running it
+pub struct FinalizeInstallArgs {
+    /// Name what is missing on this host and run nothing
     #[arg(long)]
-    pub print: bool,
-    /// Remove everything the setup step installs on this host (with --print, print the removal script)
+    pub show: bool,
+    /// With --show, also print the script a run would execute, on stdout
+    #[arg(long, requires = "show", conflicts_with = "json")]
+    pub script: bool,
+    /// With --show, print the report as JSON (schema `min/v1/finalize-install`); exits non-zero while any part is missing
+    #[arg(long, requires = "show", conflicts_with = "undo")]
+    pub json: bool,
+    /// Remove everything the step installed on this host (with --show --script, print the removal script instead)
     #[arg(long)]
     pub undo: bool,
 }

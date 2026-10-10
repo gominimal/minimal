@@ -1039,38 +1039,61 @@ fn provider_local_minimald_is_the_host_backend() {
 }
 
 #[test]
-fn net_setup_parses_to_the_setup_command() {
+fn finalize_install_parses_its_flags() {
     use clap::Parser as _;
-    let cli = Cli::try_parse_from(["min", "net", "setup"]).unwrap();
+    let cli = Cli::try_parse_from(["min", "finalize-install"]).unwrap();
     assert!(matches!(
         cli.command,
-        Some(Command::Net(NetArgs {
-            command: NetCommand::Setup(NetSetupArgs {
-                print: false,
-                undo: false
-            })
+        Some(Command::FinalizeInstall(FinalizeInstallArgs {
+            show: false,
+            script: false,
+            json: false,
+            undo: false
         }))
     ));
-    let cli = Cli::try_parse_from(["min", "net", "setup", "--print"]).unwrap();
+    let cli = Cli::try_parse_from(["min", "finalize-install", "--show", "--script"]).unwrap();
     assert!(matches!(
         cli.command,
-        Some(Command::Net(NetArgs {
-            command: NetCommand::Setup(NetSetupArgs {
-                print: true,
-                undo: false
-            })
+        Some(Command::FinalizeInstall(FinalizeInstallArgs {
+            show: true,
+            script: true,
+            json: false,
+            undo: false
         }))
     ));
-    let cli = Cli::try_parse_from(["min", "net", "setup", "--undo", "--print"]).unwrap();
+    let cli = Cli::try_parse_from(["min", "finalize-install", "--show", "--json"]).unwrap();
     assert!(matches!(
         cli.command,
-        Some(Command::Net(NetArgs {
-            command: NetCommand::Setup(NetSetupArgs {
-                print: true,
-                undo: true
-            })
+        Some(Command::FinalizeInstall(FinalizeInstallArgs {
+            show: true,
+            script: false,
+            json: true,
+            undo: false
         }))
     ));
+    let cli =
+        Cli::try_parse_from(["min", "finalize-install", "--undo", "--show", "--script"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Some(Command::FinalizeInstall(FinalizeInstallArgs {
+            show: true,
+            script: true,
+            json: false,
+            undo: true
+        }))
+    ));
+    // `--script` and `--json` need `--show`; `--json` describes an install,
+    // not a removal; the two outputs exclude each other.
+    for args in [
+        &["min", "finalize-install", "--script"][..],
+        &["min", "finalize-install", "--json"],
+        &["min", "finalize-install", "--show", "--json", "--undo"],
+        &["min", "finalize-install", "--undo", "--show", "--json"],
+        &["min", "finalize-install", "--show", "--json", "--script"],
+        &["min", "net", "setup"],
+    ] {
+        assert!(Cli::try_parse_from(args).is_err(), "{args:?}");
+    }
 }
 
 #[test]
@@ -3381,9 +3404,15 @@ async fn walked_proxy_port_reported_at_start_and_in_ls() {
         routing("default")
     );
 
-    // Session start: one line naming the VM the session landed on and the
-    // same port, so the two surfaces agree on the address to point at.
-    let start = hostname_proxy_start_line(Some("alpha"), NEXT_RUNG);
+    // Session start: the one host line names the same port as the routing
+    // line's `via 127.0.0.1:<port>`, so the two surfaces agree on the
+    // address to point at (NET-026 on the activate surface).
+    let start = crate::resolver::host_line(
+        "web",
+        &crate::resolver::LiveSurface::Proxy,
+        Some(NEXT_RUNG),
+        crate::resolver::HostInstall::default(),
+    );
     let address = format!("127.0.0.1:{NEXT_RUNG}");
     assert!(
         routing("alpha").contains(&address) && start.contains(&address),
@@ -3392,73 +3421,9 @@ async fn walked_proxy_port_reported_at_start_and_in_ls() {
         routing("alpha")
     );
     assert!(
-        start.contains("VM alpha"),
-        "on a two-VM host the start line must say whose port it is: {start}"
+        !start.contains(&RECIPES_PORT.to_string()),
+        "the start line must not name the port the recipes assume: {start}"
     );
-
-    // And the wiring: the start line names a VM exactly when the backend hosts
-    // them — the selected VM on the VM backend, nothing on the native one,
-    // whose single daemon has no VM to name. This test process never publishes
-    // a `--vm` name, so the selected VM is the default one.
-    let state = tempfile::tempdir().expect("a temp minimal state dir");
-    assert_eq!(
-        hostname_proxy_start_vm(&vm_globals(state.path(), None)),
-        Some(paths::DEFAULT_VM_NAME),
-        "the VM backend names the selected VM"
-    );
-    let native = GlobalArgs {
-        repo_dir: None,
-        minimal_dir: Some(state.path().to_path_buf()),
-        config_dir: None,
-        provider: Some(Provider::LocalMinimald),
-        no_input: true,
-        vm: None,
-    };
-    // Which backend `--provider local-minimald` selects is the platform's
-    // call: on Linux it is the native one, while macOS has no native backend
-    // at all, so `client_provider_kind` folds the flag's reading onto minvmd
-    // there — the same rule every VM-backed gate keys on, flag or no flag.
-    // The expectation is therefore the kind's, not a constant.
-    let native_names_a_vm = cfg!(target_os = "macos");
-    assert_eq!(
-        hostname_proxy_start_vm(&native),
-        native_names_a_vm.then_some(paths::DEFAULT_VM_NAME),
-        "the backend the flag selects names a VM exactly where that backend \
-         is the VM one"
-    );
-
-    // The native line is the single-VM routing line word for word — the same
-    // address in the same words, so the two surfaces read as one. A fact
-    // about the native backend, so it is asserted only where that backend
-    // exists: a host whose every backend is minvmd renders its routing lines
-    // through the VM listing, which names the VM the start line names above.
-    if !native_names_a_vm {
-        let native_start = hostname_proxy_start_line(hostname_proxy_start_vm(&native), NEXT_RUNG);
-        let mut single = Vec::new();
-        let mut native_resp = reply.clone();
-        native_resp.hostname_proxy_port = Some(NEXT_RUNG);
-        format_ls(
-            &mut single,
-            &LsArgs {
-                raw: false,
-                json: false,
-            },
-            &native_resp,
-            None,
-            None,
-        )
-        .expect("rendering the single-VM listing");
-        let single = String::from_utf8(single).expect("the listing is UTF-8");
-        assert_eq!(
-            single
-                .lines()
-                .find(|l| l.starts_with("HOSTNAME PROXY:"))
-                .expect("the single-VM listing prints a routing line"),
-            native_start.as_str(),
-            "the native start line and `min ls`'s routing line must be the same \
-             line"
-        );
-    }
 }
 
 /// Two listed sessions for the id-prefix tests: an unnamed `01a0fe9d…` and
