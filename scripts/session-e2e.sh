@@ -8906,10 +8906,13 @@ proof_box_name_resolves_natively_without_proxy() {
     fail
   fi
   echo "activate reported the surface (NET-018): $bn_api_surface"
+  # The activate line is the one host line, naming the box (NET-142). That
+  # the hostname proxy still serves beside native DNS (NET-019) is `min
+  # ls`'s to say, on its NAME SURFACE row, asserted below.
   case "$bn_api_surface" in
-    *"the hostname proxy still serves on 127.0.0.1:"*) ;;
+    "names: $BN_API_NAME.min.internal resolves in any browser on this machine"*) ;;
     *)
-      echo "::error::the native surface line does not say the hostname proxy still serves (NET-019)"
+      echo "::error::the second box's activate line is not the one host line naming the box (NET-142)"
       echo "--- surface line ---"; printf '%s\n' "$bn_api_surface"
       fail
       ;;
