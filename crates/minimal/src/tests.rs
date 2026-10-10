@@ -271,15 +271,16 @@ fn every_daemon_connection_is_classified() {
             "cmd/mod.rs::arm_activation_interrupt = ungated",
             "cmd/mod.rs::connect_daemon_unchecked = ungated",
             "cmd/net.rs::cmd_net_forward = gated",
-            // A read-only lookup around an attach the gated `cmd_attach`
-            // already made: it reads the box's pair before, and asks whether
-            // the session is gone after, to withdraw its row or release a
-            // `host_ip` name hold, and builds nothing a skew could half-make.
-            "cmd/session.rs::attached_session_record = ungated",
             "cmd/session.rs::cmd_attach = gated",
             "cmd/session.rs::cmd_exec = gated",
             "cmd/session.rs::cmd_session_run = gated",
             "cmd/session.rs::cmd_session_setup_zed = gated",
+            // A read-only lookup around an attach the gated `cmd_attach`
+            // already made: it reads the box's pair before, and asks whether
+            // the session is gone after, to withdraw its row or release a
+            // `host_ip` name hold, and which live session holds a name a
+            // re-hold took over; it builds nothing a skew could half-make.
+            "cmd/session.rs::session_record_by = ungated",
             "diag/net.rs::probe_socket = ungated",
             "task.rs::arm_task_run_interrupt = ungated",
             // Not a product path: the fall-through tests' own connections to
