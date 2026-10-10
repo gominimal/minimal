@@ -72,6 +72,44 @@ async fn version_reports_broken_pipe_when_output_is_closed() {
     }));
 }
 
+// --- finalize-install ---
+
+/// NET-122: `min finalize-install --show --json` with stdout piped (the
+/// way the installer's probe reads it) delivers the whole document and
+/// exits 1 on a host with an item not done — here a state dir with no
+/// daemon, so the names item waits on one. The exit must not lose the
+/// buffered report: `std::process::exit` flushes nothing.
+#[tokio::test]
+async fn finalize_install_show_json_reaches_a_piped_reader_before_exit() {
+    let state = tempfile::TempDir::new().unwrap();
+    let config_dir = tempfile::TempDir::new().unwrap();
+    let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_min"))
+        .args(["--minimal-dir".as_ref(), state.path().as_os_str()])
+        .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
+        .args(["--no-input", "finalize-install", "--show", "--json"])
+        .output()
+        .await
+        .expect("the min binary should be invocable");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "an unfinished host exits 1: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let report: Value = serde_json_lenient::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("the whole report reaches a piped stdout ({e}): {stdout:?}"));
+    assert_eq!(report["schema"], "min/v1/finalize-install");
+    assert_eq!(report["finished"], false);
+    let names = report["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["id"] == "names")
+        .expect("the names item is in every host's report");
+    assert_eq!(names["state"], "waiting", "{stdout}");
+}
+
 // --- ls ---
 
 #[test]
