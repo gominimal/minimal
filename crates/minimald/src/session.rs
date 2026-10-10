@@ -74,10 +74,12 @@ fn spawn_failed_error(userns_spawn_hint: Option<&str>) -> std::io::Error {
 /// keeping its kind. A launch that fails outright on a userns-restricted
 /// host (an own-ip session wiring the netns of a child that already died on
 /// its `uid_map` write) otherwise reaches the client with the same
-/// cause-less symptom as a host that dies before its attach.
+/// cause-less symptom as a host that dies before its attach. The probe
+/// sees the host, not this error, so the hint is labelled the likely cause
+/// and the error's own message stays first.
 fn with_userns_hint(err: std::io::Error, userns_spawn_hint: Option<&str>) -> std::io::Error {
     match userns_spawn_hint {
-        Some(hint) => std::io::Error::new(err.kind(), format!("{err} — {hint}")),
+        Some(hint) => std::io::Error::new(err.kind(), format!("{err} — likely cause: {hint}")),
         None => err,
     }
 }

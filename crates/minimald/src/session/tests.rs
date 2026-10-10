@@ -203,7 +203,10 @@ fn with_userns_hint_appends_the_diagnosis_and_keeps_the_kind() {
 
     let hinted = super::with_userns_hint(base(), Some("restricted — fix: x"));
     assert_eq!(hinted.kind(), std::io::ErrorKind::PermissionDenied);
-    assert_eq!(hinted.to_string(), "uid_map write — restricted — fix: x");
+    assert_eq!(
+        hinted.to_string(),
+        "uid_map write — likely cause: restricted — fix: x"
+    );
 }
 
 /// Reads the session record for `id`, or `None` once it has been deleted.
