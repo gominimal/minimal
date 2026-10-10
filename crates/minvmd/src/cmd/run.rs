@@ -110,14 +110,12 @@ fn run_supervisor(detach: bool, timeout_secs: u64) -> Result<()> {
     if detach {
         return run_detach(timeout_secs);
     }
-    let result = run_foreground();
-    // A supervisor stopped by SIGTERM/SIGINT ends by that signal once its
-    // teardown (the `Stopped` write, the guards' drops) has run, so its
-    // exit status still says what stopped it.
-    if let Some((signum, _)) = crate::control::stop_signal_received() {
-        crate::control::die_by_signal(signum);
-    }
-    result
+    // A supervisor stopped by SIGTERM/SIGINT returns here once its teardown
+    // (the `Stopped` write, the guards' drops) has run; `main` then ends the
+    // process by that signal after flushing its log
+    // ([`crate::control::die_by_received_stop_signal`]), so its exit status
+    // still says what stopped it.
+    run_foreground()
 }
 
 /// Outcome of one poll of the `--detach` readiness loop, decided from the
@@ -536,16 +534,25 @@ fn run_foreground() -> Result<()> {
     boxes
         .try_register_node_namespace(node_port.port)
         .context("publishing the node namespace's row")?;
-    // SIGTERM (a service manager's stop) and SIGINT cancel and audit every
-    // pending ask (NET-045), then stop the VM the same way `minvmd stop`
-    // does: the guest gets the Shutdown RPC so the data volume's ext4
-    // journal stays clean (informed by #705), the VMM child is signalled
-    // and reaped, and the main thread's own teardown writes the `Stopped`
-    // state, then `run_supervisor` ends the process by the signal. The
-    // whole stop is bounded at `SIGNAL_STOP_BOUND` from the signal's
-    // arrival; when it cannot run, fails, or the teardown overruns that
-    // deadline, the watcher dies by the signal itself. A second signal
-    // meanwhile ends the process at once.
+    // SIGTERM or SIGINT sent to the supervisor (a service manager's stop,
+    // or kill(1)) cancels and audits every pending ask (NET-045), then
+    // stops the VM the same way `minvmd stop` does: the guest gets the
+    // Shutdown RPC so the data volume's ext4 journal stays clean (informed
+    // by #705), the VMM child is signalled and reaped, and the main
+    // thread's own teardown writes the `Stopped` state, then `main` ends
+    // the process by the signal. The whole stop is bounded at
+    // `SIGNAL_STOP_BOUND` from the signal's arrival; when it cannot run,
+    // fails, or the teardown overruns that deadline, the watcher dies by
+    // the signal itself. A second signal meanwhile ends the process at
+    // once.
+    //
+    // Not covered: a terminal Ctrl-C on a foreground run. The VMM child
+    // shares the terminal's foreground process group, so the tty delivers
+    // SIGINT to it directly, at the same moment as to the supervisor, and
+    // the VMM dies before the Shutdown RPC can run; the journal replay
+    // backstop bounds that case, as before. Nor is a SIGKILL of the
+    // supervisor: the orphaned VMM keeps the alive lock it inherited, so
+    // the VM still reads as live, and `min stop --force` is the recovery.
     let signal_state_dir = state_dir.dir().to_path_buf();
     if let Err(error) = crate::control::watch_stop_signals(boxes.clone(), move |signum| {
         let deadline = crate::control::stop_signal_received()

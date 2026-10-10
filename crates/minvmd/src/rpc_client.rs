@@ -8,7 +8,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use minimald_rpc::OneshotSshRpc;
@@ -47,12 +47,15 @@ impl russh::client::Handler for AnyHostKey {
 /// even when the guest is wedged, so only a completed handshake proves a
 /// live daemon), and `rpc_timeout` covers the request/response exchange
 /// (long — the handler may do real work, e.g. draining sessions, before it
-/// answers).
+/// answers). `rpc_deadline`, when set, also ends the exchange at that
+/// instant: it is measured once the connect has finished, so a connect that
+/// returns early hands the time it did not use to the RPC.
 pub(crate) fn call_oneshot_blocking<R: OneshotSshRpc>(
     uds_path: &Path,
     request: R::Request<'_>,
     connect_timeout: Duration,
     rpc_timeout: Duration,
+    rpc_deadline: Option<Instant>,
 ) -> anyhow::Result<R::Response> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -67,6 +70,9 @@ pub(crate) fn call_oneshot_blocking<R: OneshotSshRpc>(
                     uds_path.display()
                 )
             })??;
+        let rpc_timeout = rpc_deadline.map_or(rpc_timeout, |deadline| {
+            rpc_timeout.min(deadline.saturating_duration_since(Instant::now()))
+        });
         tokio::time::timeout(rpc_timeout, call_oneshot::<R>(&mut handle, request))
             .await
             .map_err(|_| anyhow::anyhow!("RPC {} timed out after {rpc_timeout:?}", R::NAME))?
@@ -76,17 +82,19 @@ pub(crate) fn call_oneshot_blocking<R: OneshotSshRpc>(
 /// Ask the in-VM minimald to shut down: drain sessions and quiesce the state
 /// volume (R2.3). `force: true` because the caller is tearing the VM down
 /// regardless — a refused non-force shutdown would only trade a clean drain
-/// for an unclean SIGTERM.
+/// for an unclean SIGTERM. The bounds are [`call_oneshot_blocking`]'s.
 pub(crate) fn shutdown_guest(
     uds_path: &Path,
     connect_timeout: Duration,
     rpc_timeout: Duration,
+    rpc_deadline: Option<Instant>,
 ) -> anyhow::Result<minimald_rpc::ShutdownResponse> {
     call_oneshot_blocking::<minimald_rpc::Shutdown>(
         uds_path,
         minimald_rpc::ShutdownRequest { force: true },
         connect_timeout,
         rpc_timeout,
+        rpc_deadline,
     )
 }
 
@@ -161,8 +169,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let missing = tmp.path().join("no-such.sock");
         let started = std::time::Instant::now();
-        let err =
-            shutdown_guest(&missing, Duration::from_secs(5), Duration::from_secs(60)).unwrap_err();
+        let err = shutdown_guest(
+            &missing,
+            Duration::from_secs(5),
+            Duration::from_secs(60),
+            None,
+        )
+        .unwrap_err();
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "must fail on connect, not wait out the timeout"
@@ -183,12 +196,126 @@ mod tests {
         let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
 
         let started = std::time::Instant::now();
-        let err =
-            shutdown_guest(&sock, Duration::from_millis(300), Duration::from_secs(60)).unwrap_err();
+        let err = shutdown_guest(
+            &sock,
+            Duration::from_millis(300),
+            Duration::from_secs(60),
+            None,
+        )
+        .unwrap_err();
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "must give up at the connect deadline, not the RPC deadline"
         );
         assert!(err.to_string().contains("no live minimald"), "got: {err:#}");
+    }
+
+    /// A guest that answers the handshake at once but is still draining
+    /// when the deadline comes: the RPC must run until `rpc_deadline`, not
+    /// stop at whatever `rpc_timeout` a caller split from the same budget.
+    #[test]
+    fn shutdown_guest_rpc_runs_to_its_deadline_after_a_fast_connect() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("stalling.sock");
+        test_support::spawn_stalling_guest(&sock);
+
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(3);
+        let err = shutdown_guest(
+            &sock,
+            Duration::from_millis(1500),
+            Duration::from_secs(60),
+            Some(deadline),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("timed out"), "got: {err:#}");
+        assert!(
+            Instant::now() >= deadline,
+            "the RPC gave up {:?} before its deadline",
+            deadline.saturating_duration_since(Instant::now())
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the RPC overran its deadline: {:?}",
+            started.elapsed()
+        );
+    }
+}
+
+/// Test doubles for the in-VM daemon's side of the bridge UDS.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use russh::keys::{Algorithm, PrivateKey, key::safe_rng};
+
+    /// A guest daemon that completes the SSH handshake and accepts the
+    /// RPC's channel and subsystem, then never answers: a live guest still
+    /// draining its sessions.
+    struct StallingGuest;
+
+    impl russh::server::Handler for StallingGuest {
+        type Error = russh::Error;
+
+        async fn auth_none(&mut self, _user: &str) -> Result<russh::server::Auth, Self::Error> {
+            Ok(russh::server::Auth::Accept)
+        }
+
+        async fn channel_open_session(
+            &mut self,
+            _channel: russh::Channel<russh::server::Msg>,
+            reply: russh::server::ChannelOpenHandle,
+            _session: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            reply.accept().await;
+            Ok(())
+        }
+
+        async fn subsystem_request(
+            &mut self,
+            channel: russh::ChannelId,
+            _name: &str,
+            session: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            session.channel_success(channel)
+        }
+    }
+
+    /// Serve a [`StallingGuest`] on a UDS bound at `sock`, on a thread
+    /// that lives as long as the test process.
+    pub(crate) fn spawn_stalling_guest(sock: &Path) {
+        let listener = std::os::unix::net::UnixListener::bind(sock).expect("bind guest socket");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("guest runtime");
+            rt.block_on(async move {
+                let listener =
+                    tokio::net::UnixListener::from_std(listener).expect("tokio listener");
+                let key =
+                    PrivateKey::random(&mut safe_rng(), Algorithm::Ed25519).expect("host key");
+                let config = Arc::new(russh::server::Config {
+                    keys: vec![key],
+                    ..Default::default()
+                });
+                while let Ok((stream, _)) = listener.accept().await {
+                    let config = config.clone();
+                    tokio::spawn(async move {
+                        if let Ok(session) =
+                            russh::server::run_stream(config, stream, StallingGuest).await
+                        {
+                            // The session ends when the client hangs up;
+                            // how it ended does not matter to the test.
+                            drop(session.await);
+                        }
+                    });
+                }
+            });
+        });
     }
 }

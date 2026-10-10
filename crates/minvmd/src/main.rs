@@ -116,9 +116,9 @@ fn main() -> Result<()> {
         minvmd::state::set_vm_name(vm).map_err(|e| anyhow::anyhow!("--vm: {e}"))?;
     }
 
-    let _log_guard = init_tracing()?;
+    let log_guard = init_tracing()?;
 
-    match cli.command {
+    let result = match cli.command {
         Command::Boot { foreground } => minvmd::cmd::boot::run(foreground),
         Command::Completions { shell } => {
             let mut cmd = Cli::command();
@@ -150,7 +150,13 @@ fn main() -> Result<()> {
             minvmd::cmd::stop::run()
         }
         Command::KrunVmm => minvmd::cmd::vmm_child::run(),
-    }
+    };
+    // A `run` supervisor stopped by SIGTERM/SIGINT ends by that signal, so
+    // its exit status says what stopped it; the log guard goes first, so
+    // the signal stop's last lines reach the log before the process ends.
+    drop(log_guard);
+    minvmd::control::die_by_received_stop_signal();
+    result
 }
 
 /// Install the tracing subscriber. Foreground processes log to stdout;

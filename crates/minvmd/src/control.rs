@@ -2194,7 +2194,9 @@ extern "C" fn on_stop_signal(signum: libc::c_int) {
 /// gracefully in `then`, bounded by its own deadline, and falls back to
 /// [`die_by_signal`] when that cannot finish, so the process always
 /// terminates by the signal. Only a crash and SIGKILL stay outside this
-/// path.
+/// path. The graceful VM stop applies to a signal sent to the supervisor
+/// alone: a terminal Ctrl-C also reaches the foreground VMM child, which
+/// shares the terminal's process group, and ends it directly.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 pub(crate) fn watch_stop_signals(
     boxes: BoxRegistry,
@@ -2283,6 +2285,15 @@ static STOP_SIGNAL: std::sync::OnceLock<(libc::c_int, std::time::Instant)> =
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 pub(crate) fn stop_signal_received() -> Option<(libc::c_int, std::time::Instant)> {
     STOP_SIGNAL.get().copied()
+}
+
+/// End the process by the stop signal the watcher received, if one arrived;
+/// otherwise return. `main` calls it after dropping its log guard, so the
+/// last lines of a signal stop are flushed before the process ends.
+pub fn die_by_received_stop_signal() {
+    if let Some((signum, _)) = stop_signal_received() {
+        die_by_signal(signum);
+    }
 }
 
 /// End the process by `signum` with its default disposition, as it ended
