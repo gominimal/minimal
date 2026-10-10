@@ -2692,6 +2692,13 @@ pub(crate) const CLASSIFIER_TREE_ROOT: &str = "/sys/fs/cgroup/minimald.slice";
 #[cfg(any(test, not(target_os = "macos")))]
 pub(crate) const KVM_GROUP_RECORD: &str = "/var/lib/minimal/finalize-install-kvm-group";
 
+/// The record the step leaves when it installs the user-namespace
+/// profile, so the removal takes away only a profile the step put there;
+/// one installed another way (`install-apparmor-profile.sh`) stays.
+#[cfg(any(test, not(target_os = "macos")))]
+pub(crate) const APPARMOR_PROFILE_RECORD: &str =
+    "/var/lib/minimal/finalize-install-apparmor-profile";
+
 /// The heredoc delimiter the classifier's installer rides under in a
 /// script.
 #[cfg(any(test, not(target_os = "macos")))]
@@ -2705,19 +2712,28 @@ const CLASSIFIER_SCRIPT: &str = include_str!("../../../scripts/install-host-clas
 /// The lines that remove the Linux items beyond the names: the
 /// user-namespace profile (unloaded, then its files), the classifier tree
 /// (the step's own `--uninstall`, run only while the tree exists), and the
-/// `kvm` membership the step recorded adding. Every line tolerates what
-/// is already gone.
+/// `kvm` membership the step recorded adding. The profile comes away only
+/// by the step's record: a profile without one was installed another way
+/// and stays, named in a note. Every line tolerates what is already gone.
 #[cfg(any(test, not(target_os = "macos")))]
 fn linux_host_items_removal() -> String {
     format!(
         "\n\
-         # The user-namespace profile: unload it, then remove its files.\n\
-         if [ -f {APPARMOR_DIR}/minimald ] ; then\n\
-         \x20 apparmor_parser --remove {APPARMOR_DIR}/minimald 2>/dev/null || true\n\
-         fi\n\
-         rm -f {APPARMOR_DIR}/minimald {APPARMOR_DIR}/tunables/minimald \
+         # The user-namespace profile, by the step's record: unload it, then remove\n\
+         # its files. A profile without the record was installed another way and stays.\n\
+         if [ -f {APPARMOR_PROFILE_RECORD} ] ; then\n\
+         \x20 if [ -f {APPARMOR_DIR}/minimald ] ; then\n\
+         \x20   apparmor_parser --remove {APPARMOR_DIR}/minimald 2>/dev/null || true\n\
+         \x20 fi\n\
+         \x20 rm -f {APPARMOR_DIR}/minimald {APPARMOR_DIR}/tunables/minimald \
          {APPARMOR_DIR}/tunables/minimald.d/local\n\
-         rmdir {APPARMOR_DIR}/tunables/minimald.d 2>/dev/null || true\n\
+         \x20 rmdir {APPARMOR_DIR}/tunables/minimald.d 2>/dev/null || true\n\
+         \x20 rm -f {APPARMOR_PROFILE_RECORD}\n\
+         elif [ -f {APPARMOR_DIR}/minimald ] ; then\n\
+         \x20 echo 'note: {APPARMOR_DIR}/minimald was not installed by min finalize-install and \
+         stays; remove it with: apparmor_parser --remove {APPARMOR_DIR}/minimald && rm -f \
+         {APPARMOR_DIR}/minimald {APPARMOR_DIR}/tunables/minimald' >&2\n\
+         fi\n\
          \n\
          # The classifier tree: the step's own removal, while the tree is there.\n\
          if [ -d {CLASSIFIER_TREE_ROOT} ] ; then\n\
@@ -4810,11 +4826,17 @@ mod tests {
         // carried whole, run only while the tree exists), and the kvm
         // membership the step recorded adding.
         for step in [
-            format!("if [ -f {APPARMOR_DIR}/minimald ] ; then"),
-            format!("  apparmor_parser --remove {APPARMOR_DIR}/minimald 2>/dev/null || true"),
+            format!("if [ -f {APPARMOR_PROFILE_RECORD} ] ; then"),
+            format!("  if [ -f {APPARMOR_DIR}/minimald ] ; then"),
+            format!("    apparmor_parser --remove {APPARMOR_DIR}/minimald 2>/dev/null || true"),
             format!(
-                "rm -f {APPARMOR_DIR}/minimald {APPARMOR_DIR}/tunables/minimald \
+                "  rm -f {APPARMOR_DIR}/minimald {APPARMOR_DIR}/tunables/minimald \
                  {APPARMOR_DIR}/tunables/minimald.d/local"
+            ),
+            format!("  rm -f {APPARMOR_PROFILE_RECORD}"),
+            format!("elif [ -f {APPARMOR_DIR}/minimald ] ; then"),
+            format!(
+                "  echo 'note: {APPARMOR_DIR}/minimald was not installed by min finalize-install"
             ),
             format!("if [ -d {CLASSIFIER_TREE_ROOT} ] ; then"),
             format!("  bash -s -- --uninstall <<\\{CLASSIFIER_SCRIPT_HEREDOC}"),
@@ -4894,7 +4916,11 @@ exit 0
                     CLASSIFIER_TREE_ROOT,
                     "/nonexistent/sys/fs/cgroup/minimald.slice",
                 )
-                .replace(KVM_GROUP_RECORD, "/nonexistent/var/lib/minimal/kvm-group");
+                .replace(KVM_GROUP_RECORD, "/nonexistent/var/lib/minimal/kvm-group")
+                .replace(
+                    APPARMOR_PROFILE_RECORD,
+                    "/nonexistent/var/lib/minimal/apparmor-profile",
+                );
             let output = std::process::Command::new("/bin/sh")
                 .args(["-c", &script])
                 .env("PATH", stubs.path())
@@ -4915,6 +4941,100 @@ exit 0
                 "no profile to unload and no membership to take back on a clean host: {stderr}"
             );
         }
+    }
+
+    /// The profile comes away only when the step's record says the step
+    /// installed it: with the record, the removal unloads it, removes its
+    /// files and the record; without, a profile that is there (installed
+    /// by `install-apparmor-profile.sh`) stays, named in a note.
+    #[test]
+    fn finalize_install_undo_removes_only_the_profile_it_recorded() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let host = tempfile::tempdir().expect("a temp dir");
+        let stubs = host.path().join("stubs");
+        std::fs::create_dir(&stubs).unwrap();
+        for (tool, code) in [
+            ("apparmor_parser", 0),
+            ("systemctl", 1),
+            ("resolvectl", 1),
+            ("ip", 1),
+            ("gpasswd", 1),
+        ] {
+            let path = stubs.join(tool);
+            std::fs::write(
+                &path,
+                format!("#!/bin/sh\necho \"$0 $*\" >&2\nexit {code}\n"),
+            )
+            .unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let apparmor_dir = host.path().join("apparmor.d");
+        let record = host.path().join("finalize-install-apparmor-profile");
+        let profile = apparmor_dir.join("minimald");
+        let tunable = apparmor_dir.join("tunables/minimald");
+        let local = apparmor_dir.join("tunables/minimald.d/local");
+        let script = linux_undo_command("/nonexistent/minimal/answerer.sock")
+            .replace("/sys/class/net/", "/nonexistent/sys/class/net/")
+            .replace(
+                CLASSIFIER_TREE_ROOT,
+                "/nonexistent/sys/fs/cgroup/minimald.slice",
+            )
+            .replace(KVM_GROUP_RECORD, "/nonexistent/var/lib/minimal/kvm-group")
+            .replace(APPARMOR_PROFILE_RECORD, record.to_str().unwrap())
+            .replace(APPARMOR_DIR, apparmor_dir.to_str().unwrap());
+        let run = || {
+            let output = std::process::Command::new("/bin/sh")
+                .args(["-c", &script])
+                .env("PATH", format!("{}:/usr/bin:/bin", stubs.display()))
+                .output()
+                .expect("sh runs");
+            assert!(
+                output.status.success(),
+                "the removal succeeds: {}\n{script}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stderr).into_owned()
+        };
+
+        // A profile the step did not record: it stays, with the note.
+        std::fs::create_dir_all(local.parent().unwrap()).unwrap();
+        for file in [&profile, &tunable, &local] {
+            std::fs::write(file, "x").unwrap();
+        }
+        let stderr = run();
+        assert!(
+            profile.is_file() && tunable.is_file() && local.is_file(),
+            "{stderr}"
+        );
+        assert!(
+            !stderr.contains("apparmor_parser"),
+            "an unowned profile is not unloaded: {stderr}"
+        );
+        assert!(
+            stderr.contains("was not installed by min finalize-install")
+                && stderr.contains("apparmor_parser --remove"),
+            "the note names the profile and how to remove it: {stderr}"
+        );
+
+        // The same profile with the record: unloaded, removed, record gone.
+        std::fs::write(&record, "").unwrap();
+        let stderr = run();
+        assert!(stderr.contains("apparmor_parser --remove"), "{stderr}");
+        assert!(!stderr.contains("note:"), "{stderr}");
+        for file in [&profile, &tunable, &local, &record] {
+            assert!(!file.exists(), "{} is removed: {stderr}", file.display());
+        }
+        assert!(
+            !local.parent().unwrap().exists(),
+            "the empty local dir goes too"
+        );
+
+        // Nothing at all: silent.
+        let stderr = run();
+        assert!(
+            !stderr.contains("apparmor_parser") && !stderr.contains("note:"),
+            "{stderr}"
+        );
     }
 
     /// The service is machine-wide and runs as one operator: `min net

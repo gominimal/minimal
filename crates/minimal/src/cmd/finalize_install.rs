@@ -574,7 +574,9 @@ async fn names_item_on_this_host(global: &GlobalArgs) -> Item {
 #[cfg(any(test, target_os = "linux"))]
 pub(crate) mod linux {
     use super::*;
-    use crate::resolver::{APPARMOR_DIR, CLASSIFIER_TREE_ROOT, KVM_GROUP_RECORD};
+    use crate::resolver::{
+        APPARMOR_DIR, APPARMOR_PROFILE_RECORD, CLASSIFIER_TREE_ROOT, KVM_GROUP_RECORD,
+    };
 
     pub(crate) const USERNS_ID: &str = "userns-profile";
     const USERNS_LABEL: &str = "the private sandbox every box runs in";
@@ -711,7 +713,11 @@ pub(crate) mod linux {
             ));
         }
         script.push_str(&format!(
-            "apparmor_parser --replace {APPARMOR_DIR}/minimald\n"
+            "apparmor_parser --replace {APPARMOR_DIR}/minimald\n\
+             # The record marks the profile as this step's, so --undo removes it; one\n\
+             # installed another way is left alone.\n\
+             mkdir -p /var/lib/minimal\n\
+             : > {APPARMOR_PROFILE_RECORD}\n"
         ));
         script
     }
@@ -1289,6 +1295,7 @@ mod tests {
             "cat > /etc/apparmor.d/minimald <<\\MINIMAL_APPARMOR_PROFILE_EOF\n",
             "profile minimald @{minimald_bin} flags=(unconfined) {\n",
             "apparmor_parser --replace /etc/apparmor.d/minimald\n",
+            ": > /var/lib/minimal/finalize-install-apparmor-profile\n",
         ] {
             assert!(script.contains(step), "{step:?} in {script}");
         }
