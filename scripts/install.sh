@@ -1382,7 +1382,14 @@ offer_finalize_install() {
         case "$_fi_ans" in
             ""|[Yy]*)
                 _fi_run="$tmpdir/finalize-run"
-                if "$bindir/min" finalize-install <"$_fi_tty" >"$_fi_run"; then
+                _fi_err="$tmpdir/finalize-run-err"
+                _fi_rc=0
+                "$bindir/min" finalize-install <"$_fi_tty" >"$_fi_run" 2>"$_fi_err" || _fi_rc=$?
+                # The run rebuilds the probe's plan, so its stderr repeats the
+                # probe's warnings; drop those and keep the rest (its own
+                # errors). sudo's password prompt is on the terminal, not here.
+                grep -v '^warning: ' "$_fi_err" >&2 || true
+                if [ "$_fi_rc" -eq 0 ]; then
                     # The run's stdout is the summary again, then its closing
                     # lines (what starts when: a kvm group joins at the next
                     # login). Show only what the probe did not already.

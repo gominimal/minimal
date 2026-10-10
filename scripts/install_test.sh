@@ -181,10 +181,13 @@ case "${1:-}" in
                 fi
                 ;;
             " ")
+                # The run rebuilds the probe's plan, warnings included.
+                echo "warning: skipping VM broken-vm: its control socket did not answer" >&2
                 if [ -n "$fi_summary_file" ]; then
                     cat "$fi_summary_file"
                 fi
                 if [ -f "$HOME/finalize.run.status" ]; then
+                    echo "min finalize-install: the script exited with status 1" >&2
                     exit "$(cat "$HOME/finalize.run.status")"
                 fi
                 # A completed run ends with its closing lines on stdout, as
@@ -800,6 +803,9 @@ finalize-install" "$(cat "$HF1/finalize.calls")" \
     TTY_FILE=
     check 0 "$rc" "a failed step does not fail the install"
     want_ok "a failed step is shown as ✗" grep -q "✗ setup did not finish" "$OUT"
+    want_ok "the run's own error reaches the operator" \
+        grep -qF "the script exited with status 1" "$OUT"
+    want_err "the run's repeated warnings do not" grep -q "skipping VM" "$OUT"
     want_ok "a failed step points at the retry by path" \
         grep -qF "retry with \`$(fi_min "$HF4") finalize-install\`" "$OUT"
     want_card_last "the card follows a failed step (R10.4)"
