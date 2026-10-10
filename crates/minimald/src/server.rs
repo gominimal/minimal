@@ -788,7 +788,10 @@ impl ServerStateHandle {
     /// process on each call, so nothing is cached across creates; the lock
     /// is held for the copy of the gate alone, never across the probe.
     pub(crate) async fn user_namespace_verdict(&self) -> Option<UsernsRestriction> {
-        match self.0.lock().await.config.user_namespace_gate {
+        // Bound first so the guard is dropped before the probe runs; the
+        // match scrutinee would otherwise hold it across the `/proc` reads.
+        let gate = self.0.lock().await.config.user_namespace_gate;
+        match gate {
             UsernsGate::Live => sandbox2::user_namespaces_restriction(),
             UsernsGate::Off => None,
             UsernsGate::Fixed(restriction) => Some(restriction),

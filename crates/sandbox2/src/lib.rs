@@ -2909,11 +2909,21 @@ impl UsernsRestriction {
                  when the daemon next starts: run min stop, then your command again."
                     .to_string()
             }
-            (Self::ApparmorUnconfined, RemedyTarget::Mip { bin, data_dir }) => format!(
-                "Attach the AppArmor profile to mip (one-time, needs root): sudo bash \
-                 {data_dir}/apparmor/install-apparmor-profile.sh --path {bin} (from a checkout: \
-                 sudo scripts/install-apparmor-profile.sh --path {bin})."
-            ),
+            (Self::ApparmorUnconfined, RemedyTarget::Mip { bin, data_dir }) => {
+                // The remedy is a command the operator pastes, so each path
+                // is one shell word even with spaces in it. A path with a
+                // NUL cannot be quoted for a shell at all; it is shown bare.
+                let quote = |path: &str| {
+                    shlex::try_quote(path).map_or_else(|_| path.to_string(), |q| q.into_owned())
+                };
+                let loader = quote(&format!("{data_dir}/apparmor/install-apparmor-profile.sh"));
+                let bin = quote(bin);
+                format!(
+                    "Attach the AppArmor profile to mip (one-time, needs root): sudo bash \
+                     {loader} --path {bin} (from a checkout: \
+                     sudo scripts/install-apparmor-profile.sh --path {bin})."
+                )
+            }
         }
     }
 }
@@ -3727,6 +3737,34 @@ fn hosts_entry_present(body: &str, entry: &network::HostEntry) -> bool {
 mod tests {
     use super::*;
     use config::{Config, SandboxMapped};
+
+    /// The mip AppArmor remedy is a command the operator pastes, so a data
+    /// dir or binary path with a space stays one shell word, while a plain
+    /// path is shown bare (NET-141).
+    #[test]
+    fn mip_apparmor_remedy_quotes_paths_with_spaces() {
+        let remedy = UsernsRestriction::ApparmorUnconfined.remedy(RemedyTarget::Mip {
+            bin: "/opt/my tools/mip",
+            data_dir: "/home/me/.local/share/minimal",
+        });
+        assert!(
+            remedy.contains(
+                "sudo bash /home/me/.local/share/minimal/apparmor/install-apparmor-profile.sh \
+                 --path '/opt/my tools/mip' (from a checkout: \
+                 sudo scripts/install-apparmor-profile.sh --path '/opt/my tools/mip')."
+            ),
+            "paths with spaces are single-quoted, plain ones bare: {remedy}"
+        );
+
+        let plain = UsernsRestriction::ApparmorUnconfined.remedy(RemedyTarget::Mip {
+            bin: "/usr/local/bin/mip",
+            data_dir: "/usr/local/share/minimal",
+        });
+        assert!(
+            plain.contains("--path /usr/local/bin/mip (from a checkout"),
+            "a plain path is not quoted: {plain}"
+        );
+    }
 
     // /proc is mounted with nosuid,nodev on essentially every Linux distro;
     // if either stops showing up we've broken the FsFlags → MountOptions
