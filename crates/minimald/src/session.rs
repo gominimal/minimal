@@ -580,7 +580,9 @@ enum SessionMessage {
     /// actor has applied the change, so a Begin is visible to an attach
     /// before the upload pulls its first byte. It carries whether the
     /// change was applied: a Begin into a session that has left `Draft` is
-    /// refused, since an upload is part of the create flow only.
+    /// refused, since an upload is part of the create flow only. `Draft`
+    /// here includes a session already composed and awaiting its verdict
+    /// (`Draft { pending: Some(_) }`), not only an unconfigured one.
     SetWorkspaceUploadInFlight(bool, oneshot::Sender<bool>),
     /// Register a live direct-tcpip forward relay as belonging to this
     /// session, so teardown takes it down too: a session that goes away
@@ -917,10 +919,13 @@ pub struct Session {
     /// refused rather than configured: the Draft shortcut would compose
     /// against a workspace the creator has not finished uploading (or has
     /// uploaded but not yet configured), and the creator's own
-    /// `ConfigureLoadout` would then be refused. The creator's own attach is let through: it knows where its
-    /// activation stands. Once the creator's connection closes this stops
-    /// upgrading, and the shortcut is open again to whoever finds the
-    /// session `Draft`.
+    /// `ConfigureLoadout` would then be refused. The creator's own attach
+    /// is let through: it knows where its activation stands. Once the
+    /// creator's connection closes this stops upgrading, and the session,
+    /// if still unfinalized, is normally reaped with it. So the shortcut is
+    /// open to the creator's own connection, and otherwise only for a
+    /// session with no live creator: one restored from disk or created
+    /// in-process (`None`).
     creator: Option<std::sync::Weak<()>>,
 
     /// A non-owning handle to the [`Manager`](crate::sessions::Manager), used to

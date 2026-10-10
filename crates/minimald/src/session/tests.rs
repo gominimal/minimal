@@ -528,6 +528,88 @@ async fn a_failed_workspace_upload_does_not_leave_attaches_refused() {
     await_hello_echo(&mut channel, "an attach after a failed upload").await;
 }
 
+/// An attach that arrives while a real `WorkspaceFilesTarZst` stream is
+/// half-sent is refused, and the same attach lands once the rest of the
+/// stream and its EOF have arrived: the subsystem itself marks the upload in
+/// flight before it unpacks the first byte, and clears the mark at the end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attach_while_a_real_workspace_upload_is_half_sent_is_refused_then_lands() {
+    use crate::test_harness::create_session_req;
+    use minimald_rpc::CreateSession;
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let session_id = client
+        .call::<CreateSession>(&create_session_req("half-sent-upload", "/uwu"))
+        .await
+        .unwrap()
+        .id;
+    let paths = server
+        .state
+        .sessions_manager()
+        .await
+        .get_session(crate::sessions::SessionKeyPredicate::Id(session_id))
+        .await
+        .unwrap()
+        .expect("session should resolve")
+        .paths()
+        .await
+        .expect("paths should resolve");
+    let working = paths.working.as_utf8_path();
+
+    // A small file ahead of incompressible noise several zstd blocks long,
+    // so the first half of the payload already carries the small file whole.
+    let noise: Vec<u8> = (0..512 * 1024u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect();
+    let payload =
+        workspace_tar_zst(&[("first.txt", b"first\n"), ("big.bin", noise.as_slice())]).await;
+    let (head, tail) = payload.split_at(payload.len() / 2);
+
+    let mut upload = client
+        .open_subsystem(
+            crate::rpc::STREAM_WORKSPACE_FILES,
+            &[(crate::MINIMAL_SESSION_ID_ENV, &session_id.to_string())],
+        )
+        .await;
+    upload.data(head).await.unwrap();
+    // The small file landing proves the unpack is underway, so the upload
+    // is marked in flight by now.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !working.join("first.txt").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the first half of the upload should start unpacking");
+
+    let mut channel = client.open_shell(session_id).await;
+    let refusal = collect_to_close(&mut channel).await;
+    assert!(
+        refusal.contains("session is still receiving its workspace upload"),
+        "an attach mid-stream must be refused, got: {refusal:?}"
+    );
+    assert!(
+        !working.join(mfile::MFILE_NAME).exists(),
+        "a refused attach must not scaffold the workspace"
+    );
+
+    upload.data(tail).await.unwrap();
+    upload.eof().await.unwrap();
+    let mut stderr = Vec::new();
+    while let Some(msg) = upload.wait().await {
+        if let ChannelMsg::ExtendedData { data, ext: 1 } = msg {
+            stderr.extend_from_slice(&data);
+        }
+    }
+    let stderr = String::from_utf8_lossy(&stderr);
+    assert!(stderr.is_empty(), "the upload should land, got: {stderr:?}");
+    assert!(working.join("big.bin").exists());
+
+    let mut channel = client.open_shell(session_id).await;
+    await_hello_echo(&mut channel, "an attach after the upload").await;
+}
+
 /// Drives the full SSH path into the session host with the mock launcher:
 /// create a session, request a pty + shell, feed stdin, observe the echoed
 /// stdout, then confirm the host tears down when the process exits.
