@@ -743,10 +743,14 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
 
     let headless = global.no_input || !crate::can_prompt_interactively();
     let decision = crate::decide_workspace_upload(&upload_root, false, headless);
-    crate::run_workspace_upload(
+    if decision != crate::UploadDecision::SkipEmptyOrHome
+        && let Some(notice) = crate::resolved_upload_root_notice(&utf8_path, &upload_root)
+    {
+        eprintln!("{notice}");
+    }
+    let outcome = crate::run_workspace_upload(
         &mut client,
         id,
-        &utf8_path,
         &upload_root,
         decision,
         || {
@@ -758,10 +762,12 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
                 false,
             )
         },
-        false,
         crate::UploadProgress::Bar,
     )
-    .await?;
+    .await;
+    // `min task run` warns on a skipped undeclared root rather than refusing
+    // (it has no `--sync` flags to offer): the session still starts, empty.
+    crate::report_upload_outcome(outcome, &upload_root, false)?;
 
     // Client-side loadout patches land in the composition whether the
     // configure response is Materialized or Pending; daemon-side patches

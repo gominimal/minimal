@@ -1738,6 +1738,57 @@ fn decide_workspace_upload_covers_empty_vcs_blueprint_and_headless() {
     );
 }
 
+/// The refusal a hook-dropping undeclared skip raises names the root, the
+/// count, and the `--sync` escape hatch. It is shared by both CLI callers, so
+/// the wording cannot drift between them.
+#[test]
+fn undeclared_upload_drops_hooks_error_names_root_count_and_escape_hatch() {
+    let err = undeclared_upload_drops_hooks_error(camino::Utf8Path::new("/srv/data/run42"), 3);
+    let text = err.to_string();
+    assert!(text.contains("/srv/data/run42"), "{text}");
+    assert!(text.contains("3 lifecycle hook(s)"), "{text}");
+    assert!(text.contains("--sync tarball"), "{text}");
+    assert!(text.contains("--sync none"), "{text}");
+}
+
+/// The resolved-root notice appears only when the upload walked above the
+/// invocation directory, so `min activate` from inside a project says which
+/// root it used while a root at the invocation directory stays quiet.
+#[test]
+fn resolved_upload_root_notice_only_when_they_differ() {
+    let root = camino::Utf8Path::new("/proj");
+    let subdir = camino::Utf8Path::new("/proj/sub");
+    assert!(resolved_upload_root_notice(root, root).is_none());
+    let notice = resolved_upload_root_notice(subdir, root).expect("a notice when they differ");
+    assert!(
+        notice.contains("/proj (resolved from /proj/sub)"),
+        "{notice}"
+    );
+}
+
+/// A skip that would drop lifecycle hooks is the caller's call: the refusing
+/// caller gets an error, and one with no hooks dropped never does.
+#[test]
+fn report_upload_outcome_refuses_dropped_hooks_only() {
+    let root = camino::Utf8Path::new("/srv/data/run42");
+    assert!(
+        report_upload_outcome(
+            Ok(WorkspaceUpload::SkippedUndeclared { dropped_hooks: 2 }),
+            root,
+            true,
+        )
+        .is_err()
+    );
+    assert!(
+        report_upload_outcome(
+            Ok(WorkspaceUpload::SkippedUndeclared { dropped_hooks: 0 }),
+            root,
+            true,
+        )
+        .is_ok()
+    );
+}
+
 /// A refused composition is reported in the user's terms — the
 /// directory the activation ran from — with the daemon's own text kept
 /// as subordinate detail rather than as the headline (#581).

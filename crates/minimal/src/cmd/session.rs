@@ -203,10 +203,11 @@ pub(crate) fn vm_host_answerer_start_line(
     crate::resolver::vm_host_answerer_line(status).map(|line| format!("zone answerer: {line}"))
 }
 
-/// Whether a session holds its name in the VM host's zone in place of a
-/// row: a `host_ip` box shares the node's own row, so `min session
-/// activate` and `min dash` hold its name (NODATA) instead of registering
-/// one. `box_addresses` is `None` exactly when no row was registered.
+/// Whether a session reserves its name on the VM host instead of taking a
+/// DNS row: a `host_ip` session shares the node's own address, so `min
+/// session activate` and `min dash` only hold the name (answering NODATA)
+/// rather than register one. That is exactly the case when the record has
+/// no `box_addresses`.
 pub(crate) fn holds_name(record: &sessions::Record) -> bool {
     record.network == sessions::NetworkMode::HostNet && record.box_addresses.is_none()
 }
@@ -1178,10 +1179,16 @@ pub(crate) async fn activate_session(
             let upload_root = upload_root.expect("upload_root is set for SyncMode::Tarball above");
             let headless = args.no_prompt || global.no_input || !can_prompt_interactively();
             let decision = decide_workspace_upload(&upload_root, sync_explicit, headless);
-            let uploaded = run_workspace_upload(
+            // The resolved-root notice is CLI presentation, and precedes the
+            // upload bar it explains.
+            if decision != UploadDecision::SkipEmptyOrHome
+                && let Some(notice) = resolved_upload_root_notice(&utf8_path, &upload_root)
+            {
+                eprintln!("{notice}");
+            }
+            let outcome = run_workspace_upload(
                 &mut client,
                 id,
-                &utf8_path,
                 &upload_root,
                 decision,
                 || {
@@ -1193,13 +1200,14 @@ pub(crate) async fn activate_session(
                         false,
                     )
                 },
-                true,
                 UploadProgress::Bar,
             )
             .await;
-            if let Err(error) = uploaded {
-                // The upload failed: the activation is abandoned, and the
-                // row its registration bought goes with it (T66).
+            // A skip that would silently drop the project's lifecycle hooks
+            // refuses here (and any upload failure) — either abandons the
+            // activation, and the row its registration bought goes with it
+            // (T66).
+            if let Err(error) = report_upload_outcome(outcome, &upload_root, true) {
                 withdraw_box_row(
                     control_sock.clone(),
                     config.name.as_deref(),

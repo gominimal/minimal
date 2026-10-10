@@ -285,11 +285,11 @@ pub async fn cmd_dash(global: &GlobalArgs) -> Result<(), anyhow::Error> {
     if !host_up && !vm_up {
         ensure_daemon(global)?;
     }
-    // The dashboard's creates resolve their activation inputs through the
-    // same helper `min session activate` uses, against the created session's
-    // own project path (so a loadout with an external hook, or one whose
-    // scripts sit beside the project, works from the dashboard too). Pass the
-    // default loadout selection here; the composition happens per create.
+    // When dash creates a session, it resolves the activation inputs through
+    // the same helper `min session activate` uses, against that session's own
+    // project path — so a loadout with an external hook, or one whose scripts
+    // sit beside the project, works from the dashboard too. The default
+    // selection is passed here; composition happens per create.
     crate::dash::run(crate::dash::DashOptions {
         minimal_dir: global.minimal_dir.clone(),
         config_dir: global.config_dir.clone(),

@@ -493,16 +493,16 @@ pub async fn activate(
     // the VM host daemon to withdraw the row on the lease's close.
     let lease = row.take_lease();
     let flow = minimal_client::box_registration::finalize_holding_lease(lease, async {
-        // The caller resolved the root and the decision; the upload is the
-        // shared CLI path (quiet: the TUI owns the screen).
+        // The caller resolved the root and the decision (the Confirm answered
+        // through the TUI); the upload is the shared CLI path, quiet because
+        // the TUI owns the screen. The outcome is not rendered here — a
+        // skipped upload simply shows as the empty session.
         crate::run_workspace_upload(
             &mut client,
             id,
-            project_path.as_utf8_path(),
             &upload_root,
             decision,
             || Ok(false),
-            false,
             crate::UploadProgress::Quiet,
         )
         .await?;
