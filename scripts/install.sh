@@ -23,6 +23,13 @@
 # ending them; --force-stop (or a non-empty MINIMAL_INSTALL_FORCE_STOP) skips the
 # question, for scripted upgrades that must not block.
 #
+# The install never elevates. At its end the installed `min` probes what the
+# host still lacks (`min finalize-install --show`); when something is missing
+# and a terminal is attached the installer shows the summary and offers to run
+# `min finalize-install` (one sudo command, default yes); declined or without a
+# terminal it points at the command and never blocks. A finished host sees no
+# offer.
+#
 # Uninstall walks the local install record (no network) and removes each file
 # whose on-disk bytes still match what the installer recorded writing; it accepts
 # --force (remove modified files too), --purge (also delete the minimal data/
@@ -407,67 +414,31 @@ strip_rc_block() {
     say "  removed shell-init block from $(tilde "$1")"
 }
 
-# Offer to also remove the *system* AppArmor profile on uninstall. That profile
-# (packaging/apparmor/minimald) is installed separately, with root, by
-# install-apparmor-profile.sh; it outlives minimald, leaving an inert label
-# bound to a now-absent binary path under /etc/apparmor.d. Removing it needs
-# root — which this installer never assumes — so on an interactive terminal we
-# prompt and, on yes, elevate via the shipped loader's own --uninstall (run here,
-# before the record walk deletes that loader). Piped (curl|sh), non-interactive,
-# or dry-run: advise the root command instead, which stays valid after the walk.
-# Gated on the profile actually being present, so macOS and never-set-up hosts
-# see nothing. The apparmor.d path is overridable for install_test.sh.
-maybe_remove_apparmor_profile() {
+# Offer to also remove what `min finalize-install` installed on uninstall,
+# together with the system AppArmor profile. `min finalize-install` (opt-in,
+# with root) points the host's resolver at the box zone and installs the
+# Minimal box-name service — on macOS, the boot unit that reserves the local
+# range too; on Linux, the user-namespace profile (recorded as the step's
+# own), the classifier tree and the kvm group membership. None of it is in
+# the install record, and all of it outlives `min`. The profile may instead
+# have been installed separately, with root, by install-apparmor-profile.sh
+# (no record): it outlives minimald the same way, so it rides in the same
+# prompt, removed through the shipped loader's own --uninstall (run here,
+# before the record walk deletes that loader). Gated on any of those host
+# paths being present, so a host that never set up sees nothing. On an
+# interactive terminal, prompt once and, on yes, run `min finalize-install
+# --undo` (here, before the walk deletes `min`) and the loader for an
+# unrecorded profile; piped (curl|sh), non-interactive, or dry-run, advise the
+# root commands for everything found instead, which stay valid after the
+# walk. The roots are overridable for install_test.sh.
+maybe_remove_finalize_install() {
+    _fi_root="${MINIMAL_OVERRIDE_FINALIZE_INSTALL_ROOT:-}"
     _aa_dir="${MINIMAL_OVERRIDE_APPARMOR_DIR:-/etc/apparmor.d}"
     _aa_profile="$_aa_dir/minimald"
-    [ -e "$_aa_profile" ] || return 0
     _aa_tunable="$_aa_dir/tunables/minimald"
-
-    if [ "$dry_run" -eq 1 ]; then
-        say "  would offer to remove the system AppArmor profile $_aa_profile"
-        return 0
-    fi
-
-    # Prompt only when stdin is a terminal. Under `curl … | sh -s -- --uninstall`
-    # stdin is the script pipe, not a tty, so advise rather than consume it.
-    if [ -t 0 ]; then
-        _aa_loader="$(resolve_prefix data)/apparmor/install-apparmor-profile.sh"
-        printf 'Also remove the system AppArmor profile %s (needs root)? [y/N] ' \
-            "$_aa_profile" >&2
-        _aa_ans=
-        read -r _aa_ans || _aa_ans=
-        case "$_aa_ans" in
-            [Yy]*)
-                if [ -f "$_aa_loader" ] && command -v sudo >/dev/null 2>&1 \
-                    && sudo bash "$_aa_loader" --uninstall; then
-                    return 0
-                fi
-                say "  warning: could not remove it automatically; do it manually (root):"
-                say "      sudo apparmor_parser -R \"$_aa_profile\" && sudo rm -f \"$_aa_profile\" \"$_aa_tunable\""
-                return 0
-                ;;
-            *) return 0 ;;
-        esac
-    fi
-
-    say ""
-    say "note: the system AppArmor profile is still loaded at $_aa_profile."
-    say "  it was installed separately with root; remove it too with:"
-    say "      sudo apparmor_parser -R \"$_aa_profile\" && sudo rm -f \"$_aa_profile\" \"$_aa_tunable\""
-}
-
-# Offer to also remove the host DNS setup on uninstall. `min net setup` (opt-in,
-# with root) points the host's resolver at the box zone and installs the
-# Minimal box-name service — and, on macOS, the boot unit that reserves the
-# local range; none of it is in the install record, and all of it outlives
-# `min`. Same shape as the AppArmor offer above: gated on any of those host
-# paths being present, so a host that never ran the step sees nothing; on an
-# interactive terminal, prompt and, on yes, run the shipped `min net setup
-# --undo` (here, before the record walk deletes `min`); piped, non-interactive,
-# or dry-run, advise the root commands instead, which stay valid after the
-# walk. The root is overridable for install_test.sh.
-maybe_remove_net_setup() {
-    _ns_root="${MINIMAL_OVERRIDE_NET_SETUP_ROOT:-}"
+    _aa_record="$_fi_root/var/lib/minimal/finalize-install-apparmor-profile"
+    _kvm_record="$_fi_root/var/lib/minimal/finalize-install-kvm-group"
+    _cls_root=/sys/fs/cgroup/minimald.slice
     if [ "$os" = darwin ]; then
         _ns_paths="/etc/resolver/min.internal /Library/LaunchDaemons/dev.gominimal.zone.plist /Library/PrivilegedHelperTools/minzoned /Library/LaunchDaemons/dev.minimal.local-range.plist /Library/PrivilegedHelperTools/dev.minimal.local-range"
         _ns_undo="sudo launchctl bootout system/dev.gominimal.zone; sudo launchctl bootout system/dev.minimal.local-range; sudo rm -f $_ns_paths"
@@ -475,32 +446,76 @@ maybe_remove_net_setup() {
         _ns_paths="/etc/systemd/system/minzoned.socket /etc/systemd/system/minzoned.service /usr/local/lib/minimal/minzoned /sys/class/net/minzone0"
         _ns_undo="sudo systemctl disable --now minzoned.socket minzoned.service; sudo rm -f /etc/systemd/system/minzoned.socket /etc/systemd/system/minzoned.service /usr/local/lib/minimal/minzoned; sudo systemctl daemon-reload; sudo ip link del minzone0"
     fi
-    _ns_found=
+    # What is found, as a list for the prompt; what `min finalize-install
+    # --undo` removes; the manual remedy, one root command line per item.
+    _fi_list=
+    _fi_owned=
+    _fi_undo=
+    _aa_unowned=
     for _ns_p in $_ns_paths; do
-        if [ -e "$_ns_root$_ns_p" ]; then
-            _ns_found="$_ns_p"
+        if [ -e "$_fi_root$_ns_p" ]; then
+            _fi_list="the host DNS setup ($_ns_p)"
+            _fi_owned=1
+            _fi_undo="      $_ns_undo"
             break
         fi
     done
-    [ -n "$_ns_found" ] || return 0
+    if [ "$os" != darwin ]; then
+        if [ -e "$_aa_profile" ]; then
+            if [ -e "$_aa_record" ]; then
+                _fi_list="$_fi_list${_fi_list:+, }the user-namespace profile ($_aa_profile)"
+                _fi_owned=1
+                _fi_undo="$_fi_undo${_fi_undo:+
+}      sudo apparmor_parser -R \"$_aa_profile\"; sudo rm -f \"$_aa_profile\" \"$_aa_tunable\" \"$_aa_dir/tunables/minimald.d/local\" \"$_aa_record\""
+            else
+                _fi_list="$_fi_list${_fi_list:+, }the system AppArmor profile ($_aa_profile, not min finalize-install's)"
+                _aa_unowned=1
+                _fi_undo="$_fi_undo${_fi_undo:+
+}      sudo apparmor_parser -R \"$_aa_profile\"; sudo rm -f \"$_aa_profile\" \"$_aa_tunable\""
+            fi
+        fi
+        if [ -e "$_fi_root$_cls_root/classifier-table" ]; then
+            _fi_list="$_fi_list${_fi_list:+, }the classifier tree ($_cls_root)"
+            _fi_owned=1
+            _fi_undo="$_fi_undo${_fi_undo:+
+}      sudo nft delete table inet minimal_class; sudo find \"$_fi_root$_cls_root\" -depth -type d -exec rmdir {} +"
+        fi
+        if [ -e "$_kvm_record" ]; then
+            _fi_list="$_fi_list${_fi_list:+, }the kvm group membership"
+            _fi_owned=1
+            _fi_undo="$_fi_undo${_fi_undo:+
+}      while IFS= read -r u; do sudo gpasswd -d \"\$u\" kvm; done < $_kvm_record; sudo rm -f $_kvm_record"
+        fi
+    fi
+    [ -n "$_fi_list" ] || return 0
 
     if [ "$dry_run" -eq 1 ]; then
-        say "  would offer to remove the host DNS setup (min net setup), found at $_ns_found"
+        say "  would offer to remove the host setup outside the install record: $_fi_list"
         return 0
     fi
 
-    _ns_min="$bindir/min"
-    if [ -t 0 ] && [ -x "$_ns_min" ]; then
-        printf 'Also remove the host DNS setup that min net setup installed (needs root)? [y/N] ' >&2
-        _ns_ans=
-        read -r _ns_ans || _ns_ans=
-        case "$_ns_ans" in
+    # Prompt only when stdin is a terminal. Under `curl … | sh -s -- --uninstall`
+    # stdin is the script pipe, not a tty, so advise rather than consume it.
+    if [ -t 0 ]; then
+        _fi_min="$bindir/min"
+        _aa_loader="$(resolve_prefix data)/apparmor/install-apparmor-profile.sh"
+        printf 'Also remove the host setup installed with root outside the install record: %s? [y/N] ' \
+            "$_fi_list" >&2
+        _fi_ans=
+        read -r _fi_ans || _fi_ans=
+        case "$_fi_ans" in
             [Yy]*)
-                if "$_ns_min" net setup --undo; then
-                    return 0
+                _fi_ok=1
+                if [ -n "$_fi_owned" ]; then
+                    { [ -x "$_fi_min" ] && "$_fi_min" finalize-install --undo; } || _fi_ok=
                 fi
-                say "  warning: could not remove it automatically; do it manually (root):"
-                say "      $_ns_undo"
+                if [ -n "$_aa_unowned" ]; then
+                    { [ -f "$_aa_loader" ] && command -v sudo >/dev/null 2>&1 \
+                        && sudo bash "$_aa_loader" --uninstall; } || _fi_ok=
+                fi
+                [ -n "$_fi_ok" ] && return 0
+                say "  warning: could not remove it all automatically; do it manually (root):"
+                say "$_fi_undo"
                 return 0
                 ;;
             *) return 0 ;;
@@ -508,10 +523,14 @@ maybe_remove_net_setup() {
     fi
 
     say ""
-    say "note: the host DNS setup from min net setup is still installed ($_ns_found)."
-    say "  it was installed separately with root; \`min net setup --undo\` removes it while min"
-    say "  is installed. With min gone, remove it with:"
-    say "      $_ns_undo"
+    say "note: still installed on this host, with root, outside the install record: $_fi_list."
+    if [ -n "$_fi_owned" ]; then
+        say "  \`min finalize-install --undo\` removes what min finalize-install installed, while min"
+        say "  is installed. With min gone, remove everything listed with:"
+    else
+        say "  it was installed separately with root; remove it too with:"
+    fi
+    say "$_fi_undo"
 }
 
 # --- Uninstall (walk the install record and undo it) -----------------------
@@ -538,11 +557,9 @@ do_uninstall() {
     say ""
     [ "$dry_run" -eq 1 ] && say "uninstall: dry run — nothing will be removed"
 
-    # Before the walk (which deletes the shipped loader), offer to tear down the
-    # separately-installed system AppArmor profile too.
-    maybe_remove_apparmor_profile
-    # The host DNS setup too, for the same reason: `min` runs its removal.
-    maybe_remove_net_setup
+    # Before the walk (which deletes `min` and the shipped loader), offer to
+    # tear down what was installed with root outside the record too.
+    maybe_remove_finalize_install
 
     # Tab, computed once, so rows are split on tab alone: a dest under a
     # $HOME containing spaces must still parse as one field.
@@ -1309,48 +1326,85 @@ say ""
 say "  $b$installed installed$rst $sep $skipped current$elapsed"
 say "  ${dim}record: $(tilde "$prev_record")$rst"
 
-# --- Linux host advisory: unprivileged user namespaces ---------------------
+# --- Finish the host: offer `min finalize-install` -------------------------
 
-# Ubuntu 24.04+ defaults kernel.apparmor_restrict_unprivileged_userns=1, under
-# which minimald cannot create the user namespace every session sandbox needs —
-# sessions then die at uid_map with an opaque EPERM, far from here. Detect the
-# restriction at install time (Linux only) and point at the AppArmor loader we
-# just shipped. Advice only: installing the profile needs root, and this
-# installer never elevates. Silent on hosts that do not need it, AND on a host
-# already remediated — but "remediated" depends on the bin prefix: the stock
-# tunable attaches only /usr/bin, /usr/local/bin, and ~/.local/bin, so for a
-# custom MINIMAL_BIN the advised command carries --path, and a loaded profile
-# counts as remediation only if the tunables actually name this binary
-# (otherwise sessions still die and a reinstall must keep saying so). The
-# sysctl and apparmor.d paths are overridable for install_test.sh.
-userns_sysctl="${MINIMAL_OVERRIDE_USERNS_SYSCTL:-/proc/sys/kernel/apparmor_restrict_unprivileged_userns}"
-apparmor_dir="${MINIMAL_OVERRIDE_APPARMOR_DIR:-/etc/apparmor.d}"
-if [ "$os" = linux ] && [ -r "$userns_sysctl" ] \
-    && [ "$(cat "$userns_sysctl" 2>/dev/null)" = 1 ]; then
-    apparmor_loader="$(resolve_prefix data)/apparmor/install-apparmor-profile.sh"
-    aa_loader_args=""
-    aa_remediated=0
-    case "$bindir" in
-        /usr/bin|/usr/local/bin|"$HOME/.local/bin")
-            [ -e "$apparmor_dir/minimald" ] && aa_remediated=1
-            ;;
-        *)
-            aa_loader_args=" --path \"$bindir/minimald\""
-            if [ -e "$apparmor_dir/minimald" ] \
-                && grep -rqs "$bindir/minimald" "$apparmor_dir/tunables" 2>/dev/null; then
-                aa_remediated=1
-            fi
-            ;;
+# The install itself never elevates, so a host may still lack a privileged
+# part: the user-namespace profile on Ubuntu 24.04+, the box-name resolver
+# link and answerer (every host, macOS included), the classifier tree, KVM
+# group membership. The just-installed `min` probes all of them in ONE call
+# (`finalize-install --show --script`, exit 0 whatever it finds): the summary
+# on stderr — a ✓/✗ line per item — and on stdout the one script a run
+# executes, printed only while some item is `missing`, the only state the
+# step changes. One call, because each probe reads the daemon and, with none
+# running (a fresh install, always), waits out its connect retries. A finished
+# host (no ✗ in the summary), or a `min` too old to know the command, adds
+# nothing to the output above. With something missing, show the summary and
+# offer the step, default yes: it is non-destructive and undoable, and sudo's
+# own password prompt is a second consent. The answer comes from the
+# controlling terminal (overridable for install_test.sh), never stdin, which
+# under `curl … | sh` is the script itself. Declined, or no terminal to ask
+# on: point at the command. The run prints the same summary again on its
+# stdout before it elevates, then its closing lines; only the lines the
+# probe's summary did not already show are printed, so a kvm-group join's
+# "starts at your next login" reaches the operator once. Its prompt is on
+# the terminal and its outcome on stderr. A ✗ item no script can run — the names
+# item `waiting on a daemon` until the first `min` starts one, or a `cannot`
+# — gets the summary and no offer: there is nothing to run yet. A failed step
+# is reported and the installer still exits 0: Minimal is installed either
+# way. Every printed command names `min` as this shell can resolve it: bare
+# only once $bindir is on PATH, which on a fresh install it is not yet.
+offer_finalize_install() {
+    [ -x "$bindir/min" ] || return 0
+    _fi_summary="$tmpdir/finalize-summary"
+    _fi_script="$tmpdir/finalize-script"
+    "$bindir/min" finalize-install --show --script </dev/null \
+        >"$_fi_script" 2>"$_fi_summary" || return 0
+    grep -q '✗' "$_fi_summary" || return 0
+    case ":${PATH:-}:" in
+        *":$bindir:"*) _fi_min=min ;;
+        *)             _fi_min="\"$bindir/min\"" ;;
     esac
-    if [ "$aa_remediated" -eq 0 ] && [ -f "$apparmor_loader" ]; then
-        say ""
-        say "note: this host restricts unprivileged user namespaces (Ubuntu 24.04+);"
-        say "  minimald's session sandbox cannot start until you install its AppArmor"
-        say "  profile — a one-time step that needs root:"
-        say "      sudo bash \"$apparmor_loader\"$aa_loader_args"
-        say "  details: https://docs.minimal.dev/reference/linux-host-setup"
+    say ""
+    # The probe's own warnings (a broken named VM it skipped) are not the
+    # summary; the installer prints the status lines and nothing else.
+    grep -v '^warning: ' "$_fi_summary" >&2 || true
+    if ! [ -s "$_fi_script" ]; then
+        if grep -q 'waiting on a daemon' "$_fi_summary"; then
+            say "  box names finish once a daemon runs: after your first \`min\`, run \`$_fi_min finalize-install\`."
+        fi
+        return 0
     fi
-fi
+    _fi_tty="${MINIMAL_OVERRIDE_TTY:-/dev/tty}"
+    if (exec <"$_fi_tty") 2>/dev/null; then
+        printf 'Finish setup now? This runs one sudo command. [Y/n] ' >&2
+        _fi_ans=
+        read -r _fi_ans <"$_fi_tty" || _fi_ans=
+        case "$_fi_ans" in
+            ""|[Yy]*)
+                _fi_run="$tmpdir/finalize-run"
+                _fi_err="$tmpdir/finalize-run-err"
+                _fi_rc=0
+                "$bindir/min" finalize-install <"$_fi_tty" >"$_fi_run" 2>"$_fi_err" || _fi_rc=$?
+                # The run rebuilds the probe's plan, so its stderr repeats the
+                # probe's warnings; drop those and keep the rest (its own
+                # errors). sudo's password prompt is on the terminal, not here.
+                grep -v '^warning: ' "$_fi_err" >&2 || true
+                if [ "$_fi_rc" -eq 0 ]; then
+                    # The run's stdout is the summary again, then its closing
+                    # lines (what starts when: a kvm group joins at the next
+                    # login). Show only what the probe did not already.
+                    grep -vxF -f "$_fi_summary" "$_fi_run" >&2 || true
+                    return 0
+                fi
+                say "  ✗ setup did not finish; retry with \`$_fi_min finalize-install\`"
+                return 0
+                ;;
+        esac
+    fi
+    say "run \`$_fi_min finalize-install\` when you're ready; without a terminal, use:"
+    say "f=\$(mktemp) && $_fi_min finalize-install --show --script > \"\$f\" && sudo sh \"\$f\""
+}
+offer_finalize_install
 
 # --- The closing card ------------------------------------------------------
 

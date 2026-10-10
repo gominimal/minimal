@@ -1039,38 +1039,61 @@ fn provider_local_minimald_is_the_host_backend() {
 }
 
 #[test]
-fn net_setup_parses_to_the_setup_command() {
+fn finalize_install_parses_its_flags() {
     use clap::Parser as _;
-    let cli = Cli::try_parse_from(["min", "net", "setup"]).unwrap();
+    let cli = Cli::try_parse_from(["min", "finalize-install"]).unwrap();
     assert!(matches!(
         cli.command,
-        Some(Command::Net(NetArgs {
-            command: NetCommand::Setup(NetSetupArgs {
-                print: false,
-                undo: false
-            })
+        Some(Command::FinalizeInstall(FinalizeInstallArgs {
+            show: false,
+            script: false,
+            json: false,
+            undo: false
         }))
     ));
-    let cli = Cli::try_parse_from(["min", "net", "setup", "--print"]).unwrap();
+    let cli = Cli::try_parse_from(["min", "finalize-install", "--show", "--script"]).unwrap();
     assert!(matches!(
         cli.command,
-        Some(Command::Net(NetArgs {
-            command: NetCommand::Setup(NetSetupArgs {
-                print: true,
-                undo: false
-            })
+        Some(Command::FinalizeInstall(FinalizeInstallArgs {
+            show: true,
+            script: true,
+            json: false,
+            undo: false
         }))
     ));
-    let cli = Cli::try_parse_from(["min", "net", "setup", "--undo", "--print"]).unwrap();
+    let cli = Cli::try_parse_from(["min", "finalize-install", "--show", "--json"]).unwrap();
     assert!(matches!(
         cli.command,
-        Some(Command::Net(NetArgs {
-            command: NetCommand::Setup(NetSetupArgs {
-                print: true,
-                undo: true
-            })
+        Some(Command::FinalizeInstall(FinalizeInstallArgs {
+            show: true,
+            script: false,
+            json: true,
+            undo: false
         }))
     ));
+    let cli =
+        Cli::try_parse_from(["min", "finalize-install", "--undo", "--show", "--script"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Some(Command::FinalizeInstall(FinalizeInstallArgs {
+            show: true,
+            script: true,
+            json: false,
+            undo: true
+        }))
+    ));
+    // `--script` and `--json` need `--show`; `--json` describes an install,
+    // not a removal; the two outputs exclude each other.
+    for args in [
+        &["min", "finalize-install", "--script"][..],
+        &["min", "finalize-install", "--json"],
+        &["min", "finalize-install", "--show", "--json", "--undo"],
+        &["min", "finalize-install", "--undo", "--show", "--json"],
+        &["min", "finalize-install", "--show", "--json", "--script"],
+        &["min", "net", "setup"],
+    ] {
+        assert!(Cli::try_parse_from(args).is_err(), "{args:?}");
+    }
 }
 
 #[test]
@@ -1737,6 +1760,88 @@ fn both_creators_share_the_composition_failure_message() {
             assert!(
                 !body.contains(bare),
                 "{func} still names the internal step instead of the directory ({bare})"
+            );
+        }
+    }
+}
+
+/// A daemon refusal is printed in the daemon's own words. The RPC's name
+/// is the wire's vocabulary, not the person's, so no creator, verdict
+/// submitter, finalizer or renamer may prefix the daemon's error with
+/// it. Asserted over the function bodies, the way the composition
+/// message is, because the prefix had crept into five sites across three
+/// files before anyone noticed it on a terminal.
+#[test]
+fn daemon_refusals_print_without_rpc_names() {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    for (file, func) in [
+        ("src/cmd/session.rs", "activate_session"),
+        ("src/cmd/session.rs", "cmd_rename"),
+        ("src/task.rs", "cmd_task_run"),
+        ("src/cmd/mod.rs", "submit_verdict_and_wait"),
+        ("src/cmd/mod.rs", "upload_and_finalize"),
+    ] {
+        let text = std::fs::read_to_string(manifest.join(file)).expect("readable source");
+        let body =
+            function_body(&text, func).unwrap_or_else(|| panic!("{file} no longer defines {func}"));
+        for bare in [
+            "CreateSession failed",
+            "RenameSession failed",
+            "SubmitVerdict failed",
+            "SubmitVerdict faulted",
+            "FinalizeSession failed",
+        ] {
+            assert!(
+                !body.contains(bare),
+                "{func} still prefixes the daemon's refusal with an RPC name ({bare})"
+            );
+        }
+    }
+
+    // The daemon's side of the same surface: its refusals are printed
+    // verbatim, at finalize through `upload_and_finalize` and at attach,
+    // so none of them may name the RPC a person would have to retry. The
+    // scan is over the string literals of the daemon's session module,
+    // which covers the refusals and the log lines alike; the module has
+    // no log-only RPC name left to exempt. The RPC names stay legitimate
+    // in type paths and comments, which the scan does not read. A literal
+    // is tracked across lines — the refusals are wrapped with `\` — so a
+    // continuation line with no quote of its own is still read.
+    let daemon = std::fs::read_to_string(manifest.join("../minimald/src/session.rs"))
+        .expect("readable daemon source");
+    let mut in_literal = false;
+    for (number, line) in daemon.lines().enumerate() {
+        if !in_literal && line.trim_start().starts_with("//") {
+            continue;
+        }
+        let in_string = in_literal || line.contains('"');
+        // Toggle on every unescaped quote, so the state at the line's end
+        // says whether the next line continues a literal.
+        let mut chars = line.chars();
+        while let Some(c) = chars.next() {
+            match c {
+                '\\' => {
+                    chars.next();
+                }
+                '"' => in_literal = !in_literal,
+                _ => {}
+            }
+        }
+        if !in_string {
+            continue;
+        }
+        for rpc in [
+            "CreateSession",
+            "ConfigureLoadout",
+            "SubmitVerdict",
+            "FinalizeSession",
+            "RenameSession",
+            "WorkspacePatchesTarZst",
+        ] {
+            assert!(
+                !line.contains(rpc),
+                "minimald/src/session.rs:{}: a string names the {rpc} RPC: {line}",
+                number + 1
             );
         }
     }
@@ -3116,9 +3221,15 @@ async fn walked_proxy_port_reported_at_start_and_in_ls() {
         routing("default")
     );
 
-    // Session start: one line naming the VM the session landed on and the
-    // same port, so the two surfaces agree on the address to point at.
-    let start = hostname_proxy_start_line(Some("alpha"), NEXT_RUNG);
+    // Session start: the one host line names the same port as the routing
+    // line's `via 127.0.0.1:<port>`, so the two surfaces agree on the
+    // address to point at (NET-026 on the activate surface).
+    let start = crate::resolver::host_line(
+        "web",
+        &crate::resolver::LiveSurface::Proxy,
+        Some(NEXT_RUNG),
+        crate::resolver::HostInstall::default(),
+    );
     let address = format!("127.0.0.1:{NEXT_RUNG}");
     assert!(
         routing("alpha").contains(&address) && start.contains(&address),
@@ -3127,73 +3238,9 @@ async fn walked_proxy_port_reported_at_start_and_in_ls() {
         routing("alpha")
     );
     assert!(
-        start.contains("VM alpha"),
-        "on a two-VM host the start line must say whose port it is: {start}"
+        !start.contains(&RECIPES_PORT.to_string()),
+        "the start line must not name the port the recipes assume: {start}"
     );
-
-    // And the wiring: the start line names a VM exactly when the backend hosts
-    // them — the selected VM on the VM backend, nothing on the native one,
-    // whose single daemon has no VM to name. This test process never publishes
-    // a `--vm` name, so the selected VM is the default one.
-    let state = tempfile::tempdir().expect("a temp minimal state dir");
-    assert_eq!(
-        hostname_proxy_start_vm(&vm_globals(state.path(), None)),
-        Some(paths::DEFAULT_VM_NAME),
-        "the VM backend names the selected VM"
-    );
-    let native = GlobalArgs {
-        repo_dir: None,
-        minimal_dir: Some(state.path().to_path_buf()),
-        config_dir: None,
-        provider: Some(Provider::LocalMinimald),
-        no_input: true,
-        vm: None,
-    };
-    // Which backend `--provider local-minimald` selects is the platform's
-    // call: on Linux it is the native one, while macOS has no native backend
-    // at all, so `client_provider_kind` folds the flag's reading onto minvmd
-    // there — the same rule every VM-backed gate keys on, flag or no flag.
-    // The expectation is therefore the kind's, not a constant.
-    let native_names_a_vm = cfg!(target_os = "macos");
-    assert_eq!(
-        hostname_proxy_start_vm(&native),
-        native_names_a_vm.then_some(paths::DEFAULT_VM_NAME),
-        "the backend the flag selects names a VM exactly where that backend \
-         is the VM one"
-    );
-
-    // The native line is the single-VM routing line word for word — the same
-    // address in the same words, so the two surfaces read as one. A fact
-    // about the native backend, so it is asserted only where that backend
-    // exists: a host whose every backend is minvmd renders its routing lines
-    // through the VM listing, which names the VM the start line names above.
-    if !native_names_a_vm {
-        let native_start = hostname_proxy_start_line(hostname_proxy_start_vm(&native), NEXT_RUNG);
-        let mut single = Vec::new();
-        let mut native_resp = reply.clone();
-        native_resp.hostname_proxy_port = Some(NEXT_RUNG);
-        format_ls(
-            &mut single,
-            &LsArgs {
-                raw: false,
-                json: false,
-            },
-            &native_resp,
-            None,
-            None,
-        )
-        .expect("rendering the single-VM listing");
-        let single = String::from_utf8(single).expect("the listing is UTF-8");
-        assert_eq!(
-            single
-                .lines()
-                .find(|l| l.starts_with("HOSTNAME PROXY:"))
-                .expect("the single-VM listing prints a routing line"),
-            native_start.as_str(),
-            "the native start line and `min ls`'s routing line must be the same \
-             line"
-        );
-    }
 }
 
 /// Two listed sessions for the id-prefix tests: an unnamed `01a0fe9d…` and

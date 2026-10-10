@@ -1012,7 +1012,7 @@ async fn async_main() -> Result<(), MainError> {
     }
 
     // Setup the server config (shared by the UDS and vsock transports).
-    let config = Config {
+    let mut config = Config {
         host_key: HostKey::OnDisk {
             path: sub_path!(cli.client_instance_dir(), "ssh_host_ed25519_key")
                 .as_utf8_path()
@@ -1052,6 +1052,10 @@ async fn async_main() -> Result<(), MainError> {
                 .egress_deny_all_opt_out,
             std::env::var(EGRESS_DENY_ALL_OPT_OUT_ENV).ok().as_deref(),
         ),
+        // Live: the create gate probes this process on every create
+        // (NET-141). The preflight below switches it off under
+        // `MINIMALD_USERNS_GATE=off`.
+        user_namespace_gate: minimald::server::UsernsGate::Live,
     };
     // Ensure the SSH host key is accessible in a instance-specific known_hosts file.
     // R1.2: load once and reuse in the vsock beacon so there is no redundant disk read.
@@ -1075,25 +1079,40 @@ async fn async_main() -> Result<(), MainError> {
         known_hosts.as_utf8_path(),
     )?;
 
-    // Preflight (advisory): every session sandbox starts by unsharing an
-    // unprivileged user namespace, forked from this process with no exec in
-    // between — so this process's own privileges and AppArmor label are what
-    // the kernel will check. On a restricted host (stock Ubuntu 24.04+ with
-    // an unconfined daemon) that denial otherwise surfaces only when the
-    // first attach dies writing /proc/self/uid_map, with nothing useful in
-    // this log. Warn once at startup instead, with the fix. The in-guest
-    // microVM daemon runs as root, where no restriction binds, so this stays
-    // silent on the vsock path.
+    // Preflight: every session sandbox starts by unsharing an unprivileged
+    // user namespace, forked from this process with no exec in between — so
+    // this process's own privileges and AppArmor label are what the kernel
+    // will check. On a restricted host (stock Ubuntu 24.04+ with an
+    // unconfined daemon) that denial otherwise surfaces only when the first
+    // attach dies writing /proc/self/uid_map. The create gate (NET-141)
+    // refuses every session with the cause and the remedy before allocating
+    // anything, re-probing on each create so a remedy applied to the running
+    // host takes effect without a restart; this start-up read only warns
+    // once in the log. `MINIMALD_USERNS_GATE=off` switches the gate off for
+    // a daemon that must run anyway — the escape hatch for a probe that
+    // misreads a host — and is itself warned about, since the session then
+    // fails at its first attach instead. The in-guest microVM daemon runs
+    // as root, where no restriction binds, so this stays silent on the
+    // vsock path.
     #[cfg(target_os = "linux")]
-    if let Some(restriction) = sandbox2::user_namespaces_restriction() {
-        let fix = minimald::userns_restriction_fix(restriction);
-        tracing::warn!(
-            reason = %restriction,
-            fix,
-            docs = "https://docs.minimal.dev/reference/linux-host-setup",
-            "sessions will fail to start: this host refuses the unprivileged user \
-             namespace every session sandbox needs"
-        );
+    {
+        const USERNS_GATE_ENV: &str = "MINIMALD_USERNS_GATE";
+        if std::env::var(USERNS_GATE_ENV).is_ok_and(|v| v.trim().eq_ignore_ascii_case("off")) {
+            config.user_namespace_gate = minimald::server::UsernsGate::Off;
+            tracing::warn!(
+                env = USERNS_GATE_ENV,
+                "user-namespace gate switched off: a session this host refuses the namespace \
+                 for fails at its first attach instead of at create"
+            );
+        } else if let Some(restriction) = sandbox2::user_namespaces_restriction() {
+            tracing::warn!(
+                reason = %restriction,
+                fix = minimald::userns_restriction_fix(restriction),
+                docs = "https://docs.minimal.dev/reference/linux-host-setup",
+                "sessions will fail to start: this host refuses the unprivileged user \
+                 namespace every session sandbox needs"
+            );
+        }
     }
 
     // Track the host's wall clock, when configured.

@@ -154,8 +154,8 @@ impl fmt::Display for AttachError {
             ),
             AttachError::SessionPending => write!(
                 f,
-                "session isn't attachable yet (still awaiting either \
-                 SubmitVerdict or FinalizeSession)"
+                "session isn't attachable yet (still being activated; retry \
+                 after the activation finishes)"
             ),
             AttachError::SessionBusy => {
                 write!(f, "session host is busy; retry the attach once it drains")
@@ -248,7 +248,8 @@ pub(crate) struct SessionConfig {
 /// The egress *section* the gate compiles for a session: the materialized
 /// form of [`sessions::effective_egress`]'s answer — `None` for the
 /// allow-all default, the deny-all section for an absent declaration under the
-/// in-force default (NET-074), and a declaration verbatim. `phase` is the
+/// in-force default (NET-074), and a declaration with the destination lists
+/// it left absent resolved as that function documents. `phase` is the
 /// rollout phase to resolve under — the launcher and the task path pass
 /// [`sessions::EGRESS_DEFAULT_PHASE`], the phase this build ships, and the
 /// tests name [`sessions::EgressDefaultPhase::InForce`] so the posture they
@@ -276,10 +277,10 @@ pub(crate) fn effective_egress_section(
 /// deny-all section for an own-address box with no `egress` section once the
 /// default is in force (NET-074), the allow-all default for everything an
 /// opt-out (NET-077) or an earlier phase leaves in place, and a declaration
-/// verbatim. `phase` resolves under, exactly as [`effective_egress_section`]
-/// documents. The declaration on the record is left untouched: the strict
-/// `SessionPolicy` a client reads back stays exactly what the box was
-/// launched with.
+/// with the destination lists it left absent resolved. `phase` resolves
+/// under, exactly as [`effective_egress_section`] documents. The
+/// declaration on the record is left untouched: the strict `SessionPolicy`
+/// a client reads back stays exactly what the box was launched with.
 pub(crate) fn effective_session_policy(
     policy: &sessions::SessionPolicy,
     network: sessions::NetworkMode,
@@ -2208,7 +2209,7 @@ impl Session {
             SessionInner::Draft { pending: Some(_) } => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::WouldBlock,
-                    "session already has a pending contribution awaiting SubmitVerdict; \
+                    "session already has a pending contribution awaiting its verdict; \
                      abort it and create a new session to retry",
                 ));
             }
@@ -2462,7 +2463,7 @@ impl Session {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidInput,
                             "patches upload never completed; cannot finalize \
-                             (upload patches, then retry FinalizeSession)",
+                             (upload patches, then retry the activation)",
                         ));
                     }
                 }
@@ -2497,7 +2498,7 @@ impl Session {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidInput,
                             "hook-script upload never completed; cannot finalize \
-                             (upload hook scripts, then retry FinalizeSession)",
+                             (upload hook scripts, then retry the activation)",
                         ));
                     }
                 }
@@ -4155,8 +4156,7 @@ impl Session {
                 // the full flow.
                 return Err(AttachError::LoadoutFailed(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
-                    "composition has patches that can only be uploaded via `min session activate` \
-                     (ConfigureLoadout → WorkspacePatchesTarZst → FinalizeSession); \
+                    "composition has patches that only `min session activate` can upload; \
                      the attach shortcut can't drive that sequence — destroy this session \
                      and re-activate through the CLI",
                 )));
@@ -5181,7 +5181,7 @@ impl Session {
         if record.status != SessionStatus::Active {
             return Err(format!(
                 "session isn't attachable yet (status is {:?}, need Active — \
-             finish the upload + FinalizeSession sequence first)",
+             finish the activation first)",
                 record.status,
             ));
         }
