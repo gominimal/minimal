@@ -27,6 +27,8 @@ pub(crate) const GUEST_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// supervisor's teardown. It stays under launchd's default `ExitTimeOut`
 /// (20 s; systemd's default `TimeoutStopSec` is 90 s), so the supervisor
 /// ends by the signal itself rather than by the service manager's SIGKILL.
+/// The log flush on the way out (about a second at most) comes after it, so
+/// the process is gone within this bound plus that flush.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 pub(crate) const SIGNAL_STOP_BOUND: Duration = Duration::from_secs(15);
 

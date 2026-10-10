@@ -2319,8 +2319,14 @@ pub fn die_by_received_stop_signal() {
 /// before the stop-signal handler was installed, once the log is flushed
 /// ([`flush_log`]): whichever thread ends the process, the stop's last
 /// lines are written first.
+///
+/// Never returns. Where the signal does not end the process (pid 1 in a
+/// container ignores a default-action signal it sends itself), it exits
+/// with the shell's code for a death by that signal instead: a caller may
+/// hold the lifecycle lock until the process ends, and a process that
+/// lived on would hold it for good.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
-pub(crate) fn die_by_signal(signum: libc::c_int) {
+pub(crate) fn die_by_signal(signum: libc::c_int) -> ! {
     flush_log();
     // SAFETY: restoring the default disposition and signalling this process
     // touch no memory; the default action of SIGTERM and SIGINT ends it.
@@ -2328,6 +2334,7 @@ pub(crate) fn die_by_signal(signum: libc::c_int) {
         libc::signal(signum, libc::SIG_DFL);
         libc::kill(libc::getpid(), signum);
     }
+    std::process::exit(128 + signum);
 }
 
 /// When the last queue-full warn line was written: the line is rate-limited
