@@ -2288,9 +2288,27 @@ pub(crate) fn stop_signal_received() -> Option<(libc::c_int, std::time::Instant)
     STOP_SIGNAL.get().copied()
 }
 
+/// What flushes the process's log when dropped: a detached supervisor's
+/// non-blocking writer guard. Held here rather than in `main`, so the
+/// stop-signal watcher, which ends the process from its own thread, can
+/// flush it too.
+static LOG_FLUSHER: Mutex<Option<Box<dyn Send>>> = Mutex::new(None);
+
+/// Hand over the guard whose drop flushes the log; [`flush_log`] drops it.
+pub fn set_log_flusher(guard: impl Send + 'static) {
+    *LOG_FLUSHER.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(guard));
+}
+
+/// Flush the log by dropping the guard [`set_log_flusher`] was handed, if
+/// any. Records logged afterwards may not reach the file.
+pub fn flush_log() {
+    let guard = LOG_FLUSHER.lock().unwrap_or_else(|e| e.into_inner()).take();
+    drop(guard);
+}
+
 /// End the process by the stop signal the watcher received, if one arrived;
-/// otherwise return. `main` calls it after dropping its log guard, so the
-/// last lines of a signal stop are flushed before the process ends.
+/// otherwise return. The log is flushed first ([`die_by_signal`]), so the
+/// last lines of a signal stop reach it before the process ends.
 pub fn die_by_received_stop_signal() {
     if let Some((signum, _)) = stop_signal_received() {
         die_by_signal(signum);
@@ -2298,9 +2316,12 @@ pub fn die_by_received_stop_signal() {
 }
 
 /// End the process by `signum` with its default disposition, as it ended
-/// before the stop-signal handler was installed.
+/// before the stop-signal handler was installed, once the log is flushed
+/// ([`flush_log`]): whichever thread ends the process, the stop's last
+/// lines are written first.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 pub(crate) fn die_by_signal(signum: libc::c_int) {
+    flush_log();
     // SAFETY: restoring the default disposition and signalling this process
     // touch no memory; the default action of SIGTERM and SIGINT ends it.
     unsafe {

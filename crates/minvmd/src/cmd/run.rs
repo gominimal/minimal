@@ -548,7 +548,8 @@ fn run_foreground() -> Result<()> {
     // the VMM child is signalled without a guest ask (no guest daemon is
     // up to take one), the watcher writes `Stopped`, and it ends the
     // process by the signal, since the main thread is still in its READY
-    // wait.
+    // wait. It keeps the lifecycle write lock from that write on, and the
+    // boot forks only under that lock, so no VMM is forked behind it.
     //
     // Not covered: a terminal Ctrl-C on a foreground run. The VMM child
     // shares the terminal's foreground process group, so the tty delivers
@@ -914,8 +915,7 @@ fn run_foreground() -> Result<()> {
         // names. A redraw hands the same door to the fresh boot.
         let (name, path) = &guest_report_door;
         cmd.env(name, path);
-        child = cmd
-            .env(MARKER_SOCK_ENV, &marker_sock_path)
+        cmd.env(MARKER_SOCK_ENV, &marker_sock_path)
             // The node's proxy port travels to the guest through the VMM child's
             // env: the child is a separate process (like the marker socket path),
             // and its backend appends it to the kernel command line, where the
@@ -931,30 +931,35 @@ fn run_foreground() -> Result<()> {
             .env(
                 crate::vm::PUBLISH_GENERATION_ENV,
                 publish_generation.to_string(),
-            )
-            .spawn()
-            .with_context(|| format!("spawning VMM child: {}", exe.display()))?;
+            );
 
-        child_pid = child.id();
-        tracing::info!(pid = child_pid, "VMM child spawned");
-
-        // Update state with the known pid so that concurrent `stop` invocations
-        // during Starting can signal the correct process.
+        // Fork the VMM child and record its pid under one hold of the
+        // lifecycle write lock, so a stopper never sees a lifecycle whose
+        // child exists but is not recorded. A concurrent `stop` during
+        // Starting signals the pid it reads here. A stop signal's boot abort
+        // (`stop::graceful_stop_from_signal`) takes the same lock, writes
+        // `Stopped`, and keeps the lock until it has ended the process: it
+        // either reads this child's pid and signals it, or holds the lock
+        // first, and then this boot never forks.
         {
             let mut lock = state_dir
                 .lifecycle_lock()
                 .context("opening lifecycle lock")?;
             let _guard = lock.write().context("acquiring lifecycle write lock")?;
             let state = state_dir.read_state().context("reading state")?;
-            // A concurrent stop might have already reset us to Stopped; bail early.
+            // A concurrent stop might have already reset us to Stopped; bail
+            // before a child exists.
             if !matches!(state.lifecycle, Lifecycle::Starting) {
-                let _ = child.kill();
-                let _ = child.wait();
                 bail!(
-                    "lifecycle changed to {:?} during spawn; aborting",
+                    "lifecycle changed to {:?} before spawn; aborting",
                     state.lifecycle
                 );
             }
+            child = cmd
+                .spawn()
+                .with_context(|| format!("spawning VMM child: {}", exe.display()))?;
+            child_pid = child.id();
+            tracing::info!(pid = child_pid, "VMM child spawned");
             state_dir
                 .write_state(&State {
                     lifecycle: Lifecycle::Starting,

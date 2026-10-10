@@ -116,7 +116,9 @@ fn main() -> Result<()> {
         minvmd::state::set_vm_name(vm).map_err(|e| anyhow::anyhow!("--vm: {e}"))?;
     }
 
-    let log_guard = init_tracing()?;
+    if let Some(log_guard) = init_tracing()? {
+        minvmd::control::set_log_flusher(log_guard);
+    }
 
     let result = match cli.command {
         Command::Boot { foreground } => minvmd::cmd::boot::run(foreground),
@@ -152,10 +154,11 @@ fn main() -> Result<()> {
         Command::KrunVmm => minvmd::cmd::vmm_child::run(),
     };
     // A `run` supervisor stopped by SIGTERM/SIGINT ends by that signal, so
-    // its exit status says what stopped it; the log guard goes first, so
-    // the signal stop's last lines reach the log before the process ends.
-    drop(log_guard);
+    // its exit status says what stopped it. Dying by the signal flushes the
+    // log first, from this thread or from the stop-signal watcher's, so the
+    // signal stop's last lines reach the log before the process ends.
     minvmd::control::die_by_received_stop_signal();
+    minvmd::control::flush_log();
     result
 }
 
