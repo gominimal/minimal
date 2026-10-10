@@ -1642,9 +1642,10 @@ pub(crate) async fn activate_session(
     // a task session apart, though: it holds the name of any named host_ip
     // session without a box row that a client attaches to or execs into.
     // A task run releases such a hold by its session's id once the run
-    // returns (`release_task_name_hold`); a run whose client is killed
-    // first releases nothing, and that hold is dropped after the VM host
-    // daemon's next restart, when nothing re-makes it.
+    // returns or is interrupted (`release_task_name_hold`); a run whose
+    // client is killed outright releases nothing, and that hold is
+    // dropped after the VM host daemon's next restart, when nothing
+    // re-makes it.
     //
     // Every hold is made by a client over the host's control socket, as
     // this one and that re-hold are; the in-VM daemon makes none. So
