@@ -309,7 +309,7 @@ pub async fn cmd_finalize_install(
     if args.json {
         println!("{}", plan.json());
         if plan.exit_code() != 0 {
-            std::process::exit(plan.exit_code());
+            exit(plan.exit_code());
         }
         return Ok(());
     }
@@ -329,7 +329,7 @@ pub async fn cmd_finalize_install(
         // Nothing a script can do here: a finished host (exit 0), or one
         // whose every open item is blocked or waiting (exit 1).
         if plan.exit_code() != 0 {
-            std::process::exit(plan.exit_code());
+            exit(plan.exit_code());
         }
         return Ok(());
     };
@@ -337,7 +337,7 @@ pub async fn cmd_finalize_install(
     // is not this user's call (spec 18's open question on several users).
     if let Some(refusal) = crate::resolver::other_operator_refusal_on_this_host() {
         eprintln!("min finalize-install: {refusal}");
-        std::process::exit(1);
+        exit(1);
     }
     run_as_root(&script)?;
     println!("{}", closing_line(plan.adds_kvm_group()));
@@ -376,6 +376,18 @@ fn cmd_finalize_install_undo(show: bool) -> Result<(), anyhow::Error> {
     run_as_root(&script)
 }
 
+/// Exits with `code` once stdout and stderr are flushed: `std::process::exit`
+/// runs no destructor, and a piped stdout is block-buffered, so the report
+/// or summary printed just before it would otherwise never reach its reader
+/// (`min finalize-install --show --json > report.json` on an unfinished
+/// host would write an empty file).
+fn exit(code: i32) -> ! {
+    use std::io::Write as _;
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    std::process::exit(code)
+}
+
 /// Writes `script` to a private temp file — created exclusively, mode
 /// 0600, so no other user can read or swap it.
 pub(crate) fn write_private_script(script: &str) -> Result<tempfile::NamedTempFile, anyhow::Error> {
@@ -408,9 +420,12 @@ fn run_as_root(script: &str) -> Result<(), anyhow::Error> {
             .is_ok_and(|status| status.success());
     let argv = match run_decision(stdin_is_tty, sudo_runs_quietly) {
         RunDecision::Run(argv) => argv,
-        RunDecision::Refuse { message, exit } => {
+        RunDecision::Refuse {
+            message,
+            exit: code,
+        } => {
             eprintln!("{message}");
-            std::process::exit(exit);
+            exit(code);
         }
     };
     let file = write_private_script(script)?;
@@ -423,7 +438,7 @@ fn run_as_root(script: &str) -> Result<(), anyhow::Error> {
     file.close()
         .context("min finalize-install: could not remove the script")?;
     if !status.success() {
-        std::process::exit(status.code().unwrap_or(1));
+        exit(status.code().unwrap_or(1));
     }
     Ok(())
 }
