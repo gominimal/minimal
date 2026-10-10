@@ -2091,10 +2091,20 @@ still vouches for the table it loaded" \
     want_ok "the second run finds the daemon already placed" grep -q "already in" "$OUT"
     want_ok "the second run writes the pid no second time" \
         [ "$(grep -cx 4242 "$tree/daemon/cgroup.procs")" -eq 1 ]
+    # Only holders that are left alone (the daemon gone, a box on the same
+    # path still there): the closing line says so, not that nobody holds it.
+    rm -rf "$fproc/4242"
+    : >"$tree/daemon/cgroup.procs"
+    run_hc place_listener_skipped "$root/mi-on" --user "$me" --place-listener "$lsock"
+    check 0 "$rc" "--place-listener over holders it leaves alone exits 0"
+    want_ok "the closing line says the holders were left where they stand" \
+        grep -q "every holder of .* was left where it stands" "$OUT"
+    want_err "and does not claim the socket is unheld" grep -q "no process holds" "$OUT"
+    want_err "and places nothing" [ -s "$tree/daemon/cgroup.procs" ]
     printf 'Num       RefCount Protocol Flags    Type St Inode Path\n' >"$fproc/net/unix"
     run_hc place_listener_nobody "$root/mi-on" --user "$me" --place-listener "$lsock"
     check 0 "$rc" "--place-listener over a socket nobody holds exits 0"
-    want_ok "nobody holding it is nothing to place, said so" grep -q "nothing to place" "$OUT"
+    want_ok "nobody holding it is nothing to place, said so" grep -q "no process holds .*: nothing to place" "$OUT"
     want_err "an unbound socket is not scanned twice" grep -q "scanned again" "$OUT"
     # A listed inode whose holder is not in any fd table (it vanished under
     # the scan): one more pass after a moment, then nothing to place, and

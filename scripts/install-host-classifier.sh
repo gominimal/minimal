@@ -507,7 +507,7 @@ place_listener() {
     # live one is placed and a dead one simply has no holder).
     inodes="$(awk -v p="$listener" '$8 == p { print $7 }' "$PROC/net/unix")"
     if [ -z "$inodes" ]; then
-        note "nobody holds $listener: nothing to place"
+        note "no process holds $listener: nothing to place"
         return 0
     fi
     # The holders, one pass over every fd table per inode (find walks it
@@ -558,7 +558,14 @@ place_listener() {
             note "could not place $holder_pid in $procs: it has gone, or is not a process root may move"
         fi
     done
-    [ "$placed" -gt 0 ] || note "no process of uid $owner_uid holds $listener: nothing to place"
+    # The closing line is the one a person reads last, so it states what
+    # happened: an unheld socket, or holders that were each left alone for
+    # the reason noted above.
+    if [ -z "$holders" ]; then
+        note "no process holds $listener: nothing to place"
+    elif [ "$placed" -eq 0 ]; then
+        note "every holder of $listener was left where it stands, for the reasons above: nothing placed"
+    fi
 }
 
 # listener_holders — the pids whose fd tables carry one of $inodes, found by
