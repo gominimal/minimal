@@ -3262,8 +3262,8 @@ fn write_rules(
     match rules {
         None => writeln!(out, "  {label}  {default}")?,
         // A list that is present and empty grants nothing in its dimension
-        // — the shape an absent destination list resolves to on an
-        // own-address box (NET-074) — and is spelled out, never printed as
+        // — the shape an absent destination list resolves to on a box of
+        // any network mode (NET-074) — and is spelled out, never printed as
         // a blank value in the egress display.
         Some(rules) if rules.is_empty() => writeln!(out, "  {label}  (none)")?,
         Some(rules) => writeln!(out, "  {label}  {}", rules.join(", "))?,

@@ -1413,8 +1413,8 @@ pub(crate) fn effective_policy_reply(
 /// own-address box with no `egress` section answers `deny_all` with the
 /// default in force (NET-074) and `allow_all` behind the opt-out; a declared
 /// section answers as the gate resolves it — the lists it declared
-/// verbatim, and on an own-address box under the in-force default a
-/// destination list it left absent present and empty, the wire meaning
+/// verbatim, and under the in-force default, on a box of any network mode,
+/// a destination list it left absent present and empty, the wire meaning
 /// being "what this box is held to", never "what it wrote"; the strict
 /// declaration the record holds is never rewritten to say any of this, and
 /// `GetSessionPolicy` is the reply that echoes it.

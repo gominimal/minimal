@@ -219,8 +219,9 @@ impl EgressPolicy {
     /// it is not read — a section that grants no destination reaches
     /// nothing whatever protocols it lists, which is the shape
     /// [`effective_egress`] resolves a declaration with no destination
-    /// list (protocols only, denies only) to on an own-address box under the
-    /// in-force default without the opt-out. `deny_subnets` is not read
+    /// list (protocols only, denies only) to under the in-force default
+    /// without the opt-out, whatever the box's network mode. `deny_subnets`
+    /// is not read
     /// either — it subtracts from what the `allow_*` fields admit, and
     /// there is nothing there to subtract from. The one predicate the
     /// in-VM classifier, the host-side registry and `min session policy`

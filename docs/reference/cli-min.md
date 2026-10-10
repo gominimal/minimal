@@ -148,6 +148,12 @@ so export the variable to keep the opt-out after such a restart (see
 (see [minvmd](./cli-minvmd.md)). A host-address box with no section
 keeps allow-all either way.
 
+The opt-out also keeps the earlier meaning of an unset allow flag inside a
+declaration. On an opted-out host, `--allow-dns-hosts github.com` alone keeps
+allow-all addresses: the box reaches every address directly, and the names
+bound nothing. Activation does not warn about it. Add `--allow-subnets` to
+bound the addresses there.
+
 Activating a path that already has a session is allowed, but warns: `min` names
 the existing session and creates a second one anyway. With two sessions on one
 path, resolving that directory to a session is ambiguous, so a bare `min` there
