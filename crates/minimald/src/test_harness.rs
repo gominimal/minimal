@@ -288,9 +288,12 @@ fn config_in(temp: &TempDir, deny_all_opt_out: bool) -> Config {
         // runtime-dir lock, deriving the octet from the per-start id.
         daemon_identity_dir: None,
         deny_all_opt_out,
-        // No start-up read on a harness server: a test that needs a
-        // refusing host sets it through `ServerStateHandle::set_user_namespace_verdict`.
-        user_namespace_verdict: None,
+        // Off, not live: the harness runs unconfined on hosts that are
+        // themselves restricted (CI's Ubuntu runners, the lima guest) and
+        // never starts a sandbox, so a live probe would refuse every create
+        // here for a reason no test is about. A gate test fixes a verdict
+        // through `ServerStateHandle::set_user_namespace_gate`.
+        user_namespace_gate: crate::server::UsernsGate::Off,
     }
 }
 

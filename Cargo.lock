@@ -4270,6 +4270,7 @@ dependencies = [
  "op",
  "orchestrator",
  "ot",
+ "paths",
  "petgraph",
  "rayon",
  "rcache",

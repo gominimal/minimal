@@ -1127,7 +1127,7 @@ async fn activate_prints_no_session_id_when_composition_fails() {
 /// it. Asserts the contract every cause shares on the way: exit 1, nothing
 /// on stdout, and no session left behind. The binary is used because the
 /// exact stderr and the exit status are the contract; the verdict is set on
-/// the harness server alone and cleared before the asserts.
+/// the harness server alone and switched back off before the asserts.
 async fn refused_activation(verdict: minimald::server::UsernsRestriction) -> String {
     let (daemon, args) = setup().await;
     let minimal_dir = args.minimal_dir.clone().expect("setup points at a tempdir");
@@ -1145,7 +1145,7 @@ async fn refused_activation(verdict: minimald::server::UsernsRestriction) -> Str
     daemon
         .server
         .state
-        .set_user_namespace_verdict(Some(verdict))
+        .set_user_namespace_gate(minimald::server::UsernsGate::Fixed(verdict))
         .await;
     let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_min"))
         .args(["--minimal-dir".as_ref(), minimal_dir.as_os_str()])
@@ -1158,7 +1158,11 @@ async fn refused_activation(verdict: minimald::server::UsernsRestriction) -> Str
         .output()
         .await
         .expect("the min binary should be invocable");
-    daemon.server.state.set_user_namespace_verdict(None).await;
+    daemon
+        .server
+        .state
+        .set_user_namespace_gate(minimald::server::UsernsGate::Off)
+        .await;
 
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -1181,10 +1185,14 @@ async fn refused_activation(verdict: minimald::server::UsernsRestriction) -> Str
         resp.sessions
     );
 
-    stderr
-        .find("error: ")
-        .map(|at| stderr[at..].trim_end().to_string())
-        .unwrap_or_else(|| panic!("no error block on stderr: {stderr}"))
+    // The block starts at the last line that opens with `error: `, so a
+    // progress line that happened to contain the words is never taken.
+    let at = stderr
+        .rfind("\nerror: ")
+        .map(|at| at + 1)
+        .or_else(|| stderr.starts_with("error: ").then_some(0))
+        .unwrap_or_else(|| panic!("no error block on stderr: {stderr}"));
+    stderr[at..].trim_end().to_string()
 }
 
 /// A host whose user-namespace verdict refuses the sandbox fails the
@@ -1216,7 +1224,8 @@ async fn activate_refusal_names_finalize_install_for_apparmor_restriction() {
         "error: this machine blocks the private sandbox every box runs in (Ubuntu restricts \
          unprivileged user namespaces), so no box can start here yet.\n\
          Finish the install to allow it for Minimal only: min finalize-install   \
-         (see what it changes first: min finalize-install --show)"
+         (see what it changes first: min finalize-install --show). The profile takes \
+         effect when the daemon next starts: run min stop, then your command again."
     );
     assert!(
         !refusal.contains("sysctl"),

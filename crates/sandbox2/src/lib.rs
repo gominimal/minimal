@@ -2861,18 +2861,83 @@ impl std::fmt::Display for UsernsRestriction {
     }
 }
 
-/// Best-effort probe for whether this host will refuse the unprivileged user
-/// namespace every sandbox starts by unsharing — the counterpart of the
-/// network probe above, for the namespace that has no fallback.
+/// The binary a [`UsernsRestriction::remedy`] is written for. The AppArmor
+/// profile attaches by binary path, so the step that lifts that restriction
+/// differs per binary; the sysctl remedy does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemedyTarget<'a> {
+    /// `minimald`, at the path the installer wrote: `min finalize-install`
+    /// loads the profile for it. A profile attaches at exec, so the daemon
+    /// that is running stays unconfined until it is restarted.
+    Daemon,
+    /// A `mip` binary, which the installer's profile does not cover: the
+    /// loader script is run with `--path` for it. `bin` is the binary's
+    /// path; `data_dir` is the installer's data prefix, where the loader
+    /// lands (`<data_dir>/apparmor/install-apparmor-profile.sh`).
+    Mip { bin: &'a str, data_dir: &'a str },
+}
+
+impl UsernsRestriction {
+    /// The cause in the words a person reads inside a refusal — never the
+    /// sysctl key alone, which names the mechanism rather than the fact.
+    #[must_use]
+    pub fn cause(self) -> &'static str {
+        match self {
+            Self::Disabled => {
+                "user namespaces are switched off (user.max_user_namespaces=0 or no kernel support)"
+            }
+            Self::ApparmorUnconfined => "Ubuntu restricts unprivileged user namespaces",
+        }
+    }
+
+    /// The remedy this restriction takes for `target`, one sentence a person
+    /// can act on. The AppArmor restriction is lifted by the profile — the
+    /// install step for the daemon, the loader with `--path` for `mip` —
+    /// never by `sudo sysctl`, which switches the protection off for every
+    /// program, is lost at boot, and leaves the install's record unchanged.
+    /// Switched-off namespaces no profile can lift: the sysctl made
+    /// persistent, or a kernel built with them.
+    #[must_use]
+    pub fn remedy(self, target: RemedyTarget<'_>) -> String {
+        match (self, target) {
+            (Self::Disabled, _) => "Set user.max_user_namespaces above 0 persistently (a \
+                                    /etc/sysctl.d drop-in) or use a kernel with CONFIG_USER_NS."
+                .to_string(),
+            (Self::ApparmorUnconfined, RemedyTarget::Daemon) => {
+                "Finish the install to allow it for Minimal only: min finalize-install   (see \
+                 what it changes first: min finalize-install --show). The profile takes effect \
+                 when the daemon next starts: run min stop, then your command again."
+                    .to_string()
+            }
+            (Self::ApparmorUnconfined, RemedyTarget::Mip { bin, data_dir }) => format!(
+                "Attach the AppArmor profile to mip (one-time, needs root): sudo bash \
+                 {data_dir}/apparmor/install-apparmor-profile.sh --path {bin} (from a checkout: \
+                 sudo scripts/install-apparmor-profile.sh --path {bin})."
+            ),
+        }
+    }
+}
+
+/// Probe for whether this host will refuse the unprivileged user namespace
+/// every sandbox starts by unsharing — the counterpart of the network probe
+/// above, for the namespace that has no fallback.
 ///
 /// Returns the obstruction it finds, or `None` when none is visible. The
 /// sandbox child is forked from the calling process with no exec in between,
 /// so the caller's own privileges and AppArmor label are exactly what the
 /// kernel will check at `unshare`/`uid_map` time — probe from the daemon,
 /// not from a helper. Like the network probe this is a necessary-not-
-/// sufficient signal (seccomp or LSM policy can still deny at spawn time),
-/// but it is advisory: a false `None` surfaces later as the spawn error it
-/// always was, never as a loss of isolation.
+/// sufficient signal (seccomp or LSM policy can still deny at spawn time):
+/// a false `None` surfaces later as the spawn error it always was, never as
+/// a loss of isolation.
+///
+/// A `Some` is not advisory: `minimald` gates every session create on it
+/// (NET-141), refusing the create with this cause and its remedy, so a false
+/// `Some` — a host whose kernel would in fact allow the unshare — refuses
+/// every session on that host. Three facts are read, each live from `/proc`
+/// on every call, so a remedy applied to a running host takes effect at the
+/// next create without a restart; a daemon that must run anyway sets
+/// `MINIMALD_USERNS_GATE=off` to skip the gate.
 #[cfg(target_os = "linux")]
 #[must_use]
 pub fn user_namespaces_restriction() -> Option<UsernsRestriction> {

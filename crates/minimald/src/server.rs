@@ -275,22 +275,37 @@ pub struct Config {
     /// declares its own egress section is unaffected either way.
     #[serde(default)]
     pub deny_all_opt_out: bool,
-    /// The host's verdict on the unprivileged user namespace every session
-    /// sandbox starts by unsharing, as [`sandbox2::user_namespaces_restriction`]
-    /// read it from the daemon's own process at start-up (NET-141). `None`
-    /// — no restriction, or a daemon that has not read its host — lets a
-    /// create through; a restriction refuses every create before anything
-    /// is allocated. Seeded by the daemon binary, the one place the probe is
-    /// meaningful (the sandbox child is forked from that process, so its
-    /// label is what the kernel checks), never persisted or handed in.
+    /// How the create gate learns the host's verdict on the unprivileged
+    /// user namespace every session sandbox starts by unsharing (NET-141).
+    /// Never persisted or handed in: the daemon binary decides it at start
+    /// (live, or off under `MINIMALD_USERNS_GATE=off`), and the test harness
+    /// fixes it per server.
     #[serde(skip)]
-    pub user_namespace_verdict: Option<UsernsRestriction>,
+    pub user_namespace_gate: UsernsGate,
 }
 
-/// The verdict [`Config::user_namespace_verdict`] carries, re-exported so
-/// the daemon binary and the harness-driven tests name it without a
-/// `sandbox2` dependency of their own.
+/// The verdict [`UsernsGate::Fixed`] carries, re-exported so the daemon
+/// binary and the harness-driven tests name it without a `sandbox2`
+/// dependency of their own.
 pub use sandbox2::UsernsRestriction;
+
+/// Where the create gate's user-namespace verdict comes from (NET-141).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UsernsGate {
+    /// Probe this process on every create — a few `/proc` reads — so a
+    /// remedy applied to the running host (a sysctl made persistent) takes
+    /// effect at the next create, with no restart. The production default.
+    #[default]
+    Live,
+    /// Never refuse. The operator's escape hatch for a false positive, and
+    /// the harness default: the harness runs unconfined on a restricted host
+    /// without ever starting a sandbox, so a live probe there would refuse
+    /// creates that are not about this gate at all.
+    Off,
+    /// Answer with this verdict, whatever the host says: the seam the gate's
+    /// own tests refuse a create through.
+    Fixed(UsernsRestriction),
+}
 
 impl Config {
     /// Resolves the configured gvproxy binary path, falling back to the
@@ -769,17 +784,23 @@ impl ServerStateHandle {
     }
 
     /// The host's user-namespace verdict the create gate decides on
-    /// (NET-141) — see [`Config::user_namespace_verdict`].
+    /// (NET-141), per [`Config::user_namespace_gate`]: probed live from this
+    /// process on each call, so nothing is cached across creates; the lock
+    /// is held for the copy of the gate alone, never across the probe.
     pub(crate) async fn user_namespace_verdict(&self) -> Option<UsernsRestriction> {
-        self.0.lock().await.config.user_namespace_verdict
+        match self.0.lock().await.config.user_namespace_gate {
+            UsernsGate::Live => sandbox2::user_namespaces_restriction(),
+            UsernsGate::Off => None,
+            UsernsGate::Fixed(restriction) => Some(restriction),
+        }
     }
 
-    /// Stands in for the daemon binary's start-up read on a harness server,
-    /// whose config carries no verdict: the seam the create-gate tests set a
-    /// refusing host through, scoped to this server alone.
+    /// Re-points the gate on a harness server: the seam the create-gate
+    /// tests refuse a create through ([`UsernsGate::Fixed`]) and clear again
+    /// ([`UsernsGate::Off`]), scoped to this server alone.
     #[cfg(any(test, feature = "test-support"))]
-    pub async fn set_user_namespace_verdict(&self, verdict: Option<UsernsRestriction>) {
-        self.0.lock().await.config.user_namespace_verdict = verdict;
+    pub async fn set_user_namespace_gate(&self, gate: UsernsGate) {
+        self.0.lock().await.config.user_namespace_gate = gate;
     }
 
     /// Clears the hostname-routing unavailability note: the proxy's startup
@@ -2802,7 +2823,9 @@ pub(crate) fn test_config(dir: &std::path::Path) -> Config {
         // The default every unit-test daemon runs: the rollout phase this
         // build ships, not opted out.
         deny_all_opt_out: false,
-        user_namespace_verdict: None,
+        // A unit-test daemon never starts a sandbox, and the host it runs on
+        // may itself be restricted: the gate stays off unless a test fixes it.
+        user_namespace_gate: UsernsGate::Off,
     }
 }
 

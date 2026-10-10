@@ -1052,9 +1052,10 @@ async fn async_main() -> Result<(), MainError> {
                 .egress_deny_all_opt_out,
             std::env::var(EGRESS_DENY_ALL_OPT_OUT_ENV).ok().as_deref(),
         ),
-        // Seeded by the preflight below, once this process's own label has
-        // been read (NET-141).
-        user_namespace_verdict: None,
+        // Live: the create gate probes this process on every create
+        // (NET-141). The preflight below switches it off under
+        // `MINIMALD_USERNS_GATE=off`.
+        user_namespace_gate: minimald::server::UsernsGate::Live,
     };
     // Ensure the SSH host key is accessible in a instance-specific known_hosts file.
     // R1.2: load once and reuse in the vsock beacon so there is no redundant disk read.
@@ -1083,21 +1084,35 @@ async fn async_main() -> Result<(), MainError> {
     // this process's own privileges and AppArmor label are what the kernel
     // will check. On a restricted host (stock Ubuntu 24.04+ with an
     // unconfined daemon) that denial otherwise surfaces only when the first
-    // attach dies writing /proc/self/uid_map. The verdict is seeded here for
-    // the create gate (NET-141), which refuses every session with the cause
-    // and the remedy before allocating anything, and warned once in this
-    // log. The in-guest microVM daemon runs as root, where no restriction
-    // binds, so this stays silent on the vsock path.
+    // attach dies writing /proc/self/uid_map. The create gate (NET-141)
+    // refuses every session with the cause and the remedy before allocating
+    // anything, re-probing on each create so a remedy applied to the running
+    // host takes effect without a restart; this start-up read only warns
+    // once in the log. `MINIMALD_USERNS_GATE=off` switches the gate off for
+    // a daemon that must run anyway — the escape hatch for a probe that
+    // misreads a host — and is itself warned about, since the session then
+    // fails at its first attach instead. The in-guest microVM daemon runs
+    // as root, where no restriction binds, so this stays silent on the
+    // vsock path.
     #[cfg(target_os = "linux")]
-    if let Some(restriction) = sandbox2::user_namespaces_restriction() {
-        config.user_namespace_verdict = Some(restriction);
-        tracing::warn!(
-            reason = %restriction,
-            fix = minimald::rpc::user_namespace_refusal_for(restriction).remedy,
-            docs = "https://docs.minimal.dev/reference/linux-host-setup",
-            "sessions will fail to start: this host refuses the unprivileged user \
-             namespace every session sandbox needs"
-        );
+    {
+        const USERNS_GATE_ENV: &str = "MINIMALD_USERNS_GATE";
+        if std::env::var(USERNS_GATE_ENV).is_ok_and(|v| v.trim().eq_ignore_ascii_case("off")) {
+            config.user_namespace_gate = minimald::server::UsernsGate::Off;
+            tracing::warn!(
+                env = USERNS_GATE_ENV,
+                "user-namespace gate switched off: a session this host refuses the namespace \
+                 for fails at its first attach instead of at create"
+            );
+        } else if let Some(restriction) = sandbox2::user_namespaces_restriction() {
+            tracing::warn!(
+                reason = %restriction,
+                fix = restriction.remedy(sandbox2::RemedyTarget::Daemon),
+                docs = "https://docs.minimal.dev/reference/linux-host-setup",
+                "sessions will fail to start: this host refuses the unprivileged user \
+                 namespace every session sandbox needs"
+            );
+        }
     }
 
     // Track the host's wall clock, when configured.

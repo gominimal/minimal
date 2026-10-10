@@ -249,28 +249,21 @@ pub async fn run_task(
     // the kernel will check. On a restricted host (stock Ubuntu 24.04+ with
     // an unconfined mip) that denial otherwise surfaces only when the first
     // spawn dies writing /proc/self/uid_map, with nothing useful in the log.
-    // Warn once at the start of the first task run instead, with the fix.
-    // The fix is the install step that allows the namespace for Minimal
-    // alone — never a sysctl, which would switch the protection off for
-    // every program and be lost at boot.
+    // Warn once at the start of the first task run instead, with the fix —
+    // the cause's own, spelled by `sandbox2` for this binary: the installer's
+    // profile attaches to minimald alone, so mip's AppArmor remedy is the
+    // loader with `--path` for this mip, never `min finalize-install`.
     if let Some(restriction) = sandbox2::user_namespaces_restriction() {
+        let bin = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.to_str().map(str::to_owned))
+            .unwrap_or_else(|| "<path to this mip binary>".to_string());
         warn!(
             reason = %restriction,
-            // The same sentences `minimald_rpc::USER_NAMESPACE_APPARMOR_REFUSAL`
-            // and `USER_NAMESPACE_DISABLED_REFUSAL` spell for the session
-            // path; mip takes no dependency on the session wire crate for two
-            // strings, so keep them identical by hand. The remedy is the
-            // cause's own: the install step loads only the AppArmor profile.
-            fix = match restriction {
-                sandbox2::UsernsRestriction::Disabled => {
-                    "Set user.max_user_namespaces above 0 persistently (a /etc/sysctl.d \
-                     drop-in) or use a kernel with CONFIG_USER_NS."
-                }
-                _ => {
-                    "Finish the install to allow it for Minimal only: min finalize-install   \
-                     (see what it changes first: min finalize-install --show)"
-                }
-            },
+            fix = restriction.remedy(sandbox2::RemedyTarget::Mip {
+                bin: &bin,
+                data_dir: paths::minimal_data_dir().as_str(),
+            }),
             docs = "https://docs.minimal.dev/reference/linux-host-setup",
             "builds will fail to start: this host refuses the unprivileged user \
              namespace every build sandbox needs"
