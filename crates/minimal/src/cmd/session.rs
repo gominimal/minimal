@@ -3843,6 +3843,15 @@ pub async fn cmd_stop(global: &GlobalArgs, args: StopArgs) -> Result<(), anyhow:
             if daemon_provider_kind(global) != paths::ProviderKind::Minvmd {
                 return Err(connect_err);
             }
+            // The VM may have gone down between the probe and the connect:
+            // that is the goal state, not a wedged guest to stop from the
+            // host. Same cheap state-file read as the probe above.
+            if !autospawn::is_daemon_running(global.use_minvmd(), global.minimal_dir.as_deref())
+                .unwrap_or(true)
+            {
+                println!("Daemon is not running.");
+                return Ok(());
+            }
             return if args.force {
                 stop_wedged_vm_from_host(global.minimal_dir.clone()).await
             } else {
