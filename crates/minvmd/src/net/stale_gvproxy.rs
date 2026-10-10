@@ -26,6 +26,13 @@ use std::time::{Duration, Instant};
 /// warning and spawning anyway.
 const STALE_GONE_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// How many times the scan re-reads the argv of a live process it could not
+/// read, and the pause before each re-read. One pause covers every such
+/// process at once, so the scan's extra cost is bounded by the product
+/// however many there are.
+const ARGV_REREADS: usize = 3;
+const ARGV_REREAD_INTERVAL: Duration = Duration::from_millis(20);
+
 /// Reap a leftover gvproxy of this VM before a fresh one is spawned.
 ///
 /// The caller holds this VM's alive lock, so no other supervisor of this VM
@@ -57,6 +64,10 @@ trait ProcessLookup {
     fn all_pids(&self) -> Vec<u32>;
     fn argv(&self, pid: u32) -> Option<Vec<Vec<u8>>>;
     fn ppid(&self, pid: u32) -> Option<u32>;
+    /// Whether `pid`'s argv, unreadable just now, may read on a retry: the
+    /// process is live, not a zombie, and this user's, so it could be a
+    /// leftover this reap would kill.
+    fn argv_may_settle(&self, pid: u32) -> bool;
 }
 
 /// The host's process table.
@@ -72,6 +83,9 @@ impl ProcessLookup for HostProcesses {
     fn ppid(&self, pid: u32) -> Option<u32> {
         os::ppid(pid)
     }
+    fn argv_may_settle(&self, pid: u32) -> bool {
+        os::argv_may_settle(pid)
+    }
 }
 
 fn reap_with(procs: &impl ProcessLookup, binary: &Path, switch_sock: &Path) -> anyhow::Result<()> {
@@ -79,16 +93,7 @@ fn reap_with(procs: &impl ProcessLookup, binary: &Path, switch_sock: &Path) -> a
     // SAFETY: getppid(2) takes no arguments and cannot fail.
     let my_parent = unsafe { libc::getppid() } as u32;
     // Collect the candidates first, then signal each after a fresh check.
-    let candidates: Vec<u32> = procs
-        .all_pids()
-        .into_iter()
-        .filter(|&pid| pid != me && pid != my_parent)
-        .filter(|&pid| {
-            procs
-                .argv(pid)
-                .is_some_and(|argv| argv_is_stale_gvproxy(&argv, binary, switch_sock))
-        })
-        .collect();
+    let candidates = find_candidates(procs, binary, switch_sock, &[me, my_parent]);
     // Fail closed before killing anything: a live minvmd owning this VM's
     // switch means the alive-lock invariant is broken, and spawning would
     // bind a second switch beside it.
@@ -125,6 +130,53 @@ fn reap_with(procs: &impl ProcessLookup, binary: &Path, switch_sock: &Path) -> a
         }
     }
     Ok(())
+}
+
+/// The pids whose argv matches this VM's gvproxy, `skip` excluded. A live
+/// process of this user whose argv cannot be read is re-read
+/// ([`ARGV_REREADS`] times, [`ARGV_REREAD_INTERVAL`] apart) rather than
+/// skipped: on macOS `sysctl(KERN_PROCARGS2)` can fail transiently, and a
+/// leftover skipped that way would keep holding the switch socket.
+fn find_candidates(
+    procs: &impl ProcessLookup,
+    binary: &Path,
+    switch_sock: &Path,
+    skip: &[u32],
+) -> Vec<u32> {
+    let mut candidates = Vec::new();
+    let mut unreadable = Vec::new();
+    for pid in procs.all_pids() {
+        if skip.contains(&pid) {
+            continue;
+        }
+        match procs.argv(pid) {
+            Some(argv) if argv_is_stale_gvproxy(&argv, binary, switch_sock) => candidates.push(pid),
+            Some(_) => {}
+            None => unreadable.push(pid),
+        }
+    }
+    for _ in 0..ARGV_REREADS {
+        unreadable.retain(|&pid| procs.argv_may_settle(pid));
+        if unreadable.is_empty() {
+            break;
+        }
+        std::thread::sleep(ARGV_REREAD_INTERVAL);
+        unreadable.retain(|&pid| match procs.argv(pid) {
+            Some(argv) => {
+                if argv_is_stale_gvproxy(&argv, binary, switch_sock) {
+                    candidates.push(pid);
+                }
+                false
+            }
+            None => true,
+        });
+    }
+    for pid in unreadable {
+        if procs.argv_may_settle(pid) {
+            tracing::debug!(pid, "could not read a live process's argv; not reaping it");
+        }
+    }
+    candidates
 }
 
 /// Whether `argv` is a gvproxy of this VM: argv\[0\] is exactly `binary`, and
@@ -218,6 +270,13 @@ mod os {
     /// The exact argv of `pid`, from `/proc/<pid>/cmdline`.
     pub(super) fn argv(pid: u32) -> Option<Vec<Vec<u8>>> {
         super::split_nul_argv(&std::fs::read(format!("/proc/{pid}/cmdline")).ok()?)
+    }
+
+    /// `/proc/<pid>/cmdline` does not fail transiently: an empty or missing
+    /// one is a kernel thread, a zombie or a reaped pid, none of which a
+    /// re-read changes.
+    pub(super) fn argv_may_settle(_pid: u32) -> bool {
+        false
     }
 
     /// The parent pid of `pid`, from `/proc/<pid>/stat`. The fields follow
@@ -421,11 +480,38 @@ mod os {
         bsdinfo(pid).ok().map(|info| info.pbi_ppid)
     }
 
+    /// Whether `pid` is live, not a zombie, and runs with this process's
+    /// effective uid: the only processes a leftover gvproxy can be, and the
+    /// ones whose `KERN_PROCARGS2` read is expected to succeed, so a failed
+    /// read is worth retrying. Another user's process (a setuid `login`,
+    /// say) fails that read every time and is never retried.
+    pub(super) fn argv_may_settle(pid: u32) -> bool {
+        // SAFETY: geteuid(2) takes no arguments and cannot fail.
+        let me = unsafe { libc::geteuid() };
+        bsdinfo(pid).is_ok_and(|info| info.pbi_uid == me && info.pbi_status != libc::SZOMB)
+    }
+
+    /// `pid`'s argv, re-read while it is unreadable but may settle
+    /// ([`argv_may_settle`]), bounded like the scan's re-reads.
+    fn argv_settled(pid: u32) -> Option<Vec<Vec<u8>>> {
+        for _ in 0..super::ARGV_REREADS {
+            if let Some(argv) = argv(pid) {
+                return Some(argv);
+            }
+            if !argv_may_settle(pid) {
+                return None;
+            }
+            std::thread::sleep(super::ARGV_REREAD_INTERVAL);
+        }
+        argv(pid)
+    }
+
     /// Re-check `pid`'s argv and SIGKILL it immediately after. macOS has no
     /// pidfd: the residual pid-reuse window is the gap between these two
-    /// syscalls (see [`super::reap_stale_gvproxy`]).
+    /// syscalls (see [`super::reap_stale_gvproxy`]). A re-check that cannot
+    /// read the argv of a live candidate is retried, not taken as a miss.
     pub(super) fn kill_if_still_stale(pid: u32, binary: &Path, sock: &Path) -> Option<Victim> {
-        if !argv(pid).is_some_and(|a| super::argv_is_stale_gvproxy(&a, binary, sock)) {
+        if !argv_settled(pid).is_some_and(|a| super::argv_is_stale_gvproxy(&a, binary, sock)) {
             return None;
         }
         let raw_pid = libc::pid_t::try_from(pid).ok()?;
@@ -585,6 +671,71 @@ mod tests {
         fn ppid(&self, pid: u32) -> Option<u32> {
             self.0.iter().find(|(p, ..)| *p == pid).map(|(.., pp)| *pp)
         }
+        fn argv_may_settle(&self, pid: u32) -> bool {
+            self.0.iter().any(|(p, ..)| *p == pid)
+        }
+    }
+
+    /// A staged table whose argv reads fail the first `fails` times per pid,
+    /// as `KERN_PROCARGS2` can on a live macOS process.
+    struct FlakyArgv {
+        procs: FakeProcesses,
+        fails: usize,
+        reads: std::cell::RefCell<std::collections::HashMap<u32, usize>>,
+    }
+
+    impl ProcessLookup for FlakyArgv {
+        fn all_pids(&self) -> Vec<u32> {
+            self.procs.all_pids()
+        }
+        fn argv(&self, pid: u32) -> Option<Vec<Vec<u8>>> {
+            let mut reads = self.reads.borrow_mut();
+            let seen = reads.entry(pid).or_default();
+            *seen += 1;
+            if *seen <= self.fails {
+                return None;
+            }
+            self.procs.argv(pid)
+        }
+        fn ppid(&self, pid: u32) -> Option<u32> {
+            self.procs.ppid(pid)
+        }
+        fn argv_may_settle(&self, pid: u32) -> bool {
+            self.procs.argv_may_settle(pid)
+        }
+    }
+
+    #[test]
+    fn scan_rereads_a_live_process_whose_argv_failed_to_read() {
+        let bin = Path::new("/opt/m/gvproxy");
+        let sock = Path::new("/run/vm/gvproxy-switch.sock");
+        let gvproxy = 5_000_003;
+        let staged = || {
+            FakeProcesses(vec![(
+                gvproxy,
+                tokens(&[
+                    "/opt/m/gvproxy",
+                    "-listen",
+                    "unix:///run/vm/gvproxy-switch.sock",
+                ]),
+                1,
+            )])
+        };
+        // Reads that fail fewer times than the re-reads allow still find it.
+        let flaky = FlakyArgv {
+            procs: staged(),
+            fails: ARGV_REREADS,
+            reads: Default::default(),
+        };
+        assert_eq!(find_candidates(&flaky, bin, sock, &[]), vec![gvproxy]);
+        // A process whose argv never reads is given up on, boundedly.
+        let dead = FlakyArgv {
+            procs: staged(),
+            fails: usize::MAX,
+            reads: Default::default(),
+        };
+        assert!(find_candidates(&dead, bin, sock, &[]).is_empty());
+        assert_eq!(dead.reads.borrow()[&gvproxy], ARGV_REREADS + 1);
     }
 
     #[test]
@@ -700,19 +851,12 @@ mod tests {
         reap_stale_gvproxy(&binary, &sock).expect("reap");
 
         // The reap returns once the leftover is gone (a zombie, since this
-        // test is its parent), but on macOS the process scan can transiently
-        // fail to read a live process's argv and skip a leftover that is
-        // there — a silent skip, so the reap still returns Ok. The wait loop
-        // closes that window: as long as the leftover is still alive, the
-        // reap runs again. It is idempotent — a leftover it has killed is a
-        // zombie whose argv no longer matches, and the stand-ins it must
-        // never touch cannot match this VM's tokens at all.
+        // test is its parent).
         let by = Instant::now() + Duration::from_secs(5);
         let status = loop {
             if let Some(status) = ours.try_wait().expect("try_wait ours") {
                 break status;
             }
-            reap_stale_gvproxy(&binary, &sock).expect("reap");
             assert!(Instant::now() < by, "this VM's leftover survived the reap");
             std::thread::sleep(Duration::from_millis(10));
         };

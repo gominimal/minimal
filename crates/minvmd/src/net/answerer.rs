@@ -1773,6 +1773,20 @@ fn serve_channel(
         }
         match listener.accept() {
             Ok((stream, _)) => {
+                // On macOS (and the BSDs) an accepted socket inherits the
+                // listener's O_NONBLOCK, so the hello's bounded read would
+                // answer WouldBlock at once whenever the node's hello had
+                // not arrived yet, and the connection would be dropped
+                // unanswered. The connection's reads are bounded by their
+                // own timeouts, so it is put back in blocking mode first.
+                if let Err(error) = stream.set_nonblocking(false) {
+                    tracing::debug!(
+                        component = COMPONENT,
+                        %error,
+                        "could not put a channel connection into blocking mode"
+                    );
+                    continue;
+                }
                 // The uid gate, before any byte of the peer is read: a
                 // foreign process is refused on what it is, not on what
                 // it says, and the refusal is a warn naming its uid —
@@ -3792,32 +3806,6 @@ mod tests {
         }
     }
 
-    /// Publishes one row, retrying a connect the answerer drops before it
-    /// answers the hello: the channel loop drops a connect it cannot serve,
-    /// and on a loaded host those failures are transient. A connect whose
-    /// hello was never acked never sent its rows — the publish is written
-    /// only after the ack — so retrying cannot double-publish. Other errors
-    /// return to the caller unchanged.
-    fn connect_and_publish_retrying(
-        sock: &Path,
-        node: &str,
-        name: &str,
-        address: Ipv4Addr,
-    ) -> io::Result<Published> {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            match connect_and_publish(sock, node, vec![published_row(name, address)]) {
-                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {}
-                other => return other,
-            }
-            assert!(
-                Instant::now() < deadline,
-                "the answerer dropped every hello within 10 s"
-            );
-            std::thread::sleep(Duration::from_millis(50));
-        }
-    }
-
     /// A registry holding one published box named `name` at the reserved-range
     /// address whose tail is `tail` — [`web_registry`]'s shape, at a name and
     /// address the caller picks, so two daemons in one test hold rows that
@@ -4831,6 +4819,62 @@ mod tests {
         handle
             .join()
             .expect("the gate's thread ends when its stop is set");
+    }
+
+    /// A node whose hello reaches the channel after the connect is accepted
+    /// is still served: the accepted connection blocks on its bounded hello
+    /// read rather than inheriting the poll-mode listener's O_NONBLOCK (the
+    /// macOS default), which would drop the connect unanswered.
+    #[test]
+    fn answerer_channel_serves_a_late_hello() {
+        let dir = tempfile::TempDir::new().expect("a temp dir for the channel socket");
+        let channel = dir.path().join(CHANNEL_SOCK_FILE);
+        let listener = UnixListener::bind(&channel).expect("the channel binds");
+        // SAFETY: geteuid only reads the process's own uid.
+        let expected_uid = unsafe { libc::geteuid() };
+        let stop = Arc::new(AtomicBool::new(false));
+        let gate = Arc::clone(&stop);
+        let handle = std::thread::Builder::new()
+            .name("test-zone-late-hello".to_string())
+            .spawn(move || {
+                serve_channel(
+                    listener,
+                    Arc::new(RegisteredTables::new()),
+                    expected_uid,
+                    None,
+                    SERVICE_HOLDER,
+                    gate,
+                );
+            })
+            .expect("the channel's thread spawns");
+
+        let mut stream = UnixStream::connect(&channel).expect("the channel accepts");
+        // Longer than one accept poll slice, so the answerer has accepted
+        // the connect and started its hello read before the hello is sent.
+        std::thread::sleep(CONNECTION_POLL * 2);
+        stream
+            .set_read_timeout(Some(CHANNEL_REPLY_TIMEOUT))
+            .expect("the read bound arms");
+        write_line(
+            &mut stream,
+            &Hello {
+                node: "vm-late".to_string(),
+                version: CHANNEL_PROTOCOL_VERSION,
+            },
+        )
+        .expect("the hello is written");
+        let reply = read_reply_line(&mut stream)
+            .expect("the hello reply reads")
+            .expect("the answerer answered the late hello");
+        let reply: RegistrationReply =
+            serde_json_lenient::from_str(reply.trim()).expect("the hello reply parses");
+        assert!(reply.ok, "the late hello is acked: {:?}", reply.error);
+
+        drop(stream);
+        stop.store(true, Ordering::SeqCst);
+        handle
+            .join()
+            .expect("the channel's thread ends when its stop is set");
     }
 
     #[test]
@@ -5948,10 +5992,10 @@ mod tests {
         let node_b = node_id_for(&state_b, "default");
         let address = Ipv4Addr::new(127, 0, 64, 21);
 
-        let first = connect_and_publish_retrying(&channel, &node_a, "owned", address)
+        let first = connect_and_publish(&channel, &node_a, vec![published_row("owned", address)])
             .expect("node a publishes");
         assert!(first.refused.is_empty(), "node a's name is held");
-        let second = connect_and_publish_retrying(&channel, &node_b, "owned", address)
+        let second = connect_and_publish(&channel, &node_b, vec![published_row("owned", address)])
             .expect("node b's connection is served");
         let [refused] = &second.refused[..] else {
             panic!(
@@ -5982,17 +6026,17 @@ mod tests {
         );
         let relinked = node_id_for(&link_a, "default");
         assert_eq!(relinked, node_a, "a symlinked state dir is the same node");
-        let again = connect_and_publish_retrying(&channel, &relinked, "owned", address)
+        let again = connect_and_publish(&channel, &relinked, vec![published_row("owned", address)])
             .expect("node a re-publishes after the restart");
         assert!(again.refused.is_empty(), "node a keeps its name");
         // A second connection of the same node is the same owner too.
-        let same = connect_and_publish_retrying(&channel, &node_a, "owned", address)
+        let same = connect_and_publish(&channel, &node_a, vec![published_row("owned", address)])
             .expect("node a's second connection is served");
         assert!(
             same.refused.is_empty(),
             "the same node is never refused its own name"
         );
-        let other = connect_and_publish_retrying(&channel, &node_b, "owned", address)
+        let other = connect_and_publish(&channel, &node_b, vec![published_row("owned", address)])
             .expect("node b's connection is served");
         assert_eq!(other.refused.len(), 1, "node b is still refused the name");
         let reply = await_a_record(
