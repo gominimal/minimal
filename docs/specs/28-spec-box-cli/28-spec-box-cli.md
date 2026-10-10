@@ -12,7 +12,7 @@ updated: 2026-10-07
 
 ## Context
 
-Today's CLI has no `box` noun. A session is driven by `min session activate`, `attach`, `destroy`, `exec`, `rename`, `policy`, `hooks` and `run`, a task by `min task run --keep`, and the daemon by a bare `min stop`; today's listing prints none of type, state, provider or host. The architecture's command tree names one grammar instead: `min box` verbs for any box, the type nouns `session` and `task` as filtered forms of them, `min type`, `min host` and `min provider`, versioned `-o json` schemas, and one exit-code table. This spec specifies those long forms; the daily shortcuts layered on them are left to design work (Non-goals).
+Today's CLI has no `box` noun. A session is driven by `min session activate`, `attach`, `destroy`, `exec`, `rename`, `policy`, `hooks` and `run`, a task by `min task run --keep`, and the daemon by a bare `min stop`; today's listing prints none of type, state, provider or host. The architecture's command tree names one grammar instead: `min box` verbs for any box, the type nouns `session` and `task` as filtered forms of them, `min type`, `min host` and `min provider`, versioned `-o json` schemas, and one exit-code table. This spec specifies those long forms, with `min host` limited to `list|show|stop` and `min provider` to `list`; the daily shortcuts layered on them are left to design work (Non-goals).
 
 The box model, the record, the spec and the operations on them, is `docs/specs/29-spec-box-local-first` (BOX). This spec is the grammar that drives those operations from `min`. It is separate so the model can land first and unblock the networking and egress-proxy specs, and so the grammar is scheduled and reviewed on its own; it lands after BOX. Surfaces: the `min` CLI, its help, completions and synced reference docs.
 
@@ -24,7 +24,7 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
 
 **Roles:** developers and agents who drive boxes from the shell; developers debugging a box; developers with scripts and muscle memory on the current session verbs; developers who operate the local daemons and providers.
 
-- AS A developer or an agent, I WANT `min box start|run|list|show|spec|stop|rm|prune|resume|logs|wait|events|cp|exec|attach` for any box and `min session list|start|attach|stop|rm`, `min task run|list|logs|stop|rm` as aliases, SO THAT one verb means one thing under every noun, and a script written for a session works for a task.
+- AS A developer or an agent, I WANT `min box start|run|list|show|spec|stop|rm|prune|resume|logs|wait|events|cp|exec|attach` for any box and `min session list|start|attach|logs|stop|rm`, `min task run|list|logs|stop|rm` as aliases, SO THAT one verb means one thing under every noun, and a script written for a session works for a task.
 - AS A developer debugging any box, I WANT `min box exec <box> [-t] [--detach] -- <cmd>` to run a command inside a running box under its own namespaces, limits, and posture, with a re-attachable PTY when I ask for one, SO THAT I can get a shell into a task or check a session without another mechanism.
 - AS A developer with scripts and muscle memory, I WANT `min session activate`, `min session destroy`, `min session exec`, and bare `min stop` to keep working for one release with a hint naming the new verb, SO THAT the rename is a migration I can schedule, not a break I discover.
 - AS A developer, I WANT `min provider list --all` to show `local0` and `local-minvmd0`, and `min host list|show|stop` to work on them, SO THAT the daemon I stop, the VM I look at, and the provider a remote box will come from are one vocabulary.
@@ -97,10 +97,10 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
   tier:     T0
   verify:   cargo nextest run -p minimal task_run_provided_hidden_run_removed
 
-- **BCLI-012** WHEN `min task logs <box> -f` or `min box logs <box> -f` runs THE SYSTEM SHALL follow the box's output as BOX-155 captures it.
+- **BCLI-012** WHEN `min session logs <box> -f`, `min task logs <box> -f` or `min box logs <box> -f` runs THE SYSTEM SHALL follow the box's output as BOX-155 captures it.
   <!-- was BOX-035 -->
   tier:     T0
-  verify:   cargo nextest run -p minimal task_logs_follow
+  verify:   cargo nextest run -p minimal type_noun_logs_follow
 
 - **BCLI-013** WHEN `min box wait <box>` runs THE SYSTEM SHALL return the `exit_code` BOX-011 stores for the box, reading the stored `exited` event when the box has already ended, and for a `stopped` record with no `exit_code` return 128 plus the `signal` BOX-011 and BOX-013 store for it.
   <!-- was BOX-036 -->
@@ -144,8 +144,8 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
     tier:   T0
     verify: cargo nextest run -p minimal init_refused_type_exit3_appends_nothing
 
-- **BCLI-019** WHEN `min type list` runs THE SYSTEM SHALL show every resolved type, the six built-in types and each type the project defines, with its source, `builtin` or `project`, naming each type as BOX-161 names the type that supplies a value.
-  <!-- was BOX-057 -->
+- **BCLI-019** WHEN `min type list` runs THE SYSTEM SHALL show every resolved type, the six built-in types and each type the project defines, with its source, `builtin`, `project` or `org`, naming each type as BOX-161 names the type that supplies a value.
+  <!-- was BOX-057; `org` is reserved now, in the text and the `-o json` source enum, so organization types (gominimal/inbox#579, a BOX non-goal) need no schema change; no type carries it until then -->
   tier:     T0
   verify:   cargo nextest run -p minimal type_list_shows_builtin_and_project_types_with_source
 
@@ -242,7 +242,7 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
     tier:   T0
     verify: cargo nextest run -p minimal box_start_without_entry_ambiguous_exit2_lists_entries
 
-- **BCLI-030** THE SYSTEM SHALL provide `min session list|start|attach|stop|rm` and `min task run|list|logs|stop|rm` as aliases of the `min box` forms, filtered to boxes of that type, `min session attach` included (BCLI-032).
+- **BCLI-030** THE SYSTEM SHALL provide `min session list|start|attach|logs|stop|rm` and `min task run|list|logs|stop|rm` as aliases of the `min box` forms, filtered to boxes of that type, `min session attach` included (BCLI-032).
   <!-- was BOX-148 -->
   tier:     T0
   verify:   cargo nextest run -p minimal type_noun_verbs_alias_box_forms
@@ -280,8 +280,8 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
 - **BCLI-064** IF a box address given to any `min box`, `min session` or `min task` verb resolves to no box under BOX-005 THEN THE SYSTEM SHALL fail with exit 4, naming the address, before any other check runs.
   tier:     T0
   verify:   cargo nextest run -p minimal unknown_box_address_exit4_names_address
-- **BCLI-034** THE SYSTEM SHALL use exit code 2 for usage errors, 3 for invalid configuration, 4 for not found, 5 for policy refusals, 7 for an unreachable host, 8 for insufficient resources, and 125 to 127 for runtime failures.
-  <!-- was BOX-097 -->
+- **BCLI-034** THE SYSTEM SHALL end each command with the exit code the architecture's exit-code table assigns to its outcome, for every row the table does not mark [proposed].
+  <!-- was BOX-097; ubiquitous; bound to the table as a whole so the spec restates no partial list; the [proposed] rows, exit 8 and exit 5's provider-quota case, belong to the resources spec (gominimal/inbox#698; BRES) -->
   tier:     T0
   verify:   cargo nextest run -p minimal exit_code_table
 
@@ -428,7 +428,8 @@ The box model, the record, the spec and the operations on them, is `docs/specs/2
 - Volume verbs (`min volume list|show|rm|prune`): `docs/specs/27-spec-box-volumes` (BVOL), which carries them as BVOL-006, BVOL-007 and BVOL-012. BRES and BVOL keep their own verbs because they are small and move with the behaviour they render.
 - The dash (epic story S14): an amendment to `docs/specs/07-spec-min-dash-tui`.
 - The local providers serving the Box Provider API (epic story S16): they wait on gominimal/arch#45, and `min host` and `min provider` read the daemon directly until then.
-- `min box sync` and `min box port`: the architecture's `min box` reference; not scheduled by this epic.
+- `min box sync`, `min box port`, `min box add` and `min box restart`: the architecture's `min box` reference; not scheduled by this epic. `min box restart` sits beside `min service restart` (gominimal/inbox#678).
+- `min host create|snapshot|pause|resume|rm` and `min provider show|add|rm|login|use`: they wait on the Box Provider API (gominimal/arch#45), as the local providers do.
 - The `min agent` and `min service` nouns, including `min service restart`: the Agent Box epic gominimal/inbox#678.
 - `min box audit`: the egress-proxy spec, `docs/specs/24-spec-box-egress-proxy` (BEP).
 - Daily shortcuts (`min shell`, `min run`, `min attach`, `min ls` and any like them): user-experience design layered on this grammar, specified from design work and user journeys, not here. Today's `min ls` is left as it is.
