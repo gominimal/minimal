@@ -78,9 +78,11 @@ pub struct Layer {
     read_ids: HashMap<u64, generational_arena::Index>,
 }
 
-/// Drops the userinfo (`user:token@`) from a `scheme://` repository URL, so
-/// an error that names the repository does not repeat its credentials.
-fn without_userinfo(url: &str) -> String {
+/// Drops the userinfo (`user:token@`), query string and fragment from a
+/// repository URL, so an error that names the repository does not repeat
+/// credentials carried in any of them.
+fn without_credentials(url: &str) -> String {
+    let url = &url[..url.find(['?', '#']).unwrap_or(url.len())];
     if let Some((scheme, rest)) = url.split_once("://") {
         let authority = &rest[..rest.find('/').unwrap_or(rest.len())];
         if let Some(at) = authority.rfind('@') {
@@ -169,7 +171,7 @@ impl Layer {
                 // hunt through candidate local paths.
                 let mut msg = e.to_string();
                 if let SpecOrigin::Repo(Repo::Git { url, rev, .. }) = &opts.from {
-                    let url = without_userinfo(url);
+                    let url = without_credentials(url);
                     msg.push_str(&format!(
                         " (the layer's `minimal.toml` comes from {url} at rev \
                          {rev}: update or re-pin this layer)"
@@ -1093,6 +1095,29 @@ mod tests {
         );
         assert!(!msg.contains("s3cret"), "{msg}");
         assert!(!msg.contains("robot:"), "{msg}");
+    }
+
+    /// Userinfo, query string and fragment are all dropped, wherever the
+    /// authority ends; a URL carrying none of them passes through unchanged.
+    #[test]
+    fn without_credentials_drops_userinfo_query_and_fragment() {
+        for (url, want) in [
+            (
+                "https://u:tok@host/org/repo.git",
+                "https://host/org/repo.git",
+            ),
+            (
+                "https://host/org/repo.git?token=tok",
+                "https://host/org/repo.git",
+            ),
+            ("https://host/org/repo.git#tok", "https://host/org/repo.git"),
+            ("https://host?x=a@b", "https://host"),
+            ("https://u:tok@host?x=a@b#c", "https://host"),
+            ("https://host/org/repo.git", "https://host/org/repo.git"),
+            ("git@host:org/repo.git", "git@host:org/repo.git"),
+        ] {
+            assert_eq!(without_credentials(url), want, "{url}");
+        }
     }
 
     /// The same refusal for a layer loaded from a local directory stays

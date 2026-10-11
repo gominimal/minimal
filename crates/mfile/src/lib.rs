@@ -2572,13 +2572,14 @@ mod tests {
         std::fs::write(dir.path().join(MFILE_NAME), "[harness]\nuse = \"rust\"\n").unwrap();
 
         let err = File::from_dir(dir.path()).unwrap_err();
-        assert!(matches!(err, Error::HarnessTable(Some(_))), "{err:?}");
-        let msg = err.to_string();
-        assert!(msg.contains("Rename it to `[stack]`"), "{msg}");
+        let path = dir.path().join(MFILE_NAME);
         assert!(
-            msg.contains(&dir.path().join(MFILE_NAME).display().to_string()),
-            "{msg}"
+            matches!(&err, Error::HarnessTable(Some(p)) if *p == path),
+            "{err:?}"
         );
+        let msg = err.to_string();
+        assert!(msg.contains("Replace it with a `[stack]` table"), "{msg}");
+        assert!(msg.starts_with(&path.display().to_string()), "{msg}");
     }
 
     /// The pre-v0.5.0 `harness` key can also arrive as a bare string, not a
@@ -2589,13 +2590,15 @@ mod tests {
         std::fs::write(dir.path().join(MFILE_NAME), "harness = \"rust\"\n").unwrap();
 
         let err = File::from_dir(dir.path()).unwrap_err();
-        assert!(matches!(err, Error::HarnessTable(Some(_))), "{err:?}");
+        let path = dir.path().join(MFILE_NAME);
+        assert!(
+            matches!(&err, Error::HarnessTable(Some(p)) if *p == path),
+            "{err:?}"
+        );
         let msg = err.to_string();
         assert!(msg.contains("the `harness` key"), "{msg}");
-        assert!(
-            msg.contains(&dir.path().join(MFILE_NAME).display().to_string()),
-            "{msg}"
-        );
+        assert!(msg.contains("`name = \"x\"` under `[stack]`"), "{msg}");
+        assert!(msg.starts_with(&path.display().to_string()), "{msg}");
     }
 
     /// A file parsed without a path (the wire/fuzz entry point) is still

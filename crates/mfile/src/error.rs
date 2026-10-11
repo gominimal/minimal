@@ -44,19 +44,19 @@ impl fmt::Display for Error {
                 task,
                 keys.join(", ")
             ),
-            Error::HarnessTable(None) => write!(
-                f,
-                "the `harness` key (the pre-v0.5.0 name of `stack`) is no \
-                 longer accepted: it sets no stack, so its toolchain would \
-                 be missing. Rename it to `[stack]`.",
-            ),
-            Error::HarnessTable(Some(path)) => write!(
-                f,
-                "{}: the `harness` key (the pre-v0.5.0 name of `stack`) is \
-                 no longer accepted: it sets no stack, so its toolchain \
-                 would be missing. Rename it to `[stack]`.",
-                path.display(),
-            ),
+            Error::HarnessTable(path) => {
+                if let Some(path) = path {
+                    write!(f, "{}: ", path.display())?;
+                }
+                write!(
+                    f,
+                    "the `harness` key (the pre-v0.5.0 name of `stack`) is \
+                     no longer accepted: it sets no stack, so its toolchain \
+                     would be missing. Replace it with a `[stack]` table: \
+                     rename a `[harness]` table, and write `harness = \"x\"` \
+                     as `name = \"x\"` under `[stack]`.",
+                )
+            }
         }
     }
 }
