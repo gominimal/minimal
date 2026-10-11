@@ -490,7 +490,7 @@ fn policy_lines(model: &Model, key: &SessionKey) -> Vec<Line<'static>> {
         // A none box has no network, so it can carry no egress or ingress
         // declaration at all — nothing here would describe anything real.
         lines.push(Line::styled(
-            "No network policy (NoNet)",
+            "This box has no network (--network none)",
             Style::default().fg(Color::Gray),
         ));
         // A lane the box declared is still shown, marked as not in effect,

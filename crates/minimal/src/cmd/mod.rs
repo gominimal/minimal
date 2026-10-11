@@ -594,10 +594,10 @@ pub(crate) async fn send_abort(client: &mut client::Client, session_id: sessions
     {
         Ok(minimald_rpc::Errorable::Ok(_)) => {}
         Ok(minimald_rpc::Errorable::Err { error }) => {
-            eprintln!("AbortSession failed: {error}");
+            eprintln!("warning: could not cancel the unfinished session {session_id}: {error}");
         }
         Err(e) => {
-            eprintln!("AbortSession RPC failed: {e}");
+            eprintln!("warning: could not cancel the unfinished session {session_id}: {e}");
         }
     }
 }
@@ -628,10 +628,16 @@ pub(crate) async fn best_effort_destroy(
     match tokio::time::timeout(DESTROY_TIMEOUT, call).await {
         Ok(Ok(minimald_rpc::Errorable::Ok(_))) => {}
         Ok(Ok(minimald_rpc::Errorable::Err { error })) => {
-            eprintln!("DestroySession failed while cleaning up: {error}");
+            eprintln!(
+                "warning: could not remove the unfinished session {session_id}: {error}; \
+                 run `min session destroy {session_id}` to remove it"
+            );
         }
         Ok(Err(e)) => {
-            eprintln!("DestroySession RPC failed while cleaning up: {e}");
+            eprintln!(
+                "warning: could not remove the unfinished session {session_id}: {e}; \
+                 run `min session destroy {session_id}` to remove it"
+            );
         }
         Err(_) => {
             eprintln!(
@@ -647,9 +653,9 @@ pub(crate) async fn best_effort_destroy(
 /// because another box at the same shared loopback address holds it.
 fn shared_port_collision_warning(collision: &minimald_rpc::SharedPortCollision) -> String {
     format!(
-        "warning: port {} is already held by {}; this session will not \
-         forward it (first-come on the shared address); recreate one of them \
-         with a different external port, e.g. --ingress <other>:<internal>",
+        "warning: port {} is already used by {}, so this box does not \
+         get it. To use the port, create one of the two boxes again \
+         with a different external port, e.g. --ingress <other>:<internal>.",
         collision.port, collision.held_by
     )
 }
@@ -719,9 +725,10 @@ pub(crate) async fn upload_and_finalize(
             }
             if ok.package_check_skipped {
                 eprintln!(
-                    "warning: the session package check was skipped (the package graph \
-                     did not resolve in time or could not be evaluated; see the daemon \
-                     log); unknown package names will surface at first exec"
+                    "warning: this project's package names were not checked (the \
+                     check timed out or could not run). The box was created; an \
+                     unknown package name shows up as an error the first time a \
+                     command runs in it."
                 );
             }
             // First-come on a shared loopback address: another box at the
@@ -860,10 +867,10 @@ mod tests {
         });
         assert_eq!(
             line,
-            "warning: port 18080 is already held by first.min.internal; this session \
-             will not forward it (first-come on the shared address); recreate one \
-             of them with a different external port, e.g. --ingress \
-             <other>:<internal>"
+            "warning: port 18080 is already used by first.min.internal, so this \
+             box does not get it. To use the port, create one of the two boxes \
+             again with a different external port, e.g. --ingress \
+             <other>:<internal>."
         );
     }
 }

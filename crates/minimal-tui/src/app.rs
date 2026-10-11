@@ -554,15 +554,16 @@ fn created_status(package_check_skipped: bool, egress_deny_all_default: bool) ->
     let mut status = "session created".to_string();
     if package_check_skipped {
         status.push_str(
-            "; warning: the package check was skipped, so unknown package names will \
-             surface at first exec",
+            "; warning: package names were not checked, so an unknown package name \
+             shows up as an error the first time a command runs in the box",
         );
     }
     if egress_deny_all_default {
         status.push_str(
-            "; egress: deny-all (default for an own-ip box with no egress section); \
-             declare reach with `min session activate --allow-subnets`, \
-             --allow-dns-hosts or --allow-protocols",
+            "; this box can reach no external address (deny-all default for \
+             --network own_ip with no egress rules); to allow outbound traffic, \
+             create it with `min session activate --allow-subnets` or \
+             --allow-dns-hosts",
         );
     }
     status
@@ -1404,7 +1405,7 @@ mod tests {
         );
         let status = model.status.clone().unwrap_or_default();
         assert!(
-            status.contains("egress: deny-all (default for an own-ip box with no egress section)"),
+            status.contains("this box can reach no external address (deny-all default for --network own_ip with no egress rules)"),
             "{status}"
         );
         update(
