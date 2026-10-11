@@ -1404,11 +1404,12 @@ impl std::fmt::Display for HandOutCounts {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{} of {} box addresses are in use and {} were released but cannot be reused yet (an \
+            "{} of {} box addresses are in use and {} {} released but cannot be reused yet (an \
              address rests {} s after its release)",
             self.live,
             self.capacity,
             self.quarantined,
+            if self.quarantined == 1 { "was" } else { "were" },
             SWITCH_REUSE_QUARANTINE.as_secs()
         )?;
         if let Some(wait) = self.next_free_in {
@@ -8161,7 +8162,7 @@ mod tests {
         let said = error.to_string();
         assert!(
             said.contains(
-                "124 of 125 box addresses are in use and 1 were released but cannot be reused yet \
+                "124 of 125 box addresses are in use and 1 was released but cannot be reused yet \
                  (an address rests 300 s after its release); the next one frees in 200 s"
             ),
             "the refusal names the counts, got: {said}"

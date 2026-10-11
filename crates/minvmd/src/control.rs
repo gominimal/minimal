@@ -1560,7 +1560,9 @@ fn allocate_box_address(
             %reason,
             "box registration refused: the zone answerer handed out no address"
         );
-        BoxControlReply::Error { error: reason }
+        BoxControlReply::Error {
+            error: format!("could not give the box an address: {reason}"),
+        }
     })
 }
 
@@ -1913,7 +1915,7 @@ fn spawn_ask_thread(
                 &mut stream,
                 &BoxControlReply::Error {
                     error: format!(
-                        "the VM host daemon could not start a thread for the port prompt request: {error}"
+                        "the VM host daemon could not start handling the port prompt: {error}"
                     ),
                 },
             )
@@ -2144,12 +2146,19 @@ fn refuse_past_cap(
             "refused a connection past the VM host daemon's cap"
         );
     }
+    // The kind in the words a person reads; the log lines keep the daemon's.
+    let connections = match kind {
+        "guest ask" => "port prompt connections",
+        "ask subscription" => "connections waiting for port prompts",
+        "registration lease" => "box registration connections",
+        _ => "control connections",
+    };
     write_reply(
         stream,
         &BoxControlReply::Error {
             error: format!(
-                "the VM host daemon is at its limit of {cap} connections of this kind; try again \
-                 once one ends"
+                "the VM host daemon is at its limit of {cap} {connections}; try again once one \
+                 ends"
             ),
         },
     )
@@ -5575,7 +5584,7 @@ mod tests {
         let mut past = guest_ask(&host, &web, ASK_PORT + 2);
         let refused_ask = past.next();
         assert!(
-            matches!(&refused_ask, BoxControlReply::Error { error } if error.contains("limit of 2 connections")),
+            matches!(&refused_ask, BoxControlReply::Error { error } if error.contains("limit of 2 port prompt connections")),
             "the third guest ask is refused at the cap: {refused_ask:?}"
         );
         assert_eq!(
@@ -5590,7 +5599,7 @@ mod tests {
         );
         let refused_sub = second.next();
         assert!(
-            matches!(&refused_sub, BoxControlReply::Error { error } if error.contains("limit of 1 connections")),
+            matches!(&refused_sub, BoxControlReply::Error { error } if error.contains("limit of 1 connections waiting for port prompts")),
             "the second subscription is refused at the cap: {refused_sub:?}"
         );
         held.clear();
@@ -5686,7 +5695,7 @@ mod tests {
         let refused =
             control_past_cap(&BoxControlRequest::AnswererStatus).expect("the refusal is answered");
         assert!(
-            matches!(&refused, BoxControlReply::Error { error } if error.contains("limit of 1 connections")),
+            matches!(&refused, BoxControlReply::Error { error } if error.contains("limit of 1 control connections")),
             "a connection past the cap is refused: {refused:?}"
         );
 
@@ -6371,7 +6380,7 @@ mod tests {
         let (_second, refused) = register_holding(&host.sock_path, "db");
         match &refused {
             BoxControlReply::Error { error } => assert!(
-                error.contains("limit of 1 connections"),
+                error.contains("limit of 1 box registration connections"),
                 "the refusal names the cap, got {error}"
             ),
             other => panic!("a lease past the cap is refused, got {other:?}"),
