@@ -677,7 +677,7 @@ impl fmt::Display for ExposeRefusal {
             ),
             Self::NoPublishedAddress => write!(
                 f,
-                "this box was given no address on the host machine to open a port at"
+                "this box was given no address on the host to open a port at"
             ),
             Self::NotAttached => write!(
                 f,
@@ -1791,7 +1791,7 @@ mod tests {
         let unpublished = ExposeRefusal::NoPublishedAddress.to_string();
         let unattached = ExposeRefusal::NotAttached.to_string();
         assert!(
-            unpublished.contains("no address on the host machine"),
+            unpublished.contains("no address on the host to open a port at"),
             "{unpublished}"
         );
         assert!(

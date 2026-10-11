@@ -6811,7 +6811,7 @@ async fn vm_ask_host_refusals_are_publish_failures() {
         (minimald_rpc::AskRefused::StanceNotAsk, "set to ask"),
         (
             minimald_rpc::AskRefused::NoRow,
-            "not registered on the host machine",
+            "not registered with the VM host daemon",
         ),
     ] {
         let result = vm_ask_ended_by_host(host_refused(reason, None)).await;

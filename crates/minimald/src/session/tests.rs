@@ -4018,12 +4018,16 @@ async fn a_box_holding_a_host_row_refuses_remint_after_its_host_loop_ends() {
         "the refusal must be surfaced as an attach error; got: {refusal:?}"
     );
     assert!(
-        refusal.contains("this session's network addresses on this machine were released"),
+        refusal.contains("the VM host daemon released this session's network addresses"),
         "the refusal must name the host-row cause; got: {refusal:?}"
     );
     assert!(
         refusal.contains("min session activate"),
         "the refusal must name the step that registers a box again; got: {refusal:?}"
+    );
+    assert!(
+        refusal.contains("min session destroy <session>"),
+        "the refusal must name the session argument the destroy step takes; got: {refusal:?}"
     );
     assert!(
         refusal.contains("run the same command again"),
@@ -4043,7 +4047,7 @@ async fn assert_attach_refused_rowless(client: &mut TestClient, id: SessionId) {
     let refusal = collect_to_close(&mut channel).await;
     assert!(
         refusal.contains("Error attaching to session:")
-            && refusal.contains("this session's network addresses on this machine were released"),
+            && refusal.contains("the VM host daemon released this session's network addresses"),
         "the attach must be refused for the ended host-side row; got: {refusal:?}"
     );
 }
@@ -7945,6 +7949,12 @@ async fn refused_admission_report_leaves_no_partial_mapping() {
                 source.to_string().contains(refusal),
                 "the refused publish carries the grant's own reason: {source}"
             );
+            assert!(
+                source
+                    .to_string()
+                    .contains("the VM host daemon refused to open the port"),
+                "the refused publish says who refused it: {source}"
+            );
         }
         other => panic!("a report the grant refused must fail the publish: {other:?}"),
     }
@@ -9015,9 +9025,7 @@ async fn expose_without_published_address_is_not_a_policy_deny() {
         line.contains("port=3000")
             && line.contains("decision=allow")
             && line.contains("outcome=\"refused\"")
-            && line.contains(
-                "reason=this box was given no address on the host machine to open a port at"
-            ),
+            && line.contains("reason=this box was given no address on the host to open a port at"),
         "the line says the decision was allow and the refusal was the missing \
          publish: {line}"
     );

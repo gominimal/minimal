@@ -157,8 +157,8 @@ impl fmt::Display for AttachError {
             AttachError::LoadoutFailed(e) => write!(f, "configuring session loadout: {e}"),
             AttachError::LaunchRecordUnwritable(e) => write!(
                 f,
-                "starting the session failed: its egress enforcement state \
-                 could not be saved: {e}"
+                "starting the session failed: the session's saved state could \
+                 not be updated: {e}"
             ),
             AttachError::SessionPending => write!(
                 f,
@@ -175,7 +175,7 @@ impl fmt::Display for AttachError {
             }
             AttachError::BoxHostRowEnded => write!(
                 f,
-                "this session's network addresses on this machine were released; run \
+                "the VM host daemon released this session's network addresses; run \
                  the same command again to restore them. If it is refused again, \
                  destroy the session with `min session destroy <session>` and start \
                  it again with `min session activate`"
@@ -795,9 +795,9 @@ const HOST_NO_TTY_REASON: &str = "the attached client could not show the prompt;
 fn host_ask_cancel_text(cause: minimald_rpc::AskCancelCause) -> String {
     match cause {
         minimald_rpc::AskCancelCause::LastDetach => {
-            format!("the request was cancelled: {cause}; nobody is attached any more")
+            format!("the port prompt was cancelled: {cause}; nobody is attached any more")
         }
-        _ => format!("the request was cancelled: {cause}"),
+        _ => format!("the port prompt was cancelled: {cause}"),
     }
 }
 
@@ -805,21 +805,21 @@ fn host_ask_cancel_text(cause: minimald_rpc::AskCancelCause) -> String {
 fn host_ask_refusal_text(reason: minimald_rpc::AskRefused) -> &'static str {
     match reason {
         minimald_rpc::AskRefused::QueueFull => {
-            "too many requests from this session are already waiting for an answer"
+            "too many port prompts from this box are already waiting for an answer"
         }
         minimald_rpc::AskRefused::NoRow => {
-            "this session's network addresses are not registered on the host machine"
+            "this box's network addresses are not registered with the VM host daemon"
         }
         minimald_rpc::AskRefused::StanceNotAsk => {
-            "the host machine does not have this session's --dynamic-ingress set to ask"
+            "the VM host daemon does not have this box's --dynamic-ingress set to ask"
         }
         minimald_rpc::AskRefused::OutsideGrant => {
-            "the port is outside the --dynamic-range the host machine holds for this session"
+            "the port is outside the --dynamic-range the VM host daemon holds for this box"
         }
-        minimald_rpc::AskRefused::NoClient => "nobody is attached on the host machine to answer",
+        minimald_rpc::AskRefused::NoClient => "nobody is attached on the host to answer",
         minimald_rpc::AskRefused::Denied => "the person attached answered no",
         minimald_rpc::AskRefused::NoTty => "the attached terminal could not show the prompt",
-        minimald_rpc::AskRefused::Cancelled => "the request was cancelled before an answer",
+        minimald_rpc::AskRefused::Cancelled => "the port prompt was cancelled before an answer",
     }
 }
 
@@ -3217,7 +3217,7 @@ impl Session {
             AskEnd::HostRefused(reason) => Err(crate::net::policy::ExposeFailure::Publish {
                 port: ask.port,
                 source: std::io::Error::other(format!(
-                    "the host machine refused the request: {}",
+                    "the VM host daemon refused the port prompt: {}",
                     host_ask_refusal_text(*reason)
                 )),
             }),
