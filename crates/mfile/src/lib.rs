@@ -862,8 +862,7 @@ pub struct File {
     /// The stack configured on this repository, if any.
     ///
     /// `[harness]`, the pre-v0.5.0 name of this table, no longer parses: it
-    /// warns as an unknown field and sets no stack, so an old config has to
-    /// rename the table.
+    /// errors at load, so an old config has to rename the table.
     #[serde(default)]
     pub stack: Option<Stack>,
 
@@ -917,9 +916,6 @@ pub struct File {
 fn misplaced_top_level_key(key: &str) -> Option<&'static str> {
     match key {
         "lifecycle_hooks" => Some("[[session.lifecycle_hooks]]"),
-        // The pre-v0.5.0 name of `[stack]`, which stopped parsing: point a
-        // straggler config at the rename, not at the upgrade hint.
-        "harness" => Some("[stack]"),
         _ => None,
     }
 }
@@ -1003,6 +999,14 @@ impl File {
                     return Err(Error::MissingParamDefault(n.clone()));
                 }
             }
+        }
+        // `[harness]` stopped parsing in v0.5.0 and now lands in `extra`,
+        // setting no stack: the toolchain its name promised is silently
+        // absent, and the gap only surfaces much later, as a bare
+        // `linker 'cc' not found` from a build inside the session. Refuse
+        // the load here, at the config, where the fix is still visible.
+        if self.extra.contains_key("harness") {
+            return Err(Error::HarnessTable);
         }
         // serde takes one action key as `task.action` and leaves any other in
         // `task.extra`. Refuse the task here, before `warn_unknown_fields`
@@ -2556,31 +2560,16 @@ mod tests {
     }
 
     /// `[harness]` is the pre-v0.5.0 name of `[stack]` and no longer parses:
-    /// the stack it names is ignored, and the load points at `[stack]`
-    /// instead of the generic upgrade hint.
+    /// a file that still uses it is refused at load — before any build runs
+    /// and misses its toolchain — and pointed at the rename.
     #[test]
     fn harness_table_no_longer_parses() {
         let dir = tempdir().unwrap();
         std::fs::write(dir.path().join(MFILE_NAME), "[harness]\nuse = \"rust\"\n").unwrap();
 
-        let capture = CaptureWriter::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(capture.clone())
-            .with_ansi(false)
-            .finish();
-        let guard = tracing::subscriber::set_default(subscriber);
-        let file = File::from_dir(dir.path()).unwrap();
-        drop(guard);
-
-        assert!(file.stack.is_none());
-        let out = capture.contents();
-        assert!(
-            out.contains(
-                "harness is unknown at the top level of minimal.toml; did you mean [stack]?"
-            ),
-            "{out}"
-        );
-        assert!(!out.contains("update to a newer version"), "{out}");
+        let err = File::from_dir(dir.path()).unwrap_err();
+        assert_eq!(err.to_string(), Error::HarnessTable.to_string());
+        assert!(err.to_string().contains("Rename the table to `[stack]`"));
     }
 
     /// A task with two action keys is refused with an error naming the task
