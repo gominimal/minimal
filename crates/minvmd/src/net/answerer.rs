@@ -2555,7 +2555,7 @@ const NO_ANSWERER: &str = "the running VM cannot reach Minimal's DNS service for
                            this box cannot be given an address";
 
 /// The answer to a release or a cancel: whether it changed anything, and
-/// the sentence the daemon logged for it.
+/// a sentence saying what the daemon did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReleaseReply {
     /// Whether the request changed anything.
@@ -3217,7 +3217,7 @@ fn acquire(
             Err(error) => {
                 let why = format!(
                     "could not listen on 127.0.0.1:{port}, which box names are answered on: \
-                     {error}"
+                     {error}; free the port, then try again"
                 );
                 surface_error(status, port, &mut erroring, &why);
                 wait_refusing(&pings, &commands, PORT_RECHECK, &why);
@@ -3399,7 +3399,7 @@ fn host_interim(
         tracing::info!(component = COMPONENT, port, "{detail}");
         let _ = release.send(ReleaseReply::acted(format!(
             "the running VM stopped answering box names on 127.0.0.1:{port} so Minimal's DNS \
-             service can take over; it resumes after {} s if the service has not started",
+             service can take over; it resumes after {} s if the handover has not finished",
             paths.release_window.as_secs()
         )));
         // ── the window: the service's channel, a cancel, or the bound.
