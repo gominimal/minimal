@@ -640,8 +640,9 @@ pub struct ActivateArgs {
     /// Network mode for the session: `none` gives the session no network
     /// (every socket it opens to a destination outside itself fails),
     /// `host_ip` shares the host's network namespace (the default), and
-    /// `own_ip` gives the session an IP of its own on the host's switch, so
-    /// `--ingress` can publish ports.
+    /// `own_ip` gives the session its own IP address, so `--ingress` can
+    /// publish ports; unless the daemon opts out, an `own_ip` session with
+    /// no egress rules can reach no external address.
     ///
     /// The hyphenated spellings `no-net`, `host-net`, and `own-ip` are still
     /// accepted, but each prints a one-line hint naming the current spelling.
@@ -656,23 +657,20 @@ pub struct ActivateArgs {
     /// tcp). Repeatable. Requires `--network own_ip`.
     #[arg(long = "ingress", value_name = "EXT:INT[/PROTO]")]
     pub ingress: Vec<String>,
-    /// How dynamic ingress requests from inside this box are decided
-    /// (NET-043): `allow` publishes a port the box asks to expose (or
-    /// listens on inside `--dynamic-range`), `ask` routes the request to
-    /// the attached human, `deny` — like an unset flag — refuses every
-    /// one. Requires `--network own_ip`; the flags are the interim source
-    /// of the Box Spec `[network]` block's `dynamic_ingress` setting.
+    /// How the box's requests to publish a port while it runs are decided:
+    /// `allow` publishes a port the box asks for with `min net expose` or
+    /// listens on inside `--dynamic-range`, `ask` puts each request to the
+    /// person attached to the box, and `deny`, the same as leaving the flag
+    /// unset, refuses every request. Requires `--network own_ip`.
     #[arg(
         long = "dynamic-ingress",
         value_name = "allow|ask|deny",
         value_parser = parse_dynamic_ingress_mode
     )]
     pub dynamic_ingress: Option<sessions::DynamicIngress>,
-    /// Inclusive port range `lo-hi` (both ends included) within which
-    /// `--dynamic-ingress allow` accepts dynamic ingress requests; outside
-    /// it a request is refused with the out-of-range error. Only meaningful
-    /// beside `--dynamic-ingress`, so the range-without-mode spelling is
-    /// rejected rather than read as a deliberate allow.
+    /// Port range `LO-HI`, both ends included, in which
+    /// `--dynamic-ingress allow` accepts requests, e.g. `8000-8443`; a
+    /// request outside it is refused. Requires `--dynamic-ingress`.
     #[arg(
         long = "dynamic-range",
         value_name = "LO-HI",
@@ -680,15 +678,14 @@ pub struct ActivateArgs {
         requires = "dynamic_ingress"
     )]
     pub dynamic_range: Option<(u16, u16)>,
-    /// Allowed destination subnets in CIDR form (`egress.allow_subnets`),
-    /// e.g. `10.0.0.0/8`. Repeatable; unset means allow-all subnets. Valid on
-    /// an own-address (`--network own_ip`) or host-address
-    /// (`--network host_ip`) box; a none box rejects the whole egress
-    /// declaration.
+    /// Allow outbound traffic to this destination subnet, in CIDR form,
+    /// e.g. `10.0.0.0/8`. Repeatable. Works with `--network own_ip` and
+    /// `--network host_ip`; `--network none` rejects every egress flag.
+    /// `min session policy` shows the rules a box ended up with.
     #[arg(long = "allow-subnets", value_name = "CIDR")]
     pub allow_subnets: Vec<String>,
-    /// Allowed destination DNS hostnames (`egress.allow_dns_hosts`), e.g.
-    /// `github.com`. Repeatable; unset means allow-all hosts.
+    /// Allow outbound traffic to this DNS hostname, e.g. `github.com`.
+    /// Repeatable.
     #[arg(long = "allow-dns-hosts", value_name = "HOST")]
     pub allow_dns_hosts: Vec<String>,
     /// Allowed outbound transport protocols (`egress.allow_protocols`):
@@ -700,25 +697,16 @@ pub struct ActivateArgs {
     /// denied.
     #[arg(long = "deny-subnets", value_name = "CIDR")]
     pub deny_subnets: Vec<String>,
-    /// Declare deny-all egress: the box reaches no external address. The
-    /// section this writes is the deny-all shape — every allow list present
-    /// and empty, nothing denied on top (`sessions::EgressPolicy::deny_all()`)
-    /// — a declaration, not the default: on a host-address box the host's
-    /// classifier decides it per box (NET-079), while a box that declares no
-    /// egress at all gets the default NET-074 sets: deny-all for an own-ip
-    /// box, unless the host opts out. Valid wherever the egress rule flags
-    /// are; conflicts with every one of them, because deny-all admits no
-    /// exceptions.
+    /// Declare deny-all egress: the box reaches no external address.
+    /// Cannot be combined with the `--allow-*` or `--deny-subnets` flags.
+    /// Unless the daemon opts out, a `--network own_ip` box with no egress
+    /// rules already gets this by default.
     #[arg(long = "deny-all-egress", conflicts_with = "egress-rules")]
     pub deny_all_egress: bool,
-    /// Declare a credentialed upstream for this box (NET-134): the Box
-    /// Egress Proxy's listener becomes the box's infrastructure, reachable
-    /// whatever its `--allow-*`/`--deny-*` rules say. Without the flag every
-    /// frame this box sends to the proxy's address is dropped — by the VM
-    /// host's egress gate on a VM-backed host, by the relay's own
-    /// `egress-uncredentialed-proxy-destination` drop on a native one. The
-    /// steering the proxy applies and the credentials it redeems are the
-    /// proxy document's; this declares the lane, nothing more.
+    /// Let the box reach the Box Egress Proxy, whatever its
+    /// `--allow-*`/`--deny-*` rules say. Without this flag, everything the
+    /// box sends to the proxy's address is dropped. Takes effect only with
+    /// `--network own_ip`.
     #[arg(long)]
     pub credentialed_upstream: bool,
     /// Apply the named loadout from `<config>/minimal/loadouts/<NAME>.toml`.
