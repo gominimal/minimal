@@ -991,8 +991,9 @@ impl File {
     /// # Errors
     ///
     /// Returns [`Error::MissingParamDefault`] if any `[params.X]` entry has
-    /// no `default` field, or [`Error::HarnessTable`] if the file names the
-    /// pre-v0.5.0 `harness` key.
+    /// no `default` field, [`Error::HarnessTable`] if the file names the
+    /// pre-v0.5.0 `harness` key, or [`Error::MultipleTaskActions`] if a task
+    /// sets more than one action key.
     pub fn validate(&self) -> Result<(), Error> {
         if let Some(params) = &self.params {
             for (n, s) in params.0.iter() {

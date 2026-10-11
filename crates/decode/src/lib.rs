@@ -78,6 +78,18 @@ pub struct Layer {
     read_ids: HashMap<u64, generational_arena::Index>,
 }
 
+/// Drops the userinfo (`user:token@`) from a `scheme://` repository URL, so
+/// an error that names the repository does not repeat its credentials.
+fn without_userinfo(url: &str) -> String {
+    if let Some((scheme, rest)) = url.split_once("://") {
+        let authority = &rest[..rest.find('/').unwrap_or(rest.len())];
+        if let Some(at) = authority.rfind('@') {
+            return format!("{scheme}://{}", &rest[at + 1..]);
+        }
+    }
+    url.to_string()
+}
+
 impl Layer {
     /// Fetches a build-decl by reference.
     pub fn get(&self, idx: generational_arena::Index) -> Option<&BuildDecl> {
@@ -157,6 +169,7 @@ impl Layer {
                 // hunt through candidate local paths.
                 let mut msg = e.to_string();
                 if let SpecOrigin::Repo(Repo::Git { url, rev, .. }) = &opts.from {
+                    let url = without_userinfo(url);
                     msg.push_str(&format!(
                         " (the layer's `minimal.toml` comes from {url} at rev \
                          {rev}: update or re-pin this layer)"
@@ -1050,6 +1063,36 @@ mod tests {
             "{msg}"
         );
         assert!(msg.contains("update or re-pin this layer"), "{msg}");
+    }
+
+    /// A layer URL may carry credentials (`https://user:token@host/…`); the
+    /// refusal names the repository without repeating them.
+    #[test]
+    fn harness_key_in_repo_layer_omits_url_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("minimal.toml"), "harness = \"rust\"\n").unwrap();
+
+        let opts = LoadOptions {
+            from: SpecOrigin::Repo(Repo::Git {
+                url: "https://robot:s3cret@example.com/upstream/layer.git".to_string(),
+                rev: "abcd1234".to_string(),
+                tracking: None,
+            }),
+            ..LoadOptions::for_test()
+        };
+        let err = crate::Layer::new(dir.path(), &opts)
+            .err()
+            .unwrap_or_else(|| panic!("`harness` layer must be refused"));
+
+        let Error::Other(msg) = &err else {
+            panic!("expected Error::Other for a `harness` layer, got {err:?}");
+        };
+        assert!(
+            msg.contains("from https://example.com/upstream/layer.git at rev abcd1234"),
+            "{msg}"
+        );
+        assert!(!msg.contains("s3cret"), "{msg}");
+        assert!(!msg.contains("robot:"), "{msg}");
     }
 
     /// The same refusal for a layer loaded from a local directory stays
