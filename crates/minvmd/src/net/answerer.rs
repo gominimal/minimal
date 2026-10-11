@@ -330,8 +330,8 @@ fn prepare_interim_dir(sock: &Path) -> io::Result<()> {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     format!(
-                        "the interim answerer channel's dir {} is not a directory owned by \
-                         uid {uid} with mode 0700 (owner {}, mode {:o}); refusing to bind in it",
+                        "{} must be a directory owned by uid {uid} with mode 0700, \
+                         but it has owner {} and mode {:o}; the VM will not create its socket there",
                         dir.display(),
                         meta.uid(),
                         meta.mode() & 0o7777
@@ -655,17 +655,15 @@ impl AddressBook {
             let (held, quarantined) = (self.held.len(), self.released.len());
             return Err(match next {
                 Some(wait) => format!(
-                    "{} {first}-{last} is held or was released less than \
-                     {} s ago (the answer TTL a host resolver may still serve it under): \
-                     {held} of {capacity} are held by live boxes and {quarantined} are \
-                     quarantined; the next one frees in {} s",
+                    "{} {first}-{last} is in use or was released in the last {} s: \
+                     {held} of {capacity} are in use and {quarantined} were just released; \
+                     the next one frees in {} s",
                     minimald_rpc::BOX_ADDRESSES_EXHAUSTED,
                     REUSE_QUARANTINE.as_secs(),
                     wait.as_secs().max(1)
                 ),
                 None => format!(
-                    "{} {first}-{last} is held ({held} of {capacity} by \
-                     live boxes); none remains to hand out",
+                    "{} {first}-{last} is in use ({held} of {capacity}); none is free",
                     minimald_rpc::BOX_ADDRESSES_EXHAUSTED,
                 ),
             });
@@ -2414,7 +2412,7 @@ fn refuse_command(command: HandoverCommand, why: &str) {
     match command {
         HandoverCommand::Release(reply) | HandoverCommand::Cancel(reply) => {
             let _ = reply.send(ReleaseReply::no_op(
-                "this VM host daemon hosts no interim answerer",
+                "the running VM is not answering box names itself",
             ));
         }
         HandoverCommand::Allocate { reply, .. } => {
@@ -2538,25 +2536,23 @@ fn channelless_holder_error(port: u16, holder: Option<(u32, String)>) -> String 
     );
     if native {
         format!(
-            "the zone answerer's hook port 127.0.0.1:{port} is held by a native minimald, \
-             {who}, with no answerer channel, so no box can be handed an address: install \
-             the answerer service (min session start prints the command); native daemons \
-             publish into it once T90 lands"
+            "port 127.0.0.1:{port}, which box names are answered on, is in use by a Minimal \
+             daemon running directly on this machine ({who}), so no box in the VM can be given \
+             an address; run `min finalize-install` to install Minimal's DNS service on that \
+             port instead"
         )
     } else {
         format!(
-            "the zone answerer's hook port 127.0.0.1:{port} is held by {who}, which has no \
-             answerer channel, so no box can be handed an address: free port {port} or set \
-             the hook port"
+            "port 127.0.0.1:{port}, which box names are answered on, is in use by {who}, so no \
+             box in the VM can be given an address; free the port, then try again"
         )
     }
 }
 
 /// Why a box cannot be handed an address while this daemon reaches no
 /// answerer.
-const NO_ANSWERER: &str = "this VM host daemon reaches no zone answerer to hand the box an \
-                           address (see the zone-answerer lines in its log); box addresses \
-                           are allocated host-wide by the answerer, never by the node";
+const NO_ANSWERER: &str = "the running VM cannot reach Minimal's DNS service for box names, so \
+                           this box cannot be given an address";
 
 /// The answer to a release or a cancel: whether it changed anything, and
 /// the sentence the daemon logged for it.
@@ -2674,7 +2670,7 @@ impl AnswererStatus {
         reply
             .recv_timeout(RELEASE_WINDOW + RELEASE_REPLY_TIMEOUT)
             .unwrap_or_else(|_| {
-                Err("the zone answerer did not hand out an address in time".to_string())
+                Err("Minimal's DNS service for box names did not give this box an address in time; try again".to_string())
             })
     }
 
@@ -2756,7 +2752,7 @@ impl AnswererStatus {
     ) -> ReleaseReply {
         if !self.0.hosting.load(Ordering::SeqCst) {
             return ReleaseReply::no_op(format!(
-                "this VM host daemon hosts no interim answerer; {nothing}"
+                "the running VM is not answering box names itself; {nothing}"
             ));
         }
         let sender = self
@@ -2767,19 +2763,19 @@ impl AnswererStatus {
             .clone();
         let Some(sender) = sender else {
             return ReleaseReply::no_op(format!(
-                "this VM host daemon's answerer is not running; {nothing}"
+                "the running VM's box-name service is not running; {nothing}"
             ));
         };
         let (reply_to, reply) = std::sync::mpsc::channel();
         if sender.send(command(reply_to)).is_err() {
             return ReleaseReply::no_op(format!(
-                "this VM host daemon's answerer is not running; {nothing}"
+                "the running VM's box-name service is not running; {nothing}"
             ));
         }
         reply
             .recv_timeout(RELEASE_REPLY_TIMEOUT)
             .unwrap_or_else(|_| {
-                ReleaseReply::no_op("the zone answerer did not answer the request in time")
+                ReleaseReply::no_op("the running VM did not answer the request in time")
             })
     }
 }
@@ -3220,8 +3216,8 @@ fn acquire(
             }
             Err(error) => {
                 let why = format!(
-                    "could not bind the zone answerer's hook port 127.0.0.1:{port}: {error}; \
-                     free port {port} or set the hook port"
+                    "could not listen on 127.0.0.1:{port}, which box names are answered on: \
+                     {error}"
                 );
                 surface_error(status, port, &mut erroring, &why);
                 wait_refusing(&pings, &commands, PORT_RECHECK, &why);
@@ -3358,7 +3354,7 @@ fn host_interim(
         };
         if let Some(reply_to) = rebound.take() {
             let _ = reply_to.send(ReleaseReply::acted(format!(
-                "re-bound the interim answerer at 127.0.0.1:{port}"
+                "the running VM is answering box names on 127.0.0.1:{port} again"
             )));
         }
         // ── hosting: wait for a release.
@@ -3367,7 +3363,7 @@ fn host_interim(
                 Ok(HandoverCommand::Release(reply_to)) => break reply_to,
                 Ok(HandoverCommand::Cancel(reply_to)) => {
                     let _ = reply_to.send(ReleaseReply::no_op(
-                        "no release is pending; the interim answerer is serving",
+                        "no handover is in progress; the running VM is answering box names",
                     ));
                 }
                 // The interim is the answerer: its own boxes are handed
@@ -3401,7 +3397,11 @@ fn host_interim(
             paths.global.display()
         );
         tracing::info!(component = COMPONENT, port, "{detail}");
-        let _ = release.send(ReleaseReply::acted(detail));
+        let _ = release.send(ReleaseReply::acted(format!(
+            "the running VM stopped answering box names on 127.0.0.1:{port} so Minimal's DNS \
+             service can take over; it resumes after {} s if the service has not started",
+            paths.release_window.as_secs()
+        )));
         // ── the window: the service's channel, a cancel, or the bound.
         let deadline = Instant::now() + paths.release_window;
         // Box address requests that arrive mid-handover wait for the
@@ -3413,7 +3413,7 @@ fn host_interim(
                 Ok(HandoverCommand::Cancel(reply_to)) => break WindowEnd::Cancelled(reply_to),
                 Ok(HandoverCommand::Release(reply_to)) => {
                     let _ = reply_to.send(ReleaseReply::no_op(
-                        "the interim answerer is already released",
+                        "the running VM already stopped answering box names",
                     ));
                 }
                 Ok(
@@ -3464,15 +3464,16 @@ fn host_interim(
         for command in queued {
             refuse_command(
                 command,
-                "answerer handover did not complete: the answerer service's channel did not \
-                 answer within the release window",
+                "the handover of box names to Minimal's DNS service did not finish, so this \
+                 box was not given an address; try again",
             );
         }
         match UdpSocket::bind((Ipv4Addr::LOCALHOST, port)) {
             Ok(bound) => socket = bound,
             Err(error) => {
-                let detail =
-                    format!("could not re-bind the interim answerer at 127.0.0.1:{port}: {error}");
+                let detail = format!(
+                    "the running VM could not resume answering box names on 127.0.0.1:{port}: {error}"
+                );
                 tracing::warn!(component = COMPONENT, port, "{detail}");
                 if let Some(reply_to) = rebound.take() {
                     let _ = reply_to.send(ReleaseReply::no_op(detail));
@@ -5643,7 +5644,7 @@ mod tests {
             .allocate_at("node-b", "late", t0 + Duration::from_secs(10))
             .expect_err("nothing is free outside the quarantine");
         assert!(
-            refused.contains("released less than 15 s ago") && refused.contains("frees in 5 s"),
+            refused.contains("released in the last 15 s") && refused.contains("frees in 5 s"),
             "the refusal names the quarantine and the wait: {refused}"
         );
         assert_eq!(
@@ -5910,7 +5911,9 @@ mod tests {
         let refused = prepare_interim_dir(&wide.join(INTERIM_CHANNEL_SOCK_FILE))
             .expect_err("a dir open to others is refused");
         assert!(
-            refused.to_string().contains("refusing to bind"),
+            refused
+                .to_string()
+                .contains("will not create its socket there"),
             "{refused}"
         );
     }
@@ -6190,13 +6193,13 @@ mod tests {
             "the error names the holder's pid: {refused}"
         );
         assert!(
-            refused.contains(&format!("free port {port} or set the hook port")),
+            refused.contains("free the port, then try again"),
             "the error gives the remedy: {refused}"
         );
         // The native remedy, for a minimald holder.
         let native = channelless_holder_error(port, Some((42, "/usr/bin/minimald".to_string())));
         assert!(
-            native.contains("install the answerer service (min session start prints the command)")
+            native.contains("run `min finalize-install` to install Minimal's DNS service")
                 && native.contains("pid 42"),
             "{native}"
         );
@@ -6264,7 +6267,7 @@ mod tests {
         let reply = status.release_cancel();
         assert!(reply.acted, "the cancel re-binds: {reply:?}");
         assert!(
-            reply.detail.contains("re-bound"),
+            reply.detail.contains("again"),
             "and says so: {}",
             reply.detail
         );
