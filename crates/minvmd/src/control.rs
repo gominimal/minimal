@@ -2148,10 +2148,11 @@ fn refuse_past_cap(
     }
     // The kind in the words a person reads; the log lines keep the daemon's.
     let connections = match kind {
-        "guest ask" => "port prompt connections",
-        "ask subscription" => "connections waiting for port prompts",
-        "registration lease" => "box registration connections",
-        _ => "control connections",
+        "guest ask" => "port prompt connections".to_owned(),
+        "ask subscription" => "connections waiting for port prompts".to_owned(),
+        "registration lease" => "box registration connections".to_owned(),
+        // A kind with no phrase of its own reads under the daemon's word.
+        other => format!("{other} connections"),
     };
     write_reply(
         stream,

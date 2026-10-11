@@ -148,8 +148,8 @@ pub fn verify_provider_dir_ownership(dir: &std::path::Path) -> io::Result<()> {
             io::ErrorKind::PermissionDenied,
             format!(
                 "the Minimal state directory {} is owned by uid {}, but this user is uid \
-                 {my_uid}; the VM will not put its sockets there. Change the directory's owner to \
-                 this user with `chown`",
+                 {my_uid}; the VM host daemon will not put its sockets there. Change the \
+                 directory's owner to this user with `chown`",
                 dir.display(),
                 meta.uid(),
             ),

@@ -1404,14 +1404,20 @@ impl std::fmt::Display for HandOutCounts {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{} of {} box addresses are in use and {} {} released but cannot be reused yet (an \
-             address rests {} s after its release)",
-            self.live,
-            self.capacity,
-            self.quarantined,
-            if self.quarantined == 1 { "was" } else { "were" },
-            SWITCH_REUSE_QUARANTINE.as_secs()
+            "{} of {} box addresses are in use",
+            self.live, self.capacity
         )?;
+        // The resting rule is named only when an address is resting.
+        if self.quarantined > 0 {
+            write!(
+                f,
+                " and {} {} released but cannot be reused yet (an address rests {} s after its \
+                 release)",
+                self.quarantined,
+                if self.quarantined == 1 { "was" } else { "were" },
+                SWITCH_REUSE_QUARANTINE.as_secs()
+            )?;
+        }
         if let Some(wait) = self.next_free_in {
             // Rounded up: an address that frees in 0.4 s is not free now.
             let secs = wait
@@ -8171,6 +8177,36 @@ mod tests {
             registry.live_switch_addrs(),
             CARVED_RUN - 1,
             "the refusal holds nothing"
+        );
+    }
+
+    /// The exhaustion's sentence names the resting rule only when an address
+    /// is resting, and counts the resting addresses in the right number.
+    #[test]
+    fn switch_exhaustion_words_follow_the_quarantined_count() {
+        let registry = BoxRegistry::new(carved());
+        let _rows = fill_carved_run(&registry);
+        let error = register_carved(&registry, "late").expect_err("the run is exhausted");
+        assert!(
+            matches!(&error, AllocationError::SwitchExhausted(counts) if counts.quarantined == 0),
+            "nothing was returned, got: {error}"
+        );
+        let said = error.to_string();
+        assert!(
+            said.ends_with("125 of 125 box addresses are in use"),
+            "a run with every address live says only that, got: {said}"
+        );
+
+        let two = HandOutCounts {
+            live: 123,
+            quarantined: 2,
+            capacity: 125,
+            next_free_in: None,
+        };
+        assert_eq!(
+            two.to_string(),
+            "123 of 125 box addresses are in use and 2 were released but cannot be reused yet \
+             (an address rests 300 s after its release)"
         );
     }
 
