@@ -991,7 +991,8 @@ impl File {
     /// # Errors
     ///
     /// Returns [`Error::MissingParamDefault`] if any `[params.X]` entry has
-    /// no `default` field.
+    /// no `default` field, or [`Error::HarnessTable`] if the file names the
+    /// pre-v0.5.0 `harness` key.
     pub fn validate(&self) -> Result<(), Error> {
         if let Some(params) = &self.params {
             for (n, s) in params.0.iter() {
@@ -1006,7 +1007,7 @@ impl File {
         // `linker 'cc' not found` from a build inside the session. Refuse
         // the load here, at the config, where the fix is still visible.
         if self.extra.contains_key("harness") {
-            return Err(Error::HarnessTable);
+            return Err(Error::HarnessTable(self.mfile_path.clone()));
         }
         // serde takes one action key as `task.action` and leaves any other in
         // `task.extra`. Refuse the task here, before `warn_unknown_fields`
@@ -2561,15 +2562,51 @@ mod tests {
 
     /// `[harness]` is the pre-v0.5.0 name of `[stack]` and no longer parses:
     /// a file that still uses it is refused at load — before any build runs
-    /// and misses its toolchain — and pointed at the rename.
+    /// and misses its toolchain — and pointed at the rename. The refusal
+    /// names the offending file, so a layer pulled from upstream can be
+    /// located without re-reading every candidate.
     #[test]
     fn harness_table_no_longer_parses() {
         let dir = tempdir().unwrap();
         std::fs::write(dir.path().join(MFILE_NAME), "[harness]\nuse = \"rust\"\n").unwrap();
 
         let err = File::from_dir(dir.path()).unwrap_err();
-        assert_eq!(err.to_string(), Error::HarnessTable.to_string());
-        assert!(err.to_string().contains("Rename the table to `[stack]`"));
+        assert!(matches!(err, Error::HarnessTable(Some(_))), "{err:?}");
+        let msg = err.to_string();
+        assert!(msg.contains("Rename it to `[stack]`"), "{msg}");
+        assert!(
+            msg.contains(&dir.path().join(MFILE_NAME).display().to_string()),
+            "{msg}"
+        );
+    }
+
+    /// The pre-v0.5.0 `harness` key can also arrive as a bare string, not a
+    /// table; it lands in `extra` all the same and is refused identically.
+    #[test]
+    fn harness_scalar_key_is_refused_like_the_table() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join(MFILE_NAME), "harness = \"rust\"\n").unwrap();
+
+        let err = File::from_dir(dir.path()).unwrap_err();
+        assert!(matches!(err, Error::HarnessTable(Some(_))), "{err:?}");
+        let msg = err.to_string();
+        assert!(msg.contains("the `harness` key"), "{msg}");
+        assert!(
+            msg.contains(&dir.path().join(MFILE_NAME).display().to_string()),
+            "{msg}"
+        );
+    }
+
+    /// A file parsed without a path (the wire/fuzz entry point) is still
+    /// refused, with wording that stands on its own without one.
+    #[test]
+    fn harness_key_without_a_path_names_no_file() {
+        let file = File::from_toml_bytes(b"harness = \"rust\"\n").unwrap();
+        let err = file.validate().expect_err("`harness` must be refused");
+
+        assert!(matches!(err, Error::HarnessTable(None)), "{err:?}");
+        let msg = err.to_string();
+        assert!(msg.starts_with("the `harness` key"), "{msg}");
     }
 
     /// A task with two action keys is refused with an error naming the task

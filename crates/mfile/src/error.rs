@@ -11,10 +11,11 @@ pub enum Error {
     MissingParamDefault(String),
     /// A task sets more than one action key: the task name, then the keys.
     MultipleTaskActions(String, Vec<String>),
-    /// The file names the pre-v0.5.0 `[harness]` table, which sets no
+    /// The file names the pre-v0.5.0 `harness` key, which sets no
     /// stack: the named stack is silently absent, and the missing
-    /// toolchain surfaces much later as a bare linker error.
-    HarnessTable,
+    /// toolchain surfaces much later as a bare linker error. Carries
+    /// the path of the offending file when it is known.
+    HarnessTable(Option<PathBuf>),
 }
 
 impl fmt::Display for Error {
@@ -43,10 +44,18 @@ impl fmt::Display for Error {
                 task,
                 keys.join(", ")
             ),
-            Error::HarnessTable => write!(
+            Error::HarnessTable(None) => write!(
                 f,
-                "`[harness]` is no longer accepted: it sets no stack, so its \
-                 toolchain would be missing. Rename the table to `[stack]`.",
+                "the `harness` key (the pre-v0.5.0 name of `stack`) is no \
+                 longer accepted: it sets no stack, so its toolchain would \
+                 be missing. Rename it to `[stack]`.",
+            ),
+            Error::HarnessTable(Some(path)) => write!(
+                f,
+                "{}: the `harness` key (the pre-v0.5.0 name of `stack`) is \
+                 no longer accepted: it sets no stack, so its toolchain \
+                 would be missing. Rename it to `[stack]`.",
+                path.display(),
             ),
         }
     }
@@ -61,7 +70,7 @@ impl std::error::Error for Error {
             Error::ConflictingLayouts(_) => None,
             Error::MissingParamDefault(_) => None,
             Error::MultipleTaskActions(..) => None,
-            Error::HarnessTable => None,
+            Error::HarnessTable(_) => None,
         }
     }
 }
