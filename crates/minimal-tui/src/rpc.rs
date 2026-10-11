@@ -334,6 +334,17 @@ pub async fn record_of(provider: &mut Provider, id: SessionId) -> Option<session
 /// from, and [`release_held_name_after_attach`] still owes the row's
 /// withdrawal. `None` when the record cannot be read or holds no row.
 ///
+/// The zone hold a `host_ip` box's name depends on is not re-made here,
+/// on purpose: only the CLI's attach and exec re-send it
+/// (`rehold_held_name_before_attach`), because a re-hold owes the
+/// destroy-race undo that follows it — the session looked up again, then
+/// the hold released or handed back — and this path has no client to make
+/// that undo with. A session attached only from the dashboard therefore
+/// carries a hold nothing re-makes, and after a VM host daemon restart it
+/// is dropped by the reload expiry once the reconfirm bound passes — a
+/// documented gap, deferred until the architecture rules on a guest-door
+/// message for name holds.
+///
 /// # Errors
 ///
 /// The VM host daemon cannot be reached (#1790): the attach does not go

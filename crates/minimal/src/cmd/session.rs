@@ -434,6 +434,15 @@ async fn hold_box_name_with_vm_host(
         control_request_with_vm_host(&sock_path, verb),
     )
     .await;
+    // The reply's fields are not checked against the request: minvmd
+    // builds `NameHeld` from the request itself — `hold_box_name` answers
+    // `{name: request.name, held: true}` and `release_box_name` answers
+    // `{name: request.name, held: false}`, unconditionally
+    // (crates/minvmd/src/control.rs) — so a reply naming another name or
+    // state cannot come from a VM host daemon that answered this request;
+    // it would be a protocol bug on that side, which a client-side check
+    // would not repair. Any other verb's reply, a refusal, or no answer
+    // is reported as a failure below.
     let failure = match sent {
         Ok(Ok(minimald_rpc::BoxControlReply::NameHeld { .. })) => None,
         Ok(Ok(other)) => Some(format!("another verb's reply: {other:?}")),
