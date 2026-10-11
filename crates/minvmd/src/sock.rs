@@ -147,7 +147,8 @@ pub fn verify_provider_dir_ownership(dir: &std::path::Path) -> io::Result<()> {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(
-                "provider directory {} is owned by uid {}; expected uid {my_uid}",
+                "the Minimal state directory {} is owned by uid {}, but this user is uid \
+                 {my_uid}; the VM will not put its sockets there",
                 dir.display(),
                 meta.uid(),
             ),
@@ -159,7 +160,7 @@ pub fn verify_provider_dir_ownership(dir: &std::path::Path) -> io::Result<()> {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(
-                "provider directory {} has mode {mode:04o}; expected 0700",
+                "the Minimal state directory {} has mode {mode:04o}, but it must be 0700",
                 dir.display(),
             ),
         ));
@@ -317,7 +318,7 @@ mod tests {
         let err = verify_provider_dir_ownership(&dir).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
         assert!(err.to_string().contains("0755"), "{err}");
-        assert!(err.to_string().contains("expected 0700"), "{err}");
+        assert!(err.to_string().contains("but it must be 0700"), "{err}");
     }
 
     #[test]

@@ -1404,8 +1404,7 @@ impl std::fmt::Display for HandOutCounts {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{} of {} box addresses are held by live boxes and {} are in their {} s reuse \
-             quarantine",
+            "{} of {} box addresses are in use and {} were released less than {} s ago",
             self.live,
             self.capacity,
             self.quarantined,
@@ -1597,8 +1596,8 @@ pub enum AllocationError {
     /// forwarded connections, or have its own forwards unbound at the old
     /// box's end, so the registration is refused instead.
     #[error(
-        "address {addr} is still held by a withdrawn box whose forwards the host has not \
-         finished unbinding"
+        "address {addr} still belongs to a box that is shutting down (its port forwards are not \
+         removed yet); try again shortly"
     )]
     RevocationPending {
         /// The held address: a switch address or a published loopback one.
@@ -1607,7 +1606,7 @@ pub enum AllocationError {
     /// A withdrawal under the box's name landed while the answerer was
     /// allocating its published address: the withdrawal is ordered after
     /// the registration was read, so the registration writes no row.
-    #[error("the box was withdrawn while its address was being allocated")]
+    #[error("the box was removed while it was being given an address")]
     WithdrawnWhileAllocating,
     /// The name folds to one a live row already holds: the answerer keys
     /// an address by the name's canonical form
@@ -8161,8 +8160,8 @@ mod tests {
         let said = error.to_string();
         assert!(
             said.contains(
-                "124 of 125 box addresses are held by live boxes and 1 are in their 300 s \
-                 reuse quarantine; the next one frees in 200 s"
+                "124 of 125 box addresses are in use and 1 were released less than 300 s \
+                 ago; the next one frees in 200 s"
             ),
             "the refusal names the counts, got: {said}"
         );
