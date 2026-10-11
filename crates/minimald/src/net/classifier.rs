@@ -212,13 +212,13 @@ pub(crate) fn refuses_unenforceable_declaration(
 /// The refusal's words, spelled once for the two paths that make it: each
 /// unenforced rule by the field that names it, why this host has no rule
 /// for any of them, and — at the end, where a person still reading is
-/// looking — what to do about it: remove the rules, or declare the one
-/// shape this host's classifier enforces — by the flag that writes it,
-/// `--deny-all-egress`, or by the box's `egress` section — or take the
-/// mode that enforces them. A refusal that names what it refused without
-/// saying how to get the box running leaves a person with nothing to
-/// type, and the words are the typed error a client sees, so the create
-/// and the launch say the same thing about the same declaration.
+/// looking — what to do about it: remove the rules, take the mode that
+/// enforces them, or declare the one shape this host's classifier
+/// enforces by the flag that writes it, `--deny-all-egress`. A refusal
+/// that names what it refused without saying how to get the box running
+/// leaves a person with nothing to type, and the words are the typed
+/// error a client sees, so the create and the launch say the same thing
+/// about the same declaration.
 pub(crate) fn unenforceable_declaration_words(rules: &[UnenforceableRule]) -> String {
     let named = rules
         .iter()
