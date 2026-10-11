@@ -74,6 +74,10 @@ pub(crate) struct Item {
     pub state: ItemState,
     /// What the operator loses today, while the item is missing.
     pub today: Option<String>,
+    /// `today` as separate lines, when it is a list: the summary sets one
+    /// under the other, and the JSON keeps `today`'s single line.
+    #[serde(skip)]
+    today_list: Vec<String>,
     /// What the step changes, when it runs.
     pub step: Option<String>,
     /// Why no script can fix it, when none can.
@@ -90,6 +94,7 @@ impl Item {
             label,
             state: ItemState::Done,
             today: None,
+            today_list: Vec::new(),
             step: None,
             cause: None,
             script: None,
@@ -108,6 +113,7 @@ impl Item {
             label,
             state: ItemState::Missing,
             today: Some(today),
+            today_list: Vec::new(),
             step: Some(step),
             cause: None,
             script: Some(script),
@@ -120,6 +126,7 @@ impl Item {
             label,
             state: ItemState::Cannot,
             today: None,
+            today_list: Vec::new(),
             step: None,
             cause: Some(cause),
             script: None,
@@ -132,6 +139,7 @@ impl Item {
             label,
             state: ItemState::Waiting,
             today: None,
+            today_list: Vec::new(),
             step: None,
             cause: Some(cause),
             script: None,
@@ -236,8 +244,19 @@ impl Plan {
                 )),
                 _ => {
                     out.push_str(&format!("  ✗ {}\n", item.label));
-                    if let Some(today) = &item.today {
-                        out.push_str(&format!("      today: {today}\n"));
+                    match (&item.today, item.today_list.as_slice()) {
+                        (Some(today), []) => out.push_str(&format!("      today: {today}\n")),
+                        (Some(_), list) => {
+                            out.push_str(&format!(
+                                "      today: {} thing{} to fix:\n",
+                                list.len(),
+                                if list.len() == 1 { "" } else { "s" }
+                            ));
+                            for line in list {
+                                out.push_str(&format!("        - {line}\n"));
+                            }
+                        }
+                        (None, _) => {}
                     }
                     if let Some(step) = &item.step {
                         out.push_str(&format!("      this step: {step}\n"));
@@ -545,49 +564,46 @@ pub(crate) fn names_item(verdict: crate::resolver::NamesVerdict, port: u16) -> I
                 .to_string(),
         ),
         NamesVerdict::Missing { facts, install } => {
-            let service = if install.is_some() {
-                ", installs that service"
-            } else {
-                ""
-            };
-            let (resolver, range) = if cfg!(target_os = "macos") {
-                (
-                    format!(
-                        "sends *.min.internal lookups to Minimal's DNS service on \
-                         127.0.0.1:{port}"
-                    ),
-                    format!(
-                        ", and reserves the box IPs ({}) on this machine's \
-                         loopback at every boot",
-                        crate::resolver::range_text()
-                    ),
+            let zone = crate::resolver::ZONE;
+            // The range clause closes the macOS list, so the service
+            // clause joins with a comma there and with "and" on Linux,
+            // where it is the last one.
+            let step = if cfg!(target_os = "macos") {
+                format!(
+                    "sends *.{zone} lookups to Minimal's DNS service on \
+                     127.0.0.1:{port}{}, and reserves the box IPs ({}) on this \
+                     machine's loopback at every boot",
+                    if install.is_some() {
+                        ", installs that service"
+                    } else {
+                        ""
+                    },
+                    crate::resolver::range_text()
                 )
             } else {
-                (
-                    format!(
-                        "configures this machine's DNS (systemd-resolved) to send \
-                         *.min.internal lookups to Minimal's DNS service on \
-                         127.0.0.1:{port}"
-                    ),
-                    String::new(),
+                format!(
+                    "configures this machine's DNS (systemd-resolved) to send \
+                     *.{zone} lookups to Minimal's DNS service on \
+                     127.0.0.1:{port}{}",
+                    if install.is_some() {
+                        " and installs that service"
+                    } else {
+                        ""
+                    }
                 )
             };
-            let today = format!(
-                "{} thing{} missing:{}",
-                facts.len(),
-                if facts.len() == 1 { " is" } else { "s are" },
-                facts
-                    .iter()
-                    .map(|fact| format!("\n        - {fact}"))
-                    .collect::<String>()
-            );
-            Item::missing(
-                NAMES_ID,
-                NAMES_LABEL,
-                today,
-                format!("{resolver}{service}{range}"),
-                crate::resolver::names_steps(port, install.as_ref()),
-            )
+            // The JSON's `today` is the facts on one line; the list, its
+            // count and its indentation are the summary's alone.
+            Item {
+                today_list: facts.clone(),
+                ..Item::missing(
+                    NAMES_ID,
+                    NAMES_LABEL,
+                    facts.join("; "),
+                    step,
+                    crate::resolver::names_steps(port, install.as_ref()),
+                )
+            }
         }
     }
 }
@@ -1686,12 +1702,88 @@ mod tests {
         assert_eq!(missing.id, "names");
         assert_eq!(
             missing.today.as_deref(),
-            Some("1 thing is missing:\n        - the resolver is not configured")
+            Some("the resolver is not configured")
         );
-        assert!(missing.step.as_deref().unwrap().contains("127.0.0.1:15353"));
+        let expected_step = if cfg!(target_os = "macos") {
+            "sends *.min.internal lookups to Minimal's DNS service on 127.0.0.1:15353, and \
+             reserves the box IPs (127.0.64.0/24) on this machine's loopback at every boot"
+        } else {
+            "configures this machine's DNS (systemd-resolved) to send *.min.internal lookups \
+             to Minimal's DNS service on 127.0.0.1:15353"
+        };
+        assert_eq!(missing.step.as_deref(), Some(expected_step));
+        assert!(NAMES_LABEL.contains(crate::resolver::ZONE), "{NAMES_LABEL}");
+        let summary = Plan {
+            items: vec![missing.clone()],
+        }
+        .summary();
+        assert!(
+            summary.contains(
+                "      today: 1 thing to fix:\n        - the resolver is not configured\n      \
+                 this step: "
+            ),
+            "{summary}"
+        );
         let script = missing.script.unwrap();
         assert!(script.starts_with("# The resolver: "), "{script}");
         assert!(!script.contains("#!/bin/sh"), "{script}");
+    }
+
+    /// The names item's facts are a list in the summary and one line in
+    /// the JSON, which carries no layout; a carried service step joins the
+    /// step text as this platform's list reads.
+    #[test]
+    fn names_item_lists_its_facts_in_the_summary_only() {
+        use crate::resolver::{AnswererInstall, NamesVerdict};
+        let item = names_item(
+            NamesVerdict::Missing {
+                facts: vec![
+                    "the resolver is not configured".to_string(),
+                    "the DNS service is not installed; this step installs it".to_string(),
+                ],
+                install: Some(AnswererInstall {
+                    operator: "op".to_string(),
+                    channel: "/run/min/zone.sock".to_string(),
+                    channel_dir: "/run/min".to_string(),
+                    source: "/usr/local/bin/minzoned".to_string(),
+                    sha256: "0".repeat(64),
+                    requirement: None,
+                    controls: Vec::new(),
+                }),
+            },
+            15353,
+        );
+        let step = item.step.as_deref().unwrap();
+        if cfg!(target_os = "macos") {
+            assert!(
+                step.contains(
+                    "on 127.0.0.1:15353, installs that service, and reserves the box IPs"
+                ),
+                "{step}"
+            );
+        } else {
+            assert!(
+                step.ends_with("on 127.0.0.1:15353 and installs that service"),
+                "{step}"
+            );
+        }
+        let plan = Plan { items: vec![item] };
+        let summary = plan.summary();
+        assert!(
+            summary.contains(
+                "      today: 2 things to fix:\n        - the resolver is not configured\n        \
+                 - the DNS service is not installed; this step installs it\n      this step: "
+            ),
+            "{summary}"
+        );
+        let value: serde_json_lenient::Value = serde_json_lenient::from_str(&plan.json()).unwrap();
+        let names = &value["items"][0];
+        assert_eq!(
+            names["today"],
+            "the resolver is not configured; the DNS service is not installed; this step \
+             installs it"
+        );
+        assert!(names.get("today_list").is_none(), "{names}");
     }
 
     /// The user-namespace item's table: not an item where the kernel does

@@ -3078,8 +3078,8 @@ fn answerer_fact(answerer: &AnswererStep, carried: bool) -> Option<String> {
 /// the moment the installed copy falls behind this daemon's channel
 /// protocol: an upgrade that changes the wire re-runs the step and
 /// re-copies the program. The Absent fact says what the service is for —
-/// the zone answers only while a session's daemon holds it, and the
-/// command below installs the one service that answers between sessions
+/// the zone answers only while a session's daemon holds it, and this
+/// step installs the one service that answers between sessions
 /// and across them — and the CustodyFailed and ProtocolMismatch facts
 /// name their check and their versions the way the range's do. Either way
 /// the command the advisory names is the whole of the host's missing
@@ -3236,7 +3236,7 @@ pub(crate) fn names_verdict_at(
         };
         facts.push(format!(
             "this session publishes at the shared 127.0.0.1 interim: the \
-             loopback IPs boxes use ({}, one per box) are not on this \
+             loopback IPs boxes use ({}) are not on this \
              machine's loopback{installs_the_range}",
             range_text()
         ));
@@ -3248,7 +3248,7 @@ pub(crate) fn names_verdict_at(
         // The verdict says the proxy for exactly this fact (NET-018); the
         // advisory says the fact.
         facts.push(format!(
-            "the loopback IPs boxes use ({}, one per box) are not on this \
+            "the loopback IPs boxes use ({}) are not on this \
              machine's loopback, so this session's box names resolve to \
              addresses this machine cannot reach",
             range_text()
@@ -3258,7 +3258,7 @@ pub(crate) fn names_verdict_at(
         // The range step's own state, beside the probe's. A failed custody
         // check is said whenever it reads, over an interim or a missing
         // range or neither: it is the one fact that says *which* step of
-        // the unit is not root's, and the command below is the one that
+        // the unit is not root's, and this step is the one that
         // reinstalls both files. An absent unit is said only when no other
         // fact already names the range as missing — under the interim, or
         // on a probe that reads absent, the missing range is the fact and
@@ -3277,7 +3277,7 @@ pub(crate) fn names_verdict_at(
             }
             RangeStepState::Absent if !interim && !matches!(range_present, Some(false)) => {
                 facts.push(format!(
-                    "the loopback IPs boxes use ({}, one per box) are not \
+                    "the loopback IPs boxes use ({}) are not \
                      re-added at boot",
                     range_text()
                 ));
@@ -3298,8 +3298,8 @@ pub(crate) fn names_verdict_at(
             // the check that failed.
             AnswererStep::SourceRefused { reason, .. } => format!(
                 "this machine's DNS service program {ANSWERER_PROGRAM_NAME} failed the \
-                 check the advisory runs before offering to copy it ({reason}), so this \
-                 step leaves the DNS service out"
+                 check Minimal runs before copying it ({reason}), so this step leaves \
+                 the DNS service out"
             ),
             AnswererStep::SourceUnavailable { reason, .. } => format!(
                 "{reason}; the DNS service install is unavailable, so this \
@@ -6900,7 +6900,11 @@ exit 0
             "the advisory names the failed check: {advisory}"
         );
         assert!(
-            advisory.contains("fails a safety check"),
+            advisory.contains(&format!(
+                "the boot-time setup that adds the loopback IPs boxes use ({}) fails a \
+                 safety check",
+                range_text()
+            )),
             "the advisory says the custody verdict: {advisory}"
         );
         assert!(
@@ -8038,7 +8042,7 @@ resolvectl domain minzone0 '~min.internal'
         assert!(
             advisory.contains(&format!(
                 "this machine's DNS service program {ANSWERER_PROGRAM_NAME} failed the \
-                 check the advisory runs before offering to copy it ({reason})"
+                 check Minimal runs before copying it ({reason})"
             )),
             "the advisory names the reason: {advisory}"
         );
