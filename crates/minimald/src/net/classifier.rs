@@ -226,11 +226,9 @@ pub(crate) fn unenforceable_declaration_words(rules: &[UnenforceableRule]) -> St
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "host_ip boxes on this host enforce only deny-all egress, so these \
-         rules would go unenforced: {named}. Remove them, use \
-         --deny-all-egress (or an egress section with all three allow \
-         lists present and empty and no deny entries), or use --network \
-         own_ip, which enforces them."
+        "with --network host_ip this machine can only block all network access; it \
+         cannot apply these rules: {named}. Remove them, use --network own_ip to \
+         apply them, or use --deny-all-egress to block everything."
     )
 }
 
@@ -2298,28 +2296,28 @@ pub(crate) fn stale_carve_out_refusal(
     if recorded.is_some() && recorded == live_v4 {
         return None;
     }
-    let recorded_words = recorded.map_or_else(
-        || "no recorded carve-out".to_string(),
-        |target| target.to_string(),
+    let recorded_words =
+        recorded.map_or_else(|| "no address".to_string(), |target| target.to_string());
+    let live_words = live.map_or_else(
+        || "no address (it is not serving)".to_string(),
+        |bound| bound.to_string(),
     );
-    let live_words = live.map_or_else(|| "no live answerer".to_string(), |bound| bound.to_string());
     let install = sandbox2::classifier::install_hint();
     let re_render = format!(
-        "{install} --undo, then {install} re-renders the carve-out for the answerer's \
-         default port; a daemon whose answerer is bound elsewhere has no self-service \
-         remedy yet"
+        "`{install} --undo`, then `{install}`, rewrites the rules for the DNS \
+         service's default port, which fixes this only when the service listens there"
     );
     let remedy = match live_v4 {
-        Some(bound) => format!("re-render the carve-out onto the live bind {bound}: {re_render}"),
+        Some(_) => re_render,
         None => format!(
-            "start the daemon's zone answerer on an IPv4 loopback address, then {re_render}"
+            "Minimal's DNS service has to be serving on an IPv4 loopback address first; \
+             after that, {re_render}"
         ),
     };
     Some(format!(
-        "{}: stale carve-out: the table admits {recorded_words} and the zone answerer is \
-         bound at {live_words}, so a deny-all box's lookups would reach nothing; the box \
-         was refused rather than run on a resolver nothing serves ({remedy})",
-        Cause::TableNotEffective.detail()
+        "this box asks for no network access, and its name lookups would fail: the \
+         egress rules installed on this machine allow DNS only at {recorded_words}, but \
+         Minimal's DNS service is at {live_words}, so the box was not started. {remedy}."
     ))
 }
 
@@ -3346,7 +3344,7 @@ mod tests {
             "the refusal names every rule: {words}"
         );
         assert!(
-            words.contains("--network own_ip") && words.contains("which enforces them"),
+            words.contains("--network own_ip") && words.contains("to apply them"),
             "the refusal says own-address boxes enforce these rules: {words}"
         );
         // The words end with what to do: a refusal that names the rules it
@@ -3360,15 +3358,13 @@ mod tests {
         assert!(
             words.contains("Remove them")
                 && words.contains("--deny-all-egress")
-                && words.contains("egress section")
-                && words.contains("all three allow lists present and empty")
-                && words.contains("no deny entries")
-                && words.contains("host_ip boxes on this host enforce only deny-all egress")
-                && words.contains("these rules would go unenforced"),
+                && words.contains("--network own_ip")
+                && words.contains("can only block all network access")
+                && words.contains("it cannot apply these rules"),
             "the refusal says what to do about the rules it named: {words}"
         );
         assert!(
-            words.ends_with("which enforces them."),
+            words.ends_with("to block everything."),
             "the words end with the remedy, so what a person reads last is \
              what they can do: {words}"
         );
@@ -3470,11 +3466,6 @@ mod tests {
         assert!(
             remedy.contains("--deny-all-egress"),
             "the remedy names the flag that declares deny-all: {words}"
-        );
-        assert!(
-            remedy.contains("egress section"),
-            "the flag names the section form beside it, never in place of \
-             it: {words}"
         );
         assert!(
             remedy.contains("--network own_ip"),
@@ -5650,14 +5641,12 @@ mod tests {
         let refusal = stale_carve_out_refusal(Some(recorded), Some(live))
             .expect("a carve-out naming another port is stale");
         for needle in [
-            Cause::TableNotEffective.detail(),
-            "stale carve-out",
+            "its name lookups would fail",
             "127.0.0.1:7656",
             "127.0.0.1:7700",
-            "re-render the carve-out onto the live bind 127.0.0.1:7700: min finalize-install \
-             --undo, then min finalize-install re-renders the carve-out for the answerer's \
-             default port",
-            "no self-service remedy yet",
+            "`min finalize-install --undo`, then `min finalize-install`, rewrites the rules \
+             for the DNS service's default port",
+            "only when the service listens there",
         ] {
             assert!(
                 refusal.contains(needle),
@@ -5667,7 +5656,8 @@ mod tests {
         let unrecorded = stale_carve_out_refusal(None, Some(live))
             .expect("a table with no recorded carve-out is stale");
         assert!(
-            unrecorded.contains("no recorded carve-out") && unrecorded.contains("127.0.0.1:7700"),
+            unrecorded.contains("allow DNS only at no address")
+                && unrecorded.contains("127.0.0.1:7700"),
             "the refusal names the missing record and the live bind: {unrecorded}"
         );
     }
@@ -5736,10 +5726,9 @@ mod tests {
         let refusal = stale_carve_out_refusal(Some(recorded), None)
             .expect("a carve-out with no answerer behind it is stale");
         for needle in [
-            Cause::TableNotEffective.detail(),
-            "stale carve-out",
+            "its name lookups would fail",
             "127.0.0.1:7656",
-            "no live answerer",
+            "no address (it is not serving)",
         ] {
             assert!(
                 refusal.contains(needle),
