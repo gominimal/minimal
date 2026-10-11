@@ -693,7 +693,7 @@ pub struct ActivateArgs {
     pub allow_subnets: Vec<String>,
     /// Allow outbound traffic to this DNS hostname, e.g. `github.com`.
     /// Repeatable. Given without `--allow-subnets`, the box reaches the
-    /// named hosts and no other address; see `--allow-subnets`.
+    /// named hosts by name and no address directly; see `--allow-subnets`.
     #[arg(long = "allow-dns-hosts", value_name = "HOST")]
     pub allow_dns_hosts: Vec<String>,
     /// Allow this outbound transport protocol: tcp, udp, or icmp.
