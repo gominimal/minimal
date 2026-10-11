@@ -299,7 +299,7 @@ COMPONENTS=(
 # the stage. TEMPORARY (gominimal/inbox#899): .github/workflows/release.yml now
 # builds, signs and uploads minzoned on every platform, but a release cut before
 # that change ships no minzoned, and the session advisory names that state
-# ("this release ships no minzoned; the answerer service step is unavailable")
+# ("this release ships no minzoned; the DNS service install is unavailable")
 # instead of offering the step. Once releases with the artifact are the norm,
 # empty this list so a missing answerer fails the stage like any other binary.
 OPTIONAL_COMPONENTS=(minzoned)
