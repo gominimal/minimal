@@ -140,8 +140,8 @@ async fn wait_for_switch_socket(sock: &Path, timeout: Duration) -> io::Result<()
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     format!(
-                        "the VM's network helper did not create its socket {} within \
-                         {timeout:?}: {e}",
+                        "the VM's network helper was not accepting connections on its socket {} \
+                         after {timeout:?}: {e}",
                         sock.display()
                     ),
                 ));

@@ -655,8 +655,8 @@ pub const BOX_ADDRESSES_EXHAUSTED: &str = "every box address in";
 
 /// Whether a registration refusal is the host running out of addresses
 /// for a box — the host cannot hold one more — rather than a refusal of
-/// this box's declaration. Matched anywhere in the sentence: the control
-/// socket prefixes the answerer's reason with its own.
+/// this box's declaration. Matched anywhere in the sentence, so a
+/// sentence that carries one of these inside a longer reason still counts.
 #[must_use]
 pub fn is_address_capacity_refusal(error: &str) -> bool {
     [

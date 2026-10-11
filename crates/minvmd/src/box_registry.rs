@@ -1404,7 +1404,8 @@ impl std::fmt::Display for HandOutCounts {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{} of {} box addresses are in use and {} were released less than {} s ago",
+            "{} of {} box addresses are in use and {} were released but cannot be reused yet (an \
+             address rests {} s after its release)",
             self.live,
             self.capacity,
             self.quarantined,
@@ -1606,7 +1607,7 @@ pub enum AllocationError {
     /// A withdrawal under the box's name landed while the answerer was
     /// allocating its published address: the withdrawal is ordered after
     /// the registration was read, so the registration writes no row.
-    #[error("the box was removed while it was being given an address")]
+    #[error("the box's registration was cancelled while its address was being assigned")]
     WithdrawnWhileAllocating,
     /// The name folds to one a live row already holds: the answerer keys
     /// an address by the name's canonical form
@@ -8160,8 +8161,8 @@ mod tests {
         let said = error.to_string();
         assert!(
             said.contains(
-                "124 of 125 box addresses are in use and 1 were released less than 300 s \
-                 ago; the next one frees in 200 s"
+                "124 of 125 box addresses are in use and 1 were released but cannot be reused yet \
+                 (an address rests 300 s after its release); the next one frees in 200 s"
             ),
             "the refusal names the counts, got: {said}"
         );
