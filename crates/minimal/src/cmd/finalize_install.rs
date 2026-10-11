@@ -36,9 +36,9 @@ pub(crate) const WAITING: &str = "waiting on a daemon";
 /// The `--show --json` document's schema.
 pub(crate) const SCHEMA: &str = "min/v1/finalize-install";
 
-/// The names item's cause when no daemon reports an answerer port to
-/// point the resolver at.
-const NO_PORT: &str = "no daemon is reachable to report its answerer port";
+/// The names item's cause when no daemon reports the DNS service's port
+/// to point the resolver at.
+const NO_PORT: &str = "no daemon is reachable to report the port its DNS service listens on";
 
 /// How long the names item waits on the daemons for a port before it
 /// reports itself waiting: one bounded read, so a probe from the installer
@@ -527,7 +527,8 @@ pub(crate) fn host_install_for_this_host(global: &GlobalArgs) -> crate::resolver
 
 /// The names item's id and label.
 const NAMES_ID: &str = "names";
-const NAMES_LABEL: &str = "box names for every host program";
+const NAMES_LABEL: &str =
+    "DNS names for boxes (<box>.min.internal) in every program on this machine";
 
 /// The names item from its verdict: done, missing with the facts the
 /// advisory names and the step that installs them, or blocked by the
@@ -545,23 +546,46 @@ pub(crate) fn names_item(verdict: crate::resolver::NamesVerdict, port: u16) -> I
         ),
         NamesVerdict::Missing { facts, install } => {
             let service = if install.is_some() {
-                " and installs the Minimal box-name service"
+                ", installs that service"
             } else {
                 ""
             };
-            let range = if cfg!(target_os = "macos") {
-                ", and reserves the local range on this host's loopback"
+            let (resolver, range) = if cfg!(target_os = "macos") {
+                (
+                    format!(
+                        "sends *.min.internal lookups to Minimal's DNS service on \
+                         127.0.0.1:{port}"
+                    ),
+                    format!(
+                        ", and reserves the box IPs ({}) on this machine's \
+                         loopback at every boot",
+                        crate::resolver::range_text()
+                    ),
+                )
             } else {
-                ""
+                (
+                    format!(
+                        "configures this machine's DNS (systemd-resolved) to send \
+                         *.min.internal lookups to Minimal's DNS service on \
+                         127.0.0.1:{port}"
+                    ),
+                    String::new(),
+                )
             };
+            let today = format!(
+                "{} thing{} missing:{}",
+                facts.len(),
+                if facts.len() == 1 { " is" } else { "s are" },
+                facts
+                    .iter()
+                    .map(|fact| format!("\n        - {fact}"))
+                    .collect::<String>()
+            );
             Item::missing(
                 NAMES_ID,
                 NAMES_LABEL,
-                facts,
-                format!(
-                    "points this host's resolver at the box-zone answerer on \
-                     127.0.0.1:{port}{service}{range}"
-                ),
+                today,
+                format!("{resolver}{service}{range}"),
                 crate::resolver::names_steps(port, install.as_ref()),
             )
         }
@@ -1653,7 +1677,7 @@ mod tests {
         );
         let missing = names_item(
             NamesVerdict::Missing {
-                facts: "the resolver is not configured".to_string(),
+                facts: vec!["the resolver is not configured".to_string()],
                 install: None,
             },
             15353,
@@ -1662,7 +1686,7 @@ mod tests {
         assert_eq!(missing.id, "names");
         assert_eq!(
             missing.today.as_deref(),
-            Some("the resolver is not configured")
+            Some("1 thing is missing:\n        - the resolver is not configured")
         );
         assert!(missing.step.as_deref().unwrap().contains("127.0.0.1:15353"));
         let script = missing.script.unwrap();

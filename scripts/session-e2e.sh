@@ -7360,7 +7360,7 @@ proof_local_range_reserved_by_privileged_step() {
       fail
       ;;
   esac
-  if ! printf '%s\n' "$range_cmd" | sed -n 2p | grep -qF -- "# Finish the Minimal install on this host: box names for every host program"; then
+  if ! printf '%s\n' "$range_cmd" | sed -n 2p | grep -qF -- "# Finish the Minimal install on this host: DNS names for boxes (<box>.min.internal) in every program on this machine"; then
     echo "::error::the setup script's header does not name the names item it finishes"
     echo "--- script (first lines) ---"; printf '%s\n' "$range_cmd" | sed -n '1,4p'
     fail
