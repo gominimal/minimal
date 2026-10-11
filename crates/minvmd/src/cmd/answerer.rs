@@ -106,7 +106,7 @@ const CONTROL_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 pub fn release(controls: &[std::path::PathBuf], port: u16) -> Result<()> {
     for control in controls {
         if let Some(reply) = ask(control, &minimald_rpc::BoxControlRequest::ReleaseAnswerer)? {
-            eprintln!("minzoned: {reply}");
+            echo(controls, control, &reply);
         }
     }
     let deadline = std::time::Instant::now() + PORT_FREE_WAIT;
@@ -134,10 +134,21 @@ pub fn release_cancel(controls: &[std::path::PathBuf]) {
             control,
             &minimald_rpc::BoxControlRequest::ReleaseAnswererCancel,
         ) {
-            Ok(Some(reply)) => eprintln!("minzoned: {reply}"),
+            Ok(Some(reply)) => echo(controls, control, &reply),
             Ok(None) => {}
             Err(error) => eprintln!("minzoned: {}: {error:#}", control.display()),
         }
+    }
+}
+
+/// Prints one daemon's answer. With several control sockets asked, the line
+/// names the socket, so the answers of the default VM, a named VM, and a
+/// native daemon can be told apart.
+fn echo(controls: &[std::path::PathBuf], control: &std::path::Path, reply: &str) {
+    if controls.len() > 1 {
+        eprintln!("minzoned: {}: {reply}", control.display());
+    } else {
+        eprintln!("minzoned: {reply}");
     }
 }
 
@@ -181,13 +192,13 @@ fn ask(
         }
         Ok(minimald_rpc::BoxControlReply::Error { error }) => {
             bail!(
-                "the Minimal VM daemon at {} refused the request: {error}",
+                "the Minimal daemon at {} refused the request: {error}",
                 control.display()
             )
         }
         Ok(other) => bail!("{} answered {other:?}", control.display()),
         Err(error) => bail!(
-            "the Minimal VM daemon at {} sent a reply this minzoned does not understand \
+            "the Minimal daemon at {} sent a reply this minzoned does not understand \
              ({error}); it may be an older version: run `min stop`, then \
              `min finalize-install` again",
             control.display()

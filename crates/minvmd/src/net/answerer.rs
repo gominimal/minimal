@@ -2552,7 +2552,9 @@ fn channelless_holder_error(port: u16, holder: Option<(u32, String)>) -> String 
 /// Why a box cannot be handed an address while this daemon reaches no
 /// answerer.
 const NO_ANSWERER: &str = "the running VM cannot reach Minimal's DNS service for box names, so \
-                           this box cannot be given an address";
+                           this box cannot be given an address; run `min finalize-install --show` \
+                           to check the service's setup, or see minvmd.log for the cause (`min \
+                           dirs` shows where logs are kept)";
 
 /// The answer to a release or a cancel: whether it changed anything, and
 /// a sentence saying what the daemon did.
@@ -2670,7 +2672,11 @@ impl AnswererStatus {
         reply
             .recv_timeout(RELEASE_WINDOW + RELEASE_REPLY_TIMEOUT)
             .unwrap_or_else(|_| {
-                Err("Minimal's DNS service for box names did not give this box an address in time; try again".to_string())
+                Err(
+                    "Minimal's DNS service for box names did not give this box an address in \
+                     time; try again"
+                        .to_string(),
+                )
             })
     }
 
@@ -2763,13 +2769,13 @@ impl AnswererStatus {
             .clone();
         let Some(sender) = sender else {
             return ReleaseReply::no_op(format!(
-                "the running VM's box-name service is not running; {nothing}"
+                "the running VM is not answering box names right now; {nothing}"
             ));
         };
         let (reply_to, reply) = std::sync::mpsc::channel();
         if sender.send(command(reply_to)).is_err() {
             return ReleaseReply::no_op(format!(
-                "the running VM's box-name service is not running; {nothing}"
+                "the running VM is not answering box names right now; {nothing}"
             ));
         }
         reply
@@ -3472,7 +3478,8 @@ fn host_interim(
             Ok(bound) => socket = bound,
             Err(error) => {
                 let detail = format!(
-                    "the running VM could not resume answering box names on 127.0.0.1:{port}: {error}"
+                    "the running VM could not resume answering box names on \
+                     127.0.0.1:{port}: {error}"
                 );
                 tracing::warn!(component = COMPONENT, port, "{detail}");
                 if let Some(reply_to) = rebound.take() {
@@ -6078,6 +6085,12 @@ mod tests {
         std::fs::write(&paths.marker, b"").expect("the marker is written");
         let reply = status.release();
         assert!(reply.acted, "the hosting daemon releases: {reply:?}");
+        assert!(
+            reply.detail.contains("stopped answering box names")
+                && !reply.detail.contains("interim answerer"),
+            "the reply is the user's sentence, not the logged one: {}",
+            reply.detail
+        );
         let listener = UdpSocket::bind((Ipv4Addr::LOCALHOST, port))
             .expect("the port is free once the release is answered");
         assert!(!paths.interim.exists(), "the interim's channel is retired");
@@ -6267,7 +6280,9 @@ mod tests {
         let reply = status.release_cancel();
         assert!(reply.acted, "the cancel re-binds: {reply:?}");
         assert!(
-            reply.detail.contains("again"),
+            reply
+                .detail
+                .contains(&format!("is answering box names on 127.0.0.1:{port} again")),
             "and says so: {}",
             reply.detail
         );
