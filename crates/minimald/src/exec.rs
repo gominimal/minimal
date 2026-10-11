@@ -273,7 +273,7 @@ async fn ensure_task_rows_stand(
         Ok(())
     } else {
         Err(io::Error::other(format!(
-            "the Minimal VM host could not confirm session {}'s network addresses, so \
+            "the VM host daemon could not confirm session {}'s network addresses, so \
              the task was not run; destroy the session with `min session destroy`, then \
              start it again with `min session activate`",
             record.name.as_deref().unwrap_or("(unnamed)")
