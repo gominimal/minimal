@@ -227,6 +227,8 @@ mod tests {
     /// the range present is a fact about this host — Linux always does, a
     /// macOS host only once its aliases are installed — so only the
     /// coverage and the internal consistency are pinned.
+    // Binds real TCP sockets, which Miri's isolation refuses.
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn the_real_probe_covers_the_whole_range() {
         let probe = probe();

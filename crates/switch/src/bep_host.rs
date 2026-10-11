@@ -2515,6 +2515,10 @@ pub mod test_util {
 
 #[cfg(test)]
 mod tests {
+    // The Miri rule for this module: a test that creates a temp dir or binds
+    // a socket is `#[cfg_attr(miri, ignore)]`, because Miri's isolation has
+    // no `mkdir` and refuses the socket calls. A test driven in memory
+    // through `BepDevice::pair()` stays ungated, so Miri still interprets it.
     use super::*;
     use smoltcp::socket::tcp::State;
     use smoltcp::wire::{
@@ -3049,10 +3053,6 @@ mod tests {
     /// and its drop aborts the socket connection and the poll task. We stand in
     /// for gvproxy with a bound listener that accepts the connect upgrade; the
     /// peer dials it, sends the upgrade head, and then runs until dropped.
-    // The stack-peer integration tests below bind real Unix sockets and
-    // create temp dirs; Miri's default isolation has no `mkdir` and cannot
-    // interpret the socket calls. The pure ARP/RST/UDP/delivery tests above
-    // stay runnable there.
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn stack_peer_stops_with_the_switch() {
