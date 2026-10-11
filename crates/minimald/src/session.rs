@@ -157,8 +157,8 @@ impl fmt::Display for AttachError {
             AttachError::LoadoutFailed(e) => write!(f, "configuring session loadout: {e}"),
             AttachError::LaunchRecordUnwritable(e) => write!(
                 f,
-                "the session was not started: saving its egress enforcement \
-                 state failed: {e}"
+                "starting the session failed: its egress enforcement state \
+                 could not be saved: {e}"
             ),
             AttachError::SessionPending => write!(
                 f,
@@ -177,8 +177,8 @@ impl fmt::Display for AttachError {
                 f,
                 "this session's network addresses on this machine were released; run \
                  the same command again to restore them. If it is refused again, \
-                 destroy the session with `min session destroy` and start it again \
-                 with `min session activate`"
+                 destroy the session with `min session destroy <session>` and start \
+                 it again with `min session activate`"
             ),
         }
     }
@@ -4275,7 +4275,8 @@ impl Session {
                     std::io::ErrorKind::InvalidInput,
                     "this session's configuration includes patches that only \
                      `min session activate` can apply; destroy it with \
-                     `min session destroy`, then run `min session activate` again",
+                     `min session destroy <session>`, then run \
+                     `min session activate` again",
                 )));
             }
             // No patches: finalize inline so the shortcut still
