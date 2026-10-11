@@ -641,7 +641,7 @@ pub struct ActivateArgs {
     /// (every socket it opens to a destination outside itself fails),
     /// `host_ip` shares the host's network namespace (the default), and
     /// `own_ip` gives the session its own IP address, so `--ingress` can
-    /// publish ports; unless the daemon opts out, an `own_ip` session with
+    /// publish ports; unless the host opts out, an `own_ip` session with
     /// no egress rules can reach no external address.
     ///
     /// The hyphenated spellings `no-net`, `host-net`, and `own-ip` are still
@@ -679,28 +679,38 @@ pub struct ActivateArgs {
     )]
     pub dynamic_range: Option<(u16, u16)>,
     /// Allow outbound traffic to this destination subnet, in CIDR form,
-    /// e.g. `10.0.0.0/8`. Repeatable. Works with `--network own_ip` and
-    /// `--network host_ip`; `--network none` rejects every egress flag.
-    /// `min session policy` shows the rules a box ended up with.
+    /// e.g. `10.0.0.0/8`. Repeatable. Once any egress flag is given, an
+    /// `--allow-subnets` or `--allow-dns-hosts` list that is not given
+    /// allows nothing, unless the host opts out: `--allow-dns-hosts
+    /// github.com` alone reaches no address directly, and `--allow-subnets
+    /// 0.0.0.0/0` writes allow-all out. The egress flags are accepted with
+    /// `--network own_ip` and `--network host_ip`, and only `own_ip`
+    /// enforces these rules: a `host_ip` box is refused at creation or, on
+    /// a host that cannot filter it, runs with the rules unenforced.
+    /// `--network none` rejects every egress flag. `min session policy`
+    /// shows the rules a box ended up with.
     #[arg(long = "allow-subnets", value_name = "CIDR")]
     pub allow_subnets: Vec<String>,
     /// Allow outbound traffic to this DNS hostname, e.g. `github.com`.
-    /// Repeatable.
+    /// Repeatable. Given without `--allow-subnets`, the box reaches the
+    /// named hosts and no other address; see `--allow-subnets`.
     #[arg(long = "allow-dns-hosts", value_name = "HOST")]
     pub allow_dns_hosts: Vec<String>,
-    /// Allowed outbound transport protocols (`egress.allow_protocols`):
-    /// tcp, udp, or icmp. Repeatable; unset means allow all protocols.
+    /// Allow this outbound transport protocol: tcp, udp, or icmp.
+    /// Repeatable; unset allows every protocol. Narrows what the other
+    /// allow flags admit and admits nothing on its own.
     #[arg(long = "allow-protocols", value_name = "PROTO")]
     pub allow_protocols: Vec<String>,
-    /// Denied destination subnets in CIDR form (`egress.deny_subnets`),
-    /// subtracted from the allowed set. Repeatable; unset means nothing is
-    /// denied.
+    /// Deny outbound traffic to this destination subnet, in CIDR form,
+    /// subtracted from what the allow flags admit. Repeatable; unset
+    /// denies nothing.
     #[arg(long = "deny-subnets", value_name = "CIDR")]
     pub deny_subnets: Vec<String>,
     /// Declare deny-all egress: the box reaches no external address.
     /// Cannot be combined with the `--allow-*` or `--deny-subnets` flags.
-    /// Unless the daemon opts out, a `--network own_ip` box with no egress
-    /// rules already gets this by default.
+    /// Unless the host opts out, a `--network own_ip` box with no egress
+    /// rules already gets this by default. With `--network host_ip` it is
+    /// enforced only on a host that can filter each box.
     #[arg(long = "deny-all-egress", conflicts_with = "egress-rules")]
     pub deny_all_egress: bool,
     /// Let the box reach the Box Egress Proxy, whatever its
