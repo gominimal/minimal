@@ -274,8 +274,8 @@ async fn ensure_task_rows_stand(
     } else {
         Err(io::Error::other(format!(
             "the VM host daemon could not confirm session {}'s network addresses, so \
-             the task was not run; destroy the session with `min session destroy`, then \
-             start it again with `min session activate`",
+             the task was not run; destroy the session with `min session destroy <session>`, \
+             then start it again with `min session activate`",
             record.name.as_deref().unwrap_or("(unnamed)")
         )))
     }
@@ -2740,6 +2740,13 @@ mod tests {
             .expect_err("a registered box with no id is never answered as standing");
         assert!(
             refused.to_string().contains("could not confirm session"),
+            "{refused}"
+        );
+        // The bare command fails: a destroy needs a session or `--all`.
+        assert!(
+            refused
+                .to_string()
+                .contains("`min session destroy <session>`"),
             "{refused}"
         );
     }
