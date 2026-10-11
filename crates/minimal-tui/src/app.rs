@@ -562,8 +562,8 @@ fn created_status(package_check_skipped: bool, egress_deny_all_default: bool) ->
         status.push_str(
             "; this box can reach no external address (deny-all default for \
              --network own_ip with no egress rules); to allow outbound traffic, \
-             create it with `min session activate --allow-subnets` or \
-             --allow-dns-hosts",
+             create it again with `min session activate --network own_ip \
+             --allow-subnets <CIDR>` or `--allow-dns-hosts <HOST>`",
         );
     }
     status
@@ -1406,6 +1406,15 @@ mod tests {
         let status = model.status.clone().unwrap_or_default();
         assert!(
             status.contains("this box can reach no external address (deny-all default for --network own_ip with no egress rules)"),
+            "{status}"
+        );
+        // The remedy is a command that runs as written: each flag carries
+        // its operand, and the mode that makes the same kind of box.
+        assert!(
+            status.contains(
+                "`min session activate --network own_ip --allow-subnets <CIDR>` or \
+                 `--allow-dns-hosts <HOST>`"
+            ),
             "{status}"
         );
         update(
