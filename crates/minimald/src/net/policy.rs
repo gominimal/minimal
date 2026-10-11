@@ -681,12 +681,14 @@ impl fmt::Display for ExposeRefusal {
             ),
             Self::NotAttached => write!(
                 f,
-                "this box's network is not connected, so no port can be opened on it"
+                "this box's network is not connected, so no port can be opened on it; \
+                 start the box and try again"
             ),
             Self::NotRunning => {
                 write!(
                     f,
-                    "this box is not running, so there is nothing to open a port on"
+                    "this box is not running, so there is nothing to open a port on; \
+                     start the box and try again"
                 )
             }
             Self::AlreadyPublished { port, owner } => write!(
@@ -1792,7 +1794,10 @@ mod tests {
             unpublished.contains("no address on the host machine"),
             "{unpublished}"
         );
-        assert!(unattached.contains("not connected"), "{unattached}");
+        assert!(
+            unattached.contains("not connected") && unattached.contains("start the box"),
+            "{unattached}"
+        );
         assert_ne!(unpublished, unattached);
         assert!(!unattached.contains("denied") && !unpublished.contains("denied"));
         assert!(
