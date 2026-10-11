@@ -591,7 +591,12 @@ place_listener() {
 # find -lname pattern is a glob.
 listener_holders() {
     for inode in $inodes; do
-        find "$PROC"/[0-9]*/fd -lname "socket:\\[$inode\\]" 2>/dev/null
+        # find's exit status is not evidence here: a process that exits, or a
+        # descriptor any process closes, between find listing an fd table and
+        # reading an entry of it makes find exit non-zero, on a host where
+        # nothing is wrong. Under pipefail that status would end the unit,
+        # so it is dropped; what find printed is the scan.
+        find "$PROC"/[0-9]*/fd -lname "socket:\\[$inode\\]" 2>/dev/null || true
     done | awk -v proc="$PROC/" '
         index($0, proc) == 1 {
             rest = substr($0, length(proc) + 1)

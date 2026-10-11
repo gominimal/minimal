@@ -7708,6 +7708,17 @@ setup_classifier_note() {
   SETUP_CLASSIFIER_INSTALLED=1
 }
 
+# Prints what the manager recorded for the units a setup script installs. A
+# failed `systemctl start` says only that the unit failed; the reason is in
+# the unit's journal, which this run's own output never carries.
+setup_units_journal() {
+  command -v journalctl >/dev/null 2>&1 || return 0
+  for unit in minimald-classifier.service minimald-place.path minimald-place.service; do
+    echo "--- journal: $unit ---"
+    sudo -n journalctl --no-pager -n 40 -u "$unit" 2>&1 || true
+  done
+}
+
 # Removes the classifier install a setup script made (see
 # SETUP_CLASSIFIER_INSTALLED): the cases that run the script are about names,
 # and the two classifier proofs later in the lane install their own and refuse
@@ -8043,6 +8054,7 @@ proof_native_resolution_without_proxy_env() {
         echo "::error::the advisory's command did not run (are resolvectl and ip usable here?)"
         echo "--- command ---"; echo "$native_cmd"
         echo "--- output ---"; cat "$WORK/native-cmd.out" "$WORK/native-cmd.err" 2>/dev/null || true
+        setup_units_journal
         fail
       fi
       echo "ran the advisory's command"
@@ -8961,6 +8973,7 @@ proof_box_name_resolves_natively_without_proxy() {
       echo "::error::the advisory's command did not run (are resolvectl and ip usable here?)"
       echo "--- command ---"; echo "$bn_cmd"
       echo "--- output ---"; cat "$WORK/bn-cmd.out" "$WORK/bn-cmd.err" 2>/dev/null || true
+      setup_units_journal
       fail
     fi
     echo "ran the setup script under one sudo"

@@ -2685,6 +2685,18 @@ still vouches for the table it loaded" \
         grep -q "left 4246 alone: .*cgroup could not be read" "$OUT"
     want_ok "exactly one holder was placed" \
         [ "$(grep -c . "$tree/daemon/cgroup.procs")" -eq 1 ]
+    # A scan that find reports as failed (an fd table that changed under it,
+    # which a live process table does all the time): the holders it printed
+    # are still placed and the step still exits 0. The stand-in find prints
+    # what the real one does and then fails the way a vanished entry does.
+    : >"$tree/daemon/cgroup.procs"
+    printf '#!/bin/sh\n/usr/bin/find "$@"\nexit 1\n' >"$hcbin/find"
+    chmod +x "$hcbin/find"
+    run_hc place_listener_racy "$root/mi-on" --user "$me" --place-listener "$lsock"
+    rm -f "$hcbin/find"
+    check 0 "$rc" "--place-listener exits 0 when the fd scan reports a failure"
+    want_ok "the holder the failed scan still printed is placed" \
+        grep -qx 4242 "$tree/daemon/cgroup.procs"
     run_hc place_listener_again "$root/mi-on" --user "$me" --place-listener "$lsock"
     check 0 "$rc" "a second --place-listener exits 0"
     want_ok "the second run finds the daemon already placed" grep -q "already in" "$OUT"
