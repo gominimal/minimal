@@ -307,7 +307,7 @@ where
     if reply.trim().is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
-            "the VM host daemon closed the report door without answering",
+            "the host machine closed the connection without answering",
         ));
     }
     serde_json_lenient::from_str(reply.trim()).map_err(|error| {
@@ -361,7 +361,7 @@ async fn report_exchange(
         // itself is the failure, and the reason names it.
         io::Error::new(
             io::ErrorKind::TimedOut,
-            "the port report's reply did not arrive before its deadline",
+            "the host machine's answer did not arrive before its deadline",
         )
     })?
 }
@@ -457,7 +457,7 @@ pub(crate) async fn report_ask(
     let dial_timeout = |_elapsed| {
         io::Error::new(
             io::ErrorKind::TimedOut,
-            "the VM host daemon's report door did not accept the ask before its deadline",
+            "the host machine did not accept the request before its deadline",
         )
     };
     let reply = match &channel {
@@ -485,10 +485,10 @@ pub(crate) async fn report_ask(
     match reply {
         minimald_rpc::BoxControlReply::AskAdmit(outcome) => Ok(outcome),
         minimald_rpc::BoxControlReply::Error { error } => Err(io::Error::other(format!(
-            "the VM host daemon refused the ask: {error}"
+            "the host machine refused the request: {error}"
         ))),
         other => Err(io::Error::other(format!(
-            "the VM host daemon answered the ask with another verb's reply: {other:?}"
+            "the host machine sent an unexpected reply to the request: {other:?}"
         ))),
     }
 }
