@@ -200,7 +200,7 @@ pub(crate) async fn vm_host_answerer_status_at(
 pub(crate) fn vm_host_answerer_start_line(
     status: minimald_rpc::ZoneAnswererStatus,
 ) -> Option<String> {
-    crate::resolver::vm_host_answerer_line(status).map(|line| format!("zone answerer: {line}"))
+    crate::resolver::vm_host_answerer_line(status).map(|line| format!("DNS service: {line}"))
 }
 
 /// Releases the zone hold a destroyed session's activation made, when the
@@ -6735,7 +6735,7 @@ mod tests {
     }
 
     /// NET-138's interim, surfaced at every session start: the line names
-    /// who answers the zone under the `zone answerer:` label — this VM's
+    /// who answers the zone under the `DNS service:` label — this VM's
     /// minvmd when it holds the port, the machine's other holder when this
     /// VM's table is registered with it — and the pre-acquisition state
     /// prints nothing, exactly as its `min ls` line does.
@@ -6746,7 +6746,7 @@ mod tests {
                 .expect("a holder is a state to name");
         assert_eq!(
             holder,
-            "zone answerer: answered by the VM host daemon \
+            "DNS service: answered by the VM host daemon \
              (single-operator interim) · this VM's minvmd holds it on \
              127.0.0.1:7656 (UDP) · point the host's resolver at it for \
              *.min.internal",
@@ -6759,7 +6759,7 @@ mod tests {
             .expect("a registered table is a state to name");
         assert_eq!(
             registered,
-            "zone answerer: answered by the VM host daemon \
+            "DNS service: answered by the VM host daemon \
              (single-operator interim) · another VM host daemon holds it on \
              127.0.0.1:7656 (UDP); this VM's table is registered with it · \
              point the host's resolver at it for *.min.internal",
