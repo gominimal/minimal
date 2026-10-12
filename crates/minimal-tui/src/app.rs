@@ -554,8 +554,8 @@ fn created_status(package_check_skipped: bool, egress_deny_all_default: bool) ->
     let mut status = "session created".to_string();
     if package_check_skipped {
         status.push_str(
-            "; warning: the package check was skipped, so unknown package names will \
-             surface at first exec",
+            "; warning: package names were not checked, so an unknown package name \
+             shows up as an error the first time a command runs in the box",
         );
     }
     if egress_deny_all_default {

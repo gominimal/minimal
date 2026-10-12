@@ -588,7 +588,7 @@ pub async fn activate(
             Errorable::Ok(minimald_rpc::ConfigureLoadoutResponse::Materialized) => {}
             Errorable::Ok(minimald_rpc::ConfigureLoadoutResponse::Pending { .. }) => {
                 anyhow::bail!(
-                    "this project needs interactive policy gating; \
+                    "this project needs approvals the dashboard cannot ask for; \
                      create it with `min session activate` instead"
                 );
             }
