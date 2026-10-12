@@ -8984,7 +8984,7 @@ proof_box_name_resolves_natively_without_proxy() {
   bn_api_surface="$(grep -F -- 'resolves in any browser on this machine' \
     "$bn_api_err" 2>/dev/null | head -n1 || true)"
   if [ -z "$bn_api_surface" ]; then
-    echo "::error::the second box's activate does not report native DNS as the live name surface (NET-018) — the command ran, so the verdict must have moved"
+    echo "::error::the second box's activate does not say its name resolves in any browser on this machine (NET-018) — the command ran, so the verdict must have moved"
     echo "--- activate stderr ---"; cat "$bn_api_err" 2>/dev/null || true
     fail
   fi
@@ -9079,7 +9079,7 @@ proof_box_name_resolves_natively_without_proxy() {
   case "$bn_surface_line" in
     *"resolves through this machine's DNS"*) ;;
     *)
-      echo "::error::min ls does not report native DNS as the live name surface (NET-018)"
+      echo "::error::min ls's BOX NAMES line does not say box names resolve through this machine's DNS (NET-018)"
       echo "--- BOX NAMES line ---"; printf '%s\n' "$bn_surface_line"
       fail
       ;;
