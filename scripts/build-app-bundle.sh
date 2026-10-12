@@ -68,7 +68,9 @@ copy_file() {
 
 case "${1:-}" in
   assemble)
-    [ $# -ge 3 ] && [ $# -le 4 ] || die "usage: $0 assemble MINZONED OUT.app [VERSION]"
+    if [ $# -lt 3 ] || [ $# -gt 4 ]; then
+      die "usage: $0 assemble MINZONED OUT.app [VERSION]"
+    fi
     program="$2"
     app="$3"
     version="${4:-0.0.0}"
