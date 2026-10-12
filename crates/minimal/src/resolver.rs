@@ -3765,56 +3765,31 @@ fn reply_answers_host_row(reply: &Message) -> bool {
 }
 
 /// `min ls`'s DNS SERVICE line on a VM-backed host (NET-138): the line
-/// that says the zone is answered by the VM host daemon — the
-/// single-operator interim the answerer is — and names the holder the
-/// status read reported: this VM's minvmd when it holds the port, another
-/// VM host daemon when this one's table is registered with it. The third
-/// arm is the one that must not claim an answer: a port held by a process
-/// no channel reaches means this VM's names are not answered on the host,
-/// and the line says that instead. `None` for the pre-acquisition state —
+/// that says who answers this VM's box names, as the status read reported
+/// it: this VM's host daemon when it holds the port, another VM host
+/// daemon when this one's table is registered with it, or the installed
+/// DNS service (NET-122's host service) when that holds the port. The
+/// fourth arm is the one that must not claim an answer: a port held by a
+/// process no channel reaches means this VM's names are not answered, and
+/// the line says that instead. `None` for the pre-acquisition state —
 /// nothing to name yet, and the verb prints nothing for a listener still
 /// coming up, exactly as a native daemon's absent port does.
-///
-/// When the installed answerer host service holds the port (NET-122's host
-/// service), the line says the zone is manager-held and names the channel
-/// this VM's table publishes over — the hook probe's manager-held answer,
-/// as against the session-held interim the other two answered arms name.
 #[must_use]
 pub fn vm_host_answerer_line(status: ZoneAnswererStatus) -> Option<String> {
-    vm_host_answerer_line_at(status, &minvmd::net::answerer::resolve_channel_sock())
-}
-
-/// [`vm_host_answerer_line`] over a given machine-global channel path, so
-/// tests pin the wording without the host's path.
-#[must_use]
-pub(crate) fn vm_host_answerer_line_at(
-    status: ZoneAnswererStatus,
-    channel: &std::path::Path,
-) -> Option<String> {
     match status {
         ZoneAnswererStatus::Starting => None,
         ZoneAnswererStatus::Holder { port } => Some(format!(
-            "answered by the VM host daemon (single-operator interim) · this \
-             VM's minvmd holds it on 127.0.0.1:{port} (UDP) · point the host's \
-             resolver at it for *.{ZONE}"
+            "the running VM is answering box names itself on 127.0.0.1:{port} (UDP)"
         )),
         ZoneAnswererStatus::Registered { port } => Some(format!(
-            "answered by the VM host daemon (single-operator interim) · \
-             another VM host daemon holds it on 127.0.0.1:{port} (UDP); this \
-             VM's table is registered with it · point the host's resolver at \
-             it for *.{ZONE}"
+            "another VM host daemon answers this VM's box names on 127.0.0.1:{port} (UDP)"
         )),
         ZoneAnswererStatus::ManagerHeld { port } => Some(format!(
-            "manager-held: answered by the answerer host service · the \
-             service manager holds it on 127.0.0.1:{port} (UDP); this VM's \
-             table publishes to it over {} · point the host's resolver at it \
-             for *.{ZONE}",
-            channel.display()
+            "Minimal's DNS service answers this VM's box names on 127.0.0.1:{port} (UDP)"
         )),
         ZoneAnswererStatus::PortHeldNoChannel { port } => Some(format!(
-            "not answered on the host · a process no zone-answerer channel \
-             reaches holds 127.0.0.1:{port}, so this VM's minvmd answers \
-             nothing and its names are not answered on the host"
+            "this VM's box names are not answered: another program holds \
+             127.0.0.1:{port} (UDP)"
         )),
         // The status that carries the hostname proxy's terminal publish
         // failure says nothing about the zone answerer, so the answerer
@@ -3924,32 +3899,33 @@ pub fn proxy_down_line_beside(
 pub fn proxy_down_line(proxy_down: &ProxyDown) -> String {
     match &proxy_down.cause {
         ProxyDownCause::PortHeld => format!(
-            "the hostname proxy is not serving — another process on the host \
-             holds 127.0.0.1:{}",
+            "the hostname proxy is not serving: another program on this \
+             machine holds 127.0.0.1:{}",
             proxy_down.port
         ),
         ProxyDownCause::RedrawsRanOut => format!(
-            "the hostname proxy is not serving — its publication was redrawn \
-             and the redraws ran out; the last port was 127.0.0.1:{}",
+            "the hostname proxy is not serving: every port Minimal tried for \
+             it was already taken; the last was 127.0.0.1:{}",
             proxy_down.port
         ),
         // Said as unconfirmed, never as serving, until the guest's report
         // clears it — the same words the surface row prints for it.
         ProxyDownCause::PublishUnconfirmed => format!(
-            "hostname proxy publish unconfirmed · the VM is up, but the VM \
-             host daemon has not seen the hostname proxy publish on \
-             127.0.0.1:{}; names may not route through it until the guest \
-             reports the publish",
+            "the proxy is not confirmed yet: the VM is up, but the VM host \
+             daemon has not seen the proxy listening on 127.0.0.1:{}; box \
+             names may not open through it yet",
             proxy_down.port
         ),
         // A running VM's state, never the start failure's words — the
         // port, who holds it, and that the VM is up.
         ProxyDownCause::PortHeldAfterStart { holder } => {
-            let holder = holder.as_deref().unwrap_or("another process on the host");
+            let holder = holder
+                .as_deref()
+                .unwrap_or("another program on this machine");
             format!(
-                "the hostname proxy is not serving · the VM is up without a \
-                 hostname proxy: {holder} holds 127.0.0.1:{}; free the port \
-                 and restart the VM to publish it",
+                "the hostname proxy is not serving: the VM is up without it \
+                 because {holder} holds 127.0.0.1:{}; free the port, then \
+                 run `min stop` and `min ls` to restart the VM",
                 proxy_down.port
             )
         }
@@ -3958,8 +3934,8 @@ pub fn proxy_down_line(proxy_down: &ProxyDown) -> String {
 
 /// The warning every session start on a VM-backed host prints when the
 /// answerer's port is held by a process no channel reaches (NET-138): this
-/// VM's names are not answered on the host, and the proxy remains the
-/// surface. Printed to stderr unconditionally — the directive's "at every
+/// VM's names do not resolve through DNS on this machine. Printed to
+/// stderr unconditionally — the directive's "at every
 /// session start, TTY and non-TTY" — because the fact it names is the one
 /// a user relying on the names needs before the first lookup fails; the
 /// verdict printed below it says which surface the names do route
@@ -3967,10 +3943,8 @@ pub fn proxy_down_line(proxy_down: &ProxyDown) -> String {
 #[must_use]
 pub fn port_held_no_channel_warning(port: u16) -> String {
     format!(
-        "warning: this VM's box names are not answered on the host: a \
-         process no zone-answerer channel reaches holds the zone answerer's \
-         port 127.0.0.1:{port}. The hostname proxy remains the surface the \
-         names route through."
+        "warning: this VM's box names do not resolve through DNS on this \
+         machine: another program holds 127.0.0.1:{port} (UDP)"
     )
 }
 
@@ -4119,30 +4093,33 @@ pub fn host_line_proxy_cause(
 fn proxy_down_detail(port: u16, cause: &ProxyDownCause) -> String {
     match cause {
         ProxyDownCause::PortHeld => {
-            format!("another process on the host holds 127.0.0.1:{port}")
+            format!("another program on this machine holds 127.0.0.1:{port}")
         }
         ProxyDownCause::RedrawsRanOut => format!(
-            "its publication was redrawn and the redraws ran out; the last \
-             port was 127.0.0.1:{port}"
+            "every port Minimal tried for it was already taken; the last was \
+             127.0.0.1:{port}"
         ),
         // The VM is up, but the VM host daemon never saw the publish land:
         // no report from the guest, and no listener on the port it could
         // attribute to this VM. Said as unconfirmed, never as serving,
         // until the guest's report clears it.
         ProxyDownCause::PublishUnconfirmed => format!(
-            "the VM is up, but the VM host daemon has not seen the hostname \
-             proxy publish on 127.0.0.1:{port}; names may not route through it \
-             until the guest reports the publish"
+            "the VM is up, but the VM host daemon has not seen the proxy \
+             listening on 127.0.0.1:{port}; box names may not open through it \
+             yet"
         ),
         // The guest's late report refused the port after the VM came up:
         // the VM keeps running with no hostname proxy, so this is said as a
         // running VM's state, never in the start failure's words — the
         // port, who holds it, and that the VM is up.
         ProxyDownCause::PortHeldAfterStart { holder } => {
-            let holder = holder.as_deref().unwrap_or("another process on the host");
+            let holder = holder
+                .as_deref()
+                .unwrap_or("another program on this machine");
             format!(
-                "the VM is up without a hostname proxy: {holder} holds 127.0.0.1:{port}; \
-                 free the port and restart the VM to publish it"
+                "the VM is up without it because {holder} holds 127.0.0.1:{port}; \
+                 free the port, then run `min stop` and `min ls` to restart \
+                 the VM"
             )
         }
     }
@@ -4160,24 +4137,24 @@ fn proxy_down_detail(port: u16, cause: &ProxyDownCause) -> String {
 #[must_use]
 pub fn name_surface_line(surface: LiveSurface, proxy_port: Option<u16>) -> String {
     let proxy_half = match proxy_port {
-        Some(port) => format!("; the hostname proxy still serves on 127.0.0.1:{port}"),
+        Some(port) => format!("; the proxy also listens on 127.0.0.1:{port}"),
         None => "; the hostname proxy is not serving".to_string(),
     };
     match surface {
-        LiveSurface::Native => format!(
-            "native DNS is the live name surface · <name>.min.internal answers from \
-             the zone answerer and each box's own reserved-range address{proxy_half}"
-        ),
+        LiveSurface::Native => {
+            format!("<box>.min.internal resolves through this machine's DNS{proxy_half}")
+        }
         // The proxy as the live surface is the host not set up for native
         // names (NET-122's opt-in): the install clause `min ls` appends to
         // this row names the step that is, and nothing on either verb's
         // path prints or runs it.
         LiveSurface::Proxy => match proxy_port {
-            Some(port) => format!(
-                "the hostname proxy is the live name surface · <name>.min.internal \
-                 routes through it on 127.0.0.1:{port}"
-            ),
-            None => "the hostname proxy is the live name surface; it is not serving".to_string(),
+            Some(port) => {
+                format!("<box>.min.internal opens through the HTTP proxy at 127.0.0.1:{port}")
+            }
+            None => {
+                "the hostname proxy is not serving, and box names open only through it".to_string()
+            }
         },
         // The named cause replaces the bare "not serving" (T93), in the
         // words [`proxy_down_detail`] spells for both verbs. The port comes
@@ -4186,14 +4163,13 @@ pub fn name_surface_line(surface: LiveSurface, proxy_port: Option<u16>) -> Strin
         LiveSurface::ProxyNotServing { port, cause } => {
             let detail = proxy_down_detail(port, &cause);
             match cause {
-                ProxyDownCause::PortHeld | ProxyDownCause::RedrawsRanOut => format!(
-                    "the hostname proxy is the live name surface; it is not serving — {detail}"
-                ),
-                ProxyDownCause::PublishUnconfirmed => {
-                    format!("hostname proxy publish unconfirmed · {detail}")
+                ProxyDownCause::PortHeld
+                | ProxyDownCause::RedrawsRanOut
+                | ProxyDownCause::PortHeldAfterStart { .. } => {
+                    format!("the hostname proxy is not serving: {detail}")
                 }
-                ProxyDownCause::PortHeldAfterStart { .. } => {
-                    format!("the hostname proxy is not serving · {detail}")
+                ProxyDownCause::PublishUnconfirmed => {
+                    format!("the proxy is not confirmed yet: {detail}")
                 }
             }
         }
@@ -4454,33 +4430,27 @@ mod tests {
             .expect("the holder state prints its line");
         assert_eq!(
             line,
-            "answered by the VM host daemon (single-operator interim) · this \
-             VM's minvmd holds it on 127.0.0.1:7656 (UDP) · point the host's \
-             resolver at it for *.min.internal"
+            "the running VM is answering box names itself on 127.0.0.1:7656 (UDP)"
         );
         // The co-resident shape: another daemon holds, this one registered.
         let line = vm_host_answerer_line(ZoneAnswererStatus::Registered { port: 7_656 })
             .expect("the registered state prints its line");
         assert_eq!(
             line,
-            "answered by the VM host daemon (single-operator interim) · \
-             another VM host daemon holds it on 127.0.0.1:7656 (UDP); this \
-             VM's table is registered with it · point the host's resolver at \
-             it for *.min.internal"
+            "another VM host daemon answers this VM's box names on 127.0.0.1:7656 (UDP)"
         );
         // The arm that must not claim an answer: a port held by a process
-        // no channel reaches means this VM's names are not answered on the
-        // host, and saying "answered by" there would be the lie.
+        // no channel reaches means this VM's names are not answered, and
+        // saying something answers them there would be the lie.
         let line = vm_host_answerer_line(ZoneAnswererStatus::PortHeldNoChannel { port: 7_656 })
             .expect("the no-channel state prints its line");
         assert_eq!(
             line,
-            "not answered on the host · a process no zone-answerer channel \
-             reaches holds 127.0.0.1:7656, so this VM's minvmd answers \
-             nothing and its names are not answered on the host"
+            "this VM's box names are not answered: another program holds \
+             127.0.0.1:7656 (UDP)"
         );
         assert!(
-            !line.contains("answered by the VM host daemon"),
+            !line.contains("answers") && !line.contains("answering"),
             "a port with no daemon behind it is not an answered zone: {line}"
         );
         // The pre-acquisition state prints nothing, like a daemon still
@@ -4488,40 +4458,35 @@ mod tests {
         assert_eq!(vm_host_answerer_line(ZoneAnswererStatus::Starting), None);
     }
 
-    /// The hook probe's two answers about who holds the zone: manager-held
-    /// when the answerer host service holds the port (the line names the
-    /// channel this VM's table publishes over), session-held when a VM host
-    /// daemon hosts the single-operator interim. Pinned because the session
-    /// e2e greps the manager-held wording after the handover.
+    /// The hook probe's two answers about who holds the zone: the installed
+    /// DNS service when it holds the port, a VM host daemon when one hosts
+    /// the interim. Pinned because the session e2e greps the installed
+    /// service's wording after the handover.
     #[test]
     fn vm_host_answerer_line_says_manager_held_or_session_held() {
-        let channel = std::path::Path::new("/run/minimal/answerer.sock");
-        let line =
-            vm_host_answerer_line_at(ZoneAnswererStatus::ManagerHeld { port: 7_656 }, channel)
-                .expect("the manager-held state prints its line");
+        let line = vm_host_answerer_line(ZoneAnswererStatus::ManagerHeld { port: 7_656 })
+            .expect("the manager-held state prints its line");
         assert_eq!(
             line,
-            "manager-held: answered by the answerer host service · the service \
-             manager holds it on 127.0.0.1:7656 (UDP); this VM's table publishes \
-             to it over /run/minimal/answerer.sock · point the host's resolver \
-             at it for *.min.internal"
+            "Minimal's DNS service answers this VM's box names on 127.0.0.1:7656 (UDP)"
         );
         assert!(
-            !line.contains("single-operator interim"),
+            !line.contains("VM host daemon") && !line.contains("the running VM"),
             "a manager-held zone is not the session-held interim: {line}"
         );
         for status in [
             ZoneAnswererStatus::Holder { port: 7_656 },
             ZoneAnswererStatus::Registered { port: 7_656 },
         ] {
-            let line = vm_host_answerer_line_at(status, channel)
-                .expect("the session-held states print their lines");
+            let line =
+                vm_host_answerer_line(status).expect("the session-held states print their lines");
             assert!(
-                line.starts_with("answered by the VM host daemon (single-operator interim)"),
+                line.contains("the running VM is answering box names itself")
+                    || line.contains("another VM host daemon answers"),
                 "the interim is session-held: {line}"
             );
             assert!(
-                !line.contains("manager-held"),
+                !line.contains("Minimal's DNS service"),
                 "the session-held interim never claims the service: {line}"
             );
         }
@@ -4536,10 +4501,8 @@ mod tests {
     fn port_held_no_channel_warning_says_the_fact_and_the_surface() {
         assert_eq!(
             port_held_no_channel_warning(7_656),
-            "warning: this VM's box names are not answered on the host: a \
-             process no zone-answerer channel reaches holds the zone \
-             answerer's port 127.0.0.1:7656. The hostname proxy remains the \
-             surface the names route through."
+            "warning: this VM's box names do not resolve through DNS on this \
+             machine: another program holds 127.0.0.1:7656 (UDP)"
         );
     }
 
@@ -4975,8 +4938,8 @@ mod tests {
         );
         assert_eq!(
             down,
-            "names: web.min.internal: the hostname proxy is not serving — another process on \
-             the host holds 127.0.0.1:7654; finish setup: min finalize-install"
+            "names: web.min.internal: the hostname proxy is not serving — another program on \
+             this machine holds 127.0.0.1:7654; finish setup: min finalize-install"
         );
         // NET-020 in both forms: the cause the start reads beside its
         // verdict replaces the resolution half whether the verdict was the
@@ -4998,8 +4961,8 @@ mod tests {
         );
         assert_eq!(
             native_down,
-            "names: web.min.internal: the hostname proxy is not serving — another process on \
-             the host holds 127.0.0.1:7654"
+            "names: web.min.internal: the hostname proxy is not serving — another program on \
+             this machine holds 127.0.0.1:7654"
         );
         let native_down_open = host_line_beside(
             "web",
@@ -5010,8 +4973,8 @@ mod tests {
         );
         assert_eq!(
             native_down_open,
-            "names: web.min.internal: the hostname proxy is not serving — another process on \
-             the host holds 127.0.0.1:7654; finish setup: min finalize-install"
+            "names: web.min.internal: the hostname proxy is not serving — another program on \
+             this machine holds 127.0.0.1:7654; finish setup: min finalize-install"
         );
         // A native daemon's own report — no VM sibling — is the cause in the
         // daemon's words, and a Proxy verdict beside it never claims a port.
@@ -5041,7 +5004,7 @@ mod tests {
         // while the proxy serves.
         assert_eq!(
             host_line_proxy_cause(Some(&sibling), Some("stale")).as_deref(),
-            Some("another process on the host holds 127.0.0.1:7654")
+            Some("another program on this machine holds 127.0.0.1:7654")
         );
         assert_eq!(host_line_proxy_cause(None, None), None);
         assert_eq!(
@@ -5061,7 +5024,7 @@ mod tests {
             assert_eq!(line.lines().count(), 1, "one line, never a block: {line}");
             assert!(line.starts_with("names: "), "{line}");
             assert!(
-                !line.contains("HOSTNAME PROXY") && !line.contains("live name surface"),
+                !line.contains("HOSTNAME PROXY") && !line.contains("BOX NAMES"),
                 "the two old lines are gone from the start: {line}"
             );
         }
@@ -5907,7 +5870,8 @@ exit 0
                     "the cause is named exactly once for {folded:?}: {all}"
                 );
                 assert!(
-                    !all.contains("still serves") && !all.contains("routes through it on"),
+                    !all.contains("also listens")
+                        && !all.contains("opens through the HTTP proxy at"),
                     "no line names the down proxy as serving for {folded:?}: {all}"
                 );
                 assert!(
@@ -5952,11 +5916,11 @@ exit 0
     fn name_surface_line_says_which_surface_and_where_the_proxy_serves() {
         let native = name_surface_line(LiveSurface::Native, Some(15390));
         assert!(
-            native.contains("native DNS is the live name surface"),
+            native.contains("<box>.min.internal resolves through this machine's DNS"),
             "the native arm names the surface: {native}"
         );
         assert!(
-            native.contains("the hostname proxy still serves on 127.0.0.1:15390"),
+            native.contains("the proxy also listens on 127.0.0.1:15390"),
             "the native arm says the proxy keeps serving beside it (NET-019): {native}"
         );
         let not_serving = name_surface_line(LiveSurface::Native, None);
@@ -5965,20 +5929,20 @@ exit 0
             "a daemon with no proxy port is one whose proxy is not serving: {not_serving}"
         );
         assert!(
-            !not_serving.contains("still serves"),
+            !not_serving.contains("also listens"),
             "with no port to name, the line must not claim the proxy serves: {not_serving}"
         );
         let proxy = name_surface_line(LiveSurface::Proxy, Some(15390));
         assert!(
-            proxy.contains("the hostname proxy is the live name surface"),
+            proxy.contains("<box>.min.internal opens through the HTTP proxy at"),
             "the proxy arm names the surface: {proxy}"
         );
         assert!(
-            proxy.contains("routes through it on 127.0.0.1:15390"),
+            proxy.contains("opens through the HTTP proxy at 127.0.0.1:15390"),
             "the proxy arm names where it serves: {proxy}"
         );
         assert!(
-            !proxy.contains("native DNS is the live name surface"),
+            !proxy.contains("resolves through this machine's DNS"),
             "the proxy arm must not say the native words: {proxy}"
         );
     }
@@ -5987,8 +5951,8 @@ exit 0
     /// the hostname proxy is not serving — the port the failure is about
     /// and the cause the VM host daemon reported — instead of a bare "not
     /// serving". The two named causes are the two terminal publish
-    /// outcomes: a port another process on the host holds, and a redraw
-    /// that ran out of tries. The old daemon's substituting state carries
+    /// outcomes: a port another program on this machine holds, and a
+    /// redraw that ran out of tries. The old daemon's substituting state carries
     /// the cause in the state itself; the answerer row beside it claims
     /// nothing the status did not say, and the session start's read of
     /// it carries the cause whole, claiming no answerer facts of its own.
@@ -6008,7 +5972,10 @@ exit 0
             None,
         );
         assert!(
-            line.contains("it is not serving — another process on the host holds 127.0.0.1:7654"),
+            line.contains(
+                "the hostname proxy is not serving: another program on this machine holds \
+                 127.0.0.1:7654"
+            ),
             "the held port is named with its cause: {line}"
         );
 
@@ -6026,11 +5993,11 @@ exit 0
             None,
         );
         assert!(
-            line.contains("the redraws ran out; the last port was 127.0.0.1:19911"),
+            line.contains("was already taken; the last was 127.0.0.1:19911"),
             "the exhausted redraw is named with its last port: {line}"
         );
         assert!(
-            !line.contains("still serves"),
+            !line.contains("also listens"),
             "a proxy the VM host daemon reported down must not be said to serve: {line}"
         );
 
@@ -6093,10 +6060,7 @@ exit 0
         assert_eq!(
             vm_host_answerer_line(reply.answerer.clone()),
             Some(
-                "answered by the VM host daemon (single-operator interim) · \
-                 this VM's minvmd holds it on 127.0.0.1:7656 (UDP) · point the \
-                 host's resolver at it for *.min.internal"
-                    .to_string()
+                "the running VM is answering box names itself on 127.0.0.1:7656 (UDP)".to_string()
             ),
             "the answerer line names the holder, cause or no cause"
         );
@@ -6109,8 +6073,8 @@ exit 0
                     .as_ref()
                     .expect("the sibling cause is present")
             ),
-            "the hostname proxy is not serving — its publication was redrawn \
-             and the redraws ran out; the last port was 127.0.0.1:19911",
+            "the hostname proxy is not serving: every port Minimal tried for \
+             it was already taken; the last was 127.0.0.1:19911",
             "the cause names itself on the line of its own"
         );
     }
@@ -6135,7 +6099,7 @@ exit 0
             Some(19_917),
         );
         assert!(
-            line.starts_with("hostname proxy publish unconfirmed"),
+            line.starts_with("the proxy is not confirmed yet"),
             "the row says the publish is unconfirmed: {line}"
         );
         assert!(
@@ -6143,7 +6107,7 @@ exit 0
             "the row names the port: {line}"
         );
         assert!(
-            !line.contains("still serves") && !line.contains("routes through it on"),
+            !line.contains("also listens") && !line.contains("opens through the HTTP proxy at"),
             "an unconfirmed publish must not be said to serve: {line}"
         );
     }
@@ -6171,13 +6135,13 @@ exit 0
         );
         assert_eq!(
             line,
-            "the hostname proxy is not serving · the VM is up without a hostname proxy: \
-             pid 4242 (python3) holds 127.0.0.1:19918; free the port and restart the VM \
-             to publish it",
+            "the hostname proxy is not serving: the VM is up without it because \
+             pid 4242 (python3) holds 127.0.0.1:19918; free the port, then run \
+             `min stop` and `min ls` to restart the VM",
             "the row names the port, the holder, and that the VM is up"
         );
         assert!(
-            !line.contains("the live name surface; it is not serving —"),
+            !line.contains("box names open only through it"),
             "a late refusal must not recycle the start failure's words: {line}"
         );
 
@@ -6187,7 +6151,7 @@ exit 0
         };
         let line = name_surface_line(unnamed, None);
         assert!(
-            line.contains("another process on the host holds 127.0.0.1:19918")
+            line.contains("another program on this machine holds 127.0.0.1:19918")
                 && line.contains("the VM is up"),
             "an unnamed holder still names the port and the running VM: {line}"
         );

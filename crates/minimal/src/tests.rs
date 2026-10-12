@@ -2805,11 +2805,12 @@ async fn ls_shows_vm_per_box() {
             .to_string()
     };
     assert!(
-        surface_line_of("default").contains("the hostname proxy is the live name surface"),
+        surface_line_of("default").contains("proxy")
+            && !surface_line_of("default").contains("resolves through this machine's DNS"),
         "the VM the hook does not route to keeps its proxy line:\n{table}"
     );
     assert!(
-        surface_line_of("alpha").contains("native DNS is the live name surface"),
+        surface_line_of("alpha").contains("resolves through this machine's DNS"),
         "the VM the hook routes to is named native:\n{table}"
     );
     let answerer_row_of = |vm: &str| {
@@ -2820,15 +2821,17 @@ async fn ls_shows_vm_per_box() {
             .to_string()
     };
     assert!(
-        answerer_row_of("default").contains("this VM's minvmd holds it on 127.0.0.1:7656"),
+        answerer_row_of("default")
+            .contains("the running VM is answering box names itself on 127.0.0.1:7656"),
         "the VM whose minvmd holds the port says so, in its own row:\n{table}"
     );
     assert!(
-        answerer_row_of("alpha").contains("another VM host daemon holds it on 127.0.0.1:7656"),
+        answerer_row_of("alpha")
+            .contains("another VM host daemon answers this VM's box names on 127.0.0.1:7656"),
         "the registered VM names the holder, in its own row:\n{table}"
     );
     assert!(
-        !answerer_row_of("alpha").contains("this VM's minvmd holds it"),
+        !answerer_row_of("alpha").contains("answering box names itself"),
         "a VM registered with another daemon must not claim its own minvmd \
          holds the port:\n{table}"
     );
