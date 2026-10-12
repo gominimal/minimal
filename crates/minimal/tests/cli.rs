@@ -2075,7 +2075,10 @@ fn policy_json_distinguishes_unavailable_live_rows_from_none_published() {
         &policy,
         sessions::NetworkMode::OwnIp,
         None,
-        Err("live port mappings are unavailable: no session found".to_string()),
+        Err(
+            "could not read the ports this box published while running: no session found"
+                .to_string(),
+        ),
         &[],
     )
     .unwrap();
@@ -2333,7 +2336,7 @@ async fn policy_shows_effective_egress() {
     .unwrap();
     let text = String::from_utf8(out).unwrap();
     assert_eq!(
-        text, "No network policy (NoNet)\n",
+        text, "This box has no network (--network none)\n",
         "a none session prints the note in place of both blocks:\n{text}"
     );
 }
@@ -3012,7 +3015,8 @@ fn policy_shows_baseline_set() {
     // cutover.
     assert!(
         text.contains(
-            "node-plane baseline set (helper enumeration) — announced (node row's allow-all interim)"
+            "destinations for Minimal's own downloads in this VM (not this box's rules): \
+             announced (node row's allow-all interim)"
         ),
         "the helper's baseline set is shown beside the box's rules, headed by the \
          gate's announced posture:\n{text}"
@@ -3042,7 +3046,7 @@ fn policy_shows_baseline_set() {
     // after it, the ingress block last.
     let egress_at = text.find("egress").expect("the egress block renders");
     let baseline_at = text
-        .find("node-plane baseline set")
+        .find("Minimal's own downloads in this VM")
         .expect("the baseline set renders");
     let ingress_at = text.find("ingress").expect("the ingress block renders");
     assert!(
@@ -3064,7 +3068,7 @@ fn policy_shows_baseline_set() {
     .unwrap();
     let text = String::from_utf8(out).unwrap();
     assert!(
-        !text.contains("node-plane baseline set"),
+        !text.contains("Minimal's own downloads in this VM"),
         "a host-address box carries no baseline set:\n{text}"
     );
 
@@ -3084,7 +3088,7 @@ fn policy_shows_baseline_set() {
     .unwrap();
     let text = String::from_utf8(out).unwrap();
     assert!(
-        !text.contains("node-plane baseline set"),
+        !text.contains("Minimal's own downloads in this VM"),
         "an unnamed fabric carries no baseline set:\n{text}"
     );
 }
@@ -3101,7 +3105,8 @@ fn policy_shows_baseline_set() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn deny_all_in_force_note_printed() {
-    const NOTE: &str = "egress: deny-all (default for an own-ip box with no egress section)";
+    const NOTE: &str = "This box can reach no external address: a --network own_ip box with no \
+                        egress rules gets the deny-all default";
     assert_eq!(
         sessions::EGRESS_DEFAULT_PHASE,
         sessions::EgressDefaultPhase::InForce,

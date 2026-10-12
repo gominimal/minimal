@@ -1723,7 +1723,7 @@ proof_own_ip_egress_declared_and_enforced() {
   # no longer prints), and `min session policy` names the default it got.
   # This daemon runs without the opt-out, so the default binds. The box is
   # kept for the reach legs below, which need a live control first.
-  egress_in_force_note="egress: deny-all (default for an own-ip box with no egress section)"
+  egress_in_force_note="This box can reach no external address: a --network own_ip box with no egress rules gets the deny-all default"
   bare_sid="$(cd "$EGRESS_SEED_DIR" && mnl session activate . --no-prompt \
     --name e2e-egress-bare --network own_ip 2>"$WORK/egress-bare.err")" || {
     echo "::error::'min session activate --network own_ip' (bare box) failed"
@@ -4050,7 +4050,7 @@ proof_own_ip_box_registers_with_the_vm_host_without_a_provider_flag() {
   while [ "$SECONDS" -lt "$boxreg_ctrlc_deadline" ]; do
     kill -STOP "$BOXREG_CTRLC_PID" 2>/dev/null || break
     if [ -z "$boxreg_ctrlc_armed" ] \
-      && grep -qF -- "egress: deny-all (default for an own-ip box with no egress section)" \
+      && grep -qF -- "This box can reach no external address: a --network own_ip box with no egress rules gets the deny-all default" \
         "$WORK/boxreg-ctrlc.err" 2>/dev/null; then
       boxreg_ctrlc_armed=1
     fi
@@ -14891,7 +14891,7 @@ ESU_LISTENER_EOF
       echo "::error::box $esu_box's policy does not show its declared subnets ('$esu_line')"
       esu_fail
     fi
-    if ! grep -q 'node-plane baseline set (helper enumeration)' <<<"$esu_policy" \
+    if ! grep -q 'own downloads in this VM' <<<"$esu_policy" \
       || ! grep -q 'registry  100.64.255.254/32' <<<"$esu_policy" \
       || ! grep -q 'cache  100.64.255.254/32' <<<"$esu_policy"; then
       echo "::error::box $esu_box's policy does not show the node-plane baseline set beside its rules (the registry and cache categories at the host alias)"

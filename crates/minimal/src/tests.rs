@@ -2199,7 +2199,7 @@ fn host_stop_waits_for_the_alive_lock_not_the_lifecycle() {
     let err = wait_for_alive_lock_released(&state_dir, std::time::Duration::from_millis(300))
         .expect_err("a held alive lock is not a finished stop");
     assert!(
-        format!("{err:#}").contains("still holds the VM's alive lock"),
+        format!("{err:#}").contains("the VM host daemon (minvmd) is still running"),
         "got: {err:#}"
     );
 

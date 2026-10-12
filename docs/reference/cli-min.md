@@ -132,7 +132,7 @@ reaches no external address. It can still resolve names in the box zone,
 `host.min.internal` included. Activate prints one line saying so:
 
 ```
-egress: deny-all (default for an own-ip box with no egress section); declare reach with the --allow-subnets, --allow-dns-hosts and --allow-protocols flags
+This box can reach no external address: a --network own_ip box with no egress rules gets the deny-all default. To allow outbound traffic, activate a new session with --allow-subnets or --allow-dns-hosts, for example --allow-dns-hosts github.com.
 ```
 
 To give such a box reach, declare it with the allow flags, such as
@@ -400,7 +400,8 @@ box's relay gate when it binds the forward. If nothing in the box listens on
 the port yet, the box itself refuses a connection to it.
 A row from an older daemon whose gate did not admit runtime publishes reads
 `(pending; not yet reachable)`. A row from a daemon older than the `pending`
-field reads `(unknown; daemon predates this field)`. The CLI never shows
+field reads `(reachability unknown: the running daemon is older than this min)`.
+The CLI never shows
 either row as reachable.
 
 The daemon publishes a port the box listens on only after it writes the
@@ -409,7 +410,7 @@ stays unpublished, and the command prints one line per port after the live
 rows:
 
 ```
-warning: port 3000 is permitted but not published: the audit log /path/to/audit/decisions.log cannot be written
+warning: port 3000 is allowed but not reachable yet: Minimal could not write the audit log /path/to/audit/decisions.log. The port is published once that log can be written.
 ```
 
 The line clears once the log takes records again and the port publishes.
