@@ -574,7 +574,7 @@ pub(crate) fn range_step_over(facts: &RangeFacts) -> RangeStep {
             .find(|(path, _)| path == component)
             .map(|(_, custody)| custody)
         else {
-            checks.push(format!("its directory {component} did not read"));
+            checks.push(format!("its directory {component} could not be read"));
             continue;
         };
         if !custody.root_owned() {
@@ -922,7 +922,7 @@ pub(crate) fn answerer_step_over(facts: &AnswererFacts, daemon: u32) -> Answerer
             .find(|(path, _)| path == component)
             .map(|(_, custody)| custody)
         else {
-            checks.push(format!("its directory {component} did not read"));
+            checks.push(format!("its directory {component} could not be read"));
             continue;
         };
         if !custody.root_owned() {
@@ -1910,10 +1910,10 @@ pub(crate) fn stub_bypass_blocker(
         return None;
     }
     Some(format!(
-        "this host's lookups bypass systemd-resolved: {RESOLV_CONF} names {} \
-         and not its {RESOLVED_STUB} stub, so the routing-domain command \
-         cannot reach them; the zone resolves in host processes only once \
-         their lookups reach that stub",
+        "this machine's lookups bypass systemd-resolved: {RESOLV_CONF} names \
+         {} and not {RESOLVED_STUB}, so Minimal cannot set up *.{ZONE} for \
+         them; once {RESOLV_CONF} lists nameserver {RESOLVED_STUB}, run `min \
+         finalize-install` again",
         servers.join(" ")
     ))
 }
@@ -2225,14 +2225,14 @@ fn control_args(install: &AnswererInstall) -> String {
 /// The comment over the step that starts the answerer service: with
 /// daemons to ask (`controls` non-empty), they release the hook port
 /// first; with none, `start` alone. Either way the script then waits for
-/// the service's channel.
+/// the service to come up.
 fn handover_comment(controls: &str, start: &str) -> String {
     if controls.is_empty() {
-        format!("# Start the service: {start}, and the script waits for its channel.\n")
+        format!("# Start the service: {start}, and the script waits for it to come up.\n")
     } else {
         format!(
-            "# Hand the hook port to the service: this user's daemons release it,\n\
-             # then {start}, and the script waits for its channel.\n"
+            "# Free the port for the service: this user's Minimal daemons release it,\n\
+             # then {start}, and the script waits for it to come up.\n"
         )
     }
 }
@@ -2261,7 +2261,7 @@ fn answerer_fail_block(
         "{{\n\
          {cancel}\
          {cleanup}\
-         \x20 echo \"minimal: {reason}; the answerer service was not installed\" >&2\n\
+         \x20 echo \"minimal: {reason}; Minimal's DNS service was not installed\" >&2\n\
          \x20 exit 1\n\
          }}"
     )
@@ -2302,7 +2302,7 @@ fn verified_copy_steps(install: &AnswererInstall, dir: &str, dest: &str, macos: 
     let sha = &install.sha256;
     let refuse = |reason: &str| {
         format!(
-            "{{ rm -f \"$t\" ; echo \"minimal: {reason}; the answerer service was not \
+            "{{ rm -f \"$t\" ; echo \"minimal: {reason}; Minimal's DNS service was not \
              installed\" >&2 ; exit 1 ; }}"
         )
     };
@@ -2310,19 +2310,19 @@ fn verified_copy_steps(install: &AnswererInstall, dir: &str, dest: &str, macos: 
         (Some(requirement), true) => format!(
             "codesign --verify --strict -R \"={}\" \"$t\" || {}\n",
             requirement.replace('"', "\\\""),
-            refuse("the copied answerer failed its Developer ID check (codesign -R)")
+            refuse("the copied DNS service program failed its Developer ID check (codesign -R)")
         ),
         _ => String::new(),
     };
     format!(
         "[ -d \"{dir}\" ] || install -d -m 0755 -o root -g {group} \"{dir}\" \
-         || {{ echo \"minimal: {dir} could not be created root-owned; the answerer service \
+         || {{ echo \"minimal: {dir} could not be created root-owned; Minimal's DNS service \
          was not installed\" >&2 ; exit 1 ; }}\n\
          p=\"{dir}\"\n\
          while : ; do\n\
          \x20 find \"$p\" -maxdepth 0 -type d -user root -not -perm -g+w -not -perm -o+w \
          -not -perm -1000 | grep -q . || {{ echo \"minimal: $p, on the path to {dir}, is not a \
-         root-owned, non-sticky directory closed to group and other writes; the answerer \
+         root-owned, non-sticky directory closed to group and other writes; Minimal's DNS \
          service was not installed\" >&2 ; exit 1 ; }}\n\
          \x20 if [ \"$p\" = / ] ; then break ; fi\n\
          \x20 p=$(dirname \"$p\")\n\
@@ -2331,12 +2331,12 @@ fn verified_copy_steps(install: &AnswererInstall, dir: &str, dest: &str, macos: 
          install -m 0755 -o root -g {group} \"{source}\" \"$t\" || {copy_failed}\n\
          h=$({hash} < \"$t\" || true)\n\
          h=${{h%% *}}\n\
-         case \"$h\" in {sha}) ;; *) rm -f \"$t\" ; echo \"minimal: the answerer copy hashes \
+         case \"$h\" in {sha}) ;; *) rm -f \"$t\" ; echo \"minimal: the copied DNS service program hashes \
          $h, not the {sha} min finalize-install verified: the source changed after it was checked; \
-         the answerer service was not installed\" >&2 ; exit 1 ;; esac\n\
+         Minimal's DNS service was not installed\" >&2 ; exit 1 ;; esac\n\
          {codesign}\
          mv -f \"$t\" \"{dest}\"\n",
-        copy_failed = refuse("the answerer program could not be copied"),
+        copy_failed = refuse("the DNS service program could not be copied"),
     )
 }
 
@@ -2381,7 +2381,7 @@ fn macos_answerer_steps(install: &AnswererInstall) -> String {
     } else {
         format!(
             "\"{copy}\" release{controls} || {}\n",
-            fail("the hook port did not come free for the answerer service (a collision)")
+            fail("the port the DNS service listens on did not come free")
         )
     };
     format!(
@@ -2414,8 +2414,8 @@ fn macos_answerer_steps(install: &AnswererInstall) -> String {
         operator = install.operator,
         channel_dir = install.channel_dir,
         answerer_plist = answerer_unit_plist(install),
-        load_failed = fail("launchd did not load the answerer service"),
-        not_up = fail("the answerer service channel did not come up within 5 s"),
+        load_failed = fail("launchd did not load the DNS service"),
+        not_up = fail("the DNS service did not start within 5 s"),
     )
 }
 
@@ -2576,7 +2576,7 @@ fn linux_answerer_steps(install: &AnswererInstall) -> String {
     } else {
         format!(
             "\"{copy}\" release{controls} || {}\n",
-            fail("the hook port did not come free for the answerer service (a collision)")
+            fail("the port the DNS service listens on did not come free")
         )
     };
     format!(
@@ -2617,8 +2617,8 @@ fn linux_answerer_steps(install: &AnswererInstall) -> String {
         operator = install.operator,
         answerer_socket = answerer_socket_unit(install),
         answerer_service = answerer_service_unit(install),
-        not_active = fail("the answerer service socket unit did not become active within 5 s"),
-        not_up = fail("the answerer service channel did not come up within 5 s"),
+        not_active = fail("the DNS service socket did not become active within 5 s"),
+        not_up = fail("the DNS service did not start within 5 s"),
     )
 }
 
@@ -2652,12 +2652,13 @@ pub(crate) fn names_steps(port: u16, install: Option<&AnswererInstall>) -> Strin
 /// The lead-in sentence of the removal script on macOS.
 #[cfg(any(test, target_os = "macos"))]
 const MACOS_UNDO_WHAT: &str = "Remove what `min finalize-install` installed on this host: the \
-     resolver's hook for the zone, the local range unit, and the Minimal box-name service";
+     resolver setting for box names, the boot-time setup for the loopback IPs boxes use, and \
+     the Minimal box-name service";
 
 /// The lead-in sentence of the removal script on Linux.
 #[cfg(any(test, not(target_os = "macos")))]
 const LINUX_UNDO_WHAT: &str = "Remove what `min finalize-install` installed on this host: the \
-     resolver's hook for the zone, the Minimal box-name service, the user-namespace profile, \
+     resolver setting for box names, the Minimal box-name service, the user-namespace profile, \
      the classifier tree, and the kvm group membership the step added";
 
 /// The AppArmor profile directory the user-namespace profile installs under.
@@ -2956,8 +2957,10 @@ pub(crate) fn other_operator_refusal(
     let installed = operator_of(unit_text?)?;
     (!installed.is_empty() && installed != me).then(|| {
         format!(
-            "the Minimal box-name service on this host is installed for the user {installed}; \
-             setting it up as {me} would replace their service, so nothing was run"
+            "Minimal's DNS service on this machine is installed for the user {installed}; \
+             setting it up as {me} would replace their service, so nothing was run. Once \
+             {installed} removes it with `min finalize-install --undo`, `min \
+             finalize-install` sets it up for {me}"
         )
     })
 }
@@ -3268,7 +3271,7 @@ pub(crate) fn names_verdict_at(
                 let check = range_step
                     .failed_check
                     .as_deref()
-                    .unwrap_or("its state did not read");
+                    .unwrap_or("its state could not be read");
                 facts.push(format!(
                     "the boot-time setup that adds the loopback IPs boxes \
                      use ({}) fails a safety check: {check}",
@@ -4029,7 +4032,7 @@ pub fn host_line(
 /// line's forms: when the hostname proxy failed to bind — the VM host
 /// daemon's sibling cause, or a native daemon's own report — the cause
 /// replaces the resolution half, `names: <box>.min.internal: the hostname
-/// proxy is not serving — <cause>`, whatever the surface verdict says — the
+/// proxy is not serving: <cause>`, whatever the surface verdict says — the
 /// box stays named, the cause says why its name is not routed — because a
 /// name the line claims resolves while the proxy is down is the claim a
 /// failing lookup contradicts first. The install clause is still the verdict's: a host
@@ -4048,17 +4051,17 @@ pub fn host_line_beside(
     // host line naming the box, and a reader whose proxy is down is the one
     // who most needs to know which name the cause is about.
     let names = match (proxy_cause, surface) {
-        (Some(cause), _) => format!("{name}: the hostname proxy is not serving — {cause}"),
+        (Some(cause), _) => format!("{name}: the hostname proxy is not serving: {cause}"),
         (None, LiveSurface::Native) => {
             format!("{name} resolves in any browser on this machine")
         }
         (None, LiveSurface::Proxy) => match proxy_port {
-            Some(port) => format!("{name} via 127.0.0.1:{port}"),
+            Some(port) => format!("{name} opens through the HTTP proxy at 127.0.0.1:{port}"),
             None => format!("{name}: the hostname proxy is not serving"),
         },
         (None, LiveSurface::ProxyNotServing { port, cause }) => {
             format!(
-                "{name}: the hostname proxy is not serving — {}",
+                "{name}: the hostname proxy is not serving: {}",
                 proxy_down_detail(*port, cause)
             )
         }
@@ -4894,7 +4897,8 @@ mod tests {
         let unfinished = host_line("web", &LiveSurface::Proxy, Some(7654), others_open);
         assert_eq!(
             unfinished,
-            "names: web.min.internal via 127.0.0.1:7654; finish setup: min finalize-install"
+            "names: web.min.internal opens through the HTTP proxy at 127.0.0.1:7654; finish setup: \
+             min finalize-install"
         );
         // Names alone open: the names item is the surface verdict itself,
         // so the clause rides without any other item.
@@ -4938,7 +4942,7 @@ mod tests {
         );
         assert_eq!(
             down,
-            "names: web.min.internal: the hostname proxy is not serving — another program on \
+            "names: web.min.internal: the hostname proxy is not serving: another program on \
              this machine holds 127.0.0.1:7654; finish setup: min finalize-install"
         );
         // NET-020 in both forms: the cause the start reads beside its
@@ -4961,7 +4965,7 @@ mod tests {
         );
         assert_eq!(
             native_down,
-            "names: web.min.internal: the hostname proxy is not serving — another program on \
+            "names: web.min.internal: the hostname proxy is not serving: another program on \
              this machine holds 127.0.0.1:7654"
         );
         let native_down_open = host_line_beside(
@@ -4973,7 +4977,7 @@ mod tests {
         );
         assert_eq!(
             native_down_open,
-            "names: web.min.internal: the hostname proxy is not serving — another program on \
+            "names: web.min.internal: the hostname proxy is not serving: another program on \
              this machine holds 127.0.0.1:7654; finish setup: min finalize-install"
         );
         // A native daemon's own report — no VM sibling — is the cause in the
@@ -4992,12 +4996,12 @@ mod tests {
         );
         assert_eq!(
             proxy_down_native_daemon,
-            "names: web.min.internal: the hostname proxy is not serving — could not bind \
+            "names: web.min.internal: the hostname proxy is not serving: could not bind \
              127.0.0.1:7654: address in use. Remedy: free the port; finish setup: min \
              finalize-install"
         );
         assert!(
-            !proxy_down_native_daemon.contains("via 127.0.0.1"),
+            !proxy_down_native_daemon.contains("opens through the HTTP proxy at"),
             "a down proxy is never named as the route: {proxy_down_native_daemon}"
         );
         // The sibling wins where both are present, and nothing is a cause
@@ -5048,10 +5052,15 @@ mod tests {
                     .starts_with("names: api.min.internal resolves in any browser on this machine"),
                 "{native}"
             );
-            assert!(!native.contains("via 127.0.0.1"), "{native}");
+            assert!(
+                !native.contains("opens through the HTTP proxy at"),
+                "{native}"
+            );
             let proxy = host_line("api", &LiveSurface::Proxy, Some(7654), host);
             assert!(
-                proxy.starts_with("names: api.min.internal via 127.0.0.1:7654"),
+                proxy.starts_with(
+                    "names: api.min.internal opens through the HTTP proxy at 127.0.0.1:7654"
+                ),
                 "{proxy}"
             );
             assert!(!proxy.contains("resolves in any browser"), "{proxy}");
@@ -6693,7 +6702,7 @@ exit 0
         assert!(
             step.failed_check
                 .as_deref()
-                .is_some_and(|check| check.contains("its directory / did not read")),
+                .is_some_and(|check| check.contains("its directory / could not be read")),
             "the walk says which component it could not read: {step:?}"
         );
     }
@@ -6749,7 +6758,7 @@ exit 0
                     "# The local range: ",
                     "# The box-name service's program: ",
                     "# The box-name service: a launchd unit",
-                    "# Hand the hook port to the service: ",
+                    "# Free the port for the service: ",
                 ][..],
             ),
             (
@@ -6758,7 +6767,7 @@ exit 0
                     "# The resolver: ",
                     "# The box-name service's program: ",
                     "# The box-name service: a systemd socket and service pair",
-                    "# Hand the hook port to the service: ",
+                    "# Free the port for the service: ",
                 ][..],
             ),
         ] {
@@ -6789,6 +6798,17 @@ exit 0
                 );
             }
             assert!(sh_parses(script), "{script}");
+            for old in [
+                "answerer service",
+                "answerer program",
+                "answerer copy",
+                "hook port",
+            ] {
+                assert!(
+                    !script.contains(old),
+                    "the script says {old:?} nowhere: {script}"
+                );
+            }
         }
         assert!(
             mac.contains(

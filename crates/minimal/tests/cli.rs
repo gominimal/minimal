@@ -3428,12 +3428,12 @@ async fn listener_failure_reported_with_remedy() {
     // so the line never claims a route through a proxy that is not serving.
     assert!(
         activate_stderr.contains(&format!(
-            "names: remedy-report.min.internal: the hostname proxy is not serving — {reason}"
+            "names: remedy-report.min.internal: the hostname proxy is not serving: {reason}"
         )),
         "the host line must carry the cause in place of the resolution, got: {activate_stderr}"
     );
     assert!(
-        !activate_stderr.contains("via 127.0.0.1"),
+        !activate_stderr.contains("opens through the HTTP proxy at"),
         "a down proxy is never named as the route, got: {activate_stderr}"
     );
 
@@ -3685,8 +3685,8 @@ async fn activate_and_ls_report_native_surface() {
     .await;
     assert!(
         activate_stderr.contains(&format!(
-            "names: native-surface.min.internal via 127.0.0.1:{port}; finish setup: \
-             min finalize-install"
+            "names: native-surface.min.internal opens through the HTTP proxy at \
+             127.0.0.1:{port}; finish setup: min finalize-install"
         )),
         "activate must print the one host line naming the box, the proxy's port and the \
          install clause, got: {activate_stderr}"
