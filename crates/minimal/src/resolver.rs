@@ -2673,14 +2673,14 @@ fn bundle_copy_steps(install: &AnswererInstall, dir: &str, bundle: &str) -> Stri
         ANSWERER_BUNDLE_PROGRAM.to_string(),
         install.sha256.as_str(),
         "0755",
-        "the copied DNS service program".to_string(),
+        "DNS service program".to_string(),
     )];
     files.extend(install.bundle.iter().map(|file| {
         (
             file.path.clone(),
             file.sha256.as_str(),
             "0644",
-            format!("the copied DNS service bundle file {}", file.path),
+            format!("DNS service bundle file {}", file.path),
         )
     }));
     // Every directory a file lands in, outermost first.
@@ -2716,10 +2716,10 @@ fn bundle_copy_steps(install: &AnswererInstall, dir: &str, bundle: &str) -> Stri
              || {copy_failed}\n\
              h=$(shasum -a 256 < \"$t/{path}\" || true)\n\
              h=${{h%% *}}\n\
-             case \"$h\" in {sha}) ;; *) rm -rf \"$t\" ; echo \"minimal: {what} hashes \
+             case \"$h\" in {sha}) ;; *) rm -rf \"$t\" ; echo \"minimal: the copied {what} hashes \
              $h, not the {sha} min finalize-install verified: the source changed after it was \
              checked; Minimal's DNS service was not installed\" >&2 ; exit 1 ;; esac\n",
-            copy_failed = refuse("the DNS service program could not be copied"),
+            copy_failed = refuse(&format!("the {what} could not be copied")),
         ));
     }
     if let Some(requirement) = &install.requirement {
@@ -9866,6 +9866,29 @@ resolvectl domain minzone0 '~min.internal'
             installed,
             "the installed bundle is left as it was"
         );
+        assert!(harness.leftovers().is_empty(), "{:?}", harness.leftovers());
+    }
+
+    /// A bundle file that cannot be copied is refused by its own name, not
+    /// the program's, and nothing is installed.
+    #[test]
+    fn privileged_bundle_copy_names_the_file_that_could_not_be_copied() {
+        let harness = BundleHarness::new();
+        std::fs::remove_file(harness.source_bundle.join("Contents/CodeResources")).unwrap();
+
+        let output = harness.run(&harness.install, false);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "a failed copy is refused");
+        assert!(
+            stderr
+                .contains("the DNS service bundle file Contents/CodeResources could not be copied"),
+            "the refusal names the file: {stderr}"
+        );
+        assert!(
+            !stderr.contains("the DNS service program could not be copied"),
+            "the refusal does not blame the program: {stderr}"
+        );
+        assert!(!harness.bundle.exists(), "nothing reaches the destination");
         assert!(harness.leftovers().is_empty(), "{:?}", harness.leftovers());
     }
 
