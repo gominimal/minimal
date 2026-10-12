@@ -1064,7 +1064,7 @@ finalize-install" "$(cat "$HF1/finalize.calls")" \
     # probe reports the names item (resolver link, answerer unit, reserved
     # range). The offer works the same way.
     HF3="$root/hf3"; mkdir -p "$HF3"
-    fi_summary "$HF3" "box names for every host program"
+    fi_summary "$HF3" "DNS names for boxes (<box>.min.internal) in every program on this machine"
     PLAT_S=Darwin; PLAT_M=arm64
     TTY_FILE="$root/tty-enter"
     run fi_darwin "$HF3"
@@ -1072,7 +1072,7 @@ finalize-install" "$(cat "$HF1/finalize.calls")" \
     PLAT_S=Linux; PLAT_M=x86_64
     check 0 "$rc" "darwin: an install that offers the step exits 0"
     want_ok "darwin: the names item is shown" \
-        grep -q "✗ box names for every host program" "$OUT"
+        grep -qF "✗ DNS names for boxes (<box>.min.internal) in every program on this machine" "$OUT"
     want_ok "darwin: the offer is made" grep -qF "$fi_prompt" "$OUT"
     want_ok "darwin: Enter runs the step" grep -qx "finalize-install" "$HF3/finalize.calls"
 
@@ -1166,14 +1166,14 @@ case_installer_does_not_prompt_on_a_finished_host() {
     # no question and no pointer to a step that would run nothing, even with a
     # terminal.
     HF8="$root/hf8"; mkdir -p "$HF8"
-    printf '%s:\n  ✓ the private sandbox every box runs in\n  ✗ box names for every host program — waiting on a daemon (no daemon is reachable to report its answerer port)\n' \
+    printf '%s:\n  ✓ the private sandbox every box runs in\n  ✗ DNS names for boxes (<box>.min.internal) in every program on this machine — waiting on a daemon (no daemon is reachable to report the port its DNS service listens on)\n' \
         "$fi_status" >"$HF8/finalize.waiting"
     TTY_FILE="$root/tty-enter"
     run fi_waiting "$HF8"
     TTY_FILE=
     check 0 "$rc" "a waiting host exits 0"
     want_ok "a waiting host sees the real waiting line" \
-        grep -qF "✗ box names for every host program — waiting on a daemon" "$OUT"
+        grep -qF "✗ DNS names for boxes (<box>.min.internal) in every program on this machine — waiting on a daemon" "$OUT"
     want_err "a waiting host is not asked" grep -qF "Finish setup now?" "$OUT"
     want_err "a waiting host gets no pointer" grep -qF "$fi_route" "$OUT"
     want_ok "a waiting host is told when to come back" \
@@ -1185,7 +1185,7 @@ case_installer_does_not_prompt_on_a_finished_host() {
     # summary, which names the cause, and nothing else: no question, no
     # pointer, no come-back note.
     HF8C="$root/hf8c"; mkdir -p "$HF8C"
-    printf '%s:\n  ✓ box names for every host program\ncan'"'"'t do on this machine:\n  ✗ the private sandbox every box runs in — user namespaces are disabled on this machine (user.max_user_namespaces is 0 or missing), and no profile can turn them on\n' \
+    printf '%s:\n  ✓ DNS names for boxes (<box>.min.internal) in every program on this machine\ncan'"'"'t do on this machine:\n  ✗ the private sandbox every box runs in — user namespaces are disabled on this machine (user.max_user_namespaces is 0 or missing), and no profile can turn them on\n' \
         "$fi_status" >"$HF8C/finalize.cannot"
     TTY_FILE="$root/tty-enter"
     run fi_cannot "$HF8C"

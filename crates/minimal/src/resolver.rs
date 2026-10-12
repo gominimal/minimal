@@ -157,30 +157,14 @@ const COMMAND_RESERVES_THE_RANGE: bool = true;
 #[cfg(not(target_os = "macos"))]
 const COMMAND_RESERVES_THE_RANGE: bool = false;
 
-/// The label of the box-zone answerer service the advisory command
-/// installs (NET-122's host service): launchd's job label on macOS,
-/// systemd's unit name on Linux — the one service the machine's service
-/// manager holds the answerer's two sockets under and runs as the
-/// operator, so the zone keeps answering between sessions and across
-/// them, from a program no user can write to. The unit files, the
-/// command that installs them, and the custody checks over them all name
-/// this one label beside [`RANGE_UNIT_LABEL`]'s step — one definition, so
-/// the service the command installs, the step the advisory re-surfaces
-/// until it holds, and the unit the bundle records cannot drift apart:
-/// [`ANSWERER_LAUNCHD_LABEL`] on macOS, [`ANSWERER_SYSTEMD_UNIT`] elsewhere.
-#[cfg(target_os = "macos")]
-pub(crate) const ANSWERER_UNIT_LABEL: &str = ANSWERER_LAUNCHD_LABEL;
-#[cfg(not(target_os = "macos"))]
-pub(crate) const ANSWERER_UNIT_LABEL: &str = ANSWERER_SYSTEMD_UNIT;
-
-/// launchd's job label for the answerer service (see
-/// [`ANSWERER_UNIT_LABEL`]); the plist file is named after it.
+/// launchd's job label for the answerer service: the plist file is named
+/// after it.
 #[cfg(any(test, target_os = "macos"))]
 const ANSWERER_LAUNCHD_LABEL: &str = "dev.gominimal.zone";
 
-/// systemd's unit name stem for the answerer service (see
-/// [`ANSWERER_UNIT_LABEL`]): `minzoned.socket` and `minzoned.service`,
-/// named after the program they run.
+/// systemd's unit name stem for the answerer service:
+/// `minzoned.socket` and `minzoned.service`, named after the program
+/// they run.
 #[cfg(any(test, not(target_os = "macos")))]
 const ANSWERER_SYSTEMD_UNIT: &str = "minzoned";
 
@@ -3015,13 +2999,14 @@ pub(crate) async fn answerer_command_for_this_host() -> anyhow::Result<String> {
 
 /// The answerer service's own state as an advisory fact, beside the
 /// range's. Every state but the first two is a fact the user has no other
-/// way to see; `carried` is whether the command below carries the service
-/// step, and only then does the fact say the command installs or reinstalls
-/// it — a command rendered without the step must never claim it.
+/// way to see; `carried` is whether the step this item names carries the
+/// service step, and only then does the fact say it installs or
+/// reinstalls it — a step rendered without the service must never claim
+/// it.
 fn answerer_fact(answerer: &AnswererStep, carried: bool) -> Option<String> {
     let remedy = |verb: &str| {
         if carried {
-            format!("; the command below {verb}")
+            format!("; this step {verb}")
         } else {
             String::new()
         }
@@ -3029,33 +3014,29 @@ fn answerer_fact(answerer: &AnswererStep, carried: bool) -> Option<String> {
     match answerer {
         AnswererStep::Installed => None,
         AnswererStep::Absent => Some(format!(
-            "the box-zone answerer is not installed as a host service, so the zone answers \
-             only while a session holds it{}",
-            remedy(
-                "installs the service the service manager holds, run by the operator from a \
-                 root-owned copy"
-            )
+            "Minimal's DNS service is not installed, so box names answer \
+             only while a box is running{}",
+            remedy("installs it")
         )),
         AnswererStep::CustodyFailed { failed_check } => Some(format!(
-            "the installed box-zone answerer service {ANSWERER_UNIT_LABEL} fails custody: \
-             {failed_check}{}",
+            "the installed DNS service fails a safety check: {failed_check}{}",
             remedy("reinstalls it")
         )),
         AnswererStep::ProtocolMismatch {
             installed: None,
             daemon,
         } => Some(format!(
-            "the installed box-zone answerer service does not answer this daemon's channel \
+            "the installed DNS service does not speak this daemon's \
              protocol {daemon}{}",
-            remedy("reinstalls it from this machine's own answerer program")
+            remedy("reinstalls it from this machine's own copy")
         )),
         AnswererStep::ProtocolMismatch {
             installed: Some(installed),
             daemon,
         } => Some(format!(
-            "the installed box-zone answerer service speaks channel protocol {installed}, not \
+            "the installed DNS service speaks protocol {installed}, not \
              this daemon's {daemon}{}",
-            remedy("reinstalls it from this machine's own answerer program")
+            remedy("reinstalls it from this machine's own copy")
         )),
         // The refusal itself is said beside this one (see [`advisory_at`]):
         // what the host is missing is still a fact, and the service state
@@ -3085,7 +3066,7 @@ fn answerer_fact(answerer: &AnswererStep, carried: bool) -> Option<String> {
 /// platform's: on macOS the same advisory command does it
 /// ([`COMMAND_RESERVES_THE_RANGE`]'s platform — [`macos_command`]'s one
 /// root script installs the range unit beside the resolver file it
-/// writes), so the fact says the command below installs the range and
+/// writes), so the fact says this step installs the range and
 /// ends the interim; on Linux the whole `127/8` is local to `lo`, no
 /// install is needed, and the fact names the range as what is missing
 /// and stops there.
@@ -3097,8 +3078,8 @@ fn answerer_fact(answerer: &AnswererStep, carried: bool) -> Option<String> {
 /// the moment the installed copy falls behind this daemon's channel
 /// protocol: an upgrade that changes the wire re-runs the step and
 /// re-copies the program. The Absent fact says what the service is for —
-/// the zone answers only while a session's daemon holds it, and the
-/// command below installs the one service that answers between sessions
+/// the zone answers only while a session's daemon holds it, and this
+/// step installs the one service that answers between sessions
 /// and across them — and the CustodyFailed and ProtocolMismatch facts
 /// name their check and their versions the way the range's do. Either way
 /// the command the advisory names is the whole of the host's missing
@@ -3172,6 +3153,7 @@ pub(crate) fn advisory_at(
             // says what the script does is the first comment of its header,
             // so the script `min finalize-install --show --script` prints carries it too.
             let command = command(port, install.as_ref());
+            let facts = facts.join("; ");
             Some(format!("note: {facts}.\n{command}"))
         }
     }
@@ -3189,8 +3171,9 @@ pub(crate) enum NamesVerdict {
     /// The names step is wanted: `facts` says what is missing, `install`
     /// the service step's inputs when the step is carried.
     Missing {
-        /// What is missing, as the note says it (no trailing period).
-        facts: String,
+        /// What is missing, one short line each, in the order the note
+        /// says it (no trailing periods).
+        facts: Vec<String>,
         /// The answerer step's inputs, when the command carries it.
         install: Option<AnswererInstall>,
     },
@@ -3242,18 +3225,19 @@ pub(crate) fn names_verdict_at(
         // whose job that install is is the platform's: on macOS the same
         // advisory command installs the range unit (design §7.1 folds the
         // privileged step into the one root script the note names), so the
-        // fact says the command below ends the interim; on Linux the whole
-        // `127/8` is local to `lo` and the fact names the range as what is
-        // missing and stops there — there is no step the command could
-        // claim to run.
+        // fact says this step adds the box IPs and ends the interim; on
+        // Linux the whole `127/8` is local to `lo` and the fact names the
+        // range as what is missing and stops there — there is no step the
+        // command could claim to run.
         let installs_the_range = if range_step.state == RangeStepState::NotNeeded {
             ""
         } else {
-            "; the command below installs the range and ends the interim"
+            "; this step adds them and ends the interim"
         };
         facts.push(format!(
             "this session publishes at the shared 127.0.0.1 interim: the \
-             reserved local range {} is not installed on this host's loopback{installs_the_range}",
+             loopback IPs boxes use ({}) are not on this \
+             machine's loopback{installs_the_range}",
             range_text()
         ));
     } else if matches!(range_present, Some(false)) {
@@ -3264,9 +3248,9 @@ pub(crate) fn names_verdict_at(
         // The verdict says the proxy for exactly this fact (NET-018); the
         // advisory says the fact.
         facts.push(format!(
-            "the reserved local range {} is not installed on this host's \
-             loopback, so this session's box names resolve to addresses this \
-             host cannot reach",
+            "the loopback IPs boxes use ({}) are not on this \
+             machine's loopback, so this session's box names resolve to \
+             addresses this machine cannot reach",
             range_text()
         ));
     }
@@ -3274,7 +3258,7 @@ pub(crate) fn names_verdict_at(
         // The range step's own state, beside the probe's. A failed custody
         // check is said whenever it reads, over an interim or a missing
         // range or neither: it is the one fact that says *which* step of
-        // the unit is not root's, and the command below is the one that
+        // the unit is not root's, and this step is the one that
         // reinstalls both files. An absent unit is said only when no other
         // fact already names the range as missing — under the interim, or
         // on a probe that reads absent, the missing range is the fact and
@@ -3286,14 +3270,15 @@ pub(crate) fn names_verdict_at(
                     .as_deref()
                     .unwrap_or("its state did not read");
                 facts.push(format!(
-                    "the range unit {RANGE_UNIT_LABEL} fails custody: {check}"
+                    "the boot-time setup that adds the loopback IPs boxes \
+                     use ({}) fails a safety check: {check}",
+                    range_text()
                 ));
             }
             RangeStepState::Absent if !interim && !matches!(range_present, Some(false)) => {
                 facts.push(format!(
-                    "the boot-time range unit {RANGE_UNIT_LABEL} is not \
-                     installed, so the reserved local range {} would not be \
-                     re-applied at the next boot",
+                    "the loopback IPs boxes use ({}) are not \
+                     re-added at boot",
                     range_text()
                 ));
             }
@@ -3312,24 +3297,24 @@ pub(crate) fn names_verdict_at(
             // The identity check refused the copy source: the reason names
             // the check that failed.
             AnswererStep::SourceRefused { reason, .. } => format!(
-                "this machine's box-zone answerer program {ANSWERER_PROGRAM_NAME} failed the \
-                 check the advisory runs before offering to copy it ({reason}), so the command \
-                 below leaves the answerer service out"
+                "this machine's DNS service program {ANSWERER_PROGRAM_NAME} failed the \
+                 check Minimal runs before copying it ({reason}), so this step leaves \
+                 the DNS service out"
             ),
             AnswererStep::SourceUnavailable { reason, .. } => format!(
-                "{reason}; the answerer service step is unavailable, so the command below \
-                 leaves it out"
+                "{reason}; the DNS service install is unavailable, so this \
+                 step leaves it out"
             ),
-            AnswererStep::SourceVerified { .. } => "a path the answerer service step would \
+            AnswererStep::SourceVerified { .. } => "a path the DNS service step would \
                  carry holds a quote, `$`, a backtick, a backslash or a line break, which the \
-                 privileged command cannot quote safely, so the command below leaves the \
-                 answerer service out"
+                 privileged command cannot quote safely, so this step leaves the \
+                 DNS service out"
                 .to_string(),
             // A state no source verdict was folded into: nothing vouches for
             // the bytes the step would copy, so it is not carried.
             _ => format!(
-                "this machine's box-zone answerer program {ANSWERER_PROGRAM_NAME} was not \
-                 verified, so the command below leaves the answerer service out"
+                "this machine's DNS service program {ANSWERER_PROGRAM_NAME} was not \
+                 verified, so this step leaves the DNS service out"
             ),
         });
     }
@@ -3338,12 +3323,10 @@ pub(crate) fn names_verdict_at(
     }
     if !hook.routes(port) {
         facts.push(format!(
-            "*.{ZONE} does not resolve in host processes: the host's \
-             resolver is not configured for the zone ({})",
-            hook.detail
+            "*.{ZONE} does not resolve in browsers or other programs on \
+             this machine"
         ));
     }
-    let facts = facts.join("; ");
     match blocker {
         // The note is built from the parts that are there. A blocker can be
         // the whole of it — the hook routes, so no fact is missing — and a
@@ -3352,7 +3335,7 @@ pub(crate) fn names_verdict_at(
             note: format!("note: {blocker}."),
         },
         Some(blocker) => NamesVerdict::Blocked {
-            note: format!("note: {facts}; {blocker}."),
+            note: format!("note: {}; {blocker}.", facts.join("; ")),
         },
         None => NamesVerdict::Missing { facts, install },
     }
@@ -4219,7 +4202,7 @@ pub fn name_surface_line(surface: LiveSurface, proxy_port: Option<u16>) -> Strin
 
 /// The reserved range as `network/prefix`, the form the advisory and the
 /// bundle print.
-fn range_text() -> String {
+pub(crate) fn range_text() -> String {
     let (network, prefix) = RESERVED_LOCAL_RANGE;
     format!("{network}/{prefix}")
 }
@@ -4411,12 +4394,12 @@ mod tests {
         for state in &states {
             let carried = answerer_fact(state, true).expect("the state is a fact");
             assert!(
-                carried.contains("the command below"),
+                carried.contains("this step"),
                 "a carried step names its remedy: {carried}"
             );
             let left_out = answerer_fact(state, false).expect("the state is still a fact");
             assert!(
-                !left_out.contains("the command below"),
+                !left_out.contains("this step"),
                 "a command without the step never claims it: {left_out}"
             );
         }
@@ -4803,12 +4786,12 @@ mod tests {
         assert!(interim.contains(&range_text()));
         // The interim fact names what is missing — the range on the host's
         // loopback — and whose step ends it is this platform's: the fact's
-        // platform arms (does the command below end the interim, or is
+        // platform arms (does this step end the interim, or is
         // nothing left for it to install?) are pinned by
         // `interim_advisory_says_the_command_ends_it_on_macos`, on both
         // arms' steps.
         assert!(
-            interim.contains("is not installed on this host's loopback"),
+            interim.contains("are not on this machine's loopback"),
             "the interim advisory must name the missing range: {interim}"
         );
         assert!(
@@ -5870,7 +5853,7 @@ exit 0
         )
         .expect("a host whose own loopback lacks the range is the advisory's to say");
         assert!(
-            absent.contains("is not installed on this host's loopback"),
+            absent.contains("are not on this machine's loopback"),
             "the advisory names the missing range: {absent}"
         );
         assert!(
@@ -6917,7 +6900,11 @@ exit 0
             "the advisory names the failed check: {advisory}"
         );
         assert!(
-            advisory.contains(&format!("the range unit {RANGE_UNIT_LABEL} fails custody")),
+            advisory.contains(&format!(
+                "the boot-time setup that adds the loopback IPs boxes use ({}) fails a \
+                 safety check",
+                range_text()
+            )),
             "the advisory says the custody verdict: {advisory}"
         );
         assert!(
@@ -6955,9 +6942,7 @@ exit 0
         )
         .expect("an absent unit re-surfaces the advisory");
         assert!(
-            advisory.contains(&format!(
-                "the boot-time range unit {RANGE_UNIT_LABEL} is not installed"
-            )),
+            advisory.contains("are not re-added at boot"),
             "the advisory names the absent unit: {advisory}"
         );
     }
@@ -7031,7 +7016,7 @@ resolvectl domain minzone0 '~min.internal'
             "the advisory names this host's script: {advisory}"
         );
         assert!(
-            !advisory.contains("the command below installs the range"),
+            !advisory.contains("ends the interim"),
             "the Linux facts claim no range step: {advisory}"
         );
         // The interim arm over the Linux step: the fact names the range
@@ -7047,7 +7032,7 @@ resolvectl domain minzone0 '~min.internal'
         )
         .expect("the interim re-surfaces the advisory");
         assert!(
-            !interim.contains("the command below installs the range"),
+            !interim.contains("ends the interim"),
             "the Linux interim fact claims no range step the command has not: {interim}"
         );
     }
@@ -7121,8 +7106,8 @@ resolvectl domain minzone0 '~min.internal'
     fn interim_advisory_says_the_command_ends_it_on_macos() {
         let port = 15353;
         let configured = routing_hook();
-        // The macOS arm: the fact says the command below installs the
-        // range and ends the interim.
+        // The macOS arm: the fact says this step adds the box IPs and
+        // ends the interim.
         let interim = advisory_at(
             &configured,
             port,
@@ -7138,7 +7123,7 @@ resolvectl domain minzone0 '~min.internal'
             "the interim and the range are still the fact's own words: {interim}"
         );
         assert!(
-            interim.contains("the command below installs the range and ends the interim"),
+            interim.contains("this step adds them and ends the interim"),
             "the macOS interim fact names the command that ends it: {interim}"
         );
         // The Linux arm: the same fact, no claim about a step the command
@@ -7154,7 +7139,7 @@ resolvectl domain minzone0 '~min.internal'
         )
         .expect("the interim re-surfaces the advisory");
         assert!(
-            !interim.contains("the command below installs the range"),
+            !interim.contains("ends the interim"),
             "the Linux fact claims no range step: {interim}"
         );
     }
@@ -7916,7 +7901,7 @@ resolvectl domain minzone0 '~min.internal'
         )
         .expect("a host without the answerer service is advised");
         assert!(
-            advisory.contains("not installed as a host service")
+            advisory.contains("Minimal's DNS service is not installed")
                 && advisory.contains("install the Minimal box-name service"),
             "{advisory}"
         );
@@ -7972,7 +7957,7 @@ resolvectl domain minzone0 '~min.internal'
         let advisory =
             advise(&verified(behind)).expect("a mismatched copy re-surfaces the advisory");
         assert!(
-            advisory.contains(&format!("speaks channel protocol {}", daemon + 1))
+            advisory.contains(&format!("speaks protocol {}", daemon + 1))
                 && advisory.contains(&format!("not this daemon's {daemon}")),
             "the advisory names both versions: {advisory}"
         );
@@ -7992,9 +7977,7 @@ resolvectl domain minzone0 '~min.internal'
         let advisory =
             advise(&verified(silent)).expect("a copy that does not answer re-surfaces it");
         assert!(
-            advisory.contains(&format!(
-                "does not answer this daemon's channel protocol {daemon}"
-            )),
+            advisory.contains(&format!("does not speak this daemon's protocol {daemon}")),
             "{advisory}"
         );
 
@@ -8058,13 +8041,13 @@ resolvectl domain minzone0 '~min.internal'
         let advisory = advise(&refused).expect("a refused source still advises");
         assert!(
             advisory.contains(&format!(
-                "this machine's box-zone answerer program {ANSWERER_PROGRAM_NAME} failed the \
-                 check the advisory runs before offering to copy it ({reason})"
+                "this machine's DNS service program {ANSWERER_PROGRAM_NAME} failed the \
+                 check Minimal runs before copying it ({reason})"
             )),
             "the advisory names the reason: {advisory}"
         );
         assert!(
-            advisory.contains("not installed as a host service"),
+            advisory.contains("Minimal's DNS service is not installed"),
             "the service state underneath the refusal survives: {advisory}"
         );
         assert!(
@@ -8203,13 +8186,12 @@ resolvectl domain minzone0 '~min.internal'
         );
         let advisory = advise(&unshipped);
         assert!(
-            advisory.contains(
-                "this release ships no minzoned; the answerer service step is unavailable"
-            ),
+            advisory
+                .contains("this release ships no minzoned; the DNS service install is unavailable"),
             "{advisory}"
         );
         assert!(
-            advisory.contains("not installed as a host service"),
+            advisory.contains("Minimal's DNS service is not installed"),
             "the service state underneath survives: {advisory}"
         );
         assert!(
@@ -8235,7 +8217,7 @@ resolvectl domain minzone0 '~min.internal'
         let advisory = advise(&step);
         assert!(
             advisory.contains(
-                "this build carries no signing identity; the answerer service step is \
+                "this build carries no signing identity; the DNS service install is \
                  unavailable"
             ),
             "{advisory}"
@@ -8533,7 +8515,7 @@ resolvectl domain minzone0 '~min.internal'
         )
         .expect("a behind copy re-surfaces the advisory even when the hook routes");
         assert!(
-            advisory.contains(&format!("speaks channel protocol {}", daemon - 1))
+            advisory.contains(&format!("speaks protocol {}", daemon - 1))
                 && advisory.contains(&format!("not this daemon's {daemon}")),
             "the advisory names both versions: {advisory}"
         );
@@ -8715,7 +8697,7 @@ resolvectl domain minzone0 '~min.internal'
         )
         .expect("a native host without the answerer service is advised");
         assert!(
-            advisory.contains("not installed as a host service")
+            advisory.contains("Minimal's DNS service is not installed")
                 && advisory.contains("install the Minimal box-name service"),
             "the native advisory offers the answerer service step: {advisory}"
         );
