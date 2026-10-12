@@ -5225,7 +5225,7 @@ mod tests {
         let rendered = String::from_utf8(out).unwrap();
         assert!(
             rendered.contains(
-                "egress\n  deny-all\n  credentialed upstream  box egress proxy listener\n"
+                "egress\n  deny-all\n  credentialed upstream  allowed to reach the Box Egress Proxy\n"
             ),
             "a laned box must print the lane beside its rules, got: {rendered}"
         );
@@ -5281,7 +5281,7 @@ mod tests {
         let rendered = String::from_utf8(out).unwrap();
         assert!(
             rendered.contains(
-                "  credentialed upstream  box egress proxy listener \
+                "  credentialed upstream  allowed to reach the Box Egress Proxy \
                  (not in effect: host_ip box)\n"
             ),
             "a host-address box must show its declared lane, marked, got: {rendered}"

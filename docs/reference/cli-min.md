@@ -345,7 +345,7 @@ the egress block:
 ```
 egress
   deny-all (default)
-  credentialed upstream  box egress proxy listener
+  credentialed upstream  allowed to reach the Box Egress Proxy
 ```
 
 The row names the lane the declaration opened. The gate admits the box's
@@ -362,7 +362,7 @@ effect, with the box's mode named:
 ```
 egress
   allow-all (default)
-  credentialed upstream  box egress proxy listener (not in effect: host_ip box)
+  credentialed upstream  allowed to reach the Box Egress Proxy (not in effect: host_ip box)
 ```
 
 The ingress block lists the published port mappings the session's
