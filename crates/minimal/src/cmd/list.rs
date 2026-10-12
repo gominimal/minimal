@@ -236,27 +236,26 @@ pub(crate) fn duplicate_session_warning(
         "warning: a session already exists for this path ({handle}); activating \
          creates a second one, leaving bare `min` here ambiguous between them."
     );
-    // Only point at `attach` for a session it will actually accept. Attach
-    // refuses anything not yet `Active` (see `sessions::SessionStatus`), so for
-    // a `Pending`/`Materializing` duplicate the reuse command would fail
-    // immediately — say to wait instead. When we do suggest it, use a key
-    // `SessionLookup::parse` can resolve: a name matches by name and the full id
-    // parses as a UUID, but the short unnamed handle would parse as a
-    // nonexistent name and the attach lookup would miss.
+    // Only point at `attach` as the step to take now for a session it will
+    // actually accept. Attach refuses anything not yet `Active` (see
+    // `sessions::SessionStatus`), so for a `Pending`/`Materializing`
+    // duplicate the reuse command would fail immediately — say to wait
+    // first. Either way the command carries a key `SessionLookup::parse` can
+    // resolve: a name matches by name and the full id parses as a UUID, but
+    // the short unnamed handle would parse as a nonexistent name and the
+    // attach lookup would miss.
+    let key = existing
+        .name
+        .clone()
+        .unwrap_or_else(|| existing.id.to_string());
     match existing.status {
-        sessions::SessionStatus::Active => {
-            let key = existing
-                .name
-                .clone()
-                .unwrap_or_else(|| existing.id.to_string());
-            Some(format!(
-                "{lead} To reuse it instead: min session attach {key}"
-            ))
-        }
+        sessions::SessionStatus::Active => Some(format!(
+            "{lead} To reuse it instead: min session attach {key}"
+        )),
         _ => Some(format!(
             "{lead} The existing session is still being created; run `min ls` \
              until its status is active, then attach to it with `min session \
-             attach` instead of creating a second."
+             attach {key}` instead of creating a second."
         )),
     }
 }
@@ -407,10 +406,14 @@ async fn listings_across_vms(
                     control_sock,
                 }),
                 Ok(None) => {}
-                Err(e) => eprintln!(
+                // Only `min ls` lists sessions: `min finalize-install`
+                // reads the same listings for an answerer port, so the
+                // consequence would be false there.
+                Err(e) if strict => eprintln!(
                     "warning: skipping VM {}, so its sessions are not listed: {e:#}",
                     vm.vm
                 ),
+                Err(e) => eprintln!("warning: skipping VM {}: {e:#}", vm.vm),
             }
         }
     }

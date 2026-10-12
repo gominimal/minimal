@@ -764,9 +764,10 @@ fn duplicate_session_warning_reuses_unnamed_session_by_id() {
 
 /// Attach refuses a `Materializing` session, so the warning's reuse step
 /// must not point at it yet: the guidance says to wait for `min ls` to
-/// report the session active and only then attach.
+/// report the session active and only then attach, with the command spelled
+/// in full so it runs as printed once the wait is over.
 #[test]
-fn duplicate_session_warning_skips_attach_for_materializing() {
+fn duplicate_session_warning_waits_before_attach_for_materializing() {
     let entries = vec![twin_entry(
         "019f5d0f-0a99-78b1-9165-0809440f0052",
         Some("web"),
@@ -782,12 +783,12 @@ fn duplicate_session_warning_skips_attach_for_materializing() {
         "the wait guidance names the command to watch, got: {warning}"
     );
     assert!(
-        warning.contains("then attach to it with `min session attach`"),
-        "attach is the step after the wait, not one to take now, got: {warning}"
+        warning.contains("then attach to it with `min session attach web`"),
+        "attach is the step after the wait and carries its argument, got: {warning}"
     );
     assert!(
-        !warning.contains("min session attach web"),
-        "no attach hint naming the non-attachable session, got: {warning}"
+        !warning.contains("To reuse it instead"),
+        "no attach hint to take now for a non-attachable session, got: {warning}"
     );
 }
 
