@@ -2001,8 +2001,8 @@ pub(crate) fn ensure_interactive_attach_tty(stdin_is_tty: bool) -> Result<(), an
 /// host daemon's control socket beside `sock` and renders each ask's dialog
 /// while the relay is suspended. `None` on a native host, where the
 /// session's own binding asks, and for every exec channel. The subscription
-/// is made only for a box whose record carries an address pair
-/// ([`host_asks_target`]).
+/// is made for a box whose record carries an address pair, and for one whose
+/// record could not be read ([`host_asks_target`]).
 pub(crate) async fn session_via_ssh(
     sock: &std::path::Path,
     id: sessions::SessionId,
@@ -2027,6 +2027,7 @@ pub(crate) async fn session_via_ssh(
     // `sock` — for the pair its box's row was registered with. A lookup
     // that fails reads as no row, and says so: the row is then not asked
     // back, and the in-VM daemon's own row check decides the launch.
+    let mut record_unreadable = false;
     let record = match control_sock_beside(sock).filter(|control| control.exists()) {
         Some(_) => match attached_session_record(sock, id).await {
             Ok(record) => record,
@@ -2035,6 +2036,7 @@ pub(crate) async fn session_via_ssh(
                     "could not read the session's record ({error:#}); its box row \
                      is not asked back first"
                 );
+                record_unreadable = true;
                 None
             }
         },
@@ -2059,7 +2061,12 @@ pub(crate) async fn session_via_ssh(
             Some(_) => record.and_then(|record| record.box_addresses),
             None => None,
         };
-        let host_asks = host_asks_target(control_sock_beside(sock), host_asks_for, box_addresses);
+        let host_asks = host_asks_target(
+            control_sock_beside(sock),
+            host_asks_for,
+            box_addresses,
+            record_unreadable,
+        );
         // The relay blocks its thread until ssh exits, so it runs off the
         // runtime's workers.
         let code = tokio::task::spawn_blocking(move || {
@@ -2136,14 +2143,20 @@ pub(crate) async fn session_via_ssh(
 /// (NET-045): the VM host daemon's control socket and the box's name, for a
 /// box whose record carries an address pair. Only such a box registered a
 /// row with the VM host daemon, and the subscription reads that row; a
-/// `host_ip` or `none` box, and a session whose record could not be read,
-/// has none, so no subscription is attempted and nothing is said.
+/// `host_ip` or `none` box has none, so no subscription is attempted and
+/// nothing is said. A record that could not be read (`record_unreadable`)
+/// says neither: the subscription is then attempted by name, so a box that
+/// did register a row still gets its port prompts, and a failed attempt is
+/// said by [`subscribe_host_asks`].
 fn host_asks_target(
     control: Option<std::path::PathBuf>,
     host_asks_for: Option<&str>,
     box_addresses: Option<sessions::BoxAddresses>,
+    record_unreadable: bool,
 ) -> Option<(std::path::PathBuf, String)> {
-    box_addresses?;
+    if box_addresses.is_none() && !record_unreadable {
+        return None;
+    }
     Some((control?, host_asks_for?.to_string()))
 }
 
@@ -4356,14 +4369,32 @@ mod tests {
         IngressPolicy, IpProto, NetworkMode, PortMapping,
     };
 
-    /// A box with no address pair registered no row with the VM host daemon:
-    /// the attach gets no subscription target, so no control-socket request
-    /// is made. That covers a `host_ip` or `none` box and a record that
-    /// could not be read.
+    /// A box whose record was read and carries no address pair registered no
+    /// row with the VM host daemon: the attach gets no subscription target,
+    /// so no control-socket request is made. That covers a `host_ip` or
+    /// `none` box.
     #[test]
     fn host_asks_target_is_none_for_a_box_with_no_address_pair() {
         let control = std::path::PathBuf::from("/run/vm/control.sock");
-        assert_eq!(host_asks_target(Some(control), Some("web"), None), None);
+        assert_eq!(
+            host_asks_target(Some(control), Some("web"), None, false),
+            None
+        );
+    }
+
+    /// A record that could not be read does not say the box has no row: the
+    /// subscription is still attempted, at the control socket and under the
+    /// box's name, so an `own_ip` box keeps its port prompts. A native host
+    /// (no box named) or a missing control socket still yields none.
+    #[test]
+    fn host_asks_target_names_the_box_when_its_record_is_unreadable() {
+        let control = std::path::PathBuf::from("/run/vm/control.sock");
+        assert_eq!(
+            host_asks_target(Some(control.clone()), Some("web"), None, true),
+            Some((control.clone(), "web".to_string()))
+        );
+        assert_eq!(host_asks_target(Some(control), None, None, true), None);
+        assert_eq!(host_asks_target(None, Some("web"), None, true), None);
     }
 
     /// A box whose record carries its address pair on a VM-backed host is
@@ -4377,11 +4408,17 @@ mod tests {
             loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 0),
         };
         assert_eq!(
-            host_asks_target(Some(control.clone()), Some("web"), Some(addresses)),
+            host_asks_target(Some(control.clone()), Some("web"), Some(addresses), false),
             Some((control.clone(), "web".to_string()))
         );
-        assert_eq!(host_asks_target(Some(control), None, Some(addresses)), None);
-        assert_eq!(host_asks_target(None, Some("web"), Some(addresses)), None);
+        assert_eq!(
+            host_asks_target(Some(control), None, Some(addresses), false),
+            None
+        );
+        assert_eq!(
+            host_asks_target(None, Some("web"), Some(addresses), false),
+            None
+        );
     }
 
     #[test]

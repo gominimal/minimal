@@ -7051,6 +7051,16 @@ if [[ "$attach_out" != *"$ADD_TOOL_MARKER"* ]]; then
   echo "--- driver stderr ---"; cat "$WORK/exec.err" 2>/dev/null || true
   fail
 fi
+# The shared session's box runs on the default network mode, which registers
+# no row with the VM host daemon, so the attach must not have tried to
+# subscribe to its port prompts and then warned that it could not. The
+# warning goes to the attach's terminal, which is the pty this transcript
+# was read from.
+if [[ "$attach_out" == *"will not show port prompts for box"* ]]; then
+  echo "::error::attach warned about port prompts for a box that registered no row"
+  echo "--- attach output ---"; printf '%s\n' "$attach_out"
+  fail
+fi
 # Orientation banner: the first interactive prompt must have printed the
 # two orientation lines, with the ACTUAL session name and loadout list
 # interpolated in-shell from the $MINIMAL_* vars (daemon baseline +
