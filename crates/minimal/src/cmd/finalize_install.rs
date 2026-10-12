@@ -712,7 +712,8 @@ pub(crate) mod linux {
     pub(crate) const USERNS_ID: &str = "userns-profile";
     const USERNS_LABEL: &str = "the private sandbox every box runs in";
     pub(crate) const CLASSIFIER_ID: &str = "classifier";
-    const CLASSIFIER_LABEL: &str = "per-box egress limits for host-address boxes";
+    const CLASSIFIER_LABEL: &str = "deny-all egress enforcement for boxes that share this \
+     machine's address (--network host_ip with --deny-all-egress)";
     const KVM_LABEL: &str = "KVM access for the Linux VM provider";
 
     /// The profile the step installs, the very file the checkout ships.
@@ -998,9 +999,9 @@ pub(crate) mod linux {
                 CLASSIFIER_ID,
                 CLASSIFIER_LABEL,
                 format!(
-                    "the classifier tree at {CLASSIFIER_TREE_ROOT} is installed for another \
-                     account (uid {uid}); running this step would replace their delegation, \
-                     so that account removes it with `min finalize-install --undo` first"
+                    "egress enforcement at {CLASSIFIER_TREE_ROOT} is installed for another \
+                     account (uid {uid}), and this step would replace it; that account must \
+                     run `min finalize-install --undo` first"
                 ),
             );
         }
@@ -1008,9 +1009,9 @@ pub(crate) mod linux {
             return Item::cannot(
                 CLASSIFIER_ID,
                 CLASSIFIER_LABEL,
-                "this command runs as root, but the classifier is installed for the account \
-                 whose daemon it places and watches that account's socket: run it as that \
-                 account (it asks for sudo itself)"
+                "this command runs as root, but this step is installed for the account \
+                 that runs the Minimal daemon: run it as that account (it asks for sudo \
+                 itself)"
                     .to_string(),
             );
         }
@@ -1019,12 +1020,12 @@ pub(crate) mod linux {
         }
         let cause = match facts.mount {
             Cgroup2Mount::Absent => {
-                "no cgroup2 filesystem is mounted at /sys/fs/cgroup, which the classifier \
-                 tree lives in"
+                "no cgroup2 filesystem is mounted at /sys/fs/cgroup, which egress \
+                 enforcement needs"
             }
             Cgroup2Mount::WithoutNsdelegate => {
-                "cgroup2 is mounted without nsdelegate, so a box's cgroup is no boundary it \
-                 cannot leave"
+                "cgroup2 is mounted without nsdelegate, which egress enforcement needs to \
+                 keep a box inside its own cgroup"
             }
             // The two names ride in a shell single-quoted word, in a unit
             // file (systemd expands `%` specifiers everywhere and `$` in
@@ -1036,45 +1037,48 @@ pub(crate) mod linux {
             // that never finds the daemon.
             Cgroup2Mount::Delegated => {
                 if operator.is_empty() {
-                    "this process's user name did not read, so there is no account to \
-                     delegate the classifier tree to"
+                    "could not read this process's user name, so there is no account to \
+                     install this step for"
                 } else if !operator
                     .chars()
                     .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
                 {
                     "this process's user name carries a character outside [A-Za-z0-9._-], \
-                     which the step's shell word and unit file cannot take"
+                     which the install script and its systemd units cannot handle"
                 } else if socket.is_empty() {
-                    "this host's daemon socket path did not resolve, so there is nothing \
-                     for the placement unit to watch"
+                    "could not work out this machine's daemon socket path, which the \
+                     step's systemd unit watches"
                 } else if !socket
                     .chars()
                     .all(|c| c.is_ascii_alphanumeric() || "._/-".contains(c))
                 {
-                    "this host's daemon socket path carries a character outside \
-                     [A-Za-z0-9._/-], which the step's shell word, unit file and socket \
-                     table lookup cannot take"
+                    "this machine's daemon socket path carries a character outside \
+                     [A-Za-z0-9._/-], which the install script and its systemd units \
+                     cannot handle"
                 } else {
                     return Item::missing(
                         CLASSIFIER_ID,
                         CLASSIFIER_LABEL,
                         if !facts.table_present {
-                            "host-address boxes run unenforced: the classifier's privileged \
-                             step is not installed, or did not finish, so no box's egress \
-                             verdict is decided per box"
+                            "deny-all egress is not enforced for boxes that share this \
+                             machine's address: the step that enforces it is not \
+                             installed, or did not finish"
                         } else if !facts.copy_current {
-                            "the root-owned copy of the classifier's privileged step is not \
-                             this build's, so the placement unit runs a stale step"
+                            "the installed copy of the step that enforces deny-all egress \
+                             is missing or out of date, so this version of min's step is \
+                             not what runs at boot or at daemon start"
                         } else {
-                            "the classifier is installed but its systemd units are not, so a \
-                             daemon restart runs unplaced and a reboot loses the tree"
+                            "the step that enforces deny-all egress is installed but its \
+                             systemd units are missing or not enabled, so a daemon restart \
+                             can leave deny-all boxes refused, and a reboot can leave \
+                             deny-all egress not enforced"
                         }
                         .to_string(),
                         format!(
-                            "installs the classifier's cgroup tree and packet filter for \
-                             {operator}'s daemon, a boot unit that re-installs them, and a \
-                             systemd path unit that places the daemon's listener in its leaf \
-                             on every daemon start"
+                            "installs the cgroup tree and packet filter that enforce \
+                             deny-all egress for {operator}'s daemon, and systemd units \
+                             that restore them at boot and place the daemon under them on \
+                             every daemon start"
                         ),
                         classifier_steps(operator, socket),
                     );
@@ -1260,8 +1264,8 @@ pub(crate) mod linux {
                     return Item::cannot(
                         KVM_ID,
                         KVM_LABEL,
-                        "this process's user name did not read, so there is no account to \
-                         add to the kvm group"
+                        "could not read this process's user name, so there is no account \
+                         to add to the kvm group"
                             .to_string(),
                     );
                 }
@@ -2056,13 +2060,18 @@ mod tests {
                 sock,
                 "without nsdelegate",
             ),
-            (bare, "", sock, "user name did not read"),
+            (bare, "", sock, "could not read this process's user name"),
             (bare, "al ice", sock, outside),
             (bare, "al'ice", sock, outside),
             (bare, "al%ice", sock, outside),
             (bare, "al$ice", sock, outside),
             (bare, "al\\ice", sock, outside),
-            (bare, "alice", "", "socket path did not resolve"),
+            (
+                bare,
+                "alice",
+                "",
+                "could not work out this machine's daemon socket path",
+            ),
             (bare, "alice", "/run/it's.sock", outside),
             (bare, "alice", "/run/my dir/ssh.sock", outside),
             (bare, "alice", "/run/my\tdir/ssh.sock", outside),
@@ -2078,7 +2087,13 @@ mod tests {
         }
         let item = classifier_item_over(&bare, "alice", sock);
         assert_eq!(item.state, ItemState::Missing, "{item:?}");
-        assert!(item.today.as_deref().unwrap().contains("unenforced"));
+        assert!(item.today.as_deref().unwrap().contains("is not enforced"));
+        // The label prints after a done mark too, so it names the thing, not a state.
+        assert_eq!(
+            item.label,
+            "deny-all egress enforcement for boxes that share this machine's address \
+             (--network host_ip with --deny-all-egress)"
+        );
         assert!(item.step.as_deref().unwrap().contains("every daemon start"));
         // The marker over a stale copy: the step is there, but the one the
         // units run is not this build's, so it is missing again and the
@@ -2095,7 +2110,11 @@ mod tests {
         );
         assert_eq!(stale.state, ItemState::Missing, "{stale:?}");
         assert!(
-            stale.today.as_deref().unwrap().contains("stale step"),
+            stale
+                .today
+                .as_deref()
+                .unwrap()
+                .contains("missing or out of date"),
             "{stale:?}"
         );
         assert_eq!(
@@ -2113,10 +2132,17 @@ mod tests {
             sock,
         );
         assert_eq!(unitless.state, ItemState::Missing, "{unitless:?}");
-        assert!(
-            unitless.today.as_deref().unwrap().contains("units are not"),
-            "{unitless:?}"
-        );
+        // An unplaced daemon refuses a deny-all box (the probe cannot read
+        // the table); only the reboot, which loses the tree, runs it unenforced.
+        // Any one missing unit or link lands here, so the sentence says "can".
+        let today = unitless.today.as_deref().unwrap();
+        for words in [
+            "units are missing or not enabled",
+            "a daemon restart can leave deny-all boxes refused",
+            "a reboot can leave deny-all egress not enforced",
+        ] {
+            assert!(today.contains(words), "{unitless:?}");
+        }
         // A stale copy on a mount the tree cannot live in is still the mount's fault.
         assert_eq!(
             classifier_item_over(
@@ -2301,7 +2327,12 @@ mod tests {
         assert!(absent.cause.unwrap().contains("/dev/kvm is not there"));
         let unnamed = kvm_item_over(denied(), "", false);
         assert_eq!(unnamed.state, ItemState::Cannot);
-        assert!(unnamed.cause.unwrap().contains("did not read"));
+        assert!(
+            unnamed
+                .cause
+                .unwrap()
+                .contains("could not read this process's user name")
+        );
         let unquotable = kvm_item_over(denied(), "al ice", false);
         assert_eq!(unquotable.state, ItemState::Cannot);
         assert!(
