@@ -6073,10 +6073,7 @@ exit 0
         // cause — the DNS SERVICE line names the holder.
         assert_eq!(
             vm_host_answerer_line(reply.answerer.clone()),
-            Some(
-                "this VM's host daemon answers its box names on 127.0.0.1:7656 (UDP)"
-                    .to_string()
-            ),
+            Some("this VM's host daemon answers its box names on 127.0.0.1:7656 (UDP)".to_string()),
             "the answerer line names the holder, cause or no cause"
         );
         // And the cause has a line of its own, naming neither surface as
