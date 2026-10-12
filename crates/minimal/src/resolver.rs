@@ -14,8 +14,8 @@
 //!
 //! Nothing here prompts. Detecting reads files and runs `resolvectl`
 //! read-only; the advisory is pure string assembly over what those reads
-//! found. The privilege prompt, when there is one, belongs to `min net
-//! setup`, which the user chooses to run — never to a session start, which
+//! found. The privilege prompt, when there is one, belongs to `min
+//! finalize-install`, which the user chooses to run — never to a session start, which
 //! prints no part of the script (NET-122: opt-in, "with no privilege
 //! prompt"; NET-123's interim arm: neither prompt nor hang).
 
@@ -5616,8 +5616,8 @@ exit 0
         assert!(!tree_record.exists(), "a stale record is cleared");
     }
 
-    /// The service is machine-wide and runs as one operator: `min net
-    /// setup` refuses, before it runs anything, when the installed unit
+    /// The service is machine-wide and runs as one operator: `min
+    /// finalize-install` refuses, before it runs anything, when the installed unit
     /// names another user, and runs over a unit that names this user or
     /// over none at all. The parse reads the unit's own bytes, so the
     /// decision is tested without a root-owned path.
