@@ -240,22 +240,26 @@ pub(crate) fn duplicate_session_warning(
     // actually accept. Attach refuses anything not yet `Active` (see
     // `sessions::SessionStatus`), so for a `Pending`/`Materializing`
     // duplicate the reuse command would fail immediately — say to wait
-    // first. Either way the command carries a key `SessionLookup::parse` can
-    // resolve: a name matches by name and the full id parses as a UUID, but
-    // the short unnamed handle would parse as a nonexistent name and the
-    // attach lookup would miss.
-    let key = existing
-        .name
-        .clone()
-        .unwrap_or_else(|| existing.id.to_string());
+    // first, and show the later attach with a `<session>` placeholder so no
+    // printed command names a session attach would refuse right now. When
+    // we do suggest it, use a key `SessionLookup::parse` can resolve: a name
+    // matches by name and the full id parses as a UUID, but the short
+    // unnamed handle would parse as a nonexistent name and the attach lookup
+    // would miss.
     match existing.status {
-        sessions::SessionStatus::Active => Some(format!(
-            "{lead} To reuse it instead: min session attach {key}"
-        )),
+        sessions::SessionStatus::Active => {
+            let key = existing
+                .name
+                .clone()
+                .unwrap_or_else(|| existing.id.to_string());
+            Some(format!(
+                "{lead} To reuse it instead: min session attach {key}"
+            ))
+        }
         _ => Some(format!(
             "{lead} The existing session is still being created; run `min ls` \
              until its status is active, then attach to it with `min session \
-             attach {key}` instead of creating a second."
+             attach <session>` instead of creating a second."
         )),
     }
 }
@@ -355,7 +359,9 @@ pub(crate) async fn ls_listings_best_effort(global: &GlobalArgs) -> Vec<VmListin
 
 /// The listing behind [`ls_listings`] and [`ls_listings_best_effort`].
 /// `strict` keeps `min ls`'s rule that a failure on the selected VM is the
-/// failure to report; without it that VM is skipped like any other.
+/// failure to report; without it that VM is skipped like any other. It also
+/// selects `min ls`'s wording of the skipped-VM warning, which says that
+/// VM's sessions are not listed: a strict caller is one that lists sessions.
 async fn listings_across_vms(
     global: &GlobalArgs,
     strict: bool,
@@ -692,7 +698,7 @@ pub fn shared_port_collision_lines(listings: &[VmListing]) -> Vec<String> {
 #[must_use]
 pub fn hostname_routing_warning(reason: &str, command: &str) -> String {
     format!(
-        "warning: the proxy for box names is not serving: {reason}. Minimal \
+        "warning: the hostname proxy is not serving: {reason}. Minimal \
          retries on its own; run `{command}` again to check."
     )
 }
@@ -849,7 +855,7 @@ pub fn format_ls_on(
         if let Some(answerer) = resp.zone_answerer_port {
             writeln!(
                 out,
-                "DNS SERVICE:     listening on 127.0.0.1:{answerer} (UDP) for *.min.internal"
+                "DNS SERVICE:     listening on 127.0.0.1:{answerer} (UDP) · point the host's resolver at it for *.min.internal"
             )?;
         } else if let Some(line) = &vm_answerer_line {
             writeln!(out, "DNS SERVICE:     {line}")?;
@@ -1152,7 +1158,7 @@ pub fn format_ls_across_vms_on(
             if let Some(answerer) = listing.resp.zone_answerer_port {
                 writeln!(
                     out,
-                    "DNS SERVICE:     {vm:<width$} listening on 127.0.0.1:{answerer} (UDP) for *.min.internal",
+                    "DNS SERVICE:     {vm:<width$} listening on 127.0.0.1:{answerer} (UDP) · point the host's resolver at it for *.min.internal",
                     vm = listing.vm,
                     width = VM_COLUMN_WIDTH,
                 )?;

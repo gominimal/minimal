@@ -3366,7 +3366,7 @@ async fn listener_failure_reported_with_remedy() {
 
     let ls_stderr = run_min_stderr(&args, &["ls"]).await;
     assert!(
-        ls_stderr.contains("warning: the proxy for box names is not serving"),
+        ls_stderr.contains("warning: the hostname proxy is not serving"),
         "ls must warn about hostname routing, got: {ls_stderr}"
     );
     assert!(
@@ -3409,7 +3409,7 @@ async fn listener_failure_reported_with_remedy() {
     )
     .await;
     assert!(
-        activate_stderr.contains("warning: the proxy for box names is not serving"),
+        activate_stderr.contains("warning: the hostname proxy is not serving"),
         "activate must warn about hostname routing, got: {activate_stderr}"
     );
     assert!(
@@ -3452,7 +3452,7 @@ async fn ls_warning_clears_on_recovery() {
 
     let before = run_min_stderr(&args, &["ls"]).await;
     assert!(
-        before.contains("warning: the proxy for box names is not serving"),
+        before.contains("warning: the hostname proxy is not serving"),
         "ls must warn while the port is held, got: {before}"
     );
 
@@ -3466,7 +3466,7 @@ async fn ls_warning_clears_on_recovery() {
 
     let after = run_min_stderr(&args, &["ls"]).await;
     assert!(
-        !after.contains("warning: the proxy for box names is not serving"),
+        !after.contains("warning: the hostname proxy is not serving"),
         "the warning must clear without a daemon restart, got: {after}"
     );
 }
@@ -3550,7 +3550,7 @@ async fn min_prints_discovered_proxy_port() {
         "`min ls` must print the answerer's port beside the proxy's, got: {ls_stdout}"
     );
     assert!(
-        ls_stdout.contains("(UDP) for *.min.internal"),
+        ls_stdout.contains("point the host's resolver at it"),
         "the answerer line must say what the port is for, got: {ls_stdout}"
     );
 }

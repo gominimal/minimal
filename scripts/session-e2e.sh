@@ -10600,7 +10600,7 @@ while True:
 
   recover_activate_err="$(cat "$WORK/recover-activate.err" 2>/dev/null || true)"
   case "$recover_activate_err" in
-    *"the proxy for box names is not serving"*"could not bind 127.0.0.1:$RECOVER_PIN"*"Remedy: free the listen address"*) ;;
+    *"warning: the hostname proxy is not serving"*"could not bind 127.0.0.1:$RECOVER_PIN"*"Remedy: free the listen address"*) ;;
     *)
       echo "::error::activate against the held port did not warn with the reason and the remedy (NET-020)"
       echo "--- activate stderr ---"; cat "$WORK/recover-activate.err" 2>/dev/null || true
@@ -10617,7 +10617,7 @@ while True:
 
   recover_ls_out="$(mnl ls 2>&1)"
   case "$recover_ls_out" in
-    *"the proxy for box names is not serving"*"could not bind 127.0.0.1:$RECOVER_PIN"*"Remedy: free the listen address"*) ;;
+    *"warning: the hostname proxy is not serving"*"could not bind 127.0.0.1:$RECOVER_PIN"*"Remedy: free the listen address"*) ;;
     *)
       echo "::error::min ls against the held port did not warn with the reason and the remedy (NET-020)"
       echo "--- min ls output ---"; printf '%s\n' "$recover_ls_out"
@@ -10630,7 +10630,7 @@ while True:
     echo "--- min ls output ---"; printf '%s\n' "$recover_ls_out"
     fail
   fi
-  printf '%s\n' "$recover_ls_out" | grep -F -- 'the proxy for box names is not serving' | sed 's/^/  /'
+  printf '%s\n' "$recover_ls_out" | grep -F -- 'warning: the hostname proxy is not serving' | sed 's/^/  /'
 
   # The daemon log's own record: the warn the retry left, with its status
   # and next-retry schedule (the file log is JSON lines).
@@ -10688,7 +10688,7 @@ while True:
       | grep -oE '127\.0\.0\.1:[0-9]+' | head -n1 | cut -d: -f2 || true)"
     if [ "$recover_port_now" = "$RECOVER_PIN" ]; then
       case "$recover_ls_after" in
-        *"the proxy for box names is not serving"*) ;; # serving but still warning: keep polling
+        *"warning: the hostname proxy is not serving"*) ;; # serving but still warning: keep polling
         *) recover_cleared=1; break ;;
       esac
     fi
@@ -15736,7 +15736,7 @@ proof_min_internal_names_through_proxy() {
   for proxy_bind_try in 1 2 3 4 5; do
     proxy_ls_out="$(mnl ls 2>&1)"
     case "$proxy_ls_out" in
-      *"the proxy for box names is not serving"*) proxy_bind_taken=1 ;;
+      *"warning: the hostname proxy is not serving"*) proxy_bind_taken=1 ;;
       *) proxy_bind_taken=0; break ;;
     esac
     [ "$proxy_bind_try" = 5 ] || sleep 3
@@ -16159,7 +16159,7 @@ proof_own_ip_deny_all_box_answers_published_port() {
   for da_bind_try in 1 2 3 4 5; do
     da_ls_out="$(mnl ls 2>&1)"
     case "$da_ls_out" in
-      *"the proxy for box names is not serving"*) da_bind_taken=1 ;;
+      *"warning: the hostname proxy is not serving"*) da_bind_taken=1 ;;
       *) da_bind_taken=0; break ;;
     esac
     [ "$da_bind_try" = 5 ] || sleep 3
@@ -16693,7 +16693,7 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
     for po_try in 1 2 3 4 5; do
       po_ls="$(mnl ls 2>&1)"
       case "$po_ls" in
-        *"the proxy for box names is not serving"*) po_bind_taken=1 ;;
+        *"warning: the hostname proxy is not serving"*) po_bind_taken=1 ;;
         *) po_bind_taken=0; break ;;
       esac
       [ "$po_try" = 5 ] || sleep 3
@@ -20190,7 +20190,7 @@ proof_proxy_refuses_like_direct() {
   for par_bind_try in 1 2 3 4 5; do
     par_ls_out="$(mnl ls 2>&1)"
     case "$par_ls_out" in
-      *"the proxy for box names is not serving"*) par_bind_taken=1 ;;
+      *"warning: the hostname proxy is not serving"*) par_bind_taken=1 ;;
       *) par_bind_taken=0; break ;;
     esac
     [ "$par_bind_try" = 5 ] || sleep 3
