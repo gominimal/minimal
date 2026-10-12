@@ -6713,6 +6713,86 @@ async fn shared_address_port_collision_survives_a_daemon_restart() {
     );
 }
 
+/// NET-129 at daemon start: a shared-address port goes to the box created
+/// earliest among the boxes publishing it, whatever order the store lists
+/// them in. The store lists its records by the last five hex digits of
+/// each id, which are random, so the pair this test restarts with is chosen
+/// to list the newer box first — the order that hands it the port unless
+/// the resume sorts by id.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shared_address_holder_same_in_any_resume_order() {
+    let shared = std::net::Ipv4Addr::new(127, 0, 64, 9);
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let store_key = |id: SessionId| {
+        let id = id.to_string();
+        id[id.len() - 5..].to_owned()
+    };
+
+    // Keep two boxes on the port, replacing the older one until the newer
+    // box's store key sorts first. Destroying the older box hands the port
+    // to the one left, so the older of the pair always holds it.
+    let mut older = (
+        finalize_handed_own_ip_session(
+            &mut client,
+            "box-0",
+            std::net::Ipv4Addr::new(100, 64, 128, 9),
+            shared,
+        )
+        .await,
+        "box-0".to_owned(),
+    );
+    let mut newer = None;
+    for n in 1..=32u8 {
+        let name = format!("box-{n}");
+        let id = finalize_handed_own_ip_session(
+            &mut client,
+            &name,
+            std::net::Ipv4Addr::new(100, 64, 128, 9 + n),
+            shared,
+        )
+        .await;
+        if store_key(id) < store_key(older.0) {
+            newer = Some(id);
+            break;
+        }
+        destroy_session(&mut client, older.0).await;
+        older = (id, name);
+    }
+    let newer = newer.expect("some newer box's store key sorts before an older box's");
+    let (older, older_name) = older;
+    let held_by_older = vec![crate::net::dns::SharedPortCollision {
+        port: 18080,
+        other: format!("{older_name}.min.internal"),
+    }];
+    {
+        let registry = server.state.sessions_manager().await.hostnames();
+        let routes = registry.read().expect("registry lock");
+        assert!(routes.shared_port_collisions(older).is_empty());
+        assert_eq!(routes.shared_port_collisions(newer), held_by_older);
+    }
+
+    let server = restart(server, client).await;
+    let manager = server.state.sessions_manager().await;
+    assert_eq!(
+        manager.resume_active_sessions().await.unwrap(),
+        2,
+        "both boxes are resumed"
+    );
+    let registry = manager.hostnames();
+    let routes = registry.read().expect("registry lock");
+    assert!(
+        routes.shared_port_collisions(older).is_empty(),
+        "the box created earliest holds the port after the restart"
+    );
+    assert_eq!(
+        routes.shared_port_collisions(newer),
+        held_by_older,
+        "and the newer box yields to it, though the store lists it first"
+    );
+}
+
 /// The write-lock promotion `register_hostname` runs after its wait, driven
 /// directly with no timers: a registration that took the `127.0.0.1` interim
 /// moves to its hand once the verdict vouches for it — whether the name is

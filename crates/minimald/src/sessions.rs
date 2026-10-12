@@ -1022,7 +1022,14 @@ impl Manager {
             return Ok(0);
         }
         let mut resumed = 0;
-        for handle in self.store.handles().await? {
+        // Oldest session first (the id is a UUIDv7): each resumed box
+        // publishes as its actor starts, and a shared-address port goes to
+        // the first box publishing it, so this order gives the port to the
+        // box created earliest — the box a live hand-over elects (NET-129).
+        // The store lists its keys by a random suffix of the id.
+        let mut handles = self.store.handles().await?;
+        handles.sort_by_key(|handle| *handle.id());
+        for handle in handles {
             let session_id = *handle.id();
             if self.running.contains_key(&session_id) {
                 continue;

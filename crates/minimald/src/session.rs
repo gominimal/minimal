@@ -1886,8 +1886,21 @@ impl Session {
                     .hostnames
                     .write()
                     .expect("hostname registry lock poisoned");
-                reg.unpublish_own_address(record.id);
+                let (_, hand_overs) = reg.unpublish_own_address(record.id);
                 reg.forget_own_address(record.id);
+                // NET-129: each shared-address port this box held has a new
+                // holder of record. Its forward is bound at that box's next
+                // attach; nothing here binds it for a box already running.
+                for hand_over in hand_overs {
+                    tracing::info!(
+                        session_id = %hand_over.holder,
+                        address = %hand_over.address,
+                        port = hand_over.port,
+                        from = %record.id,
+                        action = "shared-address-port-hand-over",
+                        "a shared-address port passes to the earliest-created box still publishing it"
+                    );
+                }
             }
             self.release_loopback_address(&record, &registry_name(&record));
         }
