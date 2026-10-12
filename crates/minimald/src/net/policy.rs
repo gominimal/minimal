@@ -625,8 +625,8 @@ impl ExposeRefusal {
                 ),
             },
             Self::DeniedByHuman => format!(
-                "{self}: your operator declined it. Ask again, or forward it from the \
-                 host: {forward}"
+                "{self}: the person attached to this session answered no. Ask again, or \
+                 forward it from the host: {forward}"
             ),
             Self::AskNoTerminal => format!(
                 "{self}: no terminal was attached to answer. Attach one and retry, or \
@@ -668,7 +668,7 @@ impl fmt::Display for ExposeRefusal {
             ),
             Self::NoDynamicRange => write!(
                 f,
-                "this box declares no dynamic port range, so no port can be allowed"
+                "this box has no --dynamic-range, so no port can be opened at runtime"
             ),
             Self::OutOfRange { requested, range } => write!(
                 f,
@@ -677,14 +677,19 @@ impl fmt::Display for ExposeRefusal {
             ),
             Self::NoPublishedAddress => write!(
                 f,
-                "this box has no published address on file to expose a port at"
+                "this box was given no address on the host to open a port at"
             ),
             Self::NotAttached => write!(
                 f,
-                "this box has no address on the switch yet; start the box and try again"
+                "this box's network is not connected, so no port can be opened on it; \
+                 start the box and try again"
             ),
             Self::NotRunning => {
-                write!(f, "this box is not running; start the box and try again")
+                write!(
+                    f,
+                    "this box is not running, so there is nothing to open a port on; \
+                     start the box and try again"
+                )
             }
             Self::AlreadyPublished { port, owner } => write!(
                 f,
@@ -738,14 +743,14 @@ impl fmt::Display for ExposeFailure {
             Self::RecordUnreadable { port, source } => {
                 write!(
                     f,
-                    "reading the session record for port {port} failed: {source}"
+                    "port {port} was not opened: the session's saved state could \
+                     not be read: {source}"
                 )
             }
             Self::ActorGone { port } => {
                 write!(
                     f,
-                    "the session actor for port {port} is gone; the box is \
-                     stopping or stopped"
+                    "port {port} was not opened: the box is stopping or stopped"
                 )
             }
         }
@@ -1531,8 +1536,9 @@ mod tests {
         );
         assert_eq!(
             ExposeRefusal::DeniedByHuman.for_caller("web", NetworkMode::OwnIp, 3001),
-            "dynamic ingress is denied for this box: your operator declined it. Ask again, \
-             or forward it from the host: min net forward web <local>:3001"
+            "dynamic ingress is denied for this box: the person attached to this session \
+             answered no. Ask again, or forward it from the host: min net forward web \
+             <local>:3001"
         );
         assert_eq!(
             ExposeRefusal::AskNoTerminal.for_caller("web", NetworkMode::OwnIp, 3001),
@@ -1785,10 +1791,13 @@ mod tests {
         let unpublished = ExposeRefusal::NoPublishedAddress.to_string();
         let unattached = ExposeRefusal::NotAttached.to_string();
         assert!(
-            unpublished.contains("no published address"),
+            unpublished.contains("no address on the host to open a port at"),
             "{unpublished}"
         );
-        assert!(unattached.contains("start the box"), "{unattached}");
+        assert!(
+            unattached.contains("not connected") && unattached.contains("start the box"),
+            "{unattached}"
+        );
         assert_ne!(unpublished, unattached);
         assert!(!unattached.contains("denied") && !unpublished.contains("denied"));
         assert!(

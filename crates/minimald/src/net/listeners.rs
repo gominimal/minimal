@@ -307,7 +307,7 @@ where
     if reply.trim().is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
-            "the VM host daemon closed the report door without answering",
+            "the VM host daemon closed the connection without answering",
         ));
     }
     serde_json_lenient::from_str(reply.trim()).map_err(|error| {
@@ -361,7 +361,7 @@ async fn report_exchange(
         // itself is the failure, and the reason names it.
         io::Error::new(
             io::ErrorKind::TimedOut,
-            "the port report's reply did not arrive before its deadline",
+            "the VM host daemon's answer did not arrive before its deadline",
         )
     })?
 }
@@ -457,7 +457,7 @@ pub(crate) async fn report_ask(
     let dial_timeout = |_elapsed| {
         io::Error::new(
             io::ErrorKind::TimedOut,
-            "the VM host daemon's report door did not accept the ask before its deadline",
+            "the VM host daemon did not accept the port prompt before its deadline",
         )
     };
     let reply = match &channel {
@@ -485,10 +485,10 @@ pub(crate) async fn report_ask(
     match reply {
         minimald_rpc::BoxControlReply::AskAdmit(outcome) => Ok(outcome),
         minimald_rpc::BoxControlReply::Error { error } => Err(io::Error::other(format!(
-            "the VM host daemon refused the ask: {error}"
+            "the VM host daemon refused the port prompt: {error}"
         ))),
         other => Err(io::Error::other(format!(
-            "the VM host daemon answered the ask with another verb's reply: {other:?}"
+            "the VM host daemon sent an unexpected reply to the port prompt: {other:?}"
         ))),
     }
 }
@@ -543,7 +543,7 @@ pub(crate) async fn report_admitted_port(
                 // the next attempt would draw the same refusal, and the
                 // rate window does not need it asked for again.
                 return Err(io::Error::other(format!(
-                    "the VM host daemon refused the port report: {error}"
+                    "the VM host daemon refused to open the port: {error}"
                 )));
             }
             Ok(other) => {
@@ -551,8 +551,8 @@ pub(crate) async fn report_admitted_port(
                 // host's row may or may not name the port, and the unwind
                 // below withdraws it the way a lost reply's does.
                 unanswered = Some(io::Error::other(format!(
-                    "the VM host daemon answered the port report with another verb's \
-                     reply: {other:?}"
+                    "the VM host daemon sent an unexpected reply when asked to open the \
+                     port: {other:?}"
                 )));
                 break;
             }

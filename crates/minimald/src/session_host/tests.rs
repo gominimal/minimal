@@ -6800,10 +6800,19 @@ async fn vm_ask_cancelled_is_a_publish_failure_with_its_cause() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn vm_ask_host_refusals_are_publish_failures() {
     for (reason, says) in [
-        (minimald_rpc::AskRefused::QueueFull, "queue is full"),
-        (minimald_rpc::AskRefused::OutsideGrant, "outside"),
-        (minimald_rpc::AskRefused::StanceNotAsk, "not ask"),
-        (minimald_rpc::AskRefused::NoRow, "no row"),
+        (
+            minimald_rpc::AskRefused::QueueFull,
+            "already waiting for an answer",
+        ),
+        (
+            minimald_rpc::AskRefused::OutsideGrant,
+            "outside the --dynamic-range",
+        ),
+        (minimald_rpc::AskRefused::StanceNotAsk, "set to ask"),
+        (
+            minimald_rpc::AskRefused::NoRow,
+            "not registered with the VM host daemon",
+        ),
     ] {
         let result = vm_ask_ended_by_host(host_refused(reason, None)).await;
         match result {
