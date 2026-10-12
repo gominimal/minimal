@@ -4612,11 +4612,11 @@ mod tests {
             "the refusal names the rule it refused over, by field and entry: {error}"
         );
         assert!(
-            error.contains("host_ip boxes on this host enforce only deny-all egress"),
+            error.contains("with --network host_ip this machine can only block all network access"),
             "the refusal says whose verdict it is that cannot enforce the rule: {error}"
         );
         assert!(
-            error.contains("which enforces them"),
+            error.contains("to apply them"),
             "the refusal says own-address boxes enforce these rules, so the \
              person who typed the declaration is told where they do work: {error}"
         );
@@ -4627,7 +4627,7 @@ mod tests {
         assert!(
             error.contains("Remove them")
                 && error.contains("--deny-all-egress")
-                && error.contains("all three allow lists present and empty"),
+                && error.contains("--network own_ip"),
             "the refusal names the remedy for the rules it refused: {error}"
         );
 

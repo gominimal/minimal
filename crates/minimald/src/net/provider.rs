@@ -556,8 +556,8 @@ async fn privileged_tap(
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             format!(
-                "the PTask's network namespace is gone before its tap was made \
-                 ({netns} does not exist); the sandbox did not survive its spawn"
+                "the box's sandbox exited before its network could be set up \
+                 ({netns} does not exist)"
             ),
         ));
     }
@@ -694,7 +694,7 @@ impl Network for OwnIpNetwork {
                         let userns = sandbox2::user_namespaces_restriction()
                             .map_or_else(|| "available".to_string(), |r| r.to_string());
                         return Err(NetworkError::new(std::io::Error::other(format!(
-                            "own-IP sandbox produced no in-namespace tap fd \
+                            "the box's sandbox could not create its network device \
                              (/dev/net/tun present: {tun}; user namespaces: {userns})"
                         ))));
                     };
@@ -1127,7 +1127,7 @@ mod tests {
         let stale = plan(deny_all.clone()).plan().await;
         let refusal = stale.expect_err("a carve-out naming another bind is stale");
         assert!(
-            refusal.to_string().contains("stale carve-out"),
+            refusal.to_string().contains("its name lookups would fail"),
             "the plan refuses the box as a stale carve-out: {refusal}"
         );
 
