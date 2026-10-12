@@ -2171,6 +2171,28 @@ mod tests {
     }
 
     #[test]
+    fn ingress_mapping_errors_name_the_protocol_in_lowercase() {
+        // The protocol is printed the way a user spells it in `--ingress`,
+        // not as the Rust variant name.
+        assert_eq!(
+            PolicyError::UnsupportedIngressProtocol {
+                proto: IpProto::Icmp
+            }
+            .to_string(),
+            "ingress port mapping uses protocol icmp; only tcp and udp are supported"
+        );
+        assert_eq!(
+            PolicyError::DuplicateIngressPort {
+                external_port: 18080,
+                proto: IpProto::Tcp,
+            }
+            .to_string(),
+            "ingress port mapping publishes tcp host port 18080 more than once; \
+             each host port may appear in at most one ingress mapping per protocol"
+        );
+    }
+
+    #[test]
     fn same_host_port_on_tcp_and_udp_is_allowed() {
         // TCP and UDP on one host port are distinct binds: gvproxy keys each
         // forward by protocol and host address, so both mappings stand.

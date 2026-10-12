@@ -349,7 +349,7 @@ egress
 ```
 
 The row names the lane the declaration opened. The gate admits the box's
-frames to the box egress proxy's listener, and the proxy checks their
+frames to the Box Egress Proxy's listener, and the proxy checks their
 credential. The rows above never decide that destination. The listener is
 the lane's whole reach. The gate still refuses everything else the box
 sends to the proxy's address. A box without the lane omits the row, so
