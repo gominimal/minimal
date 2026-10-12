@@ -203,6 +203,56 @@ proves, `nightly` ships.
   `ls .github/workflows/`, `just --list`). The prose rules reject a stated
   count (`inventory.StatedCount`).
 
+### User-facing text
+
+Everything `min`, `mip`, the daemons and the installer scripts print for a
+person is part of the product. Treat a message like an interface: specify it,
+test it, and review it.
+
+**Every message passes one test.** It states the current situation in plain
+words, or it tells the user one action to take and what that action does. A
+message that does neither is removed or rewritten.
+
+- Use the words the user types and sees: command names, flag names, file
+  paths. Do not name internal components, design terms, RPC names, or
+  requirement identifiers.
+- An instruction names a command the user can run as written. If no such
+  command exists, state the situation and stop.
+- Say only what the code can prove. If a remedy is not verified against the
+  code path that prints the message, leave it out.
+- A refusal says what was refused, why, and the next step. Where a remedy can
+  be given as a flag and as a `minimal.toml` setting, name both.
+- Use one name for one thing across the CLI, the dashboard and the docs. When
+  a sentence is shown in two places, change both or neither.
+- A logged warning is not a message for the user. Log records go to the log;
+  a message for the user is written by hand.
+
+**Nothing prints before the box shell on a healthy start.** The shell's
+first paint replaces whatever was printed before it, so a line there cannot
+be read.
+
+- On the healthy path, starting or attaching to a session prints no warnings
+  and no notes.
+- A line may appear before the shell only when the user must act or decide,
+  and then it is a prompt that waits for an answer. Define what each choice
+  does and what happens without a terminal.
+- Anything else worth telling goes to a surface that stays: `min ls`,
+  `min session policy`, `min dash`, a notice inside the box, or the log.
+- An error that ends the command is not covered by this rule: the command
+  exits non-zero and the text stays on screen.
+
+**When you specify or plan work that adds or changes a message:**
+
+- Write the exact text in the spec or the issue, with the condition that
+  prints it and the surface it appears on.
+- Say why it is true: name the code path or state that makes it so.
+- List the tests and scripts that pin the text, so the change updates them.
+- If a spec fixes the old text, say so, and change the spec in the same
+  piece of work or record the spec line that must follow.
+
+**When you review such work**, read each new string as a user who has never
+seen the design, and apply the test above before approving.
+
 ### Pre-PR verification
 
 The canonical pre-PR command is `just ci`, per
