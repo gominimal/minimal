@@ -340,7 +340,7 @@ on every platform, but `stage-release.sh` and `package-nfpm.sh` still accept
 a missing `minzoned` artifact with a warning that names the omitted row.
 They stage or package all other artifacts. A release staged without it gives
 no `minzoned` to the host. The advisory then shows the state `this release
-ships no minzoned; the answerer service step is unavailable` and does not
+ships no minzoned; the DNS service install is unavailable` and does not
 offer the step. Both optional lists go after a release publishes the
 artifact on every platform.
 
