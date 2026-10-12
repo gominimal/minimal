@@ -1063,9 +1063,9 @@ impl HostnameRegistry {
                 .ports
                 .into_iter()
                 .filter(|port| previous.address != address || !ports.contains(port));
-            // Delivering a move's hand-overs to the new holders belongs to
-            // the callers that move a publish; until they take them, the
-            // election is recorded here.
+            // A move's hand-overs are logged here and not returned: the new
+            // holder of record is elected now, and its forward is bound at
+            // that box's next attach, the deferral the destroy path makes.
             for hand_over in self.hand_over(session_id, previous.address, vacated) {
                 tracing::info!(
                     session_id = %hand_over.holder,
