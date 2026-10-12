@@ -276,8 +276,9 @@ async fn ensure_task_rows_stand(
         Ok(())
     } else {
         Err(io::Error::other(format!(
-            "box {}'s row on the VM host has ended, so a task run in it would reach \
-             nothing; destroy and re-activate the session",
+            "the VM host daemon could not confirm session {}'s network addresses, so \
+             the task was not run; destroy the session with `min session destroy <session>`, \
+             then start it again with `min session activate`",
             record.name.as_deref().unwrap_or("(unnamed)")
         )))
     }
@@ -311,7 +312,7 @@ async fn attach_or_reap<P: Reapable>(
         Err(e) => {
             child.kill_and_reap();
             Err(io::Error::other(format!(
-                "attaching the task network failed: {e}"
+                "connecting the task's network failed: {e}"
             )))
         }
     }
@@ -477,7 +478,7 @@ async fn task_producer(
                 // One plan, container and attach per invocation: hakoniwa
                 // unshares per `spawn()`, so each needs its own address.
                 let planned = env.plan_launch().await.map_err(|e| {
-                    io::Error::other(format!("planning the task network failed: {e}"))
+                    io::Error::other(format!("setting up the task's network failed: {e}"))
                 })?;
                 let container = env
                     .container(planned.plan())
@@ -2999,7 +3000,14 @@ mod tests {
             .await
             .expect_err("a registered box with no id is never answered as standing");
         assert!(
-            refused.to_string().contains("row on the VM host has ended"),
+            refused.to_string().contains("could not confirm session"),
+            "{refused}"
+        );
+        // The bare command fails: a destroy needs a session or `--all`.
+        assert!(
+            refused
+                .to_string()
+                .contains("`min session destroy <session>`"),
             "{refused}"
         );
     }
