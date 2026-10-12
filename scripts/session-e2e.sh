@@ -201,7 +201,7 @@
 #                                    and host-OS resolution with no proxies
 #   native_resolution_from_host_answerer_on_vm_host
 #                                    NET-124..128/138 on a VM-backed lane:
-#                                    the VM host daemon answers the zone on
+#                                    this VM's host daemon answers the zone on
 #                                    the host loopback and the in-VM daemon
 #                                    owns no answerer
 #   native_answerer_survives_session_stop
@@ -1723,7 +1723,7 @@ proof_own_ip_egress_declared_and_enforced() {
   # no longer prints), and `min session policy` names the default it got.
   # This daemon runs without the opt-out, so the default binds. The box is
   # kept for the reach legs below, which need a live control first.
-  egress_in_force_note="egress: deny-all (default for an own-ip box with no egress section)"
+  egress_in_force_note="This box can reach no external address: a --network own_ip box with no egress rules gets the deny-all default"
   bare_sid="$(cd "$EGRESS_SEED_DIR" && mnl session activate . --no-prompt \
     --name e2e-egress-bare --network own_ip 2>"$WORK/egress-bare.err")" || {
     echo "::error::'min session activate --network own_ip' (bare box) failed"
@@ -4050,7 +4050,7 @@ proof_own_ip_box_registers_with_the_vm_host_without_a_provider_flag() {
   while [ "$SECONDS" -lt "$boxreg_ctrlc_deadline" ]; do
     kill -STOP "$BOXREG_CTRLC_PID" 2>/dev/null || break
     if [ -z "$boxreg_ctrlc_armed" ] \
-      && grep -qF -- "egress: deny-all (default for an own-ip box with no egress section)" \
+      && grep -qF -- "This box can reach no external address: a --network own_ip box with no egress rules gets the deny-all default" \
         "$WORK/boxreg-ctrlc.err" 2>/dev/null; then
       boxreg_ctrlc_armed=1
     fi
@@ -8171,8 +8171,8 @@ proof_native_resolution_without_proxy_env() {
 #     a VM-backed host the zone is the host's to answer, the guest daemon
 #     starts no answerer, and the CLI reads the host answerer's state from
 #     minvmd's control socket — never through the guest — and prints the
-#     DNS SERVICE line from it: answered by the VM host daemon, naming the
-#     holder.
+#     DNS SERVICE line from it: the VM host daemon answering this VM's
+#     box names, or another VM host daemon answering them.
 #   * The VM host daemon's answerer answers real zone names on the host, and
 #     dig reads the wire a host resolver would, at the port the answerer's
 #     own start record names — the listener it holds, or the machine's
@@ -8232,7 +8232,7 @@ proof_native_resolution_from_host_answerer_on_vm_host() {
   # `mnl ls | grep`: grep's early exit SIGPIPEs the CLI.
   host_answerer_ls="$(mnl ls 2>/dev/null || true)"
   if ! printf '%s\n' "$host_answerer_ls" \
-      | grep -qF -- 'DNS SERVICE:     answered by the VM host daemon (single-operator interim)'; then
+      | grep -qE -- "DNS SERVICE: +(this VM's host daemon answers its|another VM host daemon answers this VM's) box names on 127\.0\.0\.1:"; then
     echo "::error::min ls does not name the VM host daemon as the zone's answerer — the line the CLI reads from minvmd's control socket is missing"
     echo "--- min ls ---"; printf '%s\n' "$host_answerer_ls"
     fail
@@ -8984,7 +8984,7 @@ proof_box_name_resolves_natively_without_proxy() {
   bn_api_surface="$(grep -F -- 'resolves in any browser on this machine' \
     "$bn_api_err" 2>/dev/null | head -n1 || true)"
   if [ -z "$bn_api_surface" ]; then
-    echo "::error::the second box's activate does not report native DNS as the live name surface (NET-018) — the command ran, so the verdict must have moved"
+    echo "::error::the second box's activate does not say its name resolves in any browser on this machine (NET-018) — the command ran, so the verdict must have moved"
     echo "--- activate stderr ---"; cat "$bn_api_err" 2>/dev/null || true
     fail
   fi
@@ -9077,17 +9077,17 @@ proof_box_name_resolves_natively_without_proxy() {
   echo "--- min ls ---"; printf '%s\n' "$bn_ls"
   bn_surface_line="$(printf '%s\n' "$bn_ls" | grep -F -- 'BOX NAMES:' | head -n1 || true)"
   case "$bn_surface_line" in
-    *"native DNS is the live name surface"*) ;;
+    *"resolves through this machine's DNS"*) ;;
     *)
-      echo "::error::min ls does not report native DNS as the live name surface (NET-018)"
+      echo "::error::min ls's BOX NAMES line does not say box names resolve through this machine's DNS (NET-018)"
       echo "--- BOX NAMES line ---"; printf '%s\n' "$bn_surface_line"
       fail
       ;;
   esac
   case "$bn_surface_line" in
-    *"the hostname proxy still serves on 127.0.0.1:"*) ;;
+    *"the hostname proxy also listens on 127.0.0.1:"*) ;;
     *)
-      echo "::error::min ls's surface line does not say the hostname proxy still serves (NET-019)"
+      echo "::error::min ls's surface line does not say the hostname proxy also listens (NET-019)"
       echo "--- BOX NAMES line ---"; printf '%s\n' "$bn_surface_line"
       fail
       ;;
@@ -9753,23 +9753,23 @@ for row in json.load(open(sys.argv[1])):
   fi
   echo "  node A released the port and publishes to the manager-held service over $asr_channel"
   asr_expect_a e2e-asr-a.min.internal "$asr_a_ip"
-  # The hook probe's own answer, as `min ls` prints it: manager-held, with
-  # the channel node A publishes over. Capture-then-grep (grep's early exit
-  # would SIGPIPE the CLI).
+  # The hook probe's own answer, as `min ls` prints it: Minimal's DNS
+  # service answers this VM's box names. Capture-then-grep (grep's early
+  # exit would SIGPIPE the CLI).
   local asr_ls=""
   for _ in $(seq 1 20); do
     asr_ls="$(mnl ls 2>/dev/null || true)"
     case "$asr_ls" in
-      *"manager-held: answered by the answerer host service"*"$asr_channel"*) break ;;
+      *"Minimal's DNS service answers this VM's box names on 127.0.0.1:"*) break ;;
     esac
     sleep 0.5
   done
   case "$asr_ls" in
-    *"manager-held: answered by the answerer host service"*"$asr_channel"*)
+    *"Minimal's DNS service answers this VM's box names on 127.0.0.1:"*)
       printf '%s\n' "$asr_ls" | grep -F -- 'DNS SERVICE' | sed 's/^/  /'
       ;;
     *)
-      echo "::error::min ls does not say the zone is manager-held after the handover"
+      echo "::error::min ls does not say Minimal's DNS service answers this VM's box names after the handover"
       echo "--- min ls ---"; printf '%s\n' "$asr_ls"
       fail
       ;;
@@ -9784,12 +9784,12 @@ for row in json.load(open(sys.argv[1])):
   for _ in $(seq 1 60); do
     asr_b_ls="$(mnl2 ls 2>/dev/null || true)"
     case "$asr_b_ls" in
-      *"manager-held: answered by the answerer host service"*"$asr_channel"*) break ;;
+      *"Minimal's DNS service answers this VM's box names on 127.0.0.1:"*) break ;;
     esac
     sleep 0.5
   done
   case "$asr_b_ls" in
-    *"manager-held: answered by the answerer host service"*"$asr_channel"*)
+    *"Minimal's DNS service answers this VM's box names on 127.0.0.1:"*)
       echo "  node B re-published to the manager-held service after the handover"
       printf '%s\n' "$asr_b_ls" | grep -F -- 'DNS SERVICE' | sed 's/^/  /'
       ;;
@@ -14891,7 +14891,7 @@ ESU_LISTENER_EOF
       echo "::error::box $esu_box's policy does not show its declared subnets ('$esu_line')"
       esu_fail
     fi
-    if ! grep -q 'node-plane baseline set (helper enumeration)' <<<"$esu_policy" \
+    if ! grep -q 'own downloads in this VM' <<<"$esu_policy" \
       || ! grep -q 'registry  100.64.255.254/32' <<<"$esu_policy" \
       || ! grep -q 'cache  100.64.255.254/32' <<<"$esu_policy"; then
       echo "::error::box $esu_box's policy does not show the node-plane baseline set beside its rules (the registry and cache categories at the host alias)"
@@ -18078,8 +18078,9 @@ proof_listen_published_port_reaches_peer_and_host() {
   # target's own — a host-native daemon prints "listening on
   # 127.0.0.1:PORT (UDP)", while the VM-backed target this case's own-address
   # box needs names the port in the line the CLI renders from the VM host
-  # daemon's answerer state ("this VM's minvmd holds it on 127.0.0.1:PORT
-  # (UDP)", or the registered form) — so both spellings read here. A target
+  # daemon's answerer state ("this VM's host daemon answers its box names
+  # on 127.0.0.1:PORT (UDP)", or the registered form) — so both spellings
+  # read here. A target
   # that names no port has no word for where its boxes are published, and the
   # host legs below are WHERE-skipped on it, never failed: the peer legs
   # carry the case's enforcement assertions without it.

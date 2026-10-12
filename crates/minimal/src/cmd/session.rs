@@ -511,8 +511,8 @@ fn refuse_dynamic_ingress_off_own_ip(
 ) -> Result<(), anyhow::Error> {
     if network != crate::cli::CliNetworkMode::OwnIp && (mode.is_some() || range.is_some()) {
         anyhow::bail!(
-            "--dynamic-ingress and --dynamic-range need --network own_ip: only an own-IP box \
-             has a published address to apply them to"
+            "--dynamic-ingress and --dynamic-range need --network own_ip: only a box with \
+             its own IP address can publish ports"
         );
     }
     Ok(())
@@ -529,8 +529,8 @@ fn refuse_ingress_off_own_ip(
 ) -> Result<(), anyhow::Error> {
     if network != crate::cli::CliNetworkMode::OwnIp && has_ingress {
         anyhow::bail!(
-            "--ingress needs --network own_ip: only an own-IP box has a published \
-             address to apply it to"
+            "--ingress needs --network own_ip: only a box with its own IP address can \
+             publish ports"
         );
     }
     Ok(())
@@ -2155,8 +2155,8 @@ fn subscribe_host_asks(
         Err(error) => {
             tracing::warn!(box = %name, error = %format!("{error:#}"), "could not subscribe to the box's asks");
             eprintln!(
-                "warning: this attach cannot answer box '{name}' asking to publish a port: \
-                 {error:#}"
+                "warning: this terminal will not show port prompts for box '{name}': \
+                 {error:#}. Run `min session attach {name}` again to retry."
             );
             None
         }
@@ -2388,8 +2388,10 @@ pub fn deny_all_default_notice(phase: sessions::EgressDefaultPhase) -> Option<&'
     match phase {
         sessions::EgressDefaultPhase::Announced => None,
         sessions::EgressDefaultPhase::InForce => Some(
-            "egress: deny-all (default for an own-ip box with no egress section); declare \
-             reach with the --allow-subnets, --allow-dns-hosts and --allow-protocols flags",
+            "This box can reach no external address: a --network own_ip box with no egress \
+             rules gets the deny-all default. To allow outbound traffic, activate a new \
+             session with --allow-subnets or --allow-dns-hosts, for example \
+             --allow-dns-hosts github.com.",
         ),
     }
 }
@@ -2510,7 +2512,7 @@ pub fn format_policy(
     // declaration at all — nothing the blocks print would describe anything
     // real (the same case the TUI's detail pane replaces with this note).
     if network == sessions::NetworkMode::NoNet {
-        writeln!(out, "No network policy (NoNet)")?;
+        writeln!(out, "This box has no network (--network none)")?;
         // A lane the box declared is still shown, marked as not in effect:
         // the view states what was declared (NET-134).
         if effective.credentialed_upstream.is_some() {
@@ -2610,7 +2612,7 @@ pub fn format_policy(
         let baseline = minvmd::net::NodePlaneBaseline::built_in(fabric);
         writeln!(
             out,
-            "node-plane baseline set (helper enumeration) — {}",
+            "destinations for Minimal's own downloads in this VM (not this box's rules): {}",
             baseline.phase().as_str()
         )?;
         for entry in baseline.entries() {
@@ -2724,7 +2726,7 @@ pub fn write_live_ingress(
             Some(false) => "",
             // A reply from a daemon that predates the field: the state is
             // unknown, not reachable — the row says both.
-            None => "  (unknown; daemon predates this field)",
+            None => "  (reachability unknown: the running daemon is older than this min)",
         };
         writeln!(
             out,
@@ -2753,7 +2755,8 @@ pub fn write_unaudited_listen_ports(
     for port in ports {
         writeln!(
             out,
-            "warning: port {port} is permitted but not published: {audit_log} cannot be written"
+            "warning: port {port} is allowed but not reachable yet: Minimal could not write \
+             {audit_log}. The port is published once that log can be written."
         )?;
     }
     Ok(())
@@ -3214,10 +3217,12 @@ async fn fetch_live_ingress(
         .await
     {
         Ok(minimald_rpc::Errorable::Ok(live)) => Ok(live),
-        Ok(minimald_rpc::Errorable::Err { error }) => {
-            Err(format!("live port mappings are unavailable: {error}"))
-        }
-        Err(error) => Err(format!("live port mappings are unavailable: {error:#}")),
+        Ok(minimald_rpc::Errorable::Err { error }) => Err(format!(
+            "could not read the ports this box published while running: {error}"
+        )),
+        Err(error) => Err(format!(
+            "could not read the ports this box published while running: {error:#}"
+        )),
     }
 }
 
@@ -3880,31 +3885,34 @@ pub(crate) async fn destroy_session(
         .await
         .context("DestroySession RPC failed")?;
 
-    if let Some(resp) = resp.ok() {
-        println!("Destroyed session {} ({})", id, name.unwrap_or("-"));
-        // A failed `on_destroy` hook does not stop the destroy, so it is a
-        // warning rather than an error: the session is gone either way.
-        for failure in &resp.hook_failures {
-            let (head, output) = failure.split_once('\n').unwrap_or((failure, ""));
-            eprintln!("warning: on_destroy hook {head}; the session was destroyed anyway");
-            if !output.is_empty() {
-                eprintln!("{output}");
+    match resp {
+        minimald_rpc::Errorable::Ok(resp) => {
+            println!("Destroyed session {} ({})", id, name.unwrap_or("-"));
+            // A failed `on_destroy` hook does not stop the destroy, so it is a
+            // warning rather than an error: the session is gone either way.
+            for failure in &resp.hook_failures {
+                let (head, output) = failure.split_once('\n').unwrap_or((failure, ""));
+                eprintln!("warning: on_destroy hook {head}; the session was destroyed anyway");
+                if !output.is_empty() {
+                    eprintln!("{output}");
+                }
             }
+            // The session is gone; the row its activation bought outlives it on
+            // the VM host daemon, and its creator withdraws it here (T66) —
+            // presenting the pair the registration handed back. Best-effort: a
+            // withdrawal that cannot be made leaves the row published and warns
+            // rather than failing a destroy that already succeeded.
+            // A box that registered no row held its name in the zone instead
+            // (`host_ip`); the same destroy releases it, best-effort the same
+            // way.
+            let control_sock =
+                vm_host_control_sock(daemon_provider_kind(global), global.minimal_dir.as_deref());
+            withdraw_box_row(control_sock.clone(), name, box_addresses, None).await;
+            release_held_box_name(control_sock, id, name, box_addresses).await;
         }
-        // The session is gone; the row its activation bought outlives it on
-        // the VM host daemon, and its creator withdraws it here (T66) —
-        // presenting the pair the registration handed back. Best-effort: a
-        // withdrawal that cannot be made leaves the row published and warns
-        // rather than failing a destroy that already succeeded.
-        // A box that registered no row held its name in the zone instead
-        // (`host_ip`); the same destroy releases it, best-effort the same
-        // way.
-        let control_sock =
-            vm_host_control_sock(daemon_provider_kind(global), global.minimal_dir.as_deref());
-        withdraw_box_row(control_sock.clone(), name, box_addresses, None).await;
-        release_held_box_name(control_sock, id, name, box_addresses).await;
-    } else {
-        bail!("DestroySession returned an error from the daemon");
+        minimald_rpc::Errorable::Err { error } => {
+            bail!("the daemon reported an error destroying the session: {error}")
+        }
     }
 
     Ok(())
@@ -4121,10 +4129,9 @@ async fn stop_wedged_vm_from_host(
 /// What `min stop --force` says after killing a VM whose guest did not
 /// acknowledge Shutdown. The volume's journal keeps its filesystem metadata
 /// consistent across the kill; it does not keep the data.
-const UNACKNOWLEDGED_STOP_CAVEAT: &str = "the guest did not acknowledge shutdown; the VM was killed from the host. \
-     Running sessions were killed without their stop path, and data not yet flushed inside \
-     the VM can be lost (files truncated or empty). The volume's journal keeps its \
-     filesystem metadata consistent.";
+const UNACKNOWLEDGED_STOP_CAVEAT: &str = "The VM did not respond to shutdown, so it was killed from this machine. \
+     Running sessions were killed without their shutdown steps, and recently written files \
+     may be empty or cut short. The VM disk's filesystem itself stays consistent.";
 
 /// How long a host-side stop waits for minvmd to release the VM's alive lock
 /// once the VMM has been signalled: the supervisor has to reap the VMM child
@@ -4145,8 +4152,8 @@ pub(crate) fn wait_for_alive_lock_released(
     {
         if std::time::Instant::now() >= deadline {
             bail!(
-                "minvmd still holds the VM's alive lock after {timeout:?}; \
-                 starting it again will fail until that minvmd exits"
+                "the VM host daemon (minvmd) is still running {timeout:?} after the stop; \
+                 the VM cannot be started again until that process exits"
             );
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -5613,10 +5620,12 @@ mod tests {
             .unwrap();
         assert_eq!(
             String::from_utf8(out).unwrap(),
-            "warning: port 3000 is permitted but not published: \
-             the audit log /state/audit/decisions.log cannot be written\n\
-             warning: port 3001 is permitted but not published: \
-             the audit log /state/audit/decisions.log cannot be written\n",
+            "warning: port 3000 is allowed but not reachable yet: Minimal could not write \
+             the audit log /state/audit/decisions.log. The port is published once that log \
+             can be written.\n\
+             warning: port 3001 is allowed but not reachable yet: Minimal could not write \
+             the audit log /state/audit/decisions.log. The port is published once that log \
+             can be written.\n",
         );
 
         let mut out = Vec::new();
@@ -5841,7 +5850,8 @@ mod tests {
         let rendered = String::from_utf8(out).unwrap();
         assert!(
             rendered.contains(
-                "  tcp  127.0.64.21:3000 → :3000  (unknown; daemon predates this field)\n"
+                "  tcp  127.0.64.21:3000 → :3000  (reachability unknown: the running daemon \
+                 is older than this min)\n"
             ),
             "a mapping the daemon could not classify reads as unknown, not as reachable: {rendered}"
         );
@@ -6745,10 +6755,10 @@ mod tests {
     }
 
     /// NET-138's interim, surfaced at every session start: the line names
-    /// who answers the zone under the `DNS service:` label — this VM's
-    /// minvmd when it holds the port, the machine's other holder when this
-    /// VM's table is registered with it — and the pre-acquisition state
-    /// prints nothing, exactly as its `min ls` line does.
+    /// who answers box names under the `DNS service:` label — this VM's
+    /// host daemon when it holds the port, another VM host daemon when
+    /// this VM's table is registered with it — and the pre-acquisition
+    /// state prints nothing, exactly as its `min ls` line does.
     #[test]
     fn session_start_names_the_zone_answerer_at_every_start() {
         let holder =
@@ -6756,11 +6766,9 @@ mod tests {
                 .expect("a holder is a state to name");
         assert_eq!(
             holder,
-            "DNS service: answered by the VM host daemon \
-             (single-operator interim) · this VM's minvmd holds it on \
-             127.0.0.1:7656 (UDP) · point the host's resolver at it for \
-             *.min.internal",
-            "the start line names this VM's minvmd as the holder"
+            "DNS service: this VM's host daemon answers its box names on \
+             127.0.0.1:7656 (UDP)",
+            "the start line names this VM's host daemon as the holder"
         );
         let registered =
             vm_host_answerer_start_line(minimald_rpc::ZoneAnswererStatus::Registered {
@@ -6769,10 +6777,8 @@ mod tests {
             .expect("a registered table is a state to name");
         assert_eq!(
             registered,
-            "DNS service: answered by the VM host daemon \
-             (single-operator interim) · another VM host daemon holds it on \
-             127.0.0.1:7656 (UDP); this VM's table is registered with it · \
-             point the host's resolver at it for *.min.internal",
+            "DNS service: another VM host daemon answers this VM's box names \
+             on 127.0.0.1:7656 (UDP)",
             "the start line names the holder this VM's table answers through"
         );
         assert_eq!(

@@ -855,7 +855,7 @@ pub fn format_ls_on(
         if let Some(answerer) = resp.zone_answerer_port {
             writeln!(
                 out,
-                "DNS SERVICE:     listening on 127.0.0.1:{answerer} (UDP) · point the host's resolver at it for *.min.internal"
+                "DNS SERVICE:     listening on 127.0.0.1:{answerer} (UDP) for *.min.internal"
             )?;
         } else if let Some(line) = &vm_answerer_line {
             writeln!(out, "DNS SERVICE:     {line}")?;
@@ -1158,7 +1158,7 @@ pub fn format_ls_across_vms_on(
             if let Some(answerer) = listing.resp.zone_answerer_port {
                 writeln!(
                     out,
-                    "DNS SERVICE:     {vm:<width$} listening on 127.0.0.1:{answerer} (UDP) · point the host's resolver at it for *.min.internal",
+                    "DNS SERVICE:     {vm:<width$} listening on 127.0.0.1:{answerer} (UDP) for *.min.internal",
                     vm = listing.vm,
                     width = VM_COLUMN_WIDTH,
                 )?;

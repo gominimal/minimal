@@ -2208,7 +2208,7 @@ fn host_stop_waits_for_the_alive_lock_not_the_lifecycle() {
     let err = wait_for_alive_lock_released(&state_dir, std::time::Duration::from_millis(300))
         .expect_err("a held alive lock is not a finished stop");
     assert!(
-        format!("{err:#}").contains("still holds the VM's alive lock"),
+        format!("{err:#}").contains("the VM host daemon (minvmd) is still running"),
         "got: {err:#}"
     );
 
@@ -2814,11 +2814,14 @@ async fn ls_shows_vm_per_box() {
             .to_string()
     };
     assert!(
-        surface_line_of("default").contains("the hostname proxy is the live name surface"),
+        surface_line_of("default")
+            .contains("<box>.min.internal opens through the HTTP proxy at 127.0.0.1:")
+            || surface_line_of("default")
+                .contains("the hostname proxy is not serving, and box names open only through it"),
         "the VM the hook does not route to keeps its proxy line:\n{table}"
     );
     assert!(
-        surface_line_of("alpha").contains("native DNS is the live name surface"),
+        surface_line_of("alpha").contains("resolves through this machine's DNS"),
         "the VM the hook routes to is named native:\n{table}"
     );
     let answerer_row_of = |vm: &str| {
@@ -2829,15 +2832,17 @@ async fn ls_shows_vm_per_box() {
             .to_string()
     };
     assert!(
-        answerer_row_of("default").contains("this VM's minvmd holds it on 127.0.0.1:7656"),
+        answerer_row_of("default")
+            .contains("this VM's host daemon answers its box names on 127.0.0.1:7656"),
         "the VM whose minvmd holds the port says so, in its own row:\n{table}"
     );
     assert!(
-        answerer_row_of("alpha").contains("another VM host daemon holds it on 127.0.0.1:7656"),
+        answerer_row_of("alpha")
+            .contains("another VM host daemon answers this VM's box names on 127.0.0.1:7656"),
         "the registered VM names the holder, in its own row:\n{table}"
     );
     assert!(
-        !answerer_row_of("alpha").contains("this VM's minvmd holds it"),
+        !answerer_row_of("alpha").contains("this VM's host daemon answers"),
         "a VM registered with another daemon must not claim its own minvmd \
          holds the port:\n{table}"
     );
