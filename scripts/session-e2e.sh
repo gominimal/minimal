@@ -7417,7 +7417,7 @@ proof_local_range_reserved_by_privileged_step() {
   esac
   # One elevation: the user runs the script under one sudo, so no statement
   # in it elevates again (the header's comment names the sudo it runs under).
-  if printf '%s\n' "$range_cmd" | grep -v '^[[:space:]]*#' | grep -q -- sudo; then
+  if setup_script_elevates "$range_cmd"; then
     echo "::error::the setup script elevates on its own — the user must never be asked twice"
     echo "--- script ---"; printf '%s\n' "$range_cmd"
     fail
@@ -7772,6 +7772,18 @@ setup_classifier_teardown() {
   SETUP_CLASSIFIER_INSTALLED=""
 }
 
+# Whether a setup script elevates on its own: `sudo` in command position on
+# a line that is not a comment. A hint inside a quoted message ("try: sudo
+# ...") is text, not an elevation. awk reads its whole input, so no early
+# exit can break the pipe; under `pipefail` a broken pipe would read as "no
+# sudo" and pass a script that elevates.
+setup_script_elevates() {
+  printf '%s\n' "$1" | awk '
+    /^[[:space:]]*#/ { next }
+    /(^|[;&|(]|then|do|else)[[:space:]]*sudo([[:space:]]|$)/ { found = 1 }
+    END { exit !found }'
+}
+
 # The setup script `min finalize-install --show --script` wrote to $1 (its stdout), whole,
 # when that is a script — its first line `#!/bin/sh` — and nothing otherwise
 # (a host with nothing to run, or a blocker, prints only its note on
@@ -7937,7 +7949,7 @@ proof_native_resolution_without_proxy_env() {
           ;;
       esac
     fi
-    if printf '%s\n' "$native_cmd" | grep -v '^[[:space:]]*#' | grep -q -- sudo; then
+    if setup_script_elevates "$native_cmd"; then
       echo "::error::the setup script elevates on its own; it must run whole under the one sudo the user gives it"
       echo "--- script ---"; printf '%s\n' "$native_cmd"
       fail
@@ -8779,7 +8791,7 @@ proof_box_name_resolves_natively_without_proxy() {
         fail
         ;;
     esac
-    if printf '%s\n' "$bn_cmd" | grep -v '^[[:space:]]*#' | grep -q -- sudo; then
+    if setup_script_elevates "$bn_cmd"; then
       echo "::error::the setup script elevates on its own; it must run whole under the one sudo the user gives it"
       echo "--- script ---"; printf '%s\n' "$bn_cmd"
       fail
