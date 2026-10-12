@@ -1404,13 +1404,20 @@ impl std::fmt::Display for HandOutCounts {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{} of {} box addresses are held by live boxes and {} are in their {} s reuse \
-             quarantine",
-            self.live,
-            self.capacity,
-            self.quarantined,
-            SWITCH_REUSE_QUARANTINE.as_secs()
+            "{} of {} box addresses are in use",
+            self.live, self.capacity
         )?;
+        // The resting rule is named only when an address is resting.
+        if self.quarantined > 0 {
+            write!(
+                f,
+                " and {} {} released but cannot be reused yet (an address rests {} s after its \
+                 release)",
+                self.quarantined,
+                if self.quarantined == 1 { "was" } else { "were" },
+                SWITCH_REUSE_QUARANTINE.as_secs()
+            )?;
+        }
         if let Some(wait) = self.next_free_in {
             // Rounded up: an address that frees in 0.4 s is not free now.
             let secs = wait
@@ -1597,8 +1604,8 @@ pub enum AllocationError {
     /// forwarded connections, or have its own forwards unbound at the old
     /// box's end, so the registration is refused instead.
     #[error(
-        "address {addr} is still held by a withdrawn box whose forwards the host has not \
-         finished unbinding"
+        "address {addr} still belongs to a box that is shutting down (its port forwards are not \
+         removed yet); try again shortly"
     )]
     RevocationPending {
         /// The held address: a switch address or a published loopback one.
@@ -1607,7 +1614,7 @@ pub enum AllocationError {
     /// A withdrawal under the box's name landed while the answerer was
     /// allocating its published address: the withdrawal is ordered after
     /// the registration was read, so the registration writes no row.
-    #[error("the box was withdrawn while its address was being allocated")]
+    #[error("the box's registration was cancelled while its address was being assigned")]
     WithdrawnWhileAllocating,
     /// The name folds to one a live row already holds: the answerer keys
     /// an address by the name's canonical form
@@ -8161,8 +8168,8 @@ mod tests {
         let said = error.to_string();
         assert!(
             said.contains(
-                "124 of 125 box addresses are held by live boxes and 1 are in their 300 s \
-                 reuse quarantine; the next one frees in 200 s"
+                "124 of 125 box addresses are in use and 1 was released but cannot be reused yet \
+                 (an address rests 300 s after its release); the next one frees in 200 s"
             ),
             "the refusal names the counts, got: {said}"
         );
@@ -8170,6 +8177,36 @@ mod tests {
             registry.live_switch_addrs(),
             CARVED_RUN - 1,
             "the refusal holds nothing"
+        );
+    }
+
+    /// The exhaustion's sentence names the resting rule only when an address
+    /// is resting, and counts the resting addresses in the right number.
+    #[test]
+    fn switch_exhaustion_words_follow_the_quarantined_count() {
+        let registry = BoxRegistry::new(carved());
+        let _rows = fill_carved_run(&registry);
+        let error = register_carved(&registry, "late").expect_err("the run is exhausted");
+        assert!(
+            matches!(&error, AllocationError::SwitchExhausted(counts) if counts.quarantined == 0),
+            "nothing was returned, got: {error}"
+        );
+        let said = error.to_string();
+        assert!(
+            said.ends_with("125 of 125 box addresses are in use"),
+            "a run with every address live says only that, got: {said}"
+        );
+
+        let two = HandOutCounts {
+            live: 123,
+            quarantined: 2,
+            capacity: 125,
+            next_free_in: None,
+        };
+        assert_eq!(
+            two.to_string(),
+            "123 of 125 box addresses are in use and 2 were released but cannot be reused yet \
+             (an address rests 300 s after its release)"
         );
     }
 

@@ -332,8 +332,8 @@ pub async fn cmd_add(global: &GlobalArgs, args: AddArgs) -> Result<(), mctx::Err
             .await?;
     } else {
         eprintln!(
-            "Note: not warming the host cache; the session daemon fetches the \
-             closure into its own cache on the next `min session activate`."
+            "Note: packages are not downloaded now; they are downloaded the \
+             next time you run `min session activate`."
         );
     }
 
@@ -400,8 +400,8 @@ pub async fn cmd_update(global: &GlobalArgs, _args: UpdateArgs) -> Result<(), mc
         ctx.download_if_available(&graph, ensure_pkgs).await?;
     } else {
         eprintln!(
-            "Note: not warming the host cache; the session daemon fetches the \
-             closure into its own cache on the next `min session activate`."
+            "Note: packages are not downloaded now; they are downloaded the \
+             next time you run `min session activate`."
         );
     }
 
