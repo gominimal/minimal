@@ -672,6 +672,22 @@ pub struct ShimArgs {
     argv: Vec<OsString>,
 }
 
+/// Point this process's fd 0 at `/dev/null`, closing its copy of whatever
+/// stdin it inherited. Best effort: if `/dev/null` cannot be opened the copy
+/// stays, as it always did.
+fn release_stdin() {
+    // SAFETY: opens a new descriptor this process then owns.
+    let null = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+    if null < 0 {
+        return;
+    }
+    // SAFETY: both descriptors are this process's own; the shim is
+    // single-threaded here (see `shim_main`), so nothing races on fd 0.
+    unsafe { libc::dup2(null, libc::STDIN_FILENO) };
+    // SAFETY: `null` was opened above and is closed once.
+    unsafe { libc::close(null) };
+}
+
 /// Joins the session's namespaces and runs the requested program there,
 /// returning the exit code to leave with.
 ///
@@ -879,7 +895,14 @@ pub fn shim_main(args: ShimArgs) -> Result<i32, NsenterError> {
     }
 
     let program = PathBuf::from(program);
-    let mut child = match cmd.spawn() {
+    let spawned = cmd.spawn();
+    // The child has its own copy of stdin and this process never reads it, so
+    // the shim lets go of its copy whatever the spawn did: holding the read end
+    // kept the exec's stdin pipe open after the command closed its stdin, and
+    // the daemon then took a command that had closed its input for one that
+    // had stopped reading it (inbox#1089, lab 789z).
+    release_stdin();
+    let mut child = match spawned {
         Ok(child) => child,
         Err(source) => {
             // The child's `chdir` fails with the same `ENOENT` as a missing

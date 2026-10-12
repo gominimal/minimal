@@ -21,8 +21,12 @@ use russh::{
     Channel, ChannelId,
     server::{Msg, Session},
 };
+use std::collections::VecDeque;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tempfile::TempDir;
 use tokio::net::unix::pipe;
+
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::{
@@ -58,6 +62,13 @@ use crate::{
 /// Setup errors and per-spawn errors both surface as `Err` items in the
 /// stream; the bridge handles them uniformly.
 pub trait Exec: Send + 'static {
+    /// What the bridge does with input arriving after the current command
+    /// closed its stdin: dropped for a single program, kept for the next in
+    /// a sequence (the default).
+    fn unread_stdin(&self) -> UnreadStdin {
+        UnreadStdin::Keep
+    }
+
     type Process: Process;
 
     fn exec(self, session: SessionHandle) -> BoxStream<'static, io::Result<Self::Process>>;
@@ -900,6 +911,12 @@ const SESSION_SHELL: &str = "/usr/bin/bash";
 impl Exec for SessionExec {
     type Process = TokioProcess;
 
+    /// One program: input it leaves unread after closing its stdin has no
+    /// other reader.
+    fn unread_stdin(&self) -> UnreadStdin {
+        UnreadStdin::Discard
+    }
+
     fn exec(self, session: SessionHandle) -> BoxStream<'static, io::Result<Self::Process>> {
         stream::once(async move {
             // Launching the sandbox is part of servicing the request: an exec
@@ -1065,32 +1082,54 @@ impl<S: Exec> ExecTask<S> {
         // indefinitely (gominimal/inbox#813).
         // An in-memory pipe: unlike pipe(2) it cannot fail (no fds to run
         // out of), and dropping the pump's half still gives the bridge EOF.
-        let (stdin_tx, mut stdin_rx) = tokio::io::duplex(64 * 1024);
-        let (client_lost_tx, client_lost_rx) = watch::channel(false);
+        let held = HeldInput::new(HeldInputLimits::for_daemon());
+        let mut stdin_r = HeldInputReader(Arc::clone(&held));
+        let (end_tx, end_rx) = watch::channel(None);
+        let unread = self.exec.unread_stdin();
 
         let msgs = Box::pin(stream::unfold(rs, |mut rs| async move {
             rs.wait().await.map(|msg| (msg, rs))
         }));
-        let pump = spawn(pump_channel_input(msgs, stdin_tx, client_lost_tx));
+        let pump = spawn(pump_channel_input(msgs, held, end_tx));
 
         let stream = self.exec.exec(self.session.clone());
         let mngr = self.serv.sessions_manager().await;
         let exit_status = bridge_noting_shutdown(
             self.channel_id,
             stream,
-            &mut stdin_rx,
+            &mut stdin_r,
             &mut w,
             &mut e,
-            client_lost_rx,
+            end_rx.clone(),
+            unread,
             || mngr.is_shutting_down(),
         )
         .await;
 
         pump.abort();
+        // Awaited to its end, so no push of the pump's is still in flight
+        // when the reader is dropped and the held input is cleared; an
+        // aborted task joins as cancelled, which is the expected outcome.
+        if let Err(err) = pump.await
+            && !err.is_cancelled()
+        {
+            tracing::warn!(error = %err, "exec: the input pump ended abnormally");
+        }
+        // The notice names the bound; a command that happened to finish on
+        // its own in the same instant still gets it, which is the rarer
+        // wrong of the two (the other being no notice for an ended exec).
+        let ended = *end_rx.borrow();
+        if let Some(ExecEnd::InputHeldOver(bound)) = ended
+            && e.write_all(held_input_notice(bound).as_bytes())
+                .await
+                .is_err()
+        {
+            tracing::debug!("exec: the held-input notice was not written; the client is gone");
+        }
         let _ = w.flush().await;
         let _ = e.flush().await;
 
-        drop(stdin_rx);
+        drop(stdin_r);
         let _ = ws.eof().await;
         let _ = ws.exit_status(exit_status).await; // otherwise considered -1
         let _ = ws.close().await; // needed to release the remote
@@ -1109,58 +1148,468 @@ const SHUTDOWN_NOTICE: &[u8] = b"minimald is shutting down; the command was stop
 /// manager's shutdown state, which is set before the manager stops any box,
 /// rather than the server's shutdown token, which is cancelled only after the
 /// manager is done and so after the command is already gone.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the channel's three halves, the two ways an exec ends, and the shutdown probe; a struct would only hide which is which"
+)]
 async fn bridge_noting_shutdown<S, P, R, W, E>(
     channel_id: impl Display + Clone,
     stream: S,
     r: &mut R,
     w: &mut W,
     e: &mut E,
-    client_lost: watch::Receiver<bool>,
+    client_lost: watch::Receiver<Option<ExecEnd>>,
+    unread: UnreadStdin,
     shutting_down: impl FnOnce() -> bool,
 ) -> u32
 where
     P: Process,
     S: Stream<Item = io::Result<P>> + Unpin,
-    R: AsyncRead + Unpin,
+    R: ExecInput,
     W: AsyncWrite + Unpin,
     E: AsyncWrite + Unpin,
 {
-    let exit_status = bridge(channel_id, stream, r, w, e, client_lost).await;
+    let exit_status = bridge(channel_id, stream, r, w, e, client_lost, unread).await;
     if shutting_down() {
         let _ = e.write_all(SHUTDOWN_NOTICE).await;
     }
     exit_status
 }
 
-/// Forwards the SSH channel's read half into the exec's stdin pipe and
-/// reports when the client is gone.
+/// How much of an exec's input the daemon holds for a command that is not
+/// reading it, before the exec is ended instead (gominimal/inbox#1089, the
+/// second half of #866; Eugeny/russh#730).
 ///
-/// `Data` is written to `stdin`. `Eof` closes `stdin` (the child sees
-/// EOF) but keeps watching the channel: `min task run` from a terminal
-/// half-closes stdin straight away, so a disconnect almost always
-/// arrives *after* EOF and must still be seen. `Close`, or the end of
-/// `msgs` (the channel's sender dropped with the connection), sets
-/// `client_lost` to `true` and returns.
-async fn pump_channel_input<M, W>(mut msgs: M, stdin: W, client_lost: watch::Sender<bool>)
-where
+/// russh grants the client's send window on receipt and gives the server
+/// no way to hold it back, so the client is never slowed down from here:
+/// what the command has not read is held in the daemon or the connection
+/// hangs. At this much the pump stops taking from the channel, which parks
+/// the connection for a bounded time: until the command starts, and then
+/// for at most [`EXEC_INPUT_STALL`] without it reading a byte, after which
+/// the exec ends with a notice on its stderr ([`held_input_notice`]), an
+/// active reject rather than a hang.
+const EXEC_INPUT_HELD_MAX: usize = 256 * 1024 * 1024;
+
+/// How long a running command may leave its held input at a bound without
+/// reading any of it before the exec ends. While the pump waits it takes
+/// nothing from the channel, so the connection is parked for at most this
+/// long per bound hit. A command that reads at least a byte within each
+/// such window releases it and is never ended; one that reads nothing for
+/// a whole window is. At the daemon bound only an exec holding input of its
+/// own can be the one ended: one that holds nothing waits for the others.
+const EXEC_INPUT_STALL: Duration = Duration::from_secs(10);
+
+/// The most unread exec input this daemon holds across all its execs. The
+/// per-exec cap alone would let N stalled execs hold N times it in a guest
+/// with bounded memory; past this total the exec that would cross it ends,
+/// the same way, and the others are untouched.
+const EXEC_INPUT_HELD_DAEMON_MAX: usize = 512 * 1024 * 1024;
+
+/// Unread exec input held across this daemon's execs, in bytes.
+static EXEC_INPUT_HELD_DAEMON: AtomicUsize = AtomicUsize::new(0);
+
+/// Woken whenever any exec releases held input: a pump waiting at the
+/// daemon bound is waiting on other execs, so their releases must reach it.
+static EXEC_INPUT_PROGRESS: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// Which bound an exec's held input crossed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HeldBound {
+    /// The exec's own cap ([`EXEC_INPUT_HELD_MAX`]).
+    Exec,
+    /// The daemon's total ([`EXEC_INPUT_HELD_DAEMON_MAX`]).
+    Daemon,
+}
+
+/// Why the bridge ends an exec before its command is done.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExecEnd {
+    /// The SSH client is gone (channel close, or the sender dropped with
+    /// the connection).
+    ClientLost,
+    /// Input held for a command that was not reading it crossed a bound.
+    InputHeldOver(HeldBound),
+}
+
+/// What the bridge does with input that arrives while the current command
+/// has closed its stdin: for a single program there is nobody else to read
+/// it, so it is read and dropped (it is not held against the command); for
+/// a sequence it is kept for the next command, and a command that closes
+/// its stdin and runs on while input keeps coming is bounded like any other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnreadStdin {
+    Discard,
+    Keep,
+}
+
+/// The bounds on input held for a command that is not reading it: one for
+/// the exec, one for the daemon as a whole (shared through `daemon_held`).
+#[derive(Clone, Copy)]
+struct HeldInputLimits {
+    per_exec: usize,
+    daemon: usize,
+    daemon_held: &'static AtomicUsize,
+    /// Woken on every release into `daemon_held`, by any exec.
+    daemon_progress: &'static tokio::sync::Notify,
+    /// The stall a running command is allowed at a bound.
+    stall: Duration,
+}
+
+impl HeldInputLimits {
+    fn for_daemon() -> Self {
+        Self {
+            per_exec: EXEC_INPUT_HELD_MAX,
+            daemon: EXEC_INPUT_HELD_DAEMON_MAX,
+            daemon_held: &EXEC_INPUT_HELD_DAEMON,
+            daemon_progress: &EXEC_INPUT_PROGRESS,
+            stall: EXEC_INPUT_STALL,
+        }
+    }
+}
+
+/// The line an exec whose held input crossed a bound gets on its stderr;
+/// the numbers are the caps themselves, so a retuned cap cannot leave the
+/// notice behind.
+fn held_input_notice(bound: HeldBound) -> String {
+    let mib = |n: usize| n / (1024 * 1024);
+    match bound {
+        HeldBound::Exec => format!(
+            "minimald: {} MiB of this command's input was still unread; minimald holds no more \
+             than that for one exec, so the exec was ended\n",
+            mib(EXEC_INPUT_HELD_MAX)
+        ),
+        HeldBound::Daemon => format!(
+            "minimald: unread exec input across this daemon's execs reached {} MiB; this exec was \
+             ended rather than holding more\n",
+            mib(EXEC_INPUT_HELD_DAEMON_MAX)
+        ),
+    }
+}
+
+/// Input taken off the SSH channel and not yet read by the command. The
+/// pump pushes as packets arrive; the bridge reads through
+/// [`HeldInputReader`]; every byte is charged to the exec's and the daemon's
+/// held counts from push to read (or to [`HeldInput::clear`]), so the counts
+/// are the memory this holds, in `Vec`s rather than russh's power-of-two
+/// locked buffers.
+struct HeldInput {
+    inner: std::sync::Mutex<HeldInner>,
+    waker: futures::task::AtomicWaker,
+    held: AtomicUsize,
+    limits: HeldInputLimits,
+    /// Set once nothing will read what arrives: pushes are dropped uncharged.
+    discarding: std::sync::atomic::AtomicBool,
+    /// Set once the command is running: a bound is then a stall, not a wait.
+    started: std::sync::atomic::AtomicBool,
+    /// Woken when bytes are released, the queue is cleared, or the command
+    /// starts: what a pump waiting at a bound needs to try again.
+    progress: tokio::sync::Notify,
+}
+
+struct HeldInner {
+    chunks: VecDeque<Vec<u8>>,
+    /// Bytes of the front chunk already read.
+    offset: usize,
+    /// No more pushes: the reader reports EOF once the chunks are read.
+    eof: bool,
+}
+
+impl HeldInput {
+    fn new(limits: HeldInputLimits) -> Arc<Self> {
+        Arc::new(Self {
+            inner: std::sync::Mutex::new(HeldInner {
+                chunks: VecDeque::new(),
+                offset: 0,
+                eof: false,
+            }),
+            waker: futures::task::AtomicWaker::new(),
+            held: AtomicUsize::new(0),
+            limits,
+            discarding: std::sync::atomic::AtomicBool::new(false),
+            started: std::sync::atomic::AtomicBool::new(false),
+            progress: tokio::sync::Notify::new(),
+        })
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HeldInner> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Charges and queues `data`, or refuses it (charging nothing) with the
+    /// bound it would cross. Once the rest is to be discarded it is dropped
+    /// here, uncharged.
+    fn push(&self, data: &[u8]) -> Result<(), HeldBound> {
+        let n = data.len();
+        if n == 0 || self.discarding.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let exec_total = self.held.fetch_add(n, Ordering::AcqRel) + n;
+        let daemon_total = self.limits.daemon_held.fetch_add(n, Ordering::AcqRel) + n;
+        let over = if exec_total > self.limits.per_exec {
+            Some(HeldBound::Exec)
+        } else if daemon_total > self.limits.daemon {
+            Some(HeldBound::Daemon)
+        } else {
+            None
+        };
+        if let Some(bound) = over {
+            self.release(n);
+            return Err(bound);
+        }
+        self.lock().chunks.push_back(data.to_vec());
+        self.waker.wake();
+        Ok(())
+    }
+
+    fn release(&self, n: usize) {
+        self.held.fetch_sub(n, Ordering::AcqRel);
+        self.limits.daemon_held.fetch_sub(n, Ordering::AcqRel);
+        self.progress.notify_waiters();
+        self.limits.daemon_progress.notify_waiters();
+    }
+
+    /// Bytes this exec holds unread.
+    fn held_bytes(&self) -> usize {
+        self.held.load(Ordering::Acquire)
+    }
+
+    /// The command is running: from here a bound is a stall, not a wait for
+    /// the start. The permit is stored, so a pump that reaches the bound
+    /// first is not missed.
+    fn command_started(&self) {
+        self.started.store(true, Ordering::Release);
+        self.progress.notify_one();
+    }
+
+    fn started(&self) -> bool {
+        self.started.load(Ordering::Acquire)
+    }
+
+    /// No more input will arrive; what is queued is still read, then EOF.
+    fn close(&self) {
+        self.lock().eof = true;
+        self.waker.wake();
+    }
+
+    /// Drops everything queued, releasing it from both counts at once, and
+    /// closes: the reader sees EOF.
+    fn clear(&self) {
+        // From here nothing is read: a push that races this (the pump is
+        // aborted, not awaited to its end) must not be charged either.
+        self.discarding.store(true, Ordering::Release);
+        let dropped = {
+            let mut g = self.lock();
+            let queued: usize = g.chunks.iter().map(Vec::len).sum();
+            let dropped = queued.saturating_sub(g.offset);
+            g.chunks.clear();
+            g.offset = 0;
+            g.eof = true;
+            dropped
+        };
+        self.release(dropped);
+        self.waker.wake();
+    }
+
+    /// Nothing will read what arrives from here on: what is queued is
+    /// dropped and released, later pushes are dropped uncharged, and the
+    /// reader sees EOF. A single program that closed its stdin is not held
+    /// to input it will never read, however fast the client sends it.
+    fn discard_rest(&self) {
+        self.discarding.store(true, Ordering::Release);
+        self.clear();
+    }
+
+    #[cfg(test)]
+    fn discarding(&self) -> bool {
+        self.discarding.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for HeldInput {
+    /// Whatever this exec still counts leaves the daemon's total with it:
+    /// no path may leave the shared budget overstated.
+    fn drop(&mut self) {
+        let left = self.held.swap(0, Ordering::AcqRel);
+        if left > 0 {
+            self.limits.daemon_held.fetch_sub(left, Ordering::AcqRel);
+            self.limits.daemon_progress.notify_waiters();
+        }
+    }
+}
+
+/// Where the bridge reads a command's input from.
+trait ExecInput: AsyncRead + Unpin {
+    /// The command is running and can read from here on.
+    fn command_started(&mut self) {}
+    /// Nothing will read what arrives from here on; stop holding it.
+    fn discard_rest(&mut self) {}
+}
+
+impl ExecInput for HeldInputReader {
+    fn command_started(&mut self) {
+        self.0.command_started();
+    }
+    fn discard_rest(&mut self) {
+        self.0.discard_rest();
+    }
+}
+
+#[cfg(test)]
+impl ExecInput for tokio::io::DuplexStream {}
+
+/// The bridge's stdin: reads the held input in order, releasing each byte
+/// from the counts as it is read; EOF once the pump has closed the input
+/// (or cleared it) and the queue is empty. Dropping it clears what is left.
+struct HeldInputReader(Arc<HeldInput>);
+
+impl AsyncRead for HeldInputReader {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        let held = &self.0;
+        let mut g = held.lock();
+        let offset = g.offset;
+        let taken = g.chunks.front().map(|front| {
+            let avail = front.get(offset..).unwrap_or_default();
+            let n = avail.len().min(buf.remaining());
+            buf.put_slice(avail.get(..n).unwrap_or_default());
+            (n, offset + n >= front.len())
+        });
+        let read = if let Some((n, done)) = taken {
+            if done {
+                g.chunks.pop_front();
+                g.offset = 0;
+            } else {
+                g.offset += n;
+            }
+            Some(n)
+        } else if g.eof {
+            Some(0)
+        } else {
+            // Registered under the lock, so a push that lands after the
+            // check cannot slip between it and the registration.
+            held.waker.register(cx.waker());
+            None
+        };
+        drop(g);
+        match read {
+            Some(n) => {
+                held.release(n);
+                std::task::Poll::Ready(Ok(()))
+            }
+            None => std::task::Poll::Pending,
+        }
+    }
+}
+
+impl Drop for HeldInputReader {
+    fn drop(&mut self) {
+        self.0.clear();
+    }
+}
+
+/// Takes the SSH channel's read half off the channel as it arrives into
+/// `held` (the bridge reads it from there) and reports how the exec is to
+/// end, if the client goes or the held input crosses a bound.
+///
+/// The channel is read without ever waiting on the command. russh delivers
+/// each packet by awaiting a bounded per-channel queue, and a session loop
+/// parked on that queue delivers nothing to *any* channel, including this
+/// command's own output, whose draining is what lets the command read its
+/// stdin again (gominimal/inbox#1089, Eugeny/russh#730). So `Data` is
+/// queued, bounded per exec and for the daemon as a whole
+/// ([`HeldInputLimits`]): past either, the queue is cleared (its bytes
+/// released at once), the command sees EOF, and `end` carries the bound so
+/// the bridge ends the exec under that reason.
+///
+/// `Eof` closes the held input (the command sees EOF once it has read what
+/// is queued) but keeps watching the channel: `min task run` from a
+/// terminal half-closes stdin straight away, so a disconnect almost always
+/// arrives *after* EOF and must still be seen. `Close`, or the end of `msgs`
+/// (the channel's sender dropped with the connection), sends
+/// [`ExecEnd::ClientLost`] and returns.
+async fn pump_channel_input<M>(
+    mut msgs: M,
+    held: Arc<HeldInput>,
+    end: watch::Sender<Option<ExecEnd>>,
+) where
     M: Stream<Item = russh::ChannelMsg> + Unpin,
-    W: AsyncWrite + Unpin,
 {
-    let mut stdin = Some(stdin);
+    let mut open = true;
     loop {
         match msgs.next().await {
             Some(russh::ChannelMsg::Data { data }) => {
-                // A failed write means the pipe's read end is gone; drop
-                // the data but keep watching for a disconnect.
-                if let Some(w) = stdin.as_mut()
-                    && w.write_all(&data).await.is_err()
-                {
-                    stdin = None;
+                if !open {
+                    continue;
+                }
+                // At a bound the pump stops taking from the channel, which
+                // parks the connection behind russh's buffer, for a bounded
+                // time: until the command starts (a fast client puts the cap
+                // in flight before a command spawns), and once it runs, for
+                // at most `stall` without a byte read. A release by this
+                // exec or, at the daemon bound, by any other wakes the wait.
+                let mut starved_warned = false;
+                loop {
+                    let bound = match held.push(&data) {
+                        Ok(()) => break,
+                        Err(bound) => bound,
+                    };
+                    let progress = async {
+                        tokio::select! {
+                            _ = held.progress.notified() => {}
+                            _ = held.limits.daemon_progress.notified() => {}
+                        }
+                    };
+                    if !held.started() {
+                        progress.await;
+                        continue;
+                    }
+                    if tokio::time::timeout(held.limits.stall, progress)
+                        .await
+                        .is_ok()
+                    {
+                        continue;
+                    }
+                    // The daemon's budget is full of other execs' input and
+                    // this one holds nothing: it is not the one not reading,
+                    // and it waits for them (each of those ends within its
+                    // own stall, or its command reads).
+                    if matches!(bound, HeldBound::Daemon) && held.held_bytes() == 0 {
+                        if !starved_warned {
+                            starved_warned = true;
+                            tracing::warn!(
+                                daemon = held.limits.daemon,
+                                "exec: the daemon's input budget is held by other execs; this one waits for it",
+                            );
+                        }
+                        continue;
+                    }
+                    tracing::warn!(
+                        ?bound,
+                        per_exec = held.limits.per_exec,
+                        daemon = held.limits.daemon,
+                        stall_ms = u64::try_from(held.limits.stall.as_millis()).unwrap_or(u64::MAX),
+                        "exec: the command is not reading its input and the daemon holds the most it will; ending the exec",
+                    );
+                    held.clear();
+                    end.send_replace(Some(ExecEnd::InputHeldOver(bound)));
+                    return;
                 }
             }
-            Some(russh::ChannelMsg::Eof) => stdin = None,
+            Some(russh::ChannelMsg::Eof) => {
+                open = false;
+                held.close();
+            }
             Some(russh::ChannelMsg::Close) | None => {
-                let _ = client_lost.send(true);
+                // Released at once, as the bound-over path does: nothing of
+                // a gone client's is held against the daemon's budget while
+                // its command is still being ended.
+                held.clear();
+                end.send_replace(Some(ExecEnd::ClientLost));
                 return;
             }
             Some(_) => {}
@@ -1195,12 +1644,13 @@ async fn bridge<S, P, R, W, E>(
     r: &mut R,
     w: &mut W,
     e: &mut E,
-    mut client_lost: watch::Receiver<bool>,
+    mut client_lost: watch::Receiver<Option<ExecEnd>>,
+    unread: UnreadStdin,
 ) -> u32
 where
     P: Process,
     S: Stream<Item = io::Result<P>> + Unpin,
-    R: AsyncRead + Unpin,
+    R: ExecInput,
     W: AsyncWrite + Unpin,
     E: AsyncWrite + Unpin,
 {
@@ -1222,6 +1672,7 @@ where
                 break;
             }
         };
+        r.command_started();
         last_exit = bridge_one(
             channel_id.clone(),
             process,
@@ -1230,12 +1681,13 @@ where
             e,
             &mut stdin_open,
             &mut client_lost,
+            unread,
         )
         .await;
         // `changed()` fires once per transition, so a later step would
         // never see a disconnect an earlier step already consumed: a child
         // that exits 0 just as the client goes must still end the sequence.
-        if last_exit != 0 || *client_lost.borrow() {
+        if last_exit != 0 || client_lost.borrow().is_some() {
             break;
         }
     }
@@ -1296,6 +1748,10 @@ where
 /// `stdin_open` is threaded by `&mut` so once the SSH client closes
 /// stdin (EOF or read error), every subsequent child in the sequence
 /// sees immediate EOF on its stdin without re-reading from `r`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the channel's three halves, the sequence's stdin state, and the two ways an exec ends"
+)]
 async fn bridge_one<P, R, W, E>(
     channel_id: impl Display,
     mut process: P,
@@ -1303,11 +1759,12 @@ async fn bridge_one<P, R, W, E>(
     w: &mut W,
     e: &mut E,
     stdin_open: &mut bool,
-    client_lost: &mut watch::Receiver<bool>,
+    client_lost: &mut watch::Receiver<Option<ExecEnd>>,
+    unread: UnreadStdin,
 ) -> u32
 where
     P: Process,
-    R: AsyncRead + Unpin,
+    R: ExecInput,
     W: AsyncWrite + Unpin,
     E: AsyncWrite + Unpin,
 {
@@ -1350,7 +1807,13 @@ where
             // most one chunk the child has not accepted is ever queued.
             // `select!` evaluates every gate before it builds any branch
             // future, so a gate may borrow what a future later holds.
-            read_res = r.read(&mut stdin_buf), if *stdin_open && child_stdin.is_some() && pending.is_none() => {
+            // With `UnreadStdin::Discard` the held input is told to drop
+            // the rest once the command's stdin is found closed (the write
+            // branch), and the read goes on only to see the EOF that gives:
+            // a single program has no other reader, and input it never
+            // reads must not be held against it.
+            read_res = r.read(&mut stdin_buf), if *stdin_open && pending.is_none()
+                && (child_stdin.is_some() || unread == UnreadStdin::Discard) => {
                 match read_res {
                     Ok(0) => {
                         *stdin_open = false;
@@ -1367,7 +1830,9 @@ where
                         child_stdin = None;
                     }
                     Ok(n) => {
-                        pending = Some((stdin_buf[..n].to_vec(), 0));
+                        if child_stdin.is_some() {
+                            pending = Some((stdin_buf.get(..n).unwrap_or_default().to_vec(), 0));
+                        }
                     }
                 }
             }
@@ -1390,6 +1855,9 @@ where
                         );
                         child_stdin = None;
                         pending = None;
+                        if unread == UnreadStdin::Discard {
+                            r.discard_rest();
+                        }
                     }
                     Err(err) => {
                         tracing::warn!(
@@ -1398,6 +1866,9 @@ where
                         );
                         child_stdin = None;
                         pending = None;
+                        if unread == UnreadStdin::Discard {
+                            r.discard_rest();
+                        }
                     }
                     Ok(n) => {
                         let (data, offset) = pending.as_mut().expect("gated on a pending write");
@@ -1463,11 +1934,17 @@ where
             res = client_lost.changed(), if client_watch_open => {
                 if res.is_err() {
                     client_watch_open = false;
-                } else if *client_lost.borrow() {
-                    tracing::warn!(
-                        %channel_id,
-                        "exec: ssh client disconnected; killing child",
-                    );
+                } else if let Some(end) = *client_lost.borrow() {
+                    match end {
+                        ExecEnd::ClientLost => tracing::warn!(
+                            %channel_id,
+                            "exec: ssh client disconnected; killing child",
+                        ),
+                        ExecEnd::InputHeldOver(bound) => tracing::warn!(
+                            %channel_id, ?bound,
+                            "exec: the command's unread input crossed a bound; ending the exec",
+                        ),
+                    }
                     ssh_write_failed = true;
                 }
             }
@@ -1537,7 +2014,7 @@ where
                 status = process.wait() => status,
                 // Reduced to a bool in the branch: the `watch::Ref` it
                 // yields is not `Send` and must not live across the wait.
-                lost = async { client_lost.wait_for(|lost| *lost).await.is_ok() } => {
+                lost = async { client_lost.wait_for(|end| end.is_some()).await.is_ok() } => {
                     if lost {
                         tracing::warn!(
                             %channel_id,
@@ -2847,8 +3324,8 @@ mod tests {
 
     /// A never-firing client-loss signal for tests that exercise the
     /// bridge without modelling a disconnect.
-    fn client_lost() -> tokio::sync::watch::Receiver<bool> {
-        tokio::sync::watch::channel(false).1
+    fn client_lost() -> tokio::sync::watch::Receiver<Option<super::ExecEnd>> {
+        tokio::sync::watch::channel(None).1
     }
 
     /// `start_kill` asks the shim to exit with SIGTERM, not SIGKILL: SIGTERM
@@ -3426,6 +3903,7 @@ mod tests {
                 &mut bridge_stdout,
                 &mut bridge_stderr,
                 client_lost(),
+                super::UnreadStdin::Keep,
             )
             .await
         });
@@ -3491,6 +3969,7 @@ mod tests {
                 &mut bridge_stdout,
                 &mut bridge_stderr,
                 client_lost(),
+                super::UnreadStdin::Keep,
             )
             .await
         });
@@ -3586,6 +4065,7 @@ mod tests {
                 &mut bridge_stdout,
                 &mut bridge_stderr,
                 client_lost(),
+                super::UnreadStdin::Keep,
             )
             .await
         });
@@ -3653,6 +4133,7 @@ mod tests {
                 &mut bridge_stdout,
                 &mut bridge_stderr,
                 client_lost(),
+                super::UnreadStdin::Keep,
             )
             .await
         });
@@ -3717,6 +4198,7 @@ mod tests {
                     &mut bridge_stdout,
                     &mut bridge_stderr,
                     client_lost(),
+                    super::UnreadStdin::Keep,
                     || shutting_down,
                 )
                 .await;
@@ -3788,6 +4270,7 @@ mod tests {
                 &mut bridge_stdout,
                 &mut bridge_stderr,
                 client_lost(),
+                super::UnreadStdin::Keep,
             )
             .await
         });
@@ -3843,6 +4326,7 @@ mod tests {
                 &mut bridge_stdout,
                 &mut bridge_stderr,
                 client_lost(),
+                super::UnreadStdin::Keep,
             )
             .await
         });
@@ -3903,7 +4387,7 @@ mod tests {
         let (_unused_stderr_peer, mut bridge_stderr) = duplex(64 * 1024);
 
         // The client-loss signal fires: the SSH channel closed.
-        let (client_lost_tx, client_lost_rx) = tokio::sync::watch::channel(false);
+        let (client_lost_tx, client_lost_rx) = tokio::sync::watch::channel(None);
 
         let bridge_task = crate::traced::spawn(async move {
             bridge(
@@ -3913,11 +4397,14 @@ mod tests {
                 &mut bridge_stdout,
                 &mut bridge_stderr,
                 client_lost_rx,
+                super::UnreadStdin::Keep,
             )
             .await
         });
 
-        client_lost_tx.send(true).unwrap();
+        client_lost_tx
+            .send(Some(super::ExecEnd::ClientLost))
+            .unwrap();
 
         let exit = timeout(Duration::from_secs(10), bridge_task)
             .await
@@ -3960,7 +4447,7 @@ mod tests {
         let (_unused_stderr_peer, mut bridge_stderr) = duplex(64 * 1024);
 
         // The client-loss signal never fires: the channel stays open.
-        let (_client_lost_tx, client_lost_rx) = tokio::sync::watch::channel(false);
+        let (_client_lost_tx, client_lost_rx) = tokio::sync::watch::channel(None);
 
         let bridge_task = crate::traced::spawn(async move {
             bridge(
@@ -3970,6 +4457,7 @@ mod tests {
                 &mut bridge_stdout,
                 &mut bridge_stderr,
                 client_lost_rx,
+                super::UnreadStdin::Keep,
             )
             .await
         });
@@ -4011,7 +4499,7 @@ mod tests {
         let (mut client_stdin, mut bridge_stdin) = duplex(64 * 1024);
         let (_unused_stdout_peer, mut bridge_stdout) = duplex(64 * 1024);
         let (_unused_stderr_peer, mut bridge_stderr) = duplex(64 * 1024);
-        let (client_lost_tx, client_lost_rx) = tokio::sync::watch::channel(false);
+        let (client_lost_tx, client_lost_rx) = tokio::sync::watch::channel(None);
 
         // Far more than the child's stdin pipe holds; this writer blocks
         // once both pipes are full, which is the point.
@@ -4027,6 +4515,7 @@ mod tests {
                 &mut bridge_stdout,
                 &mut bridge_stderr,
                 client_lost_rx,
+                super::UnreadStdin::Keep,
             )
             .await
         });
@@ -4035,7 +4524,9 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(!bridge_task.is_finished());
 
-        client_lost_tx.send(true).unwrap();
+        client_lost_tx
+            .send(Some(super::ExecEnd::ClientLost))
+            .unwrap();
 
         let exit = timeout(Duration::from_secs(10), bridge_task)
             .await
@@ -4072,7 +4563,7 @@ mod tests {
         drop(closed_stdin_w);
         let (_unused_stdout_peer, mut bridge_stdout) = duplex(64 * 1024);
         let (_unused_stderr_peer, mut bridge_stderr) = duplex(64 * 1024);
-        let (client_lost_tx, client_lost_rx) = tokio::sync::watch::channel(false);
+        let (client_lost_tx, client_lost_rx) = tokio::sync::watch::channel(None);
 
         let bridge_task = crate::traced::spawn(async move {
             bridge(
@@ -4082,6 +4573,7 @@ mod tests {
                 &mut bridge_stdout,
                 &mut bridge_stderr,
                 client_lost_rx,
+                super::UnreadStdin::Keep,
             )
             .await
         });
@@ -4090,7 +4582,9 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(!bridge_task.is_finished());
 
-        client_lost_tx.send(true).unwrap();
+        client_lost_tx
+            .send(Some(super::ExecEnd::ClientLost))
+            .unwrap();
 
         let exit = timeout(Duration::from_secs(10), bridge_task)
             .await
@@ -4100,46 +4594,405 @@ mod tests {
         assert!(ctrl.was_killed());
     }
 
+    /// A fresh daemon count for one test (the real one is a process-wide
+    /// static), and limits a test does not exercise.
+    fn fresh_daemon() -> &'static std::sync::atomic::AtomicUsize {
+        Box::leak(Box::new(std::sync::atomic::AtomicUsize::new(0)))
+    }
+    fn fresh_progress() -> &'static tokio::sync::Notify {
+        Box::leak(Box::new(tokio::sync::Notify::new()))
+    }
+    fn unlimited() -> super::HeldInputLimits {
+        super::HeldInputLimits {
+            per_exec: usize::MAX,
+            daemon: usize::MAX,
+            daemon_held: fresh_daemon(),
+            daemon_progress: fresh_progress(),
+            stall: std::time::Duration::from_millis(300),
+        }
+    }
+    fn held_with(
+        limits: super::HeldInputLimits,
+    ) -> (std::sync::Arc<super::HeldInput>, super::HeldInputReader) {
+        let held = super::HeldInput::new(limits);
+        let reader = super::HeldInputReader(std::sync::Arc::clone(&held));
+        (held, reader)
+    }
+    fn msg_stream() -> (
+        tokio::sync::mpsc::UnboundedSender<russh::ChannelMsg>,
+        std::pin::Pin<Box<dyn futures::Stream<Item = russh::ChannelMsg> + Send>>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let s = Box::pin(futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|m| (m, rx))
+        }));
+        (tx, s)
+    }
+    fn data(n: usize, fill: u8) -> russh::ChannelMsg {
+        russh::ChannelMsg::Data {
+            data: vec![fill; n].into(),
+        }
+    }
+    /// Polls `cond` until it holds or `secs` pass.
+    async fn until(secs: u64, cond: impl Fn() -> bool) -> bool {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(secs);
+        while !cond() {
+            if tokio::time::Instant::now() > deadline {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        true
+    }
+
     /// `min task run` from a terminal half-closes stdin before anything
     /// else, so a disconnect arrives *after* EOF. The pump must close the
-    /// child's stdin on EOF yet keep watching, and still signal client
-    /// loss when the channel then closes.
+    /// held input on EOF (the command sees EOF once it read what is
+    /// queued) yet keep watching, and still report client loss when the
+    /// channel then closes.
     #[tokio::test]
     async fn pump_signals_client_loss_after_stdin_eof() {
         use std::time::Duration;
         use tokio::time::timeout;
 
-        let (msg_tx, msg_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (msg_tx, msgs) = msg_stream();
+        let (held, mut stdin_r) = held_with(unlimited());
+        let (end_tx, mut end_rx) = tokio::sync::watch::channel(None);
+        let pump = tokio::spawn(super::pump_channel_input(msgs, held, end_tx));
+
+        msg_tx.send(data(2, b'h')).unwrap();
+        msg_tx.send(russh::ChannelMsg::Eof).unwrap();
+        let mut got = Vec::new();
+        timeout(Duration::from_secs(10), stdin_r.read_to_end(&mut got))
+            .await
+            .expect("stdin EOF must close the command's stdin")
+            .unwrap();
+        assert_eq!(got, b"hh");
+        assert!(end_rx.borrow().is_none(), "stdin EOF is not a disconnect");
+        assert!(!pump.is_finished(), "the pump must outlive stdin EOF");
+
+        msg_tx.send(russh::ChannelMsg::Close).unwrap();
+        timeout(Duration::from_secs(10), end_rx.changed())
+            .await
+            .expect("a close after EOF must still signal client loss")
+            .unwrap();
+        assert_eq!(*end_rx.borrow(), Some(super::ExecEnd::ClientLost));
+    }
+
+    /// The deadlock's shape (gominimal/inbox#1089): the command reads
+    /// nothing, and the channel must still be taken as it arrives, because
+    /// a pump waiting on the command parks russh's session loop and with it
+    /// the command's own output. A 1-slot message channel proves each
+    /// message was taken before the next was offered; what was held is then
+    /// read in order and complete, and nothing was ended.
+    #[tokio::test]
+    async fn pump_takes_the_channel_while_the_command_reads_nothing() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let (msg_tx, msg_rx) = tokio::sync::mpsc::channel(1);
         let msgs = Box::pin(futures::stream::unfold(msg_rx, |mut rx| async move {
             rx.recv().await.map(|m| (m, rx))
         }));
-        let (stdin_w, mut stdin_r) = duplex(64);
-        let (lost_tx, mut lost_rx) = tokio::sync::watch::channel(false);
-        let pump = crate::traced::spawn(super::pump_channel_input(msgs, stdin_w, lost_tx));
+        let (held, mut stdin_r) = held_with(unlimited());
+        let (end_tx, end_rx) = tokio::sync::watch::channel(None);
+        let _pump = tokio::spawn(super::pump_channel_input(
+            msgs,
+            std::sync::Arc::clone(&held),
+            end_tx,
+        ));
 
-        msg_tx
-            .send(russh::ChannelMsg::Data {
-                data: b"hi".as_slice().into(),
-            })
-            .unwrap();
-        msg_tx.send(russh::ChannelMsg::Eof).unwrap();
+        for i in 0..64u8 {
+            timeout(Duration::from_secs(10), msg_tx.send(data(64, i)))
+                .await
+                .expect("the pump must take the channel while the command reads nothing")
+                .unwrap();
+        }
+        msg_tx.send(russh::ChannelMsg::Eof).await.unwrap();
+        assert!(
+            until(5, || held.held_bytes() == 64 * 64).await,
+            "all of it is held, charged"
+        );
+        assert!(end_rx.borrow().is_none());
 
         let mut got = Vec::new();
         timeout(Duration::from_secs(10), stdin_r.read_to_end(&mut got))
             .await
-            .expect("stdin EOF must close the child's stdin")
+            .expect("what was held reaches the command, then EOF")
             .unwrap();
-        assert_eq!(got, b"hi");
-        assert!(!*lost_rx.borrow(), "stdin EOF is not a disconnect");
-        assert!(!pump.is_finished(), "the pump must outlive stdin EOF");
+        let want: Vec<u8> = (0..64u8).flat_map(|i| [i; 64]).collect();
+        assert_eq!(got, want, "in order and complete");
+        assert_eq!(held.held_bytes(), 0, "read bytes are released");
+    }
 
-        msg_tx.send(russh::ChannelMsg::Close).unwrap();
-        timeout(Duration::from_secs(10), lost_rx.changed())
+    /// Past the exec's cap a running command that reads nothing for the
+    /// stall ends rather than holding more: the end reason names the bound,
+    /// the queue is cleared and released at once (not when the exec
+    /// finishes), and the command's stdin reads EOF.
+    #[tokio::test]
+    async fn pump_ends_the_exec_when_the_held_input_passes_the_cap() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let (msg_tx, msgs) = msg_stream();
+        let limits = super::HeldInputLimits {
+            per_exec: 200,
+            ..unlimited()
+        };
+        let (held, mut stdin_r) = held_with(limits);
+        let (end_tx, mut end_rx) = tokio::sync::watch::channel(None);
+        let pump = tokio::spawn(super::pump_channel_input(
+            msgs,
+            std::sync::Arc::clone(&held),
+            end_tx,
+        ));
+
+        held.command_started();
+        for _ in 0..3 {
+            msg_tx.send(data(100, 7)).unwrap();
+        }
+        timeout(Duration::from_secs(10), end_rx.changed())
             .await
-            .expect("a close after EOF must still signal client loss")
+            .expect("the third 100 bytes pass the 200-byte cap and nothing reads")
             .unwrap();
-        assert!(*lost_rx.borrow());
-        pump.await.unwrap();
+        assert_eq!(
+            *end_rx.borrow(),
+            Some(super::ExecEnd::InputHeldOver(super::HeldBound::Exec))
+        );
+        timeout(Duration::from_secs(10), pump)
+            .await
+            .expect("the pump returns")
+            .unwrap();
+        assert_eq!(held.held_bytes(), 0, "cleared and released on overflow");
+        assert_eq!(
+            limits
+                .daemon_held
+                .load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
+        let mut got = Vec::new();
+        timeout(Duration::from_secs(10), stdin_r.read_to_end(&mut got))
+            .await
+            .expect("the command's stdin reads EOF")
+            .unwrap();
+        assert!(
+            got.is_empty(),
+            "nothing is fed after the clear: {}",
+            got.len()
+        );
+    }
+
+    /// Two execs share the daemon's budget. The one that would cross it
+    /// while holding nothing of its own is not the one hoarding: it waits,
+    /// and goes on the moment the other releases (ended, here), while the
+    /// other keeps what it holds untouched.
+    #[tokio::test]
+    async fn the_daemon_budget_makes_an_exec_holding_nothing_wait_for_the_others() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let daemon_held = fresh_daemon();
+        let limits = super::HeldInputLimits {
+            per_exec: usize::MAX,
+            daemon: 300,
+            daemon_held,
+            daemon_progress: fresh_progress(),
+            stall: Duration::from_millis(300),
+        };
+        let mut pumps = Vec::new();
+        for _ in 0..2 {
+            let (msg_tx, msgs) = msg_stream();
+            let (held, stdin_r) = held_with(limits); // nobody reads: everything stays held
+            let (end_tx, end_rx) = tokio::sync::watch::channel(None);
+            tokio::spawn(super::pump_channel_input(
+                msgs,
+                std::sync::Arc::clone(&held),
+                end_tx,
+            ));
+            pumps.push((msg_tx, stdin_r, end_rx, held));
+        }
+        for p in &pumps {
+            p.3.command_started();
+        }
+        pumps[0].0.send(data(200, 1)).unwrap();
+        assert!(
+            until(5, || daemon_held.load(std::sync::atomic::Ordering::Acquire)
+                == 200)
+            .await
+        );
+        pumps[1].0.send(data(150, 1)).unwrap(); // 350 > 300: the budget is full of the first's input
+        tokio::time::sleep(limits.stall * 3).await;
+        assert!(
+            pumps[1].2.borrow().is_none(),
+            "an exec holding nothing is not ended at the daemon bound"
+        );
+        assert_eq!(pumps[1].3.held_bytes(), 0);
+        assert!(pumps[0].2.borrow().is_none(), "the first exec is untouched");
+        // The first exec's input goes (its client is gone): the second's
+        // waiting chunk is taken on that release.
+        pumps[0].3.clear();
+        assert!(
+            until(5, || pumps[1].3.held_bytes() == 150).await,
+            "the other exec's release woke this pump"
+        );
+        assert_eq!(daemon_held.load(std::sync::atomic::Ordering::Acquire), 150);
+        assert!(pumps[1].2.borrow().is_none());
+        // And an exec that does hold input at the daemon bound is the one
+        // that ends, as before.
+        pumps[1].0.send(data(200, 1)).unwrap(); // 350 > 300 again, this time holding 150 of its own
+        timeout(Duration::from_secs(10), pumps[1].2.changed())
+            .await
+            .expect("the hoarding exec is ended")
+            .unwrap();
+        assert_eq!(
+            *pumps[1].2.borrow(),
+            Some(super::ExecEnd::InputHeldOver(super::HeldBound::Daemon))
+        );
+        assert!(
+            until(5, || daemon_held.load(std::sync::atomic::Ordering::Acquire)
+                == 0)
+            .await
+        );
+    }
+
+    /// A push that races the reader's drop (the pump is aborted, not
+    /// awaited, in the real exec) is not charged: `clear` discards, and what
+    /// an exec still counts leaves the daemon's total when it is dropped.
+    #[tokio::test]
+    async fn nothing_stays_charged_after_the_reader_is_gone() {
+        let limits = unlimited();
+        let (held, stdin_r) = held_with(limits);
+        held.push(&[b'x'; 100]).unwrap();
+        assert_eq!(
+            limits
+                .daemon_held
+                .load(std::sync::atomic::Ordering::Acquire),
+            100
+        );
+        drop(stdin_r); // clears and discards
+        assert_eq!(held.held_bytes(), 0);
+        held.push(&[b'y'; 100]).unwrap(); // the late push
+        assert_eq!(
+            held.held_bytes(),
+            0,
+            "a push after the reader is gone is not charged"
+        );
+        assert_eq!(
+            limits
+                .daemon_held
+                .load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
+        // The safety net: a count that somehow survives leaves with the exec.
+        held.held.store(7, std::sync::atomic::Ordering::Release);
+        limits
+            .daemon_held
+            .store(7, std::sync::atomic::Ordering::Release);
+        drop(held);
+        assert_eq!(
+            limits
+                .daemon_held
+                .load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
+    }
+
+    /// A client that goes releases what it had held at once, not when its
+    /// command has finally been ended.
+    #[tokio::test]
+    async fn client_loss_releases_the_held_input_at_once() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let (msg_tx, msgs) = msg_stream();
+        let (held, _stdin_r) = held_with(unlimited());
+        let (end_tx, mut end_rx) = tokio::sync::watch::channel(None);
+        let _pump = tokio::spawn(super::pump_channel_input(
+            msgs,
+            std::sync::Arc::clone(&held),
+            end_tx,
+        ));
+        msg_tx.send(data(1000, 3)).unwrap();
+        assert!(until(5, || held.held_bytes() == 1000).await);
+        msg_tx.send(russh::ChannelMsg::Close).unwrap();
+        timeout(Duration::from_secs(10), end_rx.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(*end_rx.borrow(), Some(super::ExecEnd::ClientLost));
+        assert_eq!(
+            held.held_bytes(),
+            0,
+            "released with the client, before the command is ended"
+        );
+    }
+
+    /// A single program that closes its stdin and runs on is not charged
+    /// for input it never reads: once the bridge finds the pipe closed the
+    /// rest is dropped on arrival, uncharged, however fast it comes, and
+    /// the command is not ended.
+    #[tokio::test]
+    async fn a_command_that_closed_its_stdin_is_not_charged_for_unread_input() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let (
+            process,
+            MockEndpoints {
+                stdin_reader,
+                stdout_writer: _stdout_writer,
+                stderr_writer: _stderr_writer,
+                ctrl,
+            },
+        ) = build_mock();
+        // The command closes its stdin at once and keeps running.
+        drop(stdin_reader);
+
+        let limits = super::HeldInputLimits {
+            per_exec: 100 * 1024,
+            ..unlimited()
+        };
+        let (held, mut stdin_r) = held_with(limits);
+        let (_unused_stdout_peer, mut bridge_stdout) = duplex(64 * 1024);
+        let (_unused_stderr_peer, mut bridge_stderr) = duplex(64 * 1024);
+        let (_end_tx, end_rx) = tokio::sync::watch::channel(None);
+
+        let bridge_task = tokio::spawn(async move {
+            bridge(
+                "test",
+                process,
+                &mut stdin_r,
+                &mut bridge_stdout,
+                &mut bridge_stderr,
+                end_rx,
+                super::UnreadStdin::Discard,
+            )
+            .await
+        });
+
+        // The first chunk is what the bridge offers the command and finds
+        // the pipe closed on.
+        held.push(&[b'x'; 4096]).expect("under the cap");
+        assert!(
+            until(5, || held.discarding()).await,
+            "the bridge finds the command's stdin closed and stops holding"
+        );
+        // Three times the cap at once, with no yield between pushes: on the
+        // lab a 300 MB push outran the bridge's reads and tripped the cap.
+        // Nothing reaches the queue and nothing is charged.
+        for _ in 0..75 {
+            held.push(&[b'x'; 4096])
+                .expect("never refused once the command closed its stdin");
+        }
+        assert_eq!(held.held_bytes(), 0, "dropped input is never charged");
+        assert!(!bridge_task.is_finished(), "the command runs on");
+
+        ctrl.signal_exit(0).await;
+        let exit = timeout(Duration::from_secs(10), bridge_task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(exit, 0);
     }
 
     /// The channel's sender dropping (the connection died without a
@@ -4153,16 +5006,16 @@ mod tests {
         let msgs = Box::pin(futures::stream::unfold(msg_rx, |mut rx| async move {
             rx.recv().await.map(|m| (m, rx))
         }));
-        let (stdin_w, _stdin_r) = duplex(64);
-        let (lost_tx, mut lost_rx) = tokio::sync::watch::channel(false);
-        let pump = crate::traced::spawn(super::pump_channel_input(msgs, stdin_w, lost_tx));
+        let (held, _stdin_r) = held_with(unlimited());
+        let (lost_tx, mut lost_rx) = tokio::sync::watch::channel(None);
+        let pump = tokio::spawn(super::pump_channel_input(msgs, held, lost_tx));
 
         drop(msg_tx);
         timeout(Duration::from_secs(10), lost_rx.changed())
             .await
             .expect("a dropped channel must signal client loss")
             .unwrap();
-        assert!(*lost_rx.borrow());
+        assert_eq!(*lost_rx.borrow(), Some(super::ExecEnd::ClientLost));
         pump.await.unwrap();
     }
 
@@ -4206,6 +5059,7 @@ mod tests {
                 &mut bridge_stdout,
                 &mut bridge_stderr,
                 client_lost(),
+                super::UnreadStdin::Keep,
             )
             .await
         });
@@ -4273,6 +5127,7 @@ mod tests {
                 &mut bridge_stdout,
                 &mut bridge_stderr,
                 client_lost(),
+                super::UnreadStdin::Keep,
             )
             .await
         });
@@ -4323,8 +5178,10 @@ mod tests {
 
         // The client is gone and the transition is already observed, as
         // the first step's `changed()` branch would have left it.
-        let (client_lost_tx, mut client_lost_rx) = tokio::sync::watch::channel(false);
-        client_lost_tx.send(true).unwrap();
+        let (client_lost_tx, mut client_lost_rx) = tokio::sync::watch::channel(None);
+        client_lost_tx
+            .send(Some(super::ExecEnd::ClientLost))
+            .unwrap();
         client_lost_rx.borrow_and_update();
 
         let bridge_task = crate::traced::spawn(async move {
@@ -4335,6 +5192,7 @@ mod tests {
                 &mut bridge_stdout,
                 &mut bridge_stderr,
                 client_lost_rx,
+                super::UnreadStdin::Keep,
             )
             .await
         });
@@ -4384,6 +5242,7 @@ mod tests {
                 &mut bridge_stdout,
                 &mut bridge_stderr,
                 client_lost(),
+                super::UnreadStdin::Keep,
             )
             .await
         });
@@ -4431,6 +5290,7 @@ mod tests {
                 &mut bridge_stdout,
                 &mut bridge_stderr,
                 client_lost(),
+                super::UnreadStdin::Keep,
             )
             .await
         });
