@@ -8599,8 +8599,8 @@ resolvectl domain minzone0 '~min.internal'
             "and fails the command: {linux}"
         );
         assert!(
-            linux.contains("(a collision)"),
-            "a port taken is named a collision"
+            linux.contains("the port the DNS service listens on did not come free"),
+            "a port that did not come free is named"
         );
         assert!(sh_parses(&linux), "{linux}");
 
