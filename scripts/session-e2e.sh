@@ -7303,6 +7303,7 @@ proof_local_range_reserved_by_privileged_step() {
     range_remove_unit
   fi
   if [ -e /Library/LaunchDaemons/dev.gominimal.zone.plist ] \
+     || [ -e /Library/PrivilegedHelperTools/Minimal.app ] \
      || [ -e /Library/PrivilegedHelperTools/minzoned ]; then
     echo "removing a leftover answerer service from a prior run, for the same reason"
     ANSWERER_SERVICE_CHANNEL="${ANSWERER_SERVICE_CHANNEL:-/nonexistent}"
@@ -7660,8 +7661,12 @@ answerer_service_teardown() {
   [ -n "${ANSWERER_SERVICE_CHANNEL:-}" ] || return 0
   if [ "$(uname -s)" = Darwin ]; then
     sudo -n launchctl bootout "system/dev.gominimal.zone" >/dev/null 2>&1 || true
+    # The program copy sits in an app bundle; the bare path is where an
+    # install from before the bundle put it.
     sudo -n rm -f "/Library/LaunchDaemons/dev.gominimal.zone.plist" \
       "/Library/PrivilegedHelperTools/minzoned" >/dev/null 2>&1 || true
+    sudo -n rm -rf "/Library/PrivilegedHelperTools/Minimal.app" \
+      "/Library/PrivilegedHelperTools/Minimal.app.old" >/dev/null 2>&1 || true
   else
     sudo -n systemctl disable --now minzoned.socket \
       minzoned.service >/dev/null 2>&1 || true
@@ -9410,6 +9415,7 @@ proof_answerer_survives_session_stop() {
   # over could never exist. Remove it first, the range case's reasoning.
   if [ -e "$asr_marker" ] || [ -e "$asr_channel" ] \
      || [ -e /usr/local/lib/minimal/minzoned ] \
+     || [ -e /Library/PrivilegedHelperTools/Minimal.app ] \
      || [ -e /Library/PrivilegedHelperTools/minzoned ]; then
     echo "removing a leftover answerer service from a prior run, so node A starts from the interim"
     ANSWERER_SERVICE_CHANNEL="$asr_channel"
