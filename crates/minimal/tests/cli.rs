@@ -3892,11 +3892,11 @@ fn ls_names_the_vm_host_daemon_as_the_zone_answerer() {
     .unwrap();
     let holder_ls = String::from_utf8(out).unwrap();
     assert!(
-        holder_ls.contains("DNS SERVICE:     the VM host daemon answers this VM's box names"),
+        holder_ls.contains("DNS SERVICE:     this VM's host daemon answers its box names"),
         "the list names who answers the zone on a VM-backed host: {holder_ls}"
     );
     assert!(
-        holder_ls.contains("answers this VM's box names on 127.0.0.1:7656 (UDP)"),
+        holder_ls.contains("answers its box names on 127.0.0.1:7656 (UDP)"),
         "the line names this VM's minvmd as the holder: {holder_ls}"
     );
     // The verdict beside it: the query proved the answerer live and this
@@ -3936,7 +3936,8 @@ fn ls_names_the_vm_host_daemon_as_the_zone_answerer() {
         "a port held by a process no channel reaches is not an answered zone: {held_ls}"
     );
     assert!(
-        !held_ls.contains("answers this VM's box names"),
+        !held_ls.contains("answers this VM's box names")
+            && !held_ls.contains("answers its box names"),
         "the no-channel arm must not claim an answer: {held_ls}"
     );
     assert!(
@@ -4035,11 +4036,11 @@ fn ls_keeps_the_answerer_row_beside_a_down_proxy() {
     .unwrap();
     let held_ls = String::from_utf8(out).unwrap();
     assert!(
-        held_ls.contains("DNS SERVICE:     the VM host daemon answers this VM's box names"),
+        held_ls.contains("DNS SERVICE:     this VM's host daemon answers its box names"),
         "the answerer row prints even while the proxy is down: {held_ls}"
     );
     assert!(
-        held_ls.contains("answers this VM's box names on 127.0.0.1:7656 (UDP)"),
+        held_ls.contains("answers its box names on 127.0.0.1:7656 (UDP)"),
         "and it still names the holder: {held_ls}"
     );
     assert!(

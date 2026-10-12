@@ -2653,12 +2653,12 @@ pub(crate) fn names_steps(port: u16, install: Option<&AnswererInstall>) -> Strin
 #[cfg(any(test, target_os = "macos"))]
 const MACOS_UNDO_WHAT: &str = "Remove what `min finalize-install` installed on this host: the \
      resolver setting for box names, the boot-time setup for the loopback IPs boxes use, and \
-     the Minimal box-name service";
+     Minimal's DNS service";
 
 /// The lead-in sentence of the removal script on Linux.
 #[cfg(any(test, not(target_os = "macos")))]
 const LINUX_UNDO_WHAT: &str = "Remove what `min finalize-install` installed on this host: the \
-     resolver setting for box names, the Minimal box-name service, the user-namespace profile, \
+     resolver setting for box names, Minimal's DNS service, the user-namespace profile, \
      the classifier tree, and the kvm group membership the step added";
 
 /// The AppArmor profile directory the user-namespace profile installs under.
@@ -3782,7 +3782,7 @@ pub fn vm_host_answerer_line(status: ZoneAnswererStatus) -> Option<String> {
     match status {
         ZoneAnswererStatus::Starting => None,
         ZoneAnswererStatus::Holder { port } => Some(format!(
-            "the VM host daemon answers this VM's box names on 127.0.0.1:{port} (UDP)"
+            "this VM's host daemon answers its box names on 127.0.0.1:{port} (UDP)"
         )),
         ZoneAnswererStatus::Registered { port } => Some(format!(
             "another VM host daemon answers this VM's box names on 127.0.0.1:{port} (UDP)"
@@ -4434,7 +4434,7 @@ mod tests {
             .expect("the holder state prints its line");
         assert_eq!(
             line,
-            "the VM host daemon answers this VM's box names on 127.0.0.1:7656 (UDP)"
+            "this VM's host daemon answers its box names on 127.0.0.1:7656 (UDP)"
         );
         // The co-resident shape: another daemon holds, this one registered.
         let line = vm_host_answerer_line(ZoneAnswererStatus::Registered { port: 7_656 })
@@ -4467,7 +4467,7 @@ mod tests {
     /// the interim. Pinned because the session e2e greps the installed
     /// service's wording after the handover.
     #[test]
-    fn vm_host_answerer_line_says_manager_held_or_session_held() {
+    fn vm_host_answerer_line_says_dns_service_or_host_daemon() {
         let line = vm_host_answerer_line(ZoneAnswererStatus::ManagerHeld { port: 7_656 })
             .expect("the manager-held state prints its line");
         assert_eq!(
@@ -4485,7 +4485,7 @@ mod tests {
             let line =
                 vm_host_answerer_line(status).expect("the session-held states print their lines");
             assert!(
-                line.contains("the VM host daemon answers")
+                line.contains("this VM's host daemon answers")
                     || line.contains("another VM host daemon answers"),
                 "the interim is session-held: {line}"
             );
@@ -4496,13 +4496,13 @@ mod tests {
         }
     }
 
-    /// NET-138's session-start warning: the fact and the surface, the exact
+    /// NET-138's session-start warning: the fact and its cause, the exact
     /// text every session start prints when the port is held by a process
     /// no channel reaches — pinned because the warning rides stderr at
     /// every start, TTY and non-TTY, and a wrong fact there strands the
     /// user at the first failed lookup.
     #[test]
-    fn port_held_no_channel_warning_says_the_fact_and_the_surface() {
+    fn port_held_no_channel_warning_says_names_do_not_resolve() {
         assert_eq!(
             port_held_no_channel_warning(7_656),
             "warning: this VM's box names do not resolve through DNS on this \
@@ -5642,6 +5642,10 @@ exit 0
                 "{refusal}"
             );
             assert!(refusal.contains("would replace their service"), "{refusal}");
+            assert!(
+                refusal.contains("removes it with `min finalize-install --undo`"),
+                "the refusal keeps its remedy: {refusal}"
+            );
             assert_eq!(
                 other_operator_refusal(Some(text), operator_of, "alice"),
                 None
@@ -6070,7 +6074,7 @@ exit 0
         assert_eq!(
             vm_host_answerer_line(reply.answerer.clone()),
             Some(
-                "the VM host daemon answers this VM's box names on 127.0.0.1:7656 (UDP)"
+                "this VM's host daemon answers its box names on 127.0.0.1:7656 (UDP)"
                     .to_string()
             ),
             "the answerer line names the holder, cause or no cause"
@@ -7220,6 +7224,10 @@ resolvectl domain minzone0 '~min.internal'
         let blocker = stub_bypass_blocker(Some(domain), Some(resolv_conf), Some(nsswitch), false)
             .expect("a stub-bypassing host must block the command");
         assert!(blocker.contains("bypass systemd-resolved"), "{blocker}");
+        assert!(
+            blocker.contains("run `min finalize-install` again"),
+            "the blocker keeps its remedy: {blocker}"
+        );
         assert!(blocker.contains("192.168.1.1 1.1.1.1"), "{blocker}");
         assert!(blocker.contains(RESOLVED_STUB), "{blocker}");
 

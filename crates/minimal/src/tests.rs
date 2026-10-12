@@ -2805,8 +2805,10 @@ async fn ls_shows_vm_per_box() {
             .to_string()
     };
     assert!(
-        surface_line_of("default").contains("proxy")
-            && !surface_line_of("default").contains("resolves through this machine's DNS"),
+        surface_line_of("default")
+            .contains("<box>.min.internal opens through the HTTP proxy at 127.0.0.1:")
+            || surface_line_of("default")
+                .contains("the hostname proxy is not serving, and box names open only through it"),
         "the VM the hook does not route to keeps its proxy line:\n{table}"
     );
     assert!(
@@ -2822,7 +2824,7 @@ async fn ls_shows_vm_per_box() {
     };
     assert!(
         answerer_row_of("default")
-            .contains("the VM host daemon answers this VM's box names on 127.0.0.1:7656"),
+            .contains("this VM's host daemon answers its box names on 127.0.0.1:7656"),
         "the VM whose minvmd holds the port says so, in its own row:\n{table}"
     );
     assert!(
@@ -2831,7 +2833,7 @@ async fn ls_shows_vm_per_box() {
         "the registered VM names the holder, in its own row:\n{table}"
     );
     assert!(
-        !answerer_row_of("alpha").contains("the VM host daemon answers"),
+        !answerer_row_of("alpha").contains("this VM's host daemon answers"),
         "a VM registered with another daemon must not claim its own minvmd \
          holds the port:\n{table}"
     );

@@ -6756,9 +6756,9 @@ mod tests {
                 .expect("a holder is a state to name");
         assert_eq!(
             holder,
-            "DNS service: the VM host daemon answers this VM's box names on \
+            "DNS service: this VM's host daemon answers its box names on \
              127.0.0.1:7656 (UDP)",
-            "the start line names this VM's minvmd as the holder"
+            "the start line names this VM's host daemon as the holder"
         );
         let registered =
             vm_host_answerer_start_line(minimald_rpc::ZoneAnswererStatus::Registered {

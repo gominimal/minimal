@@ -201,7 +201,7 @@
 #                                    and host-OS resolution with no proxies
 #   native_resolution_from_host_answerer_on_vm_host
 #                                    NET-124..128/138 on a VM-backed lane:
-#                                    the VM host daemon answers the zone on
+#                                    this VM's host daemon answers the zone on
 #                                    the host loopback and the in-VM daemon
 #                                    owns no answerer
 #   native_answerer_survives_session_stop
@@ -8232,7 +8232,7 @@ proof_native_resolution_from_host_answerer_on_vm_host() {
   # `mnl ls | grep`: grep's early exit SIGPIPEs the CLI.
   host_answerer_ls="$(mnl ls 2>/dev/null || true)"
   if ! printf '%s\n' "$host_answerer_ls" \
-      | grep -qE -- "DNS SERVICE: +(the|another) VM host daemon answers this VM's box names on 127\.0\.0\.1:"; then
+      | grep -qE -- "DNS SERVICE: +(this VM's host daemon answers its|another VM host daemon answers this VM's) box names on 127\.0\.0\.1:"; then
     echo "::error::min ls does not name the VM host daemon as the zone's answerer — the line the CLI reads from minvmd's control socket is missing"
     echo "--- min ls ---"; printf '%s\n' "$host_answerer_ls"
     fail
@@ -18078,7 +18078,7 @@ proof_listen_published_port_reaches_peer_and_host() {
   # target's own — a host-native daemon prints "listening on
   # 127.0.0.1:PORT (UDP)", while the VM-backed target this case's own-address
   # box needs names the port in the line the CLI renders from the VM host
-  # daemon's answerer state ("the VM host daemon answers this VM's box names
+  # daemon's answerer state ("this VM's host daemon answers its box names
   # on 127.0.0.1:PORT (UDP)", or the registered form) — so both spellings
   # read here. A target
   # that names no port has no word for where its boxes are published, and the

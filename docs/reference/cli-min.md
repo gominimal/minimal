@@ -126,9 +126,8 @@ what a declaration with no allow list does. `--allow-dns-hosts github.com`
 alone reaches `github.com` and no address directly. `--deny-subnets` alone
 reaches nothing. Both used to reach every address the deny left, and the
 operator opt-out named below restores that earlier meaning. An
-own-address box (`--network own_ip`) without these flags, and without an
-`egress` section in its `minimal.toml`, gets the deny-all default: it
-reaches no external address. It can still resolve names in the box zone,
+own-address box (`--network own_ip`) without these flags gets the deny-all
+default: it reaches no external address. It can still resolve names in the box zone,
 `host.min.internal` included. Activate prints one line saying so:
 
 ```
@@ -136,8 +135,7 @@ This box can reach no external address: a --network own_ip box with no egress ru
 ```
 
 To give such a box reach, declare it with the allow flags, such as
-`--allow-dns-hosts github.com` or `--allow-subnets 0.0.0.0/0`, or with an
-`egress` section in `minimal.toml`. To keep the earlier allow-all default for
+`--allow-dns-hosts github.com` or `--allow-subnets 0.0.0.0/0`. To keep the earlier allow-all default for
 every undeclared box on a host, the operator opts out. A native Linux host
 opts out with `minimald run --egress-deny-all-opt-out`, or with
 `MINIMALD_EGRESS_DENY_ALL_OPT_OUT=1` in the environment that starts
