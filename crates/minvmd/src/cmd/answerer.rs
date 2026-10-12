@@ -106,7 +106,7 @@ const CONTROL_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 pub fn release(controls: &[std::path::PathBuf], port: u16) -> Result<()> {
     for control in controls {
         if let Some(reply) = ask(control, &minimald_rpc::BoxControlRequest::ReleaseAnswerer)? {
-            eprintln!("minzoned: {}: {reply}", control.display());
+            echo(controls, control, &reply);
         }
     }
     let deadline = std::time::Instant::now() + PORT_FREE_WAIT;
@@ -116,11 +116,8 @@ pub fn release(controls: &[std::path::PathBuf], port: u16) -> Result<()> {
         }
         if std::time::Instant::now() >= deadline {
             bail!(
-                "the hook port 127.0.0.1:{port} is still held {} s after the release: \
-                 another process holds it (a collision — a VM host daemon of another \
-                 state dir, a native minimald, or a foreign process), so the answerer \
-                 service cannot take it",
-                PORT_FREE_WAIT.as_secs()
+                "port 127.0.0.1:{port} is still in use by another process, so Minimal's DNS \
+                 service cannot take it; stop that process and run `min finalize-install` again"
             );
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -137,10 +134,21 @@ pub fn release_cancel(controls: &[std::path::PathBuf]) {
             control,
             &minimald_rpc::BoxControlRequest::ReleaseAnswererCancel,
         ) {
-            Ok(Some(reply)) => eprintln!("minzoned: {}: {reply}", control.display()),
+            Ok(Some(reply)) => echo(controls, control, &reply),
             Ok(None) => {}
             Err(error) => eprintln!("minzoned: {}: {error:#}", control.display()),
         }
+    }
+}
+
+/// Prints one daemon's answer. With several control sockets asked, the line
+/// names the socket, so the answers of the default VM, a named VM, and a
+/// native daemon can be told apart.
+fn echo(controls: &[std::path::PathBuf], control: &std::path::Path, reply: &str) {
+    if controls.len() > 1 {
+        eprintln!("minzoned: {}: {reply}", control.display());
+    } else {
+        eprintln!("minzoned: {reply}");
     }
 }
 
@@ -183,12 +191,16 @@ fn ask(
             }))
         }
         Ok(minimald_rpc::BoxControlReply::Error { error }) => {
-            bail!("{} refused the request: {error}", control.display())
+            bail!(
+                "the Minimal daemon at {} refused the request: {error}",
+                control.display()
+            )
         }
         Ok(other) => bail!("{} answered {other:?}", control.display()),
         Err(error) => bail!(
-            "{} answered nothing this verb understands ({error}); the daemon may predate \
-             the handover",
+            "the Minimal daemon at {} sent a reply this minzoned does not understand \
+             ({error}); it may be an older version: run `min stop`, then \
+             `min finalize-install` again",
             control.display()
         ),
     }
