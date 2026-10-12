@@ -233,6 +233,10 @@ Mac. At the time of writing, these change what the Macs run:
   `MACOS_NOTARY_PROFILE`. Signing Mac only.
 - **`minzoned` build and signing in `build-release-macos-arm64`:** signing Mac
   only. Its `session-e2e.sh` changes need nothing new on a CI Mac.
+- **The `minzoned` app bundle in `build-release-macos-arm64`:** signing Mac
+  only. The job staples the bundle with `xcrun stapler`. The Command Line
+  Tools supply `stapler` together with `notarytool`, so the Mac needs nothing
+  new.
 - **A nightly `brew-install-nightly` job on the base labels:** it runs
   `brew tap` and `brew install` on whichever Mac takes it, so with this change
   every fleet Mac needs Homebrew. The job also leaves a Homebrew tap on the

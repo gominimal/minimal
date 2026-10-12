@@ -564,6 +564,15 @@ The script holds only what this host is missing from:
 - membership of the `kvm` group, only when the configured provider is the
   Linux VM provider
 
+On macOS the step installs the box-name service's program in an app bundle,
+`/Library/PrivilegedHelperTools/Minimal.app`, that root owns. The service and
+the job that reserves the local range both run that program. A release signs
+the bundle, so System Settings lists the two jobs under the bundle's name,
+Minimal, in General, then Login Items & Extensions. A host that ran the step
+from an earlier release has a bare `minzoned` program in the same directory
+and a script for the local range. The next `min finalize-install` replaces
+both with the bundle.
+
 `min finalize-install` prints the summary of what is missing. It writes the
 script to a temporary file that only you can read (mode `0600`) and runs it
 with `sudo sh`, so `sudo` asks for your password once. It then removes the
@@ -609,7 +618,8 @@ the install. It removes the user-namespace profile, the classifier tree with
 its units and step copy, and the group membership the step added. A profile
 or a classifier tree installed another way stays, with a note. It also removes the box-name
 service and its program copy, the resolver hook, and on macOS the local range
-unit.
+unit. On macOS the program copy is the app bundle, and `--undo` also removes
+the bare program and the range script that an earlier release installed.
 The local range addresses on macOS stay on the loopback until the next boot.
 `install.sh --uninstall` points at `min finalize-install --undo` while any of
 these host files remain.
