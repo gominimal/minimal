@@ -762,8 +762,9 @@ fn duplicate_session_warning_reuses_unnamed_session_by_id() {
     );
 }
 
-/// Attach refuses a `Materializing` session, so the warning must not point
-/// at it; the duplicate is still flagged, just without an attach hint.
+/// Attach refuses a `Materializing` session, so the warning's reuse step
+/// must not point at it yet: the guidance says to wait for `min ls` to
+/// report the session active and only then attach.
 #[test]
 fn duplicate_session_warning_skips_attach_for_materializing() {
     let entries = vec![twin_entry(
@@ -777,8 +778,16 @@ fn duplicate_session_warning_skips_attach_for_materializing() {
     let warning = duplicate_session_warning(&entries, &taken)
         .expect("a session on the target path must warn");
     assert!(
-        !warning.contains("min session attach"),
-        "no attach hint for a non-attachable session, got: {warning}"
+        warning.contains("run `min ls` until its status is active"),
+        "the wait guidance names the command to watch, got: {warning}"
+    );
+    assert!(
+        warning.contains("then attach to it with `min session attach`"),
+        "attach is the step after the wait, not one to take now, got: {warning}"
+    );
+    assert!(
+        !warning.contains("min session attach web"),
+        "no attach hint naming the non-attachable session, got: {warning}"
     );
 }
 
@@ -2785,8 +2794,8 @@ async fn ls_shows_vm_per_box() {
     let surface_line_of = |vm: &str| {
         table
             .lines()
-            .find(|l| l.starts_with("NAME SURFACE:") && l.contains(vm))
-            .unwrap_or_else(|| panic!("a NAME SURFACE line for {vm} in:\n{table}"))
+            .find(|l| l.starts_with("BOX NAMES:") && l.contains(vm))
+            .unwrap_or_else(|| panic!("a BOX NAMES line for {vm} in:\n{table}"))
             .to_string()
     };
     assert!(
@@ -2800,8 +2809,8 @@ async fn ls_shows_vm_per_box() {
     let answerer_row_of = |vm: &str| {
         table
             .lines()
-            .find(|l| l.starts_with("ZONE ANSWERER:") && l.contains(vm))
-            .unwrap_or_else(|| panic!("a ZONE ANSWERER line for {vm} in:\n{table}"))
+            .find(|l| l.starts_with("DNS SERVICE:") && l.contains(vm))
+            .unwrap_or_else(|| panic!("a DNS SERVICE line for {vm} in:\n{table}"))
             .to_string()
     };
     assert!(
