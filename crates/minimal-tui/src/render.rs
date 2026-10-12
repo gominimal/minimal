@@ -1128,7 +1128,7 @@ mod tests {
         let own = policy_text(sessions::NetworkMode::OwnIp, laned.clone());
         assert!(
             own.contains(
-                "egress\n  deny-all\n  credentialed upstream  box egress proxy listener\n"
+                "egress\n  deny-all\n  credentialed upstream  allowed to reach the Box Egress Proxy\n"
             ),
             "a laned own-address box must show the lane row, got:\n{own}"
         );
@@ -1142,7 +1142,7 @@ mod tests {
         let host = policy_text(sessions::NetworkMode::HostNet, laned);
         assert!(
             host.contains(
-                "  credentialed upstream  box egress proxy listener (not in effect: host_ip box)"
+                "  credentialed upstream  allowed to reach the Box Egress Proxy (not in effect: host_ip box)"
             ),
             "a laned host-address box must show the lane, marked, got:\n{host}"
         );
