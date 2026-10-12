@@ -3366,7 +3366,7 @@ async fn listener_failure_reported_with_remedy() {
 
     let ls_stderr = run_min_stderr(&args, &["ls"]).await;
     assert!(
-        ls_stderr.contains("warning: session hostnames will not route"),
+        ls_stderr.contains("warning: the hostname proxy is not serving"),
         "ls must warn about hostname routing, got: {ls_stderr}"
     );
     assert!(
@@ -3409,7 +3409,7 @@ async fn listener_failure_reported_with_remedy() {
     )
     .await;
     assert!(
-        activate_stderr.contains("warning: session hostnames will not route"),
+        activate_stderr.contains("warning: the hostname proxy is not serving"),
         "activate must warn about hostname routing, got: {activate_stderr}"
     );
     assert!(
@@ -3452,7 +3452,7 @@ async fn ls_warning_clears_on_recovery() {
 
     let before = run_min_stderr(&args, &["ls"]).await;
     assert!(
-        before.contains("warning: session hostnames will not route"),
+        before.contains("warning: the hostname proxy is not serving"),
         "ls must warn while the port is held, got: {before}"
     );
 
@@ -3466,7 +3466,7 @@ async fn ls_warning_clears_on_recovery() {
 
     let after = run_min_stderr(&args, &["ls"]).await;
     assert!(
-        !after.contains("warning: session hostnames will not route"),
+        !after.contains("warning: the hostname proxy is not serving"),
         "the warning must clear without a daemon restart, got: {after}"
     );
 }
@@ -3540,12 +3540,12 @@ async fn min_prints_discovered_proxy_port() {
         "`min ls` must print the discovered port, got: {ls_stdout}"
     );
     assert!(
-        ls_stdout.contains("routes through it"),
+        ls_stdout.contains("as the HTTP proxy for <box>.min.internal names"),
         "the line must say what the port is for, got: {ls_stdout}"
     );
     assert!(
         ls_stdout.contains(&format!(
-            "ZONE ANSWERER:   listening on 127.0.0.1:{answerer_port} (UDP)"
+            "DNS SERVICE:     listening on 127.0.0.1:{answerer_port} (UDP)"
         )),
         "`min ls` must print the answerer's port beside the proxy's, got: {ls_stdout}"
     );
@@ -3640,7 +3640,7 @@ async fn activate_and_ls_report_native_surface() {
     let out = run_min(&args, &["ls"]).await;
     let ls_stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     assert!(
-        ls_stdout.contains("NAME SURFACE:    the hostname proxy is the live name surface"),
+        ls_stdout.contains("BOX NAMES:       the hostname proxy is the live name surface"),
         "`min ls` must report the proxy as the live surface on a hook-less host, got: {ls_stdout}"
     );
     assert!(
@@ -3734,7 +3734,7 @@ async fn activate_and_ls_report_native_surface() {
     .unwrap();
     let native_ls = String::from_utf8(native_out).unwrap();
     assert!(
-        native_ls.contains("NAME SURFACE:    native DNS is the live name surface"),
+        native_ls.contains("BOX NAMES:       native DNS is the live name surface"),
         "`min ls` must say native DNS is the live surface when the three facts hold, got: \
          {native_ls}"
     );
@@ -3767,7 +3767,7 @@ async fn activate_and_ls_report_native_surface() {
 }
 
 /// NET-018: `min ls` keeps its detail rows — `HOSTNAME PROXY:` with the
-/// port, `ZONE ANSWERER:` with the answerer's — and its `NAME SURFACE:` row
+/// port, `DNS SERVICE:` with the answerer's — and its `BOX NAMES:` row
 /// ends with the same install clause the session start's host line carries
 /// while this host's install is unfinished. Driven through the compiled
 /// binary against a daemon whose two listeners serve, on a host whose
@@ -3819,10 +3819,10 @@ async fn ls_keeps_detail_rows_and_name_surface_clause() {
         "the proxy detail row stays, with the port: {ls_stdout}"
     );
     assert!(
-        row("ZONE ANSWERER:").contains(&format!("listening on 127.0.0.1:{answerer_port} (UDP)")),
+        row("DNS SERVICE:").contains(&format!("listening on 127.0.0.1:{answerer_port} (UDP)")),
         "the answerer detail row stays, with the port: {ls_stdout}"
     );
-    let surface = row("NAME SURFACE:");
+    let surface = row("BOX NAMES:");
     assert!(
         surface.ends_with("; finish setup: min finalize-install"),
         "the surface row ends with the install clause while the install is unfinished: \
@@ -3849,7 +3849,7 @@ async fn ls_keeps_detail_rows_and_name_surface_clause() {
 // --- the VM-backed host's answerer lines (NET-138) ---
 
 /// `min ls` on a VM-backed host: the daemon behind the list reports no
-/// answerer of its own (a VM's daemon starts none), so the ZONE ANSWERER
+/// answerer of its own (a VM's daemon starts none), so the DNS SERVICE
 /// line prints from the state the VM host daemon's control socket
 /// answered — saying the zone is answered by the VM host daemon and naming
 /// the holder — while `--json` and `--raw` stay machine-readable-only, the
@@ -3888,7 +3888,7 @@ fn ls_names_the_vm_host_daemon_as_the_zone_answerer() {
     let holder_ls = String::from_utf8(out).unwrap();
     assert!(
         holder_ls
-            .contains("ZONE ANSWERER:   answered by the VM host daemon (single-operator interim)"),
+            .contains("DNS SERVICE:     answered by the VM host daemon (single-operator interim)"),
         "the list names who answers the zone on a VM-backed host: {holder_ls}"
     );
     assert!(
@@ -3897,9 +3897,9 @@ fn ls_names_the_vm_host_daemon_as_the_zone_answerer() {
     );
     // The verdict beside it: the query proved the answerer live and this
     // host's facts held, so the surface the CLI computed prints through —
-    // the same `NAME SURFACE` line the native host's list carries.
+    // the same `BOX NAMES` line the native host's list carries.
     assert!(
-        holder_ls.contains("NAME SURFACE:    native DNS is the live name surface"),
+        holder_ls.contains("BOX NAMES:       native DNS is the live name surface"),
         "the VM-host verdict rides the list like a native one: {holder_ls}"
     );
     assert!(
@@ -3927,7 +3927,7 @@ fn ls_names_the_vm_host_daemon_as_the_zone_answerer() {
     .unwrap();
     let held_ls = String::from_utf8(out).unwrap();
     assert!(
-        held_ls.contains("ZONE ANSWERER:   not answered on the host"),
+        held_ls.contains("DNS SERVICE:     not answered on the host"),
         "a port held by a process no channel reaches is not an answered zone: {held_ls}"
     );
     assert!(
@@ -3935,7 +3935,7 @@ fn ls_names_the_vm_host_daemon_as_the_zone_answerer() {
         "the no-channel arm must not claim an answer: {held_ls}"
     );
     assert!(
-        held_ls.contains("NAME SURFACE:    the hostname proxy is the live name surface"),
+        held_ls.contains("BOX NAMES:       the hostname proxy is the live name surface"),
         "the no-channel verdict reads the proxy: {held_ls}"
     );
 
@@ -3957,7 +3957,7 @@ fn ls_names_the_vm_host_daemon_as_the_zone_answerer() {
     .unwrap();
     let raw_ls = String::from_utf8(out).unwrap();
     assert!(
-        !raw_ls.contains("ZONE ANSWERER"),
+        !raw_ls.contains("DNS SERVICE"),
         "a raw list carries no answerer line: {raw_ls}"
     );
 
@@ -3987,7 +3987,7 @@ fn ls_names_the_vm_host_daemon_as_the_zone_answerer() {
 
 /// T93's sibling, as the list renders it: a reply that carries the
 /// answerer's own state *and* the hostname proxy's publish outcome keeps
-/// both — the ZONE ANSWERER row prints from the answerer field while the
+/// both — the DNS SERVICE row prints from the answerer field while the
 /// proxy is down or its publish unconfirmed, and the cause names itself
 /// on a `HOSTNAME PROXY` row of its own, never in place of the answerer's
 /// and never claiming to be the live surface. The cause row carries the
@@ -4028,7 +4028,7 @@ fn ls_keeps_the_answerer_row_beside_a_down_proxy() {
     let held_ls = String::from_utf8(out).unwrap();
     assert!(
         held_ls
-            .contains("ZONE ANSWERER:   answered by the VM host daemon (single-operator interim)"),
+            .contains("DNS SERVICE:     answered by the VM host daemon (single-operator interim)"),
         "the answerer row prints even while the proxy is down: {held_ls}"
     );
     assert!(
@@ -4074,7 +4074,7 @@ fn ls_keeps_the_answerer_row_beside_a_down_proxy() {
     .unwrap();
     let unconfirmed_ls = String::from_utf8(out).unwrap();
     assert!(
-        !unconfirmed_ls.contains("ZONE ANSWERER:"),
+        !unconfirmed_ls.contains("DNS SERVICE:"),
         "the pre-acquisition state still prints no answerer row: {unconfirmed_ls}"
     );
     assert!(
@@ -4139,7 +4139,7 @@ fn ls_keeps_the_answerer_row_beside_a_down_proxy() {
         let ls = String::from_utf8(out).unwrap();
         // One proxy verdict per VM: beside a Native verdict the cause is
         // its own HOSTNAME PROXY row; a Proxy verdict folds the cause into
-        // the NAME SURFACE row and prints no separate cause row.
+        // the BOX NAMES row and prints no separate cause row.
         let cause_rows = match surface {
             resolver::LiveSurface::Proxy => 0,
             _ => 1,
@@ -4164,7 +4164,7 @@ fn ls_keeps_the_answerer_row_beside_a_down_proxy() {
             "the surface row does not name a down proxy as serving: {ls}"
         );
         assert!(
-            ls.contains("NAME SURFACE:") && ls.contains("not serving"),
+            ls.contains("BOX NAMES:") && ls.contains("not serving"),
             "the surface row agrees the proxy is not serving: {ls}"
         );
     }
@@ -4174,7 +4174,7 @@ fn ls_keeps_the_answerer_row_beside_a_down_proxy() {
 /// one does: the VM whose reply carries a proxy-down sibling gets no
 /// `listening on` row for its reported port, its cause is named exactly
 /// once (its own `HOSTNAME PROXY` row beside a Native verdict, folded into
-/// its NAME SURFACE row beside a Proxy verdict), and its surface row never
+/// its BOX NAMES row beside a Proxy verdict), and its surface row never
 /// names the down proxy as serving. The other VM's rows are untouched.
 #[test]
 fn ls_across_vms_names_one_proxy_verdict_per_vm() {
@@ -4259,7 +4259,7 @@ fn ls_across_vms_names_one_proxy_verdict_per_vm() {
             1,
             "the down VM's cause is named exactly once:\n{text}"
         );
-        let default_surface = rows_of("NAME SURFACE:", "default");
+        let default_surface = rows_of("BOX NAMES:", "default");
         assert_eq!(default_surface.len(), 1, "got:\n{text}");
         assert!(
             !default_surface[0].contains("still serves")
@@ -4275,11 +4275,12 @@ fn ls_across_vms_names_one_proxy_verdict_per_vm() {
         let alpha_proxy = rows_of("HOSTNAME PROXY:", "alpha");
         assert_eq!(alpha_proxy.len(), 1, "got:\n{text}");
         assert!(
-            alpha_proxy[0]
-                .ends_with("listening on 127.0.0.1:7655 · <name>.min.internal routes through it"),
+            alpha_proxy[0].ends_with(
+                "listening on 127.0.0.1:7655 as the HTTP proxy for <box>.min.internal names",
+            ),
             "the serving VM's proxy row is unchanged:\n{text}"
         );
-        let alpha_surface = rows_of("NAME SURFACE:", "alpha");
+        let alpha_surface = rows_of("BOX NAMES:", "alpha");
         assert_eq!(alpha_surface.len(), 1, "got:\n{text}");
         assert!(
             alpha_surface[0].contains("routes through it on 127.0.0.1:7655"),

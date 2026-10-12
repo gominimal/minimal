@@ -236,13 +236,16 @@ pub(crate) fn duplicate_session_warning(
         "warning: a session already exists for this path ({handle}); activating \
          creates a second one, leaving bare `min` here ambiguous between them."
     );
-    // Only point at `attach` for a session it will actually accept. Attach
-    // refuses anything not yet `Active` (see `sessions::SessionStatus`), so for
-    // a `Pending`/`Materializing` duplicate the reuse command would fail
-    // immediately — say to wait instead. When we do suggest it, use a key
-    // `SessionLookup::parse` can resolve: a name matches by name and the full id
-    // parses as a UUID, but the short unnamed handle would parse as a
-    // nonexistent name and the attach lookup would miss.
+    // Only point at `attach` as the step to take now for a session it will
+    // actually accept. Attach refuses anything not yet `Active` (see
+    // `sessions::SessionStatus`), so for a `Pending`/`Materializing`
+    // duplicate the reuse command would fail immediately — say to wait
+    // first, and show the later attach with a `<session>` placeholder so no
+    // printed command names a session attach would refuse right now. When
+    // we do suggest it, use a key `SessionLookup::parse` can resolve: a name
+    // matches by name and the full id parses as a UUID, but the short
+    // unnamed handle would parse as a nonexistent name and the attach lookup
+    // would miss.
     match existing.status {
         sessions::SessionStatus::Active => {
             let key = existing
@@ -254,8 +257,9 @@ pub(crate) fn duplicate_session_warning(
             ))
         }
         _ => Some(format!(
-            "{lead} The existing session is still being created; wait for it to \
-             become active, then reuse it instead of creating a second."
+            "{lead} The existing session is still being created; run `min ls` \
+             until its status is active, then attach to it with `min session \
+             attach <session>` instead of creating a second."
         )),
     }
 }
@@ -355,7 +359,9 @@ pub(crate) async fn ls_listings_best_effort(global: &GlobalArgs) -> Vec<VmListin
 
 /// The listing behind [`ls_listings`] and [`ls_listings_best_effort`].
 /// `strict` keeps `min ls`'s rule that a failure on the selected VM is the
-/// failure to report; without it that VM is skipped like any other.
+/// failure to report; without it that VM is skipped like any other. It also
+/// selects `min ls`'s wording of the skipped-VM warning, which says that
+/// VM's sessions are not listed: a strict caller is one that lists sessions.
 async fn listings_across_vms(
     global: &GlobalArgs,
     strict: bool,
@@ -406,6 +412,13 @@ async fn listings_across_vms(
                     control_sock,
                 }),
                 Ok(None) => {}
+                // Only `min ls` lists sessions: `min finalize-install`
+                // reads the same listings for an answerer port, so the
+                // consequence would be false there.
+                Err(e) if strict => eprintln!(
+                    "warning: skipping VM {}, so its sessions are not listed: {e:#}",
+                    vm.vm
+                ),
                 Err(e) => eprintln!("warning: skipping VM {}: {e:#}", vm.vm),
             }
         }
@@ -585,7 +598,7 @@ pub async fn cmd_ls(global: &GlobalArgs, args: LsArgs) -> Result<(), anyhow::Err
     // daemon (a guest relaying a host fact is forgeable from inside the
     // escape boundary), and the liveness proof is this CLI's own A query at
     // the port that read named. The status decides that VM's own verdict
-    // and its own `ZONE ANSWERER` row — a VM whose minvmd holds the port
+    // and its own `DNS SERVICE` row — a VM whose minvmd holds the port
     // is named there, and a sibling registered with another daemon says
     // who holds it, so no row speaks with another VM's state. Read in the
     // modes that can print them, like the detection below it: `--json` and
@@ -623,7 +636,7 @@ pub async fn cmd_ls(global: &GlobalArgs, args: LsArgs) -> Result<(), anyhow::Err
             *slot = crate::resolver::vm_host_name_surface(reply.clone()).await;
         }
     }
-    // NET-018/NET-122: the install clause on each `NAME SURFACE` row reads
+    // NET-018/NET-122: the install clause on each `BOX NAMES` row reads
     // the same host facts the session start's host line does, so the two
     // verbs print the same pointer. Machine modes print no row, so they pay
     // no probe.
@@ -685,9 +698,8 @@ pub fn shared_port_collision_lines(listings: &[VmListing]) -> Vec<String> {
 #[must_use]
 pub fn hostname_routing_warning(reason: &str, command: &str) -> String {
     format!(
-        "warning: session hostnames will not route: {reason}. The daemon retries \
-         with backoff and clears this warning on its own once the listener \
-         recovers; run `{command}` again to check."
+        "warning: the hostname proxy is not serving: {reason}. Minimal \
+         retries on its own; run `{command}` again to check."
     )
 }
 
@@ -730,19 +742,19 @@ pub fn hostname_proxy_vm(kind: paths::ProviderKind) -> Option<&'static str> {
 ///
 /// `surface` is NET-018's verdict — which surface a box name resolves
 /// through on this host, as [`cmd_ls`] computed it from the one function
-/// both verbs share — printed on the `NAME SURFACE` line when the daemon's
+/// both verbs share — printed on the `BOX NAMES` line when the daemon's
 /// answerer is bound at all.
 ///
 /// `vm_answerer` is the machine's zone-answerer state on a VM-backed host
 /// (NET-138), as [`cmd_ls`] read it from the VM host daemon's control
 /// socket: when the daemon behind this list reports no answerer of its own
-/// — a VM-backed host's daemon starts none — the `ZONE ANSWERER` line
+/// — a VM-backed host's daemon starts none — the `DNS SERVICE` line
 /// prints from it instead, saying the zone is answered by the VM host
 /// daemon and naming the holder. `None`, the native shape, prints the
 /// daemon's own line exactly as before.
 ///
 /// The host's other install facts read as finished: the install clause on
-/// the `NAME SURFACE` row then rides on the surface alone. [`cmd_ls`]
+/// the `BOX NAMES` row then rides on the surface alone. [`cmd_ls`]
 /// renders through [`format_ls_on`] with this host's own facts.
 pub fn format_ls(
     out: &mut impl std::io::Write,
@@ -763,7 +775,7 @@ pub fn format_ls(
 
 /// [`format_ls`] over this host's install facts (NET-018): `host` is what
 /// `min finalize-install` would find open on this host beyond the names
-/// item, and the `NAME SURFACE` row ends with the same install clause the
+/// item, and the `BOX NAMES` row ends with the same install clause the
 /// session start's host line carries while anything is open.
 pub fn format_ls_on(
     out: &mut impl std::io::Write,
@@ -823,7 +835,7 @@ pub fn format_ls_on(
         if let Some(port) = serving_proxy_port {
             writeln!(
                 out,
-                "HOSTNAME PROXY:  listening on 127.0.0.1:{port} · <name>.min.internal routes through it"
+                "HOSTNAME PROXY:  listening on 127.0.0.1:{port} as the HTTP proxy for <box>.min.internal names"
             )?;
         }
         // The VM host daemon's two facts are computed here, because the
@@ -843,10 +855,10 @@ pub fn format_ls_on(
         if let Some(answerer) = resp.zone_answerer_port {
             writeln!(
                 out,
-                "ZONE ANSWERER:   listening on 127.0.0.1:{answerer} (UDP) · point the host's resolver at it for *.min.internal"
+                "DNS SERVICE:     listening on 127.0.0.1:{answerer} (UDP) · point the host's resolver at it for *.min.internal"
             )?;
         } else if let Some(line) = &vm_answerer_line {
-            writeln!(out, "ZONE ANSWERER:   {line}")?;
+            writeln!(out, "DNS SERVICE:     {line}")?;
         }
         // T93's sibling, in the list's own voice: when the reply carries
         // the proxy's publish outcome as well as the answerer's state —
@@ -868,7 +880,7 @@ pub fn format_ls_on(
         if let Some(surface) = surface {
             writeln!(
                 out,
-                "NAME SURFACE:    {}{}",
+                "BOX NAMES:       {}{}",
                 crate::resolver::name_surface_line(surface.clone(), serving_proxy_port),
                 crate::resolver::install_clause(crate::resolver::install_unfinished(
                     &surface, host
@@ -987,7 +999,7 @@ const VM_COLUMN_WIDTH: usize = 8;
 ///
 /// `vm_answerers` is one zone-answerer state (NET-138) per listing, as
 /// [`cmd_ls`] read each listed VM's own from that VM's control socket: that
-/// VM's `ZONE ANSWERER` line prints from it when the VM's own daemon reports
+/// VM's `DNS SERVICE` line prints from it when the VM's own daemon reports
 /// no answerer, as [`format_ls`] does for a single VM. A shorter slice than
 /// the listings — a machine mode reads nothing, and a caller that computed
 /// nothing — leaves the VMs it does not cover with no line.
@@ -1013,7 +1025,7 @@ pub fn format_ls_across_vms(
 }
 
 /// [`format_ls_across_vms`] over this host's install facts (NET-018), the
-/// way [`format_ls_on`] is [`format_ls`]'s: every VM's `NAME SURFACE` row
+/// way [`format_ls_on`] is [`format_ls`]'s: every VM's `BOX NAMES` row
 /// ends with the install clause while anything is open on this host.
 pub fn format_ls_across_vms_on(
     out: &mut impl std::io::Write,
@@ -1137,7 +1149,7 @@ pub fn format_ls_across_vms_on(
             if let Some(port) = serving_proxy_port {
                 writeln!(
                     out,
-                    "HOSTNAME PROXY:  {vm:<width$} listening on 127.0.0.1:{port} · <name>.min.internal routes through it",
+                    "HOSTNAME PROXY:  {vm:<width$} listening on 127.0.0.1:{port} as the HTTP proxy for <box>.min.internal names",
                     vm = listing.vm,
                     width = VM_COLUMN_WIDTH,
                 )?;
@@ -1146,7 +1158,7 @@ pub fn format_ls_across_vms_on(
             if let Some(answerer) = listing.resp.zone_answerer_port {
                 writeln!(
                     out,
-                    "ZONE ANSWERER:   {vm:<width$} listening on 127.0.0.1:{answerer} (UDP) · point the host's resolver at it for *.min.internal",
+                    "DNS SERVICE:     {vm:<width$} listening on 127.0.0.1:{answerer} (UDP) · point the host's resolver at it for *.min.internal",
                     vm = listing.vm,
                     width = VM_COLUMN_WIDTH,
                 )?;
@@ -1157,7 +1169,7 @@ pub fn format_ls_across_vms_on(
             {
                 writeln!(
                     out,
-                    "ZONE ANSWERER:   {vm:<width$} {line}",
+                    "DNS SERVICE:     {vm:<width$} {line}",
                     vm = listing.vm,
                     width = VM_COLUMN_WIDTH,
                 )?;
@@ -1195,7 +1207,7 @@ pub fn format_ls_across_vms_on(
             if let Some(surface) = surface {
                 writeln!(
                     out,
-                    "NAME SURFACE:    {vm:<width$} {}{}",
+                    "BOX NAMES:       {vm:<width$} {}{}",
                     crate::resolver::name_surface_line(surface.clone(), serving_proxy_port),
                     crate::resolver::install_clause(crate::resolver::install_unfinished(
                         &surface, host

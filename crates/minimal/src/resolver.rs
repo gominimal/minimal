@@ -3764,7 +3764,7 @@ fn reply_answers_host_row(reply: &Message) -> bool {
         })
 }
 
-/// `min ls`'s ZONE ANSWERER line on a VM-backed host (NET-138): the line
+/// `min ls`'s DNS SERVICE line on a VM-backed host (NET-138): the line
 /// that says the zone is answered by the VM host daemon — the
 /// single-operator interim the answerer is — and names the holder the
 /// status read reported: this VM's minvmd when it holds the port, another
@@ -3820,7 +3820,7 @@ pub(crate) fn vm_host_answerer_line_at(
         // failure says nothing about the zone answerer, so the answerer
         // row claims nothing for it — the same silence the
         // pre-acquisition state keeps. The proxy's own named cause
-        // prints in the NAME SURFACE row below, which is where the
+        // prints in the BOX NAMES row below, which is where the
         // directive puts it.
         ZoneAnswererStatus::ProxyNotServing { .. } => None,
     }
@@ -3866,7 +3866,7 @@ pub(crate) async fn vm_host_name_surface(reply: AnswererStatusReply) -> Option<L
 /// The hostname-proxy port a surface line may name as serving (T93): the
 /// port the daemon reported, unless the VM host daemon's reply carries a
 /// proxy-down sibling — then `None`, because the host-side verdict is that
-/// the proxy is not seen serving, and a NAME SURFACE line or a `listening
+/// the proxy is not seen serving, and a BOX NAMES line or a `listening
 /// on` row naming the reported port as live would contradict the cause
 /// line printed beside it.
 #[must_use]
@@ -3876,7 +3876,7 @@ pub fn serving_proxy_port(reported: Option<u16>, proxy_down: Option<&ProxyDown>)
 
 /// The surface verdict with a proxy-down sibling folded in (T93): a
 /// `Proxy` verdict beside the VM host daemon's cause becomes
-/// [`LiveSurface::ProxyNotServing`] with that cause, so the NAME SURFACE
+/// [`LiveSurface::ProxyNotServing`] with that cause, so the BOX NAMES
 /// line names why the live surface is not serving. Any other verdict is
 /// returned unchanged; its cause prints on a line of its own
 /// ([`proxy_down_line_beside`]).
@@ -3896,7 +3896,7 @@ pub fn surface_beside_proxy_down(
 
 /// The standalone proxy-down line beside a (folded) surface verdict, so
 /// the cause is named exactly once: `None` when the verdict is
-/// [`LiveSurface::ProxyNotServing`], whose NAME SURFACE line already names
+/// [`LiveSurface::ProxyNotServing`], whose BOX NAMES line already names
 /// the cause, and the [`proxy_down_line`] beside a `Native` verdict or no
 /// verdict at all.
 #[must_use]
@@ -3913,7 +3913,7 @@ pub fn proxy_down_line_beside(
 /// The proxy's publish outcome as its own printed line (T93): the same
 /// named cause — the port the failure is about, the thing to free — said
 /// beside the answerer's own facts instead of in place of them, and
-/// without the NAME SURFACE row's claim that the proxy is the surface a
+/// without the BOX NAMES row's claim that the proxy is the surface a
 /// name resolves through, because the reply that carries the cause also
 /// carries the answerer's state, and the two may disagree about which
 /// surface is live. The cause wordings mirror [`name_surface_line`]'s,
@@ -5864,7 +5864,7 @@ exit 0
 
     /// One proxy verdict per surface (T93): with a proxy-down sibling, the
     /// lines a session start or a listing prints — the standalone cause
-    /// line, when any, and the NAME SURFACE line — name the cause exactly
+    /// line, when any, and the BOX NAMES line — name the cause exactly
     /// once, whatever the verdict (Native, Proxy, none, or the
     /// pre-acquisition `ProxyNotServing` arm), and never name the reported
     /// port as serving or routing.
@@ -5983,7 +5983,7 @@ exit 0
         );
     }
 
-    /// T93: the NAME SURFACE row and the session-start message name *why*
+    /// T93: the BOX NAMES row and the session-start message name *why*
     /// the hostname proxy is not serving — the port the failure is about
     /// and the cause the VM host daemon reported — instead of a bare "not
     /// serving". The two named causes are the two terminal publish
@@ -6089,7 +6089,7 @@ exit 0
             "the sibling cause rides the same read whole"
         );
         // The answerer row prints from the answerer field, not from the
-        // cause — the ZONE ANSWERER line names the holder.
+        // cause — the DNS SERVICE line names the holder.
         assert_eq!(
             vm_host_answerer_line(reply.answerer.clone()),
             Some(
@@ -6117,7 +6117,7 @@ exit 0
 
     /// T93: a VM whose publish the VM host daemon could not confirm — no
     /// report from the guest, and no listener on the port it could
-    /// attribute to this VM — is shown as unconfirmed on the NAME SURFACE
+    /// attribute to this VM — is shown as unconfirmed on the BOX NAMES
     /// row, never as serving, even beside a serving port the reply carries.
     #[tokio::test]
     async fn name_surface_shows_an_unconfirmed_publish_as_unconfirmed() {
