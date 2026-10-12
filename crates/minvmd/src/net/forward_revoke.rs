@@ -485,6 +485,26 @@ pub(crate) enum Exposed {
     AlreadyBound,
 }
 
+/// Why an expose did not come to an [`Exposed`]. The two answers a caller
+/// must tell apart: a switch that refused bound nothing, and a switch whose
+/// answer never arrived may have bound the listener all the same.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ExposeError {
+    /// The switch answered with a status that refuses the expose: nothing
+    /// is bound at the listener for it.
+    #[error("the switch answered the expose with HTTP {status}: {body:?}")]
+    Refused { status: u16, body: String },
+    /// No status was read: the connect, write or read failed, or the bound
+    /// passed. The switch may have bound the listener before the answer was
+    /// lost.
+    #[error("the expose went unanswered: {0}")]
+    Unanswered(#[from] io::Error),
+    /// The forward names a protocol the switch has no spelling for: nothing
+    /// was sent.
+    #[error("the forward names a protocol the switch has no spelling for")]
+    Unspellable,
+}
+
 /// Asks the switch at `switch_sock` to expose `local` toward `remote`,
 /// bounded by `bound`: the publish the daemon's own client makes, originated
 /// by the host for a forward that waited on its listener. A 2xx status is
@@ -493,15 +513,16 @@ pub(crate) enum Exposed {
 ///
 /// # Errors
 ///
-/// The connect, write or read error, a timeout past `bound`, or any other
-/// status outside 2xx.
+/// [`ExposeError::Unanswered`] for the connect, write or read error and for
+/// a timeout past `bound`; [`ExposeError::Refused`] for any other status
+/// outside 2xx.
 pub(crate) async fn expose(
     switch_sock: &Path,
     local: &str,
     remote: &str,
     protocol: &str,
     bound: Duration,
-) -> io::Result<Exposed> {
+) -> Result<Exposed, ExposeError> {
     let body = serde_json_lenient::to_vec(&ExposeBody {
         local,
         remote,
@@ -515,10 +536,10 @@ pub(crate) async fn expose(
     } else if status == 500 && body.trim() == ALREADY_BOUND_BODY {
         Ok(Exposed::AlreadyBound)
     } else {
-        Err(io::Error::other(format!(
-            "the switch answered the expose with HTTP {status}: {:?}",
-            body.trim()
-        )))
+        Err(ExposeError::Refused {
+            status,
+            body: body.trim().to_owned(),
+        })
     }
 }
 
