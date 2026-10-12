@@ -15,10 +15,11 @@
 //! Ethernet frames framed with a 2-byte little-endian length prefix (the
 //! HyperKit protocol). `minvmd`'s role is to write the gvproxy `-config` YAML
 //! carrying the subnet, gateway, NAT alias, and `dhcpStaticLeases`
-//! ([`render_gvproxy_config`]) — the subnet is YAML-only (gvproxy v0.8.9 has no
-//! `-subnet` CLI flag). Opening the per-PTask tap and running the TAP↔gvproxy
-//! relay happen in the guest `minimald` over the vsock shuttle (see the
-//! `shuttle` module); this module owns only the switch process.
+//! ([`render_gvproxy_config`]) — the NAT alias, DNS zone and leases are
+//! YAML-only, so the subnet travels in the same file. Opening the per-PTask
+//! tap and running the TAP↔gvproxy relay happen in the guest `minimald` over
+//! the vsock shuttle (see the `shuttle` module); this module owns only the
+//! switch process.
 //!
 //! The supervisor tears gvproxy down with the same SIGTERM → timeout → SIGKILL
 //! sequence the vmm child uses ([`GvproxySupervisor::stop`], R1.4) and runs a
@@ -1125,6 +1126,11 @@ mod tests {
             .expect("write config");
         let body = std::fs::read_to_string(cfg.config_path()).expect("read config");
         assert!(body.contains("100.64.0.0/16"));
+        // The file the host switch reads carries the raised outbound TCP
+        // bounds, so a burst of connections from a box is not held to the
+        // switch's built-in number of dials in flight.
+        assert!(body.contains("\n  tcpMaxInFlight: 512\n"), "{body}");
+        assert!(body.contains("\n  tcpConnectTimeout: 30\n"), "{body}");
     }
 
     fn supervise_sleep() -> (GvproxySupervisor, SwitchExit) {
