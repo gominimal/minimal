@@ -3744,7 +3744,9 @@ async fn activate_and_ls_report_native_surface() {
          {native_ls}"
     );
     assert!(
-        native_ls.contains(&format!("the proxy also listens on 127.0.0.1:{port}")),
+        native_ls.contains(&format!(
+            "the hostname proxy also listens on 127.0.0.1:{port}"
+        )),
         "the native arm keeps the proxy's half beside it (NET-019): {native_ls}"
     );
     assert!(
@@ -3890,11 +3892,11 @@ fn ls_names_the_vm_host_daemon_as_the_zone_answerer() {
     .unwrap();
     let holder_ls = String::from_utf8(out).unwrap();
     assert!(
-        holder_ls.contains("DNS SERVICE:     the running VM is answering box names itself"),
+        holder_ls.contains("DNS SERVICE:     the VM host daemon answers this VM's box names"),
         "the list names who answers the zone on a VM-backed host: {holder_ls}"
     );
     assert!(
-        holder_ls.contains("answering box names itself on 127.0.0.1:7656 (UDP)"),
+        holder_ls.contains("answers this VM's box names on 127.0.0.1:7656 (UDP)"),
         "the line names this VM's minvmd as the holder: {holder_ls}"
     );
     // The verdict beside it: the query proved the answerer live and this
@@ -3934,7 +3936,7 @@ fn ls_names_the_vm_host_daemon_as_the_zone_answerer() {
         "a port held by a process no channel reaches is not an answered zone: {held_ls}"
     );
     assert!(
-        !held_ls.contains("answering box names itself"),
+        !held_ls.contains("answers this VM's box names"),
         "the no-channel arm must not claim an answer: {held_ls}"
     );
     assert!(
@@ -4033,11 +4035,11 @@ fn ls_keeps_the_answerer_row_beside_a_down_proxy() {
     .unwrap();
     let held_ls = String::from_utf8(out).unwrap();
     assert!(
-        held_ls.contains("DNS SERVICE:     the running VM is answering box names itself"),
+        held_ls.contains("DNS SERVICE:     the VM host daemon answers this VM's box names"),
         "the answerer row prints even while the proxy is down: {held_ls}"
     );
     assert!(
-        held_ls.contains("answering box names itself on 127.0.0.1:7656 (UDP)"),
+        held_ls.contains("answers this VM's box names on 127.0.0.1:7656 (UDP)"),
         "and it still names the holder: {held_ls}"
     );
     assert!(
@@ -4083,7 +4085,7 @@ fn ls_keeps_the_answerer_row_beside_a_down_proxy() {
         "the pre-acquisition state still prints no answerer row: {unconfirmed_ls}"
     );
     assert!(
-        unconfirmed_ls.starts_with("HOSTNAME PROXY:  the proxy is not confirmed yet"),
+        unconfirmed_ls.starts_with("HOSTNAME PROXY:  the hostname proxy is not confirmed yet"),
         "the unconfirmed publish is the row that prints: {unconfirmed_ls}"
     );
     assert!(

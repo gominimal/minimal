@@ -3782,7 +3782,7 @@ pub fn vm_host_answerer_line(status: ZoneAnswererStatus) -> Option<String> {
     match status {
         ZoneAnswererStatus::Starting => None,
         ZoneAnswererStatus::Holder { port } => Some(format!(
-            "the running VM is answering box names itself on 127.0.0.1:{port} (UDP)"
+            "the VM host daemon answers this VM's box names on 127.0.0.1:{port} (UDP)"
         )),
         ZoneAnswererStatus::Registered { port } => Some(format!(
             "another VM host daemon answers this VM's box names on 127.0.0.1:{port} (UDP)"
@@ -3914,8 +3914,8 @@ pub fn proxy_down_line(proxy_down: &ProxyDown) -> String {
         // Said as unconfirmed, never as serving, until the guest's report
         // clears it — the same words the surface row prints for it.
         ProxyDownCause::PublishUnconfirmed => format!(
-            "the proxy is not confirmed yet: the VM is up, but the VM host \
-             daemon has not seen the proxy listening on 127.0.0.1:{}; box \
+            "the hostname proxy is not confirmed yet: the VM is up, but the VM \
+             host daemon has not seen it listening on 127.0.0.1:{}; box \
              names may not open through it yet",
             proxy_down.port
         ),
@@ -3928,7 +3928,8 @@ pub fn proxy_down_line(proxy_down: &ProxyDown) -> String {
             format!(
                 "the hostname proxy is not serving: the VM is up without it \
                  because {holder} holds 127.0.0.1:{}; free the port, then \
-                 run `min stop` and `min ls` to restart the VM",
+                 run `min stop` and `min ls` to restart the VM (with the \
+                 same --vm or --provider flags, if you use them)",
                 proxy_down.port
             )
         }
@@ -4107,9 +4108,8 @@ fn proxy_down_detail(port: u16, cause: &ProxyDownCause) -> String {
         // attribute to this VM. Said as unconfirmed, never as serving,
         // until the guest's report clears it.
         ProxyDownCause::PublishUnconfirmed => format!(
-            "the VM is up, but the VM host daemon has not seen the proxy \
-             listening on 127.0.0.1:{port}; box names may not open through it \
-             yet"
+            "the VM is up, but the VM host daemon has not seen it listening on \
+             127.0.0.1:{port}; box names may not open through it yet"
         ),
         // The guest's late report refused the port after the VM came up:
         // the VM keeps running with no hostname proxy, so this is said as a
@@ -4122,7 +4122,8 @@ fn proxy_down_detail(port: u16, cause: &ProxyDownCause) -> String {
             format!(
                 "the VM is up without it because {holder} holds 127.0.0.1:{port}; \
                  free the port, then run `min stop` and `min ls` to restart \
-                 the VM"
+                 the VM (with the same --vm or --provider flags, if you use \
+                 them)"
             )
         }
     }
@@ -4140,7 +4141,7 @@ fn proxy_down_detail(port: u16, cause: &ProxyDownCause) -> String {
 #[must_use]
 pub fn name_surface_line(surface: LiveSurface, proxy_port: Option<u16>) -> String {
     let proxy_half = match proxy_port {
-        Some(port) => format!("; the proxy also listens on 127.0.0.1:{port}"),
+        Some(port) => format!("; the hostname proxy also listens on 127.0.0.1:{port}"),
         None => "; the hostname proxy is not serving".to_string(),
     };
     match surface {
@@ -4172,7 +4173,7 @@ pub fn name_surface_line(surface: LiveSurface, proxy_port: Option<u16>) -> Strin
                     format!("the hostname proxy is not serving: {detail}")
                 }
                 ProxyDownCause::PublishUnconfirmed => {
-                    format!("the proxy is not confirmed yet: {detail}")
+                    format!("the hostname proxy is not confirmed yet: {detail}")
                 }
             }
         }
@@ -4433,7 +4434,7 @@ mod tests {
             .expect("the holder state prints its line");
         assert_eq!(
             line,
-            "the running VM is answering box names itself on 127.0.0.1:7656 (UDP)"
+            "the VM host daemon answers this VM's box names on 127.0.0.1:7656 (UDP)"
         );
         // The co-resident shape: another daemon holds, this one registered.
         let line = vm_host_answerer_line(ZoneAnswererStatus::Registered { port: 7_656 })
@@ -4474,7 +4475,7 @@ mod tests {
             "Minimal's DNS service answers this VM's box names on 127.0.0.1:7656 (UDP)"
         );
         assert!(
-            !line.contains("VM host daemon") && !line.contains("the running VM"),
+            !line.contains("VM host daemon"),
             "a manager-held zone is not the session-held interim: {line}"
         );
         for status in [
@@ -4484,7 +4485,7 @@ mod tests {
             let line =
                 vm_host_answerer_line(status).expect("the session-held states print their lines");
             assert!(
-                line.contains("the running VM is answering box names itself")
+                line.contains("the VM host daemon answers")
                     || line.contains("another VM host daemon answers"),
                 "the interim is session-held: {line}"
             );
@@ -5929,7 +5930,7 @@ exit 0
             "the native arm names the surface: {native}"
         );
         assert!(
-            native.contains("the proxy also listens on 127.0.0.1:15390"),
+            native.contains("the hostname proxy also listens on 127.0.0.1:15390"),
             "the native arm says the proxy keeps serving beside it (NET-019): {native}"
         );
         let not_serving = name_surface_line(LiveSurface::Native, None);
@@ -6069,7 +6070,8 @@ exit 0
         assert_eq!(
             vm_host_answerer_line(reply.answerer.clone()),
             Some(
-                "the running VM is answering box names itself on 127.0.0.1:7656 (UDP)".to_string()
+                "the VM host daemon answers this VM's box names on 127.0.0.1:7656 (UDP)"
+                    .to_string()
             ),
             "the answerer line names the holder, cause or no cause"
         );
@@ -6108,7 +6110,7 @@ exit 0
             Some(19_917),
         );
         assert!(
-            line.starts_with("the proxy is not confirmed yet"),
+            line.starts_with("the hostname proxy is not confirmed yet"),
             "the row says the publish is unconfirmed: {line}"
         );
         assert!(
@@ -6146,7 +6148,8 @@ exit 0
             line,
             "the hostname proxy is not serving: the VM is up without it because \
              pid 4242 (python3) holds 127.0.0.1:19918; free the port, then run \
-             `min stop` and `min ls` to restart the VM",
+             `min stop` and `min ls` to restart the VM (with the same --vm or \
+             --provider flags, if you use them)",
             "the row names the port, the holder, and that the VM is up"
         );
         assert!(

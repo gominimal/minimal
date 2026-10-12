@@ -2822,7 +2822,7 @@ async fn ls_shows_vm_per_box() {
     };
     assert!(
         answerer_row_of("default")
-            .contains("the running VM is answering box names itself on 127.0.0.1:7656"),
+            .contains("the VM host daemon answers this VM's box names on 127.0.0.1:7656"),
         "the VM whose minvmd holds the port says so, in its own row:\n{table}"
     );
     assert!(
@@ -2831,7 +2831,7 @@ async fn ls_shows_vm_per_box() {
         "the registered VM names the holder, in its own row:\n{table}"
     );
     assert!(
-        !answerer_row_of("alpha").contains("answering box names itself"),
+        !answerer_row_of("alpha").contains("the VM host daemon answers"),
         "a VM registered with another daemon must not claim its own minvmd \
          holds the port:\n{table}"
     );

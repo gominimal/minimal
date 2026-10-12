@@ -2146,7 +2146,7 @@ fn subscribe_host_asks(
             tracing::warn!(box = %name, error = %format!("{error:#}"), "could not subscribe to the box's asks");
             eprintln!(
                 "warning: this terminal will not show port prompts for box '{name}': \
-                 {error:#}. Attach again to retry."
+                 {error:#}. Run `min session attach {name}` again to retry."
             );
             None
         }
@@ -6745,11 +6745,10 @@ mod tests {
     }
 
     /// NET-138's interim, surfaced at every session start: the line names
-    /// who answers box names under the `DNS service:` label — the running
-    /// VM itself when its host daemon holds the port, another VM host
-    /// daemon when this VM's table is registered with it — and the
-    /// pre-acquisition state prints nothing, exactly as its `min ls` line
-    /// does.
+    /// who answers box names under the `DNS service:` label — this VM's
+    /// host daemon when it holds the port, another VM host daemon when
+    /// this VM's table is registered with it — and the pre-acquisition
+    /// state prints nothing, exactly as its `min ls` line does.
     #[test]
     fn session_start_names_the_zone_answerer_at_every_start() {
         let holder =
@@ -6757,7 +6756,7 @@ mod tests {
                 .expect("a holder is a state to name");
         assert_eq!(
             holder,
-            "DNS service: the running VM is answering box names itself on \
+            "DNS service: the VM host daemon answers this VM's box names on \
              127.0.0.1:7656 (UDP)",
             "the start line names this VM's minvmd as the holder"
         );

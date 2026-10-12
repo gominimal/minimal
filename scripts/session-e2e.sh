@@ -8171,8 +8171,8 @@ proof_native_resolution_without_proxy_env() {
 #     a VM-backed host the zone is the host's to answer, the guest daemon
 #     starts no answerer, and the CLI reads the host answerer's state from
 #     minvmd's control socket — never through the guest — and prints the
-#     DNS SERVICE line from it: the running VM answering box names
-#     itself, or another VM host daemon answering them.
+#     DNS SERVICE line from it: the VM host daemon answering this VM's
+#     box names, or another VM host daemon answering them.
 #   * The VM host daemon's answerer answers real zone names on the host, and
 #     dig reads the wire a host resolver would, at the port the answerer's
 #     own start record names — the listener it holds, or the machine's
@@ -8232,7 +8232,7 @@ proof_native_resolution_from_host_answerer_on_vm_host() {
   # `mnl ls | grep`: grep's early exit SIGPIPEs the CLI.
   host_answerer_ls="$(mnl ls 2>/dev/null || true)"
   if ! printf '%s\n' "$host_answerer_ls" \
-      | grep -qE -- "DNS SERVICE: +(the running VM is answering box names itself|another VM host daemon answers this VM's box names) on 127\.0\.0\.1:"; then
+      | grep -qE -- "DNS SERVICE: +(the|another) VM host daemon answers this VM's box names on 127\.0\.0\.1:"; then
     echo "::error::min ls does not name the VM host daemon as the zone's answerer — the line the CLI reads from minvmd's control socket is missing"
     echo "--- min ls ---"; printf '%s\n' "$host_answerer_ls"
     fail
@@ -9085,9 +9085,9 @@ proof_box_name_resolves_natively_without_proxy() {
       ;;
   esac
   case "$bn_surface_line" in
-    *"the proxy also listens on 127.0.0.1:"*) ;;
+    *"the hostname proxy also listens on 127.0.0.1:"*) ;;
     *)
-      echo "::error::min ls's surface line does not say the proxy also listens (NET-019)"
+      echo "::error::min ls's surface line does not say the hostname proxy also listens (NET-019)"
       echo "--- BOX NAMES line ---"; printf '%s\n' "$bn_surface_line"
       fail
       ;;
@@ -18078,7 +18078,7 @@ proof_listen_published_port_reaches_peer_and_host() {
   # target's own — a host-native daemon prints "listening on
   # 127.0.0.1:PORT (UDP)", while the VM-backed target this case's own-address
   # box needs names the port in the line the CLI renders from the VM host
-  # daemon's answerer state ("the running VM is answering box names itself
+  # daemon's answerer state ("the VM host daemon answers this VM's box names
   # on 127.0.0.1:PORT (UDP)", or the registered form) — so both spellings
   # read here. A target
   # that names no port has no word for where its boxes are published, and the
