@@ -376,7 +376,8 @@ impl CredentialedUpstream {
     /// The lane's row text with no mode mark: what [`Self::policy_row`]
     /// prints for an own-address box, and what a view prints when it does
     /// not know the box's mode.
-    pub const POLICY_ROW: &'static str = "credentialed upstream  box egress proxy listener";
+    pub const POLICY_ROW: &'static str =
+        "credentialed upstream  allowed to reach the Box Egress Proxy";
 }
 
 /// The networking policy for a session: its egress and ingress configuration.
@@ -673,10 +674,7 @@ pub enum PolicyError {
     /// An ingress port mapping used a transport gvproxy's forwarder cannot
     /// expose. gvproxy only forwards TCP and UDP, so any other protocol (e.g.
     /// ICMP) must be rejected at validation time rather than silently mapped.
-    #[error(
-        "ingress port mapping uses unsupported protocol {proto:?}; \
-         gvproxy's static forwarder supports only TCP and UDP"
-    )]
+    #[error("ingress port mapping uses protocol {proto}; only tcp and udp are supported")]
     UnsupportedIngressProtocol { proto: IpProto },
     /// An ingress port mapping published a host port below 1024. minimald
     /// refuses to configure gvproxy to publish a privileged host port, since
@@ -739,7 +737,7 @@ pub enum PolicyError {
     /// rather than failing opaquely at attach. The same host port on TCP and
     /// on UDP is two distinct binds and is allowed.
     #[error(
-        "ingress port mapping publishes {proto:?} host port {external_port} \
+        "ingress port mapping publishes {proto} host port {external_port} \
          more than once; each host port may appear in at most one ingress \
          mapping per protocol"
     )]
@@ -1443,17 +1441,17 @@ mod tests {
         assert!(CredentialedUpstream::in_effect(NetworkMode::OwnIp));
         assert_eq!(
             CredentialedUpstream::policy_row(NetworkMode::OwnIp),
-            "credentialed upstream  box egress proxy listener"
+            "credentialed upstream  allowed to reach the Box Egress Proxy"
         );
         assert!(!CredentialedUpstream::in_effect(NetworkMode::HostNet));
         assert_eq!(
             CredentialedUpstream::policy_row(NetworkMode::HostNet),
-            "credentialed upstream  box egress proxy listener (not in effect: host_ip box)"
+            "credentialed upstream  allowed to reach the Box Egress Proxy (not in effect: host_ip box)"
         );
         assert!(!CredentialedUpstream::in_effect(NetworkMode::NoNet));
         assert_eq!(
             CredentialedUpstream::policy_row(NetworkMode::NoNet),
-            "credentialed upstream  box egress proxy listener (not in effect: none box)"
+            "credentialed upstream  allowed to reach the Box Egress Proxy (not in effect: none box)"
         );
     }
 
@@ -2169,6 +2167,28 @@ mod tests {
                 external_port: 18080,
                 proto: IpProto::Tcp,
             })
+        );
+    }
+
+    #[test]
+    fn ingress_mapping_errors_name_the_protocol_in_lowercase() {
+        // The protocol is printed the way a user spells it in `--ingress`,
+        // not as the Rust variant name.
+        assert_eq!(
+            PolicyError::UnsupportedIngressProtocol {
+                proto: IpProto::Icmp
+            }
+            .to_string(),
+            "ingress port mapping uses protocol icmp; only tcp and udp are supported"
+        );
+        assert_eq!(
+            PolicyError::DuplicateIngressPort {
+                external_port: 18080,
+                proto: IpProto::Tcp,
+            }
+            .to_string(),
+            "ingress port mapping publishes tcp host port 18080 more than once; \
+             each host port may appear in at most one ingress mapping per protocol"
         );
     }
 
