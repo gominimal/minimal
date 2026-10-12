@@ -712,8 +712,8 @@ pub(crate) mod linux {
     pub(crate) const USERNS_ID: &str = "userns-profile";
     const USERNS_LABEL: &str = "the private sandbox every box runs in";
     pub(crate) const CLASSIFIER_ID: &str = "classifier";
-    const CLASSIFIER_LABEL: &str = "deny-all egress enforced for boxes that share this \
-     machine's address (--network host_ip with --deny-all-egress)";
+    const CLASSIFIER_LABEL: &str = "deny-all egress enforcement for boxes that share this \
+     machine's address (--network host_ip)";
     const KVM_LABEL: &str = "KVM access for the Linux VM provider";
 
     /// The profile the step installs, the very file the checkout ships.
@@ -1065,18 +1065,20 @@ pub(crate) mod linux {
                              installed, or did not finish"
                         } else if !facts.copy_current {
                             "the installed copy of the step that enforces deny-all egress \
-                             is not this version of min's, so an out-of-date copy runs at \
-                             every daemon start"
+                             is missing or out of date, so this version of min's step is \
+                             not what runs at boot or at daemon start"
                         } else {
                             "the step that enforces deny-all egress is installed but its \
-                             systemd units are not, so enforcement stops after a daemon \
-                             restart or a reboot"
+                             systemd units are not, so after a daemon restart a deny-all \
+                             box is refused, and after a reboot it starts with deny-all \
+                             egress not enforced"
                         }
                         .to_string(),
                         format!(
-                            "installs the cgroup tree and packet filter that enforce it \
-                             for {operator}'s daemon, and systemd units that restore them \
-                             at boot and on every daemon start"
+                            "installs the cgroup tree and packet filter that enforce \
+                             deny-all egress for {operator}'s daemon, and systemd units \
+                             that restore them at boot and place the daemon under them on \
+                             every daemon start"
                         ),
                         classifier_steps(operator, socket),
                     );
@@ -2102,7 +2104,11 @@ mod tests {
         );
         assert_eq!(stale.state, ItemState::Missing, "{stale:?}");
         assert!(
-            stale.today.as_deref().unwrap().contains("out-of-date copy"),
+            stale
+                .today
+                .as_deref()
+                .unwrap()
+                .contains("missing or out of date"),
             "{stale:?}"
         );
         assert_eq!(
@@ -2120,10 +2126,16 @@ mod tests {
             sock,
         );
         assert_eq!(unitless.state, ItemState::Missing, "{unitless:?}");
-        assert!(
-            unitless.today.as_deref().unwrap().contains("units are not"),
-            "{unitless:?}"
-        );
+        // An unplaced daemon refuses a deny-all box (the probe cannot read
+        // the table); only the reboot, which loses the tree, runs it unenforced.
+        let today = unitless.today.as_deref().unwrap();
+        for words in [
+            "units are not",
+            "after a daemon restart a deny-all box is refused",
+            "after a reboot it starts with deny-all egress not enforced",
+        ] {
+            assert!(today.contains(words), "{unitless:?}");
+        }
         // A stale copy on a mount the tree cannot live in is still the mount's fault.
         assert_eq!(
             classifier_item_over(
