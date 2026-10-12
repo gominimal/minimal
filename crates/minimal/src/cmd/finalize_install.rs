@@ -713,7 +713,7 @@ pub(crate) mod linux {
     const USERNS_LABEL: &str = "the private sandbox every box runs in";
     pub(crate) const CLASSIFIER_ID: &str = "classifier";
     const CLASSIFIER_LABEL: &str = "deny-all egress enforcement for boxes that share this \
-     machine's address (--network host_ip)";
+     machine's address (--network host_ip with --deny-all-egress)";
     const KVM_LABEL: &str = "KVM access for the Linux VM provider";
 
     /// The profile the step installs, the very file the checkout ships.
@@ -1069,9 +1069,9 @@ pub(crate) mod linux {
                              not what runs at boot or at daemon start"
                         } else {
                             "the step that enforces deny-all egress is installed but its \
-                             systemd units are not, so after a daemon restart a deny-all \
-                             box is refused, and after a reboot it starts with deny-all \
-                             egress not enforced"
+                             systemd units are missing or not enabled, so a daemon restart \
+                             can leave deny-all boxes refused, and a reboot can leave \
+                             deny-all egress not enforced"
                         }
                         .to_string(),
                         format!(
@@ -2088,6 +2088,12 @@ mod tests {
         let item = classifier_item_over(&bare, "alice", sock);
         assert_eq!(item.state, ItemState::Missing, "{item:?}");
         assert!(item.today.as_deref().unwrap().contains("is not enforced"));
+        // The label prints after a done mark too, so it names the thing, not a state.
+        assert_eq!(
+            item.label,
+            "deny-all egress enforcement for boxes that share this machine's address \
+             (--network host_ip with --deny-all-egress)"
+        );
         assert!(item.step.as_deref().unwrap().contains("every daemon start"));
         // The marker over a stale copy: the step is there, but the one the
         // units run is not this build's, so it is missing again and the
@@ -2128,11 +2134,12 @@ mod tests {
         assert_eq!(unitless.state, ItemState::Missing, "{unitless:?}");
         // An unplaced daemon refuses a deny-all box (the probe cannot read
         // the table); only the reboot, which loses the tree, runs it unenforced.
+        // Any one missing unit or link lands here, so the sentence says "can".
         let today = unitless.today.as_deref().unwrap();
         for words in [
-            "units are not",
-            "after a daemon restart a deny-all box is refused",
-            "after a reboot it starts with deny-all egress not enforced",
+            "units are missing or not enabled",
+            "a daemon restart can leave deny-all boxes refused",
+            "a reboot can leave deny-all egress not enforced",
         ] {
             assert!(today.contains(words), "{unitless:?}");
         }
