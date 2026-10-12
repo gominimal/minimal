@@ -171,7 +171,7 @@ fn inherited_session_env_prefix_not_substring() {
 fn spawn_failed_error_without_a_hint_keeps_the_bare_symptom() {
     assert_eq!(
         super::spawn_failed_error(None).to_string(),
-        "session host exited before its channel could attach"
+        "the session's sandbox process exited before the attach could connect to it"
     );
 }
 
@@ -186,7 +186,9 @@ fn spawn_failed_error_with_a_hint_names_the_restriction_and_fix() {
                  profile (one-time, needs root)";
     let msg = super::spawn_failed_error(Some(hint)).to_string();
     assert!(
-        msg.starts_with("session host exited before its channel could attach — "),
+        msg.starts_with(
+            "the session's sandbox process exited before the attach could connect to it — "
+        ),
         "the symptom must stay the error's lead: {msg}"
     );
     assert!(msg.contains(hint), "the diagnosis must travel whole: {msg}");
@@ -1966,7 +1968,8 @@ async fn a_mint_whose_host_dies_before_attach_reports_a_spawn_failure() {
         "the refused attach should surface its error to the client, got: {refusal:?}"
     );
     assert!(
-        refusal.contains("session host exited before its channel could attach"),
+        refusal
+            .contains("the session's sandbox process exited before the attach could connect to it"),
         "a host that died before its channel attached reads as a spawn failure, got: {refusal:?}"
     );
 }
@@ -1988,7 +1991,7 @@ async fn a_mint_whose_host_wedges_reports_busy_instead_of_death() {
         "the refused attach should surface its error to the client, got: {refusal:?}"
     );
     assert!(
-        refusal.contains("session host is busy; retry the attach once it drains"),
+        refusal.contains("the session is busy; run the attach again in a moment"),
         "a host that wedged before its channel attached reads as busy, not exited, got: {refusal:?}"
     );
     assert!(
@@ -2003,7 +2006,7 @@ async fn a_mint_whose_host_wedges_reports_busy_instead_of_death() {
     let mut retry = client.open_shell(id).await;
     let refusal = collect_to_close(&mut retry).await;
     assert!(
-        refusal.contains("session host is busy; retry the attach once it drains"),
+        refusal.contains("the session is busy; run the attach again in a moment"),
         "a retry must reach the kept wedged host, not mint a second one, got: {refusal:?}"
     );
 }
@@ -4015,7 +4018,7 @@ async fn a_box_holding_a_host_row_refuses_remint_after_its_host_loop_ends() {
         "the refusal must be surfaced as an attach error; got: {refusal:?}"
     );
     assert!(
-        refusal.contains("host-side network registration"),
+        refusal.contains("the VM host daemon released this session's network addresses"),
         "the refusal must name the host-row cause; got: {refusal:?}"
     );
     assert!(
@@ -4023,7 +4026,11 @@ async fn a_box_holding_a_host_row_refuses_remint_after_its_host_loop_ends() {
         "the refusal must name the step that registers a box again; got: {refusal:?}"
     );
     assert!(
-        refusal.contains("run the attach or exec again"),
+        refusal.contains("min session destroy <session>"),
+        "the refusal must name the session argument the destroy step takes; got: {refusal:?}"
+    );
+    assert!(
+        refusal.contains("run the same command again"),
         "the refusal must name the re-run that resumes the row; got: {refusal:?}"
     );
     assert_eq!(
@@ -4040,7 +4047,7 @@ async fn assert_attach_refused_rowless(client: &mut TestClient, id: SessionId) {
     let refusal = collect_to_close(&mut channel).await;
     assert!(
         refusal.contains("Error attaching to session:")
-            && refusal.contains("host-side network registration"),
+            && refusal.contains("the VM host daemon released this session's network addresses"),
         "the attach must be refused for the ended host-side row; got: {refusal:?}"
     );
 }
@@ -7946,6 +7953,12 @@ async fn refused_admission_report_leaves_no_partial_mapping() {
                 source.to_string().contains(refusal),
                 "the refused publish carries the grant's own reason: {source}"
             );
+            assert!(
+                source
+                    .to_string()
+                    .contains("the VM host daemon refused to open the port"),
+                "the refused publish says who refused it: {source}"
+            );
         }
         other => panic!("a report the grant refused must fail the publish: {other:?}"),
     }
@@ -8927,7 +8940,8 @@ async fn expose_on_stopped_box_refused() {
         line.contains("port=3000")
             && line.contains("decision=allow")
             && line.contains("outcome=\"refused\"")
-            && line.contains("reason=this box is not running; start the box and try again"),
+            && line
+                .contains("reason=this box is not running, so there is nothing to open a port on"),
         "the refusal names the box, the port, the decision and the reason: {line}"
     );
 }
@@ -9015,8 +9029,7 @@ async fn expose_without_published_address_is_not_a_policy_deny() {
         line.contains("port=3000")
             && line.contains("decision=allow")
             && line.contains("outcome=\"refused\"")
-            && line
-                .contains("reason=this box has no published address on file to expose a port at"),
+            && line.contains("reason=this box was given no address on the host to open a port at"),
         "the line says the decision was allow and the refusal was the missing \
          publish: {line}"
     );

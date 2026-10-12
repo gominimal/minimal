@@ -2941,7 +2941,9 @@ exit $rc
         let lines = read_lines(&theirs);
         assert_eq!(lines.len(), 1, "one reply: {lines:?}");
         assert!(
-            lines[0].starts_with("error: reading the session record for port 3000 failed:"),
+            lines[0].starts_with(
+                "error: port 3000 was not opened: the session's saved state could not be read:"
+            ),
             "the reply is the typed record-read failure: {lines:?}"
         );
 
@@ -2991,7 +2993,7 @@ exit $rc
         let lines = read_lines(&theirs);
         assert_eq!(lines.len(), 1, "one reply: {lines:?}");
         assert!(
-            lines[0].starts_with("error: the session actor for port 3000 is gone"),
+            lines[0].starts_with("error: port 3000 was not opened: the box is stopping or stopped"),
             "a reply channel the actor dropped is its own typed failure: {lines:?}"
         );
 
@@ -3049,8 +3051,9 @@ exit $rc
         assert!(
             lines_for("recweb")[0].contains("port=3000")
                 && lines_for("recweb")[0].contains("outcome=\"refused\"")
-                && lines_for("recweb")[0]
-                    .contains("reason=reading the session record for port 3000 failed"),
+                && lines_for("recweb")[0].contains(
+                    "reason=port 3000 was not opened: the session's saved state could not be read"
+                ),
             "the record-read failure's line names the box, whose name the \
              unreadable record could not: {}",
             lines_for("recweb")[0]
@@ -3059,7 +3062,7 @@ exit $rc
             lines_for("bindweb")[0].contains("port=3000")
                 && lines_for("bindweb")[0].contains("outcome=\"refused\"")
                 && lines_for("bindweb")[0]
-                    .contains("reason=the session actor for port 3000 is gone"),
+                    .contains("reason=port 3000 was not opened: the box is stopping or stopped"),
             "the dropped reply channel's line is this channel's, naming the \
              box: {}",
             lines_for("bindweb")[0]

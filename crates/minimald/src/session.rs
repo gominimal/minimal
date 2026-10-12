@@ -67,7 +67,9 @@ fn userns_spawn_hint() -> Option<String> {
 /// that names neither the restriction nor the fix.
 fn spawn_failed_error(userns_spawn_hint: Option<&str>) -> std::io::Error {
     with_userns_hint(
-        std::io::Error::other("session host exited before its channel could attach"),
+        std::io::Error::other(
+            "the session's sandbox process exited before the attach could connect to it",
+        ),
         userns_spawn_hint,
     )
 }
@@ -157,8 +159,8 @@ impl fmt::Display for AttachError {
             AttachError::LoadoutFailed(e) => write!(f, "configuring session loadout: {e}"),
             AttachError::LaunchRecordUnwritable(e) => write!(
                 f,
-                "recording the launch's egress enforcement on the session \
-                 record: {e}"
+                "starting the session failed: the session's saved state could \
+                 not be updated: {e}"
             ),
             AttachError::SessionPending => write!(
                 f,
@@ -171,14 +173,14 @@ impl fmt::Display for AttachError {
                  attach once the upload completes"
             ),
             AttachError::SessionBusy => {
-                write!(f, "session host is busy; retry the attach once it drains")
+                write!(f, "the session is busy; run the attach again in a moment")
             }
             AttachError::BoxHostRowEnded => write!(
                 f,
-                "this box's host-side network registration has ended; run the attach or \
-                 exec again to resume it, and if that is refused too (the host no longer \
-                 holds the box's record), destroy the session with `min session destroy` \
-                 and activate it again with `min session activate`"
+                "the VM host daemon released this session's network addresses; run \
+                 the same command again to restore them. If it is refused again, \
+                 destroy the session with `min session destroy <session>` and start \
+                 it again with `min session activate`"
             ),
         }
     }
@@ -795,25 +797,31 @@ const HOST_NO_TTY_REASON: &str = "the attached client could not show the prompt;
 fn host_ask_cancel_text(cause: minimald_rpc::AskCancelCause) -> String {
     match cause {
         minimald_rpc::AskCancelCause::LastDetach => {
-            format!("the ask was cancelled: {cause}; nobody is attached any more")
+            format!("the port prompt was cancelled: {cause}; nobody is attached any more")
         }
-        _ => format!("the ask was cancelled: {cause}"),
+        _ => format!("the port prompt was cancelled: {cause}"),
     }
 }
 
 /// A host refusal as the expose's failure names it.
 fn host_ask_refusal_text(reason: minimald_rpc::AskRefused) -> &'static str {
     match reason {
-        minimald_rpc::AskRefused::QueueFull => "the box's pending-ask queue is full",
-        minimald_rpc::AskRefused::NoRow => "the VM host daemon holds no row for this box",
-        minimald_rpc::AskRefused::StanceNotAsk => "the box's host-held stance is not ask",
+        minimald_rpc::AskRefused::QueueFull => {
+            "too many port prompts from this box are already waiting for an answer"
+        }
+        minimald_rpc::AskRefused::NoRow => {
+            "this box's network addresses are not registered with the VM host daemon"
+        }
+        minimald_rpc::AskRefused::StanceNotAsk => {
+            "the VM host daemon does not have this box's --dynamic-ingress set to ask"
+        }
         minimald_rpc::AskRefused::OutsideGrant => {
-            "the port is outside the box's host-held dynamic range"
+            "the port is outside the --dynamic-range the VM host daemon holds for this box"
         }
         minimald_rpc::AskRefused::NoClient => "nobody is attached on the host to answer",
-        minimald_rpc::AskRefused::Denied => "the attached human answered no",
-        minimald_rpc::AskRefused::NoTty => "the host client had no terminal for the dialog",
-        minimald_rpc::AskRefused::Cancelled => "the ask was cancelled before an answer",
+        minimald_rpc::AskRefused::Denied => "the person attached answered no",
+        minimald_rpc::AskRefused::NoTty => "the attached terminal could not show the prompt",
+        minimald_rpc::AskRefused::Cancelled => "the port prompt was cancelled before an answer",
     }
 }
 
@@ -3233,7 +3241,7 @@ impl Session {
             AskEnd::HostRefused(reason) => Err(crate::net::policy::ExposeFailure::Publish {
                 port: ask.port,
                 source: std::io::Error::other(format!(
-                    "the VM host daemon refused the ask: {}",
+                    "the VM host daemon refused the port prompt: {}",
                     host_ask_refusal_text(*reason)
                 )),
             }),
@@ -4289,9 +4297,10 @@ impl Session {
                 // the full flow.
                 return Err(AttachError::LoadoutFailed(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
-                    "composition has patches that only `min session activate` can upload; \
-                     the attach shortcut can't drive that sequence — destroy this session \
-                     and re-activate through the CLI",
+                    "this session's configuration includes patches that only \
+                     `min session activate` can apply; destroy it with \
+                     `min session destroy <session>`, then run \
+                     `min session activate` again",
                 )));
             }
             // No patches: finalize inline so the shortcut still
