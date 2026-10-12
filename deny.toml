@@ -15,6 +15,11 @@ ignore = [
     # in 0.2.0, but nickel master still pins "0.1"; drop this ignore once a
     # nickel rev carrying the 0.2 bump is pinned in Cargo.toml.
     "RUSTSEC-2026-0292",
+    # unsafe-libyaml is archived upstream and has no maintained release.
+    # Reached only via nickel-lang-core -> serde_yaml, a non-optional nickel
+    # dependency used for its YAML export and error formats. Drop this ignore
+    # once a pinned nickel release moves off serde_yaml.
+    "RUSTSEC-2024-0449",
 ]
 
 [licenses]
