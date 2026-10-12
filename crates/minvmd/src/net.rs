@@ -141,7 +141,8 @@ async fn wait_for_switch_socket(sock: &Path, timeout: Duration) -> io::Result<()
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     format!(
-                        "gvproxy switch socket {} did not appear within {timeout:?}: {e}",
+                        "the VM's network helper (gvproxy) was not accepting connections on its \
+                         socket {} after {timeout:?}: {e}",
                         sock.display()
                     ),
                 ));
@@ -923,7 +924,7 @@ impl HostGvproxy {
             Err(_) => {
                 let _ = thread.join();
                 Err(io::Error::other(
-                    "host gvproxy supervisor thread exited before reporting readiness",
+                    "the VM's network helper (gvproxy) stopped before it was ready",
                 ))
             }
         }

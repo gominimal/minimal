@@ -1164,7 +1164,9 @@ fn serve_held_registration(
         write_reply(
             stream,
             &BoxControlReply::Error {
-                error: format!("the VM host daemon could not hold the registration: {error}"),
+                error: format!(
+                    "the VM host daemon could not keep the registration connection open: {error}"
+                ),
             },
         )
     };
@@ -1227,7 +1229,9 @@ fn hold_registration_lease(
             if let Err(write_error) = write_reply(
                 &mut stream,
                 &BoxControlReply::Error {
-                    error: format!("the VM host daemon could not hold the registration: {error}"),
+                    error: format!(
+                        "the VM host daemon could not keep the registration connection open: {error}"
+                    ),
                 },
             ) {
                 tracing::debug!(error = %write_error, "could not write the lease refusal");
@@ -1557,7 +1561,7 @@ fn allocate_box_address(
             "box registration refused: the zone answerer handed out no address"
         );
         BoxControlReply::Error {
-            error: format!("the zone answerer could not allocate a box address: {reason}"),
+            error: format!("could not give the box an address: {reason}"),
         }
     })
 }
@@ -1910,7 +1914,9 @@ fn spawn_ask_thread(
             write_reply(
                 &mut stream,
                 &BoxControlReply::Error {
-                    error: format!("the VM host daemon could not serve the ask verb: {error}"),
+                    error: format!(
+                        "the VM host daemon could not start handling the port prompt: {error}"
+                    ),
                 },
             )
         }
@@ -2140,12 +2146,20 @@ fn refuse_past_cap(
             "refused a connection past the VM host daemon's cap"
         );
     }
+    // The kind in the words a person reads; the log lines keep the daemon's.
+    let connections = match kind {
+        "guest ask" => "port prompt connections".to_owned(),
+        "ask subscription" => "connections waiting for port prompts".to_owned(),
+        "registration lease" => "box registration connections".to_owned(),
+        // A kind with no phrase of its own reads under the daemon's word.
+        other => format!("{other} connections"),
+    };
     write_reply(
         stream,
         &BoxControlReply::Error {
             error: format!(
-                "the VM host daemon is already serving {cap} {kind} connections; try again \
-                 once one ends"
+                "the VM host daemon is at its limit of {cap} {connections}; try again once one \
+                 ends"
             ),
         },
     )
@@ -2485,7 +2499,7 @@ fn serve_ask_subscription(
             &mut stream,
             &BoxControlReply::Error {
                 error: format!(
-                    "no live box row holds box id {}; there are no asks to subscribe to",
+                    "no running box has id {}, so there are no port prompts to wait for",
                     crate::bep_attach::BoxIdText(&box_id)
                 ),
             },
@@ -2611,7 +2625,9 @@ fn record_ask_answer(
             );
             audit_ask(audit_path, AskAudit::new("refused_unknown_id", ask_id));
             BoxControlReply::Error {
-                error: format!("no pending or recently ended ask holds id {ask_id}"),
+                error: format!(
+                    "port prompt {ask_id} is not pending and did not end recently; nothing was changed"
+                ),
             }
         }
     }
@@ -5572,7 +5588,7 @@ mod tests {
         let mut past = guest_ask(&host, &web, ASK_PORT + 2);
         let refused_ask = past.next();
         assert!(
-            matches!(&refused_ask, BoxControlReply::Error { error } if error.contains("2 guest ask")),
+            matches!(&refused_ask, BoxControlReply::Error { error } if error.contains("limit of 2 port prompt connections")),
             "the third guest ask is refused at the cap: {refused_ask:?}"
         );
         assert_eq!(
@@ -5587,7 +5603,7 @@ mod tests {
         );
         let refused_sub = second.next();
         assert!(
-            matches!(&refused_sub, BoxControlReply::Error { error } if error.contains("1 ask subscription")),
+            matches!(&refused_sub, BoxControlReply::Error { error } if error.contains("limit of 1 connections waiting for port prompts")),
             "the second subscription is refused at the cap: {refused_sub:?}"
         );
         held.clear();
@@ -5683,7 +5699,7 @@ mod tests {
         let refused =
             control_past_cap(&BoxControlRequest::AnswererStatus).expect("the refusal is answered");
         assert!(
-            matches!(&refused, BoxControlReply::Error { error } if error.contains("1 control")),
+            matches!(&refused, BoxControlReply::Error { error } if error.contains("limit of 1 control connections")),
             "a connection past the cap is refused: {refused:?}"
         );
 
@@ -6368,7 +6384,7 @@ mod tests {
         let (_second, refused) = register_holding(&host.sock_path, "db");
         match &refused {
             BoxControlReply::Error { error } => assert!(
-                error.contains("already serving 1 registration lease connections"),
+                error.contains("limit of 1 box registration connections"),
                 "the refusal names the cap, got {error}"
             ),
             other => panic!("a lease past the cap is refused, got {other:?}"),
