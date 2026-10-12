@@ -2000,7 +2000,9 @@ pub(crate) fn ensure_interactive_attach_tty(stdin_is_tty: bool) -> Result<(), an
 /// answers on a VM-backed host (NET-045): the attach subscribes on the VM
 /// host daemon's control socket beside `sock` and renders each ask's dialog
 /// while the relay is suspended. `None` on a native host, where the
-/// session's own binding asks, and for every exec channel.
+/// session's own binding asks, and for every exec channel. The subscription
+/// is made only for a box whose record carries an address pair
+/// ([`host_asks_target`]).
 pub(crate) async fn session_via_ssh(
     sock: &std::path::Path,
     id: sessions::SessionId,
@@ -2049,8 +2051,6 @@ pub(crate) async fn session_via_ssh(
 
     if wire.is_none() {
         let stdin_is_tty = std::io::stdin().is_terminal();
-        let host_asks = host_asks_for
-            .and_then(|name| control_sock_beside(sock).map(|control| (control, name.to_string())));
         // The pair the box's row was registered with, read before the
         // attach: an attach that ends in a daemon-side destroy leaves no
         // record to read it from, and the row is still this client's to
@@ -2059,6 +2059,7 @@ pub(crate) async fn session_via_ssh(
             Some(_) => record.and_then(|record| record.box_addresses),
             None => None,
         };
+        let host_asks = host_asks_target(control_sock_beside(sock), host_asks_for, box_addresses);
         // The relay blocks its thread until ssh exits, so it runs off the
         // runtime's workers.
         let code = tokio::task::spawn_blocking(move || {
@@ -2131,11 +2132,26 @@ pub(crate) async fn session_via_ssh(
     std::process::exit(128 + signo);
 }
 
+/// Where an interactive attach subscribes to its box's pending asks
+/// (NET-045): the VM host daemon's control socket and the box's name, for a
+/// box whose record carries an address pair. Only such a box registered a
+/// row with the VM host daemon, and the subscription reads that row; a
+/// `host_ip` or `none` box, and a session whose record could not be read,
+/// has none, so no subscription is attempted and nothing is said.
+fn host_asks_target(
+    control: Option<std::path::PathBuf>,
+    host_asks_for: Option<&str>,
+    box_addresses: Option<sessions::BoxAddresses>,
+) -> Option<(std::path::PathBuf, String)> {
+    box_addresses?;
+    Some((control?, host_asks_for?.to_string()))
+}
+
 /// Subscribe an interactive attach to its box's pending asks on the VM host
-/// daemon (NET-045), from the control socket and the box's name. A
-/// subscription that cannot be made leaves the attach as it is: the box's
-/// asks are then refused at the host for want of an attached client, and
-/// the reason is said here.
+/// daemon (NET-045), from the target [`host_asks_target`] chose; `None`
+/// attempts nothing. A subscription that was attempted and cannot be made
+/// leaves the attach as it is: the box's asks are then refused at the host
+/// for want of an attached client, and the reason is said here, once.
 fn subscribe_host_asks(
     target: Option<(std::path::PathBuf, String)>,
 ) -> Option<minimal_client::attach::HostAsks> {
@@ -2143,7 +2159,7 @@ fn subscribe_host_asks(
     match minimal_client::attach::HostAsks::subscribe(&control, &name) {
         Ok(asks) => Some(asks),
         Err(error) => {
-            tracing::warn!(box = %name, error = %format!("{error:#}"), "could not subscribe to the box's asks");
+            tracing::debug!(box = %name, error = %format!("{error:#}"), "could not subscribe to the box's asks");
             eprintln!(
                 "warning: this attach cannot answer box '{name}' asking to publish a port: \
                  {error:#}"
@@ -2154,7 +2170,8 @@ fn subscribe_host_asks(
 }
 
 /// The box an interactive attach answers asks for (NET-045): its name, on a
-/// VM-backed host only.
+/// VM-backed host only. Whether the attach subscribes for it is decided
+/// from its record ([`host_asks_target`]).
 pub(crate) fn host_asks_box(global: &GlobalArgs, name: Option<&str>) -> Option<String> {
     (daemon_provider_kind(global) == paths::ProviderKind::Minvmd)
         .then_some(name)
@@ -4331,6 +4348,34 @@ mod tests {
         CredentialedUpstream, DynamicIngress, EffectiveEgress, EffectiveSessionPolicy,
         IngressPolicy, IpProto, NetworkMode, PortMapping,
     };
+
+    /// A box with no address pair registered no row with the VM host daemon:
+    /// the attach gets no subscription target, so no control-socket request
+    /// is made. That covers a `host_ip` or `none` box and a record that
+    /// could not be read.
+    #[test]
+    fn host_asks_target_is_none_for_a_box_with_no_address_pair() {
+        let control = std::path::PathBuf::from("/run/vm/control.sock");
+        assert_eq!(host_asks_target(Some(control), Some("web"), None), None);
+    }
+
+    /// A box whose record carries its address pair on a VM-backed host is
+    /// subscribed for, at the control socket and under its name; a native
+    /// host (no box named) or a missing control socket still yields none.
+    #[test]
+    fn host_asks_target_names_the_control_socket_and_box_with_an_address_pair() {
+        let control = std::path::PathBuf::from("/run/vm/control.sock");
+        let addresses = sessions::BoxAddresses {
+            switch_address: std::net::Ipv4Addr::new(100, 64, 0, 2),
+            loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 0),
+        };
+        assert_eq!(
+            host_asks_target(Some(control.clone()), Some("web"), Some(addresses)),
+            Some((control.clone(), "web".to_string()))
+        );
+        assert_eq!(host_asks_target(Some(control), None, Some(addresses)), None);
+        assert_eq!(host_asks_target(None, Some("web"), Some(addresses)), None);
+    }
 
     #[test]
     fn normalize_subnets_masks_host_bits_and_keeps_the_rest() {
