@@ -221,7 +221,9 @@ Remove or rewrite a message that does neither.
 - An instruction names a command the user can run as written. If no such
   command exists, state the situation and stop.
 - A command that takes an argument shows it. Fill in the value when the
-  message knows it. Use a placeholder in angle brackets only when it does not.
+  message knows it. Use a placeholder in angle brackets when it does not, or
+  when the value is a secret. A secret prints only where the command itself
+  just issued it for the user to keep.
 - Say only what the code can prove. Leave out a remedy that you did not check
   against the code path that prints the message.
 - When one condition covers several causes with different outcomes, say what
@@ -240,20 +242,23 @@ Remove or rewrite a message that does neither.
 **Do not add a message before the box shell on a healthy start.** On an
 interactive attach, the shell's first paint replaces whatever the command
 printed before it, so nobody can read a line there. A command that does not
-attach, or that runs without a terminal, prints lines that stay.
+attach, or that runs without a terminal, prints lines that stay. A healthy
+start is one that reaches the shell with nothing for the user to do. A value
+that a command prints on stdout for a script to read is output, not a message.
 
 - This rule governs new messages. A line that a spec requires at session
   start stays until that spec changes. Do not remove it to satisfy this rule.
 - On the healthy path, do not add a warning or a note to an interactive start
   or attach.
-- A line can appear before the shell only when the command cannot continue
-  without a decision from the user. That line is a prompt that waits for an
-  answer. A prompt is never for information, and an advisory never becomes a
-  prompt.
-- Without a terminal, or with `--no-input`, a prompt becomes an immediate
+- A new line can appear before the shell only when the command cannot
+  continue without a decision from the user. That line is a prompt that waits
+  for an answer. A prompt is never for information, and an advisory never
+  becomes a prompt.
+- Without a terminal, or with `--no-input`, a new prompt is an immediate
   error that names the flag that answers it, and the command does not wait.
-- Anything else worth telling goes to a surface that stays, such as `min ls`,
-  `min session policy`, `min dash`, a notice inside the box, or the log.
+- Anything else worth telling the user goes to a surface that stays, such as
+  `min ls`, `min session policy`, `min dash` or a notice inside the box. A
+  detail for whoever debugs the start goes to the log.
 - An error that ends the command is not covered by this rule: the command
   exits non-zero and the text stays on screen.
 
@@ -263,7 +268,7 @@ attach, or that runs without a terminal, prints lines that stay.
   prints it and the surface it appears on.
 - Say why it is true: name the code path or state that makes it so.
 - List the tests and scripts that pin the text, so the change updates them.
-- If a spec fixes the old text, say so. Change the spec in the same piece of
+- If a spec pins the old text, say so. Change the spec in the same piece of
   work, or record the spec line that must follow in an issue linked from the
   PR.
 
