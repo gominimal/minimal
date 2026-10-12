@@ -233,6 +233,8 @@ printf 'mock-gvproxy-switch-arm64-body\n' >"$mock/versions/v1/gvproxy-min-linux-
 # architecture is exercised with its own artifact and hash).
 write_min_stub "$mock/versions/v1/minimal-darwin-arm64" darwin-arm64
 printf 'darwin-arm64-answerer-body\n'    >"$mock/versions/v1/minzoned-macos-arm64"
+# One of the other files of the app bundle the answerer ships in on macOS.
+printf 'darwin-arm64-answerer-info-body\n' >"$mock/versions/v1/minzoned-macos-arm64-Info.plist"
 printf 'darwin-arm64-rootfs-body\n'      >"$mock/versions/v1/rootfs-darwin-arm64.img"
 
 # AppArmor components: noarch text (the loader is a runnable stub here), shipped
@@ -262,6 +264,7 @@ h_gvmin_arm="$(hash_file "$mock/versions/v1/gvproxy-min-linux-arm64")"
 
 h_dmin="$(hash_file "$mock/versions/v1/minimal-darwin-arm64")"
 h_danswerer="$(hash_file "$mock/versions/v1/minzoned-macos-arm64")"
+h_dinfo="$(hash_file "$mock/versions/v1/minzoned-macos-arm64-Info.plist")"
 h_drootfs="$(hash_file "$mock/versions/v1/rootfs-darwin-arm64.img")"
 
 h_aaprof="$(hash_file "$mock/versions/v1/minimald.apparmor")"
@@ -316,7 +319,9 @@ write_manifest() {
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
             minimal darwin arm64 v1 "$h_dmin" file bin/min versions/v1/minimal-darwin-arm64
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
-            minzoned darwin arm64 v1 "$h_danswerer" file bin/minzoned versions/v1/minzoned-macos-arm64
+            minzoned darwin arm64 v1 "$h_danswerer" file bin/Minimal.app/Contents/MacOS/minzoned versions/v1/minzoned-macos-arm64
+        printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+            minzoned-info darwin arm64 v1 "$h_dinfo" file bin/Minimal.app/Contents/Info.plist versions/v1/minzoned-macos-arm64-Info.plist
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
             rootfs darwin arm64 v1 "$h_drootfs" file data/rootfs.img versions/v1/rootfs-darwin-arm64.img
         # AppArmor support files ship to every Linux arch.
@@ -740,6 +745,8 @@ case_finalize_install_uninstall() {
             /etc/nsswitch.conf|/etc/resolv.conf) continue ;;
             # System directories the step installs into and leaves.
             /Library/LaunchDaemons|/Library/PrivilegedHelperTools) continue ;;
+            # Paths inside the app bundle, which the advice removes whole.
+            /Library/PrivilegedHelperTools/Minimal.app/*) continue ;;
             # A fixture path in the source's own tests.
             /opt/minimal-test/*) continue ;;
             '') continue ;;
@@ -795,6 +802,9 @@ EOF
     check 0 "$rc" "darwin: uninstall-net-setup seed install exits 0"
     fake_nsd="$root/fake net root-d \$HOME"
     for f in etc/resolver/min.internal Library/LaunchDaemons/dev.gominimal.zone.plist \
+        Library/PrivilegedHelperTools/Minimal.app/Contents/MacOS/minzoned \
+        Library/PrivilegedHelperTools/Minimal.app/Contents/Info.plist \
+        Library/PrivilegedHelperTools/Minimal.app.old/Contents/MacOS/minzoned \
         Library/PrivilegedHelperTools/minzoned Library/LaunchDaemons/dev.minimal.local-range.plist \
         Library/PrivilegedHelperTools/dev.minimal.local-range \
         "Library/Application Support/minimal/run/answerer.sock"; do
@@ -812,6 +822,7 @@ EOF
         test -f "$fake_nsd/etc/resolver/min.internal"
     apply_remedies 1
     for f in etc/resolver/min.internal Library/LaunchDaemons/dev.gominimal.zone.plist \
+        Library/PrivilegedHelperTools/Minimal.app Library/PrivilegedHelperTools/Minimal.app.old \
         Library/PrivilegedHelperTools/minzoned Library/LaunchDaemons/dev.minimal.local-range.plist \
         Library/PrivilegedHelperTools/dev.minimal.local-range \
         "Library/Application Support/minimal"; do
@@ -2832,7 +2843,8 @@ case_linux_vm_stack() {
 case_linux_amd64_manifest_ships_vm_stack() { case_linux_vm_stack amd64; }
 case_linux_arm64_manifest_ships_vm_stack() { case_linux_vm_stack arm64; }
 
-# --- NET-122: the answerer ships beside min on every platform, as the copy
+# --- NET-122: the answerer ships beside min on every platform (on macOS
+# inside the app bundle bin/Minimal.app), as the copy
 # source the session advisory's privileged step copies from. The installer
 # places it with the same rules as the other binaries and writes no unit or
 # plist naming the user-prefix path — the advisory's one privileged command is
@@ -2886,18 +2898,57 @@ case_answerer_source_installed() {
         "arm64: the answerer installs beside min"
     PLAT_M=x86_64
 
-    # darwin/arm64: beside min, dequarantined like every other bin row,
-    # recorded at the user prefix.
+    # darwin/arm64: inside the app bundle beside min, one row per bundle
+    # file, dequarantined like every other bin row, recorded at the user
+    # prefix.
     PLAT_S=Darwin; PLAT_M=arm64
     : >"$root/xattr.calls"
     H_A3="$root/h_ans_darwin"; mkdir -p "$H_A3"
+    _app="bin/Minimal.app/Contents"
     run ans_darwin_install "$H_A3"
     check 0 "$rc" "darwin install with the answerer row exits 0"
-    want_ok "darwin: the answerer installs beside min" test -f "$H_A3/bin/minzoned"
+    check "$h_danswerer" "$(hash_file "$H_A3/$_app/MacOS/minzoned")" \
+        "darwin: the answerer installs inside the app bundle beside min"
+    want_ok "darwin: the answerer is executable like every bin row" test -x "$H_A3/$_app/MacOS/minzoned"
+    check "$h_dinfo" "$(hash_file "$H_A3/$_app/Info.plist")" \
+        "darwin: the bundle's other files install at their paths inside it"
+    want_err "darwin: no bare answerer is installed beside the bundle" test -e "$H_A3/bin/minzoned"
     want_ok "darwin: quarantine stripped from the answerer bin (xattr)" \
-        grep -q "/bin/minzoned\.tmp" "$root/xattr.calls"
+        grep -q "/$_app/MacOS/minzoned\.tmp" "$root/xattr.calls"
     want_ok "darwin: the answerer is recorded at its user-prefix path" \
-        record_has minzoned "$H_A3/bin/minzoned" "$H_A3/xdg-state/minimal/installed"
+        record_has minzoned "$H_A3/$_app/MacOS/minzoned" "$H_A3/xdg-state/minimal/installed"
+    run ans_darwin_uninstall "$H_A3" --uninstall
+    check 0 "$rc" "darwin uninstall exits 0"
+    want_err "darwin: uninstall leaves no bundle directory behind" test -e "$H_A3/bin/Minimal.app"
+
+    # A release from before the bundle placed the answerer at bin/minzoned.
+    # Upgrading to a release with the bundle removes that file, so it does
+    # not stay on PATH as a second copy source; and a channel that points
+    # back at the older release leaves no half bundle.
+    H_A4="$root/h_ans_darwin_moved"; mkdir -p "$H_A4"
+    # shellcheck disable=SC2016  # $1.. are awk's fields, not shell parameters
+    awk '$1=="minzoned-info" && $2=="darwin" {next}
+         $1=="minzoned" && $2=="darwin" {$7="bin/minzoned"} {print}' \
+        "$root/good-components" >"$root/pre-bundle-components"
+    cp "$root/pre-bundle-components" "$mock/versions/v1/components"
+    run ans_darwin_pre_bundle "$H_A4"
+    check 0 "$rc" "darwin install from a release before the bundle exits 0"
+    want_ok "darwin: that release installs the bare answerer" test -f "$H_A4/bin/minzoned"
+    cp "$root/good-components" "$mock/versions/v1/components"   # restore
+    run ans_darwin_moved "$H_A4"
+    check 0 "$rc" "darwin upgrade to the bundle exits 0"
+    want_ok "darwin: the upgrade installs the bundle" test -f "$H_A4/$_app/MacOS/minzoned"
+    want_err "darwin: the upgrade removes the answerer's old path" test -e "$H_A4/bin/minzoned"
+    want_ok "darwin: the installer says what it removed" \
+        grep -q "minzoned: removed .*/bin/minzoned (the release now places it elsewhere)" "$OUT"
+    want_err "darwin: the removed path is no longer recorded" \
+        record_has minzoned "$H_A4/bin/minzoned" "$H_A4/xdg-state/minimal/installed"
+    cp "$root/pre-bundle-components" "$mock/versions/v1/components"
+    run ans_darwin_back "$H_A4"
+    check 0 "$rc" "darwin install back to the release before the bundle exits 0"
+    want_ok "darwin: the bare answerer is back" test -f "$H_A4/bin/minzoned"
+    want_err "darwin: no half bundle is left behind" test -e "$H_A4/bin/Minimal.app"
+    cp "$root/good-components" "$mock/versions/v1/components"   # restore
     PLAT_S=Linux; PLAT_M=x86_64
 }
 
