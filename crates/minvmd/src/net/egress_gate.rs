@@ -3048,8 +3048,8 @@ async fn revoke_on_row_withdrawal(
 ///
 /// A listener the box held may have another box's declared forward waiting
 /// on it ([`PublishedForwards`]). The box's own waiting forwards are dropped
-/// first: nothing is bound for a box that ended. Each listener the passes
-/// unbind is handed to its waiting forward in the same step
+/// first: nothing is bound for a box that ended. Each listener a pass
+/// unbinds is handed to its waiting forward in the same step
 /// ([`unbind_pass`]), and a hand-over whose expose failed is retried with
 /// each unbind pass and then on the whole of `backoff` again, once the
 /// box's own unbinds are done or given up ([`retry_hand_overs`]): the waits
