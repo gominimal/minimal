@@ -1,9 +1,9 @@
 //! Session primitives: lifecycle hooks and loadouts that describe the runtime
 //! shape of a Minimal session.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddrV4};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -1244,6 +1244,18 @@ pub struct Record {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub host_row_bound: bool,
 
+    /// The published loopback `address:port`s this box held, and so bound a
+    /// forward for, at its last host launch (NET-129). Read back at the
+    /// box's first publish after a daemon restart: several boxes can
+    /// publish one port at a shared address, one of them holds it, and the
+    /// box that was serving it before the restart takes it again whichever
+    /// box the restart publishes first. Daemon-owned, like
+    /// [`Self::host_ip_enforcement`]. Empty for a box that has not launched,
+    /// one that held no port at its last launch, and a record that predates
+    /// the field.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub bound_ports: BTreeSet<SocketAddrV4>,
+
     /// Free-form attributes.
     pub attrs: BTreeMap<String, String>,
 }
@@ -1470,6 +1482,7 @@ mod tests {
             host_ip_enforcement: None,
             box_id: None,
             host_row_bound: false,
+            bound_ports: std::collections::BTreeSet::new(),
             attrs: BTreeMap::new(),
         }
     }
