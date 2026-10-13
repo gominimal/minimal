@@ -4603,7 +4603,8 @@ impl Session {
             tracing::warn!(
                 session_id = %record.id,
                 %error,
-                "the launch could not record the shared-address ports it bound;                  a daemon restart may hand them to another box"
+                "the launch could not record the shared-address ports it bound; \
+                 a daemon restart may hand them to another box"
             );
         }
         Ok((channel, (host, task)))
