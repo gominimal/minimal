@@ -638,10 +638,20 @@ const RANGE_ALIAS_MASK: &str = "0xffffffff";
 /// so each took the `/8` of its class. Such an address still binds, so the
 /// bind probe reads the range present. The root-owned program that added it
 /// runs again at every boot, and this is the read that tells an installed
-/// unit from one whose program still applies the wrong mask. An address
-/// listed twice, once at `/32` and once wider, counts as wide. Pure over
+/// unit from one whose program still applies the wrong mask. Pure over
 /// the output, so the parse is unit-tested on every platform the suite
 /// runs on.
+///
+/// An address listed twice, once at `/32` and once wider, counts as wide.
+/// That is stricter than the range program's own skip, which looks only for
+/// the `/32` line, and it is on purpose. An interface holds one entry per
+/// address, so applying an address it already carries updates that entry:
+/// on a host that carried the range at `/8`, the re-applied address read
+/// one line at `/32` and none at `/8`. No host is known to list an address
+/// twice, and no command of the range program would repair one that did.
+/// So if one ever does, this read keeps the step open and names the
+/// address, where the looser check would report a finished install over a
+/// `/8` line.
 pub(crate) fn wide_range_alias(present: &str) -> Option<String> {
     present.lines().find_map(|line| {
         let mut words = line.split_whitespace();
