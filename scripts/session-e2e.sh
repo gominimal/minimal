@@ -7780,7 +7780,7 @@ setup_classifier_teardown() {
 setup_script_elevates() {
   printf '%s\n' "$1" | awk '
     /^[[:space:]]*#/ { next }
-    /(^|[;&|(]|then|do|else)[[:space:]]*sudo([[:space:]]|$)/ { found = 1 }
+    /(^|[;&|({`!]|(^|[^[:alnum:]_])(then|do|else|if|elif|while|until|time))[[:space:]]*sudo([[:space:]]|$)/ { found = 1 }
     END { exit !found }'
 }
 
