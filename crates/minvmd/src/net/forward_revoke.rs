@@ -116,6 +116,15 @@ pub(crate) fn held_answer() -> Vec<u8> {
     .into_bytes()
 }
 
+/// The answer gvproxy gives an expose it bound, as the daemon's client
+/// reads it: a 2xx status and no body. The gate answers with it a publish
+/// of a forward its own expose already bound for the publishing box
+/// ([`expose`]), so the guest reads what the switch would have said had it
+/// bound the forward for that request.
+pub(crate) fn bound_answer() -> &'static [u8] {
+    b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+}
+
 /// One forwarded TCP connection, keyed from the box's side: the box's
 /// address and port, then the peer's address and port. The peer is the
 /// switch's own stack, which dials the box for the host-side listener.
