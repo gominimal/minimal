@@ -404,9 +404,13 @@ fuzz crate target *args: (_need "cargo-fuzz" "cargo install cargo-fuzz --locked"
     [ -f "fuzz/{{target}}.dict" ] && dict="-dict=fuzz/{{target}}.dict"
     cargo +nightly fuzz run {{target}} -- -rss_limit_mb=2048 $dict {{args}}
 
+# Extra arguments go to nextest positionally, so a filterset like
+# `-E 'not binary(/_integration$/)'` stays one word (the macOS lane's unit step).
+#
 # Unit + in-process integration tests. CI: every lane's core-tests suite.
-test: _nextest
-    cargo nextest run {{scope}} {{ci-profile}} --locked --no-tests=fail
+[positional-arguments]
+test *args: _nextest
+    cargo nextest run {{scope}} {{ci-profile}} --locked --no-tests=fail "$@"
 
 # The tight loop while writing one test. Output is shown, so a test that prints
 # a measurement is readable without remembering `--no-capture`, and
@@ -424,6 +428,14 @@ test-one filter *args: _nextest
 # Doctests — nextest can't run them, so they are their own surface.
 doctest:
     cargo test {{scope}} --doc --locked
+
+# CI: the macOS unit job stages this archive for the mini's hypervisor tier, so
+# the archived package set is whatever `scope` names, never a second list.
+#
+# Archive this host's test binaries for replay elsewhere (`just test-archive out.tar.zst`).
+[positional-arguments]
+test-archive file: _nextest
+    cargo nextest archive {{scope}} --locked --archive-file "$1"
 
 # Regenerate the minimal-tui insta snapshots after an intentional render change;
 # `just test` fails until these are updated. Review the diff, then `just test` to verify.

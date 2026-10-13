@@ -89,6 +89,8 @@ jobs:
                         # boot the VM on HVF (parity with the KVM lane's filter).
                         - ".minimal/minimal.toml"
                         - ".github/workflows/ci-macos.yml"
+                        # The unit job's crate scope lives in the justfile.
+                        - "justfile"
                         - "scripts/**"
                         # Composite actions this lane's setup runs through — without
                         # these, a composite-only edit would skip this lane and
@@ -407,9 +409,9 @@ jobs:
               # Run every full-boot harness the archive carries by the `_integration`
               # convention — `binary(/_integration$/)` minus the `_root_integration` harnesses
               # (Linux-only; empty here) and minus krun_smoke_integration (the kernel-less
-              # FFI smoke run above; the sessions unit binaries the archive also
-              # carries don't match the filterset — their tier ran on the hosted
-              # `unit` job). Currently boot_integration, minimald_session_integration,
+              # FFI smoke run above; the other unit binaries the archive also
+              # carries (the justfile's darwin `scope`) don't match the
+              # filterset — their tier ran on the hosted `unit` job). Currently boot_integration, minimald_session_integration,
               # and volume_quiesce_integration; a new *_integration.rs joins with no yaml. Each
               # boots the GENERIC upstream rootfs with minimald as the initramfs
               # /init and drives the full Stage-2 path (russh client -> bridge ->
@@ -553,13 +555,17 @@ jobs:
             - name: Provision libkrun (pinned own build)
               uses: ./.github/actions/setup-libkrun-macos
             - name: Install nextest
+              # just too: the test steps below call justfile recipes, so the
+              # crate list lives only in the justfile's `scope` variable.
               uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
               with:
-                  tool: nextest
+                  tool: nextest,just
             - name: Clippy (minvmd)
               run: cargo clippy -p minvmd --all-targets --locked -- -D warnings
-            - name: Unit tests (minvmd + sessions)
-              # sessions is platform-sensitive surface: std::fs::canonicalize
+            - name: Unit tests (justfile darwin scope)
+              # The crates are the justfile's darwin `scope` (minvmd + sessions
+              # today); rename or add one there, not here. sessions is
+              # platform-sensitive surface: std::fs::canonicalize
               # behavior on prefix-symlinked roots (/tmp → /private/tmp on
               # macOS) and the follow_symlinks dual-path policy logic. The
               # `_integration` harnesses are excluded here — they are the
@@ -572,12 +578,10 @@ jobs:
               # (`cargo build -p minimal` is fine: no dev-deps.) The CLI's macOS
               # coverage stays the session e2e until minimald's sandbox deps
               # are cfg(linux)-gated.
-              run: |
-                  cargo nextest run -p minvmd -p sessions --locked --profile ci \
-                    --no-tests=fail -E 'not binary(/_integration$/)'
-            - name: Doctests (minvmd + sessions)
+              run: just test --profile ci -E 'not binary(/_integration$/)'
+            - name: Doctests (justfile darwin scope)
               # nextest does not run doctests; same split as core-tests.
-              run: cargo test --doc -p minvmd -p sessions --locked
+              run: just doctest
             - name: Build minvmd + the minimal CLI
               run: |
                   cargo build -p minvmd --bin minvmd --locked
@@ -614,11 +618,11 @@ jobs:
               # test binary, so the mini's harnesses are selected by the
               # `_integration` convention with no per-test list — a new
               # crates/minvmd/tests/*_integration.rs is picked up with no yaml.
+              # The archived crates are the justfile's darwin `scope`.
               run: |
                   set -euo pipefail
                   mkdir -p testbed/bin testbed/lib
-                  cargo nextest archive -p minvmd -p sessions --locked \
-                    --archive-file testbed/nextest-archive.tar.zst
+                  just test-archive testbed/nextest-archive.tar.zst
                   cp target/debug/minvmd testbed/bin/minvmd
                   cp target/debug/min testbed/bin/min
                   cp "$LIBKRUN_PREFIX/libkrun.1.dylib" testbed/lib/libkrun.1.dylib
