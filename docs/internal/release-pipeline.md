@@ -295,9 +295,10 @@ whose `package.version` is stale or not above the newest `v*` tag.
   `minzoned`, changes the libkrun link path in `minvmd` to `@rpath`
   ([`scripts/rewrite-macos-linkage.sh`](../../scripts/rewrite-macos-linkage.sh)),
   and checks that `min` and `minzoned` link only system libraries. It
-  signs `minvmd`, `min`, and `minzoned` with the Developer ID, the
-  hardened runtime, and a timestamp. Then it notarizes all of them. See the
-  **Notarization** paragraph below.
+  puts `minzoned` in an app bundle, `Minimal.app`. It signs `minvmd`, `min`,
+  and the bundle with the Developer ID, the hardened runtime, and a
+  timestamp. Then it notarizes all of them and staples the bundle. See the
+  **The macOS app bundle** and **Notarization** paragraphs below.
 - `build-libkrun-macos-arm64` builds the `libkrun.1.dylib` for macOS users on
   a hosted runner. `sign-macos-artifacts` signs it and the macOS `gvproxy`
   with the Developer ID on the self-hosted runner.
@@ -324,16 +325,20 @@ half of the work:
   binary must have no embedded search path, and its interpreter must be a
   system loader. If the gate fails, the build fails.
 - [`scripts/stage-release.sh`](../../scripts/stage-release.sh) stages
-  `bin/minzoned` beside `bin/min` on every platform that has `min`. The
-  staged copy is only the source that the advisory copies. No unit file and
-  no `launchd` property list refers to it at its user-writable path.
+  `bin/minzoned` beside `bin/min` on every Linux platform that has `min`. On
+  macOS it stages the files of the app bundle under `bin/Minimal.app`, also
+  beside `bin/min`. The staged copy is only the source that the advisory
+  copies. No unit file and no `launchd` property list refers to it at its
+  user-writable path.
 - [`scripts/package-nfpm.sh`](../../scripts/package-nfpm.sh) and
   [`packaging/nfpm.yaml`](../../packaging/nfpm.yaml) put
   `/usr/bin/minzoned` in every `.deb`, `.rpm`, and `.apk`. The packages
   do not install a service. The advisory's privileged command is the only
   privileged step.
 - [`scripts/install.sh`](../../scripts/install.sh) installs it beside `min`
-  and replaces it on upgrade, like every other `bin` row.
+  and replaces it on upgrade, like every other `bin` row. On macOS an
+  upgrade from a release that installed `bin/minzoned` removes that file,
+  because the program is now in the bundle.
 
 *Still optional in the scripts.* The release workflow uploads `minzoned`
 on every platform, but `stage-release.sh` and `package-nfpm.sh` still accept
@@ -353,9 +358,10 @@ artifact on every platform.
   the gate.
 - **The user side checks identity.** The source is beside `min` in a prefix
   that its user can write, so each user-side check is only a pre-check. On
-  macOS, the advisory runs `codesign --verify --strict -R` with the Developer
-  ID designated requirement. The requirement names Apple's Developer ID chain,
-  the team in `subject.OU`, and the signing identifier.
+  macOS, the advisory runs `codesign --verify --strict -R` on the app bundle
+  with the Developer ID designated requirement. The requirement names Apple's
+  Developer ID chain, the team in `subject.OU`, and the signing identifier.
+  The signature covers the program, `Info.plist`, and the icon.
 - The release build of `min` gets the team ID and the identifier at compile
   time, from `MINIMAL_ZONED_TEAMID` and `MINIMAL_ZONED_IDENTIFIER`.
   Without them, a release `min` does not offer the step, and it gives the
@@ -363,7 +369,8 @@ artifact on every platform.
   `codesign --strict` alone, because any ad-hoc signature passes that check.
   Debug and test builds skip the check.
 - On both operating systems, the advisory then pins the SHA-256 of the bytes
-  that it checked.
+  that it checked. On macOS it pins each file of the bundle, because the
+  signature does not cover the stapled ticket.
 - **The privileged step checks the root-owned copy again** (design §7.1,
   post-install custody). The rendered root command examines the destination
   directory and each parent directory up to `/`. It stops at the first one
@@ -376,7 +383,11 @@ artifact on every platform.
   copy. If the hash is different, it removes the copy and exits with both
   hashes in the message. On macOS it runs the `codesign -R` check on the copy
   again. Then it renames the copy into place. Only after that does it write
-  the unit or property list that names the copy.
+  the unit or property list that names the copy. On macOS the copy is the
+  whole bundle. The command makes it in an exclusive `mktemp -d` directory
+  that only root can read, and hashes each file against its pin. It runs the
+  `codesign -R` check on the directory, and then renames the directory to
+  `/Library/PrivilegedHelperTools/Minimal.app`.
 
 The release workflow
 ([`.github/workflows/release.yml`](../../.github/workflows/release.yml))
@@ -389,18 +400,18 @@ handles `minzoned` with the same steps that the other binaries have:
 - `build-release-macos-arm64`: the job's `env` gets
   `MINIMAL_ZONED_TEAMID` and `MINIMAL_ZONED_IDENTIFIER`, so the `min`
   that it builds has the signing identity. The job builds `minzoned` in
-  its own invocation, link-gates it, and renames it to
-  `minzoned-macos-arm64`.
-- The job signs it with the Developer ID, the hardened runtime, a timestamp,
-  and `--identifier "$MINIMAL_ZONED_IDENTIFIER"`. The signature has no
-  entitlements, unlike the `minvmd` signature. There is no hypervisor
+  its own invocation, link-gates it, and assembles `Minimal.app` around it.
+- The job signs the bundle with the Developer ID, the hardened runtime, a
+  timestamp, and `--identifier "$MINIMAL_ZONED_IDENTIFIER"`. The signature
+  has no entitlements, unlike the `minvmd` signature. There is no hypervisor
   entitlement, no `disable-library-validation`, no
   `allow-dyld-environment-variables`, and no JIT. The job then checks the
   signature with the designated requirement that `min` uses.
 - After the signature check, the link gate runs again on the signed
-  artifact, and the job uploads it.
-- The job notarizes `minzoned` with the other macOS binaries. See
-  the **Notarization** paragraph below.
+  program.
+- The job notarizes the bundle with the other macOS binaries, staples it,
+  and uploads its files. See the **The macOS app bundle** and
+  **Notarization** paragraphs below.
 - The release job and the stage-installer job stay the same. They collect
   artifacts by the platform-suffixed names, so the new names go into the
   GitHub Release, the `components` manifest, and the packages. The SHA-256
@@ -419,19 +430,69 @@ This section does not close these residuals:
   [`scripts/session-e2e.sh`](../../scripts/session-e2e.sh) skips it there. A
   privileged macOS e2e runner is still necessary for that proof.
 
+**The macOS app bundle.** macOS lists each `launchd` job in System Settings,
+under General, then Login Items & Extensions. A job whose program is a bare
+signed file has the developer's name and a placeholder icon. A job whose
+program is not signed is an item from an unidentified developer. A job has
+an app's name and icon only when its program is in an app bundle that the
+vendor's Developer ID signs. So the release puts `minzoned` in a bundle, and
+both jobs that `min finalize-install` installs run the program in the
+root-owned copy of that bundle:
+
+```
+Minimal.app/Contents/Info.plist                    packaging/macos/Info.plist
+Minimal.app/Contents/MacOS/minzoned                the program
+Minimal.app/Contents/Resources/AppIcon.icns        packaging/macos/AppIcon.icns
+Minimal.app/Contents/_CodeSignature/CodeResources  added by codesign
+Minimal.app/Contents/CodeResources                 added by stapler
+```
+
+[`scripts/build-app-bundle.sh`](../../scripts/build-app-bundle.sh) assembles
+the first three files. `just app-bundle` runs it on a debug `minzoned` and
+writes an unsigned bundle to `target/app-bundle`. The bundle identifier in
+`Info.plist` is the signing identifier, `MINIMAL_ZONED_IDENTIFIER`. The
+release job fails if they are different.
+
+A release publishes flat files, not directories. After the job staples the
+bundle, `build-app-bundle.sh flatten` copies each bundle file to a flat
+name that starts with `minzoned-macos-arm64`. The program keeps the name
+`minzoned-macos-arm64`. `stage-release.sh` installs each flat file at its
+path under `bin/Minimal.app`, and `scripts/stage-release_test.sh` fails if
+the two tables are different. The job then makes the bundle again from the
+flat files, as the installer does. It runs the `codesign -R` check and
+`stapler validate` on that copy.
+
+The program in the bundle does not pass `codesign --verify` as a file by
+itself, because its signature names the bundle's `Info.plist`. It still
+runs. Do not use `minzoned-macos-arm64` from the GitHub Release without the
+other bundle files.
+
+The range job has no script when the step installs the bundle. Its program is
+`minzoned reserve-local-range`, and the range is a constant in the program.
+A script has no signature that macOS can read, so a job that runs a script
+stays an item from an unidentified developer.
+
+To test the job without a release, run `release.yml` with `dry_run` set. It
+builds, signs, notarizes, staples, and checks the bundle, and it publishes
+nothing. The name and icon in System Settings are a manual check. Run
+`min finalize-install` from that build on a Mac. `sfltool dumpbtm` then
+shows the two jobs with `Minimal.app` as their parent.
+
 **Notarization.** After the signature checks and the last link gate,
-`build-release-macos-arm64` sends `min`, `minvmd`, and `minzoned` to
-the Apple notary service before it uploads them. The step puts each binary
-in a zip made with `ditto`, because `notarytool` does not take a bare
-Mach-O file. It runs `xcrun notarytool submit --wait` on each zip. The
+`build-release-macos-arm64` sends `min`, `minvmd`, and the `minzoned` app
+bundle to the Apple notary service before it uploads them. The step puts
+each one in a zip made with `ditto`, because `notarytool` does not take a
+bare Mach-O file or a bundle directory. It runs
+`xcrun notarytool submit --wait` on each zip. The
 release fails unless each result is `Accepted`. On any other result, the
 step prints the notary log for that submission. Notarization does not
 change the file, so the job uploads the same signed bytes.
 
-The job does not staple. The release publishes each binary as a bare Mach-O
-file, and `stapler` can attach a ticket only to an app bundle, a `.pkg`, or
-a `.dmg`. Gatekeeper gets the ticket from Apple online when it checks a
-binary.
+The job does not staple `min` or `minvmd`. The release publishes each as a
+bare Mach-O file, and `stapler` can attach a ticket only to an app bundle, a
+`.pkg`, or a `.dmg`. Gatekeeper gets the ticket from Apple online when it
+checks a binary. The job staples the app bundle. The ticket is the file
+`Contents/CodeResources`, which the signature does not cover.
 
 The step needs two things that the workflow cannot set up:
 
@@ -576,13 +637,15 @@ The components come from the `COMPONENTS` table in `stage-release.sh`:
   `bin/minimald`, `bin/minvmd`, `bin/gvproxy-min`, a `git-remote-min` symlink,
   the guest files (`data/vmlinuz`, `data/rootfs.img`, `data/initramfs.cpio`),
   and the AppArmor profile, tunable, and loader under `data/`.
-- macOS arm64: `bin/min`, `bin/minzoned`, `bin/minvmd`,
+- macOS arm64: `bin/min`, the `bin/Minimal.app` bundle that contains
+  `minzoned`, `bin/minvmd`,
   `bin/gvproxy-min`, `lib/libkrun.1.dylib`, the `git-remote-min` symlink, and
   the same guest files. Only macOS has a `lib/` folder, because the Linux
   `minvmd` links libkrun statically.
 
 `bin/minzoned` is the box-zone answerer binary that the session-start
-advisory copies into its root-owned service path. The installer puts it
+advisory copies into its root-owned service path. On macOS it is in
+`bin/Minimal.app`, and the advisory copies the bundle. The installer puts it
 beside `min`, and nothing else refers to it there. Manifest rows write no
 unit file and no `launchd` property list. None of them names the root-owned
 service path that the advisory's privileged command creates.

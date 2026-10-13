@@ -44,9 +44,12 @@
 #
 # Every component the manifest carries installs by the same generic loop, and
 # one of them carries a contract worth naming: `minzoned` (NET-122's
-# box-zone answerer) installs as `bin/minzoned` beside `min` on every
+# box-zone answerer) installs as `bin/minzoned` beside `min` on every Linux
 # platform the manifest ships `min` for, and an upgrade replaces it like every
-# other `bin` row — same SHA-256 compare, same swap. The installed copy is
+# other `bin` row — same SHA-256 compare, same swap. On macOS it installs
+# inside an app bundle, `bin/Minimal.app`, still beside `min`, one row per
+# bundle file: macOS lists a background service under an app's name and icon
+# only when its program belongs to a signed app bundle. The installed copy is
 # ONLY the copy source: the session-start advisory finds it beside `min` and
 # its one privileged command copies it to a root-owned path before the service
 # manager ever runs it. The installer itself writes no answerer service — no
@@ -463,7 +466,11 @@ maybe_remove_finalize_install() {
     # out of both lists because the macOS path has a space in it and its
     # presence alone never says the service is installed.
     if [ "$os" = darwin ]; then
-        _ns_files="/etc/resolver/min.internal /Library/LaunchDaemons/dev.gominimal.zone.plist /Library/PrivilegedHelperTools/minzoned /Library/LaunchDaemons/dev.minimal.local-range.plist /Library/PrivilegedHelperTools/dev.minimal.local-range"
+        # Minimal.app is the app bundle the service's program is installed
+        # in, a directory (so the remedy removes it, and only it and the
+        # .old a replaced bundle leaves, with -r); the bare minzoned is where
+        # an install from before the bundle put the program.
+        _ns_files="/etc/resolver/min.internal /Library/LaunchDaemons/dev.gominimal.zone.plist /Library/PrivilegedHelperTools/Minimal.app /Library/PrivilegedHelperTools/Minimal.app.old /Library/PrivilegedHelperTools/minzoned /Library/LaunchDaemons/dev.minimal.local-range.plist /Library/PrivilegedHelperTools/dev.minimal.local-range"
         _ns_paths="$_ns_files"
         _ns_chan="$_fi_root/Library/Application Support/minimal/run/answerer.sock"
     else
@@ -472,12 +479,16 @@ maybe_remove_finalize_install() {
         _ns_chan="$_fi_root/run/minimal/answerer.sock"
     fi
     _ns_rm=
+    _ns_rm_r=
     for _ns_p in $_ns_files; do
-        _ns_rm="$_ns_rm $(shq "$_fi_root$_ns_p")"
+        case "$_ns_p" in
+            */Minimal.app|*/Minimal.app.old) _ns_rm_r="$_ns_rm_r $(shq "$_fi_root$_ns_p")" ;;
+            *) _ns_rm="$_ns_rm $(shq "$_fi_root$_ns_p")" ;;
+        esac
     done
     _ns_rm="$_ns_rm $(shq "$_ns_chan")"
     if [ "$os" = darwin ]; then
-        _ns_undo="sudo launchctl bootout system/dev.gominimal.zone; sudo launchctl bootout system/dev.minimal.local-range; sudo rm -f$_ns_rm; sudo rmdir $(shq "${_ns_chan%/*}") $(shq "$_fi_root/Library/Application Support/minimal") 2>/dev/null || true"
+        _ns_undo="sudo launchctl bootout system/dev.gominimal.zone; sudo launchctl bootout system/dev.minimal.local-range; sudo rm -f$_ns_rm; sudo rm -rf$_ns_rm_r; sudo rmdir $(shq "${_ns_chan%/*}") $(shq "$_fi_root/Library/Application Support/minimal") 2>/dev/null || true"
     else
         _ns_undo="sudo systemctl disable --now minzoned.socket minzoned.service; sudo rm -f$_ns_rm; sudo systemctl daemon-reload; sudo systemctl reset-failed minzoned.socket minzoned.service; [ ! -e $(shq "$_fi_root/sys/class/net/minzone0") ] || { sudo resolvectl revert minzone0; sudo ip link del minzone0; }; sudo rmdir $(shq "${_ns_chan%/*}") $(shq "$_lib_dir") 2>/dev/null || true"
     fi
@@ -761,8 +772,15 @@ do_uninstall() {
         # Shell-integration dirs first: the init dir must empty out
         # before the data prefix can, and the completion dirs (plus their
         # parents, which the installer may have created) are shared with other
-        # tools so, like bin, they are only ever rmdir'd-if-empty.
+        # tools so, like bin, they are only ever rmdir'd-if-empty. The macOS
+        # app bundle's directories (bin/Minimal.app) go innermost first, so
+        # the bin dir can empty out after them.
         for d in "$init_dir" \
+                 "$bindir/Minimal.app/Contents/MacOS" \
+                 "$bindir/Minimal.app/Contents/Resources" \
+                 "$bindir/Minimal.app/Contents/_CodeSignature" \
+                 "$bindir/Minimal.app/Contents" \
+                 "$bindir/Minimal.app" \
                  "$(resolve_prefix data)/apparmor/tunables" \
                  "$(resolve_prefix data)/apparmor" \
                  "$bash_comp_dir" "${bash_comp_dir%/*}" \
@@ -1276,6 +1294,59 @@ verify_switch_binary() {
 }
 verify_switch_binary
 remove_renamed_gvproxy
+
+# --- minzoned files a previous release placed elsewhere ------------------
+
+# On macOS `minzoned` moved from `bin/minzoned` into the app bundle
+# `bin/Minimal.app`. The component kept its name and changed its dest, so the
+# file at the old dest is in no manifest any more and the record written below
+# no longer lists it: it would sit on PATH forever, where `min` could still
+# find it as a copy source. Remove it on the same terms as uninstall, only
+# when its bytes are still exactly what was recorded, and only when this run
+# placed the component somewhere else: a manifest that ships no `minzoned`
+# at all leaves the old file alone. The same walk covers the bundle's other
+# files, so a channel that points back at a release from before the bundle
+# leaves no half bundle behind.
+remove_moved_minzoned() {
+    [ -f "$prev_record" ] || return 0
+    cut -f1 "$records" | grep -qx minzoned || return 0
+    _tab="$(printf '\t')"
+    while IFS="$_tab" read -r _comp _dest _ _want; do
+        case "$_comp" in
+            minzoned|minzoned-*) ;;
+            *) continue ;;
+        esac
+        [ -n "$_dest" ] || continue
+        # Still a path this run placed a file at: nothing moved.
+        if cut -f2 "$records" | grep -qxF "$_dest"; then
+            continue
+        fi
+        [ -f "$_dest" ] || continue
+        [ -L "$_dest" ] && continue
+        if [ "$(sha256 "$_dest")" != "$_want" ]; then
+            say "  $_comp: kept $_dest (modified since install; the release now places it elsewhere)"
+        elif rm -f "$_dest"; then
+            say "  $_comp: removed $_dest (the release now places it elsewhere)"
+        else
+            # Carry the row into this run's record so the next run retries:
+            # the record is replaced below, and without the row the old file
+            # would never be revisited.
+            say "  $_comp: could not remove $_dest; will retry on the next install"
+            printf '%s\t%s\t%s\t%s\n' "$_comp" "$_dest" "$_want" "$_want" >>"$records"
+        fi
+    done <"$prev_record"
+    # The bundle's directories, when the walk emptied them: innermost first.
+    for _d in "$bindir/Minimal.app/Contents/MacOS" \
+              "$bindir/Minimal.app/Contents/Resources" \
+              "$bindir/Minimal.app/Contents/_CodeSignature" \
+              "$bindir/Minimal.app/Contents" \
+              "$bindir/Minimal.app"; do
+        if [ -d "$_d" ]; then
+            rmdir "$_d" 2>/dev/null || true
+        fi
+    done
+}
+remove_moved_minzoned
 
 # Persist the resolved (component, dest, installed-hash) rows for this
 # platform, replacing the prior record read during the loop. Enables a future

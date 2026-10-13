@@ -14,8 +14,8 @@
 //!
 //! Nothing here prompts. Detecting reads files and runs `resolvectl`
 //! read-only; the advisory is pure string assembly over what those reads
-//! found. The privilege prompt, when there is one, belongs to `min net
-//! setup`, which the user chooses to run — never to a session start, which
+//! found. The privilege prompt, when there is one, belongs to `min
+//! finalize-install`, which the user chooses to run — never to a session start, which
 //! prints no part of the script (NET-122: opt-in, "with no privilege
 //! prompt"; NET-123's interim arm: neither prompt nor hang).
 
@@ -130,6 +130,59 @@ const RANGE_ADDRESS_PLACEHOLDER: &str = "@RANGE_ADDRESSES@";
 #[cfg(any(test, target_os = "macos"))]
 const RANGE_UNIT_PLIST: &str = include_str!("resolver/dev.minimal.local-range.plist");
 
+/// The verb of the box-name service's program that applies the reserved
+/// local range (`minzoned reserve-local-range`): the range is compiled into
+/// the program, and the verb takes no argument and reads no environment
+/// variable and no file.
+#[cfg(any(test, target_os = "macos"))]
+const RANGE_PROGRAM_VERB: &str = "reserve-local-range";
+
+/// The template of the unit's plist when its program is the box-name
+/// service's own program inside the root-owned app bundle
+/// ([`MACOS_ANSWERER_PROGRAM_PATH`]) and not the script
+/// ([`range_unit_bundle_plist`] renders it): the same label, `RunAtLoad`
+/// true, no `KeepAlive`, no `UserName` (it runs as root), no environment
+/// variables, and ProgramArguments the program and [`RANGE_PROGRAM_VERB`].
+///
+/// macOS lists a launchd job under an app's name and icon only when the
+/// job's program is code signed by the app's developer. A script carries no
+/// signature, and the unit that runs one is listed as an item from an
+/// unidentified developer. So where the step installs the signed bundle, the
+/// range unit runs the bundle's program, and `AssociatedBundleIdentifiers`
+/// names the bundle ([`ANSWERER_BUNDLE_IDENTIFIER`]).
+#[cfg(any(test, target_os = "macos"))]
+const RANGE_UNIT_BUNDLE_PLIST_TEMPLATE: &str = "\
+<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">
+<plist version=\"1.0\">
+<dict>
+\t<key>Label</key>
+\t<string>dev.minimal.local-range</string>
+\t<key>ProgramArguments</key>
+\t<array>
+\t\t<string>__PROGRAM__</string>
+\t\t<string>__VERB__</string>
+\t</array>
+\t<key>AssociatedBundleIdentifiers</key>
+\t<array>
+\t\t<string>__BUNDLE__</string>
+\t</array>
+\t<key>RunAtLoad</key>
+\t<true/>
+</dict>
+</plist>
+";
+
+/// [`RANGE_UNIT_BUNDLE_PLIST_TEMPLATE`], rendered: constants alone fill it,
+/// so the plist is the same bytes on every host.
+#[cfg(any(test, target_os = "macos"))]
+fn range_unit_bundle_plist() -> String {
+    RANGE_UNIT_BUNDLE_PLIST_TEMPLATE
+        .replace("__PROGRAM__", MACOS_ANSWERER_PROGRAM_PATH)
+        .replace("__VERB__", RANGE_PROGRAM_VERB)
+        .replace("__BUNDLE__", ANSWERER_BUNDLE_IDENTIFIER)
+}
+
 /// The heredoc delimiters the command carries the two files' bytes under.
 /// Distinctive enough that no rendered byte can close one early: the
 /// program's lines are `ifconfig` aliases and the plist's are XML, and
@@ -168,13 +221,65 @@ const ANSWERER_LAUNCHD_LABEL: &str = "dev.gominimal.zone";
 #[cfg(any(test, not(target_os = "macos")))]
 const ANSWERER_SYSTEMD_UNIT: &str = "minzoned";
 
+/// The name of the app bundle `minzoned` ships in on macOS, and of the
+/// root-owned copy the step installs.
+const ANSWERER_BUNDLE_NAME: &str = "Minimal.app";
+
+/// The answerer program's path inside its app bundle.
+#[cfg(any(test, target_os = "macos"))]
+const ANSWERER_BUNDLE_PROGRAM: &str = "Contents/MacOS/minzoned";
+
+/// The bundle's other files, by their paths inside it: the two a bundle is
+/// assembled from, the seal a signature adds, and the notarization ticket a
+/// staple adds. The step copies the ones the source bundle has. Only a
+/// signed bundle has the seal and only a stapled one the ticket, and the
+/// signature check on the root-owned copy is what refuses a release bundle
+/// that lacks a file its signature covers.
+const ANSWERER_BUNDLE_FILES: &[&str] = &[
+    "Contents/Info.plist",
+    "Contents/Resources/AppIcon.icns",
+    "Contents/_CodeSignature/CodeResources",
+    "Contents/CodeResources",
+];
+
+/// The bundle's `CFBundleIdentifier` (`packaging/macos/Info.plist`), which
+/// both launchd plists name under `AssociatedBundleIdentifiers`. It is also
+/// the code-signing identifier the release signs the bundle under; the
+/// release build fails when the two differ.
+#[cfg(any(test, target_os = "macos"))]
+const ANSWERER_BUNDLE_IDENTIFIER: &str = "dev.minimal.minzoned";
+
+/// The root-owned app bundle the step installs: `/Library/PrivilegedHelperTools`
+/// is the directory the range unit's files live in, every component of it
+/// root's.
+///
+/// The service's program lives in a bundle because macOS lists a launchd job
+/// under an app's name and icon (System Settings > General > Login Items &
+/// Extensions) only when the job's program belongs to an app bundle signed
+/// with the vendor's Developer ID. A bare program is listed under the
+/// developer's name with a placeholder icon.
+#[cfg(any(test, target_os = "macos"))]
+const MACOS_ANSWERER_BUNDLE_PATH: &str = "/Library/PrivilegedHelperTools/Minimal.app";
+
+/// The directory of [`MACOS_ANSWERER_BUNDLE_PATH`] the program is copied into.
+#[cfg(any(test, target_os = "macos"))]
+const MACOS_ANSWERER_PROGRAM_DIR: &str =
+    "/Library/PrivilegedHelperTools/Minimal.app/Contents/MacOS";
+
 /// The root-owned path the answerer program is copied to — never a
-/// user-writable binary: `/Library/PrivilegedHelperTools` beside the range
-/// program, every component of it root's, so a user can neither replace
+/// user-writable binary: inside [`MACOS_ANSWERER_BUNDLE_PATH`], every
+/// component of it root's, so a user can neither replace
 /// the copy the service runs nor read what the step wrote before the
 /// ownership converged ([`answerer_step_over`] walks every component).
+pub(crate) const MACOS_ANSWERER_PROGRAM_PATH: &str =
+    "/Library/PrivilegedHelperTools/Minimal.app/Contents/MacOS/minzoned";
+
+/// The path the step copied the answerer program to before it shipped in a
+/// bundle. A unit that still names it fails the step's check
+/// ([`answerer_step_over`]), so `min finalize-install` installs the bundle
+/// and removes this file, and the removal script removes it too.
 #[cfg(any(test, target_os = "macos"))]
-const MACOS_ANSWERER_PROGRAM_PATH: &str = "/Library/PrivilegedHelperTools/minzoned";
+const LEGACY_MACOS_ANSWERER_PROGRAM_PATH: &str = "/Library/PrivilegedHelperTools/minzoned";
 
 /// The plist the answerer step installs: the file launchd scans at boot,
 /// which is what makes the service hold the sockets at every one.
@@ -243,6 +348,9 @@ const ANSWERER_UNIT_PATHS: &[&str] = &[ANSWERER_UNIT_SOCKET_PATH, ANSWERER_UNIT_
 /// operator runs must be able to connect and publish, and the
 /// answerer's own gate — the peer uid check — decides who may, so the
 /// socket's mode grants only the connect.
+/// `AssociatedBundleIdentifiers` names the app bundle the program sits in
+/// ([`ANSWERER_BUNDLE_IDENTIFIER`]), the key by which macOS lists the job
+/// under the bundle's name and icon.
 ///
 /// Like [`RANGE_UNIT_PLIST`], the script writes the body under a quoted
 /// heredoc, so nothing in it expands.
@@ -260,6 +368,10 @@ const ANSWERER_PLIST_TEMPLATE: &str = "\
 \t</array>
 \t<key>UserName</key>
 \t<string>__OPERATOR__</string>
+\t<key>AssociatedBundleIdentifiers</key>
+\t<array>
+\t\t<string>__BUNDLE__</string>
+\t</array>
 \t<key>Sockets</key>
 \t<dict>
 \t\t<key>Listener</key>
@@ -527,6 +639,21 @@ fn not_root_owned(what: &str, path: &str, custody: &FileCustody) -> String {
     )
 }
 
+/// The program the range unit runs, read from what its plist names: the
+/// box-name service's program inside the root-owned app bundle
+/// ([`MACOS_ANSWERER_PROGRAM_PATH`]) when the plist names that, and the
+/// script ([`RANGE_PROGRAM_PATH`]) otherwise. The step installs the first
+/// where it installs the bundle and the second where it has no bundle to
+/// install; both are root-owned paths, and the custody checks hold the unit
+/// to whichever one its plist names.
+pub(crate) fn range_program_path(plist_program: Option<&str>) -> &'static str {
+    if plist_program == Some(MACOS_ANSWERER_PROGRAM_PATH) {
+        MACOS_ANSWERER_PROGRAM_PATH
+    } else {
+        RANGE_PROGRAM_PATH
+    }
+}
+
 /// The range step the custody facts decide (NET-123's privileged step's
 /// custody, checked where the hook is detected): absent when neither of
 /// the unit's files is installed; installed when every check holds — every
@@ -558,8 +685,9 @@ pub(crate) fn range_step_over(facts: &RangeFacts) -> RangeStep {
     // The walk, from `/` down over both paths, in the order the checks are
     // stated: a directory a user can write is a unit a user can replace,
     // whatever the files' own owner reads.
+    let program_path = range_program_path(facts.plist_program.as_deref());
     let mut walked = Vec::new();
-    for path in [RANGE_PROGRAM_PATH, RANGE_PLIST_PATH] {
+    for path in [program_path, RANGE_PLIST_PATH] {
         for component in path_components(path) {
             if !walked.contains(&component) {
                 walked.push(component);
@@ -583,7 +711,7 @@ pub(crate) fn range_step_over(facts: &RangeFacts) -> RangeStep {
     }
     // Both files, then what each of them points at.
     for (what, path, custody) in [
-        ("its program", RANGE_PROGRAM_PATH, facts.program),
+        ("its program", program_path, facts.program),
         ("its plist", RANGE_PLIST_PATH, facts.plist),
     ] {
         match custody {
@@ -597,12 +725,12 @@ pub(crate) fn range_step_over(facts: &RangeFacts) -> RangeStep {
     match facts.plist_program.as_deref() {
         None => checks.push(format!(
             "its plist's ProgramArguments names no program, not the \
-             root-owned {RANGE_PROGRAM_PATH}"
+             root-owned {program_path}"
         )),
-        Some(RANGE_PROGRAM_PATH) => {}
+        Some(named) if named == program_path => {}
         Some(other) => checks.push(format!(
             "its plist's ProgramArguments names {other}, not the \
-             root-owned {RANGE_PROGRAM_PATH}"
+             root-owned {program_path}"
         )),
     }
     match facts.loaded_program.as_deref() {
@@ -610,10 +738,10 @@ pub(crate) fn range_step_over(facts: &RangeFacts) -> RangeStep {
             "no job is loaded under the label {RANGE_UNIT_LABEL}, so the \
              installed files are not the unit that runs"
         )),
-        Some(RANGE_PROGRAM_PATH) => {}
+        Some(loaded) if loaded == program_path => {}
         Some(other) => checks.push(format!(
             "the loaded job under the label {RANGE_UNIT_LABEL} runs {other}, \
-             not the root-owned {RANGE_PROGRAM_PATH}"
+             not the root-owned {program_path}"
         )),
     }
     match checks.first() {
@@ -722,14 +850,16 @@ async fn launchctl_print_program() -> Option<String> {
 /// the command that fixes what it finds is the user's to run, never the
 /// session start's (NET-122).
 pub(crate) async fn range_unit_state() -> RangeStep {
+    let plist_program = tokio::fs::read_to_string(RANGE_PLIST_PATH)
+        .await
+        .ok()
+        .and_then(|text| plist_program_argument(&text).map(str::to_string));
+    let program_path = range_program_path(plist_program.as_deref());
     let facts = RangeFacts {
-        components: path_component_custody(&[RANGE_PROGRAM_PATH, RANGE_PLIST_PATH]).await,
-        program: file_custody(RANGE_PROGRAM_PATH).await,
+        components: path_component_custody(&[program_path, RANGE_PLIST_PATH]).await,
+        program: file_custody(program_path).await,
         plist: file_custody(RANGE_PLIST_PATH).await,
-        plist_program: tokio::fs::read_to_string(RANGE_PLIST_PATH)
-            .await
-            .ok()
-            .and_then(|text| plist_program_argument(&text).map(str::to_string)),
+        plist_program,
         loaded_program: launchctl_print_program().await,
     };
     range_step_over(&facts)
@@ -993,6 +1123,10 @@ pub(crate) struct AnswererInstall {
     /// The SHA-256 of the source bytes verified at render time: the
     /// privileged step refuses a root-owned copy that hashes otherwise.
     pub sha256: String,
+    /// The other files of the app bundle the source sits in
+    /// ([`VerifiedSource::bundle`]), each pinned the same way. Empty for a
+    /// bare program: the step then copies the program alone.
+    pub bundle: Vec<BundleFile>,
     /// The designated requirement the privileged step re-verifies its copy
     /// with on macOS ([`VerifiedSource::requirement`]); `None` renders no
     /// signature re-check.
@@ -1032,21 +1166,86 @@ pub(crate) fn operator_name() -> String {
 /// build puts them in one target dir), then each directory of `path`. Only
 /// `minzoned` is ever named — never `minvmd`, whatever sits beside it —
 /// and `None` when no such file exists, so the advisory names no program
-/// it cannot find.
+/// it cannot find. On macOS the program inside its app bundle
+/// ([`BUNDLED_ANSWERER_SOURCE`]) is found before a bare one in the same
+/// directory.
 pub(crate) fn answerer_source_in(
     exe_dir: Option<&std::path::Path>,
     path: Option<&std::ffi::OsStr>,
 ) -> Option<String> {
-    let beside = exe_dir.map(|dir| dir.join(ANSWERER_PROGRAM_NAME));
-    let on_path = path
-        .into_iter()
-        .flat_map(std::env::split_paths)
-        .map(|dir| dir.join(ANSWERER_PROGRAM_NAME));
-    beside
+    answerer_source_named(ANSWERER_SOURCE_NAMES, exe_dir, path)
+}
+
+/// The answerer program inside its app bundle, relative to the directory
+/// the bundle sits in: where a macOS release ships it.
+const BUNDLED_ANSWERER_SOURCE: &str = "Minimal.app/Contents/MacOS/minzoned";
+
+/// The names the answerer program is looked for under in each directory, in
+/// order: on macOS inside its app bundle first, then bare (a dev build has
+/// no bundle); elsewhere bare alone.
+#[cfg(target_os = "macos")]
+const ANSWERER_SOURCE_NAMES: &[&str] = &[BUNDLED_ANSWERER_SOURCE, ANSWERER_PROGRAM_NAME];
+#[cfg(not(target_os = "macos"))]
+const ANSWERER_SOURCE_NAMES: &[&str] = &[ANSWERER_PROGRAM_NAME];
+
+/// [`answerer_source_in`] over the names to look for: each directory is
+/// tried under every name before the next directory is, so a program beside
+/// `min` is found before any on `PATH`, bundled or bare.
+fn answerer_source_named(
+    names: &[&str],
+    exe_dir: Option<&std::path::Path>,
+    path: Option<&std::ffi::OsStr>,
+) -> Option<String> {
+    let on_path = path.into_iter().flat_map(std::env::split_paths);
+    exe_dir
+        .map(std::path::Path::to_path_buf)
         .into_iter()
         .chain(on_path)
+        .flat_map(|dir| names.iter().map(move |name| dir.join(name)))
         .find(|candidate| candidate.is_file())
         .map(|found| found.display().to_string())
+}
+
+/// The app bundle a copy source sits in, when it sits in one: the source's
+/// path up to and including [`ANSWERER_BUNDLE_NAME`] when it ends with the
+/// program's path inside the bundle. `None` for a bare program.
+fn bundle_root_of(source: &str) -> Option<&str> {
+    let before = source.strip_suffix(BUNDLED_ANSWERER_SOURCE)?;
+    before
+        .ends_with('/')
+        .then(|| &source[..before.len() + ANSWERER_BUNDLE_NAME.len()])
+}
+
+/// One file of the app bundle the copy source sits in, pinned beside the
+/// program: the privileged step copies it into the root-owned bundle and
+/// refuses a copy that hashes otherwise.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct BundleFile {
+    /// The file's path inside the bundle, one of [`ANSWERER_BUNDLE_FILES`].
+    pub path: String,
+    /// Lowercase hex SHA-256 of the bytes read at render time.
+    pub sha256: String,
+}
+
+/// The files of the bundle `source` sits in, each with its SHA-256: every
+/// one of [`ANSWERER_BUNDLE_FILES`] that exists. Empty for a bare program,
+/// and for a bundle that holds the program alone.
+async fn bundle_files_of(source: &str) -> std::io::Result<Vec<BundleFile>> {
+    let Some(root) = bundle_root_of(source) else {
+        return Ok(Vec::new());
+    };
+    let mut files = Vec::new();
+    for path in ANSWERER_BUNDLE_FILES {
+        match sha256_of(&format!("{root}/{path}")).await {
+            Ok(sha256) => files.push(BundleFile {
+                path: (*path).to_string(),
+                sha256,
+            }),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(files)
 }
 
 /// The answerer program this machine's step copies ([`answerer_source_in`]
@@ -1091,6 +1290,7 @@ pub(crate) fn answerer_install(verified: &VerifiedSource) -> Option<AnswererInst
         channel: channel.display().to_string(),
         source: verified.path.clone(),
         sha256: verified.sha256.clone(),
+        bundle: verified.bundle.clone(),
         requirement: verified.requirement.clone(),
         controls: HANDOVER_CONTROLS
             .lock()
@@ -1205,6 +1405,11 @@ pub(crate) struct VerifiedSource {
     pub path: String,
     /// Lowercase hex SHA-256 of the bytes verified at render time.
     pub sha256: String,
+    /// The other files of the app bundle the program sits in, each pinned
+    /// like the program ([`bundle_files_of`]). Empty when the source is a
+    /// bare program, as it is on Linux and in a dev build.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub bundle: Vec<BundleFile>,
     /// The designated requirement the root step re-checks the copy with;
     /// `None` on Linux, where the hash pin is the identity, and in debug
     /// and test builds.
@@ -1253,10 +1458,12 @@ async fn answerer_source_identity(_source: String) -> Result<Option<String>, Sou
 async fn answerer_source_identity(source: String) -> Result<Option<String>, SourceProblem> {
     let requirement =
         macos_answerer_requirement(ANSWERER_SIGNING_TEAMID, ANSWERER_SIGNING_IDENTIFIER)?;
+    // A bundled program is verified as its bundle: the signature covers
+    // the bundle's other files too.
     let run = tokio::process::Command::new("codesign")
         .args(["--verify", "--strict", "-R"])
         .arg(format!("={requirement}"))
-        .arg(&source)
+        .arg(bundle_root_of(&source).unwrap_or(&source))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
@@ -1301,7 +1508,8 @@ async fn sha256_of(path: &str) -> std::io::Result<String> {
 /// unavailable (none shipped, or no identity to check it by), refused (it
 /// failed the check), or verified — and only a verified source is pinned:
 /// its bytes are hashed after the check passes, and the privileged step
-/// refuses a copy whose hash differs.
+/// refuses a copy whose hash differs. A source inside an app bundle has the
+/// bundle's other files pinned with it.
 pub(crate) async fn answerer_step_with_source<F, Fut>(
     step: AnswererStep,
     source: Option<String>,
@@ -1317,16 +1525,25 @@ where
     let pinned = match source {
         None => Err(SourceProblem::Unavailable(ANSWERER_NOT_SHIPPED.to_string())),
         Some(path) => match identity(path.clone()).await {
-            Ok(requirement) => sha256_of(&path)
-                .await
-                .map(|sha256| VerifiedSource {
-                    path,
-                    sha256,
-                    requirement,
-                })
-                .map_err(|error| {
-                    SourceProblem::Refused(format!("could not be read to pin its SHA-256: {error}"))
-                }),
+            Ok(requirement) => {
+                let pins = async {
+                    let sha256 = sha256_of(&path).await?;
+                    let bundle = bundle_files_of(&path).await?;
+                    Ok::<_, std::io::Error>((sha256, bundle))
+                };
+                pins.await
+                    .map(|(sha256, bundle)| VerifiedSource {
+                        path: path.clone(),
+                        sha256,
+                        bundle,
+                        requirement,
+                    })
+                    .map_err(|error| {
+                        SourceProblem::Refused(format!(
+                            "could not be read to pin its SHA-256: {error}"
+                        ))
+                    })
+            }
             Err(problem) => Err(problem),
         },
     };
@@ -2161,6 +2378,11 @@ pub(crate) const UNDO_SHOWN_BY: &str = "min finalize-install --undo --show --scr
 /// a second of the script returning, and [`RANGE_UNIT_PLIST`]'s `RunAtLoad`
 /// re-applies it at every boot after. A re-run replaces the unit and
 /// re-runs the program rather than dying on a label collision.
+///
+/// Where the step installs the answerer's app bundle, the order differs
+/// ([`macos_names_steps`]): the bundle is copied and verified first, and
+/// the range unit then runs the program inside it
+/// ([`macos_range_bundle_steps`]) and carries no script of its own.
 #[cfg(any(test, target_os = "macos"))]
 pub(crate) fn macos_command(port: u16, install: Option<&AnswererInstall>) -> String {
     let what = if install.is_some() {
@@ -2181,14 +2403,47 @@ pub(crate) fn macos_command(port: u16, install: Option<&AnswererInstall>) -> Str
 /// header that script renders for every item.
 #[cfg(any(test, target_os = "macos"))]
 pub(crate) fn macos_names_steps(port: u16, install: Option<&AnswererInstall>) -> String {
-    let program = range_program();
-    let range = range_text();
     let mut script = format!(
         "# The resolver: send *.{ZONE} lookups to the box-zone answerer on 127.0.0.1:{port}.\n\
          mkdir -p /etc/resolver {RANGE_PROGRAM_DIR} {RANGE_PLIST_DIR}\n\
          printf \"nameserver 127.0.0.1\\nport {port}\\n\" > {RESOLVER_FILE}\n\
-         \n\
-         # The local range: a boot-time unit, root's, that adds {range} to lo0\n\
+         \n",
+    );
+    match install {
+        // The step installs the app bundle: the bundle goes in first,
+        // because the range unit runs the program inside it.
+        Some(install) if !install.bundle.is_empty() => {
+            script.push_str(&macos_answerer_copy_steps(install));
+            script.push('\n');
+            script.push_str(&macos_range_bundle_steps());
+            script.push('\n');
+            script.push_str(&macos_answerer_unit_steps(install));
+        }
+        // A bare program, or none: the range unit runs the script this
+        // command carries, and needs nothing the answerer's steps install.
+        _ => {
+            script.push_str(&macos_range_script_steps());
+            if let Some(install) = install {
+                script.push('\n');
+                script.push_str(&macos_answerer_copy_steps(install));
+                script.push('\n');
+                script.push_str(&macos_answerer_unit_steps(install));
+            }
+        }
+    }
+    script
+}
+
+/// The range steps of [`macos_names_steps`] that install the unit with the
+/// script as its program: both files written from the bytes this command
+/// carries, converged to root's ownership and modes, and the unit loaded.
+/// The form a host takes when the step has no app bundle to install.
+#[cfg(any(test, target_os = "macos"))]
+fn macos_range_script_steps() -> String {
+    let program = range_program();
+    let range = range_text();
+    format!(
+        "# The local range: a boot-time unit, root's, that adds {range} to lo0\n\
          # now and at every boot.\n\
          cat > {RANGE_PROGRAM_PATH} <<\\{RANGE_PROGRAM_HEREDOC}\n\
          {program}\
@@ -2201,11 +2456,37 @@ pub(crate) fn macos_names_steps(port: u16, install: Option<&AnswererInstall>) ->
          chmod 0644 {RANGE_PLIST_PATH}\n\
          (launchctl bootout system/{RANGE_UNIT_LABEL} 2>/dev/null || true)\n\
          launchctl bootstrap system {RANGE_PLIST_PATH}\n",
-    );
-    if let Some(install) = install {
-        script.push_str(&macos_answerer_steps(install));
-    }
-    script
+    )
+}
+
+/// The range steps of [`macos_names_steps`] that install the unit with the
+/// box-name service's program as its program ([`range_unit_bundle_plist`]):
+/// the plist written from the bytes this command carries and converged to
+/// root's ownership and mode, the old unit booted out, the script an
+/// earlier install left removed, and the unit loaded. They run after the
+/// bundle is in place ([`bundle_copy_steps`]), so the program the plist
+/// names is the verified, root-owned copy.
+///
+/// The unit's program is signed code inside the bundle, which is what
+/// lets macOS list the unit under the bundle's name; a script has no
+/// signature for it to read. The range the program applies is compiled into
+/// it, so the unit still reads no configuration.
+#[cfg(any(test, target_os = "macos"))]
+fn macos_range_bundle_steps() -> String {
+    let range = range_text();
+    let plist = range_unit_bundle_plist();
+    format!(
+        "# The local range: a boot-time unit, root's, that adds {range} to lo0\n\
+         # now and at every boot. It runs the box-name service's program.\n\
+         cat > {RANGE_PLIST_PATH} <<\\{RANGE_PLIST_HEREDOC}\n\
+         {plist}\
+         {RANGE_PLIST_HEREDOC}\n\
+         chown root:wheel {RANGE_PLIST_PATH}\n\
+         chmod 0644 {RANGE_PLIST_PATH}\n\
+         (launchctl bootout system/{RANGE_UNIT_LABEL} 2>/dev/null || true)\n\
+         rm -f {RANGE_PROGRAM_PATH}\n\
+         launchctl bootstrap system {RANGE_PLIST_PATH}\n",
+    )
 }
 
 /// How many quarter-second polls the step waits for the service's channel
@@ -2315,6 +2596,28 @@ fn verified_copy_steps(install: &AnswererInstall, dir: &str, dest: &str, macos: 
         _ => String::new(),
     };
     format!(
+        "{root_dir}\
+         t=$(mktemp \"{dir}/.{ANSWERER_PROGRAM_NAME}.XXXXXX\")\n\
+         install -m 0755 -o root -g {group} \"{source}\" \"$t\" || {copy_failed}\n\
+         h=$({hash} < \"$t\" || true)\n\
+         h=${{h%% *}}\n\
+         case \"$h\" in {sha}) ;; *) rm -f \"$t\" ; echo \"minimal: the copied DNS service program hashes \
+         $h, not the {sha} min finalize-install verified: the source changed after it was checked; \
+         Minimal's DNS service was not installed\" >&2 ; exit 1 ;; esac\n\
+         {codesign}\
+         mv -f \"$t\" \"{dest}\"\n",
+        root_dir = root_dir_steps(dir, group),
+        copy_failed = refuse("the DNS service program could not be copied"),
+    )
+}
+
+/// The first check of the privileged copy ([`verified_copy_steps`],
+/// [`bundle_copy_steps`]): make `dir` root-owned at 0755 when it is not
+/// there, then walk it and every ancestor up to `/`, refusing at the first
+/// that is not a root-owned, non-sticky directory closed to group and other
+/// writes.
+fn root_dir_steps(dir: &str, group: &str) -> String {
+    format!(
         "[ -d \"{dir}\" ] || install -d -m 0755 -o root -g {group} \"{dir}\" \
          || {{ echo \"minimal: {dir} could not be created root-owned; Minimal's DNS service \
          was not installed\" >&2 ; exit 1 ; }}\n\
@@ -2326,39 +2629,194 @@ fn verified_copy_steps(install: &AnswererInstall, dir: &str, dest: &str, macos: 
          service was not installed\" >&2 ; exit 1 ; }}\n\
          \x20 if [ \"$p\" = / ] ; then break ; fi\n\
          \x20 p=$(dirname \"$p\")\n\
-         done\n\
-         t=$(mktemp \"{dir}/.{ANSWERER_PROGRAM_NAME}.XXXXXX\")\n\
-         install -m 0755 -o root -g {group} \"{source}\" \"$t\" || {copy_failed}\n\
-         h=$({hash} < \"$t\" || true)\n\
-         h=${{h%% *}}\n\
-         case \"$h\" in {sha}) ;; *) rm -f \"$t\" ; echo \"minimal: the copied DNS service program hashes \
-         $h, not the {sha} min finalize-install verified: the source changed after it was checked; \
-         Minimal's DNS service was not installed\" >&2 ; exit 1 ;; esac\n\
-         {codesign}\
-         mv -f \"$t\" \"{dest}\"\n",
-        copy_failed = refuse("the DNS service program could not be copied"),
+         done\n"
     )
+}
+
+/// The privileged step's verified copy of the answerer's app bundle: the
+/// macOS form of [`verified_copy_steps`] for a source that sits in a bundle,
+/// with the same order of checks and the same rule that nothing reaches the
+/// root-owned path unverified. `dir` is the root-owned directory the bundle
+/// is installed in and `bundle` the bundle's path inside it.
+///
+/// 1. `dir` and every ancestor of it pass [`root_dir_steps`].
+/// 2. `mktemp -d` makes an exclusive directory inside `dir`, root's alone
+///    (mode 0700), and the bundle is built in it: nobody else can read a
+///    file there until every check has passed.
+/// 3. The program and every bundle file the render pinned
+///    ([`AnswererInstall::bundle`]) are copied in, root's, each hashed and
+///    compared with its pin. A mismatch removes the directory and exits
+///    non-zero naming the file and both hashes. Every file is pinned, not
+///    only the program, because the signature does not cover the stapled
+///    ticket and a dev build's bundle carries no signature at all.
+/// 4. When the install carries a requirement, `codesign --verify --strict
+///    -R` verifies the built bundle against it: the program's signature,
+///    and through it the files the signature seals.
+/// 5. The directory is opened to 0755 and renamed to `bundle`. A bundle
+///    already there is renamed aside first and removed after, so a failed
+///    rename never leaves a half-replaced bundle.
+///
+/// Nothing here touches the running service or the units, so a refusal
+/// leaves the host as it was.
+#[cfg(any(test, target_os = "macos"))]
+fn bundle_copy_steps(install: &AnswererInstall, dir: &str, bundle: &str) -> String {
+    let source_bundle = bundle_root_of(&install.source).unwrap_or(&install.source);
+    let refuse = |reason: &str| {
+        format!(
+            "{{ rm -rf \"$t\" ; echo \"minimal: {reason}; Minimal's DNS service was not \
+             installed\" >&2 ; exit 1 ; }}"
+        )
+    };
+    // The program first, then the bundle's other files: (path inside the
+    // bundle, pin, mode, what a refusal calls it).
+    let mut files = vec![(
+        ANSWERER_BUNDLE_PROGRAM.to_string(),
+        install.sha256.as_str(),
+        "0755",
+        "DNS service program".to_string(),
+    )];
+    files.extend(install.bundle.iter().map(|file| {
+        (
+            file.path.clone(),
+            file.sha256.as_str(),
+            "0644",
+            format!("DNS service bundle file {}", file.path),
+        )
+    }));
+    // Every directory a file lands in, outermost first.
+    let mut dirs: Vec<String> = Vec::new();
+    for (path, ..) in &files {
+        let mut prefix = String::new();
+        let mut parts: Vec<&str> = path.split('/').collect();
+        parts.pop();
+        for part in parts {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(part);
+            if !dirs.contains(&prefix) {
+                dirs.push(prefix.clone());
+            }
+        }
+    }
+    let mut script = format!(
+        "{root_dir}\
+         t=$(mktemp -d \"{dir}/.{ANSWERER_BUNDLE_NAME}.XXXXXX\")\n",
+        root_dir = root_dir_steps(dir, "wheel"),
+    );
+    for made in &dirs {
+        script.push_str(&format!(
+            "install -d -m 0755 -o root -g wheel \"$t/{made}\" || {}\n",
+            refuse("the DNS service's app bundle could not be created")
+        ));
+    }
+    for (path, sha, mode, what) in &files {
+        script.push_str(&format!(
+            "install -m {mode} -o root -g wheel \"{source_bundle}/{path}\" \"$t/{path}\" \
+             || {copy_failed}\n\
+             h=$(shasum -a 256 < \"$t/{path}\" || true)\n\
+             h=${{h%% *}}\n\
+             case \"$h\" in {sha}) ;; *) rm -rf \"$t\" ; echo \"minimal: the copied {what} hashes \
+             $h, not the {sha} min finalize-install verified: the source changed after it was \
+             checked; Minimal's DNS service was not installed\" >&2 ; exit 1 ;; esac\n",
+            copy_failed = refuse(&format!("the {what} could not be copied")),
+        ));
+    }
+    if let Some(requirement) = &install.requirement {
+        script.push_str(&format!(
+            "codesign --verify --strict -R \"={}\" \"$t\" || {}\n",
+            requirement.replace('"', "\\\""),
+            refuse("the copied DNS service program failed its Developer ID check (codesign -R)")
+        ));
+    }
+    script.push_str(&format!(
+        "chmod 0755 \"$t\"\n\
+         rm -rf \"{bundle}.old\"\n\
+         if [ -e \"{bundle}\" ] ; then mv \"{bundle}\" \"{bundle}.old\" ; fi\n\
+         mv \"$t\" \"{bundle}\"\n\
+         rm -rf \"{bundle}.old\"\n"
+    ));
+    script
 }
 
 /// The lines that take the macOS answerer service down and remove what
 /// its step installed: boot the job out (guarded — a host where it is not
-/// loaded has nothing to boot out), then remove its plist, its root-owned
-/// program copy and its channel socket. Shared by the step's failure
-/// block ([`macos_answerer_steps`]) and the removal script
+/// loaded has nothing to boot out), then remove its plist and its channel
+/// socket ([`macos_unit_removal`]), then its root-owned app bundle, a bundle
+/// an interrupted replace left aside, and the program an install from
+/// before the bundle left ([`LEGACY_MACOS_ANSWERER_PROGRAM_PATH`]). Shared
+/// by the failure block of a step that copied a bare program
+/// ([`macos_answerer_unit_steps`]) and the removal script
 /// ([`macos_undo_command`]), so a failed install and an undo remove the
 /// same files. `indent` prefixes every line.
 #[cfg(any(test, target_os = "macos"))]
 fn macos_service_removal(channel: &str, indent: &str) -> String {
     format!(
+        "{unit}\
+         {indent}rm -rf \"{MACOS_ANSWERER_BUNDLE_PATH}\" \"{MACOS_ANSWERER_BUNDLE_PATH}.old\" \
+         \"{LEGACY_MACOS_ANSWERER_PROGRAM_PATH}\"\n",
+        unit = macos_unit_removal(channel, indent),
+    )
+}
+
+/// The lines that take the macOS answerer service down and remove its
+/// plist and its channel socket, leaving the app bundle: what the step's
+/// failure block runs where the range unit runs the bundle's program
+/// ([`macos_range_bundle_steps`]), so a service that failed to start does
+/// not take the range unit's program with it. `indent` prefixes every line.
+#[cfg(any(test, target_os = "macos"))]
+fn macos_unit_removal(channel: &str, indent: &str) -> String {
+    format!(
         "{indent}(launchctl bootout system/{ANSWERER_LAUNCHD_LABEL} 2>/dev/null || true)\n\
-         {indent}rm -f {ANSWERER_PLIST_PATH} \"{MACOS_ANSWERER_PROGRAM_PATH}\" \"{channel}\"\n"
+         {indent}rm -f {ANSWERER_PLIST_PATH} \"{channel}\"\n"
     )
 }
 
 /// The macOS answerer steps of the privileged script (NET-122's host
-/// service), after the range's: copy `minzoned` to the root-owned path,
-/// verified first ([`verified_copy_steps`]); boot out a running service;
-/// write the plist naming the copy, root's; ask this CLI's VM host daemons
+/// service) come in two halves. This one copies `minzoned` to the
+/// root-owned path, verified first: with its app bundle when the source
+/// sits in one ([`bundle_copy_steps`]), and alone when it is a bare
+/// program ([`verified_copy_steps`]), as a dev build's is.
+/// [`macos_answerer_unit_steps`] is the other half.
+///
+/// A copy that fails its hash pin or its Developer ID re-check never
+/// reaches the root-owned path, and the running service is left as it was.
+#[cfg(any(test, target_os = "macos"))]
+fn macos_answerer_copy_steps(install: &AnswererInstall) -> String {
+    if install.bundle.is_empty() {
+        // A bare program replaces whatever bundle an earlier install left:
+        // its other files go, so no signature sits beside a program it does
+        // not cover.
+        let stale: String = ANSWERER_BUNDLE_FILES
+            .iter()
+            .map(|path| format!(" \"{MACOS_ANSWERER_BUNDLE_PATH}/{path}\""))
+            .collect();
+        format!(
+            "# The box-name service's program: {ANSWERER_PROGRAM_NAME}, copied to a root-owned\n\
+             # path and checked there, as root, before anything names it.\n\
+             {verified_copy}\
+             rm -f{stale}\n",
+            verified_copy = verified_copy_steps(
+                install,
+                MACOS_ANSWERER_PROGRAM_DIR,
+                MACOS_ANSWERER_PROGRAM_PATH,
+                true
+            ),
+        )
+    } else {
+        format!(
+            "# The box-name service's program: {ANSWERER_PROGRAM_NAME}, copied with its app bundle\n\
+             # to a root-owned path and checked there, as root, before anything names it.\n\
+             {}",
+            bundle_copy_steps(install, RANGE_PROGRAM_DIR, MACOS_ANSWERER_BUNDLE_PATH),
+        )
+    }
+}
+
+/// The unit half of the macOS answerer steps, after the copy
+/// ([`macos_answerer_copy_steps`]): boot out a running service; remove the
+/// program an install from before the bundle left; write the plist naming
+/// the copy, root's; ask this CLI's VM host daemons
 /// to release the hook port (the copy's `release` verb, which waits up to
 /// 2 s for the port to be free); then load the plist and wait up to 5 s
 /// for the channel. Either wait running out asks the daemons to re-bind
@@ -2366,15 +2824,18 @@ fn macos_service_removal(channel: &str, indent: &str) -> String {
 /// out, removes its files and exits non-zero naming the reason, so the
 /// host is never left with nobody answering. With no daemon known, the
 /// unit is loaded directly.
-///
-/// A copy that fails its hash pin or its Developer ID re-check never
-/// reaches the root-owned path, and the running service is left as it was.
 #[cfg(any(test, target_os = "macos"))]
-fn macos_answerer_steps(install: &AnswererInstall) -> String {
+fn macos_answerer_unit_steps(install: &AnswererInstall) -> String {
     let controls = control_args(install);
     let copy = MACOS_ANSWERER_PROGRAM_PATH;
     let channel = &install.channel;
-    let cleanup = macos_service_removal(channel, "  ");
+    // Where the range unit runs the bundle's program, a service that fails
+    // to start leaves the bundle in place.
+    let cleanup = if install.bundle.is_empty() {
+        macos_service_removal(channel, "  ")
+    } else {
+        macos_unit_removal(channel, "  ")
+    };
     let fail = |reason: &str| answerer_fail_block(install, copy, &cleanup, reason);
     let release = if controls.is_empty() {
         String::new()
@@ -2385,14 +2846,10 @@ fn macos_answerer_steps(install: &AnswererInstall) -> String {
         )
     };
     format!(
-        "\n\
-         # The box-name service's program: {ANSWERER_PROGRAM_NAME}, copied to a root-owned\n\
-         # path and checked there, as root, before anything names it.\n\
-         {verified_copy}\
-         \n\
-         # The box-name service: a launchd unit run as {operator}, holding the\n\
+        "# The box-name service: a launchd unit run as {operator}, holding the\n\
          # answerer's listener on 127.0.0.1 and its channel socket.\n\
          (launchctl bootout system/{ANSWERER_LAUNCHD_LABEL} 2>/dev/null || true)\n\
+         rm -f \"{LEGACY_MACOS_ANSWERER_PROGRAM_PATH}\"\n\
          mkdir -p \"{channel_dir}\"\n\
          cat > {ANSWERER_PLIST_PATH} <<\\{ANSWERER_PLIST_HEREDOC}\n\
          {answerer_plist}\
@@ -2410,7 +2867,6 @@ fn macos_answerer_steps(install: &AnswererInstall) -> String {
          done\n\
          [ -S \"{channel}\" ] || {not_up}\n",
         handover = handover_comment(&controls, "launchd loads the service"),
-        verified_copy = verified_copy_steps(install, RANGE_PROGRAM_DIR, copy, true),
         operator = install.operator,
         channel_dir = install.channel_dir,
         answerer_plist = answerer_unit_plist(install),
@@ -2428,6 +2884,7 @@ fn macos_answerer_steps(install: &AnswererInstall) -> String {
 fn answerer_unit_plist(install: &AnswererInstall) -> String {
     ANSWERER_PLIST_TEMPLATE
         .replace("__PROGRAM__", MACOS_ANSWERER_PROGRAM_PATH)
+        .replace("__BUNDLE__", ANSWERER_BUNDLE_IDENTIFIER)
         .replace("__OPERATOR__", &install.operator)
         .replace("__CHANNEL__", &install.channel)
 }
@@ -2829,10 +3286,12 @@ fn channel_dir_removal(channel: &str) -> String {
 }
 
 /// The script that removes everything [`macos_command`] installs (NET-122's
-/// removal): the box-name service — booted out, its plist, program copy
-/// and channel socket removed by the same lines the step's own failure
-/// block runs ([`macos_service_removal`]), its channel's directories when
-/// empty — then the range unit, booted out and its two files removed, then
+/// removal): the box-name service — booted out, its plist, channel socket
+/// and app bundle removed ([`macos_service_removal`]), with the program an
+/// install from before the bundle left, its channel's directories when
+/// empty — then the range unit, booted out and its plist and script
+/// removed (a unit that runs the bundle's program has no script, and its
+/// program went with the bundle), then
 /// the resolver file. Every step tolerates what is already gone — a job
 /// that is not loaded, a file that is not there — so the script succeeds
 /// on a host it already cleaned, or on one `min finalize-install` never touched.
@@ -2844,8 +3303,8 @@ fn channel_dir_removal(channel: &str) -> String {
 pub(crate) fn macos_undo_command(channel: &str) -> String {
     format!(
         "{header}\n\
-         # The box-name service: unload it, then remove its plist, its program\n\
-         # copy, its channel socket, and the channel's directories when empty.\n\
+         # The box-name service: unload it, then remove its plist, its channel\n\
+         # socket, its app bundle, and the channel's directories when empty.\n\
          {service}\
          {channel_dirs}\
          \n\
@@ -4293,6 +4752,7 @@ mod tests {
             channel: channel.display().to_string(),
             source: TEST_ANSWERER_SOURCE.to_string(),
             sha256: TEST_ANSWERER_SHA256.to_string(),
+            bundle: Vec::new(),
             requirement: None,
             controls: vec![
                 "/state/minimal/providers/local-minvmd0/control.sock".to_string(),
@@ -4314,6 +4774,7 @@ mod tests {
             source: VerifiedSource {
                 path: TEST_ANSWERER_SOURCE.to_string(),
                 sha256: TEST_ANSWERER_SHA256.to_string(),
+                bundle: Vec::new(),
                 requirement: None,
             },
         }
@@ -4324,6 +4785,7 @@ mod tests {
         answerer_install(&VerifiedSource {
             path: TEST_ANSWERER_SOURCE.to_string(),
             sha256: TEST_ANSWERER_SHA256.to_string(),
+            bundle: Vec::new(),
             requirement: None,
         })
     }
@@ -4394,6 +4856,7 @@ mod tests {
             channel: "/run/minimal/answerer.sock".to_string(),
             source: "/home/operator/.local/bin/minzoned".to_string(),
             sha256: TEST_ANSWERER_SHA256.to_string(),
+            bundle: Vec::new(),
             requirement: None,
             controls: vec!["/home/operator/.minimal/vm/control.sock".to_string()],
         };
@@ -5137,12 +5600,17 @@ mod tests {
         }
 
         // macOS: both jobs booted out (tolerating a job not loaded), the
-        // two plists and the two programs removed, the resolver file, and
-        // the channel's directories only when empty.
+        // two plists, the app bundle, the range script and the program an
+        // install from before the bundle left removed, the resolver file,
+        // and the channel's directories only when empty.
         for step in [
             format!("(launchctl bootout system/{ANSWERER_LAUNCHD_LABEL} 2>/dev/null || true)"),
             format!("(launchctl bootout system/{RANGE_UNIT_LABEL} 2>/dev/null || true)"),
-            format!("rm -f {ANSWERER_PLIST_PATH} \"{MACOS_ANSWERER_PROGRAM_PATH}\" \"{channel}\""),
+            format!("rm -f {ANSWERER_PLIST_PATH} \"{channel}\""),
+            format!(
+                "rm -rf \"{MACOS_ANSWERER_BUNDLE_PATH}\" \"{MACOS_ANSWERER_BUNDLE_PATH}.old\" \
+                 \"{LEGACY_MACOS_ANSWERER_PROGRAM_PATH}\""
+            ),
             format!("rm -f {RANGE_PLIST_PATH} {RANGE_PROGRAM_PATH}"),
             format!("rm -f {RESOLVER_FILE}"),
             "rmdir \"/Library/Application Support/minimal/run\" 2>/dev/null || true".to_string(),
@@ -5616,8 +6084,8 @@ exit 0
         assert!(!tree_record.exists(), "a stale record is cleared");
     }
 
-    /// The service is machine-wide and runs as one operator: `min net
-    /// setup` refuses, before it runs anything, when the installed unit
+    /// The service is machine-wide and runs as one operator: `min
+    /// finalize-install` refuses, before it runs anything, when the installed unit
     /// names another user, and runs over a unit that names this user or
     /// over none at all. The parse reads the unit's own bytes, so the
     /// decision is tested without a root-owned path.
@@ -8786,6 +9254,681 @@ resolvectl domain minzone0 '~min.internal'
                     .to_string()
             ),
             "the one beside min wins"
+        );
+    }
+
+    /// [`test_install`] for a copy source that sits in an app bundle, with
+    /// every bundle file pinned: what a macOS release's `min` renders from.
+    fn bundled_install() -> AnswererInstall {
+        AnswererInstall {
+            source: format!("/opt/minimal-test/bin/{BUNDLED_ANSWERER_SOURCE}"),
+            bundle: ANSWERER_BUNDLE_FILES
+                .iter()
+                .map(|path| BundleFile {
+                    path: (*path).to_string(),
+                    sha256: TEST_ANSWERER_SHA256.to_string(),
+                })
+                .collect(),
+            ..test_install()
+        }
+    }
+
+    /// The bundle's layout is stated in four places: the paths here, the
+    /// bundle's `Info.plist`, the script that assembles it, and the release's
+    /// component table. They agree, so the bundle `min` looks for is the one
+    /// a release ships and the identifier both plists name is the bundle's.
+    #[test]
+    fn the_app_bundle_layout_matches_packaging() {
+        assert_eq!(
+            MACOS_ANSWERER_PROGRAM_PATH,
+            format!("{MACOS_ANSWERER_BUNDLE_PATH}/{ANSWERER_BUNDLE_PROGRAM}")
+        );
+        assert_eq!(
+            MACOS_ANSWERER_PROGRAM_PATH,
+            format!("{MACOS_ANSWERER_PROGRAM_DIR}/{ANSWERER_PROGRAM_NAME}")
+        );
+        assert_eq!(
+            MACOS_ANSWERER_BUNDLE_PATH,
+            format!("{RANGE_PROGRAM_DIR}/{ANSWERER_BUNDLE_NAME}")
+        );
+        assert_eq!(
+            BUNDLED_ANSWERER_SOURCE,
+            format!("{ANSWERER_BUNDLE_NAME}/{ANSWERER_BUNDLE_PROGRAM}")
+        );
+
+        let info = include_str!("../../../packaging/macos/Info.plist");
+        for (key, value) in [
+            ("CFBundleIdentifier", ANSWERER_BUNDLE_IDENTIFIER),
+            ("CFBundleExecutable", ANSWERER_PROGRAM_NAME),
+        ] {
+            assert!(
+                info.contains(&format!("<key>{key}</key>\n\t<string>{value}</string>")),
+                "packaging/macos/Info.plist sets {key} to {value}: {info}"
+            );
+        }
+
+        let assemble = include_str!("../../../scripts/build-app-bundle.sh");
+        let stage = include_str!("../../../scripts/stage-release.sh");
+        for path in std::iter::once(&ANSWERER_BUNDLE_PROGRAM).chain(ANSWERER_BUNDLE_FILES) {
+            assert!(
+                assemble.contains(&format!("\"{path}|")),
+                "scripts/build-app-bundle.sh carries {path}"
+            );
+            assert!(
+                stage.contains(&format!("|bin/{ANSWERER_BUNDLE_NAME}/{path}|")),
+                "scripts/stage-release.sh installs {path} beside min"
+            );
+        }
+    }
+
+    /// On macOS the program is looked for inside its app bundle before a
+    /// bare one in the same directory, a directory is exhausted before the
+    /// next is tried, and only a path that ends with the bundle's own layout
+    /// reads as bundled.
+    #[test]
+    fn answerer_source_prefers_the_app_bundle() {
+        let names = &[BUNDLED_ANSWERER_SOURCE, ANSWERER_PROGRAM_NAME];
+        let beside = tempfile::TempDir::new().expect("a dir beside min");
+        let on_path = tempfile::TempDir::new().expect("a dir on PATH");
+        let path = std::env::join_paths([on_path.path()]).expect("a PATH");
+        let bundle_in = |dir: &std::path::Path| {
+            let program = dir.join(BUNDLED_ANSWERER_SOURCE);
+            std::fs::create_dir_all(program.parent().unwrap()).unwrap();
+            std::fs::write(&program, b"").unwrap();
+            program.display().to_string()
+        };
+
+        let on_path_bundle = bundle_in(on_path.path());
+        assert_eq!(
+            answerer_source_named(names, Some(beside.path()), Some(&path)),
+            Some(on_path_bundle.clone()),
+            "a bundle on PATH is found when nothing sits beside min"
+        );
+        assert_eq!(
+            bundle_root_of(&on_path_bundle),
+            Some(
+                on_path
+                    .path()
+                    .join(ANSWERER_BUNDLE_NAME)
+                    .display()
+                    .to_string()
+                    .as_str()
+            )
+        );
+
+        let bare = beside.path().join(ANSWERER_PROGRAM_NAME);
+        std::fs::write(&bare, b"").unwrap();
+        assert_eq!(
+            answerer_source_named(names, Some(beside.path()), Some(&path)),
+            Some(bare.display().to_string()),
+            "a bare program beside min is found before a bundle on PATH"
+        );
+        let beside_bundle = bundle_in(beside.path());
+        assert_eq!(
+            answerer_source_named(names, Some(beside.path()), Some(&path)),
+            Some(beside_bundle),
+            "the bundle beside min is found before the bare program beside it"
+        );
+
+        assert_eq!(bundle_root_of(&bare.display().to_string()), None);
+        assert_eq!(bundle_root_of(BUNDLED_ANSWERER_SOURCE), None);
+        assert_eq!(
+            bundle_root_of("/opt/NotMinimal.app/Contents/MacOS/minzoned"),
+            None
+        );
+    }
+
+    /// A verified source inside an app bundle has every bundle file that
+    /// exists pinned beside the program, by its path inside the bundle; a
+    /// bare program has none.
+    #[tokio::test]
+    async fn a_bundled_source_pins_every_bundle_file() {
+        use sha2::Digest as _;
+        let dir = tempfile::TempDir::new().expect("a temp dir");
+        let bundle = dir.path().join(ANSWERER_BUNDLE_NAME);
+        let program = dir.path().join(BUNDLED_ANSWERER_SOURCE);
+        std::fs::create_dir_all(program.parent().unwrap()).unwrap();
+        std::fs::write(&program, b"program").unwrap();
+        // Two of the four: an unsigned bundle has no seal and no ticket.
+        let present = ["Contents/Info.plist", "Contents/Resources/AppIcon.icns"];
+        for path in present {
+            let file = bundle.join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, path.as_bytes()).unwrap();
+        }
+
+        let step = answerer_step_with_source(
+            AnswererStep::Absent,
+            Some(program.display().to_string()),
+            answerer_source_identity,
+        )
+        .await;
+        let AnswererStep::SourceVerified { source, .. } = &step else {
+            panic!("a readable bundled source verifies: {step:?}");
+        };
+        assert_eq!(source.path, program.display().to_string());
+        assert_eq!(source.sha256, hex::encode(sha2::Sha256::digest(b"program")));
+        assert_eq!(
+            source.bundle,
+            present
+                .iter()
+                .map(|path| BundleFile {
+                    path: (*path).to_string(),
+                    sha256: hex::encode(sha2::Sha256::digest(path.as_bytes())),
+                })
+                .collect::<Vec<_>>()
+        );
+        let install = answerer_install(source).expect("the paths quote");
+        assert_eq!(install.bundle, source.bundle);
+
+        let bare = dir.path().join(ANSWERER_PROGRAM_NAME);
+        std::fs::write(&bare, b"program").unwrap();
+        let step = answerer_step_with_source(
+            AnswererStep::Absent,
+            Some(bare.display().to_string()),
+            answerer_source_identity,
+        )
+        .await;
+        assert!(
+            matches!(&step, AnswererStep::SourceVerified { source, .. } if source.bundle.is_empty()),
+            "{step:?}"
+        );
+    }
+
+    // NET-122 and NET-123 on macOS where the release ships the answerer in
+    // an app bundle: the one privileged step copies the bundle to a
+    // root-owned path, and both launchd units run the program inside that
+    // copy and name the bundle, so macOS lists them under the bundle's name.
+    // The range unit carries no script: its program is signed code, and the
+    // range it applies is compiled into that program.
+    #[test]
+    fn advisory_runs_both_units_from_the_app_bundle_on_macos() {
+        let install = bundled_install();
+        let mac = macos_command(15353, Some(&install));
+        assert!(sh_parses(&mac), "{mac}");
+        assert!(mac.lines().any(|line| line == "set -eu"), "{mac}");
+        assert!(!mac.contains("&&"), "no step hides in an && list: {mac}");
+        for statement in script_statements(&without_heredoc_bodies(&mac)) {
+            assert!(!statement.contains("sudo"), "{statement}");
+        }
+
+        // The bundle is in place before either unit is written or loaded.
+        let source_bundle = bundle_root_of(&install.source).expect("the source is bundled");
+        let program_copy = format!(
+            "install -m 0755 -o root -g wheel \"{}\" \"$t/{ANSWERER_BUNDLE_PROGRAM}\"",
+            install.source
+        );
+        let copy_at = mac.find(&program_copy).expect("the program is copied");
+        for file in &install.bundle {
+            let copy = format!(
+                "install -m 0644 -o root -g wheel \"{source_bundle}/{path}\" \"$t/{path}\"",
+                path = file.path
+            );
+            assert!(mac.contains(&copy), "{} is copied: {mac}", file.path);
+        }
+        assert_eq!(
+            mac.matches(&format!(" in {TEST_ANSWERER_SHA256}) ;;"))
+                .count(),
+            1 + install.bundle.len(),
+            "the program and every bundle file are checked against their pins: {mac}"
+        );
+        let placed_at = mac
+            .find(&format!("mv \"$t\" \"{MACOS_ANSWERER_BUNDLE_PATH}\""))
+            .expect("the verified bundle is renamed into place");
+        let range_plist_at = mac
+            .find(&format!("cat > {RANGE_PLIST_PATH}"))
+            .expect("the range plist is written");
+        let range_load_at = mac
+            .find(&format!("launchctl bootstrap system {RANGE_PLIST_PATH}"))
+            .expect("the range unit is loaded");
+        let service_load_at = mac
+            .find(&format!("launchctl bootstrap system {ANSWERER_PLIST_PATH}"))
+            .expect("the service is loaded");
+        assert!(
+            copy_at < placed_at
+                && placed_at < range_plist_at
+                && range_plist_at < range_load_at
+                && range_load_at < service_load_at,
+            "copy, then the range unit, then the service: {mac}"
+        );
+
+        // The range unit: the bundle's program and its verb, nothing else to
+        // read, and no script.
+        let range_plist = range_unit_bundle_plist();
+        assert!(mac.contains(&range_plist), "{mac}");
+        assert_eq!(
+            plist_program_argument(&range_plist),
+            Some(MACOS_ANSWERER_PROGRAM_PATH)
+        );
+        assert!(
+            range_plist.contains(&format!(
+                "<string>{MACOS_ANSWERER_PROGRAM_PATH}</string>\n\t\t<string>{RANGE_PROGRAM_VERB}</string>\n\t</array>"
+            )),
+            "the program and its one verb are the whole argument list: {range_plist}"
+        );
+        assert!(range_plist.contains(&format!("<string>{RANGE_UNIT_LABEL}</string>")));
+        for absent in ["UserName", "EnvironmentVariables", "KeepAlive"] {
+            assert!(!range_plist.contains(absent), "{range_plist}");
+        }
+        assert!(
+            !mac.contains(&format!("cat > {RANGE_PROGRAM_PATH}")),
+            "no range script is written: {mac}"
+        );
+        assert!(
+            mac.contains(&format!("rm -f {RANGE_PROGRAM_PATH}\n")),
+            "the script an earlier install left is removed: {mac}"
+        );
+        assert_eq!(
+            range_program_path(plist_program_argument(&range_plist)),
+            MACOS_ANSWERER_PROGRAM_PATH
+        );
+
+        // Both units name the bundle.
+        let service_plist = answerer_unit_plist(&install);
+        assert!(mac.contains(&service_plist), "{mac}");
+        let association = format!(
+            "<key>AssociatedBundleIdentifiers</key>\n\t<array>\n\t\t\
+             <string>{ANSWERER_BUNDLE_IDENTIFIER}</string>\n\t</array>"
+        );
+        for plist in [&range_plist, &service_plist] {
+            assert!(plist.contains(&association), "{plist}");
+        }
+
+        // What an install from before the bundle left is removed, and a
+        // service that fails to start leaves the bundle the range unit runs.
+        assert!(
+            mac.contains(&format!("rm -f \"{LEGACY_MACOS_ANSWERER_PROGRAM_PATH}\"\n")),
+            "{mac}"
+        );
+        assert!(
+            !mac[range_load_at..].contains(&format!("rm -rf \"{MACOS_ANSWERER_BUNDLE_PATH}\"")),
+            "no failure block removes the bundle: {mac}"
+        );
+        assert!(
+            mac.contains(&macos_unit_removal(&install.channel, "  ")),
+            "{mac}"
+        );
+
+        // A bare program is copied alone, and the range unit keeps its script.
+        let bare = macos_command(15353, Some(&test_install()));
+        assert!(
+            bare.contains(&format!("cat > {RANGE_PROGRAM_PATH}")),
+            "{bare}"
+        );
+        assert!(!bare.contains(&range_plist), "{bare}");
+        assert!(
+            bare.contains(&format!(
+                "rm -f \"{MACOS_ANSWERER_BUNDLE_PATH}/Contents/Info.plist\""
+            )),
+            "a bare program leaves no stale bundle file beside it: {bare}"
+        );
+    }
+
+    /// The range unit's custody follows the program its plist names: the
+    /// bundle's program holds exactly as the script does, a loaded job that
+    /// still runs the other one fails, and so does a bundle directory
+    /// someone else can write.
+    #[test]
+    fn range_step_custody_follows_the_program_the_plist_names() {
+        let root = |mode| FileCustody { owner: 0, mode };
+        let mut components = Vec::new();
+        for path in [MACOS_ANSWERER_PROGRAM_PATH, RANGE_PLIST_PATH] {
+            for component in path_components(path) {
+                components.push((component, root(0o755)));
+            }
+        }
+        let facts = RangeFacts {
+            components,
+            program: Some(root(0o755)),
+            plist: Some(root(0o644)),
+            plist_program: Some(MACOS_ANSWERER_PROGRAM_PATH.to_string()),
+            loaded_program: Some(MACOS_ANSWERER_PROGRAM_PATH.to_string()),
+        };
+        assert_eq!(range_step_over(&facts).state, RangeStepState::Installed);
+        assert_eq!(installed_range_step().state, RangeStepState::Installed);
+
+        let stale = RangeFacts {
+            loaded_program: Some(RANGE_PROGRAM_PATH.to_string()),
+            ..facts.clone()
+        };
+        let step = range_step_over(&stale);
+        assert_eq!(step.state, RangeStepState::CustodyFailed);
+        let check = step.failed_check.expect("the check is named");
+        assert!(
+            check.contains(RANGE_PROGRAM_PATH) && check.contains(MACOS_ANSWERER_PROGRAM_PATH),
+            "{check}"
+        );
+
+        let mut open = facts.clone();
+        for (path, custody) in &mut open.components {
+            if path == MACOS_ANSWERER_BUNDLE_PATH {
+                custody.mode = 0o775;
+            }
+        }
+        let step = range_step_over(&open);
+        assert_eq!(step.state, RangeStepState::CustodyFailed);
+        assert!(
+            step.failed_check
+                .as_deref()
+                .is_some_and(|check| check.contains(MACOS_ANSWERER_BUNDLE_PATH)),
+            "{step:?}"
+        );
+    }
+
+    /// A host whose service was installed before the program shipped in a
+    /// bundle has a unit naming the old path and nothing at the new one: the
+    /// step does not hold, so `min finalize-install` runs again and installs
+    /// the bundle.
+    #[test]
+    fn a_service_installed_before_the_bundle_resurfaces_the_step() {
+        let daemon = minvmd::net::answerer::CHANNEL_PROTOCOL_VERSION;
+        let facts = AnswererFacts {
+            components: path_components(LEGACY_MACOS_ANSWERER_PROGRAM_PATH)
+                .into_iter()
+                .chain(path_components(ANSWERER_PLIST_PATH))
+                .map(|component| {
+                    (
+                        component,
+                        FileCustody {
+                            owner: 0,
+                            mode: 0o755,
+                        },
+                    )
+                })
+                .collect(),
+            program: None,
+            units: ANSWERER_UNIT_PATHS
+                .iter()
+                .map(|_| {
+                    Some(FileCustody {
+                        owner: 0,
+                        mode: 0o644,
+                    })
+                })
+                .collect(),
+            unit_program: Some(LEGACY_MACOS_ANSWERER_PROGRAM_PATH.to_string()),
+            installed_version: Some(daemon),
+        };
+        let step = answerer_step_over(&facts, daemon);
+        assert!(
+            matches!(step, AnswererStep::CustodyFailed { .. }) && !step.holds(),
+            "{step:?}"
+        );
+    }
+
+    /// A temp tree the bundle copy fragment runs in, unprivileged, like
+    /// [`CopyHarness`]: `install` is a plain `cp` or `mkdir -p`, `find`
+    /// answers as root's above the tree, `shasum` is whichever SHA-256 tool
+    /// the host has, and `codesign` records its arguments and fails when
+    /// `CODESIGN_FAILS` is set.
+    struct BundleHarness {
+        _root: tempfile::TempDir,
+        stubs: std::path::PathBuf,
+        tree: std::path::PathBuf,
+        dest_dir: std::path::PathBuf,
+        bundle: std::path::PathBuf,
+        source_bundle: std::path::PathBuf,
+        codesign_log: std::path::PathBuf,
+        install: AnswererInstall,
+    }
+
+    impl BundleHarness {
+        fn new() -> Self {
+            use sha2::Digest as _;
+            use std::os::unix::fs::PermissionsExt as _;
+            let root = tempfile::tempdir().expect("a temp dir");
+            let base = root.path().canonicalize().expect("the temp dir resolves");
+            let stubs = base.join("stubs");
+            let tree = base.join("tree");
+            let dest_dir = tree.join("dest");
+            std::fs::create_dir_all(&stubs).unwrap();
+            std::fs::create_dir_all(&dest_dir).unwrap();
+            for dir in [&tree, &dest_dir] {
+                std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            let stub = |name: &str, body: &str| {
+                let path = stubs.join(name);
+                std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            };
+            stub(
+                "install",
+                "if [ \"$1\" = -d ]; then while [ $# -gt 1 ]; do shift; done; \
+                 mkdir -p \"$1\"; exit; fi\n\
+                 while [ $# -gt 2 ]; do shift; done\ncp \"$1\" \"$2\"",
+            );
+            stub(
+                "find",
+                "p=$1; shift\n\
+                 case \"$p\" in \"$COPY_TREE\"|\"$COPY_TREE\"/*) ;; *) printf '%s\\n' \"$p\"; exit 0 ;; esac\n\
+                 exec /usr/bin/find \"$p\" $(printf '%s ' \"$@\" | sed \"s/-user root/-user $(id -un)/\")",
+            );
+            stub(
+                "shasum",
+                "if command -v sha256sum >/dev/null 2>&1; then exec sha256sum; fi\n\
+                 exec /usr/bin/shasum -a 256",
+            );
+            stub(
+                "codesign",
+                "printf '%s\\n' \"$*\" >> \"$CODESIGN_LOG\"\n[ -z \"${CODESIGN_FAILS:-}\" ]",
+            );
+
+            let source_bundle = base.join("source").join(ANSWERER_BUNDLE_NAME);
+            let write = |path: &str| {
+                let file = source_bundle.join(path);
+                std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+                let bytes = format!("the checked bytes of {path}\n");
+                std::fs::write(&file, &bytes).unwrap();
+                hex::encode(sha2::Sha256::digest(bytes.as_bytes()))
+            };
+            let sha256 = write(ANSWERER_BUNDLE_PROGRAM);
+            let bundle_files = ANSWERER_BUNDLE_FILES
+                .iter()
+                .map(|path| BundleFile {
+                    path: (*path).to_string(),
+                    sha256: write(path),
+                })
+                .collect();
+            let install = AnswererInstall {
+                source: source_bundle
+                    .join(ANSWERER_BUNDLE_PROGRAM)
+                    .display()
+                    .to_string(),
+                sha256,
+                bundle: bundle_files,
+                ..test_install()
+            };
+            BundleHarness {
+                _root: root,
+                stubs,
+                tree,
+                bundle: dest_dir.join(ANSWERER_BUNDLE_NAME),
+                dest_dir,
+                source_bundle,
+                codesign_log: base.join("codesign.log"),
+                install,
+            }
+        }
+
+        /// Runs the rendered fragment for `install` the way the setup script
+        /// runs it, after its `set -eu`.
+        fn run(&self, install: &AnswererInstall, codesign_fails: bool) -> std::process::Output {
+            let fragment = bundle_copy_steps(
+                install,
+                &self.dest_dir.display().to_string(),
+                &self.bundle.display().to_string(),
+            );
+            let mut command = std::process::Command::new("/bin/sh");
+            command
+                .args(["-c", &format!("set -eu\n{fragment}")])
+                .env(
+                    "PATH",
+                    format!(
+                        "{}:{}",
+                        self.stubs.display(),
+                        std::env::var("PATH").unwrap_or_default()
+                    ),
+                )
+                .env("COPY_TREE", &self.tree)
+                .env("CODESIGN_LOG", &self.codesign_log)
+                .env_remove("CODESIGN_FAILS");
+            if codesign_fails {
+                command.env("CODESIGN_FAILS", "1");
+            }
+            command.output().expect("sh runs")
+        }
+
+        /// What sits in the destination directory beside the bundle.
+        fn leftovers(&self) -> Vec<String> {
+            std::fs::read_dir(&self.dest_dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|name| name != ANSWERER_BUNDLE_NAME)
+                .collect()
+        }
+    }
+
+    /// The privileged step's verified copy of the app bundle: every pinned
+    /// file reaches the root-owned bundle with the bytes that were checked,
+    /// a bundle already there is replaced whole, and nothing is left beside
+    /// it.
+    #[test]
+    fn privileged_bundle_copy_installs_every_pinned_file() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let harness = BundleHarness::new();
+        let stale = harness.bundle.join("Contents/stale");
+        std::fs::create_dir_all(stale.parent().unwrap()).unwrap();
+        std::fs::write(&stale, b"from an earlier install").unwrap();
+
+        let output = harness.run(&harness.install, false);
+        assert!(
+            output.status.success(),
+            "the checked bundle installs: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        for path in std::iter::once(&ANSWERER_BUNDLE_PROGRAM).chain(ANSWERER_BUNDLE_FILES) {
+            assert_eq!(
+                std::fs::read(harness.bundle.join(path)).unwrap(),
+                std::fs::read(harness.source_bundle.join(path)).unwrap(),
+                "{path}"
+            );
+        }
+        assert!(!stale.exists(), "the earlier bundle is replaced whole");
+        assert!(harness.leftovers().is_empty(), "{:?}", harness.leftovers());
+        let mode = std::fs::metadata(&harness.bundle)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(mode, 0o755, "the bundle is opened once it is verified");
+        assert!(
+            !harness.codesign_log.exists(),
+            "an install with no requirement runs no signature check"
+        );
+    }
+
+    /// A bundle file swapped after the render is refused like a swapped
+    /// program: the refusal names the file and both hashes, the temp
+    /// directory is removed, and the bundle already installed stays as it
+    /// was. The ticket is the file no signature covers, so it is the one
+    /// swapped here.
+    #[test]
+    fn privileged_bundle_copy_refuses_a_bundle_file_swapped_after_render() {
+        use sha2::Digest as _;
+        let harness = BundleHarness::new();
+        assert!(harness.run(&harness.install, false).status.success());
+        let installed = std::fs::read(harness.bundle.join("Contents/CodeResources")).unwrap();
+
+        let swapped = b"bytes planted after the advisory checked\n";
+        std::fs::write(
+            harness.source_bundle.join("Contents/CodeResources"),
+            swapped,
+        )
+        .unwrap();
+        let output = harness.run(&harness.install, false);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "a swapped bundle file is refused");
+        let pinned = &harness
+            .install
+            .bundle
+            .iter()
+            .find(|file| file.path == "Contents/CodeResources")
+            .unwrap()
+            .sha256;
+        assert!(
+            stderr.contains("bundle file Contents/CodeResources")
+                && stderr.contains(pinned.as_str())
+                && stderr.contains(&hex::encode(sha2::Sha256::digest(swapped))),
+            "the refusal names the file and both hashes: {stderr}"
+        );
+        assert_eq!(
+            std::fs::read(harness.bundle.join("Contents/CodeResources")).unwrap(),
+            installed,
+            "the installed bundle is left as it was"
+        );
+        assert!(harness.leftovers().is_empty(), "{:?}", harness.leftovers());
+    }
+
+    /// A bundle file that cannot be copied is refused by its own name, not
+    /// the program's, and nothing is installed.
+    #[test]
+    fn privileged_bundle_copy_names_the_file_that_could_not_be_copied() {
+        let harness = BundleHarness::new();
+        std::fs::remove_file(harness.source_bundle.join("Contents/CodeResources")).unwrap();
+
+        let output = harness.run(&harness.install, false);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "a failed copy is refused");
+        assert!(
+            stderr
+                .contains("the DNS service bundle file Contents/CodeResources could not be copied"),
+            "the refusal names the file: {stderr}"
+        );
+        assert!(
+            !stderr.contains("the DNS service program could not be copied"),
+            "the refusal does not blame the program: {stderr}"
+        );
+        assert!(!harness.bundle.exists(), "nothing reaches the destination");
+        assert!(harness.leftovers().is_empty(), "{:?}", harness.leftovers());
+    }
+
+    /// With a requirement, the built bundle is verified against it as a
+    /// bundle before it is renamed into place, and a bundle that fails is
+    /// removed with nothing installed.
+    #[test]
+    fn privileged_bundle_copy_verifies_the_bundle_signature() {
+        let harness = BundleHarness::new();
+        let requirement = answerer_requirement("3G47C5HY64", "dev.minimal.minzoned").unwrap();
+        let install = AnswererInstall {
+            requirement: Some(requirement.clone()),
+            ..harness.install.clone()
+        };
+
+        let output = harness.run(&install, true);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "a failed signature check refuses");
+        assert!(
+            stderr.contains("failed its Developer ID check (codesign -R)"),
+            "{stderr}"
+        );
+        assert!(!harness.bundle.exists(), "nothing reaches the destination");
+        assert!(harness.leftovers().is_empty(), "{:?}", harness.leftovers());
+
+        let output = harness.run(&install, false);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let log = std::fs::read_to_string(&harness.codesign_log).unwrap();
+        let last = log.lines().last().expect("codesign ran");
+        assert!(
+            last.starts_with(&format!("--verify --strict -R ={requirement} "))
+                && last.contains(&format!(
+                    "{}/.{ANSWERER_BUNDLE_NAME}.",
+                    harness.dest_dir.display()
+                )),
+            "the temp bundle is what is verified: {last}"
         );
     }
 }

@@ -7313,6 +7313,7 @@ proof_local_range_reserved_by_privileged_step() {
     range_remove_unit
   fi
   if [ -e /Library/LaunchDaemons/dev.gominimal.zone.plist ] \
+     || [ -e /Library/PrivilegedHelperTools/Minimal.app ] \
      || [ -e /Library/PrivilegedHelperTools/minzoned ]; then
     echo "removing a leftover answerer service from a prior run, for the same reason"
     ANSWERER_SERVICE_CHANNEL="${ANSWERER_SERVICE_CHANNEL:-/nonexistent}"
@@ -7416,7 +7417,7 @@ proof_local_range_reserved_by_privileged_step() {
   esac
   # One elevation: the user runs the script under one sudo, so no statement
   # in it elevates again (the header's comment names the sudo it runs under).
-  if printf '%s\n' "$range_cmd" | grep -v '^[[:space:]]*#' | grep -q -- sudo; then
+  if setup_script_elevates "$range_cmd"; then
     echo "::error::the setup script elevates on its own — the user must never be asked twice"
     echo "--- script ---"; printf '%s\n' "$range_cmd"
     fail
@@ -7670,8 +7671,12 @@ answerer_service_teardown() {
   [ -n "${ANSWERER_SERVICE_CHANNEL:-}" ] || return 0
   if [ "$(uname -s)" = Darwin ]; then
     sudo -n launchctl bootout "system/dev.gominimal.zone" >/dev/null 2>&1 || true
+    # The program copy sits in an app bundle; the bare path is where an
+    # install from before the bundle put it.
     sudo -n rm -f "/Library/LaunchDaemons/dev.gominimal.zone.plist" \
       "/Library/PrivilegedHelperTools/minzoned" >/dev/null 2>&1 || true
+    sudo -n rm -rf "/Library/PrivilegedHelperTools/Minimal.app" \
+      "/Library/PrivilegedHelperTools/Minimal.app.old" >/dev/null 2>&1 || true
   else
     sudo -n systemctl disable --now minzoned.socket \
       minzoned.service >/dev/null 2>&1 || true
@@ -7765,6 +7770,18 @@ setup_classifier_teardown() {
   fi
   sudo -n rm -f /var/lib/minimal/finalize-install-classifier >/dev/null 2>&1 || true
   SETUP_CLASSIFIER_INSTALLED=""
+}
+
+# Whether a setup script elevates on its own: `sudo` in command position on
+# a line that is not a comment. A hint inside a quoted message ("try: sudo
+# ...") is text, not an elevation. awk reads its whole input, so no early
+# exit can break the pipe; under `pipefail` a broken pipe would read as "no
+# sudo" and pass a script that elevates.
+setup_script_elevates() {
+  printf '%s\n' "$1" | awk '
+    /^[[:space:]]*#/ { next }
+    /(^|[;&|({`!]|(^|[^[:alnum:]_])(then|do|else|if|elif|while|until|time))[[:space:]]*sudo([[:space:]]|$)/ { found = 1 }
+    END { exit !found }'
 }
 
 # The setup script `min finalize-install --show --script` wrote to $1 (its stdout), whole,
@@ -7932,7 +7949,7 @@ proof_native_resolution_without_proxy_env() {
           ;;
       esac
     fi
-    if printf '%s\n' "$native_cmd" | grep -v '^[[:space:]]*#' | grep -q -- sudo; then
+    if setup_script_elevates "$native_cmd"; then
       echo "::error::the setup script elevates on its own; it must run whole under the one sudo the user gives it"
       echo "--- script ---"; printf '%s\n' "$native_cmd"
       fail
@@ -8774,7 +8791,7 @@ proof_box_name_resolves_natively_without_proxy() {
         fail
         ;;
     esac
-    if printf '%s\n' "$bn_cmd" | grep -v '^[[:space:]]*#' | grep -q -- sudo; then
+    if setup_script_elevates "$bn_cmd"; then
       echo "::error::the setup script elevates on its own; it must run whole under the one sudo the user gives it"
       echo "--- script ---"; printf '%s\n' "$bn_cmd"
       fail
@@ -9420,6 +9437,7 @@ proof_answerer_survives_session_stop() {
   # over could never exist. Remove it first, the range case's reasoning.
   if [ -e "$asr_marker" ] || [ -e "$asr_channel" ] \
      || [ -e /usr/local/lib/minimal/minzoned ] \
+     || [ -e /Library/PrivilegedHelperTools/Minimal.app ] \
      || [ -e /Library/PrivilegedHelperTools/minzoned ]; then
     echo "removing a leftover answerer service from a prior run, so node A starts from the interim"
     ANSWERER_SERVICE_CHANNEL="$asr_channel"

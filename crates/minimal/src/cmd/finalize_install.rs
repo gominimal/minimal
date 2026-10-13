@@ -1751,6 +1751,7 @@ mod tests {
                     channel_dir: "/run/min".to_string(),
                     source: "/usr/local/bin/minzoned".to_string(),
                     sha256: "0".repeat(64),
+                    bundle: Vec::new(),
                     requirement: None,
                     controls: Vec::new(),
                 }),

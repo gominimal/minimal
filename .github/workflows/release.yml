@@ -455,7 +455,8 @@ jobs:
         # labels only (docs/internal/macos-runner-setup.md).
         runs-on: [self-hosted, macOS, ARM64, minimal-signing]
         # 60, not 45: the build takes about 15 minutes, and the notarization
-        # step below waits on Apple's notary service for three submissions.
+        # step below waits on Apple's notary service for three submissions
+        # (minvmd, min, and the app bundle minzoned ships in).
         timeout-minutes: 60
         needs: [assert-version]
         if: vars.RUN_MACOS_CI != 'false'
@@ -465,7 +466,10 @@ jobs:
             # into `min` (option_env! in crates/minimal/src/resolver.rs): the
             # session advisory verifies the copy source against the Developer
             # ID requirement for this team and identifier, and a `min` built
-            # without them offers no answerer step on macOS.
+            # without them offers no answerer step on macOS. The identifier
+            # is also the CFBundleIdentifier of the app bundle minzoned ships
+            # in (packaging/macos/Info.plist); the assemble step below fails
+            # when the two differ.
             MINIMAL_ZONED_TEAMID: 3G47C5HY64
             MINIMAL_ZONED_IDENTIFIER: dev.minimal.minzoned
         steps:
@@ -524,11 +528,33 @@ jobs:
               run: |
                   mv target/release/minvmd target/release/minvmd-macos-arm64
                   mv target/release/min target/release/minimal-macos-arm64
-                  mv target/release/minzoned target/release/minzoned-macos-arm64
+            - name: Assemble the minzoned app bundle
+              # minzoned ships inside Minimal.app, never as a bare file: macOS
+              # lists a launchd job under an app's name and icon (System
+              # Settings > General > Login Items & Extensions) only when the
+              # job's program belongs to an app bundle signed with the
+              # vendor's Developer ID. The bundle is Info.plist, the program
+              # and the icon (scripts/build-app-bundle.sh); it is signed,
+              # notarized and stapled below, then flattened to one file per
+              # bundle file for the release.
+              #
+              # The bundle's version is the release version, or 0.0.0 on a
+              # build that is not a versioned release.
+              run: |
+                  scripts/build-app-bundle.sh assemble target/release/minzoned \
+                    target/release/Minimal.app "${MINIMAL_RELEASE_VERSION:-0.0.0}"
+                  bundle_id="$(plutil -extract CFBundleIdentifier raw -o - \
+                    target/release/Minimal.app/Contents/Info.plist)"
+                  if [ "$bundle_id" != "$MINIMAL_ZONED_IDENTIFIER" ]; then
+                    echo "::error::packaging/macos/Info.plist names the bundle '$bundle_id', but min verifies minzoned as '$MINIMAL_ZONED_IDENTIFIER'" >&2
+                    exit 1
+                  fi
             - name: Codesign binaries with Developer ID
-              # Sign the two shipped Mach-O binaries with the Developer ID
-              # Application identity held in the runner's signing keychain. This
-              # is the LAST mutation before upload.
+              # Sign the two shipped Mach-O binaries and the minzoned app
+              # bundle with the Developer ID Application identity held in the
+              # runner's signing keychain. For the two binaries this is the
+              # LAST mutation before upload; the bundle is stapled after it is
+              # notarized, which adds a file its signature does not cover.
               # Hardened runtime (--options runtime) + a secure --timestamp so the
               # artifacts are notarization-ready.
               env:
@@ -552,32 +578,40 @@ jobs:
                   # minzoned: no entitlements at all (no hypervisor, no
                   # disable-library-validation, no dyld environment, no JIT),
                   # and an explicit identifier, the one `min` checks it by.
+                  # Signing the bundle signs its program, Contents/MacOS/minzoned,
+                  # and seals Info.plist and the icon into that signature
+                  # (Contents/_CodeSignature/CodeResources). No --deep: the
+                  # bundle holds one program and no nested code.
                   codesign --force --timestamp --options runtime \
                     --identifier "$MINIMAL_ZONED_IDENTIFIER" \
                     --sign "$IDENTITY" \
-                    target/release/minzoned-macos-arm64
+                    target/release/Minimal.app
 
                   codesign --verify --strict --verbose=2 target/release/minvmd-macos-arm64
                   codesign --verify --strict --verbose=2 target/release/minimal-macos-arm64
                   # The exact designated requirement the session advisory and
-                  # the privileged step verify the answerer against.
+                  # the privileged step verify the answerer's bundle against.
                   codesign --verify --strict --verbose=2 \
                     -R "=anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = \"$MINIMAL_ZONED_TEAMID\" and identifier \"$MINIMAL_ZONED_IDENTIFIER\"" \
-                    target/release/minzoned-macos-arm64
+                    target/release/Minimal.app
             - name: Re-check minzoned links on the signed artifact
-              # The last check before upload, on the signed and renamed bytes.
-              run: scripts/check-zoned-links.sh target/release/minzoned-macos-arm64
+              # The link check on the signed bytes, before notarization. The
+              # "Staple and flatten the minzoned app bundle" step repeats it on
+              # the rebuilt bundle, which is the last check before upload.
+              run: scripts/check-zoned-links.sh target/release/Minimal.app/Contents/MacOS/minzoned
             - name: Notarize binaries
-              # Submit each signed binary to Apple's notary service and fail the
-              # release unless every result is Accepted. Notarization does not
-              # modify the file, so the uploaded bytes stay the signed, link-gated
-              # bytes above. notarytool takes a zip, a .pkg or a .dmg, never a
-              # bare Mach-O, so each binary goes up in a ditto zip that is used
-              # only for the submission.
+              # Submit each signed binary, and the signed minzoned app bundle,
+              # to Apple's notary service and fail the release unless every
+              # result is Accepted. Notarization does not modify the file, so
+              # the uploaded bytes stay the signed, link-gated bytes above.
+              # notarytool takes a zip, a .pkg or a .dmg, never a bare Mach-O
+              # or a bundle directory, so each one goes up in a ditto zip that
+              # is used only for the submission.
               #
-              # No staple: the release ships each binary as a bare Mach-O file,
-              # and stapler cannot attach a ticket to one (only to an .app, a .pkg
-              # or a .dmg). Gatekeeper looks the ticket up online instead.
+              # No staple for minvmd and min: the release ships each as a bare
+              # Mach-O file, and stapler cannot attach a ticket to one (only to
+              # an .app, a .pkg or a .dmg). Gatekeeper looks the ticket up
+              # online instead. The app bundle is stapled in the next step.
               #
               # The credentials are a notarytool keychain profile stored in the
               # signing keychain; the repository variable MACOS_NOTARY_PROFILE
@@ -598,7 +632,7 @@ jobs:
                   mkdir -p "$work"
                   for f in target/release/minvmd-macos-arm64 \
                            target/release/minimal-macos-arm64 \
-                           target/release/minzoned-macos-arm64; do
+                           target/release/Minimal.app; do
                     name=$(basename "$f")
                     zip="$work/$name.zip"
                     result="$work/$name.json"
@@ -637,11 +671,68 @@ jobs:
                   name: minimal-macos-arm64
                   path: target/release/minimal-macos-arm64
                   retention-days: 7
-            - name: Upload binary (minzoned)
+            - name: Staple and flatten the minzoned app bundle
+              # Staple the notarization ticket to the bundle, so macOS can
+              # check it with no network: stapler writes it to
+              # Contents/CodeResources, a path the bundle's signature does
+              # not cover, so the signature verified above still holds and is
+              # verified again here. The ticket can take a moment to reach
+              # the service stapler reads it from, so the staple is retried.
+              #
+              # A release carries flat files, so the bundle is then flattened
+              # to one file per bundle file (scripts/build-app-bundle.sh), the
+              # names scripts/stage-release.sh installs under bin/Minimal.app.
+              # The last check rebuilds the bundle from those flat files, the
+              # way the installer lays it down, and verifies that copy: its
+              # Developer ID requirement, and its stapled ticket.
+              run: |
+                  app=target/release/Minimal.app
+                  flat=target/release/minzoned-flat
+                  requirement="=anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = \"$MINIMAL_ZONED_TEAMID\" and identifier \"$MINIMAL_ZONED_IDENTIFIER\""
+
+                  stapled=
+                  for _ in 1 2 3 4 5; do
+                    if xcrun stapler staple "$app"; then
+                      stapled=yes
+                      break
+                    fi
+                    sleep 15
+                  done
+                  if [ -z "$stapled" ]; then
+                    echo "::error::stapler could not staple the notarization ticket to $app" >&2
+                    exit 1
+                  fi
+                  xcrun stapler validate "$app"
+                  codesign --verify --strict --verbose=2 -R "$requirement" "$app"
+
+                  # A persistent runner keeps target/: start from an empty
+                  # directory, so a file a previous run left is never shipped.
+                  rm -rf "$flat"
+                  scripts/build-app-bundle.sh flatten "$app" "$flat"
+                  ls -l "$flat"
+                  for name in minzoned-macos-arm64-CodeSignature minzoned-macos-arm64-ticket; do
+                    if [ ! -f "$flat/$name" ]; then
+                      echo "::error::the flattened bundle has no $name: the bundle is not signed and stapled" >&2
+                      exit 1
+                    fi
+                  done
+
+                  rebuilt="$RUNNER_TEMP/minzoned-rebuilt"
+                  rm -rf "$rebuilt"
+                  scripts/build-app-bundle.sh unflatten "$flat" "$rebuilt/Minimal.app"
+                  codesign --verify --strict --verbose=2 -R "$requirement" "$rebuilt/Minimal.app"
+                  xcrun stapler validate "$rebuilt/Minimal.app"
+                  scripts/check-zoned-links.sh "$rebuilt/Minimal.app/Contents/MacOS/minzoned"
+                  rm -rf "$rebuilt"
+            - name: Upload the minzoned app bundle's files
+              # One artifact, one flat file per bundle file: the release job's
+              # merge-multiple download drops each beside the other
+              # artifacts under its flat name.
               uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
               with:
                   name: minzoned-macos-arm64
-                  path: target/release/minzoned-macos-arm64
+                  path: target/release/minzoned-flat/
+                  if-no-files-found: error
                   retention-days: 7
 
     build-libkrun-macos-arm64:
