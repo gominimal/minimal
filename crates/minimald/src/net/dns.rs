@@ -3621,6 +3621,7 @@ mod tests {
         reg.publish_own_address(older, "older", node, port.clone());
         reg.register_own_ip(older, "older", port.clone());
         reg.publish_own_address(newer, "newer", node, port.clone());
+        reg.register_own_ip(newer, "newer", port.clone());
         reg.restore_bound_ports(newer, &bound);
         assert_eq!(
             reg.publish_own_address(newer, "newer", node, port.clone()),
