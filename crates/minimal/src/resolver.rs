@@ -5340,8 +5340,9 @@ mod tests {
     }
 
     // The full path on this host: whatever `detect` finds, the advisory
-    // either stays quiet because the hook already routes the port and
-    // nothing blocks the command, or says what the host needs — this
+    // either stays quiet because the hook already routes the port, the
+    // range step holds and nothing blocks the command, or says what the
+    // host needs — this
     // platform's exact command, or the blocker that makes it dead. Either
     // arm is a pass; only the mismatch — advised without anything to say,
     // or quiet while the host cannot resolve the zone — fails.
@@ -5356,8 +5357,8 @@ mod tests {
             None,
             &AnswererStep::Installed,
         );
-        let (hook, blocker, _) = &detection;
-        if hook.routes(port) && blocker.is_none() {
+        let (hook, blocker, range_step) = &detection;
+        if hook.routes(port) && blocker.is_none() && range_step.custody_holds() {
             assert!(advisory.is_none(), "configured host must not be advised");
         } else if let Some(blocker) = blocker {
             let advisory = advisory.expect("a host the command cannot reach must be told why");
