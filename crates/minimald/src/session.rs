@@ -1889,8 +1889,9 @@ impl Session {
                 let (_, hand_overs) = reg.unpublish_own_address(record.id);
                 reg.forget_own_address(record.id);
                 // NET-129: each shared-address port this box held has a new
-                // holder of record. Its forward is bound at that box's next
-                // attach; nothing here binds it for a box already running.
+                // holder of record — a running box before a stopped one. Its
+                // forward is bound at that box's next attach; nothing here
+                // binds it for a box already running.
                 for hand_over in hand_overs {
                     tracing::info!(
                         session_id = %hand_over.holder,

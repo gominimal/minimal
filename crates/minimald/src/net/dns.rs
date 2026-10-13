@@ -377,7 +377,8 @@ struct OwnPublished {
 
 /// A shared-address port passing to a new holder (NET-129): the holder's
 /// publish was withdrawn, left the address, or stopped naming the port, and
-/// the box created earliest among those still publishing it there took it.
+/// the box created earliest among the running boxes still publishing it
+/// there took it — or among the stopped ones, when none is running.
 /// Returned as data so the caller can bind the new holder's forward.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PortHandOver {
@@ -558,8 +559,8 @@ pub struct HostnameRegistry {
     /// port; when its publish is withdrawn, leaves the address or stops
     /// naming the port, the lowest [`SessionId`] still publishing it takes
     /// over ([`Self::hand_over`]) — the id is a UUIDv7, so that is the box
-    /// created earliest. An entry exists exactly while some box publishes
-    /// the port at the address.
+    /// created earliest — a running box before a stopped one. An entry
+    /// exists exactly while some box publishes the port at the address.
     own_holders: HashMap<(Ipv4Addr, u16), SessionId>,
     /// The loopback address a creator handed each own-address box, by stable
     /// session id (T66, NET-123 §7.1): recorded at the box's registration
@@ -1134,9 +1135,13 @@ impl HostnameRegistry {
     /// held and no longer publishes there (NET-129): the lowest
     /// [`SessionId`] among the boxes still publishing the port at the
     /// address — exactly one, the box created earliest — or nobody when none
-    /// is left. A port `leaving` only yielded is untouched: its holder
-    /// stands. Called after `leaving`'s publish is removed or replaced, so
-    /// it is never a candidate for a port it vacated.
+    /// is left. A box whose host is running is elected before one whose
+    /// host is stopped (NET-128): a stopped box binds nothing, so the port
+    /// would go unserved while a running box kept yielding it. The election
+    /// is not re-run when a box stops or starts: the holder it made stands.
+    /// A port `leaving` only yielded is untouched: its holder stands.
+    /// Called after `leaving`'s publish is removed or replaced, so it is
+    /// never a candidate for a port it vacated.
     fn hand_over(
         &mut self,
         leaving: SessionId,
@@ -1153,7 +1158,7 @@ impl HostnameRegistry {
                 .iter()
                 .filter(|(_, own)| own.address == address && own.ports.contains(&port))
                 .map(|(id, _)| *id)
-                .min();
+                .min_by_key(|id| (self.stopped.contains(id), *id));
             match next {
                 Some(holder) => {
                     self.own_holders.insert((address, port), holder);
@@ -1208,9 +1213,10 @@ impl HostnameRegistry {
     /// recorded hand goes with the publish: a landing's sweep must not find
     /// a hand for a box that no longer exists. Each shared port it held
     /// passes to the box created earliest among those still publishing it
-    /// at the address ([`Self::hand_over`]) — one new holder per port, which
-    /// the remaining boxes yield to — and those hand-overs are returned
-    /// beside the address, for the caller to bind the new holders' forwards.
+    /// at the address, a running box first ([`Self::hand_over`]) — one new
+    /// holder per port, which the remaining boxes yield to — and those
+    /// hand-overs are returned beside the address, for the caller to bind
+    /// the new holders' forwards.
     pub fn unpublish_own_address(
         &mut self,
         session_id: SessionId,
@@ -3372,6 +3378,69 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// NET-129 beside NET-128: a destroyed holder's port goes to a box
+    /// whose host is running before one whose host is stopped, whatever
+    /// their ids — a stopped box binds nothing, so electing it would leave
+    /// the port unserved while a running box kept yielding. The stopped box
+    /// stays a candidate of last resort, and a box that starts again after
+    /// the election does not take the port back from the standing holder.
+    #[test]
+    fn a_destroyed_holder_hands_the_port_to_a_running_box_before_a_stopped_one() {
+        let node = Ipv4Addr::new(127, 0, 64, 200);
+        let mut reg = HostnameRegistry::new("dev", false).with_node_address(node);
+        let (one, two, three) = (id("1"), id("2"), id("3"));
+        let port = BTreeSet::from([8080u16]);
+        let held_by = |name: &str| {
+            vec![SharedPortCollision {
+                port: 8080,
+                other: format!("{name}.min.internal"),
+            }]
+        };
+
+        // Box 2 holds the port; box 1 — created earlier — yields and is
+        // stopped; box 3 yields and is running.
+        for (session, name) in [(two, "two"), (one, "one"), (three, "three")] {
+            reg.publish_own_address(session, name, node, port.clone());
+            reg.register_own_ip(session, name, port.clone());
+        }
+        reg.mark_stopped(one);
+
+        let (_, hand_overs) = reg.unpublish_own_address(two);
+        assert_eq!(
+            hand_overs,
+            vec![PortHandOver {
+                holder: three,
+                address: node,
+                port: 8080,
+            }],
+            "the running box takes the port, though the stopped box was created earlier"
+        );
+        assert!(reg.shared_port_collisions(three).is_empty());
+        assert_eq!(reg.shared_port_collisions(one), held_by("three"));
+
+        // The stopped box starts again: the standing holder keeps the port.
+        reg.mark_running(one);
+        assert!(reg.shared_port_collisions(three).is_empty());
+        assert_eq!(reg.shared_port_collisions(one), held_by("three"));
+
+        // With only stopped boxes left, the earliest-created one takes it.
+        let four = id("4");
+        reg.publish_own_address(four, "four", node, port.clone());
+        reg.register_own_ip(four, "four", port);
+        reg.mark_stopped(one);
+        reg.mark_stopped(four);
+        let (_, hand_overs) = reg.unpublish_own_address(three);
+        assert_eq!(
+            hand_overs,
+            vec![PortHandOver {
+                holder: one,
+                address: node,
+                port: 8080,
+            }],
+            "no running box is left, so the earliest-created stopped box holds the port"
+        );
     }
 
     /// A holder that stops naming a port hands it over as a destroyed
